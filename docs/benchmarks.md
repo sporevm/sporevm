@@ -412,6 +412,40 @@ only dirty chunks. `--allow-full-scan` permits a versioned full scan but does no
 accept older, unversioned metric records. Performance claims from this
 benchmark require a ReleaseSafe binary on Linux ARM64/KVM.
 
+For repeated live checkpoints under a database write workload, use the opt-in
+pgbench harness:
+
+```console
+mise run benchmark:pgbench-snapshot
+```
+
+The harness grows a PostgreSQL image before timing, initializes pgbench, adds a
+per-client transactional commit counter to the standard TPC-B transaction, and
+takes three non-destructive named saves while eight clients keep writing. Each
+save records the existing disk, backend snapshot, and complete source-pause
+metrics. A guest-side one-second counter sampler records the workload gap around
+each save. Cadence is measured from one save start to the next; if a save itself
+exceeds the interval, the following save starts as soon as the VM is available.
+After the final checkpoint, the source workload is stopped and every checkpoint
+is restored, quiesced, checked against the pre-save transaction lower bound,
+and verified with `pg_amcheck`. Because a restored full-machine spore resumes
+the snapshotted pgbench processes, the result reports transactions committed
+before the first restore-side quiesce separately; that value is not treated as
+snapshot drift.
+
+Results and command logs are written beneath
+`zig-cache/sporevm-benchmarks/pgbench-snapshot/`. The default scale is 10 so the
+spike is practical on both development backends; pass `--scale 100 --disk-size
+8gb` for the 1.5 GB working-set shape used in the Tensorlake comparison. The
+harness requires at least 2 GiB of free guest disk after scale-100
+initialization so PostgreSQL's WAL and checkpoint churn cannot turn capacity
+exhaustion into a misleading snapshot failure. Each run also places its sparse
+runtime overlay in the task-owned work directory instead of the host's shared
+temporary root, keeping host filesystem pressure isolated between benchmark
+runs. This remains outside the
+scheduled benchmark suite until the workload has established a useful baseline
+and an architecture decision needs a durable regression guardrail.
+
 The `disk_metrics` object separates logical parent data referenced by the new
 index from what publication actually did. `parent_referenced_bytes` counts
 logical nonzero parent references before digest deduplication;
@@ -431,6 +465,9 @@ and whole-capture timings remain in the backend snapshot metric and the
 benchmark's `snapshot_metrics` and `duration_ms`; do not substitute either for
 disk snapshot cost. `snapshot_metrics` retains the backend's machine, device,
 generation, RAM, disk, manifest, and total snapshot millisecond breakdown.
+When dirty-object sealing runs in parallel, its zero-scan, hash, and object-write
+timings report the slowest worker's phase rather than summing overlapping worker
+intervals, so they remain comparable with the wall-clock disk total.
 
 Use `--work-dir` and `--cache-dir` to make filesystem placement explicit. For
 example, placing both beneath the prepared NVMe scratch measures the normal

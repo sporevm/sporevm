@@ -1171,6 +1171,76 @@ SHA256 values were
 and `8ccbcea2bf5d33a774c80b0ca7f386d4a251e4a256ec8d4c87fc84dcb7b695e1` for
 HVF.
 
+A July 2026 pgbench spike at product head
+`10d704ba038686e4c7fe34b8275af37f2c06be9c` exercised repeated named saves
+while PostgreSQL kept committing the standard TPC-B transaction plus a
+transactional progress counter. The scale-100 Linux/KVM run used an 8 GiB
+guest disk, 1 GiB RAM, two vCPUs, eight clients, two jobs, and nine save starts
+at a 30-second cadence. All nine restores retained a counter at or above the
+pre-save lower bound and passed `pg_amcheck`. Save starts were 30.082–30.114
+seconds apart. The raw JSONL SHA256 was
+`c0a4edee2106bc5e5598bf04fb7f7b3979c25fe4a236ec558b360e709aa616b2`.
+
+| Shape | Saves | Source pause median / max | Disk median | RAM median | Dirty chunks median | Object write / hash median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| scale 10 KVM | 3 | 3,646 / 4,246 ms | 2,025 ms | 1,354 ms | 3,105 | not retained in summary |
+| scale 100 KVM | 9 | 13,698 / 16,518 ms | 10,813 ms | 2,268 ms | 26,597 | 8,631 / 1,897 ms |
+
+The matching macOS/HVF scale-10 run also passed three restores and measured a
+3,624 ms median source pause, 2,511 ms disk, and 887 ms RAM. A nine-save
+scale-100 HVF diagnostic passed restore validation with a 28,822 ms median
+pause and 26,243 ms disk, but it waited 30 seconds after each save rather than
+measuring start-to-start, so it accumulated more dirty work and is not a
+controlled backend comparison. A corrected two-vCPU HVF attempt then failed
+before its first save with PostgreSQL WAL `fdatasync` and relation-read I/O
+errors; an otherwise matching one-vCPU control passed. Treat that as an
+intermittent HVF/high-load correctness lead, not evidence against the portable
+disk format.
+
+The architecture decision remains unchanged. The KVM run demonstrates that
+dirty tracking avoids full scans and repeated restores remain sound, while
+changed-object publication still dominates the pause at database scale. The
+next optimization spike should isolate and reduce per-object publication work
+before considering a different disk representation; the current evidence does
+not justify replacing the unified chunk-disk design.
+
+The July 16 follow-up isolated that publication cost without changing the disk
+format. Each immutable 64 KiB object is still fsynced before its final hard link,
+but a snapshot now batches the shared object-directory fsync once before index
+publication and seals independent dirty chunks across at most eight workers.
+The parallel timing fields use the slowest worker rather than summing overlapping
+wall-clock intervals. A controlled old-versus-new HVF comparison used the same
+prepared image, task-owned overlay directory, scale-100 database, two vCPUs,
+eight clients, three restores, and 30-second start-to-start cadence:
+
+| Product path | Source pause median / max | Disk median | RAM median | Dirty chunks median | Object write / hash median |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| serial object durability | 38,459 / 54,585 ms | 36,884 ms | 2,750 ms | 35,816 | 34,302 / 1,683 ms |
+| batched parallel durability | 18,304 / 28,358 ms | 16,791 ms | 1,342 ms | 35,825 | 15,642 / 326 ms |
+
+All six restores passed their pre-save counter bound and `pg_amcheck`. The new
+path reduced the median disk time by 54.5% and median source pause by 52.4%
+without weakening the invariant that object data and directory entries are
+durable before the canonical index. The old and new raw JSONL SHA256 values
+were `b3541773d324247e54183b79fcb3f671d56f4d837d4c83544c6f9f4db2307112`
+and `4a8bd730c4e7bb420d7faaa42e2465ebe9535d00ae1ae1068a3d6f8ba245b53a`.
+An isolated native Linux ARM64/KVM follow-up used the same ReleaseSafe source
+to write a 256 MiB random guest file under two vCPUs, save, restore, and verify
+the identical SHA256. That is native runtime proof of the shared publication
+and restore path rather than a cross-compile inference.
+
+The earlier pre-snapshot PostgreSQL I/O failure remains unclassified rather
+than fixed. An 8 GiB guest had more than 5 GiB free, the same image completed
+the controlled three-save baseline, and the optimized three-save repeat also
+completed, so guest capacity is ruled out and a deterministic two-vCPU HVF
+fault was not reproduced. The harness now isolates each runtime overlay, and
+debug monitors retain the exact failed chunk-mapped read, write, prefault, or
+flush operation plus host errno where available. Until that evidence triggers,
+the remaining possibilities are an intermittent HVF/virtio-blk interaction or
+transient host overlay I/O under the higher two-vCPU request rate; confidence in
+either explanation is low. This is a correctness lead to keep investigating,
+not a reason to replace the unified disk architecture.
+
 The native publication gate is complete. Physical same- and cross-filesystem
 pack→unpack→run passed on distinct device IDs with the same verified bundle
 digest (`bd13758c8df47d7b98725accaf56d390613abee6fdf0aec79c5c216c345ea0a5`),

@@ -67,7 +67,10 @@ pub const Backend = union(enum) {
                 return true;
             },
             .chunk_mapped => |disk| {
-                disk.readAt(buf, offset) catch return false;
+                disk.readAt(buf, offset) catch |err| {
+                    std.log.debug("virtio-blk chunk-mapped read failed: error={s} offset={d} len={d}", .{ @errorName(err), offset, buf.len });
+                    return false;
+                };
                 return true;
             },
             .memory => |m| {
@@ -98,7 +101,10 @@ pub const Backend = union(enum) {
                 return true;
             },
             .chunk_mapped => |disk| {
-                disk.writeAt(buf, offset) catch return false;
+                disk.writeAt(buf, offset) catch |err| {
+                    std.log.debug("virtio-blk chunk-mapped write failed: error={s} offset={d} len={d}", .{ @errorName(err), offset, buf.len });
+                    return false;
+                };
                 return true;
             },
             .memory => |m| {
@@ -153,7 +159,10 @@ pub const Backend = union(enum) {
         switch (self) {
             .file => |fd| return std.c.fsync(fd) == 0,
             .chunk_mapped => |disk| {
-                disk.flush() catch return false;
+                disk.flush() catch |err| {
+                    std.log.debug("virtio-blk chunk-mapped flush failed: error={s}", .{@errorName(err)});
+                    return false;
+                };
                 return true;
             },
             .memory => return true,

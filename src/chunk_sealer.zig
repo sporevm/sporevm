@@ -10,6 +10,7 @@ const chunk = @import("chunk.zig");
 
 const testing = if (builtin.is_test) struct {
     var created_dir_syncs: ?*usize = null;
+    var dir_syncs: ?*usize = null;
 } else struct {};
 
 pub const Error = error{
@@ -106,6 +107,25 @@ pub fn writePathAllIfMissingTimedResult(
     return try writeFileAllIfMissingTimedResult(allocator, path_z, data, work_stats);
 }
 
+/// Publishes one immutable object as part of a caller-owned directory batch.
+/// The object bytes are fsynced before the final link is created, but the
+/// containing directory is deliberately not synced. The caller must fsync the
+/// shared directory once after every successful batch and before publishing
+/// any index or manifest that references these objects.
+pub fn writePathAllIfMissingTimedForBatch(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    data: []const u8,
+    work_stats: *WorkStats,
+) Error!WriteIfMissingResult {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const start = try monotonicNs();
+    const result = try writeFileAllIfMissingResultInternal(allocator, path_z, data, false);
+    work_stats.chunk_write_ns +|= try elapsedMonotonicNs(start);
+    return result;
+}
+
 pub fn pwriteFileAllTimed(fd: std.c.fd_t, offset: usize, data: []const u8, work_stats: *WorkStats) Error!void {
     const start = try monotonicNs();
     try pwriteFileAll(fd, offset, data);
@@ -155,11 +175,20 @@ pub fn writeFileAllIfMissingResult(
     path: [:0]const u8,
     data: []const u8,
 ) Error!WriteIfMissingResult {
+    return writeFileAllIfMissingResultInternal(allocator, path, data, true);
+}
+
+fn writeFileAllIfMissingResultInternal(
+    allocator: std.mem.Allocator,
+    path: [:0]const u8,
+    data: []const u8,
+    sync_parent: bool,
+) Error!WriteIfMissingResult {
     const existing_fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (existing_fd >= 0) {
         _ = std.c.close(existing_fd);
         try verifyExistingFile(path, data);
-        try fsyncParentDirPath(allocator, path[0..path.len]);
+        if (sync_parent) try fsyncParentDirPath(allocator, path[0..path.len]);
         return .reused_existing;
     }
     switch (std.c.errno(existing_fd)) {
@@ -191,13 +220,13 @@ pub fn writeFileAllIfMissingResult(
 
         const link_rc = std.c.link(temp_path.ptr, path.ptr);
         if (link_rc == 0) {
-            try fsyncParentDirPath(allocator, path[0..path.len]);
+            if (sync_parent) try fsyncParentDirPath(allocator, path[0..path.len]);
             return .published;
         }
         switch (std.c.errno(link_rc)) {
             .EXIST => {
                 try verifyExistingFile(path, data);
-                try fsyncParentDirPath(allocator, path[0..path.len]);
+                if (sync_parent) try fsyncParentDirPath(allocator, path[0..path.len]);
                 return .reused_existing;
             },
             else => return error.IoFailed,
@@ -346,6 +375,9 @@ pub fn fsyncDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
     try fsyncFd(fd);
+    if (comptime builtin.is_test) {
+        if (testing.dir_syncs) |count| count.* += 1;
+    }
 }
 
 fn fstatRegularSize(fd: std.c.fd_t) Error!usize {
@@ -417,6 +449,32 @@ pub fn ParallelWork(
             requested_workers: usize,
             record_cpu: bool,
         ) !WorkStats {
+            return runWithTimingAggregation(allocator, context, item_count, requested_workers, record_cpu, .sum);
+        }
+
+        /// Runs independent work while reporting the slowest worker's phase
+        /// timings instead of summing overlapping wall-clock intervals. Counts
+        /// still aggregate across every worker.
+        pub fn runMaxTimings(
+            allocator: std.mem.Allocator,
+            context: *Context,
+            item_count: usize,
+            requested_workers: usize,
+            record_cpu: bool,
+        ) !WorkStats {
+            return runWithTimingAggregation(allocator, context, item_count, requested_workers, record_cpu, .max);
+        }
+
+        const TimingAggregation = enum { sum, max };
+
+        fn runWithTimingAggregation(
+            allocator: std.mem.Allocator,
+            context: *Context,
+            item_count: usize,
+            requested_workers: usize,
+            record_cpu: bool,
+            timing_aggregation: TimingAggregation,
+        ) !WorkStats {
             const worker_count = @min(requested_workers, item_count);
             if (worker_count == 0) return .{};
 
@@ -453,7 +511,17 @@ pub fn ParallelWork(
             }
 
             var out: WorkStats = .{};
-            for (worker_stats) |stats| out.add(stats);
+            for (worker_stats) |stats| switch (timing_aggregation) {
+                .sum => out.add(stats),
+                .max => {
+                    out.sealed_chunks +|= stats.sealed_chunks;
+                    out.zero_scan_ns = @max(out.zero_scan_ns, stats.zero_scan_ns);
+                    out.hash_ns = @max(out.hash_ns, stats.hash_ns);
+                    out.chunk_write_ns = @max(out.chunk_write_ns, stats.chunk_write_ns);
+                    out.backing_write_ns = @max(out.backing_write_ns, stats.backing_write_ns);
+                    out.cpu_ns +|= stats.cpu_ns;
+                },
+            };
             return out;
         }
 
@@ -526,6 +594,28 @@ test "write-if-missing verifies existing data" {
     try writeFileAllIfMissing(allocator, path_z, "abc");
     try writeFileAllIfMissing(allocator, path_z, "abc");
     try std.testing.expectError(error.BadChunk, writeFileAllIfMissing(allocator, path_z, "def"));
+}
+
+test "batched immutable writes use one caller-owned directory barrier" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const parent = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/objects", .{tmp.sub_path[0..]});
+    defer allocator.free(parent);
+    try ensureDirPath(allocator, parent);
+    const path = try std.fmt.allocPrint(allocator, "{s}/chunk", .{parent});
+    defer allocator.free(path);
+
+    var dir_syncs: usize = 0;
+    testing.dir_syncs = &dir_syncs;
+    defer testing.dir_syncs = null;
+    var stats: WorkStats = .{};
+    try std.testing.expectEqual(.published, try writePathAllIfMissingTimedForBatch(allocator, path, "abc", &stats));
+    try std.testing.expectEqual(.reused_existing, try writePathAllIfMissingTimedForBatch(allocator, path, "abc", &stats));
+    try std.testing.expectEqual(@as(usize, 0), dir_syncs);
+
+    try fsyncDirPath(allocator, parent);
+    try std.testing.expectEqual(@as(usize, 1), dir_syncs);
 }
 
 const ConcurrentWriteContext = struct {

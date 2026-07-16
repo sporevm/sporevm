@@ -200,6 +200,10 @@ description = "Benchmark writable rootfs COW, sealed append, and replay paths"
 run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast -lc --test-filter 'disk fork benchmark'"
 description = "Benchmark native disk-head cloning, 32-child preparation, and generation-32 reads"
 
+[tasks."benchmark:pgbench-snapshot"]
+run = "mise run build:release && scripts/benchmark/pgbench-snapshot.py --no-build"
+description = "Benchmark repeated named saves under pgbench write load and verify restored databases"
+
 [tasks."smoke:local-pull"]
 run = "mise run build && test/smoke/fanout/local-pull.sh"
 description = "Smoke local file:// pull materialization and restored rootfs fan-out"

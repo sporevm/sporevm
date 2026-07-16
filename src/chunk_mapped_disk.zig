@@ -514,7 +514,10 @@ pub const ChunkMappedDisk = struct {
     }
 
     pub fn readAt(self: *ChunkMappedDisk, buf: []u8, offset: u64) Error!void {
-        try self.prefaultCasRange(buf.len, offset);
+        self.prefaultCasRange(buf.len, offset) catch |err| {
+            std.log.debug("chunk-mapped disk prefault failed: error={s} offset={d} len={d}", .{ @errorName(err), offset, buf.len });
+            return err;
+        };
         var cursor: usize = 0;
         while (cursor < buf.len) {
             const absolute = offset + cursor;
@@ -549,7 +552,10 @@ pub const ChunkMappedDisk = struct {
             // fd, so classify them dirty before a short write can expose a
             // changed prefix while leaving the old parent digest reusable.
             if (source == .overlay_clean) self.sources[span.chunk_index] = .overlay;
-            try writeExact(overlay_fd, buf[cursor..][0..span.len], absolute);
+            writeExact(overlay_fd, buf[cursor..][0..span.len], absolute) catch |err| {
+                std.log.debug("chunk-mapped disk overlay write failed: error={s} offset={d} len={d}", .{ @errorName(err), absolute, span.len });
+                return err;
+            };
             self.sources[span.chunk_index] = .overlay;
             cursor += span.len;
         }
@@ -648,7 +654,11 @@ pub const ChunkMappedDisk = struct {
 
     pub fn flush(self: *ChunkMappedDisk) Error!void {
         if (self.overlay_fd) |fd| {
-            if (std.c.fsync(fd) != 0) return error.FlushFailed;
+            const rc = std.c.fsync(fd);
+            if (rc != 0) {
+                std.log.debug("chunk-mapped disk overlay flush failed: errno={s}", .{@tagName(std.c.errno(rc))});
+                return error.FlushFailed;
+            }
         }
     }
 
@@ -951,9 +961,6 @@ pub const ChunkMappedDisk = struct {
         defer self.allocator.free(object_dir);
         try chunk_sealer.ensureDirPath(self.allocator, object_dir);
 
-        const max_chunk_size = std.math.cast(usize, self.chunk_size) orelse return error.BadClusterSize;
-        const buf = try self.allocator.alloc(u8, max_chunk_size);
-        defer self.allocator.free(buf);
         var work_stats: chunk_sealer.WorkStats = .{};
         const use_parent_index = self.canReuseParentIndex();
         var sealed_candidate_chunks: usize = 0;
@@ -966,6 +973,31 @@ pub const ChunkMappedDisk = struct {
         defer published_parent_objects.deinit();
         var parent_digest_cursor = self.digest_index.cursor();
         const parent_chunk_count = self.parentChunkCount();
+        var sealed_data_objects = false;
+
+        var parallel_batch: ?SnapshotSealBatch = null;
+        defer if (parallel_batch) |*batch| batch.deinit(self.allocator);
+        if (use_parent_index) {
+            var dirty_indices: std.ArrayList(usize) = .empty;
+            defer dirty_indices.deinit(self.allocator);
+            var parallel_safe = true;
+            for (self.sources, 0..) |source, chunk_index| {
+                if (source == .zero or source == .zero_dirty) continue;
+                if (chunk_index < parent_chunk_count and !self.needsSnapshotSeal(chunk_index)) continue;
+                try dirty_indices.append(self.allocator, chunk_index);
+                // CAS faults promote shared source-map state and use the disk's
+                // allocator, so retain the serial path for that uncommon shape.
+                if (source == .cas) parallel_safe = false;
+            }
+            if (parallel_safe) {
+                parallel_batch = try self.sealSnapshotChunksParallel(dir, dirty_indices.items);
+                work_stats = parallel_batch.?.stats;
+            }
+        }
+        var parallel_result_cursor: usize = 0;
+        const max_chunk_size = std.math.cast(usize, self.chunk_size) orelse return error.BadClusterSize;
+        const serial_buf = try self.allocator.alloc(u8, max_chunk_size);
+        defer self.allocator.free(serial_buf);
 
         for (0..self.chunkCount()) |chunk_index| {
             const logical_chunk: u64 = @intCast(chunk_index);
@@ -1007,7 +1039,28 @@ pub const ChunkMappedDisk = struct {
                 continue;
             }
             sealed_candidate_chunks += 1;
-            try self.sealSnapshotChunk(dir, chunk_index, buf, &chunks, &zero_chunks, &work_stats);
+            if (parallel_batch) |batch| {
+                if (parallel_result_cursor >= batch.results.len or batch.indices[parallel_result_cursor] != chunk_index) return error.BadManifest;
+                switch (batch.results[parallel_result_cursor]) {
+                    .zero => try zero_chunks.append(self.allocator, @intCast(chunk_index)),
+                    .data => |id| {
+                        var digest_buf: ManifestDigest = undefined;
+                        try appendChunkEntry(self.allocator, &chunks, chunk_index, manifestDigest(id, &digest_buf));
+                        sealed_data_objects = true;
+                    },
+                }
+                parallel_result_cursor += 1;
+            } else {
+                sealed_data_objects = try self.sealSnapshotChunk(dir, chunk_index, serial_buf, &chunks, &zero_chunks, &work_stats) or sealed_data_objects;
+            }
+        }
+        if (parallel_batch) |batch| {
+            if (parallel_result_cursor != batch.results.len) return error.BadManifest;
+        }
+        if (sealed_data_objects) {
+            const sync_start_ns = try monotonicNs();
+            try chunk_sealer.fsyncDirPath(self.allocator, object_dir);
+            work_stats.chunk_write_ns +|= elapsedSince(sync_start_ns);
         }
         if (linked_parent_object) {
             const sync_start_ns = try monotonicNs();
@@ -1166,27 +1219,64 @@ pub const ChunkMappedDisk = struct {
         chunks: *std.ArrayList(disk_index.DiskIndexChunk),
         zero_chunks: *std.ArrayList(u64),
         work_stats: *chunk_sealer.WorkStats,
-    ) Error!void {
+    ) Error!bool {
         const len = try self.chunkLen(chunk_index);
         const data = buf[0..len];
         try self.readChunk(chunk_index, data);
         const sealed = try chunk_sealer.sealBytes(data, work_stats);
         work_stats.sealed_chunks += 1;
         switch (sealed) {
-            .zero => try zero_chunks.append(self.allocator, @intCast(chunk_index)),
+            .zero => {
+                try zero_chunks.append(self.allocator, @intCast(chunk_index));
+                return false;
+            },
             .data => |id| {
                 const hex = id.toHex();
                 const digest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
                 errdefer self.allocator.free(digest);
                 const object_path = try rootfs_cas.manifestObjectPath(self.allocator, dir, digest);
                 defer self.allocator.free(object_path);
-                try chunk_sealer.writePathAllIfMissingTimed(self.allocator, object_path, data, work_stats);
+                _ = try chunk_sealer.writePathAllIfMissingTimedForBatch(self.allocator, object_path, data, work_stats);
                 try chunks.append(self.allocator, .{
                     .logical_chunk = @intCast(chunk_index),
                     .digest = digest,
                 });
+                return true;
             },
         }
+    }
+
+    fn sealSnapshotChunksParallel(self: *ChunkMappedDisk, dir: []const u8, indices: []const usize) Error!SnapshotSealBatch {
+        const owned_indices = try self.allocator.dupe(usize, indices);
+        errdefer self.allocator.free(owned_indices);
+        const results = try self.allocator.alloc(SnapshotSealResult, indices.len);
+        errdefer self.allocator.free(results);
+        if (indices.len == 0) return .{ .indices = owned_indices, .results = results };
+
+        var context = SnapshotSealContext{
+            .disk = self,
+            .dir = dir,
+            .indices = owned_indices,
+            .results = results,
+        };
+        const ParallelSeal = chunk_sealer.ParallelWork(SnapshotSealContext, sealSnapshotChunkWorker);
+        const stats = ParallelSeal.runMaxTimings(
+            self.allocator,
+            &context,
+            indices.len,
+            chunk_sealer.parallelWorkerCount(indices.len),
+            false,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.BadChunk => error.BadChunk,
+            error.MissingChunk => error.MissingChunk,
+            error.BadManifest => error.BadManifest,
+            error.BadClusterSize => error.BadClusterSize,
+            error.OutOfRange => error.OutOfRange,
+            error.ShortRead => error.ShortRead,
+            else => error.IoFailed,
+        };
+        return .{ .indices = owned_indices, .results = results, .stats = stats };
     }
 
     fn publishParentObject(
@@ -1463,6 +1553,50 @@ const IndexState = struct {
     parent_logical_size: u64,
 };
 
+const SnapshotSealResult = union(enum) {
+    zero,
+    data: chunk.ChunkId,
+};
+
+const SnapshotSealBatch = struct {
+    indices: []usize,
+    results: []SnapshotSealResult,
+    stats: chunk_sealer.WorkStats = .{},
+
+    fn deinit(self: *SnapshotSealBatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.indices);
+        allocator.free(self.results);
+        self.* = undefined;
+    }
+};
+
+const SnapshotSealContext = struct {
+    disk: *ChunkMappedDisk,
+    dir: []const u8,
+    indices: []const usize,
+    results: []SnapshotSealResult,
+};
+
+fn sealSnapshotChunkWorker(context: *SnapshotSealContext, item_index: usize, work_stats: *chunk_sealer.WorkStats) anyerror!void {
+    const chunk_index = context.indices[item_index];
+    const len = try context.disk.chunkLen(chunk_index);
+    const data = try std.heap.page_allocator.alloc(u8, len);
+    defer std.heap.page_allocator.free(data);
+    try context.disk.readChunk(chunk_index, data);
+    const sealed = try chunk_sealer.sealBytes(data, work_stats);
+    work_stats.sealed_chunks += 1;
+    context.results[item_index] = switch (sealed) {
+        .zero => .zero,
+        .data => |id| result: {
+            var digest_buf: ManifestDigest = undefined;
+            const object_path = try rootfs_cas.manifestObjectPath(std.heap.page_allocator, context.dir, manifestDigest(id, &digest_buf));
+            defer std.heap.page_allocator.free(object_path);
+            _ = try chunk_sealer.writePathAllIfMissingTimedForBatch(std.heap.page_allocator, object_path, data, work_stats);
+            break :result .{ .data = id };
+        },
+    };
+}
+
 const ManifestDigest = [spore.rootfs_digest_prefix.len + chunk.ChunkId.hex_len]u8;
 
 fn chunkIdFromDigest(digest: []const u8) Error!chunk.ChunkId {
@@ -1507,7 +1641,14 @@ fn readExact(fd: std.c.fd_t, buf: []u8, offset: u64) Error!void {
         const absolute = std.math.add(u64, offset, done) catch return error.OutOfRange;
         const file_offset = std.math.cast(std.c.off_t, absolute) orelse return error.OutOfRange;
         const n = std.c.pread(fd, buf.ptr + done, buf.len - done, file_offset);
-        if (n <= 0) return error.ShortRead;
+        if (n < 0) {
+            std.log.debug("chunk-mapped disk overlay read failed: errno={s} offset={d} len={d}", .{ @tagName(std.c.errno(n)), absolute, buf.len - done });
+            return error.ShortRead;
+        }
+        if (n == 0) {
+            std.log.debug("chunk-mapped disk overlay read reached unexpected EOF: offset={d} len={d}", .{ absolute, buf.len - done });
+            return error.ShortRead;
+        }
         done += @intCast(n);
     }
 }
@@ -1518,7 +1659,14 @@ fn writeExact(fd: std.c.fd_t, buf: []const u8, offset: u64) Error!void {
         const absolute = std.math.add(u64, offset, done) catch return error.OutOfRange;
         const file_offset = std.math.cast(std.c.off_t, absolute) orelse return error.OutOfRange;
         const n = std.c.pwrite(fd, buf.ptr + done, buf.len - done, file_offset);
-        if (n <= 0) return error.ShortWrite;
+        if (n < 0) {
+            std.log.debug("chunk-mapped disk overlay pwrite failed: errno={s} offset={d} len={d}", .{ @tagName(std.c.errno(n)), absolute, buf.len - done });
+            return error.ShortWrite;
+        }
+        if (n == 0) {
+            std.log.debug("chunk-mapped disk overlay pwrite returned zero: offset={d} len={d}", .{ absolute, buf.len - done });
+            return error.ShortWrite;
+        }
         done += @intCast(n);
     }
 }
