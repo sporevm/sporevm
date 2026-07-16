@@ -155,7 +155,8 @@ The missing work falls into three different categories:
   `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
   (`--parents`, `--chown`, `--chmod`), RUN mounts other than bounded default
   `type=cache,target=...`, local `ADD`, ADD flags
-  other than numeric `--chmod`, heredocs, `USER`, `VOLUME`, `EXPOSE`,
+  other than numeric `--chmod`, RUN heredocs and COPY heredoc forms other than
+  one unquoted non-chomping source, `USER`, `VOLUME`, `EXPOSE`,
   `HEALTHCHECK`, and `ONBUILD` still fail closed. C2 now also accepts bounded
   non-empty JSON-array `RUN` and executes
   its exact argv with Docker-compatible PATH lookup and no implicit variable
@@ -163,9 +164,9 @@ The missing work falls into three different categories:
   with runc's last-value-wins rule before cache hashing and guest serialization.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
-  features (`RUN --mount=type=cache`, additional `ADD` forms, and heredocs)
-  far outside the subset. The base image keeps arriving as an OCI layout via
-  `--build-context`.
+  features that remain outside the subset, including RUN heredocs, broader
+  mount forms, and SSH declarations. The base image keeps arriving as an OCI
+  layout via `--build-context`.
 - The unchanged Buildkite `ci` target is also exercised independently as a
   read-only prioritization oracle. Its first grounded failure may identify C2,
   C3, or C4 work, but does not move mounted RUN or remote ADD semantics into
@@ -489,6 +490,7 @@ implementing Spore's mounts or cache policy.
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
 | `RUN [--mount=type=cache,target=<path>]… <shell>` / `RUN [--mount=type=cache,target=<path>]… ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. The first C3 slice accepts only cache mounts with omitted ID/sharing; bind, tmpfs, secret, SSH, per-instruction network, and heredocs remain rejected. |
 | `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
+| `COPY <<NAME <dest>` | one unquoted, non-chomping inline source with no flags. The body preserves its final newline and quote bytes while expanding stable ARG/ENV expressions from the instruction-start snapshot. It becomes one root-owned `0644` regular file; a directory destination uses `NAME` as its basename. Multiple, mixed, quoted, and chomping heredocs fail closed. |
 | `ADD [--chmod=<octal>] <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Numeric chmod expands at instruction start and must resolve from `0` through `07777`; other flags, symbolic modes, local/Git sources, credentials, and archive extraction fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
 | `ARG K[=default]` | value from `--build-arg` or an expanded default; unset values expand to empty unless a supported operator supplies another result. |
@@ -699,7 +701,11 @@ Per-instruction inputs:
   u64le(len(mode)) || mode || u64le(len(payload)) || payload`. The payload is
   file content, symlink target text, or empty bytes for a directory.
   Ownership is not hashed (COPY forces 0:0). mtimes are not hashed
-  (Docker parity).
+  (Docker parity). A heredoc contributes its delimiter-derived relative name,
+  regular-file type, fixed `0644` mode, and BLAKE3 digest of the exact resolved
+  body through the same framing; the canonical source, resolved destination,
+  workdir, and instruction-start environment digest complete the normal COPY
+  key.
 - `ADD`: the resolved public HTTPS URL and destination, URL-path or response
   filename, downloaded content digest, validated optional `Last-Modified`,
   resolved numeric mode (default `0600`), current `WORKDIR`, and
@@ -1184,7 +1190,9 @@ session as `RUN`, rather than host-side ext4 surgery:
    data, and applies `.dockerignore`. Executor misses stream each matched file
    once into a private sparse spool while hashing those same bytes; modes and
    symlink targets are captured by value. The immutable captured entries are
-   both the cache input digest and the context-disk source.
+   both the cache input digest and the context-disk source. A supported heredoc
+   skips context traversal: its bounded resolved bytes, fixed mode, and
+   delimiter-derived name directly form the same typed regular-file entry.
 2. Map Docker destinations on the host: directory sources copy contents,
    multiple sources require a `/`-terminated destination, relative destinations
    resolve against `WORKDIR`, and guest paths containing `..` fail closed.
@@ -1678,15 +1686,30 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    Mode changes miss, unchanged refetches with the same bytes and mode hit, and
    mode remains independent from the validated remote mtime. Symbolic modes,
    COPY chmod, local ADD, extraction, and other ADD flags remain rejected.
-5. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add RUN
-   and COPY heredocs, `COPY --parents`, and `COPY --chmod` only when the next
+5. **Active — single-source COPY heredoc.** Exact merged main `8655d5b0`, tree
+   `d2f01b53`, passed Buildkite #1397 and independent packaged HVF/KVM
+   acceptance for default cache mounts. The unchanged `fb742fd5` oracle then
+   stopped parser-only at line 121 on `COPY <<EOF`, with no fetch, VM, runtime,
+   rootfs, or cache mutation. This slice accepts only one unquoted,
+   non-chomping inline source with no flags. It preserves the final newline and
+   literal quote bytes, expands the body and destination from the
+   instruction-start snapshot, and lowers one BLAKE3-addressed root-owned
+   `0644` file through the existing typed COPY transition, immutable context
+   disk, strict v4 request, and guest apply path. Quoted or chomping
+   delimiters, multiple or mixed sources, COPY flags, and RUN heredocs remain
+   rejected. A focused exact-input rerun with this candidate parses both COPY
+   heredocs and stops at the cache-mounted RUN heredoc whose instruction begins
+   on line 130 (the `<<EOF` token is on line 132), before any fetch, cache
+   mutation, or VM boot.
+6. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add RUN
+   heredocs, `COPY --parents`, and `COPY --chmod` only when the next
    unchanged-oracle run reaches them. Split these into separate PRs whenever
    their parser, filesystem result, cache identity, or failure-publication
    protocols differ.
-6. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
+7. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
    a later unchanged-oracle run produces a concrete mismatch or unsupported
    span.
-7. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
+8. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
    `--exclude`, `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`,
    `HEALTHCHECK`, `VOLUME`, and other metadata only when the unchanged workload
    or the representative common-template corpus demonstrates demand.
@@ -1743,10 +1766,10 @@ device policy, capability set, and syscall filter keep sibling cache directories
 the aggregate block device, console, vsock, and initrd namespace unreachable.
 The unchanged frozen Buildkite target at commit `fb742fd5` and Dockerfile
 SHA-256 `36867efe6eef1e96da5115aa91df0d087be61763c0097846a971d8709e659a2b`
-parses through its three line-82 default cache mounts with this candidate and
-next fails during whole-file parsing at line 121 on `COPY <<EOF`. No fetch,
-VM boot, or cache/runtime mutation occurs, so COPY heredocs are the next
-grounded oracle boundary after this slice lands.
+parsed through its three line-82 default cache mounts after merged-main
+acceptance at `8655d5b0` and next failed during whole-file parsing at line 121
+on `COPY <<EOF`. No fetch, VM boot, or cache/runtime mutation occurred, so the
+single-source COPY heredoc slice above became the next grounded boundary.
 2. Implement read-only context and stage bind mounts plus tmpfs mounts.
 3. Add per-RUN network selection and key it independently from global default.
 4. Generalize the landed default-ID store with explicit-ID ownership,

@@ -7,6 +7,7 @@ pub const Variable = struct {
 
 pub const Options = struct {
     escape: u8 = '\\',
+    preserve_quotes: bool = false,
 };
 
 pub const max_expanded_word_bytes = 1024 * 1024;
@@ -25,6 +26,7 @@ pub fn expand(
         .input = input,
         .variables = variables,
         .escape = options.escape,
+        .preserve_quotes = options.preserve_quotes,
     };
     return parser.process(null);
 }
@@ -42,6 +44,7 @@ const Parser = struct {
     input: []const u8,
     variables: []const Variable,
     escape: u8,
+    preserve_quotes: bool,
     index: usize = 0,
     depth: u8 = 0,
 
@@ -55,14 +58,20 @@ const Parser = struct {
                 return out.toOwnedSlice();
             }
             switch (c) {
-                '\'' => try self.singleQuoted(&out),
-                '"' => try self.doubleQuoted(&out),
+                '\'' => if (self.preserve_quotes) {
+                    try appendByte(&out, c);
+                    self.index += 1;
+                } else try self.singleQuoted(&out),
+                '"' => if (self.preserve_quotes) {
+                    try appendByte(&out, c);
+                    self.index += 1;
+                } else try self.doubleQuoted(&out),
                 '$' => try self.dollar(&out),
                 else => {
                     if (c == self.escape) {
                         self.index += 1;
                         if (self.index == self.input.len) break;
-                        try appendByte(&out, self.input[self.index]);
+                        if (self.input[self.index] != '\n') try appendByte(&out, self.input[self.index]);
                         self.index += 1;
                     } else {
                         try appendByte(&out, c);
@@ -286,6 +295,22 @@ test "Dockerfile variable expansion preserves quote and escape semantics" {
         defer allocator.free(got);
         try std.testing.expectEqualStrings(case.expected, got);
     }
+}
+
+test "COPY heredoc expansion preserves quotes while expanding their contents" {
+    const allocator = std.testing.allocator;
+    const values = &.{Variable{ .key = "VALUE", .value = "expanded" }};
+    const got = try expand(
+        allocator,
+        "plain=$VALUE\nsingle='$VALUE'\ndouble=\"$VALUE\"\nliteral=\\$VALUE\njoined=left\\\nright\n",
+        values,
+        .{ .preserve_quotes = true },
+    );
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings(
+        "plain=expanded\nsingle='expanded'\ndouble=\"expanded\"\nliteral=$VALUE\njoined=leftright\n",
+        got,
+    );
 }
 
 test "Dockerfile variable expansion rejects malformed and unstable modifiers" {

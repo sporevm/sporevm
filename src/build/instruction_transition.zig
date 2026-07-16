@@ -20,6 +20,7 @@ pub const InstructionTransition = union(enum) {
 
     pub const Copy = union(enum) {
         context: ContextCopy,
+        heredoc: HeredocCopy,
         build_input: build_exec.CopyStep,
     };
 
@@ -27,6 +28,16 @@ pub const InstructionTransition = union(enum) {
         line: usize,
         canonical_instruction: []const u8,
         resolved_sources: []const []const u8,
+        resolved_dest: []const u8,
+        env_digest: []const u8,
+        workdir: []const u8,
+    };
+
+    pub const HeredocCopy = struct {
+        line: usize,
+        canonical_instruction: []const u8,
+        source_name: []const u8,
+        resolved_body: []const u8,
         resolved_dest: []const u8,
         env_digest: []const u8,
         workdir: []const u8,
@@ -103,6 +114,7 @@ pub fn lowerMissSuffix(
         .add => |add| try steps.append(.{ .copy = try lowerRemoteAdd(allocator, &context_disk, add) }),
         .copy => |copy| switch (copy) {
             .build_input => |step| try steps.append(.{ .copy = step }),
+            .heredoc => |heredoc| try steps.append(.{ .copy = try lowerHeredocCopy(allocator, &context_disk, heredoc) }),
             .context => |context| {
                 if (context_snapshot == null) context_snapshot = try build_context.CopySnapshot.init(allocator, io, cache_root);
                 const snapshot = if (context_snapshot) |*value| value else unreachable;
@@ -152,6 +164,62 @@ fn lowerRemoteAdd(
         .env_digest = add.input.env_digest,
         .workdir = add.input.workdir,
         .requests = requests,
+    };
+}
+
+fn lowerHeredocCopy(
+    allocator: std.mem.Allocator,
+    context_disk: *build_context_disk.Builder,
+    heredoc: InstructionTransition.HeredocCopy,
+) !build_exec.CopyStep {
+    const entry = try heredocCopyEntry(allocator, heredoc);
+    const source_prefix = try context_disk.addCapturedCopy(&.{entry});
+    const request = try heredocCopyRequest(allocator, heredoc, source_prefix);
+    return .{
+        .line = heredoc.line,
+        .canonical_instruction = heredoc.canonical_instruction,
+        .input_digest = try build_context.hashResolvedCopyEntries(allocator, &.{entry}),
+        .env_digest = heredoc.env_digest,
+        .workdir = heredoc.workdir,
+        .requests = try allocator.dupe(build_exec.CopyRequest, &.{request}),
+    };
+}
+
+pub fn preflightHeredocCopy(allocator: std.mem.Allocator, heredoc: InstructionTransition.HeredocCopy) !void {
+    _ = try heredocCopyRequest(allocator, heredoc, "spore-copy-heredoc-prefix-00000000");
+}
+
+fn heredocCopyRequest(
+    allocator: std.mem.Allocator,
+    heredoc: InstructionTransition.HeredocCopy,
+    source_prefix: []const u8,
+) !build_exec.CopyRequest {
+    const source = try std.fs.path.join(allocator, &.{ source_prefix, heredoc.source_name });
+    const request = build_exec.CopyRequest{
+        .source = source,
+        .dest = try normalizeGuestPath(allocator, heredoc.workdir, heredoc.resolved_dest),
+        .source_kind = .file,
+        .dest_is_dir = copyDestEndsWithSlash(heredoc.resolved_dest),
+        .entry_count = 1,
+    };
+    try build_exec.validateCopyRequest(request);
+    try build_exec.validateCopyDestinationJoin(request);
+    return request;
+}
+
+fn heredocCopyEntry(allocator: std.mem.Allocator, heredoc: InstructionTransition.HeredocCopy) !build_context.CopyResolvedEntry {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(heredoc.resolved_body);
+    var raw: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hash.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return .{
+        .rel = heredoc.source_name,
+        .kind = .file,
+        .mode = 0o644,
+        .size = heredoc.resolved_body.len,
+        .content_digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex}),
+        .inline_data = heredoc.resolved_body,
     };
 }
 
@@ -366,6 +434,14 @@ fn cacheStep(
         .add => |add| .{ .copy = try lowerRemoteAddForCache(allocator, add) },
         .copy => |copy| switch (copy) {
             .build_input => |step| .{ .copy = step },
+            .heredoc => |heredoc| .{ .copy = .{
+                .line = heredoc.line,
+                .canonical_instruction = heredoc.canonical_instruction,
+                .input_digest = try build_context.hashResolvedCopyEntries(allocator, &.{try heredocCopyEntry(allocator, heredoc)}),
+                .env_digest = heredoc.env_digest,
+                .workdir = heredoc.workdir,
+                .requests = &.{},
+            } },
             .context => |context| blk: {
                 const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, context.resolved_sources, diagnostic.copy) catch |err| {
                     diagnostic.instruction_line.* = context.line;
@@ -411,6 +487,40 @@ fn normalizeBuildInputCopySource(allocator: std.mem.Allocator, source: []const u
     }
     if (parts.items.len == 0) return allocator.dupe(u8, ".");
     return std.mem.join(allocator, "/", parts.items);
+}
+
+test "COPY heredoc lowering keys resolved bytes and reuses ordinary file destination semantics" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const base = InstructionTransition.HeredocCopy{
+        .line = 2,
+        .canonical_instruction = "COPY <<EOF /out/\nvalue\nEOF",
+        .source_name = "EOF",
+        .resolved_body = "value\n",
+        .resolved_dest = "/out/",
+        .env_digest = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        .workdir = "/",
+    };
+    var disk = build_context_disk.Builder.init(arena);
+    const lowered = try lowerHeredocCopy(arena, &disk, base);
+    try std.testing.expectEqual(@as(usize, 1), lowered.requests.len);
+    try std.testing.expectEqualStrings("/out", lowered.requests[0].dest);
+    try std.testing.expect(lowered.requests[0].dest_is_dir);
+    try std.testing.expect(std.mem.endsWith(u8, lowered.requests[0].source, "/EOF"));
+    try std.testing.expectEqual(@as(build_exec.CopySourceKind, .file), lowered.requests[0].source_kind);
+
+    var changed = base;
+    changed.resolved_body = "changed\n";
+    var changed_disk = build_context_disk.Builder.init(arena);
+    const changed_lowered = try lowerHeredocCopy(arena, &changed_disk, changed);
+    try std.testing.expect(!std.mem.eql(u8, lowered.input_digest, changed_lowered.input_digest));
+
+    changed = base;
+    changed.source_name = "DOCUMENT";
+    var renamed_disk = build_context_disk.Builder.init(arena);
+    const renamed = try lowerHeredocCopy(arena, &renamed_disk, changed);
+    try std.testing.expect(!std.mem.eql(u8, lowered.input_digest, renamed.input_digest));
 }
 
 fn copyDestIsDirectory(dest: []const u8, resolution: build_context.CopyResolution) bool {

@@ -91,6 +91,7 @@ pub const CopyResolvedEntry = struct {
     symlink_target: []const u8 = "",
     snapshot_path: []const u8 = "",
     snapshot_offset: u64 = 0,
+    inline_data: ?[]const u8 = null,
 };
 
 const snapshot_dir = "build/context-snapshots";
