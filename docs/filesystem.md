@@ -94,6 +94,18 @@ then applies that inode through the existing confined guest copy path, so mode
 and `Last-Modified` mtime remain independent. Empty, symbolic, malformed,
 duplicate, and out-of-range modes fail before an ADD request is sent.
 
+A single unquoted `COPY <<NAME destination` heredoc becomes one immutable
+root-owned `0644` regular file in that same context-disk pipeline. Its bounded
+body expands from the instruction-start ARG/ENV snapshot without consuming
+literal quote bytes, then the builder hashes the exact resolved bytes and the
+delimiter-derived source name before cache lookup. The existing strict COPY v4
+request applies the file, so a trailing-slash destination uses `NAME` as the
+basename and ordinary COPY owns destination conflicts and checkpoint cleanup.
+The canonical heredoc source, resolved destination, workdir, environment
+state, parent, and executor identity complete the step key. Quoted or
+tab-chomping delimiters, multiple or mixed heredoc sources, COPY flags on the
+form, and RUN heredocs remain fail-closed.
+
 Automatic growth supports SporeVM's journal-less native ext4 profile and
 journal-less layouts from SporeVM's e2fsprogs writer, or equivalent layouts the
 pinned guest kernel can online-grow. Before the first writable mount, the initrd

@@ -45,7 +45,12 @@ pub const Builder = struct {
         });
         for (entries) |entry| {
             if (std.mem.eql(u8, entry.rel, ".")) continue;
-            if (entry.kind == .file and entry.snapshot_path.len == 0) return error.CopySourceNotSnapshotted;
+            if (entry.kind == .file) {
+                const has_snapshot = entry.snapshot_path.len != 0;
+                const has_inline = entry.inline_data != null;
+                if (has_snapshot == has_inline) return error.InvalidCopySourceBacking;
+                if (entry.inline_data) |data| if (data.len != entry.size) return error.InvalidCopySourceBacking;
+            }
             var disk_entry = entry;
             disk_entry.rel = try std.fs.path.join(self.allocator, &.{ prefix, entry.rel });
             try self.entries.append(disk_entry);
@@ -151,19 +156,29 @@ pub const Builder = struct {
                     .gid = 0,
                 }),
                 .file => {
-                    if (entry.snapshot_path.len == 0) return error.CopySourceNotSnapshotted;
-                    const source_path = try self.allocator.dupe(u8, entry.snapshot_path);
-                    try out.append(.{
-                        .path = entry.rel,
-                        .kind = .{ .file_source = .{ .file = tar.FileSlice{
-                            .path = source_path,
-                            .offset = entry.snapshot_offset,
-                            .size = entry.size,
-                        } } },
-                        .mode = @intCast(entry.mode),
-                        .uid = 0,
-                        .gid = 0,
-                    });
+                    if (entry.inline_data) |data| {
+                        try out.append(.{
+                            .path = entry.rel,
+                            .kind = .{ .file = data },
+                            .mode = @intCast(entry.mode),
+                            .uid = 0,
+                            .gid = 0,
+                        });
+                    } else {
+                        if (entry.snapshot_path.len == 0) return error.CopySourceNotSnapshotted;
+                        const source_path = try self.allocator.dupe(u8, entry.snapshot_path);
+                        try out.append(.{
+                            .path = entry.rel,
+                            .kind = .{ .file_source = .{ .file = tar.FileSlice{
+                                .path = source_path,
+                                .offset = entry.snapshot_offset,
+                                .size = entry.size,
+                            } } },
+                            .mode = @intCast(entry.mode),
+                            .uid = 0,
+                            .gid = 0,
+                        });
+                    }
                 },
                 .sym_link => try out.append(.{
                     .path = entry.rel,

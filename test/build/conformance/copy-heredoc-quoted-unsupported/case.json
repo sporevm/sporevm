@@ -1,0 +1,9 @@
+{
+  "description": "quoted COPY heredoc delimiters remain fail-closed",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported COPY heredoc form"
+  },
+  "scan_prefixes": []
+}

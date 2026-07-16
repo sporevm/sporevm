@@ -1,0 +1,46 @@
+{
+  "description": "single unquoted COPY heredocs preserve bytes, expand from instruction state, and key resolved content",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 4,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "resolved-arg-change",
+      "writes": {
+        "Dockerfile": "FROM base\nARG VALUE=changed\nARG DEST=/oracle/plain\nRUN mkdir -p /oracle/directory && printf old >/oracle/plain\nCOPY <<EOF ${DEST}\nplain=$VALUE\nsingle='$VALUE'\ndouble=\"$VALUE\"\nliteral=\\$VALUE\nunset=${UNSET}\nfallback=${UNSET:-fallback}\nEOF\nCOPY <<DOCUMENT /oracle/directory/\nnamed=$VALUE\nDOCUMENT\nCOPY <<EMPTY /oracle/empty\nEMPTY\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 4,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-body-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

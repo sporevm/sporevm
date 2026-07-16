@@ -77,6 +77,12 @@ pub const Copy = struct {
     link: ?bool = null,
     sources: []const []const u8,
     dest: []const u8,
+    heredoc: ?CopyHeredoc = null,
+};
+
+pub const CopyHeredoc = struct {
+    name: []const u8,
+    body: []const u8,
 };
 
 pub const Add = struct {
@@ -108,6 +114,7 @@ const LogicalLine = struct {
     line: usize,
     end_line: usize,
     text: []const u8,
+    heredoc: ?CopyHeredoc = null,
 };
 
 const max_dockerfile_bytes = 1024 * 1024;
@@ -131,8 +138,11 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagn
         const space = firstSpace(trimmed) orelse trimmed.len;
         const op = trimmed[0..space];
         const rest = std.mem.trimStart(u8, trimmed[space..], " \t");
-        const raw = try allocator.dupe(u8, trimmed);
-        const value = parseInstruction(allocator, line.line, op, rest, directives.escape, diagnostic) catch return error.DockerfileParseFailed;
+        const raw = if (line.heredoc) |heredoc|
+            try std.fmt.allocPrint(allocator, "{s}\n{s}{s}", .{ trimmed, heredoc.body, heredoc.name })
+        else
+            try allocator.dupe(u8, trimmed);
+        const value = parseInstruction(allocator, line.line, op, rest, line.heredoc, directives.escape, diagnostic) catch return error.DockerfileParseFailed;
         try instructions.append(.{
             .line = line.line,
             .span = .{ .start_line = line.line, .end_line = line.end_line },
@@ -178,6 +188,7 @@ fn parseInstruction(
     line: usize,
     op: []const u8,
     rest: []const u8,
+    heredoc: ?CopyHeredoc,
     escape: u8,
     diagnostic: *Diagnostic,
 ) !Instruction.Value {
@@ -248,8 +259,24 @@ fn parseInstruction(
         } };
     }
     if (asciiEql(op, "COPY")) {
-        if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported COPY heredoc");
         const args = try splitWords(allocator, rest, escape, line, diagnostic);
+        if (heredoc) |copy_heredoc| {
+            if (args.len != 2 or args[0].raw.len != copy_heredoc.name.len + 2 or
+                !std.mem.startsWith(u8, args[0].raw, "<<") or
+                !std.mem.eql(u8, args[0].raw[2..], copy_heredoc.name) or
+                !validHeredocDelimiter(copy_heredoc.name))
+            {
+                return fail(diagnostic, line, "unsupported COPY heredoc form");
+            }
+            try validateExpansion(allocator, args[1].raw, escape, line, diagnostic);
+            try validateHeredocExpansion(allocator, copy_heredoc.body, escape, line, diagnostic);
+            return .{ .copy = .{
+                .sources = &.{},
+                .dest = args[1].raw,
+                .heredoc = copy_heredoc,
+            } };
+        }
+        if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported COPY heredoc");
         var first_source: usize = 0;
         var from: ?[]const u8 = null;
         var link: ?bool = null;
@@ -430,7 +457,8 @@ fn logicalLines(
     var continuing = false;
     var line_no: usize = 1;
     var it = std.mem.splitScalar(u8, bytes, '\n');
-    while (it.next()) |raw_line| : (line_no += 1) {
+    while (it.next()) |raw_line| {
+        defer line_no += 1;
         const line = std.mem.trimEnd(u8, raw_line, "\r");
         const trimmed_left = std.mem.trimStart(u8, line, " \t");
         if (trimmed_left.len == 0) continue;
@@ -443,11 +471,63 @@ fn logicalLines(
         if (current.items.len > max_logical_line_bytes) return fail(diagnostic, current_line, "Dockerfile logical line is too long");
         continuing = has_continuation;
         if (!continuing) {
-            try lines.append(.{ .line = current_line, .end_line = line_no, .text = try current.toOwnedSlice() });
+            const text = try current.toOwnedSlice();
+            if (copyHeredocTerminator(text)) |terminator| {
+                if (terminator.len == 0) return fail(diagnostic, current_line, "unsupported COPY heredoc form");
+                var body = std.array_list.Managed(u8).init(allocator);
+                var terminated = false;
+                while (it.next()) |raw_body_line| {
+                    line_no += 1;
+                    const body_line = std.mem.trimEnd(u8, raw_body_line, "\r");
+                    if (std.mem.eql(u8, body_line, terminator)) {
+                        terminated = true;
+                        break;
+                    }
+                    try body.appendSlice(body_line);
+                    try body.append('\n');
+                    if (body.items.len > max_dockerfile_bytes) return fail(diagnostic, current_line, "COPY heredoc is too large");
+                }
+                if (!terminated) return fail(diagnostic, current_line, "unterminated COPY heredoc");
+                try lines.append(.{
+                    .line = current_line,
+                    .end_line = line_no,
+                    .text = text,
+                    .heredoc = .{
+                        .name = try allocator.dupe(u8, terminator),
+                        .body = try body.toOwnedSlice(),
+                    },
+                });
+            } else {
+                try lines.append(.{ .line = current_line, .end_line = line_no, .text = text });
+            }
             current = std.array_list.Managed(u8).init(allocator);
         }
     }
     if (continuing) return fail(diagnostic, current_line, "unterminated Dockerfile line continuation");
+}
+
+fn copyHeredocTerminator(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const space = firstSpace(trimmed) orelse return null;
+    if (!asciiEql(trimmed[0..space], "COPY")) return null;
+    const rest = std.mem.trimStart(u8, trimmed[space..], " \t");
+    const marker = std.mem.indexOf(u8, rest, "<<") orelse return null;
+    var token_end = marker + 2;
+    while (token_end < rest.len and rest[token_end] != ' ' and rest[token_end] != '\t') token_end += 1;
+    var token = rest[marker + 2 .. token_end];
+    if (token.len != 0 and token[0] == '-') token = token[1..];
+    if (token.len >= 2 and ((token[0] == '\'' and token[token.len - 1] == '\'') or
+        (token[0] == '"' and token[token.len - 1] == '"')))
+    {
+        token = token[1 .. token.len - 1];
+    }
+    return token;
+}
+
+fn validHeredocDelimiter(value: []const u8) bool {
+    if (value.len == 0 or !(std.ascii.isAlphabetic(value[0]) or value[0] == '_')) return false;
+    for (value[1..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    return true;
 }
 
 fn parseDirectives(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !Directives {
@@ -493,6 +573,14 @@ fn validateExpansion(allocator: std.mem.Allocator, input: []const u8, escape: u8
     variable_expansion.validate(allocator, input, .{ .escape = escape }) catch |err| switch (err) {
         error.BadVariableSubstitution, error.UnsupportedVariableModifier => return fail(diagnostic, line, "unsupported variable expansion"),
         error.VariableExpansionTooLarge => return fail(diagnostic, line, "expanded Dockerfile argument is too large"),
+        else => |other| return other,
+    };
+}
+
+fn validateHeredocExpansion(allocator: std.mem.Allocator, input: []const u8, escape: u8, line: usize, diagnostic: *Diagnostic) !void {
+    variable_expansion.validate(allocator, input, .{ .escape = escape, .preserve_quotes = true }) catch |err| switch (err) {
+        error.BadVariableSubstitution, error.UnsupportedVariableModifier => return fail(diagnostic, line, "unsupported variable expansion"),
+        error.VariableExpansionTooLarge => return fail(diagnostic, line, "expanded COPY heredoc is too large"),
         else => |other| return other,
     };
 }
@@ -725,6 +813,54 @@ test "Dockerfile parser accepts supported subset" {
     try std.testing.expectEqual(@as(usize, 1), doc.stages.len);
     try std.testing.expectEqual(@as(usize, 6), doc.stages[0].instructions.len);
     try std.testing.expectEqualStrings("base", doc.stages[0].from.value.from.source);
+}
+
+test "Dockerfile parser preserves a narrow COPY heredoc with its source span" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena_state.allocator(),
+        \\FROM scratch
+        \\ARG VERSION=24
+        \\COPY <<EOF /etc/example
+        \\value=${VERSION}
+        \\quoted='${VERSION}'
+        \\# body comment is data
+        \\EOF
+        \\CMD ["true"]
+        \\
+    , &diag);
+    const instruction = doc.stages[0].instructions[1];
+    const copy = instruction.value.copy;
+    try std.testing.expectEqual(@as(usize, 3), instruction.span.start_line);
+    try std.testing.expectEqual(@as(usize, 7), instruction.span.end_line);
+    try std.testing.expectEqual(@as(usize, 0), copy.sources.len);
+    try std.testing.expectEqualStrings("/etc/example", copy.dest);
+    try std.testing.expectEqualStrings("EOF", copy.heredoc.?.name);
+    try std.testing.expectEqualStrings("value=${VERSION}\nquoted='${VERSION}'\n# body comment is data\n", copy.heredoc.?.body);
+    try std.testing.expectEqualStrings(
+        "COPY <<EOF /etc/example\nvalue=${VERSION}\nquoted='${VERSION}'\n# body comment is data\nEOF",
+        instruction.raw,
+    );
+}
+
+test "Dockerfile parser rejects unsupported and malformed COPY heredocs before later instructions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const invalid = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM scratch\nCOPY <<'EOF' /out\n$VALUE\nEOF\n", .message = "unsupported COPY heredoc form" },
+        .{ .dockerfile = "FROM scratch\nCOPY <<-EOF /out\nvalue\nEOF\n", .message = "unsupported COPY heredoc form" },
+        .{ .dockerfile = "FROM scratch\nCOPY <<EOF extra /out\nvalue\nEOF\n", .message = "unsupported COPY heredoc form" },
+        .{ .dockerfile = "FROM scratch\nCOPY --chmod=0644 <<EOF /out\nvalue\nEOF\n", .message = "unsupported COPY heredoc form" },
+        .{ .dockerfile = "FROM scratch\nCOPY <<EOF /out\nvalue\n", .message = "unterminated COPY heredoc" },
+        .{ .dockerfile = "FROM scratch\nCOPY <<EOF /out\n${VALUE:?no}\nEOF\nRUN should-not-parse\n", .message = "unsupported variable expansion" },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), case.dockerfile, &diag));
+        try std.testing.expectEqual(@as(usize, 2), diag.line);
+        try std.testing.expectEqualStrings(case.message, diag.message);
+    }
 }
 
 test "Dockerfile parser fails closed on unsupported features" {

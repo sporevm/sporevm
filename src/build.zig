@@ -544,9 +544,12 @@ fn preflightBuildPlan(
             switch (instruction.value) {
                 .run => |run| _ = try runStep(allocator, diagnostic, state, instruction, run, options),
                 .copy => |copy| {
-                    const resolved_sources = try substituteStateList(allocator, copy.sources, state, instruction.escape);
-                    const resolved_dest = try substituteState(allocator, copy.dest, state, instruction.escape);
-                    if (copy.from != null) {
+                    if (copy.heredoc) |heredoc| {
+                        const transition = try heredocCopyTransition(allocator, state, instruction, copy, heredoc);
+                        try instruction_transition.preflightHeredocCopy(allocator, transition);
+                    } else if (copy.from != null) {
+                        const resolved_sources = try substituteStateList(allocator, copy.sources, state, instruction.escape);
+                        const resolved_dest = try substituteState(allocator, copy.dest, state, instruction.escape);
                         _ = instruction_transition.buildInputCopy(
                             allocator,
                             instruction.line,
@@ -563,6 +566,8 @@ fn preflightBuildPlan(
                             return err;
                         };
                     } else {
+                        const resolved_sources = try substituteStateList(allocator, copy.sources, state, instruction.escape);
+                        const resolved_dest = try substituteState(allocator, copy.dest, state, instruction.escape);
                         var transition_diagnostic = transitionDiagnostics(diagnostic);
                         try instruction_transition.preflightContextCopy(
                             io,
@@ -738,7 +743,14 @@ fn instructionTransitionResolved(
     }
     return switch (instruction.value) {
         .run => |run| .{ .run = try runStep(allocator, diagnostic, state.*, instruction, run, options) },
-        .copy => |copy| if (copy.from != null) blk: {
+        .copy => |copy| if (copy.heredoc) |heredoc| blk: {
+            const transition = try heredocCopyTransition(allocator, state.*, instruction, copy, heredoc);
+            instruction_transition.preflightHeredocCopy(allocator, transition) catch |err| {
+                diagnostic.instruction_line = instruction.line;
+                return err;
+            };
+            break :blk .{ .copy = .{ .heredoc = transition } };
+        } else if (copy.from != null) blk: {
             const binding = findStageCopyBinding(stage_inputs.bindings, instruction_index) orelse return error.BadManifest;
             const transition = instruction_transition.buildInputCopy(
                 allocator,
@@ -776,6 +788,34 @@ fn instructionTransitionResolved(
         .from => unreachable,
         else => unreachable,
     };
+}
+
+fn heredocCopyTransition(
+    allocator: std.mem.Allocator,
+    state: State,
+    instruction: dockerfile.Instruction,
+    copy: dockerfile.Copy,
+    heredoc: dockerfile.CopyHeredoc,
+) !instruction_transition.InstructionTransition.HeredocCopy {
+    return .{
+        .line = instruction.line,
+        .canonical_instruction = instruction.raw,
+        .source_name = heredoc.name,
+        .resolved_body = try substituteHeredocState(allocator, heredoc.body, state, instruction.escape),
+        .resolved_dest = try substituteState(allocator, copy.dest, state, instruction.escape),
+        .env_digest = try effectiveEnvDigest(allocator, state),
+        .workdir = state.workdir,
+    };
+}
+
+fn substituteHeredocState(allocator: std.mem.Allocator, input: []const u8, state: State, escape: u8) ![]const u8 {
+    return substituteWithOptions(
+        allocator,
+        input,
+        state.args.items,
+        try effectiveStateEnv(allocator, state),
+        .{ .escape = escape, .preserve_quotes = true },
+    );
 }
 
 fn resolveRemoteAddInput(
@@ -1491,6 +1531,16 @@ fn substituteState(allocator: std.mem.Allocator, input: []const u8, state: State
 }
 
 fn substitute(allocator: std.mem.Allocator, input: []const u8, args: []const ArgValue, env: []const []const u8, escape: u8) ![]const u8 {
+    return substituteWithOptions(allocator, input, args, env, .{ .escape = escape });
+}
+
+fn substituteWithOptions(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    args: []const ArgValue,
+    env: []const []const u8,
+    expansion_options: variable_expansion.Options,
+) ![]const u8 {
     var variables = std.array_list.Managed(variable_expansion.Variable).init(allocator);
     for (env) |entry| {
         if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
@@ -1500,7 +1550,7 @@ fn substitute(allocator: std.mem.Allocator, input: []const u8, args: []const Arg
     for (args) |arg| {
         try variables.append(.{ .key = arg.key, .value = arg.value });
     }
-    return variable_expansion.expand(allocator, input, variables.items, .{ .escape = escape });
+    return variable_expansion.expand(allocator, input, variables.items, expansion_options);
 }
 
 fn lookupArg(name: []const u8, args: []const ArgValue) ?[]const u8 {
@@ -1642,7 +1692,7 @@ fn contextCopyTransitionForTest(
     return switch (transition) {
         .copy => |copy| switch (copy) {
             .context => |context| context,
-            .build_input => unreachable,
+            .heredoc, .build_input => unreachable,
         },
         .run, .add, .workdir => unreachable,
     };
@@ -1654,6 +1704,54 @@ test "variable substitution uses env before args" {
     const arena = arena_state.allocator();
     const got = try substitute(arena, "${APP}/$MODE", &.{.{ .key = "MODE", .value = "arg" }}, &.{"APP=/srv"}, '\\');
     try std.testing.expectEqualStrings("/srv/arg", got);
+}
+
+test "COPY heredoc transition expands from the instruction-start state" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parse_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\COPY <<EOF ${DEST}
+        \\arg=$VALUE
+        \\env=$ENV_VALUE
+        \\single='$VALUE'
+        \\unset=${MISSING}
+        \\fallback=${MISSING:-fallback}
+        \\literal=\$VALUE
+        \\EOF
+        \\
+    , &parse_diagnostic);
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "VALUE", .value = "argument" });
+    try args.append(.{ .key = "DEST", .value = "/oracle/result" });
+    var state = State{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{"ENV_VALUE=environment"}),
+        .args = args,
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+    };
+    var diagnostic: Diagnostic = .{};
+    const transition = (try instructionTransition(
+        arena,
+        .{ .tag = "local/app:dev", .context_dir = "unused", .dockerfile_path = "unused" },
+        &diagnostic,
+        &.{},
+        .{ .bindings = &.{}, .rootfs = &.{} },
+        0,
+        &.{},
+        &state,
+        document.stages[0].instructions[0],
+        0,
+    )).?;
+    const heredoc = transition.copy.heredoc;
+    try std.testing.expectEqualStrings("EOF", heredoc.source_name);
+    try std.testing.expectEqualStrings("/oracle/result", heredoc.resolved_dest);
+    try std.testing.expectEqualStrings(
+        "arg=argument\nenv=environment\nsingle='argument'\nunset=\nfallback=fallback\nliteral=$VALUE\n",
+        heredoc.resolved_body,
+    );
 }
 
 test "automatic platform args derive from the selected platform and accept overrides" {

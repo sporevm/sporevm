@@ -2,6 +2,21 @@
 
 ## Next
 
+`spore build` now accepts a single unquoted, non-chomping COPY heredoc source,
+for example `COPY <<EOF /etc/example`. The body keeps its final newline and
+literal quote bytes while builder-owned ARG and ENV expansion follows the same
+instruction-start snapshot, unset-to-empty behavior, stable parameter
+operators, and escape handling as other COPY operands. The resolved bytes are
+BLAKE3-addressed as a root-owned `0644` regular file in the existing immutable
+context disk, and the normal strict COPY v4 path applies it, so exact-file,
+directory-destination, conflict, checkpoint, and cleanup behavior stay shared
+with context COPY. The delimiter supplies the filename when the destination is
+a directory. The canonical source, delimiter, resolved content digest,
+destination, workdir, environment state, parent rootfs, and executor identity
+remain cache inputs. Quoted or tab-chomping delimiters, multiple or mixed
+sources, heredoc COPY flags, and RUN heredocs still fail during full-file
+parsing.
+
 `spore build` now matches Docker's frontend behavior for continued tokens,
 bracket-prefixed shell commands, parent-relative `WORKDIR`, and step timeouts.
 Removing a line-continuation escape no longer inserts a space, so identifiers
@@ -77,8 +92,8 @@ platform, parent rootfs, executor identity, and the explicit destination policy
 are cache inputs; changed source-stage bytes miss while unchanged rebuilds hit.
 The strict guest v5 request accepts link policy only from bounded immutable
 build-input disks, and conflict removal shares COPY's 65,536-entry limit.
-Local-context `--link`, COPY `--chmod`, `--parents`, heredocs, OCI layer
-rebasing, mounted RUN, and SSH remain unsupported.
+Local-context `--link`, COPY `--chmod`, `--parents`, non-single-source COPY
+heredocs, OCI layer rebasing, and SSH remain unsupported.
 
 `spore build` now accepts one public HTTPS URL and one destination in `ADD`.
 The builder resolves both operands from the instruction-start ENV/ARG snapshot,
@@ -149,7 +164,7 @@ guest request boundary rejects full-buffer truncation and duplicate top-level
 type keys for every request kind, validates raw UTF-8 in JSON strings, and
 decodes Unicode escapes and valid surrogate pairs to UTF-8 so raw and
 equivalently escaped JSON produce identical argv bytes. Shell-form RUN remains `/bin/sh -c`;
-mounted RUN and heredocs remain unsupported.
+RUN heredocs and mount forms beyond bounded default cache mounts remain unsupported.
 
 Cold OCI base imports no longer scan the complete merged filesystem for every
 regular-file replacement. The importer keeps per-inode hardlink reference
@@ -353,8 +368,8 @@ virtio-blk inputs, and cache keys bind the exact source index plus the exact
 kernel, initrd, and embedded build-agent identity. Cross-stage COPY preserves
 modes, ownership, mtimes, symlinks, hardlinks within each source tree, and regular-file
 `security.capability`; every other visible `security.*` xattr fails closed.
-Mounted RUN, heredocs, advanced COPY flags, and non-root build execution remain
-unsupported.
+RUN mount forms beyond bounded default cache mounts, RUN heredocs, advanced
+COPY flags and heredoc forms, and non-root build execution remain unsupported.
 
 Automatic growth is limited to SporeVM's journal-less native and e2fsprogs
 ext4 profiles, or equivalent layouts accepted by the pinned guest kernel.
