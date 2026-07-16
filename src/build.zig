@@ -487,6 +487,7 @@ fn preflightBuildPlan(
                             resolved_dest,
                             try effectiveEnvDigest(allocator, state),
                             state.workdir,
+                            copy.link orelse false,
                             0,
                             metadataOnlyStorage(),
                         ) catch |err| {
@@ -679,6 +680,7 @@ fn instructionTransitionResolved(
                 try substituteState(allocator, copy.dest, state.*, instruction.escape),
                 try effectiveEnvDigest(allocator, state.*),
                 state.workdir,
+                copy.link orelse false,
                 binding.input_index,
                 binding.storage,
             ) catch |err| {

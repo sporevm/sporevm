@@ -50,8 +50,9 @@ related_plans:
 > context work adds a stat-cache for content digests and replaces the deleted
 > build COPY entry stream with a cached read-only ext4 context disk.
 >
-> **Capacity update (2026-07-11).** Build cache v7 separates rootfs capacity
-> preparation from Dockerfile instruction caching. The automatic policy is the
+> **Capacity update (2026-07-11).** Build cache v7 introduced separate rootfs
+> capacity preparation; current cache v8 retains that contract and adds typed
+> COPY destination policy. The automatic policy is the
 > idempotent absolute target `max(parent_logical_size, 16 GiB)`: supported
 > journal-less compact images prepare once to 16 GiB, while images already at
 > or above 16 GiB retain their exact size. A typed `PREPARE` record reuses that
@@ -146,12 +147,12 @@ The missing work falls into three different categories:
 
 ## Current Contract And Progress
 
-- No BuildKit compatibility beyond the stated subset. C1 accepts source-spanned
+- No BuildKit compatibility beyond the stated subset. The current subset accepts source-spanned
   multi-stage `FROM … AS`, reachable-target planning, `scratch`, public
   registry/local/named-context bases, previous-stage inheritance, literal
-  `COPY --from`, `--target`, and final `ENTRYPOINT`/`CMD` publication. COPY
-  flags (`--link`, `--parents`, `--chown`, `--chmod`), `RUN --mount`, local or
-  flagged `ADD`,
+  `COPY --from`, result-correct cross-stage `COPY --link`, `--target`, and final
+  `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
+  (`--parents`, `--chown`, `--chmod`), `RUN --mount`, local or flagged `ADD`,
   heredocs, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`, and `ONBUILD` still fail
   closed. C2 now also accepts bounded non-empty JSON-array `RUN` and executes
   its exact argv with Docker-compatible PATH lookup and no implicit variable
@@ -159,7 +160,7 @@ The missing work falls into three different categories:
   with runc's last-value-wins rule before cache hashing and guest serialization.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
-  features (`RUN --mount=type=cache`, `COPY --link`, additional `ADD` forms, heredocs)
+  features (`RUN --mount=type=cache`, additional `ADD` forms, and heredocs)
   far outside the subset. The base image keeps arriving as an OCI layout via
   `--build-context`.
 - The unchanged Buildkite `ci` target is also exercised independently as a
@@ -191,6 +192,22 @@ The missing work falls into three different categories:
   lookup, applies an opaque regular file with mode `0600` through the shared
   COPY path, and retains HTTP, credentials, Git, flags, unpacking, and special
   files as unsupported behavior.
+- The public HTTPS ADD slice landed as PR #501 at
+  `5cf5dd3e30b7dfaa4800638c59083c2af8b7b24a`, tree
+  `59691bddf136e7d512c98a66a0006c5a605db537`. The unchanged frozen Buildkite
+  oracle then passed both line-42 ADD instructions during full-file parsing and
+  stopped at line 72 on
+  `COPY --link --from=test-engine-client /usr/local/bin/bktec /usr/local/bin/bktec`.
+  No fetch, cache mutation, or VM boot occurred; C3 mounts, later `ADD --chmod`,
+  and SSH remained unreached. The oracle removed its isolated task state after
+  recording log SHA-256
+  `e207c09bb97c01a1717aadf131819e4e951cb022842587072f444eac3e2d6cde`.
+- Cross-stage `COPY --link[=true]` now applies the copied result as if it were
+  built on scratch before merging above the current parent: lower destination
+  symlinks are not followed, conflicting lower files/directories are replaced,
+  and matching directories merge. `--link=false` retains ordinary COPY
+  behavior. Spore conservatively keeps the current parent in cache identity;
+  it does not claim BuildKit layer rebasing or parent-independent reuse.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
 - No flat checkpoint store and no full-image hash fallback in the executor.
@@ -324,8 +341,9 @@ capacity recursively. There is no hidden override or public capacity knob.
 Logical capacity remains sparse and does not reserve 16 GiB of physical
 storage.
 
-Before the first executor-backed instruction, the builder resolves a typed v7
-`PREPARE` key from the parent index, exact target, and the exact managed
+Before the first executor-backed instruction, the current builder resolves a
+typed v8 `PREPARE` key, retaining the v7 capacity contract, from the parent
+index, exact target, and the exact managed
 kernel/initrd plus growth-protocol producer identity. A hit becomes the parent
 for ordinary Dockerfile keys. On a miss, the same VM that will execute the
 remaining steps grows the clean-zero chunk map. Before the first writable
@@ -427,7 +445,7 @@ implementing Spore's mounts or cache policy.
 | --- | --- |
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
 | `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; exec form preserves a bounded non-empty JSON string array and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
-| `COPY [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. Other COPY flags fail closed. |
+| `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
 | `ADD <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Flags, local/Git sources, credentials, and archive extraction fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
 | `ARG K[=default]` | value from `--build-arg` or an expanded default; unset values expand to empty unless a supported operator supplies another result. |
@@ -468,10 +486,10 @@ src/build/context.zig    .dockerignore-aware context walking, stat-cache
 src/build/context_disk.zig
                          read-only ext4 context disk emission/reuse for
                          executed COPY steps
-src/build/step_cache.zig step-key computation + canonical v7 record adapter
+src/build/step_cache.zig step-key computation + canonical v8 record adapter
                          shared by cache-hit and GC validation; on-disk records
                          map deterministic parent+instruction inputs to child
-                         index_digest outcomes, including the typed v7 PREPARE
+                         index_digest outcomes, including the typed v8 PREPARE
                          normalization record
 src/build/exec.zig       persistent build-VM session: boot the deepest
                          cached index writable through ChunkMappedDisk,
@@ -575,25 +593,26 @@ A completed stage artifact is:
 
 ### Step keys
 
-Build cache v7 has two typed derivations in the same record namespace. The
+Build cache v8 has two typed derivations in the same record namespace. The
 synthetic `PREPARE` operation normalizes capacity before Dockerfile cache keys
 are resolved; RUN, COPY, ADD, and WORKDIR then use the prepared child as their
 ordinary parent. A key is a cache lookup address, and the record at that address
 stores the child `index_digest` produced by the prior successful execution.
 
 ```
-prepare_key = blake3_framed(builder_version_v7, platform,
+prepare_key = blake3_framed(builder_version_v8, platform,
                             parent_index_digest, "PREPARE", exact_target,
                             producer_identity)
 
-step_key = blake3_framed(builder_version_v7, platform,
+step_key = blake3_framed(builder_version_v8, platform,
                          prepared_parent_index_digest, instruction_kind,
                          canonical_instruction, input_digest, env_digest,
-                         workdir, network_mode, executor_identity)
+                         workdir, network_mode, copy_destination_policy,
+                         executor_identity)
 ```
 
 Every field is length-framed, and optional fields carry an explicit presence
-tag. `disk_grow_target` is absent from v7 Dockerfile inputs and records. The
+tag. `disk_grow_target` is absent from v8 Dockerfile inputs and records. The
 producer identity binds the exact kernel and initrd bytes that will boot plus
 the growth request, mount/no-lazy-init policy, transient WRITE_ZEROES contract,
 and preparation host-contract version. The same exact-byte identity is carried
@@ -782,17 +801,17 @@ Intermediates are input-addressed by their step key, but their artifacts are
 normal rootfs CAS indexes. The step record is not restore authority; it is a
 local memo from deterministic inputs to a child `index_digest`. A cache hit
 requires the child index to parse, validate against the rootfs descriptor, and
-have the already-published completeness stamp. v7 does not repair a missing
+have the already-published completeness stamp. V8 does not repair a missing
 stamp during lookup: missing or malformed indexes, missing complete stamps, or
 bad records are misses. GC continues to parse older records conservatively and
-may retain their complete content, but v6 records cannot hit v7 keys.
+may retain their complete content, but v7 and v6 records cannot hit v8 keys.
 
 Cache correctness rules:
 
 ```json
 {
   "kind": "sporevm-build-step-v1",
-  "builder_version": "sporevm-build-v7",
+  "builder_version": "sporevm-build-v8",
   "platform": {"os": "linux", "arch": "arm64"},
   "step_key": "…",
   "parent_index_digest": "…",
@@ -824,7 +843,7 @@ completeness stamps, and GC roots rather than a second cache subsystem:
 ```json
 {
   "kind": "sporevm-build-step-v1",
-  "builder_version": "sporevm-build-v7",
+  "builder_version": "sporevm-build-v8",
   "platform": {"os": "linux", "arch": "arm64"},
   "step_key": "…",
   "parent_index_digest": "blake3:…",
@@ -936,7 +955,7 @@ and enumerate one canonical full rootfs CAS index.
 
 1. Before the first executor-backed instruction, compute the absolute target
    `max(FROM.logical_size, 16 GiB)`. If no growth is needed, continue directly.
-   Otherwise resolve the v7 `PREPARE` key. A valid hit supplies the prepared
+   Otherwise resolve the v8 `PREPARE` key. A valid hit supplies the prepared
    child index before any Dockerfile key is calculated, including under
    `--no-cache`.
 2. On a `PREPARE` miss, open the immutable FROM index as the
@@ -1000,12 +1019,16 @@ and enumerate one canonical full rootfs CAS index.
    - `COPY`: before boot, the host emits the resolved context entries needed
      by executed COPY steps into a cached read-only ext4 context disk and
      attaches it as an additional virtio-blk device. Per step, the host sends
-     one or more fixed-shape `spore-build-copy-v4` control requests naming the
-     source disk and bounded input index, source subtree, destination, source
-     kind, bounded entry count, and optional ADD mtime. The agent recursively copies from the
+     one or more fixed-shape COPY control requests. Ordinary COPY and ADD use
+     `spore-build-copy-v4`; cross-stage `COPY --link=true` uses strict v5 with
+     an explicit `destination_policy=link`. Both name the source disk and
+     bounded input index, source subtree, destination, source kind, bounded
+     entry count, and optional ADD mtime. The agent recursively copies from the
      selected context or immutable build-input disk into `/mnt/rootfs` using
      the confined destination resolver (see COPY Semantics). The guest retains
-     `spore-build-copy-v2` and v3 only as older compatible inputs.
+     `spore-build-copy-v2` and v3 only as older compatible inputs. V5 is
+     accepted only for immutable build-input disks; local-context link policy
+     remains rejected.
    - `CHECKPOINT`: agent handles `fsfreeze-v1` after the step exits;
      the VMM drains/flushes pending virtio-blk writes, the host calls
      `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes the
@@ -1056,7 +1079,7 @@ spore_rootfs_rw=1`, with `spore_build_context=1` and/or
 `spore_build_inputs=<count>`). The initrd agent now provides the build control verbs
 (`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
 `spore-build-run-v2`,
-`spore-build-copy-v4`); the target base must provide `/bin/sh` for shell-form
+`spore-build-copy-v4`, `spore-build-copy-v5`); the target base must provide `/bin/sh` for shell-form
 RUN and nothing for capacity preparation. Exec-form RUN instead requires only
 its selected executable. The guest accepts the older
 `spore-build-copy-v2` context-only and v3 requests for compatibility. A missing RUN
@@ -1087,28 +1110,35 @@ session as `RUN`, rather than host-side ext4 surgery:
    the sidecar is published after full disk emission. Changed contexts still
    mostly dedupe through the rootfs CAS chunks emitted by the native ext4
    writer.
-4. Send fixed-shape `spore-build-copy-v4` control requests. Each request names
+4. Send fixed-shape `spore-build-copy-v4` ordinary requests or strict v5
+   cross-stage link requests. Each request names
    the context or immutable build-input disk and bounded input index, source
    subtree, destination, source kind, `dest_is_dir`, entry count, and optional
    ADD mtime. The guest
    enforces disk, index, path, and entry-count bounds, then recursively copies
-   from the selected read-only mount. Destination paths are resolved
+   from the selected read-only mount. An immutable build-input source operand
+   follows its final symlink through the confined source resolver; symlinks
+   encountered below a copied directory remain entries. Destination paths are resolved
    relative to an fd for `/mnt/rootfs` with `openat2(RESOLVE_IN_ROOT |
    RESOLVE_NO_MAGICLINKS)`, falling back on kernels without `openat2` to a
    confined manual component walk that keeps symlink targets rooted in the
    rootfs. Final-component symlinks are followed under the same confined
-   resolution, so file entries write through them, directory entries merge
+   resolution for ordinary COPY, so file entries write through them, directory entries merge
    through symlinked directories, and dangling file symlink targets are created
    inside the rootfs. It applies entries with root ownership, parent creation,
-   directory merge, file overwrite, and symlink preservation.
+   directory merge, file overwrite, and symlink preservation. Link policy
+   creates a scratch-like destination tree: implicit directories are real
+   root-owned `0755` entries, lower symlinks are not followed, conflicting lower
+   types are removed within the traversal bound, and lower contents survive
+   only for directory-on-directory merges.
 5. Checkpoint exactly as RUN does (freeze, dirty-only sealing plus full-index
    emission, complete stamp, step record, thaw).
 
 Corollary: COPY and remote URL ADD do not require `tar` in the base image or add a tar
 or custom entry-stream parser to the initrd agent, and keeps guest memory usage
 bounded by per-entry copy buffers rather than total input size. COPY flags
-`--chown`, `--chmod`, and `--link`, plus local, Git, flagged, and extracting ADD
-forms, remain unsupported and fail closed.
+`--chown`, `--chmod`, `--parents`, and local-context `--link`, plus local, Git,
+flagged, and extracting ADD forms, remain unsupported and fail closed.
 
 Why the guest and not `debugfs` writes or host staging: a real Linux kernel
 applies ownership, modes, symlinks, and directory merge behavior natively and
@@ -1130,6 +1160,9 @@ Docker semantic contract, tested explicitly:
 - `COPY dir/ /dest/` copies the *contents* of `dir` into `/dest`.
 - Multiple sources require a `/`-terminated destination.
 - Relative destinations resolve against the current `WORKDIR`.
+- Cross-stage `COPY --link=true` ignores lower destination symlinks and type
+  when constructing its upper result, then merges that result above the parent;
+  `--link=false` uses ordinary COPY semantics.
 - Copied entries are owned `0:0`; file modes come from the context.
 - Destination symlinks are followed under confined rootfs resolution: file
   entries write through final symlinks, directory entries merge through
@@ -1350,7 +1383,7 @@ surface:
 
 - **Done:** extract the cache-prefix walk and executor-suffix lowering from
   `src/build.zig` behind one typed RUN/COPY/ADD/WORKDIR transition.
-- **Done:** decode builder-v7 records through one canonical adapter shared by
+- **Done:** decode builder-v8 records through one canonical adapter shared by
   cache-hit and GC validation.
 - **Done:** move the build COPY filesystem engine out of the PID1 protocol
   dispatcher into `guest/minimal-initrd/build_copy.c`; the PID1 agent retains
@@ -1415,17 +1448,23 @@ cold full hash and a warm stat-cache hit path must produce byte-identical step
 keys. The host emits or reuses a cached read-only ext4 image under
 `build/context-disks/`, attaches it as a second virtio-blk instance at boot,
 and originally sent bounded `spore-build-copy-v2` context-only control
-messages. The current executor emits strict `spore-build-copy-v4`, which also
-binds the selected context or immutable build-input disk, bounded input index,
-and optional ADD mtime. The guest retains v2 and v3 for older compatible input,
-validates the current v4 object as an exact newline-terminated shape, mounts
-the selected disk read-only, and confines all
-destination apply-path resolution to `/mnt/rootfs` while preserving
-Docker-style rootfs-internal and final-component symlink traversal.
+messages. The current executor emits strict `spore-build-copy-v4` for ordinary
+COPY/ADD and strict v5 for cross-stage link policy. Both bind the selected
+context or immutable build-input disk, bounded input index, and optional ADD
+mtime; v5 also requires the exact `link` destination policy and rejects context
+disks. The guest retains v2 and v3 for older compatible input, validates current
+v4 and v5 objects as exact newline-terminated shapes, mounts the selected disk
+read-only, and confines all destination apply-path resolution to
+`/mnt/rootfs`. Ordinary COPY preserves Docker-style rootfs-internal and
+final-component symlink traversal. Link policy instead constructs real
+destination directories without following lower symlinks, merges
+directory-on-directory results, and removes a conflicting lower subtree within
+the shared 65,536-entry bound before applying an upper file, directory, or
+symlink.
 COPY checkpoints use the same freeze → snapshot → complete stamp → step
 record → thaw ordering as RUN; if any COPY request in a step fails, the build
 fails before snapshot promotion for that step. Session start uses the
-prepared parent produced by the v7 policy above; COPY keys never carry a grow
+prepared parent produced by the v8 policy above; COPY keys never carry a grow
 target, and there is no capacity override. A manual
 Docker-vs-Spore metadata oracle lives at
 `scripts/spore-build-copy-oracle.sh`.
@@ -1526,21 +1565,32 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    platform values, warm hits, a resolved COPY-destination miss, malformed
    input, and a deliberately unsupported unstable modifier. No remote input is
    accepted by this slice.
-2. **Oracle-prioritized public HTTPS ADD.** The separate C4 mutable-URL slice accepts
+2. **Done — landed in PR #501:** oracle-prioritized public HTTPS ADD. The
+   separate C4 mutable-URL slice accepts
    the exact general form required at line 42: expanded public HTTPS source,
    expanded destination, opaque bytes, mode `0600`, and always-refetch
    content-addressed reuse. The parser happens to encounter C4 before the
    remaining C2 breadth; that changes delivery order, not ownership. Rerun the
-   unchanged target after landing to select the next slice.
-3. **Buildkite-reachable frontend and filesystem behavior.** Add RUN and COPY
-   heredocs, `COPY --parents`, `COPY --chmod`, and result-correct `COPY --link`
-   including `--from` only when a later unchanged-oracle run reaches them.
-   Split these into separate PRs whenever their parser, filesystem result,
-   cache identity, or failure-publication protocols differ.
-4. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
+   unchanged target after landing to select the next slice. The rerun reached
+   cross-stage `COPY --link` at line 72.
+3. **Done:** result-correct cross-stage `COPY --link`. The accepted true policy
+   extends the typed COPY instruction, transition, v8 cache record, and strict
+   v5 guest request. The guest builds the destination result without following
+   lower symlinks, replaces file/directory conflicts, merges matching
+   directories, and bounds removal by the existing COPY traversal envelope.
+   Source-stage indexes and resolved destination/environment inputs remain
+   cache identity, while the current parent remains a conservative dependency.
+   This slice claims no parent-independent layer rebasing and leaves
+   local-context `--link`, `--chmod`, `--parents`, and heredocs rejected.
+4. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add RUN
+   and COPY heredocs, `COPY --parents`, and `COPY --chmod` only when the next
+   unchanged-oracle run reaches them. Split these into separate PRs whenever
+   their parser, filesystem result, cache identity, or failure-publication
+   protocols differ.
+5. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
    a later unchanged-oracle run produces a concrete mismatch or unsupported
    span.
-5. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
+6. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
    `--exclude`, `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`,
    `HEALTHCHECK`, `VOLUME`, and other metadata only when the unchanged workload
    or the representative common-template corpus demonstrates demand.
@@ -1694,12 +1744,12 @@ named credential broker requires its own product and security plan.
 - Step keys: golden tests that keys are stable across runs and change exactly
   when the spec says (each invalidation rule in the Cache Model section gets a
   test).
-- Step cache: v7 PREPARE keys vary with parent, exact target, and producer;
+- Step cache: v8 PREPARE keys vary with parent, exact target, and producer;
   Dockerfile keys use the prepared child and contain no growth target; records
   survive process restart; missing artifact ⇒ miss; corrupted record ⇒ miss;
   missing complete stamp ⇒ miss without repair; atomic write leaves no partial
   record after simulated failure between snapshot publication and record write;
-  v6 records remain GC roots but are cache misses.
+  v7 and v6 records remain GC roots but are cache misses.
 - Executor: exit-code propagation, env/workdir application, network
   on/off, idempotent 16 GiB policy, already-large preservation, clean-zero
   sparse growth, direct resize response validation, same-VM PREPARE checkpoint,
@@ -1791,7 +1841,7 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
   their exact size. There is no hidden override, recursive doubling, additive
   growth, or public knob.
 - Capacity normalization is the typed synthetic `PREPARE` operation in build
-  cache v7, keyed by parent index, exact target, and exact kernel/initrd plus
+  cache v8, keyed by parent index, exact target, and exact kernel/initrd plus
   growth-contract producer identity. Dockerfile keys contain no capacity field,
   but bind the exact executor kernel/initrd identity; `--no-cache` still reuses
   PREPARE.

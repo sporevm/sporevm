@@ -65,6 +65,7 @@ pub const Run = union(enum) {
 
 pub const Copy = struct {
     from: ?[]const u8 = null,
+    link: ?bool = null,
     sources: []const []const u8,
     dest: []const u8,
 };
@@ -214,6 +215,7 @@ fn parseInstruction(
         const args = try splitWords(allocator, rest, escape, line, diagnostic);
         var first_source: usize = 0;
         var from: ?[]const u8 = null;
+        var link: ?bool = null;
         while (first_source < args.len and std.mem.startsWith(u8, args[first_source].value, "--")) : (first_source += 1) {
             const arg = args[first_source];
             if (std.mem.startsWith(u8, arg.value, "--from=") and arg.value.len > "--from=".len and from == null and
@@ -227,10 +229,29 @@ fn parseInstruction(
                 if (!std.mem.eql(u8, resolved, from.?)) return fail(diagnostic, line, "COPY --from does not support variable expansion or quoting");
                 continue;
             }
+            if ((std.mem.eql(u8, arg.value, "--link") or std.mem.startsWith(u8, arg.value, "--link=")) and
+                std.mem.eql(u8, arg.raw, arg.value))
+            {
+                if (link != null) return fail(diagnostic, line, "duplicate COPY flag: --link");
+                if (std.mem.eql(u8, arg.value, "--link")) {
+                    link = true;
+                } else {
+                    const value = arg.value["--link=".len..];
+                    if (asciiEql(value, "true")) {
+                        link = true;
+                    } else if (asciiEql(value, "false")) {
+                        link = false;
+                    } else {
+                        return fail(diagnostic, line, "COPY --link requires true or false");
+                    }
+                }
+                continue;
+            }
             const flag = if (std.mem.indexOfScalar(u8, arg.value, '=')) |eq| arg.value[0..eq] else arg.value;
             const message = try std.fmt.allocPrint(allocator, "unsupported COPY flag: {s}", .{flag});
             return fail(diagnostic, line, message);
         }
+        if (link != null and from == null) return fail(diagnostic, line, "COPY --link requires --from");
         if (args.len - first_source < 2) return fail(diagnostic, line, "COPY requires at least one source and a destination");
         for (args[first_source..]) |arg| {
             if (std.mem.startsWith(u8, arg.value, "--")) {
@@ -242,7 +263,7 @@ fn parseInstruction(
         }
         const sources = try allocator.alloc([]const u8, args.len - first_source - 1);
         for (args[first_source .. args.len - 1], sources) |arg, *source_arg| source_arg.* = arg.raw;
-        return .{ .copy = .{ .from = from, .sources = sources, .dest = args[args.len - 1].raw } };
+        return .{ .copy = .{ .from = from, .link = link, .sources = sources, .dest = args[args.len - 1].raw } };
     }
     if (asciiEql(op, "ADD")) {
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported ADD heredoc");
@@ -694,6 +715,7 @@ test "Dockerfile parser emits source-spanned stages and typed cross-stage copies
     try std.testing.expectEqualStrings("$BUILDPLATFORM", doc.stages[0].from.value.from.platform.?);
     try std.testing.expectEqualStrings("final", doc.stages[1].name.?);
     try std.testing.expectEqualStrings("build", doc.stages[1].instructions[0].value.copy.from.?);
+    try std.testing.expectEqual(@as(?bool, null), doc.stages[1].instructions[0].value.copy.link);
     try std.testing.expect(doc.stages[1].instructions[1].value == .entrypoint);
     try std.testing.expectEqual(@as(usize, 4), doc.stages[1].span.start_line);
     try std.testing.expectEqual(@as(usize, 7), doc.stages[1].span.end_line);
@@ -782,10 +804,47 @@ test "Dockerfile parser rejects COPY flags in any position" {
     try std.testing.expectEqualStrings("unsupported COPY flag: --chmod", diag.message);
 
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY --link a /dest\n", &diag));
-    try std.testing.expectEqualStrings("unsupported COPY flag: --link", diag.message);
+    try std.testing.expectEqualStrings("COPY --link requires --from", diag.message);
 
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nCOPY --from=$STAGE /a /dest\n", &diag));
     try std.testing.expectEqualStrings("COPY --from does not support variable expansion or quoting", diag.message);
+}
+
+test "Dockerfile parser accepts bounded cross-stage COPY link booleans" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena_state.allocator(),
+        \\FROM base AS source
+        \\FROM base
+        \\COPY --link --from=source /true /true
+        \\COPY --from=source --link=FALSE /false /false
+        \\
+    , &diag);
+    try std.testing.expectEqual(@as(?bool, true), doc.stages[1].instructions[0].value.copy.link);
+    try std.testing.expectEqual(@as(?bool, false), doc.stages[1].instructions[1].value.copy.link);
+
+    const invalid = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM base AS source\nFROM base\nCOPY --link= --from=source /a /b\n", .message = "COPY --link requires true or false" },
+        .{ .dockerfile = "FROM base AS source\nFROM base\nCOPY --link=yes --from=source /a /b\n", .message = "COPY --link requires true or false" },
+        .{ .dockerfile = "FROM base AS source\nFROM base\nCOPY --link --link=false --from=source /a /b\n", .message = "duplicate COPY flag: --link" },
+        .{ .dockerfile = "FROM base AS source\nFROM base\nCOPY --link=\"true\" --from=source /a /b\n", .message = "unsupported COPY flag: --link" },
+        .{ .dockerfile = "FROM base\nCOPY --link=false /a /b\n", .message = "COPY --link requires --from" },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), case.dockerfile, &diag));
+        try std.testing.expectEqualStrings(case.message, diag.message);
+    }
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(),
+        \\FROM base AS source
+        \\FROM base
+        \\COPY --link --from=source /a /b
+        \\COPY --chmod=0755 --from=source /c /d
+        \\
+    , &diag));
+    try std.testing.expectEqual(@as(usize, 4), diag.line);
+    try std.testing.expectEqualStrings("unsupported COPY flag: --chmod", diag.message);
 }
 
 test "Dockerfile parser accepts narrow remote ADD and rejects unsupported forms" {
