@@ -59,6 +59,8 @@ pub fn build(b: *std.Build) void {
     }
     minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_copy.c"));
     minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_copy.h"));
+    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.c"));
+    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.h"));
     libspore_mod.addAnonymousImport("run_assets", .{
         .root_source_file = minimal_exec_initrd_module,
     });
@@ -202,6 +204,10 @@ pub fn build(b: *std.Build) void {
         });
         mod.addCSourceFile(.{
             .file = b.path("guest/minimal-initrd/build_copy.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
+        });
+        mod.addCSourceFile(.{
+            .file = b.path("guest/minimal-initrd/build_run_sandbox.c"),
             .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
         });
         break :blk mod;

@@ -1,0 +1,47 @@
+{
+  "description": "RUN gets a scoped procfs and device view while ordinary rootfs results persist",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 7,
+    "expect_boot_count": 2,
+    "expect_resize_count": 1
+  },
+  "network": "spore",
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "later-run-miss-after-sandbox-hit",
+      "writes": {
+        "transition-input": "changed\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 2,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-later-run-miss",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "description": "RUN sandbox preserves an ordinary nonzero exit status",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: instruction failed: RUN exit 42",
+    "spore_exit_code": 42
+  },
+  "scan_prefixes": []
+}

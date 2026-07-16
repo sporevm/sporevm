@@ -1,0 +1,16 @@
+{
+  "description": "RUN command is PID 1 and preserves Docker's default-signal behavior",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 1,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ]
+}

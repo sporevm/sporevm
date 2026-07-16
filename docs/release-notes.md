@@ -14,6 +14,24 @@ segments. The build timeout now applies independently to each Dockerfile
 instruction; multi-request COPY operations share one instruction budget, and
 aggregate instruction timing remains available in build diagnostics.
 
+Every `spore build` RUN now executes in an operation-owned Linux isolation
+view. Shell and exec forms retain their existing environment, workdir, stdio,
+networking, exit, and rootfs behavior, while a private PID and mount view gives
+the command a scoped procfs and a fresh minimal `/dev`. The initrd and agent
+namespace are unreachable through `/proc/1/root`; BuildKit-compatible
+read-only and masked proc paths prevent guest-global sysctl mutation and hide
+sensitive kernel pseudo-files. Auxiliary context and stage virtio disks plus
+the VM console have no device nodes. A cgroup device
+policy rejects raw access through attacker-created aliases. The seccomp filter
+rejects `socket` and `socketpair` with `AF_VSOCK`, and rejects
+`io_uring_setup` entirely, so io_uring is unavailable inside build RUNs and
+cannot create an asynchronous path to the agent or host control transport.
+Ordinary IP networking stays unchanged. The command receives the pinned
+BuildKit default capability set, and namespace destruction plus cgroup
+kill-and-empty verification owns cleanup before checkpoint publication.
+`RUN --mount`, secret/SSH forwarding, new device types, and manifest changes
+remain unsupported.
+
 `spore build` now accepts numeric `--chmod` on the public HTTPS single-file
 `ADD` form. Octal values from `0` through `07777`, including ARG-expanded and
 leading-zero spellings, apply to the downloaded regular file; the default

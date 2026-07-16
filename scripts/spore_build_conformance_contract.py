@@ -75,6 +75,7 @@ class BuildExpectation:
     docker: Outcome
     spore: Outcome
     spore_diagnostic: str | None
+    spore_exit_code: int | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -210,7 +211,7 @@ def parse_spore_network(value: Any, label: str) -> SporeNetwork:
 
 def parse_expectation(value: Any, label: str) -> BuildExpectation:
     raw = require_object(value, label)
-    reject_unknown_fields(raw, {"docker", "spore", "spore_diagnostic"}, label)
+    reject_unknown_fields(raw, {"docker", "spore", "spore_diagnostic", "spore_exit_code"}, label)
     if "docker" not in raw or "spore" not in raw:
         raise HarnessError(f"{label} requires docker and spore fields")
     docker = parse_outcome(raw["docker"], f"{label}.docker")
@@ -221,11 +222,24 @@ def parse_expectation(value: Any, label: str) -> BuildExpectation:
         if diagnostic_value is not None
         else None
     )
+    exit_code_value = raw.get("spore_exit_code")
+    exit_code = (
+        require_nonnegative_int(exit_code_value, f"{label}.spore_exit_code")
+        if exit_code_value is not None
+        else None
+    )
     if spore is Outcome.FAILURE and diagnostic is None:
         raise HarnessError(f"{label}.spore_diagnostic is required when Spore should fail")
     if spore is Outcome.SUCCESS and diagnostic is not None:
         raise HarnessError(f"{label}.spore_diagnostic is only valid when Spore should fail")
-    return BuildExpectation(docker=docker, spore=spore, spore_diagnostic=diagnostic)
+    if spore is Outcome.SUCCESS and exit_code is not None:
+        raise HarnessError(f"{label}.spore_exit_code is only valid when Spore should fail")
+    return BuildExpectation(
+        docker=docker,
+        spore=spore,
+        spore_diagnostic=diagnostic,
+        spore_exit_code=exit_code,
+    )
 
 
 def parse_transition(value: Any, label: str) -> Transition:
@@ -423,6 +437,7 @@ def self_test_schema(cases: list[Case]) -> None:
     }
     invalid = [
         {**valid, "unknown": True},
+        {**valid, "expect": {"docker": "success", "spore": "success", "spore_exit_code": 0}},
         {**valid, "initial_execution": {"expect_executed_steps": 1, "expect_boot_count": 1}},
         {**valid, "initial_execution": {"expect_executed_steps": -1, "expect_boot_count": 1, "expect_resize_count": 1}},
         {
@@ -590,6 +605,12 @@ def assert_expected_builds(case: Case, docker: CommandResult, spore: SporeBuildR
                 "Spore diagnostic mismatch:\n"
                 + diff_json(expected_diagnostic, actual_diagnostic, "expected", "actual")
             )
+        if expected.spore_exit_code is not None:
+            exit_diagnostic = (
+                f"spore build: executor step failed with exit code {expected.spore_exit_code}"
+            )
+            if exit_diagnostic not in spore.command.stderr.splitlines():
+                raise CaseError(f"Spore did not emit exact exit diagnostic: {exit_diagnostic!r}")
         return False
     return True
 
