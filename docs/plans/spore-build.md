@@ -233,6 +233,13 @@ The missing work falls into three different categories:
   block device. The guest contracts are `spore-rootfs-grow-v1`, the `fsfreeze`
   checkpoint handshake, and fixed-shape RUN/COPY requests over the existing
   exec stream.
+- A 2026-07-16 security review proved that a cgroup plus chroot is not a RUN
+  sandbox: attacker-controlled build code could traverse the agent's procfs
+  through `/proc/1/root` and could open auxiliary virtio block devices exposed
+  by the rootfs devtmpfs. The selected prerequisite is a dedicated,
+  operation-owned RUN isolation view. The cache-mount prototype and exploit
+  evidence are preserved separately and remain unpublished; `RUN --mount`
+  stays rejected until this foundation lands and is independently accepted.
 
 C0 closes the known checkpoint, resize, resource-envelope, matcher, and cache
 lifecycle gaps in the original single-stage subset. C1 adds ordinary
@@ -746,6 +753,30 @@ never silently execute it as root.
 
 Mounted RUN support is one generic execution facility, not a collection of
 instruction-specific exceptions:
+
+Every build RUN first enters the same operation-owned sandbox, whether or not
+future explicit mounts are present. Its supervisor owns new PID, mount, cgroup,
+IPC, and UTS namespaces; makes mount propagation recursively private; and
+enters a descriptor-clean rootfs confinement so the initrd and agent mount
+tree are unreachable.
+The command is PID 1 in its PID namespace and sees a procfs mounted from that
+namespace, with the BuildKit read-only and masked proc paths that prevent
+guest-global sysctl mutation and access to sensitive kernel pseudo-files. It
+also sees a new minimal `/dev` and devpts, read-only sysfs and cgroup views,
+and no auxiliary virtio block or console nodes. A cgroup device policy permits
+the normal character devices and harmless device-node creation while rejecting
+reads or writes of every block device and console alias. A narrow seccomp
+policy rejects AF_VSOCK creation, `socketpair(AF_VSOCK)`, and `io_uring_setup`
+so the command cannot reach the agent/host control transport or bypass the
+socket-family rule asynchronously. The command receives only the pinned
+BuildKit-compatible capability set and its intended stdio descriptors.
+
+The supervisor mirrors ordinary exit and signal status. Namespace destruction
+owns mount teardown, while cgroup kill-and-empty verification independently
+covers success, nonzero exit, signal, timeout, setup failure, and control loss.
+Any incomplete setup or cleanup fails the RUN and blocks checkpoint or cache
+publication. This foundation adds no Dockerfile syntax, device type, manifest
+field, credential authority, or persistent filesystem view.
 
 | Mount | Source | Writable | Snapshot into rootfs | Cache identity |
 | --- | --- | ---: | ---: | --- |
@@ -1638,7 +1669,17 @@ Do not accept it merely because parsing succeeds.
 
 **Estimate:** 6–10 weeks.
 
-1. Add typed RUN mount plans and an operation-owned guest mount namespace.
+1. **Implemented foundation; landing gated on native acceptance:** the
+   operation-owned RUN sandbox prerequisite accepts no mount syntax. Every
+   ordinary shell- and exec-form RUN gets a private PID/mount/cgroup/IPC/UTS
+   view, scoped procfs, minimal `/dev`, device-deny policy, bounded
+   capabilities, and transactional teardown. Before merge, native HVF and KVM
+   tests must prove that `/proc/1/root`, proc sysctls,
+   AF_VSOCK, console
+   and auxiliary virtio devices, device-node aliases, namespace joins, and
+   mount attempts cannot escape the view while ordinary stdio, networking,
+   environment, workdir, supported root-user, exit, and rootfs behavior stay
+   compatible with the pinned BuildKit result.
 2. Implement read-only context and stage bind mounts plus tmpfs mounts.
 3. Add per-RUN network selection and key it independently from global default.
 4. Design and implement the local writable cache store with bounded ids,
@@ -1779,6 +1820,13 @@ named credential broker requires its own product and security plan.
   sparse growth, direct resize response validation, same-VM PREPARE checkpoint,
   `--no-cache` PREPARE reuse, and failure cleanup before any Dockerfile step or
   destination-ref publication.
+- RUN sandbox: ordinary shell and exec differential fixtures plus adversarial
+  HVF and KVM coverage for scoped procfs, denied proc-sysctl mutation,
+  denied AF_VSOCK, absent default
+  console and auxiliary-disk nodes, denied raw access through attacker-created
+  aliases, mount and namespace denial, minimal devices, exact exit/signal
+  propagation, timeout/setup failure, descendant cleanup, and a clean following
+  RUN/checkpoint.
 - COPY matrix listed above, plus context-escape rejection tests.
 - Large COPY: generated sparse fixture with aggregate payload above guest RAM
   succeeds through context-disk apply and records emitted/reused diagnostics.
@@ -1833,6 +1881,15 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 
 ## Resolved Decisions
 
+- Every build RUN uses a dedicated operation-owned sandbox before C3 accepts
+  any mount syntax. Rejected: retaining the agent's mount/PID namespace with a
+  chroot and cgroup alone, because procfs exposes the init namespace and rootfs
+  devtmpfs exposes every virtio block device. The selected view uses private
+  PID/mount/cgroup/IPC/UTS namespaces, descriptor-clean rootfs confinement,
+  scoped procfs, minimal `/dev`, a cgroup device policy, a narrow AF_VSOCK and
+  io_uring seccomp denial, and the pinned BuildKit capability
+  set; VM-level networking remains unchanged to preserve the current RUN
+  network contract.
 - Checkpoints, not layers: `spore build` produces rootfs CAS indexes; there is
   no layer composition mechanism and no requirement to export Docker layers
   back out (no two-way door). Intermediate states exist as step-key-addressed
@@ -1925,6 +1982,11 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 
 ## Key Learnings From Pressure-Testing
 
+- A chroot and cgroup bound process lifetime but did not bound filesystem
+  authority: `/proc/1/root` reached the initrd namespace and rootfs devtmpfs
+  named auxiliary virtio disks. Cache mounts would turn that latent authority
+  into writable cross-operation state, so the operation-owned namespace and
+  device boundary must land before any mounted RUN syntax.
 - `--no-cache` makes the cache-key/artifact distinction operational, not just
   conceptual: the same deterministic input key can legitimately produce a new
   child snapshot. Only the derived step mapping is replaceable; CAS indexes and

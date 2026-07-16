@@ -119,6 +119,15 @@ static int path_absent(const char *path) {
   return access(path, F_OK) != 0 && errno == ENOENT;
 }
 
+static int cgroup_is_readonly(void) {
+  int fd = open("/sys/fs/cgroup/cgroup.procs", O_WRONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    close(fd);
+    return 0;
+  }
+  return errno == EROFS || errno == EACCES || errno == EPERM;
+}
+
 static int symlink_target_is(const char *path, const char *expected);
 
 static void sleep_ms(long milliseconds) {
@@ -130,18 +139,12 @@ static void sleep_ms(long milliseconds) {
   }
 }
 
-static int move_to_root_cgroup(void) {
-  int fd = open("/sys/fs/cgroup/cgroup.procs", O_WRONLY | O_CLOEXEC);
-  if (fd < 0) return 1;
-  char pid[32];
-  int len = snprintf(pid, sizeof(pid), "%ld\n", (long)getpid());
-  ssize_t written = len > 0 && (size_t)len < sizeof(pid) ? write(fd, pid, (size_t)len) : -1;
-  int close_rc = close(fd);
-  return written == len && close_rc == 0 ? 0 : 1;
-}
-
 static int spawn_background_writer(void) {
   unlink("/background-survived");
+  if (!cgroup_is_readonly()) {
+    write_str(2, "build-smoke-sh: RUN cgroup view is writable\n");
+    return 7;
+  }
   int ready[2];
   if (pipe(ready) != 0) return 7;
   pid_t pid = fork();
@@ -152,7 +155,8 @@ static int spawn_background_writer(void) {
   }
   if (pid == 0) {
     close(ready[0]);
-    if (setsid() < 0 || move_to_root_cgroup() != 0 || write(ready[1], "1", 1) != 1) _exit(7);
+    /* Detach from the shell session but remain owned by the operation cgroup. */
+    if (setsid() < 0 || write(ready[1], "1", 1) != 1) _exit(7);
     close(ready[1]);
     int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
     if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 ||
@@ -329,19 +333,19 @@ static int verify_copy(void) {
     write_str(2, "build-smoke-sh: bad absolute symlink target file\n");
     return 4;
   }
-  if (!dir_exists("/proc/1/root")) {
-    write_str(2, "build-smoke-sh: missing initrd root view\n");
+  if (!dir_exists("/proc/1/root") || !path_absent("/proc/1/root/run/sporevm")) {
+    write_str(2, "build-smoke-sh: proc root escaped the RUN rootfs\n");
     return 4;
   }
   if (!file_content_is("/escape.txt", "escape\n") ||
-      !path_absent("/proc/1/root/escape.txt")) {
-    write_str(2, "build-smoke-sh: bad confined absolute symlink escape COPY\n");
+      !file_content_is("/proc/1/root/escape.txt", "escape\n")) {
+    write_str(2, "build-smoke-sh: bad scoped-proc absolute symlink COPY\n");
     return 4;
   }
   if (!symlink_target_is("/work/write-file", "/sentinel.txt") ||
       !file_content_is("/sentinel.txt", "through\n") ||
       !mode_is("/sentinel.txt", 0600) ||
-      !path_absent("/proc/1/root/sentinel.txt")) {
+      !file_content_is("/proc/1/root/sentinel.txt", "through\n")) {
     write_str(2, "build-smoke-sh: bad file symlink write-through COPY\n");
     return 4;
   }

@@ -1,0 +1,10 @@
+{
+  "description": "RUN sandbox translates a fatal signal to the Docker-compatible exit status",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: instruction failed: RUN [\"python3\",\"-c\",\"import os; os.abort()\"]",
+    "spore_exit_code": 139
+  },
+  "scan_prefixes": []
+}
