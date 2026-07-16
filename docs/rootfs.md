@@ -65,7 +65,7 @@ the selected image's shell and needs no e2fsprogs or `resize2fs`. Builder-v7
 records the complete grown index as a typed `PREPARE` derivation keyed by the
 parent, exact target, and exact kernel/initrd growth producer. Other Dockerfiles
 and `--no-cache` builds that intentionally bypass Dockerfile instruction-cache
-reads reuse that preparation without another resize. RUN/COPY/WORKDIR cache
+reads reuse that preparation without another resize. RUN/COPY/ADD/WORKDIR cache
 keys also bind that exact executor identity, so a different agent/kernel cannot
 reuse downstream outputs merely because it produced the same prepared bytes. A
 miss snapshots and publishes `PREPARE` before step zero, then continues in the
@@ -89,7 +89,7 @@ Other features or topology may still fail kernel online resize or geometry
 validation. Every unsupported case fails before PREPARE, step, image, or
 destination-ref publication; there is no slow `resize2fs` fallback.
 
-Block or inode exhaustion during COPY/RUN is terminal for that invocation.
+Block or inode exhaustion during COPY/ADD/RUN is terminal for that invocation.
 SporeVM does not replay a step that may have external side effects and does not
 publish the failed step or destination ref. The v1 16 GiB build cap keeps a
 fully populated rootfs index below the current canonical-index limit; a larger

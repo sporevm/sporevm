@@ -1,4 +1,5 @@
 const std = @import("std");
+const remote_add_policy = @import("remote_add_policy.zig");
 const run_contract = @import("run_contract.zig");
 const variable_expansion = @import("variables.zig");
 
@@ -42,6 +43,7 @@ pub const Instruction = struct {
         from: From,
         run: Run,
         copy: Copy,
+        add: Add,
         env: Env,
         arg: Arg,
         workdir: []const u8,
@@ -64,6 +66,11 @@ pub const Run = union(enum) {
 pub const Copy = struct {
     from: ?[]const u8 = null,
     sources: []const []const u8,
+    dest: []const u8,
+};
+
+pub const Add = struct {
+    source: []const u8,
     dest: []const u8,
 };
 
@@ -237,6 +244,23 @@ fn parseInstruction(
         for (args[first_source .. args.len - 1], sources) |arg, *source_arg| source_arg.* = arg.raw;
         return .{ .copy = .{ .from = from, .sources = sources, .dest = args[args.len - 1].raw } };
     }
+    if (asciiEql(op, "ADD")) {
+        if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported ADD heredoc");
+        const args = try splitWords(allocator, rest, escape, line, diagnostic);
+        for (args) |arg| {
+            if (std.mem.startsWith(u8, arg.value, "--")) {
+                const message = try std.fmt.allocPrint(allocator, "unsupported ADD flag: {s}", .{arg.value});
+                return fail(diagnostic, line, message);
+            }
+        }
+        if (args.len != 2) return fail(diagnostic, line, "remote ADD requires exactly one source and one destination");
+        if (!remote_add_policy.validateTemplate(args[0].value)) return fail(diagnostic, line, "remote ADD source must have a literal HTTPS authority");
+        if (hasParentPathSegment(args[1].value)) return fail(diagnostic, line, "remote ADD destination must not contain a parent path segment");
+        for (args) |arg| {
+            try validateExpansion(allocator, arg.raw, escape, line, diagnostic);
+        }
+        return .{ .add = .{ .source = args[0].raw, .dest = args[1].raw } };
+    }
     if (asciiEql(op, "ENV")) {
         const pairs = try parseEnv(allocator, rest, escape, line, diagnostic);
         return .{ .env = .{ .pairs = pairs } };
@@ -272,6 +296,12 @@ fn parseInstruction(
     const message = try std.fmt.allocPrint(allocator, "unsupported Dockerfile instruction: {s}", .{op});
     diagnostic.* = .{ .line = line, .message = message };
     return error.DockerfileParseFailed;
+}
+
+fn hasParentPathSegment(path: []const u8) bool {
+    var segments = std.mem.splitScalar(u8, path, '/');
+    while (segments.next()) |segment| if (std.mem.eql(u8, segment, "..")) return true;
+    return false;
 }
 
 fn logicalLines(
@@ -758,12 +788,45 @@ test "Dockerfile parser rejects COPY flags in any position" {
     try std.testing.expectEqualStrings("COPY --from does not support variable expansion or quoting", diag.message);
 }
 
-test "Dockerfile parser rejects ADD fail closed" {
+test "Dockerfile parser accepts narrow remote ADD and rejects unsupported forms" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: Diagnostic = .{};
-    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD a /dest\n", &diag));
-    try std.testing.expectEqualStrings("unsupported Dockerfile instruction: ADD", diag.message);
+    const doc = try parse(arena_state.allocator(), "FROM base\nADD https://example.com/${TARGETARCH}/tool /usr/bin/tool\n", &diag);
+    const add = doc.stages[0].instructions[0].value.add;
+    try std.testing.expectEqualStrings("https://example.com/${TARGETARCH}/tool", add.source);
+    try std.testing.expectEqualStrings("/usr/bin/tool", add.dest);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD --chmod=0755 https://example.com/tool /tool\n", &diag));
+    try std.testing.expectEqualStrings("unsupported ADD flag: --chmod=0755", diag.message);
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD a b /dest\n", &diag));
+    try std.testing.expectEqualStrings("remote ADD requires exactly one source and one destination", diag.message);
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD <<EOF /dest\n", &diag));
+    try std.testing.expectEqualStrings("unsupported ADD heredoc", diag.message);
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD local.tar /dest\n", &diag));
+    try std.testing.expectEqualStrings("remote ADD source must have a literal HTTPS authority", diag.message);
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD https://user@example.com/file /dest\n", &diag));
+    try std.testing.expectEqualStrings("remote ADD source must have a literal HTTPS authority", diag.message);
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD https://example.com/file ../dest\n", &diag));
+    try std.testing.expectEqualStrings("remote ADD destination must not contain a parent path segment", diag.message);
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD https://example.com/file /dest\nLABEL later=unsupported\n", &diag));
+    try std.testing.expectEqual(@as(usize, 3), diag.line);
+    try std.testing.expectEqualStrings("unsupported Dockerfile instruction: LABEL", diag.message);
+}
+
+test "unsupported later-stage ADD semantics win before earlier-stage execution" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(),
+        \\FROM base AS build
+        \\RUN echo would-execute
+        \\FROM build
+        \\ADD http://example.com/file /dest
+        \\
+    , &diag));
+    try std.testing.expectEqual(@as(usize, 4), diag.line);
+    try std.testing.expectEqualStrings("remote ADD source must have a literal HTTPS authority", diag.message);
 }
 
 test "unsupported instructions win over expansion diagnostics" {

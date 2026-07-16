@@ -44,7 +44,7 @@ builder-v7 `PREPARE` record makes it reusable. Its key binds the immutable
 parent index, exact target, platform, and exact kernel/initrd plus growth
 protocol identity. `--no-cache` bypasses Dockerfile step-record reads but still
 reuses PREPARE because capacity normalization is infrastructure, not a
-Dockerfile result. RUN/COPY/WORKDIR keys separately bind the same exact
+Dockerfile result. RUN/COPY/ADD/WORKDIR keys separately bind the same exact
 executor identity. The managed default derives that identity from canonical
 kernel and embedded-initrd digests without reading the artifact bodies on a
 fully cached build; a later miss verifies the once-opened kernel bytes and
@@ -53,6 +53,21 @@ build records remain conservative GC roots but miss under v7; existing rootfs
 indexes and local images remain readable. Failed
 growth, quiescence, completeness, PREPARE, step, or ref publication never
 rewrites the parent or makes incomplete storage reachable.
+
+Mutable public HTTPS ADD inputs are fetched and BLAKE3-hashed before their
+step-record lookup. Their typed key binds the resolved URL and destination,
+the safe response `Content-Disposition` filename or URL-path fallback, actual
+content digest, fixed `0600` mode,
+validated optional `Last-Modified` timestamp, instruction-start ENV/ARG state,
+platform, parent, and executor identity. A valid HTTP-date is applied as the
+destination mtime through the confined guest COPY path; absent or malformed
+dates use the Unix epoch. A build accepts at most 64 such instructions, 1 GiB
+of combined response bodies, and ten minutes of combined host-fetch time or
+the smaller build timeout. The private synced staging file is deleted after the
+context-disk apply path has either completed or failed. If a process crashes,
+the next remote ADD staging session removes abandoned files after acquiring the
+directory lock; only the existing complete rootfs CAS child and its step record
+become reusable authority.
 
 Automatic growth supports SporeVM's journal-less native ext4 profile and
 journal-less layouts from SporeVM's e2fsprogs writer, or equivalent layouts the

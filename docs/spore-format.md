@@ -68,7 +68,7 @@ completeness stamp is present. PREPARE lookup remains enabled under
 `spore build --no-cache`; that flag continues to bypass Dockerfile instruction
 reuse only.
 
-Every RUN/COPY/WORKDIR key and record also binds `executor_identity`, the exact
+Every RUN/COPY/ADD/WORKDIR key and record also binds `executor_identity`, the exact
 kernel/initrd plus build-agent contract for the build. For managed defaults the
 identity is derived from canonical kernel and embedded-initrd digests without
 materializing either body on a cache hit. An executor miss reads the kernel

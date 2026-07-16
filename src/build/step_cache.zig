@@ -78,6 +78,7 @@ pub const StepInput = struct {
         prepare: Prepare,
         run: Run,
         copy: Copy,
+        add: Copy,
         workdir: Workdir,
     };
 
@@ -177,6 +178,20 @@ pub const StepInput = struct {
                 .input_digest = copy.input_digest,
                 .env_digest = copy.env_digest,
                 .workdir = copy.workdir,
+                .network_mode = null,
+                .memory_bytes = null,
+                .vcpus = null,
+                .nofile_soft = null,
+                .nofile_hard = null,
+                .exact_target = null,
+                .producer_identity = null,
+                .executor_identity = self.executor_identity,
+            },
+            .add => |add| .{
+                .instruction_kind = "ADD",
+                .input_digest = add.input_digest,
+                .env_digest = add.env_digest,
+                .workdir = add.workdir,
                 .network_mode = null,
                 .memory_bytes = null,
                 .vcpus = null,
@@ -566,6 +581,21 @@ fn currentRecordInput(record: StepRecord) !StepInput {
             } },
         };
     }
+    if (std.mem.eql(u8, record.instruction_kind, "ADD")) {
+        if (!std.mem.startsWith(u8, record.instruction, "ADD ") or record.input_digest.len == 0 or
+            record.network_mode != null or !no_resource_fields) return error.MalformedBuildRecord;
+        return .{
+            .platform = record.platform,
+            .parent_index_digest = record.parent_index_digest,
+            .canonical_instruction = record.instruction,
+            .executor_identity = record.executor_identity,
+            .operation = .{ .add = .{
+                .input_digest = record.input_digest,
+                .env_digest = record.env_digest,
+                .workdir = record.workdir,
+            } },
+        };
+    }
     if (std.mem.eql(u8, record.instruction_kind, "WORKDIR")) {
         if (!std.mem.startsWith(u8, record.instruction, "WORKDIR ") or record.input_digest.len == 0 or
             record.network_mode != null or !no_resource_fields) return error.MalformedBuildRecord;
@@ -588,7 +618,7 @@ fn currentRecordRetainedByGc(input: StepInput) bool {
     return switch (input.operation) {
         .run => |run| run.memory_bytes != null and run.vcpus != null and
             run.nofile_soft != null and run.nofile_hard != null,
-        .scratch, .prepare, .copy, .workdir => true,
+        .scratch, .prepare, .copy, .add, .workdir => true,
     };
 }
 
@@ -622,6 +652,10 @@ fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
             validateBlake3Identity(input.executor_identity) catch return error.BadBuildCacheInput;
             if (copy.input_digest.len == 0 or !std.fs.path.isAbsolute(copy.workdir)) return error.BadBuildCacheInput;
         },
+        .add => |add| {
+            validateBlake3Identity(input.executor_identity) catch return error.BadBuildCacheInput;
+            if (add.input_digest.len == 0 or !std.fs.path.isAbsolute(add.workdir)) return error.BadBuildCacheInput;
+        },
         .workdir => |workdir| {
             validateBlake3Identity(input.executor_identity) catch return error.BadBuildCacheInput;
             if (!std.fs.path.isAbsolute(workdir.target) or !std.fs.path.isAbsolute(workdir.workdir)) return error.BadBuildCacheInput;
@@ -633,7 +667,7 @@ fn validateChildForInput(input: StepInput, storage: spore.RootfsStorage) !void {
     switch (input.operation) {
         .scratch => |scratch| if (storage.logical_size != scratch.exact_target) return error.BadManifest,
         .prepare => |prepare| if (storage.logical_size != prepare.exact_target) return error.BadManifest,
-        .run, .copy, .workdir => {},
+        .run, .copy, .add, .workdir => {},
     }
 }
 

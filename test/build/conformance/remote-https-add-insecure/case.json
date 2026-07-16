@@ -1,0 +1,9 @@
+{
+  "description": "remote ADD rejects non-HTTPS transport before guest execution",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: remote ADD source must have a literal HTTPS authority"
+  },
+  "scan_prefixes": []
+}

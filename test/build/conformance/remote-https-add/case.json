@@ -1,0 +1,64 @@
+{
+  "description": "public HTTPS ADD expansion, redirects, destination rules, mode, and byte-addressed reuse match Docker",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 2,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle",
+    "/LICENSE"
+  ],
+  "compare_mtime_paths": [
+    "/oracle/terminal-to-html.gz",
+    "/oracle/renamed-terminal-to-html.gz",
+    "/LICENSE"
+  ],
+  "transitions": [
+    {
+      "name": "warm-refetch-same-bytes",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "resolved-destination-change",
+      "writes": {
+        "Dockerfile": "FROM base\nARG TARGETOS\nARG TARGETARCH\nARG TERMINAL_TO_HTML_VERSION=3.16.8\nARG SPORE_VERSION=v0.13.1\nADD \"https://github.com/buildkite/terminal-to-html/releases/download/v${TERMINAL_TO_HTML_VERSION}/terminal-to-html-${TERMINAL_TO_HTML_VERSION}-${TARGETOS}-${TARGETARCH}.gz\" /oracle/renamed-terminal-to-html.gz\nADD \"https://raw.githubusercontent.com/sporevm/sporevm/${SPORE_VERSION}/LICENSE\" /\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 2,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "changed-url-and-bytes",
+      "writes": {
+        "Dockerfile": "FROM base\nARG TARGETOS\nARG TARGETARCH\nARG TERMINAL_TO_HTML_VERSION=3.16.8\nARG SPORE_VERSION=v0.13.1\nADD \"https://github.com/buildkite/terminal-to-html/releases/download/v${TERMINAL_TO_HTML_VERSION}/terminal-to-html-${TERMINAL_TO_HTML_VERSION}-${TARGETOS}-${TARGETARCH}.gz\" /oracle/renamed-terminal-to-html.gz\nADD \"https://raw.githubusercontent.com/sporevm/sporevm/${SPORE_VERSION}/README.md\" /LICENSE\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 1,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-byte-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

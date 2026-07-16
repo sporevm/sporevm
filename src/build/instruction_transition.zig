@@ -4,14 +4,18 @@ const Io = std.Io;
 const build_context = @import("context.zig");
 const build_context_disk = @import("context_disk.zig");
 const build_exec = @import("exec.zig");
+const remote_add = @import("remote_add.zig");
 const step_cache = @import("step_cache.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const rootfs_cas = @import("../rootfs_cas.zig");
 const spore = @import("../spore.zig");
 
+const preflight_context_source_prefix = std.fmt.comptimePrint("s{d}", .{std.math.maxInt(usize)});
+
 pub const InstructionTransition = union(enum) {
     run: build_exec.RunStep,
     copy: Copy,
+    add: remote_add.Prepared,
     workdir: build_exec.WorkdirStep,
 
     pub const Copy = union(enum) {
@@ -96,6 +100,7 @@ pub fn lowerMissSuffix(
     for (transitions) |transition| switch (transition) {
         .run => |step| try steps.append(.{ .run = step }),
         .workdir => |step| try steps.append(.{ .workdir = step }),
+        .add => |add| try steps.append(.{ .copy = try lowerRemoteAdd(allocator, &context_disk, add) }),
         .copy => |copy| switch (copy) {
             .build_input => |step| try steps.append(.{ .copy = step }),
             .context => |context| {
@@ -122,6 +127,92 @@ pub fn lowerMissSuffix(
     return .{ .steps = try steps.toOwnedSlice(), .context_disk_path = context_disk_path };
 }
 
+fn lowerRemoteAdd(
+    allocator: std.mem.Allocator,
+    context_disk: *build_context_disk.Builder,
+    add: remote_add.Prepared,
+) !build_exec.CopyStep {
+    const source_prefix = try context_disk.addCapturedCopy(&.{.{
+        .rel = add.staged.source_name,
+        .kind = .file,
+        .mode = remote_add.default_mode,
+        .size = add.staged.size,
+        .content_digest = add.staged.content_digest,
+        .snapshot_path = add.staged.path,
+    }});
+    const source = try std.fs.path.join(allocator, &.{ source_prefix, add.staged.source_name });
+    const input_digest = try remoteAddInputDigest(allocator, add);
+    const requests = try allocator.alloc(build_exec.CopyRequest, 1);
+    requests[0] = try remoteAddCopyRequest(allocator, add, source);
+    return .{
+        .instruction_kind = .add,
+        .line = add.input.line,
+        .canonical_instruction = add.input.canonical_instruction,
+        .input_digest = input_digest,
+        .env_digest = add.input.env_digest,
+        .workdir = add.input.workdir,
+        .requests = requests,
+    };
+}
+
+pub fn preflightRemoteAdd(allocator: std.mem.Allocator, add: remote_add.Prepared) !void {
+    const conservative_prefix = "spore-remote-add-prefix-00000000";
+    const source = try std.fs.path.join(allocator, &.{ conservative_prefix, add.staged.source_name });
+    _ = try remoteAddCopyRequest(allocator, add, source);
+}
+
+fn remoteAddCopyRequest(
+    allocator: std.mem.Allocator,
+    add: remote_add.Prepared,
+    source: []const u8,
+) !build_exec.CopyRequest {
+    const request = build_exec.CopyRequest{
+        .source = source,
+        .dest = try normalizeGuestPath(allocator, add.input.workdir, add.input.resolved_dest),
+        .source_kind = .file,
+        .dest_is_dir = copyDestEndsWithSlash(add.input.resolved_dest),
+        .entry_count = 1,
+        .mtime_unix_seconds = add.staged.mtime_unix_seconds orelse 0,
+    };
+    try build_exec.validateCopyRequest(request);
+    try build_exec.validateCopyDestinationJoin(request);
+    return request;
+}
+
+fn remoteAddInputDigest(
+    allocator: std.mem.Allocator,
+    add: remote_add.Prepared,
+) ![]const u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hashField(&hash, "spore-build-remote-add-v1");
+    hashField(&hash, add.input.resolved_url);
+    hashField(&hash, add.input.resolved_dest);
+    hashField(&hash, add.staged.source_name);
+    hashField(&hash, add.staged.content_digest);
+    if (add.staged.mtime_unix_seconds) |mtime| {
+        hash.update("\x01");
+        var mtime_bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &mtime_bytes, mtime, .little);
+        hash.update(&mtime_bytes);
+    } else {
+        hash.update("\x00");
+    }
+    var mode: [4]u8 = undefined;
+    std.mem.writeInt(u32, &mode, remote_add.default_mode, .little);
+    hashField(&hash, &mode);
+    var raw: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hash.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
+}
+
+fn hashField(hash: *std.crypto.hash.Blake3, value: []const u8) void {
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, value.len, .little);
+    hash.update(&len);
+    hash.update(value);
+}
+
 pub fn lowerContextCopy(
     io: Io,
     allocator: std.mem.Allocator,
@@ -142,13 +233,15 @@ pub fn lowerContextCopy(
     }, context_snapshot);
     const input_digest = try build_context.hashResolvedCopyEntries(allocator, captured);
     const source_prefix = try context_disk.addCapturedCopy(captured);
-    const dest_is_dir = copyDestIsDirectory(context.resolved_dest, resolution);
-    if (resolution.roots.len > 1 and !copyDestEndsWithSlash(context.resolved_dest)) {
-        diagnostic.instruction_line.* = context.line;
-        return error.CopyDestinationMustBeDirectory;
-    }
-    const dest = try normalizeGuestPath(allocator, context.workdir, context.resolved_dest);
-    const requests = try copyRequests(allocator, diagnostic, context.line, resolution, source_prefix, dest, dest_is_dir);
+    const requests = try validatedContextCopyRequests(
+        allocator,
+        diagnostic,
+        context.line,
+        resolution,
+        source_prefix,
+        context.resolved_dest,
+        context.workdir,
+    );
     return .{
         .line = context.line,
         .canonical_instruction = context.canonical_instruction,
@@ -157,6 +250,67 @@ pub fn lowerContextCopy(
         .workdir = context.workdir,
         .requests = requests,
     };
+}
+
+pub fn preflightContextCopy(
+    io: Io,
+    allocator: std.mem.Allocator,
+    ctx: build_context.BuildContext,
+    diagnostic: *Diagnostics,
+    line: usize,
+    resolved_sources: []const []const u8,
+    resolved_dest: []const u8,
+    workdir: []const u8,
+) !void {
+    const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, resolved_sources, diagnostic.copy) catch |err| {
+        diagnostic.instruction_line.* = line;
+        if (err == error.FileNotFound) {
+            if (resolved_sources.len != 0) diagnostic.copy.source = resolved_sources[0];
+            return error.CopySourceNotFound;
+        }
+        return err;
+    };
+    _ = try validatedContextCopyRequests(
+        allocator,
+        diagnostic,
+        line,
+        resolution,
+        preflight_context_source_prefix,
+        resolved_dest,
+        workdir,
+    );
+}
+
+fn validatedContextCopyRequests(
+    allocator: std.mem.Allocator,
+    diagnostic: *Diagnostics,
+    line: usize,
+    resolution: build_context.CopyResolution,
+    source_prefix: []const u8,
+    resolved_dest: []const u8,
+    workdir: []const u8,
+) ![]const build_exec.CopyRequest {
+    if (resolution.roots.len > 1 and !copyDestEndsWithSlash(resolved_dest)) {
+        diagnostic.instruction_line.* = line;
+        return error.CopyDestinationMustBeDirectory;
+    }
+    for (resolution.entries) |entry| _ = copySourceKind(entry.kind) catch |err| {
+        diagnostic.instruction_line.* = line;
+        return err;
+    };
+    const dest = normalizeGuestPath(allocator, workdir, resolved_dest) catch |err| {
+        diagnostic.instruction_line.* = line;
+        return err;
+    };
+    return copyRequests(
+        allocator,
+        diagnostic,
+        line,
+        resolution,
+        source_prefix,
+        dest,
+        copyDestIsDirectory(resolved_dest, resolution),
+    );
 }
 
 pub fn buildInputCopy(
@@ -183,6 +337,7 @@ pub fn buildInputCopy(
             .source_disk = .build_input,
             .input_index = input_index,
         };
+        try build_exec.validateCopyRequest(requests[index]);
     }
     return .{ .copy = .{ .build_input = .{
         .line = line,
@@ -205,6 +360,7 @@ fn cacheStep(
     return switch (transition) {
         .run => |step| .{ .run = step },
         .workdir => |step| .{ .workdir = step },
+        .add => |add| .{ .copy = try lowerRemoteAddForCache(allocator, add) },
         .copy => |copy| switch (copy) {
             .build_input => |step| .{ .copy = step },
             .context => |context| blk: {
@@ -225,6 +381,18 @@ fn cacheStep(
                 } };
             },
         },
+    };
+}
+
+fn lowerRemoteAddForCache(allocator: std.mem.Allocator, add: remote_add.Prepared) !build_exec.CopyStep {
+    return .{
+        .instruction_kind = .add,
+        .line = add.input.line,
+        .canonical_instruction = add.input.canonical_instruction,
+        .input_digest = try remoteAddInputDigest(allocator, add),
+        .env_digest = add.input.env_digest,
+        .workdir = add.input.workdir,
+        .requests = &.{},
     };
 }
 
@@ -277,13 +445,19 @@ fn copyRequests(
             source_prefix
         else
             try std.fs.path.join(allocator, &.{ source_prefix, root.rel });
-        try out.append(.{
+        const request = build_exec.CopyRequest{
             .source = source,
             .dest = dest,
             .source_kind = try copySourceKind(root.kind),
             .dest_is_dir = dest_is_dir,
             .entry_count = entry_count,
-        });
+        };
+        build_exec.validateCopyRequest(request) catch |err| {
+            diagnostic.instruction_line.* = instruction_line;
+            diagnostic.copy.source = root.rel;
+            return err;
+        };
+        try out.append(request);
     }
     return out.toOwnedSlice();
 }
@@ -408,4 +582,179 @@ test "cache walk advances the parent and reports only the miss suffix" {
         .complete => |storage| try std.testing.expectEqualStrings(second.index_digest, storage.index_digest),
         .miss => return error.UnexpectedBuildCacheMiss,
     }
+}
+
+test "context COPY preflight reserves the longest generated source prefix" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-build-copy-prefix-preflight";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    const first = try arena.alloc(u8, 250);
+    const second = try arena.alloc(u8, 250);
+    @memset(first, 'a');
+    @memset(second, 'b');
+    const directory = try std.fs.path.join(arena, &.{ tmp, first });
+    const source = try std.fs.path.join(arena, &.{ first, second });
+    const source_path = try std.fs.path.join(arena, &.{ tmp, source });
+    try Io.Dir.cwd().createDirPath(io, directory);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "x" });
+
+    var context_hash: build_context.HashDiagnostic = .{};
+    var context_disk: build_context_disk.Diagnostic = .{};
+    var instruction_line: usize = 0;
+    var copy: build_context.CopyDiagnostic = .{};
+    var limit: u64 = 0;
+    var actual: u64 = 0;
+    var diagnostic = Diagnostics{
+        .context_hash = &context_hash,
+        .context_disk = &context_disk,
+        .instruction_line = &instruction_line,
+        .copy = &copy,
+        .limit = &limit,
+        .actual = &actual,
+    };
+    const ctx = build_context.BuildContext{ .root = tmp, .absolute_root = tmp };
+    try std.testing.expectError(error.CopySourceNotFound, preflightContextCopy(
+        io,
+        arena,
+        ctx,
+        &diagnostic,
+        7,
+        &.{source},
+        "/dest/",
+        "/",
+    ));
+    try std.testing.expectEqual(@as(usize, 7), instruction_line);
+    try std.testing.expectEqualStrings(source, copy.source);
+}
+
+test "remote ADD cache identity binds resolved URL destination and downloaded bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const staged = remote_add.StagedFile{
+        .path = "/tmp/staged",
+        .source_name = "tool",
+        .content_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .size = 7,
+        .mtime_unix_seconds = 1_700_000_000,
+    };
+    const add = remote_add.Prepared{
+        .input = .{
+            .stage_index = 0,
+            .instruction_index = 0,
+            .line = 2,
+            .canonical_instruction = "ADD https://example.com/tool /usr/bin/tool",
+            .resolved_url = "https://example.com/tool",
+            .resolved_dest = "/usr/bin/tool",
+            .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .workdir = "/",
+        },
+        .staged = staged,
+    };
+    const base = try remoteAddInputDigest(allocator, add);
+    var changed_add = add;
+    changed_add.input.resolved_dest = "/opt/tool";
+    const changed_dest = try remoteAddInputDigest(allocator, changed_add);
+    try std.testing.expect(!std.mem.eql(u8, base, changed_dest));
+    changed_add = add;
+    changed_add.input.resolved_url = "https://example.com/other";
+    const changed_url = try remoteAddInputDigest(allocator, changed_add);
+    try std.testing.expect(!std.mem.eql(u8, base, changed_url));
+    changed_add = add;
+    changed_add.staged.content_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const changed_bytes = try remoteAddInputDigest(allocator, changed_add);
+    try std.testing.expect(!std.mem.eql(u8, base, changed_bytes));
+    changed_add = add;
+    changed_add.staged.mtime_unix_seconds = null;
+    const changed_mtime = try remoteAddInputDigest(allocator, changed_add);
+    try std.testing.expect(!std.mem.eql(u8, base, changed_mtime));
+}
+
+test "remote ADD lowers through the shared COPY apply protocol" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var context_disk = build_context_disk.Builder.init(allocator);
+    const step = try lowerRemoteAdd(allocator, &context_disk, .{
+        .input = .{
+            .stage_index = 0,
+            .instruction_index = 0,
+            .line = 4,
+            .canonical_instruction = "ADD https://example.com/tool /usr/local/bin/",
+            .resolved_url = "https://example.com/tool",
+            .resolved_dest = "/usr/local/bin/",
+            .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .workdir = "/work",
+        },
+        .staged = .{
+            .path = "/tmp/staged",
+            .source_name = "tool",
+            .content_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .size = 7,
+            .mtime_unix_seconds = 1_700_000_000,
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 1), step.requests.len);
+    try std.testing.expectEqualStrings("s0/tool", step.requests[0].source);
+    try std.testing.expectEqualStrings("/usr/local/bin", step.requests[0].dest);
+    try std.testing.expect(step.requests[0].dest_is_dir);
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000), step.requests[0].mtime_unix_seconds);
+    try std.testing.expectEqual(@as(u32, remote_add.default_mode), context_disk.entries.items[1].mode);
+
+    const epoch_step = try lowerRemoteAdd(allocator, &context_disk, .{
+        .input = .{
+            .stage_index = 0,
+            .instruction_index = 1,
+            .line = 5,
+            .canonical_instruction = "ADD https://example.com/plain /plain",
+            .resolved_url = "https://example.com/plain",
+            .resolved_dest = "/plain",
+            .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .workdir = "/",
+        },
+        .staged = .{
+            .path = "/tmp/plain",
+            .source_name = "plain",
+            .content_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            .size = 5,
+            .mtime_unix_seconds = null,
+        },
+    });
+    try std.testing.expectEqual(@as(?i64, 0), epoch_step.requests[0].mtime_unix_seconds);
+}
+
+test "remote ADD preflight bounds filename joins for runtime directories" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source_name = try allocator.alloc(u8, 250);
+    @memset(source_name, 's');
+    const destination = try allocator.alloc(u8, 301);
+    destination[0] = '/';
+    @memset(destination[1..300], 'd');
+    destination[300] = 'd';
+    try std.testing.expectError(error.CopyDestinationUnsupported, preflightRemoteAdd(allocator, .{
+        .input = .{
+            .stage_index = 0,
+            .instruction_index = 1,
+            .line = 3,
+            .canonical_instruction = "ADD https://example.com/file /long/",
+            .resolved_url = "https://example.com/file",
+            .resolved_dest = destination,
+            .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .workdir = "/",
+        },
+        .staged = .{
+            .path = "/tmp/staged",
+            .source_name = source_name,
+            .content_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .size = 1,
+            .mtime_unix_seconds = null,
+        },
+    }));
 }
