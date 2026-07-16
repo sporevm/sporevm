@@ -13,6 +13,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_COPY_PATH_LEN SPORE_BUILD_COPY_PATH_MAX
@@ -1074,10 +1075,31 @@ static int copy_result(char *error, size_t error_cap, int code, const char *mess
   return code;
 }
 
+static int set_confined_mtime(int root_fd, const char *path, int64_t unix_seconds) {
+  int fd = confined_open_existing(root_fd, path, O_RDONLY);
+  if (fd < 0) return -1;
+  time_t seconds = (time_t)unix_seconds;
+  if ((int64_t)seconds != unix_seconds) {
+    close(fd);
+    errno = EOVERFLOW;
+    return -1;
+  }
+  struct timespec times[2] = {
+    { .tv_sec = 0, .tv_nsec = UTIME_OMIT },
+    { .tv_sec = seconds, .tv_nsec = 0 },
+  };
+  int rc = futimens(fd, times);
+  int saved = errno;
+  if (close(fd) != 0 && rc == 0) return -1;
+  errno = saved;
+  return rc;
+}
+
 int spore_build_copy_apply(
     const char *root, const char *source_root,
     const char *source, const char *dest,
     int source_kind, int dest_is_dir, uint64_t entry_count,
+    int mtime_present, int64_t mtime_unix_seconds,
     char *error, size_t error_cap) {
   if (error_cap > 0) error[0] = '\0';
   if (validate_build_context_source_path(source) != 0) {
@@ -1195,6 +1217,12 @@ int spore_build_copy_apply(
     close(root_fd);
     return SPORE_BUILD_COPY_APPLY_FAILED;
   }
+  if (mtime_present && set_confined_mtime(root_fd, dest_path, mtime_unix_seconds) != 0) {
+    copy_tree_state_deinit(&copy_state);
+    close(source_parent_fd);
+    close(root_fd);
+    return copy_result(error, error_cap, SPORE_BUILD_COPY_APPLY_FAILED, "spore build: COPY destination mtime apply failed\n");
+  }
   copy_tree_state_deinit(&copy_state);
   int close_rc = close(source_parent_fd);
   if (close(root_fd) != 0) close_rc = -1;
@@ -1240,6 +1268,25 @@ __attribute__((visibility("hidden"))) int spore_build_copy_test_confined_source_
   if (parent_fd < 0) return -1;
   int rc = fstatat(parent_fd, name, &(struct stat){0}, AT_SYMLINK_NOFOLLOW);
   close(parent_fd);
+  return rc;
+}
+
+__attribute__((visibility("hidden"))) int spore_build_copy_test_confined_mtime(
+    const unsigned char *root_bytes, size_t root_len,
+    const unsigned char *path_bytes, size_t path_len, int64_t unix_seconds) {
+  if (root_len == 0 || root_len >= 1024 || path_len == 0 || path_len > MAX_COPY_PATH_LEN) return -1;
+  char root[1024];
+  char path[MAX_COPY_PATH_LEN + 1];
+  memcpy(root, root_bytes, root_len);
+  root[root_len] = '\0';
+  memcpy(path, path_bytes, path_len);
+  path[path_len] = '\0';
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0) return -1;
+  int rc = set_confined_mtime(root_fd, path, unix_seconds);
+  int saved = errno;
+  if (close(root_fd) != 0 && rc == 0) return -1;
+  errno = saved;
   return rc;
 }
 

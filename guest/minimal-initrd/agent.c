@@ -2060,6 +2060,8 @@ struct run_request {
   int copy_source_disk;
   uint64_t copy_input_index;
   int copy_dest_is_dir;
+  int copy_mtime_present;
+  int64_t copy_mtime_unix_seconds;
   uint64_t build_command_len;
   int build_exec_form;
   uint64_t nofile_soft;
@@ -2102,6 +2104,29 @@ static int parse_json_bool(const char **cursor, int *out) {
     return 0;
   }
   return -1;
+}
+
+static int parse_json_optional_i64(const char **cursor, int *present, int64_t *out) {
+  const char *p = *cursor;
+  if (strncmp(p, "null", 4) == 0 && json_token_finished(p[4])) {
+    *present = 0;
+    *out = 0;
+    *cursor = p + 4;
+    return 0;
+  }
+  int negative = 0;
+  if (*p == '-') {
+    negative = 1;
+    p++;
+  }
+  uint64_t magnitude = 0;
+  if (parse_json_u64(&p, &magnitude) != 0) return -1;
+  if ((!negative && magnitude > INT64_MAX) ||
+      (negative && magnitude > (uint64_t)INT64_MAX + 1)) return -1;
+  *present = 1;
+  *out = negative ? (magnitude == (uint64_t)INT64_MAX + 1 ? INT64_MIN : -(int64_t)magnitude) : (int64_t)magnitude;
+  *cursor = p;
+  return 0;
 }
 
 static int parse_exec_argv_value(const char **cursor, struct run_request *out) {
@@ -2284,6 +2309,106 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
   return 0;
 }
 
+static int parse_build_copy_v4_request(const char *req, size_t req_len, struct run_request *out) {
+  if (req_len == 0 || req[req_len - 1] != '\n') return -1;
+  enum {
+    SEEN_TYPE = 1u << 0,
+    SEEN_SESSION_ID = 1u << 1,
+    SEEN_SOURCE = 1u << 2,
+    SEEN_DEST = 1u << 3,
+    SEEN_SOURCE_KIND = 1u << 4,
+    SEEN_DEST_IS_DIR = 1u << 5,
+    SEEN_ENTRY_COUNT = 1u << 6,
+    SEEN_SOURCE_DISK = 1u << 7,
+    SEEN_INPUT_INDEX = 1u << 8,
+    SEEN_MTIME = 1u << 9,
+    SEEN_ALL = (1u << 10) - 1,
+  };
+
+  const char *p = skip_ws(req);
+  if (*p != '{') return -1;
+  p++;
+  unsigned int seen = 0;
+  for (;;) {
+    p = skip_ws(p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+    char key[32];
+    if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
+    p = skip_ws(p);
+    if (*p != ':') return -1;
+    p = skip_ws(p + 1);
+
+    unsigned int bit = 0;
+    if (strcmp(key, "type") == 0) {
+      bit = SEEN_TYPE;
+      char type[32];
+      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-copy-v4") != 0) return -1;
+    } else if (strcmp(key, "session_id") == 0) {
+      bit = SEEN_SESSION_ID;
+      if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
+    } else if (strcmp(key, "source") == 0) {
+      bit = SEEN_SOURCE;
+      if (parse_json_string(&p, out->copy_source, sizeof(out->copy_source)) != 0 || out->copy_source[0] == '\0') return -1;
+    } else if (strcmp(key, "dest") == 0) {
+      bit = SEEN_DEST;
+      if (parse_json_string(&p, out->copy_dest, sizeof(out->copy_dest)) != 0 || out->copy_dest[0] != '/') return -1;
+    } else if (strcmp(key, "source_kind") == 0) {
+      bit = SEEN_SOURCE_KIND;
+      char source_kind[16];
+      if (parse_json_string(&p, source_kind, sizeof(source_kind)) != 0) return -1;
+      if (strcmp(source_kind, "directory") == 0) out->copy_source_kind = COPY_KIND_DIR;
+      else if (strcmp(source_kind, "file") == 0) out->copy_source_kind = COPY_KIND_FILE;
+      else if (strcmp(source_kind, "sym_link") == 0) out->copy_source_kind = COPY_KIND_SYMLINK;
+      else if (strcmp(source_kind, "auto") == 0) out->copy_source_kind = COPY_KIND_AUTO;
+      else return -1;
+    } else if (strcmp(key, "dest_is_dir") == 0) {
+      bit = SEEN_DEST_IS_DIR;
+      if (parse_json_bool(&p, &out->copy_dest_is_dir) != 0) return -1;
+    } else if (strcmp(key, "entry_count") == 0) {
+      bit = SEEN_ENTRY_COUNT;
+      if (parse_json_u64(&p, &out->copy_entry_count) != 0 || out->copy_entry_count > MAX_BUILD_CONTEXT_COPY_ENTRIES) return -1;
+    } else if (strcmp(key, "source_disk") == 0) {
+      bit = SEEN_SOURCE_DISK;
+      char source_disk[24];
+      if (parse_json_string(&p, source_disk, sizeof(source_disk)) != 0) return -1;
+      if (strcmp(source_disk, "context") == 0) out->copy_source_disk = COPY_SOURCE_CONTEXT;
+      else if (strcmp(source_disk, "build_input") == 0) out->copy_source_disk = COPY_SOURCE_BUILD_INPUT;
+      else return -1;
+    } else if (strcmp(key, "input_index") == 0) {
+      bit = SEEN_INPUT_INDEX;
+      if (parse_json_u64(&p, &out->copy_input_index) != 0 || out->copy_input_index >= MAX_BUILD_INPUT_DISKS) return -1;
+    } else if (strcmp(key, "mtime_unix_seconds") == 0) {
+      bit = SEEN_MTIME;
+      if (parse_json_optional_i64(&p, &out->copy_mtime_present, &out->copy_mtime_unix_seconds) != 0) return -1;
+    } else {
+      return -1;
+    }
+    if ((seen & bit) != 0) return -1;
+    seen |= bit;
+
+    p = skip_ws(p);
+    if (*p == '}') {
+      p++;
+      break;
+    }
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
+    if (*p == '}') return -1;
+  }
+  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
+  if (out->copy_source_disk == COPY_SOURCE_CONTEXT) {
+    if (out->copy_source_kind == COPY_KIND_AUTO || out->copy_entry_count == 0 || out->copy_input_index != 0) return -1;
+  } else if (out->copy_source_kind != COPY_KIND_AUTO || out->copy_entry_count != 0) {
+    return -1;
+  }
+  out->kind = REQUEST_BUILD_COPY;
+  out->protocol_v1 = 1;
+  return 0;
+}
+
 static int parse_string_field(const char *req, const char *name, char *out, size_t cap) {
   const char *p = find_field_value(req, name);
   if (p == NULL) return 0;
@@ -2366,6 +2491,9 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
   if (type_rc < 0) return -1;
   if (type_rc > 0 && strcmp(type, "spore-build-run-v2") == 0) {
     return parse_build_run_v2_request(req, req_len, out);
+  }
+  if (type_rc > 0 && strcmp(type, "spore-build-copy-v4") == 0) {
+    return parse_build_copy_v4_request(req, req_len, out);
   }
   if (type_rc > 0) {
     if (strcmp(type, "ready") == 0) {
@@ -4598,7 +4726,9 @@ static void accept_request(int listener, struct session *session, struct client 
         "/mnt/rootfs", source_root,
         request.copy_source, request.copy_dest,
         request.copy_source_kind, request.copy_dest_is_dir,
-        request.copy_entry_count, error, sizeof(error));
+        request.copy_entry_count,
+        request.copy_mtime_present, request.copy_mtime_unix_seconds,
+        error, sizeof(error));
     if (exit_code == SPORE_BUILD_COPY_OK) {
       (void)send_client_exit(client, 0);
     } else {

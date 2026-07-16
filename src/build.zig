@@ -7,6 +7,7 @@ const build_context = @import("build/context.zig");
 const build_context_disk = @import("build/context_disk.zig");
 const build_exec = @import("build/exec.zig");
 const instruction_transition = @import("build/instruction_transition.zig");
+const remote_add = @import("build/remote_add.zig");
 const build_plan = @import("build/plan.zig");
 const variable_expansion = @import("build/variables.zig");
 const step_cache = @import("build/step_cache.zig");
@@ -155,6 +156,12 @@ const StageArtifact = struct {
     arg_overrides: []const ArgValue = &.{},
 };
 
+const MetadataArtifact = struct {
+    config: rootfs_mod.ImageConfig,
+    args: []const ArgValue = &.{},
+    arg_overrides: []const ArgValue = &.{},
+};
+
 const StageCopyBinding = struct {
     instruction_index: usize,
     input_index: usize,
@@ -210,6 +217,19 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             }
         }
     }
+    var remote_add_count: u64 = 0;
+    for (plan.order) |stage_index| for (plan.stages[stage_index].source.instructions) |instruction| switch (instruction.value) {
+        .add => {
+            remote_add_count += 1;
+            if (remote_add_count > remote_add.max_inputs) {
+                diagnostic.instruction_line = instruction.line;
+                diagnostic.limit = remote_add.max_inputs;
+                diagnostic.actual = remote_add_count;
+                return error.RemoteAddCountExceeded;
+            }
+        },
+        else => {},
+    };
 
     var context_dir = Io.Dir.cwd().openDir(init.io, options.context_dir, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => {
@@ -263,6 +283,33 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             else => {},
         };
     }
+    const remote_add_inputs = if (remote_add_count == 0)
+        &.{}
+    else
+        preflightBuildPlan(init.io, allocator, options, diagnostic, ctx, plan, global_args.items, resolved_bases) catch |err| switch (err) {
+            error.VariableExpansionTooLarge => {
+                diagnostic.dockerfile = .{ .line = diagnostic.instruction_line, .message = "expanded Dockerfile argument is too large" };
+                return error.DockerfilePlanFailed;
+            },
+            else => |other| return other,
+        };
+    var remote_add_batch = try remote_add.prepare(init.io, allocator, cache_root, remote_add_inputs, options.timeout_ms, .{
+        .instruction_line = &diagnostic.instruction_line,
+        .limit = &diagnostic.limit,
+        .actual = &diagnostic.actual,
+    });
+    defer if (remote_add_batch) |*batch| batch.deinit();
+    if (remote_add_batch) |batch| for (batch.items) |add| {
+        instruction_transition.preflightRemoteAdd(allocator, add) catch |err| {
+            diagnostic.instruction_line = add.input.line;
+            return switch (err) {
+                error.CopyDestinationUnsupported => error.RemoteAddDestinationUnsupported,
+                error.CopySourceNotFound => error.RemoteAddFilenameUnsupported,
+                else => |other| other,
+            };
+        };
+    };
+
     cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
     const build_cache_lock = if (cache_lock) |*lock| lock else unreachable;
     // Register this defer after the lock defer: LIFO then guarantees every
@@ -300,7 +347,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         for (base_artifact.arg_overrides) |arg| try putArg(allocator, &state.arg_overrides, arg.key, arg.value);
         state.producer = shared_producer;
         const stage_inputs = try prepareStageInputs(allocator, diagnostic, planned_stage, artifacts, resolved_copy_bases[stage_index]);
-        const built = try buildStage(init, allocator, options, diagnostic, ctx, &stat_cache, global_args.items, planned_stage.source.instructions, stage_inputs, state, build_cache_lock);
+        const built = try buildStage(init, allocator, options, diagnostic, ctx, &stat_cache, global_args.items, stage_index, planned_stage.source.instructions, stage_inputs, state, if (remote_add_batch) |batch| batch.items else &.{}, build_cache_lock);
         state = built.state;
         if (shared_producer == null) shared_producer = state.producer;
         any_exec_step = any_exec_step or built.has_exec_step;
@@ -385,6 +432,119 @@ fn prepareStageInputs(
     return .{ .bindings = try bindings.toOwnedSlice(), .rootfs = input_rootfs };
 }
 
+fn preflightBuildPlan(
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: Options,
+    diagnostic: *Diagnostic,
+    ctx: build_context.BuildContext,
+    plan: build_plan.Plan,
+    global_args: []const ArgValue,
+    resolved_bases: []const ?Base,
+) ![]const remote_add.Input {
+    const artifacts = try allocator.alloc(?MetadataArtifact, plan.stages.len);
+    @memset(artifacts, null);
+    var inputs = std.array_list.Managed(remote_add.Input).init(allocator);
+
+    for (plan.order) |stage_index| {
+        const planned_stage = plan.stages[stage_index];
+        const base: MetadataArtifact = switch (planned_stage.base) {
+            .external => blk: {
+                const resolved = resolved_bases[stage_index] orelse return error.BadManifest;
+                break :blk .{ .config = resolved.config };
+            },
+            .stage => |dependency| artifacts[dependency] orelse return error.BadManifest,
+            .scratch => .{ .config = .{ .architecture = options.platform.arch, .os = options.platform.os, .config = .{} } },
+        };
+        var state = try stateFromBase(allocator, base.config, metadataOnlyStorage(), base.args, 0);
+        for (base.arg_overrides) |arg| try putArg(allocator, &state.arg_overrides, arg.key, arg.value);
+
+        for (planned_stage.source.instructions, 0..) |instruction, instruction_index| {
+            const metadata = applyMetadataInstruction(allocator, options, global_args, &state, instruction) catch |err| switch (err) {
+                error.VariableExpansionTooLarge => {
+                    diagnostic.dockerfile = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
+                    return error.DockerfilePlanFailed;
+                },
+                else => |other| return other,
+            };
+            if (metadata) continue;
+            if (!rootUser(state.user)) {
+                diagnostic.instruction_line = instruction.line;
+                return error.UnsupportedBuildUser;
+            }
+            diagnostic.instruction_line = instruction.line;
+            switch (instruction.value) {
+                .run => |run| _ = try runStep(allocator, diagnostic, state, instruction, run, options),
+                .copy => |copy| {
+                    const resolved_sources = try substituteStateList(allocator, copy.sources, state, instruction.escape);
+                    const resolved_dest = try substituteState(allocator, copy.dest, state, instruction.escape);
+                    if (copy.from != null) {
+                        _ = instruction_transition.buildInputCopy(
+                            allocator,
+                            instruction.line,
+                            instruction.raw,
+                            resolved_sources,
+                            resolved_dest,
+                            try effectiveEnvDigest(allocator, state),
+                            state.workdir,
+                            0,
+                            metadataOnlyStorage(),
+                        ) catch |err| {
+                            diagnostic.instruction_line = instruction.line;
+                            return err;
+                        };
+                    } else {
+                        var transition_diagnostic = transitionDiagnostics(diagnostic);
+                        try instruction_transition.preflightContextCopy(
+                            io,
+                            allocator,
+                            ctx,
+                            &transition_diagnostic,
+                            instruction.line,
+                            resolved_sources,
+                            resolved_dest,
+                            state.workdir,
+                        );
+                    }
+                },
+                .add => try inputs.append(resolveRemoteAddInput(allocator, diagnostic, state, instruction, stage_index, instruction_index) catch |err| switch (err) {
+                    error.VariableExpansionTooLarge => {
+                        diagnostic.dockerfile = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
+                        return error.DockerfilePlanFailed;
+                    },
+                    else => |other| return other,
+                }),
+                .workdir => |raw| {
+                    const step = try workdirStep(allocator, state, instruction, raw);
+                    try build_exec.validateWorkdirTarget(step.target);
+                    state.workdir = step.target;
+                },
+                .from, .env, .arg, .cmd, .entrypoint => unreachable,
+            }
+        }
+        artifacts[stage_index] = .{
+            .config = try imageConfig(allocator, options.platform, state),
+            .args = try cloneArgs(allocator, state.args.items),
+            .arg_overrides = try cloneArgs(allocator, state.arg_overrides.items),
+        };
+    }
+    diagnostic.instruction_line = 0;
+    return inputs.toOwnedSlice();
+}
+
+fn metadataOnlyStorage() spore.RootfsStorage {
+    return .{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = spore.disk_chunk_size,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = "blake3",
+        .index_digest = "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+        .base_identity = "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+        .object_namespace = "rootfs/blake3",
+    };
+}
+
 fn buildStage(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -393,16 +553,18 @@ fn buildStage(
     ctx: build_context.BuildContext,
     stat_cache: *build_context.StatCache,
     global_args: []const ArgValue,
+    stage_index: usize,
     instructions: []const dockerfile.Instruction,
     stage_inputs: StageInputs,
     initial_state: State,
+    prepared_remote_adds: []const remote_add.Prepared,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !BuiltStage {
     var state = initial_state;
     var transitions = std.array_list.Managed(instruction_transition.InstructionTransition).init(allocator);
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     for (instructions, 0..) |instruction, index| {
-        if (try instructionTransition(allocator, options, diagnostic, global_args, stage_inputs, &state, instruction, index)) |transition| {
+        if (try instructionTransition(allocator, options, diagnostic, global_args, stage_inputs, stage_index, prepared_remote_adds, &state, instruction, index)) |transition| {
             try transitions.append(transition);
         }
     }
@@ -473,11 +635,13 @@ fn instructionTransition(
     diagnostic: *Diagnostic,
     global_args: []const ArgValue,
     stage_inputs: StageInputs,
+    stage_index: usize,
+    prepared_remote_adds: []const remote_add.Prepared,
     state: *State,
     instruction: dockerfile.Instruction,
     instruction_index: usize,
 ) !?instruction_transition.InstructionTransition {
-    return instructionTransitionResolved(allocator, options, diagnostic, global_args, stage_inputs, state, instruction, instruction_index) catch |err| switch (err) {
+    return instructionTransitionResolved(allocator, options, diagnostic, global_args, stage_inputs, stage_index, prepared_remote_adds, state, instruction, instruction_index) catch |err| switch (err) {
         error.VariableExpansionTooLarge => {
             diagnostic.dockerfile = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
             return error.DockerfilePlanFailed;
@@ -492,6 +656,8 @@ fn instructionTransitionResolved(
     diagnostic: *Diagnostic,
     global_args: []const ArgValue,
     stage_inputs: StageInputs,
+    stage_index: usize,
+    prepared_remote_adds: []const remote_add.Prepared,
     state: *State,
     instruction: dockerfile.Instruction,
     instruction_index: usize,
@@ -531,6 +697,7 @@ fn instructionTransitionResolved(
                 .workdir = state.workdir,
             } } };
         },
+        .add => .{ .add = remote_add.find(prepared_remote_adds, stage_index, instruction_index) orelse return error.BadManifest },
         .workdir => |raw| blk: {
             const step = try workdirStep(allocator, state.*, instruction, raw);
             state.workdir = step.target;
@@ -538,6 +705,37 @@ fn instructionTransitionResolved(
         },
         .from => unreachable,
         else => unreachable,
+    };
+}
+
+fn resolveRemoteAddInput(
+    allocator: std.mem.Allocator,
+    diagnostic: *Diagnostic,
+    state: State,
+    instruction: dockerfile.Instruction,
+    stage_index: usize,
+    instruction_index: usize,
+) !remote_add.Input {
+    const add = instruction.value.add;
+    const resolved_url = try substituteState(allocator, add.source, state, instruction.escape);
+    const resolved_dest = try substituteState(allocator, add.dest, state, instruction.escape);
+    _ = remote_add.validateUrl(resolved_url) catch |err| {
+        diagnostic.instruction_line = instruction.line;
+        return err;
+    };
+    _ = instruction_transition.normalizeGuestPath(allocator, state.workdir, resolved_dest) catch |err| {
+        diagnostic.instruction_line = instruction.line;
+        return if (err == error.CopyDestinationUnsupported) error.RemoteAddDestinationUnsupported else err;
+    };
+    return .{
+        .stage_index = stage_index,
+        .instruction_index = instruction_index,
+        .line = instruction.line,
+        .canonical_instruction = instruction.raw,
+        .resolved_url = resolved_url,
+        .resolved_dest = resolved_dest,
+        .env_digest = try effectiveEnvDigest(allocator, state),
+        .workdir = state.workdir,
     };
 }
 
@@ -1352,13 +1550,13 @@ fn contextCopyTransitionForTest(
         .tag = "local/app:dev",
         .context_dir = context_dir,
         .dockerfile_path = "unused",
-    }, diagnostic, &.{}, .{ .bindings = &.{}, .rootfs = &.{} }, &state, instruction, instruction_index)) orelse unreachable;
+    }, diagnostic, &.{}, .{ .bindings = &.{}, .rootfs = &.{} }, 0, &.{}, &state, instruction, instruction_index)) orelse unreachable;
     return switch (transition) {
         .copy => |copy| switch (copy) {
             .context => |context| context,
             .build_input => unreachable,
         },
-        .run, .workdir => unreachable,
+        .run, .add, .workdir => unreachable,
     };
 }
 
@@ -1445,6 +1643,154 @@ test "COPY and WORKDIR expand exact quoted operands from stage state" {
 
     const workdir = try workdirStep(arena, state, instructions[3], instructions[3].value.workdir);
     try std.testing.expectEqualStrings("/srv/work", workdir.target);
+}
+
+test "remote ADD resolves inherited ARG and automatic platform values at instruction start" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parse_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\ARG TARGETARCH
+        \\FROM scratch
+        \\ARG TARGETOS
+        \\ARG TARGETARCH
+        \\ARG VERSION=1.2.3
+        \\ADD "https://example.com/${VERSION}/tool-${TARGETOS}-${TARGETARCH}" '/opt/$VERSION/tool'
+        \\
+    , &parse_diagnostic);
+    const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
+    const global_args = try globalBuildArgs(arena, options, document.global_args, &parse_diagnostic);
+    var state = try stateFromBase(arena, .{}, testStorage(), global_args.items, 0);
+    var diagnostic: Diagnostic = .{};
+    const instructions = document.stages[0].instructions;
+    for (instructions[0..3]) |instruction| {
+        try std.testing.expect(try applyMetadataInstruction(arena, options, global_args.items, &state, instruction));
+    }
+    const input = try resolveRemoteAddInput(
+        arena,
+        &diagnostic,
+        state,
+        instructions[3],
+        0,
+        3,
+    );
+    try std.testing.expectEqualStrings("https://example.com/1.2.3/tool-linux-arm64", input.resolved_url);
+    try std.testing.expectEqualStrings("/opt/$VERSION/tool", input.resolved_dest);
+}
+
+test "remote ADD rejects unsupported sources and destinations before fetch" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
+    inline for (.{
+        .{ "ARG TAIL=repo.git\nADD https://example.com/${TAIL} /dest", error.UnsupportedRemoteAddUrl },
+        .{ "ARG PART=..\nADD https://example.com/file /safe/${PART}/escape", error.RemoteAddDestinationUnsupported },
+    }) |case| {
+        var parse_diagnostic: dockerfile.Diagnostic = .{};
+        const source = try std.fmt.allocPrint(arena, "FROM scratch\n{s}\n", .{case[0]});
+        const document = try dockerfile.parse(arena, source, &parse_diagnostic);
+        var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+        var diagnostic: Diagnostic = .{};
+        try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, document.stages[0].instructions[0]));
+        try std.testing.expectError(case[1], resolveRemoteAddInput(
+            arena,
+            &diagnostic,
+            state,
+            document.stages[0].instructions[1],
+            0,
+            1,
+        ));
+        try std.testing.expectEqual(@as(usize, 3), diagnostic.instruction_line);
+    }
+}
+
+test "build preflight rejects later deterministic invalidity before remote ADD preparation" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
+    inline for (.{
+        .{ "ARG TAIL=repo.git\nADD https://example.com/${TAIL} /dest", error.UnsupportedRemoteAddUrl },
+        .{ "ARG PART=..\nADD https://example.com/file /safe/${PART}/escape", error.RemoteAddDestinationUnsupported },
+        .{ "ADD https://observer.example/file /file\nCOPY definitely-missing /x", error.CopySourceNotFound },
+    }) |case| {
+        var parse_diagnostic: dockerfile.Diagnostic = .{};
+        const source = try std.fmt.allocPrint(arena,
+            \\FROM scratch AS build
+            \\RUN true
+            \\FROM build
+            \\{s}
+            \\
+        , .{case[0]});
+        const document = try dockerfile.parse(arena, source, &parse_diagnostic);
+        const plan = try build_plan.create(arena, &document, .{}, &parse_diagnostic);
+        var diagnostic: Diagnostic = .{};
+        const resolved = try allocatorNullBases(arena, plan.stages.len);
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const context_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
+        const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
+        try std.testing.expectError(case[1], preflightBuildPlan(
+            std.testing.io,
+            arena,
+            options,
+            &diagnostic,
+            ctx,
+            plan,
+            &.{},
+            resolved,
+        ));
+        try std.testing.expect(diagnostic.instruction_line != 0);
+    }
+
+    {
+        var parse_diagnostic: dockerfile.Diagnostic = .{};
+        const document = try dockerfile.parse(arena,
+            \\FROM scratch
+            \\ADD https://example.com/file /file
+            \\COPY . /context/
+            \\
+        , &parse_diagnostic);
+        const plan = try build_plan.create(arena, &document, .{}, &parse_diagnostic);
+        var diagnostic: Diagnostic = .{};
+        const resolved = try allocatorNullBases(arena, plan.stages.len);
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "input", .data = "payload" });
+        const context_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
+        const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
+        const inputs = try preflightBuildPlan(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved);
+        try std.testing.expectEqual(@as(usize, 1), inputs.len);
+    }
+
+    {
+        const long_target = try arena.alloc(u8, build_exec.max_guest_working_dir_len + 1);
+        long_target[0] = '/';
+        @memset(long_target[1..], 'w');
+        var parse_diagnostic: dockerfile.Diagnostic = .{};
+        const source = try std.fmt.allocPrint(arena, "FROM scratch\nADD https://example.com/file /file\nWORKDIR {s}\n", .{long_target});
+        const document = try dockerfile.parse(arena, source, &parse_diagnostic);
+        const plan = try build_plan.create(arena, &document, .{}, &parse_diagnostic);
+        var diagnostic: Diagnostic = .{};
+        const resolved = try allocatorNullBases(arena, plan.stages.len);
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const context_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
+        const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
+        try std.testing.expectError(
+            error.RunWorkingDirUnsupported,
+            preflightBuildPlan(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved),
+        );
+        try std.testing.expectEqual(@as(usize, 3), diagnostic.instruction_line);
+    }
+}
+
+fn allocatorNullBases(allocator: std.mem.Allocator, len: usize) ![]?Base {
+    const bases = try allocator.alloc(?Base, len);
+    @memset(bases, null);
+    return bases;
 }
 
 test "CMD and ENTRYPOINT retain variables for runtime expansion" {

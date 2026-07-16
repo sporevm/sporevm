@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-15
+last_reviewed: 2026-07-16
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -150,7 +150,8 @@ The missing work falls into three different categories:
   multi-stage `FROM … AS`, reachable-target planning, `scratch`, public
   registry/local/named-context bases, previous-stage inheritance, literal
   `COPY --from`, `--target`, and final `ENTRYPOINT`/`CMD` publication. COPY
-  flags (`--link`, `--parents`, `--chown`, `--chmod`), `RUN --mount`, `ADD`,
+  flags (`--link`, `--parents`, `--chown`, `--chmod`), `RUN --mount`, local or
+  flagged `ADD`,
   heredocs, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`, and `ONBUILD` still fail
   closed. C2 now also accepts bounded non-empty JSON-array `RUN` and executes
   its exact argv with Docker-compatible PATH lookup and no implicit variable
@@ -158,7 +159,7 @@ The missing work falls into three different categories:
   with runc's last-value-wins rule before cache hashing and guest serialization.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
-  features (`RUN --mount=type=cache`, `COPY --link`, remote `ADD`, heredocs)
+  features (`RUN --mount=type=cache`, `COPY --link`, additional `ADD` forms, heredocs)
   far outside the subset. The base image keeps arriving as an OCI layout via
   `--build-context`.
 - The unchanged Buildkite `ci` target is also exercised independently as a
@@ -178,6 +179,18 @@ The missing work falls into three different categories:
   The syntax 1.20 directive was accepted, while C3 mounts and SSH remained
   unreached. The oracle removed its task-owned scratch afterward, leaving no VM
   or task-owned runtime/cache state.
+- The expansion/platform foundation landed as PR #498 at
+  `da69aefc918229c8fff810c16b0977e155c2f3ae`. The independent unchanged-oracle
+  rerun against that exact main and the same frozen Buildkite input again
+  stopped at line 42 before network or VM startup, proving that the next
+  boundary remained the narrow public HTTPS ADD slice rather than a regression
+  in C2 expansion.
+- C4 now accepts exactly one public HTTPS URL with a literal scheme/authority
+  and expanded path/query plus one expanded destination. It always refetches
+  and hashes the actual bytes before cache
+  lookup, applies an opaque regular file with mode `0600` through the shared
+  COPY path, and retains HTTP, credentials, Git, flags, unpacking, and special
+  files as unsupported behavior.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
 - No flat checkpoint store and no full-image hash fallback in the executor.
@@ -415,6 +428,7 @@ implementing Spore's mounts or cache policy.
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
 | `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; exec form preserves a bounded non-empty JSON string array and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
 | `COPY [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. Other COPY flags fail closed. |
+| `ADD <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Flags, local/Git sources, credentials, and archive extraction fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
 | `ARG K[=default]` | value from `--build-arg` or an expanded default; unset values expand to empty unless a supported operator supplies another result. |
 | `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Created in the guest if missing, matching Docker. |
@@ -423,7 +437,8 @@ implementing Spore's mounts or cache policy.
 | comments, line continuations, `${VAR}`/`$VAR` substitution in supported instruction arguments | The leading directive window accepts the stable Dockerfile syntax directive and backslash/backtick escape directives; single quotes remain literal, double quotes expand, and unsupported syntax frontends fail closed. |
 
 Builder-owned variable substitution applies to `FROM`, `ENV`, `ARG` defaults,
-`WORKDIR`, and `COPY` source/destination arguments using the declared
+`WORKDIR`, `COPY` source/destination arguments, and the accepted `ADD` URL
+path/query and destination using the declared
 `ARG`/`ENV` state. `COPY --from` remains literal. `CMD` and
 `ENTRYPOINT` retain variables for runtime. Shell-form `RUN` is not pre-expanded;
 its guest shell sees the effective `ARG`/`ENV` environment and performs shell
@@ -444,7 +459,7 @@ src/build.zig            orchestrator: plan, typed stage transitions,
                          final ref publication
 src/build/instruction_transition.zig
                          cache-prefix walk and executor-suffix lowering from
-                         one typed RUN/COPY/WORKDIR transition
+                         one typed RUN/COPY/ADD/WORKDIR transition
 src/build/dockerfile.zig subset parser -> []Instruction, fail-closed,
                          fuzz target required (new parser of
                          user-influenced input per SECURITY.md)
@@ -562,7 +577,7 @@ A completed stage artifact is:
 
 Build cache v7 has two typed derivations in the same record namespace. The
 synthetic `PREPARE` operation normalizes capacity before Dockerfile cache keys
-are resolved; RUN, COPY, and WORKDIR then use the prepared child as their
+are resolved; RUN, COPY, ADD, and WORKDIR then use the prepared child as their
 ordinary parent. A key is a cache lookup address, and the record at that address
 stores the child `index_digest` produced by the prior successful execution.
 
@@ -582,7 +597,7 @@ tag. `disk_grow_target` is absent from v7 Dockerfile inputs and records. The
 producer identity binds the exact kernel and initrd bytes that will boot plus
 the growth request, mount/no-lazy-init policy, transient WRITE_ZEROES contract,
 and preparation host-contract version. The same exact-byte identity is carried
-as `executor_identity` in every RUN/COPY/WORKDIR key: two producers that happen
+as `executor_identity` in every RUN/COPY/ADD/WORKDIR key: two producers that happen
 to emit the same PREPARE child cannot reuse each other's executor results.
 Paths and hypervisor backend are not identity inputs. For managed defaults,
 the identity uses the canonical SHA-256 from the bounded read-only kernel
@@ -619,17 +634,20 @@ Per-instruction inputs:
   file content, symlink target text, or empty bytes for a directory.
   Ownership is not hashed (COPY forces 0:0). mtimes are not hashed
   (Docker parity).
+- `ADD`: the resolved public HTTPS URL and destination, URL-path or response
+  filename, downloaded content digest, validated optional `Last-Modified`,
+  fixed `0600` mode, current `WORKDIR`, and instruction-start ENV/ARG state.
 - `ENV` / `ARG` / `CMD`: metadata instructions update the state consumed by
-  later execution keys. A changed `ENV` or `ARG` invalidates later `RUN`/`COPY`
+  later execution keys. A changed `ENV` or `ARG` invalidates later `RUN`/`COPY`/`ADD`
   steps, while a final `CMD` keeps the same rootfs `index_digest` and costs only
   a local ref/config re-publish.
 - `WORKDIR`: the normalized absolute path and current state key the filesystem
   step that creates the directory. A changed `WORKDIR` publishes a new child
-  index and invalidates later `RUN`/`COPY` steps.
+  index and invalidates later `RUN`/`COPY`/`ADD` steps.
 
 ### Scheduler and build sessions
 
-`--no-cache` bypasses only RUN/COPY/WORKDIR record reads. It deliberately still
+`--no-cache` bypasses only RUN/COPY/ADD/WORKDIR record reads. It deliberately still
 reads `PREPARE`: forcing Dockerfile execution must not repeat stable
 infrastructure normalization, replace the prepared parent with another valid
 kernel-produced index, or reintroduce cold resize cost. An isolated preparation
@@ -889,18 +907,26 @@ separate host-side credential feature; credentials never enter rootfs metadata
 or the guest.
 
 Remote URL `ADD` reuses the host fetch policy and verifies downloaded bytes
-before publishing them as immutable build input. `ADD --checksum` lands first.
-An unpinned URL may be supported by fetching and hashing it on each build; this
-is conservative but sound. Local tar extraction reuses the bounded, path-safe
-rootfs tar machinery and extends its fuzz corpus. Remote Git sources, Git build
-contexts, `ADD --keep-git-dir`, and remote `ADD --unpack` remain unsupported.
+before cache lookup or immutable build-input publication. The approved mutable
+URL contract always performs a fresh GET on each build and reuses downstream
+work only when the resolved operands, actual content digest, and validated
+optional `Last-Modified` timestamp match. A valid HTTP-date becomes the applied
+mtime; an absent or malformed one uses the Unix epoch. A redirect target is revalidated on every
+hop but is transport evidence rather than stable cache identity: ephemeral
+signed redirect URLs cannot hide changed bytes because the content digest
+remains authoritative, and they do not force a miss when the requested URL,
+bytes, and persistent metadata are unchanged. `ADD --checksum` remains a
+separate later integrity-pinned form. Local tar extraction reuses the bounded,
+path-safe rootfs tar machinery and extends its fuzz corpus. Remote Git sources,
+Git build contexts, `ADD --keep-git-dir`, and remote `ADD --unpack` remain
+unsupported.
 
 ## Compatibility Matrix
 
 The matrix records planned result support, not BuildKit layer/export parity.
 
 Uncached steps execute in **one persistent build VM per build**, not one VM per
-step. A preparation miss and all remaining RUN/COPY/WORKDIR instructions share
+step. A preparation miss and all remaining RUN/COPY/ADD/WORKDIR instructions share
 that VM. A preparation hit becomes the normal Dockerfile cache parent, so a
 later Dockerfile miss boots directly from the prepared child with no resize.
 Checkpoints freeze the filesystem, drain virtio-blk, seal only changed chunks,
@@ -974,12 +1000,12 @@ and enumerate one canonical full rootfs CAS index.
    - `COPY`: before boot, the host emits the resolved context entries needed
      by executed COPY steps into a cached read-only ext4 context disk and
      attaches it as an additional virtio-blk device. Per step, the host sends
-     one or more fixed-shape `spore-build-copy-v3` control requests naming the
+     one or more fixed-shape `spore-build-copy-v4` control requests naming the
      source disk and bounded input index, source subtree, destination, source
-     kind, and bounded entry count. The agent recursively copies from the
+     kind, bounded entry count, and optional ADD mtime. The agent recursively copies from the
      selected context or immutable build-input disk into `/mnt/rootfs` using
      the confined destination resolver (see COPY Semantics). The guest retains
-     `spore-build-copy-v2` only as an older context-disk-compatible input.
+     `spore-build-copy-v2` and v3 only as older compatible inputs.
    - `CHECKPOINT`: agent handles `fsfreeze-v1` after the step exits;
      the VMM drains/flushes pending virtio-blk writes, the host calls
      `ChunkMappedDisk.snapshotIndex()` into the rootfs CAS, writes the
@@ -1030,10 +1056,10 @@ spore_rootfs_rw=1`, with `spore_build_context=1` and/or
 `spore_build_inputs=<count>`). The initrd agent now provides the build control verbs
 (`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
 `spore-build-run-v2`,
-`spore-build-copy-v3`); the target base must provide `/bin/sh` for shell-form
+`spore-build-copy-v4`); the target base must provide `/bin/sh` for shell-form
 RUN and nothing for capacity preparation. Exec-form RUN instead requires only
 its selected executable. The guest accepts the older
-`spore-build-copy-v2` context-only request for compatibility. A missing RUN
+`spore-build-copy-v2` context-only and v3 requests for compatibility. A missing RUN
 shell fails closed through the step's captured output.
 
 ## COPY Semantics
@@ -1061,9 +1087,10 @@ session as `RUN`, rather than host-side ext4 surgery:
    the sidecar is published after full disk emission. Changed contexts still
    mostly dedupe through the rootfs CAS chunks emitted by the native ext4
    writer.
-4. Send fixed-shape `spore-build-copy-v3` control requests. Each request names
+4. Send fixed-shape `spore-build-copy-v4` control requests. Each request names
    the context or immutable build-input disk and bounded input index, source
-   subtree, destination, source kind, `dest_is_dir`, and entry count. The guest
+   subtree, destination, source kind, `dest_is_dir`, entry count, and optional
+   ADD mtime. The guest
    enforces disk, index, path, and entry-count bounds, then recursively copies
    from the selected read-only mount. Destination paths are resolved
    relative to an fd for `/mnt/rootfs` with `openat2(RESOLVE_IN_ROOT |
@@ -1077,11 +1104,11 @@ session as `RUN`, rather than host-side ext4 surgery:
 5. Checkpoint exactly as RUN does (freeze, dirty-only sealing plus full-index
    emission, complete stamp, step record, thaw).
 
-Corollary: COPY does not require `tar` in the base image, does not add a tar
+Corollary: COPY and remote URL ADD do not require `tar` in the base image or add a tar
 or custom entry-stream parser to the initrd agent, and keeps guest memory usage
-bounded by per-entry copy buffers rather than total COPY size. Hardlinks,
-xattrs, `--chown`, `--chmod`, `--from`, `--link`, `ADD`, and multi-stage builds
-remain unsupported and fail closed.
+bounded by per-entry copy buffers rather than total input size. COPY flags
+`--chown`, `--chmod`, and `--link`, plus local, Git, flagged, and extracting ADD
+forms, remain unsupported and fail closed.
 
 Why the guest and not `debugfs` writes or host staging: a real Linux kernel
 applies ownership, modes, symlinks, and directory merge behavior natively and
@@ -1322,7 +1349,7 @@ Structural follow-ups are explicit gates before C2 widens the instruction
 surface:
 
 - **Done:** extract the cache-prefix walk and executor-suffix lowering from
-  `src/build.zig` behind one typed RUN/COPY/WORKDIR transition.
+  `src/build.zig` behind one typed RUN/COPY/ADD/WORKDIR transition.
 - **Done:** decode builder-v7 records through one canonical adapter shared by
   cache-hit and GC validation.
 - **Done:** move the build COPY filesystem engine out of the PID1 protocol
@@ -1388,10 +1415,11 @@ cold full hash and a warm stat-cache hit path must produce byte-identical step
 keys. The host emits or reuses a cached read-only ext4 image under
 `build/context-disks/`, attaches it as a second virtio-blk instance at boot,
 and originally sent bounded `spore-build-copy-v2` context-only control
-messages. The current executor emits `spore-build-copy-v3`, which also binds
-the selected context or immutable build-input disk and bounded input index.
-The guest retains v2 only for older context-compatible input, validates both
-request shapes, mounts the selected disk read-only, and confines all
+messages. The current executor emits strict `spore-build-copy-v4`, which also
+binds the selected context or immutable build-input disk, bounded input index,
+and optional ADD mtime. The guest retains v2 and v3 for older compatible input,
+validates the current v4 object as an exact newline-terminated shape, mounts
+the selected disk read-only, and confines all
 destination apply-path resolution to `/mnt/rootfs` while preserving
 Docker-style rootfs-internal and final-component symlink traversal.
 COPY checkpoints use the same freeze → snapshot → complete stamp → step
@@ -1483,7 +1511,7 @@ amortized per build.
 The merged exec-form RUN work has an independent manual SHIP verdict. Land
 small general PRs in the order the unchanged Buildkite oracle demonstrates:
 
-1. **Done locally, reviewed and validated; pending landing:** builder-owned expansion and
+1. **Done — landed in PR #498:** builder-owned expansion and
    automatic platform arguments. Expansion-capable operands retain quote and
    escape provenance through parsing and resolve from one instruction-start
    snapshot. The shared resolver implements unset-to-empty plus stable `:-`,
@@ -1493,15 +1521,17 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    literal. A new environment-state digest identity prevents older
    quote-stripping COPY/WORKDIR records from aliasing the new semantics. The
    Dockerfile parser and dedicated resolver are fuzzed, and the pinned
-   BuildKit v0.30.0 HVF differential graph passes all 30 cases, including
+   BuildKit v0.30.0 HVF differential graph passed all 30 cases, including
    ordering, inherited ENV/ARG, quoting, unset/set-empty operators, automatic
    platform values, warm hits, a resolved COPY-destination miss, malformed
    input, and a deliberately unsupported unstable modifier. No remote input is
    accepted by this slice.
-2. **Oracle-proven public HTTPS ADD.** After the expansion foundation lands,
-   implement the narrow C4 mutable-URL slice described below as a separate PR,
-   then rerun the unchanged target. The parser happens to encounter C4 before
-   the remaining C2 breadth; that changes delivery order, not ownership.
+2. **Oracle-prioritized public HTTPS ADD.** The separate C4 mutable-URL slice accepts
+   the exact general form required at line 42: expanded public HTTPS source,
+   expanded destination, opaque bytes, mode `0600`, and always-refetch
+   content-addressed reuse. The parser happens to encounter C4 before the
+   remaining C2 breadth; that changes delivery order, not ownership. Rerun the
+   unchanged target after landing to select the next slice.
 3. **Buildkite-reachable frontend and filesystem behavior.** Add RUN and COPY
    heredocs, `COPY --parents`, `COPY --chmod`, and result-correct `COPY --link`
    including `--from` only when a later unchanged-oracle run reaches them.
@@ -1561,23 +1591,29 @@ larger generic design. Do not expand spore manifests solely for build caches.
 
 **Estimate:** 3–5 weeks.
 
-- first, a bounded host-fetched public HTTPS single-file ADD for the exact
+- **Implemented in the narrow mutable-URL slice:** a bounded host-fetched
+  public HTTPS single-file ADD for the exact
   mutable-URL form proven by the oracle, while keeping the implementation
   general. Expand URL and destination through the C2 engine, preserve remote
   gzip bytes without local-tar extraction, stage bytes durably before applying
   them through the shared COPY destination/ownership/mode machinery, and fail
   closed on unsupported schemes, redirect-policy violations, status codes,
-  size, or destination behavior;
-- use Zig's standard URI/HTTP primitives, the existing public-target and
-  DNS-rebinding policy in `host_fetch_policy.zig`, and a factored generic form
-  of the registry fetcher's bounded redirect/streaming logic. Do not introduce
-  a second HTTP stack or hand-roll URI, TLS, redirect, or IP-range parsing;
+  size, time, count, aggregate-body, or destination behavior. A build accepts
+  at most 64 remote ADD instructions, 1 GiB of combined response bodies, and
+  ten minutes of combined host-fetch time or the smaller build timeout;
+- use Zig's standard URI/HTTP primitives and the existing neutral public-target,
+  DNS-rebinding, and resolved-address TLS helpers in `host_fetch_policy.zig`.
+  The ADD owner retains its response bounds, redirect semantics, staging, and
+  content identity rather than coupling them to registry-specific fetch rules;
 - key every persistent semantic input, including the resolved URL and
-  destination, platform/ARG values, response identity or content bytes,
-  redirect result, mode/ownership policy, parent state, and executor/parser
-  producer identities. Mutable-URL reuse must be conservative. Before fixing
-  the precise revalidation and cache-hit contract, stop for an explicit product
-  decision backed by pinned BuildKit behavior;
+  destination, platform/ARG values, actual content digest, safe response
+  `Content-Disposition` filename or URL-path fallback,
+  validated optional `Last-Modified` timestamp, mode/ownership policy, parent
+  state, and executor/parser producer identities.
+  The approved conservative contract refetches every build before lookup. Each
+  redirect is policy-validated, while its potentially ephemeral signed URL is
+  not stable semantic identity; unchanged requested URL plus unchanged bytes
+  may hit, and changed bytes must miss;
 - add `ADD --checksum` as a separate integrity-pinned form rather than
   pretending the observed mutable URL is immutable;
 - local tar ADD through the existing bounded extraction model;
@@ -1589,12 +1625,15 @@ larger generic design. Do not expand spore manifests solely for build caches.
   slice, and extend the Dockerfile fuzz target in the same change for every new
   attacker-influenced ADD operand or flag grammar.
 
-**Done when:** pinned remote/local ADD fixtures match BuildKit result semantics
-under expansion, redirects, errors, checksum mismatch, changed remote bytes,
-destination rules, ownership, merge, and cold/warm/rebuild cache behavior,
-while every unsupported Git/unpack form fails before network access. Full-file
-parse-before-execute remains mandatory, so an unsupported later instruction
-prevents the earlier ADD from fetching.
+**This slice is done when:** pinned remote URL ADD fixtures match BuildKit result
+semantics under expansion, redirects, errors, changed remote bytes, destination
+rules, ownership, and cold/warm/rebuild cache behavior, while unsupported
+transports and later unsupported instructions fail before ADD network access.
+Checksum, local ADD, ownership flags, merge behavior, and extraction retain
+their own later acceptance work. The public differential fixture changes both
+the requested URL and bytes; same-URL changed-content invalidation is covered by
+the typed content-digest identity unit test rather than claimed as differential
+proof.
 
 **Stop/go gate:** do not turn `ADD` into a source-control client or general
 remote archive service. A feature requiring Git credentials, submodules, SSH,
@@ -1780,6 +1819,20 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
   42. Delivery therefore advances the independent C2 expansion/platform-value
   foundation and then the smallest sound C4 URL-ADD slice before unrelated C2
   metadata breadth; the two capabilities remain separately reviewed and owned.
+- Mutable public HTTPS ADD uses an always-refetch, content-addressed contract.
+  The host re-resolves and GETs each accepted URL on every build, stages and
+  syncs bounded bytes, hashes them before cache lookup, and may reuse only when
+  the resolved operands, content digest, and validated optional Last-Modified
+  result match. A valid HTTP-date becomes the destination mtime through the
+  shared confined apply path, while an absent or malformed date uses the Unix
+  epoch. This is intentionally more conservative than
+  validator-based reuse and grants no credential authority. The builder sends
+  no `Authorization` header and does not consult host credential stores; URI
+  userinfo is rejected,
+  while requested query strings and server-provided HTTPS redirect targets
+  remain ordinary URL data. A build accepts at most 64 remote ADD instructions,
+  1 GiB of combined response bodies, and ten minutes of combined host-fetch
+  time or the smaller build timeout.
 
 ## Deferred Decisions And Triggers
 

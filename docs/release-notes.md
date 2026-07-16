@@ -2,6 +2,29 @@
 
 ## Next
 
+`spore build` now accepts one public HTTPS URL and one destination in `ADD`.
+The builder resolves both operands from the instruction-start ENV/ARG snapshot,
+including automatic `TARGETOS` and `TARGETARCH`, then performs a fresh host-side
+GET on every build. Every request and redirect is re-resolved through the
+public-address policy; URI userinfo, HTTP downgrades, Git sources, fragments,
+non-success responses, excessive redirects, encoded responses, and over-budget
+bodies fail closed. The URL scheme and authority are literal; only its
+path/query and the destination expand. The builder sends no `Authorization`
+header and does not consult host credential stores; requested query strings and server-provided HTTPS redirect
+targets remain URL data. A build accepts at most 64 remote ADD instructions,
+1 GiB of combined response bodies, and ten minutes of combined host-fetch time
+or the smaller build timeout. The downloaded bytes are staged privately, synced, and
+BLAKE3-hashed before cache lookup. ADD keys bind the resolved URL and
+destination, safe response `Content-Disposition` filename or URL-path fallback,
+downloaded content digest, mode `0600`, platform,
+validated `Last-Modified` timestamp, ENV/ARG state, parent rootfs, and executor
+identity, so unchanged bytes may reuse downstream work while changed mutable
+content or metadata misses. A valid HTTP-date is applied as the destination
+mtime through the confined guest COPY path; absent or malformed dates use the
+Unix epoch, as they do in BuildKit. Remote archives remain opaque files. ADD flags, local
+sources, Git, ambient authentication, archive unpacking, and heredocs remain
+unsupported.
+
 `spore build` now resolves builder-owned variables with Docker-compatible
 instruction-start snapshots, quote and escape handling, unset-to-empty
 behavior, and the stable `:-`, `-`, `:+`, and `+` parameter operators. The

@@ -499,6 +499,47 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.CopyDestinationUnsupported => {
             try stderr.writeAll("spore build: COPY destination must stay inside the guest rootfs and fit executor bounds\n");
         },
+        error.RemoteAddDestinationUnsupported => {
+            try stderr.print("spore build: Dockerfile line {d}: ADD destination must stay inside the guest rootfs and fit executor bounds\n", .{diagnostic.instruction_line});
+        },
+        error.RemoteAddFilenameUnsupported => {
+            try stderr.print("spore build: Dockerfile line {d}: ADD response filename is unsafe or exceeds executor path bounds\n", .{diagnostic.instruction_line});
+        },
+        error.UnsupportedRemoteAddUrl, error.UnsupportedRemoteFetchScheme, error.UnsafeRemoteFetchTarget => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: ADD source must be a public HTTPS URL without credentials, fragments, or Git transport\n", .{diagnostic.instruction_line});
+            } else try stderr.writeAll("spore build: ADD source must be a public HTTPS URL without credentials, fragments, or Git transport\n");
+        },
+        error.RemoteAddBodyTooLarge => {
+            try stderr.print(
+                "spore build: Dockerfile line {d}: ADD response exceeds the {d}-byte limit\n",
+                .{ diagnostic.instruction_line, diagnostic.limit },
+            );
+        },
+        error.RemoteAddAggregateTooLarge => {
+            try stderr.print(
+                "spore build: Dockerfile line {d}: total ADD responses exceed the {d}-byte build limit\n",
+                .{ diagnostic.instruction_line, diagnostic.limit },
+            );
+        },
+        error.RemoteAddCountExceeded => {
+            try stderr.print(
+                "spore build: Dockerfile line {d}: build has more than {d} remote ADD inputs\n",
+                .{ diagnostic.instruction_line, diagnostic.limit },
+            );
+        },
+        error.RemoteAddTimeout => {
+            try stderr.print("spore build: Dockerfile line {d}: remote ADD fetch exceeded the build timeout\n", .{diagnostic.instruction_line});
+        },
+        error.RemoteAddConcurrencyUnavailable => {
+            try stderr.print("spore build: Dockerfile line {d}: remote ADD fetch requires cancellable host I/O\n", .{diagnostic.instruction_line});
+        },
+        error.RemoteAddTooManyRedirects, error.RemoteAddRedirectLocationMissing, error.RemoteAddMalformedResponse, error.RemoteAddUnsupportedContentEncoding => {
+            try stderr.print("spore build: Dockerfile line {d}: ADD received an invalid or excessive HTTPS redirect/response chain\n", .{diagnostic.instruction_line});
+        },
+        error.RemoteAddHttpStatus => {
+            try stderr.print("spore build: Dockerfile line {d}: ADD HTTPS request returned a non-success status\n", .{diagnostic.instruction_line});
+        },
         error.CopyEntryCountUnsupported => {
             if (diagnostic.instruction_line != 0 and diagnostic.limit != 0) {
                 try stderr.print(
@@ -530,13 +571,17 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
             }
         },
         error.UnsupportedBuildUser => {
-            try stderr.writeAll("spore build: executing RUN, COPY, or WORKDIR from a non-root inherited USER is not supported yet\n");
+            try stderr.writeAll("spore build: executing RUN, COPY, ADD, or WORKDIR from a non-root inherited USER is not supported yet\n");
         },
         error.UnsupportedOnBuild => {
             try stderr.writeAll("spore build: reachable base image contains unsupported ONBUILD triggers\n");
         },
         else => {
-            try stderr.print("spore build: {s}\n", .{@errorName(err)});
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: {s}\n", .{ diagnostic.instruction_line, @errorName(err) });
+            } else {
+                try stderr.print("spore build: {s}\n", .{@errorName(err)});
+            }
         },
     }
 }

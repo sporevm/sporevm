@@ -27,6 +27,7 @@ int spore_build_copy_apply(
     const char *root, const char *source_root,
     const char *source, const char *dest,
     int source_kind, int dest_is_dir, uint64_t entry_count,
+    int mtime_present, int64_t mtime_unix_seconds,
     char *error, size_t error_cap);
 
 int spore_build_ensure_directory(const char *root, const char *path);
