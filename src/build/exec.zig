@@ -33,7 +33,7 @@ pub const default_build_vcpus: topology.VcpuCount = 1;
 pub const max_build_nofile: u64 = 1_048_576;
 pub const default_build_nofile = NofileLimit{ .soft = 65_536, .hard = 65_536 };
 const max_guest_request_len = 8191;
-pub const max_run_command_len = 64 * 1024;
+pub const max_run_command_len = run_contract.max_shell_command_bytes;
 pub const max_run_exec_args = run_contract.max_exec_args;
 pub const max_run_exec_args_bytes = run_contract.max_exec_args_bytes;
 pub const max_guest_envc = 64;

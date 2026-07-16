@@ -2,6 +2,20 @@
 
 ## Next
 
+`spore build` now accepts one unquoted, non-chomping RUN heredoc as the complete
+command after optional default cache mounts, for example `RUN <<EOF`. A
+non-empty body without NUL or a leading shebang is preserved byte-for-byte,
+including its final newline, and executes through the existing `/bin/sh -c`
+path. Dockerfile ARG/ENV values, quotes, escapes, unset variables, and parameter
+operators therefore retain ordinary guest-shell behavior rather than COPY-style
+builder expansion. Exact canonical body text, effective environment, workdir,
+network, resources, ordered normalized cache mounts, parent rootfs, and executor
+identity remain cache inputs, while the existing per-instruction timeout and
+RUN sandbox own execution and cleanup. Shell-prefix, quoted, chomping, multiple,
+empty, shebang/direct-exec, and exec-form heredocs still fail during full-file
+parsing. The accepted form reuses the existing shell v1/v3 request and does not
+add a guest protocol, mount type, secret/SSH input, device, or manifest field.
+
 `spore build` now accepts a single unquoted, non-chomping COPY heredoc source,
 for example `COPY <<EOF /etc/example`. The body keeps its final newline and
 literal quote bytes while builder-owned ARG and ENV expansion follows the same
@@ -14,8 +28,7 @@ with context COPY. The delimiter supplies the filename when the destination is
 a directory. The canonical source, delimiter, resolved content digest,
 destination, workdir, environment state, parent rootfs, and executor identity
 remain cache inputs. Quoted or tab-chomping delimiters, multiple or mixed
-sources, heredoc COPY flags, and RUN heredocs still fail during full-file
-parsing.
+sources, and heredoc COPY flags still fail during full-file parsing.
 
 `spore build` now matches Docker's frontend behavior for continued tokens,
 bracket-prefixed shell commands, parent-relative `WORKDIR`, and step timeouts.
@@ -163,8 +176,9 @@ trailing non-whitespace bytes. It now requires its framing newline. The shared
 guest request boundary rejects full-buffer truncation and duplicate top-level
 type keys for every request kind, validates raw UTF-8 in JSON strings, and
 decodes Unicode escapes and valid surrogate pairs to UTF-8 so raw and
-equivalently escaped JSON produce identical argv bytes. Shell-form RUN remains `/bin/sh -c`;
-RUN heredocs and mount forms beyond bounded default cache mounts remain unsupported.
+equivalently escaped JSON produce identical argv bytes. Shell-form RUN remains
+`/bin/sh -c`; only the later narrow single-body RUN heredoc and bounded default
+cache mounts extend that form.
 
 Cold OCI base imports no longer scan the complete merged filesystem for every
 regular-file replacement. The importer keeps per-inode hardlink reference
@@ -368,8 +382,8 @@ virtio-blk inputs, and cache keys bind the exact source index plus the exact
 kernel, initrd, and embedded build-agent identity. Cross-stage COPY preserves
 modes, ownership, mtimes, symlinks, hardlinks within each source tree, and regular-file
 `security.capability`; every other visible `security.*` xattr fails closed.
-RUN mount forms beyond bounded default cache mounts, RUN heredocs, advanced
-COPY flags and heredoc forms, and non-root build execution remain unsupported.
+RUN mount forms beyond bounded default cache mounts, advanced RUN/COPY heredoc
+forms, advanced COPY flags, and non-root build execution remain unsupported.
 
 Automatic growth is limited to SporeVM's journal-less native and e2fsprogs
 ext4 profiles, or equivalent layouts accepted by the pinned guest kernel.

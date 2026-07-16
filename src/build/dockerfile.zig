@@ -77,10 +77,10 @@ pub const Copy = struct {
     link: ?bool = null,
     sources: []const []const u8,
     dest: []const u8,
-    heredoc: ?CopyHeredoc = null,
+    heredoc: ?Heredoc = null,
 };
 
-pub const CopyHeredoc = struct {
+pub const Heredoc = struct {
     name: []const u8,
     body: []const u8,
 };
@@ -114,7 +114,7 @@ const LogicalLine = struct {
     line: usize,
     end_line: usize,
     text: []const u8,
-    heredoc: ?CopyHeredoc = null,
+    heredoc: ?Heredoc = null,
 };
 
 const max_dockerfile_bytes = 1024 * 1024;
@@ -188,7 +188,7 @@ fn parseInstruction(
     line: usize,
     op: []const u8,
     rest: []const u8,
-    heredoc: ?CopyHeredoc,
+    heredoc: ?Heredoc,
     escape: u8,
     diagnostic: *Diagnostic,
 ) !Instruction.Value {
@@ -244,6 +244,22 @@ fn parseInstruction(
             command_start = token_end;
         }
         const command_raw = rest[command_start..];
+        if (heredoc) |run_heredoc| {
+            if (command_raw.len != run_heredoc.name.len + 2 or
+                !std.mem.startsWith(u8, command_raw, "<<") or
+                !std.mem.eql(u8, command_raw[2..], run_heredoc.name) or
+                !validHeredocDelimiter(run_heredoc.name) or
+                run_heredoc.body.len == 0 or
+                std.mem.startsWith(u8, run_heredoc.body, "#!") or
+                std.mem.indexOfScalar(u8, run_heredoc.body, 0) != null)
+            {
+                return fail(diagnostic, line, "unsupported RUN heredoc form");
+            }
+            return .{ .run = .{
+                .command = .{ .shell = try allocator.dupe(u8, run_heredoc.body) },
+                .cache_mounts = try cache_mounts.toOwnedSlice(),
+            } };
+        }
         if (std.mem.startsWith(u8, command_raw, "[")) {
             if (try parseRunExec(allocator, command_raw, line, diagnostic)) |argv| {
                 return .{ .run = .{
@@ -472,28 +488,37 @@ fn logicalLines(
         continuing = has_continuation;
         if (!continuing) {
             const text = try current.toOwnedSlice();
-            if (copyHeredocTerminator(text)) |terminator| {
-                if (terminator.len == 0) return fail(diagnostic, current_line, "unsupported COPY heredoc form");
+            if (instructionHeredoc(text)) |marker| {
+                if (marker.count != 1 or marker.terminator.len == 0) {
+                    return fail(diagnostic, current_line, marker.instruction.unsupportedMessage());
+                }
                 var body = std.array_list.Managed(u8).init(allocator);
                 var terminated = false;
                 while (it.next()) |raw_body_line| {
                     line_no += 1;
                     const body_line = std.mem.trimEnd(u8, raw_body_line, "\r");
-                    if (std.mem.eql(u8, body_line, terminator)) {
+                    const possible_terminator = if (marker.chomp) std.mem.trimStart(u8, body_line, "\t") else body_line;
+                    if (std.mem.eql(u8, possible_terminator, marker.terminator)) {
                         terminated = true;
                         break;
                     }
                     try body.appendSlice(body_line);
                     try body.append('\n');
-                    if (body.items.len > max_dockerfile_bytes) return fail(diagnostic, current_line, "COPY heredoc is too large");
+                    const body_limit: usize = switch (marker.instruction) {
+                        .copy => max_dockerfile_bytes,
+                        .run => run_contract.max_shell_command_bytes,
+                    };
+                    if (body.items.len > body_limit) {
+                        return fail(diagnostic, current_line, marker.instruction.tooLargeMessage());
+                    }
                 }
-                if (!terminated) return fail(diagnostic, current_line, "unterminated COPY heredoc");
+                if (!terminated) return fail(diagnostic, current_line, marker.instruction.unterminatedMessage());
                 try lines.append(.{
                     .line = current_line,
                     .end_line = line_no,
                     .text = text,
                     .heredoc = .{
-                        .name = try allocator.dupe(u8, terminator),
+                        .name = try allocator.dupe(u8, marker.terminator),
                         .body = try body.toOwnedSlice(),
                     },
                 });
@@ -506,22 +531,79 @@ fn logicalLines(
     if (continuing) return fail(diagnostic, current_line, "unterminated Dockerfile line continuation");
 }
 
-fn copyHeredocTerminator(text: []const u8) ?[]const u8 {
+const HeredocInstruction = enum {
+    copy,
+    run,
+
+    fn unsupportedMessage(value: HeredocInstruction) []const u8 {
+        return switch (value) {
+            .copy => "unsupported COPY heredoc form",
+            .run => "unsupported RUN heredoc form",
+        };
+    }
+
+    fn tooLargeMessage(value: HeredocInstruction) []const u8 {
+        return switch (value) {
+            .copy => "COPY heredoc is too large",
+            .run => "RUN heredoc is too large",
+        };
+    }
+
+    fn unterminatedMessage(value: HeredocInstruction) []const u8 {
+        return switch (value) {
+            .copy => "unterminated COPY heredoc",
+            .run => "unterminated RUN heredoc",
+        };
+    }
+};
+
+const HeredocMarker = struct {
+    instruction: HeredocInstruction,
+    terminator: []const u8,
+    count: usize,
+    chomp: bool,
+};
+
+fn instructionHeredoc(text: []const u8) ?HeredocMarker {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     const space = firstSpace(trimmed) orelse return null;
-    if (!asciiEql(trimmed[0..space], "COPY")) return null;
+    const instruction: HeredocInstruction = if (asciiEql(trimmed[0..space], "COPY"))
+        .copy
+    else if (asciiEql(trimmed[0..space], "RUN"))
+        .run
+    else
+        return null;
     const rest = std.mem.trimStart(u8, trimmed[space..], " \t");
-    const marker = std.mem.indexOf(u8, rest, "<<") orelse return null;
-    var token_end = marker + 2;
-    while (token_end < rest.len and rest[token_end] != ' ' and rest[token_end] != '\t') token_end += 1;
-    var token = rest[marker + 2 .. token_end];
-    if (token.len != 0 and token[0] == '-') token = token[1..];
+    var marker_start: ?usize = null;
+    var marker_end: usize = 0;
+    var count: usize = 0;
+    var token_start: usize = 0;
+    while (token_start < rest.len) {
+        while (token_start < rest.len and (rest[token_start] == ' ' or rest[token_start] == '\t')) token_start += 1;
+        if (token_start == rest.len) break;
+        var token_end = token_start;
+        while (token_end < rest.len and rest[token_end] != ' ' and rest[token_end] != '\t') token_end += 1;
+        var prefix_end = token_start;
+        while (prefix_end < token_end and std.ascii.isDigit(rest[prefix_end])) prefix_end += 1;
+        if (prefix_end + 2 <= token_end and std.mem.eql(u8, rest[prefix_end .. prefix_end + 2], "<<")) {
+            count += 1;
+            if (marker_start == null) {
+                marker_start = prefix_end;
+                marker_end = token_end;
+            }
+        }
+        token_start = token_end;
+    }
+    const marker = marker_start orelse return null;
+    var token = rest[marker + 2 .. marker_end];
+    const chomp = token.len != 0 and token[0] == '-';
+    if (chomp) token = token[1..];
     if (token.len >= 2 and ((token[0] == '\'' and token[token.len - 1] == '\'') or
         (token[0] == '"' and token[token.len - 1] == '"')))
     {
         token = token[1 .. token.len - 1];
     }
-    return token;
+    return .{ .instruction = instruction, .terminator = token, .count = count, .chomp = chomp };
 }
 
 fn validHeredocDelimiter(value: []const u8) bool {
@@ -861,6 +943,107 @@ test "Dockerfile parser rejects unsupported and malformed COPY heredocs before l
         try std.testing.expectEqual(@as(usize, 2), diag.line);
         try std.testing.expectEqualStrings(case.message, diag.message);
     }
+}
+
+test "Dockerfile parser preserves a narrow cache-mounted RUN heredoc with its source span" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena_state.allocator(),
+        \\FROM scratch
+        \\ARG VALUE=one
+        \\RUN --mount=type=cache,target=/var/cache/a \
+        \\    --mount=type=cache,target=/var/cache/b <<EOF
+        \\set -eu
+        \\printf '%s\n' "$VALUE" > /result
+        \\# body comment is shell input
+        \\EOF
+        \\CMD ["true"]
+        \\
+    , &diag);
+    const instruction = doc.stages[0].instructions[1];
+    const run = instruction.value.run;
+    try std.testing.expectEqual(@as(usize, 3), instruction.span.start_line);
+    try std.testing.expectEqual(@as(usize, 8), instruction.span.end_line);
+    try std.testing.expectEqual(@as(usize, 2), run.cache_mounts.len);
+    try std.testing.expectEqualStrings("/var/cache/a", run.cache_mounts[0].target);
+    try std.testing.expectEqualStrings("/var/cache/b", run.cache_mounts[1].target);
+    try std.testing.expectEqualStrings(
+        "set -eu\nprintf '%s\\n' \"$VALUE\" > /result\n# body comment is shell input\n",
+        run.command.shell,
+    );
+    try std.testing.expectEqualStrings(
+        "RUN --mount=type=cache,target=/var/cache/a     --mount=type=cache,target=/var/cache/b <<EOF\n" ++
+            "set -eu\nprintf '%s\\n' \"$VALUE\" > /result\n# body comment is shell input\nEOF",
+        instruction.raw,
+    );
+}
+
+test "Dockerfile parser rejects neighboring RUN heredoc forms before later instructions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const invalid = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM scratch\nRUN <<'EOF'\nprintf quoted\nEOF\n", .message = "unsupported RUN heredoc form" },
+        .{ .dockerfile = "FROM scratch\nRUN <<-EOF\n\tprintf chomp\n\tEOF\n", .message = "unsupported RUN heredoc form" },
+        .{ .dockerfile = "FROM scratch\nRUN cat <<EOF\nvalue\nEOF\n", .message = "unsupported RUN heredoc form" },
+        .{ .dockerfile = "FROM scratch\nRUN <<ONE <<TWO\none\nONE\ntwo\nTWO\n", .message = "unsupported RUN heredoc form" },
+        .{ .dockerfile = "FROM scratch\nRUN <<EOF\n#!/bin/sh\nprintf direct\nEOF\n", .message = "unsupported RUN heredoc form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=cache,target=/cache <<EOF\nEOF\n", .message = "unsupported RUN heredoc form" },
+        .{ .dockerfile = "FROM scratch\nRUN <<EOF\nprintf unterminated\n", .message = "unterminated RUN heredoc" },
+        .{ .dockerfile = "FROM scratch\nRUN <<EOF\nprintf before\x00printf after\nEOF\n", .message = "unsupported RUN heredoc form" },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), case.dockerfile, &diag));
+        try std.testing.expectEqual(@as(usize, 2), diag.line);
+        try std.testing.expectEqualStrings(case.message, diag.message);
+    }
+}
+
+test "Dockerfile parser applies the RUN command bound while scanning heredocs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const bounded_body = try allocator.alloc(u8, run_contract.max_shell_command_bytes - 1);
+    @memset(bounded_body, 'x');
+    const bounded_source = try std.fmt.allocPrint(
+        allocator,
+        "FROM scratch\nRUN <<EOF\n{s}\nEOF\n",
+        .{bounded_body},
+    );
+    var diag: Diagnostic = .{};
+    const bounded = try parse(allocator, bounded_source, &diag);
+    try std.testing.expectEqual(run_contract.max_shell_command_bytes, bounded.stages[0].instructions[0].value.run.command.shell.len);
+
+    const oversized_body = try allocator.alloc(u8, run_contract.max_shell_command_bytes);
+    @memset(oversized_body, 'x');
+    const oversized_source = try std.fmt.allocPrint(
+        allocator,
+        "FROM scratch\nRUN <<EOF\n{s}\nEOF\n",
+        .{oversized_body},
+    );
+    try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, oversized_source, &diag));
+    try std.testing.expectEqual(@as(usize, 2), diag.line);
+    try std.testing.expectEqualStrings("RUN heredoc is too large", diag.message);
+}
+
+test "Dockerfile parser rejects an oversized RUN heredoc in an unselected stage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+
+    const oversized_body = try allocator.alloc(u8, run_contract.max_shell_command_bytes);
+    @memset(oversized_body, 'x');
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "FROM scratch AS unused\nRUN <<EOF\n{s}\nEOF\nFROM scratch AS selected\nCMD [\"true\"]\n",
+        .{oversized_body},
+    );
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, source, &diag));
+    try std.testing.expectEqual(@as(usize, 2), diag.line);
+    try std.testing.expectEqualStrings("RUN heredoc is too large", diag.message);
 }
 
 test "Dockerfile parser fails closed on unsupported features" {

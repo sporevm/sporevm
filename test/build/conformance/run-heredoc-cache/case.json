@@ -1,0 +1,49 @@
+{
+  "description": "single RUN heredocs preserve shell bytes with multiple default cache mounts",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 2,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle",
+    "/var/cache/oracle-run-heredoc-a",
+    "/var/cache/oracle-run-heredoc-b",
+    "/var/lib/oracle-run-heredoc-c"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "body-change",
+      "writes": {
+        "Dockerfile": "FROM base\nARG VALUE=initial\nENV ENV_VALUE=environment\nRUN --mount=type=cache,target=/var/cache/oracle-run-heredoc-a \\\n    --mount=type=cache,target=/var/cache/oracle-run-heredoc-b \\\n    --mount=type=cache,target=/var/lib/oracle-run-heredoc-c <<EOF\nset -eu\nmkdir -p /oracle\nprintf a > /var/cache/oracle-run-heredoc-a/value\nprintf b > /var/cache/oracle-run-heredoc-b/value\nprintf c > /var/lib/oracle-run-heredoc-c/value\nprintf 'body=changed\\n' > /oracle/shell\nprintf 'single=%s\\n' '$VALUE' >> /oracle/shell\nprintf 'double=%s\\n' \"$VALUE\" >> /oracle/shell\nprintf 'env=%s\\n' \"$ENV_VALUE\" >> /oracle/shell\nprintf 'literal=%s\\n' \"\\$VALUE\" >> /oracle/shell\nprintf 'unset=%s\\n' \"${UNSET-}\" >> /oracle/shell\nprintf 'fallback=%s\\n' \"${UNSET:-fallback}\" >> /oracle/shell\nEOF\nRUN --mount=type=cache,target=/var/cache/oracle-run-heredoc-a \\\n    --mount=type=cache,target=/var/cache/oracle-run-heredoc-b \\\n    --mount=type=cache,target=/var/lib/oracle-run-heredoc-c <<EOF\nset -eu\ncat /var/cache/oracle-run-heredoc-a/value \\\n    /var/cache/oracle-run-heredoc-b/value \\\n    /var/lib/oracle-run-heredoc-c/value > /oracle/cache\nEOF\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 2,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-body-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

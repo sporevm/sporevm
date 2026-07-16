@@ -104,7 +104,18 @@ basename and ordinary COPY owns destination conflicts and checkpoint cleanup.
 The canonical heredoc source, resolved destination, workdir, environment
 state, parent, and executor identity complete the step key. Quoted or
 tab-chomping delimiters, multiple or mixed heredoc sources, COPY flags on the
-form, and RUN heredocs remain fail-closed.
+form remain fail-closed.
+
+A single unquoted, non-chomping `RUN <<NAME` heredoc uses the ordinary RUN
+filesystem transaction. Its non-empty, non-shebang body is preserved with the
+final newline and streamed to `/bin/sh -c`; the guest shell, rather than the
+builder operand expander, owns ARG/ENV substitution, quoting, escaping, unset
+variables, and parameter operators. The exact canonical body, effective
+environment, workdir, resources, network, parent, executor, and any ordered
+default cache mounts remain step inputs. The existing RUN sandbox, timeout,
+reverse-order cache teardown, freeze, and publication rules are unchanged.
+Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and
+exec-form heredocs remain fail-closed before execution.
 
 Automatic growth supports SporeVM's journal-less native ext4 profile and
 journal-less layouts from SporeVM's e2fsprogs writer, or equivalent layouts the
