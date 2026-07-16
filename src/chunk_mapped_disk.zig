@@ -996,9 +996,8 @@ pub const ChunkMappedDisk = struct {
         }
         var parallel_result_cursor: usize = 0;
         const max_chunk_size = std.math.cast(usize, self.chunk_size) orelse return error.BadClusterSize;
-        var empty_serial_buf: [0]u8 = .{};
-        const serial_buf: []u8 = if (parallel_batch == null) try self.allocator.alloc(u8, max_chunk_size) else &empty_serial_buf;
-        defer if (serial_buf.len != 0) self.allocator.free(serial_buf);
+        const serial_buf = try self.allocator.alloc(u8, max_chunk_size);
+        defer self.allocator.free(serial_buf);
 
         for (0..self.chunkCount()) |chunk_index| {
             const logical_chunk: u64 = @intCast(chunk_index);
@@ -1642,8 +1641,12 @@ fn readExact(fd: std.c.fd_t, buf: []u8, offset: u64) Error!void {
         const absolute = std.math.add(u64, offset, done) catch return error.OutOfRange;
         const file_offset = std.math.cast(std.c.off_t, absolute) orelse return error.OutOfRange;
         const n = std.c.pread(fd, buf.ptr + done, buf.len - done, file_offset);
-        if (n <= 0) {
+        if (n < 0) {
             std.log.debug("chunk-mapped disk overlay read failed: errno={s} offset={d} len={d}", .{ @tagName(std.c.errno(n)), absolute, buf.len - done });
+            return error.ShortRead;
+        }
+        if (n == 0) {
+            std.log.debug("chunk-mapped disk overlay read reached unexpected EOF: offset={d} len={d}", .{ absolute, buf.len - done });
             return error.ShortRead;
         }
         done += @intCast(n);
@@ -1656,8 +1659,12 @@ fn writeExact(fd: std.c.fd_t, buf: []const u8, offset: u64) Error!void {
         const absolute = std.math.add(u64, offset, done) catch return error.OutOfRange;
         const file_offset = std.math.cast(std.c.off_t, absolute) orelse return error.OutOfRange;
         const n = std.c.pwrite(fd, buf.ptr + done, buf.len - done, file_offset);
-        if (n <= 0) {
+        if (n < 0) {
             std.log.debug("chunk-mapped disk overlay pwrite failed: errno={s} offset={d} len={d}", .{ @tagName(std.c.errno(n)), absolute, buf.len - done });
+            return error.ShortWrite;
+        }
+        if (n == 0) {
+            std.log.debug("chunk-mapped disk overlay pwrite returned zero: offset={d} len={d}", .{ absolute, buf.len - done });
             return error.ShortWrite;
         }
         done += @intCast(n);
