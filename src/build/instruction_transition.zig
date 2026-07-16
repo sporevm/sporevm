@@ -135,7 +135,7 @@ fn lowerRemoteAdd(
     const source_prefix = try context_disk.addCapturedCopy(&.{.{
         .rel = add.staged.source_name,
         .kind = .file,
-        .mode = remote_add.default_mode,
+        .mode = add.input.mode,
         .size = add.staged.size,
         .content_digest = add.staged.content_digest,
         .snapshot_path = add.staged.path,
@@ -198,7 +198,7 @@ fn remoteAddInputDigest(
         hash.update("\x00");
     }
     var mode: [4]u8 = undefined;
-    std.mem.writeInt(u32, &mode, remote_add.default_mode, .little);
+    std.mem.writeInt(u32, &mode, add.input.mode, .little);
     hashField(&hash, &mode);
     var raw: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
     hash.final(&raw);
@@ -707,6 +707,7 @@ test "remote ADD cache identity binds resolved URL destination and downloaded by
             .canonical_instruction = "ADD https://example.com/tool /usr/bin/tool",
             .resolved_url = "https://example.com/tool",
             .resolved_dest = "/usr/bin/tool",
+            .mode = remote_add.default_mode,
             .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             .workdir = "/",
         },
@@ -729,6 +730,10 @@ test "remote ADD cache identity binds resolved URL destination and downloaded by
     changed_add.staged.mtime_unix_seconds = null;
     const changed_mtime = try remoteAddInputDigest(allocator, changed_add);
     try std.testing.expect(!std.mem.eql(u8, base, changed_mtime));
+    changed_add = add;
+    changed_add.input.mode = 0o644;
+    const changed_mode = try remoteAddInputDigest(allocator, changed_add);
+    try std.testing.expect(!std.mem.eql(u8, base, changed_mode));
 }
 
 test "remote ADD lowers through the shared COPY apply protocol" {
@@ -744,6 +749,7 @@ test "remote ADD lowers through the shared COPY apply protocol" {
             .canonical_instruction = "ADD https://example.com/tool /usr/local/bin/",
             .resolved_url = "https://example.com/tool",
             .resolved_dest = "/usr/local/bin/",
+            .mode = 0o413,
             .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             .workdir = "/work",
         },
@@ -760,7 +766,7 @@ test "remote ADD lowers through the shared COPY apply protocol" {
     try std.testing.expectEqualStrings("/usr/local/bin", step.requests[0].dest);
     try std.testing.expect(step.requests[0].dest_is_dir);
     try std.testing.expectEqual(@as(?i64, 1_700_000_000), step.requests[0].mtime_unix_seconds);
-    try std.testing.expectEqual(@as(u32, remote_add.default_mode), context_disk.entries.items[1].mode);
+    try std.testing.expectEqual(@as(u32, 0o413), context_disk.entries.items[1].mode);
 
     const epoch_step = try lowerRemoteAdd(allocator, &context_disk, .{
         .input = .{
@@ -770,6 +776,7 @@ test "remote ADD lowers through the shared COPY apply protocol" {
             .canonical_instruction = "ADD https://example.com/plain /plain",
             .resolved_url = "https://example.com/plain",
             .resolved_dest = "/plain",
+            .mode = 0,
             .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             .workdir = "/",
         },
@@ -782,6 +789,7 @@ test "remote ADD lowers through the shared COPY apply protocol" {
         },
     });
     try std.testing.expectEqual(@as(?i64, 0), epoch_step.requests[0].mtime_unix_seconds);
+    try std.testing.expectEqual(@as(u32, 0), context_disk.entries.items[3].mode);
 }
 
 test "remote ADD preflight bounds filename joins for runtime directories" {
@@ -802,6 +810,7 @@ test "remote ADD preflight bounds filename joins for runtime directories" {
             .canonical_instruction = "ADD https://example.com/file /long/",
             .resolved_url = "https://example.com/file",
             .resolved_dest = destination,
+            .mode = remote_add.default_mode,
             .env_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             .workdir = "/",
         },

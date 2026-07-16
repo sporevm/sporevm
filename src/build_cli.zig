@@ -505,6 +505,9 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.RemoteAddFilenameUnsupported => {
             try stderr.print("spore build: Dockerfile line {d}: ADD response filename is unsafe or exceeds executor path bounds\n", .{diagnostic.instruction_line});
         },
+        error.UnsupportedRemoteAddMode => {
+            try stderr.print("spore build: Dockerfile line {d}: ADD --chmod must resolve to an octal value between 0 and 07777\n", .{diagnostic.instruction_line});
+        },
         error.UnsupportedRemoteAddUrl, error.UnsupportedRemoteFetchScheme, error.UnsafeRemoteFetchTarget => {
             if (diagnostic.instruction_line != 0) {
                 try stderr.print("spore build: Dockerfile line {d}: ADD source must be a public HTTPS URL without credentials, fragments, or Git transport\n", .{diagnostic.instruction_line});
@@ -666,6 +669,19 @@ test "build CLI reports an invalid inherited RUN environment at its instruction"
     try writeBuildError(&stderr.writer, error.InvalidRunEnvironment, diagnostic);
     try std.testing.expectEqualStrings(
         "spore build: Dockerfile line 2: RUN environment contains an invalid entry\n",
+        stderr.written(),
+    );
+}
+
+test "build CLI reports an invalid remote ADD chmod at its instruction" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var diagnostic: build_mod.Diagnostic = .{};
+    diagnostic.instruction_line = 9;
+    try writeBuildError(&stderr.writer, error.UnsupportedRemoteAddMode, diagnostic);
+    try std.testing.expectEqualStrings(
+        "spore build: Dockerfile line 9: ADD --chmod must resolve to an octal value between 0 and 07777\n",
         stderr.written(),
     );
 }

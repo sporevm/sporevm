@@ -58,7 +58,7 @@ rewrites the parent or makes incomplete storage reachable.
 Mutable public HTTPS ADD inputs are fetched and BLAKE3-hashed before their
 step-record lookup. Their typed key binds the resolved URL and destination,
 the safe response `Content-Disposition` filename or URL-path fallback, actual
-content digest, fixed `0600` mode,
+content digest, resolved numeric mode (default `0600`),
 validated optional `Last-Modified` timestamp, instruction-start ENV/ARG state,
 platform, parent, and executor identity. A valid HTTP-date is applied as the
 destination mtime through the confined guest COPY path; absent or malformed
@@ -69,6 +69,14 @@ context-disk apply path has either completed or failed. If a process crashes,
 the next remote ADD staging session removes abandoned files after acquiring the
 directory lock; only the existing complete rootfs CAS child and its step record
 become reusable authority.
+
+The public HTTPS single-file form also accepts `--chmod=<octal>`. The operand
+uses the same instruction-start expansion rules as other builder-owned fields,
+must resolve to `0` through `07777`, and enters both the immutable context-disk
+source inode and the ADD input digest. The unchanged strict COPY v4 request
+then applies that inode through the existing confined guest copy path, so mode
+and `Last-Modified` mtime remain independent. Empty, symbolic, malformed,
+duplicate, and out-of-range modes fail before an ADD request is sent.
 
 Automatic growth supports SporeVM's journal-less native ext4 profile and
 journal-less layouts from SporeVM's e2fsprogs writer, or equivalent layouts the

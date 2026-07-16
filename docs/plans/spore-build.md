@@ -152,9 +152,10 @@ The missing work falls into three different categories:
   registry/local/named-context bases, previous-stage inheritance, literal
   `COPY --from`, result-correct cross-stage `COPY --link`, `--target`, and final
   `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
-  (`--parents`, `--chown`, `--chmod`), `RUN --mount`, local or flagged `ADD`,
-  heredocs, `USER`, `VOLUME`, `EXPOSE`, `HEALTHCHECK`, and `ONBUILD` still fail
-  closed. C2 now also accepts bounded non-empty JSON-array `RUN` and executes
+  (`--parents`, `--chown`, `--chmod`), `RUN --mount`, local `ADD`, ADD flags
+  other than numeric `--chmod`, heredocs, `USER`, `VOLUME`, `EXPOSE`,
+  `HEALTHCHECK`, and `ONBUILD` still fail closed. C2 now also accepts bounded
+  non-empty JSON-array `RUN` and executes
   its exact argv with Docker-compatible PATH lookup and no implicit variable
   expansion. Effective RUN environments normalize duplicate inherited keys
   with runc's last-value-wins rule before cache hashing and guest serialization.
@@ -189,9 +190,10 @@ The missing work falls into three different categories:
 - C4 now accepts exactly one public HTTPS URL with a literal scheme/authority
   and expanded path/query plus one expanded destination. It always refetches
   and hashes the actual bytes before cache
-  lookup, applies an opaque regular file with mode `0600` through the shared
-  COPY path, and retains HTTP, credentials, Git, flags, unpacking, and special
-  files as unsupported behavior.
+  lookup, applies an opaque regular file through the shared COPY path, and
+  accepts an optional instruction-expanded numeric mode from `0` through
+  `07777` with default `0600`. It retains HTTP, credentials, Git, other flags,
+  symbolic modes, unpacking, and special files as unsupported behavior.
 - The public HTTPS ADD slice landed as PR #501 at
   `5cf5dd3e30b7dfaa4800638c59083c2af8b7b24a`, tree
   `59691bddf136e7d512c98a66a0006c5a605db537`. The unchanged frozen Buildkite
@@ -208,6 +210,15 @@ The missing work falls into three different categories:
   and matching directories merge. `--link=false` retains ordinary COPY
   behavior. Spore conservatively keeps the current parent in cache identity;
   it does not claim BuildKit layer rebasing or parent-independent reuse.
+- Cross-stage COPY link support landed as PR #502 at
+  `b4833aa9f6d697cb44e247fba77d15cbe0d904ec`, tree
+  `16c805dedcd845991944bc18d04cdfaf881019b6`. The unchanged frozen Buildkite
+  oracle then passed line 72 during full-file parsing and stopped at line 80 on
+  `ADD --chmod=0644 https://www.postgresql.org/media/keys/ACCC4CF8.asc
+  /etc/apt/keyrings/pgdg.asc`. No remote fetch, image resolution, VM boot, or
+  cache mutation occurred; C3 mounts at line 82 remained unreached. Merged-main
+  Buildkite #1385 subsequently passed that exact merge, including Linux
+  ARM64/KVM conformance, before the numeric remote ADD chmod slice began.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
 - No flat checkpoint store and no full-image hash fallback in the executor.
@@ -446,7 +457,7 @@ implementing Spore's mounts or cache policy.
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
 | `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; exec form preserves a bounded non-empty JSON string array and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
 | `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
-| `ADD <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Flags, local/Git sources, credentials, and archive extraction fail closed. |
+| `ADD [--chmod=<octal>] <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Numeric chmod expands at instruction start and must resolve from `0` through `07777`; other flags, symbolic modes, local/Git sources, credentials, and archive extraction fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
 | `ARG K[=default]` | value from `--build-arg` or an expanded default; unset values expand to empty unless a supported operator supplies another result. |
 | `WORKDIR /path` | affects `RUN` cwd, `COPY` relative dest, final config. Created in the guest if missing, matching Docker. |
@@ -455,8 +466,8 @@ implementing Spore's mounts or cache policy.
 | comments, line continuations, `${VAR}`/`$VAR` substitution in supported instruction arguments | The leading directive window accepts the stable Dockerfile syntax directive and backslash/backtick escape directives; single quotes remain literal, double quotes expand, and unsupported syntax frontends fail closed. |
 
 Builder-owned variable substitution applies to `FROM`, `ENV`, `ARG` defaults,
-`WORKDIR`, `COPY` source/destination arguments, and the accepted `ADD` URL
-path/query and destination using the declared
+`WORKDIR`, `COPY` source/destination arguments, and the accepted `ADD` numeric
+mode, URL path/query, and destination using the declared
 `ARG`/`ENV` state. `COPY --from` remains literal. `CMD` and
 `ENTRYPOINT` retain variables for runtime. Shell-form `RUN` is not pre-expanded;
 its guest shell sees the effective `ARG`/`ENV` environment and performs shell
@@ -655,7 +666,8 @@ Per-instruction inputs:
   (Docker parity).
 - `ADD`: the resolved public HTTPS URL and destination, URL-path or response
   filename, downloaded content digest, validated optional `Last-Modified`,
-  fixed `0600` mode, current `WORKDIR`, and instruction-start ENV/ARG state.
+  resolved numeric mode (default `0600`), current `WORKDIR`, and
+  instruction-start ENV/ARG state.
 - `ENV` / `ARG` / `CMD`: metadata instructions update the state consumed by
   later execution keys. A changed `ENV` or `ARG` invalidates later `RUN`/`COPY`/`ADD`
   steps, while a final `CMD` keeps the same rootfs `index_digest` and costs only
@@ -1138,7 +1150,8 @@ Corollary: COPY and remote URL ADD do not require `tar` in the base image or add
 or custom entry-stream parser to the initrd agent, and keeps guest memory usage
 bounded by per-entry copy buffers rather than total input size. COPY flags
 `--chown`, `--chmod`, `--parents`, and local-context `--link`, plus local, Git,
-flagged, and extracting ADD forms, remain unsupported and fail closed.
+extracting, and ADD flags other than numeric `--chmod`, remain unsupported and
+fail closed.
 
 Why the guest and not `debugfs` writes or host staging: a real Linux kernel
 applies ownership, modes, symlinks, and directory merge behavior natively and
@@ -1568,7 +1581,7 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
 2. **Done — landed in PR #501:** oracle-prioritized public HTTPS ADD. The
    separate C4 mutable-URL slice accepts
    the exact general form required at line 42: expanded public HTTPS source,
-   expanded destination, opaque bytes, mode `0600`, and always-refetch
+   expanded destination, opaque bytes, initial fixed mode `0600`, and always-refetch
    content-addressed reuse. The parser happens to encounter C4 before the
    remaining C2 breadth; that changes delivery order, not ownership. Rerun the
    unchanged target after landing to select the next slice. The rerun reached
@@ -1582,15 +1595,22 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    cache identity, while the current parent remains a conservative dependency.
    This slice claims no parent-independent layer rebasing and leaves
    local-context `--link`, `--chmod`, `--parents`, and heredocs rejected.
-4. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add RUN
+4. **Done in this slice:** numeric `--chmod` for the existing public HTTPS
+   single-file ADD path. The flag expands from the instruction-start snapshot,
+   accepts only octal `0` through `07777`, binds the resolved mode in ADD input
+   identity, and reuses the context-disk plus strict COPY v4 guest apply path.
+   Mode changes miss, unchanged refetches with the same bytes and mode hit, and
+   mode remains independent from the validated remote mtime. Symbolic modes,
+   COPY chmod, local ADD, extraction, and other ADD flags remain rejected.
+5. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add RUN
    and COPY heredocs, `COPY --parents`, and `COPY --chmod` only when the next
    unchanged-oracle run reaches them. Split these into separate PRs whenever
    their parser, filesystem result, cache identity, or failure-publication
    protocols differ.
-5. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
+6. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
    a later unchanged-oracle run produces a concrete mismatch or unsupported
    span.
-6. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
+7. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
    `--exclude`, `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`,
    `HEALTHCHECK`, `VOLUME`, and other metadata only when the unchanged workload
    or the representative common-template corpus demonstrates demand.
@@ -1668,7 +1688,9 @@ larger generic design. Do not expand spore manifests solely for build caches.
   pretending the observed mutable URL is immutable;
 - local tar ADD through the existing bounded extraction model;
 - `--chmod`, ownership, excludes, link behavior, and destination rules shared
-  with COPY where Docker defines the same contract;
+  with COPY where Docker defines the same contract. Numeric remote-file
+  `--chmod` is implemented through the existing context-disk/COPY v4 path;
+  symbolic and COPY modes remain separate work;
 - explicit rejection for remote Git sources, Git build contexts,
   `--keep-git-dir`, and remote `--unpack`;
 - update `SECURITY.md`, compatibility notes, and release notes in the owning

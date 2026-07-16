@@ -21,6 +21,11 @@ pub fn validateUrl(raw: []const u8) !std.Uri {
     return uri;
 }
 
+pub fn parseNumericMode(raw: []const u8) !u32 {
+    if (std.mem.indexOfScalar(u8, raw, '_') != null) return error.UnsupportedRemoteAddMode;
+    return std.fmt.parseUnsigned(u12, raw, 8) catch return error.UnsupportedRemoteAddMode;
+}
+
 fn gitPath(path: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, path, "/");
     var cursor = trimmed.len;
@@ -61,4 +66,26 @@ test "remote ADD template and resolved policy stay aligned" {
     try std.testing.expectError(error.UnsupportedRemoteAddUrl, validateUrl("https://user@example.com/tool"));
     try std.testing.expectError(error.UnsupportedRemoteAddUrl, validateUrl("https://example.com/repo%2Egit"));
     _ = try validateUrl("https://example.com/releases/tool?download=1");
+}
+
+test "remote ADD numeric chmod matches BuildKit octal range" {
+    try std.testing.expectEqual(@as(u32, 0), try parseNumericMode("0"));
+    try std.testing.expectEqual(@as(u32, 0o644), try parseNumericMode("644"));
+    try std.testing.expectEqual(@as(u32, 0o644), try parseNumericMode("0000644"));
+    try std.testing.expectEqual(@as(u32, 0o7777), try parseNumericMode("07777"));
+    inline for (.{ "", "8", "64a", "+644", "-1", "6_44", "10000", "077777777777777777777777" }) |value| {
+        try std.testing.expectError(error.UnsupportedRemoteAddMode, parseNumericMode(value));
+    }
+}
+
+fn fuzzNumericMode(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [256]u8 = undefined;
+    const len = smith.slice(&bytes);
+    if (parseNumericMode(bytes[0..len])) |mode| {
+        try std.testing.expect(mode <= 0o7777);
+    } else |_| {}
+}
+
+test "fuzz remote ADD numeric chmod" {
+    try std.testing.fuzz({}, fuzzNumericMode, .{});
 }
