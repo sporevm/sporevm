@@ -191,6 +191,8 @@ pub const CopySourceDisk = enum {
     build_input,
 };
 
+pub const CopyDestinationPolicy = step_cache.CopyDestinationPolicy;
+
 pub const CopyRequest = struct {
     source: []const u8,
     dest: []const u8,
@@ -200,6 +202,7 @@ pub const CopyRequest = struct {
     source_disk: CopySourceDisk = .context,
     input_index: usize = 0,
     mtime_unix_seconds: ?i64 = null,
+    destination_policy: CopyDestinationPolicy = .follow,
 };
 
 pub const CopyStep = struct {
@@ -209,6 +212,7 @@ pub const CopyStep = struct {
     input_digest: []const u8,
     env_digest: []const u8,
     workdir: []const u8,
+    destination_policy: CopyDestinationPolicy = .follow,
     requests: []const CopyRequest,
 };
 
@@ -298,6 +302,7 @@ pub fn cacheInputForStep(
                     .input_digest = copy.input_digest,
                     .env_digest = copy.env_digest,
                     .workdir = copy.workdir,
+                    .destination_policy = copy.destination_policy,
                 } },
                 .add => .{ .add = .{
                     .input_digest = copy.input_digest,
@@ -667,6 +672,9 @@ const BuildControl = struct {
             },
             .copy => |copy| {
                 if (copy.requests.len == 0) return error.CopyEntryCountUnsupported;
+                for (copy.requests) |request| {
+                    if (request.destination_policy != copy.destination_policy) return error.BadManifest;
+                }
                 self.active_copy_request_index = 0;
                 try self.startCopyRequest(dev);
             },
@@ -1154,7 +1162,35 @@ fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: Co
         .input_index = request.input_index,
         .mtime_unix_seconds = request.mtime_unix_seconds,
     };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    const json = switch (request.destination_policy) {
+        .follow => try std.json.Stringify.valueAlloc(allocator, payload, .{}),
+        .link => blk: {
+            const LinkPayload = struct {
+                type: []const u8 = "spore-build-copy-v5",
+                session_id: []const u8,
+                source: []const u8,
+                dest: []const u8,
+                source_kind: []const u8,
+                dest_is_dir: bool,
+                entry_count: usize,
+                source_disk: []const u8,
+                input_index: usize,
+                mtime_unix_seconds: ?i64,
+                destination_policy: []const u8 = "link",
+            };
+            break :blk try std.json.Stringify.valueAlloc(allocator, LinkPayload{
+                .session_id = session_id,
+                .source = request.source,
+                .dest = request.dest,
+                .source_kind = @tagName(request.source_kind),
+                .dest_is_dir = request.dest_is_dir,
+                .entry_count = request.entry_count,
+                .source_disk = @tagName(request.source_disk),
+                .input_index = request.input_index,
+                .mtime_unix_seconds = request.mtime_unix_seconds,
+            }, .{});
+        },
+    };
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
@@ -1205,6 +1241,7 @@ pub fn validateCopyRequest(request: CopyRequest) !void {
     } else {
         if (request.source_kind != .auto or request.entry_count != 0 or request.input_index >= max_build_input_disks) return error.CopySourceUnsupported;
     }
+    if (request.destination_policy == .link and request.source_disk != .build_input) return error.CopySourceUnsupported;
 }
 
 pub fn validateCopyDestinationJoin(request: CopyRequest) !void {
@@ -1242,14 +1279,17 @@ fn fuzzCopyRequest(_: void, s: *std.testing.Smith) !void {
         if (byte.* == 0 or byte.* == '/') byte.* = 'x';
     }
     const name = if (raw_len == 0) "x" else path_buf[0..raw_len];
+    const link = raw_len != 0 and (path_buf[0] & 1) != 0;
     var path_storage: [80]u8 = undefined;
     const dest = std.fmt.bufPrint(&path_storage, "/{s}", .{name}) catch return;
     const request = copyRequest(std.testing.allocator, "spore-build-1", .{
         .source = name,
         .dest = dest,
-        .source_kind = .file,
+        .source_kind = if (link) .auto else .file,
         .dest_is_dir = false,
-        .entry_count = 1,
+        .entry_count = if (link) 0 else 1,
+        .source_disk = if (link) .build_input else .context,
+        .destination_policy = if (link) .link else .follow,
     }) catch return;
     defer std.testing.allocator.free(request);
     try std.testing.expect(request.len <= max_guest_request_len);
@@ -1293,12 +1333,15 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
         var stream_len: usize = 0;
 
         if (mode == 4) {
+            const link = fuzz_len > 1 and (fuzz_bytes[1] & 1) != 0;
             const request = copyRequest(std.testing.allocator, "spore-build-fuzz", .{
                 .source = "input",
                 .dest = "/output",
-                .source_kind = .file,
+                .source_kind = if (link) .auto else .file,
                 .dest_is_dir = false,
-                .entry_count = 1,
+                .entry_count = if (link) 0 else 1,
+                .source_disk = if (link) .build_input else .context,
+                .destination_policy = if (link) .link else .follow,
             }) catch return;
             defer std.testing.allocator.free(request);
             _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
@@ -1895,6 +1938,54 @@ test "build copy request selects an immutable build input" {
     try std.testing.expectEqualStrings("build_input", object.get("source_disk").?.string);
     try std.testing.expectEqual(@as(i64, 1), object.get("input_index").?.integer);
     try std.testing.expectEqualStrings("auto", object.get("source_kind").?.string);
+}
+
+test "build copy link request uses the strict v5 build-input contract" {
+    const request = try copyRequest(std.testing.allocator, "spore-build-1", .{
+        .source = "out/app",
+        .dest = "/app",
+        .source_kind = .auto,
+        .dest_is_dir = false,
+        .entry_count = 0,
+        .source_disk = .build_input,
+        .input_index = 1,
+        .destination_policy = .link,
+    });
+    defer std.testing.allocator.free(request);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("spore-build-copy-v5", object.get("type").?.string);
+    try std.testing.expectEqualStrings("link", object.get("destination_policy").?.string);
+
+    try std.testing.expectError(error.CopySourceUnsupported, copyRequest(std.testing.allocator, "spore-build-1", .{
+        .source = "input",
+        .dest = "/output",
+        .source_kind = .file,
+        .dest_is_dir = false,
+        .entry_count = 1,
+        .destination_policy = .link,
+    }));
+}
+
+test "build copy v5 guest parser rejects incomplete or ambiguous link policy" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    const valid = "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\"}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(valid.ptr, valid.len, valid[0..0].ptr, 0));
+
+    const invalid = [_][]const u8{
+        valid[0 .. valid.len - 1],
+        valid[0 .. valid.len - 2] ++ " trailing\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"follow\"}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\",\"destination_policy\":\"link\"}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\"}\n",
+        "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\"}\n",
+    };
+    for (invalid) |request| {
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+    }
 }
 
 test "build workdir request names an absolute target" {

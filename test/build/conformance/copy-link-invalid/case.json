@@ -1,0 +1,9 @@
+{
+  "description": "malformed COPY --link boolean values fail during full-file parsing",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 3: COPY --link requires true or false"
+  },
+  "scan_prefixes": []
+}

@@ -1,0 +1,51 @@
+{
+  "description": "cross-stage COPY --link matches BuildKit destination conflicts and source-stage cache invalidation",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 9,
+    "expect_boot_count": 2,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle",
+    "/redirect"
+  ],
+  "compare_hardlink_paths": [
+    "/oracle/merge/child",
+    "/oracle/merge/hard"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "source-stage-mutation",
+      "writes": {
+        "payload.txt": "payload-edited\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 8,
+      "expect_boot_count": 2,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-mutation",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

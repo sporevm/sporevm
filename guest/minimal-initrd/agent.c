@@ -81,6 +81,8 @@
 #define COPY_KIND_AUTO SPORE_BUILD_COPY_KIND_AUTO
 #define COPY_SOURCE_CONTEXT SPORE_BUILD_COPY_SOURCE_CONTEXT
 #define COPY_SOURCE_BUILD_INPUT SPORE_BUILD_COPY_SOURCE_BUILD_INPUT
+#define COPY_DESTINATION_FOLLOW SPORE_BUILD_COPY_DESTINATION_FOLLOW
+#define COPY_DESTINATION_LINK SPORE_BUILD_COPY_DESTINATION_LINK
 #define MAX_BUILD_RUN_COMMAND_LEN 65536ULL
 #define MAX_BUILD_EXEC_ARGS_BYTES 4096
 #define MAX_BUILD_EXEC_PATH_LEN 8192
@@ -2060,6 +2062,7 @@ struct run_request {
   int copy_source_disk;
   uint64_t copy_input_index;
   int copy_dest_is_dir;
+  int copy_destination_policy;
   int copy_mtime_present;
   int64_t copy_mtime_unix_seconds;
   uint64_t build_command_len;
@@ -2309,7 +2312,7 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
   return 0;
 }
 
-static int parse_build_copy_v4_request(const char *req, size_t req_len, struct run_request *out) {
+static int parse_build_copy_request(const char *req, size_t req_len, struct run_request *out, const char *expected_type, int require_destination_policy) {
   if (req_len == 0 || req[req_len - 1] != '\n') return -1;
   enum {
     SEEN_TYPE = 1u << 0,
@@ -2322,7 +2325,9 @@ static int parse_build_copy_v4_request(const char *req, size_t req_len, struct r
     SEEN_SOURCE_DISK = 1u << 7,
     SEEN_INPUT_INDEX = 1u << 8,
     SEEN_MTIME = 1u << 9,
-    SEEN_ALL = (1u << 10) - 1,
+    SEEN_DESTINATION_POLICY = 1u << 10,
+    SEEN_V4_ALL = (1u << 10) - 1,
+    SEEN_V5_ALL = (1u << 11) - 1,
   };
 
   const char *p = skip_ws(req);
@@ -2345,7 +2350,7 @@ static int parse_build_copy_v4_request(const char *req, size_t req_len, struct r
     if (strcmp(key, "type") == 0) {
       bit = SEEN_TYPE;
       char type[32];
-      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-copy-v4") != 0) return -1;
+      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, expected_type) != 0) return -1;
     } else if (strcmp(key, "session_id") == 0) {
       bit = SEEN_SESSION_ID;
       if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
@@ -2383,6 +2388,12 @@ static int parse_build_copy_v4_request(const char *req, size_t req_len, struct r
     } else if (strcmp(key, "mtime_unix_seconds") == 0) {
       bit = SEEN_MTIME;
       if (parse_json_optional_i64(&p, &out->copy_mtime_present, &out->copy_mtime_unix_seconds) != 0) return -1;
+    } else if (strcmp(key, "destination_policy") == 0) {
+      if (!require_destination_policy) return -1;
+      bit = SEEN_DESTINATION_POLICY;
+      char destination_policy[16];
+      if (parse_json_string(&p, destination_policy, sizeof(destination_policy)) != 0 || strcmp(destination_policy, "link") != 0) return -1;
+      out->copy_destination_policy = COPY_DESTINATION_LINK;
     } else {
       return -1;
     }
@@ -2398,12 +2409,14 @@ static int parse_build_copy_v4_request(const char *req, size_t req_len, struct r
     p = skip_ws(p + 1);
     if (*p == '}') return -1;
   }
-  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
+  unsigned int required = require_destination_policy ? SEEN_V5_ALL : SEEN_V4_ALL;
+  if (seen != required || *skip_ws(p) != '\0') return -1;
   if (out->copy_source_disk == COPY_SOURCE_CONTEXT) {
     if (out->copy_source_kind == COPY_KIND_AUTO || out->copy_entry_count == 0 || out->copy_input_index != 0) return -1;
   } else if (out->copy_source_kind != COPY_KIND_AUTO || out->copy_entry_count != 0) {
     return -1;
   }
+  if (require_destination_policy && out->copy_source_disk != COPY_SOURCE_BUILD_INPUT) return -1;
   out->kind = REQUEST_BUILD_COPY;
   out->protocol_v1 = 1;
   return 0;
@@ -2493,7 +2506,10 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     return parse_build_run_v2_request(req, req_len, out);
   }
   if (type_rc > 0 && strcmp(type, "spore-build-copy-v4") == 0) {
-    return parse_build_copy_v4_request(req, req_len, out);
+    return parse_build_copy_request(req, req_len, out, "spore-build-copy-v4", 0);
+  }
+  if (type_rc > 0 && strcmp(type, "spore-build-copy-v5") == 0) {
+    return parse_build_copy_request(req, req_len, out, "spore-build-copy-v5", 1);
   }
   if (type_rc > 0) {
     if (strcmp(type, "ready") == 0) {
@@ -4727,6 +4743,7 @@ static void accept_request(int listener, struct session *session, struct client 
         request.copy_source, request.copy_dest,
         request.copy_source_kind, request.copy_dest_is_dir,
         request.copy_entry_count,
+        request.copy_destination_policy,
         request.copy_mtime_present, request.copy_mtime_unix_seconds,
         error, sizeof(error));
     if (exit_code == SPORE_BUILD_COPY_OK) {

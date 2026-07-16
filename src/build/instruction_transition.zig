@@ -321,6 +321,7 @@ pub fn buildInputCopy(
     resolved_dest: []const u8,
     env_digest: []const u8,
     workdir: []const u8,
+    link: bool,
     input_index: usize,
     storage: spore.RootfsStorage,
 ) !InstructionTransition {
@@ -336,6 +337,7 @@ pub fn buildInputCopy(
             .entry_count = 0,
             .source_disk = .build_input,
             .input_index = input_index,
+            .destination_policy = if (link) .link else .follow,
         };
         try build_exec.validateCopyRequest(requests[index]);
     }
@@ -345,6 +347,7 @@ pub fn buildInputCopy(
         .input_digest = storage.index_digest,
         .env_digest = env_digest,
         .workdir = workdir,
+        .destination_policy = if (link) .link else .follow,
         .requests = requests,
     } } };
 }
@@ -630,6 +633,59 @@ test "context COPY preflight reserves the longest generated source prefix" {
     ));
     try std.testing.expectEqual(@as(usize, 7), instruction_line);
     try std.testing.expectEqualStrings(source, copy.source);
+}
+
+test "cross-stage COPY link policy and source snapshot are cache identity" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const source_a = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = rootfs_cas.default_chunk_size,
+        .chunk_size = rootfs_cas.default_chunk_size,
+        .hash_algorithm = "blake3",
+        .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .object_namespace = "rootfs/blake3",
+    };
+    var source_b = source_a;
+    source_b.index_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    source_b.base_identity = source_b.index_digest;
+
+    const linked = try buildInputCopy(
+        allocator,
+        7,
+        "COPY --link --from=source /out/app /app",
+        &.{"/out/app"},
+        "/app",
+        "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "/",
+        true,
+        0,
+        source_a,
+    );
+    const linked_step = linked.copy.build_input;
+    try std.testing.expectEqual(build_exec.CopyDestinationPolicy.link, linked_step.destination_policy);
+    try std.testing.expectEqual(build_exec.CopyDestinationPolicy.link, linked_step.requests[0].destination_policy);
+
+    const changed_source = try buildInputCopy(
+        allocator,
+        7,
+        "COPY --link --from=source /out/app /app",
+        &.{"/out/app"},
+        "/app",
+        "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "/",
+        true,
+        0,
+        source_b,
+    );
+    const parent = "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const executor = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    const first_key = try step_cache.stepKey(allocator, build_exec.cacheInputForStep(.{}, parent, executor, .{ .copy = linked_step }, .{}));
+    const changed_key = try step_cache.stepKey(allocator, build_exec.cacheInputForStep(.{}, parent, executor, .{ .copy = changed_source.copy.build_input }, .{}));
+    try std.testing.expect(!std.mem.eql(u8, first_key, changed_key));
 }
 
 test "remote ADD cache identity binds resolved URL destination and downloaded bytes" {

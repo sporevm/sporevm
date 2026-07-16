@@ -2,6 +2,22 @@
 
 ## Next
 
+`spore build` now accepts `COPY --link` for immutable cross-stage and named
+build inputs. True link policy builds the destination result without reading or
+following lower destination symlinks, replaces lower file/directory conflicts,
+and merges matching directories, so the flattened ext4 result matches pinned
+BuildKit even though Spore conservatively keeps the current parent in its cache
+key. `--link=false` retains ordinary cross-stage COPY behavior. Source-stage
+operands follow a rootfs-confined final symlink, while symlinks encountered
+inside a copied directory remain symlink entries, matching BuildKit. Source-stage
+rootfs identity, resolved operands, instruction-start ENV/ARG state, workdir,
+platform, parent rootfs, executor identity, and the explicit destination policy
+are cache inputs; changed source-stage bytes miss while unchanged rebuilds hit.
+The strict guest v5 request accepts link policy only from bounded immutable
+build-input disks, and conflict removal shares COPY's 65,536-entry limit.
+Local-context `--link`, `--chmod`, `--parents`, heredocs, OCI layer rebasing,
+mounted RUN, and SSH remain unsupported.
+
 `spore build` now accepts one public HTTPS URL and one destination in `ADD`.
 The builder resolves both operands from the instruction-start ENV/ARG snapshot,
 including automatic `TARGETOS` and `TARGETARCH`, then performs a fresh host-side

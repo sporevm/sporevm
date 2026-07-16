@@ -23,6 +23,8 @@
 #define COPY_KIND_DIR SPORE_BUILD_COPY_KIND_DIR
 #define COPY_KIND_SYMLINK SPORE_BUILD_COPY_KIND_SYMLINK
 #define COPY_KIND_AUTO SPORE_BUILD_COPY_KIND_AUTO
+#define COPY_DESTINATION_FOLLOW SPORE_BUILD_COPY_DESTINATION_FOLLOW
+#define COPY_DESTINATION_LINK SPORE_BUILD_COPY_DESTINATION_LINK
 #define MAX_BUILD_CONTEXT_COPY_ENTRIES SPORE_BUILD_COPY_MAX_ENTRIES
 #define BUILD_AGENT_FD_BUDGET SPORE_BUILD_COPY_FD_BUDGET
 #define MAX_COPY_XATTR_NAMES 512
@@ -304,6 +306,61 @@ static int confined_open_existing(int root_fd, const char *path, int flags) {
   return confined_open_path(root_fd, path, flags, 0);
 }
 
+static int resolve_confined_source_path(int root_fd, const char *raw_path, char *out, size_t out_cap) {
+  const char *rel = raw_path[0] == '/' ? raw_path + 1 : raw_path;
+  if (rel[0] == '\0') rel = ".";
+  char pending[MAX_COPY_FULL_PATH_LEN + MAX_COPY_PATH_LEN + 2];
+  char logical[MAX_COPY_FULL_PATH_LEN];
+  logical[0] = '\0';
+  int n = snprintf(pending, sizeof(pending), "%s", rel);
+  if (n < 0 || (size_t)n >= sizeof(pending)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  unsigned symlink_depth = 0;
+
+  for (;;) {
+    char component[MAX_COPY_PATH_LEN + 1];
+    int next = pop_pending_component(pending, component, sizeof(component));
+    if (next < 0) return -1;
+    if (next == 0) break;
+    if (strcmp(component, ".") == 0) continue;
+    if (strcmp(component, "..") == 0) {
+      pop_path_component(logical);
+      continue;
+    }
+
+    char candidate[MAX_COPY_FULL_PATH_LEN + MAX_COPY_PATH_LEN + 2];
+    snprintf(candidate, sizeof(candidate), "%s", logical);
+    if (append_path_component(candidate, sizeof(candidate), component, strlen(component)) != 0) return -1;
+    struct stat st;
+    if (fstatat(root_fd, candidate, &st, AT_SYMLINK_NOFOLLOW) != 0) return -1;
+    if (S_ISLNK(st.st_mode)) {
+      if (++symlink_depth > MAX_SYMLINK_DEPTH) {
+        errno = ELOOP;
+        return -1;
+      }
+      char target[MAX_COPY_PATH_LEN + 1];
+      ssize_t len = readlinkat(root_fd, candidate, target, sizeof(target) - 1);
+      if (len < 0) return -1;
+      target[len] = '\0';
+      if (target[0] == '/') logical[0] = '\0';
+      if (prepend_symlink_target(pending, sizeof(pending), target) != 0) return -1;
+      continue;
+    }
+    if (append_path_component(logical, sizeof(logical), component, strlen(component)) != 0) return -1;
+  }
+
+  const char *resolved = logical[0] == '\0' ? "." : logical;
+  size_t resolved_len = strlen(resolved);
+  if (resolved_len >= out_cap || resolved_len > MAX_COPY_PATH_LEN) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(out, resolved, resolved_len + 1);
+  return 0;
+}
+
 static int confined_parent_fd(int root_fd, const char *path, char *name, size_t name_cap) {
   const char *rel = path[0] == '/' ? path + 1 : path;
   if (rel[0] == '\0') {
@@ -378,7 +435,56 @@ static int ensure_parent_dirs(int root_fd, const char *path) {
 
 static int reject_security_xattrs_at(int parent_fd, const char *name);
 
-static int prepare_overwrite_path(int root_fd, const char *path, int allow_existing_dir) {
+struct destination_removal_state {
+  uint64_t removed_entries;
+};
+
+static int remove_destination_tree_at(int parent_fd, const char *name, size_t depth, struct destination_removal_state *state) {
+  if (depth > MAX_COPY_PATH_LEN / 2) {
+    errno = ELOOP;
+    return -1;
+  }
+  struct stat st;
+  if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) return errno == ENOENT ? 0 : -1;
+  if (state->removed_entries >= MAX_BUILD_CONTEXT_COPY_ENTRIES) {
+    errno = E2BIG;
+    return -1;
+  }
+  state->removed_entries++;
+  if (reject_security_xattrs_at(parent_fd, name) != 0) return -1;
+  if (!S_ISDIR(st.st_mode)) return unlinkat(parent_fd, name, 0);
+
+  int dir_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dir_fd < 0) return -1;
+  DIR *dir = fdopendir(dir_fd);
+  if (dir == NULL) {
+    close(dir_fd);
+    return -1;
+  }
+  int rc = 0;
+  int saved = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+    if (remove_destination_tree_at(dirfd(dir), entry->d_name, depth + 1, state) != 0) {
+      rc = -1;
+      saved = errno;
+      break;
+    }
+  }
+  if (closedir(dir) != 0 && rc == 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (rc == 0 && unlinkat(parent_fd, name, AT_REMOVEDIR) != 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (rc != 0) errno = saved;
+  return rc;
+}
+
+static int prepare_overwrite_path(int root_fd, const char *path, int allow_existing_dir, int destination_policy, struct destination_removal_state *removal_state) {
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
   if (parent_fd < 0) return -1;
@@ -396,14 +502,105 @@ static int prepare_overwrite_path(int root_fd, const char *path, int allow_exist
     return -1;
   }
   if (S_ISDIR(st.st_mode)) {
-    if (close(parent_fd) != 0) return -1;
-    return allow_existing_dir ? 0 : -1;
+    if (allow_existing_dir) return close(parent_fd);
+    if (destination_policy != COPY_DESTINATION_LINK || removal_state == NULL) {
+      close(parent_fd);
+      errno = EISDIR;
+      return -1;
+    }
+    int rc = remove_destination_tree_at(parent_fd, name, 0, removal_state);
+    int saved = errno;
+    if (close(parent_fd) != 0 && rc == 0) return -1;
+    errno = saved;
+    return rc;
   }
   int rc = unlinkat(parent_fd, name, 0);
   int saved = errno;
   if (close(parent_fd) != 0 && rc == 0) return -1;
   errno = saved;
   return rc;
+}
+
+static int ensure_link_directory_component(int root_fd, const char *path, mode_t mode, uid_t uid, gid_t gid, struct destination_removal_state *removal_state) {
+  char name[MAX_COPY_PATH_LEN + 1];
+  int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
+  if (parent_fd < 0) return -1;
+  struct stat st;
+  int exists = fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0;
+  if (!exists && errno != ENOENT) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+  if (exists && !S_ISDIR(st.st_mode)) {
+    if (remove_destination_tree_at(parent_fd, name, 0, removal_state) != 0) {
+      int saved = errno;
+      close(parent_fd);
+      errno = saved;
+      return -1;
+    }
+    exists = 0;
+  }
+  if (!exists && mkdirat(parent_fd, name, mode & 07777) != 0) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+  if (reject_security_xattrs_at(parent_fd, name) != 0) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+  int dir_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dir_fd < 0) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
+  }
+  int rc = fchown(dir_fd, uid, gid);
+  if (rc == 0) rc = fchmod(dir_fd, mode & 07777);
+  int saved = rc != 0 ? errno : 0;
+  if (close(dir_fd) != 0 && rc == 0) {
+    rc = -1;
+    saved = errno;
+  }
+  if (close(parent_fd) != 0 && rc == 0) {
+    rc = -1;
+    saved = errno;
+  }
+  errno = saved;
+  return rc;
+}
+
+static int ensure_link_directories(int root_fd, const char *path, int include_final, struct destination_removal_state *removal_state) {
+  const char *rel = path[0] == '/' ? path + 1 : path;
+  if (rel[0] == '\0') return 0;
+  char prefix[MAX_COPY_PATH_LEN + 1];
+  size_t prefix_len = 0;
+  for (const char *p = rel;; p++) {
+    if (*p != '/' && *p != '\0') {
+      if (prefix_len + 1 >= sizeof(prefix)) {
+        errno = ENAMETOOLONG;
+        return -1;
+      }
+      prefix[prefix_len++] = *p;
+      continue;
+    }
+    if (*p == '\0' && !include_final) break;
+    if (prefix_len == 0) {
+      errno = EINVAL;
+      return -1;
+    }
+    prefix[prefix_len] = '\0';
+    if (ensure_link_directory_component(root_fd, prefix, 0755, 0, 0, removal_state) != 0) return -1;
+    if (*p == '\0') break;
+    prefix[prefix_len++] = '/';
+  }
+  return 0;
 }
 
 struct supported_copy_xattrs {
@@ -552,6 +749,7 @@ struct copied_hardlink {
 struct copy_tree_state {
   uint64_t expected_entries;
   uint64_t seen_entries;
+  struct destination_removal_state destination_removal;
   struct copied_hardlink *hardlinks;
   size_t hardlink_count;
   size_t hardlink_capacity;
@@ -563,7 +761,7 @@ static void copy_tree_state_deinit(struct copy_tree_state *state) {
   memset(state, 0, sizeof(*state));
 }
 
-static int apply_existing_hardlink(int root_fd, const struct stat *source_stat, const char *dest_path, struct copy_tree_state *state) {
+static int apply_existing_hardlink(int root_fd, const struct stat *source_stat, const char *dest_path, int destination_policy, struct copy_tree_state *state) {
   if (source_stat->st_nlink < 2) return 0;
   int existing_fd = -1;
   for (size_t i = 0; i < state->hardlink_count; i++) {
@@ -573,7 +771,8 @@ static int apply_existing_hardlink(int root_fd, const struct stat *source_stat, 
     }
   }
   if (existing_fd < 0) return 0;
-  if (ensure_parent_dirs(root_fd, dest_path) != 0 || prepare_overwrite_path(root_fd, dest_path, 0) != 0) return -1;
+  if (ensure_parent_dirs(root_fd, dest_path) != 0 ||
+      prepare_overwrite_path(root_fd, dest_path, 0, destination_policy, &state->destination_removal) != 0) return -1;
 
   char dest_name[MAX_COPY_PATH_LEN + 1];
   int dest_parent_fd = confined_parent_fd(root_fd, dest_path, dest_name, sizeof(dest_name));
@@ -609,8 +808,11 @@ static int record_hardlink(const struct stat *source_stat, int dest_fd, struct c
   return 0;
 }
 
-static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode, uid_t uid, gid_t gid) {
+static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode, uid_t uid, gid_t gid, int destination_policy, struct copy_tree_state *state) {
   if (ensure_parent_dirs(root_fd, path) != 0) return -1;
+  if (destination_policy == COPY_DESTINATION_LINK) {
+    return ensure_link_directory_component(root_fd, path, mode, uid, gid, &state->destination_removal);
+  }
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
   if (parent_fd < 0) return -1;
@@ -647,7 +849,7 @@ static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode, ui
 
   if (dir_fd < 0) {
     if (exists) {
-      if (prepare_overwrite_path(root_fd, path, 1) != 0) {
+      if (prepare_overwrite_path(root_fd, path, 1, COPY_DESTINATION_FOLLOW, NULL) != 0) {
         int saved = errno;
         close(parent_fd);
         errno = saved;
@@ -680,10 +882,15 @@ static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode, ui
   return rc;
 }
 
-static int ensure_context_copy_root_dir(int root_fd, const char *path) {
+static int ensure_context_copy_root_dir(int root_fd, const char *path, int destination_policy, struct copy_tree_state *state) {
   if (strcmp(path, "/") == 0) {
     if (reject_security_xattrs_fd(root_fd) != 0) return -1;
+    if (destination_policy == COPY_DESTINATION_LINK &&
+        (fchown(root_fd, 0, 0) != 0 || fchmod(root_fd, 0755) != 0)) return -1;
     return 0;
+  }
+  if (destination_policy == COPY_DESTINATION_LINK) {
+    return ensure_link_directories(root_fd, path, 1, &state->destination_removal);
   }
   if (ensure_parent_dirs(root_fd, path) != 0) return -1;
 
@@ -714,7 +921,7 @@ static int ensure_context_copy_root_dir(int root_fd, const char *path) {
     errno = saved;
     return rc;
   }
-  if (exists && prepare_overwrite_path(root_fd, path, 1) != 0) {
+  if (exists && prepare_overwrite_path(root_fd, path, 1, COPY_DESTINATION_FOLLOW, NULL) != 0) {
     int saved = errno;
     close(parent_fd);
     errno = saved;
@@ -760,7 +967,7 @@ static int copy_fd_to_fd(int in_fd, int out_fd, const char *path, uint64_t size,
   return 0;
 }
 
-static int apply_context_copy_file(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, int preserve_owner, struct copy_tree_state *state, char *error, size_t cap) {
+static int apply_context_copy_file(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, int preserve_owner, int destination_policy, struct copy_tree_state *state, char *error, size_t cap) {
   int in_fd = openat(source_parent_fd, source_name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (in_fd < 0) {
     snprintf(error, cap, "spore build: COPY source open failed: path=%s errno=%d\n", source_path, errno);
@@ -786,7 +993,7 @@ static int apply_context_copy_file(int root_fd, int source_parent_fd, const char
     return -1;
   }
 
-  int hardlink_rc = apply_existing_hardlink(root_fd, &source_stat, dest_path, state);
+  int hardlink_rc = apply_existing_hardlink(root_fd, &source_stat, dest_path, destination_policy, state);
   if (hardlink_rc != 0) {
     int saved = errno;
     close(in_fd);
@@ -806,26 +1013,37 @@ static int apply_context_copy_file(int root_fd, int source_parent_fd, const char
     return -1;
   }
 
-  struct stat st;
   int cleanup_on_error = 1;
-  if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
-    if (reject_security_xattrs_at(parent_fd, name) != 0) {
+  int fd;
+  if (destination_policy == COPY_DESTINATION_LINK) {
+    if (prepare_overwrite_path(root_fd, path, 0, destination_policy, &state->destination_removal) != 0) {
       int saved = errno;
       close(parent_fd);
       close(in_fd);
       errno = saved;
       return -1;
     }
-    cleanup_on_error = !S_ISLNK(st.st_mode);
-  } else if (errno != ENOENT) {
-    int saved = errno;
-    close(parent_fd);
-    close(in_fd);
-    errno = saved;
-    return -1;
+    fd = openat(parent_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, source_stat.st_mode & 07777);
+  } else {
+    struct stat st;
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+      if (reject_security_xattrs_at(parent_fd, name) != 0) {
+        int saved = errno;
+        close(parent_fd);
+        close(in_fd);
+        errno = saved;
+        return -1;
+      }
+      cleanup_on_error = !S_ISLNK(st.st_mode);
+    } else if (errno != ENOENT) {
+      int saved = errno;
+      close(parent_fd);
+      close(in_fd);
+      errno = saved;
+      return -1;
+    }
+    fd = confined_open_path(root_fd, path, O_WRONLY | O_CREAT, source_stat.st_mode & 07777);
   }
-
-  int fd = confined_open_path(root_fd, path, O_WRONLY | O_CREAT, source_stat.st_mode & 07777);
   if (fd < 0) {
     int saved = errno;
     close(parent_fd);
@@ -871,7 +1089,7 @@ static int apply_context_copy_file(int root_fd, int source_parent_fd, const char
   return rc;
 }
 
-static int apply_context_copy_symlink(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, uid_t uid, gid_t gid, const struct stat *source_stat, char *error, size_t cap) {
+static int apply_context_copy_symlink(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, uid_t uid, gid_t gid, const struct stat *source_stat, int destination_policy, struct copy_tree_state *state, char *error, size_t cap) {
   char target[MAX_COPY_PATH_LEN + 1];
   if (readlinkat_bounded(source_parent_fd, source_name, target, sizeof(target)) < 0) {
     snprintf(error, cap, "spore build: COPY symlink read failed: path=%s errno=%d\n", source_path, errno);
@@ -879,7 +1097,7 @@ static int apply_context_copy_symlink(int root_fd, int source_parent_fd, const c
   }
   const char *path = dest_path;
   if (ensure_parent_dirs(root_fd, path) != 0) return -1;
-  if (prepare_overwrite_path(root_fd, path, 0) != 0) return -1;
+  if (prepare_overwrite_path(root_fd, path, 0, destination_policy, &state->destination_removal) != 0) return -1;
   char name[MAX_COPY_PATH_LEN + 1];
   int parent_fd = confined_parent_fd(root_fd, path, name, sizeof(name));
   if (parent_fd < 0) return -1;
@@ -915,7 +1133,7 @@ static int join_source_path(char *out, size_t cap, const char *base, const char 
   return n > 0 && (size_t)n < cap ? 0 : -1;
 }
 
-static int copy_context_tree(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, int source_root, int preserve_owner, struct copy_tree_state *state, char *error, size_t cap) {
+static int copy_context_tree(int root_fd, int source_parent_fd, const char *source_name, const char *source_path, const char *dest_path, int source_root, int preserve_owner, int destination_policy, struct copy_tree_state *state, char *error, size_t cap) {
   uint64_t traversal_limit = state->expected_entries == 0 ? MAX_BUILD_CONTEXT_COPY_ENTRIES : state->expected_entries;
   if (state->seen_entries >= traversal_limit) {
     snprintf(error, cap, "spore build: COPY context entry count exceeds request: path=%s limit=%llu actual=%llu\n", source_path, (unsigned long long)traversal_limit, (unsigned long long)(state->seen_entries + 1));
@@ -933,8 +1151,8 @@ static int copy_context_tree(int root_fd, int source_parent_fd, const char *sour
   }
   if (S_ISDIR(st.st_mode)) {
     int dir_rc = source_root
-        ? ensure_context_copy_root_dir(root_fd, dest_path)
-        : apply_context_copy_dir(root_fd, dest_path, st.st_mode & 07777, preserve_owner ? st.st_uid : 0, preserve_owner ? st.st_gid : 0);
+        ? ensure_context_copy_root_dir(root_fd, dest_path, destination_policy, state)
+        : apply_context_copy_dir(root_fd, dest_path, st.st_mode & 07777, preserve_owner ? st.st_uid : 0, preserve_owner ? st.st_gid : 0, destination_policy, state);
     if (dir_rc != 0) {
       snprintf(error, cap, "spore build: COPY directory apply failed: path=%s errno=%d\n", dest_path, errno);
       return -1;
@@ -959,7 +1177,7 @@ static int copy_context_tree(int root_fd, int source_parent_fd, const char *sour
       char child_dest[MAX_COPY_PATH_LEN + 1];
       if (join_source_path(child_source, sizeof(child_source), source_path, entry->d_name) != 0 ||
           join_dest_path(child_dest, sizeof(child_dest), dest_path, entry->d_name) != 0 ||
-          copy_context_tree(root_fd, dirfd(dir), entry->d_name, child_source, child_dest, 0, preserve_owner, state, error, cap) != 0) {
+          copy_context_tree(root_fd, dirfd(dir), entry->d_name, child_source, child_dest, 0, preserve_owner, destination_policy, state, error, cap) != 0) {
         rc = -1;
         saved = errno;
         break;
@@ -977,10 +1195,10 @@ static int copy_context_tree(int root_fd, int source_parent_fd, const char *sour
     return rc;
   }
   if (S_ISREG(st.st_mode)) {
-    return apply_context_copy_file(root_fd, source_parent_fd, source_name, source_path, dest_path, preserve_owner, state, error, cap);
+    return apply_context_copy_file(root_fd, source_parent_fd, source_name, source_path, dest_path, preserve_owner, destination_policy, state, error, cap);
   }
   if (S_ISLNK(st.st_mode)) {
-    return apply_context_copy_symlink(root_fd, source_parent_fd, source_name, source_path, dest_path, preserve_owner ? st.st_uid : 0, preserve_owner ? st.st_gid : 0, &st, error, cap);
+    return apply_context_copy_symlink(root_fd, source_parent_fd, source_name, source_path, dest_path, preserve_owner ? st.st_uid : 0, preserve_owner ? st.st_gid : 0, &st, destination_policy, state, error, cap);
   }
   snprintf(error, cap, "spore build: COPY source has unsupported type: path=%s\n", source_path);
   return -1;
@@ -1099,6 +1317,7 @@ int spore_build_copy_apply(
     const char *root, const char *source_root,
     const char *source, const char *dest,
     int source_kind, int dest_is_dir, uint64_t entry_count,
+    int destination_policy,
     int mtime_present, int64_t mtime_unix_seconds,
     char *error, size_t error_cap) {
   if (error_cap > 0) error[0] = '\0';
@@ -1112,6 +1331,10 @@ int spore_build_copy_apply(
     if (error_cap > 0) snprintf(error, error_cap, "spore build: COPY entry count exceeds limit: path=%s limit=%llu actual=%llu\n", source, (unsigned long long)MAX_BUILD_CONTEXT_COPY_ENTRIES, (unsigned long long)entry_count);
     return SPORE_BUILD_COPY_INVALID;
   }
+  if ((destination_policy != COPY_DESTINATION_FOLLOW && destination_policy != COPY_DESTINATION_LINK) ||
+      (destination_policy == COPY_DESTINATION_LINK && source_kind != COPY_KIND_AUTO)) {
+    return copy_result(error, error_cap, SPORE_BUILD_COPY_INVALID, "spore build: invalid COPY destination policy\n");
+  }
   int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (root_fd < 0) {
     return copy_result(error, error_cap, SPORE_BUILD_COPY_UNAVAILABLE, "spore build: rootfs unavailable\n");
@@ -1122,19 +1345,30 @@ int spore_build_copy_apply(
     return copy_result(error, error_cap, SPORE_BUILD_COPY_UNAVAILABLE, "spore build: COPY source root unavailable\n");
   }
 
+  char resolved_source[MAX_COPY_PATH_LEN + 1];
+  const char *effective_source = source;
+  if (source_kind == COPY_KIND_AUTO) {
+    if (resolve_confined_source_path(source_root_fd, source, resolved_source, sizeof(resolved_source)) != 0) {
+      close(source_root_fd);
+      close(root_fd);
+      return copy_result(error, error_cap, SPORE_BUILD_COPY_APPLY_FAILED, "spore build: COPY source path resolution failed\n");
+    }
+    effective_source = resolved_source;
+  }
+
   char source_path[MAX_COPY_FULL_PATH_LEN + MAX_COPY_PATH_LEN + 2];
-  if (build_copy_source_path(source_path, sizeof(source_path), source_root, source) != 0) {
+  if (build_copy_source_path(source_path, sizeof(source_path), source_root, effective_source) != 0) {
     close(source_root_fd);
     close(root_fd);
     return copy_result(error, error_cap, SPORE_BUILD_COPY_INVALID, "spore build: COPY source path is too long for context disk\n");
   }
   char source_name[MAX_COPY_PATH_LEN + 1];
   int source_parent_fd;
-  if (strcmp(source, ".") == 0) {
+  if (strcmp(effective_source, ".") == 0) {
     source_parent_fd = dup(source_root_fd);
     snprintf(source_name, sizeof(source_name), ".");
   } else {
-    source_parent_fd = confined_parent_fd(source_root_fd, source, source_name, sizeof(source_name));
+    source_parent_fd = confined_parent_fd(source_root_fd, effective_source, source_name, sizeof(source_name));
   }
   close(source_root_fd);
   if (source_parent_fd < 0) {
@@ -1165,7 +1399,7 @@ int spore_build_copy_apply(
   }
 
   int resolved_dest_is_dir = dest_is_dir;
-  if (source_kind != COPY_KIND_DIR && !resolved_dest_is_dir) {
+  if (destination_policy == COPY_DESTINATION_FOLLOW && source_kind != COPY_KIND_DIR && !resolved_dest_is_dir) {
     int dest_fd = confined_open_existing(root_fd, dest, O_RDONLY | O_DIRECTORY);
     if (dest_fd >= 0) {
       resolved_dest_is_dir = 1;
@@ -1199,7 +1433,16 @@ int spore_build_copy_apply(
   struct copy_tree_state copy_state;
   memset(&copy_state, 0, sizeof(copy_state));
   copy_state.expected_entries = entry_count;
-  if (copy_context_tree(root_fd, source_parent_fd, source_name, source_path, dest_path, 1, preserve_owner, &copy_state, error, error_cap) != 0) {
+  if (destination_policy == COPY_DESTINATION_LINK) {
+    int include_final = source_kind == COPY_KIND_DIR || resolved_dest_is_dir;
+    if (ensure_link_directories(root_fd, dest, include_final, &copy_state.destination_removal) != 0) {
+      copy_tree_state_deinit(&copy_state);
+      close(source_parent_fd);
+      close(root_fd);
+      return copy_result(error, error_cap, SPORE_BUILD_COPY_APPLY_FAILED, "spore build: COPY --link destination preparation failed\n");
+    }
+  }
+  if (copy_context_tree(root_fd, source_parent_fd, source_name, source_path, dest_path, 1, preserve_owner, destination_policy, &copy_state, error, error_cap) != 0) {
     int copy_errno = errno;
     copy_tree_state_deinit(&copy_state);
     close(source_parent_fd);
@@ -1382,8 +1625,47 @@ __attribute__((visibility("hidden"))) int spore_build_copy_fuzz_tree(
     close(dest_fd);
     return -1;
   }
+  int destination_policy = fuzz_len > 2 && (fuzz[2] & 1) != 0
+      ? COPY_DESTINATION_LINK
+      : COPY_DESTINATION_FOLLOW;
+  if (destination_policy == COPY_DESTINATION_LINK && fuzz_len > 3) {
+    if ((fuzz[3] & 1) != 0) {
+      if (symlinkat("/outside", dest_fd, "copy") != 0) {
+        copy_tree_state_deinit(&state);
+        close(source_fd);
+        close(dest_fd);
+        return -1;
+      }
+    } else if (mkdirat(dest_fd, "copy", 0700) == 0) {
+      int copy_fd = openat(dest_fd, "copy", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      if (copy_fd >= 0) {
+        int stale_fd = openat(copy_fd, "stale", O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (stale_fd >= 0) close(stale_fd);
+        close(copy_fd);
+      }
+    }
+  }
   char error[384];
-  int rc = copy_context_tree(dest_fd, source_fd, "tree", tree, "/copy", 1, 1, &state, error, sizeof(error));
+  if (destination_policy == COPY_DESTINATION_LINK) {
+    const char *source_operand = "tree";
+    if (fuzz_len > 4 && (fuzz[4] & 1) != 0) {
+      if (symlinkat("tree", source_fd, "tree-link") != 0) {
+        copy_tree_state_deinit(&state);
+        close(source_fd);
+        close(dest_fd);
+        return -1;
+      }
+      source_operand = "tree-link";
+    }
+    copy_tree_state_deinit(&state);
+    close(source_fd);
+    close(dest_fd);
+    return spore_build_copy_apply(
+        dest_root, source_root, source_operand, "/copy",
+        COPY_KIND_AUTO, 0, 0, COPY_DESTINATION_LINK,
+        0, 0, error, sizeof(error));
+  }
+  int rc = copy_context_tree(dest_fd, source_fd, "tree", tree, "/copy", 1, 1, destination_policy, &state, error, sizeof(error));
   copy_tree_state_deinit(&state);
   close(source_fd);
   close(dest_fd);

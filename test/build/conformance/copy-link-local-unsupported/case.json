@@ -1,0 +1,9 @@
+{
+  "description": "local-context COPY --link remains outside the accepted cross-stage slice",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: COPY --link requires --from"
+  },
+  "scan_prefixes": []
+}

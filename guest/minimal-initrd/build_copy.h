@@ -12,6 +12,9 @@
 #define SPORE_BUILD_COPY_SOURCE_CONTEXT 0
 #define SPORE_BUILD_COPY_SOURCE_BUILD_INPUT 1
 
+#define SPORE_BUILD_COPY_DESTINATION_FOLLOW 0
+#define SPORE_BUILD_COPY_DESTINATION_LINK 1
+
 #define SPORE_BUILD_COPY_PATH_MAX 512
 #define SPORE_BUILD_COPY_MAX_ENTRIES 65536ULL
 #define SPORE_BUILD_COPY_FD_BUDGET (SPORE_BUILD_COPY_MAX_ENTRIES + 256ULL)
@@ -27,6 +30,7 @@ int spore_build_copy_apply(
     const char *root, const char *source_root,
     const char *source, const char *dest,
     int source_kind, int dest_is_dir, uint64_t entry_count,
+    int destination_policy,
     int mtime_present, int64_t mtime_unix_seconds,
     char *error, size_t error_cap);
 

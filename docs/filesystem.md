@@ -30,7 +30,8 @@ rootfs cas-preload --attach-spore` remains a repair/debug path for existing
 exact-rootfs spores; it is not the normal producer path.
 
 `spore build` uses the same descriptor-bound indexes and writable head. Before
-the first executor-backed instruction, builder v7 computes
+the first executor-backed instruction, the current builder v8 retains the v7
+capacity contract and computes
 `max(parent_logical_size, 16 GiB)`. A smaller supported journal-less parent is
 extended once with authoritative clean-zero chunks; a parent already at or
 above 16 GiB retains its exact geometry. There is no recursive headroom rule or
@@ -40,7 +41,7 @@ visible device size, so the zero range remains sparse and the growth path
 invokes neither the image's shell nor `resize2fs`.
 
 The grown canonical index is published as a complete rootfs before a typed
-builder-v7 `PREPARE` record makes it reusable. Its key binds the immutable
+builder-v8 `PREPARE` record makes it reusable. Its key binds the immutable
 parent index, exact target, platform, and exact kernel/initrd plus growth
 protocol identity. `--no-cache` bypasses Dockerfile step-record reads but still
 reuses PREPARE because capacity normalization is infrastructure, not a
@@ -49,8 +50,8 @@ executor identity. The managed default derives that identity from canonical
 kernel and embedded-initrd digests without reading the artifact bodies on a
 fully cached build; a later miss verifies the once-opened kernel bytes and
 boots that same allocation. Explicit overrides are eagerly retained. Old
-build records remain conservative GC roots but miss under v7; existing rootfs
-indexes and local images remain readable. Failed
+builder-v7 and builder-v6 records remain conservative GC roots but miss under
+v8; existing rootfs indexes and local images remain readable. Failed
 growth, quiescence, completeness, PREPARE, step, or ref publication never
 rewrites the parent or makes incomplete storage reachable.
 
