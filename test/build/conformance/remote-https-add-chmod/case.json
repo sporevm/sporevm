@@ -1,0 +1,50 @@
+{
+  "description": "numeric remote ADD chmod matches BuildKit modes, conflicts, mtimes, and cache invalidation",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 3,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "compare_mtime_paths": [
+    "/oracle/chmod-file",
+    "/oracle/chmod-target"
+  ],
+  "transitions": [
+    {
+      "name": "warm-refetch-same-mode-and-bytes",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "resolved-mode-change",
+      "writes": {
+        "Dockerfile": "FROM base\nRUN mkdir -p /oracle \\\n && printf old >/oracle/chmod-file \\\n && printf target >/oracle/chmod-target \\\n && ln -s /oracle/chmod-target /chmod-link \\\n && chmod 0777 /oracle/chmod-file /oracle/chmod-target\nARG MODE=0600\nADD --chmod=\"${MODE}\" https://www.postgresql.org/media/keys/ACCC4CF8.asc /oracle/chmod-file\nADD --chmod=07777 https://www.postgresql.org/media/keys/ACCC4CF8.asc /chmod-link\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 2,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-mode-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

@@ -6,6 +6,8 @@ const Blake3 = std.crypto.hash.Blake3;
 const fetch_policy = @import("../host_fetch_policy.zig");
 const policy = @import("remote_add_policy.zig");
 
+pub const parseNumericMode = policy.parseNumericMode;
+
 pub const max_body_bytes: u64 = 1024 * 1024 * 1024;
 pub const max_redirects: u8 = 5;
 pub const default_mode: u32 = 0o600;
@@ -35,6 +37,7 @@ pub const Input = struct {
     canonical_instruction: []const u8,
     resolved_url: []const u8,
     resolved_dest: []const u8,
+    mode: u32,
     env_digest: []const u8,
     workdir: []const u8,
 };

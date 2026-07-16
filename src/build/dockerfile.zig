@@ -71,6 +71,7 @@ pub const Copy = struct {
 };
 
 pub const Add = struct {
+    chmod: ?[]const u8 = null,
     source: []const u8,
     dest: []const u8,
 };
@@ -268,19 +269,40 @@ fn parseInstruction(
     if (asciiEql(op, "ADD")) {
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported ADD heredoc");
         const args = try splitWords(allocator, rest, escape, line, diagnostic);
-        for (args) |arg| {
-            if (std.mem.startsWith(u8, arg.value, "--")) {
-                const message = try std.fmt.allocPrint(allocator, "unsupported ADD flag: {s}", .{arg.value});
-                return fail(diagnostic, line, message);
+        var chmod: ?[]const u8 = null;
+        var first_source: usize = 0;
+        while (first_source < args.len and std.mem.startsWith(u8, args[first_source].value, "--")) : (first_source += 1) {
+            const arg = args[first_source];
+            if (std.mem.eql(u8, arg.value, "--chmod") and std.mem.eql(u8, arg.raw, arg.value)) {
+                return fail(diagnostic, line, "ADD --chmod requires a value");
             }
+            if (std.mem.startsWith(u8, arg.value, "--chmod=") and std.mem.startsWith(u8, arg.raw, "--chmod=")) {
+                if (chmod != null) return fail(diagnostic, line, "duplicate ADD flag: --chmod");
+                const value = arg.raw["--chmod=".len..];
+                if (value.len == 0) return fail(diagnostic, line, "ADD --chmod requires a non-empty octal value");
+                try validateExpansion(allocator, value, escape, line, diagnostic);
+                chmod = value;
+                continue;
+            }
+            const flag = if (std.mem.indexOfScalar(u8, arg.value, '=')) |eq| arg.value[0..eq] else arg.value;
+            const message = try std.fmt.allocPrint(allocator, "unsupported ADD flag: {s}", .{flag});
+            return fail(diagnostic, line, message);
         }
-        if (args.len != 2) return fail(diagnostic, line, "remote ADD requires exactly one source and one destination");
-        if (!remote_add_policy.validateTemplate(args[0].value)) return fail(diagnostic, line, "remote ADD source must have a literal HTTPS authority");
-        if (hasParentPathSegment(args[1].value)) return fail(diagnostic, line, "remote ADD destination must not contain a parent path segment");
-        for (args) |arg| {
+        for (args[first_source..]) |arg| {
+            if (!std.mem.startsWith(u8, arg.value, "--")) continue;
+            const flag = if (std.mem.indexOfScalar(u8, arg.value, '=')) |eq| arg.value[0..eq] else arg.value;
+            const message = try std.fmt.allocPrint(allocator, "unsupported ADD flag: {s}", .{flag});
+            return fail(diagnostic, line, message);
+        }
+        if (args.len - first_source != 2) return fail(diagnostic, line, "remote ADD requires exactly one source and one destination");
+        const source = args[first_source];
+        const dest = args[first_source + 1];
+        if (!remote_add_policy.validateTemplate(source.value)) return fail(diagnostic, line, "remote ADD source must have a literal HTTPS authority");
+        if (hasParentPathSegment(dest.value)) return fail(diagnostic, line, "remote ADD destination must not contain a parent path segment");
+        for (args[first_source..]) |arg| {
             try validateExpansion(allocator, arg.raw, escape, line, diagnostic);
         }
-        return .{ .add = .{ .source = args[0].raw, .dest = args[1].raw } };
+        return .{ .add = .{ .chmod = chmod, .source = source.raw, .dest = dest.raw } };
     }
     if (asciiEql(op, "ENV")) {
         const pairs = try parseEnv(allocator, rest, escape, line, diagnostic);
@@ -853,11 +875,26 @@ test "Dockerfile parser accepts narrow remote ADD and rejects unsupported forms"
     var diag: Diagnostic = .{};
     const doc = try parse(arena_state.allocator(), "FROM base\nADD https://example.com/${TARGETARCH}/tool /usr/bin/tool\n", &diag);
     const add = doc.stages[0].instructions[0].value.add;
+    try std.testing.expect(add.chmod == null);
     try std.testing.expectEqualStrings("https://example.com/${TARGETARCH}/tool", add.source);
     try std.testing.expectEqualStrings("/usr/bin/tool", add.dest);
 
-    try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD --chmod=0755 https://example.com/tool /tool\n", &diag));
-    try std.testing.expectEqualStrings("unsupported ADD flag: --chmod=0755", diag.message);
+    const chmod_doc = try parse(arena_state.allocator(), "FROM base\nARG MODE=0644\nADD --chmod=${MODE} https://example.com/tool /tool\n", &diag);
+    try std.testing.expectEqualStrings("${MODE}", chmod_doc.stages[0].instructions[1].value.add.chmod.?);
+    const quoted_chmod_doc = try parse(arena_state.allocator(), "FROM base\nADD --chmod=\"0000644\" https://example.com/tool /tool\n", &diag);
+    try std.testing.expectEqualStrings("\"0000644\"", quoted_chmod_doc.stages[0].instructions[0].value.add.chmod.?);
+
+    const invalid_flags = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM base\nADD --chmod https://example.com/tool /tool\n", .message = "ADD --chmod requires a value" },
+        .{ .dockerfile = "FROM base\nADD --chmod= https://example.com/tool /tool\n", .message = "ADD --chmod requires a non-empty octal value" },
+        .{ .dockerfile = "FROM base\nADD --chmod=0644 --chmod=0600 https://example.com/tool /tool\n", .message = "duplicate ADD flag: --chmod" },
+        .{ .dockerfile = "FROM base\nADD --chown=0:0 https://example.com/tool /tool\n", .message = "unsupported ADD flag: --chown" },
+        .{ .dockerfile = "FROM base\nADD --chmod=0644 https://example.com/tool --link /tool\n", .message = "unsupported ADD flag: --link" },
+    };
+    for (invalid_flags) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), case.dockerfile, &diag));
+        try std.testing.expectEqualStrings(case.message, diag.message);
+    }
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD a b /dest\n", &diag));
     try std.testing.expectEqualStrings("remote ADD requires exactly one source and one destination", diag.message);
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "FROM base\nADD <<EOF /dest\n", &diag));

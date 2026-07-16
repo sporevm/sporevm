@@ -721,6 +721,13 @@ fn resolveRemoteAddInput(
     const add = instruction.value.add;
     const resolved_url = try substituteState(allocator, add.source, state, instruction.escape);
     const resolved_dest = try substituteState(allocator, add.dest, state, instruction.escape);
+    const mode = if (add.chmod) |raw| blk: {
+        const resolved = try substituteState(allocator, raw, state, instruction.escape);
+        break :blk remote_add.parseNumericMode(resolved) catch {
+            diagnostic.instruction_line = instruction.line;
+            return error.UnsupportedRemoteAddMode;
+        };
+    } else remote_add.default_mode;
     _ = remote_add.validateUrl(resolved_url) catch |err| {
         diagnostic.instruction_line = instruction.line;
         return err;
@@ -736,6 +743,7 @@ fn resolveRemoteAddInput(
         .canonical_instruction = instruction.raw,
         .resolved_url = resolved_url,
         .resolved_dest = resolved_dest,
+        .mode = mode,
         .env_digest = try effectiveEnvDigest(allocator, state),
         .workdir = state.workdir,
     };
@@ -1658,7 +1666,8 @@ test "remote ADD resolves inherited ARG and automatic platform values at instruc
         \\ARG TARGETOS
         \\ARG TARGETARCH
         \\ARG VERSION=1.2.3
-        \\ADD "https://example.com/${VERSION}/tool-${TARGETOS}-${TARGETARCH}" '/opt/$VERSION/tool'
+        \\ARG MODE=0000644
+        \\ADD --chmod="${MODE}" "https://example.com/${VERSION}/tool-${TARGETOS}-${TARGETARCH}" '/opt/$VERSION/tool'
         \\
     , &parse_diagnostic);
     const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
@@ -1666,19 +1675,20 @@ test "remote ADD resolves inherited ARG and automatic platform values at instruc
     var state = try stateFromBase(arena, .{}, testStorage(), global_args.items, 0);
     var diagnostic: Diagnostic = .{};
     const instructions = document.stages[0].instructions;
-    for (instructions[0..3]) |instruction| {
+    for (instructions[0..4]) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, global_args.items, &state, instruction));
     }
     const input = try resolveRemoteAddInput(
         arena,
         &diagnostic,
         state,
-        instructions[3],
+        instructions[4],
         0,
-        3,
+        4,
     );
     try std.testing.expectEqualStrings("https://example.com/1.2.3/tool-linux-arm64", input.resolved_url);
     try std.testing.expectEqualStrings("/opt/$VERSION/tool", input.resolved_dest);
+    try std.testing.expectEqual(@as(u32, 0o644), input.mode);
 }
 
 test "remote ADD rejects unsupported sources and destinations before fetch" {
@@ -1689,6 +1699,8 @@ test "remote ADD rejects unsupported sources and destinations before fetch" {
     inline for (.{
         .{ "ARG TAIL=repo.git\nADD https://example.com/${TAIL} /dest", error.UnsupportedRemoteAddUrl },
         .{ "ARG PART=..\nADD https://example.com/file /safe/${PART}/escape", error.RemoteAddDestinationUnsupported },
+        .{ "ARG MODE=10000\nADD --chmod=${MODE} https://example.com/file /dest", error.UnsupportedRemoteAddMode },
+        .{ "ARG UNUSED\nADD --chmod=u=rw https://example.com/file /dest", error.UnsupportedRemoteAddMode },
     }) |case| {
         var parse_diagnostic: dockerfile.Diagnostic = .{};
         const source = try std.fmt.allocPrint(arena, "FROM scratch\n{s}\n", .{case[0]});
@@ -1716,6 +1728,8 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
     inline for (.{
         .{ "ARG TAIL=repo.git\nADD https://example.com/${TAIL} /dest", error.UnsupportedRemoteAddUrl },
         .{ "ARG PART=..\nADD https://example.com/file /safe/${PART}/escape", error.RemoteAddDestinationUnsupported },
+        .{ "ARG MODE=10000\nADD --chmod=${MODE} https://example.com/file /dest", error.UnsupportedRemoteAddMode },
+        .{ "ARG UNUSED\nADD --chmod=u=rw https://example.com/file /dest", error.UnsupportedRemoteAddMode },
         .{ "ADD https://observer.example/file /file\nCOPY definitely-missing /x", error.CopySourceNotFound },
     }) |case| {
         var parse_diagnostic: dockerfile.Diagnostic = .{};

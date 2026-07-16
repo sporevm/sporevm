@@ -1,0 +1,9 @@
+{
+  "description": "symbolic remote ADD chmod remains outside the accepted numeric slice",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: ADD --chmod must resolve to an octal value between 0 and 07777"
+  },
+  "scan_prefixes": []
+}

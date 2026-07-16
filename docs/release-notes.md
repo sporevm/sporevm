@@ -2,6 +2,16 @@
 
 ## Next
 
+`spore build` now accepts numeric `--chmod` on the public HTTPS single-file
+`ADD` form. Octal values from `0` through `07777`, including ARG-expanded and
+leading-zero spellings, apply to the downloaded regular file; the default
+remains `0600`. The resolved mode participates in ADD cache identity, while
+the existing strict COPY v4 request and confined guest copy path preserve mode,
+destination-conflict, and `Last-Modified` behavior. Empty, malformed,
+duplicate, out-of-range, and symbolic values fail closed before the ADD GET.
+Local ADD, archive extraction, COPY chmod, credentials, Git, and SSH remain
+unsupported.
+
 `spore build` now accepts `COPY --link` for immutable cross-stage and named
 build inputs. True link policy builds the destination result without reading or
 following lower destination symlinks, replaces lower file/directory conflicts,
@@ -15,8 +25,8 @@ platform, parent rootfs, executor identity, and the explicit destination policy
 are cache inputs; changed source-stage bytes miss while unchanged rebuilds hit.
 The strict guest v5 request accepts link policy only from bounded immutable
 build-input disks, and conflict removal shares COPY's 65,536-entry limit.
-Local-context `--link`, `--chmod`, `--parents`, heredocs, OCI layer rebasing,
-mounted RUN, and SSH remain unsupported.
+Local-context `--link`, COPY `--chmod`, `--parents`, heredocs, OCI layer
+rebasing, mounted RUN, and SSH remain unsupported.
 
 `spore build` now accepts one public HTTPS URL and one destination in `ADD`.
 The builder resolves both operands from the instruction-start ENV/ARG snapshot,
@@ -32,14 +42,14 @@ targets remain URL data. A build accepts at most 64 remote ADD instructions,
 or the smaller build timeout. The downloaded bytes are staged privately, synced, and
 BLAKE3-hashed before cache lookup. ADD keys bind the resolved URL and
 destination, safe response `Content-Disposition` filename or URL-path fallback,
-downloaded content digest, mode `0600`, platform,
+downloaded content digest, resolved numeric mode (default `0600`), platform,
 validated `Last-Modified` timestamp, ENV/ARG state, parent rootfs, and executor
 identity, so unchanged bytes may reuse downstream work while changed mutable
 content or metadata misses. A valid HTTP-date is applied as the destination
 mtime through the confined guest COPY path; absent or malformed dates use the
-Unix epoch, as they do in BuildKit. Remote archives remain opaque files. ADD flags, local
-sources, Git, ambient authentication, archive unpacking, and heredocs remain
-unsupported.
+Unix epoch, as they do in BuildKit. Remote archives remain opaque files. ADD
+flags other than numeric `--chmod`, symbolic modes, local sources, Git, ambient
+authentication, archive unpacking, and heredocs remain unsupported.
 
 `spore build` now resolves builder-owned variables with Docker-compatible
 instruction-start snapshots, quote and escape handling, unset-to-empty

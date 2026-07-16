@@ -1,0 +1,9 @@
+{
+  "description": "duplicate remote ADD chmod flags fail during full-file parsing",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: duplicate ADD flag: --chmod"
+  },
+  "scan_prefixes": []
+}
