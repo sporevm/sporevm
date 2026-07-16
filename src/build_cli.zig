@@ -456,6 +456,38 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.RunWorkingDirUnsupported => {
             try stderr.writeAll("spore build: WORKDIR is too long for the guest executor\n");
         },
+        error.RunCacheMountDeviceBudgetUnsupported => {
+            const instruction_line = if (diagnostic.instruction_line != 0)
+                diagnostic.instruction_line
+            else
+                diagnostic.executor.instruction_line;
+            if (instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN cache mounts cannot be combined with a context disk and two stage input disks\n", .{instruction_line});
+            } else {
+                try stderr.writeAll("spore build: RUN cache mounts exceed the frozen build device budget\n");
+            }
+        },
+        error.RunCacheMountTargetUnsupported => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN cache mount target must resolve to a non-root path within executor bounds\n", .{diagnostic.instruction_line});
+            } else {
+                try stderr.writeAll("spore build: RUN cache mount target must resolve to a non-root path within executor bounds\n");
+            }
+        },
+        error.RunCacheMountTargetConflict => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN cache mount targets overlap after resolution\n", .{diagnostic.instruction_line});
+            } else {
+                try stderr.writeAll("spore build: RUN cache mount targets overlap after resolution\n");
+            }
+        },
+        error.TooManyRunCacheMounts => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN has too many cache mounts\n", .{diagnostic.instruction_line});
+            } else {
+                try stderr.writeAll("spore build: RUN has too many cache mounts\n");
+            }
+        },
         error.UnsupportedBuildFrom => {
             try stderr.writeAll("spore build: FROM image reference is not supported\n");
         },

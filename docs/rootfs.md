@@ -61,7 +61,7 @@ one growth boot, the managed initrd validates the primary ext4 superblock
 read-only before the first writable mount, derives the visible device geometry,
 revalidates the source state before the ioctl and after the resized filesystem
 is synced, and calls `EXT4_IOC_RESIZE_FS`; capacity preparation does not invoke
-the selected image's shell and needs no e2fsprogs or `resize2fs`. Builder-v8
+the selected image's shell and needs no e2fsprogs or `resize2fs`. Builder-v9
 retains v7's typed `PREPARE` derivation for the complete grown index, keyed by the
 parent, exact target, and exact kernel/initrd growth producer. Other Dockerfiles
 and `--no-cache` builds that intentionally bypass Dockerfile instruction-cache
@@ -298,7 +298,7 @@ spore --json cache gc --rootfs
 ```
 
 Rootfs cache GC treats current `spore build` step records as roots. Valid
-complete builder-v7 and builder-v6 records cannot hit builder-v8 keys, but
+complete builder-v8, builder-v7, and builder-v6 records cannot hit builder-v9 keys, but
 remain retained roots for their child storage. Malformed or incomplete known records and
 semantically stale current records are pruneable. Unknown future step-record
 kinds or schema versions are retained and make the CAS sweep conservative.

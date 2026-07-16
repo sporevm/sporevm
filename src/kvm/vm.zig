@@ -57,6 +57,8 @@ pub const Config = struct {
     context_disk_fd: ?std.c.fd_t = null,
     /// Bounded immutable build inputs, enumerated after the context disk.
     build_input_disk_backends: []const blk.Backend = &.{},
+    /// Transient writable build cache volume. Never captured in a manifest.
+    build_cache_disk_backend: ?blk.Backend = null,
     /// Optional active disk head to seal into a portable manifest layer when
     /// a snapshot is taken.
     disk_snapshot: ?disk_layer.SnapshotState = null,
@@ -313,6 +315,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var blk_dev: blk.Blk = undefined;
     var context_blk_dev: blk.Blk = undefined;
     var build_input_blk_devs: [2]blk.Blk = undefined;
+    var build_cache_blk_dev: blk.Blk = undefined;
     var net_dev = net.Net.init(.{ .backend = config.network.backend });
     defer net_dev.shutdown();
     var rng_dev = rng.Rng{};
@@ -334,10 +337,15 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         transport_count += 1;
     }
     if (config.build_input_disk_backends.len > build_input_blk_devs.len) return error.TooManyBuildInputDisks;
-    if (transport_count + config.build_input_disk_backends.len + 3 + @intFromBool(hotplug_mapping != null) > transports_buf.len) return error.TooManyVirtioDevices;
+    if (transport_count + config.build_input_disk_backends.len + @intFromBool(config.build_cache_disk_backend != null) + 3 + @intFromBool(hotplug_mapping != null) > transports_buf.len) return error.TooManyVirtioDevices;
     for (config.build_input_disk_backends, 0..) |backend, index| {
         build_input_blk_devs[index] = blk.Blk.initImmutableSource(backend);
         transports_buf[transport_count] = mmio.Transport.init(build_input_blk_devs[index].device());
+        transport_count += 1;
+    }
+    if (config.build_cache_disk_backend) |backend| {
+        build_cache_blk_dev = blk.Blk.init(backend);
+        transports_buf[transport_count] = mmio.Transport.init(build_cache_blk_dev.device());
         transport_count += 1;
     }
     const net_transport_index = transport_count;

@@ -58,9 +58,18 @@ pub const From = struct {
     name: ?[]const u8 = null,
 };
 
-pub const Run = union(enum) {
+pub const RunCommand = union(enum) {
     shell: []const u8,
     exec: []const []const u8,
+};
+
+pub const RunCacheMount = struct {
+    target: []const u8,
+};
+
+pub const Run = struct {
+    command: RunCommand,
+    cache_mounts: []const RunCacheMount = &.{},
 };
 
 pub const Copy = struct {
@@ -106,6 +115,7 @@ const max_logical_line_bytes = 64 * 1024;
 const max_stages = 256;
 pub const max_run_exec_args = run_contract.max_exec_args;
 pub const max_run_exec_args_bytes = run_contract.max_exec_args_bytes;
+pub const max_run_cache_mounts = 8;
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !Document {
     diagnostic.* = .{};
@@ -204,12 +214,38 @@ fn parseInstruction(
     }
     if (asciiEql(op, "RUN")) {
         if (rest.len == 0) return fail(diagnostic, line, "RUN requires a shell command");
-        if (std.mem.startsWith(u8, std.mem.trimStart(u8, rest, " \t"), "--")) return fail(diagnostic, line, "unsupported RUN flag");
-        if (std.mem.startsWith(u8, std.mem.trimStart(u8, rest, " \t"), "[")) {
-            if (try parseRunExec(allocator, rest, line, diagnostic)) |argv| return .{ .run = .{ .exec = argv } };
+        var cache_mounts = std.array_list.Managed(RunCacheMount).init(allocator);
+        var command_start: usize = 0;
+        while (true) {
+            while (command_start < rest.len and (rest[command_start] == ' ' or rest[command_start] == '\t')) command_start += 1;
+            if (command_start == rest.len) return fail(diagnostic, line, "RUN requires a shell command");
+            var token_end = command_start;
+            while (token_end < rest.len and rest[token_end] != ' ' and rest[token_end] != '\t') token_end += 1;
+            const token = rest[command_start..token_end];
+            if (!std.mem.startsWith(u8, token, "--")) break;
+            if (!std.mem.startsWith(u8, token, "--mount=") or
+                std.mem.indexOfAny(u8, token, "\"'") != null or std.mem.indexOfScalar(u8, token, escape) != null)
+            {
+                return fail(diagnostic, line, "unsupported RUN flag");
+            }
+            if (cache_mounts.items.len == max_run_cache_mounts) return fail(diagnostic, line, "RUN has too many cache mounts");
+            try cache_mounts.append(try parseRunCacheMount(allocator, token["--mount=".len..], escape, line, diagnostic));
+            command_start = token_end;
         }
-        if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported RUN heredoc");
-        return .{ .run = .{ .shell = try allocator.dupe(u8, rest) } };
+        const command_raw = rest[command_start..];
+        if (std.mem.startsWith(u8, command_raw, "[")) {
+            if (try parseRunExec(allocator, command_raw, line, diagnostic)) |argv| {
+                return .{ .run = .{
+                    .command = .{ .exec = argv },
+                    .cache_mounts = try cache_mounts.toOwnedSlice(),
+                } };
+            }
+        }
+        if (std.mem.indexOf(u8, command_raw, "<<") != null) return fail(diagnostic, line, "unsupported RUN heredoc");
+        return .{ .run = .{
+            .command = .{ .shell = try allocator.dupe(u8, command_raw) },
+            .cache_mounts = try cache_mounts.toOwnedSlice(),
+        } };
     }
     if (asciiEql(op, "COPY")) {
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported COPY heredoc");
@@ -339,6 +375,41 @@ fn parseInstruction(
     const message = try std.fmt.allocPrint(allocator, "unsupported Dockerfile instruction: {s}", .{op});
     diagnostic.* = .{ .line = line, .message = message };
     return error.DockerfileParseFailed;
+}
+
+fn parseRunCacheMount(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    escape: u8,
+    line: usize,
+    diagnostic: *Diagnostic,
+) !RunCacheMount {
+    if (raw.len == 0) return fail(diagnostic, line, "RUN cache mount requires type=cache and target=<path>");
+    var mount_type: ?[]const u8 = null;
+    var target: ?[]const u8 = null;
+    var fields = std.mem.splitScalar(u8, raw, ',');
+    while (fields.next()) |field| {
+        if (field.len == 0) return fail(diagnostic, line, "RUN cache mount has an empty option");
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse
+            return fail(diagnostic, line, "RUN cache mount options must use key=value");
+        const key = field[0..equals];
+        const value = field[equals + 1 ..];
+        if (key.len == 0 or value.len == 0) return fail(diagnostic, line, "RUN cache mount options require non-empty values");
+        if (asciiEql(key, "type")) {
+            if (mount_type != null) return fail(diagnostic, line, "duplicate RUN cache mount option: type");
+            mount_type = value;
+        } else if (asciiEql(key, "target")) {
+            if (target != null) return fail(diagnostic, line, "duplicate RUN cache mount option: target");
+            target = value;
+        } else {
+            return fail(diagnostic, line, "unsupported RUN cache mount option");
+        }
+    }
+    const resolved_type = mount_type orelse return fail(diagnostic, line, "RUN cache mount requires type=cache");
+    if (!asciiEql(resolved_type, "cache")) return fail(diagnostic, line, "unsupported RUN mount type");
+    const resolved_target = target orelse return fail(diagnostic, line, "RUN cache mount requires target=<path>");
+    try validateExpansion(allocator, resolved_target, escape, line, diagnostic);
+    return .{ .target = try allocator.dupe(u8, resolved_target) };
 }
 
 fn hasParentPathSegment(path: []const u8) bool {
@@ -661,6 +732,65 @@ test "Dockerfile parser fails closed on unsupported features" {
     defer arena_state.deinit();
     var diag: Diagnostic = .{};
     try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), "RUN --mount=type=cache true\n", &diag));
+    try std.testing.expectEqualStrings("RUN cache mount requires target=<path>", diag.message);
+}
+
+test "Dockerfile parser accepts bounded default cache mounts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena_state.allocator(),
+        \\FROM scratch
+        \\RUN --mount=target=/var/cache/apt,type=cache --mount=type=cache,target=$CACHE_DIR ["true"]
+        \\
+    , &diag);
+    const run = doc.stages[0].instructions[0].value.run;
+    try std.testing.expectEqual(@as(usize, 2), run.cache_mounts.len);
+    try std.testing.expectEqualStrings("/var/cache/apt", run.cache_mounts[0].target);
+    try std.testing.expectEqualStrings("$CACHE_DIR", run.cache_mounts[1].target);
+    try std.testing.expectEqualStrings("true", run.command.exec[0]);
+
+    const invalid = [_][]const u8{
+        "FROM scratch\nRUN --mount=type=cache,target=/a,id=explicit true\n",
+        "FROM scratch\nRUN --mount=type=cache,target=/a,sharing=locked true\n",
+        "FROM scratch\nRUN --mount=type=bind,target=/a true\n",
+        "FROM scratch\nRUN --mount=type=cache,type=cache,target=/a true\n",
+        "FROM scratch\nRUN --mount=type=cache,target=/a,target=/b true\n",
+        "FROM scratch\nRUN --mount=type=cache,target=\"/a\" true\n",
+    };
+    for (invalid) |bytes| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), bytes, &diag));
+    }
+}
+
+test "Dockerfile parser leaves shell RUN quoting and comments opaque" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+    const parsed = try parse(arena_state.allocator(), "FROM scratch\nRUN --mount=type=cache,target=/cache true # \"\n", &diag);
+    const run = parsed.stages[0].instructions[0].value.run;
+    try std.testing.expectEqualStrings("true # \"", run.command.shell);
+    try std.testing.expectEqual(@as(usize, 1), run.cache_mounts.len);
+}
+
+test "Dockerfile parser scans only literal leading RUN flags" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diag: Diagnostic = .{};
+
+    const plain = try parse(arena_state.allocator(), "FROM scratch\nRUN printf '  exact  '  # tail\n", &diag);
+    try std.testing.expectEqualStrings("printf '  exact  '  # tail", plain.stages[0].instructions[0].value.run.command.shell);
+
+    const mounted = try parse(arena_state.allocator(), "FROM scratch\nRUN --mount=type=cache,target=/cache printf '  exact  '  # tail\n", &diag);
+    const run = mounted.stages[0].instructions[0].value.run;
+    try std.testing.expectEqualStrings("printf '  exact  '  # tail", run.command.shell);
+    try std.testing.expectEqual(@as(usize, 1), run.cache_mounts.len);
+
+    try std.testing.expectError(error.DockerfileParseFailed, parse(
+        arena_state.allocator(),
+        "FROM scratch\nRUN --network=none printf exact\n",
+        &diag,
+    ));
     try std.testing.expectEqualStrings("unsupported RUN flag", diag.message);
 }
 
@@ -705,13 +835,13 @@ test "Dockerfile parser removes comments inside continuations" {
         \\    && echo two
         \\
     , &diagnostic);
-    const default_shell = default_escape.stages[0].instructions[0].value.run.shell;
+    const default_shell = default_escape.stages[0].instructions[0].value.run.command.shell;
     try std.testing.expect(std.mem.indexOfScalar(u8, default_shell, '#') == null);
     try std.testing.expect(std.mem.indexOf(u8, default_shell, "&& echo two") != null);
 
     const backtick_crlf = "# escape=`\r\nFROM scratch\r\nRUN echo one `\r\n  # comment\r\n  && echo two\r\n";
     const backtick_escape = try parse(allocator, backtick_crlf, &diagnostic);
-    const backtick_shell = backtick_escape.stages[0].instructions[0].value.run.shell;
+    const backtick_shell = backtick_escape.stages[0].instructions[0].value.run.command.shell;
     try std.testing.expect(std.mem.indexOfScalar(u8, backtick_shell, '#') == null);
     try std.testing.expect(std.mem.indexOf(u8, backtick_shell, "&& echo two") != null);
 }
@@ -732,7 +862,7 @@ test "Dockerfile parser joins continued lines without inserting bytes" {
         &diagnostic,
     );
     const instructions = document.stages[0].instructions;
-    try std.testing.expectEqualStrings("echo ok", instructions[0].value.run.shell);
+    try std.testing.expectEqualStrings("echo ok", instructions[0].value.run.command.shell);
     try std.testing.expectEqual(@as(usize, 1), instructions[1].value.copy.sources.len);
     try std.testing.expectEqualStrings("filename.txt", instructions[1].value.copy.sources[0]);
     try std.testing.expectEqualStrings("longvalue", instructions[2].value.env.pairs[0].value);
@@ -764,7 +894,7 @@ test "Dockerfile parser treats invalid bracket JSON as shell form" {
         \\
     , &diagnostic);
     const instructions = document.stages[0].instructions;
-    try std.testing.expectEqualStrings("[ -f /x ] || true", instructions[0].value.run.shell);
+    try std.testing.expectEqualStrings("[ -f /x ] || true", instructions[0].value.run.command.shell);
     try std.testing.expectEqualStrings("[ -f /x ] && echo ready", instructions[1].value.cmd.shell);
     try std.testing.expectEqualStrings("[ -x /bin/sh ] && exec /bin/sh", instructions[2].value.entrypoint.shell);
 }
@@ -834,7 +964,7 @@ test "Dockerfile parser leaves RUN shell expansion untouched" {
     , &diag);
     try std.testing.expectEqualStrings(
         "echo $? $(dpkg --print-architecture) \"${VERSION_CODENAME}\" '$BUILD_ARG' $$",
-        doc.stages[0].instructions[0].value.run.shell,
+        doc.stages[0].instructions[0].value.run.command.shell,
     );
 }
 
@@ -847,7 +977,7 @@ test "Dockerfile parser preserves bounded exec-form RUN argv" {
         \\RUN ["printf","%s|%s|%s","two words","","$VALUE"]
         \\
     , &diag);
-    const argv = doc.stages[0].instructions[0].value.run.exec;
+    const argv = doc.stages[0].instructions[0].value.run.command.exec;
     try std.testing.expectEqual(@as(usize, 5), argv.len);
     try std.testing.expectEqualStrings("two words", argv[2]);
     try std.testing.expectEqualStrings("", argv[3]);

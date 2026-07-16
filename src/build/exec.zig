@@ -10,6 +10,8 @@ const run_mod = @import("../run.zig");
 const memory_config = @import("../memory.zig");
 const topology = @import("../topology.zig");
 const runtime_disk = @import("../runtime_disk.zig");
+const cache_mount = @import("cache_mount.zig");
+const board = @import("../board.zig");
 const spore = @import("../spore.zig");
 const run_contract = @import("run_contract.zig");
 const step_cache = @import("step_cache.zig");
@@ -177,6 +179,8 @@ pub const RunStep = struct {
     env_digest: []const u8,
     workdir: []const u8,
     network_mode: step_cache.NetworkMode,
+    cache_mount_digest: []const u8 = "",
+    cache_mounts: []const cache_mount.Mount = &.{},
 };
 
 pub const CopySourceKind = enum {
@@ -290,6 +294,7 @@ pub fn cacheInputForStep(
                 .vcpus = resources.vcpus,
                 .nofile_soft = resources.nofile.soft,
                 .nofile_hard = resources.nofile.hard,
+                .cache_mount_digest = run.cache_mount_digest,
             } },
         },
         .copy => |copy| .{
@@ -416,12 +421,26 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     }
     const network_mode = try networkModeForSteps(options.steps);
     const session_start_ns = try monotonicNs();
+    const cache_run = firstCacheMountRun(options.steps);
+    if (!buildDeviceEnvelopeFits(options.context_disk_path != null, options.build_input_rootfs.len, cache_run != null)) {
+        if (options.diagnostic) |diag| {
+            diag.instruction = cache_run.?.canonical_instruction;
+            diag.instruction_line = cache_run.?.line;
+        }
+        return error.RunCacheMountDeviceBudgetUnsupported;
+    }
+
+    var cache_store: ?cache_mount.Store = if (cache_run != null)
+        try cache_mount.Store.open(init.io, allocator, options.cache_root)
+    else
+        null;
+    defer if (cache_store) |*store| store.deinit();
 
     var control = try BuildControl.init(init.io, allocator, options, try p0IdleProbeMs(init.environ_map));
     defer control.deinit();
 
     const rootfs = try rootfsFromStorage(allocator, options.base_storage);
-    const monitor_options = monitorOptionsForSession(options, rootfs, network_mode);
+    const monitor_options = monitorOptionsForSession(options, rootfs, network_mode, if (cache_store) |*store| store.fd else null);
     const boot = switch (options.producer.boot_source) {
         .retained => |retained| retained,
         .managed => |managed| blk: {
@@ -442,6 +461,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         null,
         options.rootfs_cache_lock,
     );
+    if (cache_store) |*store| try store.sync();
 
     if (control.failed_exit_code) |exit_code| {
         if (options.diagnostic) |diag| {
@@ -474,7 +494,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
 }
 
-fn monitorOptionsForSession(options: Options, rootfs: spore.Rootfs, network_mode: step_cache.NetworkMode) run_mod.Options {
+fn monitorOptionsForSession(options: Options, rootfs: spore.Rootfs, network_mode: step_cache.NetworkMode, cache_disk_fd: ?std.c.fd_t) run_mod.Options {
     return .{
         .kernel_path = "",
         .initrd_path = null,
@@ -482,6 +502,7 @@ fn monitorOptionsForSession(options: Options, rootfs: spore.Rootfs, network_mode
         .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
         .context_disk_path = options.context_disk_path,
         .build_input_rootfs = options.build_input_rootfs,
+        .build_cache_disk_fd = cache_disk_fd,
         .build_mode = true,
         .disk_snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
         .command = &.{},
@@ -491,6 +512,25 @@ fn monitorOptionsForSession(options: Options, rootfs: spore.Rootfs, network_mode
         .timeout_ms = options.timeout_ms,
         .spore_executable = options.spore_executable,
     };
+}
+
+fn firstCacheMountRun(steps: []const Step) ?RunStep {
+    for (steps) |step| switch (step) {
+        .run => |run| if (run.cache_mounts.len != 0) return run,
+        .copy, .workdir => {},
+    };
+    return null;
+}
+
+pub fn buildDeviceEnvelopeFits(has_context: bool, build_input_count: usize, has_cache: bool) bool {
+    const fixed_devices: usize = 5; // console, rootfs, net, vsock, rng
+    return fixed_devices + @intFromBool(has_context) + build_input_count + @intFromBool(has_cache) <= board.max_virtio_devices;
+}
+
+test "cache mounts preserve the frozen build device envelope" {
+    try std.testing.expect(buildDeviceEnvelopeFits(true, 1, true));
+    try std.testing.expect(buildDeviceEnvelopeFits(false, 2, true));
+    try std.testing.expect(!buildDeviceEnvelopeFits(true, 2, true));
 }
 
 fn networkModeForSteps(steps: []const Step) !step_cache.NetworkMode {
@@ -681,7 +721,7 @@ const BuildControl = struct {
         const session_id = try std.fmt.allocPrint(self.allocator, "spore-build-{d}", .{self.step_index + 1});
         switch (step) {
             .run => |run| {
-                const request = try runRequest(self.allocator, session_id, run.command, run.env, run.workdir, self.resources.nofile, self.io);
+                const request = try runRequestWithMounts(self.allocator, session_id, run.command, run.env, run.workdir, self.resources.nofile, run.cache_mounts, self.io);
                 const stdin_payload = switch (run.command) {
                     .shell => |shell| shell,
                     .exec => "",
@@ -1062,8 +1102,21 @@ fn runRequest(
     nofile: NofileLimit,
     io: Io,
 ) ![]const u8 {
+    return runRequestWithMounts(allocator, session_id, command, env, workdir, nofile, &.{}, io);
+}
+
+fn runRequestWithMounts(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    command: RunCommand,
+    env: []const []const u8,
+    workdir: []const u8,
+    nofile: NofileLimit,
+    cache_mounts: []const cache_mount.Mount,
+    io: Io,
+) ![]const u8 {
     const now: u64 = @intCast(Io.Clock.real.now(io).nanoseconds);
-    const json = try runRequestJson(allocator, session_id, command, env, workdir, nofile, now);
+    const json = try runRequestJson(allocator, session_id, command, env, workdir, nofile, cache_mounts, now);
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
@@ -1076,8 +1129,19 @@ pub fn validateRunRequest(
     workdir: []const u8,
     nofile: NofileLimit,
 ) !void {
+    return validateRunRequestWithMounts(allocator, command, env, workdir, nofile, &.{});
+}
+
+pub fn validateRunRequestWithMounts(
+    allocator: std.mem.Allocator,
+    command: RunCommand,
+    env: []const []const u8,
+    workdir: []const u8,
+    nofile: NofileLimit,
+    cache_mounts: []const cache_mount.Mount,
+) !void {
     const max_session_id = "x" ** 63;
-    const json = try runRequestJson(allocator, max_session_id, command, env, workdir, nofile, std.math.maxInt(u64));
+    const json = try runRequestJson(allocator, max_session_id, command, env, workdir, nofile, cache_mounts, std.math.maxInt(u64));
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
 }
@@ -1089,12 +1153,65 @@ fn runRequestJson(
     env: []const []const u8,
     workdir: []const u8,
     nofile: NofileLimit,
+    cache_mounts: []const cache_mount.Mount,
     now: u64,
 ) ![]const u8 {
     try nofile.validate();
     if (workdir.len == 0 or workdir.len > max_guest_working_dir_len) return error.RunWorkingDirUnsupported;
     if (env.len > max_guest_envc) return error.RunEnvCountUnsupported;
     for (env) |entry| if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
+    if (cache_mounts.len > cache_mount.max_mounts_per_run) return error.TooManyRunCacheMounts;
+    if (cache_mounts.len != 0) {
+        const shell = switch (command) {
+            .shell => |value| value,
+            .exec => "",
+        };
+        const argv = switch (command) {
+            .shell => &.{},
+            .exec => |value| value,
+        };
+        if (shell.len > max_run_command_len) return error.RunCommandTooLong;
+        if (argv.len != 0) {
+            if (run_contract.execArgvViolation(argv)) |violation| switch (violation) {
+                .empty, .too_many_args => return error.RunArgCountUnsupported,
+                .empty_executable, .nul => return error.RunArgUnsupported,
+                .decoded_too_large => return error.RunRequestTooLarge,
+            };
+        }
+        const PayloadMount = struct { target: []const u8, key: []const u8 };
+        const payload_mounts = try allocator.alloc(PayloadMount, cache_mounts.len);
+        defer allocator.free(payload_mounts);
+        for (cache_mounts, 0..) |mount, index| payload_mounts[index] = .{ .target = mount.target, .key = mount.key };
+        const payload = struct {
+            type: []const u8 = "spore-build-run-v3",
+            session_id: []const u8,
+            resume_time_unix_ns: u64,
+            command_len: usize,
+            argv: []const []const u8,
+            env: []const []const u8,
+            working_dir: []const u8,
+            cache_mounts: []const PayloadMount,
+            stdio: []const u8 = "pipe",
+            term: []const u8 = "xterm",
+            terminal_rows: u16 = 24,
+            terminal_cols: u16 = 80,
+            memory_pressure: bool = false,
+            nofile_soft: u64,
+            nofile_hard: u64,
+            closed_env: bool = true,
+        }{
+            .session_id = session_id,
+            .resume_time_unix_ns = now,
+            .command_len = shell.len,
+            .argv = argv,
+            .env = env,
+            .working_dir = workdir,
+            .cache_mounts = payload_mounts,
+            .nofile_soft = nofile.soft,
+            .nofile_hard = nofile.hard,
+        };
+        return std.json.Stringify.valueAlloc(allocator, payload, .{});
+    }
     return switch (command) {
         .shell => |shell| blk: {
             if (shell.len > max_run_command_len) return error.RunCommandTooLong;
@@ -1875,7 +1992,7 @@ test "build session forwards the selected spore executable to the monitor" {
         .device = .{ .mmio_slot = 1 },
         .artifact = .{ .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .size = 4096 },
     };
-    const monitor_options = monitorOptionsForSession(options, rootfs, .spore);
+    const monitor_options = monitorOptionsForSession(options, rootfs, .spore, null);
     try std.testing.expectEqualStrings(executable, monitor_options.spore_executable);
     try std.testing.expectEqual(run_mod.NetworkMode.spore, monitor_options.network);
 }
@@ -2149,6 +2266,42 @@ test "build exec-form RUN request carries exact bounded argv" {
 
     const escaped_controls = "\x01" ** 1366;
     try std.testing.expectError(error.RunRequestTooLarge, validateRunRequest(std.testing.allocator, .{ .exec = &.{ "printf", escaped_controls } }, &.{"PATH=/usr/bin"}, "/", default_build_nofile));
+}
+
+test "cache-mounted RUN uses strict v3 request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const mounts = try cache_mount.resolve(arena, "/work", &.{ "/var/cache/apt", "relative" });
+    const request = try runRequestWithMounts(
+        std.testing.allocator,
+        "spore-build-1",
+        .{ .exec = &.{ "printf", "ok" } },
+        &.{"PATH=/usr/bin"},
+        "/work",
+        default_build_nofile,
+        mounts,
+        std.testing.io,
+    );
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"target\":\"/var/cache/apt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"target\":\"/work/relative\"") != null);
+    if (comptime guest_agent_fuzz_supported) {
+        try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+        const malformed = [_][]const u8{
+            request[0 .. request.len - 1],
+            "{\"type\":\"spore-build-run-v3\"}\n",
+            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache/../escape\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache\",\"key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"target\":\"/cache/nested\",\"key\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        };
+        for (malformed) |raw| {
+            try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(raw.ptr, raw.len, raw[0..0].ptr, 0));
+        }
+    }
 }
 
 test "guest exec request parser preserves Unicode and rejects invalid scalar encodings" {

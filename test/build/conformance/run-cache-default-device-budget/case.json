@@ -1,0 +1,9 @@
+{
+  "description": "cache-mounted RUN fails before execution when context plus two stage inputs exceed the frozen virtio envelope",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 9: RUN cache mounts cannot be combined with a context disk and two stage input disks"
+  },
+  "scan_prefixes": []
+}

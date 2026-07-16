@@ -30,6 +30,7 @@ from spore_build_conformance_contract import (
     CommandResult,
     HarnessError,
     IndexExpectation,
+    Outcome,
     SporeBuildResult,
     Transition,
     assert_cache_status,
@@ -37,6 +38,7 @@ from spore_build_conformance_contract import (
     assert_expected_builds,
     command_failure,
     diff_json,
+    exact_spore_diagnostic,
     load_cases,
     normalize_filesystem_records,
     normalized_config,
@@ -354,6 +356,16 @@ def apply_transition(context: pathlib.Path, transition: Transition) -> None:
             os.utime(path, ns=(prior.st_atime_ns, prior.st_mtime_ns))
 
 
+def build_publication_snapshot(spore_env: dict[str, str]) -> dict[str, str]:
+    root = pathlib.Path(spore_env["SPOREVM_ROOTFS_CACHE_DIR"])
+    paths = list((root / "build" / "steps").glob("*.json"))
+    paths.extend((root / "refs").rglob("*.json"))
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(paths)
+    }
+
+
 def build_args(spec: CaseSpec) -> list[str]:
     args: list[str] = []
     for key, value in sorted(spec.build_args.items()):
@@ -588,6 +600,7 @@ def run_case(
         name = transition.name
         transition_dir = case_dir / name
         apply_transition(context, transition)
+        publication_before = build_publication_snapshot(spore_env)
         transitioned = spore_build(
             spore_bin,
             spore_env,
@@ -598,8 +611,29 @@ def run_case(
             transition_dir / "spore-build",
             no_cache=transition.no_cache,
         )
-        if transitioned.command.returncode != 0:
-            raise CaseError(f"transition {name}: {command_failure(transitioned.command)}")
+        succeeded = transitioned.command.returncode == 0
+        if succeeded != (transition.outcome is Outcome.SUCCESS):
+            raise CaseError(
+                f"transition {name}: expected {transition.outcome.value}, got exit "
+                f"{transitioned.command.returncode}\n{command_failure(transitioned.command)}"
+            )
+        if transition.outcome is Outcome.FAILURE:
+            actual_diagnostic = exact_spore_diagnostic(transitioned.command.stderr)
+            if actual_diagnostic != transition.spore_diagnostic:
+                raise CaseError(
+                    f"transition {name}: Spore diagnostic mismatch:\n"
+                    + diff_json(
+                        transition.spore_diagnostic,
+                        actual_diagnostic,
+                        "expected",
+                        "actual",
+                    )
+                )
+            publication_after = build_publication_snapshot(spore_env)
+            if publication_after != publication_before:
+                raise CaseError(f"transition {name}: failed build changed step records or refs")
+            continue
+        assert transition.expect_cache is not None
         assert_cache_status(transitioned.cache_status, transition.expect_cache, name)
         assert_execution_diagnostics(transitioned, transition, name)
         if transitioned.index_digest is None or transitioned.metadata_path is None:

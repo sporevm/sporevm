@@ -92,6 +92,9 @@
 #define BUILD_CONTEXT_ROOT "/mnt/build-context"
 #define BUILD_INPUT_ROOT "/mnt/build-inputs"
 #define MAX_BUILD_INPUT_DISKS 2
+#define MAX_BUILD_CACHE_MOUNTS 8
+#define MAX_BUILD_CACHE_KEY_LEN 64
+#define BUILD_CACHE_ROOT "/run/sporevm/build-cache"
 #define SPORE_PF_KTHREAD 0x00200000UL
 #ifndef FIFREEZE
 #define FIFREEZE _IOWR('X', 119, int)
@@ -2119,6 +2122,11 @@ struct run_request {
   char env_storage[MAX_ENVC][MAX_ENV_LEN];
   char *envp[MAX_ENVC + 1];
   char working_dir[MAX_WORKDIR_LEN];
+  size_t build_cache_mount_count;
+  struct {
+    char target[MAX_COPY_PATH_LEN + 1];
+    char key[MAX_BUILD_CACHE_KEY_LEN + 1];
+  } build_cache_mounts[MAX_BUILD_CACHE_MOUNTS];
 };
 
 static int json_token_finished(char c);
@@ -2177,7 +2185,7 @@ static int parse_json_optional_i64(const char **cursor, int *present, int64_t *o
   return 0;
 }
 
-static int parse_exec_argv_value(const char **cursor, struct run_request *out) {
+static int parse_exec_argv_value_mode(const char **cursor, struct run_request *out, int allow_empty) {
   const char *p = *cursor;
   if (*p != '[') return -1;
   p++;
@@ -2186,7 +2194,12 @@ static int parse_exec_argv_value(const char **cursor, struct run_request *out) {
   size_t storage_len = 0;
   size_t decoded_len = 0;
   p = skip_ws(p);
-  if (*p == ']') return -1;
+  if (*p == ']') {
+    if (!allow_empty) return -1;
+    out->argv[0] = NULL;
+    *cursor = p + 1;
+    return 0;
+  }
   for (;;) {
     if (argc >= MAX_ARGC || storage_len >= sizeof(out->arg_storage)) return -1;
     out->argv[argc] = out->arg_storage + storage_len;
@@ -2244,7 +2257,108 @@ static int parse_exec_env_value(const char **cursor, struct run_request *out) {
   return 0;
 }
 
-static int parse_build_run_v2_request(const char *req, size_t req_len, struct run_request *out) {
+static int valid_build_cache_key(const char *key) {
+  if (strlen(key) != MAX_BUILD_CACHE_KEY_LEN) return 0;
+  for (size_t i = 0; i < MAX_BUILD_CACHE_KEY_LEN; i++) {
+    if (!((key[i] >= '0' && key[i] <= '9') || (key[i] >= 'a' && key[i] <= 'f'))) return 0;
+  }
+  return 1;
+}
+
+static int valid_build_cache_target(const char *target) {
+  size_t len = strlen(target);
+  if (len < 2 || len > MAX_COPY_PATH_LEN || target[0] != '/' || target[len - 1] == '/') return 0;
+  const char *p = target + 1;
+  while (*p != '\0') {
+    const char *slash = strchr(p, '/');
+    size_t part_len = slash ? (size_t)(slash - p) : strlen(p);
+    if (part_len == 0 || (part_len == 1 && p[0] == '.') ||
+        (part_len == 2 && p[0] == '.' && p[1] == '.')) return 0;
+    p += part_len;
+    if (*p == '/') p++;
+  }
+  return 1;
+}
+
+static int build_cache_targets_overlap(const char *a, const char *b) {
+  size_t a_len = strlen(a);
+  size_t b_len = strlen(b);
+  if (strcmp(a, b) == 0) return 1;
+  if (a_len < b_len && strncmp(a, b, a_len) == 0 && b[a_len] == '/') return 1;
+  if (b_len < a_len && strncmp(a, b, b_len) == 0 && a[b_len] == '/') return 1;
+  return 0;
+}
+
+static int parse_build_cache_mounts_value(const char **cursor, struct run_request *out) {
+  const char *p = *cursor;
+  if (*p != '[') return -1;
+  p = skip_ws(p + 1);
+  if (*p == ']') return -1;
+  size_t count = 0;
+  for (;;) {
+    if (count >= MAX_BUILD_CACHE_MOUNTS || *p != '{') return -1;
+    p++;
+    unsigned int seen = 0;
+    for (;;) {
+      p = skip_ws(p);
+      if (*p == '}') {
+        p++;
+        break;
+      }
+      char field[16];
+      if (parse_json_string(&p, field, sizeof(field)) != 0) return -1;
+      p = skip_ws(p);
+      if (*p != ':') return -1;
+      p = skip_ws(p + 1);
+      unsigned int bit = 0;
+      if (strcmp(field, "target") == 0) {
+        bit = 1u;
+        if (parse_json_string(&p, out->build_cache_mounts[count].target,
+                              sizeof(out->build_cache_mounts[count].target)) != 0 ||
+            !valid_build_cache_target(out->build_cache_mounts[count].target)) return -1;
+      } else if (strcmp(field, "key") == 0) {
+        bit = 2u;
+        if (parse_json_string(&p, out->build_cache_mounts[count].key,
+                              sizeof(out->build_cache_mounts[count].key)) != 0 ||
+            !valid_build_cache_key(out->build_cache_mounts[count].key)) return -1;
+      } else {
+        return -1;
+      }
+      if ((seen & bit) != 0) return -1;
+      seen |= bit;
+      p = skip_ws(p);
+      if (*p == '}') {
+        p++;
+        break;
+      }
+      if (*p != ',') return -1;
+      p = skip_ws(p + 1);
+      if (*p == '}') return -1;
+    }
+    if (seen != 3u) return -1;
+    for (size_t prior = 0; prior < count; prior++) {
+      if (build_cache_targets_overlap(out->build_cache_mounts[prior].target,
+                                      out->build_cache_mounts[count].target) ||
+          strcmp(out->build_cache_mounts[prior].key,
+                 out->build_cache_mounts[count].key) == 0) return -1;
+    }
+    count++;
+    p = skip_ws(p);
+    if (*p == ']') {
+      p++;
+      break;
+    }
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
+    if (*p == ']') return -1;
+  }
+  out->build_cache_mount_count = count;
+  *cursor = p;
+  return 0;
+}
+
+static int parse_build_run_request(const char *req, size_t req_len, struct run_request *out,
+                                   const char *expected_type, int version) {
   if (req_len == 0 || req[req_len - 1] != '\n') return -1;
   enum {
     SEEN_TYPE = 1u << 0,
@@ -2261,8 +2375,11 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
     SEEN_NOFILE_SOFT = 1u << 11,
     SEEN_NOFILE_HARD = 1u << 12,
     SEEN_CLOSED_ENV = 1u << 13,
-    SEEN_ALL = (1u << 14) - 1,
+    SEEN_COMMAND_LEN = 1u << 14,
+    SEEN_CACHE_MOUNTS = 1u << 15,
+    SEEN_COMMON = (1u << 14) - 1,
   };
+  if (version != 2 && version != 3) return -1;
 
   const char *p = skip_ws(req);
   if (*p != '{') return -1;
@@ -2274,7 +2391,6 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
       p++;
       break;
     }
-
     char key[32];
     if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
     p = skip_ws(p);
@@ -2285,22 +2401,29 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
     if (strcmp(key, "type") == 0) {
       bit = SEEN_TYPE;
       char type[32];
-      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-run-v2") != 0) return -1;
+      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, expected_type) != 0) return -1;
     } else if (strcmp(key, "session_id") == 0) {
       bit = SEEN_SESSION_ID;
       if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
     } else if (strcmp(key, "resume_time_unix_ns") == 0) {
       bit = SEEN_RESUME_TIME;
       if (parse_json_u64(&p, &out->resume_time_unix_ns) != 0) return -1;
+    } else if (strcmp(key, "command_len") == 0) {
+      bit = SEEN_COMMAND_LEN;
+      if (version != 3 || parse_json_u64(&p, &out->build_command_len) != 0 ||
+          out->build_command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
     } else if (strcmp(key, "argv") == 0) {
       bit = SEEN_ARGV;
-      if (parse_exec_argv_value(&p, out) != 0) return -1;
+      if (parse_exec_argv_value_mode(&p, out, version == 3) != 0) return -1;
     } else if (strcmp(key, "env") == 0) {
       bit = SEEN_ENV;
       if (parse_exec_env_value(&p, out) != 0) return -1;
     } else if (strcmp(key, "working_dir") == 0) {
       bit = SEEN_WORKDIR;
       if (parse_json_string(&p, out->working_dir, sizeof(out->working_dir)) != 0 || out->working_dir[0] != '/') return -1;
+    } else if (strcmp(key, "cache_mounts") == 0) {
+      bit = SEEN_CACHE_MOUNTS;
+      if (version != 3 || parse_build_cache_mounts_value(&p, out) != 0) return -1;
     } else if (strcmp(key, "stdio") == 0) {
       bit = SEEN_STDIO;
       char stdio[8];
@@ -2321,8 +2444,8 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
       out->terminal_cols = (uint16_t)cols;
     } else if (strcmp(key, "memory_pressure") == 0) {
       bit = SEEN_MEMORY_PRESSURE;
-      int memory_pressure = 0;
-      if (parse_json_bool(&p, &memory_pressure) != 0 || memory_pressure) return -1;
+      int value = 0;
+      if (parse_json_bool(&p, &value) != 0 || value) return -1;
     } else if (strcmp(key, "nofile_soft") == 0) {
       bit = SEEN_NOFILE_SOFT;
       if (parse_json_u64(&p, &out->nofile_soft) != 0) return -1;
@@ -2331,14 +2454,13 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
       if (parse_json_u64(&p, &out->nofile_hard) != 0) return -1;
     } else if (strcmp(key, "closed_env") == 0) {
       bit = SEEN_CLOSED_ENV;
-      int closed_env = 0;
-      if (parse_json_bool(&p, &closed_env) != 0 || !closed_env) return -1;
+      int value = 0;
+      if (parse_json_bool(&p, &value) != 0 || !value) return -1;
     } else {
       return -1;
     }
     if ((seen & bit) != 0) return -1;
     seen |= bit;
-
     p = skip_ws(p);
     if (*p == '}') {
       p++;
@@ -2348,13 +2470,24 @@ static int parse_build_run_v2_request(const char *req, size_t req_len, struct ru
     p = skip_ws(p + 1);
     if (*p == '}') return -1;
   }
-  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
+  unsigned int required = SEEN_COMMON;
+  if (version == 3) required |= SEEN_COMMAND_LEN | SEEN_CACHE_MOUNTS;
+  if (seen != required || *skip_ws(p) != '\0') return -1;
   if (out->nofile_soft == 0 || out->nofile_soft > out->nofile_hard || out->nofile_hard > MAX_BUILD_NOFILE) return -1;
-
+  if (version == 3 && !((out->build_command_len > 0 && out->argv[0] == NULL) ||
+                        (out->build_command_len == 0 && out->argv[0] != NULL))) return -1;
   out->kind = REQUEST_BUILD_RUN;
   out->protocol_v1 = 1;
-  out->build_exec_form = 1;
+  out->build_exec_form = version == 2 || out->argv[0] != NULL;
   return 0;
+}
+
+static int parse_build_run_v2_request(const char *req, size_t req_len, struct run_request *out) {
+  return parse_build_run_request(req, req_len, out, "spore-build-run-v2", 2);
+}
+
+static int parse_build_run_v3_request(const char *req, size_t req_len, struct run_request *out) {
+  return parse_build_run_request(req, req_len, out, "spore-build-run-v3", 3);
 }
 
 static int parse_build_copy_request(const char *req, size_t req_len, struct run_request *out, const char *expected_type, int require_destination_policy) {
@@ -2549,6 +2682,9 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
   if (type_rc < 0) return -1;
   if (type_rc > 0 && strcmp(type, "spore-build-run-v2") == 0) {
     return parse_build_run_v2_request(req, req_len, out);
+  }
+  if (type_rc > 0 && strcmp(type, "spore-build-run-v3") == 0) {
+    return parse_build_run_v3_request(req, req_len, out);
   }
   if (type_rc > 0 && strcmp(type, "spore-build-copy-v4") == 0) {
     return parse_build_copy_request(req, req_len, out, "spore-build-copy-v4", 0);
@@ -4614,7 +4750,136 @@ static void run_transient_exec(struct client *client, const struct run_request *
   reset_session(&transient);
 }
 
-static void run_build_exec(struct client *client, const struct run_request *request, char *command, int use_rootfs) {
+struct build_cache_mount_state {
+  int cache_mounted;
+  int cache_root_fd;
+  size_t count;
+  struct {
+    int source_fd;
+    int target_fd;
+    int bound;
+    int target_cleanup_required;
+    size_t created_components;
+    struct spore_build_cache_created_component target_identity;
+    struct spore_build_cache_created_component created_component_ids[SPORE_BUILD_CACHE_MAX_CREATED_COMPONENTS];
+    char target[MAX_COPY_PATH_LEN + 1];
+  } mounts[MAX_BUILD_CACHE_MOUNTS];
+};
+
+static int build_run_cache_cleanup_poisoned = 0;
+
+static void poison_build_run_cache_cleanup(const char *phase) {
+  dprintf(2, "build RUN cache cleanup could not be verified: %s\n", phase);
+  build_run_cache_cleanup_poisoned = 1;
+}
+
+static int build_cache_fd_path(char *out, size_t cap, int fd) {
+  int n = snprintf(out, cap, "/proc/self/fd/%d", fd);
+  return n > 0 && (size_t)n < cap ? 0 : -1;
+}
+
+static int cleanup_build_cache_mounts(struct build_cache_mount_state *state, const char *root) {
+  int failed = 0;
+  for (size_t i = state->count; i > 0; i--) {
+    size_t index = i - 1;
+    if (state->mounts[index].bound) {
+      char target_fd_path[64];
+      if (build_cache_fd_path(target_fd_path, sizeof(target_fd_path), state->mounts[index].target_fd) != 0 ||
+          umount2(target_fd_path, 0) != 0) failed = 1;
+      state->mounts[index].bound = 0;
+    }
+  }
+  if (state->cache_root_fd >= 0 && syncfs(state->cache_root_fd) != 0) failed = 1;
+  for (size_t i = 0; i < state->count; i++) {
+    if (state->mounts[i].source_fd >= 0 && close(state->mounts[i].source_fd) != 0) failed = 1;
+    if (state->mounts[i].target_fd >= 0 && close(state->mounts[i].target_fd) != 0) failed = 1;
+    state->mounts[i].source_fd = -1;
+    state->mounts[i].target_fd = -1;
+  }
+  if (state->cache_root_fd >= 0 && close(state->cache_root_fd) != 0) failed = 1;
+  state->cache_root_fd = -1;
+  if (state->cache_mounted && umount2(BUILD_CACHE_ROOT, 0) != 0) failed = 1;
+  state->cache_mounted = 0;
+  for (size_t i = state->count; i > 0; i--) {
+    size_t index = i - 1;
+    if (state->mounts[index].target_cleanup_required &&
+        spore_build_cache_target_cleanup(root, state->mounts[index].target,
+                                         &state->mounts[index].target_identity,
+                                         state->mounts[index].created_component_ids,
+                                         state->mounts[index].created_components) != 0) failed = 1;
+    state->mounts[index].target_cleanup_required = 0;
+    state->mounts[index].created_components = 0;
+  }
+  state->count = 0;
+  return failed ? -1 : 0;
+}
+
+static int setup_build_cache_mounts(const struct run_request *request, const char *root,
+                                    int has_context, int build_input_count,
+                                    struct build_cache_mount_state *state,
+                                    char *error, size_t error_cap) {
+  memset(state, 0, sizeof(*state));
+  state->cache_root_fd = -1;
+  for (size_t i = 0; i < MAX_BUILD_CACHE_MOUNTS; i++) {
+    state->mounts[i].source_fd = -1;
+    state->mounts[i].target_fd = -1;
+  }
+  if (request->build_cache_mount_count == 0) return 0;
+  mkdir("/run/sporevm", 0755);
+  mkdir(BUILD_CACHE_ROOT, 0755);
+  char device[32];
+  int letter = 'b' + has_context + build_input_count;
+  int dn = snprintf(device, sizeof(device), "/dev/vd%c", letter);
+  if (dn <= 0 || (size_t)dn >= sizeof(device) || wait_for_path(device, 100, 50000) != 0) {
+    snprintf(error, error_cap, "spore build: cache mount block device unavailable\n");
+    return -1;
+  }
+  if (mount(device, BUILD_CACHE_ROOT, "ext4", 0, "") != 0) {
+    snprintf(error, error_cap, "spore build: cache mount filesystem unavailable\n");
+    return -1;
+  }
+  state->cache_mounted = 1;
+  state->cache_root_fd = open(BUILD_CACHE_ROOT, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (state->cache_root_fd < 0) goto fail;
+
+  for (size_t i = 0; i < request->build_cache_mount_count; i++) {
+    state->count = i + 1;
+    snprintf(state->mounts[i].target, sizeof(state->mounts[i].target), "%s",
+             request->build_cache_mounts[i].target);
+    if (mkdirat(state->cache_root_fd, request->build_cache_mounts[i].key, 0755) != 0 && errno != EEXIST) goto fail;
+    state->mounts[i].source_fd = openat(state->cache_root_fd, request->build_cache_mounts[i].key,
+                                       O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (state->mounts[i].source_fd < 0) goto fail;
+    if (spore_build_cache_target_prepare(root, state->mounts[i].target,
+                                         &state->mounts[i].target_fd,
+                                         &state->mounts[i].target_identity,
+                                         state->mounts[i].created_component_ids,
+                                         &state->mounts[i].created_components) != 0) {
+      state->mounts[i].target_cleanup_required = state->mounts[i].created_components != 0;
+      goto fail;
+    }
+    state->mounts[i].target_cleanup_required = 1;
+    char source_fd_path[64];
+    char target_fd_path[64];
+    if (build_cache_fd_path(source_fd_path, sizeof(source_fd_path), state->mounts[i].source_fd) != 0 ||
+        build_cache_fd_path(target_fd_path, sizeof(target_fd_path), state->mounts[i].target_fd) != 0 ||
+        mount(source_fd_path, target_fd_path, NULL, MS_BIND, NULL) != 0) goto fail;
+    state->mounts[i].bound = 1;
+  }
+  return 0;
+
+fail:
+  snprintf(error, error_cap, "spore build: cache mount setup failed\n");
+  if (cleanup_build_cache_mounts(state, root) != 0) {
+    poison_build_run_cache_cleanup("setup");
+    snprintf(error, error_cap, "spore build: RUN cache mount cleanup failed\n");
+    return -2;
+  }
+  return -1;
+}
+
+static void run_build_exec(struct client *client, const struct run_request *request, char *command, int use_rootfs,
+                           struct build_cache_mount_state *cache_state, const char *root) {
   char *argv[4];
   char *const *effective_argv = request->argv;
   if (!request->build_exec_form) {
@@ -4637,9 +4902,15 @@ static void run_build_exec(struct client *client, const struct run_request *requ
   };
   int rc = start_session(&transient, request->session_id, effective_argv, request->envp, request->working_dir, &options);
   if (rc != 0) {
-    (void)send_client_error_exit(
-        client, rc, transient.setup_error[0] != '\0' ? transient.setup_error :
-        "spore build: RUN exec setup failed\n");
+    int cache_cleanup_rc = cleanup_build_cache_mounts(cache_state, root);
+    if (cache_cleanup_rc != 0) {
+      poison_build_run_cache_cleanup("RUN setup");
+      (void)send_client_error_exit(client, 125, "spore build: RUN cache mount cleanup failed\n");
+    } else {
+      (void)send_client_error_exit(
+          client, rc, transient.setup_error[0] != '\0' ? transient.setup_error :
+          "spore build: RUN exec setup failed\n");
+    }
     close_client(client);
     return;
   }
@@ -4695,6 +4966,12 @@ static void run_build_exec(struct client *client, const struct run_request *requ
         fail_closed_build_run_cleanup("command exit");
       }
       descendants_cleaned = 1;
+      if (cleanup_build_cache_mounts(cache_state, root) != 0) {
+        poison_build_run_cache_cleanup("command exit");
+        (void)send_client_error_exit(client, 125, "spore build: RUN cache mount cleanup failed\n");
+        close_client(client);
+        break;
+      }
     }
     if (descendants_cleaned) maybe_send_session_exit(&transient, client);
   }
@@ -4702,6 +4979,11 @@ static void run_build_exec(struct client *client, const struct run_request *requ
   if (client->fd < 0 && transient.started && !descendants_cleaned) {
     if (clean_build_run_processes(&transient) != 0) {
       fail_closed_build_run_cleanup("control loss");
+    }
+  }
+  if (cache_state->count != 0 || cache_state->cache_mounted) {
+    if (cleanup_build_cache_mounts(cache_state, root) != 0) {
+      poison_build_run_cache_cleanup("control loss");
     }
   }
   reset_session(&transient);
@@ -4747,6 +5029,12 @@ static void accept_request(int listener, struct session *session, struct client 
   client->stdin_offset = 0;
   client->stdin_input_owner = request.protocol_v1 && request.stdin_enabled;
   client->terminal_input_owner = request.protocol_v1 && request.tty && (request.kind == REQUEST_START || request.interactive);
+
+  if (build_run_cache_cleanup_poisoned) {
+    (void)send_client_error_exit(client, 125, "spore build: prior RUN cache mount cleanup failed\n");
+    close_client(client);
+    return;
+  }
 
   if (request.kind == REQUEST_READY) {
     if (use_rootfs && !rootfs_ready) {
@@ -4812,8 +5100,18 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
+    struct build_cache_mount_state cache_state;
+    const char *root = "/mnt/rootfs";
+    int cache_setup_rc = setup_build_cache_mounts(&request, root, build_context_requested, build_input_count,
+                                                  &cache_state, error, sizeof(error));
+    if (cache_setup_rc != 0) {
+      (void)send_client_error_exit(client, cache_setup_rc == -2 ? 125 : 126,
+                                   error[0] != '\0' ? error : "spore build: cache mount setup failed\n");
+      close_client(client);
+      return;
+    }
     apply_resume_clock(request.resume_time_unix_ns);
-    run_build_exec(client, &request, command, use_rootfs);
+    run_build_exec(client, &request, command, use_rootfs, &cache_state, root);
     close_client(client);
     return;
   }

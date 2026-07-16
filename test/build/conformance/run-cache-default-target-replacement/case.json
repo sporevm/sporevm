@@ -1,0 +1,10 @@
+{
+  "description": "cache target replacement poisons the build without publishing the RUN result",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 3: instruction failed: RUN --mount=type=cache,target=/owned/cache sh -euxc 'printf cache >/owned/cache/value; mv /owned /moved; ln -s /moved /owned'",
+    "spore_exit_code": 125
+  },
+  "scan_prefixes": []
+}

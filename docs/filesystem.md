@@ -30,7 +30,7 @@ rootfs cas-preload --attach-spore` remains a repair/debug path for existing
 exact-rootfs spores; it is not the normal producer path.
 
 `spore build` uses the same descriptor-bound indexes and writable head. Before
-the first executor-backed instruction, the current builder v8 retains the v7
+the first executor-backed instruction, the current builder v9 retains the v8
 capacity contract and computes
 `max(parent_logical_size, 16 GiB)`. A smaller supported journal-less parent is
 extended once with authoritative clean-zero chunks; a parent already at or
@@ -41,7 +41,7 @@ visible device size, so the zero range remains sparse and the growth path
 invokes neither the image's shell nor `resize2fs`.
 
 The grown canonical index is published as a complete rootfs before a typed
-builder-v8 `PREPARE` record makes it reusable. Its key binds the immutable
+builder-v9 `PREPARE` record makes it reusable. Its key binds the immutable
 parent index, exact target, platform, and exact kernel/initrd plus growth
 protocol identity. `--no-cache` bypasses Dockerfile step-record reads but still
 reuses PREPARE because capacity normalization is infrastructure, not a
@@ -50,10 +50,26 @@ executor identity. The managed default derives that identity from canonical
 kernel and embedded-initrd digests without reading the artifact bodies on a
 fully cached build; a later miss verifies the once-opened kernel bytes and
 boots that same allocation. Explicit overrides are eagerly retained. Old
-builder-v7 and builder-v6 records remain conservative GC roots but miss under
-v8; existing rootfs indexes and local images remain readable. Failed
+builder-v8, builder-v7, and builder-v6 records remain conservative GC roots but
+miss under v9; existing rootfs indexes and local images remain readable. Failed
 growth, quiescence, completeness, PREPARE, step, or ref publication never
 rewrites the parent or makes incomplete storage reachable.
+
+Default `RUN --mount=type=cache,target=...` state lives in one host-local,
+4 GiB sparse aggregate ext4 disk under the rootfs cache, protected by its own
+exclusive lock. The disk is a transient writable virtio-blk attachment during
+build execution and never enters a rootfs index, image, or Spore manifest. Each
+omitted ID is `path.Clean` of the target after Dockerfile expansion and before a
+relative target is joined to `WORKDIR`; the cleaned ID selects a BLAKE3-named
+directory inside the aggregate disk. The guest bind-mounts those directories in
+instruction order, unmounts them in reverse order after killing RUN descendants,
+syncs and cleanly unmounts the cache filesystem, and removes target directories
+it created before the rootfs freeze handshake. Failed RUN writes are retained,
+but cleanup failure blocks the checkpoint and step record. One RUN accepts at
+most eight mounts. A symlinked, non-regular, size-mismatched, bad-magic, or
+host-visible unclean aggregate disk is recreated before reuse; a guest mount
+rejection remains a build error. The current `spore rootfs df`, prune, and GC
+surfaces do not account for or remove this host-local cache disk.
 
 Mutable public HTTPS ADD inputs are fetched and BLAKE3-hashed before their
 step-record lookup. Their typed key binds the resolved URL and destination,

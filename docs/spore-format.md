@@ -50,14 +50,15 @@ before boot.
 `build/steps/<step_key>.json`. These records are host-local cache metadata, not
 portable spore format. The record envelope remains
 `kind: "sporevm-build-step-v1"`; the current build-cache ABI is identified by
-`builder_version: "sporevm-build-v8"`. A record binds `platform`, `step_key`,
+`builder_version: "sporevm-build-v9"`. A record binds `platform`, `step_key`,
 `parent_index_digest`, `child_index_digest`, `instruction_kind`, canonical
 instruction text, `input_digest`, `env_digest`, `workdir`, optional
-`network_mode`, optional preparation fields, COPY destination policy, executor
-identity for ordinary executor-backed steps, and the child's `rootfs_storage`
+`network_mode`, optional preparation fields, COPY destination policy, ordered
+RUN cache-mount identity, executor identity for ordinary executor-backed
+steps, and the child's `rootfs_storage`
 descriptor.
 
-Builder v8 retains v7's representation of rootfs capacity normalization as the
+Builder v9 retains v8's representation of rootfs capacity normalization as the
 typed synthetic operation `PREPARE`, not as Dockerfile syntax. Its canonical instruction and
 instruction kind are both `PREPARE`; `exact_target` and `producer_identity`
 are required, length-framed step-key inputs alongside the exact parent index,
@@ -86,10 +87,10 @@ and the mutable local ref are published after the selected storage is
 revalidated. PREPARE records use the existing step-record GC root and introduce
 no portable manifest, rootfs descriptor, index, or object kind.
 
-Rootfs cache GC recognizes valid complete builder-v7 and builder-v6 records as
-legacy cache misses but retains both the record and its child storage as roots.
-Malformed or incomplete known records and semantically stale builder-v8 records are
-pruneable. Unknown future record kinds or schema versions are preserved and
+Rootfs cache GC recognizes valid complete builder-v8, builder-v7, and builder-v6
+records as legacy cache misses but retains both the record and its child storage
+as roots. Malformed or incomplete known records and semantically stale
+builder-v9 records are pruneable. Unknown future record kinds or schema versions are preserved and
 conservatively retain the rootfs CAS namespace.
 
 The local image identity published by `spore build` is distinct from the raw
