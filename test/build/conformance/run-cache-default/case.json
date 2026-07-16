@@ -1,0 +1,80 @@
+{
+  "description": "multiple default shared RUN caches normalize aliases, persist across steps and builds, and stay out of rootfs checkpoints",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 3,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle",
+    "/oracle-cache-default-a",
+    "/work/oracle-cache-default-relative"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "changed-build-arg",
+      "writes": {
+        "Dockerfile": "FROM base\nWORKDIR /work\nENV CACHE_TARGET=/cache//tmp/../../oracle-cache-default-a/\nARG TOKEN=two\nRUN --mount=type=cache,target=$CACHE_TARGET --mount=type=cache,target=oracle-cache-default-relative sh -euxc 'absolute=0; relative=0; test ! -f /oracle-cache-default-a/count || absolute=$(cat /oracle-cache-default-a/count); test ! -f oracle-cache-default-relative/count || relative=$(cat oracle-cache-default-relative/count); absolute=$((absolute+1)); relative=$((relative+1)); printf %s $absolute >/oracle-cache-default-a/count; printf %s $relative >oracle-cache-default-relative/count; printf %s $TOKEN >/oracle-cache-default-a/token'\nRUN --mount=type=cache,target=/oracle-cache-default-a --mount=type=cache,target=./oracle-cache-default-relative/ sh -euxc 'mkdir -p /oracle; cp /oracle-cache-default-a/count /oracle/absolute-count; cp oracle-cache-default-relative/count /oracle/relative-count; cp /oracle-cache-default-a/token /oracle/token'\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 2,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-build-arg-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "failed-run-retains-cache",
+      "writes": {
+        "Dockerfile": "FROM base\nWORKDIR /work\nARG TOKEN=failed\nRUN --mount=type=cache,target=/oracle-cache-default-a --mount=type=cache,target=./oracle-cache-default-relative/ sh -euxc 'printf retained >/oracle-cache-default-a/failed-write; printf retained >oracle-cache-default-relative/failed-write; exit 17'\n"
+      },
+      "outcome": "failure",
+      "spore_diagnostic": "spore build: Dockerfile line 4: instruction failed: RUN --mount=type=cache,target=/oracle-cache-default-a --mount=type=cache,target=./oracle-cache-default-relative/ sh -euxc 'printf retained >/oracle-cache-default-a/failed-write; printf retained >oracle-cache-default-relative/failed-write; exit 17'"
+    },
+    {
+      "name": "failed-run-remains-uncached",
+      "outcome": "failure",
+      "spore_diagnostic": "spore build: Dockerfile line 4: instruction failed: RUN --mount=type=cache,target=/oracle-cache-default-a --mount=type=cache,target=./oracle-cache-default-relative/ sh -euxc 'printf retained >/oracle-cache-default-a/failed-write; printf retained >oracle-cache-default-relative/failed-write; exit 17'"
+    },
+    {
+      "name": "recover-after-failed-run",
+      "writes": {
+        "Dockerfile": "FROM base\nWORKDIR /work\nRUN --mount=type=cache,target=/oracle-cache-default-a --mount=type=cache,target=oracle-cache-default-relative sh -euxc 'test \"$(cat /oracle-cache-default-a/failed-write)\" = retained; test \"$(cat oracle-cache-default-relative/failed-write)\" = retained; mkdir -p /oracle; printf recovered >/oracle/failure-cache'\nRUN sh -euxc 'test ! -e /oracle-cache-default-a; test ! -e /work/oracle-cache-default-relative'\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 2,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "warm-after-failed-run-recovery",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "description": "explicit cache IDs remain fail-closed outside the default-ID slice",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported RUN cache mount option"
+  },
+  "scan_prefixes": []
+}

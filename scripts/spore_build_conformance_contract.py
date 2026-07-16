@@ -83,7 +83,9 @@ class Transition:
     name: str
     writes: dict[str, str]
     preserve_mtime: tuple[str, ...]
-    expect_cache: CacheStatus
+    outcome: Outcome
+    spore_diagnostic: str | None
+    expect_cache: CacheStatus | None
     expect_index: IndexExpectation | None
     expect_executed_steps: int
     expect_boot_count: int
@@ -248,6 +250,8 @@ def parse_transition(value: Any, label: str) -> Transition:
         raw,
         {
             "name",
+            "outcome",
+            "spore_diagnostic",
             "writes",
             "preserve_mtime",
             "expect_cache",
@@ -260,13 +264,15 @@ def parse_transition(value: Any, label: str) -> Transition:
         },
         label,
     )
-    required = {
-        "name",
-        "expect_cache",
-        "expect_executed_steps",
-        "expect_boot_count",
-        "expect_resize_count",
-    }
+    outcome = parse_outcome(raw.get("outcome", "success"), f"{label}.outcome")
+    required = {"name"}
+    if outcome is Outcome.SUCCESS:
+        required |= {
+            "expect_cache",
+            "expect_executed_steps",
+            "expect_boot_count",
+            "expect_resize_count",
+        }
     missing = sorted(required - set(raw))
     if missing:
         raise HarnessError(f"{label} is missing required field(s): {', '.join(missing)}")
@@ -276,26 +282,53 @@ def parse_transition(value: Any, label: str) -> Transition:
     no_cache = raw.get("no_cache", False)
     if type(no_cache) is not bool:
         raise HarnessError(f"{label}.no_cache must be a boolean")
+    diagnostic_value = raw.get("spore_diagnostic")
+    diagnostic = (
+        require_string(diagnostic_value, f"{label}.spore_diagnostic")
+        if diagnostic_value is not None
+        else None
+    )
+    if outcome is Outcome.FAILURE and diagnostic is None:
+        raise HarnessError(f"{label}.spore_diagnostic is required when the transition should fail")
+    if outcome is Outcome.SUCCESS and diagnostic is not None:
+        raise HarnessError(f"{label}.spore_diagnostic is only valid for a failed transition")
+    if outcome is Outcome.FAILURE and ("expect_index" in raw or compare):
+        raise HarnessError(f"{label} cannot compare or assert an index for a failed transition")
+    success_only = {
+        "expect_cache",
+        "expect_executed_steps",
+        "expect_boot_count",
+        "expect_resize_count",
+    }
+    ignored = sorted(success_only & set(raw)) if outcome is Outcome.FAILURE else []
+    if ignored:
+        raise HarnessError(f"{label} has success-only field(s): {', '.join(ignored)}")
     return Transition(
         name=require_string(raw["name"], f"{label}.name"),
+        outcome=outcome,
+        spore_diagnostic=diagnostic,
         writes=require_string_map(raw.get("writes", {}), f"{label}.writes"),
         preserve_mtime=require_string_list(
             raw.get("preserve_mtime", []), f"{label}.preserve_mtime"
         ),
-        expect_cache=parse_cache_status(raw["expect_cache"], f"{label}.expect_cache"),
+        expect_cache=(
+            parse_cache_status(raw["expect_cache"], f"{label}.expect_cache")
+            if "expect_cache" in raw
+            else None
+        ),
         expect_index=(
             parse_index_expectation(raw["expect_index"], f"{label}.expect_index")
             if "expect_index" in raw
             else None
         ),
         expect_executed_steps=require_nonnegative_int(
-            raw["expect_executed_steps"], f"{label}.expect_executed_steps"
+            raw.get("expect_executed_steps", 0), f"{label}.expect_executed_steps"
         ),
         expect_boot_count=require_nonnegative_int(
-            raw["expect_boot_count"], f"{label}.expect_boot_count"
+            raw.get("expect_boot_count", 0), f"{label}.expect_boot_count"
         ),
         expect_resize_count=require_nonnegative_int(
-            raw["expect_resize_count"], f"{label}.expect_resize_count"
+            raw.get("expect_resize_count", 0), f"{label}.expect_resize_count"
         ),
         compare=compare,
         no_cache=no_cache,
@@ -450,6 +483,15 @@ def self_test_schema(cases: list[Case]) -> None:
                     "expect_boot_count": 1,
                     "expect_resize_count": 0,
                     "no_cache": "yes",
+                }
+            ],
+        },
+        {
+            **valid,
+            "transitions": [
+                {
+                    "name": "bad-failure-without-diagnostic",
+                    "outcome": "failure",
                 }
             ],
         },

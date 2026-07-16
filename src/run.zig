@@ -154,6 +154,9 @@ pub const Options = struct {
     /// Immutable rootfs artifacts attached read-only after the optional build
     /// context disk. Build requests address these by bounded input index.
     build_input_rootfs: []const spore.Rootfs = &.{},
+    /// Mutable host-local cache volume attached after immutable build inputs.
+    /// It is build-only state and is never represented in a Spore manifest.
+    build_cache_disk_fd: ?std.c.fd_t = null,
     /// Selects the build guest contract. Build checkpoints must persist
     /// Docker-visible rootfs paths such as /tmp and /run instead of covering
     /// them with the runtime's ephemeral tmpfs mounts.
@@ -3533,6 +3536,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .root_blk_options = root_blk_options,
                 .context_disk_fd = context_disk_fd,
                 .build_input_disk_backends = build_input_backends,
+                .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
                 .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,
@@ -3562,6 +3566,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 .root_blk_options = root_blk_options,
                 .context_disk_fd = context_disk_fd,
                 .build_input_disk_backends = build_input_backends,
+                .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
                 .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                 .rootfs = opts.rootfs,
                 .network_manifest = network_manifest,

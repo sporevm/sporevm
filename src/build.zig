@@ -5,6 +5,7 @@ const Io = std.Io;
 const dockerfile = @import("build/dockerfile.zig");
 const build_context = @import("build/context.zig");
 const build_context_disk = @import("build/context_disk.zig");
+const build_cache_mount = @import("build/cache_mount.zig");
 const build_exec = @import("build/exec.zig");
 const instruction_transition = @import("build/instruction_transition.zig");
 const remote_add = @import("build/remote_add.zig");
@@ -217,6 +218,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             }
         }
     }
+    try preflightBuildDeviceEnvelope(allocator, plan, diagnostic);
     var remote_add_count: u64 = 0;
     for (plan.order) |stage_index| for (plan.stages[stage_index].source.instructions) |instruction| switch (instruction.value) {
         .add => {
@@ -382,6 +384,72 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         .local_ref_path = publish.local_ref_path,
         .cache_hit = any_exec_step and diagnostic.executor.executed_steps == 0,
     };
+}
+
+const PlannedInputIdentity = union(enum) {
+    stage: usize,
+    external: []const u8,
+};
+
+// This syntax-only identity is deliberately conservative. Device-envelope
+// preflight runs before external inputs are fetched or stage artifacts exist,
+// so it cannot deduplicate by resolved index digest as prepareStageInputs does.
+// Equal source identities always produce one input disk within a build;
+// distinct identities may later collapse to the same digest, which can only
+// make this preflight reject early rather than undercount attached devices.
+
+fn samePlannedInput(a: PlannedInputIdentity, b: PlannedInputIdentity) bool {
+    return switch (a) {
+        .stage => |stage| switch (b) {
+            .stage => |other| stage == other,
+            .external => false,
+        },
+        .external => |source| switch (b) {
+            .stage => false,
+            .external => |other| std.mem.eql(u8, source, other),
+        },
+    };
+}
+
+fn preflightBuildDeviceEnvelope(
+    allocator: std.mem.Allocator,
+    plan: build_plan.Plan,
+    diagnostic: *Diagnostic,
+) !void {
+    for (plan.order) |stage_index| {
+        const stage = plan.stages[stage_index];
+        var cache_line: usize = 0;
+        for (stage.source.instructions) |instruction| switch (instruction.value) {
+            .run => |run| if (run.cache_mounts.len != 0 and cache_line == 0) {
+                cache_line = instruction.line;
+            },
+            else => {},
+        };
+        if (cache_line == 0) continue;
+
+        var has_context = false;
+        var inputs = std.array_list.Managed(PlannedInputIdentity).init(allocator);
+        for (stage.copies) |copy| {
+            const candidate: PlannedInputIdentity = switch (copy.source) {
+                .context => {
+                    has_context = true;
+                    continue;
+                },
+                .stage => |dependency| .{ .stage = dependency },
+                .external => |source| .{ .external = source },
+            };
+            var seen = false;
+            for (inputs.items) |existing| if (samePlannedInput(existing, candidate)) {
+                seen = true;
+                break;
+            };
+            if (!seen) try inputs.append(candidate);
+        }
+        if (!build_exec.buildDeviceEnvelopeFits(has_context, inputs.items.len, true)) {
+            diagnostic.instruction_line = cache_line;
+            return error.RunCacheMountDeviceBudgetUnsupported;
+        }
+    }
 }
 
 const BuiltStage = struct {
@@ -1183,7 +1251,7 @@ fn runStep(
     run: dockerfile.Run,
     options: Options,
 ) !build_exec.RunStep {
-    switch (run) {
+    switch (run.command) {
         .shell => |shell| if (shell.len > build_exec.max_run_command_len) {
             diagnostic.instruction_line = instruction.line;
             diagnostic.limit = build_exec.max_run_command_len;
@@ -1199,7 +1267,7 @@ fn runStep(
             }
         },
     }
-    const command: build_exec.RunCommand = switch (run) {
+    const command: build_exec.RunCommand = switch (run.command) {
         .shell => |shell| .{ .shell = shell },
         .exec => |argv| .{ .exec = argv },
     };
@@ -1207,7 +1275,15 @@ fn runStep(
         if (err == error.InvalidRunEnvironment) diagnostic.instruction_line = instruction.line;
         return err;
     };
-    build_exec.validateRunRequest(allocator, command, env, state.workdir, runResources(options).nofile) catch |err| {
+    const resolved_mount_targets = try allocator.alloc([]const u8, run.cache_mounts.len);
+    for (run.cache_mounts, 0..) |mount, index| {
+        resolved_mount_targets[index] = try substituteState(allocator, mount.target, state, instruction.escape);
+    }
+    const cache_mounts = build_cache_mount.resolve(allocator, state.workdir, resolved_mount_targets) catch |err| {
+        diagnostic.instruction_line = instruction.line;
+        return err;
+    };
+    build_exec.validateRunRequestWithMounts(allocator, command, env, state.workdir, runResources(options).nofile, cache_mounts) catch |err| {
         diagnostic.instruction_line = instruction.line;
         return err;
     };
@@ -1219,6 +1295,8 @@ fn runStep(
         .env_digest = try effectiveRunEnvDigest(allocator, state),
         .workdir = state.workdir,
         .network_mode = options.network,
+        .cache_mount_digest = try build_cache_mount.digest(allocator, cache_mounts),
+        .cache_mounts = cache_mounts,
     };
 }
 
@@ -2174,7 +2252,7 @@ test "implicit root HOME transitions only affected RUN cache identities" {
         .line = 4,
         .span = .{ .start_line = 4, .end_line = 4 },
         .raw = "RUN go build ./...",
-        .value = .{ .run = .{ .shell = "go build ./..." } },
+        .value = .{ .run = .{ .command = .{ .shell = "go build ./..." } } },
     };
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, state, instruction, instruction.value.run, .{
@@ -2220,7 +2298,7 @@ test "RUN executor preserves shell text for guest expansion" {
         .line = 2,
         .span = .{ .start_line = 2, .end_line = 2 },
         .raw = "RUN " ++ shell,
-        .value = .{ .run = .{ .shell = shell } },
+        .value = .{ .run = .{ .command = .{ .shell = shell } } },
     };
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, .{
@@ -2236,6 +2314,39 @@ test "RUN executor preserves shell text for guest expansion" {
     try std.testing.expectEqualStrings(shell, step.command.shell);
     try std.testing.expectEqualStrings("APP_ENV=test", step.env[0]);
     try std.testing.expectEqualStrings("BUILD_ARG=from-arg", step.env[1]);
+}
+
+test "RUN cache mount identity uses expanded path.Clean target" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\RUN --mount=type=cache,target=$CACHE_DIR true
+        \\
+    , &parser_diagnostic);
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "CACHE_DIR", .value = "/cache//tmp/../pkg/" });
+    const instruction = document.stages[0].instructions[0];
+    var diagnostic: Diagnostic = .{};
+    const step = try runStep(arena, &diagnostic, .{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{}),
+        .args = args,
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+        .workdir = "/work",
+    }, instruction, instruction.value.run, .{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    });
+    try std.testing.expectEqual(@as(usize, 1), step.cache_mounts.len);
+    try std.testing.expectEqualStrings("/cache/pkg", step.cache_mounts[0].id);
+    try std.testing.expectEqualStrings("/cache/pkg", step.cache_mounts[0].target);
+    const alias = try build_cache_mount.resolve(arena, "/work", &.{"/cache/pkg"});
+    try std.testing.expectEqualStrings(alias[0].key, step.cache_mounts[0].key);
+    try std.testing.expectEqualStrings(try build_cache_mount.digest(arena, alias), step.cache_mount_digest);
 }
 
 test "RUN executor preserves exact argv and effective ENV ARG state" {

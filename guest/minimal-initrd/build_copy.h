@@ -18,6 +18,12 @@
 #define SPORE_BUILD_COPY_PATH_MAX 512
 #define SPORE_BUILD_COPY_MAX_ENTRIES 65536ULL
 #define SPORE_BUILD_COPY_FD_BUDGET (SPORE_BUILD_COPY_MAX_ENTRIES + 256ULL)
+#define SPORE_BUILD_CACHE_MAX_CREATED_COMPONENTS ((SPORE_BUILD_COPY_PATH_MAX + 1) / 2)
+
+struct spore_build_cache_created_component {
+  uint64_t device;
+  uint64_t inode;
+};
 
 enum spore_build_copy_exit {
   SPORE_BUILD_COPY_OK = 0,
@@ -35,6 +41,16 @@ int spore_build_copy_apply(
     char *error, size_t error_cap);
 
 int spore_build_ensure_directory(const char *root, const char *path);
+int spore_build_cache_target_prepare(
+    const char *root, const char *path, int *target_fd,
+    struct spore_build_cache_created_component *target_identity,
+    struct spore_build_cache_created_component *created_components,
+    size_t *created_component_count);
+int spore_build_cache_target_cleanup(
+    const char *root, const char *path,
+    const struct spore_build_cache_created_component *target_identity,
+    const struct spore_build_cache_created_component *created_components,
+    size_t created_component_count);
 int spore_build_copy_ensure_fd_budget(void);
 
 #endif

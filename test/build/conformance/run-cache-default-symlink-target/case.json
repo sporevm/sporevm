@@ -1,0 +1,10 @@
+{
+  "description": "cache target symlink ancestry remains fail-closed before command execution",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 3: instruction failed: RUN --mount=type=cache,target=/alias/cache sh -euxc 'printf should-not-run >/oracle-ran'",
+    "spore_exit_code": 126
+  },
+  "scan_prefixes": []
+}

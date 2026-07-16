@@ -12,6 +12,7 @@ spec_refs:
   - src/disk_index.zig
   - src/chunk_mapped_disk.zig
   - src/build.zig
+  - src/build/cache_mount.zig
   - src/build/exec.zig
   - src/build/step_cache.zig
   - src/run.zig
@@ -51,8 +52,8 @@ related_plans:
 > build COPY entry stream with a cached read-only ext4 context disk.
 >
 > **Capacity update (2026-07-11).** Build cache v7 introduced separate rootfs
-> capacity preparation; current cache v8 retains that contract and adds typed
-> COPY destination policy. The automatic policy is the
+> capacity preparation; current cache v9 retains that contract and adds typed
+> COPY destination policy plus ordered default RUN cache-mount identity. The automatic policy is the
 > idempotent absolute target `max(parent_logical_size, 16 GiB)`: supported
 > journal-less compact images prepare once to 16 GiB, while images already at
 > or above 16 GiB retain their exact size. A typed `PREPARE` record reuses that
@@ -152,7 +153,8 @@ The missing work falls into three different categories:
   registry/local/named-context bases, previous-stage inheritance, literal
   `COPY --from`, result-correct cross-stage `COPY --link`, `--target`, and final
   `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
-  (`--parents`, `--chown`, `--chmod`), `RUN --mount`, local `ADD`, ADD flags
+  (`--parents`, `--chown`, `--chmod`), RUN mounts other than bounded default
+  `type=cache,target=...`, local `ADD`, ADD flags
   other than numeric `--chmod`, heredocs, `USER`, `VOLUME`, `EXPOSE`,
   `HEALTHCHECK`, and `ONBUILD` still fail closed. C2 now also accepts bounded
   non-empty JSON-array `RUN` and executes
@@ -219,6 +221,27 @@ The missing work falls into three different categories:
   cache mutation occurred; C3 mounts at line 82 remained unreached. Merged-main
   Buildkite #1385 subsequently passed that exact merge, including Linux
   ARM64/KVM conformance, before the numeric remote ADD chmod slice began.
+- Numeric remote ADD chmod landed as PR #504 at
+  `3da9e35175098b477d01413f0e04bfaaccbf63a6`, tree
+  `e0bb97df5bdb9d62abba06f21c780386e9e82a16`. The unchanged frozen Buildkite
+  oracle then parsed through line 80 and stopped at line 82 on three
+  `RUN --mount=type=cache,target=...` flags with omitted IDs and sharing. No
+  remote fetch, image resolution, VM boot, or cache-volume creation occurred.
+  Merged-main Buildkite #1388 passed that exact merge before this C3 slice
+  began. Live main then advanced to `c3e16ea12ba5f6eb10276feeafec4f7d6f208dfe`
+  through PR #503; its chunk-sealing and zero-length virtio-blk reporting
+  changes do not overlap the cache-mount frontend, store, or guest lifecycle.
+- **Current C3 slice:** accept multiple default
+  `RUN --mount=type=cache,target=...` mounts. The omitted ID is
+  `path.Clean(expanded target)` before a relative target is joined to
+  `WORKDIR`; aliases therefore select one BLAKE3-named directory inside one
+  aggregate host-local ext4 disk and one exclusive store lock. The guest mounts
+  targets in instruction order, removes them in reverse order after RUN
+  descendant cleanup, syncs and unmounts the cache disk, removes only target
+  directories it created, and permits rootfs freeze only after successful
+  teardown. Cache writes survive failed RUNs and later builds but never enter a
+  rootfs checkpoint or portable manifest. Explicit IDs, non-default sharing,
+  nested or duplicate targets, and other mount types remain fail-closed.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
 - No flat checkpoint store and no full-image hash fallback in the executor.
@@ -362,7 +385,7 @@ Logical capacity remains sparse and does not reserve 16 GiB of physical
 storage.
 
 Before the first executor-backed instruction, the current builder resolves a
-typed v8 `PREPARE` key, retaining the v7 capacity contract, from the parent
+typed v9 `PREPARE` key, retaining the v8 capacity contract, from the parent
 index, exact target, and the exact managed
 kernel/initrd plus growth-protocol producer identity. A hit becomes the parent
 for ordinary Dockerfile keys. On a miss, the same VM that will execute the
@@ -464,7 +487,7 @@ implementing Spore's mounts or cache policy.
 | Instruction | Support |
 | --- | --- |
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
-| `RUN <shell>` / `RUN ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. Both run in the guest as root. No `--mount`, per-instruction `--network`, or heredoc. |
+| `RUN [--mount=type=cache,target=<path>]… <shell>` / `RUN [--mount=type=cache,target=<path>]… ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. The first C3 slice accepts only cache mounts with omitted ID/sharing; bind, tmpfs, secret, SSH, per-instruction network, and heredocs remain rejected. |
 | `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
 | `ADD [--chmod=<octal>] <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Numeric chmod expands at instruction start and must resolve from `0` through `07777`; other flags, symbolic modes, local/Git sources, credentials, and archive extraction fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
@@ -506,10 +529,13 @@ src/build/context.zig    .dockerignore-aware context walking, stat-cache
 src/build/context_disk.zig
                          read-only ext4 context disk emission/reuse for
                          executed COPY steps
-src/build/step_cache.zig step-key computation + canonical v8 record adapter
+src/build/cache_mount.zig
+                         default cache-ID normalization and identity plus the
+                         aggregate ext4 store lifecycle and exclusive lock
+src/build/step_cache.zig step-key computation + canonical v9 record adapter
                          shared by cache-hit and GC validation; on-disk records
                          map deterministic parent+instruction inputs to child
-                         index_digest outcomes, including the typed v8 PREPARE
+                         index_digest outcomes, including the typed v9 PREPARE
                          normalization record
 src/build/exec.zig       persistent build-VM session: boot the deepest
                          cached index writable through ChunkMappedDisk,
@@ -613,26 +639,27 @@ A completed stage artifact is:
 
 ### Step keys
 
-Build cache v8 has two typed derivations in the same record namespace. The
+Build cache v9 has two typed derivations in the same record namespace. The
 synthetic `PREPARE` operation normalizes capacity before Dockerfile cache keys
 are resolved; RUN, COPY, ADD, and WORKDIR then use the prepared child as their
 ordinary parent. A key is a cache lookup address, and the record at that address
 stores the child `index_digest` produced by the prior successful execution.
 
 ```
-prepare_key = blake3_framed(builder_version_v8, platform,
+prepare_key = blake3_framed(builder_version_v9, platform,
                             parent_index_digest, "PREPARE", exact_target,
                             producer_identity)
 
-step_key = blake3_framed(builder_version_v8, platform,
+step_key = blake3_framed(builder_version_v9, platform,
                          prepared_parent_index_digest, instruction_kind,
                          canonical_instruction, input_digest, env_digest,
                          workdir, network_mode, copy_destination_policy,
+                         cache_mount_digest,
                          executor_identity)
 ```
 
 Every field is length-framed, and optional fields carry an explicit presence
-tag. `disk_grow_target` is absent from v8 Dockerfile inputs and records. The
+tag. `disk_grow_target` is absent from v9 Dockerfile inputs and records. The
 producer identity binds the exact kernel and initrd bytes that will boot plus
 the growth request, mount/no-lazy-init policy, transient WRITE_ZEROES contract,
 and preparation host-contract version. The same exact-byte identity is carried
@@ -751,8 +778,8 @@ never silently execute it as root.
 
 ### Mount model
 
-Mounted RUN support is one generic execution facility, not a collection of
-instruction-specific exceptions:
+The long-term mounted RUN design is one generic execution facility. The table
+below is future scope beyond the first accepted cache-only slice:
 
 Every build RUN first enters the same operation-owned sandbox, whether or not
 future explicit mounts are present. Its supervisor owns new PID, mount, cgroup,
@@ -785,10 +812,23 @@ field, credential authority, or persistent filesystem view.
 | tmpfs | empty per operation | yes | no | mount options only |
 | cache | local named cache store | yes | no | cache id/options; contents do not make a rootfs hit valid |
 
-All mounts live outside the rootfs disk and are applied in an operation-owned
-mount namespace before chroot/exec. The agent unmounts and verifies cleanup
-before descendant cleanup, freeze, and snapshot. A failed unmount, busy mount,
-or surviving helper fails the step without publishing a cache record.
+All mounts live outside the rootfs disk. The default cache slice mounts the
+aggregate in the trusted agent namespace, bind-mounts only selected cache
+directories onto confined rootfs targets, and then enters the same
+operation-owned RUN sandbox as an unmounted instruction. The sandbox chroot
+inherits those selected targets but cannot name the aggregate or sibling cache
+keys. After sandbox PID/cgroup teardown, the agent unmounts targets in reverse
+order, syncs and unmounts the aggregate disk, removes only target directories
+it created, and then permits freeze and snapshot. Cleanup records the
+device/inode identity of the mount target and every created component, then
+reopens the path without following symlinks; pre-existing symlink ancestry is
+rejected before RUN starts. It must remove a created empty
+mountpoint, removes empty created ancestors, and preserves the first nonempty
+ancestor so ordinary rootfs sibling content survives. Unmount failure, a
+nonempty created mountpoint, path replacement, or unverifiable ownership
+poisons the guest build session, returns exit 125, and blocks step-record and
+ref publication. PID 1 remains alive to drain that failure over vsock while
+rejecting every later request, including checkpoint operations.
 
 Immutable bind inputs can reuse the context or stage disks. Writable cache
 mounts require a separate local storage contract with explicit ownership,
@@ -796,11 +836,12 @@ locking, crash recovery, and GC. Do not emulate cache mounts with directories
 inside the rootfs followed by deletion: their blocks would enter intermediate
 snapshots and alter later behavior.
 
-`sharing=locked` is the first writable cache mode because it has deterministic
-one-writer behavior. `private` and `shared` land only with explicit clone and
-concurrency semantics. A missing cache may change command performance and
-downloads but not permit reuse of an output produced from semantically
-different rootfs inputs.
+The first writable slice accepts only omitted `sharing`, whose BuildKit default
+is `shared`; Spore conservatively serializes all access with one exclusive host
+store lock. Explicit `sharing=locked`, `sharing=private`, and explicit cache IDs
+remain rejected until their ownership and concurrency contracts land. A missing
+cache may change command performance and downloads but not permit reuse of an
+output produced from semantically different rootfs inputs.
 
 ### Credential boundary
 
@@ -846,17 +887,17 @@ Intermediates are input-addressed by their step key, but their artifacts are
 normal rootfs CAS indexes. The step record is not restore authority; it is a
 local memo from deterministic inputs to a child `index_digest`. A cache hit
 requires the child index to parse, validate against the rootfs descriptor, and
-have the already-published completeness stamp. V8 does not repair a missing
+have the already-published completeness stamp. V9 does not repair a missing
 stamp during lookup: missing or malformed indexes, missing complete stamps, or
 bad records are misses. GC continues to parse older records conservatively and
-may retain their complete content, but v7 and v6 records cannot hit v8 keys.
+may retain their complete content, but v8, v7, and v6 records cannot hit v9 keys.
 
 Cache correctness rules:
 
 ```json
 {
   "kind": "sporevm-build-step-v1",
-  "builder_version": "sporevm-build-v8",
+  "builder_version": "sporevm-build-v9",
   "platform": {"os": "linux", "arch": "arm64"},
   "step_key": "…",
   "parent_index_digest": "…",
@@ -877,6 +918,7 @@ Cache correctness rules:
   "env_digest": "…",
   "workdir": "/app",
   "network_mode": "spore",
+  "cache_mount_digest": "blake3:…",
   "executor_identity": "blake3:…",
   "created_unix": 0
 }
@@ -888,7 +930,7 @@ completeness stamps, and GC roots rather than a second cache subsystem:
 ```json
 {
   "kind": "sporevm-build-step-v1",
-  "builder_version": "sporevm-build-v8",
+  "builder_version": "sporevm-build-v9",
   "platform": {"os": "linux", "arch": "arm64"},
   "step_key": "…",
   "parent_index_digest": "blake3:…",
@@ -1000,7 +1042,7 @@ and enumerate one canonical full rootfs CAS index.
 
 1. Before the first executor-backed instruction, compute the absolute target
    `max(FROM.logical_size, 16 GiB)`. If no growth is needed, continue directly.
-   Otherwise resolve the v8 `PREPARE` key. A valid hit supplies the prepared
+   Otherwise resolve the v9 `PREPARE` key. A valid hit supplies the prepared
    child index before any Dockerfile key is calculated, including under
    `--no-cache`.
 2. On a `PREPARE` miss, open the immutable FROM index as the
@@ -1054,7 +1096,8 @@ and enumerate one canonical full rootfs CAS index.
      other lookup-time failures, rejects a relative executable match, and
      selects the first executable absolute candidate; failure to execute that
      selected candidate is terminal and never falls through to a later entry.
-     The v2 guest request is an exact bounded object: every documented field
+     Cache-mounted shell or exec form uses the strict `spore-build-run-v3`
+     object with its exact bounded mount list. The shared v2/v3 parser requires every documented field
      appears once, aliases and unknown fields are rejected, arrays have no
      trailing commas, the complete request ends in a newline, and no
      non-whitespace bytes follow the object. Strings preserve valid raw UTF-8
@@ -1123,7 +1166,7 @@ read-only context or immutable build-input disks (`spore_rootfs=1
 spore_rootfs_rw=1`, with `spore_build_context=1` and/or
 `spore_build_inputs=<count>`). The initrd agent now provides the build control verbs
 (`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
-`spore-build-run-v2`,
+`spore-build-run-v2`, `spore-build-run-v3`,
 `spore-build-copy-v4`, `spore-build-copy-v5`); the target base must provide `/bin/sh` for shell-form
 RUN and nothing for capacity preparation. Exec-form RUN instead requires only
 its selected executable. The guest accepts the older
@@ -1429,7 +1472,7 @@ surface:
 
 - **Done:** extract the cache-prefix walk and executor-suffix lowering from
   `src/build.zig` behind one typed RUN/COPY/ADD/WORKDIR transition.
-- **Done:** decode builder-v8 records through one canonical adapter shared by
+- **Done:** decode current builder records through one canonical adapter shared by
   cache-hit and GC validation.
 - **Done:** move the build COPY filesystem engine out of the PID1 protocol
   dispatcher into `guest/minimal-initrd/build_copy.c`; the PID1 agent retains
@@ -1510,7 +1553,7 @@ symlink.
 COPY checkpoints use the same freeze → snapshot → complete stamp → step
 record → thaw ordering as RUN; if any COPY request in a step fails, the build
 fails before snapshot promotion for that step. Session start uses the
-prepared parent produced by the v8 policy above; COPY keys never carry a grow
+prepared parent produced by the v9 policy above; COPY keys never carry a grow
 target, and there is no capacity override. A manual
 Docker-vs-Spore metadata oracle lives at
 `scripts/spore-build-copy-oracle.sh`.
@@ -1620,7 +1663,7 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    unchanged target after landing to select the next slice. The rerun reached
    cross-stage `COPY --link` at line 72.
 3. **Done:** result-correct cross-stage `COPY --link`. The accepted true policy
-   extends the typed COPY instruction, transition, v8 cache record, and strict
+   extends the typed COPY instruction, transition, cache record, and strict
    v5 guest request. The guest builds the destination result without following
    lower symlinks, replaces file/directory conflicts, merges matching
    directories, and bounds removal by the existing COPY traversal envelope.
@@ -1669,24 +1712,47 @@ Do not accept it merely because parsing succeeds.
 
 **Estimate:** 6–10 weeks.
 
-1. **Implemented foundation; landing gated on native acceptance:** the
-   operation-owned RUN sandbox prerequisite accepts no mount syntax. Every
-   ordinary shell- and exec-form RUN gets a private PID/mount/cgroup/IPC/UTS
-   view, scoped procfs, minimal `/dev`, device-deny policy, bounded
-   capabilities, and transactional teardown. Before merge, native HVF and KVM
-   tests must prove that `/proc/1/root`, proc sysctls,
-   AF_VSOCK, console
-   and auxiliary virtio devices, device-node aliases, namespace joins, and
-   mount attempts cannot escape the view while ordinary stdio, networking,
-   environment, workdir, supported root-user, exit, and rootfs behavior stay
-   compatible with the pinned BuildKit result.
+1. **Landed foundation:** every ordinary shell- and exec-form RUN gets a
+   private PID/mount/cgroup/IPC/UTS view, scoped procfs, minimal `/dev`,
+   device-deny policy, bounded capabilities, and transactional teardown. Exact
+   merged-main CI and packaged HVF/KVM acceptance prove `/proc/1/root`, proc
+   sysctls, AF_VSOCK, console and auxiliary virtio devices, device-node aliases,
+   namespace joins, and mount attempts cannot escape the view while ordinary
+   stdio, networking, environment, workdir, root-user, exit, and rootfs behavior
+   remain compatible with pinned BuildKit.
+
+The next oracle-driven slice implements only multiple cache mounts with
+`type=cache`, `target`, and omitted `id`/`sharing`. It uses a bounded 4 GiB
+sparse aggregate ext4 disk outside rootfs CAS plus a single exclusive store
+lock, conservatively serializing BuildKit's default shared-writer mode. The
+cleaned expanded target is the default ID and the ordered resolved target,
+default ID, derived storage key, and `shared` policy enter builder-v9 RUN cache
+identity; mutable cache contents deliberately do not. A strict
+`spore-build-run-v3` request carries at most eight canonical absolute targets
+and lowercase 256-bit storage keys. Reverse-order unmount, `syncfs`, clean disk
+unmount, and removal of builder-created target directories complete before the
+existing freeze/checkpoint protocol. The transient disk reuses virtio-blk but
+does not enter any manifest or frozen device contract; invalid or unclean
+host-local disks are discarded rather than trusted. A context disk plus two
+stage-input disks already fills the remaining frozen virtio slots, so combining
+that envelope with a cache-mounted RUN fails during selected-plan preflight.
+The aggregate is not yet included in `spore rootfs df`, prune, or GC accounting.
+The landed operation sandbox is the selected-cache security boundary: cache
+binds enter only its private mount view, while its scoped procfs, minimal `/dev`,
+device policy, capability set, and syscall filter keep sibling cache directories,
+the aggregate block device, console, vsock, and initrd namespace unreachable.
+The unchanged frozen Buildkite target at commit `fb742fd5` and Dockerfile
+SHA-256 `36867efe6eef1e96da5115aa91df0d087be61763c0097846a971d8709e659a2b`
+parses through its three line-82 default cache mounts with this candidate and
+next fails during whole-file parsing at line 121 on `COPY <<EOF`. No fetch,
+VM boot, or cache/runtime mutation occurs, so COPY heredocs are the next
+grounded oracle boundary after this slice lands.
 2. Implement read-only context and stage bind mounts plus tmpfs mounts.
 3. Add per-RUN network selection and key it independently from global default.
-4. Design and implement the local writable cache store with bounded ids,
-   atomic creation, exclusive locking, crash recovery, accounting, prune, and
-   sound conservative behavior. `sharing=locked` maps directly to exclusive
-   locking; default/shared writers may be serialized more aggressively;
-   unsupported `private` behavior fails closed.
+4. Generalize the landed default-ID store with explicit-ID ownership,
+   per-ID concurrency, accounting, prune, and GC. `sharing=locked` maps directly
+   to exclusive locking; default/shared writers may be serialized more
+   aggressively; unsupported `private` behavior fails closed.
 
 Every mounted operation verifies unmount and helper cleanup before snapshot.
 Cache volumes have separate reachability and GC from rootfs step records.
@@ -1809,12 +1875,12 @@ named credential broker requires its own product and security plan.
 - Step keys: golden tests that keys are stable across runs and change exactly
   when the spec says (each invalidation rule in the Cache Model section gets a
   test).
-- Step cache: v8 PREPARE keys vary with parent, exact target, and producer;
+- Step cache: v9 PREPARE keys vary with parent, exact target, and producer;
   Dockerfile keys use the prepared child and contain no growth target; records
   survive process restart; missing artifact ⇒ miss; corrupted record ⇒ miss;
   missing complete stamp ⇒ miss without repair; atomic write leaves no partial
   record after simulated failure between snapshot publication and record write;
-  v7 and v6 records remain GC roots but are cache misses.
+  v8, v7, and v6 records remain GC roots but are cache misses.
 - Executor: exit-code propagation, env/workdir application, network
   on/off, idempotent 16 GiB policy, already-large preservation, clean-zero
   sparse growth, direct resize response validation, same-VM PREPARE checkpoint,
@@ -1922,7 +1988,7 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
   their exact size. There is no hidden override, recursive doubling, additive
   growth, or public knob.
 - Capacity normalization is the typed synthetic `PREPARE` operation in build
-  cache v8, keyed by parent index, exact target, and exact kernel/initrd plus
+  cache v9, keyed by parent index, exact target, and exact kernel/initrd plus
   growth-contract producer identity. Dockerfile keys contain no capacity field,
   but bind the exact executor kernel/initrd identity; `--no-cache` still reuses
   PREPARE.
@@ -1982,6 +2048,12 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 
 ## Key Learnings From Pressure-Testing
 
+- Cache teardown needs path ownership, not a count of created directories.
+  RUN may add legitimate sibling state under a setup-created parent or replace
+  the target path entirely. Recording target and created-component identities
+  lets teardown preserve a nonempty ancestor while failing closed on
+  replacement; poisoning the session while PID 1 drains exit 125 avoids losing
+  the vsock failure frame before the host can stop the VM.
 - A chroot and cgroup bound process lifetime but did not bound filesystem
   authority: `/proc/1/root` reached the initrd namespace and rootfs devtmpfs
   named auxiliary virtio disks. Cache mounts would turn that latent authority

@@ -1288,6 +1288,275 @@ int spore_build_ensure_directory(const char *root, const char *path) {
   return rc == 0 ? SPORE_BUILD_COPY_OK : SPORE_BUILD_COPY_APPLY_FAILED;
 }
 
+static int cache_open_directory_no_symlinks(int root_fd, const char *path) {
+  const char *rel = path[0] == '/' ? path + 1 : path;
+  int current_fd = dup(root_fd);
+  if (current_fd < 0) return -1;
+  if (rel[0] == '\0') return current_fd;
+
+  char remaining[MAX_COPY_PATH_LEN + 1];
+  snprintf(remaining, sizeof(remaining), "%s", rel);
+  char *cursor = remaining;
+  for (;;) {
+    char *slash = strchr(cursor, '/');
+    if (slash) *slash = '\0';
+    int next_fd = openat(current_fd, cursor, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int saved_errno = errno;
+    if (close(current_fd) != 0) {
+      int close_errno = errno;
+      if (next_fd >= 0) close(next_fd);
+      errno = close_errno;
+      return -1;
+    }
+    if (next_fd < 0) {
+      errno = saved_errno;
+      return -1;
+    }
+    current_fd = next_fd;
+    if (!slash) return current_fd;
+    cursor = slash + 1;
+  }
+}
+
+int spore_build_cache_target_prepare(
+    const char *root, const char *path, int *target_fd,
+    struct spore_build_cache_created_component *target_identity,
+    struct spore_build_cache_created_component *created_components,
+    size_t *created_component_count) {
+  if (!target_fd || !target_identity || !created_components || !created_component_count ||
+      path[0] != '/' || path[1] == '\0' ||
+      validate_spore_copy_entry_path(path) != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  *target_fd = -1;
+  *created_component_count = 0;
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0) return -1;
+
+  char prefix[MAX_COPY_PATH_LEN + 1];
+  size_t path_len = strlen(path);
+  memcpy(prefix, path, path_len + 1);
+  for (size_t i = 1; i <= path_len; i++) {
+    if (prefix[i] != '/' && prefix[i] != '\0') continue;
+    char saved = prefix[i];
+    prefix[i] = '\0';
+    int created = 0;
+    int fd = cache_open_directory_no_symlinks(root_fd, prefix);
+    if (fd >= 0) {
+      if (close(fd) != 0) {
+        int saved_errno = errno;
+        close(root_fd);
+        errno = saved_errno;
+        return -1;
+      }
+    } else if (errno == ENOENT) {
+      if (ensure_confined_directory(root_fd, prefix, 0755) != 0) {
+        int saved_errno = errno;
+        close(root_fd);
+        errno = saved_errno;
+        return -1;
+      }
+      created = 1;
+    } else {
+      int saved_errno = errno;
+      close(root_fd);
+      errno = saved_errno;
+      return -1;
+    }
+    if (created) {
+      if (*created_component_count >= SPORE_BUILD_CACHE_MAX_CREATED_COMPONENTS) {
+        close(root_fd);
+        errno = E2BIG;
+        return -1;
+      }
+      fd = cache_open_directory_no_symlinks(root_fd, prefix);
+      struct stat st;
+      if (fd < 0 || fstat(fd, &st) != 0) {
+        int saved_errno = errno;
+        if (fd >= 0) close(fd);
+        close(root_fd);
+        errno = saved_errno;
+        return -1;
+      }
+      created_components[*created_component_count] = (struct spore_build_cache_created_component){
+        .device = (uint64_t)st.st_dev,
+        .inode = (uint64_t)st.st_ino,
+      };
+      (*created_component_count)++;
+      if (close(fd) != 0) {
+        int saved_errno = errno;
+        close(root_fd);
+        errno = saved_errno;
+        return -1;
+      }
+    }
+    prefix[i] = saved;
+  }
+
+  int fd = cache_open_directory_no_symlinks(root_fd, path);
+  int saved_errno = fd < 0 ? errno : 0;
+  if (close(root_fd) != 0 && fd >= 0) {
+    saved_errno = errno;
+    close(fd);
+    fd = -1;
+  }
+  if (fd < 0) {
+    errno = saved_errno;
+    return -1;
+  }
+  struct stat target_st;
+  if (fstat(fd, &target_st) != 0) {
+    saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return -1;
+  }
+  *target_identity = (struct spore_build_cache_created_component){
+    .device = (uint64_t)target_st.st_dev,
+    .inode = (uint64_t)target_st.st_ino,
+  };
+  *target_fd = fd;
+  return 0;
+}
+
+static int cache_parent_fd_no_symlinks(int root_fd, const char *path, char *name, size_t name_cap) {
+  const char *rel = path[0] == '/' ? path + 1 : path;
+  const char *slash = strrchr(rel, '/');
+  const char *base = slash ? slash + 1 : rel;
+  size_t base_len = strlen(base);
+  if (base_len == 0 || base_len >= name_cap) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(name, base, base_len + 1);
+  if (!slash) return dup(root_fd);
+
+  char parent[MAX_COPY_PATH_LEN + 1];
+  size_t parent_len = (size_t)(slash - rel);
+  if (parent_len == 0 || parent_len >= sizeof(parent)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(parent, rel, parent_len);
+  parent[parent_len] = '\0';
+  return cache_open_directory_no_symlinks(root_fd, parent);
+}
+
+int spore_build_cache_target_cleanup(
+    const char *root, const char *path,
+    const struct spore_build_cache_created_component *target_identity,
+    const struct spore_build_cache_created_component *created_components,
+    size_t created_component_count) {
+  if (!target_identity || !created_components ||
+      created_component_count > SPORE_BUILD_CACHE_MAX_CREATED_COMPONENTS) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (path[0] != '/' || path[1] == '\0' || validate_spore_copy_entry_path(path) != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0) return -1;
+  if (created_component_count == 0) {
+    char name[MAX_COPY_PATH_LEN + 1];
+    int parent_fd = cache_parent_fd_no_symlinks(root_fd, path, name, sizeof(name));
+    if (parent_fd < 0) {
+      int saved_errno = errno;
+      close(root_fd);
+      errno = saved_errno;
+      return -1;
+    }
+    struct stat st;
+    int stat_rc = fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW);
+    int saved_errno = errno;
+    if (close(parent_fd) != 0) {
+      int close_errno = errno;
+      close(root_fd);
+      errno = close_errno;
+      return -1;
+    }
+    if (stat_rc != 0) {
+      close(root_fd);
+      errno = saved_errno;
+      return -1;
+    }
+    if (!S_ISDIR(st.st_mode) || (uint64_t)st.st_dev != target_identity->device ||
+        (uint64_t)st.st_ino != target_identity->inode) {
+      close(root_fd);
+      errno = ESTALE;
+      return -1;
+    }
+    return close(root_fd);
+  }
+  const struct spore_build_cache_created_component deepest =
+      created_components[created_component_count - 1];
+  if (deepest.device != target_identity->device || deepest.inode != target_identity->inode) {
+    close(root_fd);
+    errno = ESTALE;
+    return -1;
+  }
+  char current[MAX_COPY_PATH_LEN + 1];
+  snprintf(current, sizeof(current), "%s", path);
+  for (size_t i = 0; i < created_component_count; i++) {
+    char name[MAX_COPY_PATH_LEN + 1];
+    int parent_fd = cache_parent_fd_no_symlinks(root_fd, current, name, sizeof(name));
+    if (parent_fd < 0) {
+      int saved_errno = errno;
+      close(root_fd);
+      errno = saved_errno;
+      return -1;
+    }
+    struct stat st;
+    const struct spore_build_cache_created_component expected =
+        created_components[created_component_count - 1 - i];
+    if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+      int saved_errno = errno;
+      close(parent_fd);
+      close(root_fd);
+      errno = saved_errno;
+      return -1;
+    }
+    if (!S_ISDIR(st.st_mode) || (uint64_t)st.st_dev != expected.device ||
+        (uint64_t)st.st_ino != expected.inode) {
+      close(parent_fd);
+      close(root_fd);
+      errno = ESTALE;
+      return -1;
+    }
+    int rc = unlinkat(parent_fd, name, AT_REMOVEDIR);
+    int saved_errno = errno;
+    if (close(parent_fd) != 0) {
+      int close_errno = errno;
+      close(root_fd);
+      errno = close_errno;
+      return -1;
+    }
+    if (rc != 0) {
+      if (saved_errno == ENOTEMPTY && i > 0) {
+        int close_rc = close(root_fd);
+        if (close_rc != 0) return -1;
+        return 0;
+      }
+      close(root_fd);
+      errno = saved_errno;
+      return -1;
+    }
+    char *slash = strrchr(current, '/');
+    if (!slash || slash == current) {
+      if (i + 1 != created_component_count) {
+        close(root_fd);
+        errno = ESTALE;
+        return -1;
+      }
+      break;
+    }
+    *slash = '\0';
+  }
+  return close(root_fd);
+}
+
 static int copy_result(char *error, size_t error_cap, int code, const char *message) {
   if (error_cap > 0) snprintf(error, error_cap, "%s", message);
   return code;

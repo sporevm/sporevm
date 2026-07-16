@@ -29,8 +29,30 @@ cannot create an asynchronous path to the agent or host control transport.
 Ordinary IP networking stays unchanged. The command receives the pinned
 BuildKit default capability set, and namespace destruction plus cgroup
 kill-and-empty verification owns cleanup before checkpoint publication.
-`RUN --mount`, secret/SSH forwarding, new device types, and manifest changes
-remain unsupported.
+Secret/SSH forwarding, new device types, and manifest changes remain
+unsupported.
+
+`spore build` now accepts one or more `RUN --mount=type=cache,target=...`
+mounts when both `id` and `sharing` are omitted. The target expands from the
+instruction-start ENV/ARG snapshot; BuildKit's default ID is
+`path.Clean(expanded target)`, so repeated separators, dot segments, and a
+trailing slash share one persistent host-local directory. Relative targets are
+mounted below `WORKDIR` while retaining their cleaned relative default ID.
+Cache bytes persist across steps, failed RUNs, and later builds, but the mount
+and any target directories created for it are removed before every rootfs
+checkpoint. If a RUN writes ordinary rootfs content beside a nested cache
+target whose parent was created for the mount, that nonempty parent and its
+content remain in the checkpoint while the mountpoint and cache bytes do not.
+A single 4 GiB sparse aggregate ext4 cache disk and exclusive host lock
+serialize default shared writers conservatively without changing the portable
+device or manifest contracts. Cache contents do not enter RUN result-cache
+identity; the ordered resolved targets, derived default IDs, storage keys, and
+sharing policy do. Each RUN accepts at most eight mounts; current
+`spore rootfs df`, prune, and GC do not account for or remove the aggregate.
+Builds that also need a context disk and two stage-input disks fail before
+execution because the frozen eight-device envelope has no cache-disk slot.
+Explicit `id`, non-default `sharing`, nested or duplicate
+targets, and bind/tmpfs/secret/SSH mounts remain unsupported.
 
 `spore build` now accepts numeric `--chmod` on the public HTTPS single-file
 `ADD` form. Octal values from `0` through `07777`, including ARG-expanded and

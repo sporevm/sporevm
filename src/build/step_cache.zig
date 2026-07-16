@@ -7,8 +7,8 @@ const spore = @import("../spore.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 
-pub const builder_version = "sporevm-build-v8";
-const legacy_builder_versions = [_][]const u8{ "sporevm-build-v7", "sporevm-build-v6" };
+pub const builder_version = "sporevm-build-v9";
+const legacy_builder_versions = [_][]const u8{ "sporevm-build-v8", "sporevm-build-v7", "sporevm-build-v6" };
 const record_kind = "sporevm-build-step-v1";
 const stale_record_kind_v2 = "sporevm-build-step-v2";
 const max_step_record_bytes = 256 * 1024;
@@ -105,6 +105,7 @@ pub const StepInput = struct {
         vcpus: ?u32 = null,
         nofile_soft: ?u64 = null,
         nofile_hard: ?u64 = null,
+        cache_mount_digest: []const u8 = "",
     };
 
     pub const Copy = struct {
@@ -134,6 +135,7 @@ pub const StepInput = struct {
         producer_identity: ?[]const u8,
         executor_identity: []const u8,
         copy_destination_policy: ?CopyDestinationPolicy,
+        cache_mount_digest: []const u8,
     };
 
     fn flatFields(self: StepInput) FlatFields {
@@ -152,6 +154,7 @@ pub const StepInput = struct {
                 .producer_identity = null,
                 .executor_identity = "",
                 .copy_destination_policy = null,
+                .cache_mount_digest = "",
             },
             .prepare => |prepare| .{
                 .instruction_kind = "PREPARE",
@@ -167,6 +170,7 @@ pub const StepInput = struct {
                 .producer_identity = prepare.producer_identity,
                 .executor_identity = "",
                 .copy_destination_policy = null,
+                .cache_mount_digest = "",
             },
             .run => |run| .{
                 .instruction_kind = "RUN",
@@ -182,6 +186,7 @@ pub const StepInput = struct {
                 .producer_identity = null,
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = null,
+                .cache_mount_digest = run.cache_mount_digest,
             },
             .copy => |copy| .{
                 .instruction_kind = "COPY",
@@ -197,6 +202,7 @@ pub const StepInput = struct {
                 .producer_identity = null,
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = copy.destination_policy,
+                .cache_mount_digest = "",
             },
             .add => |add| .{
                 .instruction_kind = "ADD",
@@ -212,6 +218,7 @@ pub const StepInput = struct {
                 .producer_identity = null,
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = null,
+                .cache_mount_digest = "",
             },
             .workdir => |workdir| .{
                 .instruction_kind = "WORKDIR",
@@ -227,6 +234,7 @@ pub const StepInput = struct {
                 .producer_identity = null,
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = null,
+                .cache_mount_digest = "",
             },
         };
     }
@@ -284,6 +292,7 @@ pub const StepRecord = struct {
     producer_identity: ?[]const u8 = null,
     executor_identity: []const u8 = "",
     copy_destination_policy: ?CopyDestinationPolicy = null,
+    cache_mount_digest: []const u8 = "",
     created_unix: i64 = 0,
 };
 
@@ -309,6 +318,7 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
     hashOptionalField(&h, fields.producer_identity);
     hashField(&h, fields.executor_identity);
     hashOptionalField(&h, if (fields.copy_destination_policy) |policy| @tagName(policy) else null);
+    hashField(&h, fields.cache_mount_digest);
     return finishHex(allocator, &h);
 }
 
@@ -380,6 +390,7 @@ pub fn writeRecord(
         .producer_identity = fields.producer_identity,
         .executor_identity = fields.executor_identity,
         .copy_destination_policy = fields.copy_destination_policy,
+        .cache_mount_digest = fields.cache_mount_digest,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, record, .{
         .whitespace = .indent_2,
@@ -526,7 +537,8 @@ fn stepInputEql(a: StepInput, b: StepInput) bool {
         af.exact_target == bf.exact_target and
         optionalStringEql(af.producer_identity, bf.producer_identity) and
         std.mem.eql(u8, af.executor_identity, bf.executor_identity) and
-        af.copy_destination_policy == bf.copy_destination_policy;
+        af.copy_destination_policy == bf.copy_destination_policy and
+        std.mem.eql(u8, af.cache_mount_digest, bf.cache_mount_digest);
 }
 
 fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -551,7 +563,7 @@ fn currentRecordInput(record: StepRecord) !StepInput {
         if (!std.mem.eql(u8, record.instruction, "SCRATCH") or record.input_digest.len == 0 or
             record.env_digest.len != 0 or record.workdir.len != 0 or record.network_mode != null or
             !no_resource_fields or record.producer_identity != null or record.executor_identity.len != 0 or
-            record.copy_destination_policy != null)
+            record.copy_destination_policy != null or record.cache_mount_digest.len != 0)
         {
             return error.MalformedBuildRecord;
         }
@@ -562,7 +574,8 @@ fn currentRecordInput(record: StepRecord) !StepInput {
         const producer = record.producer_identity orelse return error.MalformedBuildRecord;
         if (!std.mem.eql(u8, record.instruction, "PREPARE") or record.input_digest.len != 0 or
             record.env_digest.len != 0 or record.workdir.len != 0 or record.network_mode != null or
-            !no_resource_fields or record.executor_identity.len != 0 or record.copy_destination_policy != null) return error.MalformedBuildRecord;
+            !no_resource_fields or record.executor_identity.len != 0 or record.copy_destination_policy != null or
+            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
         const input = try prepareInput(record.platform, record.parent_index_digest, target, producer);
         return input;
     }
@@ -583,12 +596,14 @@ fn currentRecordInput(record: StepRecord) !StepInput {
                 .vcpus = record.vcpus,
                 .nofile_soft = record.nofile_soft,
                 .nofile_hard = record.nofile_hard,
+                .cache_mount_digest = record.cache_mount_digest,
             } },
         };
     }
     if (std.mem.eql(u8, record.instruction_kind, "COPY")) {
         if (!std.mem.startsWith(u8, record.instruction, "COPY ") or record.input_digest.len == 0 or
-            record.network_mode != null or !no_resource_fields or record.copy_destination_policy == null) return error.MalformedBuildRecord;
+            record.network_mode != null or !no_resource_fields or record.copy_destination_policy == null or
+            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
             .parent_index_digest = record.parent_index_digest,
@@ -604,7 +619,8 @@ fn currentRecordInput(record: StepRecord) !StepInput {
     }
     if (std.mem.eql(u8, record.instruction_kind, "ADD")) {
         if (!std.mem.startsWith(u8, record.instruction, "ADD ") or record.input_digest.len == 0 or
-            record.network_mode != null or !no_resource_fields or record.copy_destination_policy != null) return error.MalformedBuildRecord;
+            record.network_mode != null or !no_resource_fields or record.copy_destination_policy != null or
+            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
             .parent_index_digest = record.parent_index_digest,
@@ -619,7 +635,8 @@ fn currentRecordInput(record: StepRecord) !StepInput {
     }
     if (std.mem.eql(u8, record.instruction_kind, "WORKDIR")) {
         if (!std.mem.startsWith(u8, record.instruction, "WORKDIR ") or record.input_digest.len == 0 or
-            record.network_mode != null or !no_resource_fields or record.copy_destination_policy != null) return error.MalformedBuildRecord;
+            record.network_mode != null or !no_resource_fields or record.copy_destination_policy != null or
+            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
             .parent_index_digest = record.parent_index_digest,
@@ -668,6 +685,9 @@ fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
         .run => |run| {
             validateBlake3Identity(input.executor_identity) catch return error.BadBuildCacheInput;
             if (!std.fs.path.isAbsolute(run.workdir)) return error.BadBuildCacheInput;
+            if (run.cache_mount_digest.len != 0) {
+                validateBlake3Identity(run.cache_mount_digest) catch return error.BadBuildCacheInput;
+            }
         },
         .copy => |copy| {
             validateBlake3Identity(input.executor_identity) catch return error.BadBuildCacheInput;
@@ -810,6 +830,27 @@ test "COPY destination policy is explicit cache identity" {
     const link_key = try stepKey(allocator, link);
     defer allocator.free(link_key);
     try std.testing.expect(!std.mem.eql(u8, follow_key, link_key));
+}
+
+test "RUN cache mount digest is explicit cache identity" {
+    const allocator = std.testing.allocator;
+    const base: StepInput = .{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = "RUN --mount=type=cache,target=/cache true",
+        .executor_identity = test_executor_identity,
+        .operation = .{ .run = .{
+            .network_mode = .none,
+            .cache_mount_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        } },
+    };
+    const first = try stepKey(allocator, base);
+    defer allocator.free(first);
+    var changed = base;
+    changed.operation.run.cache_mount_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const second = try stepKey(allocator, changed);
+    defer allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
 test "prepare input is canonical and key changes with target and producer" {
@@ -1102,7 +1143,7 @@ test "pre-capability COPY record misses after executor identity changes" {
     try std.testing.expect((try readHit(io, arena, cache_root, new_input, new_key)) != null);
 }
 
-test "gc inspection retains complete v7 and v6 records" {
+test "gc inspection retains complete legacy records" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1119,6 +1160,7 @@ test "gc inspection retains complete v7 and v6 records" {
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
     const keys = [_][]const u8{
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     };
