@@ -1,0 +1,9 @@
+{
+  "description": "quoted RUN heredoc delimiters remain fail-closed before cache-mount setup",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 3: unsupported RUN heredoc form"
+  },
+  "scan_prefixes": []
+}

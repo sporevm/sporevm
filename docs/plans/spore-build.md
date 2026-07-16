@@ -155,8 +155,9 @@ The missing work falls into three different categories:
   `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
   (`--parents`, `--chown`, `--chmod`), RUN mounts other than bounded default
   `type=cache,target=...`, local `ADD`, ADD flags
-  other than numeric `--chmod`, RUN heredocs and COPY heredoc forms other than
-  one unquoted non-chomping source, `USER`, `VOLUME`, `EXPOSE`,
+  other than numeric `--chmod`, RUN heredoc forms other than one unquoted,
+  non-chomping shell body, COPY heredoc forms other than one unquoted
+  non-chomping source, `USER`, `VOLUME`, `EXPOSE`,
   `HEALTHCHECK`, and `ONBUILD` still fail closed. C2 now also accepts bounded
   non-empty JSON-array `RUN` and executes
   its exact argv with Docker-compatible PATH lookup and no implicit variable
@@ -164,8 +165,8 @@ The missing work falls into three different categories:
   with runc's last-value-wins rule before cache hashing and guest serialization.
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
-  features that remain outside the subset, including RUN heredocs, broader
-  mount forms, and SSH declarations. The base image keeps arriving as an OCI
+  features that remain outside the subset, including broader heredoc and mount
+  forms plus SSH declarations. The base image keeps arriving as an OCI
   layout via `--build-context`.
 - The unchanged Buildkite `ci` target is also exercised independently as a
   read-only prioritization oracle. Its first grounded failure may identify C2,
@@ -488,7 +489,8 @@ implementing Spore's mounts or cache policy.
 | Instruction | Support |
 | --- | --- |
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
-| `RUN [--mount=type=cache,target=<path>]… <shell>` / `RUN [--mount=type=cache,target=<path>]… ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. The first C3 slice accepts only cache mounts with omitted ID/sharing; bind, tmpfs, secret, SSH, per-instruction network, and heredocs remain rejected. |
+| `RUN [--mount=type=cache,target=<path>]… <shell>` / `RUN [--mount=type=cache,target=<path>]… ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. The first C3 slice accepts only cache mounts with omitted ID/sharing; bind, tmpfs, secret, SSH, and per-instruction network remain rejected. |
+| `RUN [--mount=type=cache,target=<path>]… <<NAME` | one unquoted, non-chomping heredoc token as the complete RUN command. A non-empty body without a leading shebang is preserved byte-for-byte, including its final newline, and executes through the ordinary shell RUN path. ARG/ENV, quoting, escaping, unset variables, and parameter operators are therefore evaluated by the guest shell, not the builder-owned operand expander. Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and exec-form heredocs fail closed. |
 | `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
 | `COPY <<NAME <dest>` | one unquoted, non-chomping inline source with no flags. The body preserves its final newline and quote bytes while expanding stable ARG/ENV expressions from the instruction-start snapshot. It becomes one root-owned `0644` regular file; a directory destination uses `NAME` as its basename. Multiple, mixed, quoted, and chomping heredocs fail closed. |
 | `ADD [--chmod=<octal>] <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Numeric chmod expands at instruction start and must resolve from `0` through `07777`; other flags, symbolic modes, local/Git sources, credentials, and archive extraction fail closed. |
@@ -502,10 +504,12 @@ implementing Spore's mounts or cache policy.
 Builder-owned variable substitution applies to `FROM`, `ENV`, `ARG` defaults,
 `WORKDIR`, `COPY` source/destination arguments, and the accepted `ADD` numeric
 mode, URL path/query, and destination using the declared
-`ARG`/`ENV` state. `COPY --from` remains literal. `CMD` and
-`ENTRYPOINT` retain variables for runtime. Shell-form `RUN` is not pre-expanded;
-its guest shell sees the effective `ARG`/`ENV` environment and performs shell
-expansion. Exec-form `RUN` preserves every argv string literally. The
+`ARG`/`ENV` state. `COPY --from` remains literal. `CMD` and `ENTRYPOINT` retain
+variables for runtime. Shell-form `RUN`, including the accepted simple RUN
+heredoc, is not pre-expanded; its guest shell sees the effective `ARG`/`ENV`
+environment and performs shell expansion. That environment and the exact
+heredoc body remain cache inputs. Exec-form `RUN` preserves every argv string
+literally. The
 builder-owned subset accepts `$NAME`, `${NAME}`, `${NAME:-word}`,
 `${NAME-word}`, `${NAME:+word}`, and `${NAME+word}`, including nested stable
 expansion in `word`. Pattern removal, replacement, required-value, and other
@@ -1686,30 +1690,40 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    Mode changes miss, unchanged refetches with the same bytes and mode hit, and
    mode remains independent from the validated remote mtime. Symbolic modes,
    COPY chmod, local ADD, extraction, and other ADD flags remain rejected.
-5. **Active — single-source COPY heredoc.** Exact merged main `8655d5b0`, tree
-   `d2f01b53`, passed Buildkite #1397 and independent packaged HVF/KVM
-   acceptance for default cache mounts. The unchanged `fb742fd5` oracle then
-   stopped parser-only at line 121 on `COPY <<EOF`, with no fetch, VM, runtime,
-   rootfs, or cache mutation. This slice accepts only one unquoted,
-   non-chomping inline source with no flags. It preserves the final newline and
-   literal quote bytes, expands the body and destination from the
-   instruction-start snapshot, and lowers one BLAKE3-addressed root-owned
-   `0644` file through the existing typed COPY transition, immutable context
-   disk, strict v4 request, and guest apply path. Quoted or chomping
-   delimiters, multiple or mixed sources, COPY flags, and RUN heredocs remain
-   rejected. A focused exact-input rerun with this candidate parses both COPY
-   heredocs and stops at the cache-mounted RUN heredoc whose instruction begins
-   on line 130 (the `<<EOF` token is on line 132), before any fetch, cache
-   mutation, or VM boot.
-6. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add RUN
-   heredocs, `COPY --parents`, and `COPY --chmod` only when the next
-   unchanged-oracle run reaches them. Split these into separate PRs whenever
-   their parser, filesystem result, cache identity, or failure-publication
-   protocols differ.
-7. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
+5. **Done — landed in PR #508:** single-source COPY heredoc. Exact merged main
+   `6e679896d5b79f6bab2131ff7f8573c79537e66c`, tree `23ead6e7`, passed
+   Buildkite #1399 and independent packaged HVF/KVM acceptance. The slice
+   accepts one unquoted, non-chomping inline source with no flags, preserves
+   the final newline and quote bytes, expands from the instruction-start
+   snapshot, and lowers one root-owned `0644` file through the existing typed
+   COPY and guest apply seams. The unchanged `fb742fd5` oracle then parsed both
+   COPY heredocs and stopped parser-only at the cache-mounted RUN heredoc whose
+   instruction begins on line 130, with zero fetch, VM, runtime, rootfs, or
+   cache mutation.
+6. **Active — single shell RUN heredoc.** BuildKit v0.30.0 source and a pinned
+   Buildx v0.33.0 differential show that `RUN <<NAME` without a shebang lowers
+   the exact body to the ordinary shell RUN path; the frontend does not substitute
+   the body, so ARG/ENV, quotes, escapes, unset variables, and parameter
+   operators retain ordinary shell semantics. The accepted slice is exactly
+   one unquoted, non-chomping marker as the complete command after zero or more
+   already-supported default cache mounts. It requires a non-empty body without
+   NUL or a leading shebang, preserves the final newline, and reuses the typed
+   RUN transition plus existing v1/v3 shell requests, timeout, sandbox,
+   selected cache-mount plan, and cleanup. Exact canonical body text,
+   effective ARG/ENV state, workdir, network, resources, ordered normalized
+   mount identity, parent rootfs, and executor identity remain cache inputs.
+   Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and
+   exec-form heredocs fail during the full-file parse/preflight pass. This is
+   the narrow general form required by frozen line 130; it does not add a guest
+   protocol or alter C3 storage or sandbox contracts.
+7. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add
+   `COPY --parents` and `COPY --chmod` only when the next unchanged-oracle run
+   reaches them. Split these into separate PRs whenever their parser,
+   filesystem result, cache identity, or failure-publication protocols differ.
+8. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
    a later unchanged-oracle run produces a concrete mismatch or unsupported
    span.
-8. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
+9. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
    `--exclude`, `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`,
    `HEALTHCHECK`, `VOLUME`, and other metadata only when the unchanged workload
    or the representative common-template corpus demonstrates demand.
@@ -1769,7 +1783,11 @@ SHA-256 `36867efe6eef1e96da5115aa91df0d087be61763c0097846a971d8709e659a2b`
 parsed through its three line-82 default cache mounts after merged-main
 acceptance at `8655d5b0` and next failed during whole-file parsing at line 121
 on `COPY <<EOF`. No fetch, VM boot, or cache/runtime mutation occurred, so the
-single-source COPY heredoc slice above became the next grounded boundary.
+single-source COPY heredoc slice became the next grounded boundary. That slice
+landed unchanged in PR #508 at exact main `6e679896`, passed Buildkite #1399
+and packaged HVF/KVM acceptance, and moved the same zero-mutation oracle to the
+line-130 cache-mounted `RUN <<EOF`. The active single RUN heredoc slice above
+is therefore the next grounded boundary.
 2. Implement read-only context and stage bind mounts plus tmpfs mounts.
 3. Add per-RUN network selection and key it independently from global default.
 4. Generalize the landed default-ID store with explicit-ID ownership,

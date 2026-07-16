@@ -795,7 +795,7 @@ fn heredocCopyTransition(
     state: State,
     instruction: dockerfile.Instruction,
     copy: dockerfile.Copy,
-    heredoc: dockerfile.CopyHeredoc,
+    heredoc: dockerfile.Heredoc,
 ) !instruction_transition.InstructionTransition.HeredocCopy {
     return .{
         .line = instruction.line,

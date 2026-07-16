@@ -1,0 +1,9 @@
+{
+  "description": "shebang RUN heredocs remain fail-closed instead of approximating BuildKit direct execution",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported RUN heredoc form"
+  },
+  "scan_prefixes": []
+}
