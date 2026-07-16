@@ -453,7 +453,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
             diag.boot_count = 1;
             diag.executed_steps = control.executed_steps;
             diag.session_ms = ((try monotonicNs()) -| session_start_ns) / std.time.ns_per_ms;
-            diag.instruction_ms = control.instruction_elapsed_ms;
+            diag.instruction_ms = control.instruction_timing.total_ms;
             diag.checkpoint_control_ms = control.checkpoint_control_ms;
             diag.snapshot_ms = control.snapshot_ms;
             diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
@@ -466,7 +466,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         diag.boot_count = 1;
         diag.executed_steps = control.executed_steps;
         diag.session_ms = ((try monotonicNs()) -| session_start_ns) / std.time.ns_per_ms;
-        diag.instruction_ms = control.instruction_elapsed_ms;
+        diag.instruction_ms = control.instruction_timing.total_ms;
         diag.checkpoint_control_ms = control.checkpoint_control_ms;
         diag.snapshot_ms = control.snapshot_ms;
         diag.max_checkpoint_control_ms = control.max_checkpoint_control_ms;
@@ -511,6 +511,24 @@ fn networkModeForSteps(steps: []const Step) !step_cache.NetworkMode {
 /// Session state is arena-owned; see `runSession` for the allocator lifetime
 /// contract. Fields that are replaced during checkpointing are intentionally not
 /// individually freed.
+const InstructionTiming = struct {
+    total_ms: u64 = 0,
+    current_step_ms: u64 = 0,
+
+    fn record(self: *InstructionTiming, elapsed_ms: u64) void {
+        self.total_ms +|= elapsed_ms;
+        self.current_step_ms +|= elapsed_ms;
+    }
+
+    fn elapsedWithActive(self: InstructionTiming, active_ms: u64) u64 {
+        return self.current_step_ms +| active_ms;
+    }
+
+    fn finishStep(self: *InstructionTiming) void {
+        self.current_step_ms = 0;
+    }
+};
+
 const BuildControl = struct {
     io: Io,
     allocator: std.mem.Allocator,
@@ -557,7 +575,7 @@ const BuildControl = struct {
     max_checkpoint_control_ms: u64 = 0,
     preparation_start_ns: ?u64 = null,
     preparation_publish_ms: ?u64 = null,
-    instruction_elapsed_ms: u64 = 0,
+    instruction_timing: InstructionTiming = .{},
 
     fn init(io: Io, allocator: std.mem.Allocator, options: Options, p0_idle_probe_ms: u64) !BuildControl {
         return .{
@@ -741,7 +759,7 @@ const BuildControl = struct {
             .complete => {
                 const exit_code = self.stream.exit_code orelse return error.BadRunExitFrame;
                 if (self.active_stream == .run or self.active_stream == .copy or self.active_stream == .workdir) {
-                    self.instruction_elapsed_ms +|= self.stream.elapsedMs();
+                    self.instruction_timing.record(self.stream.elapsedMs());
                 }
                 dev.resetHostStream();
                 self.stream_valid = false;
@@ -755,7 +773,7 @@ const BuildControl = struct {
             },
             else => {
                 const elapsed = if (self.active_stream == .run or self.active_stream == .copy or self.active_stream == .workdir)
-                    self.instruction_elapsed_ms +| self.stream.elapsedMs()
+                    self.instruction_timing.elapsedWithActive(self.stream.elapsedMs())
                 else
                     self.stream.elapsedMs();
                 if (elapsed > self.timeout_ms) {
@@ -840,7 +858,10 @@ const BuildControl = struct {
                 }
                 self.current_storage = storage;
                 self.pending_storage = null;
-                if (completed_kind == .dockerfile_step) self.step_index += 1;
+                if (completed_kind == .dockerfile_step) {
+                    self.step_index += 1;
+                    self.instruction_timing.finishStep();
+                }
                 self.active_input = null;
                 self.active_step_key = "";
                 self.active_stdin_payload = "";
@@ -1795,6 +1816,15 @@ test "checkpoint controls use step-specific vsock identities" {
     defer allocator.free(prepare_thaw);
     try std.testing.expectEqualStrings("spore-build-prepare-freeze", prepare_freeze);
     try std.testing.expectEqualStrings("spore-build-prepare-thaw", prepare_thaw);
+}
+
+test "instruction timeout accounting resets between Dockerfile steps" {
+    var timing: InstructionTiming = .{};
+    timing.record(1_200);
+    try std.testing.expectEqual(@as(u64, 1_900), timing.elapsedWithActive(700));
+    timing.finishStep();
+    try std.testing.expectEqual(@as(u64, 700), timing.elapsedWithActive(700));
+    try std.testing.expectEqual(@as(u64, 1_200), timing.total_ms);
 }
 
 test "preparation metric line preserves authoritative publication and total fields" {

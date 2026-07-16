@@ -206,7 +206,7 @@ fn parseInstruction(
         if (rest.len == 0) return fail(diagnostic, line, "RUN requires a shell command");
         if (std.mem.startsWith(u8, std.mem.trimStart(u8, rest, " \t"), "--")) return fail(diagnostic, line, "unsupported RUN flag");
         if (std.mem.startsWith(u8, std.mem.trimStart(u8, rest, " \t"), "[")) {
-            return .{ .run = .{ .exec = try parseRunExec(allocator, rest, line, diagnostic) } };
+            if (try parseRunExec(allocator, rest, line, diagnostic)) |argv| return .{ .run = .{ .exec = argv } };
         }
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported RUN heredoc");
         return .{ .run = .{ .shell = try allocator.dupe(u8, rest) } };
@@ -330,11 +330,11 @@ fn parseInstruction(
     }
     if (asciiEql(op, "CMD")) {
         if (rest.len == 0) return fail(diagnostic, line, "CMD requires a command");
-        return .{ .cmd = try parseCmd(allocator, rest, line, diagnostic) };
+        return .{ .cmd = try parseCmd(allocator, rest, line, diagnostic, .cmd) };
     }
     if (asciiEql(op, "ENTRYPOINT")) {
         if (rest.len == 0) return fail(diagnostic, line, "ENTRYPOINT requires a command");
-        return .{ .entrypoint = try parseCmd(allocator, rest, line, diagnostic) };
+        return .{ .entrypoint = try parseCmd(allocator, rest, line, diagnostic, .entrypoint) };
     }
     const message = try std.fmt.allocPrint(allocator, "unsupported Dockerfile instruction: {s}", .{op});
     diagnostic.* = .{ .line = line, .message = message };
@@ -368,7 +368,6 @@ fn logicalLines(
         const trimmed_right = std.mem.trimEnd(u8, line, " \t");
         const has_continuation = trimmed_right.len != 0 and trimmed_right[trimmed_right.len - 1] == escape;
         const part = if (has_continuation) trimmed_right[0 .. trimmed_right.len - 1] else line;
-        if (continuing) try current.append(' ');
         try current.appendSlice(part);
         if (current.items.len > max_logical_line_bytes) return fail(diagnostic, current_line, "Dockerfile logical line is too long");
         continuing = has_continuation;
@@ -469,14 +468,18 @@ fn parseCmd(
     rest: []const u8,
     line: usize,
     diagnostic: *Diagnostic,
+    instruction: enum { cmd, entrypoint },
 ) !Cmd {
     const trimmed = std.mem.trimStart(u8, rest, " \t");
     if (!std.mem.startsWith(u8, trimmed, "[")) return .{ .shell = try allocator.dupe(u8, rest) };
-    var parsed = std.json.parseFromSlice([][]const u8, allocator, trimmed, .{ .allocate = .alloc_always }) catch {
-        return fail(diagnostic, line, "CMD exec form must be a JSON string array");
+    const entries = parseMaybeJsonStringArray(allocator, trimmed) catch |err| switch (err) {
+        error.JsonNotStringArray => return fail(diagnostic, line, switch (instruction) {
+            .cmd => "CMD exec form must be a JSON string array",
+            .entrypoint => "ENTRYPOINT exec form must be a JSON string array",
+        }),
+        else => |other| return other,
     };
-    defer parsed.deinit();
-    return .{ .exec = try cloneStringList(allocator, parsed.value) };
+    return if (entries) |value| .{ .exec = value } else .{ .shell = try allocator.dupe(u8, rest) };
 }
 
 fn parseRunExec(
@@ -484,20 +487,43 @@ fn parseRunExec(
     rest: []const u8,
     line: usize,
     diagnostic: *Diagnostic,
-) ![]const []const u8 {
+) !?[]const []const u8 {
     const trimmed = std.mem.trimStart(u8, rest, " \t");
-    var parsed = std.json.parseFromSlice([][]const u8, allocator, trimmed, .{ .allocate = .alloc_always }) catch {
-        return fail(diagnostic, line, "RUN exec form must be a non-empty JSON string array");
+    const entries = parseMaybeJsonStringArray(allocator, trimmed) catch |err| switch (err) {
+        error.JsonNotStringArray => return fail(diagnostic, line, "RUN exec form must be a non-empty JSON string array"),
+        else => |other| return other,
     };
-    defer parsed.deinit();
-    if (run_contract.execArgvViolation(parsed.value)) |violation| switch (violation) {
+    const argv = entries orelse return null;
+    if (run_contract.execArgvViolation(argv)) |violation| switch (violation) {
         .empty => return fail(diagnostic, line, "RUN exec form must be a non-empty JSON string array"),
         .empty_executable => return fail(diagnostic, line, "RUN exec form requires a non-empty executable"),
         .too_many_args => return fail(diagnostic, line, "RUN exec form has too many arguments; limit is 16"),
         .nul => return fail(diagnostic, line, "RUN exec form arguments cannot contain NUL bytes"),
         .decoded_too_large => return fail(diagnostic, line, "RUN exec form arguments are too large; limit is 4096 decoded bytes"),
     };
-    return cloneStringList(allocator, parsed.value);
+    return argv;
+}
+
+fn parseMaybeJsonStringArray(allocator: std.mem.Allocator, input: []const u8) !?[]const []const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+    defer parsed.deinit();
+    const values = switch (parsed.value) {
+        .array => |array| array.items,
+        else => return error.JsonNotStringArray,
+    };
+    for (values) |value| switch (value) {
+        .string => {},
+        else => return error.JsonNotStringArray,
+    };
+    const out = try allocator.alloc([]const u8, values.len);
+    for (values, out) |value, *entry| entry.* = switch (value) {
+        .string => |string| try allocator.dupe(u8, string),
+        else => unreachable,
+    };
+    return out;
 }
 
 const WordToken = struct {
@@ -690,6 +716,28 @@ test "Dockerfile parser removes comments inside continuations" {
     try std.testing.expect(std.mem.indexOf(u8, backtick_shell, "&& echo two") != null);
 }
 
+test "Dockerfile parser joins continued lines without inserting bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diagnostic: Diagnostic = .{};
+    const document = try parse(
+        arena_state.allocator(),
+        "FROM scratch\n" ++
+            "RUN ech\\\n" ++
+            "o ok\n" ++
+            "COPY file\\\n" ++
+            "name.txt /dst/\n" ++
+            "ENV NAME=long\\\n" ++
+            "value\n",
+        &diagnostic,
+    );
+    const instructions = document.stages[0].instructions;
+    try std.testing.expectEqualStrings("echo ok", instructions[0].value.run.shell);
+    try std.testing.expectEqual(@as(usize, 1), instructions[1].value.copy.sources.len);
+    try std.testing.expectEqualStrings("filename.txt", instructions[1].value.copy.sources[0]);
+    try std.testing.expectEqualStrings("longvalue", instructions[2].value.env.pairs[0].value);
+}
+
 test "Dockerfile parser leaves command variables for runtime expansion" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -702,6 +750,38 @@ test "Dockerfile parser leaves command variables for runtime expansion" {
     , &diagnostic);
     try std.testing.expectEqualStrings("$TOKEN", document.stages[0].instructions[0].value.entrypoint.exec[1]);
     try std.testing.expectEqualStrings("echo \"${VALUE:-default}\"", document.stages[0].instructions[1].value.cmd.shell);
+}
+
+test "Dockerfile parser treats invalid bracket JSON as shell form" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diagnostic: Diagnostic = .{};
+    const document = try parse(arena_state.allocator(),
+        \\FROM scratch
+        \\RUN [ -f /x ] || true
+        \\CMD [ -f /x ] && echo ready
+        \\ENTRYPOINT [ -x /bin/sh ] && exec /bin/sh
+        \\
+    , &diagnostic);
+    const instructions = document.stages[0].instructions;
+    try std.testing.expectEqualStrings("[ -f /x ] || true", instructions[0].value.run.shell);
+    try std.testing.expectEqualStrings("[ -f /x ] && echo ready", instructions[1].value.cmd.shell);
+    try std.testing.expectEqualStrings("[ -x /bin/sh ] && exec /bin/sh", instructions[2].value.entrypoint.shell);
+}
+
+test "Dockerfile parser rejects valid non-string command arrays" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var diagnostic: Diagnostic = .{};
+    const invalid = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM scratch\nCMD [\"true\",1]\n", .message = "CMD exec form must be a JSON string array" },
+        .{ .dockerfile = "FROM scratch\nENTRYPOINT [\"true\",1]\n", .message = "ENTRYPOINT exec form must be a JSON string array" },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), case.dockerfile, &diagnostic));
+        try std.testing.expectEqual(@as(usize, 2), diagnostic.line);
+        try std.testing.expectEqualStrings(case.message, diagnostic.message);
+    }
 }
 
 test "Dockerfile parser rejects duplicate escape directives" {

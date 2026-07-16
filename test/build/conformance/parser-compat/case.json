@@ -1,12 +1,12 @@
 {
-  "description": "relative and parent WORKDIR resolution and directory creation match Docker",
+  "description": "continued tokens and bracket-prefixed shell commands match Docker filesystem and config behavior",
   "expect": {
     "docker": "success",
     "spore": "success"
   },
   "initial_cache": "miss",
   "initial_execution": {
-    "expect_executed_steps": 4,
+    "expect_executed_steps": 5,
     "expect_boot_count": 1,
     "expect_resize_count": 1
   },

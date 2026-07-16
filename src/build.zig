@@ -1395,7 +1395,7 @@ fn resolveCmd(allocator: std.mem.Allocator, cmd: dockerfile.Cmd) ![]const []cons
 }
 
 fn resolveWorkdir(allocator: std.mem.Allocator, current: []const u8, next: []const u8) ![]const u8 {
-    return instruction_transition.normalizeGuestPath(allocator, current, next);
+    return std.fs.path.resolvePosix(allocator, &.{ current, next });
 }
 
 fn substituteStateList(allocator: std.mem.Allocator, raw: []const []const u8, state: State, escape: u8) ![]const []const u8 {
@@ -1653,6 +1653,21 @@ test "COPY and WORKDIR expand exact quoted operands from stage state" {
 
     const workdir = try workdirStep(arena, state, instructions[3], instructions[3].value.workdir);
     try std.testing.expectEqualStrings("/srv/work", workdir.target);
+}
+
+test "WORKDIR resolves parent components with POSIX root confinement" {
+    const allocator = std.testing.allocator;
+    const parent = try resolveWorkdir(allocator, "/app/src", "..");
+    defer allocator.free(parent);
+    try std.testing.expectEqualStrings("/app", parent);
+
+    const root = try resolveWorkdir(allocator, "/", "../..");
+    defer allocator.free(root);
+    try std.testing.expectEqualStrings("/", root);
+
+    const absolute = try resolveWorkdir(allocator, "/app", "/tmp/../work");
+    defer allocator.free(absolute);
+    try std.testing.expectEqualStrings("/work", absolute);
 }
 
 test "remote ADD resolves inherited ARG and automatic platform values at instruction start" {
