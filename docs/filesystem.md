@@ -71,6 +71,18 @@ host-visible unclean aggregate disk is recreated before reuse; a guest mount
 rejection remains a build error. The current `spore rootfs df`, prune, and GC
 surfaces do not account for or remove this host-local cache disk.
 
+One exact `RUN --mount=type=ssh` declaration is accepted only as optional-absent
+compatibility when the caller supplies no SSH input. For that RUN, the builder
+adds `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` only when the effective
+environment does not already define the key, matching BuildKit's observable
+precedence. It creates no socket or `/run/buildkit` path and adds no guest
+request field, host input, or forwarding transport. The resolved environment
+and a typed `ssh_declared_absent` bit enter RUN cache identity, but neither the
+inert value nor any mount state enters image config or a rootfs checkpoint. A
+command that tests or connects to the nonexistent socket fails normally and
+publishes no failed step. Options, duplicate SSH declarations, required or
+custom sockets, secrets, and all credential-bearing forms remain fail-closed.
+
 Mutable public HTTPS ADD inputs are fetched and BLAKE3-hashed before their
 step-record lookup. Their typed key binds the resolved URL and destination,
 the safe response `Content-Disposition` filename or URL-path fallback, actual

@@ -695,9 +695,10 @@ The Buildkite CI Dockerfile at
 `2f31a768d9423507e9b864e1634b0064c17cf3da` cannot currently be rebuilt from
 `FROM local/buildkite-compose-cache:dev`. It combines its runtime and code with
 multi-stage output, cross-stage copies, remote and heredoc inputs, BuildKit
-cache/bind/SSH mounts, and COPY flags outside the supported `spore build`
-subset. SporeVM can consume the resulting monolithic image as a base, but
-cannot apply it as a child delta above an already committed cache image.
+cache/bind/credential-bearing SSH mounts, and COPY flags outside the supported
+`spore build` subset. SporeVM can consume the resulting monolithic image as a
+base, but cannot apply it as a child delta above an already committed cache
+image.
 
 S2 therefore stopped at its explicit decision gate. No Compose pull or fan-out
 numbers were collected: they would measure a code-first cache whose lifetime

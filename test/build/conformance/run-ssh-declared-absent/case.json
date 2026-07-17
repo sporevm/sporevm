@@ -1,0 +1,37 @@
+{
+  "description": "default optional-absent SSH declarations expose only BuildKit's inert environment value",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 4,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle",
+    "/var/cache/oracle-ssh-a",
+    "/var/cache/oracle-ssh-b",
+    "/run/buildkit"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "requires-agent-does-not-publish",
+      "writes": {
+        "Dockerfile": "FROM base\nRUN --mount=type=ssh test -S \"$SSH_AUTH_SOCK\"\n"
+      },
+      "outcome": "failure",
+      "spore_diagnostic": "spore build: Dockerfile line 2: instruction failed: RUN --mount=type=ssh test -S \"$SSH_AUTH_SOCK\""
+    }
+  ]
+}

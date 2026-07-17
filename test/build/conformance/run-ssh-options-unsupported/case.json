@@ -1,0 +1,9 @@
+{
+  "description": "SSH mount options remain outside optional-absent compatibility",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported RUN SSH mount form"
+  },
+  "scan_prefixes": []
+}

@@ -30,6 +30,8 @@ const scratch_format_identity = "sporevm-empty-ext4-scratch-v2:image=16GiB:inode
 const default_linux_path = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const default_root_run_home_value = "/root";
 const default_root_run_home = "HOME=" ++ default_root_run_home_value;
+const default_absent_ssh_auth_sock_value = "/run/buildkit/ssh_agent.0";
+const default_absent_ssh_auth_sock = "SSH_AUTH_SOCK=" ++ default_absent_ssh_auth_sock_value;
 const max_builder_variable_state_bytes: usize = 64 * 1024 * 1024;
 
 pub const testing = if (builtin.is_test) struct {
@@ -1311,7 +1313,7 @@ fn runStep(
         .shell => |shell| .{ .shell = shell },
         .exec => |argv| .{ .exec = argv },
     };
-    const env = runEnvironment(allocator, state) catch |err| {
+    const env = runEnvironment(allocator, state, run.ssh_declared_absent) catch |err| {
         if (err == error.InvalidRunEnvironment) diagnostic.instruction_line = instruction.line;
         return err;
     };
@@ -1332,11 +1334,15 @@ fn runStep(
         .canonical_instruction = instruction.raw,
         .command = command,
         .env = env,
-        .env_digest = try effectiveRunEnvDigest(allocator, state),
+        .env_digest = if (run.ssh_declared_absent)
+            try step_cache.envDigest(allocator, env, state.args.items)
+        else
+            try effectiveRunEnvDigest(allocator, state),
         .workdir = state.workdir,
         .network_mode = options.network,
         .cache_mount_digest = try build_cache_mount.digest(allocator, cache_mounts),
         .cache_mounts = cache_mounts,
+        .ssh_declared_absent = run.ssh_declared_absent,
     };
 }
 
@@ -1387,7 +1393,7 @@ fn effectiveRunEnvDigest(allocator: std.mem.Allocator, state: State) ![]const u8
     return step_cache.envDigest(allocator, env.items, state.args.items);
 }
 
-fn runEnvironment(allocator: std.mem.Allocator, state: State) ![]const []const u8 {
+fn runEnvironment(allocator: std.mem.Allocator, state: State, ssh_declared_absent: bool) ![]const []const u8 {
     var entries = std.array_list.Managed([]const u8).init(allocator);
     try entries.appendSlice(try effectiveStateEnv(allocator, state));
     for (state.args.items) |arg| {
@@ -1397,6 +1403,9 @@ fn runEnvironment(allocator: std.mem.Allocator, state: State) ![]const []const u
         try entries.append(try std.fmt.allocPrint(allocator, "{s}={s}", .{ arg.key, value }));
     }
     try putEnv(allocator, &entries, "HOME", effectiveRootRunHome(state));
+    if (ssh_declared_absent and !envContainsKey(entries.items, "SSH_AUTH_SOCK")) {
+        try entries.append(default_absent_ssh_auth_sock);
+    }
     try validateRunEnvironment(entries.items);
     return entries.toOwnedSlice();
 }
@@ -2029,7 +2038,7 @@ test "run environment includes declared args after env" {
         .{ .key = "UNSET", .value = null },
     };
     const state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "MODE=env", "APP=/srv/app" }) } }, testStorage(), &args, 0);
-    const entries = try runEnvironment(arena, state);
+    const entries = try runEnvironment(arena, state, false);
     try std.testing.expectEqual(@as(usize, 5), entries.len);
     try std.testing.expectEqualStrings("MODE=env", entries[0]);
     try std.testing.expectEqualStrings("APP=/srv/app", entries[1]);
@@ -2048,7 +2057,7 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
         "KEEP=one",
         "PATH=/oracle/b",
     }) } }, testStorage(), &.{}, 0);
-    const entries = try runEnvironment(arena, duplicate_state);
+    const entries = try runEnvironment(arena, duplicate_state, false);
     try std.testing.expectEqual(@as(usize, 3), entries.len);
     try std.testing.expectEqualStrings("KEEP=one", entries[0]);
     try std.testing.expectEqualStrings("PATH=/oracle/b", entries[1]);
@@ -2068,7 +2077,7 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
     try std.testing.expectEqual(@as(usize, 2), overridden_state.environment.effective.items.len);
     try std.testing.expectEqualStrings("KEEP=one", overridden_state.environment.effective.items[0]);
     try std.testing.expectEqualStrings("PATH=/dockerfile", overridden_state.environment.effective.items[1]);
-    try std.testing.expectEqualStrings("/dockerfile", envValue(try runEnvironment(arena, overridden_state), "PATH").?);
+    try std.testing.expectEqualStrings("/dockerfile", envValue(try runEnvironment(arena, overridden_state, false), "PATH").?);
     const published = overridden_state.environment.config.items;
     try std.testing.expectEqual(@as(usize, 3), published.len);
     try std.testing.expectEqualStrings("PATH=/dockerfile", published[0]);
@@ -2079,7 +2088,7 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
     try std.testing.expectEqualStrings("/oracle/b", envValue(inherited_state.environment.effective.items, "PATH").?);
 
     const missing_equals = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"BROKEN"}) } }, testStorage(), &.{}, 0);
-    try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, missing_equals), "BROKEN").?);
+    try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, missing_equals, false), "BROKEN").?);
     try std.testing.expectEqualStrings("BROKEN=", missing_equals.environment.effective.items[0]);
     try std.testing.expectEqualStrings("BROKEN", (try imageConfig(arena, .{}, missing_equals)).config.?.Env.?[0]);
     const missing = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
@@ -2090,13 +2099,13 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
     ));
 
     const empty_entry = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{""}) } }, testStorage(), &.{}, 0);
-    try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, empty_entry));
+    try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, empty_entry, false));
 
     const nul_without_equals = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"BROKEN\x00"}) } }, testStorage(), &.{}, 0);
-    try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, nul_without_equals));
+    try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, nul_without_equals, false));
 
     const empty_name = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"=value"}) } }, testStorage(), &.{}, 0);
-    try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, empty_name));
+    try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, empty_name, false));
 
     var large_env = std.array_list.Managed([]const u8).init(arena);
     for (0..4096) |i| try large_env.append(try std.fmt.allocPrint(arena, "KEY_{d}=value", .{i}));
@@ -2122,7 +2131,7 @@ test "ARG and ENV instruction order controls RUN state without changing image co
     for (document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
     }
-    try std.testing.expectEqualStrings("from-arg", envValue(try runEnvironment(arena, state), "ORDER").?);
+    try std.testing.expectEqualStrings("from-arg", envValue(try runEnvironment(arena, state, false), "ORDER").?);
     try std.testing.expectEqualStrings("ORDER=from-env", (try imageConfig(arena, .{}, state)).config.?.Env.?[1]);
 
     var later_env_diagnostic: dockerfile.Diagnostic = .{};
@@ -2136,7 +2145,7 @@ test "ARG and ENV instruction order controls RUN state without changing image co
     for (later_env.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &later_state, instruction));
     }
-    try std.testing.expectEqualStrings("from-env", envValue(try runEnvironment(arena, later_state), "ORDER").?);
+    try std.testing.expectEqualStrings("from-env", envValue(try runEnvironment(arena, later_state, false), "ORDER").?);
 }
 
 test "build stage defaults PATH and root RUN HOME when absent or empty" {
@@ -2145,7 +2154,7 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     const arena = arena_state.allocator();
 
     const default_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
-    const defaulted = try runEnvironment(arena, default_state);
+    const defaulted = try runEnvironment(arena, default_state, false);
     try std.testing.expectEqual(@as(usize, 2), defaulted.len);
     try std.testing.expectEqualStrings(default_linux_path, defaulted[0]);
     try std.testing.expectEqualStrings(default_root_run_home, defaulted[1]);
@@ -2154,13 +2163,13 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     try std.testing.expectEqualStrings(default_linux_path, default_config.config.?.Env.?[0]);
 
     const explicit_home_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"HOME=/workspace"}) } }, testStorage(), &.{}, 0);
-    const from_env = try runEnvironment(arena, explicit_home_state);
+    const from_env = try runEnvironment(arena, explicit_home_state, false);
     try std.testing.expectEqual(@as(usize, 2), from_env.len);
     try std.testing.expectEqualStrings("HOME=/workspace", from_env[0]);
     try std.testing.expectEqualStrings(default_linux_path, from_env[1]);
 
     const empty_home_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"HOME="}) } }, testStorage(), &.{}, 0);
-    const empty_home = try runEnvironment(arena, empty_home_state);
+    const empty_home = try runEnvironment(arena, empty_home_state, false);
     try std.testing.expectEqual(@as(usize, 2), empty_home.len);
     try std.testing.expectEqualStrings(default_root_run_home, empty_home[0]);
     try std.testing.expectEqualStrings(default_linux_path, empty_home[1]);
@@ -2169,13 +2178,13 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
 
     const home_arg = [_]ArgValue{.{ .key = "HOME", .value = "/arg-home" }};
     const home_arg_state = try stateFromBase(arena, .{}, testStorage(), &home_arg, 0);
-    const from_arg = try runEnvironment(arena, home_arg_state);
+    const from_arg = try runEnvironment(arena, home_arg_state, false);
     try std.testing.expectEqual(@as(usize, 2), from_arg.len);
     try std.testing.expectEqualStrings(default_linux_path, from_arg[0]);
     try std.testing.expectEqualStrings("HOME=/arg-home", from_arg[1]);
 
     const explicit_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH=/custom/bin"}) } }, testStorage(), &.{}, 0);
-    const explicit_path = try runEnvironment(arena, explicit_path_state);
+    const explicit_path = try runEnvironment(arena, explicit_path_state, false);
     try std.testing.expectEqual(@as(usize, 2), explicit_path.len);
     try std.testing.expectEqualStrings("PATH=/custom/bin", explicit_path[0]);
     try std.testing.expectEqualStrings(default_root_run_home, explicit_path[1]);
@@ -2191,7 +2200,7 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     try std.testing.expectEqual(@as(usize, 1), bare_path_state.environment.config.items.len);
     try std.testing.expectEqualStrings("PATH", bare_path_state.environment.config.items[0]);
     try std.testing.expectEqualStrings("PATH=", bare_path_state.environment.effective.items[0]);
-    try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, bare_path_state), "PATH").?);
+    try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, bare_path_state, false), "PATH").?);
 
     var overridden_bare_path_state = bare_path_state;
     try overridden_bare_path_state.environment.put(arena, "PATH", "/custom/bin");
@@ -2283,7 +2292,7 @@ test "root RUN HOME follows ENV and ARG instruction order without changing image
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
     }
     try std.testing.expectEqualStrings("/arg-home", lookupArg("HOME", state.arg_overrides.items).?);
-    const env_then_arg = try runEnvironment(arena, state);
+    const env_then_arg = try runEnvironment(arena, state, false);
     try std.testing.expectEqualStrings("/arg-home", envValue(env_then_arg, "HOME").?);
     const env_then_arg_config = try imageConfig(arena, .{}, state);
     try std.testing.expectEqualStrings("HOME=/published-home", env_then_arg_config.config.?.Env.?[1]);
@@ -2301,7 +2310,7 @@ test "root RUN HOME follows ENV and ARG instruction order without changing image
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &later_env_state, instruction));
     }
     try std.testing.expect(lookupArg("HOME", later_env_state.arg_overrides.items) == null);
-    const arg_then_empty_env = try runEnvironment(arena, later_env_state);
+    const arg_then_empty_env = try runEnvironment(arena, later_env_state, false);
     try std.testing.expectEqualStrings(default_root_run_home_value, envValue(arg_then_empty_env, "HOME").?);
     const arg_then_empty_config = try imageConfig(arena, .{}, later_env_state);
     try std.testing.expectEqualStrings("HOME=", arg_then_empty_config.config.?.Env.?[1]);
@@ -2383,6 +2392,33 @@ test "realistic pinned Go multi-stage scratch Dockerfile parses and plans" {
     try std.testing.expectEqual(@as(usize, 1), plan.target_index);
 }
 
+test "optional-absent SSH declaration injects only the inert default environment value" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const default_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    const plain = try runEnvironment(arena, default_state, false);
+    try std.testing.expect(envValue(plain, "SSH_AUTH_SOCK") == null);
+    const declared = try runEnvironment(arena, default_state, true);
+    try std.testing.expectEqualStrings(default_absent_ssh_auth_sock_value, envValue(declared, "SSH_AUTH_SOCK").?);
+    try std.testing.expectEqualStrings(default_absent_ssh_auth_sock, declared[declared.len - 1]);
+
+    const inherited_state = try stateFromBase(arena, .{
+        .config = .{ .Env = @constCast(&[_][]const u8{"SSH_AUTH_SOCK=/inherited/agent"}) },
+    }, testStorage(), &.{}, 0);
+    try std.testing.expectEqualStrings("/inherited/agent", envValue(try runEnvironment(arena, inherited_state, true), "SSH_AUTH_SOCK").?);
+
+    const empty_state = try stateFromBase(arena, .{
+        .config = .{ .Env = @constCast(&[_][]const u8{"SSH_AUTH_SOCK="}) },
+    }, testStorage(), &.{}, 0);
+    try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, empty_state, true), "SSH_AUTH_SOCK").?);
+
+    const arg = [_]ArgValue{.{ .key = "SSH_AUTH_SOCK", .value = "/arg/agent" }};
+    const arg_state = try stateFromBase(arena, .{}, testStorage(), &arg, 0);
+    try std.testing.expectEqualStrings("/arg/agent", envValue(try runEnvironment(arena, arg_state, true), "SSH_AUTH_SOCK").?);
+}
+
 test "RUN executor preserves shell text for guest expansion" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2412,6 +2448,63 @@ test "RUN executor preserves shell text for guest expansion" {
     try std.testing.expectEqualStrings(shell, step.command.shell);
     try std.testing.expectEqualStrings("APP_ENV=test", step.env[0]);
     try std.testing.expectEqualStrings("BUILD_ARG=from-arg", step.env[1]);
+}
+
+test "RUN transition carries optional-absent SSH state and inert environment" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\RUN --mount=type=ssh true
+        \\
+    , &parser_diagnostic);
+    const instruction = document.stages[0].instructions[0];
+    const state = State{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{}),
+        .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+    };
+    var diagnostic: Diagnostic = .{};
+    const step = try runStep(arena, &diagnostic, state, instruction, instruction.value.run, .{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    });
+    try std.testing.expect(step.ssh_declared_absent);
+    try std.testing.expectEqualStrings(default_absent_ssh_auth_sock_value, envValue(step.env, "SSH_AUTH_SOCK").?);
+    const config = try imageConfig(arena, .{}, state);
+    try std.testing.expect(envValue(config.config.?.Env orelse &.{}, "SSH_AUTH_SOCK") == null);
+
+    const input = build_exec.cacheInputForStep(.{}, testStorage().index_digest, test_executor_identity, .{ .run = step }, runResources(.{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    }));
+    try std.testing.expect(input.operation.run.ssh_declared_absent);
+    const default_key = try step_cache.stepKey(arena, input);
+
+    const inherited_state = State{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{"SSH_AUTH_SOCK=/inherited/agent"}),
+        .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+    };
+    const inherited_step = try runStep(arena, &diagnostic, inherited_state, instruction, instruction.value.run, .{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    });
+    try std.testing.expectEqualStrings("/inherited/agent", envValue(inherited_step.env, "SSH_AUTH_SOCK").?);
+    const inherited_input = build_exec.cacheInputForStep(.{}, testStorage().index_digest, test_executor_identity, .{ .run = inherited_step }, runResources(.{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    }));
+    const inherited_key = try step_cache.stepKey(arena, inherited_input);
+    try std.testing.expect(!std.mem.eql(u8, default_key, inherited_key));
 }
 
 test "RUN cache mount identity uses expanded path.Clean target" {

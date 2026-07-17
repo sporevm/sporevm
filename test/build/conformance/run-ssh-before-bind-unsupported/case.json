@@ -1,0 +1,9 @@
+{
+  "description": "optional-absent SSH planning advances to the next unsupported context bind mount",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported RUN mount type"
+  },
+  "scan_prefixes": []
+}

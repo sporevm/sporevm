@@ -55,8 +55,14 @@ portable spore format. The record envelope remains
 instruction text, `input_digest`, `env_digest`, `workdir`, optional
 `network_mode`, optional preparation fields, COPY destination policy, ordered
 RUN cache-mount identity, executor identity for ordinary executor-backed
-steps, and the child's `rootfs_storage`
+steps, optional typed `ssh_declared_absent` RUN state, and the child's `rootfs_storage`
 descriptor.
+
+`ssh_declared_absent: true` records only the accepted credential-free default
+declaration. Its step key also binds the resolved RUN environment, including
+BuildKit's inert default `SSH_AUTH_SOCK` value when applicable. Absence of the
+field means no such declaration; it never names a socket, secret, transport,
+or portable machine-state field.
 
 Builder v9 retains v8's representation of rootfs capacity normalization as the
 typed synthetic operation `PREPARE`, not as Dockerfile syntax. Its canonical instruction and

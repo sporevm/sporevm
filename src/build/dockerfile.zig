@@ -70,6 +70,7 @@ pub const RunCacheMount = struct {
 pub const Run = struct {
     command: RunCommand,
     cache_mounts: []const RunCacheMount = &.{},
+    ssh_declared_absent: bool = false,
 };
 
 pub const Copy = struct {
@@ -226,6 +227,7 @@ fn parseInstruction(
     if (asciiEql(op, "RUN")) {
         if (rest.len == 0) return fail(diagnostic, line, "RUN requires a shell command");
         var cache_mounts = std.array_list.Managed(RunCacheMount).init(allocator);
+        var ssh_declared_absent = false;
         var command_start: usize = 0;
         while (true) {
             while (command_start < rest.len and (rest[command_start] == ' ' or rest[command_start] == '\t')) command_start += 1;
@@ -239,8 +241,18 @@ fn parseInstruction(
             {
                 return fail(diagnostic, line, "unsupported RUN flag");
             }
-            if (cache_mounts.items.len == max_run_cache_mounts) return fail(diagnostic, line, "RUN has too many cache mounts");
-            try cache_mounts.append(try parseRunCacheMount(allocator, token["--mount=".len..], escape, line, diagnostic));
+            const raw_mount = token["--mount=".len..];
+            if (std.mem.eql(u8, raw_mount, "type=ssh")) {
+                if (ssh_declared_absent) return fail(diagnostic, line, "multiple RUN SSH mounts are unsupported");
+                ssh_declared_absent = true;
+            } else {
+                if (runMountType(raw_mount)) |mount_type| {
+                    if (std.mem.eql(u8, mount_type, "ssh")) return fail(diagnostic, line, "unsupported RUN SSH mount form");
+                    if (!asciiEql(mount_type, "cache")) return fail(diagnostic, line, "unsupported RUN mount type");
+                }
+                if (cache_mounts.items.len == max_run_cache_mounts) return fail(diagnostic, line, "RUN has too many cache mounts");
+                try cache_mounts.append(try parseRunCacheMount(allocator, raw_mount, escape, line, diagnostic));
+            }
             command_start = token_end;
         }
         const command_raw = rest[command_start..];
@@ -258,6 +270,7 @@ fn parseInstruction(
             return .{ .run = .{
                 .command = .{ .shell = try allocator.dupe(u8, run_heredoc.body) },
                 .cache_mounts = try cache_mounts.toOwnedSlice(),
+                .ssh_declared_absent = ssh_declared_absent,
             } };
         }
         if (std.mem.startsWith(u8, command_raw, "[")) {
@@ -265,6 +278,7 @@ fn parseInstruction(
                 return .{ .run = .{
                     .command = .{ .exec = argv },
                     .cache_mounts = try cache_mounts.toOwnedSlice(),
+                    .ssh_declared_absent = ssh_declared_absent,
                 } };
             }
         }
@@ -272,6 +286,7 @@ fn parseInstruction(
         return .{ .run = .{
             .command = .{ .shell = try allocator.dupe(u8, command_raw) },
             .cache_mounts = try cache_mounts.toOwnedSlice(),
+            .ssh_declared_absent = ssh_declared_absent,
         } };
     }
     if (asciiEql(op, "COPY")) {
@@ -418,6 +433,15 @@ fn parseInstruction(
     const message = try std.fmt.allocPrint(allocator, "unsupported Dockerfile instruction: {s}", .{op});
     diagnostic.* = .{ .line = line, .message = message };
     return error.DockerfileParseFailed;
+}
+
+fn runMountType(raw: []const u8) ?[]const u8 {
+    var fields = std.mem.splitScalar(u8, raw, ',');
+    while (fields.next()) |field| {
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        if (std.mem.eql(u8, field[0..equals], "type")) return field[equals + 1 ..];
+    }
+    return null;
 }
 
 fn parseRunCacheMount(
@@ -1079,6 +1103,40 @@ test "Dockerfile parser accepts bounded default cache mounts" {
     };
     for (invalid) |bytes| {
         try std.testing.expectError(error.DockerfileParseFailed, parse(arena_state.allocator(), bytes, &diag));
+    }
+}
+
+test "Dockerfile parser accepts one exact optional-absent SSH declaration" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var diag: Diagnostic = .{};
+    const doc = try parse(allocator,
+        \\FROM scratch
+        \\RUN --mount=type=ssh --mount=type=cache,target=/cache true
+        \\
+    , &diag);
+    const run = doc.stages[0].instructions[0].value.run;
+    try std.testing.expect(run.ssh_declared_absent);
+    try std.testing.expectEqual(@as(usize, 1), run.cache_mounts.len);
+    try std.testing.expectEqualStrings("/cache", run.cache_mounts[0].target);
+    try std.testing.expectEqualStrings("true", run.command.shell);
+
+    const invalid = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh --mount=type=ssh true\n", .message = "multiple RUN SSH mounts are unsupported" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,required=true true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,required=false true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,id=default true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,target=/tmp/agent true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,mode=0600 true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,uid=0 true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,gid=0 true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=target=/tmp/agent,type=ssh true\n", .message = "unsupported RUN SSH mount form" },
+        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh --mount=type=bind,source=input,target=input true\n", .message = "unsupported RUN mount type" },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, case.dockerfile, &diag));
+        try std.testing.expectEqualStrings(case.message, diag.message);
     }
 }
 
