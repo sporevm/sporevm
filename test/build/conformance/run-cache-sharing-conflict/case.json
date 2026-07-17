@@ -1,0 +1,9 @@
+{
+  "description": "one resolved cache ID cannot declare conflicting sharing modes",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 3: RUN cache mounts using the same resolved id must use the same sharing mode"
+  },
+  "scan_prefixes": []
+}

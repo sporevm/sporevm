@@ -1,9 +1,9 @@
 {
-  "description": "explicit cache IDs remain fail-closed outside the default-ID slice",
+  "description": "an expanded cache ID must remain nonempty",
   "expect": {
     "docker": "success",
     "spore": "failure",
-    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported RUN cache mount option"
+    "spore_diagnostic": "spore build: Dockerfile line 3: RUN cache mount id must resolve to 1 through 512 bytes without NUL"
   },
   "scan_prefixes": []
 }

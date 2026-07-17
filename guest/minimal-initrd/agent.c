@@ -2349,9 +2349,7 @@ static int parse_build_cache_mounts_value(const char **cursor, struct run_reques
     if (seen != 3u) return -1;
     for (size_t prior = 0; prior < count; prior++) {
       if (build_cache_targets_overlap(out->build_cache_mounts[prior].target,
-                                      out->build_cache_mounts[count].target) ||
-          strcmp(out->build_cache_mounts[prior].key,
-                 out->build_cache_mounts[count].key) == 0) return -1;
+                                      out->build_cache_mounts[count].target)) return -1;
     }
     count++;
     p = skip_ws(p);

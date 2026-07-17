@@ -1,0 +1,58 @@
+{
+  "description": "cache result identity follows BuildKit ID and resolved-destination value equality",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 3,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "relative-omitted-shared-to-locked-hits",
+      "writes": {
+        "Dockerfile": "FROM base\nWORKDIR /work\nRUN --mount=type=cache,target=relative-cache,sharing=locked sh -euxc 'mkdir -p /oracle; printf relative >/oracle/relative'\nRUN --mount=type=cache,target=/equal,id=/equal,sharing=shared sh -euxc 'printf explicit >/oracle/explicit'\n"
+      },
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "explicit-equal-target-to-cleared-id-misses",
+      "writes": {
+        "Dockerfile": "FROM base\nWORKDIR /work\nRUN --mount=type=cache,target=relative-cache,sharing=locked sh -euxc 'mkdir -p /oracle; printf relative >/oracle/relative'\nRUN --mount=type=cache,target=/equal,id=/different,sharing=locked sh -euxc 'printf explicit >/oracle/explicit'\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 1,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-explicit-edit",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

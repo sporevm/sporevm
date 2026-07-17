@@ -1,9 +1,9 @@
 {
-  "description": "non-default cache sharing modes remain fail-closed",
+  "description": "private cache sharing remains fail-closed after expansion",
   "expect": {
     "docker": "success",
     "spore": "failure",
-    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported RUN cache mount option"
+    "spore_diagnostic": "spore build: Dockerfile line 3: RUN cache mount sharing must resolve to shared or locked"
   },
   "scan_prefixes": []
 }

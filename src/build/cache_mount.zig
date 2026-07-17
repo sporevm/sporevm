@@ -8,6 +8,7 @@ const ext4_writer = @import("../rootfs/ext4_writer.zig");
 
 pub const max_mounts_per_run = 8;
 pub const max_target_bytes = 512;
+pub const max_id_bytes = 512;
 pub const default_disk_bytes: u64 = 4 << 30;
 const default_inode_count: u32 = 262_144;
 const store_rel = "build/cache-mounts-v1";
@@ -20,10 +21,22 @@ const super_offset: u64 = 1024;
 const super_magic_offset: usize = 0x38;
 const super_state_offset: usize = 0x3a;
 
+pub const Sharing = enum {
+    shared,
+    locked,
+};
+
+pub const ConfiguredMount = struct {
+    target: []const u8,
+    id: ?[]const u8 = null,
+    sharing: Sharing = .shared,
+};
+
 pub const Mount = struct {
     target: []const u8,
     id: []const u8,
     key: []const u8,
+    sharing: Sharing = .shared,
 };
 
 pub fn resolve(
@@ -31,14 +44,30 @@ pub fn resolve(
     workdir: []const u8,
     resolved_targets: []const []const u8,
 ) ![]const Mount {
-    if (resolved_targets.len > max_mounts_per_run) return error.TooManyRunCacheMounts;
+    const configured = try allocator.alloc(ConfiguredMount, resolved_targets.len);
+    for (resolved_targets, 0..) |target, index| configured[index] = .{ .target = target };
+    return resolveConfigured(allocator, workdir, configured);
+}
+
+pub fn resolveConfigured(
+    allocator: std.mem.Allocator,
+    workdir: []const u8,
+    configured: []const ConfiguredMount,
+) ![]const Mount {
+    if (configured.len > max_mounts_per_run) return error.TooManyRunCacheMounts;
     var mounts = std.array_list.Managed(Mount).init(allocator);
-    for (resolved_targets) |resolved_target| {
+    for (configured) |input| {
+        const resolved_target = input.target;
         // BuildKit derives an omitted cache ID from path.Clean of the target
         // after Dockerfile variable expansion, but before joining a relative
         // target to WORKDIR.
-        const id = try cleanPosix(allocator, resolved_target);
-        if (std.mem.eql(u8, id, ".") or id.len > max_target_bytes) return error.RunCacheMountTargetUnsupported;
+        const id = if (input.id) |custom_id|
+            try validateCustomId(custom_id)
+        else
+            try cleanPosix(allocator, resolved_target);
+        if (input.id == null and (std.mem.eql(u8, id, ".") or id.len > max_target_bytes)) {
+            return error.RunCacheMountTargetUnsupported;
+        }
         const target = if (std.fs.path.isAbsolute(resolved_target))
             try cleanPosix(allocator, resolved_target)
         else blk: {
@@ -51,10 +80,28 @@ pub fn resolve(
         const key = try cacheKey(allocator, id);
         for (mounts.items) |existing| {
             if (pathsOverlap(existing.target, target)) return error.RunCacheMountTargetConflict;
+            if (std.mem.eql(u8, existing.key, key) and existing.sharing != input.sharing) {
+                return error.RunCacheMountSharingConflict;
+            }
         }
-        try mounts.append(.{ .target = target, .id = id, .key = key });
+        try mounts.append(.{
+            .target = target,
+            .id = id,
+            .key = key,
+            .sharing = input.sharing,
+        });
     }
     return mounts.toOwnedSlice();
+}
+
+pub fn validateCompatible(mounts: []const Mount) !void {
+    for (mounts, 0..) |mount, index| {
+        for (mounts[0..index]) |existing| {
+            if (std.mem.eql(u8, existing.key, mount.key) and existing.sharing != mount.sharing) {
+                return error.RunCacheMountSharingConflict;
+            }
+        }
+    }
 }
 
 pub fn digest(allocator: std.mem.Allocator, mounts: []const Mount) ![]const u8 {
@@ -65,14 +112,20 @@ pub fn digest(allocator: std.mem.Allocator, mounts: []const Mount) ![]const u8 {
     for (mounts) |mount| {
         hashField(&h, "cache");
         hashField(&h, mount.target);
-        hashField(&h, mount.id);
-        hashField(&h, mount.key);
-        hashField(&h, "shared");
+        // BuildKit v0.30.0 retains cache options only when the effective ID
+        // equals the resolved destination and sharing is shared. The solver
+        // deliberately cannot distinguish an explicit equal-target ID from
+        // the historical absolute omitted-ID case.
+        if (mount.sharing == .shared and std.mem.eql(u8, mount.id, mount.target)) {
+            hashField(&h, mount.id);
+            hashField(&h, mount.key);
+            hashField(&h, "shared");
+        }
     }
     return finishDigest(allocator, &h);
 }
 
-fn cacheKey(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
+pub fn cacheKey(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
     var h = std.crypto.hash.Blake3.init(.{});
     hashField(&h, cache_key_domain);
     hashField(&h, id);
@@ -80,6 +133,13 @@ fn cacheKey(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
     h.final(&bytes);
     const hex = std.fmt.bytesToHex(bytes, .lower);
     return allocator.dupe(u8, &hex);
+}
+
+fn validateCustomId(id: []const u8) ![]const u8 {
+    if (id.len == 0 or id.len > max_id_bytes or std.mem.indexOfScalar(u8, id, 0) != null) {
+        return error.RunCacheMountIdUnsupported;
+    }
+    return id;
 }
 
 fn cleanPosix(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -235,6 +295,109 @@ test "cache mounts reject duplicate and nested destinations" {
     try std.testing.expectError(error.RunCacheMountTargetConflict, resolve(allocator, "/", &.{ "/a", "/a" }));
     try std.testing.expectError(error.RunCacheMountTargetConflict, resolve(allocator, "/", &.{ "/a", "/a/b" }));
     try std.testing.expectError(error.RunCacheMountTargetUnsupported, resolve(allocator, "/", &.{"/"}));
+}
+
+test "custom cache ids are opaque aggregate subdirectory inputs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const raw_id = "../../locks/cache/\xF0\x9F\x92\xBE";
+    const mounts = try resolveConfigured(allocator, "/", &.{.{
+        .target = "/cache",
+        .id = raw_id,
+        .sharing = .locked,
+    }});
+    try std.testing.expectEqualStrings(raw_id, mounts[0].id);
+    try std.testing.expectEqual(@as(usize, std.crypto.hash.Blake3.digest_length * 2), mounts[0].key.len);
+    try std.testing.expect(std.mem.indexOfScalar(u8, mounts[0].key, '/') == null);
+    try std.testing.expect(std.mem.indexOf(u8, mounts[0].key, "..") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mounts[0].key, "locks") == null);
+}
+
+test "custom cache id hashing is bounded collision-resistant and byte exact" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var keys = std.StringHashMap(void).init(allocator);
+    for (0..256) |index| {
+        const id = try std.fmt.allocPrint(allocator, "cache/{d}/\xE2\x98\x83", .{index});
+        const key = try cacheKey(allocator, id);
+        try std.testing.expect(!keys.contains(key));
+        try keys.put(key, {});
+    }
+    const boundary = try allocator.alloc(u8, max_id_bytes);
+    @memset(boundary, 'x');
+    _ = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = boundary }});
+    const oversized = try allocator.alloc(u8, max_id_bytes + 1);
+    @memset(oversized, 'x');
+    try std.testing.expectError(error.RunCacheMountIdUnsupported, resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = oversized }}));
+    try std.testing.expectError(error.RunCacheMountIdUnsupported, resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = "bad\x00id" }}));
+}
+
+test "explicit and omitted ids share aggregate storage keys" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const omitted = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache" }});
+    const explicit = try resolveConfigured(allocator, "/", &.{.{ .target = "/other", .id = "/cache", .sharing = .locked }});
+    try std.testing.expectEqualStrings(omitted[0].key, explicit[0].key);
+    const distinct = try resolveConfigured(allocator, "/", &.{.{ .target = "/other", .id = "/different" }});
+    try std.testing.expect(!std.mem.eql(u8, omitted[0].key, distinct[0].key));
+}
+
+test "aggregate cache preserves eight mount contract with custom reuse" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const mounts = try resolveConfigured(allocator, "/", &.{
+        .{ .target = "/one" },
+        .{ .target = "/two" },
+        .{ .target = "/three" },
+        .{ .target = "/four" },
+        .{ .target = "/five" },
+        .{ .target = "/six" },
+        .{ .target = "/seven", .id = "shared-id", .sharing = .locked },
+        .{ .target = "/eight", .id = "shared-id", .sharing = .locked },
+    });
+    try std.testing.expectEqual(@as(usize, max_mounts_per_run), mounts.len);
+    try std.testing.expectEqualStrings(mounts[6].key, mounts[7].key);
+}
+
+test "same aggregate cache id rejects incompatible sharing declarations" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    try std.testing.expectError(error.RunCacheMountSharingConflict, resolveConfigured(allocator, "/", &.{
+        .{ .target = "/one", .id = "same", .sharing = .shared },
+        .{ .target = "/two", .id = "same", .sharing = .locked },
+    }));
+    const first = try resolveConfigured(allocator, "/", &.{.{ .target = "/one", .id = "same", .sharing = .shared }});
+    const second = try resolveConfigured(allocator, "/", &.{.{ .target = "/two", .id = "same", .sharing = .locked }});
+    const combined = [_]Mount{ first[0], second[0] };
+    try std.testing.expectError(error.RunCacheMountSharingConflict, validateCompatible(&combined));
+}
+
+test "BuildKit cache result identity uses id and destination value equality" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const custom_a = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = "a", .sharing = .shared }});
+    const custom_b = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = "b", .sharing = .locked }});
+    try std.testing.expectEqualStrings(try digest(allocator, custom_a), try digest(allocator, custom_b));
+    // BuildKit's solver sees only CacheOpt.ID and the resolved destination.
+    // An explicit shared ID equal to the destination is therefore
+    // intentionally indistinguishable from the historical default case.
+    const explicit_equal_target = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = "/cache", .sharing = .shared }});
+    try std.testing.expect(!std.mem.eql(u8, try digest(allocator, explicit_equal_target), try digest(allocator, custom_b)));
+
+    const default_shared = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache" }});
+    const default_locked = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .sharing = .locked }});
+    try std.testing.expect(!std.mem.eql(u8, try digest(allocator, default_shared), try digest(allocator, default_locked)));
+    // The default ID is cleaned before a relative target joins WORKDIR, so it
+    // differs from the resolved destination and BuildKit clears both forms.
+    const relative_shared = try resolveConfigured(allocator, "/work", &.{.{ .target = "cache" }});
+    const relative_locked = try resolveConfigured(allocator, "/work", &.{.{ .target = "cache", .sharing = .locked }});
+    try std.testing.expectEqualStrings(try digest(allocator, relative_shared), try digest(allocator, relative_locked));
 }
 
 test "cache store recreates a host-visible unclean aggregate" {

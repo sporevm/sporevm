@@ -2,6 +2,22 @@
 
 ## Next
 
+`spore build` now accepts expanded explicit `id` and
+`sharing=shared|locked` on bounded `RUN --mount=type=cache` declarations.
+Explicit and omitted IDs both select digest-named subdirectories inside the
+existing single 4 GiB aggregate disk, so raw IDs never become host paths and
+equal resolved IDs share storage. Both sharing modes are conservatively
+serialized by the aggregate lock and the existing whole-build cache lock;
+Spore does not provide BuildKit's concurrent shared-writer scheduling. Result
+caching matches BuildKit v0.30.0's value-based asymmetric contract: cache
+options remain in identity only when a shared ID equals the resolved target;
+other ID and sharing values are cleared. An explicit equal-target ID therefore
+behaves like the historical absolute omitted-ID case, while an omitted relative
+target joined to `WORKDIR` is cleared. Cache contents remain
+outside rootfs snapshots and portable manifests, fully cached builds do not
+open the aggregate, and unsupported sharing modes or contradictory same-ID
+declarations fail during full-plan semantic preflight.
+
 `spore build` now accepts default read-only context-file bind mounts on
 ordinary shell-form RUN, such as
 `RUN --mount=type=bind,source=Gemfile,target=Gemfile ...`. Source and target
@@ -107,8 +123,9 @@ kill-and-empty verification owns cleanup before checkpoint publication.
 Secret/SSH forwarding, new device types, and manifest changes remain
 unsupported.
 
-`spore build` now accepts one or more `RUN --mount=type=cache,target=...`
-mounts when both `id` and `sharing` are omitted. The target expands from the
+`spore build` accepts one or more `RUN --mount=type=cache,target=...`
+mounts. The original default form omits `id` and `sharing`; its target expands
+from the
 instruction-start ENV/ARG snapshot; BuildKit's default ID is
 `path.Clean(expanded target)`, so repeated separators, dot segments, and a
 trailing slash share one persistent host-local directory. Relative targets are
@@ -121,12 +138,13 @@ content remain in the checkpoint while the mountpoint and cache bytes do not.
 A single 4 GiB sparse aggregate ext4 cache disk and exclusive host lock
 serialize default shared writers conservatively without changing the portable
 device or manifest contracts. Cache contents do not enter RUN result-cache
-identity; the ordered resolved targets, derived default IDs, storage keys, and
-sharing policy do. Each RUN accepts at most eight mounts; current
+identity. Ordered targets remain semantic inputs, while ID and sharing are
+retained only for BuildKit's shared value-equals-resolved-destination case and
+canonicalized away otherwise. Each RUN accepts at most eight mounts; current
 `spore rootfs df`, prune, and GC do not account for or remove the aggregate.
 Builds that also need a context disk and two stage-input disks fail before
 execution because the frozen eight-device envelope has no cache-disk slot.
-Explicit `id`, non-default `sharing`, nested or duplicate targets,
+Nested or duplicate targets, `sharing=private`,
 writable/custom/directory or non-context bind mounts, exec-form or heredoc RUN
 combinations, tmpfs/secret mounts, and
 credential-bearing SSH mounts remain unsupported.

@@ -81,15 +81,23 @@ global reference registry.
 | Saved lifecycle metadata | input spore directories and bundles | Saved lifecycle fields are compatibility hints, not fresh host authority. In particular, `console_log_path` is untrusted and restore never opens or truncates it; named restore currently configures no console log until a future explicit restore option selects a new host path. Ready, list, result, and failure output expose only the path actually configured for the live monitor. |
 | Embedded initrd Toybox shell and applets | host-selected guest argv and guest workload input | the default initrd builds Toybox from pinned source with a minimal applet config and runs it only as guest child workload code; Toybox does not add host parsers, VMM devices, monitor control requests, or rootfs cache authority. Unsupported applets are absent, existing SporeVM helper binaries win over Toybox symlinks, and exact argv still uses `execve(argv[0], ...)` without guest PATH lookup |
 
-Default RUN cache mounts add no host credential or portable-state authority.
-The parser accepts at most eight `type=cache,target=...` entries with omitted
-ID and sharing, expands targets through the bounded builder-owned engine, and
-derives the host directory only from `path.Clean` of that resolved target plus
-a domain-separated BLAKE3 key. A strict newline-terminated v3 request requires
-every field once, canonical absolute targets, lowercase fixed-length keys, and
+RUN cache mounts add no host credential or portable-state authority. The
+parser accepts at most eight `type=cache,target=...` entries with an optional
+opaque `id` and `sharing=shared|locked`. Target, ID, and sharing expand through
+the bounded builder-owned engine; an omitted ID is `path.Clean` of the resolved
+target, while every resolved ID becomes a domain-separated BLAKE3 key before
+it can select storage. Raw IDs therefore never become host paths or lock names.
+Empty, NUL-containing, oversized, malformed, unsupported, or contradictory
+same-ID declarations fail during semantic preflight before remote ADD
+preparation or guest execution. Reachable base resolution/import may already
+have populated its cache because inherited OCI configuration is required for
+that resolution; after a cache option fails semantic preflight, no remote ADD
+request, aggregate-cache open or mutation, VM/runtime activity, snapshot, step
+record, or destination publication occurs. A strict newline-terminated v3
+request requires every field once, canonical absolute targets, lowercase fixed-length keys, and
 complete input consumption; it shares the existing request-parser fuzz entry
 point. The host opens one fixed-size regular no-follow ext4 file while holding
-an exclusive cache-store lock and exposes it as a transient writable
+an exclusive aggregate cache-store lock and exposes it as a transient writable
 virtio-blk device only to build VMs. The guest creates and opens targets through
 the rootfs-confined resolver and bind-mounts only the selected cache directories
 onto those targets before entering the operation-owned RUN sandbox. The
@@ -108,8 +116,15 @@ state written beside the mount. Actual unmount failure, a nonempty mountpoint,
 or unverifiable ownership poisons the guest build session, returns exit 125,
 and blocks step-record and ref publication. Dirty,
 symlinked, non-regular, size-mismatched, bad-magic, or host-visible unclean cache
-disks are discarded; a guest mount rejection remains a build error. Cache bytes
-are never rootfs CAS, manifest, secret, SSH, or credential input.
+disks are discarded; a guest mount rejection remains a build error. Both
+`shared` and `locked` use the same safe serialization: the aggregate lock spans
+the uncached executor session, and the existing coarse rootfs-cache lock
+currently serializes the whole build. Spore does not claim BuildKit's
+concurrent shared-writer scheduling. Fully cached builds never open or attach
+the aggregate. BuildKit result identity retains cache options only for a shared
+ID whose value equals the resolved destination; Spore matches that value-based
+rule without trying to recover whether the ID was written explicitly. Cache
+bytes are never rootfs CAS, manifest, secret, SSH, or credential input.
 
 Default context bind mounts accept only one expanded literal relative source
 and one expanded target per declaration on ordinary shell-form RUN. Exec-form
