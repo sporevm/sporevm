@@ -82,6 +82,43 @@ pub const CopyResolution = struct {
     roots: []const CopyRoot,
 };
 
+pub fn normalizeRunBindSource(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    if (source.len == 0 or std.fs.path.isAbsolute(source) or std.mem.indexOfAny(u8, source, "*?[\x00") != null) {
+        return error.RunContextBindSourceUnsupported;
+    }
+    var parts = std.array_list.Managed([]const u8).init(allocator);
+    defer parts.deinit();
+    var it = std.mem.splitScalar(u8, source, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (std.mem.eql(u8, part, "..")) return error.RunContextBindSourceUnsupported;
+        try parts.append(part);
+    }
+    if (parts.items.len == 0) return error.RunContextBindSourceUnsupported;
+    return std.mem.join(allocator, "/", parts.items);
+}
+
+pub fn resolveRunBindSource(
+    allocator: std.mem.Allocator,
+    io: Io,
+    context: BuildContext,
+    normalized_source: []const u8,
+) !CopyResolution {
+    const resolution = resolveCopySources(allocator, io, context, &.{normalized_source}) catch |err| switch (err) {
+        error.CopySourceEscapesContext => return error.RunContextBindSourceUnsupported,
+        else => return err,
+    };
+    if (resolution.roots.len != 1 or resolution.entries.len != 1 or
+        resolution.roots[0].kind != .file or resolution.entries[0].kind != .file or
+        resolution.entries[0].source_rel.len != 0 or
+        !std.mem.eql(u8, resolution.roots[0].rel, normalized_source) or
+        !std.mem.eql(u8, resolution.entries[0].rel, normalized_source))
+    {
+        return error.RunContextBindSourceUnsupported;
+    }
+    return resolution;
+}
+
 pub const CopyResolvedEntry = struct {
     rel: []const u8,
     kind: Io.File.Kind,
@@ -92,6 +129,28 @@ pub const CopyResolvedEntry = struct {
     snapshot_path: []const u8 = "",
     snapshot_offset: u64 = 0,
     inline_data: ?[]const u8 = null,
+    captured_mtime: ?CapturedMtime = null,
+};
+
+pub const CapturedMtime = struct {
+    seconds: i64,
+    nanoseconds: u32,
+
+    // ext4 combines signed low seconds with two extra epoch bits. Negative
+    // values have no extra epoch, while positive values extend through 2446.
+    pub const min_seconds: i64 = std.math.minInt(i32);
+    pub const max_seconds: i64 = 0x37fffffff;
+
+    pub fn fromUnixNanoseconds(value: i128) !CapturedMtime {
+        const seconds = @divFloor(value, std.time.ns_per_s);
+        if (seconds < min_seconds or seconds > max_seconds) return error.ContextSourceMtimeOutOfRange;
+        const nanoseconds = value - seconds * std.time.ns_per_s;
+        std.debug.assert(nanoseconds >= 0 and nanoseconds < std.time.ns_per_s);
+        return .{
+            .seconds = @intCast(seconds),
+            .nanoseconds = @intCast(nanoseconds),
+        };
+    }
 };
 
 const snapshot_dir = "build/context-snapshots";
@@ -189,7 +248,29 @@ const CapturedFile = struct {
 pub const HashOptions = struct {
     stat_cache: ?*StatCache = null,
     diagnostic: ?*HashDiagnostic = null,
+    capture_mtime: bool = false,
 };
+
+test "captured context mtime normalizes ext4 range and nanoseconds" {
+    try std.testing.expectEqual(CapturedMtime{
+        .seconds = 1_700_000_000,
+        .nanoseconds = 123_456_789,
+    }, try CapturedMtime.fromUnixNanoseconds(1_700_000_000_123_456_789));
+    try std.testing.expectEqual(CapturedMtime{
+        .seconds = -1,
+        .nanoseconds = 999_999_999,
+    }, try CapturedMtime.fromUnixNanoseconds(-1));
+    _ = try CapturedMtime.fromUnixNanoseconds(@as(i128, CapturedMtime.min_seconds) * std.time.ns_per_s);
+    _ = try CapturedMtime.fromUnixNanoseconds(@as(i128, CapturedMtime.max_seconds) * std.time.ns_per_s + 999_999_999);
+    try std.testing.expectError(
+        error.ContextSourceMtimeOutOfRange,
+        CapturedMtime.fromUnixNanoseconds((@as(i128, CapturedMtime.min_seconds) - 1) * std.time.ns_per_s),
+    );
+    try std.testing.expectError(
+        error.ContextSourceMtimeOutOfRange,
+        CapturedMtime.fromUnixNanoseconds((@as(i128, CapturedMtime.max_seconds) + 1) * std.time.ns_per_s),
+    );
+}
 
 const stat_cache_kind = "sporevm-build-context-stat-cache-v1";
 const max_stat_cache_records = 131_072;
@@ -607,6 +688,10 @@ fn resolveCopyEntries(
                     .content_digest = digest,
                     .snapshot_path = if (captured != null) snapshot.?.path else "",
                     .snapshot_offset = if (captured) |value| value.offset else 0,
+                    .captured_mtime = if (options.capture_mtime)
+                        try CapturedMtime.fromUnixNanoseconds(stat.mtime.nanoseconds)
+                    else
+                        null,
                 });
             },
             .directory => {
@@ -1184,6 +1269,42 @@ test "COPY dereferences a selected symlink within the context" {
     try std.testing.expect(std.mem.startsWith(u8, entries[0].content_digest, "blake3:"));
 }
 
+test "RUN context bind source normalization is literal and stable" {
+    const allocator = std.testing.allocator;
+    const normalized = try normalizeRunBindSource(allocator, "./nested//file.txt");
+    defer allocator.free(normalized);
+    try std.testing.expectEqualStrings("nested/file.txt", normalized);
+
+    inline for (.{ "", ".", "/absolute", "../escape", "nested/../escape", "*.txt", "a?[b" }) |source| {
+        try std.testing.expectError(error.RunContextBindSourceUnsupported, normalizeRunBindSource(allocator, source));
+    }
+}
+
+test "RUN context bind accepts one regular file and rejects directory and symlink sources" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-run-bind-source";
+    const context_root = root ++ "/context";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root ++ "/dir");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/input.txt", .data = "input\n" });
+    try Io.Dir.cwd().symLink(io, "input.txt", context_root ++ "/input-link", .{});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/dir/nested.txt", .data = "nested\n" });
+    try Io.Dir.cwd().symLink(io, "dir", context_root ++ "/dir-link", .{});
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &diag);
+    const regular = try resolveRunBindSource(arena, io, ctx, "input.txt");
+    try std.testing.expectEqual(@as(usize, 1), regular.entries.len);
+    try std.testing.expectEqualStrings("input.txt", regular.entries[0].rel);
+    try std.testing.expectError(error.RunContextBindSourceUnsupported, resolveRunBindSource(arena, io, ctx, "dir"));
+    try std.testing.expectError(error.RunContextBindSourceUnsupported, resolveRunBindSource(arena, io, ctx, "input-link"));
+    try std.testing.expectError(error.RunContextBindSourceUnsupported, resolveRunBindSource(arena, io, ctx, "dir-link/nested.txt"));
+}
+
 test "COPY snapshot pins file bytes and symlink targets" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1238,6 +1359,43 @@ test "COPY snapshot pins file bytes and symlink targets" {
     try Io.Dir.cwd().deleteFile(io, link_path);
     try std.testing.expectEqual(bytes.len, try snapshot_file.readPositionalAll(io, &bytes, captured_file.?.snapshot_offset));
     try std.testing.expectEqualStrings("alpha", &bytes);
+}
+
+test "bind capture pins mtime from the same checked source stat" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-snapshot-mtime";
+    const context_root = root ++ "/context";
+    const cache_root = root ++ "/cache";
+    const source_path = context_root ++ "/input";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root);
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "input" });
+    const pinned_ns: i128 = 1_700_000_000_123_456_789;
+    try Io.Dir.cwd().setTimestamps(io, source_path, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = pinned_ns } } });
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, context_root, &diag);
+    const resolution = try resolveRunBindSource(arena, io, ctx, "input");
+    var snapshot = try CopySnapshot.init(arena, io, cache_root);
+    defer snapshot.deinit(io);
+    const captured = try captureCopyResolutionWithOptions(arena, io, ctx, resolution, .{ .capture_mtime = true }, &snapshot);
+    try std.testing.expectEqual(CapturedMtime{
+        .seconds = 1_700_000_000,
+        .nanoseconds = 123_456_789,
+    }, captured[0].captured_mtime.?);
+
+    try Io.Dir.cwd().setTimestamps(io, source_path, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = pinned_ns + std.time.ns_per_s } } });
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), captured[0].captured_mtime.?.seconds);
+
+    var ordinary_snapshot = try CopySnapshot.init(arena, io, cache_root);
+    defer ordinary_snapshot.deinit(io);
+    const ordinary = try captureCopyResolutionWithOptions(arena, io, ctx, resolution, .{}, &ordinary_snapshot);
+    try std.testing.expectEqual(@as(?CapturedMtime, null), ordinary[0].captured_mtime);
 }
 
 test "COPY snapshot rejects an intermediate symlink swap" {

@@ -1,0 +1,9 @@
+{
+  "description": "writable context binds remain fail-closed during full-file planning",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: unsupported RUN context bind mount option"
+  },
+  "scan_prefixes": []
+}

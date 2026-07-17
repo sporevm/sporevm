@@ -354,6 +354,8 @@ def apply_transition(context: pathlib.Path, transition: Transition) -> None:
         path.write_text(contents)
         if prior is not None:
             os.utime(path, ns=(prior.st_atime_ns, prior.st_mtime_ns))
+    for raw, mode in transition.modes.items():
+        confined_path(context, raw).chmod(int(mode, 8))
 
 
 def build_publication_snapshot(spore_env: dict[str, str]) -> dict[str, str]:

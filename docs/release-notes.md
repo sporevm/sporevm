@@ -2,6 +2,41 @@
 
 ## Next
 
+`spore build` now accepts default read-only context-file bind mounts on
+ordinary shell-form RUN, such as
+`RUN --mount=type=bind,source=Gemfile,target=Gemfile ...`. Source and target
+expand from the instruction-start snapshot; sources must resolve through
+`.dockerignore` to one literal regular file, and relative targets resolve under
+`WORKDIR`. Ordered normalized paths, source mode, and actual BLAKE3 content are
+RUN cache inputs. Misses reuse the existing immutable context capture and
+read-only context disk, while the strict v4 RUN request exposes only selected
+files inside the operation-owned sandbox. Missing or symlinked sources,
+directories, special files, writable/custom binds, stage/image/named-context
+sources, overlapping targets, and broader mount options fail closed before
+execution.
+
+Bind source mtime follows BuildKit's split contract. A race-checked captured
+mtime selects the v2 context-disk transport identity, but mtime is excluded
+from semantic RUN cache identity. An mtime-only edit can therefore reuse the
+prior RUN result; a later miss observes the new nanosecond value. Context disks
+without captured mtime retain v1, while ordinary COPY/ADD entries and
+rootfs/import emission retain their existing deterministic zero-timestamp
+behavior and identities.
+
+Bind mounts and setup-owned target scaffolding are removed before every rootfs
+checkpoint, so the transport inode and mountpoint never enter the snapshot;
+ordinary files that RUN writes from bind data remain persistent output.
+Existing regular-file targets are restored unchanged, while owned absent-target
+scaffolding is removed only while empty so ordinary sibling rootfs content is
+preserved. Root targets, trailing-slash targets, and targets overlapping
+`/proc`, `/dev`, `/sys`, `/run/sporevm`, `/run/buildkit`, or
+`/etc/resolv.conf` fail during planning, including protected ancestors and
+descendants. Unmount failure, target replacement, or unverifiable ownership
+poisons the build session and prevents step, cache-record, and destination-ref
+publication. The accepted form composes with optional-absent SSH and default
+cache mounts, but adds no writable bind, credential, device, manifest,
+stage-input, or generic mount authority.
+
 `spore build` now accepts one exact default `RUN --mount=type=ssh`
 declaration when no SSH input is supplied. This is optional-absent syntax and
 result compatibility, not forwarding support: the RUN receives BuildKit's
@@ -92,7 +127,9 @@ sharing policy do. Each RUN accepts at most eight mounts; current
 Builds that also need a context disk and two stage-input disks fail before
 execution because the frozen eight-device envelope has no cache-disk slot.
 Explicit `id`, non-default `sharing`, nested or duplicate targets,
-bind/tmpfs/secret mounts, and credential-bearing SSH mounts remain unsupported.
+writable/custom/directory or non-context bind mounts, exec-form or heredoc RUN
+combinations, tmpfs/secret mounts, and
+credential-bearing SSH mounts remain unsupported.
 
 `spore build` now accepts numeric `--chmod` on the public HTTPS single-file
 `ADD` form. Octal values from `0` through `07777`, including ARG-expanded and

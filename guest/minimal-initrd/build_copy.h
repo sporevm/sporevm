@@ -51,6 +51,17 @@ int spore_build_cache_target_cleanup(
     const struct spore_build_cache_created_component *target_identity,
     const struct spore_build_cache_created_component *created_components,
     size_t created_component_count);
+int spore_build_context_bind_source_open(const char *root, const char *path);
+int spore_build_context_bind_target_prepare(
+    const char *root, const char *path, int *target_fd, int *target_created,
+    struct spore_build_cache_created_component *target_identity,
+    struct spore_build_cache_created_component *created_components,
+    size_t *created_component_count);
+int spore_build_context_bind_target_cleanup(
+    const char *root, const char *path, int target_created,
+    const struct spore_build_cache_created_component *target_identity,
+    const struct spore_build_cache_created_component *created_components,
+    size_t created_component_count);
 int spore_build_copy_ensure_fd_budget(void);
 
 #endif

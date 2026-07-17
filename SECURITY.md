@@ -111,6 +111,48 @@ symlinked, non-regular, size-mismatched, bad-magic, or host-visible unclean cach
 disks are discarded; a guest mount rejection remains a build error. Cache bytes
 are never rootfs CAS, manifest, secret, SSH, or credential input.
 
+Default context bind mounts accept only one expanded literal relative source
+and one expanded target per declaration on ordinary shell-form RUN. Exec-form
+and heredoc RUN combinations fail during the full-file parse. Planning resolves the source
+through `.dockerignore`, rejects missing paths, directories, symlinks, special
+files, globs, parent traversal, and non-context authorities, and records the
+normalized source/target, read-only policy, mode, and BLAKE3 bytes in ordered
+RUN cache identity. Captured mtime is intentionally excluded from that semantic
+identity to match BuildKit's mtime-only cache hits. A miss validates the source
+mtime against ext4's nanosecond timestamp range, binds its presence and value
+to the context-disk transport identity, selecting v2 whenever a captured mtime
+is present, and seals each regular file through the existing mutation-checked
+context snapshot. Context disks without captured mtime retain the unchanged v1
+identity, and ordinary COPY/ADD entries plus rootfs/import producers retain
+their existing zero-timestamp behavior and identity. The live host path is
+never mounted or opened by the VM. Out-of-range seconds or
+nanoseconds fail before execution rather than being truncated or wrapped. The strict
+newline-terminated v4 request accepts at most eight canonical captured source
+paths and absolute targets, rejects duplicate, unknown, malformed, trailing,
+overlapping cache/bind, and bind/bind fields, and shares the existing
+attacker-input request fuzz target. Targets overlapping the sandbox-owned
+`/proc`, `/dev`, and `/sys` views, the agent-owned `/run/sporevm` path, the
+inert SSH compatibility path at `/run/buildkit`, or the managed resolver target
+fail before setup; this includes ancestors that would hide a protected path and
+descendants that would alter one.
+
+The trusted agent opens the selected context-disk source and rootfs target
+component-by-component without following symlinks, mounts the regular file
+with `MS_RDONLY|MS_NOSUID|MS_NODEV`, and exposes it only through the
+operation-owned RUN sandbox. Existing regular-file targets remain the lower
+inode; absent targets and parent components carry recorded device/inode
+ownership. After descendants are killed and reaped, binds unmount in reverse
+order, descriptors close, the owned target is removed, and only still-empty
+owned ancestors are removed. `ENOTEMPTY` on an ancestor preserves legitimate
+rootfs sibling state; unmount failure, non-regular or replaced paths, symlinked
+ancestry, or unverifiable ownership poisons the build session with exit 125 and
+blocks checkpoint, step-record, and ref publication. Bind sources, target
+mountpoints, setup scaffolding, and context-disk transport inodes never enter
+rootfs CAS or portable state. Ordinary files that RUN deliberately writes from
+bind data remain normal rootfs output.
+Writable/custom, directory, stage/image/named-context, tmpfs, secret, and
+credential-bearing bind authorities remain rejected.
+
 The only accepted SSH syntax is one exact default
 `RUN --mount=type=ssh` declaration with no caller-supplied input. Full-file
 planning rejects every option, duplicate, required or custom socket, secret,

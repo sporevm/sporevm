@@ -1,0 +1,9 @@
+{
+  "description": "dockerignored context bind sources fail before execution",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: RUN context bind source did not match a context file: input"
+  },
+  "scan_prefixes": []
+}

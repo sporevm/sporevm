@@ -82,6 +82,7 @@ class BuildExpectation:
 class Transition:
     name: str
     writes: dict[str, str]
+    modes: dict[str, str]
     preserve_mtime: tuple[str, ...]
     outcome: Outcome
     spore_diagnostic: str | None
@@ -253,6 +254,7 @@ def parse_transition(value: Any, label: str) -> Transition:
             "outcome",
             "spore_diagnostic",
             "writes",
+            "modes",
             "preserve_mtime",
             "expect_cache",
             "expect_index",
@@ -308,6 +310,7 @@ def parse_transition(value: Any, label: str) -> Transition:
         outcome=outcome,
         spore_diagnostic=diagnostic,
         writes=require_string_map(raw.get("writes", {}), f"{label}.writes"),
+        modes=require_string_map(raw.get("modes", {}), f"{label}.modes"),
         preserve_mtime=require_string_list(
             raw.get("preserve_mtime", []), f"{label}.preserve_mtime"
         ),

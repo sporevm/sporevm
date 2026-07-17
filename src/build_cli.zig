@@ -488,6 +488,33 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
                 try stderr.writeAll("spore build: RUN has too many cache mounts\n");
             }
         },
+        error.TooManyRunContextBindMounts => {
+            try stderr.print("spore build: Dockerfile line {d}: RUN has too many context bind mounts\n", .{diagnostic.instruction_line});
+        },
+        error.RunContextBindSourceNotFound => {
+            try stderr.print(
+                "spore build: Dockerfile line {d}: RUN context bind source did not match a context file: {s}\n",
+                .{ diagnostic.instruction_line, diagnostic.copy.source },
+            );
+        },
+        error.RunContextBindSourceUnsupported => {
+            try stderr.print("spore build: Dockerfile line {d}: RUN context bind source must be one literal regular file inside the build context\n", .{diagnostic.instruction_line});
+        },
+        error.ContextSourceMtimeOutOfRange => {
+            try stderr.print(
+                "spore build: Dockerfile line {d}: RUN context bind source mtime is outside the supported ext4 range: {s}\n",
+                .{ diagnostic.instruction_line, diagnostic.copy.source },
+            );
+        },
+        error.RunContextBindTargetUnsupported, error.RunContextBindPathUnsupported => {
+            try stderr.print("spore build: Dockerfile line {d}: RUN context bind target must resolve to a non-root regular-file path within executor bounds\n", .{diagnostic.instruction_line});
+        },
+        error.RunMountTargetsOverlap => {
+            try stderr.print("spore build: Dockerfile line {d}: RUN mount targets overlap after resolution\n", .{diagnostic.instruction_line});
+        },
+        error.RunContextBindCommandUnsupported => {
+            try stderr.print("spore build: Dockerfile line {d}: RUN context bind mounts require ordinary shell form\n", .{diagnostic.instruction_line});
+        },
         error.UnsupportedBuildFrom => {
             try stderr.writeAll("spore build: FROM image reference is not supported\n");
         },

@@ -10,7 +10,8 @@ const rootfs_cas = @import("../rootfs_cas.zig");
 const tar = @import("../rootfs/tar.zig");
 
 const context_disk_dir = "build/context-disks";
-const complete_stamp_contents = "spore-build-context-disk-complete-v1\n";
+const complete_stamp_contents_v1 = "spore-build-context-disk-complete-v1\n";
+const complete_stamp_contents_v2 = "spore-build-context-disk-complete-v2-mtime\n";
 
 pub const Diagnostic = struct {
     entries: u64 = 0,
@@ -80,6 +81,7 @@ pub const Builder = struct {
         if (inode_count_u64 > std.math.maxInt(u32)) return error.ContextDiskTooManyEntries;
         const inode_count: u32 = @intCast(inode_count_u64);
         const disk_digest = try self.diskDigest(self.allocator);
+        const stamp_contents = self.completeStampContents();
         const dir = try std.fs.path.join(self.allocator, &.{ cache_root, context_disk_dir });
         try chunk_sealer.ensureDirPath(self.allocator, dir);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.ext4", .{ dir, disk_digest });
@@ -91,7 +93,7 @@ pub const Builder = struct {
         diagnostic.digest = disk_digest;
         diagnostic.path = path;
 
-        if (try reusableDisk(self.allocator, io, path, stamp_path, image_size)) {
+        if (try reusableDisk(self.allocator, io, path, stamp_path, image_size, stamp_contents)) {
             diagnostic.reused = true;
             return path;
         }
@@ -112,7 +114,7 @@ pub const Builder = struct {
         });
         try chmodReadOnly(self.allocator, temp);
         try renameReplace(self.allocator, temp, path);
-        try chunk_sealer.writeFileAtomicDurable(self.allocator, stamp_path, complete_stamp_contents, 0o444);
+        try chunk_sealer.writeFileAtomicDurable(self.allocator, stamp_path, stamp_contents, 0o444);
         diagnostic.emit_ns = elapsedNs(start);
         diagnostic.emitted = true;
         return path;
@@ -120,7 +122,8 @@ pub const Builder = struct {
 
     fn diskDigest(self: Builder, allocator: std.mem.Allocator) ![]const u8 {
         var h = Blake3.init(.{});
-        hashField(&h, "spore-build-context-disk-v1");
+        const includes_mtime = self.includesCapturedMtime();
+        hashField(&h, if (includes_mtime) "spore-build-context-disk-v2-mtime" else "spore-build-context-disk-v1");
         for (self.entries.items) |entry| {
             hashField(&h, entry.rel);
             hashField(&h, @tagName(entry.kind));
@@ -136,11 +139,33 @@ pub const Builder = struct {
                 .sym_link => hashField(&h, entry.symlink_target),
                 else => return error.UnsupportedCopySourceType,
             }
+            if (includes_mtime) {
+                if (entry.captured_mtime) |mtime| {
+                    hashField(&h, "mtime-present");
+                    var seconds_buf: [8]u8 = undefined;
+                    std.mem.writeInt(i64, &seconds_buf, mtime.seconds, .little);
+                    hashField(&h, &seconds_buf);
+                    var nanoseconds_buf: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &nanoseconds_buf, mtime.nanoseconds, .little);
+                    hashField(&h, &nanoseconds_buf);
+                } else {
+                    hashField(&h, "mtime-absent");
+                }
+            }
         }
         var raw: [Blake3.digest_length]u8 = undefined;
         h.final(&raw);
         const hex = std.fmt.bytesToHex(raw, .lower);
         return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
+    }
+
+    fn includesCapturedMtime(self: Builder) bool {
+        for (self.entries.items) |entry| if (entry.captured_mtime != null) return true;
+        return false;
+    }
+
+    fn completeStampContents(self: Builder) []const u8 {
+        return if (self.includesCapturedMtime()) complete_stamp_contents_v2 else complete_stamp_contents_v1;
     }
 
     fn ext4Entries(self: Builder) ![]const ext4_writer.Entry {
@@ -163,6 +188,7 @@ pub const Builder = struct {
                             .mode = @intCast(entry.mode),
                             .uid = 0,
                             .gid = 0,
+                            .mtime = ext4Mtime(entry.captured_mtime),
                         });
                     } else {
                         if (entry.snapshot_path.len == 0) return error.CopySourceNotSnapshotted;
@@ -177,6 +203,7 @@ pub const Builder = struct {
                             .mode = @intCast(entry.mode),
                             .uid = 0,
                             .gid = 0,
+                            .mtime = ext4Mtime(entry.captured_mtime),
                         });
                     }
                 },
@@ -194,7 +221,7 @@ pub const Builder = struct {
     }
 };
 
-fn reusableDisk(allocator: std.mem.Allocator, io: Io, path: []const u8, stamp_path: []const u8, expected_size: u64) !bool {
+fn reusableDisk(allocator: std.mem.Allocator, io: Io, path: []const u8, stamp_path: []const u8, expected_size: u64, expected_stamp: []const u8) !bool {
     const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => |e| return e,
@@ -204,13 +231,18 @@ fn reusableDisk(allocator: std.mem.Allocator, io: Io, path: []const u8, stamp_pa
         error.FileNotFound => return false,
         else => |e| return e,
     };
-    if (stamp_stat.kind != .file or stamp_stat.size != complete_stamp_contents.len) return false;
-    const stamp = Io.Dir.cwd().readFileAlloc(io, stamp_path, allocator, .limited(complete_stamp_contents.len + 1)) catch |err| switch (err) {
+    if (stamp_stat.kind != .file or stamp_stat.size != expected_stamp.len) return false;
+    const stamp = Io.Dir.cwd().readFileAlloc(io, stamp_path, allocator, .limited(expected_stamp.len + 1)) catch |err| switch (err) {
         error.FileNotFound, error.StreamTooLong => return false,
         else => |e| return e,
     };
     defer allocator.free(stamp);
-    return std.mem.eql(u8, stamp, complete_stamp_contents);
+    return std.mem.eql(u8, stamp, expected_stamp);
+}
+
+fn ext4Mtime(value: ?build_context.CapturedMtime) ?ext4_writer.Mtime {
+    const mtime = value orelse return null;
+    return .{ .seconds = mtime.seconds, .nanoseconds = mtime.nanoseconds };
 }
 
 fn completeStampPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -255,7 +287,7 @@ fn elapsedNs(start_ns: u64) u64 {
     return end_ns - start_ns;
 }
 
-test "context disk requires a complete stamp before reuse" {
+test "mtime context disk requires a v2 complete stamp before reuse" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -275,7 +307,7 @@ test "context disk requires a complete stamp before reuse" {
     const resolution = try build_context.resolveCopySources(arena, io, context, &.{"source.txt"});
     var snapshot = try build_context.CopySnapshot.init(arena, io, cache_root);
     defer snapshot.deinit(io);
-    const captured = try build_context.captureCopyResolutionWithOptions(arena, io, context, resolution, .{}, &snapshot);
+    const captured = try build_context.captureCopyResolutionWithOptions(arena, io, context, resolution, .{ .capture_mtime = true }, &snapshot);
 
     var builder = Builder.init(arena);
     _ = try builder.addCapturedCopy(captured);
@@ -321,4 +353,57 @@ test "context disk isolates each COPY in its own transport namespace" {
     try std.testing.expectEqual(@as(usize, 6), builder.entries.items.len);
     try std.testing.expectEqualStrings("s0/dir/a.txt", builder.entries.items[2].rel);
     try std.testing.expectEqualStrings("s1/dir/b.txt", builder.entries.items[5].rel);
+}
+
+test "captured mtime selects v2 transport identity without changing v1" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var legacy = Builder.init(arena);
+    _ = try legacy.addCapturedCopy(&.{.{
+        .rel = "input",
+        .kind = .file,
+        .mode = 0o644,
+        .size = 5,
+        .content_digest = "blake3:content",
+        .inline_data = "input",
+    }});
+    const legacy_digest = try legacy.diskDigest(arena);
+    try std.testing.expectEqualStrings(
+        "blake3:8c791019ccaf9623df73a70089feb675cbf8f0b2ec706433451d22e50854463a",
+        legacy_digest,
+    );
+    try std.testing.expectEqualStrings(complete_stamp_contents_v1, legacy.completeStampContents());
+
+    var first = Builder.init(arena);
+    _ = try first.addCapturedCopy(&.{.{
+        .rel = "input",
+        .kind = .file,
+        .mode = 0o644,
+        .size = 5,
+        .content_digest = "blake3:content",
+        .inline_data = "input",
+        .captured_mtime = .{ .seconds = 1_700_000_000, .nanoseconds = 123_456_789 },
+    }});
+    const first_digest = try first.diskDigest(arena);
+    try std.testing.expectEqualStrings(complete_stamp_contents_v2, first.completeStampContents());
+    try std.testing.expect(!std.mem.eql(u8, legacy_digest, first_digest));
+    const first_entries = try first.ext4Entries();
+    try std.testing.expectEqual(ext4_writer.Mtime{
+        .seconds = 1_700_000_000,
+        .nanoseconds = 123_456_789,
+    }, first_entries[1].mtime.?);
+
+    var changed = Builder.init(arena);
+    _ = try changed.addCapturedCopy(&.{.{
+        .rel = "input",
+        .kind = .file,
+        .mode = 0o644,
+        .size = 5,
+        .content_digest = "blake3:content",
+        .inline_data = "input",
+        .captured_mtime = .{ .seconds = 1_700_000_001, .nanoseconds = 123_456_789 },
+    }});
+    try std.testing.expect(!std.mem.eql(u8, first_digest, try changed.diskDigest(arena)));
 }
