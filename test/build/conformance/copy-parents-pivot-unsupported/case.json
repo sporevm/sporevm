@@ -1,0 +1,9 @@
+{
+  "description": "COPY parents rejects internal source pivots before execution",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 3: COPY --parents does not support an internal /./ source pivot: src/./payload"
+  },
+  "scan_prefixes": []
+}

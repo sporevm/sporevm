@@ -1,0 +1,39 @@
+{
+  "description": "COPY --parents root conflicts preserve the existing file and publish no failed result",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 2,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/dest",
+    "/oracle"
+  ],
+  "transitions": [
+    {
+      "name": "root-conflict-fails-without-publication",
+      "writes": {
+        "Dockerfile": "# syntax=docker/dockerfile:1.20\nFROM base\nRUN printf old >/dest\nCOPY --parents x /dest\n"
+      },
+      "outcome": "failure",
+      "spore_diagnostic": "spore build: Dockerfile line 4: instruction failed: COPY --parents x /dest"
+    },
+    {
+      "name": "recovery-preserves-root-file",
+      "writes": {
+        "Dockerfile": "# syntax=docker/dockerfile:1.20\nFROM base\nRUN printf old >/dest\nRUN test \"$(cat /dest)\" = old && mkdir -p /oracle && printf recovery >/oracle/result\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 1,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    }
+  ]
+}

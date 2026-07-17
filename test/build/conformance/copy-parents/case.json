@@ -1,0 +1,68 @@
+{
+  "description": "context COPY parents reconstructs ordered file directory and glob paths under WORKDIR",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 4,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/work",
+    "/oracle"
+  ],
+  "spore_epoch_mtime_paths": [
+    "/work/lib",
+    "/work/app/helpers"
+  ],
+  "modes": {
+    "lib": "0700",
+    "app/helpers": "0710"
+  },
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "mtime-only-source-change-hits",
+      "writes": {
+        "lib/x.rb": "ruby\n"
+      },
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "content-change-misses",
+      "writes": {
+        "lib/x.rb": "ruby-changed\n",
+        "Dockerfile": "# syntax=docker/dockerfile:1.20\nFROM base\nWORKDIR /work\nCOPY --parents lib/x.rb app/helpers/ public/*.html ./\nCOPY --parents lib/x.rb public/*.html /no-slash\nRUN test \"$(cat lib/x.rb)\" = ruby-changed && test \"$(cat app/helpers/value.rb)\" = helper && test \"$(cat public/a.html)\" = a && test \"$(cat public/z.html)\" = z && test \"$(cat /no-slash/lib/x.rb)\" = ruby-changed && test \"$(cat /no-slash/public/a.html)\" = a && test \"$(cat /no-slash/public/z.html)\" = z && mkdir -p /oracle && printf changed >/oracle/result\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 3,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-content-change",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

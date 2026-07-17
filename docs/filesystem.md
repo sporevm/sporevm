@@ -166,6 +166,22 @@ state, parent, and executor identity complete the step key. Quoted or
 tab-chomping delimiters, multiple or mixed heredoc sources, COPY flags on the
 form remain fail-closed.
 
+Context `COPY --parents` uses the same immutable capture and strict COPY v4
+apply path. The host maps each selected file, directory, or glob root to its
+ordered cleaned root-relative destination below the resolved `WORKDIR` target,
+then binds that mapping and the captured bytes and modes into COPY identity.
+`--parents=false` is ordinary context COPY. The context-root operands `.` and
+`./`, internal `/./` pivots, stage or named-context sources, `--link`,
+heredocs, and other flag combinations remain unsupported. The synthetic tree
+merges reconstructed directories only with existing directories (including
+confined symlinks to directories); a file or non-directory conflict fails
+without unlinking either the root destination or a nested entry. Unlike
+BuildKit, which exposes captured source mtimes on a cold
+parents copy while excluding them from semantic cache identity, Spore keeps
+the existing deterministic Unix-epoch context-COPY timestamps. An mtime-only
+edit therefore hits in both builders, but a forced Spore miss still emits zero
+timestamps; the frozen compatibility workload does not inspect them.
+
 A single unquoted, non-chomping `RUN <<NAME` heredoc uses the ordinary RUN
 filesystem transaction. Its non-empty, non-shebang body is preserved with the
 final newline and streamed to `/bin/sh -c`; the guest shell, rather than the

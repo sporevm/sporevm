@@ -2,6 +2,24 @@
 
 ## Next
 
+`spore build` now accepts context-form `COPY --parents[=true|false]` with
+multiple regular-file, directory, and glob sources. The true form reconstructs
+each selected source's cleaned root-relative path below the destination,
+including destinations resolved from inherited `WORKDIR`; false retains
+ordinary context COPY behavior. Source order, resolved roots, destination,
+captured modes and bytes, environment state, parent rootfs, and executor
+identity remain typed cache inputs, while the existing immutable context disk
+and COPY v4 request retain confinement and checkpoint behavior. Ordinary COPY
+keeps its existing overwrite rules, while the parents synthetic tree rejects
+root and nested non-directory conflicts without replacing them. The
+context-root operands `.` and `./`, internal `/./` source
+pivots, `--from`, `--link`, heredocs, and all other flag compositions remain
+fail-closed. Spore deliberately keeps its
+existing deterministic Unix-epoch timestamps for ordinary context COPY, so it
+differs from BuildKit's source-mtime transport metadata; mtime-only source
+changes still hit the semantic COPY result, and the frozen Buildkite workload
+does not read those mtimes.
+
 `spore build` now accepts expanded explicit `id` and
 `sharing=shared|locked` on bounded `RUN --mount=type=cache` declarations.
 Explicit and omitted IDs both select digest-named subdirectories inside the
