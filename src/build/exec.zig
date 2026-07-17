@@ -181,6 +181,7 @@ pub const RunStep = struct {
     network_mode: step_cache.NetworkMode,
     cache_mount_digest: []const u8 = "",
     cache_mounts: []const cache_mount.Mount = &.{},
+    ssh_declared_absent: bool = false,
 };
 
 pub const CopySourceKind = enum {
@@ -295,6 +296,7 @@ pub fn cacheInputForStep(
                 .nofile_soft = resources.nofile.soft,
                 .nofile_hard = resources.nofile.hard,
                 .cache_mount_digest = run.cache_mount_digest,
+                .ssh_declared_absent = run.ssh_declared_absent,
             } },
         },
         .copy => |copy| .{

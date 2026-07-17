@@ -111,6 +111,18 @@ symlinked, non-regular, size-mismatched, bad-magic, or host-visible unclean cach
 disks are discarded; a guest mount rejection remains a build error. Cache bytes
 are never rootfs CAS, manifest, secret, SSH, or credential input.
 
+The only accepted SSH syntax is one exact default
+`RUN --mount=type=ssh` declaration with no caller-supplied input. Full-file
+planning rejects every option, duplicate, required or custom socket, secret,
+and credential-bearing form. The builder adds BuildKit's inert
+`SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` value to that RUN only when its
+effective environment lacks the key; it creates no socket, directory, guest
+request field, file descriptor, host/VMM transport, broker, CLI option, or
+durable state. The resolved environment and typed `ssh_declared_absent` state
+are separate RUN cache inputs so a future credential-bearing operation cannot
+reuse the result. A command that requires the nonexistent socket exits through
+the ordinary RUN failure path, which publishes no step record or image ref.
+
 Builder-owned Dockerfile expansion is part of the full-file parse boundary.
 Expansion-capable operands retain their exact quote and escape spelling through
 parsing, and the bounded stable `$NAME`, `${NAME}`, default, and alternate

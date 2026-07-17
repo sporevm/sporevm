@@ -106,6 +106,7 @@ pub const StepInput = struct {
         nofile_soft: ?u64 = null,
         nofile_hard: ?u64 = null,
         cache_mount_digest: []const u8 = "",
+        ssh_declared_absent: bool = false,
     };
 
     pub const Copy = struct {
@@ -136,6 +137,7 @@ pub const StepInput = struct {
         executor_identity: []const u8,
         copy_destination_policy: ?CopyDestinationPolicy,
         cache_mount_digest: []const u8,
+        ssh_declared_absent: bool,
     };
 
     fn flatFields(self: StepInput) FlatFields {
@@ -155,6 +157,7 @@ pub const StepInput = struct {
                 .executor_identity = "",
                 .copy_destination_policy = null,
                 .cache_mount_digest = "",
+                .ssh_declared_absent = false,
             },
             .prepare => |prepare| .{
                 .instruction_kind = "PREPARE",
@@ -171,6 +174,7 @@ pub const StepInput = struct {
                 .executor_identity = "",
                 .copy_destination_policy = null,
                 .cache_mount_digest = "",
+                .ssh_declared_absent = false,
             },
             .run => |run| .{
                 .instruction_kind = "RUN",
@@ -187,6 +191,7 @@ pub const StepInput = struct {
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = null,
                 .cache_mount_digest = run.cache_mount_digest,
+                .ssh_declared_absent = run.ssh_declared_absent,
             },
             .copy => |copy| .{
                 .instruction_kind = "COPY",
@@ -203,6 +208,7 @@ pub const StepInput = struct {
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = copy.destination_policy,
                 .cache_mount_digest = "",
+                .ssh_declared_absent = false,
             },
             .add => |add| .{
                 .instruction_kind = "ADD",
@@ -219,6 +225,7 @@ pub const StepInput = struct {
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = null,
                 .cache_mount_digest = "",
+                .ssh_declared_absent = false,
             },
             .workdir => |workdir| .{
                 .instruction_kind = "WORKDIR",
@@ -235,6 +242,7 @@ pub const StepInput = struct {
                 .executor_identity = self.executor_identity,
                 .copy_destination_policy = null,
                 .cache_mount_digest = "",
+                .ssh_declared_absent = false,
             },
         };
     }
@@ -293,6 +301,7 @@ pub const StepRecord = struct {
     executor_identity: []const u8 = "",
     copy_destination_policy: ?CopyDestinationPolicy = null,
     cache_mount_digest: []const u8 = "",
+    ssh_declared_absent: ?bool = null,
     created_unix: i64 = 0,
 };
 
@@ -319,6 +328,7 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
     hashField(&h, fields.executor_identity);
     hashOptionalField(&h, if (fields.copy_destination_policy) |policy| @tagName(policy) else null);
     hashField(&h, fields.cache_mount_digest);
+    if (fields.ssh_declared_absent) hashField(&h, "spore-build-run-ssh-declared-absent-v1");
     return finishHex(allocator, &h);
 }
 
@@ -391,6 +401,7 @@ pub fn writeRecord(
         .executor_identity = fields.executor_identity,
         .copy_destination_policy = fields.copy_destination_policy,
         .cache_mount_digest = fields.cache_mount_digest,
+        .ssh_declared_absent = if (fields.ssh_declared_absent) true else null,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, record, .{
         .whitespace = .indent_2,
@@ -538,7 +549,8 @@ fn stepInputEql(a: StepInput, b: StepInput) bool {
         optionalStringEql(af.producer_identity, bf.producer_identity) and
         std.mem.eql(u8, af.executor_identity, bf.executor_identity) and
         af.copy_destination_policy == bf.copy_destination_policy and
-        std.mem.eql(u8, af.cache_mount_digest, bf.cache_mount_digest);
+        std.mem.eql(u8, af.cache_mount_digest, bf.cache_mount_digest) and
+        af.ssh_declared_absent == bf.ssh_declared_absent;
 }
 
 fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -558,12 +570,13 @@ fn validChildStorage(record: StepRecord, expected_key: []const u8) ?spore.Rootfs
 fn currentRecordInput(record: StepRecord) !StepInput {
     const no_prepare_fields = record.exact_target == null and record.producer_identity == null;
     const no_resource_fields = record.memory_bytes == null and record.vcpus == null and record.nofile_soft == null and record.nofile_hard == null;
+    const no_ssh_field = record.ssh_declared_absent == null;
     if (std.mem.eql(u8, record.instruction_kind, "SCRATCH")) {
         const target = record.exact_target orelse return error.MalformedBuildRecord;
         if (!std.mem.eql(u8, record.instruction, "SCRATCH") or record.input_digest.len == 0 or
             record.env_digest.len != 0 or record.workdir.len != 0 or record.network_mode != null or
             !no_resource_fields or record.producer_identity != null or record.executor_identity.len != 0 or
-            record.copy_destination_policy != null or record.cache_mount_digest.len != 0)
+            record.copy_destination_policy != null or record.cache_mount_digest.len != 0 or !no_ssh_field)
         {
             return error.MalformedBuildRecord;
         }
@@ -575,12 +588,13 @@ fn currentRecordInput(record: StepRecord) !StepInput {
         if (!std.mem.eql(u8, record.instruction, "PREPARE") or record.input_digest.len != 0 or
             record.env_digest.len != 0 or record.workdir.len != 0 or record.network_mode != null or
             !no_resource_fields or record.executor_identity.len != 0 or record.copy_destination_policy != null or
-            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
+            record.cache_mount_digest.len != 0 or !no_ssh_field) return error.MalformedBuildRecord;
         const input = try prepareInput(record.platform, record.parent_index_digest, target, producer);
         return input;
     }
     if (!no_prepare_fields) return error.MalformedBuildRecord;
     if (std.mem.eql(u8, record.instruction_kind, "RUN")) {
+        if (record.ssh_declared_absent) |declared| if (!declared) return error.MalformedBuildRecord;
         if (!std.mem.startsWith(u8, record.instruction, "RUN ") or record.input_digest.len != 0 or
             record.network_mode == null or record.copy_destination_policy != null) return error.MalformedBuildRecord;
         return .{
@@ -597,13 +611,14 @@ fn currentRecordInput(record: StepRecord) !StepInput {
                 .nofile_soft = record.nofile_soft,
                 .nofile_hard = record.nofile_hard,
                 .cache_mount_digest = record.cache_mount_digest,
+                .ssh_declared_absent = record.ssh_declared_absent orelse false,
             } },
         };
     }
     if (std.mem.eql(u8, record.instruction_kind, "COPY")) {
         if (!std.mem.startsWith(u8, record.instruction, "COPY ") or record.input_digest.len == 0 or
             record.network_mode != null or !no_resource_fields or record.copy_destination_policy == null or
-            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
+            record.cache_mount_digest.len != 0 or !no_ssh_field) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
             .parent_index_digest = record.parent_index_digest,
@@ -620,7 +635,7 @@ fn currentRecordInput(record: StepRecord) !StepInput {
     if (std.mem.eql(u8, record.instruction_kind, "ADD")) {
         if (!std.mem.startsWith(u8, record.instruction, "ADD ") or record.input_digest.len == 0 or
             record.network_mode != null or !no_resource_fields or record.copy_destination_policy != null or
-            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
+            record.cache_mount_digest.len != 0 or !no_ssh_field) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
             .parent_index_digest = record.parent_index_digest,
@@ -636,7 +651,7 @@ fn currentRecordInput(record: StepRecord) !StepInput {
     if (std.mem.eql(u8, record.instruction_kind, "WORKDIR")) {
         if (!std.mem.startsWith(u8, record.instruction, "WORKDIR ") or record.input_digest.len == 0 or
             record.network_mode != null or !no_resource_fields or record.copy_destination_policy != null or
-            record.cache_mount_digest.len != 0) return error.MalformedBuildRecord;
+            record.cache_mount_digest.len != 0 or !no_ssh_field) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
             .parent_index_digest = record.parent_index_digest,
@@ -853,6 +868,24 @@ test "RUN cache mount digest is explicit cache identity" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
+test "optional-absent SSH declaration is explicit RUN cache identity" {
+    const allocator = std.testing.allocator;
+    const base: StepInput = .{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = "RUN true",
+        .executor_identity = test_executor_identity,
+        .operation = .{ .run = .{ .network_mode = .none } },
+    };
+    const plain = try stepKey(allocator, base);
+    defer allocator.free(plain);
+    var declared = base;
+    declared.operation.run.ssh_declared_absent = true;
+    const absent_ssh = try stepKey(allocator, declared);
+    defer allocator.free(absent_ssh);
+    try std.testing.expect(!std.mem.eql(u8, plain, absent_ssh));
+}
+
 test "prepare input is canonical and key changes with target and producer" {
     const allocator = std.testing.allocator;
     const parent = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -974,9 +1007,9 @@ test "rewriting a step record replaces a prior child snapshot" {
     const input = StepInput{
         .platform = .{},
         .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .canonical_instruction = "RUN fetch-current-packages",
+        .canonical_instruction = "RUN --mount=type=ssh fetch-current-packages",
         .executor_identity = test_executor_identity,
-        .operation = .{ .run = .{ .network_mode = .spore } },
+        .operation = .{ .run = .{ .network_mode = .spore, .ssh_declared_absent = true } },
     };
     const key = try stepKey(arena, input);
 

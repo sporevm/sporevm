@@ -2,6 +2,18 @@
 
 ## Next
 
+`spore build` now accepts one exact default `RUN --mount=type=ssh`
+declaration when no SSH input is supplied. This is optional-absent syntax and
+result compatibility, not forwarding support: the RUN receives BuildKit's
+inert `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` value only when its effective
+environment did not already define the key, while no socket or
+`/run/buildkit` path is created. The typed absent declaration and resolved
+environment are cache inputs, and a command that requires the agent fails
+normally without publishing the failed step. Options, duplicates, required or
+custom sockets, host inputs, secrets, and every credential-bearing SSH form
+still fail during full-file planning. No guest protocol, device, manifest,
+credential broker, CLI option, or durable secret state is added.
+
 `spore build` now accepts one unquoted, non-chomping RUN heredoc as the complete
 command after optional default cache mounts, for example `RUN <<EOF`. A
 non-empty body without NUL or a leading shebang is preserved byte-for-byte,
@@ -14,7 +26,7 @@ identity remain cache inputs, while the existing per-instruction timeout and
 RUN sandbox own execution and cleanup. Shell-prefix, quoted, chomping, multiple,
 empty, shebang/direct-exec, and exec-form heredocs still fail during full-file
 parsing. The accepted form reuses the existing shell v1/v3 request and does not
-add a guest protocol, mount type, secret/SSH input, device, or manifest field.
+add a guest protocol, credential-bearing input, device, or manifest field.
 
 `spore build` now accepts a single unquoted, non-chomping COPY heredoc source,
 for example `COPY <<EOF /etc/example`. The body keeps its final newline and
@@ -79,8 +91,8 @@ sharing policy do. Each RUN accepts at most eight mounts; current
 `spore rootfs df`, prune, and GC do not account for or remove the aggregate.
 Builds that also need a context disk and two stage-input disks fail before
 execution because the frozen eight-device envelope has no cache-disk slot.
-Explicit `id`, non-default `sharing`, nested or duplicate
-targets, and bind/tmpfs/secret/SSH mounts remain unsupported.
+Explicit `id`, non-default `sharing`, nested or duplicate targets,
+bind/tmpfs/secret mounts, and credential-bearing SSH mounts remain unsupported.
 
 `spore build` now accepts numeric `--chmod` on the public HTTPS single-file
 `ADD` form. Octal values from `0` through `07777`, including ARG-expanded and
@@ -89,8 +101,8 @@ remains `0600`. The resolved mode participates in ADD cache identity, while
 the existing strict COPY v4 request and confined guest copy path preserve mode,
 destination-conflict, and `Last-Modified` behavior. Empty, malformed,
 duplicate, out-of-range, and symbolic values fail closed before the ADD GET.
-Local ADD, archive extraction, COPY chmod, credentials, Git, and SSH remain
-unsupported.
+Local ADD, archive extraction, COPY chmod, credentials, Git, and SSH forwarding
+remain unsupported.
 
 `spore build` now accepts `COPY --link` for immutable cross-stage and named
 build inputs. True link policy builds the destination result without reading or
@@ -106,7 +118,7 @@ are cache inputs; changed source-stage bytes miss while unchanged rebuilds hit.
 The strict guest v5 request accepts link policy only from bounded immutable
 build-input disks, and conflict removal shares COPY's 65,536-entry limit.
 Local-context `--link`, COPY `--chmod`, `--parents`, non-single-source COPY
-heredocs, OCI layer rebasing, and SSH remain unsupported.
+heredocs, OCI layer rebasing, and credential-bearing SSH remain unsupported.
 
 `spore build` now accepts one public HTTPS URL and one destination in `ADD`.
 The builder resolves both operands from the instruction-start ENV/ARG snapshot,

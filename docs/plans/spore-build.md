@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-16
+last_reviewed: 2026-07-17
 spec_refs:
   - docs/rootfs.md
   - docs/filesystem.md
@@ -154,7 +154,8 @@ The missing work falls into three different categories:
   `COPY --from`, result-correct cross-stage `COPY --link`, `--target`, and final
   `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
   (`--parents`, `--chown`, `--chmod`), RUN mounts other than bounded default
-  `type=cache,target=...`, local `ADD`, ADD flags
+  `type=cache,target=...` and one exact optional-absent `type=ssh`
+  declaration, local `ADD`, ADD flags
   other than numeric `--chmod`, RUN heredoc forms other than one unquoted,
   non-chomping shell body, COPY heredoc forms other than one unquoted
   non-chomping source, `USER`, `VOLUME`, `EXPOSE`,
@@ -166,7 +167,7 @@ The missing work falls into three different categories:
 - No replacement for the wrapper's preliminary `docker build --target ci` of
   the Buildkite app image. That Dockerfile uses `syntax=docker/dockerfile:1.20`
   features that remain outside the subset, including broader heredoc and mount
-  forms plus SSH declarations. The base image keeps arriving as an OCI
+  forms plus credential-bearing SSH behavior. The base image keeps arriving as an OCI
   layout via `--build-context`.
 - The unchanged Buildkite `ci` target is also exercised independently as a
   read-only prioritization oracle. Its first grounded failure may identify C2,
@@ -243,7 +244,9 @@ The missing work falls into three different categories:
   directories it created, and permits rootfs freeze only after successful
   teardown. Cache writes survive failed RUNs and later builds but never enter a
   rootfs checkpoint or portable manifest. Explicit IDs, non-default sharing,
-  nested or duplicate targets, and other mount types remain fail-closed.
+  nested or duplicate targets, and other runtime mount types remain
+  fail-closed; the one optional-absent SSH declaration creates no runtime
+  mount.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
 - No flat checkpoint store and no full-image hash fallback in the executor.
@@ -489,7 +492,7 @@ implementing Spore's mounts or cache policy.
 | Instruction | Support |
 | --- | --- |
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
-| `RUN [--mount=type=cache,target=<path>]… <shell>` / `RUN [--mount=type=cache,target=<path>]… ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. The first C3 slice accepts only cache mounts with omitted ID/sharing; bind, tmpfs, secret, SSH, and per-instruction network remain rejected. |
+| `RUN [--mount=type=ssh] [--mount=type=cache,target=<path>]… <shell>` / `RUN … ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. Cache mounts require omitted ID/sharing. One exact default SSH declaration is accepted only as optional-absent compatibility: it adds the inert BuildKit `SSH_AUTH_SOCK` value when the effective RUN environment lacks the key, but creates no socket or credential path. Bind, tmpfs, secret, credential-bearing SSH, and per-instruction network remain rejected. |
 | `RUN [--mount=type=cache,target=<path>]… <<NAME` | one unquoted, non-chomping heredoc token as the complete RUN command. A non-empty body without a leading shebang is preserved byte-for-byte, including its final newline, and executes through the ordinary shell RUN path. ARG/ENV, quoting, escaping, unset variables, and parameter operators are therefore evaluated by the guest shell, not the builder-owned operand expander. Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and exec-form heredocs fail closed. |
 | `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
 | `COPY <<NAME <dest>` | one unquoted, non-chomping inline source with no flags. The body preserves its final newline and quote bytes while expanding stable ARG/ENV expressions from the instruction-start snapshot. It becomes one root-owned `0644` regular file; a directory destination uses `NAME` as its basename. Multiple, mixed, quoted, and chomping heredocs fail closed. |
@@ -696,7 +699,10 @@ Per-instruction inputs:
   ordered for OCI publication, while equivalent normalized ENV plus typed ARG
   state intentionally shares a digest. The digest distinguishes ENV from ARG state
   and unset ARG from an explicitly empty value, and cannot alias embedded
-  newlines with multiple entries. `input_digest` is empty.
+  newlines with multiple entries. An accepted optional-absent SSH declaration
+  adds the resolved effective environment and an explicit
+  `ssh_declared_absent` state; future forwarded-agent work cannot alias it.
+  `input_digest` is empty.
 - `COPY`: the substituted source patterns and dest, the current `WORKDIR`,
   and `input_digest` = the context content hash of the matched sources:
   after sorting by relative path and deduplicating repeated matches, each
@@ -855,25 +861,28 @@ output produced from semantically different rootfs inputs.
 
 ### Credential boundary
 
-The core builder rejects `RUN --mount=type=secret`,
-`RUN --mount=type=ssh`, raw host secret files, PEM inputs, and SSH-agent
-forwarding. These features do not align with the repository invariant that
-credentials stay out of the VMM process and durable machine state, and their
-usage does not justify making them part of the compatibility architecture.
+The core builder rejects `RUN --mount=type=secret`, credential-bearing SSH
+mounts, raw host secret files, PEM inputs, and SSH-agent forwarding. One exact
+default `RUN --mount=type=ssh` declaration is accepted only when the caller
+supplies no SSH input. BuildKit v0.30.0 makes that optional-absent operation
+observable by adding `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` when the
+effective RUN environment lacks the key, even though it omits the socket mount.
+Spore matches that precedence for the RUN alone while creating no socket,
+`/run/buildkit` path, host input, forwarding transport, guest protocol field,
+credential broker, CLI option, or durable state.
+
+The typed plan and cache record carry `ssh_declared_absent`, and the resolved
+effective environment remains cache identity. A future operation with a real
+agent therefore cannot reuse this result. Options, duplicate declarations,
+`required=true`, custom id/target/mode/uid/gid, secrets, and any caller-supplied
+SSH input fail during full-file planning. If the command actually requires the
+nonexistent socket, its ordinary nonzero RUN result publishes no step or image
+record.
 
 A future named credential broker may implement a deliberately different,
 mediated contract if real consumers justify it. That work requires a separate
 security plan and does not block this roadmap. Dockerfiles that require raw
-secret or SSH mounts continue to fail during planning.
-
-The unchanged Buildkite oracle contains a declared SSH mount, but it does not
-authorize credential forwarding. When that declaration becomes the first real
-blocker, preserve pinned BuildKit evidence and stop for a product/security
-decision between two narrow outcomes: accept an optional absent SSH declaration
-only when no socket or credential input is present or used, or retain a small
-compatibility-Dockerfile exception outside SporeVM. Do not choose between those
-outcomes implicitly, and do not add an SSH socket, host input, or durable secret
-state as part of C2 or C3.
+secret or actual SSH mounts continue to fail during planning.
 
 ### Cache model
 
@@ -1700,7 +1709,7 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    COPY heredocs and stopped parser-only at the cache-mounted RUN heredoc whose
    instruction begins on line 130, with zero fetch, VM, runtime, rootfs, or
    cache mutation.
-6. **Active — single shell RUN heredoc.** BuildKit v0.30.0 source and a pinned
+6. **Done — landed in PR #509:** single shell RUN heredoc. BuildKit v0.30.0 source and a pinned
    Buildx v0.33.0 differential show that `RUN <<NAME` without a shebang lowers
    the exact body to the ordinary shell RUN path; the frontend does not substitute
    the body, so ARG/ENV, quotes, escapes, unset variables, and parameter
@@ -1715,15 +1724,28 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and
    exec-form heredocs fail during the full-file parse/preflight pass. This is
    the narrow general form required by frozen line 130; it does not add a guest
-   protocol or alter C3 storage or sandbox contracts.
-7. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add
+   protocol or alter C3 storage or sandbox contracts. Exact merged main
+   `b8702decef5a1f73f93854af4f070c74d4375ed9`, tree `6902c634`, passed
+   Buildkite #1401 and independent packaged HVF/KVM acceptance. The unchanged
+   oracle then stopped parser-only at line 237 on `RUN --mount=type=ssh`.
+7. **Active — optional-absent SSH declaration compatibility.** Accept only one
+   exact default `type=ssh` declaration with no caller input. Pinned BuildKit
+   v0.30.0 injects `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` when the effective
+   RUN environment lacks that key but creates no socket or path when the mount
+   is optional and absent. Match that inert value and precedence, bind the
+   resolved environment plus typed `ssh_declared_absent` state into cache
+   identity, and reject every option, duplicate, required/custom, host-input,
+   secret, and forwarding form before execution. This slice adds no guest
+   protocol or credential authority; the next unchanged-oracle failure should
+   be the first context bind mount later in the same instruction.
+8. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add
    `COPY --parents` and `COPY --chmod` only when the next unchanged-oracle run
    reaches them. Split these into separate PRs whenever their parser,
    filesystem result, cache identity, or failure-publication protocols differ.
-8. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
+9. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
    a later unchanged-oracle run produces a concrete mismatch or unsupported
    span.
-9. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
+10. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
    `--exclude`, `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`,
    `HEALTHCHECK`, `VOLUME`, and other metadata only when the unchanged workload
    or the representative common-template corpus demonstrates demand.
@@ -1758,7 +1780,7 @@ Do not accept it merely because parsing succeeds.
    stdio, networking, environment, workdir, root-user, exit, and rootfs behavior
    remain compatible with pinned BuildKit.
 
-The next oracle-driven slice implements only multiple cache mounts with
+The landed first mounted-RUN slice implements only multiple cache mounts with
 `type=cache`, `target`, and omitted `id`/`sharing`. It uses a bounded 4 GiB
 sparse aggregate ext4 disk outside rootfs CAS plus a single exclusive store
 lock, conservatively serializing BuildKit's default shared-writer mode. The
@@ -1786,8 +1808,12 @@ on `COPY <<EOF`. No fetch, VM boot, or cache/runtime mutation occurred, so the
 single-source COPY heredoc slice became the next grounded boundary. That slice
 landed unchanged in PR #508 at exact main `6e679896`, passed Buildkite #1399
 and packaged HVF/KVM acceptance, and moved the same zero-mutation oracle to the
-line-130 cache-mounted `RUN <<EOF`. The active single RUN heredoc slice above
-is therefore the next grounded boundary.
+line-130 cache-mounted `RUN <<EOF`. That heredoc slice landed in PR #509 at
+exact main `b8702dec`, after which the unchanged zero-mutation oracle reached
+line 237 and stopped on the leading default `type=ssh` declaration. Pinned
+BuildKit evidence and an explicit product/security decision selected the
+optional-absent compatibility slice above; actual forwarding remains outside
+C3.
 2. Implement read-only context and stage bind mounts plus tmpfs mounts.
 3. Add per-RUN network selection and key it independently from global default.
 4. Generalize the landed default-ID store with explicit-ID ownership,
@@ -1889,9 +1915,10 @@ enters SporeVM.
 /path/to/fb742fd` builds the unmodified pinned target on Linux ARM64 with no
 BuildKit prerequisite, the result passes `/bin/true` plus Ruby, Bundler, and
 RSpec probes, and cold, warm, incremental, source, lockfile, build-arg, and
-base-change evidence proves sound cache behavior. If SSH is the only remaining
-incompatibility, completion waits on the explicit credential-boundary decision
-above rather than silently changing the Dockerfile or forwarding credentials.
+base-change evidence proves sound cache behavior. The optional-absent SSH
+declaration above is the complete credential-free compatibility boundary; any
+workload that needs a real agent remains unsupported rather than silently
+forwarding credentials.
 
 ### C6 — Evidence-gated long tail
 
@@ -1903,9 +1930,10 @@ No blanket parity milestone follows C5. Add features from real corpus failures:
 - standard frontend version updates.
 
 OCI layer output, registry publishing, cache import/export, remote shared cache,
-custom frontend images, labs features, secret/SSH mounts, remote Git inputs,
-privileged execution, and host integration stay outside this roadmap. A future
-named credential broker requires its own product and security plan.
+custom frontend images, labs features, secret or credential-bearing SSH mounts,
+remote Git inputs, privileged execution, and host integration stay outside this
+roadmap. A future named credential broker requires its own product and security
+plan.
 
 ## Verification
 
@@ -2071,6 +2099,14 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
   remain ordinary URL data. A build accepts at most 64 remote ADD instructions,
   1 GiB of combined response bodies, and ten minutes of combined host-fetch
   time or the smaller build timeout.
+- One exact default `RUN --mount=type=ssh` declaration is accepted only as
+  optional-absent compatibility when no SSH input exists. Pinned BuildKit
+  v0.30.0 injects an inert `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` value when
+  the effective RUN environment does not already define the key, while omitting
+  the mount itself. Spore matches that observable value and precedence, records
+  `ssh_declared_absent` plus the resolved environment in cache identity, and
+  creates no socket, path, transport, broker, CLI input, or durable state.
+  Credential-bearing and customized forms remain rejected.
 
 ## Deferred Decisions And Triggers
 
@@ -2081,11 +2117,10 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 - Any future automatic capacity above 16 GiB needs a compact index format or a
   lower proven dense-index ceiling; the current 64 MiB index limit is a hard
   format constraint, not a reason to add a user knob.
-- SSH remains a product/security decision. Revisit it only when the unchanged
-  pinned target reaches its SSH declaration as the first real blocker, with
-  BuildKit evidence for whether the build actually consumes a socket or input.
-  Choose explicitly between an optional absent declaration with no credential
-  authority and retaining the compatibility-Dockerfile exception.
+- Actual SSH forwarding remains outside this roadmap. Revisit it only through a
+  separate named-credential-broker product and security plan; the accepted
+  optional-absent declaration grants no forwarding authority and does not make
+  raw SSH mounts an incremental extension.
 
 ## Key Learnings From Pressure-Testing
 
