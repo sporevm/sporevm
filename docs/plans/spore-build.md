@@ -152,8 +152,9 @@ The missing work falls into three different categories:
   multi-stage `FROM … AS`, reachable-target planning, `scratch`, public
   registry/local/named-context bases, previous-stage inheritance, literal
   `COPY --from`, result-correct cross-stage `COPY --link`, `--target`, and final
-  `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
-  (`--parents`, `--chown`, `--chmod`), RUN mounts other than bounded default
+  `ENTRYPOINT`/`CMD` publication. Context `COPY --parents` accepts the narrow
+  root-relative file/directory/glob form; local-context `COPY --link` and COPY
+  flags (`--chown`, `--chmod`), RUN mounts other than bounded default
   `type=cache,target=...`, immutable default read-only context-file
   `type=bind,source=...,target=...`, and one exact optional-absent `type=ssh`
   declaration, local `ADD`, ADD flags
@@ -508,7 +509,7 @@ implementing Spore's mounts or cache policy.
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
 | `RUN [--mount=type=ssh] [--mount=type=cache,target=<path>[,id=<opaque>][,sharing=shared\|locked]]… [--mount=type=bind,source=<file>,target=<path>]… <shell>` / `RUN … ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. Cache IDs and sharing expand at instruction start, select digest-only subdirectories in one aggregate disk, and are conservatively serialized for the whole build; private sharing fails closed. Context binds accept only literal regular files from the immutable build context and the default read-only policy on ordinary shell-form RUN; exec-form and heredoc combinations remain fail-closed. Normalized source/target, mode, and bytes are cache identity. Bind transport inodes, mountpoints, and setup scaffolding never enter the rootfs snapshot, while ordinary files written by RUN remain persistent output. One exact default SSH declaration is accepted only as optional-absent compatibility: it adds the inert BuildKit `SSH_AUTH_SOCK` value when the effective RUN environment lacks the key, but creates no socket or credential path. Writable/custom, directory, stage/image/named-context, tmpfs, secret, credential-bearing SSH, and per-instruction network forms remain rejected. |
 | `RUN [--mount=type=cache,target=<path>]… <<NAME` | one unquoted, non-chomping heredoc token as the complete RUN command. A non-empty body without a leading shebang is preserved byte-for-byte, including its final newline, and executes through the ordinary shell RUN path. ARG/ENV, quoting, escaping, unset variables, and parameter operators are therefore evaluated by the guest shell, not the builder-owned operand expander. Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and exec-form heredocs fail closed. |
-| `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
+| `COPY [--parents[=<bool>]] <src>… <dest>` / `COPY [--link[=<bool>]] --from=<stage-or-context> <src>… <dest>` | Context sources expand through the instruction-start state. `--parents=true` reconstructs ordered cleaned root-relative file, directory, and glob paths below the destination; false is ordinary context COPY. Context-root operands `.` and `./`, internal `/./` pivots, and all compositions with `--from`, `--link`, or heredocs fail closed. Parents-specific root and nested directory conflicts preserve an existing non-directory and fail without publication. Cross-stage `--from` remains literal; `--link=true` uses no-follow scratch-merge destination behavior and false retains ordinary cross-stage COPY. |
 | `COPY <<NAME <dest>` | one unquoted, non-chomping inline source with no flags. The body preserves its final newline and quote bytes while expanding stable ARG/ENV expressions from the instruction-start snapshot. It becomes one root-owned `0644` regular file; a directory destination uses `NAME` as its basename. Multiple, mixed, quoted, and chomping heredocs fail closed. |
 | `ADD [--chmod=<octal>] <https-url> <dest>` | one public HTTPS URL with literal scheme/authority and expanded path/query plus one expanded destination. The opaque response is always refetched, bounded, and content-addressed. Numeric chmod expands at instruction start and must resolve from `0` through `07777`; other flags, symbolic modes, local/Git sources, credentials, and archive extraction fail closed. |
 | `ENV K=V` / `ENV K V` | build env + final image config. |
@@ -1806,7 +1807,7 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    explicit cache ID plus `sharing=locked` is the next grounded C3 boundary.
    Exact merge `cd5db062` passed Buildkite #1405 plus packaged HVF/KVM
    acceptance and preserved that zero-mutation oracle result.
-9. **Active — explicit aggregate cache identity and locked declaration.**
+9. **Done — landed in PR #513:** explicit aggregate cache identity and locked declaration.
    Accept expanded opaque `id` plus `sharing=shared|locked` without adding a
    disk or protocol: every resolved ID selects a domain-separated digest
    subdirectory inside the landed 4 GiB aggregate. Equal explicit and omitted
@@ -1821,10 +1822,22 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    when a shared ID equals the resolved destination, and clear them otherwise.
    Keep v3, eight mounts, the frozen device envelope, snapshot exclusion,
    failure-write persistence, timeout cleanup, and fully cached no-open behavior.
-10. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add
-   `COPY --parents` and `COPY --chmod` only when the next unchanged-oracle run
-   reaches them. Split these into separate PRs whenever their parser,
-   filesystem result, cache identity, or failure-publication protocols differ.
+10. **Active — context `COPY --parents`.** Exact merged main `c72c0a6d`, tree
+   `04d0cdcf`, passed Buildkite #1409 plus fresh packaged HVF/KVM acceptance.
+   The unchanged `fb742fd5` oracle then stopped parser-only at line 278 on a
+   context `COPY --parents` containing multiple files, directories, and a glob
+   below inherited `WORKDIR`, with zero fetch, VM, runtime, rootfs, or cache
+   mutation. This slice accepts only that general context form, preserves
+   ordered cleaned root-relative parents, and binds the resolved mapping into
+   typed COPY identity. Context-root operands `.` and `./`, internal `/./`
+   pivots, `--from`, `--link`, heredocs, and other flag compositions remain
+   fail-closed. Root and nested reconstructed-directory conflicts preserve the
+   existing non-directory and publish no failed result. Spore keeps deterministic
+   zero context-COPY timestamps rather than BuildKit source mtimes; the frozen
+   target does not consume them. A candidate rerun of the unchanged frozen
+   target parses this instruction and stops before execution at line 434 on
+   unsupported `VOLUME`, with no state mutation. `COPY --chmod` remains a
+   separate later slice.
 11. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
    a later unchanged-oracle run produces a concrete mismatch or unsupported
    span.

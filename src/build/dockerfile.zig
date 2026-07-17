@@ -84,6 +84,7 @@ pub const Run = struct {
 pub const Copy = struct {
     from: ?[]const u8 = null,
     link: ?bool = null,
+    parents: ?bool = null,
     sources: []const []const u8,
     dest: []const u8,
     heredoc: ?Heredoc = null,
@@ -332,6 +333,7 @@ fn parseInstruction(
         var first_source: usize = 0;
         var from: ?[]const u8 = null;
         var link: ?bool = null;
+        var parents: ?bool = null;
         while (first_source < args.len and std.mem.startsWith(u8, args[first_source].value, "--")) : (first_source += 1) {
             const arg = args[first_source];
             if (std.mem.startsWith(u8, arg.value, "--from=") and arg.value.len > "--from=".len and from == null and
@@ -363,10 +365,29 @@ fn parseInstruction(
                 }
                 continue;
             }
+            if ((std.mem.eql(u8, arg.value, "--parents") or std.mem.startsWith(u8, arg.value, "--parents=")) and
+                std.mem.eql(u8, arg.raw, arg.value))
+            {
+                if (parents != null) return fail(diagnostic, line, "duplicate COPY flag: --parents");
+                if (std.mem.eql(u8, arg.value, "--parents")) {
+                    parents = true;
+                } else {
+                    const value = arg.value["--parents=".len..];
+                    if (asciiEql(value, "true")) {
+                        parents = true;
+                    } else if (asciiEql(value, "false")) {
+                        parents = false;
+                    } else {
+                        return fail(diagnostic, line, "COPY --parents requires true or false");
+                    }
+                }
+                continue;
+            }
             const flag = if (std.mem.indexOfScalar(u8, arg.value, '=')) |eq| arg.value[0..eq] else arg.value;
             const message = try std.fmt.allocPrint(allocator, "unsupported COPY flag: {s}", .{flag});
             return fail(diagnostic, line, message);
         }
+        if (parents != null and (from != null or link != null)) return fail(diagnostic, line, "COPY --parents does not support other flags");
         if (link != null and from == null) return fail(diagnostic, line, "COPY --link requires --from");
         if (args.len - first_source < 2) return fail(diagnostic, line, "COPY requires at least one source and a destination");
         for (args[first_source..]) |arg| {
@@ -379,7 +400,7 @@ fn parseInstruction(
         }
         const sources = try allocator.alloc([]const u8, args.len - first_source - 1);
         for (args[first_source .. args.len - 1], sources) |arg, *source_arg| source_arg.* = arg.raw;
-        return .{ .copy = .{ .from = from, .link = link, .sources = sources, .dest = args[args.len - 1].raw } };
+        return .{ .copy = .{ .from = from, .link = link, .parents = parents, .sources = sources, .dest = args[args.len - 1].raw } };
     }
     if (asciiEql(op, "ADD")) {
         if (std.mem.indexOf(u8, rest, "<<") != null) return fail(diagnostic, line, "unsupported ADD heredoc");
@@ -1586,6 +1607,36 @@ test "Dockerfile parser accepts bounded cross-stage COPY link booleans" {
     , &diag));
     try std.testing.expectEqual(@as(usize, 4), diag.line);
     try std.testing.expectEqualStrings("unsupported COPY flag: --chmod", diag.message);
+}
+
+test "Dockerfile parser accepts strict context COPY parents booleans and rejects compositions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var diag: Diagnostic = .{};
+    const doc = try parse(arena,
+        \\FROM base
+        \\COPY --parents one two /out/
+        \\COPY --parents=FALSE nested/file /flat/
+        \\
+    , &diag);
+    try std.testing.expectEqual(@as(?bool, true), doc.stages[0].instructions[0].value.copy.parents);
+    try std.testing.expectEqual(@as(?bool, false), doc.stages[0].instructions[1].value.copy.parents);
+
+    const invalid = [_]struct { dockerfile: []const u8, message: []const u8 }{
+        .{ .dockerfile = "FROM base\nCOPY --parents= one /out/\n", .message = "COPY --parents requires true or false" },
+        .{ .dockerfile = "FROM base\nCOPY --parents=yes one /out/\n", .message = "COPY --parents requires true or false" },
+        .{ .dockerfile = "FROM base\nCOPY --parents --parents=false one /out/\n", .message = "duplicate COPY flag: --parents" },
+        .{ .dockerfile = "FROM base\nCOPY --parents=\"true\" one /out/\n", .message = "unsupported COPY flag: --parents" },
+        .{ .dockerfile = "FROM base AS source\nFROM base\nCOPY --parents --from=source /one /out/\n", .message = "COPY --parents does not support other flags" },
+        .{ .dockerfile = "FROM base AS source\nFROM base\nCOPY --from=source --link --parents /one /out/\n", .message = "COPY --parents does not support other flags" },
+        .{ .dockerfile = "FROM base\nCOPY --parents --chmod=0644 one /out/\n", .message = "unsupported COPY flag: --chmod" },
+        .{ .dockerfile = "FROM base\nCOPY --parents <<EOF /out\nvalue\nEOF\n", .message = "unsupported COPY heredoc form" },
+    };
+    for (invalid) |case| {
+        try std.testing.expectError(error.DockerfileParseFailed, parse(arena, case.dockerfile, &diag));
+        try std.testing.expectEqualStrings(case.message, diag.message);
+    }
 }
 
 test "Dockerfile parser accepts narrow remote ADD and rejects unsupported forms" {

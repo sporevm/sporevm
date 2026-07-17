@@ -110,6 +110,7 @@ class CaseSpec:
     initial_execution: ExecutionExpectation | None
     scan_prefixes: tuple[str, ...]
     compare_mtime_paths: tuple[str, ...]
+    spore_epoch_mtime_paths: tuple[str, ...]
     compare_hardlink_paths: tuple[str, ...]
     empty_dirs: tuple[str, ...]
     symlinks: dict[str, str]
@@ -363,6 +364,7 @@ def parse_case_spec(value: Any, label: str) -> CaseSpec:
             "initial_execution",
             "scan_prefixes",
             "compare_mtime_paths",
+            "spore_epoch_mtime_paths",
             "compare_hardlink_paths",
             "empty_dirs",
             "symlinks",
@@ -415,6 +417,9 @@ def parse_case_spec(value: Any, label: str) -> CaseSpec:
         scan_prefixes=require_string_list(raw["scan_prefixes"], f"{label}.scan_prefixes"),
         compare_mtime_paths=require_string_list(
             raw.get("compare_mtime_paths", []), f"{label}.compare_mtime_paths"
+        ),
+        spore_epoch_mtime_paths=require_string_list(
+            raw.get("spore_epoch_mtime_paths", []), f"{label}.spore_epoch_mtime_paths"
         ),
         compare_hardlink_paths=require_string_list(
             raw.get("compare_hardlink_paths", []), f"{label}.compare_hardlink_paths"

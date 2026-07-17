@@ -749,6 +749,7 @@ struct copied_hardlink {
 struct copy_tree_state {
   uint64_t expected_entries;
   uint64_t seen_entries;
+  int reject_non_directory_dirs;
   struct destination_removal_state destination_removal;
   struct copied_hardlink *hardlinks;
   size_t hardlink_count;
@@ -849,6 +850,12 @@ static int apply_context_copy_dir(int root_fd, const char *path, mode_t mode, ui
 
   if (dir_fd < 0) {
     if (exists) {
+      if (state->reject_non_directory_dirs) {
+        int saved = errno;
+        close(parent_fd);
+        errno = saved;
+        return -1;
+      }
       if (prepare_overwrite_path(root_fd, path, 1, COPY_DESTINATION_FOLLOW, NULL) != 0) {
         int saved = errno;
         close(parent_fd);
@@ -920,6 +927,12 @@ static int ensure_context_copy_root_dir(int root_fd, const char *path, int desti
     if (close(parent_fd) != 0 && rc == 0) rc = -1;
     errno = saved;
     return rc;
+  }
+  if (exists && state->reject_non_directory_dirs) {
+    int saved = errno;
+    close(parent_fd);
+    errno = saved;
+    return -1;
   }
   if (exists && prepare_overwrite_path(root_fd, path, 1, COPY_DESTINATION_FOLLOW, NULL) != 0) {
     int saved = errno;
@@ -1924,6 +1937,7 @@ int spore_build_copy_apply(
     int mtime_present, int64_t mtime_unix_seconds,
     char *error, size_t error_cap) {
   if (error_cap > 0) error[0] = '\0';
+  const int requested_source_kind = source_kind;
   if (validate_build_context_source_path(source) != 0) {
     return copy_result(error, error_cap, SPORE_BUILD_COPY_INVALID, "spore build: invalid COPY source path on context disk\n");
   }
@@ -2036,6 +2050,12 @@ int spore_build_copy_apply(
   struct copy_tree_state copy_state;
   memset(&copy_state, 0, sizeof(copy_state));
   copy_state.expected_entries = entry_count;
+  // A context directory normally has dest_is_dir set. The synthetic
+  // COPY --parents tree deliberately leaves it clear so every reconstructed
+  // directory merges only with a directory and never replaces a file.
+  copy_state.reject_non_directory_dirs =
+      requested_source_kind == COPY_KIND_DIR && source_kind == COPY_KIND_DIR &&
+      !dest_is_dir && destination_policy == COPY_DESTINATION_FOLLOW;
   if (destination_policy == COPY_DESTINATION_LINK) {
     int include_final = source_kind == COPY_KIND_DIR || resolved_dest_is_dir;
     if (ensure_link_directories(root_fd, dest, include_final, &copy_state.destination_removal) != 0) {

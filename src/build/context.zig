@@ -75,6 +75,7 @@ pub const CopyEntry = struct {
 pub const CopyRoot = struct {
     rel: []const u8,
     kind: Io.File.Kind,
+    source_index: usize = 0,
 };
 
 pub const CopyResolution = struct {
@@ -552,8 +553,8 @@ pub fn resolveCopySourcesWithDiagnostic(
         else => |e| return e,
     };
     defer context_root.close(io);
-    for (sources) |source| {
-        appendSourceMatches(allocator, io, context, context_root, source, &entries, &roots) catch |err| {
+    for (sources, 0..) |source, source_index| {
+        appendSourceMatches(allocator, io, context, context_root, source, source_index, &entries, &roots) catch |err| {
             if (err == error.CopySourceNotFound) {
                 if (diagnostic) |diag| diag.source = source;
             }
@@ -852,6 +853,7 @@ fn appendSourceMatches(
     context: BuildContext,
     context_root: Io.Dir,
     raw_source: []const u8,
+    source_index: usize,
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
 ) !void {
@@ -860,14 +862,14 @@ fn appendSourceMatches(
         const pattern = path_pattern.Pattern.compile(allocator, source, .copy) catch return error.UnsupportedCopyGlob;
         var dir = try openContextDir(io, context_root, "");
         defer dir.close(io);
-        if (!try appendWildcardMatches(allocator, io, context, dir, "", pattern, entries, roots)) return error.CopySourceNotFound;
+        if (!try appendWildcardMatches(allocator, io, context, dir, "", pattern, source_index, entries, roots)) return error.CopySourceNotFound;
         return;
     }
     const parent_rel = std.fs.path.dirname(source) orelse "";
     const basename = std.fs.path.basename(source);
     var parent = try openContextDir(io, context_root, parent_rel);
     defer parent.close(io);
-    if (!try appendPathAt(allocator, io, context, parent, basename, source, source, entries, roots, true)) return error.CopySourceNotFound;
+    if (!try appendPathAt(allocator, io, context, parent, basename, source, source, source_index, entries, roots, true)) return error.CopySourceNotFound;
 }
 
 fn appendWildcardMatches(
@@ -877,6 +879,7 @@ fn appendWildcardMatches(
     dir: Io.Dir,
     parent_rel: []const u8,
     pattern: path_pattern.Pattern,
+    source_index: usize,
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
 ) !bool {
@@ -893,7 +896,7 @@ fn appendWildcardMatches(
             try std.fs.path.join(allocator, &.{ parent_rel, child });
         const stat = try dir.statFile(io, child, .{ .follow_symlinks = false });
         if (pattern.matches(rel)) {
-            matched = (try appendPathAt(allocator, io, context, dir, child, rel, rel, entries, roots, true)) or matched;
+            matched = (try appendPathAt(allocator, io, context, dir, child, rel, rel, source_index, entries, roots, true)) or matched;
             continue;
         }
         if (!pattern.couldMatchDescendant(rel)) continue;
@@ -906,7 +909,7 @@ fn appendWildcardMatches(
                         else => |e| return e,
                     };
                     defer child_dir.close(io);
-                    matched = (try appendWildcardMatches(allocator, io, context, child_dir, rel, pattern, entries, roots)) or matched;
+                    matched = (try appendWildcardMatches(allocator, io, context, child_dir, rel, pattern, source_index, entries, roots)) or matched;
                 }
             },
             .sym_link => if (pattern.requiresLiteralDirectory(rel)) return error.CopySourceEscapesContext,
@@ -942,6 +945,7 @@ fn appendPathAt(
     basename: []const u8,
     source_rel: []const u8,
     output_rel: []const u8,
+    source_index: usize,
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
     source_root: bool,
@@ -949,7 +953,7 @@ fn appendPathAt(
     const stat = try parent.statFile(io, basename, .{ .follow_symlinks = false });
     if (source_root and stat.kind == .sym_link) {
         if (ignored(context, output_rel)) return false;
-        const included = try appendDereferencedSourceSymlink(allocator, io, context, source_rel, output_rel, entries, roots);
+        const included = try appendDereferencedSourceSymlink(allocator, io, context, source_rel, output_rel, source_index, entries, roots);
         const after = try parent.statFile(io, basename, .{ .follow_symlinks = false });
         if (!sameFileStat(stat, after)) return error.BuildContextChangedDuringSnapshot;
         return included;
@@ -991,7 +995,7 @@ fn appendPathAt(
                     try allocator.dupe(u8, child)
                 else
                     try std.fs.path.join(allocator, &.{ output_rel, child });
-                child_included = (try appendPathAt(allocator, io, context, dir, child, child_source_rel, child_output_rel, entries, roots, false)) or child_included;
+                child_included = (try appendPathAt(allocator, io, context, dir, child, child_source_rel, child_output_rel, source_index, entries, roots, false)) or child_included;
             }
             if (is_ignored and child_included) try entries.append(.{
                 .rel = try allocator.dupe(u8, output_rel),
@@ -1002,7 +1006,7 @@ fn appendPathAt(
         },
         else => return error.UnsupportedCopySourceType,
     };
-    if (included and source_root) try roots.append(.{ .rel = try allocator.dupe(u8, output_rel), .kind = stat.kind });
+    if (included and source_root) try roots.append(.{ .rel = try allocator.dupe(u8, output_rel), .kind = stat.kind, .source_index = source_index });
     return included;
 }
 
@@ -1012,6 +1016,7 @@ fn appendDereferencedSourceSymlink(
     context: BuildContext,
     source_rel: []const u8,
     output_rel: []const u8,
+    source_index: usize,
     entries: *std.array_list.Managed(CopyEntry),
     roots: *std.array_list.Managed(CopyRoot),
 ) !bool {
@@ -1026,10 +1031,10 @@ fn appendDereferencedSourceSymlink(
     var parent = try openContextDir(io, context_root, parent_rel);
     defer parent.close(io);
     const target_stat = try parent.statFile(io, basename, .{ .follow_symlinks = false });
-    const included = try appendPathAt(allocator, io, context, parent, basename, target_rel, output_rel, entries, roots, false);
+    const included = try appendPathAt(allocator, io, context, parent, basename, target_rel, output_rel, source_index, entries, roots, false);
     const target_after = try parent.statFile(io, basename, .{ .follow_symlinks = false });
     if (!sameFileStat(target_stat, target_after)) return error.BuildContextChangedDuringSnapshot;
-    if (included) try roots.append(.{ .rel = try allocator.dupe(u8, output_rel), .kind = target_stat.kind });
+    if (included) try roots.append(.{ .rel = try allocator.dupe(u8, output_rel), .kind = target_stat.kind, .source_index = source_index });
     return included;
 }
 
@@ -1085,7 +1090,8 @@ fn entryLessThan(_: void, a: CopyEntry, b: CopyEntry) bool {
 }
 
 fn rootLessThan(_: void, a: CopyRoot, b: CopyRoot) bool {
-    return std.mem.lessThan(u8, a.rel, b.rel);
+    if (!std.mem.eql(u8, a.rel, b.rel)) return std.mem.lessThan(u8, a.rel, b.rel);
+    return a.source_index < b.source_index;
 }
 
 fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -1589,6 +1595,31 @@ test "context hashing deduplicates repeated COPY source matches" {
     try std.testing.expectEqualStrings(once, twice);
 }
 
+test "COPY roots deterministically keep the earliest overlapping selector" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-context-root-order";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/nested");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/a.txt", .data = "a\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/b.txt", .data = "b\n" });
+
+    var diag: IgnoreDiagnostic = .{};
+    const ctx = try load(arena, io, root, &diag);
+    const resolution = try resolveCopySources(arena, io, ctx, &.{ "nested/a.txt", "nested/*.txt", "nested/a.txt" });
+    try std.testing.expectEqual(@as(usize, 2), resolution.roots.len);
+    try std.testing.expectEqualStrings("nested/a.txt", resolution.roots[0].rel);
+    try std.testing.expectEqual(@as(usize, 0), resolution.roots[0].source_index);
+    try std.testing.expectEqualStrings("nested/b.txt", resolution.roots[1].rel);
+    try std.testing.expectEqual(@as(usize, 1), resolution.roots[1].source_index);
+    const once = try hashCopySources(arena, io, ctx, &.{ "nested/a.txt", "nested/b.txt" });
+    const overlap = try hashCopyResolution(arena, io, ctx, resolution);
+    try std.testing.expectEqualStrings(once, overlap);
+}
+
 test "context stat cache preserves cold hash identity and warms hits" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1750,8 +1781,8 @@ fn oldUnframedHashCopySourcesForTest(
     var roots = std.array_list.Managed(CopyRoot).init(allocator);
     var context_root = try Io.Dir.cwd().openDir(io, context.absolute_root, .{ .iterate = true, .follow_symlinks = false });
     defer context_root.close(io);
-    for (sources) |source| {
-        try appendSourceMatches(allocator, io, context, context_root, source, &entries, &roots);
+    for (sources, 0..) |source, source_index| {
+        try appendSourceMatches(allocator, io, context, context_root, source, source_index, &entries, &roots);
     }
     std.mem.sort(CopyEntry, entries.items, {}, entryLessThan);
 

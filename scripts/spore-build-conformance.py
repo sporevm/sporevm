@@ -530,6 +530,15 @@ def compare_outputs(
         scanner,
         output_dir,
     )
+    spore_by_path = {record.get("path"): record for record in spore_filesystem}
+    for path in case.spec.spore_epoch_mtime_paths:
+        record = spore_by_path.get(path)
+        if record is None:
+            raise CaseError(f"Spore filesystem scan omitted epoch-mtime path: {path}")
+        if record.get("mtime_ns") != 0:
+            raise CaseError(
+                f"Spore filesystem path {path} has mtime_ns={record.get('mtime_ns')!r}, expected 0"
+            )
     mtime_paths = set(case.spec.compare_mtime_paths)
     hardlink_paths = set(case.spec.compare_hardlink_paths)
     for records in (docker_filesystem, spore_filesystem):

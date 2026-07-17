@@ -29,6 +29,7 @@ pub const InstructionTransition = union(enum) {
         canonical_instruction: []const u8,
         resolved_sources: []const []const u8,
         resolved_dest: []const u8,
+        parents: bool = false,
         env_digest: []const u8,
         workdir: []const u8,
     };
@@ -308,15 +309,18 @@ pub fn lowerContextCopy(
     diagnostic: *Diagnostics,
     context: InstructionTransition.ContextCopy,
 ) !build_exec.CopyStep {
-    const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, context.resolved_sources, diagnostic.copy) catch |err| {
+    try validateParentsSources(diagnostic, context.line, context.resolved_sources, context.parents);
+    const resolved = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, context.resolved_sources, diagnostic.copy) catch |err| {
         diagnostic.instruction_line.* = context.line;
         return err;
     };
+    const resolution = try contextCopyResolution(allocator, resolved, context.parents);
     const captured = try build_context.captureCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
         .stat_cache = stat_cache,
         .diagnostic = diagnostic.context_hash,
     }, context_snapshot);
-    const input_digest = try build_context.hashResolvedCopyEntries(allocator, captured);
+    const content_digest = try build_context.hashResolvedCopyEntries(allocator, captured);
+    const input_digest = try contextCopyInputDigest(allocator, content_digest, resolution, context.resolved_dest, context.workdir, context.parents);
     const source_prefix = try context_disk.addCapturedCopy(captured);
     const requests = try validatedContextCopyRequests(
         allocator,
@@ -326,6 +330,7 @@ pub fn lowerContextCopy(
         source_prefix,
         context.resolved_dest,
         context.workdir,
+        context.parents,
     );
     return .{
         .line = context.line,
@@ -346,8 +351,10 @@ pub fn preflightContextCopy(
     resolved_sources: []const []const u8,
     resolved_dest: []const u8,
     workdir: []const u8,
+    parents: bool,
 ) !void {
-    const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, resolved_sources, diagnostic.copy) catch |err| {
+    try validateParentsSources(diagnostic, line, resolved_sources, parents);
+    const resolved = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, resolved_sources, diagnostic.copy) catch |err| {
         diagnostic.instruction_line.* = line;
         if (err == error.FileNotFound) {
             if (resolved_sources.len != 0) diagnostic.copy.source = resolved_sources[0];
@@ -355,6 +362,7 @@ pub fn preflightContextCopy(
         }
         return err;
     };
+    const resolution = try contextCopyResolution(allocator, resolved, parents);
     _ = try validatedContextCopyRequests(
         allocator,
         diagnostic,
@@ -363,7 +371,62 @@ pub fn preflightContextCopy(
         preflight_context_source_prefix,
         resolved_dest,
         workdir,
+        parents,
     );
+}
+
+fn validateParentsSources(diagnostic: *Diagnostics, line: usize, sources: []const []const u8, parents: bool) !void {
+    if (!parents) return;
+    for (sources) |source| {
+        var saw_prefix = false;
+        var components = std.mem.splitScalar(u8, source, '/');
+        while (components.next()) |component| {
+            if (component.len == 0) continue;
+            if (std.mem.eql(u8, component, ".")) {
+                if (!saw_prefix) continue;
+                diagnostic.instruction_line.* = line;
+                diagnostic.copy.source = source;
+                return error.CopyParentsPivotUnsupported;
+            }
+            saw_prefix = true;
+        }
+        if (!saw_prefix and !std.fs.path.isAbsolute(source)) {
+            diagnostic.instruction_line.* = line;
+            diagnostic.copy.source = source;
+            return error.CopyParentsRootUnsupported;
+        }
+    }
+}
+
+fn contextCopyResolution(
+    allocator: std.mem.Allocator,
+    resolution: build_context.CopyResolution,
+    parents: bool,
+) !build_context.CopyResolution {
+    if (!parents) return resolution;
+    var entries = std.array_list.Managed(build_context.CopyEntry).init(allocator);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(allocator);
+    for (resolution.entries) |entry| {
+        try entries.append(entry);
+        try seen.put(allocator, entry.rel, {});
+    }
+    for (resolution.roots) |root| {
+        var ancestor = std.fs.path.dirname(root.rel);
+        while (ancestor) |path| : (ancestor = std.fs.path.dirname(path)) {
+            if (path.len == 0 or std.mem.eql(u8, path, ".")) break;
+            if (seen.contains(path)) continue;
+            const rel = try allocator.dupe(u8, path);
+            try entries.append(.{ .rel = rel, .kind = .directory });
+            try seen.put(allocator, rel, {});
+        }
+    }
+    std.mem.sort(build_context.CopyEntry, entries.items, {}, copyEntryLessThan);
+    return .{ .entries = try entries.toOwnedSlice(), .roots = resolution.roots };
+}
+
+fn copyEntryLessThan(_: void, a: build_context.CopyEntry, b: build_context.CopyEntry) bool {
+    return std.mem.lessThan(u8, a.rel, b.rel);
 }
 
 fn validatedContextCopyRequests(
@@ -374,8 +437,9 @@ fn validatedContextCopyRequests(
     source_prefix: []const u8,
     resolved_dest: []const u8,
     workdir: []const u8,
+    parents: bool,
 ) ![]const build_exec.CopyRequest {
-    if (resolution.roots.len > 1 and !copyDestEndsWithSlash(resolved_dest)) {
+    if (!parents and resolution.roots.len > 1 and !copyDestEndsWithSlash(resolved_dest)) {
         diagnostic.instruction_line.* = line;
         return error.CopyDestinationMustBeDirectory;
     }
@@ -395,6 +459,7 @@ fn validatedContextCopyRequests(
         source_prefix,
         dest,
         copyDestIsDirectory(resolved_dest, resolution),
+        parents,
     );
 }
 
@@ -463,17 +528,18 @@ fn cacheStep(
                 .requests = &.{},
             } },
             .context => |context| blk: {
-                const resolution = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, context.resolved_sources, diagnostic.copy) catch |err| {
+                const resolved = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, context.resolved_sources, diagnostic.copy) catch |err| {
                     diagnostic.instruction_line.* = context.line;
                     return err;
                 };
+                const resolution = try contextCopyResolution(allocator, resolved, context.parents);
                 break :blk .{ .copy = .{
                     .line = context.line,
                     .canonical_instruction = context.canonical_instruction,
-                    .input_digest = try build_context.hashCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
+                    .input_digest = try contextCopyInputDigest(allocator, try build_context.hashCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
                         .stat_cache = stat_cache,
                         .diagnostic = diagnostic.context_hash,
-                    }),
+                    }), resolution, context.resolved_dest, context.workdir, context.parents),
                     .env_digest = context.env_digest,
                     .workdir = context.workdir,
                     .requests = &.{},
@@ -784,6 +850,45 @@ test "COPY heredoc lowering keys resolved bytes and reuses ordinary file destina
     try std.testing.expect(!std.mem.eql(u8, lowered.input_digest, renamed.input_digest));
 }
 
+test "COPY parents synthetic tree captures parent directory modes without mtimes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-build-copy-parents-metadata";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/secret");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/selected");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/secret/value", .data = "secret\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/selected/value", .data = "selected\n" });
+    const secret_z = try arena.dupeZ(u8, root ++ "/secret");
+    const selected_z = try arena.dupeZ(u8, root ++ "/selected");
+    if (std.c.chmod(secret_z.ptr, 0o700) != 0 or std.c.chmod(selected_z.ptr, 0o710) != 0) return error.TestUnexpectedResult;
+
+    var ignore_diagnostic: build_context.IgnoreDiagnostic = .{};
+    const ctx = try build_context.load(arena, io, root, &ignore_diagnostic);
+    const resolved = try build_context.resolveCopySources(arena, io, ctx, &.{ "secret/value", "selected/" });
+    const resolution = try contextCopyResolution(arena, resolved, true);
+    const entries = try build_context.describeCopyResolutionWithOptions(arena, io, ctx, resolution, .{});
+    var saw_secret = false;
+    var saw_selected = false;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.rel, "secret")) {
+            try std.testing.expectEqual(@as(u32, 0o700), entry.mode);
+            try std.testing.expectEqual(@as(?build_context.CapturedMtime, null), entry.captured_mtime);
+            saw_secret = true;
+        }
+        if (std.mem.eql(u8, entry.rel, "selected")) {
+            try std.testing.expectEqual(@as(u32, 0o710), entry.mode);
+            try std.testing.expectEqual(@as(?build_context.CapturedMtime, null), entry.captured_mtime);
+            saw_selected = true;
+        }
+    }
+    try std.testing.expect(saw_secret);
+    try std.testing.expect(saw_selected);
+}
+
 fn copyDestIsDirectory(dest: []const u8, resolution: build_context.CopyResolution) bool {
     if (copyDestEndsWithSlash(dest)) return true;
     if (resolution.roots.len != 1) return false;
@@ -802,8 +907,32 @@ fn copyRequests(
     source_prefix: []const u8,
     dest: []const u8,
     dest_is_dir: bool,
+    parents: bool,
 ) ![]const build_exec.CopyRequest {
     if (resolution.roots.len == 0) return error.CopySourceNotFound;
+    if (parents) {
+        const entry_count = std.math.add(usize, resolution.entries.len, 1) catch return error.CopyEntryCountUnsupported;
+        if (entry_count > build_exec.max_copy_entries) {
+            diagnostic.instruction_line.* = instruction_line;
+            diagnostic.copy.source = resolution.roots[0].rel;
+            diagnostic.limit.* = build_exec.max_copy_entries;
+            diagnostic.actual.* = entry_count;
+            return error.CopyEntryCountUnsupported;
+        }
+        const request = build_exec.CopyRequest{
+            .source = source_prefix,
+            .dest = dest,
+            .source_kind = .directory,
+            .dest_is_dir = false,
+            .entry_count = entry_count,
+        };
+        build_exec.validateCopyRequest(request) catch |err| {
+            diagnostic.instruction_line.* = instruction_line;
+            diagnostic.copy.source = resolution.roots[0].rel;
+            return err;
+        };
+        return allocator.dupe(build_exec.CopyRequest, &.{request});
+    }
     var out = std.array_list.Managed(build_exec.CopyRequest).init(allocator);
     for (resolution.roots) |root| {
         const entry_count = copyRootEntryCount(resolution, root);
@@ -834,6 +963,43 @@ fn copyRequests(
         try out.append(request);
     }
     return out.toOwnedSlice();
+}
+
+fn parentsRootLessThan(_: void, a: build_context.CopyRoot, b: build_context.CopyRoot) bool {
+    if (a.source_index != b.source_index) return a.source_index < b.source_index;
+    return std.mem.lessThan(u8, a.rel, b.rel);
+}
+
+fn parentsCopyDestination(allocator: std.mem.Allocator, dest: []const u8, root: build_context.CopyRoot) ![]const u8 {
+    if (std.mem.eql(u8, root.rel, ".")) return dest;
+    const suffix = if (root.kind == .directory) root.rel else std.fs.path.dirname(root.rel) orelse return dest;
+    return std.fs.path.join(allocator, &.{ dest, suffix });
+}
+
+fn contextCopyInputDigest(
+    allocator: std.mem.Allocator,
+    content_digest: []const u8,
+    resolution: build_context.CopyResolution,
+    resolved_dest: []const u8,
+    workdir: []const u8,
+    parents: bool,
+) ![]const u8 {
+    if (!parents) return content_digest;
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hashField(&hash, "spore-build-context-copy-parents-v1");
+    hashField(&hash, content_digest);
+    hashField(&hash, try normalizeGuestPath(allocator, workdir, resolved_dest));
+    const ordered = try allocator.dupe(build_context.CopyRoot, resolution.roots);
+    std.mem.sort(build_context.CopyRoot, ordered, {}, parentsRootLessThan);
+    for (ordered) |root| {
+        hashField(&hash, root.rel);
+        hashField(&hash, @tagName(root.kind));
+        hashField(&hash, try parentsCopyDestination(allocator, try normalizeGuestPath(allocator, workdir, resolved_dest), root));
+    }
+    var raw: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hash.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
 }
 
 fn copyRootEntryCount(resolution: build_context.CopyResolution, root: build_context.CopyRoot) usize {
@@ -1001,6 +1167,7 @@ test "context COPY preflight reserves the longest generated source prefix" {
         &.{source},
         "/dest/",
         "/",
+        false,
     ));
     try std.testing.expectEqual(@as(usize, 7), instruction_line);
     try std.testing.expectEqualStrings(source, copy.source);

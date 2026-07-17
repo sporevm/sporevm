@@ -649,6 +649,7 @@ fn preflightBuildPlan(
                             resolved_sources,
                             resolved_dest,
                             state.workdir,
+                            copy.parents orelse false,
                         );
                     }
                 },
@@ -846,6 +847,7 @@ fn instructionTransitionResolved(
                 .canonical_instruction = instruction.raw,
                 .resolved_sources = resolved_sources,
                 .resolved_dest = try substituteState(allocator, copy.dest, state.*, instruction.escape),
+                .parents = copy.parents orelse false,
                 .env_digest = try effectiveEnvDigest(allocator, state.*),
                 .workdir = state.workdir,
             } } };
@@ -3347,6 +3349,132 @@ test "COPY multiple sources require trailing slash destination" {
     const context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[1], 1);
     var transition_diagnostic = transitionDiagnostics(&diagnostic);
     try std.testing.expectError(error.CopyDestinationMustBeDirectory, instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, context));
+}
+
+test "COPY parents reconstructs ordered file directory and glob roots under WORKDIR" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-spore-build-copy-parents";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/lib");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/app/helpers");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/public");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/lib/x.rb", .data = "ruby\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/app/helpers/value.rb", .data = "helper\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/public/z.html", .data = "z\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/public/a.html", .data = "a\n" });
+
+    var ctx_diag: build_context.IgnoreDiagnostic = .{};
+    const ctx = try build_context.load(arena, io, root, &ctx_diag);
+    var df_diag: dockerfile.Diagnostic = .{};
+    const doc = try dockerfile.parse(arena,
+        \\FROM base
+        \\WORKDIR /work
+        \\COPY --parents lib/x.rb app/helpers/ public/*.html ./
+        \\COPY --parents=false lib/x.rb ./
+        \\COPY --parents lib/x.rb no-slash
+        \\
+    , &df_diag);
+    const state = State{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{}),
+        .args = std.array_list.Managed(ArgValue).init(arena),
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+        .workdir = "/work",
+    };
+    var diagnostic: Diagnostic = .{};
+    var snapshot = try build_context.CopySnapshot.init(arena, io, root);
+    defer snapshot.deinit(io);
+    var context_disk = build_context_disk.Builder.init(arena);
+    var transition_diagnostic = transitionDiagnostics(&diagnostic);
+
+    const parents_context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[1], 1);
+    const parents_step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, parents_context);
+    try std.testing.expect(parents_context.parents);
+    try std.testing.expectEqual(@as(usize, 1), parents_step.requests.len);
+    try std.testing.expectEqualStrings("s0", parents_step.requests[0].source);
+    try std.testing.expectEqualStrings("/work", parents_step.requests[0].dest);
+    try std.testing.expectEqual(.directory, parents_step.requests[0].source_kind);
+    try std.testing.expect(!parents_step.requests[0].dest_is_dir);
+    try std.testing.expectEqual(@as(usize, 9), parents_step.requests[0].entry_count);
+
+    var flat_disk = build_context_disk.Builder.init(arena);
+    const flat_context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[2], 2);
+    const flat_step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &flat_disk, &transition_diagnostic, flat_context);
+    try std.testing.expect(!flat_context.parents);
+    try std.testing.expectEqual(@as(usize, 1), flat_step.requests.len);
+    try std.testing.expectEqualStrings("/work", flat_step.requests[0].dest);
+    try std.testing.expect(flat_step.requests[0].dest_is_dir);
+    try std.testing.expect(!std.mem.eql(u8, parents_step.input_digest, flat_step.input_digest));
+
+    var single_disk = build_context_disk.Builder.init(arena);
+    const single_context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[3], 3);
+    const single_step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &single_disk, &transition_diagnostic, single_context);
+    try std.testing.expectEqual(@as(usize, 1), single_step.requests.len);
+    try std.testing.expectEqualStrings("/work/no-slash", single_step.requests[0].dest);
+    try std.testing.expectEqualStrings("s0", single_step.requests[0].source);
+    try std.testing.expectEqual(.directory, single_step.requests[0].source_kind);
+    try std.testing.expectEqual(@as(usize, 3), single_step.requests[0].entry_count);
+}
+
+test "COPY parents rejects an internal source pivot during full preflight" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = "zig-cache/test-spore-build-copy-parents-pivot";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/src");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/payload", .data = "value\n" });
+    var ignore_diag: build_context.IgnoreDiagnostic = .{};
+    const ctx = try build_context.load(arena, io, root, &ignore_diag);
+    var context_hash: build_context.HashDiagnostic = .{};
+    var context_disk: build_context_disk.Diagnostic = .{};
+    var instruction_line: usize = 0;
+    var copy: build_context.CopyDiagnostic = .{};
+    var limit: u64 = 0;
+    var actual: u64 = 0;
+    var diagnostic = instruction_transition.Diagnostics{
+        .context_hash = &context_hash,
+        .context_disk = &context_disk,
+        .instruction_line = &instruction_line,
+        .copy = &copy,
+        .limit = &limit,
+        .actual = &actual,
+    };
+    try std.testing.expectError(error.CopyParentsPivotUnsupported, instruction_transition.preflightContextCopy(
+        io,
+        arena,
+        ctx,
+        &diagnostic,
+        7,
+        &.{"src/./payload"},
+        "/out/",
+        "/",
+        true,
+    ));
+    try std.testing.expectEqual(@as(usize, 7), instruction_line);
+    try std.testing.expectEqualStrings("src/./payload", copy.source);
+
+    instruction_line = 0;
+    copy = .{};
+    try std.testing.expectError(error.CopyParentsRootUnsupported, instruction_transition.preflightContextCopy(
+        io,
+        arena,
+        ctx,
+        &diagnostic,
+        8,
+        &.{"."},
+        "/out/",
+        "/",
+        true,
+    ));
+    try std.testing.expectEqual(@as(usize, 8), instruction_line);
+    try std.testing.expectEqualStrings(".", copy.source);
 }
 
 test "COPY directory source preserves empty subdirectory entry" {

@@ -1603,6 +1603,20 @@ extern fn spore_build_copy_fuzz_tree(source_root: [*]const u8, source_root_len: 
 extern fn spore_build_copy_test_fd_budget() u64;
 extern fn spore_build_copy_test_security_xattr_long_name(root: [*]const u8, root_len: usize) c_int;
 extern fn spore_build_copy_test_security_xattr_policy(regular_source: c_int, existing_destination: c_int, name: [*]const u8, name_len: usize) c_int;
+extern fn spore_build_copy_apply(
+    root: [*:0]const u8,
+    source_root: [*:0]const u8,
+    source: [*:0]const u8,
+    dest: [*:0]const u8,
+    source_kind: c_int,
+    dest_is_dir: c_int,
+    entry_count: u64,
+    destination_policy: c_int,
+    mtime_present: c_int,
+    mtime_unix_seconds: i64,
+    error_message: [*]u8,
+    error_cap: usize,
+) c_int;
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
@@ -1706,6 +1720,119 @@ test "build COPY engine confines source parent resolution" {
             @as(c_int, -1),
             spore_build_copy_test_confined_source_parent(root.ptr, root.len, "safe/escape/secret".ptr, "safe/escape/secret".len),
         );
+    }
+}
+
+test "build COPY parents preserves conflicts without changing auto directory merge" {
+    if (comptime guest_agent_fuzz_supported) {
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        try tmp.dir.createDirPath(io, "source/root-tree");
+        try tmp.dir.writeFile(io, .{ .sub_path = "source/root-tree/x", .data = "new" });
+        try tmp.dir.createDirPath(io, "source/nested-tree/secret");
+        try tmp.dir.writeFile(io, .{ .sub_path = "source/nested-tree/secret/value", .data = "new" });
+        try tmp.dir.createDirPath(io, "root-conflict");
+        try tmp.dir.writeFile(io, .{ .sub_path = "root-conflict/dest", .data = "old" });
+        try tmp.dir.createDirPath(io, "nested-conflict/dest");
+        try tmp.dir.writeFile(io, .{ .sub_path = "nested-conflict/dest/secret", .data = "old" });
+        try tmp.dir.setFilePermissions(io, "root-conflict/dest", .fromMode(0o600), .{ .follow_symlinks = false });
+        try tmp.dir.setFilePermissions(io, "nested-conflict/dest/secret", .fromMode(0o640), .{ .follow_symlinks = false });
+        try tmp.dir.createDirPath(io, "auto-directory/dest");
+        try tmp.dir.writeFile(io, .{ .sub_path = "auto-directory/dest/original", .data = "old" });
+
+        const root_before = try tmp.dir.statFile(io, "root-conflict/dest", .{ .follow_symlinks = false });
+        const nested_before = try tmp.dir.statFile(io, "nested-conflict/dest/secret", .{ .follow_symlinks = false });
+
+        const source_root = try tmp.dir.realPathFileAlloc(io, "source", allocator);
+        defer allocator.free(source_root);
+        const source_root_z = try allocator.dupeZ(u8, source_root);
+        defer allocator.free(source_root_z);
+        const root_conflict = try tmp.dir.realPathFileAlloc(io, "root-conflict", allocator);
+        defer allocator.free(root_conflict);
+        const root_conflict_z = try allocator.dupeZ(u8, root_conflict);
+        defer allocator.free(root_conflict_z);
+        const nested_conflict = try tmp.dir.realPathFileAlloc(io, "nested-conflict", allocator);
+        defer allocator.free(nested_conflict);
+        const nested_conflict_z = try allocator.dupeZ(u8, nested_conflict);
+        defer allocator.free(nested_conflict_z);
+        const auto_directory = try tmp.dir.realPathFileAlloc(io, "auto-directory", allocator);
+        defer allocator.free(auto_directory);
+        const auto_directory_z = try allocator.dupeZ(u8, auto_directory);
+        defer allocator.free(auto_directory_z);
+
+        var diagnostic: [384]u8 = undefined;
+        const root_rc = spore_build_copy_apply(
+            root_conflict_z,
+            source_root_z,
+            "root-tree",
+            "/dest",
+            'D',
+            0,
+            2,
+            0,
+            0,
+            0,
+            &diagnostic,
+            diagnostic.len,
+        );
+        try std.testing.expectEqual(@as(c_int, 1), root_rc);
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.sliceTo(&diagnostic, 0), "COPY directory apply failed: path=/dest errno=") != null);
+        const root_value = try tmp.dir.readFileAlloc(io, "root-conflict/dest", allocator, .limited(16));
+        defer allocator.free(root_value);
+        try std.testing.expectEqualStrings("old", root_value);
+        const root_after = try tmp.dir.statFile(io, "root-conflict/dest", .{ .follow_symlinks = false });
+        try std.testing.expectEqual(root_before.inode, root_after.inode);
+        try std.testing.expectEqual(@intFromEnum(root_before.permissions) & 0o7777, @intFromEnum(root_after.permissions) & 0o7777);
+
+        @memset(diagnostic[0..], 0);
+        const nested_rc = spore_build_copy_apply(
+            nested_conflict_z,
+            source_root_z,
+            "nested-tree",
+            "/dest",
+            'D',
+            0,
+            3,
+            0,
+            0,
+            0,
+            &diagnostic,
+            diagnostic.len,
+        );
+        try std.testing.expectEqual(@as(c_int, 1), nested_rc);
+        try std.testing.expect(std.mem.indexOf(u8, std.mem.sliceTo(&diagnostic, 0), "COPY directory apply failed: path=/dest/secret errno=") != null);
+        const nested_value = try tmp.dir.readFileAlloc(io, "nested-conflict/dest/secret", allocator, .limited(16));
+        defer allocator.free(nested_value);
+        try std.testing.expectEqualStrings("old", nested_value);
+        const nested_after = try tmp.dir.statFile(io, "nested-conflict/dest/secret", .{ .follow_symlinks = false });
+        try std.testing.expectEqual(nested_before.inode, nested_after.inode);
+        try std.testing.expectEqual(@intFromEnum(nested_before.permissions) & 0o7777, @intFromEnum(nested_after.permissions) & 0o7777);
+
+        @memset(diagnostic[0..], 0);
+        const auto_rc = spore_build_copy_apply(
+            auto_directory_z,
+            source_root_z,
+            "root-tree",
+            "/dest",
+            'A',
+            0,
+            0,
+            0,
+            0,
+            0,
+            &diagnostic,
+            diagnostic.len,
+        );
+        try std.testing.expectEqual(@as(c_int, 0), auto_rc);
+        const auto_value = try tmp.dir.readFileAlloc(io, "auto-directory/dest/x", allocator, .limited(16));
+        defer allocator.free(auto_value);
+        try std.testing.expectEqualStrings("new", auto_value);
+        const auto_original = try tmp.dir.readFileAlloc(io, "auto-directory/dest/original", allocator, .limited(16));
+        defer allocator.free(auto_original);
+        try std.testing.expectEqualStrings("old", auto_original);
     }
 }
 

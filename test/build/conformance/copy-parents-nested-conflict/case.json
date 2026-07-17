@@ -1,0 +1,39 @@
+{
+  "description": "COPY --parents nested conflicts preserve the existing file and publish no failed result",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 2,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/dest",
+    "/oracle"
+  ],
+  "transitions": [
+    {
+      "name": "nested-conflict-fails-without-publication",
+      "writes": {
+        "Dockerfile": "# syntax=docker/dockerfile:1.20\nFROM base\nRUN mkdir /dest && printf old >/dest/secret\nCOPY --parents secret/value /dest\n"
+      },
+      "outcome": "failure",
+      "spore_diagnostic": "spore build: Dockerfile line 4: instruction failed: COPY --parents secret/value /dest"
+    },
+    {
+      "name": "recovery-preserves-nested-file",
+      "writes": {
+        "Dockerfile": "# syntax=docker/dockerfile:1.20\nFROM base\nRUN mkdir /dest && printf old >/dest/secret\nRUN test \"$(cat /dest/secret)\" = old && mkdir -p /oracle && printf recovery >/oracle/result\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 1,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    }
+  ]
+}

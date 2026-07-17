@@ -551,6 +551,18 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.CopySourceEscapesContext => {
             try stderr.writeAll("spore build: COPY source escapes the build context\n");
         },
+        error.CopyParentsPivotUnsupported => {
+            try stderr.print(
+                "spore build: Dockerfile line {d}: COPY --parents does not support an internal /./ source pivot: {s}\n",
+                .{ diagnostic.instruction_line, diagnostic.copy.source },
+            );
+        },
+        error.CopyParentsRootUnsupported => {
+            try stderr.print(
+                "spore build: Dockerfile line {d}: COPY --parents does not support the context root as a source: {s}\n",
+                .{ diagnostic.instruction_line, diagnostic.copy.source },
+            );
+        },
         error.CopySourceNotFound => {
             if (diagnostic.instruction_line != 0 and diagnostic.copy.source.len != 0) {
                 try stderr.print(
@@ -749,6 +761,34 @@ test "build CLI reports an invalid inherited RUN environment at its instruction"
     try writeBuildError(&stderr.writer, error.InvalidRunEnvironment, diagnostic);
     try std.testing.expectEqualStrings(
         "spore build: Dockerfile line 2: RUN environment contains an invalid entry\n",
+        stderr.written(),
+    );
+}
+
+test "build CLI reports unsupported COPY parents source pivots at their instruction" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var diagnostic: build_mod.Diagnostic = .{};
+    diagnostic.instruction_line = 14;
+    diagnostic.copy.source = "src/./payload";
+    try writeBuildError(&stderr.writer, error.CopyParentsPivotUnsupported, diagnostic);
+    try std.testing.expectEqualStrings(
+        "spore build: Dockerfile line 14: COPY --parents does not support an internal /./ source pivot: src/./payload\n",
+        stderr.written(),
+    );
+}
+
+test "build CLI reports unsupported COPY parents context-root sources" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    var diagnostic: build_mod.Diagnostic = .{};
+    diagnostic.instruction_line = 15;
+    diagnostic.copy.source = ".";
+    try writeBuildError(&stderr.writer, error.CopyParentsRootUnsupported, diagnostic);
+    try std.testing.expectEqualStrings(
+        "spore build: Dockerfile line 15: COPY --parents does not support the context root as a source: .\n",
         stderr.written(),
     );
 }
