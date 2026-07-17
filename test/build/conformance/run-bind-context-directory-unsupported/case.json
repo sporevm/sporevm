@@ -1,0 +1,9 @@
+{
+  "description": "context bind directories remain outside the regular-file slice",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: RUN context bind source must be one literal regular file inside the build context"
+  },
+  "scan_prefixes": []
+}

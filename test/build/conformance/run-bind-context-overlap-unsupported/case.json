@@ -1,0 +1,9 @@
+{
+  "description": "overlapping context bind targets fail during selected-plan preflight",
+  "expect": {
+    "docker": "failure",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: RUN mount targets overlap after resolution"
+  },
+  "scan_prefixes": []
+}

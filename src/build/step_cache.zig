@@ -106,6 +106,7 @@ pub const StepInput = struct {
         nofile_soft: ?u64 = null,
         nofile_hard: ?u64 = null,
         cache_mount_digest: []const u8 = "",
+        context_bind_digest: []const u8 = "",
         ssh_declared_absent: bool = false,
     };
 
@@ -178,7 +179,7 @@ pub const StepInput = struct {
             },
             .run => |run| .{
                 .instruction_kind = "RUN",
-                .input_digest = "",
+                .input_digest = run.context_bind_digest,
                 .env_digest = run.env_digest,
                 .workdir = run.workdir,
                 .network_mode = run.network_mode,
@@ -595,7 +596,7 @@ fn currentRecordInput(record: StepRecord) !StepInput {
     if (!no_prepare_fields) return error.MalformedBuildRecord;
     if (std.mem.eql(u8, record.instruction_kind, "RUN")) {
         if (record.ssh_declared_absent) |declared| if (!declared) return error.MalformedBuildRecord;
-        if (!std.mem.startsWith(u8, record.instruction, "RUN ") or record.input_digest.len != 0 or
+        if (!std.mem.startsWith(u8, record.instruction, "RUN ") or
             record.network_mode == null or record.copy_destination_policy != null) return error.MalformedBuildRecord;
         return .{
             .platform = record.platform,
@@ -611,6 +612,7 @@ fn currentRecordInput(record: StepRecord) !StepInput {
                 .nofile_soft = record.nofile_soft,
                 .nofile_hard = record.nofile_hard,
                 .cache_mount_digest = record.cache_mount_digest,
+                .context_bind_digest = record.input_digest,
                 .ssh_declared_absent = record.ssh_declared_absent orelse false,
             } },
         };
@@ -702,6 +704,9 @@ fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
             if (!std.fs.path.isAbsolute(run.workdir)) return error.BadBuildCacheInput;
             if (run.cache_mount_digest.len != 0) {
                 validateBlake3Identity(run.cache_mount_digest) catch return error.BadBuildCacheInput;
+            }
+            if (run.context_bind_digest.len != 0) {
+                validateBlake3Identity(run.context_bind_digest) catch return error.BadBuildCacheInput;
             }
         },
         .copy => |copy| {
@@ -868,6 +873,27 @@ test "RUN cache mount digest is explicit cache identity" {
     try std.testing.expect(!std.mem.eql(u8, first, second));
 }
 
+test "RUN context bind digest is explicit cache identity" {
+    const allocator = std.testing.allocator;
+    const base: StepInput = .{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = "RUN --mount=type=bind,source=Gemfile,target=Gemfile true",
+        .executor_identity = test_executor_identity,
+        .operation = .{ .run = .{
+            .network_mode = .none,
+            .context_bind_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        } },
+    };
+    const first = try stepKey(allocator, base);
+    defer allocator.free(first);
+    var changed = base;
+    changed.operation.run.context_bind_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const second = try stepKey(allocator, changed);
+    defer allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
 test "optional-absent SSH declaration is explicit RUN cache identity" {
     const allocator = std.testing.allocator;
     const base: StepInput = .{
@@ -1007,9 +1033,13 @@ test "rewriting a step record replaces a prior child snapshot" {
     const input = StepInput{
         .platform = .{},
         .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .canonical_instruction = "RUN --mount=type=ssh fetch-current-packages",
+        .canonical_instruction = "RUN --mount=type=ssh --mount=type=bind,source=Gemfile,target=Gemfile fetch-current-packages",
         .executor_identity = test_executor_identity,
-        .operation = .{ .run = .{ .network_mode = .spore, .ssh_declared_absent = true } },
+        .operation = .{ .run = .{
+            .network_mode = .spore,
+            .context_bind_digest = "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            .ssh_declared_absent = true,
+        } },
     };
     const key = try stepKey(arena, input);
 

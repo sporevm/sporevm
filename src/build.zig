@@ -222,6 +222,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     }
     try preflightBuildDeviceEnvelope(allocator, plan, diagnostic);
     var remote_add_count: u64 = 0;
+    var has_context_binds = false;
     for (plan.order) |stage_index| for (plan.stages[stage_index].source.instructions) |instruction| switch (instruction.value) {
         .add => {
             remote_add_count += 1;
@@ -232,6 +233,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 return error.RemoteAddCountExceeded;
             }
         },
+        .run => |run| has_context_binds = has_context_binds or run.context_bind_mounts.len != 0,
         else => {},
     };
 
@@ -287,7 +289,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             else => {},
         };
     }
-    const remote_add_inputs = if (remote_add_count == 0)
+    const remote_add_inputs = if (remote_add_count == 0 and !has_context_binds)
         &.{}
     else
         preflightBuildPlan(init.io, allocator, options, diagnostic, ctx, plan, global_args.items, resolved_bases) catch |err| switch (err) {
@@ -430,6 +432,13 @@ fn preflightBuildDeviceEnvelope(
         if (cache_line == 0) continue;
 
         var has_context = false;
+        for (stage.source.instructions) |instruction| switch (instruction.value) {
+            .run => |run| if (run.context_bind_mounts.len != 0) {
+                has_context = true;
+                break;
+            },
+            else => {},
+        };
         var inputs = std.array_list.Managed(PlannedInputIdentity).init(allocator);
         for (stage.copies) |copy| {
             const candidate: PlannedInputIdentity = switch (copy.source) {
@@ -544,7 +553,18 @@ fn preflightBuildPlan(
             }
             diagnostic.instruction_line = instruction.line;
             switch (instruction.value) {
-                .run => |run| _ = try runStep(allocator, diagnostic, state, instruction, run, options),
+                .run => |run| {
+                    const step = try runStep(allocator, diagnostic, state, instruction, run, options);
+                    var transition_diagnostic = transitionDiagnostics(diagnostic);
+                    try instruction_transition.preflightContextBindRun(
+                        io,
+                        allocator,
+                        ctx,
+                        &transition_diagnostic,
+                        step,
+                        runResources(options).nofile,
+                    );
+                },
                 .copy => |copy| {
                     if (copy.heredoc) |heredoc| {
                         const transition = try heredocCopyTransition(allocator, state, instruction, copy, heredoc);
@@ -1325,7 +1345,42 @@ fn runStep(
         diagnostic.instruction_line = instruction.line;
         return err;
     };
-    build_exec.validateRunRequestWithMounts(allocator, command, env, state.workdir, runResources(options).nofile, cache_mounts) catch |err| {
+    const context_bind_mounts = try allocator.alloc(build_exec.ContextBindMount, run.context_bind_mounts.len);
+    for (run.context_bind_mounts, 0..) |mount, index| {
+        const source = build_context.normalizeRunBindSource(
+            allocator,
+            try substituteState(allocator, mount.source, state, instruction.escape),
+        ) catch |err| {
+            diagnostic.instruction_line = instruction.line;
+            return err;
+        };
+        const target = instruction_transition.normalizeGuestPath(
+            allocator,
+            state.workdir,
+            try substituteState(allocator, mount.target, state, instruction.escape),
+        ) catch |err| {
+            diagnostic.instruction_line = instruction.line;
+            return if (err == error.CopyDestinationUnsupported) error.RunContextBindTargetUnsupported else err;
+        };
+        context_bind_mounts[index] = .{
+            .source = source,
+            .target = target,
+            .transport_source = source,
+        };
+    }
+    validateRunMountTargets(cache_mounts, context_bind_mounts) catch |err| {
+        diagnostic.instruction_line = instruction.line;
+        return err;
+    };
+    build_exec.validateRunRequestWithContextBinds(
+        allocator,
+        command,
+        env,
+        state.workdir,
+        runResources(options).nofile,
+        cache_mounts,
+        context_bind_mounts,
+    ) catch |err| {
         diagnostic.instruction_line = instruction.line;
         return err;
     };
@@ -1342,8 +1397,26 @@ fn runStep(
         .network_mode = options.network,
         .cache_mount_digest = try build_cache_mount.digest(allocator, cache_mounts),
         .cache_mounts = cache_mounts,
+        .context_bind_mounts = context_bind_mounts,
         .ssh_declared_absent = run.ssh_declared_absent,
     };
+}
+
+fn validateRunMountTargets(cache_mounts: []const build_cache_mount.Mount, context_binds: []const build_exec.ContextBindMount) !void {
+    for (context_binds, 0..) |bind, index| {
+        for (context_binds[0..index]) |prior| {
+            if (runMountTargetsOverlap(bind.target, prior.target)) return error.RunMountTargetsOverlap;
+        }
+        for (cache_mounts) |cache| {
+            if (runMountTargetsOverlap(bind.target, cache.target)) return error.RunMountTargetsOverlap;
+        }
+    }
+}
+
+fn runMountTargetsOverlap(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (a.len < b.len and std.mem.startsWith(u8, b, a) and b[a.len] == '/') return true;
+    return b.len < a.len and std.mem.startsWith(u8, a, b) and a[b.len] == '/';
 }
 
 fn workdirStep(
@@ -1931,6 +2004,8 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
         .{ "ARG MODE=10000\nADD --chmod=${MODE} https://example.com/file /dest", error.UnsupportedRemoteAddMode },
         .{ "ARG UNUSED\nADD --chmod=u=rw https://example.com/file /dest", error.UnsupportedRemoteAddMode },
         .{ "ADD https://observer.example/file /file\nCOPY definitely-missing /x", error.CopySourceNotFound },
+        .{ "ADD https://observer.example/file /file\nRUN --mount=type=bind,source=definitely-missing,target=/x true", error.RunContextBindSourceNotFound },
+        .{ "RUN true\nRUN --mount=type=bind,source=definitely-missing,target=/x true", error.RunContextBindSourceNotFound },
     }) |case| {
         var parse_diagnostic: dockerfile.Diagnostic = .{};
         const source = try std.fmt.allocPrint(arena,
@@ -2538,6 +2613,58 @@ test "RUN cache mount identity uses expanded path.Clean target" {
     const alias = try build_cache_mount.resolve(arena, "/work", &.{"/cache/pkg"});
     try std.testing.expectEqualStrings(alias[0].key, step.cache_mounts[0].key);
     try std.testing.expectEqualStrings(try build_cache_mount.digest(arena, alias), step.cache_mount_digest);
+}
+
+test "RUN context bind resolves instruction-start source and WORKDIR target" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\RUN --mount=type=ssh --mount=type=cache,target=/cache --mount=type=bind,source=$SOURCE,target=$TARGET true
+        \\
+    , &parser_diagnostic);
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "SOURCE", .value = "./Gemfile" });
+    try args.append(.{ .key = "TARGET", .value = "inputs//Gemfile" });
+    const instruction = document.stages[0].instructions[0];
+    var diagnostic: Diagnostic = .{};
+    const step = try runStep(arena, &diagnostic, .{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{}),
+        .args = args,
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+        .workdir = "/work",
+    }, instruction, instruction.value.run, .{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    });
+    try std.testing.expect(step.ssh_declared_absent);
+    try std.testing.expectEqual(@as(usize, 1), step.cache_mounts.len);
+    try std.testing.expectEqual(@as(usize, 1), step.context_bind_mounts.len);
+    try std.testing.expectEqualStrings("Gemfile", step.context_bind_mounts[0].source);
+    try std.testing.expectEqualStrings("/work/inputs/Gemfile", step.context_bind_mounts[0].target);
+}
+
+test "RUN context bind targets reject cache and bind overlap" {
+    const cache = [_]build_cache_mount.Mount{.{
+        .id = "/cache",
+        .target = "/cache",
+        .key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }};
+    const overlapping_cache = [_]build_exec.ContextBindMount{.{
+        .source = "input",
+        .target = "/cache/input",
+    }};
+    try std.testing.expectError(error.RunMountTargetsOverlap, validateRunMountTargets(&cache, &overlapping_cache));
+
+    const overlapping_binds = [_]build_exec.ContextBindMount{
+        .{ .source = "first", .target = "/work/input" },
+        .{ .source = "second", .target = "/work/input/nested" },
+    };
+    try std.testing.expectError(error.RunMountTargetsOverlap, validateRunMountTargets(&.{}, &overlapping_binds));
 }
 
 test "RUN executor preserves exact argv and effective ENV ARG state" {

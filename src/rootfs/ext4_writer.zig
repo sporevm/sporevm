@@ -88,6 +88,12 @@ pub const Entry = struct {
     uid: u32 = 0,
     gid: u32 = 0,
     xattrs: []const xattrs_mod.Attribute = &.{},
+    mtime: ?Mtime = null,
+};
+
+pub const Mtime = struct {
+    seconds: i64,
+    nanoseconds: u32,
 };
 
 pub const Options = struct {
@@ -161,6 +167,7 @@ const InodePlan = struct {
     single_indirect_block: u32 = 0,
     double_indirect_block: u32 = 0,
     xattr_block: u32 = 0,
+    mtime: ?EncodedMtime = null,
 
     fn fileType(self: InodePlan) u8 {
         return switch (self.kind) {
@@ -173,6 +180,11 @@ const InodePlan = struct {
             .socket => file_type_sock,
         };
     }
+};
+
+const EncodedMtime = struct {
+    seconds_low: u32,
+    extra: u32,
 };
 
 const PathRef = struct {
@@ -852,6 +864,10 @@ fn planImage(allocator: std.mem.Allocator, entries: []const Entry, inode_count: 
 
     var next_inode: u32 = first_non_reserved_inode + 1;
     for (sorted) |entry| {
+        if (entry.mtime != null) switch (entry.kind) {
+            .file, .file_source => {},
+            else => return error.UnsupportedEntryMtime,
+        };
         if (entry.kind == .hardlink) continue;
         const normalized = try validatePath(entry.path);
         if (std.mem.eql(u8, normalized, "lost+found")) return error.DuplicateRootFSEntry;
@@ -967,6 +983,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
         if (!std.mem.eql(u8, attr.name, xattrs_mod.security_capability_name)) return error.UnsupportedTarXattr;
         try xattrs_mod.validateSecurityCapability(attr.value);
     }
+    const mtime = if (entry.mtime) |value| try encodeMtime(value) else null;
     return switch (entry.kind) {
         .file => |data| .{
             .ino = inode_no,
@@ -978,6 +995,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
             .size = data.len,
             .data = data,
             .xattrs = entry.xattrs,
+            .mtime = mtime,
         },
         .file_source => |source| .{
             .ino = inode_no,
@@ -989,6 +1007,7 @@ fn entryInodePlan(entry: Entry, normalized: []const u8, inode_no: u32) !InodePla
             .size = source.size(),
             .file_source = source,
             .xattrs = entry.xattrs,
+            .mtime = mtime,
         },
         .symlink => |target| .{
             .ino = inode_no,
@@ -1592,6 +1611,13 @@ fn writeInode(buf: []u8, inode: InodePlan) void {
     if (inode.size > std.math.maxInt(u32)) put(u32, buf, 0x6c, @intCast(inode.size >> 32));
     put(u16, buf, 0x78, @truncate(inode.uid >> 16));
     put(u16, buf, 0x7a, @truncate(inode.gid >> 16));
+    if (inode.mtime) |mtime| {
+        put(u32, buf, 0x10, mtime.seconds_low);
+        // The mtime extra field ends 12 bytes beyond the original 128-byte
+        // inode. Leave legacy inodes untouched unless a caller opted in.
+        put(u16, buf, 0x80, 12);
+        put(u32, buf, 0x88, mtime.extra);
+    }
 
     switch (inode.kind) {
         .symlink => {
@@ -1607,6 +1633,83 @@ fn writeInode(buf: []u8, inode: InodePlan) void {
         },
         else => writeBlockPointers(buf[0x28..0x64], inode),
     }
+}
+
+fn encodeMtime(mtime: Mtime) !EncodedMtime {
+    if (mtime.seconds < std.math.minInt(i32) or mtime.seconds > 0x37fffffff) return error.Ext4MtimeOutOfRange;
+    if (mtime.nanoseconds >= std.time.ns_per_s) return error.Ext4MtimeOutOfRange;
+    const seconds_bits: u64 = @bitCast(mtime.seconds);
+    const seconds_low: u32 = @truncate(seconds_bits);
+    const signed_low: i64 = @as(i32, @bitCast(seconds_low));
+    const epoch_delta = mtime.seconds - signed_low;
+    const epoch_width: i64 = @as(i64, 1) << 32;
+    if (@mod(epoch_delta, epoch_width) != 0) return error.Ext4MtimeOutOfRange;
+    const epoch: u32 = @intCast(@divExact(epoch_delta, epoch_width));
+    if (epoch > 3) return error.Ext4MtimeOutOfRange;
+    // Linux stores the two epoch bits below the 30-bit nanosecond value.
+    return .{
+        .seconds_low = seconds_low,
+        .extra = (mtime.nanoseconds << 2) | epoch,
+    };
+}
+
+test "ext4 mtime encoding preserves epochs and nanoseconds" {
+    const ordinary = try encodeMtime(.{ .seconds = 1_700_000_000, .nanoseconds = 123_456_789 });
+    try std.testing.expectEqual(@as(u32, 1_700_000_000), ordinary.seconds_low);
+    try std.testing.expectEqual(@as(u32, 123_456_789 << 2), ordinary.extra);
+
+    const after_2038 = try encodeMtime(.{ .seconds = 0x80000000, .nanoseconds = 1 });
+    try std.testing.expectEqual(@as(u32, 0x80000000), after_2038.seconds_low);
+    try std.testing.expectEqual(@as(u32, 5), after_2038.extra);
+
+    const minimum = try encodeMtime(.{ .seconds = std.math.minInt(i32), .nanoseconds = 0 });
+    try std.testing.expectEqual(@as(u32, 0x80000000), minimum.seconds_low);
+    try std.testing.expectEqual(@as(u32, 0), minimum.extra);
+
+    const maximum = try encodeMtime(.{ .seconds = 0x37fffffff, .nanoseconds = 999_999_999 });
+    try std.testing.expectEqual(@as(u32, 0x7fffffff), maximum.seconds_low);
+    try std.testing.expectEqual(@as(u32, (999_999_999 << 2) | 3), maximum.extra);
+
+    try std.testing.expectError(error.Ext4MtimeOutOfRange, encodeMtime(.{ .seconds = @as(i64, std.math.minInt(i32)) - 1, .nanoseconds = 0 }));
+    try std.testing.expectError(error.Ext4MtimeOutOfRange, encodeMtime(.{ .seconds = 0x380000000, .nanoseconds = 0 }));
+    try std.testing.expectError(error.Ext4MtimeOutOfRange, encodeMtime(.{ .seconds = 0, .nanoseconds = std.time.ns_per_s }));
+}
+
+test "write inode leaves legacy timestamps byte-identical unless opted in" {
+    var legacy: [inode_size]u8 = @splat(0);
+    writeInode(&legacy, .{
+        .ino = 12,
+        .kind = .file,
+        .mode = s_ifreg | 0o644,
+        .uid = 0,
+        .gid = 0,
+    });
+    try std.testing.expect(std.mem.allEqual(u8, legacy[0x08..0x18], 0));
+    try std.testing.expect(std.mem.allEqual(u8, legacy[0x80..0x8c], 0));
+
+    var captured: [inode_size]u8 = @splat(0);
+    writeInode(&captured, .{
+        .ino = 12,
+        .kind = .file,
+        .mode = s_ifreg | 0o644,
+        .uid = 0,
+        .gid = 0,
+        .mtime = try encodeMtime(.{ .seconds = 1_700_000_000, .nanoseconds = 123_456_789 }),
+    });
+    try std.testing.expectEqual(@as(u32, 1_700_000_000), std.mem.readInt(u32, captured[0x10..0x14], .little));
+    try std.testing.expectEqual(@as(u16, 12), std.mem.readInt(u16, captured[0x80..0x82], .little));
+    try std.testing.expectEqual(@as(u32, 123_456_789 << 2), std.mem.readInt(u32, captured[0x88..0x8c], .little));
+    try std.testing.expect(std.mem.allEqual(u8, captured[0x08..0x10], 0));
+    try std.testing.expect(std.mem.allEqual(u8, captured[0x14..0x18], 0));
+}
+
+test "ext4 writer rejects mtime on non-file entries" {
+    const entries = [_]Entry{.{
+        .path = "directory",
+        .kind = .directory,
+        .mtime = .{ .seconds = 1, .nanoseconds = 2 },
+    }};
+    try std.testing.expectError(error.UnsupportedEntryMtime, planImage(std.testing.allocator, &entries, 1024));
 }
 
 fn writeBlockPointers(buf: []u8, inode: InodePlan) void {

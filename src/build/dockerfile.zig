@@ -67,9 +67,15 @@ pub const RunCacheMount = struct {
     target: []const u8,
 };
 
+pub const RunContextBindMount = struct {
+    source: []const u8,
+    target: []const u8,
+};
+
 pub const Run = struct {
     command: RunCommand,
     cache_mounts: []const RunCacheMount = &.{},
+    context_bind_mounts: []const RunContextBindMount = &.{},
     ssh_declared_absent: bool = false,
 };
 
@@ -124,6 +130,7 @@ const max_stages = 256;
 pub const max_run_exec_args = run_contract.max_exec_args;
 pub const max_run_exec_args_bytes = run_contract.max_exec_args_bytes;
 pub const max_run_cache_mounts = 8;
+pub const max_run_context_bind_mounts = 8;
 
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !Document {
     diagnostic.* = .{};
@@ -227,6 +234,7 @@ fn parseInstruction(
     if (asciiEql(op, "RUN")) {
         if (rest.len == 0) return fail(diagnostic, line, "RUN requires a shell command");
         var cache_mounts = std.array_list.Managed(RunCacheMount).init(allocator);
+        var context_bind_mounts = std.array_list.Managed(RunContextBindMount).init(allocator);
         var ssh_declared_absent = false;
         var command_start: usize = 0;
         while (true) {
@@ -248,6 +256,12 @@ fn parseInstruction(
             } else {
                 if (runMountType(raw_mount)) |mount_type| {
                     if (std.mem.eql(u8, mount_type, "ssh")) return fail(diagnostic, line, "unsupported RUN SSH mount form");
+                    if (std.mem.eql(u8, mount_type, "bind")) {
+                        if (context_bind_mounts.items.len == max_run_context_bind_mounts) return fail(diagnostic, line, "RUN has too many context bind mounts");
+                        try context_bind_mounts.append(try parseRunContextBindMount(allocator, raw_mount, escape, line, diagnostic));
+                        command_start = token_end;
+                        continue;
+                    }
                     if (!asciiEql(mount_type, "cache")) return fail(diagnostic, line, "unsupported RUN mount type");
                 }
                 if (cache_mounts.items.len == max_run_cache_mounts) return fail(diagnostic, line, "RUN has too many cache mounts");
@@ -257,6 +271,7 @@ fn parseInstruction(
         }
         const command_raw = rest[command_start..];
         if (heredoc) |run_heredoc| {
+            if (context_bind_mounts.items.len != 0) return fail(diagnostic, line, "RUN context bind mounts require ordinary shell form");
             if (command_raw.len != run_heredoc.name.len + 2 or
                 !std.mem.startsWith(u8, command_raw, "<<") or
                 !std.mem.eql(u8, command_raw[2..], run_heredoc.name) or
@@ -270,14 +285,17 @@ fn parseInstruction(
             return .{ .run = .{
                 .command = .{ .shell = try allocator.dupe(u8, run_heredoc.body) },
                 .cache_mounts = try cache_mounts.toOwnedSlice(),
+                .context_bind_mounts = try context_bind_mounts.toOwnedSlice(),
                 .ssh_declared_absent = ssh_declared_absent,
             } };
         }
         if (std.mem.startsWith(u8, command_raw, "[")) {
             if (try parseRunExec(allocator, command_raw, line, diagnostic)) |argv| {
+                if (context_bind_mounts.items.len != 0) return fail(diagnostic, line, "RUN context bind mounts require ordinary shell form");
                 return .{ .run = .{
                     .command = .{ .exec = argv },
                     .cache_mounts = try cache_mounts.toOwnedSlice(),
+                    .context_bind_mounts = try context_bind_mounts.toOwnedSlice(),
                     .ssh_declared_absent = ssh_declared_absent,
                 } };
             }
@@ -286,6 +304,7 @@ fn parseInstruction(
         return .{ .run = .{
             .command = .{ .shell = try allocator.dupe(u8, command_raw) },
             .cache_mounts = try cache_mounts.toOwnedSlice(),
+            .context_bind_mounts = try context_bind_mounts.toOwnedSlice(),
             .ssh_declared_absent = ssh_declared_absent,
         } };
     }
@@ -477,6 +496,49 @@ fn parseRunCacheMount(
     const resolved_target = target orelse return fail(diagnostic, line, "RUN cache mount requires target=<path>");
     try validateExpansion(allocator, resolved_target, escape, line, diagnostic);
     return .{ .target = try allocator.dupe(u8, resolved_target) };
+}
+
+fn parseRunContextBindMount(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    escape: u8,
+    line: usize,
+    diagnostic: *Diagnostic,
+) !RunContextBindMount {
+    var mount_type: ?[]const u8 = null;
+    var source: ?[]const u8 = null;
+    var target: ?[]const u8 = null;
+    var fields = std.mem.splitScalar(u8, raw, ',');
+    while (fields.next()) |field| {
+        if (field.len == 0) return fail(diagnostic, line, "RUN context bind mount has an empty option");
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse
+            return fail(diagnostic, line, "RUN context bind mount options must use key=value");
+        const key = field[0..equals];
+        const value = field[equals + 1 ..];
+        if (key.len == 0 or value.len == 0) return fail(diagnostic, line, "RUN context bind mount options require non-empty values");
+        if (asciiEql(key, "type")) {
+            if (mount_type != null) return fail(diagnostic, line, "duplicate RUN context bind mount option: type");
+            mount_type = value;
+        } else if (std.mem.eql(u8, key, "source")) {
+            if (source != null) return fail(diagnostic, line, "duplicate RUN context bind mount option: source");
+            source = value;
+        } else if (std.mem.eql(u8, key, "target")) {
+            if (target != null) return fail(diagnostic, line, "duplicate RUN context bind mount option: target");
+            target = value;
+        } else {
+            return fail(diagnostic, line, "unsupported RUN context bind mount option");
+        }
+    }
+    const resolved_type = mount_type orelse return fail(diagnostic, line, "RUN context bind mount requires type=bind");
+    if (!std.mem.eql(u8, resolved_type, "bind")) return fail(diagnostic, line, "unsupported RUN mount type");
+    const resolved_source = source orelse return fail(diagnostic, line, "RUN context bind mount requires source=<path>");
+    const resolved_target = target orelse return fail(diagnostic, line, "RUN context bind mount requires target=<path>");
+    try validateExpansion(allocator, resolved_source, escape, line, diagnostic);
+    try validateExpansion(allocator, resolved_target, escape, line, diagnostic);
+    return .{
+        .source = try allocator.dupe(u8, resolved_source),
+        .target = try allocator.dupe(u8, resolved_target),
+    };
 }
 
 fn hasParentPathSegment(path: []const u8) bool {
@@ -1084,7 +1146,7 @@ test "Dockerfile parser accepts bounded default cache mounts" {
     var diag: Diagnostic = .{};
     const doc = try parse(arena_state.allocator(),
         \\FROM scratch
-        \\RUN --mount=target=/var/cache/apt,type=cache --mount=type=cache,target=$CACHE_DIR ["true"]
+        \\RUN --mount=target=/var/cache/apt,Type=cache --mount=type=cache,target=$CACHE_DIR ["true"]
         \\
     , &diag);
     const run = doc.stages[0].instructions[0].value.run;
@@ -1132,12 +1194,53 @@ test "Dockerfile parser accepts one exact optional-absent SSH declaration" {
         .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,uid=0 true\n", .message = "unsupported RUN SSH mount form" },
         .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh,gid=0 true\n", .message = "unsupported RUN SSH mount form" },
         .{ .dockerfile = "FROM scratch\nRUN --mount=target=/tmp/agent,type=ssh true\n", .message = "unsupported RUN SSH mount form" },
-        .{ .dockerfile = "FROM scratch\nRUN --mount=type=ssh --mount=type=bind,source=input,target=input true\n", .message = "unsupported RUN mount type" },
     };
     for (invalid) |case| {
         try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, case.dockerfile, &diag));
         try std.testing.expectEqualStrings(case.message, diag.message);
     }
+}
+
+test "Dockerfile parser accepts only default context bind mounts" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    var diag: Diagnostic = .{};
+    const doc = try parse(allocator,
+        \\FROM scratch
+        \\RUN --mount=type=ssh --mount=type=cache,target=/cache --mount=target=$TARGET,source=$SOURCE,type=bind true
+        \\
+    , &diag);
+    const run = doc.stages[0].instructions[0].value.run;
+    try std.testing.expect(run.ssh_declared_absent);
+    try std.testing.expectEqual(@as(usize, 1), run.cache_mounts.len);
+    try std.testing.expectEqual(@as(usize, 1), run.context_bind_mounts.len);
+    try std.testing.expectEqualStrings("$SOURCE", run.context_bind_mounts[0].source);
+    try std.testing.expectEqualStrings("$TARGET", run.context_bind_mounts[0].target);
+
+    const invalid = [_][]const u8{
+        "FROM scratch\nRUN --mount=type=bind,target=/input true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input,target=/input,readonly=true true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input,target=/input,rw=true true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input,target=/input,from=stage true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input,source=other,target=/input true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input,target=/input,target=/other true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input,target=/input, true\n",
+        "FROM scratch\nRUN --mount=type=bind,source=input,target=/input [\"true\"]\n",
+        "FROM scratch\nRUN --mount=type=Bind,source=input,target=/input true\n",
+        "FROM scratch\nRUN --mount=type=bind,Source=input,target=/input true\n",
+    };
+    for (invalid) |bytes| try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, bytes, &diag));
+
+    var too_many = std.array_list.Managed(u8).init(allocator);
+    try too_many.appendSlice("FROM scratch\nRUN ");
+    for (0..max_run_context_bind_mounts + 1) |index| {
+        try too_many.appendSlice(try std.fmt.allocPrint(allocator, "--mount=type=bind,source=f{d},target=/f{d} ", .{ index, index }));
+    }
+    try too_many.appendSlice("true\n");
+    try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, too_many.items, &diag));
+    try std.testing.expectEqualStrings("RUN has too many context bind mounts", diag.message);
 }
 
 test "Dockerfile parser leaves shell RUN quoting and comments opaque" {

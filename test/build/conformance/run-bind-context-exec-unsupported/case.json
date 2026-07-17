@@ -1,0 +1,9 @@
+{
+  "description": "exec-form context binds remain fail-closed during full-file planning",
+  "expect": {
+    "docker": "success",
+    "spore": "failure",
+    "spore_diagnostic": "spore build: Dockerfile line 2: RUN context bind mounts require ordinary shell form"
+  },
+  "scan_prefixes": []
+}

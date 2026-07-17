@@ -109,7 +109,24 @@ pub fn lowerMissSuffix(
     defer if (context_snapshot) |*snapshot| snapshot.deinit(io);
 
     for (transitions) |transition| switch (transition) {
-        .run => |step| try steps.append(.{ .run = step }),
+        .run => |step| {
+            if (step.context_bind_mounts.len == 0) {
+                try steps.append(.{ .run = step });
+            } else {
+                if (context_snapshot == null) context_snapshot = try build_context.CopySnapshot.init(allocator, io, cache_root);
+                const snapshot = if (context_snapshot) |*value| value else unreachable;
+                try steps.append(.{ .run = try lowerContextBindRun(
+                    io,
+                    allocator,
+                    ctx,
+                    stat_cache,
+                    snapshot,
+                    &context_disk,
+                    diagnostic,
+                    step,
+                ) });
+            }
+        },
         .workdir => |step| try steps.append(.{ .workdir = step }),
         .add => |add| try steps.append(.{ .copy = try lowerRemoteAdd(allocator, &context_disk, add) }),
         .copy => |copy| switch (copy) {
@@ -429,7 +446,10 @@ fn cacheStep(
     transition: InstructionTransition,
 ) !build_exec.Step {
     return switch (transition) {
-        .run => |step| .{ .run = step },
+        .run => |step| .{ .run = if (step.context_bind_mounts.len == 0)
+            step
+        else
+            try cacheContextBindRun(io, allocator, ctx, stat_cache, diagnostic, step) },
         .workdir => |step| .{ .workdir = step },
         .add => |add| .{ .copy = try lowerRemoteAddForCache(allocator, add) },
         .copy => |copy| switch (copy) {
@@ -461,6 +481,247 @@ fn cacheStep(
             },
         },
     };
+}
+
+pub fn preflightContextBindRun(
+    io: Io,
+    allocator: std.mem.Allocator,
+    ctx: build_context.BuildContext,
+    diagnostic: *Diagnostics,
+    step: build_exec.RunStep,
+    nofile: build_exec.NofileLimit,
+) !void {
+    if (step.context_bind_mounts.len == 0) return;
+    const mounts = try allocator.dupe(build_exec.ContextBindMount, step.context_bind_mounts);
+    for (mounts) |*mount| {
+        _ = build_context.resolveRunBindSource(allocator, io, ctx, mount.source) catch |err| {
+            diagnostic.instruction_line.* = step.line;
+            diagnostic.copy.source = mount.source;
+            return runBindSourceError(err);
+        };
+        mount.transport_source = try std.fs.path.join(allocator, &.{ preflight_context_source_prefix, std.fs.path.basename(mount.source) });
+    }
+    build_exec.validateRunRequestWithContextBinds(
+        allocator,
+        step.command,
+        step.env,
+        step.workdir,
+        nofile,
+        step.cache_mounts,
+        mounts,
+    ) catch |err| {
+        diagnostic.instruction_line.* = step.line;
+        return err;
+    };
+}
+
+fn cacheContextBindRun(
+    io: Io,
+    allocator: std.mem.Allocator,
+    ctx: build_context.BuildContext,
+    stat_cache: *build_context.StatCache,
+    diagnostic: *Diagnostics,
+    step: build_exec.RunStep,
+) !build_exec.RunStep {
+    var out = step;
+    const mounts = try allocator.alloc(build_exec.ContextBindMount, step.context_bind_mounts.len);
+    for (step.context_bind_mounts, 0..) |mount, index| {
+        const resolution = build_context.resolveRunBindSource(allocator, io, ctx, mount.source) catch |err| {
+            diagnostic.instruction_line.* = step.line;
+            diagnostic.copy.source = mount.source;
+            return runBindSourceError(err);
+        };
+        diagnostic.instruction_line.* = step.line;
+        diagnostic.copy.source = mount.source;
+        const entries = try build_context.describeCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
+            .stat_cache = stat_cache,
+            .diagnostic = diagnostic.context_hash,
+        });
+        if (entries.len != 1) return error.RunContextBindSourceUnsupported;
+        mounts[index] = .{
+            .source = mount.source,
+            .target = mount.target,
+            .mode = entries[0].mode,
+            .content_digest = entries[0].content_digest,
+            .transport_source = mount.source,
+        };
+    }
+    out.context_bind_mounts = mounts;
+    out.context_bind_digest = try contextBindDigest(allocator, mounts);
+    return out;
+}
+
+fn lowerContextBindRun(
+    io: Io,
+    allocator: std.mem.Allocator,
+    ctx: build_context.BuildContext,
+    stat_cache: ?*build_context.StatCache,
+    context_snapshot: *build_context.CopySnapshot,
+    context_disk: *build_context_disk.Builder,
+    diagnostic: *Diagnostics,
+    step: build_exec.RunStep,
+) !build_exec.RunStep {
+    var out = step;
+    const mounts = try allocator.alloc(build_exec.ContextBindMount, step.context_bind_mounts.len);
+    for (step.context_bind_mounts, 0..) |mount, index| {
+        const resolution = build_context.resolveRunBindSource(allocator, io, ctx, mount.source) catch |err| {
+            diagnostic.instruction_line.* = step.line;
+            diagnostic.copy.source = mount.source;
+            return runBindSourceError(err);
+        };
+        diagnostic.instruction_line.* = step.line;
+        diagnostic.copy.source = mount.source;
+        const captured = try build_context.captureCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
+            .stat_cache = stat_cache,
+            .diagnostic = diagnostic.context_hash,
+            .capture_mtime = true,
+        }, context_snapshot);
+        if (captured.len != 1) return error.RunContextBindSourceUnsupported;
+        var transport_entry = captured[0];
+        transport_entry.rel = std.fs.path.basename(mount.source);
+        const prefix = try context_disk.addCapturedCopy(&.{transport_entry});
+        mounts[index] = .{
+            .source = mount.source,
+            .target = mount.target,
+            .mode = captured[0].mode,
+            .content_digest = captured[0].content_digest,
+            .transport_source = try std.fs.path.join(allocator, &.{ prefix, transport_entry.rel }),
+        };
+    }
+    out.context_bind_mounts = mounts;
+    out.context_bind_digest = try contextBindDigest(allocator, mounts);
+    return out;
+}
+
+fn runBindSourceError(err: anyerror) anyerror {
+    return switch (err) {
+        error.CopySourceNotFound, error.FileNotFound => error.RunContextBindSourceNotFound,
+        error.CopySourceEscapesContext => error.RunContextBindSourceUnsupported,
+        else => err,
+    };
+}
+
+fn contextBindDigest(allocator: std.mem.Allocator, mounts: []const build_exec.ContextBindMount) ![]const u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hashField(&hash, "spore-build-run-context-binds-v1");
+    var count: [8]u8 = undefined;
+    std.mem.writeInt(u64, &count, mounts.len, .little);
+    hashField(&hash, &count);
+    for (mounts) |mount| {
+        hashField(&hash, mount.source);
+        hashField(&hash, mount.target);
+        hashField(&hash, "readonly");
+        var mode: [4]u8 = undefined;
+        std.mem.writeInt(u32, &mode, mount.mode, .little);
+        hashField(&hash, &mode);
+        hashField(&hash, mount.content_digest);
+    }
+    var raw: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hash.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    return std.fmt.allocPrint(allocator, "blake3:{s}", .{&hex});
+}
+
+test "RUN context bind identity covers ordered semantic inputs and ignores transport paths" {
+    const allocator = std.testing.allocator;
+    const base = [_]build_exec.ContextBindMount{
+        .{
+            .source = "Gemfile",
+            .target = "/work/Gemfile",
+            .mode = 0o644,
+            .content_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .transport_source = "copy-0/Gemfile",
+        },
+        .{
+            .source = "Gemfile.lock",
+            .target = "/work/Gemfile.lock",
+            .mode = 0o644,
+            .content_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .transport_source = "copy-1/Gemfile.lock",
+        },
+    };
+    const expected = try contextBindDigest(allocator, &base);
+    defer allocator.free(expected);
+
+    var changed = base;
+    changed[0].transport_source = "different-session/Gemfile";
+    const different_transport = try contextBindDigest(allocator, &changed);
+    defer allocator.free(different_transport);
+    try std.testing.expectEqualStrings(expected, different_transport);
+
+    inline for (.{ "source", "target", "mode", "content", "order" }) |field| {
+        changed = base;
+        if (std.mem.eql(u8, field, "source")) changed[0].source = "Otherfile";
+        if (std.mem.eql(u8, field, "target")) changed[0].target = "/work/Otherfile";
+        if (std.mem.eql(u8, field, "mode")) changed[0].mode = 0o755;
+        if (std.mem.eql(u8, field, "content"))
+            changed[0].content_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        if (std.mem.eql(u8, field, "order")) std.mem.swap(build_exec.ContextBindMount, &changed[0], &changed[1]);
+        const actual = try contextBindDigest(allocator, &changed);
+        defer allocator.free(actual);
+        try std.testing.expect(!std.mem.eql(u8, expected, actual));
+    }
+}
+
+test "RUN context bind cache input follows content and mode but ignores mtime" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tmp = "zig-cache/test-build-run-context-bind-cache";
+    const context_root = tmp ++ "/context";
+    const cache_root = tmp ++ "/cache";
+    const source_path = context_root ++ "/input";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_root);
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "alpha\n" });
+
+    var ignore: build_context.IgnoreDiagnostic = .{};
+    const ctx = try build_context.load(arena, io, context_root, &ignore);
+    var context_hash: build_context.HashDiagnostic = .{};
+    var context_disk: build_context_disk.Diagnostic = .{};
+    var instruction_line: usize = 0;
+    var copy: build_context.CopyDiagnostic = .{};
+    var limit: u64 = 0;
+    var actual: u64 = 0;
+    var diagnostic = Diagnostics{
+        .context_hash = &context_hash,
+        .context_disk = &context_disk,
+        .instruction_line = &instruction_line,
+        .copy = &copy,
+        .limit = &limit,
+        .actual = &actual,
+    };
+    const step = build_exec.RunStep{
+        .line = 2,
+        .canonical_instruction = "RUN --mount=type=bind,source=input,target=/input true",
+        .command = .{ .shell = "true" },
+        .env = &.{},
+        .env_digest = "",
+        .workdir = "/",
+        .network_mode = .none,
+        .context_bind_mounts = &.{.{ .source = "input", .target = "/input" }},
+    };
+
+    var first_cache = build_context.StatCache.load(arena, io, cache_root, &context_hash);
+    const first = try cacheContextBindRun(io, arena, ctx, &first_cache, &diagnostic, step);
+    const original_stat = try Io.Dir.cwd().statFile(io, source_path, .{ .follow_symlinks = false });
+    try Io.Dir.cwd().setTimestamps(io, source_path, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = original_stat.mtime.nanoseconds + std.time.ns_per_s } } });
+    var mtime_cache = build_context.StatCache.load(arena, io, cache_root, &context_hash);
+    const mtime = try cacheContextBindRun(io, arena, ctx, &mtime_cache, &diagnostic, step);
+    try std.testing.expectEqualStrings(first.context_bind_digest, mtime.context_bind_digest);
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "bravo\n" });
+    var content_cache = build_context.StatCache.load(arena, io, cache_root, &context_hash);
+    const content = try cacheContextBindRun(io, arena, ctx, &content_cache, &diagnostic, step);
+    try std.testing.expect(!std.mem.eql(u8, first.context_bind_digest, content.context_bind_digest));
+
+    try Io.Dir.cwd().setFilePermissions(io, source_path, @enumFromInt(0o755), .{ .follow_symlinks = false });
+    var mode_cache = build_context.StatCache.load(arena, io, cache_root, &context_hash);
+    const mode = try cacheContextBindRun(io, arena, ctx, &mode_cache, &diagnostic, step);
+    try std.testing.expect(!std.mem.eql(u8, content.context_bind_digest, mode.context_bind_digest));
 }
 
 fn lowerRemoteAddForCache(allocator: std.mem.Allocator, add: remote_add.Prepared) !build_exec.CopyStep {

@@ -71,6 +71,43 @@ host-visible unclean aggregate disk is recreated before reuse; a guest mount
 rejection remains a build error. The current `spore rootfs df`, prune, and GC
 surfaces do not account for or remove this host-local cache disk.
 
+`RUN --mount=type=bind,source=<file>,target=<path>` accepts only an immutable
+regular file from the build context and the default read-only bind policy.
+Source and target expand from the instruction-start ARG/ENV snapshot; the
+source is normalized as one literal relative context path and the target is
+normalized beneath `WORKDIR` when relative. `.dockerignore`, missing files,
+directories, symlinks, special files, parent traversal, globs, writable binds,
+custom options, and stage/image/named-context sources fail during full-file
+planning. Root targets, trailing-slash targets, and targets overlapping
+`/proc`, `/dev`, `/sys`, `/run/sporevm`, `/run/buildkit`, or
+`/etc/resolv.conf` are also rejected, including ancestors that would hide a
+protected path and descendants that would alter one. Before cache lookup or VM startup, each
+selected file's path, mode, and BLAKE3 content digest enter ordered RUN
+identity. A miss streams the file once into the existing immutable context
+capture and exposes only that sealed regular file from the read-only context
+disk. The same race-checked source stat captures nanosecond mtime for that
+transport inode. Presence and value select a v2 context-disk producer identity;
+disks without captured mtime retain v1, and ordinary COPY/ADD entries retain
+their zero-timestamp behavior and semantic identity. BuildKit deliberately excludes bind source mtime from semantic RUN
+identity: an mtime-only edit can hit the old RUN result, but a later miss
+observes the newly captured mtime. Values outside the ext4 signed-epoch range
+(1901-12-13 through 2446-05-10) fail on a miss before execution rather than
+truncating or wrapping.
+
+The strict newline-terminated v4 RUN request carries at most eight captured
+source paths and canonical absolute targets, optionally composed with the
+landed default cache mounts and optional-absent SSH declaration. The agent
+opens both source and target without following symlinks, bind-mounts the source
+read-only, and then enters the operation-owned RUN sandbox. An absent target is
+represented by an owned empty file; an existing regular file is covered and
+restored unchanged. After descendant cleanup, binds are unmounted in reverse
+order and only the target plus empty ancestor components created by setup are
+removed. A sibling file created by RUN makes its parent ordinary preserved
+rootfs state. The bind transport inode, mountpoint, and owned target scaffolding
+never enter the rootfs checkpoint; ordinary files that RUN writes from bind
+data remain persistent output. Unmount failure, path replacement, or unverifiable ownership
+poisons the build session and blocks step, cache-record, and ref publication.
+
 One exact `RUN --mount=type=ssh` declaration is accepted only as optional-absent
 compatibility when the caller supplies no SSH input. For that RUN, the builder
 adds `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` only when the effective

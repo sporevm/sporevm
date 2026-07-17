@@ -154,7 +154,8 @@ The missing work falls into three different categories:
   `COPY --from`, result-correct cross-stage `COPY --link`, `--target`, and final
   `ENTRYPOINT`/`CMD` publication. Local-context `COPY --link` and COPY flags
   (`--parents`, `--chown`, `--chmod`), RUN mounts other than bounded default
-  `type=cache,target=...` and one exact optional-absent `type=ssh`
+  `type=cache,target=...`, immutable default read-only context-file
+  `type=bind,source=...,target=...`, and one exact optional-absent `type=ssh`
   declaration, local `ADD`, ADD flags
   other than numeric `--chmod`, RUN heredoc forms other than one unquoted,
   non-chomping shell body, COPY heredoc forms other than one unquoted
@@ -234,7 +235,7 @@ The missing work falls into three different categories:
   began. Live main then advanced to `c3e16ea12ba5f6eb10276feeafec4f7d6f208dfe`
   through PR #503; its chunk-sealing and zero-length virtio-blk reporting
   changes do not overlap the cache-mount frontend, store, or guest lifecycle.
-- **Current C3 slice:** accept multiple default
+- **Landed C3 cache slice:** accept multiple default
   `RUN --mount=type=cache,target=...` mounts. The omitted ID is
   `path.Clean(expanded target)` before a relative target is joined to
   `WORKDIR`; aliases therefore select one BLAKE3-named directory inside one
@@ -247,6 +248,19 @@ The missing work falls into three different categories:
   nested or duplicate targets, and other runtime mount types remain
   fail-closed; the one optional-absent SSH declaration creates no runtime
   mount.
+- **Current C3 context-bind slice:** accept only default read-only binds of
+  literal regular files from the immutable build context. Source and target
+  expand from the instruction-start snapshot, normalize before planning, and
+  enter RUN identity with source mode and content digest. Captured mtime is
+  transport metadata rather than semantic RUN identity, matching BuildKit's
+  mtime-only cache hits. A miss captures the file and its race-checked
+  nanosecond mtime into the v2 identity of the existing read-only context disk;
+  disks without captured mtime retain v1, and ordinary entries retain their
+  zero-timestamp behavior. The guest attaches only that
+  file to the operation-owned sandbox, then unmounts it and removes owned
+  target scaffolding before checkpoint. Directories, symlinks, special files,
+  writable/custom binds, stage/image/named-context sources, and overlapping
+  targets remain fail-closed.
 - No OCI image/layer output. `spore build` produces Spore rootfs artifacts and
   local refs, not pushable OCI images.
 - No flat checkpoint store and no full-image hash fallback in the executor.
@@ -492,7 +506,7 @@ implementing Spore's mounts or cache policy.
 | Instruction | Support |
 | --- | --- |
 | `FROM [--platform=linux/arm64] <source> [AS <name>]` | `scratch`, previous stage, named `--build-context` (OCI layout), local ref, public registry ref, or digest ref. Other platforms fail closed. |
-| `RUN [--mount=type=ssh] [--mount=type=cache,target=<path>]… <shell>` / `RUN … ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. Cache mounts require omitted ID/sharing. One exact default SSH declaration is accepted only as optional-absent compatibility: it adds the inert BuildKit `SSH_AUTH_SOCK` value when the effective RUN environment lacks the key, but creates no socket or credential path. Bind, tmpfs, secret, credential-bearing SSH, and per-instruction network remain rejected. |
+| `RUN [--mount=type=ssh] [--mount=type=cache,target=<path>]… [--mount=type=bind,source=<file>,target=<path>]… <shell>` / `RUN … ["argv", …]` | shell form executes as `/bin/sh -c`; bracket-prefixed text falls back to shell form when it is not valid JSON. Exec form preserves a bounded non-empty JSON string array, rejects valid arrays containing non-string values, and searches PATH only when argv zero contains no slash. Cache mounts require omitted ID/sharing. Context binds accept only literal regular files from the immutable build context and the default read-only policy on ordinary shell-form RUN; exec-form and heredoc combinations remain fail-closed. Normalized source/target, mode, and bytes are cache identity. Bind transport inodes, mountpoints, and setup scaffolding never enter the rootfs snapshot, while ordinary files written by RUN remain persistent output. One exact default SSH declaration is accepted only as optional-absent compatibility: it adds the inert BuildKit `SSH_AUTH_SOCK` value when the effective RUN environment lacks the key, but creates no socket or credential path. Writable/custom, directory, stage/image/named-context, tmpfs, secret, credential-bearing SSH, and per-instruction network forms remain rejected. |
 | `RUN [--mount=type=cache,target=<path>]… <<NAME` | one unquoted, non-chomping heredoc token as the complete RUN command. A non-empty body without a leading shebang is preserved byte-for-byte, including its final newline, and executes through the ordinary shell RUN path. ARG/ENV, quoting, escaping, unset variables, and parameter operators are therefore evaluated by the guest shell, not the builder-owned operand expander. Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and exec-form heredocs fail closed. |
 | `COPY [--link[=<bool>]] [--from=<stage-or-context>] <src>… <dest>` | context-relative or build-input-relative expanded source/destination operands, including files and directories. `--from` remains literal, matching BuildKit. `--link=true` is accepted only with `--from` and uses no-follow scratch-merge destination behavior; `--link=false` retains ordinary cross-stage COPY behavior. Local-context `--link` and other COPY flags fail closed. |
 | `COPY <<NAME <dest>` | one unquoted, non-chomping inline source with no flags. The body preserves its final newline and quote bytes while expanding stable ARG/ENV expressions from the instruction-start snapshot. It becomes one root-owned `0644` regular file; a directory destination uses `NAME` as its basename. Multiple, mixed, quoted, and chomping heredocs fail closed. |
@@ -506,7 +520,8 @@ implementing Spore's mounts or cache policy.
 
 Builder-owned variable substitution applies to `FROM`, `ENV`, `ARG` defaults,
 `WORKDIR`, `COPY` source/destination arguments, and the accepted `ADD` numeric
-mode, URL path/query, and destination using the declared
+mode, URL path/query, and destination, plus accepted context-bind source and
+target operands, using the declared
 `ARG`/`ENV` state. `COPY --from` remains literal. `CMD` and `ENTRYPOINT` retain
 variables for runtime. Shell-form `RUN`, including the accepted simple RUN
 heredoc, is not pre-expanded; its guest shell sees the effective `ARG`/`ENV`
@@ -846,6 +861,24 @@ poisons the guest build session, returns exit 125, and blocks step-record and
 ref publication. PID 1 remains alive to drain that failure over vsock while
 rejecting every later request, including checkpoint operations.
 
+The first immutable context-bind slice reuses that ownership model for regular
+file targets. Full-file planning resolves one literal relative source through
+`.dockerignore`; cache preparation hashes its mode and bytes, and miss lowering
+seals it into the existing context snapshot before the VM starts. The same
+validated stat supplies ext4-range nanosecond mtime and selects the v2 context
+disk identity. It is excluded from the RUN key, so an mtime-only change reuses
+the cached result while any later forced miss observes the new transport
+metadata. Context disks without captured mtime retain byte-identical v1
+production, and ordinary entries keep zero timestamps. The strict
+v4 RUN request names only a per-capture context-disk path and canonical rootfs
+target. The agent opens both endpoints without following symlinks, mounts the
+file read-only, and removes only the owned empty-file target plus empty owned
+ancestors after reverse-order unmount. Existing regular-file targets are never
+removed, and a nonempty owned ancestor preserves ordinary sibling rootfs
+content. Any target replacement or uncertain cleanup poisons the same build
+session. This adds no host bind, writable source, new disk kind, or portable
+mount state.
+
 Immutable bind inputs can reuse the context or stage disks. Writable cache
 mounts require a separate local storage contract with explicit ownership,
 locking, crash recovery, and GC. Do not emulate cache mounts with directories
@@ -1116,7 +1149,10 @@ and enumerate one canonical full rootfs CAS index.
      selects the first executable absolute candidate; failure to execute that
      selected candidate is terminal and never falls through to a later entry.
      Cache-mounted shell or exec form uses the strict `spore-build-run-v3`
-     object with its exact bounded mount list. The shared v2/v3 parser requires every documented field
+     object with its exact bounded mount list. A RUN with context-file binds
+     uses strict v4, which adds non-empty ordered captured-source and canonical
+     target arrays while retaining the cache list; its selected files already
+     reside on the immutable context disk before startup. The shared v2/v3/v4 parser requires every documented field
      appears once, aliases and unknown fields are rejected, arrays have no
      trailing commas, the complete request ends in a newline, and no
      non-whitespace bytes follow the object. Strings preserve valid raw UTF-8
@@ -1185,7 +1221,7 @@ read-only context or immutable build-input disks (`spore_rootfs=1
 spore_rootfs_rw=1`, with `spore_build_context=1` and/or
 `spore_build_inputs=<count>`). The initrd agent now provides the build control verbs
 (`spore-rootfs-grow-v1`, `fsfreeze-v1`, `fsthaw-v1`, `spore-build-run-v1`,
-`spore-build-run-v2`, `spore-build-run-v3`,
+`spore-build-run-v2`, `spore-build-run-v3`, `spore-build-run-v4`,
 `spore-build-copy-v4`, `spore-build-copy-v5`); the target base must provide `/bin/sh` for shell-form
 RUN and nothing for capacity preparation. Exec-form RUN instead requires only
 its selected executable. The guest accepts the older
@@ -1728,7 +1764,7 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    `b8702decef5a1f73f93854af4f070c74d4375ed9`, tree `6902c634`, passed
    Buildkite #1401 and independent packaged HVF/KVM acceptance. The unchanged
    oracle then stopped parser-only at line 237 on `RUN --mount=type=ssh`.
-7. **Active — optional-absent SSH declaration compatibility.** Accept only one
+7. **Done — landed in PR #510:** optional-absent SSH declaration compatibility. Accept only one
    exact default `type=ssh` declaration with no caller input. Pinned BuildKit
    v0.30.0 injects `SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` when the effective
    RUN environment lacks that key but creates no socket or path when the mount
@@ -1737,15 +1773,43 @@ small general PRs in the order the unchanged Buildkite oracle demonstrates:
    identity, and reject every option, duplicate, required/custom, host-input,
    secret, and forwarding form before execution. This slice adds no guest
    protocol or credential authority; the next unchanged-oracle failure should
-   be the first context bind mount later in the same instruction.
-8. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add
+   be the first context bind mount later in the same instruction. Exact merged
+   main `13b0e5fb68f6bc567935190e352db67bf1f94611`, tree `a5095c35`, passed
+   Buildkite #1403 plus independent packaged HVF/KVM acceptance. The unchanged
+   oracle advanced through SSH and stopped on the first context `type=bind`
+   declaration in the same line-237 instruction with zero state mutation.
+8. **Active — immutable context regular-file binds.** Accept only default
+   read-only `type=bind,source=<file>,target=<path>` from the build context,
+   composed with the landed absent SSH declaration and default cache mounts on
+   ordinary shell-form RUN. Exec-form and heredoc combinations remain
+   fail-closed in this slice.
+   Normalize expanded literal sources and targets at instruction start, resolve
+   `.dockerignore` before execution, capture one regular file per bind into the
+   existing immutable context disk, and bind ordered path/mode/content inputs
+   into RUN identity. Preserve the same captured source mtime only in a
+   context-disk v2 transport identity; omit it from semantic RUN
+   identity to match BuildKit's mtime-only hit behavior. The operation-owned sandbox exposes only selected files;
+   reverse-order unmount and inode-owned target cleanup precede checkpoint.
+   Writable/custom, directory/symlink/special, stage/image/named-context, and
+   overlapping forms stay fail-closed. Root and trailing-slash targets plus
+   targets at or beneath `/proc`, `/dev`, `/sys`, `/run/sporevm`,
+   `/run/buildkit`, and `/etc/resolv.conf` are rejected during full-file
+   planning. Protected-path overlap is symmetric, so ancestors that would hide
+   a protected path and descendants that would alter one both fail closed.
+   The unchanged `fb742fd5` Buildkite oracle on this candidate parses through
+   all three line-237 context binds and stops parser-only at line 259 on
+   `type=cache,id=frontend-yarn,sharing=locked,target=/usr/local/share/.cache/yarn`.
+   It exits 2 with no fetch, VM, runtime, rootfs, kernel, or cache mutation, so
+   explicit cache ID plus `sharing=locked` is the next grounded C3 boundary and
+   remains outside this slice.
+9. **Remaining Buildkite-reachable frontend and filesystem behavior.** Add
    `COPY --parents` and `COPY --chmod` only when the next unchanged-oracle run
    reaches them. Split these into separate PRs whenever their parser,
    filesystem result, cache identity, or failure-publication protocols differ.
-9. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
+10. **Evidence-gated matching.** Close glob and `.dockerignore` gaps only when
    a later unchanged-oracle run produces a concrete mismatch or unsupported
    span.
-10. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
+11. **Deferred breadth.** Add `RUN --security=sandbox`, `COPY --chown` and
    `--exclude`, `SHELL`, `USER`, `LABEL`, `EXPOSE`, `STOPSIGNAL`,
    `HEALTHCHECK`, `VOLUME`, and other metadata only when the unchanged workload
    or the representative common-template corpus demonstrates demand.
@@ -1814,7 +1878,9 @@ line 237 and stopped on the leading default `type=ssh` declaration. Pinned
 BuildKit evidence and an explicit product/security decision selected the
 optional-absent compatibility slice above; actual forwarding remains outside
 C3.
-2. Implement read-only context and stage bind mounts plus tmpfs mounts.
+2. Expand context binds beyond regular files only when a grounded workload
+   requires it, then implement stage bind mounts and tmpfs mounts as separate
+   slices.
 3. Add per-RUN network selection and key it independently from global default.
 4. Generalize the landed default-ID store with explicit-ID ownership,
    per-ID concurrency, accounting, prune, and GC. `sharing=locked` maps directly

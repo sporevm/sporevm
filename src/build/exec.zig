@@ -41,6 +41,7 @@ pub const max_guest_env_len = 255;
 pub const max_guest_working_dir_len = 255;
 pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
+pub const max_context_bind_mounts = 8;
 pub const max_build_input_disks = 2;
 const enospc_patterns = [_][]const u8{
     "SPORE_BUILD_ENOSPC",
@@ -181,7 +182,17 @@ pub const RunStep = struct {
     network_mode: step_cache.NetworkMode,
     cache_mount_digest: []const u8 = "",
     cache_mounts: []const cache_mount.Mount = &.{},
+    context_bind_digest: []const u8 = "",
+    context_bind_mounts: []const ContextBindMount = &.{},
     ssh_declared_absent: bool = false,
+};
+
+pub const ContextBindMount = struct {
+    source: []const u8,
+    target: []const u8,
+    mode: u32 = 0,
+    content_digest: []const u8 = "",
+    transport_source: []const u8 = "",
 };
 
 pub const CopySourceKind = enum {
@@ -296,6 +307,7 @@ pub fn cacheInputForStep(
                 .nofile_soft = resources.nofile.soft,
                 .nofile_hard = resources.nofile.hard,
                 .cache_mount_digest = run.cache_mount_digest,
+                .context_bind_digest = run.context_bind_digest,
                 .ssh_declared_absent = run.ssh_declared_absent,
             } },
         },
@@ -723,7 +735,7 @@ const BuildControl = struct {
         const session_id = try std.fmt.allocPrint(self.allocator, "spore-build-{d}", .{self.step_index + 1});
         switch (step) {
             .run => |run| {
-                const request = try runRequestWithMounts(self.allocator, session_id, run.command, run.env, run.workdir, self.resources.nofile, run.cache_mounts, self.io);
+                const request = try runRequestWithMounts(self.allocator, session_id, run.command, run.env, run.workdir, self.resources.nofile, run.cache_mounts, run.context_bind_mounts, self.io);
                 const stdin_payload = switch (run.command) {
                     .shell => |shell| shell,
                     .exec => "",
@@ -1104,7 +1116,7 @@ fn runRequest(
     nofile: NofileLimit,
     io: Io,
 ) ![]const u8 {
-    return runRequestWithMounts(allocator, session_id, command, env, workdir, nofile, &.{}, io);
+    return runRequestWithMounts(allocator, session_id, command, env, workdir, nofile, &.{}, &.{}, io);
 }
 
 fn runRequestWithMounts(
@@ -1115,10 +1127,11 @@ fn runRequestWithMounts(
     workdir: []const u8,
     nofile: NofileLimit,
     cache_mounts: []const cache_mount.Mount,
+    context_bind_mounts: []const ContextBindMount,
     io: Io,
 ) ![]const u8 {
     const now: u64 = @intCast(Io.Clock.real.now(io).nanoseconds);
-    const json = try runRequestJson(allocator, session_id, command, env, workdir, nofile, cache_mounts, now);
+    const json = try runRequestJson(allocator, session_id, command, env, workdir, nofile, cache_mounts, context_bind_mounts, now);
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
@@ -1142,8 +1155,20 @@ pub fn validateRunRequestWithMounts(
     nofile: NofileLimit,
     cache_mounts: []const cache_mount.Mount,
 ) !void {
+    return validateRunRequestWithContextBinds(allocator, command, env, workdir, nofile, cache_mounts, &.{});
+}
+
+pub fn validateRunRequestWithContextBinds(
+    allocator: std.mem.Allocator,
+    command: RunCommand,
+    env: []const []const u8,
+    workdir: []const u8,
+    nofile: NofileLimit,
+    cache_mounts: []const cache_mount.Mount,
+    context_bind_mounts: []const ContextBindMount,
+) !void {
     const max_session_id = "x" ** 63;
-    const json = try runRequestJson(allocator, max_session_id, command, env, workdir, nofile, cache_mounts, std.math.maxInt(u64));
+    const json = try runRequestJson(allocator, max_session_id, command, env, workdir, nofile, cache_mounts, context_bind_mounts, std.math.maxInt(u64));
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
 }
@@ -1156,6 +1181,7 @@ fn runRequestJson(
     workdir: []const u8,
     nofile: NofileLimit,
     cache_mounts: []const cache_mount.Mount,
+    context_bind_mounts: []const ContextBindMount,
     now: u64,
 ) ![]const u8 {
     try nofile.validate();
@@ -1163,7 +1189,13 @@ fn runRequestJson(
     if (env.len > max_guest_envc) return error.RunEnvCountUnsupported;
     for (env) |entry| if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
     if (cache_mounts.len > cache_mount.max_mounts_per_run) return error.TooManyRunCacheMounts;
-    if (cache_mounts.len != 0) {
+    if (context_bind_mounts.len > max_context_bind_mounts) return error.TooManyRunContextBindMounts;
+    for (context_bind_mounts) |mount| try validateContextBindMount(mount);
+    if (context_bind_mounts.len != 0) switch (command) {
+        .shell => {},
+        .exec => return error.RunContextBindCommandUnsupported,
+    };
+    if (cache_mounts.len != 0 or context_bind_mounts.len != 0) {
         const shell = switch (command) {
             .shell => |value| value,
             .exec => "",
@@ -1184,8 +1216,63 @@ fn runRequestJson(
         const payload_mounts = try allocator.alloc(PayloadMount, cache_mounts.len);
         defer allocator.free(payload_mounts);
         for (cache_mounts, 0..) |mount, index| payload_mounts[index] = .{ .target = mount.target, .key = mount.key };
+        const PayloadBind = struct { source: []const u8, target: []const u8 };
+        const payload_binds = try allocator.alloc(PayloadBind, context_bind_mounts.len);
+        defer allocator.free(payload_binds);
+        for (context_bind_mounts, 0..) |mount, index| payload_binds[index] = .{ .source = mount.transport_source, .target = mount.target };
+        const Common = struct {
+            session_id: []const u8,
+            resume_time_unix_ns: u64,
+            command_len: usize,
+            argv: []const []const u8,
+            env: []const []const u8,
+            working_dir: []const u8,
+            nofile_soft: u64,
+            nofile_hard: u64,
+        };
+        const common = Common{
+            .session_id = session_id,
+            .resume_time_unix_ns = now,
+            .command_len = shell.len,
+            .argv = argv,
+            .env = env,
+            .working_dir = workdir,
+            .nofile_soft = nofile.soft,
+            .nofile_hard = nofile.hard,
+        };
+        if (context_bind_mounts.len == 0) {
+            const payload = struct {
+                type: []const u8 = "spore-build-run-v3",
+                session_id: []const u8,
+                resume_time_unix_ns: u64,
+                command_len: usize,
+                argv: []const []const u8,
+                env: []const []const u8,
+                working_dir: []const u8,
+                cache_mounts: []const PayloadMount,
+                stdio: []const u8 = "pipe",
+                term: []const u8 = "xterm",
+                terminal_rows: u16 = 24,
+                terminal_cols: u16 = 80,
+                memory_pressure: bool = false,
+                nofile_soft: u64,
+                nofile_hard: u64,
+                closed_env: bool = true,
+            }{
+                .session_id = common.session_id,
+                .resume_time_unix_ns = common.resume_time_unix_ns,
+                .command_len = common.command_len,
+                .argv = common.argv,
+                .env = common.env,
+                .working_dir = common.working_dir,
+                .cache_mounts = payload_mounts,
+                .nofile_soft = common.nofile_soft,
+                .nofile_hard = common.nofile_hard,
+            };
+            return std.json.Stringify.valueAlloc(allocator, payload, .{});
+        }
         const payload = struct {
-            type: []const u8 = "spore-build-run-v3",
+            type: []const u8 = "spore-build-run-v4",
             session_id: []const u8,
             resume_time_unix_ns: u64,
             command_len: usize,
@@ -1193,6 +1280,7 @@ fn runRequestJson(
             env: []const []const u8,
             working_dir: []const u8,
             cache_mounts: []const PayloadMount,
+            context_binds: []const PayloadBind,
             stdio: []const u8 = "pipe",
             term: []const u8 = "xterm",
             terminal_rows: u16 = 24,
@@ -1202,15 +1290,16 @@ fn runRequestJson(
             nofile_hard: u64,
             closed_env: bool = true,
         }{
-            .session_id = session_id,
-            .resume_time_unix_ns = now,
-            .command_len = shell.len,
-            .argv = argv,
-            .env = env,
-            .working_dir = workdir,
+            .session_id = common.session_id,
+            .resume_time_unix_ns = common.resume_time_unix_ns,
+            .command_len = common.command_len,
+            .argv = common.argv,
+            .env = common.env,
+            .working_dir = common.working_dir,
             .cache_mounts = payload_mounts,
-            .nofile_soft = nofile.soft,
-            .nofile_hard = nofile.hard,
+            .context_binds = payload_binds,
+            .nofile_soft = common.nofile_soft,
+            .nofile_hard = common.nofile_hard,
         };
         return std.json.Stringify.valueAlloc(allocator, payload, .{});
     }
@@ -1276,6 +1365,36 @@ fn runRequestJson(
             break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
         },
     };
+}
+
+fn validateContextBindMount(mount: ContextBindMount) !void {
+    if (mount.source.len == 0 or mount.source.len > max_copy_entry_path_len or
+        mount.transport_source.len == 0 or mount.transport_source.len > max_copy_entry_path_len or
+        mount.target.len < 2 or mount.target.len > max_copy_entry_path_len or
+        !std.fs.path.isAbsolute(mount.target) or mount.target[mount.target.len - 1] == '/')
+    {
+        return error.RunContextBindPathUnsupported;
+    }
+    for ([_][]const u8{ mount.source, mount.transport_source }) |path| {
+        if (std.fs.path.isAbsolute(path)) return error.RunContextBindPathUnsupported;
+        var it = std.mem.splitScalar(u8, path, '/');
+        while (it.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.RunContextBindPathUnsupported;
+        }
+    }
+    var target_it = std.mem.splitScalar(u8, mount.target[1..], '/');
+    while (target_it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.RunContextBindPathUnsupported;
+    }
+    for ([_][]const u8{ "/proc", "/dev", "/sys", "/run/sporevm", "/run/buildkit", "/etc/resolv.conf" }) |owned| {
+        if (contextBindPathsOverlap(mount.target, owned)) return error.RunContextBindPathUnsupported;
+    }
+}
+
+fn contextBindPathsOverlap(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (a.len < b.len and std.mem.startsWith(u8, b, a) and b[a.len] == '/') return true;
+    return b.len < a.len and std.mem.startsWith(u8, a, b) and a[b.len] == '/';
 }
 
 fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: CopyRequest) ![]const u8 {
@@ -1458,6 +1577,8 @@ extern fn spore_agent_fuzz_build_resolv_target(target: [*]const u8, target_len: 
 extern fn spore_agent_test_bounded_readlink(target: [*]const u8, target_len: usize) c_int;
 extern fn spore_build_copy_test_confined_source_parent(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
 extern fn spore_build_copy_test_confined_mtime(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize, unix_seconds: i64) c_int;
+extern fn spore_build_copy_test_context_bind_source(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
+extern fn spore_build_copy_test_context_bind_target(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize, create_sibling: c_int) c_int;
 extern fn spore_build_copy_fuzz_tree(source_root: [*]const u8, source_root_len: usize, dest_root: [*]const u8, dest_root_len: usize, fuzz: [*]const u8, fuzz_len: usize) c_int;
 extern fn spore_build_copy_test_fd_budget() u64;
 extern fn spore_build_copy_test_security_xattr_long_name(root: [*]const u8, root_len: usize) c_int;
@@ -1584,6 +1705,35 @@ test "build COPY engine applies remote mtime through a confined final symlink" {
         try std.testing.expectEqual(@as(c_int, 0), spore_build_copy_test_confined_mtime(root.ptr, root.len, "/link".ptr, "/link".len, expected));
         const target = try tmp.dir.statFile(io, "root/inside/target", .{ .follow_symlinks = false });
         try std.testing.expectEqual(expected * std.time.ns_per_s, target.mtime.nanoseconds);
+    }
+}
+
+test "build context bind helpers reject symlinks and preserve owned target state" {
+    if (comptime guest_agent_fuzz_supported) {
+        const io = std.testing.io;
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "context/dir");
+        try tmp.dir.writeFile(io, .{ .sub_path = "context/file", .data = "data" });
+        try tmp.dir.symLink(io, "file", "context/link", .{});
+        const context_root = try tmp.dir.realPathFileAlloc(io, "context", allocator);
+        defer allocator.free(context_root);
+        try std.testing.expectEqual(@as(c_int, 0), spore_build_copy_test_context_bind_source(context_root.ptr, context_root.len, "file".ptr, "file".len));
+        try std.testing.expectEqual(@as(c_int, -1), spore_build_copy_test_context_bind_source(context_root.ptr, context_root.len, "link".ptr, "link".len));
+        try std.testing.expectEqual(@as(c_int, -1), spore_build_copy_test_context_bind_source(context_root.ptr, context_root.len, "dir".ptr, "dir".len));
+
+        try tmp.dir.createDirPath(io, "rootfs");
+        const rootfs = try tmp.dir.realPathFileAlloc(io, "rootfs", allocator);
+        defer allocator.free(rootfs);
+        try std.testing.expectEqual(@as(c_int, 0), spore_build_copy_test_context_bind_target(rootfs.ptr, rootfs.len, "/new/target".ptr, "/new/target".len, 1));
+        try tmp.dir.createDirPath(io, "rootfs/existing");
+        try tmp.dir.writeFile(io, .{ .sub_path = "rootfs/existing/target", .data = "lower" });
+        try std.testing.expectEqual(@as(c_int, 0), spore_build_copy_test_context_bind_target(rootfs.ptr, rootfs.len, "/existing/target".ptr, "/existing/target".len, 0));
+        const lower = try tmp.dir.readFileAlloc(io, "rootfs/existing/target", allocator, .limited(16));
+        defer allocator.free(lower);
+        try std.testing.expectEqualStrings("lower", lower);
+        try std.testing.expectEqual(@as(c_int, 0), spore_build_copy_test_context_bind_target(rootfs.ptr, rootfs.len, "/replaced/target".ptr, "/replaced/target".len, 2));
     }
 }
 
@@ -2283,6 +2433,7 @@ test "cache-mounted RUN uses strict v3 request" {
         "/work",
         default_build_nofile,
         mounts,
+        &.{},
         std.testing.io,
     );
     defer std.testing.allocator.free(request);
@@ -2303,6 +2454,91 @@ test "cache-mounted RUN uses strict v3 request" {
         for (malformed) |raw| {
             try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(raw.ptr, raw.len, raw[0..0].ptr, 0));
         }
+    }
+}
+
+test "context-bind RUN uses strict v4 request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const caches = try cache_mount.resolve(arena, "/work", &.{"/cache"});
+    const binds = [_]ContextBindMount{
+        .{
+            .source = "Gemfile",
+            .target = "/work/Gemfile",
+            .mode = 0o644,
+            .content_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .transport_source = "s0/Gemfile",
+        },
+        .{
+            .source = "Gemfile.lock",
+            .target = "/work/Gemfile.lock",
+            .mode = 0o644,
+            .content_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .transport_source = "s1/Gemfile.lock",
+        },
+    };
+    const request = try runRequestWithMounts(
+        std.testing.allocator,
+        "spore-build-1",
+        .{ .shell = "cat Gemfile" },
+        &.{"PATH=/usr/bin"},
+        "/work",
+        default_build_nofile,
+        caches,
+        &binds,
+        std.testing.io,
+    );
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"source\":\"s0/Gemfile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"target\":\"/work/Gemfile.lock\"") != null);
+    var protected = binds;
+    protected[0].target = "/proc/input";
+    try std.testing.expectError(error.RunContextBindPathUnsupported, validateRunRequestWithContextBinds(
+        arena,
+        .{ .shell = "true" },
+        &.{},
+        "/",
+        default_build_nofile,
+        &.{},
+        &protected,
+    ));
+    if (comptime guest_agent_fuzz_supported) {
+        try std.testing.expectEqual(guest_agent_fuzz_run_request, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+        const malformed = [_][]const u8{
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[{\"source\":\"../x\",\"target\":\"/x\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[{\"source\":\"x\",\"target\":\"/proc/x\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[{\"source\":\"x\",\"target\":\"/run/buildkit/ssh_agent.0\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[{\"source\":\"x\",\"target\":\"/x\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/x\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"context_binds\":[{\"source\":\"x\",\"target\":\"/x\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        };
+        for (malformed) |raw| try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(raw.ptr, raw.len, raw[0..0].ptr, 0));
+
+        const duplicate_source = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            request,
+            "\"source\":\"s0/Gemfile\"",
+            "\"source\":\"s0/Gemfile\",\"source\":\"s0/Gemfile\"",
+        );
+        defer std.testing.allocator.free(duplicate_source);
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(duplicate_source.ptr, duplicate_source.len, duplicate_source[0..0].ptr, 0));
+
+        const unknown_field = try std.mem.replaceOwned(
+            u8,
+            std.testing.allocator,
+            request,
+            "\"source\":\"s0/Gemfile\"",
+            "\"source\":\"s0/Gemfile\",\"readonly\":true",
+        );
+        defer std.testing.allocator.free(unknown_field);
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(unknown_field.ptr, unknown_field.len, unknown_field[0..0].ptr, 0));
+
+        const trailing_bytes = try std.fmt.allocPrint(std.testing.allocator, "{s}x\n", .{request});
+        defer std.testing.allocator.free(trailing_bytes);
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(trailing_bytes.ptr, trailing_bytes.len, trailing_bytes[0..0].ptr, 0));
     }
 }
 
