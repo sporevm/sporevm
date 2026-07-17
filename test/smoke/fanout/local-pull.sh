@@ -141,7 +141,7 @@ fi
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
 grep -Fq '"rootfs"' "${capture_dir}/manifest.json" || die "capture manifest did not record rootfs metadata"
 
-"${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" --json pack "${capture_dir}" --children "${fork_dir}" --out "${bundle_dir}" >"${workdir}/pack.json"
 
 for i in $(seq 0 $((count - 1))); do
