@@ -65,6 +65,8 @@ pub const RunCommand = union(enum) {
 
 pub const RunCacheMount = struct {
     target: []const u8,
+    id: ?[]const u8 = null,
+    sharing: ?[]const u8 = null,
 };
 
 pub const RunContextBindMount = struct {
@@ -473,6 +475,8 @@ fn parseRunCacheMount(
     if (raw.len == 0) return fail(diagnostic, line, "RUN cache mount requires type=cache and target=<path>");
     var mount_type: ?[]const u8 = null;
     var target: ?[]const u8 = null;
+    var id: ?[]const u8 = null;
+    var sharing: ?[]const u8 = null;
     var fields = std.mem.splitScalar(u8, raw, ',');
     while (fields.next()) |field| {
         if (field.len == 0) return fail(diagnostic, line, "RUN cache mount has an empty option");
@@ -487,6 +491,12 @@ fn parseRunCacheMount(
         } else if (asciiEql(key, "target")) {
             if (target != null) return fail(diagnostic, line, "duplicate RUN cache mount option: target");
             target = value;
+        } else if (asciiEql(key, "id")) {
+            if (id != null) return fail(diagnostic, line, "duplicate RUN cache mount option: id");
+            id = value;
+        } else if (asciiEql(key, "sharing")) {
+            if (sharing != null) return fail(diagnostic, line, "duplicate RUN cache mount option: sharing");
+            sharing = value;
         } else {
             return fail(diagnostic, line, "unsupported RUN cache mount option");
         }
@@ -495,7 +505,20 @@ fn parseRunCacheMount(
     if (!asciiEql(resolved_type, "cache")) return fail(diagnostic, line, "unsupported RUN mount type");
     const resolved_target = target orelse return fail(diagnostic, line, "RUN cache mount requires target=<path>");
     try validateExpansion(allocator, resolved_target, escape, line, diagnostic);
-    return .{ .target = try allocator.dupe(u8, resolved_target) };
+    if (id) |value| try validateExpansion(allocator, value, escape, line, diagnostic);
+    if (sharing) |value| {
+        try validateExpansion(allocator, value, escape, line, diagnostic);
+        if (std.mem.indexOfScalar(u8, value, '$') == null and
+            !asciiEql(value, "shared") and !asciiEql(value, "locked"))
+        {
+            return fail(diagnostic, line, "unsupported RUN cache sharing mode");
+        }
+    }
+    return .{
+        .target = try allocator.dupe(u8, resolved_target),
+        .id = if (id) |value| try allocator.dupe(u8, value) else null,
+        .sharing = if (sharing) |value| try allocator.dupe(u8, value) else null,
+    };
 }
 
 fn parseRunContextBindMount(
@@ -1140,24 +1163,30 @@ test "Dockerfile parser fails closed on unsupported features" {
     try std.testing.expectEqualStrings("RUN cache mount requires target=<path>", diag.message);
 }
 
-test "Dockerfile parser accepts bounded default cache mounts" {
+test "Dockerfile parser accepts bounded cache identity and sharing options" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: Diagnostic = .{};
     const doc = try parse(arena_state.allocator(),
         \\FROM scratch
-        \\RUN --mount=target=/var/cache/apt,Type=cache --mount=type=cache,target=$CACHE_DIR ["true"]
+        \\RUN --mount=target=/var/cache/apt,Type=cache,id=frontend-$TARGET,sharing=locked --mount=type=cache,target=$CACHE_DIR,sharing=$CACHE_SHARING ["true"]
         \\
     , &diag);
     const run = doc.stages[0].instructions[0].value.run;
     try std.testing.expectEqual(@as(usize, 2), run.cache_mounts.len);
     try std.testing.expectEqualStrings("/var/cache/apt", run.cache_mounts[0].target);
+    try std.testing.expectEqualStrings("frontend-$TARGET", run.cache_mounts[0].id.?);
+    try std.testing.expectEqualStrings("locked", run.cache_mounts[0].sharing.?);
     try std.testing.expectEqualStrings("$CACHE_DIR", run.cache_mounts[1].target);
+    try std.testing.expect(run.cache_mounts[1].id == null);
+    try std.testing.expectEqualStrings("$CACHE_SHARING", run.cache_mounts[1].sharing.?);
     try std.testing.expectEqualStrings("true", run.command.exec[0]);
 
     const invalid = [_][]const u8{
-        "FROM scratch\nRUN --mount=type=cache,target=/a,id=explicit true\n",
-        "FROM scratch\nRUN --mount=type=cache,target=/a,sharing=locked true\n",
+        "FROM scratch\nRUN --mount=type=cache,target=/a,id=one,id=two true\n",
+        "FROM scratch\nRUN --mount=type=cache,target=/a,sharing=shared,sharing=locked true\n",
+        "FROM scratch\nRUN --mount=type=cache,target=/a,sharing=private true\n",
+        "FROM scratch\nRUN --mount=type=cache,target=/a,sharing=bogus true\n",
         "FROM scratch\nRUN --mount=type=bind,target=/a true\n",
         "FROM scratch\nRUN --mount=type=cache,type=cache,target=/a true\n",
         "FROM scratch\nRUN --mount=type=cache,target=/a,target=/b true\n",

@@ -223,6 +223,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     try preflightBuildDeviceEnvelope(allocator, plan, diagnostic);
     var remote_add_count: u64 = 0;
     var has_context_binds = false;
+    var has_cache_mounts = false;
     for (plan.order) |stage_index| for (plan.stages[stage_index].source.instructions) |instruction| switch (instruction.value) {
         .add => {
             remote_add_count += 1;
@@ -233,7 +234,10 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 return error.RemoteAddCountExceeded;
             }
         },
-        .run => |run| has_context_binds = has_context_binds or run.context_bind_mounts.len != 0,
+        .run => |run| {
+            has_context_binds = has_context_binds or run.context_bind_mounts.len != 0;
+            has_cache_mounts = has_cache_mounts or run.cache_mounts.len != 0;
+        },
         else => {},
     };
 
@@ -289,7 +293,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             else => {},
         };
     }
-    const remote_add_inputs = if (remote_add_count == 0 and !has_context_binds)
+    const remote_add_inputs = if (remote_add_count == 0 and !has_context_binds and !has_cache_mounts)
         &.{}
     else
         preflightBuildPlan(init.io, allocator, options, diagnostic, ctx, plan, global_args.items, resolved_bases) catch |err| switch (err) {
@@ -463,6 +467,45 @@ fn preflightBuildDeviceEnvelope(
     }
 }
 
+test "device preflight counts one aggregate cache after id aliases and state changes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch AS input
+        \\FROM scratch AS app
+        \\ARG ID=one
+        \\RUN --mount=type=cache,target=/one,id=$ID true
+        \\RUN --mount=type=cache,target=/two,id=${ID} true
+        \\ARG ID=two
+        \\RUN --mount=type=cache,target=/three,id=$ID true
+        \\COPY --from=input /source /dest
+        \\COPY . /context
+        \\
+    , &parser_diagnostic);
+    const plan = try build_plan.create(arena, &document, .{ .target = "app" }, &parser_diagnostic);
+    var diagnostic: Diagnostic = .{};
+    try preflightBuildDeviceEnvelope(arena, plan, &diagnostic);
+
+    const over_budget = try dockerfile.parse(arena,
+        \\FROM scratch AS first
+        \\FROM scratch AS second
+        \\FROM scratch AS app
+        \\ARG ID=one
+        \\RUN --mount=type=cache,target=/one,id=$ID true
+        \\ARG ID=two
+        \\RUN --mount=type=cache,target=/two,id=$ID true
+        \\COPY --from=first /one /one
+        \\COPY --from=second /two /two
+        \\COPY . /context
+        \\
+    , &parser_diagnostic);
+    const over_budget_plan = try build_plan.create(arena, &over_budget, .{ .target = "app" }, &parser_diagnostic);
+    try std.testing.expectError(error.RunCacheMountDeviceBudgetUnsupported, preflightBuildDeviceEnvelope(arena, over_budget_plan, &diagnostic));
+    try std.testing.expect(diagnostic.instruction_line != 0);
+}
+
 const BuiltStage = struct {
     state: State,
     has_exec_step: bool,
@@ -537,6 +580,7 @@ fn preflightBuildPlan(
         };
         var state = try stateFromBase(allocator, base.config, metadataOnlyStorage(), base.args, 0);
         for (base.arg_overrides) |arg| try putArg(allocator, &state.arg_overrides, arg.key, arg.value);
+        var stage_cache_mounts = std.array_list.Managed(build_cache_mount.Mount).init(allocator);
 
         for (planned_stage.source.instructions, 0..) |instruction, instruction_index| {
             const metadata = applyMetadataInstruction(allocator, options, global_args, &state, instruction) catch |err| switch (err) {
@@ -555,6 +599,11 @@ fn preflightBuildPlan(
             switch (instruction.value) {
                 .run => |run| {
                     const step = try runStep(allocator, diagnostic, state, instruction, run, options);
+                    try stage_cache_mounts.appendSlice(step.cache_mounts);
+                    build_cache_mount.validateCompatible(stage_cache_mounts.items) catch |err| {
+                        diagnostic.instruction_line = instruction.line;
+                        return err;
+                    };
                     var transition_diagnostic = transitionDiagnostics(diagnostic);
                     try instruction_transition.preflightContextBindRun(
                         io,
@@ -828,6 +877,79 @@ fn heredocCopyTransition(
         .env_digest = try effectiveEnvDigest(allocator, state),
         .workdir = state.workdir,
     };
+}
+
+fn canonicalizeCacheRunInstruction(allocator: std.mem.Allocator, raw: []const u8, has_cache_mounts: bool) ![]const u8 {
+    if (!has_cache_mounts) return raw;
+    if (!std.mem.startsWith(u8, raw, "RUN")) return error.BadManifest;
+    var out = std.array_list.Managed(u8).init(allocator);
+    try out.appendSlice("RUN");
+    var cursor: usize = 3;
+    while (cursor < raw.len) {
+        const whitespace_start = cursor;
+        while (cursor < raw.len and (raw[cursor] == ' ' or raw[cursor] == '\t')) cursor += 1;
+        if (cursor == raw.len or raw[cursor] == '\n') {
+            try out.appendSlice(raw[whitespace_start..]);
+            break;
+        }
+        const token_start = cursor;
+        while (cursor < raw.len and raw[cursor] != ' ' and raw[cursor] != '\t' and raw[cursor] != '\n') cursor += 1;
+        const token = raw[token_start..cursor];
+        if (!std.mem.startsWith(u8, token, "--mount=")) {
+            try out.appendSlice(raw[whitespace_start..]);
+            break;
+        }
+        try out.append(' ');
+        if (runMountTokenIsCache(token["--mount=".len..]))
+            try out.appendSlice("--mount=cache")
+        else
+            try out.appendSlice(token);
+    }
+    return out.toOwnedSlice();
+}
+
+fn runMountTokenIsCache(raw: []const u8) bool {
+    var fields = std.mem.splitScalar(u8, raw, ',');
+    while (fields.next()) |field| {
+        const equals = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        if (std.ascii.eqlIgnoreCase(field[0..equals], "type")) {
+            return std.ascii.eqlIgnoreCase(field[equals + 1 ..], "cache");
+        }
+    }
+    return false;
+}
+
+test "cache RUN canonical instruction excludes id and sharing but preserves mount order and command" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const a = try canonicalizeCacheRunInstruction(
+        allocator,
+        "RUN --mount=type=ssh --mount=type=cache,target=/cache,id=a,sharing=shared --mount=type=bind,source=Gemfile,target=Gemfile echo one",
+        true,
+    );
+    const b = try canonicalizeCacheRunInstruction(
+        allocator,
+        "RUN --mount=type=ssh --mount=target=/cache,sharing=locked,id=b,type=cache --mount=type=bind,source=Gemfile,target=Gemfile echo one",
+        true,
+    );
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expectEqualStrings(
+        "RUN --mount=type=ssh --mount=cache --mount=type=bind,source=Gemfile,target=Gemfile echo one",
+        a,
+    );
+    const reordered = try canonicalizeCacheRunInstruction(
+        allocator,
+        "RUN --mount=type=cache,target=/cache,id=a --mount=type=ssh --mount=type=bind,source=Gemfile,target=Gemfile echo one",
+        true,
+    );
+    try std.testing.expect(!std.mem.eql(u8, a, reordered));
+    const changed_command = try canonicalizeCacheRunInstruction(
+        allocator,
+        "RUN --mount=type=ssh --mount=type=cache,target=/cache,id=a --mount=type=bind,source=Gemfile,target=Gemfile echo two",
+        true,
+    );
+    try std.testing.expect(!std.mem.eql(u8, a, changed_command));
 }
 
 fn substituteHeredocState(allocator: std.mem.Allocator, input: []const u8, state: State, escape: u8) ![]const u8 {
@@ -1337,11 +1459,22 @@ fn runStep(
         if (err == error.InvalidRunEnvironment) diagnostic.instruction_line = instruction.line;
         return err;
     };
-    const resolved_mount_targets = try allocator.alloc([]const u8, run.cache_mounts.len);
+    const configured_cache_mounts = try allocator.alloc(build_cache_mount.ConfiguredMount, run.cache_mounts.len);
     for (run.cache_mounts, 0..) |mount, index| {
-        resolved_mount_targets[index] = try substituteState(allocator, mount.target, state, instruction.escape);
+        const sharing: build_cache_mount.Sharing = if (mount.sharing) |raw_sharing| blk: {
+            const resolved_sharing = try substituteState(allocator, raw_sharing, state, instruction.escape);
+            if (std.ascii.eqlIgnoreCase(resolved_sharing, "shared")) break :blk .shared;
+            if (std.ascii.eqlIgnoreCase(resolved_sharing, "locked")) break :blk .locked;
+            diagnostic.instruction_line = instruction.line;
+            return error.RunCacheMountSharingUnsupported;
+        } else .shared;
+        configured_cache_mounts[index] = .{
+            .target = try substituteState(allocator, mount.target, state, instruction.escape),
+            .id = if (mount.id) |raw_id| try substituteState(allocator, raw_id, state, instruction.escape) else null,
+            .sharing = sharing,
+        };
     }
-    const cache_mounts = build_cache_mount.resolve(allocator, state.workdir, resolved_mount_targets) catch |err| {
+    const cache_mounts = build_cache_mount.resolveConfigured(allocator, state.workdir, configured_cache_mounts) catch |err| {
         diagnostic.instruction_line = instruction.line;
         return err;
     };
@@ -1386,7 +1519,8 @@ fn runStep(
     };
     return .{
         .line = instruction.line,
-        .canonical_instruction = instruction.raw,
+        .canonical_instruction = try canonicalizeCacheRunInstruction(allocator, instruction.raw, cache_mounts.len != 0),
+        .source_instruction = instruction.raw,
         .command = command,
         .env = env,
         .env_digest = if (run.ssh_declared_absent)
@@ -2006,6 +2140,7 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
         .{ "ADD https://observer.example/file /file\nCOPY definitely-missing /x", error.CopySourceNotFound },
         .{ "ADD https://observer.example/file /file\nRUN --mount=type=bind,source=definitely-missing,target=/x true", error.RunContextBindSourceNotFound },
         .{ "RUN true\nRUN --mount=type=bind,source=definitely-missing,target=/x true", error.RunContextBindSourceNotFound },
+        .{ "ADD https://observer.example/file /file\nARG ID=same\nRUN --mount=type=cache,target=/one,id=$ID,sharing=shared true\nRUN --mount=type=cache,target=/two,id=${ID},sharing=locked true", error.RunCacheMountSharingConflict },
     }) |case| {
         var parse_diagnostic: dockerfile.Diagnostic = .{};
         const source = try std.fmt.allocPrint(arena,
@@ -2034,6 +2169,28 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
             resolved,
         ));
         try std.testing.expect(diagnostic.instruction_line != 0);
+    }
+
+    {
+        var parse_diagnostic: dockerfile.Diagnostic = .{};
+        const document = try dockerfile.parse(arena,
+            \\FROM scratch
+            \\ADD https://observer.example/file /file
+            \\ARG ID=first
+            \\RUN --mount=type=cache,target=/one,id=$ID,sharing=shared true
+            \\ARG ID=second
+            \\RUN --mount=type=cache,target=/two,id=$ID,sharing=locked true
+            \\
+        , &parse_diagnostic);
+        const plan = try build_plan.create(arena, &document, .{}, &parse_diagnostic);
+        var diagnostic: Diagnostic = .{};
+        const resolved = try allocatorNullBases(arena, plan.stages.len);
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const context_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
+        const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
+        const inputs = try preflightBuildPlan(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved);
+        try std.testing.expectEqual(@as(usize, 1), inputs.len);
     }
 
     {
@@ -2613,6 +2770,171 @@ test "RUN cache mount identity uses expanded path.Clean target" {
     const alias = try build_cache_mount.resolve(arena, "/work", &.{"/cache/pkg"});
     try std.testing.expectEqualStrings(alias[0].key, step.cache_mounts[0].key);
     try std.testing.expectEqualStrings(try build_cache_mount.digest(arena, alias), step.cache_mount_digest);
+}
+
+test "RUN cache mount resolves opaque custom id and sharing at instruction start" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\RUN --mount=type=cache,target=$CACHE_DIR,id=frontend-$TARGETARCH,sharing=$SHARING true
+        \\
+    , &parser_diagnostic);
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "CACHE_DIR", .value = "/cache" });
+    try args.append(.{ .key = "TARGETARCH", .value = "arm64" });
+    try args.append(.{ .key = "SHARING", .value = "locked" });
+    const instruction = document.stages[0].instructions[0];
+    var diagnostic: Diagnostic = .{};
+    const step = try runStep(arena, &diagnostic, .{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{}),
+        .args = args,
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+    }, instruction, instruction.value.run, .{
+        .tag = "local/test:dev",
+        .context_dir = "unused",
+        .dockerfile_path = "unused",
+    });
+    try std.testing.expectEqualStrings("frontend-arm64", step.cache_mounts[0].id);
+    try std.testing.expectEqual(build_cache_mount.Sharing.locked, step.cache_mounts[0].sharing);
+    try std.testing.expectEqual(@as(usize, std.crypto.hash.Blake3.digest_length * 2), step.cache_mounts[0].key.len);
+}
+
+test "RUN cache mount rejects expanded id and sharing bounds before execution" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parser_diagnostic: dockerfile.Diagnostic = .{};
+    const document = try dockerfile.parse(arena,
+        \\FROM scratch
+        \\RUN --mount=type=cache,target=/cache,id=$A$B$C,sharing=$SHARING true
+        \\
+    , &parser_diagnostic);
+    const instruction = document.stages[0].instructions[0];
+    const options = Options{ .tag = "local/test:dev", .context_dir = "unused", .dockerfile_path = "unused" };
+
+    const oversized_part = try arena.alloc(u8, 171);
+    @memset(oversized_part, 'x');
+    try std.testing.expectEqual(build_cache_mount.max_id_bytes + 1, oversized_part.len * 3);
+    for ([_]struct { a: []const u8, b: []const u8, c: []const u8, sharing: []const u8, expected: anyerror }{
+        .{ .a = "", .b = "", .c = "", .sharing = "shared", .expected = error.RunCacheMountIdUnsupported },
+        .{ .a = oversized_part, .b = oversized_part, .c = oversized_part, .sharing = "shared", .expected = error.RunCacheMountIdUnsupported },
+        .{ .a = "valid", .b = "", .c = "", .sharing = "private", .expected = error.RunCacheMountSharingUnsupported },
+    }) |case| {
+        var args = std.array_list.Managed(ArgValue).init(arena);
+        try args.append(.{ .key = "A", .value = case.a });
+        try args.append(.{ .key = "B", .value = case.b });
+        try args.append(.{ .key = "C", .value = case.c });
+        try args.append(.{ .key = "SHARING", .value = case.sharing });
+        var diagnostic: Diagnostic = .{};
+        try std.testing.expectError(case.expected, runStep(arena, &diagnostic, .{
+            .storage = testStorage(),
+            .environment = try buildEnvironmentFromEffective(arena, &.{}),
+            .args = args,
+            .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+        }, instruction, instruction.value.run, options));
+        try std.testing.expectEqual(instruction.line, diagnostic.instruction_line);
+    }
+
+    const boundary_a = try arena.alloc(u8, 170);
+    const boundary_b = try arena.alloc(u8, 170);
+    const boundary_c = try arena.alloc(u8, 172);
+    @memset(boundary_a, 'x');
+    @memset(boundary_b, 'x');
+    @memset(boundary_c, 'x');
+    try std.testing.expectEqual(build_cache_mount.max_id_bytes, boundary_a.len + boundary_b.len + boundary_c.len);
+    var args = std.array_list.Managed(ArgValue).init(arena);
+    try args.append(.{ .key = "A", .value = boundary_a });
+    try args.append(.{ .key = "B", .value = boundary_b });
+    try args.append(.{ .key = "C", .value = boundary_c });
+    try args.append(.{ .key = "SHARING", .value = "locked" });
+    var diagnostic: Diagnostic = .{};
+    _ = try runStep(arena, &diagnostic, .{
+        .storage = testStorage(),
+        .environment = try buildEnvironmentFromEffective(arena, &.{}),
+        .args = args,
+        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
+    }, instruction, instruction.value.run, options);
+}
+
+test "cache records reuse custom id and sharing edits but miss default shared to locked" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Helper = struct {
+        fn run(arena_allocator: std.mem.Allocator, source: []const u8, workdir: []const u8) !build_exec.RunStep {
+            var parser_diagnostic: dockerfile.Diagnostic = .{};
+            const document = try dockerfile.parse(arena_allocator, source, &parser_diagnostic);
+            const instruction = document.stages[0].instructions[0];
+            var diagnostic: Diagnostic = .{};
+            return runStep(arena_allocator, &diagnostic, .{
+                .storage = testStorage(),
+                .environment = try buildEnvironmentFromEffective(arena_allocator, &.{}),
+                .args = std.array_list.Managed(ArgValue).init(arena_allocator),
+                .arg_overrides = std.array_list.Managed(ArgValue).init(arena_allocator),
+                .workdir = workdir,
+            }, instruction, instruction.value.run, .{
+                .tag = "local/test:dev",
+                .context_dir = "unused",
+                .dockerfile_path = "unused",
+            });
+        }
+    };
+    const custom_a = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=/cache,id=a,sharing=shared printf custom >/dev/null\n", "/");
+    const custom_b = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=/cache,id=b,sharing=locked printf custom >/dev/null\n", "/");
+    const default_shared = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=/cache printf default >/dev/null\n", "/");
+    const default_locked = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=/cache,sharing=locked printf default >/dev/null\n", "/");
+    const explicit_equal_target = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=/cache,id=/cache,sharing=shared printf explicit >/dev/null\n", "/");
+    const explicit_changed = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=/cache,id=/different,sharing=locked printf explicit >/dev/null\n", "/");
+    const relative_shared = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=cache printf relative >/dev/null\n", "/work");
+    const relative_locked = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=cache,sharing=locked printf relative >/dev/null\n", "/work");
+
+    const tmp = "zig-cache/test-cache-id-result-record";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/base.ext4", .data = "base" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/child.ext4", .data = "child" });
+    const base = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, tmp ++ "/base.ext4", rootfs_cas.default_chunk_size));
+    const child = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, tmp ++ "/child.ext4", rootfs_cas.default_chunk_size));
+    const resources = runResources(.{ .tag = "local/test:dev", .context_dir = "unused", .dockerfile_path = "unused" });
+
+    const custom_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = custom_a }, resources);
+    const custom_key = try step_cache.stepKey(arena, custom_input);
+    _ = try step_cache.writeRecord(io, arena, cache_root, custom_input, custom_key, child);
+    const custom_edit_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = custom_b }, resources);
+    const custom_edit_key = try step_cache.stepKey(arena, custom_edit_input);
+    try std.testing.expectEqualStrings(custom_key, custom_edit_key);
+    try std.testing.expect((try step_cache.readHit(io, arena, cache_root, custom_edit_input, custom_edit_key)) != null);
+
+    const default_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = default_shared }, resources);
+    const default_key = try step_cache.stepKey(arena, default_input);
+    _ = try step_cache.writeRecord(io, arena, cache_root, default_input, default_key, child);
+    const locked_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = default_locked }, resources);
+    const locked_key = try step_cache.stepKey(arena, locked_input);
+    try std.testing.expect(!std.mem.eql(u8, custom_key, locked_key));
+    try std.testing.expect(!std.mem.eql(u8, default_key, locked_key));
+    try std.testing.expect((try step_cache.readHit(io, arena, cache_root, locked_input, locked_key)) == null);
+
+    const explicit_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = explicit_equal_target }, resources);
+    const explicit_key = try step_cache.stepKey(arena, explicit_input);
+    _ = try step_cache.writeRecord(io, arena, cache_root, explicit_input, explicit_key, child);
+    const explicit_changed_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = explicit_changed }, resources);
+    const explicit_changed_key = try step_cache.stepKey(arena, explicit_changed_input);
+    try std.testing.expect(!std.mem.eql(u8, explicit_key, explicit_changed_key));
+    try std.testing.expect((try step_cache.readHit(io, arena, cache_root, explicit_changed_input, explicit_changed_key)) == null);
+
+    const relative_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = relative_shared }, resources);
+    const relative_key = try step_cache.stepKey(arena, relative_input);
+    _ = try step_cache.writeRecord(io, arena, cache_root, relative_input, relative_key, child);
+    const relative_locked_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = relative_locked }, resources);
+    const relative_locked_key = try step_cache.stepKey(arena, relative_locked_input);
+    try std.testing.expectEqualStrings(relative_key, relative_locked_key);
+    try std.testing.expect((try step_cache.readHit(io, arena, cache_root, relative_locked_input, relative_locked_key)) != null);
 }
 
 test "RUN context bind resolves instruction-start source and WORKDIR target" {

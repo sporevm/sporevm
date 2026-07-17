@@ -1,0 +1,65 @@
+{
+  "description": "explicit cache IDs and sharing use one aggregate disk while matching BuildKit result-key asymmetry",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 4,
+    "expect_boot_count": 1,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle",
+    "/custom-one",
+    "/custom-two",
+    "/default-cache",
+    "/explicit-alias",
+    "/omitted-alias",
+    "/cache-1",
+    "/cache-8"
+  ],
+  "transitions": [
+    {
+      "name": "warm",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    },
+    {
+      "name": "custom-id-and-sharing-edit-hits",
+      "writes": {
+        "Dockerfile": "FROM base\nRUN --mount=type=cache,target=/custom-one,id=custom-b,sharing=locked --mount=type=cache,target=/custom-two,id=custom-b,sharing=locked sh -euxc 'count=0; test ! -f /custom-one/count || count=$(cat /custom-one/count); count=$((count+1)); printf %s $count >/custom-two/count; mkdir -p /oracle; cp /custom-one/count /oracle/custom-count'\nRUN --mount=type=cache,target=/explicit-alias,id=/omitted-alias,sharing=locked --mount=type=cache,target=/omitted-alias,sharing=locked sh -euxc 'printf reused >/explicit-alias/value; test \"$(cat /omitted-alias/value)\" = reused; printf reused >/oracle/explicit-omitted'\nRUN --mount=type=cache,target=/cache-1 --mount=type=cache,target=/cache-2 --mount=type=cache,target=/cache-3 --mount=type=cache,target=/cache-4 --mount=type=cache,target=/cache-5 --mount=type=cache,target=/cache-6 --mount=type=cache,target=/cache-7 --mount=type=cache,target=/cache-8 sh -euxc 'for n in 1 2 3 4 5 6 7 8; do printf %s \"$n\" >\"/cache-$n/value\"; done; mkdir -p /oracle; printf eight >/oracle/eight-mounts'\nRUN --mount=type=cache,target=/default-cache sh -euxc 'count=0; test ! -f /default-cache/count || count=$(cat /default-cache/count); count=$((count+1)); printf %s $count >/default-cache/count; mkdir -p /oracle; cp /default-cache/count /oracle/default-count'\n"
+      },
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "omitted-default-shared-to-locked-misses",
+      "writes": {
+        "Dockerfile": "FROM base\nRUN --mount=type=cache,target=/custom-one,id=custom-b,sharing=locked --mount=type=cache,target=/custom-two,id=custom-b,sharing=locked sh -euxc 'count=0; test ! -f /custom-one/count || count=$(cat /custom-one/count); count=$((count+1)); printf %s $count >/custom-two/count; mkdir -p /oracle; cp /custom-one/count /oracle/custom-count'\nRUN --mount=type=cache,target=/explicit-alias,id=/omitted-alias,sharing=locked --mount=type=cache,target=/omitted-alias,sharing=locked sh -euxc 'printf reused >/explicit-alias/value; test \"$(cat /omitted-alias/value)\" = reused; printf reused >/oracle/explicit-omitted'\nRUN --mount=type=cache,target=/cache-1 --mount=type=cache,target=/cache-2 --mount=type=cache,target=/cache-3 --mount=type=cache,target=/cache-4 --mount=type=cache,target=/cache-5 --mount=type=cache,target=/cache-6 --mount=type=cache,target=/cache-7 --mount=type=cache,target=/cache-8 sh -euxc 'for n in 1 2 3 4 5 6 7 8; do printf %s \"$n\" >\"/cache-$n/value\"; done; mkdir -p /oracle; printf eight >/oracle/eight-mounts'\nRUN --mount=type=cache,target=/default-cache,sharing=locked sh -euxc 'count=0; test ! -f /default-cache/count || count=$(cat /default-cache/count); count=$((count+1)); printf %s $count >/default-cache/count; mkdir -p /oracle; cp /default-cache/count /oracle/default-count'\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 1,
+      "expect_boot_count": 1,
+      "expect_resize_count": 0,
+      "compare": true
+    },
+    {
+      "name": "warm-after-locked-default",
+      "expect_cache": "hit",
+      "expect_index": "same",
+      "expect_executed_steps": 0,
+      "expect_boot_count": 0,
+      "expect_resize_count": 0
+    }
+  ]
+}

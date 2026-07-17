@@ -474,6 +474,27 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
                 try stderr.writeAll("spore build: RUN cache mount target must resolve to a non-root path within executor bounds\n");
             }
         },
+        error.RunCacheMountIdUnsupported => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN cache mount id must resolve to 1 through 512 bytes without NUL\n", .{diagnostic.instruction_line});
+            } else {
+                try stderr.writeAll("spore build: RUN cache mount id must resolve to 1 through 512 bytes without NUL\n");
+            }
+        },
+        error.RunCacheMountSharingUnsupported => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN cache mount sharing must resolve to shared or locked\n", .{diagnostic.instruction_line});
+            } else {
+                try stderr.writeAll("spore build: RUN cache mount sharing must resolve to shared or locked\n");
+            }
+        },
+        error.RunCacheMountSharingConflict => {
+            if (diagnostic.instruction_line != 0) {
+                try stderr.print("spore build: Dockerfile line {d}: RUN cache mounts using the same resolved id must use the same sharing mode\n", .{diagnostic.instruction_line});
+            } else {
+                try stderr.writeAll("spore build: RUN cache mounts using the same resolved id must use the same sharing mode\n");
+            }
+        },
         error.RunCacheMountTargetConflict => {
             if (diagnostic.instruction_line != 0) {
                 try stderr.print("spore build: Dockerfile line {d}: RUN cache mount targets overlap after resolution\n", .{diagnostic.instruction_line});
@@ -730,6 +751,35 @@ test "build CLI reports an invalid inherited RUN environment at its instruction"
         "spore build: Dockerfile line 2: RUN environment contains an invalid entry\n",
         stderr.written(),
     );
+}
+
+test "build CLI reports resolved cache id and sharing failures at their instruction" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        err: anyerror,
+        expected: []const u8,
+    }{
+        .{
+            .err = error.RunCacheMountIdUnsupported,
+            .expected = "spore build: Dockerfile line 12: RUN cache mount id must resolve to 1 through 512 bytes without NUL\n",
+        },
+        .{
+            .err = error.RunCacheMountSharingUnsupported,
+            .expected = "spore build: Dockerfile line 12: RUN cache mount sharing must resolve to shared or locked\n",
+        },
+        .{
+            .err = error.RunCacheMountSharingConflict,
+            .expected = "spore build: Dockerfile line 12: RUN cache mounts using the same resolved id must use the same sharing mode\n",
+        },
+    };
+    for (cases) |case| {
+        var stderr: Io.Writer.Allocating = .init(allocator);
+        defer stderr.deinit();
+        var diagnostic: build_mod.Diagnostic = .{};
+        diagnostic.instruction_line = 12;
+        try writeBuildError(&stderr.writer, case.err, diagnostic);
+        try std.testing.expectEqualStrings(case.expected, stderr.written());
+    }
 }
 
 test "build CLI reports an invalid remote ADD chmod at its instruction" {

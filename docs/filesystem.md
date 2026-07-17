@@ -55,13 +55,17 @@ miss under v9; existing rootfs indexes and local images remain readable. Failed
 growth, quiescence, completeness, PREPARE, step, or ref publication never
 rewrites the parent or makes incomplete storage reachable.
 
-Default `RUN --mount=type=cache,target=...` state lives in one host-local,
+`RUN --mount=type=cache,target=...` state lives in one host-local,
 4 GiB sparse aggregate ext4 disk under the rootfs cache, protected by its own
 exclusive lock. The disk is a transient writable virtio-blk attachment during
 build execution and never enters a rootfs index, image, or Spore manifest. Each
 omitted ID is `path.Clean` of the target after Dockerfile expansion and before a
-relative target is joined to `WORKDIR`; the cleaned ID selects a BLAKE3-named
-directory inside the aggregate disk. The guest bind-mounts those directories in
+relative target is joined to `WORKDIR`; an explicit ID is an opaque expanded
+string. Both select the same domain-separated BLAKE3-named directory inside the
+aggregate disk, so equal resolved IDs share storage without becoming host path
+authority. `sharing=shared` and `sharing=locked` are accepted, but both are
+conservatively serialized by the aggregate lock and the existing whole-build
+rootfs-cache lock. The guest bind-mounts those directories in
 instruction order, unmounts them in reverse order after killing RUN descendants,
 syncs and cleanly unmounts the cache filesystem, and removes target directories
 it created before the rootfs freeze handshake. Failed RUN writes are retained,
@@ -69,7 +73,14 @@ but cleanup failure blocks the checkpoint and step record. One RUN accepts at
 most eight mounts. A symlinked, non-regular, size-mismatched, bad-magic, or
 host-visible unclean aggregate disk is recreated before reuse; a guest mount
 rejection remains a build error. The current `spore rootfs df`, prune, and GC
-surfaces do not account for or remove this host-local cache disk.
+surfaces do not account for or remove this bounded host-local cache disk.
+BuildKit v0.30.0 retains cache options in RUN result identity only when the
+effective ID value equals the resolved destination and sharing is `shared`;
+otherwise it clears ID and sharing. Spore matches that value-based quirk: an
+explicit shared ID equal to its target is indistinguishable from the historical
+absolute omitted-ID case, while an omitted relative target whose destination
+later joins `WORKDIR` is cleared. An edit can therefore hit without opening the
+newly named store or miss and execute according to those effective values.
 
 `RUN --mount=type=bind,source=<file>,target=<path>` accepts only an immutable
 regular file from the build context and the default read-only bind policy.

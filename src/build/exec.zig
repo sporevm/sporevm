@@ -175,6 +175,7 @@ pub const RunCommand = union(enum) {
 pub const RunStep = struct {
     line: usize = 0,
     canonical_instruction: []const u8,
+    source_instruction: []const u8 = "",
     command: RunCommand,
     env: []const []const u8,
     env_digest: []const u8,
@@ -248,6 +249,14 @@ pub const Step = union(enum) {
     fn canonicalInstruction(self: Step) []const u8 {
         return switch (self) {
             .run => |step| step.canonical_instruction,
+            .copy => |step| step.canonical_instruction,
+            .workdir => |step| step.canonical_instruction,
+        };
+    }
+
+    fn diagnosticInstruction(self: Step) []const u8 {
+        return switch (self) {
+            .run => |step| if (step.source_instruction.len != 0) step.source_instruction else step.canonical_instruction,
             .copy => |step| step.canonical_instruction,
             .workdir => |step| step.canonical_instruction,
         };
@@ -436,9 +445,11 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     const network_mode = try networkModeForSteps(options.steps);
     const session_start_ns = try monotonicNs();
     const cache_run = firstCacheMountRun(options.steps);
+    const session_cache_mounts = try collectCacheMounts(allocator, options.steps);
+    try cache_mount.validateCompatible(session_cache_mounts);
     if (!buildDeviceEnvelopeFits(options.context_disk_path != null, options.build_input_rootfs.len, cache_run != null)) {
         if (options.diagnostic) |diag| {
-            diag.instruction = cache_run.?.canonical_instruction;
+            diag.instruction = if (cache_run.?.source_instruction.len != 0) cache_run.?.source_instruction else cache_run.?.canonical_instruction;
             diag.instruction_line = cache_run.?.line;
         }
         return error.RunCacheMountDeviceBudgetUnsupported;
@@ -534,6 +545,15 @@ fn firstCacheMountRun(steps: []const Step) ?RunStep {
         .copy, .workdir => {},
     };
     return null;
+}
+
+fn collectCacheMounts(allocator: std.mem.Allocator, steps: []const Step) ![]const cache_mount.Mount {
+    var mounts = std.array_list.Managed(cache_mount.Mount).init(allocator);
+    for (steps) |step| switch (step) {
+        .run => |run| try mounts.appendSlice(run.cache_mounts),
+        .copy, .workdir => {},
+    };
+    return mounts.toOwnedSlice();
 }
 
 pub fn buildDeviceEnvelopeFits(has_context: bool, build_input_count: usize, has_cache: bool) bool {
@@ -857,7 +877,7 @@ const BuildControl = struct {
             },
             .run, .copy, .workdir => {
                 if (exit_code != 0) {
-                    self.failed_instruction = self.steps[self.step_index].canonicalInstruction();
+                    self.failed_instruction = self.steps[self.step_index].diagnosticInstruction();
                     self.failed_instruction_line = self.steps[self.step_index].line();
                     self.failed_exit_code = exit_code;
                     self.phase = .failed;
@@ -2443,6 +2463,8 @@ test "cache-mounted RUN uses strict v3 request" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"target\":\"/work/relative\"") != null);
     if (comptime guest_agent_fuzz_supported) {
         try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+        const reused_key = "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/one\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"target\":\"/two\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
+        try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(reused_key.ptr, reused_key.len, reused_key[0..0].ptr, 0));
         const malformed = [_][]const u8{
             request[0 .. request.len - 1],
             "{\"type\":\"spore-build-run-v3\"}\n",
