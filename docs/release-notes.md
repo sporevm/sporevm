@@ -237,6 +237,25 @@ heavy layers. Opt-in rootfs profiling now reports each OCI layer separately,
 and build output splits executor session time into guest instructions,
 snapshots, checkpoint control, and remaining overhead.
 
+Named saves now seal independent dirty disk chunks across at most eight workers
+and fsync the shared object directory once before publishing the canonical
+index. In the controlled scale-100 pgbench workload, median source pause fell
+from 38.46 seconds to 18.30 seconds and median disk publication from 36.88
+seconds to 16.79 seconds. Zero-length overlay reads and writes now report
+unexpected EOF or a short write instead of logging them as success.
+
+Distribution pulls now publish bytes already verified from portable storage
+without rereading or rehashing them, and incomplete or invalid completed host
+cache entries are repaired durably before reuse. For the fixed 2,621-object
+Node 22 Alpine benchmark bundle, profiled median pull time fell from
+approximately 3.94 seconds to 1.82 seconds.
+
+Compatibility: the host-local builder cache ABI advanced from v7 in v0.13.1 to
+v9. Complete v6, v7, and v8 records remain conservative GC roots, but the first
+v9 build misses them and writes new v9 records; existing rootfs indexes and
+local images remain readable. `SPORE_ABI_VERSION` remains 15, and no portable
+spore, device, or manifest format changed after v0.13.1.
+
 Bounded named exec now has a documented lossless JSON representation for
 arbitrary stdout and stderr bytes. Valid UTF-8 remains a JSON string, while an
 invalid UTF-8 stream is emitted as an integer byte array; Zig, C, and Go callers
