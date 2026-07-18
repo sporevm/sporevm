@@ -2,6 +2,13 @@
 
 ## Next
 
+`spore build` now keeps large accepted COPY heredocs cacheable. Step-record
+publication and both record readers share a 16 MiB bound, so a record larger
+than the previous 256 KiB read cap can be reused by a warm build and inspected
+as a normal GC root instead of becoming a perpetual miss and an unknown
+conservative record. The writer rejects any serialized record beyond the
+shared bound before atomic replacement.
+
 Named VM startup now waits five milliseconds between monitor-readiness attempts
 during the normal startup window, after ten initial one-millisecond waits. The
 previous twenty-millisecond cadence was a material and variable part of fast

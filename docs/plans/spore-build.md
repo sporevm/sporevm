@@ -2269,6 +2269,10 @@ defined in `docs/plans/spore-build-rootfs-capacity.md`.
 - Valid step records root the indexes and objects they name. M4 GC/prune must
   retire unreachable build records before their CAS indexes, with complete
   stamps deleted before referenced indexes or chunks.
+- Step-record publication and both readers must use one shared bound. A writer
+  may never publish a record that warm lookup treats as a miss and GC treats as
+  unknown; the 16 MiB local-record cap covers accepted large COPY heredocs and
+  fails before atomic replacement when exceeded.
 - The cached path must be fast *end to end*, not just inside `spore build`:
   the wrapper's `rm -rf` + 573M context copy would have silently kept the
   rebuild at ~30s. M3 explicitly owns the wrapper-side integration cost.

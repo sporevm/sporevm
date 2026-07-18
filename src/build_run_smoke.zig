@@ -267,6 +267,7 @@ pub fn main(init: std.process.Init) !void {
     try runLaterStageFailureRetrySmoke(init, allocator, io, cache_root, context_dir, dockerfile_path, base_storage);
     try runShelllessResizeSmoke(init, allocator, io, cache_root, context_dir, dockerfile_path);
     try runResolverScaffoldSmoke(init, allocator, io, context_dir, dockerfile_path, args[2]);
+    try runLargeHeredocCacheSmoke(init, allocator, io, context_dir, dockerfile_path);
 
     std.debug.print(
         "spore-build-run-smoke ok: first={s} cached={s} uncached={s} default-after-uncached={s} edited={s} context-disk-first=emitted:{d}ms context-disk-uncached=reused:{d}ms context-disk-edited=emitted:{d}ms\n",
@@ -281,6 +282,54 @@ pub fn main(init: std.process.Init) !void {
             nsToMs(edited_diag.context_disk.emit_ns),
         },
     );
+}
+
+fn runLargeHeredocCacheSmoke(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    io: Io,
+    context_dir: []const u8,
+    dockerfile_path: []const u8,
+) !void {
+    const header = "FROM local/build-smoke-base:dev\nCOPY <<EOF /large-heredoc\n";
+    const footer = "\nEOF\n";
+    const body_len = 300 * 1024;
+    const dockerfile = try allocator.alloc(u8, header.len + body_len + footer.len);
+    @memcpy(dockerfile[0..header.len], header);
+    @memset(dockerfile[header.len..][0..body_len], 'x');
+    @memcpy(dockerfile[header.len + body_len ..], footer);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dockerfile_path, .data = dockerfile });
+
+    var cold_diagnostic: build_mod.Diagnostic = .{};
+    const cold = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-heredoc:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &cold_diagnostic,
+    });
+    if (cold.cache_hit or cold_diagnostic.executor.boot_count != 1 or
+        cold_diagnostic.executor.executed_steps != 1 or cold_diagnostic.executor.resize_count != 0)
+    {
+        return error.ExpectedLargeHeredocColdBuild;
+    }
+
+    var warm_diagnostic: build_mod.Diagnostic = .{};
+    const warm = try build_mod.build(init, allocator, .{
+        .tag = "local/build-smoke-large-heredoc:dev",
+        .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
+        .platform = .{},
+        .network = .none,
+        .diagnostic = &warm_diagnostic,
+    });
+    if (!warm.cache_hit or warm_diagnostic.executor.boot_count != 0 or
+        warm_diagnostic.executor.executed_steps != 0 or warm_diagnostic.executor.resize_count != 0 or
+        !std.mem.eql(u8, cold.index_digest, warm.index_digest))
+    {
+        return error.ExpectedLargeHeredocWarmHit;
+    }
 }
 
 fn createSmokeRoot(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, mode: Mode) ![]const u8 {
