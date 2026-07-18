@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     const target_arch = target.result.cpu.arch;
     const target_is_hvf = target_os == .macos and target_arch == .aarch64;
     const target_is_kvm = target_os == .linux and target_arch == .aarch64;
+    const target_is_kvm_boot = target_os == .linux and (target_arch == .aarch64 or target_arch == .x86_64);
     const host_is_hvf = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
     const host_is_kvm = builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
     const optimize = b.standardOptimizeOption(.{
@@ -260,6 +261,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_c_smoke = b.addRunArtifact(c_smoke);
 
+    const x86_64_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/x86_64_tests.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_x86_64_tests = b.addRunArtifact(x86_64_tests);
+
     // ponytail: test artifacts share fixed zig-cache paths; serialize until tests use per-process temp dirs.
     run_libspore_smoke_tests.step.dependOn(&run_libspore_tests.step);
     run_c_api_tests.step.dependOn(&run_libspore_smoke_tests.step);
@@ -267,6 +276,7 @@ pub fn build(b: *std.Build) void {
     run_durable_crash_tests_suite.step.dependOn(&run_internal_tests.step);
     run_exe_tests.step.dependOn(&run_durable_crash_tests_suite.step);
     run_c_smoke.step.dependOn(&run_exe_tests.step);
+    run_x86_64_tests.step.dependOn(&run_c_smoke.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_libspore_tests.step);
@@ -276,6 +286,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_durable_crash_tests_suite.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_c_smoke.step);
+    test_step.dependOn(&run_x86_64_tests.step);
 
     const rootfs_slow_test_step = b.step("rootfs-slow-test", "Run slow rootfs/ext4 conformance tests");
     rootfs_slow_test_step.dependOn(&run_rootfs_slow_tests.step);
@@ -463,14 +474,15 @@ pub fn build(b: *std.Build) void {
         boot_step.dependOn(&sign_boot.step);
     }
 
-    // Linux KVM boot harness: host-only, needs /dev/kvm on aarch64 Linux.
-    if (target_is_kvm) {
+    // Linux KVM boot harness: host-only, needs /dev/kvm on the target architecture.
+    if (target_is_kvm_boot) {
         const kvm_boot_mod = b.createModule(.{
-            .root_source_file = b.path("src/kvm_boot.zig"),
+            .root_source_file = b.path(if (target_arch == .x86_64) "src/x86_64_kvm_boot.zig" else "src/kvm_boot.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = optimize != .Debug,
             .link_libc = true,
-            .imports = &.{
+            .imports = if (target_arch == .x86_64) &.{} else &.{
                 .{ .name = "spore_internal", .module = internal_mod },
             },
         });

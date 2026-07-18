@@ -60,12 +60,28 @@ throughout the work.
 - A dedicated bare-metal Intel x86-64 development host is live, healthy,
   SSM-accessible, idle, and able to open `/dev/kvm`. Its private identity and
   lifecycle remain owned by `sporevm-ops` rather than this public plan.
-- The unchanged local baseline passes `mise run test` on Apple Silicon.
-- Slice 0a is active. The first implementation stage is the pure x86 board and
-  bzImage planner plus a console-only single-vCPU KVM harness. Stage 0a.1 may
-  accept an explicit bzImage for bring-up, but Stages 0a.2 and 0a.3 bind their
-  evidence to the exact digest and verified config of the candidate managed
-  x86 kernel.
+- Stage 0a.1 now has a candidate implementation: the pure board/bzImage/E820
+  planner, bounded PIO envelope decoder, and console-only single-vCPU harness
+  pass 13/13 focused tests with two fuzz targets, the full `mise run test` suite
+  with exit 0, and an `x86_64-linux-musl` cross-build on Apple Silicon.
+- The final native harness proof used harness SHA256
+  `5dca52c223938b8c0e15172fd434b4c84609b4ec5472fb53e99b829abc69e58e`,
+  Ubuntu 6.17 bzImage
+  `57b671001dbe2c0ac95a862c36c4b2362df04d288d936d6794259789db84232f`,
+  config `b66306f7d36063cf6f3abeaf3e039c063bf073dcf77dfc15e7d00780f2dd0660`,
+  and ticker initrd
+  `2d6dbf97476cbe7d41a6d6c16225f3e12612f827c3c64fd76c834b592c760413`.
+  The retained `native-final.log` has SHA256
+  `269a8254a8537ba6e1a962d1696b4a3dbc58d6a43668d2dc733c1cb74a327d9b`.
+  During a bounded 30-second run with 512MiB low RAM, timeout produced
+  `run_rc=124`; the dedicated host emitted one init marker and 29
+  `SPOREVM_X86_STAGE_0A1_TICK` markers through the existing virtio-console sink,
+  and no harness process remained afterward.
+- Stage 0a.1's final auto-review passed all three lenses with no material
+  findings, and the final Anthropic Fable deep-analysis continuation approved
+  with no material finding remaining. Stage 0a.2 has not started; its evidence
+  remains bound to the exact digest and verified config of the candidate
+  managed x86 kernel.
 
 ## Motivation
 
