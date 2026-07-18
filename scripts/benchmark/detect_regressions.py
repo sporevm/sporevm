@@ -85,6 +85,7 @@ class BenchmarkRun:
     host_id: str
     config: dict[str, Any]
     rows: list[dict[str, Any]]
+    regression_report: dict[str, Any] | None
 
 
 @dataclass
@@ -106,6 +107,7 @@ class Verdict:
     threshold: str
     history_runs: int
     note: str = ""
+    active_regression: bool = False
 
 
 def die(message: str) -> None:
@@ -166,7 +168,24 @@ def run_from_results(path: Path, config_override: dict[str, Any] | None = None) 
     run_id = str(config.get("run_id") or first.get("run_id") or path.parent.name)
     created_at = str(config.get("created_at") or first.get("created_at") or run_id)
     host_id = str(config.get("host_id") or first.get("host_id") or current_hostname())
-    return BenchmarkRun(path=path, run_id=run_id, created_at=created_at, host_id=host_id, config=config, rows=rows)
+    regression_report: dict[str, Any] | None = None
+    report_path = path.with_name("regression-report.json")
+    if report_path.exists():
+        try:
+            raw_report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_report = None
+        if isinstance(raw_report, dict):
+            regression_report = raw_report
+    return BenchmarkRun(
+        path=path,
+        run_id=run_id,
+        created_at=created_at,
+        host_id=host_id,
+        config=config,
+        rows=rows,
+        regression_report=regression_report,
+    )
 
 
 def run_from_summary(path: Path) -> BenchmarkRun:
@@ -282,7 +301,15 @@ def run_from_legacy_dir(path: Path) -> BenchmarkRun | None:
     if not rows:
         return None
     config = {"host_id": current_hostname(), "legacy_benchmark_dir": str(path)}
-    return BenchmarkRun(path=path, run_id=path.name, created_at=path.name, host_id=current_hostname(), config=config, rows=rows)
+    return BenchmarkRun(
+        path=path,
+        run_id=path.name,
+        created_at=path.name,
+        host_id=current_hostname(),
+        config=config,
+        rows=rows,
+        regression_report=None,
+    )
 
 
 def load_runs(path: Path, *, recursive: bool) -> list[BenchmarkRun]:
@@ -495,7 +522,6 @@ def filtered_history(
     history: list[tuple[BenchmarkRun, dict[str, MetricSeries]]],
     *,
     ignore_host: bool,
-    trailing_window: int,
 ) -> list[tuple[BenchmarkRun, MetricSeries]]:
     candidates: list[tuple[BenchmarkRun, dict[str, MetricSeries]]] = []
     for run, metrics in history:
@@ -524,7 +550,7 @@ def filtered_history(
         elif marker is not None:
             continue
         compatible.append((run, metrics[metric_id]))
-    return compatible[-trailing_window:]
+    return compatible
 
 
 def compare_counter(current: float, baseline: float) -> tuple[str, float | None, str]:
@@ -604,6 +630,78 @@ def history_baseline(metric_class: str, baseline_runs: list[tuple[BenchmarkRun, 
     return float(statistics.median(run_medians))
 
 
+def reported_active_baseline(run: BenchmarkRun, metric_id: str) -> float | None:
+    report = run.regression_report
+    if not isinstance(report, dict):
+        return None
+    verdicts = report.get("verdicts")
+    if not isinstance(verdicts, list):
+        return None
+    for verdict in verdicts:
+        if not isinstance(verdict, dict) or verdict.get("metric_id") != metric_id:
+            continue
+        if verdict.get("active_regression") is not True:
+            return None
+        baseline = verdict.get("baseline")
+        if isinstance(baseline, (int, float)) and not isinstance(baseline, bool):
+            return float(baseline)
+        return None
+    return None
+
+
+def timing_history_state(
+    metric_id: str,
+    metric_class: str,
+    history_runs: list[tuple[BenchmarkRun, MetricSeries]],
+    *,
+    trailing_window: int,
+    warn_threshold: float,
+) -> tuple[float, bool, int]:
+    """Return the baseline, whether the prior run was fail-tier, and window size.
+
+    Fail-tier observations are excluded from the rolling baseline until a run
+    recovers. Archived reports carry a frozen baseline across bounded or
+    partially downloaded history.
+    """
+    accepted: list[tuple[BenchmarkRun, MetricSeries]] = []
+    frozen_baseline: float | None = None
+
+    for index, run_series in enumerate(history_runs):
+        run, series = run_series
+        carried_baseline = reported_active_baseline(run, metric_id)
+        if carried_baseline is not None:
+            frozen_baseline = carried_baseline
+            continue
+        if index == 0:
+            accepted.append(run_series)
+            continue
+
+        if frozen_baseline is None:
+            baseline_runs = accepted[-trailing_window:]
+            baseline = history_baseline(metric_class, baseline_runs)
+            assert isinstance(baseline, (int, float))
+        else:
+            baseline = frozen_baseline
+
+        value = current_stat(series)
+        assert isinstance(value, (int, float))
+        verdict, _, _ = compare_timing(value, float(baseline), warn_threshold)
+        if verdict == "fail":
+            if frozen_baseline is None:
+                frozen_baseline = float(baseline)
+            continue
+
+        frozen_baseline = None
+        accepted.append(run_series)
+
+    if frozen_baseline is not None:
+        return frozen_baseline, True, min(len(history_runs), trailing_window)
+    baseline_runs = accepted[-trailing_window:]
+    baseline = history_baseline(metric_class, baseline_runs)
+    assert isinstance(baseline, (int, float))
+    return float(baseline), False, len(baseline_runs)
+
+
 def compatible_history_runs(current: BenchmarkRun, history_runs: list[BenchmarkRun], *, ignore_host: bool) -> list[BenchmarkRun]:
     return [
         run
@@ -673,7 +771,6 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
             metric_id,
             history,
             ignore_host=args.ignore_host,
-            trailing_window=args.trailing_window,
         )
         if not baseline_runs:
             if ceiling_failed:
@@ -702,7 +799,21 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
                 history_runs=0,
             ))
             continue
-        baseline = history_baseline(series.metric_class, baseline_runs)
+        active_regression = False
+        confirmed = False
+        if series.metric_class in ("latency", "throughput"):
+            warn = THROUGHPUT_WARN if series.metric_class == "throughput" else LATENCY_WARN
+            baseline, confirmed, history_run_count = timing_history_state(
+                metric_id,
+                series.metric_class,
+                baseline_runs,
+                trailing_window=args.trailing_window,
+                warn_threshold=warn,
+            )
+        else:
+            baseline_runs = baseline_runs[-args.trailing_window:]
+            baseline = history_baseline(series.metric_class, baseline_runs)
+            history_run_count = len(baseline_runs)
         if ceiling_failed:
             verdict, delta_pct, threshold = "fail", ((current_value - baseline) / baseline) * 100.0 if baseline else None, f"absolute max <= {fmt_value(absolute_max, metric_id)}"
             note = "current value exceeds the durable expectation ceiling"
@@ -721,17 +832,8 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
             note = ""
         else:
             assert isinstance(current_value, (int, float)) and isinstance(baseline, (int, float))
-            warn = THROUGHPUT_WARN if series.metric_class == "throughput" else LATENCY_WARN
-            confirmed = False
-            if len(baseline_runs) >= 2:
-                prior_baseline = history_baseline(series.metric_class, baseline_runs[:-1])
-                prior_value = current_stat(baseline_runs[-1][1])
-                assert isinstance(prior_baseline, (int, float)) and isinstance(prior_value, (int, float))
-                prior_verdict, _, _ = compare_timing(prior_value, prior_baseline, warn)
-                if prior_verdict == "fail":
-                    baseline = prior_baseline
-                    confirmed = True
             verdict, delta_pct, threshold = compare_timing(current_value, baseline, warn)
+            active_regression = verdict == "fail"
             if verdict == "fail" and not confirmed:
                 verdict = "warn"
                 note = "first fail-tier relative breach; a second consecutive breach is required"
@@ -747,8 +849,9 @@ def evaluate(args: argparse.Namespace) -> tuple[list[Verdict], dict[str, Any]]:
             delta=delta,
             delta_pct=delta_pct,
             threshold=threshold,
-            history_runs=len(baseline_runs),
+            history_runs=history_run_count,
             note=note,
+            active_regression=active_regression,
         ))
 
     failure_count = sum(1 for item in verdicts if item.verdict == "fail")
@@ -838,7 +941,7 @@ def render_markdown(verdicts: list[Verdict], summary: dict[str, Any]) -> str:
             f"{fmt_delta(item)} | {item.history_runs} | {item.threshold} | {item.note} |"
         )
     lines.append("")
-    lines.append("_Timing and counter values are run medians compared with the median of trailing run medians; success_rate uses the trailing best rate. Relative timing failures require two consecutive fail-tier breaches. Digest metrics fail on any change, and counters warn on any unexplained change._")
+    lines.append("_Timing and counter values are run medians compared with the median of trailing run medians; fail-tier timing runs freeze and stay out of the baseline until recovery. Success_rate uses the trailing best rate. Relative timing failures require two consecutive fail-tier breaches. Digest metrics fail on any change, and counters warn on any unexplained change._")
     return "\n".join(lines) + "\n"
 
 
@@ -913,6 +1016,56 @@ def self_test() -> None:
         confirmed_item = next(item for item in verdicts if item.metric_id == "warm_spore_tti/sequential/tti_ms")
         assert summary["failures"] == 1 and confirmed_item.verdict == "fail"
         assert confirmed_item.baseline == 100.0
+
+        stable_batch = write_fixture_run(
+            tmp,
+            "batch-299",
+            [{"benchmark": "distribution_tti", "mode": "sequential_batch", "wall_clock_ms": 299_000}],
+        )
+        regressed_batch_a = write_fixture_run(
+            tmp,
+            "batch-300",
+            [{"benchmark": "distribution_tti", "mode": "sequential_batch", "wall_clock_ms": 395_000}],
+        )
+        regressed_batch_b = write_fixture_run(
+            tmp,
+            "batch-301",
+            [{"benchmark": "distribution_tti", "mode": "sequential_batch", "wall_clock_ms": 393_000}],
+        )
+        regressed_batch_c = write_fixture_run(
+            tmp,
+            "batch-302",
+            [{"benchmark": "distribution_tti", "mode": "sequential_batch", "wall_clock_ms": 391_000}],
+        )
+        args = parse_args([
+            str(regressed_batch_c / "results.jsonl"),
+            "--history", str(stable_batch),
+            "--history", str(regressed_batch_a),
+            "--history", str(regressed_batch_b),
+        ])
+        verdicts, summary = evaluate(args)
+        batch_item = next(item for item in verdicts if item.metric_id.endswith("/wall_clock_ms"))
+        assert summary["failures"] == 1 and batch_item.verdict == "fail"
+        assert batch_item.baseline == 299_000.0 and batch_item.active_regression is True
+
+        (regressed_batch_b / "regression-report.json").write_text(
+            json.dumps({
+                "verdicts": [{
+                    "metric_id": "distribution_tti/sequential_batch/wall_clock_ms",
+                    "baseline": 299_000.0,
+                    "active_regression": True,
+                }],
+            }) + "\n",
+            encoding="utf-8",
+        )
+        args = parse_args([
+            str(regressed_batch_c / "results.jsonl"),
+            "--history", str(regressed_batch_a),
+            "--history", str(regressed_batch_b),
+        ])
+        verdicts, summary = evaluate(args)
+        carried_item = next(item for item in verdicts if item.metric_id.endswith("/wall_clock_ms"))
+        assert summary["failures"] == 1 and carried_item.baseline == 299_000.0
 
         small_delta = write_fixture_run(
             tmp,

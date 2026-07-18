@@ -24,6 +24,7 @@ SH
   test -f "${tmp}/history/run-new/results.jsonl"
   test ! -e "${tmp}/history/run-old"
   grep -q 'history/main/macos/' "${tmp}/aws.log"
+  grep -q -- '--include regression-report.json' "${tmp}/aws.log"
   echo "download-history self-test ok"
 }
 
@@ -59,6 +60,7 @@ while IFS= read -r run; do
     --exclude "*" \
     --include "config.json" \
     --include "results.jsonl" \
+    --include "regression-report.json" \
     --include "summary.json" >/dev/null 2>&1 || true
 done < <(aws s3 ls "${prefix}/" 2>/dev/null | awk '$1 == "PRE" { print $2 }' | tail -n "${limit}")
 
