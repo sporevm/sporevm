@@ -9,6 +9,15 @@ as a normal GC root instead of becoming a perpetual miss and an unknown
 conservative record. The writer rejects any serialized record beyond the
 shared bound before atomic replacement.
 
+Image-backed named VMs now retain OCI `Config.Env` and `WorkingDir` for the
+detached create command and every normal, interactive, and TTY exec. `spore
+exec` accepts repeatable `--env KEY[=VALUE]` and `--workdir PATH` overrides;
+the existing run precedence applies, including `KEY=` replacing an inherited
+value with an empty value. Image defaults persist through live forks, named
+save/restore, offline forks, and bundle transport as bounded optional
+`exec_defaults` manifest metadata, while per-exec values remain request-local
+and are never saved as lifecycle or manifest metadata.
+
 Named VM startup now waits five milliseconds between monitor-readiness attempts
 during the normal startup window, after ten initial one-millisecond waits. The
 previous twenty-millisecond cadence was a material and variable part of fast

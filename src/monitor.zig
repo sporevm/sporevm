@@ -212,6 +212,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         break :blk try allocator.dupe(u8, gen_dev.paramsPayload());
     } else null;
     const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
+    const spec_exec_defaults = if (existing_spec) |spec| spec.value.exec_defaults orelse lifecycle.ExecDefaults{} else lifecycle.ExecDefaults{};
     const spec_sessions = if (existing_spec) |spec|
         if (spec.value.sessions.len != 0) spec.value.sessions else sessionHandlesForResume(allocator, opts.resume_dir)
     else
@@ -244,6 +245,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .network = try run.manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy),
         .annotations = spec_annotations,
         .sessions = spec_sessions,
+        .exec_defaults = if (spec_exec_defaults.env.len != 0 or spec_exec_defaults.working_dir != null) spec_exec_defaults else null,
         .image_ref = opts.image_ref,
         .resume_dir = opts.resume_dir,
         .resume_generation = spec_resume_generation,
@@ -255,7 +257,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     });
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
+    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
     if (spec_disk_baseline_lease) |lease| {
@@ -370,6 +372,23 @@ const StartupMetadata = struct {
     ready: lifecycle.Ready,
 };
 
+const EffectiveExecContext = struct {
+    env: []const []const u8,
+    working_dir: ?[]const u8,
+};
+
+fn effectiveExecContext(
+    env_buffer: *[run.max_guest_envc][]const u8,
+    defaults: lifecycle.ExecDefaults,
+    env_overrides: []const []const u8,
+    working_dir_override: ?[]const u8,
+) !EffectiveExecContext {
+    const env = try run.mergeGuestEnvInto(env_buffer, defaults.env, env_overrides);
+    const working_dir = working_dir_override orelse defaults.working_dir;
+    try run.validateGuestExecContext(env, working_dir);
+    return .{ .env = env, .working_dir = working_dir };
+}
+
 const ExecServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -382,6 +401,7 @@ const ExecServer = struct {
     timeout_ms: u64,
     server: net.Server,
     generation_params: ?[]const u8,
+    exec_defaults: lifecycle.ExecDefaults,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     state: RequestState = .idle,
@@ -431,7 +451,7 @@ const ExecServer = struct {
     disk_baseline_active: ?runtime_disk_lease.Active = null,
     snapshot_publication_wait: snapshot_publication.Wait = .{},
 
-    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
         // sun_path holds only 104; enforce the real platform limit before
         // listen so an oversized path fails with a clear log line instead
@@ -468,6 +488,7 @@ const ExecServer = struct {
             .timeout_ms = timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
             .generation_params = generation_params,
+            .exec_defaults = exec_defaults,
             .disk_claims = runtime_disk_claim.Registry.init(allocator),
             .session_nonce = session_nonce,
             .next_host_stream_sequence = session_nonce,
@@ -783,19 +804,27 @@ const ExecServer = struct {
         return @intCast(ns);
     }
 
-    fn execRequest(self: *ExecServer, argv: []const []const u8) ![]const u8 {
+    fn execRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try self.nextSessionId(&id_buf);
-        if (self.generation_params) |params| {
-            return run.execRequestWithSessionGenerationParams(self.allocator, argv, session_id, self.wallClockUnixNs(), params);
-        }
-        return run.execRequestWithSession(self.allocator, argv, session_id, self.wallClockUnixNs());
+        var merged_env: [run.max_guest_envc][]const u8 = undefined;
+        const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
+        return run.execRequestWithSessionContext(self.allocator, argv, session_id, .{
+            .env = exec_context.env,
+            .working_dir = exec_context.working_dir,
+            .resume_time_unix_ns = self.wallClockUnixNs(),
+            .generation_params = self.generation_params,
+        });
     }
 
-    fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, interactive: bool, tty: bool, terminal_name: []const u8, terminal_size: spore_stream.Resize) ![]const u8 {
+    fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, interactive: bool, tty: bool, terminal_name: []const u8, terminal_size: spore_stream.Resize) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try self.nextSessionId(&id_buf);
+        var merged_env: [run.max_guest_envc][]const u8 = undefined;
+        const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
         return run.interactiveExecRequestWithSession(self.allocator, argv, session_id, .{
+            .env = exec_context.env,
+            .working_dir = exec_context.working_dir,
             .interactive = interactive,
             .tty = tty,
             .terminal_name = terminal_name,
@@ -804,10 +833,16 @@ const ExecServer = struct {
         });
     }
 
-    fn detachedExecRequest(self: *ExecServer, argv: []const []const u8) ![]const u8 {
+    fn detachedExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try self.nextSessionId(&id_buf);
-        return run.detachedExecRequestWithSession(self.allocator, argv, session_id, self.wallClockUnixNs());
+        var merged_env: [run.max_guest_envc][]const u8 = undefined;
+        const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
+        return run.detachedExecRequestWithSessionContext(self.allocator, argv, session_id, .{
+            .env = exec_context.env,
+            .working_dir = exec_context.working_dir,
+            .resume_time_unix_ns = self.wallClockUnixNs(),
+        });
     }
 
     fn copyRequest(self: *ExecServer, request_type: []const u8, path: []const u8) ![]const u8 {
@@ -1107,6 +1142,7 @@ const ExecServer = struct {
         defer if (manifest_v1) |*parsed| parsed.deinit();
         if (manifest) |*parsed| {
             parsed.value.annotations = lifecycle_spec.value.annotations;
+            parsed.value.exec_defaults = lifecycle_spec.value.exec_defaults;
             if (parsed.value.disk) |disk| {
                 const bytes = try std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{ .whitespace = .indent_2 });
                 defer self.allocator.free(bytes);
@@ -1122,6 +1158,7 @@ const ExecServer = struct {
         } else {
             manifest_v1 = try spore.loadManifestV1(self.allocator, work_dir);
             manifest_v1.?.value.annotations = lifecycle_spec.value.annotations;
+            manifest_v1.?.value.exec_defaults = lifecycle_spec.value.exec_defaults;
             if (manifest_v1.?.value.disk) |disk| {
                 const bytes = try std.json.Stringify.valueAlloc(self.allocator, manifest_v1.?.value, .{ .whitespace = .indent_2 });
                 defer self.allocator.free(bytes);
@@ -1684,7 +1721,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             .cols = parsed.value.terminal_cols orelse 80,
         };
         const terminal_name = parsed.value.term orelse "xterm";
-        const request = server.interactiveExecRequest(argv, interactive, tty, terminal_name, terminal_size) catch |err| {
+        const request = server.interactiveExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, interactive, tty, terminal_name, terminal_size) catch |err| {
             try writeStreamingControlError(stream.socket.handle, guestCommandErrorMessage(err));
             return false;
         };
@@ -1727,12 +1764,12 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         return false;
     };
     const request = if (detached)
-        server.detachedExecRequest(argv) catch |err| {
+        server.detachedExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir) catch |err| {
             try writeControlError(server.io, stream, guestCommandErrorMessage(err));
             return false;
         }
     else
-        server.execRequest(argv) catch |err| {
+        server.execRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir) catch |err| {
             try writeControlError(server.io, stream, guestCommandErrorMessage(err));
             return false;
         };
@@ -1749,6 +1786,9 @@ fn guestCommandErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.RunArgCountUnsupported => "guest command must contain between 1 and 16 arguments",
         error.RunArgTooLong, error.RunRequestTooLarge => "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest",
+        error.RunEnvCountUnsupported => "guest environment contains more than 64 entries",
+        error.RunEnvTooLong => "guest environment entry exceeds 255 bytes",
+        error.RunWorkingDirUnsupported => "guest working directory must be an absolute path of at most 255 bytes",
         else => "invalid guest command",
     };
 }
@@ -1775,6 +1815,8 @@ fn readControlLineFd(fd: std.c.fd_t, buffer: []u8) ![]const u8 {
 const ControlRequest = struct {
     type: []const u8,
     argv: ?[]const []const u8 = null,
+    env: ?[]const []const u8 = null,
+    working_dir: ?[]const u8 = null,
     out_dir: ?[]const u8 = null,
     publish_dir: ?[]const u8 = null,
     path: ?[]const u8 = null,
@@ -2133,6 +2175,27 @@ test "monitor image handoff accepts lifecycle rootfs metadata" {
     try std.testing.expect(monitorImageRootfsAvailable(null, null, false));
 }
 
+test "named exec context applies image defaults and ephemeral overrides" {
+    var env_buffer: [run.max_guest_envc][]const u8 = undefined;
+    const context = try effectiveExecContext(&env_buffer, .{
+        .env = &.{ "IMAGE_VALUE=default", "CLEAR_ME", "KEEP=1" },
+        .working_dir = "/app",
+    }, &.{ "IMAGE_VALUE=override", "CLEAR_ME=" }, "/work");
+
+    try std.testing.expectEqual(@as(usize, 3), context.env.len);
+    try std.testing.expectEqualStrings("KEEP=1", context.env[0]);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=override", context.env[1]);
+    try std.testing.expectEqualStrings("CLEAR_ME=", context.env[2]);
+    try std.testing.expectEqualStrings("/work", context.working_dir.?);
+
+    const inherited = try effectiveExecContext(&env_buffer, .{
+        .env = &.{"IMAGE_VALUE=default"},
+        .working_dir = "/app",
+    }, &.{}, null);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", inherited.env[0]);
+    try std.testing.expectEqualStrings("/app", inherited.working_dir.?);
+}
+
 test "readiness probe accepts current and bounded legacy guest replies" {
     try std.testing.expect(readinessProbeSucceeded(0, ""));
     try std.testing.expect(readinessProbeSucceeded(2, legacy_readiness_error));
@@ -2277,6 +2340,10 @@ test "snapshot publication preserves create annotations and applies save overlay
     try lifecycle.writeSporeLifecycleSpec(arena, io, work_dir, .{
         .name = "source",
         .annotations = merged,
+        .exec_defaults = .{
+            .env = &.{"IMAGE_VALUE=default"},
+            .working_dir = "/workspace",
+        },
     });
 
     var wait = snapshot_publication.Wait{};
@@ -2294,6 +2361,8 @@ test "snapshot publication preserves create annotations and applies save overlay
     try std.testing.expectEqualStrings("create", published.value.annotations.map.get("create-only").?);
     try std.testing.expectEqualStrings("save", published.value.annotations.map.get("save-only").?);
     try std.testing.expectEqualStrings("save", published.value.annotations.map.get("shared").?);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", published.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("/workspace", published.value.exec_defaults.?.working_dir.?);
 }
 
 test "snapshot disk lease handoff preserves old authority on failure and commits new authority transactionally" {

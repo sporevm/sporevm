@@ -49,6 +49,23 @@ spore exec -it bench-1 -- /bin/sh
 `-i` and `-t` are independent: neither flag selects output attachment, and a
 host terminal is not required when PTY output or input is redirected.
 
+Named VMs created with `--image` apply the image's OCI `Config.Env` and
+`WorkingDir` to every command, including the detached command passed to
+`spore create`, plain exec, interactive exec, and TTY exec. Entrypoint, Cmd,
+and User remain unapplied. Each exec can override that context before the VM
+name:
+
+```bash
+spore exec --env RACK_ENV=test --env BUNDLE_GEMFILE --workdir /app bench-1 \
+  -- bundle exec rspec
+```
+
+`--env KEY=VALUE` replaces the image value for that key, repeated overrides
+use the last value, `--env KEY` copies the current host value, and `--env KEY=`
+sets an explicit empty value so an inherited value is cleared. `--workdir`
+must be an absolute path. These overrides apply to one exec request only; the
+next exec, a fork, and a later save still use the image defaults.
+
 Exact argv does not perform guest PATH lookup. Use `-- /bin/echo hi`, not
 `-- echo hi`, unless the guest environment itself can execute `echo` at that
 exact path.
@@ -184,6 +201,14 @@ starts. Named VM names remain lifecycle monitor handles.
 ## Saves And Forks
 
 `spore save NAME --out DIR` writes a spore and leaves the named VM running.
+Image-created named saves record `exec_defaults` as optional manifest metadata:
+the OCI environment list and working directory are preserved by stop and
+non-destructive save, restore, offline fork, pack/unpack, and live named fork.
+The same defaults remain in host-private lifecycle metadata for compatibility
+with the named monitor. A missing field means no saved exec defaults, so older
+spores retain their existing root-directory and empty-environment behavior.
+Per-exec `--env` and `--workdir` values are never copied into either metadata
+surface.
 Writable-disk saves are machine-local by default: host-private lifecycle
 metadata names an opaque durable pin in the configured rootfs cache. The pin
 roots the immutable disk index and chunks independently of the save path, so

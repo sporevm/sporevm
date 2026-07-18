@@ -146,6 +146,8 @@ const exec_usage =
     \\  spore exec [options] NAME -- <argv...>
     \\
     \\Options:
+    \\  --env KEY[=VALUE]       Override image environment; KEY copies the host value
+    \\  --workdir PATH          Override the image working directory
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
@@ -291,6 +293,7 @@ pub const Spec = struct {
     network: ?spore.Network = null,
     annotations: spore.Annotations = .{},
     sessions: []const spore.Session = &.{},
+    exec_defaults: ?ExecDefaults = null,
     image_ref: ?[]const u8 = null,
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
@@ -300,6 +303,8 @@ pub const Spec = struct {
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
 };
+
+pub const ExecDefaults = spore.ExecDefaults;
 
 pub const DiskForkClaim = struct {
     source_socket_path: []const u8,
@@ -459,6 +464,8 @@ const ExecOptions = struct {
     name: []const u8,
     command_mode: run_mod.CommandMode = .shell,
     command: []const []const u8,
+    guest_env_specs: run_mod.GuestEnvSpecList = .{},
+    guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
 };
@@ -543,6 +550,8 @@ pub const RestoreNamedOptions = struct {
 pub const ExecNamedOptions = struct {
     name: []const u8,
     command: []const []const u8,
+    guest_env: []const []const u8 = &.{},
+    guest_working_dir: ?[]const u8 = null,
     network_policy: ?spore_net_policy.NetworkPolicy = null,
     interactive: bool = false,
     tty: bool = false,
@@ -611,6 +620,8 @@ pub const TerminalSize = spore_stream.Resize;
 pub const ExecNamedStreamOptions = struct {
     name: []const u8,
     command: []const []const u8,
+    guest_env: []const []const u8 = &.{},
+    guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
     terminal_name: []const u8 = "xterm",
@@ -851,8 +862,12 @@ fn createNamedWithTiming(
     const rootfs_resolved_ms = monotonicMs();
     spec.rootfs_path = if (rootfs.path) |path| try std.fs.path.resolve(arena, &.{path}) else null;
     spec.rootfs = rootfs.rootfs;
+    spec.exec_defaults = if (rootfs.guest_env.len != 0 or rootfs.guest_working_dir != null) .{
+        .env = rootfs.guest_env,
+        .working_dir = rootfs.guest_working_dir,
+    } else null;
     const rootfs_abspath_ms = monotonicMs();
-    if (spec.rootfs != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
+    if (spec.rootfs != null or spec.exec_defaults != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
     const spore_executable_path = try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
@@ -945,6 +960,7 @@ pub fn restoreNamed(
         break :blk try attach_mod.prepareRestoreGenerationState(arena, manifest_generation, params);
     } else null;
     const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
+    const manifest_exec_defaults = if (manifest) |parsed| parsed.value.exec_defaults else manifest_v1.?.value.exec_defaults;
     const memory = memory_config.fromManifestBytes(ram_size) catch return error.InvalidMemorySize;
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
 
@@ -973,6 +989,7 @@ pub fn restoreNamed(
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
         .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .sessions = sessions,
+        .exec_defaults = manifest_exec_defaults orelse base.exec_defaults,
         .memory = memory,
         .vcpus = manifest_vcpus,
         .guest_port = base.guest_port,
@@ -986,7 +1003,7 @@ pub fn restoreNamed(
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const state = try classifyVmState(arena, init.io, paths, pidAlive);
     if (state != .absent) return namedVmExists(arena, init.io, paths, "restore", spec.name, state);
-    if (spec.rootfs != null or spec.disk != null or spec.resume_generation != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0) try writeSpec(arena, init.io, paths, spec);
+    if (spec.rootfs != null or spec.disk != null or spec.resume_generation != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0 or spec.exec_defaults != null) try writeSpec(arena, init.io, paths, spec);
 
     const prepared_ms = monotonicMs();
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
@@ -1079,7 +1096,7 @@ pub fn execNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "exec", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    const response = try sendExecRequest(arena, context.io, ready.value.control_socket_path, options.command);
+    const response = try sendExecRequest(arena, context.io, ready.value.control_socket_path, options.command, options.guest_env, options.guest_working_dir);
     return parseExecNamedResponse(allocator, arena, response);
 }
 
@@ -1170,6 +1187,8 @@ fn execNamedStreaming(
     return execStreamControl(context, arena, ready.value.control_socket_path, .{
         .name = options.name,
         .command = options.command,
+        .guest_env = options.guest_env,
+        .guest_working_dir = options.guest_working_dir,
         .interactive = options.interactive,
         .tty = options.tty,
         .terminal_name = terminalName(context.environ_map),
@@ -1216,7 +1235,7 @@ fn startNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "start", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    const response = try sendStartRequest(arena, context.io, ready.value.control_socket_path, options.command);
+    const response = try sendStartRequest(arena, context.io, ready.value.control_socket_path, options.command, options.guest_env, options.guest_working_dir);
     return parseExecNamedResponse(allocator, arena, response);
 }
 
@@ -1323,9 +1342,12 @@ fn saveStopNamed(
     var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
     defer if (manifest_v1) |*parsed| parsed.deinit();
     if (manifest == null) manifest_v1 = try spore.loadManifestV1(arena, out_dir);
-    if (!spore.annotationsEmpty(options.annotations)) {
+    if (suspend_spec.exec_defaults != null or !spore.annotationsEmpty(options.annotations)) {
         if (manifest) |*parsed| {
-            parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
+            if (!spore.annotationsEmpty(options.annotations)) {
+                parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
+            }
+            parsed.value.exec_defaults = suspend_spec.exec_defaults;
             if (parsed.value.disk) |disk| {
                 const bytes = try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
                 const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
@@ -1338,7 +1360,10 @@ fn saveStopNamed(
             }
             suspend_spec.annotations = parsed.value.annotations;
         } else if (manifest_v1) |*parsed| {
-            parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
+            if (!spore.annotationsEmpty(options.annotations)) {
+                parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
+            }
+            parsed.value.exec_defaults = suspend_spec.exec_defaults;
             if (parsed.value.disk) |disk| {
                 const bytes = try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
                 const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
@@ -1453,6 +1478,7 @@ pub fn forkNamed(
         const children_start_ms = monotonicMs();
 
         try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
+        try writeSporeExecDefaults(arena, snapshot_dir, source_spec.value.exec_defaults);
         _ = try spore.fork(arena, .{
             .parent_dir = snapshot_dir,
             .out_dir = children_dir,
@@ -1476,6 +1502,7 @@ pub fn forkNamed(
         const response = try sendSnapshotRequest(arena, init.io, ready.value.control_socket_path, snapshot_dir, null);
         if (!(snapshotResponseOk(arena, response) catch return error.BadMonitorResponse)) return error.MonitorRequestFailed;
         try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
+        try writeSporeExecDefaults(arena, snapshot_dir, source_spec.value.exec_defaults);
 
         _ = try spore.fork(arena, .{
             .parent_dir = snapshot_dir,
@@ -1716,6 +1743,22 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     }
     const parsed = parseExecArgs(args);
     const allocator = init.arena.allocator();
+    var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
+    const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
+        error.MissingHostEnvironment => {
+            std.debug.print("spore exec: --env {s} is not set in the host environment\n", .{env_diagnostic.missing_key orelse "unknown"});
+            std.process.exit(2);
+        },
+        error.RunEnvTooLong => {
+            std.debug.print("spore exec: --env entry exceeds 255 bytes\n", .{});
+            std.process.exit(2);
+        },
+        error.RunEnvCountUnsupported => {
+            std.debug.print("spore exec: too many --env entries\n", .{});
+            std.process.exit(2);
+        },
+        else => return err,
+    };
     const command = run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
         error.ShellCommandArgumentCountUnsupported => {
             std.debug.print("spore exec: shell command form accepts one command string; quote it or use -- for argv\n", .{});
@@ -1729,6 +1772,8 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     }, allocator, .{
         .name = parsed.name,
         .command = command,
+        .guest_env = guest_env,
+        .guest_working_dir = parsed.guest_working_dir,
         .interactive = parsed.interactive,
         .tty = parsed.tty,
     }) catch |err| switch (err) {
@@ -2461,6 +2506,7 @@ pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Pa
 }
 
 fn validateSpec(spec: Spec) !void {
+    if (spec.exec_defaults) |defaults| try run_mod.validateGuestExecContext(defaults.env, defaults.working_dir);
     if (spec.disk_baseline_lease) |lease| try lease.validate();
     if (spec.disk_fork_claim) |claim| {
         if (!std.fs.path.isAbsolute(claim.source_socket_path)) return error.BadManifest;
@@ -3135,6 +3181,8 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var name: ?[]const u8 = null;
     var command_mode: run_mod.CommandMode = .shell;
     var command: []const []const u8 = &.{};
+    var guest_env_specs = run_mod.GuestEnvSpecList{};
+    var guest_working_dir: ?[]const u8 = null;
     var interactive = false;
     var tty = false;
 
@@ -3147,6 +3195,15 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         } else if (name != null) {
             command = args[i..];
             break;
+        } else if (std.mem.eql(u8, args[i], "--env")) {
+            if (i + 1 >= args.len) usageExit(exec_usage);
+            i += 1;
+            guest_env_specs.append(run_mod.parseGuestEnvSpec(args[i]) catch usageExit(exec_usage)) catch usageExit(exec_usage);
+        } else if (std.mem.eql(u8, args[i], "--workdir")) {
+            if (i + 1 >= args.len) usageExit(exec_usage);
+            i += 1;
+            run_mod.validateGuestExecContext(&.{}, args[i]) catch usageExit(exec_usage);
+            guest_working_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
             interactive = true;
         } else if (std.mem.eql(u8, args[i], "-t") or std.mem.eql(u8, args[i], "--tty")) {
@@ -3167,6 +3224,8 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         .name = vm_name,
         .command_mode = command_mode,
         .command = command,
+        .guest_env_specs = guest_env_specs,
+        .guest_working_dir = guest_working_dir,
         .interactive = interactive,
         .tty = tty,
     };
@@ -3470,6 +3529,23 @@ pub fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []cons
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 }
 
+fn writeSporeExecDefaults(allocator: std.mem.Allocator, dir: []const u8, defaults: ?spore.ExecDefaults) !void {
+    if (defaults == null) return;
+    var manifest = spore.loadManifest(allocator, dir) catch |err| switch (err) {
+        error.BadManifest => null,
+        else => |e| return e,
+    };
+    defer if (manifest) |*parsed| parsed.deinit();
+    if (manifest) |*parsed| {
+        parsed.value.exec_defaults = defaults;
+        return spore.saveManifest(allocator, dir, parsed.value);
+    }
+    var manifest_v1 = try spore.loadManifestV1(allocator, dir);
+    defer manifest_v1.deinit();
+    manifest_v1.value.exec_defaults = defaults;
+    try spore.saveManifestV1(allocator, dir, manifest_v1.value);
+}
+
 pub fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?std.json.Parsed(Spec) {
     const path = try std.fs.path.resolve(allocator, &.{ dir, lifecycle_spore_metadata_file });
     const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_metadata_bytes)) catch |err| switch (err) {
@@ -3728,6 +3804,7 @@ fn startForkChildExecutable(
         .disk_fork_claim = fork_claim,
         .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
         .sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions,
+        .exec_defaults = base.exec_defaults,
         .memory = memory,
         .vcpus = manifest_vcpus,
         .guest_port = base.guest_port,
@@ -4442,11 +4519,13 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.control_socket_path) != null);
 }
 
-fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
+fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "exec",
         argv: []const []const u8,
-    }{ .argv = argv };
+        env: []const []const u8,
+        working_dir: ?[]const u8,
+    }{ .argv = argv, .env = env, .working_dir = working_dir };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     return sendControlJson(allocator, io, socket_path, json);
@@ -4456,6 +4535,8 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
     const payload = struct {
         type: []const u8 = "exec-stream-v1",
         argv: []const []const u8,
+        env: []const []const u8,
+        working_dir: ?[]const u8,
         stdio: []const u8,
         interactive: bool,
         term: []const u8,
@@ -4463,6 +4544,8 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
         terminal_cols: u16,
     }{
         .argv = options.command,
+        .env = options.guest_env,
+        .working_dir = options.guest_working_dir,
         .stdio = if (options.tty) "tty" else "pipe",
         .interactive = options.interactive,
         .term = options.terminal_name,
@@ -4559,11 +4642,13 @@ fn openCopyNamedStreamAt(
     return .{ .io = context.io, .stream = stream };
 }
 
-fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8) ![]const u8 {
+fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "start",
         argv: []const []const u8,
-    }{ .argv = argv };
+        env: []const []const u8,
+        working_dir: ?[]const u8,
+    }{ .argv = argv, .env = env, .working_dir = working_dir };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     return sendControlJson(allocator, io, socket_path, json);
@@ -6070,6 +6155,10 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
             .baseline_kind = .rootfs,
             .baseline_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         },
+        .exec_defaults = .{
+            .env = &.{ "IMAGE_VALUE=default", "CLEAR_ME=inherited" },
+            .working_dir = "/app",
+        },
         .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
     });
     var spec = try readSpec(allocator, io, paths);
@@ -6081,6 +6170,9 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqualStrings("example.com", spec.value.network.?.allow_hosts[0]);
     try std.testing.expectEqual(runtime_disk_lease.Store.rootfs_cache, spec.value.disk_baseline_lease.?.store);
     try std.testing.expectEqualStrings("/cache", spec.value.disk_baseline_lease.?.root);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", spec.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("CLEAR_ME=inherited", spec.value.exec_defaults.?.env[1]);
+    try std.testing.expectEqualStrings("/app", spec.value.exec_defaults.?.working_dir.?);
     try std.testing.expectEqual(memory_config.Policy.explicit, spec.value.memory.policy);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), spec.value.memory.bytes);
 
@@ -6141,6 +6233,29 @@ test "durable lifecycle metadata drops transient disk fork claims" {
     var parsed = try std.json.parseFromSlice(Spec, allocator, bytes, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     try std.testing.expect(parsed.value.disk_fork_claim == null);
+}
+
+test "named exec defaults are additive portable manifest metadata" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = "zig-cache/test-lifecycle-exec-defaults-manifest";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    try spore.saveManifest(arena, dir, manifest_test_support.manifest(.{}));
+
+    try writeSporeExecDefaults(arena, dir, .{
+        .env = &.{ "IMAGE_VALUE=default", "CLEAR_ME=inherited" },
+        .working_dir = "/workspace",
+    });
+
+    const parsed = try spore.loadManifest(arena, dir);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", parsed.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("CLEAR_ME=inherited", parsed.value.exec_defaults.?.env[1]);
+    try std.testing.expectEqualStrings("/workspace", parsed.value.exec_defaults.?.working_dir.?);
 }
 
 test "named restore rejects every saved console host path authority" {
@@ -6237,12 +6352,16 @@ test "exec parser accepts shell and exact commands" {
 }
 
 test "exec parser accepts interactive and tty flags" {
-    const combined_opts = parseExecArgs(&.{ "-it", "box", "--", "/bin/sh" });
+    const combined_opts = parseExecArgs(&.{ "--env", "CLEAR_ME=", "--env", "HOST_VALUE", "--workdir", "/app", "-it", "box", "--", "/bin/sh" });
     try std.testing.expectEqualStrings("box", combined_opts.name);
     try std.testing.expectEqual(run_mod.CommandMode.argv, combined_opts.command_mode);
     try std.testing.expect(combined_opts.interactive);
     try std.testing.expect(combined_opts.tty);
     try std.testing.expectEqualStrings("/bin/sh", combined_opts.command[0]);
+    try std.testing.expectEqual(@as(usize, 2), combined_opts.guest_env_specs.len);
+    try std.testing.expectEqualStrings("CLEAR_ME=", combined_opts.guest_env_specs.items[0].literal);
+    try std.testing.expectEqualStrings("HOST_VALUE", combined_opts.guest_env_specs.items[1].copy);
+    try std.testing.expectEqualStrings("/app", combined_opts.guest_working_dir.?);
 
     const long_opts = parseExecArgs(&.{ "--interactive", "--tty", "box", "cat" });
     try std.testing.expectEqualStrings("box", long_opts.name);
