@@ -1,6 +1,6 @@
 ---
 status: landed
-last_reviewed: 2026-07-14
+last_reviewed: 2026-07-18
 spec_refs:
   - docs/memory.md
   - docs/spore-format.md
@@ -125,6 +125,20 @@ capture. The Linux job selects the host-provisioned, agent-writable
 checkout or general benchmark scratch. Earlier candidate review and native
 evidence predated the HVF counter finding; the exact-head evidence above
 supersedes those runs and closes the corrected KVM/HVF release gate.
+
+The v0.14 release audit exposed a second HVF measurement boundary: the public
+restore call polled the ready file and versioned monitor hello every 20 ms after
+its first ten attempts. Local-backed monitors were already ready in roughly
+15-24 ms, so that polling phase contributed a variable share of the public API
+wall and made the strict two-times eager/local median gate alternate failures
+between one and two vCPUs. Readiness polling now retains ten one-millisecond
+startup attempts, uses five milliseconds for the next 100 attempts, and then
+returns to the twenty-millisecond failure cadence. This leaves the timeout, PID
+check, exact-version hello, and failure contract unchanged; a full timeout adds
+only about 75 probes over the old schedule rather than sustaining a higher
+polling rate. Fresh exact-source ReleaseSafe HVF matrices must still pass the
+unchanged two-times gate on both vCPU counts; the cadence change is a product
+latency fix, not a threshold waiver.
 
 ## Key Learnings From Pressure-Testing
 

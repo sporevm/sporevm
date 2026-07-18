@@ -253,9 +253,13 @@ Correctness gates run before performance gates. Same-head median public restore
 wall time, `restore_return_ms`, must be at least twice as fast with local backing
 as with deliberate eager fallback for each backend and vCPU count. This field
 is used because it is the public restore-to-ready API wall, including prepare,
-monitor startup, and the readiness wait. Local backing must report zero backend
-RAM materialization on every row; eager materialization must be positive but
-has no upper threshold. Run-from, first-exec, and repeated-exec medians fail a
+monitor startup, and the readiness wait. The parent waits one millisecond
+between each of the first ten readiness attempts, five milliseconds between the
+next 100 attempts, and then twenty milliseconds between attempts during a long
+failure. This bounds normal-start observation latency without permanently
+increasing the timeout polling rate. Local backing must report zero backend RAM
+materialization on every row; eager materialization must be positive but has no
+upper threshold. Run-from, first-exec, and repeated-exec medians fail a
 non-regression gate only when they are both more than 20 percent and at least
 50 ms slower. Historical v0.12.0 comparison uses that non-regression rule but
 does not substitute for the same-head local-versus-eager gate.

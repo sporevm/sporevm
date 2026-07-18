@@ -4109,23 +4109,107 @@ const FakeHelloServer = struct {
     io: Io,
     server: net.Server,
     response: []const u8,
+    request_count: usize = 1,
 };
 
 fn fakeHelloServerMain(fake: *FakeHelloServer) void {
+    for (0..fake.request_count) |_| fakeHelloServerOnce(fake) catch return;
+}
+
+fn fakeHelloServerOnce(fake: *FakeHelloServer) !void {
     var stream = fake.server.accept(fake.io) catch return;
     defer stream.close(fake.io);
 
     var read_buffer: [256]u8 = undefined;
     var reader = stream.reader(fake.io, &read_buffer);
-    _ = reader.interface.takeDelimiterExclusive('\n') catch return;
-    writeAll(fake.io, stream, fake.response) catch return;
-    writeAll(fake.io, stream, "\n") catch return;
+    _ = try reader.interface.takeDelimiterExclusive('\n');
+    try writeAll(fake.io, stream, fake.response);
+    try writeAll(fake.io, stream, "\n");
+}
+
+const small_stack_control_requests = 16;
+// The exact Linux ARM64 test binary needs 272 KiB after TLS and guard overhead.
+// Keep functional coverage comfortably above that runtime-specific floor; the
+// ReleaseSafe frame budget is verified separately from this thread size.
+const small_stack_control_bytes = 512 * 1024;
+
+const SmallStackControlClient = struct {
+    io: Io,
+    socket_path: []const u8,
+    response_matches: bool = false,
+    err: ?anyerror = null,
+
+    fn run(client: *SmallStackControlClient) void {
+        var caller_storage: [64]u8 = undefined;
+        var caller_allocator = std.heap.FixedBufferAllocator.init(&caller_storage);
+        for (0..small_stack_control_requests) |_| {
+            const response = sendControlJsonRaw(
+                caller_allocator.allocator(),
+                client.io,
+                client.socket_path,
+                "{\"type\":\"hello\"}",
+            ) catch |err| {
+                client.err = err;
+                return;
+            };
+            const response_matches = std.mem.eql(u8, "{\"type\":\"hello\"}", response);
+            caller_allocator.allocator().free(response);
+            if (!response_matches) return;
+        }
+        client.response_matches = true;
+    }
+};
+
+test "lifecycle control response scratch fits a bounded stack and caller allocator" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-small-stack-{d}.sock", .{currentTestPid()});
+    defer allocator.free(socket_path);
+    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    Io.Dir.cwd().deleteFile(io, socket_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
+    const address = try net.UnixAddress.init(socket_path);
+    var fake = FakeHelloServer{
+        .io = io,
+        .server = try address.listen(io, .{ .kernel_backlog = 1 }),
+        .response = "{\"type\":\"hello\"}",
+        .request_count = small_stack_control_requests,
+    };
+    defer fake.server.deinit(io);
+
+    var client = SmallStackControlClient{ .io = io, .socket_path = socket_path };
+    const client_thread = try std.Thread.spawn(.{ .stack_size = small_stack_control_bytes }, SmallStackControlClient.run, .{&client});
+    fakeHelloServerMain(&fake);
+    client_thread.join();
+
+    if (client.err) |err| return err;
+    try std.testing.expect(client.response_matches);
+}
+
+fn readyPollDelayMs(attempt: u32) u64 {
+    if (attempt < 10) return 1;
+    if (attempt < 110) return 5;
+    return 20;
 }
 
 fn readyPollSleep(attempt: *u32) void {
-    const delay_ms: u64 = if (attempt.* < 10) 1 else 20;
+    const delay_ms = readyPollDelayMs(attempt.*);
     attempt.* +|= 1;
     sleepMs(delay_ms);
+}
+
+test "lifecycle readiness polling keeps startup detection bounded" {
+    try std.testing.expectEqual(@as(u64, 1), readyPollDelayMs(0));
+    try std.testing.expectEqual(@as(u64, 1), readyPollDelayMs(9));
+    try std.testing.expectEqual(@as(u64, 5), readyPollDelayMs(10));
+    try std.testing.expectEqual(@as(u64, 5), readyPollDelayMs(109));
+    try std.testing.expectEqual(@as(u64, 20), readyPollDelayMs(110));
+    try std.testing.expectEqual(@as(u64, 20), readyPollDelayMs(std.math.maxInt(u32)));
 }
 
 fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64, spore_executable_path: []const u8) !void {
@@ -4572,11 +4656,14 @@ fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const
     const address = try controlSocketAddress(socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
     defer stream.close(io);
+    // libspore can enter here on a fixed-size cgo system stack, while callers
+    // commonly use arenas that cannot reclaim scratch beneath the response.
+    const read_buffer = try std.heap.page_allocator.alloc(u8, max_control_response);
+    defer std.heap.page_allocator.free(read_buffer);
     writeAll(io, stream, json) catch return error.MonitorUnavailable;
     writeAll(io, stream, "\n") catch return error.MonitorUnavailable;
 
-    var read_buffer: [max_control_response]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
+    var reader = stream.reader(io, read_buffer);
     const line = reader.interface.takeDelimiterExclusive('\n') catch return error.MonitorUnavailable;
     return allocator.dupe(u8, line);
 }
