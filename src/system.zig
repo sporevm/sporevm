@@ -2891,6 +2891,52 @@ test "system cache gc preserves storage rooted only by a PREPARE record" {
     try std.testing.expect(!try fileExists(io, rooted_stamp_path));
 }
 
+test "system cache gc reads a large COPY heredoc step record" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-large-build-step-root";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const rooted = try writeGcStorageFixture(allocator, io, root, null, 0x34);
+    const orphan = try writeGcStorageFixture(allocator, io, root, null, 0x45);
+    try rootfs_cas.markStorageComplete(io, allocator, root, rooted.storage.index_digest);
+    try rootfs_cas.markStorageComplete(io, allocator, root, orphan.storage.index_digest);
+    const instruction = try allocator.alloc(u8, 300 * 1024);
+    @memset(instruction, 'x');
+    @memcpy(instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
+    const input = build_step_cache.StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = instruction,
+        .executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        .operation = .{ .copy = .{
+            .input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .workdir = "/",
+            .destination_policy = .follow,
+        } },
+    };
+    const key = try build_step_cache.stepKey(allocator, input);
+    _ = try build_step_cache.writeRecord(io, allocator, root, input, key, rooted.storage);
+
+    const rooted_index_path = try rootfs_cas.manifestIndexPath(allocator, root, rooted.storage.index_digest);
+    const rooted_object_path = try rootfs_cas.manifestObjectPath(allocator, root, rooted.object_digest);
+    const orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, orphan.storage.index_digest);
+    const orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest);
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+
+    try std.testing.expectEqual(@as(usize, 0), forced.unparseable_step_record_count);
+    try std.testing.expectEqual(@as(usize, 1), forced.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 1), forced.rooted_objects);
+    try std.testing.expect(try fileExists(io, rooted_index_path));
+    try std.testing.expect(try fileExists(io, rooted_object_path));
+    try std.testing.expect(!try fileExists(io, orphan_index_path));
+    try std.testing.expect(!try fileExists(io, orphan_object_path));
+}
+
 test "system cache gc ignores known build records with incomplete storage" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

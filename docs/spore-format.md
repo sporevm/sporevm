@@ -50,7 +50,10 @@ before boot.
 `build/steps/<step_key>.json`. These records are host-local cache metadata, not
 portable spore format. The record envelope remains
 `kind: "sporevm-build-step-v1"`; the current build-cache ABI is identified by
-`builder_version: "sporevm-build-v9"`. A record binds `platform`, `step_key`,
+`builder_version: "sporevm-build-v9"`. Records are bounded to 16 MiB at both
+publication and read time; a writer that would exceed that bound fails before
+atomic replacement, so every product-published record remains readable by
+warm lookup and GC. A record binds `platform`, `step_key`,
 `parent_index_digest`, `child_index_digest`, `instruction_kind`, canonical
 instruction text, `input_digest`, `env_digest`, `workdir`, optional
 `network_mode`, optional preparation fields, COPY destination policy, ordered

@@ -11,7 +11,10 @@ pub const builder_version = "sporevm-build-v9";
 const legacy_builder_versions = [_][]const u8{ "sporevm-build-v8", "sporevm-build-v7", "sporevm-build-v6" };
 const record_kind = "sporevm-build-step-v1";
 const stale_record_kind_v2 = "sporevm-build-step-v2";
-const max_step_record_bytes = 256 * 1024;
+// A record can contain an accepted 1 MiB Dockerfile instruction. Six bytes per
+// input byte covers worst-case JSON string escaping, with the remainder
+// reserved for the fixed envelope and bounded typed fields.
+const max_step_record_bytes = 16 * 1024 * 1024;
 const test_executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 // SCRATCH has no filesystem parent. This reserved identity occupies the
 // parent-key domain without pretending that a user-visible image exists.
@@ -408,6 +411,8 @@ pub fn writeRecord(
         .whitespace = .indent_2,
         .emit_null_optional_fields = false,
     });
+    defer allocator.free(json);
+    if (json.len > max_step_record_bytes) return error.BuildCacheRecordTooLarge;
     // Step keys identify inputs, not immutable outputs. In particular,
     // `--no-cache` may rerun a networked RUN and produce a different valid
     // child snapshot for the same key, so atomically replace this derived map.
@@ -1047,6 +1052,88 @@ test "rewriting a step record replaces a prior child snapshot" {
     _ = try writeRecord(io, arena, cache_root, input, key, second_storage);
     const hit = (try readHit(io, arena, cache_root, input, key)) orelse return error.MissingBuildCacheRecord;
     try std.testing.expectEqualStrings(second_storage.index_digest, hit.index_digest);
+}
+
+test "large COPY heredoc record is a warm hit and a GC root" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-build-step-cache-large-copy-heredoc";
+    const cache_root = tmp ++ "/cache";
+    const child_rootfs = tmp ++ "/child.ext4";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "large heredoc child rootfs bytes" });
+
+    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
+    const instruction = try arena.alloc(u8, 300 * 1024);
+    @memset(instruction, 'x');
+    @memcpy(instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
+    const input = StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = instruction,
+        .executor_identity = test_executor_identity,
+        .operation = .{ .copy = .{
+            .input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .workdir = "/",
+            .destination_policy = .follow,
+        } },
+    };
+    const key = try stepKey(arena, input);
+    const path = try writeRecord(io, arena, cache_root, input, key, storage);
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_step_record_bytes));
+    try std.testing.expect(bytes.len > 256 * 1024);
+
+    const hit = (try readHit(io, arena, cache_root, input, key)) orelse return error.MissingBuildCacheRecord;
+    try std.testing.expectEqualStrings(storage.index_digest, hit.index_digest);
+    switch (try inspectRecordForGc(io, arena, cache_root, path, key)) {
+        .root => |root| try std.testing.expectEqualStrings(storage.index_digest, root.index_digest),
+        .legacy, .stale, .unknown => return error.MissingBuildCacheRecord,
+    }
+}
+
+test "step record writer rejects output beyond the reader bound" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-build-step-cache-record-bound";
+    const cache_root = tmp ++ "/cache";
+    const child_rootfs = tmp ++ "/child.ext4";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "bounded record child rootfs bytes" });
+
+    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
+    const instruction = try arena.alloc(u8, max_step_record_bytes);
+    @memset(instruction, 'x');
+    @memcpy(instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
+    const input = StepInput{
+        .platform = .{},
+        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .canonical_instruction = instruction,
+        .executor_identity = test_executor_identity,
+        .operation = .{ .copy = .{
+            .input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .workdir = "/",
+            .destination_policy = .follow,
+        } },
+    };
+    const key = try stepKey(arena, input);
+    try std.testing.expectError(
+        error.BuildCacheRecordTooLarge,
+        writeRecord(io, arena, cache_root, input, key, storage),
+    );
+    const path = try recordPath(arena, cache_root, key);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
 }
 
 test "prepare record round trips typed identity and exact target" {
