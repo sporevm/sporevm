@@ -4128,6 +4128,9 @@ fn fakeHelloServerOnce(fake: *FakeHelloServer) !void {
 }
 
 const small_stack_control_requests = 16;
+// Linux AArch64's PTHREAD_STACK_MIN is 128 KiB. This remains smaller than the
+// withdrawn function's 132,544-byte frame before accounting for its callers.
+const small_stack_control_bytes = 128 * 1024;
 
 const SmallStackControlClient = struct {
     io: Io,
@@ -4179,7 +4182,7 @@ test "lifecycle control response scratch fits a bounded stack and caller allocat
     defer fake.server.deinit(io);
 
     var client = SmallStackControlClient{ .io = io, .socket_path = socket_path };
-    const client_thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, SmallStackControlClient.run, .{&client});
+    const client_thread = try std.Thread.spawn(.{ .stack_size = small_stack_control_bytes }, SmallStackControlClient.run, .{&client});
     fakeHelloServerMain(&fake);
     client_thread.join();
 
