@@ -70,6 +70,22 @@ Exact argv does not perform guest PATH lookup. Use `-- /bin/echo hi`, not
 `-- echo hi`, unless the guest environment itself can execute `echo` at that
 exact path.
 
+Pass `--timing-json PATH` before the VM name to retain one named-exec phase
+record without changing output streaming or exit propagation:
+
+```bash
+spore exec --timing-json run.json bench-1 -- /bin/true
+```
+
+The `spore.named-exec-timing.v1` artifact separates monitor dispatch, guest
+process start, guest execution wall time, guest user/system CPU in
+microseconds, post-exit output/result delivery, stream teardown, and total
+monitor request time. Dispatch is the residual host-side request/transport
+time after the independently measured guest and teardown phases are removed;
+the calculation does not compare unsynchronised host and guest clocks.
+Telemetry that is absent or malformed is emitted as `null` and never changes
+the guest result. The output path's parent must already exist.
+
 Named create exposes the same create-time annotation and networking options as
 the lifecycle library:
 
@@ -391,6 +407,9 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   backpressure: a disconnected consumer or local socket that cannot accept a
   complete frame within the 25 ms send deadline aborts that exec so it cannot
   block the VM control loop indefinitely.
+- `ExecNamedStream.timing` becomes available when the timing event preceding
+  the exit frame is consumed. The bounded `ExecNamedResult` carries the same
+  optional timing structure.
 - The bounded `execNamed` compatibility collector returns owned byte slices to
   Zig. Its C JSON result keeps valid UTF-8 stdout and stderr as strings and
   represents invalid UTF-8 streams as integer byte arrays; the Go binding

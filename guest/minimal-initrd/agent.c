@@ -173,6 +173,8 @@ static int64_t t_request_accept = 0;
 static int64_t t_request_decode = 0;
 static int64_t t_command_start = 0;
 static int64_t t_command_exit = 0;
+static int64_t t_command_user_us = -1;
+static int64_t t_command_system_us = -1;
 static int sigchld_pipe[2] = { -1, -1 };
 static int proc_dir_fd = -1;
 static const uint64_t memory_high_step_bytes = 1073741824ULL;
@@ -1499,26 +1501,28 @@ static int send_spio_exit(int fd, int exit_code) {
 static int format_timing(char *frame, size_t cap) {
   int64_t now = now_ms();
   int n = snprintf(frame, cap,
-                   "timing listen=%lld accept=%lld decode=%lld spawn=%lld exit=%lld now=%lld\n",
+                   "timing listen=%lld accept=%lld decode=%lld spawn=%lld exit=%lld now=%lld user_us=%lld system_us=%lld\n",
                    (long long)(t_listen_ready ? t_listen_ready - t_init_start : -1),
                    (long long)(t_request_accept ? t_request_accept - t_init_start : -1),
                    (long long)(t_request_decode ? t_request_decode - t_init_start : -1),
                    (long long)(t_command_start ? t_command_start - t_init_start : -1),
                    (long long)(t_command_exit ? t_command_exit - t_init_start : -1),
-                   (long long)(now ? now - t_init_start : -1));
+                   (long long)(now ? now - t_init_start : -1),
+                   (long long)t_command_user_us,
+                   (long long)t_command_system_us);
   if (n <= 0 || (size_t)n >= cap) return -1;
   return n;
 }
 
 static int send_timing_frame(int fd) {
-  char frame[128];
+  char frame[192];
   int n = format_timing(frame, sizeof(frame));
   if (n < 0) return -1;
   return write_all(fd, frame, (size_t)n);
 }
 
 static int send_spio_timing_frame(int fd) {
-  char frame[128];
+  char frame[192];
   int n = format_timing(frame, sizeof(frame));
   if (n < 0) return -1;
   if (n > 0 && frame[n - 1] == '\n') n--;
@@ -1727,9 +1731,9 @@ static void mirror_console(int is_stdout, const unsigned char *buf, size_t len) 
   (void)write_all(fd, buf, len);
 }
 
-static int wait_child(pid_t pid, int *status) {
+static int wait_child(pid_t pid, int *status, struct rusage *usage) {
   for (;;) {
-    pid_t rc = waitpid(pid, status, WNOHANG);
+    pid_t rc = wait4(pid, status, WNOHANG, usage);
     if (rc == pid) return 1;
     if (rc == 0) return 0;
     if (errno == EINTR) continue;
@@ -3863,6 +3867,9 @@ static int start_session(struct session *session, const char *session_id, char *
   uint16_t terminal_rows = options->terminal_rows;
   uint16_t terminal_cols = options->terminal_cols;
   t_command_start = now_ms();
+  t_command_exit = 0;
+  t_command_user_us = -1;
+  t_command_system_us = -1;
   int stdin_pipe[2] = { -1, -1 };
   int stdout_pipe[2] = { -1, -1 };
   int stderr_pipe[2] = { -1, -1 };
@@ -4724,9 +4731,15 @@ static void poll_session_exit(struct session *session, struct client *client) {
   if (!session->started || session->exited) return;
 
   int status = 0;
-  int wr = wait_child(session->pid, &status);
+  struct rusage usage;
+  memset(&usage, 0, sizeof(usage));
+  int wr = wait_child(session->pid, &status, &usage);
   if (wr == 0) return;
   t_command_exit = now_ms();
+  if (wr > 0) {
+    t_command_user_us = (int64_t)usage.ru_utime.tv_sec * 1000000LL + usage.ru_utime.tv_usec;
+    t_command_system_us = (int64_t)usage.ru_stime.tv_sec * 1000000LL + usage.ru_stime.tv_usec;
+  }
   if (wr < 0) {
     session->exit_code = 127;
   } else if (WIFEXITED(status)) {

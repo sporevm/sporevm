@@ -425,6 +425,11 @@ while (true) {
 ```
 
 Stream event byte slices are borrowed until the next stream operation.
+After `.exit` is returned, `stream.timing` contains the optional
+`NamedExecTiming` received immediately before it. The bounded Zig
+`ExecNamedResult` carries the same value. Its phases split dispatch, guest
+process start, guest execution, guest user/system CPU, output/result delivery,
+teardown, and total monitor time; telemetry does not affect command success.
 
 ## Networking
 

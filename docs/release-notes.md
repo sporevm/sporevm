@@ -19,6 +19,14 @@ save/restore, offline forks, and bundle transport as bounded optional
 `exec_defaults` manifest metadata, while per-exec values remain request-local
 and are never saved as lifecycle or manifest metadata.
 
+`spore exec --timing-json PATH` now writes a versioned named-exec timing
+artifact without changing streamed stdout, stderr, or the guest exit status.
+It separates monitor dispatch, guest process start, guest execution, guest
+user/system CPU, post-exit output/result delivery, and monitor stream teardown.
+The same timing is available from Zig's bounded result and streaming handle.
+Guest timing values remain bounded, fuzzed, untrusted telemetry; malformed
+values are omitted rather than affecting execution.
+
 Named VM startup now waits five milliseconds between monitor-readiness attempts
 during the normal startup window, after ten initial one-millisecond waits. The
 previous twenty-millisecond cadence was a material and variable part of fast

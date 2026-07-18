@@ -150,6 +150,7 @@ const exec_usage =
     \\  --workdir PATH          Override the image working directory
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
+    \\  --timing-json PATH      Write named-exec phase timing as JSON
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
@@ -468,6 +469,7 @@ const ExecOptions = struct {
     guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
+    timing_json_path: ?[]const u8 = null,
 };
 
 const SaveOptions = struct {
@@ -602,6 +604,20 @@ pub const NamedLifecycleTiming = struct {
     total_ms: u64,
 };
 
+pub const named_exec_timing_schema = "spore.named-exec-timing.v1";
+pub const named_exec_timing_schema_version: u32 = 1;
+
+pub const NamedExecTiming = struct {
+    dispatch_ms: ?u64 = null,
+    guest_process_start_ms: ?u64 = null,
+    guest_execution_ms: ?u64 = null,
+    guest_user_cpu_us: ?u64 = null,
+    guest_system_cpu_us: ?u64 = null,
+    output_result_delivery_ms: ?u64 = null,
+    teardown_ms: u64,
+    total_ms: u64,
+};
+
 pub const ExecNamedResult = struct {
     exit_code: u8,
     stdout: []u8,
@@ -609,6 +625,7 @@ pub const ExecNamedResult = struct {
     network_events_jsonl: []u8 = &.{},
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
+    timing: ?NamedExecTiming = null,
 };
 
 /// `execNamed` is a compatibility collector and rejects output beyond this
@@ -645,6 +662,7 @@ pub const ExecNamedStream = struct {
     stdout_offset: u64 = 0,
     stderr_offset: u64 = 0,
     terminal_offset: u64 = 0,
+    timing: ?NamedExecTiming = null,
     payload: [spore_stream.max_payload_len]u8 = undefined,
 
     pub fn deinit(self: *ExecNamedStream) void {
@@ -700,7 +718,11 @@ pub const ExecNamedStream = struct {
                     if (header.stream_id != .control) return error.BadMonitorResponse;
                     return .{ .err = payload };
                 },
-                .event => continue,
+                .event => {
+                    if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
+                    if (parseNamedExecTimingEvent(payload)) |timing| self.timing = timing;
+                    continue;
+                },
                 else => return error.BadMonitorResponse,
             }
         }
@@ -760,6 +782,27 @@ pub const ExecNamedStream = struct {
         }
     }
 };
+
+const NamedExecTimingEvent = struct {
+    type: []const u8,
+    schema_version: u32,
+    timing: NamedExecTiming,
+};
+
+fn parseNamedExecTimingEvent(payload: []const u8) ?NamedExecTiming {
+    var storage: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var parsed = std.json.parseFromSlice(NamedExecTimingEvent, fixed.allocator(), payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.type, "named_exec_timing") or
+        parsed.value.schema_version != named_exec_timing_schema_version)
+    {
+        return null;
+    }
+    return parsed.value.timing;
+}
 
 const NamedNetworkConfig = struct {
     mode: run_mod.NetworkMode = .disabled,
@@ -1166,11 +1209,16 @@ pub fn copyOutNamed(
     try extractCopyArchive(allocator, context.io, archive.path, options.host_path);
 }
 
+const ExecNamedStreamingResult = struct {
+    exit_code: u8,
+    timing: ?NamedExecTiming,
+};
+
 fn execNamedStreaming(
     context: Context,
     allocator: std.mem.Allocator,
     options: ExecNamedOptions,
-) !u8 {
+) !ExecNamedStreamingResult {
     clearLastError();
     if (options.command.len == 0) return error.InvalidGuestCommand;
     if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
@@ -1766,7 +1814,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         },
         else => return err,
     };
-    const exit_code = execNamedStreaming(.{
+    const result = execNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
     }, allocator, .{
@@ -1799,7 +1847,24 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         },
         else => |e| return e,
     };
-    if (exit_code != 0) std.process.exit(exit_code);
+    if (parsed.timing_json_path) |path| {
+        const artifact = struct {
+            schema: []const u8 = named_exec_timing_schema,
+            schema_version: u32 = named_exec_timing_schema_version,
+            name: []const u8,
+            exit_code: u8,
+            timing: ?NamedExecTiming,
+        }{
+            .name = parsed.name,
+            .exit_code = result.exit_code,
+            .timing = result.timing,
+        };
+        writeTimingJson(allocator, init.io, path, artifact) catch |err| {
+            std.debug.print("spore exec: cannot write timing JSON to {s}: {s}\n", .{ path, @errorName(err) });
+            std.process.exit(1);
+        };
+    }
+    if (result.exit_code != 0) std.process.exit(result.exit_code);
 }
 
 pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
@@ -3185,6 +3250,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var guest_working_dir: ?[]const u8 = null;
     var interactive = false;
     var tty = false;
+    var timing_json_path: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -3211,6 +3277,14 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         } else if (std.mem.eql(u8, args[i], "-it") or std.mem.eql(u8, args[i], "-ti")) {
             interactive = true;
             tty = true;
+        } else if (std.mem.eql(u8, args[i], "--timing-json")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0) usageExit(exec_usage);
+            timing_json_path = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--timing-json=")) {
+            const value = args[i]["--timing-json=".len..];
+            if (value.len == 0) usageExit(exec_usage);
+            timing_json_path = value;
         } else if (std.mem.startsWith(u8, args[i], "-")) {
             usageExit(exec_usage);
         } else {
@@ -3228,6 +3302,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         .guest_working_dir = guest_working_dir,
         .interactive = interactive,
         .tty = tty,
+        .timing_json_path = timing_json_path,
     };
 }
 
@@ -4572,7 +4647,7 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
     return exec_stream;
 }
 
-fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !u8 {
+fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !ExecNamedStreamingResult {
     var stream = try openExecNamedStreamAt(context, allocator, socket_path, options);
     defer stream.deinit();
     var raw_terminal: ?ExecRawTerminal = null;
@@ -4591,7 +4666,8 @@ fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path
         .interactive = options.interactive,
         .tty = options.tty,
     };
-    return pump.run();
+    const exit_code = try pump.run();
+    return .{ .exit_code = exit_code, .timing = stream.timing };
 }
 
 fn copyStreamControl(
@@ -4991,6 +5067,7 @@ const ControlResponse = struct {
     stderr_truncated: bool = false,
     out_dir: ?[]const u8 = null,
     message: ?[]const u8 = null,
+    timing: ?NamedExecTiming = null,
 };
 
 fn parseExecNamedResponse(
@@ -5039,6 +5116,7 @@ fn parseExecNamedResponse(
         .network_events_jsonl = network_events_jsonl,
         .stdout_truncated = parsed.value.stdout_truncated,
         .stderr_truncated = parsed.value.stderr_truncated,
+        .timing = parsed.value.timing,
     };
 }
 
@@ -5963,7 +6041,7 @@ test "named exec response rejects truncated collector output" {
 test "named exec response decodes complete bounded output" {
     const allocator = std.testing.allocator;
     const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":false}
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":false,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
     ;
     const result = try parseExecNamedResponse(allocator, allocator, response);
     defer deinitExecNamedResult(allocator, result);
@@ -5972,6 +6050,20 @@ test "named exec response decodes complete bounded output" {
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 'A' }, result.stdout);
     try std.testing.expectEqualSlices(u8, &.{ 0xfe, 'B' }, result.stderr);
     try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
+    try std.testing.expectEqual(@as(?u64, 2), result.timing.?.dispatch_ms);
+    try std.testing.expectEqual(@as(?u64, 7_000), result.timing.?.guest_user_cpu_us);
+    try std.testing.expectEqual(@as(u64, 13), result.timing.?.total_ms);
+}
+
+test "named exec timing event validates type and schema" {
+    const valid =
+        \\{"type":"named_exec_timing","schema_version":1,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
+    ;
+    const timing = parseNamedExecTimingEvent(valid).?;
+    try std.testing.expectEqual(@as(?u64, 9), timing.guest_execution_ms);
+    try std.testing.expectEqual(@as(u64, 13), timing.total_ms);
+    try std.testing.expect(parseNamedExecTimingEvent("{\"type\":\"other\",\"schema_version\":1,\"timing\":{\"teardown_ms\":0,\"total_ms\":1}}") == null);
+    try std.testing.expect(parseNamedExecTimingEvent("not json") == null);
 }
 
 test "named exec response preserves monitor error detail" {
@@ -6369,6 +6461,16 @@ test "exec parser accepts interactive and tty flags" {
     try std.testing.expect(long_opts.interactive);
     try std.testing.expect(long_opts.tty);
     try std.testing.expectEqualStrings("cat", long_opts.command[0]);
+}
+
+test "exec parser accepts timing JSON before the VM name" {
+    const separate = parseExecArgs(&.{ "--timing-json", "/tmp/run.json", "box", "true" });
+    try std.testing.expectEqualStrings("/tmp/run.json", separate.timing_json_path.?);
+    try std.testing.expectEqualStrings("box", separate.name);
+
+    const joined = parseExecArgs(&.{ "--timing-json=/tmp/joined.json", "box", "--", "/bin/true" });
+    try std.testing.expectEqualStrings("/tmp/joined.json", joined.timing_json_path.?);
+    try std.testing.expectEqual(run_mod.CommandMode.argv, joined.command_mode);
 }
 
 test "create parser accepts bounded vcpu count" {
