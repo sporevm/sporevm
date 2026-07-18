@@ -4128,9 +4128,10 @@ fn fakeHelloServerOnce(fake: *FakeHelloServer) !void {
 }
 
 const small_stack_control_requests = 16;
-// Linux AArch64's PTHREAD_STACK_MIN is 128 KiB. This remains smaller than the
-// withdrawn function's 132,544-byte frame before accounting for its callers.
-const small_stack_control_bytes = 128 * 1024;
+// The exact Linux ARM64 test binary needs 272 KiB after TLS and guard overhead.
+// Keep functional coverage comfortably above that runtime-specific floor; the
+// ReleaseSafe frame budget is verified separately from this thread size.
+const small_stack_control_bytes = 512 * 1024;
 
 const SmallStackControlClient = struct {
     io: Io,
