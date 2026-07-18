@@ -304,6 +304,16 @@ under `rootfs.cache`.
   and the currently attached client are never part of the spore. Producers must
   write at most 16 handles; ids are 1-63 ASCII alphanumeric, dash, underscore,
   or dot characters.
+- `exec_defaults`: optional command context for image-created named VMs. `env`
+  is the retained OCI `Config.Env` list, bounded to 64 entries of at most 255
+  bytes each, and `working_dir` is an optional absolute path of at most 255
+  bytes. Named save and fork persist these defaults so restore, bundle
+  transport, and child VMs execute like the source image. The field is
+  optional within v2 and v3: producers omit it when no defaults exist, and
+  absence means no saved command defaults. Readers from releases predating
+  this field use strict manifest parsing and reject a manifest that contains
+  it, so only image-context saves cross that reader-version boundary. Per-exec
+  environment and working-directory overrides are intentionally excluded.
 
 Every `spore-disk-index-v1` identity is the BLAKE3 digest of one exact canonical
 JSON encoding. The top-level fields appear in this order: `kind`,
@@ -399,8 +409,8 @@ HVF runtime uses v3 with a tagged same-HVF `backend_private` GIC blob. Bundle
 commands preserve v3 manifests through production, pull, and local
 materialization.
 
-V3 keeps the v2 memory, device, generation, rootfs, disk, network, and
-annotation contracts. The platform object adds:
+V3 keeps the v2 memory, device, generation, rootfs, disk, network, annotations,
+and optional exec-default contracts. The platform object adds:
 
 - `vcpu_count`: bounded by the shared SporeVM topology cap.
 - `gic_redist_stride`: the redistributor frame stride used to validate the

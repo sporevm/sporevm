@@ -124,6 +124,10 @@ description = "Smoke named lifecycle copy-in and copy-out"
 run = "mise run build && test/smoke/lifecycle/tty.sh"
 description = "Smoke named lifecycle noninteractive, interactive, and TTY exec streaming"
 
+[tasks."smoke:lifecycle-image-context"]
+run = "mise run build && test/smoke/lifecycle/image-context.sh"
+description = "Smoke named image env/workdir defaults, exec overrides, fork, save, and restore"
+
 [tasks."smoke:monitor-jail"]
 run = "mise run build && test/smoke/monitor/jail.sh"
 description = "Smoke the monitor jail denied-operation path"

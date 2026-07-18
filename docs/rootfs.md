@@ -47,6 +47,9 @@ spore run --image docker.io/library/alpine:3.20 'echo hi'
 Without `--`, the command runs as `/bin/sh -lc` in the guest. Use
 `-- <argv...>` for exact argv. `--image` applies OCI image `Env` and
 `WorkingDir` when present. It does not apply OCI Entrypoint, Cmd, or User.
+`spore create --image` now uses the same context for its detached initial
+command and every later `spore exec`; named exec can override it per request
+with `--env` and `--workdir`.
 
 `spore build` prepares capacity automatically before the first executor-backed
 Dockerfile instruction. A supported journal-less rootfs smaller than 16 GiB

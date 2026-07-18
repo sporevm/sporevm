@@ -402,6 +402,15 @@ pub const Session = struct {
     streams: SessionStreams = .{},
 };
 
+pub const max_exec_default_env = 64;
+pub const max_exec_default_env_entry_len = 255;
+pub const max_exec_default_working_dir_len = 255;
+
+pub const ExecDefaults = struct {
+    env: []const []const u8 = &.{},
+    working_dir: ?[]const u8 = null,
+};
+
 pub const SessionAttachRequest = struct {
     id: []const u8 = default_session_id,
     stdin: bool = false,
@@ -434,7 +443,12 @@ pub const Manifest = struct {
     disk: ?Disk = null,
     network: ?Network = null,
     sessions: []const Session = &.{},
+    exec_defaults: ?ExecDefaults = null,
     memory: MemoryManifest,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyManifest(self, writer);
+    }
 };
 
 pub const ManifestV1 = struct {
@@ -448,8 +462,29 @@ pub const ManifestV1 = struct {
     disk: ?Disk = null,
     network: ?Network = null,
     sessions: []const Session = &.{},
+    exec_defaults: ?ExecDefaults = null,
     memory: MemoryManifest,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try stringifyManifest(self, writer);
+    }
 };
+
+fn stringifyManifest(manifest: anytype, writer: anytype) !void {
+    try writer.beginObject();
+    inline for (std.meta.fields(@TypeOf(manifest))) |field| {
+        if (comptime std.mem.eql(u8, field.name, "exec_defaults")) {
+            if (@field(manifest, field.name)) |defaults| {
+                try writer.objectField(field.name);
+                try writer.write(defaults);
+            }
+        } else {
+            try writer.objectField(field.name);
+            try writer.write(@field(manifest, field.name));
+        }
+    }
+    try writer.endObject();
+}
 
 // --- file helpers (libc-based; std.Io migration is a later cleanup) ---------
 
@@ -1973,6 +2008,7 @@ pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Man
 pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
     try validateAnnotations(manifest.annotations);
     try validateSessions(manifest.sessions);
+    if (manifest.exec_defaults) |defaults| try validateExecDefaults(defaults);
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
@@ -2597,6 +2633,7 @@ pub fn validateManifest(manifest: Manifest) Error!void {
         manifest.disk,
         manifest.network,
         manifest.sessions,
+        manifest.exec_defaults,
         manifest.memory,
     );
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
@@ -2614,6 +2651,7 @@ pub fn validateManifestV1(manifest: ManifestV1) Error!void {
         manifest.disk,
         manifest.network,
         manifest.sessions,
+        manifest.exec_defaults,
         manifest.memory,
     );
     try validateMachineV1(manifest.platform, manifest.machine);
@@ -2635,10 +2673,12 @@ fn validateManifestCommon(
     disk: ?Disk,
     network: ?Network,
     sessions: []const Session,
+    exec_defaults: ?ExecDefaults,
     memory: MemoryManifest,
 ) Error!void {
     try validateAnnotations(annotations);
     try validateSessions(sessions);
+    if (exec_defaults) |defaults| try validateExecDefaults(defaults);
     if (cpu_profile.len == 0) return error.BadManifest;
     if (counter_frequency_hz == 0 or
         counter_frequency_hz > std.math.maxInt(u32))
@@ -2659,6 +2699,16 @@ fn validateManifestCommon(
     }
     if (network) |n| {
         try validateNetwork(n);
+    }
+}
+
+pub fn validateExecDefaults(defaults: ExecDefaults) Error!void {
+    if (defaults.env.len > max_exec_default_env) return error.BadManifest;
+    for (defaults.env) |entry| {
+        if (entry.len > max_exec_default_env_entry_len) return error.BadManifest;
+    }
+    if (defaults.working_dir) |working_dir| {
+        if (working_dir.len == 0 or working_dir.len > max_exec_default_working_dir_len or !std.fs.path.isAbsolute(working_dir)) return error.BadManifest;
     }
 }
 
@@ -3747,6 +3797,10 @@ test "manifest json round-trip" {
             .allow_cidrs = &.{"93.184.216.34/32"},
             .allow_hosts = &.{"example.com"},
         },
+        .exec_defaults = .{
+            .env = &.{ "IMAGE_VALUE=default", "CLEAR_ME=inherited" },
+            .working_dir = "/workspace",
+        },
         .memory = testZeroMemoryManifest(1 << 29),
     };
     try saveManifest(arena, dir, manifest);
@@ -3770,8 +3824,19 @@ test "manifest json round-trip" {
     try std.testing.expectEqualStrings(network_kind_spore, parsed.value.network.?.kind);
     try std.testing.expectEqualStrings("93.184.216.34/32", parsed.value.network.?.allow_cidrs[0]);
     try std.testing.expectEqualStrings("example.com", parsed.value.network.?.allow_hosts[0]);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", parsed.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("CLEAR_ME=inherited", parsed.value.exec_defaults.?.env[1]);
+    try std.testing.expectEqualStrings("/workspace", parsed.value.exec_defaults.?.working_dir.?);
     try std.testing.expectEqualStrings("sha256:abc123", parsed.value.annotations.map.get("dev.buildkite.cleanroom.policy_hash").?);
     try std.testing.expectEqualStrings("worker", parsed.value.annotations.map.get("org.opencontainers.image.ref.name").?);
+}
+
+test "manifest omits absent exec defaults" {
+    const allocator = std.testing.allocator;
+    const manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
+    const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{});
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"exec_defaults\"") == null);
 }
 
 test "manifest loaders preserve format-too-old errors" {
@@ -4254,6 +4319,10 @@ test "fork mints child manifests with shared chunks and pending generation" {
     parent_manifest.devices = &devices;
     parent_manifest.rootfs = testRootfs(1);
     parent_manifest.disk = testDisk(1);
+    parent_manifest.exec_defaults = .{
+        .env = &.{"IMAGE_VALUE=default"},
+        .working_dir = "/workspace",
+    };
     parent_manifest.network = .{
         .allow_cidrs = &.{"93.184.216.0/24"},
         .allow_hosts = &.{"example.com"},
@@ -4274,6 +4343,8 @@ test "fork mints child manifests with shared chunks and pending generation" {
     defer first.deinit();
     try std.testing.expectEqual(@as(u64, 42), first.value.generation.generation);
     try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", first.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("/workspace", first.value.exec_defaults.?.working_dir.?);
     try std.testing.expect(first.value.generation.params_b64.len > 0);
     try std.testing.expect(first.value.machine.gic.gicv3.?.line_levels[0].asserted);
     try std.testing.expect(first.value.rootfs != null);

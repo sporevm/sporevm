@@ -42,7 +42,7 @@ const managed_kernel_download_attempts = 3;
 const max_guest_argc = 16;
 pub const max_guest_request_len = 8191;
 const max_guest_arg_len = max_guest_request_len;
-const max_guest_envc = 64;
+pub const max_guest_envc = 64;
 const max_guest_env_len = 255;
 const max_guest_working_dir_len = 255;
 const max_guest_port = 65535;
@@ -1524,11 +1524,28 @@ pub fn mergeGuestEnv(allocator: std.mem.Allocator, base: []const []const u8, ove
     if (overrides.len == 0) return base;
     var out = std.array_list.Managed([]const u8).init(allocator);
     for (base) |entry| {
-        if (!guestEnvHasKey(overrides, guestEnvEntryKey(entry))) try out.append(entry);
+        if (!guestEnvHasKey(overrides, inheritedGuestEnvEntryKey(entry))) try out.append(entry);
     }
     for (overrides) |entry| try out.append(entry);
     if (out.items.len > max_guest_envc) return error.RunEnvCountUnsupported;
     return out.toOwnedSlice();
+}
+
+pub fn mergeGuestEnvInto(out: [][]const u8, base: []const []const u8, overrides: []const []const u8) ![]const []const u8 {
+    var len: usize = 0;
+    for (base) |entry| {
+        if (!guestEnvHasKey(overrides, inheritedGuestEnvEntryKey(entry))) {
+            if (len >= out.len or len >= max_guest_envc) return error.RunEnvCountUnsupported;
+            out[len] = entry;
+            len += 1;
+        }
+    }
+    for (overrides) |entry| {
+        if (len >= out.len or len >= max_guest_envc) return error.RunEnvCountUnsupported;
+        out[len] = entry;
+        len += 1;
+    }
+    return out[0..len];
 }
 
 fn upsertGuestEnvEntry(entries: *std.array_list.Managed([]const u8), entry: []const u8) !void {
@@ -1559,6 +1576,10 @@ fn guestEnvEntryKey(entry: []const u8) ?[]const u8 {
     const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return null;
     if (eq == 0) return null;
     return entry[0..eq];
+}
+
+fn inheritedGuestEnvEntryKey(entry: []const u8) ?[]const u8 {
+    return guestEnvEntryKey(entry) orelse if (entry.len != 0) entry else null;
 }
 
 fn validateGuestEnvKey(key: []const u8) !void {
@@ -3732,6 +3753,22 @@ pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []cons
     });
 }
 
+pub const ExecRequestContextOptions = struct {
+    env: []const []const u8 = &.{},
+    working_dir: ?[]const u8 = null,
+    resume_time_unix_ns: u64 = 0,
+    generation_params: ?[]const u8 = null,
+};
+
+pub fn execRequestWithSessionContext(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: ExecRequestContextOptions) ![]const u8 {
+    return execRequestWithSessionOptions(allocator, argv, session_id, .{
+        .env = options.env,
+        .working_dir = options.working_dir,
+        .resume_time_unix_ns = options.resume_time_unix_ns,
+        .generation_params = options.generation_params,
+    });
+}
+
 pub fn execRequestWithSessionGenerationParams(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64, generation_params: []const u8) ![]const u8 {
     return execRequestWithSessionOptions(allocator, argv, session_id, .{
         .resume_time_unix_ns = resume_time_unix_ns,
@@ -3740,6 +3777,8 @@ pub fn execRequestWithSessionGenerationParams(allocator: std.mem.Allocator, argv
 }
 
 pub const InteractiveExecRequestOptions = struct {
+    env: []const []const u8 = &.{},
+    working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
     terminal_name: []const u8 = "xterm",
@@ -3749,6 +3788,8 @@ pub const InteractiveExecRequestOptions = struct {
 
 pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: InteractiveExecRequestOptions) ![]const u8 {
     const exec_options = GuestExecOptions{
+        .env = options.env,
+        .working_dir = options.working_dir,
         .interactive = options.interactive,
         .tty = options.tty,
         .terminal_name = options.terminal_name,
@@ -3761,21 +3802,30 @@ pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []c
 }
 
 pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64) ![]const u8 {
+    return detachedExecRequestWithSessionContext(allocator, argv, session_id, .{
+        .resume_time_unix_ns = resume_time_unix_ns,
+    });
+}
+
+pub fn detachedExecRequestWithSessionContext(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: ExecRequestContextOptions) ![]const u8 {
     try validateGuestArgv(argv);
+    try validateGuestExecContext(options.env, options.working_dir);
     const payload = struct {
         type: []const u8 = "start",
         session_id: []const u8,
         resume_time_unix_ns: u64,
         argv: []const []const u8,
-        env: []const []const u8 = &.{},
-        working_dir: []const u8 = "",
+        env: []const []const u8,
+        working_dir: []const u8,
         memory_pressure: bool = false,
         detached: bool = true,
         closed_env: bool = true,
     }{
         .session_id = session_id,
-        .resume_time_unix_ns = resume_time_unix_ns,
+        .resume_time_unix_ns = options.resume_time_unix_ns,
         .argv = argv,
+        .env = options.env,
+        .working_dir = options.working_dir orelse "",
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -4198,12 +4248,16 @@ fn validateGuestArgv(argv: []const []const u8) !void {
 }
 
 fn validateGuestExecOptions(options: GuestExecOptions) !void {
-    if (options.env.len > max_guest_envc) return error.RunEnvCountUnsupported;
-    for (options.env) |entry| {
+    try validateGuestExecContext(options.env, options.working_dir);
+}
+
+pub fn validateGuestExecContext(env: []const []const u8, working_dir: ?[]const u8) !void {
+    if (env.len > max_guest_envc) return error.RunEnvCountUnsupported;
+    for (env) |entry| {
         if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
     }
-    if (options.working_dir) |dir| {
-        if (dir.len == 0 or dir.len > max_guest_working_dir_len) return error.RunWorkingDirUnsupported;
+    if (working_dir) |dir| {
+        if (dir.len == 0 or dir.len > max_guest_working_dir_len or !std.fs.path.isAbsolute(dir)) return error.RunWorkingDirUnsupported;
     }
 }
 
@@ -4278,9 +4332,13 @@ test "run request can encode explicit session id" {
 }
 
 test "run detached exec request asks guest to start without waiting" {
-    const request = try detachedExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-1", 1_700_000_000_000_000_000);
+    const request = try detachedExecRequestWithSessionContext(std.testing.allocator, &.{"/bin/true"}, "lifecycle-1", .{
+        .env = &.{"SPORE_CONTEXT=detached"},
+        .working_dir = "/work",
+        .resume_time_unix_ns = 1_700_000_000_000_000_000,
+    });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"detached\":true,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[\"SPORE_CONTEXT=detached\"],\"working_dir\":\"/work\",\"memory_pressure\":false,\"detached\":true,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {
@@ -4340,13 +4398,19 @@ test "cli env specs reject empty keys and missing host values" {
 }
 
 test "cli env overrides image env by key" {
-    const merged = try mergeGuestEnv(std.testing.allocator, &.{ "PATH=/bin", "KEEP=1" }, &.{ "PATH=/usr/bin", "NEW=2" });
+    const merged = try mergeGuestEnv(std.testing.allocator, &.{ "PATH", "KEEP=1" }, &.{ "PATH=/usr/bin", "NEW=2" });
     defer std.testing.allocator.free(merged);
 
     try std.testing.expectEqual(@as(usize, 3), merged.len);
     try std.testing.expectEqualStrings("KEEP=1", merged[0]);
     try std.testing.expectEqualStrings("PATH=/usr/bin", merged[1]);
     try std.testing.expectEqualStrings("NEW=2", merged[2]);
+
+    var buffer: [max_guest_envc][]const u8 = undefined;
+    const cleared = try mergeGuestEnvInto(&buffer, &.{ "CLEAR_ME", "KEEP=1" }, &.{"CLEAR_ME="});
+    try std.testing.expectEqual(@as(usize, 2), cleared.len);
+    try std.testing.expectEqualStrings("KEEP=1", cleared[0]);
+    try std.testing.expectEqualStrings("CLEAR_ME=", cleared[1]);
 }
 
 test "image rootfs metadata supplies run env and working directory" {
@@ -4724,10 +4788,15 @@ test "interactive run request uses start v1 pipe stdio" {
 }
 
 test "streaming exec request uses start v1 with closed pipe stdin" {
-    const request = try interactiveExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "default", .{});
+    const request = try interactiveExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "default", .{
+        .env = &.{"SPORE_CONTEXT=stream"},
+        .working_dir = "/workspace",
+    });
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"env\":[\"SPORE_CONTEXT=stream\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"working_dir\":\"/workspace\"") != null);
 }
 
 test "tty run request uses start v1 terminal metadata" {

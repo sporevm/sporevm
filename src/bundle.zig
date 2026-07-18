@@ -3993,7 +3993,12 @@ test "pack and unpack chunkpack bundle strips local backing" {
     ram[9] = 0xA1;
     ram[2 * spore.chunk_size + 3] = 0xB2;
     const memory = try spore.saveMemoryWithBacking(arena, parent_dir, ram);
-    try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 7));
+    var source_manifest = testManifest(memory, ram.len, 7);
+    source_manifest.exec_defaults = .{
+        .env = &.{"IMAGE_VALUE=default"},
+        .working_dir = "/workspace",
+    };
+    try spore.saveManifest(arena, parent_dir, source_manifest);
 
     const pack_result = try pack(arena, .{ .io = std.testing.io, .spore_dir = parent_dir, .out_dir = bundle_dir });
     try std.testing.expectEqual(@as(usize, 3), pack_result.chunk_count);
@@ -4005,6 +4010,8 @@ test "pack and unpack chunkpack bundle strips local backing" {
     const bundle_manifest = try spore.loadManifest(arena, bundle_dir);
     defer bundle_manifest.deinit();
     try std.testing.expect(bundle_manifest.value.memory.backing == null);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", bundle_manifest.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("/workspace", bundle_manifest.value.exec_defaults.?.working_dir.?);
     const backing_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, spore.ram_backing_path });
     try std.testing.expect(std.c.access(backing_path, 0) != 0);
 
@@ -4027,6 +4034,8 @@ test "pack and unpack chunkpack bundle strips local backing" {
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();
     try std.testing.expect(restored_manifest.value.memory.backing == null);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", restored_manifest.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("/workspace", restored_manifest.value.exec_defaults.?.working_dir.?);
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0xCC);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
@@ -4052,7 +4061,12 @@ test "pack and unpack preserves manifest v1" {
     ram[ram.len - 1] = 0x42;
     const memory = try spore.saveMemoryWithBacking(arena, parent_dir, ram);
     var vcpus = [_]spore.VcpuState{ testVcpuState(0), testVcpuState(1) };
-    try spore.saveManifestV1(arena, parent_dir, testManifestV1(memory, ram.len, &vcpus));
+    var source_manifest = testManifestV1(memory, ram.len, &vcpus);
+    source_manifest.exec_defaults = .{
+        .env = &.{"IMAGE_VALUE=default"},
+        .working_dir = "/workspace",
+    };
+    try spore.saveManifestV1(arena, parent_dir, source_manifest);
 
     _ = try pack(arena, .{ .io = io, .spore_dir = parent_dir, .out_dir = bundle_dir });
     try std.testing.expectError(error.BadManifest, spore.loadManifest(arena, bundle_dir));
@@ -4061,12 +4075,16 @@ test "pack and unpack preserves manifest v1" {
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), bundle_manifest.value.platform.vcpu_count);
     try std.testing.expect(bundle_manifest.value.memory.backing == null);
     try std.testing.expectEqual(gicv3.StateKind.backend_private, bundle_manifest.value.machine.gic.kind);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", bundle_manifest.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("/workspace", bundle_manifest.value.exec_defaults.?.working_dir.?);
 
     _ = try unpack(arena, .{ .io = io, .bundle_dir = bundle_dir, .out_dir = out_dir });
     const restored_manifest = try spore.loadManifestV1(arena, out_dir);
     defer restored_manifest.deinit();
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), restored_manifest.value.platform.vcpu_count);
     try std.testing.expect(restored_manifest.value.memory.backing == null);
+    try std.testing.expectEqualStrings("IMAGE_VALUE=default", restored_manifest.value.exec_defaults.?.env[0]);
+    try std.testing.expectEqualStrings("/workspace", restored_manifest.value.exec_defaults.?.working_dir.?);
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0xCC);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
