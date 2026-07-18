@@ -10,6 +10,7 @@ const disk_index = @import("disk_index.zig");
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
 const local_paths = @import("local_paths.zig");
+const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -26,6 +27,7 @@ const rootfs_eager_materialize_env = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCH
 
 const testing = if (builtin.is_test) struct {
     var local_rootfs_object_reads: ?*usize = null;
+    var saved_spore_authority_barrier: ?*@import("test_barrier.zig").Barrier = null;
 } else struct {};
 
 pub const Options = struct {
@@ -290,9 +292,23 @@ const SavedDiskAuthority = struct { root: []const u8, runtime_lease: ?runtime_di
 fn resolveSavedDiskRoot(context: Context, allocator: std.mem.Allocator, options: Options, disk: spore.Disk) !SavedDiskAuthority {
     if (options.disk_root) |root| return .{ .root = try allocator.dupe(u8, root) };
     const spore_dir = options.spore_dir orelse return error.BadManifest;
+    const lease_runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
+    defer allocator.free(lease_runtime_root);
+    var lease_lock = try runtime_disk_lease.lockRegistry(context.io, allocator, lease_runtime_root);
+    defer lease_lock.deinit();
     if (try saved_spore_pin.hasLocalIndex(context.io, allocator, spore_dir, disk)) {
-        return .{ .root = try allocator.dupe(u8, spore_dir) };
+        var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+        const root_len = try Io.Dir.cwd().realPathFile(context.io, spore_dir, &root_buf);
+        const root = try allocator.dupe(u8, root_buf[0..root_len]);
+        errdefer allocator.free(root);
+        const lease = try runtime_disk_lease.fromSavedDisk(root, disk);
+        if (comptime builtin.is_test) if (testing.saved_spore_authority_barrier) |barrier| barrier.pause(context.io);
+        return .{
+            .root = root,
+            .runtime_lease = try runtime_disk_lease.acquireActiveLocked(context.io, allocator, lease_runtime_root, lease, &lease_lock),
+        };
     }
+    lease_lock.deinit();
     const configured_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(configured_root);
     const cache_root = if (std.fs.path.isAbsolute(configured_root))
@@ -1576,4 +1592,103 @@ test "runtime disk restores chunk-index disk manifests" {
     defer missing_runtime.deinit();
     var missing_byte: [1]u8 = undefined;
     try std.testing.expectError(error.MissingChunk, missing_runtime.chunk_mapped.?.readAt(&missing_byte, local_index.value.chunks[0].logical_chunk * storage.chunk_size));
+}
+
+test "foreground local CAS lease serializes concurrent saved-spore removal" {
+    const saved_spore_remove = @import("saved_spore_remove.zig");
+    const test_barrier = @import("test_barrier.zig");
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const spore_dir = try std.fs.path.join(arena, &.{ root, "portable.spore" });
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, spore_dir, 0x51, true);
+    try spore.saveManifest(arena, spore_dir, fixture.manifest);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    try env.put(local_paths.runtime_dir_env, runtime_root);
+    const context = Context{ .io = io, .environ_map = &env };
+
+    var restore_boundary = test_barrier.Barrier{};
+    testing.saved_spore_authority_barrier = &restore_boundary;
+    defer testing.saved_spore_authority_barrier = null;
+    const RestoreContext = struct {
+        allocator: std.mem.Allocator,
+        context: Context,
+        spore_dir: []const u8,
+        disk: spore.Disk,
+        authority: ?SavedDiskAuthority = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.authority = resolveSavedDiskRoot(self.context, self.allocator, .{ .spore_dir = self.spore_dir }, self.disk) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var restore_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer restore_arena_state.deinit();
+    var restore_context = RestoreContext{
+        .allocator = restore_arena_state.allocator(),
+        .context = context,
+        .spore_dir = spore_dir,
+        .disk = fixture.disk,
+    };
+    var restore_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, RestoreContext.run, .{&restore_context}),
+        .barriers = &.{&restore_boundary},
+    };
+    defer restore_thread.deinit();
+    restore_boundary.waitReached(io);
+
+    const RemoveContext = struct {
+        allocator: std.mem.Allocator,
+        context: Context,
+        spore_dir: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const removed = saved_spore_remove.remove(self.context, self.allocator, self.spore_dir) catch |err| {
+                self.err = err;
+                return;
+            };
+            saved_spore_remove.deinit(self.allocator, removed);
+        }
+    };
+    var remove_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer remove_arena_state.deinit();
+    var remove_blocked = Io.Semaphore{};
+    runtime_disk_lease.testing.registry_lock_blocked = &remove_blocked;
+    defer runtime_disk_lease.testing.registry_lock_blocked = null;
+    var remove_context = RemoveContext{
+        .allocator = remove_arena_state.allocator(),
+        .context = context,
+        .spore_dir = spore_dir,
+    };
+    var remove_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, RemoveContext.run, .{&remove_context}),
+        .barriers = &.{},
+    };
+    defer remove_thread.deinit();
+    remove_blocked.waitUncancelable(io);
+    restore_boundary.release(io);
+    restore_thread.join();
+    remove_thread.join();
+    if (restore_context.err) |err| return err;
+    try std.testing.expectEqual(error.SavedSporeInUse, remove_context.err orelse return error.TestUnexpectedResult);
+    var authority = restore_context.authority orelse return error.TestUnexpectedResult;
+    defer restore_arena_state.allocator().free(authority.root);
+    if (authority.runtime_lease) |*active| active.deinit();
+    authority.runtime_lease = null;
+    _ = try Io.Dir.cwd().statFile(io, spore_dir, .{ .follow_symlinks = false });
 }

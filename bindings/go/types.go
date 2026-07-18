@@ -360,7 +360,7 @@ type RemoveNamedOptions struct {
 	Name string
 }
 
-// RemoveSavedOptions removes a machine-local saved spore and, when present, its durable disk pin.
+// RemoveSavedOptions selects a saved spore whose verified pinned or portable disk authority will be removed.
 type RemoveSavedOptions struct {
 	SporeDir string
 }

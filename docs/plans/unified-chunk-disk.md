@@ -1359,9 +1359,13 @@ performs a one-time verified migration into the global CAS; the exact-head
 measurements above report it separately from steady-state save and the existing
 same-/cross-filesystem export evidence.
 `spore rm --spore` removes a valid diskless save without creating pin
-authority. For disk-backed saves it removes the visible directory and syncs
-its parent before unpinning under the cache lock. Raw moves preserve the opaque
-identity, while
+authority. Portable disk-backed spores from pack/unpack or pull own their
+authoritative index locally, so removal deletes and syncs the self-contained
+directory without touching the host pin registry. Descriptor and object
+verification precedes deletion, and serialized active runtime leases prevent
+removal while foreground or named lazy restores still use that directory. For machine-local
+disk-backed saves it removes the visible directory and syncs its parent before
+unpinning under the cache lock. Raw moves preserve the opaque identity, while
 raw copies share it and cannot be removed independently; fork or pack/unpack
 creates an independent lifecycle boundary. Raw deletion safely leaks a pin.
 `spore cache pins` reports IDs and index health without claiming orphan

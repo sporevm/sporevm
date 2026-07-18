@@ -232,9 +232,11 @@ needed.
 
 Use `removeSavedSpore` to remove a saved-spore directory and unregister its
 durable disk pin when present. `RemovedSavedSpore.pin_removed` distinguishes
-disk-backed removal from a diskless save; `pin_id` is empty for the diskless
-case. The owned `spore_dir` and `pin_id` must be released with
-`deinitRemovedSavedSpore`.
+machine-local pinned removal from diskless or portable local-CAS removal;
+`pin_id` is empty when no durable pin existed. The owned `spore_dir` and
+`pin_id` must be released with
+`deinitRemovedSavedSpore`. Portable removal returns `SavedSporeInUse` while a
+live restore still owns the directory as lazy disk authority.
 
 Use `run` only when you already have explicit kernel and rootfs or disk inputs.
 

@@ -218,14 +218,22 @@ manifest without dropping create-time annotations:
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
-Delete a machine-local saved spore with `spore rm --spore DIR`. Diskless saves
+Delete a saved spore with `spore rm --spore DIR`. Diskless saves
 have no pin, so removal validates the manifest, deletes the directory, and
-durably syncs its parent. Disk-backed removal keeps the cache lock while it
-validates the pin, deletes the visible save, syncs the parent, and unregisters
-the pin. Raw `rm -rf` cannot make live CAS data collectable, but it leaks a
-disk pin. `spore cache pins` lists pin IDs and canonical-index health; it does
-not track save paths or claim to detect orphans. An operator who already knows
-that an exact pin ID is unused may remove it with the expert-only
+durably syncs its parent. Portable disk-backed spores from pack/unpack or pull
+carry their authoritative disk index locally and likewise have no host-private
+pin, so removal verifies the descriptor-bound index and referenced objects,
+then deletes and syncs only that self-contained directory. Foreground and named
+restores publish active authority records for lazy disk faults; removal returns
+`SavedSporeInUse` until those readers stop. Corrupt or partial local CAS state,
+and ambiguous directories containing both local CAS and a host-private pin
+reference, fail closed without deleting either authority.
+Machine-local disk-backed removal keeps the cache lock while it validates the
+pin, deletes the visible save, syncs the parent, and unregisters the pin. Raw
+`rm -rf` cannot make live CAS data collectable, but it leaks a disk pin. `spore
+cache pins` lists pin IDs and canonical-index health; it does not track save
+paths or claim to detect orphans. An operator who already knows that an exact
+pin ID is unused may remove it with the expert-only
 `spore cache unpin PIN_ID --force`; this can invalidate every raw copy sharing
 that identity.
 

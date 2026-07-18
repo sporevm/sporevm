@@ -1023,9 +1023,19 @@ const SavedDiskLeaseHandoff = struct {
 };
 
 fn leaseForSavedDisk(io: Io, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, spore_dir: []const u8, disk: spore.Disk) !SavedDiskLeaseHandoff {
+    const lease_runtime_root = try local_paths.runtimeRootPath(allocator, environ);
+    defer allocator.free(lease_runtime_root);
+    var lease_lock = try runtime_disk_lease.lockRegistry(io, allocator, lease_runtime_root);
+    defer lease_lock.deinit();
     if (try saved_spore_pin.hasLocalIndex(io, allocator, spore_dir, disk)) {
-        return .{ .lease = try runtime_disk_lease.fromSavedDisk(spore_dir, disk) };
+        const lease = try runtime_disk_lease.fromSavedDisk(spore_dir, disk);
+        if (comptime builtin.is_test) if (testing.named_restore_authority_barrier) |barrier| barrier.pause(io);
+        return .{
+            .lease = lease,
+            .active = try runtime_disk_lease.acquireActiveLocked(io, allocator, lease_runtime_root, lease, &lease_lock),
+        };
     }
+    lease_lock.deinit();
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, environ);
     var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache_root);
     defer cache_lock.deinit();
@@ -1045,7 +1055,7 @@ fn leaseForSavedDisk(io: Io, allocator: std.mem.Allocator, environ: *const std.p
         if (comptime builtin.is_test) if (testing.named_restore_authority_barrier) |barrier| barrier.pause(io);
         return .{ .lease = lease, .active = active };
     } else |err| switch (err) {
-        error.FileNotFound => return .{ .lease = try runtime_disk_lease.fromSavedDisk(spore_dir, disk) },
+        error.FileNotFound => return error.FileNotFound,
         else => |e| return e,
     }
 }
@@ -3431,10 +3441,12 @@ fn temporarySiblingOutputDir(allocator: std.mem.Allocator, io: Io, out_dir: []co
 
 fn resolveExistingSporeDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
     const path = try std.fs.path.resolve(allocator, &.{raw});
-    errdefer allocator.free(path);
+    defer allocator.free(path);
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != Io.File.Kind.directory) return error.InvalidSporeDir;
-    return path;
+    var real_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const real_len = try Io.Dir.cwd().realPathFile(io, path, &real_buf);
+    return allocator.dupe(u8, real_buf[0..real_len]);
 }
 
 fn pathExists(io: Io, path: []const u8) !bool {
@@ -6547,7 +6559,111 @@ test "named restore lease planning prefers local CAS over stale pin reference" {
     defer if (handoff.active) |*active| active.deinit();
     try std.testing.expectEqual(runtime_disk_lease.Store.saved_spore, handoff.lease.store);
     try std.testing.expectEqualStrings(spore_dir, handoff.lease.root);
-    try std.testing.expect(handoff.active == null);
+    try std.testing.expect(handoff.active != null);
+}
+
+test "named restore local CAS lease blocks concurrent saved-spore removal" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const spore_dir = try std.fs.path.join(arena, &.{ root, "portable.spore" });
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, spore_dir, 0x71, true);
+    try spore.saveManifest(arena, spore_dir, fixture.manifest);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    try env.put(local_paths.runtime_dir_env, runtime_root);
+
+    var restore_boundary = test_barrier.Barrier{};
+    testing.named_restore_authority_barrier = &restore_boundary;
+    defer testing.named_restore_authority_barrier = null;
+    const RestoreContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        env: *const std.process.Environ.Map,
+        spore_dir: []const u8,
+        disk: spore.Disk,
+        handoff: ?SavedDiskLeaseHandoff = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.handoff = leaseForSavedDisk(self.io, self.allocator, self.env, self.spore_dir, self.disk) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var restore_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer restore_arena_state.deinit();
+    var restore_context = RestoreContext{
+        .allocator = restore_arena_state.allocator(),
+        .io = io,
+        .env = &env,
+        .spore_dir = spore_dir,
+        .disk = fixture.disk,
+    };
+    var restore_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, RestoreContext.run, .{&restore_context}),
+        .barriers = &.{&restore_boundary},
+    };
+    defer restore_thread.deinit();
+    restore_boundary.waitReached(io);
+
+    const RemoveContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        env: *const std.process.Environ.Map,
+        spore_dir: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const removed = removeSavedSpore(.{ .io = self.io, .environ_map = self.env }, self.allocator, self.spore_dir) catch |err| {
+                self.err = err;
+                return;
+            };
+            deinitRemovedSavedSpore(self.allocator, removed);
+        }
+    };
+    var remove_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer remove_arena_state.deinit();
+    var remove_blocked = Io.Semaphore{};
+    runtime_disk_lease.testing.registry_lock_blocked = &remove_blocked;
+    defer runtime_disk_lease.testing.registry_lock_blocked = null;
+    var remove_context = RemoveContext{
+        .allocator = remove_arena_state.allocator(),
+        .io = io,
+        .env = &env,
+        .spore_dir = spore_dir,
+    };
+    var remove_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, RemoveContext.run, .{&remove_context}),
+        .barriers = &.{},
+    };
+    defer remove_thread.deinit();
+    remove_blocked.waitUncancelable(io);
+    restore_boundary.release(io);
+    restore_thread.join();
+    remove_thread.join();
+    if (restore_context.err) |err| return err;
+    try std.testing.expectEqual(error.SavedSporeInUse, remove_context.err orelse return error.TestUnexpectedResult);
+    var handoff = restore_context.handoff orelse return error.TestUnexpectedResult;
+    try std.testing.expect(handoff.active != null);
+    _ = try Io.Dir.cwd().statFile(io, spore_dir, .{ .follow_symlinks = false });
+    if (handoff.active) |*active| active.deinit();
+    handoff.active = null;
+
+    const removed = try removeSavedSpore(.{ .io = io, .environ_map = &env }, allocator, spore_dir);
+    defer deinitRemovedSavedSpore(allocator, removed);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, spore_dir, .{ .follow_symlinks = false }));
 }
 
 test "named restore active lease survives concurrent saved-spore removal and destructive collection" {
