@@ -2,6 +2,16 @@
 
 ## Next
 
+`spore rm --spore` now removes disk-backed spores produced by `spore unpack`
+or `spore pull`. These portable spores carry their authoritative disk index
+inside the directory and do not have a host-private durable pin, so removal
+deletes and syncs the self-contained directory while reporting
+`pin_removed: false`. Machine-local disk-backed saves retain the existing
+validate-delete-sync-unpin ordering, and an unpinned disk manifest without a
+verified complete local authority still fails closed without deleting the
+directory. Portable removal also fails closed while a foreground or named
+restore owns the directory for lazy disk reads.
+
 `spore build` now accepts context-form `COPY --parents[=true|false]` with
 multiple regular-file, directory, and glob sources. The true form reconstructs
 each selected source's cleaned root-relative path below the destination,

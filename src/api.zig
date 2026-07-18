@@ -1141,7 +1141,7 @@ pub fn removeNamed(
     return lifecycle.removeNamed(context, allocator, options);
 }
 
-/// Remove a machine-local saved spore and unregister its durable CAS pin.
+/// Remove a saved spore and release its verified pinned or portable disk authority.
 pub fn removeSavedSpore(context: Context, allocator: std.mem.Allocator, spore_dir: []const u8) !RemovedSavedSpore {
     return lifecycle.removeSavedSpore(context, allocator, spore_dir);
 }

@@ -258,11 +258,14 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_resume_generation_params);
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
-    if (spec_disk_baseline_lease) |lease| if (lease.store == .rootfs_cache) {
-        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, lease.root);
-        defer cache_lock.deinit();
+    if (spec_disk_baseline_lease) |lease| {
+        var cache_lock: ?rootfs_mod.RootfsCacheLock = if (lease.store == .rootfs_cache)
+            try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, lease.root)
+        else
+            null;
+        defer if (cache_lock) |*lock| lock.deinit();
         server.disk_baseline_active = try runtime_disk_lease.acquireActive(init.io, allocator, paths.runtime_root, lease);
-    };
+    }
     if (gateway_active) server.network_events = &gateway;
     const metadata_ms = lifecycle.monotonicMs();
     server.startup = .{

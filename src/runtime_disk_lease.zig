@@ -14,12 +14,22 @@ const active_file_prefix = "runtime-";
 const active_file_suffix = ".json";
 const active_nonce_bytes = 16;
 const max_active_lease_bytes = 64 * 1024;
+const registry_lock_name = ".disk-baseline-leases.lock";
+const flock_exclusive: c_int = 2;
+const flock_nonblocking: c_int = 4;
+const flock_unlock: c_int = 8;
 const private_dir_permissions: Io.File.Permissions = if (builtin.os.tag == .windows)
     .default_dir
 else
     @enumFromInt(0o700);
 
 pub const OwnerPid = if (builtin.os.tag == .windows) i32 else std.posix.pid_t;
+
+pub const testing = if (builtin.is_test) struct {
+    /// Posted only after a nonblocking registry-lock attempt proves another
+    /// owner holds the lock, immediately before the normal blocking acquire.
+    pub var registry_lock_blocked: ?*Io.Semaphore = null;
+} else struct {};
 
 pub const Store = enum {
     rootfs_cache,
@@ -71,6 +81,41 @@ pub const Active = struct {
         self.* = undefined;
     }
 };
+
+/// Serializes live-authority publication with destructive saved-spore
+/// removal. Callers that inspect active records before deleting an authority
+/// root must hold this lock until deletion is committed.
+pub const RegistryLock = struct {
+    fd: std.c.fd_t,
+
+    pub fn deinit(self: *RegistryLock) void {
+        if (self.fd >= 0) {
+            _ = std.c.flock(self.fd, flock_unlock);
+            _ = std.c.close(self.fd);
+            self.fd = -1;
+        }
+    }
+};
+
+pub fn lockRegistry(io: Io, allocator: std.mem.Allocator, runtime_root: []const u8) !RegistryLock {
+    try ensurePrivateDir(io, runtime_root);
+    const path = try std.fs.path.resolve(allocator, &.{ runtime_root, registry_lock_name });
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
+    if (fd < 0) return error.IoFailed;
+    errdefer _ = std.c.close(fd);
+    if (comptime builtin.is_test) {
+        if (testing.registry_lock_blocked) |blocked| {
+            if (std.c.flock(fd, flock_exclusive | flock_nonblocking) == 0) return .{ .fd = fd };
+            if (std.c.errno(-1) != .AGAIN) return error.IoFailed;
+            blocked.post(io);
+        }
+    }
+    if (std.c.flock(fd, flock_exclusive) != 0) return error.IoFailed;
+    return .{ .fd = fd };
+}
 
 pub const ActiveIterator = struct {
     allocator: std.mem.Allocator,
@@ -137,6 +182,19 @@ pub fn acquireActive(
     runtime_root: []const u8,
     lease: Lease,
 ) !Active {
+    var lock = try lockRegistry(io, allocator, runtime_root);
+    defer lock.deinit();
+    return acquireActiveLocked(io, allocator, runtime_root, lease, &lock);
+}
+
+pub fn acquireActiveLocked(
+    io: Io,
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    lease: Lease,
+    lock: *const RegistryLock,
+) !Active {
+    if (lock.fd < 0) return error.IoFailed;
     try lease.validate();
     try ensurePrivateDir(io, runtime_root);
     const active_dir = try std.fs.path.resolve(allocator, &.{ runtime_root, active_dir_name });
@@ -166,6 +224,28 @@ pub fn acquireActive(
     defer file.close(io);
     try file.writeStreamingAll(io, json);
     return .{ .allocator = allocator, .io = io, .path = path };
+}
+
+pub fn savedSporeActiveLocked(
+    io: Io,
+    allocator: std.mem.Allocator,
+    runtime_root: []const u8,
+    spore_dir: []const u8,
+    lock: *const RegistryLock,
+) !bool {
+    if (lock.fd < 0) return error.IoFailed;
+    var active = try ActiveIterator.init(allocator, io, runtime_root);
+    defer active.deinit();
+    while (try active.next()) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        const lease = parsed.value;
+        // Removal destroys the whole authority root. A live lazy runtime may
+        // still own an older descriptor after the manifest is replaced, so
+        // the canonical root alone is the destructive-safety boundary.
+        if (lease.store == .saved_spore and std.mem.eql(u8, lease.root, spore_dir)) return true;
+    }
+    return false;
 }
 
 pub fn activeOwnerPid(file_name: []const u8) ?OwnerPid {

@@ -50,7 +50,16 @@ destructive prune retain all CAS. Raw filesystem deletion can leak a pin but
 cannot expose live data to collection. Raw copies share a pin identity, so
 explicit removal or expert-only force-unpin can invalidate every copy; the
 cache lists exact IDs and index health but does not infer orphan status from a
-global reference registry.
+global reference registry. Portable unpack and pull instead materialize a
+descriptor-bound local CAS inside the saved-spore directory. Destructive
+removal classifies that authority only after verifying the canonical index and
+every referenced object against their BLAKE3 digests; a simultaneous
+host-private pin reference fails closed. Foreground and named restore publish
+host-private active saved-spore leases before releasing the registry lock that
+serializes authority selection with removal. Removal refuses any live lease
+for the canonical directory, regardless of the descriptor currently named by
+its manifest, then holds the same lock through deletion. This changes no
+portable manifest, device, or public API format.
 
 | Surface | Input source | Status |
 |---|---|---|
