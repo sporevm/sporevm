@@ -13,6 +13,7 @@ const remote_add = @import("build/remote_add.zig");
 const build_plan = @import("build/plan.zig");
 const variable_expansion = @import("build/variables.zig");
 const step_cache = @import("build/step_cache.zig");
+const backend_mod = @import("backend.zig");
 const disk_index = @import("disk_index.zig");
 const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
@@ -188,6 +189,8 @@ const CachedMetadata = struct {
 const automatic_build_capacity_bytes: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Result {
+    _ = try backend_mod.requireProductRunner(.auto);
+
     var local_diagnostic: Diagnostic = .{};
     const diagnostic = options.diagnostic orelse &local_diagnostic;
     diagnostic.* = .{};
@@ -471,6 +474,33 @@ fn preflightBuildDeviceEnvelope(
             diagnostic.instruction_line = cache_line;
             return error.RunCacheMountDeviceBudgetUnsupported;
         }
+    }
+}
+
+test "build requires a product runner before reading inputs" {
+    if (backend_mod.requireProductRunner(.auto)) |_| {
+        return error.SkipZigTest;
+    } else |expected_err| {
+        const allocator = std.testing.allocator;
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        var env = std.process.Environ.Map.init(allocator);
+        defer env.deinit();
+        const init = testInit(allocator, std.testing.io, &arena_state, &env);
+        var diagnostic: Diagnostic = .{};
+
+        _ = build(init, arena_state.allocator(), .{
+            .tag = "local/runner-gate:dev",
+            .context_dir = "zig-cache/test-spore-build-runner-gate/missing-context",
+            .dockerfile_path = "zig-cache/test-spore-build-runner-gate/missing-Dockerfile",
+            .diagnostic = &diagnostic,
+        }) catch |actual_err| {
+            try std.testing.expectEqual(expected_err, actual_err);
+            try std.testing.expect(diagnostic.missing_input == null);
+            return;
+        };
+
+        return error.TestExpectedError;
     }
 }
 

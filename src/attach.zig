@@ -5,13 +5,12 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const attach_stream = @import("attach_stream.zig");
+const backend_mod = @import("backend.zig");
 const Context = @import("context.zig").Context;
 const fd_util = @import("fd.zig");
 const hvf = @import("hvf/hvf.zig");
-const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
-    @import("kvm/kvm.zig")
-else
-    struct {};
+const kvm_native = @import("kvm/native.zig");
+const kvm = kvm_native.binding;
 const net_gateway = @import("net_gateway.zig");
 const ram_restore = @import("ram_restore.zig");
 const generation = @import("generation.zig");
@@ -165,6 +164,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     try events.emitStart(opts.backend);
     errdefer |err| events.emitFailure(err) catch {};
 
+    const backend = try backend_mod.requireProductRunner(opts.backend);
+    events.setBackend(backend);
+
     var parsed: ?std.json.Parsed(spore.Manifest) = spore.loadManifest(allocator, opts.spore_dir) catch |err| blk: {
         if (err != error.BadManifest) return @errorCast(err);
         break :blk null;
@@ -245,8 +247,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (stdin_control) |*control| control.deinit();
     const exec_control = if (stdin_control) |*control| control.control() else null;
 
-    const backend = try opts.backend.resolveForHost();
-    events.setBackend(backend);
     if (gateway_active) try events.emitPortForwards(&network_options.policy);
     const ram_size = if (parsed) |manifest| manifest.value.platform.ram_size else parsed_v1.?.value.platform.ram_size;
     const vcpu_count = if (parsed) |_| @as(u32, 1) else parsed_v1.?.value.platform.vcpu_count;

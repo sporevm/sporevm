@@ -6,16 +6,15 @@ const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const attach_stream = @import("attach_stream.zig");
+const backend_mod = @import("backend.zig");
 const capture = @import("capture.zig");
 const Context = @import("context.zig").Context;
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
 const hvf = @import("hvf/hvf.zig");
-const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
-    @import("kvm/kvm.zig")
-else
-    struct {};
+const kvm_native = @import("kvm/native.zig");
+const kvm = kvm_native.binding;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
@@ -102,45 +101,7 @@ pub const ClassifiedFailure = machine_output.CliError;
 pub const FailureCode = machine_output.ErrorCode;
 pub const FailureScope = machine_output.Scope;
 
-pub const Backend = enum {
-    auto,
-    hvf,
-    kvm,
-
-    pub fn parse(raw: []const u8) ?Backend {
-        if (std.mem.eql(u8, raw, "auto")) return .auto;
-        if (std.mem.eql(u8, raw, "hvf")) return .hvf;
-        if (std.mem.eql(u8, raw, "kvm")) return .kvm;
-        return null;
-    }
-
-    pub fn name(self: Backend) []const u8 {
-        return switch (self) {
-            .auto => "auto",
-            .hvf => "hvf",
-            .kvm => "kvm",
-        };
-    }
-
-    pub fn supportedOnHost(self: Backend) bool {
-        return switch (self) {
-            .auto => Backend.hvf.supportedOnHost() or Backend.kvm.supportedOnHost(),
-            .hvf => comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64,
-            .kvm => comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64,
-        };
-    }
-
-    pub fn resolveForHost(self: Backend) !Backend {
-        return switch (self) {
-            .auto => blk: {
-                if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) break :blk .hvf;
-                if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) break :blk .kvm;
-                return error.UnsupportedBackend;
-            },
-            .hvf, .kvm => self,
-        };
-    }
-};
+pub const Backend = backend_mod.Backend;
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -3084,7 +3045,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         });
     }
 
-    const backend = try opts.backend.resolveForHost();
+    const backend = try backend_mod.requireProductRunner(opts.backend);
     events.setBackend(backend);
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
@@ -3439,6 +3400,7 @@ pub fn loadMonitorBootArtifacts(
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control, startup_probe: ?*vsock.HostStream) !MonitorResult {
+    _ = try backend_mod.requireProductRunner(opts.backend);
     const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
     return executeMonitorWithBootArtifacts(context, allocator, opts, artifacts, control, startup_probe);
 }
@@ -3451,6 +3413,7 @@ pub fn executeMonitorWithRootfsCacheLock(
     startup_probe: ?*vsock.HostStream,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !MonitorResult {
+    _ = try backend_mod.requireProductRunner(opts.backend);
     const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
     return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
 }
@@ -3490,7 +3453,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
 
-    const backend = try opts.backend.resolveForHost();
+    const backend = try backend_mod.requireProductRunner(opts.backend);
     var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes);
     defer ram_plan.deinit();
     if (opts.resume_dir != null) std.log.info("named monitor memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });

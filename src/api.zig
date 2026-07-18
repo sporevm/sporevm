@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const architecture = @import("architecture.zig");
+const backend_mod = @import("backend.zig");
 const bundle = @import("bundle.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
@@ -862,6 +863,7 @@ pub fn runManaged(
     if (options.disk_size) |disk_size| {
         if (options.commit_ref == null or disk_size == 0 or disk_size % rootfs_cas.default_chunk_size != 0) return error.InvalidRunDiskSize;
     }
+    _ = try backend_mod.requireProductRunner(options.backend);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -927,6 +929,8 @@ pub fn runFromSpore(
     allocator: std.mem.Allocator,
     options: RunFromSporeOptions,
 ) !RunResult {
+    _ = try backend_mod.requireProductRunner(options.backend);
+
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

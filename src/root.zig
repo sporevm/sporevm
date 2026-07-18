@@ -5,9 +5,9 @@
 //! exposes backend, device, storage, daemon, and CLI implementation modules for
 //! in-repo tools. Product callers should import `libspore`, not this module.
 
-const builtin = @import("builtin");
-
 pub const api = @import("api.zig");
+pub const architecture = @import("architecture.zig");
+pub const backend = @import("backend.zig");
 pub const board = @import("board.zig");
 pub const block_source = @import("block_source.zig");
 pub const boot = @import("boot.zig");
@@ -67,10 +67,8 @@ pub const spore_netd_tcp = @import("spore_netd_tcp.zig");
 pub const spore_stream = @import("spore_stream.zig");
 pub const spore = @import("spore.zig");
 pub const system = @import("system.zig");
-pub const kvm = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)
-    @import("kvm/kvm.zig")
-else
-    struct {};
+pub const kvm_native = @import("kvm/native.zig");
+pub const kvm = kvm_native.binding;
 pub const virtio = struct {
     pub const queue = @import("virtio/queue.zig");
     pub const mmio = @import("virtio/mmio.zig");

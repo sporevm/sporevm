@@ -22,6 +22,7 @@ const saved_spore_pin = @import("saved_spore_pin.zig");
 const saved_spore_remove = @import("saved_spore_remove.zig");
 const generation = @import("generation.zig");
 const attach_mod = @import("attach.zig");
+const backend_mod = @import("backend.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -865,7 +866,7 @@ fn createNamedWithTiming(
 ) !NamedLifecycleResult {
     clearLastError();
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
-    if (!monitorBackendSupported(options.backend.name())) return error.HostUnsupported;
+    _ = try backend_mod.requireProductRunner(options.backend);
     try topology.validateVcpuCount(options.vcpus);
     try spore.validateAnnotations(options.annotations);
 
@@ -952,6 +953,8 @@ pub fn restoreNamed(
 ) !NamedLifecycleResult {
     const start_ms = monotonicMs();
     clearLastError();
+    const requested_backend = options.backend orelse run_mod.Backend.auto;
+    _ = try backend_mod.requireProductRunner(requested_backend);
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

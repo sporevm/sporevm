@@ -211,7 +211,14 @@ pub fn fromZigError(err: anyerror) CliError {
         => CliError.init(.object_invalid, if (err == error.FormatTooOld) format_too_old_message else ErrorCode.object_invalid.defaultMessage(), @errorName(err)),
         error.UnsupportedHost,
         error.UnsupportedBackend,
+        error.ApiVersionMismatch,
+        error.KvmCapabilityMissing,
+        error.KvmRunnerNotLanded,
         => CliError.init(.host_unsupported, ErrorCode.host_unsupported.defaultMessage(), @errorName(err)),
+        error.MissingKvmDevice,
+        error.KvmOpenFailed,
+        error.KvmProbeFailed,
+        => CliError.init(.host_unavailable, ErrorCode.host_unavailable.defaultMessage(), @errorName(err)),
         error.RootfsCacheUnavailable,
         error.MissingHome,
         => CliError.init(.cache_unavailable, ErrorCode.cache_unavailable.defaultMessage(), @errorName(err)),
@@ -257,6 +264,10 @@ test "setup errors classify for API callers" {
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.MissingRootfsArtifact).code);
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.UnsupportedExt4FileSize).code);
     try std.testing.expectEqual(ErrorCode.cache_integrity_failed, fromZigError(error.ManagedKernelChecksumMismatch).code);
+    try std.testing.expectEqual(ErrorCode.host_unsupported, fromZigError(error.KvmRunnerNotLanded).code);
+    try std.testing.expectEqual(ErrorCode.host_unsupported, fromZigError(error.KvmCapabilityMissing).code);
+    try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.MissingKvmDevice).code);
+    try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.KvmProbeFailed).code);
 }
 
 test "error envelope uses shared schema" {

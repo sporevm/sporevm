@@ -189,6 +189,59 @@ throughout the work.
   final Anthropic Fable continuation approved the pre-native code and plan with
   no material findings; the native gates above close the remaining stage
   conditions.
+- Stage 1.2 now has a candidate implementation and exact native proof. One
+  canonical architecture module owns the manifest, OCI/CLI, Zig-target, and
+  KVM host-class spellings; compile-time native KVM binding selection supports
+  Linux aarch64 and x86-64 without changing ARM behavior. The internal backend
+  availability probe checks `/dev/kvm`, KVM API 12, and the Stage 0a bring-up
+  capabilities from their existing single source, then fails closed at the
+  explicit `KvmRunnerNotLanded` boundary. Public `Backend.supportedOnHost()`
+  and `resolveForHost()` remain false/unsupported on x86 until that runner
+  lands, while private binding selection preserves the precise internal probe.
+  Product launch, attach, named create/restore, monitor, and `spore build`
+  paths apply the runner gate before artifact, input, disk, cache, network,
+  runtime, publication, or VM work. The final post-fix patch used for native
+  validation has SHA256
+  `9e82a11aa41ffb0f147e809b3c7375032d00ec738bd5ab5cc703762cf5041751`.
+  Architecture tests passed 3/3, backend tests passed 22/22, and the full
+  `mise run test` suite, `mise run build`, formatting, diff hygiene, ARM and
+  x86 backend compile-only tests, and both ReleaseSafe product cross-builds
+  pass. The native ARM64 proof used `spore` SHA256
+  `aad076aa242b80d8076221a41fba2c872b4e06b8aecf7b3fcc814ca5ad181ffb`:
+  isolated fresh smoke returned `smoke:run ok`, and a separate two-vCPU run
+  reported CPUs `0-1`, both with rc 0 and empty stderr. Its evidence-manifest
+  SHA256 is
+  `34ec81d3f4cfc19fb69d1768b00ce45039dbf1a1e2fe5c8278853e8f94e214e6`;
+  the task-owned validator resources were deleted and the installed agent
+  remained healthy and idle. The native x86 proof used ReleaseSafe `spore`
+  SHA256
+  `51a44ddf5788ee87753701787781c0b429e4609ad06a4e1a572e24e00a4a9871`
+  and default-debug harness SHA256
+  `acdfa526631e935a43988f76af2c24e58093d1388e36f4e174e11c9ce44909cf`.
+  All six launch/lifecycle entry points returned the exact runner-boundary
+  error with unchanged state and no lingering process. Default-cache,
+  `--no-cache`, and missing-context builds returned the exact build boundary
+  error without reading or mutating inputs, caches, or output; a retained
+  prior product also seeded a real task-owned warm cache that the new product
+  rejected without mutation. A native static backend test passed 22/22,
+  including public x86 readiness remaining closed while internal binding
+  selection reached `KvmRunnerNotLanded`. A compile-time-filtered native
+  internal test passed the lifecycle public-readiness expectation exactly once;
+  its two implicit module blocks also passed for a 3/3 total. Isolated chroot
+  controls returned `MissingKvmDevice` without `/dev/kvm` and `KvmOpenFailed`
+  for a task-owned mode-000 device, leaving the host device unchanged. The
+  harness remained
+  byte-identical to the already validated Stage 1.2 lifecycle harness, so its
+  complete idle, reboot, native-poweroff, and doorbell matrix did not require
+  another execution. The retrieved post-fix remote archive SHA256 is
+  `7a778216243bd2342f27723aa9dad49f480e96b804ad14acde02272010f72615`;
+  its 166 entries verify, and the local critical-manifest SHA256 is
+  `d5d81f875404c7e879333708b8c0c89cb7fde93ada96a7ca34cb30f3813d6f32`.
+  The private transfer object and bucket were deleted and proven absent; the
+  task-owned remote workspace and evidence archive remain retained. A final
+  adversarial auto-review found the public-readiness and build-gate omissions,
+  then a later review found one stale lifecycle-test expectation. The fixes
+  and final native proof above close all three findings.
 
 ## Motivation
 
@@ -866,6 +919,9 @@ its new SHA256 before committing.
 - Promote the spike's x86 bindings behind the architecture boundary and expose
   one internal backend-availability result without maintaining a second set of
   common constants.
+- Limit this stage's availability probe to the KVM device, API version, and
+  already-proven bring-up capabilities. Stage 1.3 exclusively owns the CPU
+  profile's CPUID, XSAVE, MSR, and clock predicates.
 
 **Exit:** the Linux x86-64 binary builds, internal backend tests report the
 exact KVM availability reason, and product launch fails at the explicit runner

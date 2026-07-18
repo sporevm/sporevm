@@ -15,6 +15,7 @@ const net = std.Io.net;
 
 const generation = @import("generation.zig");
 const lifecycle = @import("lifecycle.zig");
+const backend_mod = @import("backend.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
@@ -170,10 +171,10 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
 
     const opts = try parseMonitorArgs(args);
     const parsed_ms = lifecycle.monotonicMs();
-    if (!lifecycle.monitorBackendSupported(opts.backend.name())) {
-        std.debug.print("spore monitor: monitor mode requires HVF on Apple Silicon or KVM on Linux/arm64\n", .{});
+    _ = backend_mod.requireProductRunner(opts.backend) catch |err| {
+        std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
         std.process.exit(2);
-    }
+    };
     if (opts.resume_dir != null and opts.rootfs_path != null) {
         std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
