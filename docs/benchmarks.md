@@ -575,11 +575,15 @@ scripts/benchmark/detect_regressions.py \
 ```
 
 The detector compares each current run median against the median of the last
-five compatible run medians from the same `host_id`. It uses history from
-downloaded Buildkite artifacts when available. Non-scheduled runs tolerate empty
-or missing history so developers can run the same script locally. Scheduled
-Buildkite runs fail when no compatible same-host history exists unless the
-current run declares an intentional reset with `SPOREVM_BENCHMARK_RESET` or a
+five compatible, non-fail-tier run medians from the same `host_id`. Once a
+metric reaches the fail tier, the detector freezes that pre-regression baseline
+until the metric recovers, so a sustained regression cannot ratchet its own
+baseline upward and turn green. Each archived regression report carries that
+state into the next bounded S3 history download. Non-scheduled runs tolerate
+empty or missing history so developers can run the same script locally.
+Scheduled Buildkite runs fail when no compatible same-host history exists
+unless the current run declares an intentional reset with
+`SPOREVM_BENCHMARK_RESET` or a
 `spore-benchmark-reset:` commit-message line. The failure annotation points at
 the likely causes: artifact fetch failure, `host_id` drift, or a fresh pipeline
 that needs an intentional bootstrap.
@@ -594,10 +598,10 @@ their guardrails.
 
 The detector also checks durable absolute ceilings from
 `benchmarks/expectations.json`. A metric that exceeds its `max` value fails even
-when the rolling trailing window has already ratcheted up to the same slower
-value. These ceilings are the long-lived floor for headline guardrail metrics
-and should be changed deliberately in PRs, unlike the rolling baseline that is
-refreshed from scheduled artifacts.
+without historical confirmation. These ceilings are the long-lived floor for
+headline guardrail metrics and should be changed deliberately in PRs, unlike
+the rolling baseline that is refreshed from scheduled observations after a
+metric recovers.
 
 Thresholds are metric-class based:
 
@@ -816,23 +820,21 @@ workspace, the step compares the new `latest-summary.json` against that
 baseline. Baselines should come from the same profile unless the comparator is
 run by hand with a narrower `--only` list.
 
-Before the regression detector runs, the CI wrapper tries to download prior
-`results.jsonl`, `config.json`, and `summary.json` artifacts from recent builds
-of the same benchmark pipeline into `zig-cache/sporevm-benchmarks/history`. If
-`BUILDKITE_API_TOKEN` is available, it resolves prior build UUIDs through the
-Buildkite REST API before calling `buildkite-agent artifact download --build`.
-Without that token it falls back to probing recent build numbers and tolerates
-misses. Set `SPOREVM_BENCHMARK_HISTORY_DIR` to point at a local history
-directory, or `SPOREVM_BENCHMARK_HISTORY_BUILDS` to change the number of prior
-Buildkite builds probed. Missing artifact history is allowed; the detector
-emits `no_history` rows and keeps non-scheduled builds green until comparable
-history exists. Scheduled builds require at least one compatible same-host
-history run unless the current run carries an intentional reset marker, so
-artifact download failures or host-id drift do not silently disable the
-guardrail. Once a benchmark suite has produced a complete result, the wrapper
-publishes that observation and its regression report to S3 even when regression
-detection fails. Failed observations therefore remain available for variance
-analysis and consecutive-run confirmation instead of disappearing from history.
+Before the regression detector runs, the CI wrapper downloads prior
+`results.jsonl`, `config.json`, `summary.json`, and `regression-report.json`
+objects from the benchmark history S3 bucket into
+`zig-cache/sporevm-benchmarks/history`. Set `SPOREVM_BENCHMARK_HISTORY_DIR` to
+point at a local history directory, or `SPOREVM_BENCHMARK_HISTORY_BUILDS` to
+change the number of prior runs downloaded. Missing history is allowed; the
+detector emits `no_history` rows and keeps non-scheduled builds green until
+comparable history exists. Scheduled builds require at least one compatible
+same-host history run unless the current run carries an intentional reset
+marker, so history download failures or host-id drift do not silently disable
+the guardrail. Once a benchmark suite has produced a complete result, the
+wrapper publishes that observation and its regression report to S3 even when
+regression detection fails. Failed observations therefore remain available for
+variance analysis and consecutive-run confirmation instead of disappearing
+from history.
 
 Regardless of comparison result, the step exports `site/data.json` and
 `site/data.js`, uploads benchmark JSON, logs, rootfs metadata, trend data,
