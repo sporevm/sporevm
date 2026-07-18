@@ -2,6 +2,15 @@
 
 ## Next
 
+Named VM startup now waits five milliseconds between monitor-readiness attempts
+during the normal startup window, after ten initial one-millisecond waits. The
+previous twenty-millisecond cadence was a material and variable part of fast
+local-backed restores, so the public restore-to-ready latency could miss the
+release's two-times eager/local speedup floor even though RAM materialization
+was correctly eliminated. Longer failures return to the existing
+twenty-millisecond cadence; the timeout, PID validation, versioned monitor
+hello, and failure diagnostics are unchanged.
+
 `spore rm --spore` now removes disk-backed spores produced by `spore unpack`
 or `spore pull`. These portable spores carry their authoritative disk index
 inside the directory and do not have a host-private durable pin, so removal

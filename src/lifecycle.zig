@@ -4122,10 +4122,25 @@ fn fakeHelloServerMain(fake: *FakeHelloServer) void {
     writeAll(fake.io, stream, "\n") catch return;
 }
 
+fn readyPollDelayMs(attempt: u32) u64 {
+    if (attempt < 10) return 1;
+    if (attempt < 110) return 5;
+    return 20;
+}
+
 fn readyPollSleep(attempt: *u32) void {
-    const delay_ms: u64 = if (attempt.* < 10) 1 else 20;
+    const delay_ms = readyPollDelayMs(attempt.*);
     attempt.* +|= 1;
     sleepMs(delay_ms);
+}
+
+test "lifecycle readiness polling keeps startup detection bounded" {
+    try std.testing.expectEqual(@as(u64, 1), readyPollDelayMs(0));
+    try std.testing.expectEqual(@as(u64, 1), readyPollDelayMs(9));
+    try std.testing.expectEqual(@as(u64, 5), readyPollDelayMs(10));
+    try std.testing.expectEqual(@as(u64, 5), readyPollDelayMs(109));
+    try std.testing.expectEqual(@as(u64, 20), readyPollDelayMs(110));
+    try std.testing.expectEqual(@as(u64, 20), readyPollDelayMs(std.math.maxInt(u32)));
 }
 
 fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64, spore_executable_path: []const u8) !void {
