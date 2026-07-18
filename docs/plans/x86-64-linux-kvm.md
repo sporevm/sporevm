@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-18
+last_reviewed: 2026-07-19
 spec_refs:
   - docs/spore-format.md
   - docs/state-portability.md
@@ -242,6 +242,27 @@ throughout the work.
   adversarial auto-review found the public-readiness and build-gate omissions,
   then a later review found one stale lifecycle-test expectation. The fixes
   and final native proof above close all three findings.
+- Stage 1.3 now freezes the candidate-profile audit contract without claiming
+  a usable profile. One atomic status remains `pending_stage0b`; ordered
+  decision inventories cover CPUID topology/identity/XSAVE/PV selectors,
+  hard VMX/SVM exclusions, the architectural 576-byte legacy-plus-header and
+  Linux KVM 4096-byte legacy XSAVE boundaries, every plan-named MSR, the
+  profile-specific KVM capabilities, and the unresolved clock questions.
+  Concrete masks, layouts, MSR dispositions, clock values, host facts, and
+  compatibility remain unavailable until Slice 0b. The exact reviewed patch
+  before this evidence ledger has SHA256
+  `028bfe789c14078399ae15bc47def0db111196e08e7a861ded5787597a7d2e56`.
+  The focused x86 suite passed 479 tests with five expected skips and 32 fuzz
+  targets; the full `mise run test`, `mise run build`, formatting, and diff
+  hygiene pass. A ReleaseSafe static x86-64 test binary with SHA256
+  `6c5f091c83f55ce704cbeae251e0262ef18b9ac4a270936f8bfb866b1fa38523`
+  ran natively on the dedicated host's Linux 6.17.0-1019-aws kernel and passed
+  all six profile-contract tests with no residual process. The retained remote
+  test artifact is mode 500 and owned by the task user; the transient S3
+  transfer object and bucket were deleted and the bucket returns 404. Final
+  adversarial and
+  minimality reviews approved the exact pre-native patch, and the Anthropic
+  Fable continuation approved it with no material finding.
 
 ## Motivation
 
@@ -928,14 +949,25 @@ exact KVM availability reason, and product launch fails at the explicit runner
 boundary before artifact resolution or VM creation, while every existing ARM
 backend-selection test remains green.
 
-#### Stage 1.3: Define the candidate CPU profile
+#### Stage 1.3: Freeze the candidate-profile audit contract
 
-- Add the bounded `x86_cpu_profile` module and explicit candidate CPUID
-  allowlist, XSAVE bounds, MSR list, clock-policy shape, capability predicate,
-  and pure fixtures; Slice 0b owns native approval.
+- Add the bounded `x86_cpu_profile` module with one atomic
+  `pending_stage0b` status, the CPUID selectors and nested-virtualization bits
+  requiring a decision, the architectural legacy-XSAVE and Linux KVM XSAVE2
+  boundary, the complete plan-named MSR and profile-specific KVM-capability
+  inventories, the unresolved clock-decision inventory, and pure fixtures. Do
+  not publish a partially approved profile or a caller-asserted compatibility
+  result.
+- Slice 0b turns these audit obligations into the concrete CPUID allowlist,
+  XSAVE/XCRS layout, MSR dispositions, clock policy, profile identity, typed
+  host facts, and fail-closed compatibility predicate, then owns native
+  approval. Existing KVM topology normalization remains its single owner until
+  that concrete profile consumes it.
 
-**Exit:** fixtures prove the candidate profile's CPUID, XSAVE, MSR, clock, and
-capability predicates fail closed; native approval remains owned by Slice 0b.
+**Exit:** fixtures prove every audit inventory is bounded, ordered, unique,
+and atomically pending Slice 0b, with VMX/SVM exposure explicitly forbidden
+and no runtime or public availability claim. Native values and compatibility
+remain unavailable until Slice 0b closes them with bare-metal evidence.
 
 #### Stage 1.4: Add the host-info v2 contract
 
