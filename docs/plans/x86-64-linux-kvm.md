@@ -152,6 +152,43 @@ throughout the work.
   ship-risk, maintainability, and Ponytail lenses approved with no findings,
   and the final Anthropic Fable continuation approved Stage 0a.3 with no
   material finding.
+- Stage 1.1 now has a candidate implementation and exact native proof. One
+  `src/kvm/common.zig` module owns the architecture-neutral KVM literals,
+  layouts, structs, and raw helpers consumed by both bindings; ARM and x86 keep
+  their existing open flags, capability policy, IRQ encoding, run completion,
+  exit decoding, and error semantics. The final pre-native patch SHA256 is
+  `303022769f2b5c201e34f866dbcd11e9982067006f67082ed4aadef8e7700b13`.
+  Common-module tests passed 3/3, the focused x86 suite passed 470 tests with
+  five expected skips and 32 fuzz targets, and the full suite passed 2,367
+  tests with 21 expected skips. `mise run build`, formatting, diff hygiene,
+  the ARM product and harness cross-builds, the x86 harness and product
+  cross-builds, and the deterministic x86 initrd test pass. The native ARM64
+  proof used ReleaseSafe `spore` SHA256
+  `bb30f2e1ca9de09eba64db8f3507cc8b623eae788c435813bd7743c3cd117f0b`:
+  the isolated fresh smoke returned `smoke:run ok`, and a separate two-vCPU
+  run reported CPUs `0-1`, both with rc 0 and empty stderr. Its 93-file
+  evidence manifest SHA256 is
+  `dc575df102e5390e6a564fc4debef33644bb6a2c496fb45cba2b1a8144175e6c`;
+  the task-owned validator resources were deleted and the installed agent
+  remained healthy and idle. Because the default-debug x86 harness changed,
+  the complete lifecycle matrix was rerun with harness SHA256
+  `6191441ec869e83c3e8269527434f92efbc5070f41c2954e4009941720a607fe`,
+  the Stage 0a.2 managed bzImage, and the Stage 0a.3 lifecycle initrd. Idle
+  reached ready and timed out with rc 124, reboot returned rc 0 as
+  `guest_reset`, native poweroff reached `System halted` and timed out with rc
+  124 without a terminal classification, and doorbell poweroff returned rc 0
+  as `guest_off`. No run emitted a failure marker or raw
+  `KVM_EXIT_SHUTDOWN`, and no harness process remained. The retrieved remote
+  evidence archive SHA256 is
+  `104b0c78574b5687d5b59d51b86745f84275fb34f487763bf1f6dea8ef8eb419`;
+  its manifest SHA256 is
+  `543e3102ebdd8726904ab050a436cbe37ce108b1974c4bae5fb07237edef4a3b`,
+  and the 102-file local umbrella manifest SHA256 is
+  `0184d6dc7119a797b3f24a9567706f0dfa444ec6bdfaf7687b12050d1583d916`.
+  The final auto-review ship-risk, maintainability, and Ponytail lenses and the
+  final Anthropic Fable continuation approved the pre-native code and plan with
+  no material findings; the native gates above close the remaining stage
+  conditions.
 
 ## Motivation
 
@@ -377,9 +414,10 @@ removes that runtime restriction.
 
 ### Split common and architecture-specific KVM UAPI narrowly
 
-Extract only proven common KVM pieces first: `/dev/kvm` open/version checks,
-VM/vCPU creation, run mapping, memory slots, dirty logs, generic MMIO exits,
-and interrupt-line calls. Keep architecture UAPI and policy separate:
+Extract only the KVM pieces both architecture paths consume: `/dev/kvm`
+open/version checks, VM/vCPU creation, run mapping, memory slots, generic MMIO
+exit layouts, and interrupt-line calls. Move dirty-log UAPI when x86 capture
+creates its second consumer. Keep architecture UAPI and policy separate:
 
 - ARM one-reg, VGICv3, PSCI, and counter control stay ARM-owned;
 - x86 CPUID, regs/sregs, XSAVE/XCRS, MSRs, LAPIC/irqchip/PIT, vCPU events,
@@ -791,24 +829,80 @@ replacement or second same-class host remains a Slice 7 gate.
 
 ### Slice 1: Establish architecture and KVM module boundaries
 
-- Add canonical architecture/platform spelling and host detection.
-- Allow Linux x86-64 builds and `--backend auto|kvm` resolution.
-- Split common KVM UAPI/helpers from ARM-only UAPI without behavior changes.
-- Promote the x86 UAPI introduced by the spike into architecture-owned bindings
-  and add capability reporting without maintaining a second set of constants.
+#### Stage 1.1: Extract the proven common KVM UAPI
+
+- Add one `src/kvm/common.zig` module for the fixed architecture-neutral Linux
+  KVM API version, generic ioctl numbers, memory and IRQ structs, shared
+  `kvm_run` header/MMIO/system-event layouts, and low-level helpers required by
+  the existing ARM backend and the planned x86 path.
+- Keep ARM one-reg, VGICv3, PSCI, counter, device-attribute, and completion
+  policy in the ARM module. Keep x86 CPUID, register, irqchip/PIT, MP, TSS,
+  PIO, immediate-exit, and `EAGAIN` policy in the x86 module.
+- Preserve the existing public helpers and architecture-specific `/dev/kvm`
+  open, capability-result, IRQ encoding, MMIO decoding, exit-classification,
+  run-completion, and error/log semantics while removing duplicate constants
+  and layouts. Do not add a generic backend trait or change either run loop.
+- Assert the shared `kvm_run` header, MMIO, system-event, memory-region, and IRQ
+  ABI layouts in host-runnable tests.
+
+**Exit:** both architecture bindings consume the one common UAPI source and
+all existing callers compile unchanged. `mise run test`, `mise run build`, the
+cross-builds, and the native ARM64 fresh/multi-vCPU smoke pass. The
+default-debug x86 harness remains byte-identical; if it changes, rerun the
+complete Stage 0a.3 idle, reboot, native-poweroff, and doorbell matrix against
+its new SHA256 before committing.
+
+#### Stage 1.2: Add canonical architecture and backend selection
+
+- Add one internal architecture identifier and the conversions required now
+  for compile targets, manifests, CLI display, and host classification. Slice
+  3b owns OCI selection policy, and Slice 7 owns release asset names after the
+  mise/ubi fixture.
+- Allow Linux x86-64 product builds and compile-time host detection, selecting
+  the x86 KVM binding and internal capability predicate. Stage 1.4 owns public
+  host-info exposure. Keep launch, attach, and capture entry points fail closed
+  with an explicit runner-not-landed error until Slices 2a and 3a wire the
+  fresh-run path.
+- Promote the spike's x86 bindings behind the architecture boundary and expose
+  one internal backend-availability result without maintaining a second set of
+  common constants.
+
+**Exit:** the Linux x86-64 binary builds, internal backend tests report the
+exact KVM availability reason, and product launch fails at the explicit runner
+boundary before artifact resolution or VM creation, while every existing ARM
+backend-selection test remains green.
+
+#### Stage 1.3: Define the candidate CPU profile
+
 - Add the bounded `x86_cpu_profile` module and explicit candidate CPUID
   allowlist, XSAVE bounds, MSR list, clock-policy shape, capability predicate,
-  and unit tests; Slice 0b owns native approval.
+  and pure fixtures; Slice 0b owns native approval.
+
+**Exit:** fixtures prove the candidate profile's CPUID, XSAVE, MSR, clock, and
+capability predicates fail closed; native approval remains owned by Slice 0b.
+
+#### Stage 1.4: Add the host-info v2 contract
+
 - Add `spore.host-info.v2` with architecture-discriminated facts and the final
   profile field shape. Preserve C v1 on ARM, add the versioned C v2 entry point,
   update the Zig API deliberately, and report the unapproved candidate through
   backend availability rather than a transitional public schema state.
-- Parameterize the comptime-embedded minimal exec initrd and digest pins by
-  target architecture so the x86 CLI cross-build does not embed an ARM initrd.
-- Cross-compile the CLI and libraries for `x86_64-linux-musl` in ordinary CI.
+- Add exact JSON, Zig, and C schema/ABI tests, including byte-for-byte C v1 ARM
+  compatibility.
 
-**Exit:** the x86 binary builds, reports why KVM is or is not supported, and
-all ARM unit/native tests remain unchanged.
+**Exit:** the x86 binary reports the exact missing capability or candidate
+profile fact, and the v1 ARM host-info ABI remains byte-for-byte compatible.
+
+#### Stage 1.5: Parameterize embedded guest artifacts and CI builds
+
+- Parameterize the comptime-embedded minimal exec initrd and digest pins by
+  target architecture so the x86 CLI cross-build never embeds an ARM initrd.
+- Cross-compile the CLI and libraries for `x86_64-linux-musl` in ordinary CI,
+  retaining the native ARM build and test matrix.
+
+**Exit:** the x86 CLI and libraries cross-build with architecture-correct
+embedded artifacts, report why KVM is or is not supported, and all ARM
+unit/native tests remain unchanged. Completing Stage 1.5 completes Slice 1.
 
 ### Slice 2a: Land the x86 board and fresh run loop on low RAM
 
@@ -822,7 +916,8 @@ all ARM unit/native tests remain unchanged.
 - Implement only the frozen PIO allow/ignore/decode table; reject all other
   PIO and MMIO exits.
 - Run all existing virtio-mmio devices and the generation device.
-- Parameterize the guest initrd and helpers for x86.
+- Run the Stage 1.5 x86 embedded initrd and helpers natively through the
+  existing guest-agent protocol.
 - Add one agent/vsock execution plus generation and device-enumeration smokes
   through an explicit kernel/initrd. Slice 3a owns the complete product matrix.
 
@@ -1149,6 +1244,10 @@ original host class. Benchmark and correctness history stay keyed by profile.
   loop interleaves ARM boot, VGIC, PSCI, and snapshot policy. Capture lands only
   after its concrete quiescence and lifecycle mechanics are shared rather than
   duplicated.
+- Slice 1 shares literal KVM UAPI and layouts before behavior. Architecture
+  modules retain open flags, IRQ encoding, MMIO decoding, run completion, and
+  exit policy; x86 build and host inspection remain fail closed at product
+  launch until the reviewed runner lands.
 - PIO, reboot, and poweroff behavior cannot be frozen from documentation. The
   native trace is the source of truth, followed by a finite fail-closed table.
 - Nested KVM is useful for board bring-up but not clock portability evidence;

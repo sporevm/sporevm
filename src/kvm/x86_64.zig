@@ -5,22 +5,23 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const common = @import("common.zig");
 const topology = @import("../topology.zig");
 
-pub const KVM_API_VERSION: u32 = 12;
-pub const KVM_GET_API_VERSION: u32 = 0xae00;
-pub const KVM_CREATE_VM: u32 = 0xae01;
+pub const KVM_API_VERSION = common.KVM_API_VERSION;
+pub const KVM_GET_API_VERSION = common.KVM_GET_API_VERSION;
+pub const KVM_CREATE_VM = common.KVM_CREATE_VM;
 pub const KVM_GET_SUPPORTED_CPUID: u32 = 0xc008ae05;
-pub const KVM_CHECK_EXTENSION: u32 = 0xae03;
-pub const KVM_GET_VCPU_MMAP_SIZE: u32 = 0xae04;
-pub const KVM_CREATE_VCPU: u32 = 0xae41;
-pub const KVM_SET_USER_MEMORY_REGION: u32 = 0x4020ae46;
+pub const KVM_CHECK_EXTENSION = common.KVM_CHECK_EXTENSION;
+pub const KVM_GET_VCPU_MMAP_SIZE = common.KVM_GET_VCPU_MMAP_SIZE;
+pub const KVM_CREATE_VCPU = common.KVM_CREATE_VCPU;
+pub const KVM_SET_USER_MEMORY_REGION = common.KVM_SET_USER_MEMORY_REGION;
 pub const KVM_SET_TSS_ADDR: u32 = 0xae47;
 pub const KVM_SET_IDENTITY_MAP_ADDR: u32 = 0x4008ae48;
 pub const KVM_CREATE_IRQCHIP: u32 = 0xae60;
-pub const KVM_IRQ_LINE: u32 = 0x4008ae61;
+pub const KVM_IRQ_LINE = common.KVM_IRQ_LINE;
 pub const KVM_CREATE_PIT2: u32 = 0x4040ae77;
-pub const KVM_RUN: u32 = 0xae80;
+pub const KVM_RUN = common.KVM_RUN;
 pub const KVM_GET_SREGS: u32 = 0x8138ae83;
 pub const KVM_SET_REGS: u32 = 0x4090ae82;
 pub const KVM_SET_SREGS: u32 = 0x4138ae84;
@@ -29,16 +30,16 @@ pub const KVM_GET_MP_STATE: u32 = 0x8004ae98;
 
 pub const KVM_EXIT_IO: u32 = 2;
 pub const KVM_EXIT_HLT: u32 = 5;
-pub const KVM_EXIT_MMIO: u32 = 6;
-pub const KVM_EXIT_SHUTDOWN: u32 = 8;
-pub const KVM_EXIT_FAIL_ENTRY: u32 = 9;
-pub const KVM_EXIT_INTERNAL_ERROR: u32 = 17;
-pub const KVM_EXIT_SYSTEM_EVENT: u32 = 24;
-pub const KVM_SYSTEM_EVENT_SHUTDOWN: u32 = 1;
-pub const KVM_SYSTEM_EVENT_RESET: u32 = 2;
+pub const KVM_EXIT_MMIO = common.KVM_EXIT_MMIO;
+pub const KVM_EXIT_SHUTDOWN = common.KVM_EXIT_SHUTDOWN;
+pub const KVM_EXIT_FAIL_ENTRY = common.KVM_EXIT_FAIL_ENTRY;
+pub const KVM_EXIT_INTERNAL_ERROR = common.KVM_EXIT_INTERNAL_ERROR;
+pub const KVM_EXIT_SYSTEM_EVENT = common.KVM_EXIT_SYSTEM_EVENT;
+pub const KVM_SYSTEM_EVENT_SHUTDOWN = common.KVM_SYSTEM_EVENT_SHUTDOWN;
+pub const KVM_SYSTEM_EVENT_RESET = common.KVM_SYSTEM_EVENT_RESET;
 
 pub const KVM_CAP_IRQCHIP: u32 = 0;
-pub const KVM_CAP_USER_MEMORY: u32 = 3;
+pub const KVM_CAP_USER_MEMORY = common.KVM_CAP_USER_MEMORY;
 pub const KVM_CAP_SET_TSS_ADDR: u32 = 4;
 pub const KVM_CAP_EXT_CPUID: u32 = 7;
 pub const KVM_CAP_NR_VCPUS: u32 = 9;
@@ -58,11 +59,9 @@ pub const KVM_MP_STATE_SIPI_RECEIVED: u32 = 4;
 pub const max_cpuid_entries: usize = 256;
 pub const max_io_payload: usize = 4096;
 
-pub const Error = error{
+pub const Error = common.Error || error{
     ApiVersionMismatch,
     KvmCapabilityMissing,
-    KvmIoctlFailed,
-    OpenFailed,
     CpuidTooLarge,
     UnsupportedVcpuCount,
     InvalidVcpuIndex,
@@ -81,20 +80,20 @@ pub const IoDecodeError = error{
 };
 
 pub const RunLayout = struct {
-    pub const immediate_exit: usize = 1;
-    pub const exit_reason: usize = 8;
+    pub const immediate_exit = common.RunLayout.immediate_exit;
+    pub const exit_reason = common.RunLayout.exit_reason;
     pub const io_direction: usize = 32;
     pub const io_size: usize = 33;
     pub const io_port: usize = 34;
     pub const io_count: usize = 36;
     pub const io_data_offset: usize = 40;
     pub const io_envelope_end: usize = 48;
-    pub const mmio_phys_addr: usize = 32;
-    pub const mmio_data: usize = 40;
-    pub const mmio_len: usize = 48;
-    pub const mmio_is_write: usize = 52;
+    pub const mmio_phys_addr = common.RunLayout.mmio_phys_addr;
+    pub const mmio_data = common.RunLayout.mmio_data;
+    pub const mmio_len = common.RunLayout.mmio_len;
+    pub const mmio_is_write = common.RunLayout.mmio_is_write;
     pub const mmio_end: usize = 53;
-    pub const system_event_type: usize = 32;
+    pub const system_event_type = common.RunLayout.system_event_type;
 };
 
 pub const IoDirection = enum(u8) { read = 0, write = 1 };
@@ -137,18 +136,9 @@ pub fn decodeIoExit(run: []u8) IoDecodeError!IoExit {
     };
 }
 
-pub const UserspaceMemoryRegion = extern struct {
-    slot: u32,
-    flags: u32,
-    guest_phys_addr: u64,
-    memory_size: u64,
-    userspace_addr: u64,
-};
+pub const UserspaceMemoryRegion = common.UserspaceMemoryRegion;
 
-pub const IrqLevel = extern struct {
-    irq: u32,
-    level: u32,
-};
+pub const IrqLevel = common.IrqLevel;
 
 pub const PitConfig = extern struct {
     flags: u32 = 0,
@@ -241,21 +231,11 @@ pub const MpState = extern struct {
 };
 
 pub fn openDevKvm() Error!std.c.fd_t {
-    const path: [:0]const u8 = "/dev/kvm";
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, @as(c_uint, 0));
-    if (fd < 0) return error.OpenFailed;
-    return fd;
+    return common.openDevKvm(.{ .close_on_exec = true });
 }
 
 pub fn ioctl(fd: std.c.fd_t, request: u32, arg: usize, op: []const u8) Error!usize {
-    const rc = linux.ioctl(fd, request, arg);
-    switch (linux.errno(rc)) {
-        .SUCCESS => return rc,
-        else => |err| {
-            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, request, @tagName(err) });
-            return error.KvmIoctlFailed;
-        },
-    }
+    return common.ioctl(fd, request, arg, op);
 }
 
 pub fn checkApiVersion(kvm_fd: std.c.fd_t) Error!void {
@@ -438,8 +418,7 @@ pub fn getMpState(vcpu_fd: std.c.fd_t) Error!MpState {
 }
 
 pub fn setIrq(vm_fd: std.c.fd_t, gsi: u32, level: bool) Error!void {
-    var irq = IrqLevel{ .irq = gsi, .level = @intFromBool(level) };
-    _ = try ioctl(vm_fd, KVM_IRQ_LINE, @intFromPtr(&irq), "KVM_IRQ_LINE");
+    return common.setIrqLine(vm_fd, gsi, level);
 }
 
 pub const RunResult = enum {
