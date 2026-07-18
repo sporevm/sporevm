@@ -98,6 +98,7 @@ def run_lane(
     timeout_s: float,
     include_run_from: bool,
     base_env: dict[str, str],
+    require_readiness_phases: bool = True,
     path_aliases: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
     require_control_socket_path_budget(runtime_dir, iterations)
@@ -282,6 +283,7 @@ def run_lane(
         expected_proof_verity=expected_proof_verity,
         expected_ram_mib=expected_ram_mib,
         include_run_from=include_run_from,
+        require_readiness_phases=require_readiness_phases,
     )
     return rows
 
@@ -300,6 +302,7 @@ def validate_rows(
     expected_proof_verity: str | None,
     expected_ram_mib: int,
     include_run_from: bool,
+    require_readiness_phases: bool = True,
 ) -> None:
     errors: list[str] = []
     if len(rows) != iterations:
@@ -361,17 +364,20 @@ def validate_rows(
             "backend_memory_ms",
             "backend_state_ms",
             "backend_pre_run_ms",
-            "readiness_attach_ms",
-            "readiness_connect_request_delivered_ms",
-            "readiness_connect_ms",
-            "readiness_request_delivered_ms",
-            "readiness_guest_timing_ms",
-            "readiness_response_ms",
             "readiness_ready_ms",
             "first_noop_exec_ms",
             "repeated_exec_median_ms",
             "cleanup_ms",
         )
+        if require_readiness_phases:
+            numeric_fields += (
+                "readiness_attach_ms",
+                "readiness_connect_request_delivered_ms",
+                "readiness_connect_ms",
+                "readiness_request_delivered_ms",
+                "readiness_guest_timing_ms",
+                "readiness_response_ms",
+            )
         if include_run_from:
             numeric_fields += ("run_from_noop_ms",)
         for field in numeric_fields:
@@ -402,6 +408,88 @@ def validate_rows(
                     errors.append(f"{prefix}: {field} is required when a planner reason is expected")
     if errors:
         raise BenchmarkError(f"{scenario}: strict row validation failed:\n  " + "\n  ".join(errors))
+
+
+def self_test_historical_readiness_validation() -> None:
+    row: dict[str, object] = {
+        "schema": ROW_SCHEMA,
+        "scenario": "historical_baseline_vcpu1",
+        "iteration": 1,
+        "backend": "hvf",
+        "requested_backend": "hvf",
+        "vcpus": 1,
+        "restore_schema": "spore.lifecycle.v1",
+        "restore_schema_version": 1,
+        "restore_action": "restored",
+        "requested_name": "n1",
+        "restore_name": "n1",
+        "restore_state": "ready",
+        "exec_ready_source": "restore_contract",
+        "restore_source": "eager_chunks",
+        "restore_metric_count": 1,
+        "readiness_metric_count": 1,
+        "restore_ram_mib": 1024,
+        "restore_status": 0,
+        "first_exec_status": 0,
+        "cleanup_status": 0,
+        "cleanup_forced_pid": False,
+        "cleanup_lease_count_before": 0,
+        "cleanup_lease_count_after_rm": 0,
+        "cleanup_lease_count_after": 0,
+        "cleanup_lease_restored": True,
+        "cleanup_forced_lease": False,
+        "cleanup_runtime_absent": True,
+        "cleanup_pid_absent": True,
+        "error": "",
+        "restore_return_ms": 10,
+        "restore_prepare_ms": 1,
+        "restore_spawn_monitor_ms": 2,
+        "exec_ready_wait_ms": 3,
+        "restore_total_ms": 6,
+        "backend_memory_ms": 1,
+        "backend_state_ms": 1,
+        "backend_pre_run_ms": 2,
+        "readiness_attach_ms": None,
+        "readiness_connect_request_delivered_ms": None,
+        "readiness_connect_ms": None,
+        "readiness_request_delivered_ms": None,
+        "readiness_guest_timing_ms": None,
+        "readiness_response_ms": None,
+        "readiness_ready_ms": 4,
+        "first_noop_exec_ms": 1,
+        "repeated_exec_median_ms": 1,
+        "repeated_exec_ms": [1],
+        "repeated_exec_statuses": [0],
+        "cleanup_ms": 1,
+    }
+    arguments = {
+        "scenario": "historical_baseline_vcpu1",
+        "iterations": 1,
+        "repeated_execs": 1,
+        "backend": "hvf",
+        "vcpus": 1,
+        "expected_source": "eager_chunks",
+        "expected_reason": None,
+        "expected_proof_schema": None,
+        "expected_proof_verity": None,
+        "expected_ram_mib": 1024,
+        "include_run_from": False,
+    }
+    validate_rows([row], **arguments, require_readiness_phases=False)
+    try:
+        validate_rows([row], **arguments, require_readiness_phases=True)
+    except BenchmarkError as err:
+        for field in (
+            "readiness_attach_ms",
+            "readiness_connect_request_delivered_ms",
+            "readiness_connect_ms",
+            "readiness_request_delivered_ms",
+            "readiness_guest_timing_ms",
+            "readiness_response_ms",
+        ):
+            assert field in str(err)
+    else:
+        raise AssertionError("current rows accepted missing readiness phase metrics")
 
 
 def manifest_vcpu_count(manifest: object, requested_vcpus: int) -> int:
@@ -766,9 +854,9 @@ def matrix(args: argparse.Namespace, runner: CommandRunner) -> int:
         historical_identity = parent_identity(historical_parent, historical_runtime, historical_capture, 1)
         parents["historical_vcpu1"] = historical_identity
         parent_postconditions.append((historical_parent, historical_runtime, historical_capture, 1, historical_identity))
-        for key, runtime_name, binary, source, reason in (
-            ("historical_baseline_vcpu1", "hb", baseline_bin, "eager_chunks", None),
-            ("historical_current_vcpu1", "hc", current_bin, "local_backing", "proof_valid"),
+        for key, runtime_name, binary, source, reason, require_readiness_phases in (
+            ("historical_baseline_vcpu1", "hb", baseline_bin, "eager_chunks", None, False),
+            ("historical_current_vcpu1", "hc", current_bin, "local_backing", "proof_valid", True),
         ):
             runtime = runtime_root / runtime_name
             shutil.copytree(historical_runtime, runtime, dirs_exist_ok=True)
@@ -781,6 +869,7 @@ def matrix(args: argparse.Namespace, runner: CommandRunner) -> int:
                 expected_proof_verity="none" if reason is not None else None,
                 expected_ram_mib=expected_ram_mib,
                 timeout_s=args.timeout, include_run_from=True, base_env=base_env, path_aliases=aliases,
+                require_readiness_phases=require_readiness_phases,
             )
             all_rows.extend(lanes[key])
 
@@ -1119,6 +1208,7 @@ def main() -> int:
         self_test_manifest_vcpu_count()
         self_test_control_socket_path_budget()
         self_test_parent_proof_metrics()
+        self_test_historical_readiness_validation()
         return 0
     signals = SignalState()
     signals.install()
