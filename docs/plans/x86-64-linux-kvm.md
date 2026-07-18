@@ -79,9 +79,46 @@ throughout the work.
   and no harness process remained afterward.
 - Stage 0a.1's final auto-review passed all three lenses with no material
   findings, and the final Anthropic Fable deep-analysis continuation approved
-  with no material finding remaining. Stage 0a.2 has not started; its evidence
-  remains bound to the exact digest and verified config of the candidate
-  managed x86 kernel.
+  with no material finding remaining.
+- Stage 0a.2's managed-kernel prerequisite is complete at sibling-kernel commit
+  `4f165a82feded571da55ae276bfe0133adefb64e`. Its final auto-review passed the
+  ship-risk, maintainability, and Ponytail lenses; the final Anthropic Fable
+  review approved with no material finding remaining. A clean native x86-64
+  build emitted bzImage SHA256
+  `07a9b6d8a9efd2b7c5e886d1c010e67245fa132c8b48cf567f200099b55abee8`,
+  complete config SHA256
+  `d67ef9eb0cfee797d1edb09027214b312361139db2621d483edfe0debd13e95e`,
+  checksum SHA256
+  `c7ad2f454aa7a56cdf19f7199748c3aaea8472f0994499c03081eb6b4239f243`,
+  and provenance-manifest SHA256
+  `d26c201232657e3e95801395b6b1818cead3d574b6cbe2fb2a77e117c8e7a713`.
+  The emitted config passes the release-time required/forbidden symbol gate,
+  including SMP, MP/APIC, built-in virtio-mmio devices, strict `/dev/mem`, and
+  the absence of ACPI, PCI, legacy serial, and i8042 input. All Stage 0a.2
+  evidence remains bound to these exact bytes.
+- Stage 0a.2 now has a candidate implementation: a bounded Intel MP 1.4 table,
+  normalized per-vCPU CPUID topology, fixed two-vCPU KVM bring-up, the full
+  eight-slot virtio-mmio inventory, the generation device, and a deterministic
+  static board-probe initrd. The final reviewed native proof used harness SHA256
+  `2676ab2c144b71409fd6777a0be369847e3ac16d5ff5d6bdba8a9ca11f0cc50e`,
+  probe-initrd SHA256
+  `ea15b43e068d17009913348e0fa0ba4f3d314832c1e83ff4f22dbb666b342707`,
+  and the prerequisite managed bzImage above. During a bounded 35-second run
+  with 512MiB RAM and two vCPUs, timeout produced `run_rc=124` because the
+  successful probe idles. The retained `native-probe.log` has SHA256
+  `bd5898995a6f960f6ddd0f97d7b39f21a53c6a95f6b997d27edfe3b43c9f42f8`;
+  its exact-input sidecar has SHA256
+  `8189b332f2b5b93252c9afca463cc8b27788bad951aa4946696f57c99b0db7b3`.
+  It reports CPUs `0-1`, the exact device-ID multiset
+  `1 2 2 2 2 3 4 19`, `hvc0` output, and generation magic `0x4e475053`, with
+  no failure marker or lingering harness process. The only observed PIO was
+  four one-byte writes, two each to ports `0x70` and `0x71`. The final focused
+  x86 suite passed 452 tests with five expected skips and 30 fuzz targets; the
+  full `mise run test`, native build, x86-64 cross-build, deterministic-initrd
+  test, and diff hygiene all pass. The final auto-review passed its ship-risk,
+  maintainability, and Ponytail lenses with no material finding remaining. The
+  final Anthropic Fable review approved the stage with no material finding;
+  its three non-blocking board-freeze observations are assigned to Stage 0a.3.
 
 ## Motivation
 
@@ -608,9 +645,9 @@ existing virtio-console implementation.
 - Instantiate the full console, block, net, vsock, and RNG virtio-mmio set plus
   the generation device at provisional x86 addresses and GSIs. Reserve and
   prove the complete eight-slot transport/GSI topology, including extra block
-  devices used for context, build, and cache inputs and one transient
-  virtio-mem position, even when the ordinary probe does not instantiate every
-  optional device.
+  devices used for context, build, and cache inputs. The provisional transient
+  inventory fixes virtio-mem at slot 4 in place of the optional cache block,
+  so it preserves the same eight transports, addresses, and GSIs.
 - Add a static board-probe initrd that reports online CPUs, enumerated virtio
   device IDs, `hvc0` operation, and generation-device magic through `/dev/mem`.
 
@@ -635,6 +672,14 @@ address, and GSI layout is bounded and collision-free.
   contracts in this plan and update `SECURITY.md` with the finite PIO policy.
   Slice 2a writes the durable product board to `docs/spore-format.md` when the
   reusable modules enter the product path.
+- Before freezing the board, lower a virtio GSI after any transport write that
+  clears `interrupt_status`, including device reset rather than InterruptACK
+  alone, and reject 8-byte accesses in the 32-bit virtio register window below
+  the device-specific configuration area.
+- Record why the MP floating pointer's provisional GPA-zero placement is found
+  by the pinned kernel's bottom-1KiB scan and remains protected as reserved low
+  memory; move it to a conventional firmware search range if the final managed
+  kernel or board contract cannot make that dependency explicit and stable.
 
 **Exit:** the finite PIO/device-control table produces distinct deterministic
 `guest_reset` and `guest_off` outcomes, each classification records its raw KVM

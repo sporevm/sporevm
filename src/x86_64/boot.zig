@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const board = @import("board.zig");
+const mp = @import("mp.zig");
 
 const boot_params_size: usize = 4096;
 const setup_header_start: usize = 0x1f1;
@@ -54,7 +55,7 @@ pub const gdt = blk: {
     break :blk bytes;
 };
 
-pub const Error = board.Error || error{
+pub const Error = board.Error || mp.Error || error{
     BadBootFlag,
     BadHeaderMagic,
     UnsupportedBootProtocol,
@@ -97,6 +98,8 @@ pub const Range = struct {
 pub const Plan = struct {
     image: ImageInfo,
     ram_size: u64,
+    cpu_count: u8,
+    mp_table: Range,
     kernel_load: Range,
     kernel_runtime: Range,
     zero_page: Range,
@@ -149,8 +152,9 @@ pub fn parseBzImage(kernel: []const u8) Error!ImageInfo {
     };
 }
 
-pub fn plan(kernel: []const u8, initrd_len: usize, command_line: []const u8, ram_size: u64) Error!Plan {
+pub fn plan(kernel: []const u8, initrd_len: usize, command_line: []const u8, ram_size: u64, cpu_count: u8) Error!Plan {
     try board.validateLayout(ram_size);
+    const mp_table_end = try mp.tableEnd(cpu_count);
     const image = try parseBzImage(kernel);
     if (std.mem.indexOfScalar(u8, command_line, 0) != null) return error.CommandLineContainsNul;
     if (command_line.len > image.cmdline_size or command_line.len > max_command_line) {
@@ -184,6 +188,11 @@ pub fn plan(kernel: []const u8, initrd_len: usize, command_line: []const u8, ram
     const result = Plan{
         .image = image,
         .ram_size = ram_size,
+        .cpu_count = cpu_count,
+        .mp_table = .{
+            .start = board.mp_floating_pointer_addr,
+            .end = @intCast(mp_table_end),
+        },
         .kernel_load = kernel_load,
         .kernel_runtime = kernel_runtime,
         .zero_page = .{ .start = board.zero_page_addr, .end = board.zero_page_addr + boot_params_size },
@@ -202,11 +211,13 @@ pub fn plan(kernel: []const u8, initrd_len: usize, command_line: []const u8, ram
     return result;
 }
 
-pub fn load(ram: []u8, kernel: []const u8, initrd: ?[]const u8, command_line: []const u8) Error!Plan {
+pub fn load(ram: []u8, kernel: []const u8, initrd: ?[]const u8, command_line: []const u8, cpu_count: u8) Error!Plan {
     const normalized_initrd = if (initrd) |bytes| if (bytes.len == 0) null else bytes else null;
-    const layout = try plan(kernel, if (normalized_initrd) |bytes| bytes.len else 0, command_line, ram.len);
+    const layout = try plan(kernel, if (normalized_initrd) |bytes| bytes.len else 0, command_line, ram.len, cpu_count);
     @memset(ram, 0);
 
+    const mp_table_end = try mp.write(ram, cpu_count);
+    if (mp_table_end != layout.mp_table.end) return error.InvalidConfigurationTable;
     const payload = kernel[layout.image.setup_bytes..];
     @memcpy(ramSlice(ram, board.kernel_addr, payload.len), payload);
     @memcpy(ramSlice(ram, board.gdt_addr, gdt.len), &gdt);
@@ -283,12 +294,13 @@ fn overlaps(a: Range, b: Range) bool {
 }
 
 fn validatePopulatedRanges(layout: Plan) Error!void {
-    var ranges: [5]Range = undefined;
-    ranges[0] = layout.gdt;
-    ranges[1] = layout.zero_page;
-    ranges[2] = layout.command_line;
-    ranges[3] = layout.kernel_load;
-    var count: usize = 4;
+    var ranges: [6]Range = undefined;
+    ranges[0] = layout.mp_table;
+    ranges[1] = layout.gdt;
+    ranges[2] = layout.zero_page;
+    ranges[3] = layout.command_line;
+    ranges[4] = layout.kernel_load;
+    var count: usize = 5;
     if (layout.initrd) |initrd| {
         ranges[count] = initrd;
         count += 1;
@@ -304,7 +316,7 @@ fn validatePopulatedRanges(layout: Plan) Error!void {
     if (layout.kernel_runtime.start >= layout.kernel_runtime.end or layout.kernel_runtime.end > layout.ram_size) {
         return error.RamTooSmall;
     }
-    for (ranges[0..3]) |range| {
+    for (ranges[0..4]) |range| {
         if (overlaps(range, layout.kernel_runtime)) return error.RamTooSmall;
     }
     if (layout.initrd) |initrd| {
@@ -346,15 +358,18 @@ fn makeTestImage(buffer: []u8, setup_sects: u8) []u8 {
 test "bzImage planner builds a bounded low-memory boot layout" {
     var image_buf: [8192]u8 = undefined;
     const image = makeTestImage(&image_buf, 4);
-    const layout = try plan(image, 1024, "console=hvc0", 64 * 1024 * 1024);
+    const layout = try plan(image, 1024, "console=hvc0", 64 * 1024 * 1024, 2);
     try std.testing.expectEqual(@as(usize, 5 * 512), layout.image.setup_bytes);
+    try std.testing.expectEqual(@as(u8, 2), layout.cpu_count);
+    try std.testing.expectEqual(board.mp_floating_pointer_addr, layout.mp_table.start);
+    try std.testing.expectEqual(@as(u64, @intCast(try mp.tableEnd(2))), layout.mp_table.end);
     try std.testing.expectEqual(board.kernel_addr, layout.kernel_load.start);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), layout.kernel_runtime.start);
     try std.testing.expect(!overlaps(layout.initrd.?, layout.kernel_load));
     try std.testing.expect(!overlaps(layout.initrd.?, layout.kernel_runtime));
     try std.testing.expectEqual(@as(u32, e820_reserved), layout.e820[1].kind);
 
-    const populated = [_]Range{ layout.gdt, layout.zero_page, layout.command_line, layout.kernel_load, layout.initrd.? };
+    const populated = [_]Range{ layout.mp_table, layout.gdt, layout.zero_page, layout.command_line, layout.kernel_load, layout.initrd.? };
     for (populated, 0..) |range, index| {
         try std.testing.expect(range.start < range.end);
         try std.testing.expect(range.end <= layout.ram_size);
@@ -362,7 +377,11 @@ test "bzImage planner builds a bounded low-memory boot layout" {
             try std.testing.expect(!overlaps(range, other));
         }
     }
-    for (populated[0..3]) |range| try std.testing.expect(!overlaps(range, layout.kernel_runtime));
+    for (populated[0..4]) |range| try std.testing.expect(!overlaps(range, layout.kernel_runtime));
+
+    const maximum = try plan(image, 0, "console=hvc0", 64 * 1024 * 1024, mp.max_cpu_count);
+    try std.testing.expectEqual(@as(u64, @intCast(try mp.tableEnd(mp.max_cpu_count))), maximum.mp_table.end);
+    try std.testing.expect(maximum.mp_table.end <= maximum.gdt.start);
 }
 
 test "bzImage planner reserves the official runtime window and moves initrd around it" {
@@ -370,7 +389,7 @@ test "bzImage planner reserves the official runtime window and moves initrd arou
     var image = makeTestImage(&image_buf, 4);
     writeInt(u64, image, pref_address_offset, 0x0300_0001);
 
-    const layout = try plan(image, 12 * 1024 * 1024, "console=hvc0", board.min_ram_size);
+    const layout = try plan(image, 12 * 1024 * 1024, "console=hvc0", board.min_ram_size, 2);
     try std.testing.expectEqual(@as(u64, 0x0320_0000), layout.kernel_runtime.start);
     try std.testing.expectEqual(layout.kernel_runtime.start, layout.initrd.?.end);
     try std.testing.expect(!overlaps(layout.initrd.?, layout.kernel_load));
@@ -378,13 +397,13 @@ test "bzImage planner reserves the official runtime window and moves initrd arou
 
     image[relocatable_kernel_offset] = 0;
     writeInt(u64, image, pref_address_offset, 0x0140_0000);
-    const fixed = try plan(image, 0, "console=hvc0", board.min_ram_size);
+    const fixed = try plan(image, 0, "console=hvc0", board.min_ram_size, 2);
     try std.testing.expectEqual(@as(u64, 0x0140_0000), fixed.kernel_runtime.start);
 
     image = makeTestImage(&image_buf, 4);
     writeInt(u32, image, kernel_alignment_offset, board.page_size);
     writeInt(u64, image, pref_address_offset, 0);
-    const overlapping = try plan(image, 1024, "console=hvc0", board.min_ram_size);
+    const overlapping = try plan(image, 1024, "console=hvc0", board.min_ram_size, 2);
     try std.testing.expect(overlaps(overlapping.kernel_load, overlapping.kernel_runtime));
     try std.testing.expect(!overlaps(overlapping.initrd.?, overlapping.kernel_load));
     try std.testing.expect(!overlaps(overlapping.initrd.?, overlapping.kernel_runtime));
@@ -396,7 +415,7 @@ test "load writes the zero page, payload, command line, initrd, GDT, and E820" {
     const image = makeTestImage(&image_buf, 4);
     const ram = try allocator.alloc(u8, 64 * 1024 * 1024);
     defer allocator.free(ram);
-    const layout = try load(ram, image, "initrd", "console=hvc0");
+    const layout = try load(ram, image, "initrd", "console=hvc0", 2);
     const zero_page = ram[@intCast(board.zero_page_addr)..][0..boot_params_size];
 
     try std.testing.expectEqualSlices(u8, image[layout.image.setup_bytes..], ram[@intCast(board.kernel_addr)..][0..layout.image.payload_len]);
@@ -405,10 +424,11 @@ test "load writes the zero page, payload, command line, initrd, GDT, and E820" {
     try std.testing.expectEqual(@as(u8, 3), zero_page[e820_count_offset]);
     try std.testing.expectEqualSlices(u8, &gdt, ram[@intCast(board.gdt_addr)..][0..gdt.len]);
     try std.testing.expectEqualStrings("initrd", ram[@intCast(layout.initrd.?.start)..][0.."initrd".len]);
+    try mp.validate(ram, 2);
 
     writeInt(u32, image, ramdisk_image_offset, 0xdead_beef);
     writeInt(u32, image, ramdisk_size_offset, 0xfeed_face);
-    const empty_layout = try load(ram, image, "", "console=hvc0");
+    const empty_layout = try load(ram, image, "", "console=hvc0", 2);
     try std.testing.expectEqual(@as(?Range, null), empty_layout.initrd);
     try std.testing.expectEqual(@as(u32, 0), readInt(u32, zero_page, ramdisk_image_offset));
     try std.testing.expectEqual(@as(u32, 0), readInt(u32, zero_page, ramdisk_size_offset));
@@ -438,21 +458,23 @@ test "bzImage parser and planner fail closed on malformed fields" {
 
     image = makeTestImage(&image_buf, 4);
     writeInt(u64, image, pref_address_offset, std.math.maxInt(u64));
-    try std.testing.expectError(error.AddressOverflow, plan(image, 0, "ok", board.min_ram_size));
+    try std.testing.expectError(error.AddressOverflow, plan(image, 0, "ok", board.min_ram_size, 2));
 
     image = makeTestImage(&image_buf, 4);
     image[relocatable_kernel_offset] = 0;
     writeInt(u64, image, pref_address_offset, 0);
-    try std.testing.expectError(error.InvalidRuntimeAddress, plan(image, 0, "ok", board.min_ram_size));
+    try std.testing.expectError(error.InvalidRuntimeAddress, plan(image, 0, "ok", board.min_ram_size, 2));
 
     image = makeTestImage(&image_buf, 4);
     writeInt(u32, image, cmdline_size_offset, 4);
-    _ = try plan(image, 0, "four", board.min_ram_size);
-    try std.testing.expectError(error.CommandLineTooLarge, plan(image, 0, "fives", board.min_ram_size));
+    _ = try plan(image, 0, "four", board.min_ram_size, 2);
+    try std.testing.expectError(error.CommandLineTooLarge, plan(image, 0, "fives", board.min_ram_size, 2));
 
     image = makeTestImage(&image_buf, 4);
-    try std.testing.expectError(error.CommandLineContainsNul, plan(image, 0, "bad\x00line", board.min_ram_size));
-    try std.testing.expectError(error.InvalidRamSize, plan(image, 0, "ok", board.max_ram_size + board.page_size));
+    try std.testing.expectError(error.CommandLineContainsNul, plan(image, 0, "bad\x00line", board.min_ram_size, 2));
+    try std.testing.expectError(error.InvalidRamSize, plan(image, 0, "ok", board.max_ram_size + board.page_size, 2));
+    try std.testing.expectError(error.InvalidCpuCount, plan(image, 0, "ok", board.min_ram_size, 1));
+    try std.testing.expectError(error.InvalidCpuCount, plan(image, 0, "ok", board.min_ram_size, mp.max_cpu_count + 1));
 }
 
 fn fuzzBzImagePlanner(_: void, smith: *std.testing.Smith) !void {
@@ -463,9 +485,10 @@ fn fuzzBzImagePlanner(_: void, smith: *std.testing.Smith) !void {
     const ram_mib = 64 + @as(u64, smith.value(u16)) % (2048 - 64 + 1);
     const ram_size = ram_mib * 1024 * 1024;
     const initrd_len: usize = smith.value(u32);
+    const cpu_count = 1 + smith.value(u8) % (mp.max_cpu_count + 1);
 
     _ = parseBzImage(raw_kernel[0..raw_kernel_len]) catch {};
-    _ = plan(raw_kernel[0..raw_kernel_len], initrd_len, command_line[0..command_line_len], ram_size) catch {};
+    _ = plan(raw_kernel[0..raw_kernel_len], initrd_len, command_line[0..command_line_len], ram_size, cpu_count) catch {};
 
     var structured_buf: [8192]u8 = undefined;
     const structured = makeTestImage(&structured_buf, smith.value(u8));
@@ -475,7 +498,7 @@ fn fuzzBzImagePlanner(_: void, smith: *std.testing.Smith) !void {
     writeInt(u32, structured, init_size_offset, smith.value(u32));
     writeInt(u32, structured, initrd_addr_max_offset, smith.value(u32));
     writeInt(u32, structured, cmdline_size_offset, smith.value(u32));
-    _ = plan(structured, initrd_len, command_line[0..command_line_len], ram_size) catch {};
+    _ = plan(structured, initrd_len, command_line[0..command_line_len], ram_size, cpu_count) catch {};
 }
 
 test "fuzz x86 bzImage parser and placement planner" {
