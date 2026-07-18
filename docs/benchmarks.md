@@ -208,7 +208,10 @@ runtime for deliberate `eager_chunks` with `reason=key_unavailable`. A separate
 one-vCPU historical pair runs the v0.12.0 binary and the current binary against
 the same v0.12.0 parent. The historical lane is separate because v0.12.0 did
 not publish the current proof telemetry and its HVF multi-vCPU path did not
-publish complete backend restore metrics.
+publish complete backend restore metrics. Its rows must still report the older
+ready-publication timing and pass the full lifecycle, exec, and cleanup
+contract, but they do not claim the six readiness phase fields introduced
+after v0.12.0. Current-binary rows require every phase field.
 
 Every current row must report one proof-validation line and one backend restore
 line, and every current or tmpfs parent must report exactly one proof-write

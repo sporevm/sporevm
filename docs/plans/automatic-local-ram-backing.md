@@ -114,7 +114,9 @@ execs per lane. It validates current one- and two-vCPU local backing and
 deliberate eager fallback on KVM and HVF, keeps the v0.12.0 historical lane
 separate, pins every historical release input and each managed-kernel artifact,
 records the task-owned kernel cache, and enforces named cleanup through parser
-failure and signals. Linux additionally exercises schema-v2 fs-verity,
+failure and signals. The pinned v0.12.0 lane requires its older ready-publication
+timing but not the six readiness phase fields added later; every current row
+requires the complete phase set. Linux additionally exercises schema-v2 fs-verity,
 schema-v1 tmpfs, fan-out, and cross-filesystem fallback. Its Linux release lane
 ignores the general benchmark scratch, requires the selected scratch to be
 ext4, and enables and measures a disposable fs-verity file before parent
