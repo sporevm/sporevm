@@ -16,6 +16,8 @@ const virtio_vsock = @import("../virtio/vsock.zig");
 pub const page_size: u64 = 4096;
 pub const min_ram_size: u64 = 64 * 1024 * 1024;
 pub const max_ram_size: u64 = 2 * 1024 * 1024 * 1024;
+pub const board_profile = "sporevm-x86_64-board-v0";
+pub const device_model_version: u32 = 1;
 
 pub const gdt_addr: u64 = 0x0000_0500;
 pub const zero_page_addr: u64 = 0x0000_7000;
@@ -26,6 +28,9 @@ pub const kernel_addr: u64 = 0x0010_0000;
 /// complete maximum-size table must remain below the GDT.
 pub const mp_floating_pointer_addr: u64 = 0x0000_0000;
 pub const mp_config_table_addr: u64 = 0x0000_0010;
+/// The pinned Linux 6.1.155 kernel scans the bottom 1KiB in 16-byte steps for
+/// the MP floating pointer. Keep that complete search window reserved in E820.
+pub const mp_scan_window_size: u64 = 0x0000_0400;
 
 pub const legacy_hole_start: u64 = 0x0009_fc00;
 pub const legacy_hole_end: u64 = 0x0010_0000;
@@ -39,6 +44,21 @@ pub const max_virtio_devices: usize = 8;
 pub const generation_base: u64 = virtio_base + virtio_stride * max_virtio_devices;
 pub const generation_size: u64 = generation.window_size;
 pub const generation_gsi: u32 = virtio_first_gsi + max_virtio_devices;
+pub const poweroff_doorbell_offset: u64 = 0x020;
+pub const poweroff_command: u32 = 0x4646_4f50; // "POFF", little-endian bytes
+
+pub const GenerationControlAction = enum { none, read_zero, guest_off };
+
+pub fn generationControlAction(offset: u64, len: u32, is_write: bool, value: u64) !GenerationControlAction {
+    const end = std.math.add(u64, offset, len) catch return error.InvalidBoardControl;
+    const control_end = poweroff_doorbell_offset + @sizeOf(u32);
+    if (offset >= control_end or end <= poweroff_doorbell_offset) return .none;
+    if (!is_write) return .read_zero;
+    if (offset != poweroff_doorbell_offset or len != @sizeOf(u32) or value != poweroff_command) {
+        return error.InvalidBoardControl;
+    }
+    return .guest_off;
+}
 
 /// Preserve the Stage 0a.1 console names while Stage 0a.2 exercises the full
 /// ordinary eight-transport inventory.
@@ -138,6 +158,7 @@ pub const Error = error{
     CommandLineBufferTooSmall,
     BoardRangeOverlap,
     BoardRangeOverflow,
+    InvalidBoardControl,
 };
 
 pub const Range = struct {
@@ -282,6 +303,38 @@ test "complete virtio and generation inventory is bounded and collision-free" {
     try std.testing.expectEqual(@as(u64, 0xd000_1000), generation_base);
     try std.testing.expectEqual(@as(u32, 13), generation_gsi);
     try std.testing.expectError(error.InvalidVirtioSlot, virtioSlot(max_virtio_devices));
+}
+
+test "x86 board poweroff doorbell is exact fail closed and stateless" {
+    try std.testing.expectEqual(GenerationControlAction.guest_off, try generationControlAction(poweroff_doorbell_offset, 4, true, poweroff_command));
+    try std.testing.expectEqual(GenerationControlAction.none, try generationControlAction(0x014, 4, true, 1));
+    try std.testing.expectEqual(GenerationControlAction.read_zero, try generationControlAction(poweroff_doorbell_offset, 4, false, 0));
+    try std.testing.expectEqual(GenerationControlAction.read_zero, try generationControlAction(poweroff_doorbell_offset, 8, false, 0));
+
+    try std.testing.expectError(error.InvalidBoardControl, generationControlAction(poweroff_doorbell_offset, 1, true, poweroff_command));
+    try std.testing.expectError(error.InvalidBoardControl, generationControlAction(poweroff_doorbell_offset, 2, true, poweroff_command));
+    try std.testing.expectError(error.InvalidBoardControl, generationControlAction(poweroff_doorbell_offset, 8, true, poweroff_command));
+    try std.testing.expectError(error.InvalidBoardControl, generationControlAction(poweroff_doorbell_offset, 4, true, poweroff_command ^ 1));
+    try std.testing.expectError(error.InvalidBoardControl, generationControlAction(poweroff_doorbell_offset - 4, 8, true, poweroff_command));
+}
+
+fn fuzzGenerationControl(_: void, smith: *std.testing.Smith) !void {
+    const offset = smith.value(u64);
+    const len = smith.value(u32);
+    const is_write = smith.value(bool);
+    const value = smith.value(u64);
+    const action = generationControlAction(offset, len, is_write, value) catch return;
+    if (action == .guest_off) {
+        try std.testing.expectEqual(poweroff_doorbell_offset, offset);
+        try std.testing.expectEqual(@as(u32, @sizeOf(u32)), len);
+        try std.testing.expect(is_write);
+        try std.testing.expectEqual(@as(u64, poweroff_command), value);
+    }
+    if (len == 8) try std.testing.expect(action != .guest_off);
+}
+
+test "fuzz x86 generation control never launders a poweroff" {
+    try std.testing.fuzz({}, fuzzGenerationControl, .{});
 }
 
 test "maximum virtio command line describes every reserved slot exactly once" {

@@ -325,6 +325,7 @@ test "maximum MP table is bounded below the GDT" {
     try std.testing.expectEqual(@as(usize, 364), try configurationTableSize(max_cpu_count));
     try std.testing.expectEqual(@as(usize, 380), try tableEnd(max_cpu_count));
     try std.testing.expect(try tableEnd(max_cpu_count) <= board.gdt_addr);
+    try std.testing.expect(try tableEnd(max_cpu_count) <= board.mp_scan_window_size);
     try std.testing.expect(board.virtio_slots[board.virtio_slots.len - 1].gsi < isa_irq_count);
     try std.testing.expect(board.generation_gsi < isa_irq_count);
 }

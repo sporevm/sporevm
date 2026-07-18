@@ -29,6 +29,12 @@ required_source_tokens=(
   'console=hvc0 stdout=ok'
   'detail=bad-magic'
   'status=ready'
+  'sporevm.probe_mode='
+  'poweroff-native'
+  'POWEROFF_DOORBELL_OFFSET 0x020U'
+  'POWEROFF_COMMAND UINT32_C(0x46464f50)'
+  '"write-returned"'
+  'sync();'
 )
 for token in "${required_source_tokens[@]}"; do
   grep -Fq "${token}" "${source_file}" || fail "source omits ${token}"

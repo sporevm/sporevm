@@ -5,10 +5,11 @@ usage() {
   cat <<'EOF'
 usage: scripts/kernel/make-x86-board-probe-initrd.sh <out.cpio>
 
-Build the deterministic static x86-64 /init used by the Stage 0a.2 host-only
-board probe, then package it in a deterministic newc initrd. The guest prints
-parseable CPU, virtio, hvc0/stdout, and generation-device evidence before
-idling. It expects the generation device at provisional GPA 0xd0001000.
+Build the deterministic static x86-64 /init used by the Stage 0a.3 host-only
+board and lifecycle probe, then package it in a deterministic newc initrd. The
+guest prints parseable CPU, virtio, hvc0/stdout, generation-device, and selected
+lifecycle evidence. It expects the generation device at provisional GPA
+0xd0001000.
 
 Environment:
   CC  x86_64 Linux-musl C compiler command, including any target-selection

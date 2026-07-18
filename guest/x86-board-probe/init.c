@@ -10,15 +10,28 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <linux/reboot.h>
 
 #define PROBE_PREFIX "sporevm-board-probe"
 #define GENERATION_GPA UINT64_C(0xd0001000)
 #define GENERATION_WINDOW_SIZE 0x1000U
 #define GENERATION_MAGIC UINT32_C(0x4e475053)
+#define POWEROFF_DOORBELL_OFFSET 0x020U
+#define POWEROFF_COMMAND UINT32_C(0x46464f50)
 #define MAX_TEXT_FILE 256U
+#define MAX_COMMAND_LINE 4096U
 #define MAX_VIRTIO_DEVICES 32U
+
+enum probe_mode {
+  PROBE_MODE_IDLE,
+  PROBE_MODE_REBOOT,
+  PROBE_MODE_POWEROFF_NATIVE,
+  PROBE_MODE_POWEROFF,
+};
 
 struct virtio_device {
   unsigned index;
@@ -119,6 +132,51 @@ static int contains_word(const char *text, const char *word) {
     }
   }
   return 0;
+}
+
+static enum probe_mode parse_probe_mode(void) {
+  static const char prefix[] = "sporevm.probe_mode=";
+  char command_line[MAX_COMMAND_LINE];
+  read_text_file("/proc/cmdline", command_line, sizeof(command_line));
+
+  enum probe_mode mode = PROBE_MODE_IDLE;
+  int found = 0;
+  const char *cursor = command_line;
+  while (*cursor != '\0') {
+    while (is_space(*cursor)) {
+      cursor++;
+    }
+    const char *start = cursor;
+    while (*cursor != '\0' && !is_space(*cursor)) {
+      cursor++;
+    }
+    size_t length = (size_t)(cursor - start);
+    if (length < sizeof(prefix) - 1 ||
+        memcmp(start, prefix, sizeof(prefix) - 1) != 0) {
+      continue;
+    }
+    if (found) {
+      fail_probe("probe-mode", "duplicate", 0);
+    }
+    found = 1;
+    const char *value = start + sizeof(prefix) - 1;
+    size_t value_length = length - (sizeof(prefix) - 1);
+    if (value_length == 4 && memcmp(value, "idle", 4) == 0) {
+      mode = PROBE_MODE_IDLE;
+    } else if (value_length == 6 && memcmp(value, "reboot", 6) == 0) {
+      mode = PROBE_MODE_REBOOT;
+    } else if (value_length == 15 &&
+               memcmp(value, "poweroff-native", 15) == 0) {
+      mode = PROBE_MODE_POWEROFF_NATIVE;
+    } else if (value_length == 8 && memcmp(value, "poweroff", 8) == 0) {
+      mode = PROBE_MODE_POWEROFF;
+    } else if (value_length == 0) {
+      fail_probe("probe-mode", "empty", 0);
+    } else {
+      fail_probe("probe-mode", "unknown", 0);
+    }
+  }
+  return mode;
 }
 
 static unsigned count_online_cpus(const char *text) {
@@ -280,6 +338,40 @@ static void probe_generation_device(void) {
          (unsigned long long)GENERATION_GPA, magic);
 }
 
+_Noreturn static void issue_reboot_command(int command, const char *mode) {
+  printf(PROBE_PREFIX " action=%s status=requested\n", mode);
+  sync();
+  errno = 0;
+  long result = syscall(SYS_reboot, LINUX_REBOOT_MAGIC1, LINUX_REBOOT_MAGIC2,
+                        command, NULL);
+  fail_probe("lifecycle", result < 0 ? "reboot-syscall" : "reboot-returned",
+             result < 0 ? errno : 0);
+}
+
+_Noreturn static void issue_poweroff_doorbell(void) {
+  int fd = open("/dev/mem", O_RDWR | O_CLOEXEC | O_SYNC);
+  if (fd < 0) {
+    fail_probe("poweroff-doorbell", "open-devmem", errno);
+  }
+  void *mapping = mmap(NULL, GENERATION_WINDOW_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, (off_t)GENERATION_GPA);
+  int saved_errno = errno;
+  close(fd);
+  if (mapping == MAP_FAILED) {
+    fail_probe("poweroff-doorbell", "mmap", saved_errno);
+  }
+
+  printf(PROBE_PREFIX
+         " action=poweroff gpa=0x%llx offset=0x%x value=0x%08x "
+         "status=requested\n",
+         (unsigned long long)GENERATION_GPA, POWEROFF_DOORBELL_OFFSET,
+         POWEROFF_COMMAND);
+  sync();
+  *(volatile uint32_t *)((volatile unsigned char *)mapping +
+                         POWEROFF_DOORBELL_OFFSET) = POWEROFF_COMMAND;
+  fail_probe("poweroff-doorbell", "write-returned", 0);
+}
+
 int main(void) {
   setvbuf(stdout, NULL, _IONBF, 0);
   printf(PROBE_PREFIX " status=start\n");
@@ -287,6 +379,7 @@ int main(void) {
   mount_filesystem("proc", "/proc", "proc");
   mount_filesystem("sysfs", "/sys", "sysfs");
   mount_filesystem("devtmpfs", "/dev", "devtmpfs");
+  enum probe_mode mode = parse_probe_mode();
 
   char online[MAX_TEXT_FILE];
   read_text_file("/sys/devices/system/cpu/online", online, sizeof(online));
@@ -316,5 +409,15 @@ int main(void) {
 
   probe_generation_device();
   printf(PROBE_PREFIX " status=ready\n");
-  idle_forever();
+  switch (mode) {
+    case PROBE_MODE_IDLE:
+      printf(PROBE_PREFIX " action=idle status=ok\n");
+      idle_forever();
+    case PROBE_MODE_REBOOT:
+      issue_reboot_command(LINUX_REBOOT_CMD_RESTART, "reboot");
+    case PROBE_MODE_POWEROFF_NATIVE:
+      issue_reboot_command(LINUX_REBOOT_CMD_POWER_OFF, "poweroff-native");
+    case PROBE_MODE_POWEROFF:
+      issue_poweroff_doorbell();
+  }
 }

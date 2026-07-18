@@ -22,6 +22,10 @@ const irq_status_offset: u64 = 0x010;
 const irq_ack_offset: u64 = 0x014;
 const generation_offset: u64 = 0x018;
 
+// The shared SPGN v1 register protocol ends at 0x01f. Architecture-owned
+// boards may decode controls in 0x020..0x0ff before delegating the remaining
+// window here; this backend-neutral device keeps those bytes inert.
+
 pub const irq_generation_changed: u32 = 1;
 
 pub const Error = error{

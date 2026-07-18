@@ -296,7 +296,12 @@ under `rootfs.cache`.
   `parallel_count`; distributed offset/range partitioning is deferred. Backend
   restore refreshes the params page at actual resume time with volatile
   `resume_time_unix_ns` and `resume_entropy_seed` values before reasserting the
-  generation interrupt.
+  generation interrupt. The shared SPGN register protocol remains version 1
+  and occupies offsets `0x000..0x01f`; offsets `0x020..0x0ff` are reserved for
+  architecture-owned board controls decoded before the shared device. The
+  current aarch64 board defines no such controls, so those bytes remain inert.
+  Slice 2a of the x86-64 plan must document the x86 board's reviewed controls
+  here before that board enters the product runner or a portable manifest.
 - `sessions`: optional low-level process/session handles captured with the VM.
   A handle is generic: `id`, `kind: "process"`, and stream capabilities for
   `stdin`, `stdout`, `stderr`, and `terminal`. `spore run --from` uses the

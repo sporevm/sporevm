@@ -106,7 +106,7 @@ pub const Plan = struct {
     command_line: Range,
     gdt: Range,
     initrd: ?Range,
-    e820: [3]E820Entry,
+    e820: [4]E820Entry,
 };
 
 pub fn parseBzImage(kernel: []const u8) Error!ImageInfo {
@@ -180,7 +180,8 @@ pub fn plan(kernel: []const u8, initrd_len: usize, command_line: []const u8, ram
     };
 
     const e820 = [_]E820Entry{
-        .{ .addr = 0, .size = board.legacy_hole_start, .kind = e820_ram },
+        .{ .addr = 0, .size = board.mp_scan_window_size, .kind = e820_reserved },
+        .{ .addr = board.mp_scan_window_size, .size = board.legacy_hole_start - board.mp_scan_window_size, .kind = e820_ram },
         .{ .addr = board.legacy_hole_start, .size = board.legacy_hole_end - board.legacy_hole_start, .kind = e820_reserved },
         .{ .addr = board.legacy_hole_end, .size = ram_size - board.legacy_hole_end, .kind = e820_ram },
     };
@@ -367,7 +368,9 @@ test "bzImage planner builds a bounded low-memory boot layout" {
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), layout.kernel_runtime.start);
     try std.testing.expect(!overlaps(layout.initrd.?, layout.kernel_load));
     try std.testing.expect(!overlaps(layout.initrd.?, layout.kernel_runtime));
-    try std.testing.expectEqual(@as(u32, e820_reserved), layout.e820[1].kind);
+    try std.testing.expectEqual(@as(u32, e820_reserved), layout.e820[0].kind);
+    try std.testing.expectEqual(@as(u64, board.mp_scan_window_size), layout.e820[0].size);
+    try std.testing.expectEqual(@as(u32, e820_reserved), layout.e820[2].kind);
 
     const populated = [_]Range{ layout.mp_table, layout.gdt, layout.zero_page, layout.command_line, layout.kernel_load, layout.initrd.? };
     for (populated, 0..) |range, index| {
@@ -421,7 +424,7 @@ test "load writes the zero page, payload, command line, initrd, GDT, and E820" {
     try std.testing.expectEqualSlices(u8, image[layout.image.setup_bytes..], ram[@intCast(board.kernel_addr)..][0..layout.image.payload_len]);
     try std.testing.expectEqualStrings("console=hvc0", ram[@intCast(board.cmdline_addr)..][0.."console=hvc0".len]);
     try std.testing.expectEqual(@as(u32, board.kernel_addr), readInt(u32, zero_page, code32_start_offset));
-    try std.testing.expectEqual(@as(u8, 3), zero_page[e820_count_offset]);
+    try std.testing.expectEqual(@as(u8, 4), zero_page[e820_count_offset]);
     try std.testing.expectEqualSlices(u8, &gdt, ram[@intCast(board.gdt_addr)..][0..gdt.len]);
     try std.testing.expectEqualStrings("initrd", ram[@intCast(layout.initrd.?.start)..][0.."initrd".len]);
     try mp.validate(ram, 2);

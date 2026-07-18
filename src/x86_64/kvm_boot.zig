@@ -1,12 +1,13 @@
 //! Host-only x86-64 Linux/KVM bzImage boot harness.
 //!
-//! Stage 0a.2 proves the provisional SMP board and its complete ordinary
-//! device inventory. It deliberately excludes product profiles, snapshots,
-//! and persistent disk paths.
+//! Stage 0a.3 freezes the provisional board's finite PIO and lifecycle policy
+//! with structured host evidence. It deliberately excludes product profiles,
+//! snapshots, and persistent disk paths.
 
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const boot_harness = @import("../boot_harness.zig");
 const fd_util = @import("../fd.zig");
 const generation = @import("../generation.zig");
@@ -22,13 +23,14 @@ const virtio_vsock = @import("../virtio/vsock.zig");
 const board = @import("board.zig");
 const boot = @import("boot.zig");
 const cpu = @import("cpu.zig");
+const host_evidence = @import("host_evidence.zig");
+const lifecycle = @import("lifecycle.zig");
+const pio = @import("pio.zig");
 
 const max_boot_file = 256 * 1024 * 1024;
 const stage_vcpu_count: u8 = 2;
 const probe_disk_size = 1024 * 1024;
 const wake_signal = posix.SIG.URG;
-
-pub const ExitCause = enum { system_shutdown, system_reset, shutdown };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -51,19 +53,32 @@ pub fn main(init: std.process.Init) !void {
     const cmdline = try std.fmt.allocPrint(arena, "{s} {s}", .{ base_cmdline, descriptors });
     const ram_size = std.math.mul(u64, options.mem_mib, 1024 * 1024) catch return error.InvalidRamSize;
 
+    var kernel_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(kernel, &kernel_digest, .{});
+    const kernel_hex = std.fmt.bytesToHex(kernel_digest, .lower);
+    if (initrd) |bytes| {
+        var initrd_digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(bytes, &initrd_digest, .{});
+        const initrd_hex = std.fmt.bytesToHex(initrd_digest, .lower);
+        std.debug.print("sporevm kvm-boot: artifacts kernel_sha256={s} initrd_sha256={s}\n", .{ &kernel_hex, &initrd_hex });
+    } else {
+        std.debug.print("sporevm kvm-boot: artifacts kernel_sha256={s} initrd=absent\n", .{&kernel_hex});
+    }
+
     std.debug.print("sporevm kvm-boot: arch=x86_64 kernel={s} mem={d}MiB vcpus={d} cmdline=\"{s}\"\n", .{
         options.kernel_path,
         options.mem_mib,
         stage_vcpu_count,
         cmdline,
     });
-    const cause = try run(arena, .{
+    const terminal = try run(arena, .{
         .kernel = kernel,
         .initrd = initrd,
         .cmdline = cmdline,
         .ram_size = ram_size,
     });
-    std.debug.print("\nsporevm kvm-boot: raw exit cause={s}\n", .{@tagName(cause)});
+    var evidence_buffer: [512]u8 = undefined;
+    std.debug.print("\nsporevm kvm-boot: {s}\n", .{try lifecycle.formatEvidence(&evidence_buffer, terminal)});
 }
 
 const Config = struct {
@@ -81,15 +96,30 @@ const Vcpu = struct {
     thread: ?std.Thread = null,
     thread_id: std.atomic.Value(linux.pid_t) = .init(0),
 
-    fn deinit(self: *Vcpu) void {
+    fn joinThread(self: *Vcpu) void {
         if (self.thread) |thread| thread.join();
         self.thread = null;
+    }
+
+    fn releaseResources(self: *Vcpu) void {
+        std.debug.assert(self.thread == null);
         if (self.run_mapped) std.posix.munmap(self.run_bytes);
         self.run_mapped = false;
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.fd = -1;
     }
 };
+
+fn joinThreads(entries: anytype) void {
+    for (entries) |*entry| entry.joinThread();
+}
+
+fn teardownThreadResources(entries: anytype) void {
+    // A live worker may still address every kvm_run page through WakeSet, so
+    // collection-wide join is a barrier before releasing any entry.
+    joinThreads(entries);
+    for (entries) |*entry| entry.releaseResources();
+}
 
 const WakeSet = struct {
     vcpus: []Vcpu,
@@ -128,7 +158,7 @@ const WakeSignal = struct {
 fn handleWakeSignal(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {}
 
 const RunResult = union(enum) {
-    cause: ExitCause,
+    cause: lifecycle.Terminal,
     err: anyerror,
 };
 
@@ -149,15 +179,89 @@ const SpinLock = struct {
 const RunState = struct {
     mutex: SpinLock = .{},
     stop: std.atomic.Value(bool) = .init(false),
-    first: ?RunResult = null,
+    phase: union(enum) {
+        open,
+        reserved: struct {
+            owner: u8,
+            terminal: lifecycle.Terminal,
+            completed: bool = false,
+        },
+        published: RunResult,
+    } = .open,
 
-    fn finish(self: *RunState, result: RunResult) bool {
+    fn finishError(self: *RunState, err: anyerror) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.first != null) return false;
-        self.first = result;
-        self.stop.store(true, .release);
-        return true;
+        return switch (self.phase) {
+            .open => blk: {
+                self.phase = .{ .published = .{ .err = err } };
+                self.stop.store(true, .release);
+                break :blk true;
+            },
+            .reserved, .published => false,
+        };
+    }
+
+    fn reserveTerminal(self: *RunState, terminal: lifecycle.Terminal) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.phase) {
+            .open => blk: {
+                self.phase = .{ .reserved = .{ .owner = terminal.vcpu_index, .terminal = terminal } };
+                break :blk true;
+            },
+            .reserved, .published => false,
+        };
+    }
+
+    fn markTerminalCompleted(self: *RunState, owner: u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.phase) {
+            .reserved => |*reservation| blk: {
+                if (reservation.owner != owner or reservation.completed) break :blk false;
+                reservation.completed = true;
+                break :blk true;
+            },
+            .open, .published => false,
+        };
+    }
+
+    fn publishReserved(self: *RunState, owner: u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.phase) {
+            .reserved => |reservation| blk: {
+                if (reservation.owner != owner or !reservation.completed) break :blk false;
+                self.phase = .{ .published = .{ .cause = reservation.terminal } };
+                self.stop.store(true, .release);
+                break :blk true;
+            },
+            .open, .published => false,
+        };
+    }
+
+    fn failReserved(self: *RunState, owner: u8, err: anyerror) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.phase) {
+            .reserved => |reservation| blk: {
+                if (reservation.owner != owner) break :blk false;
+                self.phase = .{ .published = .{ .err = err } };
+                self.stop.store(true, .release);
+                break :blk true;
+            },
+            .open, .published => false,
+        };
+    }
+
+    fn publishedResult(self: *RunState) ?RunResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.phase) {
+            .published => |result| result,
+            .open, .reserved => null,
+        };
     }
 
     fn stopped(self: *const RunState) bool {
@@ -186,25 +290,21 @@ fn kvmPostRunAction(result: kvm.RunResult) KvmPostRunAction {
     };
 }
 
-fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
+fn run(allocator: std.mem.Allocator, config: Config) !lifecycle.Terminal {
     try board.validateLayout(config.ram_size);
 
     const kvm_fd = try kvm.openDevKvm();
     defer _ = std.c.close(kvm_fd);
-    try kvm.checkApiVersion(kvm_fd);
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_USER_MEMORY, "KVM_CAP_USER_MEMORY");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_IRQCHIP, "KVM_CAP_IRQCHIP");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_SET_TSS_ADDR, "KVM_CAP_SET_TSS_ADDR");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_SET_IDENTITY_MAP_ADDR, "KVM_CAP_SET_IDENTITY_MAP_ADDR");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_PIT2, "KVM_CAP_PIT2");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_EXT_CPUID, "KVM_CAP_EXT_CPUID");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_MP_STATE, "KVM_CAP_MP_STATE");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_IMMEDIATE_EXIT, "KVM_CAP_IMMEDIATE_EXIT");
-    if (try kvm.checkExtension(kvm_fd, kvm.KVM_CAP_NR_VCPUS) < stage_vcpu_count) {
+    const capabilities = try host_evidence.collectCapabilities(kvm_fd);
+    var host_buffer: [512]u8 = undefined;
+    std.debug.print("sporevm kvm-boot: {s}\n", .{try host_evidence.formatCapabilities(&host_buffer, capabilities)});
+    if (capabilities.nrVcpus() < stage_vcpu_count) {
         return error.UnsupportedVcpuCount;
     }
 
     const supported_cpuid = try kvm.getSupportedCpuid(kvm_fd);
+    const cpuid_evidence = try host_evidence.collectCpuid(&supported_cpuid);
+    std.debug.print("sporevm kvm-boot: {s}\n", .{try host_evidence.formatCpuid(&host_buffer, cpuid_evidence)});
     const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
     defer _ = std.c.close(vm_fd);
 
@@ -214,6 +314,7 @@ fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_IRQCHIP, 0, "KVM_CREATE_IRQCHIP");
     var pit = kvm.PitConfig{};
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_PIT2, @intFromPtr(&pit), "KVM_CREATE_PIT2");
+    std.debug.print("sporevm kvm-boot: setup tss=0x{x} identity_map=0x{x} irqchip=ok pit2=ok\n", .{ board.tss_addr, board.identity_map_addr });
 
     const ram = try std.posix.mmap(
         null,
@@ -235,12 +336,15 @@ fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         .userspace_addr = @intFromPtr(ram.ptr),
     };
     _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&memory_region), "KVM_SET_USER_MEMORY_REGION");
+    std.debug.print("sporevm kvm-boot: setup memslot=ok guest_phys=0x0 size={d}\n", .{config.ram_size});
 
     const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
     if (run_size < kvm.RunLayout.mmio_end) return error.KvmRunMappingTooSmall;
+    var signal = WakeSignal.install();
+    defer signal.deinit();
     var vcpus: [stage_vcpu_count]Vcpu = undefined;
     var initialized: usize = 0;
-    defer for (vcpus[0..initialized]) |*vcpu| vcpu.deinit();
+    defer teardownThreadResources(vcpus[0..initialized]);
 
     // Every vCPU and its distinct CPUID is ready before any worker can enter
     // KVM_RUN, so Linux never observes a partially constructed topology.
@@ -265,12 +369,14 @@ fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         var cpuid = try kvm.normalizeSupportedCpuidTopology(supported_cpuid, stage_vcpu_count, @intCast(initialized));
         _ = try kvm.ioctl(vcpu_fd, kvm.KVM_SET_CPUID2, @intFromPtr(&cpuid), "KVM_SET_CPUID2");
     }
+    std.debug.print("sporevm kvm-boot: setup get_supported_cpuid=ok set_cpuid2_vcpus={d}\n", .{initialized});
     try configureProtectedMode(vcpus[0].fd, layout);
     for (vcpus[1..initialized]) |*vcpu| {
         if ((try kvm.getMpState(vcpu.fd)).mp_state != kvm.KVM_MP_STATE_UNINITIALIZED) {
             return error.UnexpectedApState;
         }
     }
+    std.debug.print("sporevm kvm-boot: setup bsp=protected-mode ap_initial_state=uninitialized ap_count={d}\n", .{initialized - 1});
 
     var console_dev = virtio_console.Console{ .sink = consoleSink };
     var disk_memory: [4][]u8 = undefined;
@@ -300,8 +406,6 @@ fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try validateTransportInventory(&transports, &board.stage0a2_ordinary_inventory);
     var gen_dev = generation.Device{};
 
-    var signal = WakeSignal.install();
-    defer signal.deinit();
     var state = RunState{};
     var wake_set = WakeSet{ .vcpus = vcpus[0..initialized] };
     var device_lock = SpinLock{};
@@ -319,19 +423,15 @@ fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .ram = guest_ram,
         };
         vcpus[started].thread = std.Thread.spawn(.{}, vcpuThreadMain, .{&contexts[started]}) catch |err| {
-            _ = state.finish(.{ .err = err });
-            wake_set.wakeAll();
+            if (state.finishError(err)) wake_set.wakeAll();
             return err;
         };
     }
 
     // Joining is safe because the first terminal/error result wakes every
-    // KVM_RUN with immediate_exit plus a process-directed SIGURG.
-    for (vcpus[0..started]) |*vcpu| {
-        if (vcpu.thread) |thread| thread.join();
-        vcpu.thread = null;
-    }
-    const result = state.first orelse return error.MissingVcpuResult;
+    // KVM_RUN with immediate_exit plus a thread-directed SIGURG.
+    joinThreads(vcpus[0..started]);
+    const result = state.publishedResult() orelse return error.MissingVcpuResult;
     return switch (result) {
         .cause => |cause| cause,
         .err => |err| err,
@@ -351,11 +451,11 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
     var pending_completion = false;
     while (true) {
         if (ctx.state.stopped()) {
-            completePending(ctx, &pending_completion) catch |err| finishThread(ctx, .{ .err = err });
+            completePending(ctx, &pending_completion) catch |err| finishThread(ctx, err);
             return;
         }
         const run_result = kvm.runVcpu(ctx.vcpu.fd) catch |err| {
-            finishThread(ctx, .{ .err = err });
+            finishThread(ctx, err);
             return;
         };
         // Re-entry completes the prior PIO/MMIO operation before KVM observes
@@ -380,49 +480,98 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
         switch (kvm.exitReason(ctx.vcpu.run_bytes)) {
             kvm.KVM_EXIT_IO => {
                 ctx.device_lock.lock();
-                handlePio(ctx.vcpu.index, ctx.vcpu.run_bytes) catch |err| {
+                const terminal = handlePio(ctx.vcpu.index, ctx.vcpu.run_bytes) catch |err| {
                     ctx.device_lock.unlock();
-                    finishThread(ctx, .{ .err = err });
+                    finishThread(ctx, err);
                     return;
                 };
-                ctx.device_lock.unlock();
                 pending_completion = true;
+                const owns_terminal = if (terminal) |result|
+                    ctx.state.reserveTerminal(result)
+                else
+                    false;
+                ctx.device_lock.unlock();
+                if (terminal != null) {
+                    completeTerminal(ctx, &pending_completion, owns_terminal);
+                    return;
+                }
             },
             kvm.KVM_EXIT_MMIO => {
                 ctx.device_lock.lock();
-                handleMmio(ctx.vm_fd, ctx.vcpu.run_bytes, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
+                const terminal = handleMmio(ctx.vcpu.index, ctx.vm_fd, ctx.vcpu.run_bytes, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
                     ctx.device_lock.unlock();
-                    finishThread(ctx, .{ .err = err });
+                    finishThread(ctx, err);
                     return;
                 };
-                ctx.device_lock.unlock();
                 pending_completion = true;
+                const owns_terminal = if (terminal) |result|
+                    ctx.state.reserveTerminal(result)
+                else
+                    false;
+                ctx.device_lock.unlock();
+                if (terminal != null) {
+                    completeTerminal(ctx, &pending_completion, owns_terminal);
+                    return;
+                }
             },
             kvm.KVM_EXIT_HLT => std.Thread.yield() catch {},
             kvm.KVM_EXIT_SYSTEM_EVENT => switch (readRunInt(u32, ctx.vcpu.run_bytes, kvm.RunLayout.system_event_type)) {
-                kvm.KVM_SYSTEM_EVENT_SHUTDOWN => finishThread(ctx, .{ .cause = .system_shutdown }),
-                kvm.KVM_SYSTEM_EVENT_RESET => finishThread(ctx, .{ .cause = .system_reset }),
-                else => finishThread(ctx, .{ .err = error.UnexpectedKvmExit }),
+                kvm.KVM_SYSTEM_EVENT_SHUTDOWN => {
+                    publishSystemTerminal(ctx, .{ .vcpu_index = ctx.vcpu.index, .cause = .{ .system_event_shutdown = .{
+                        .exit_reason = kvm.KVM_EXIT_SYSTEM_EVENT,
+                    } } });
+                    return;
+                },
+                kvm.KVM_SYSTEM_EVENT_RESET => {
+                    publishSystemTerminal(ctx, .{ .vcpu_index = ctx.vcpu.index, .cause = .{ .system_event_reset = .{
+                        .exit_reason = kvm.KVM_EXIT_SYSTEM_EVENT,
+                    } } });
+                    return;
+                },
+                else => |event_type| {
+                    std.log.err("raw unknown KVM_EXIT_SYSTEM_EVENT type={d} reason={d} vcpu={d}", .{
+                        event_type,
+                        kvm.KVM_EXIT_SYSTEM_EVENT,
+                        ctx.vcpu.index,
+                    });
+                    finishThread(ctx, error.UnexpectedKvmExit);
+                    return;
+                },
             },
-            // Preserve the raw exit class. Stage 0a.3 must prove whether this
-            // is a triple fault, reset, or poweroff before assigning product
-            // lifecycle semantics.
-            kvm.KVM_EXIT_SHUTDOWN => finishThread(ctx, .{ .cause = .shutdown }),
-            kvm.KVM_EXIT_FAIL_ENTRY, kvm.KVM_EXIT_INTERNAL_ERROR => finishThread(ctx, .{ .err = error.UnexpectedKvmExit }),
+            // KVM_EXIT_SHUTDOWN commonly represents a triple fault. It remains
+            // raw fatal evidence and never acquires reset or poweroff meaning.
+            kvm.KVM_EXIT_SHUTDOWN => {
+                std.log.err("raw unclassified KVM_EXIT_SHUTDOWN reason={d} vcpu={d}", .{ kvm.KVM_EXIT_SHUTDOWN, ctx.vcpu.index });
+                finishThread(ctx, error.UnclassifiedKvmShutdown);
+                return;
+            },
+            kvm.KVM_EXIT_FAIL_ENTRY, kvm.KVM_EXIT_INTERNAL_ERROR => {
+                finishThread(ctx, error.UnexpectedKvmExit);
+                return;
+            },
             else => |reason| {
                 std.log.err("unhandled x86 KVM exit reason {d} on vcpu {d}", .{ reason, ctx.vcpu.index });
-                finishThread(ctx, .{ .err = error.UnexpectedKvmExit });
+                finishThread(ctx, error.UnexpectedKvmExit);
+                return;
             },
         }
         if (ctx.state.stopped()) {
-            completePending(ctx, &pending_completion) catch |err| finishThread(ctx, .{ .err = err });
+            completePending(ctx, &pending_completion) catch |err| finishThread(ctx, err);
             return;
         }
     }
 }
 
-fn finishThread(ctx: *ThreadContext, result: RunResult) void {
-    if (ctx.state.finish(result)) ctx.wake_set.wakeAll();
+fn finishThread(ctx: *ThreadContext, err: anyerror) void {
+    if (ctx.state.finishError(err)) {
+        ctx.wake_set.wakeAll();
+    } else {
+        logRefusedVcpuError(ctx, err);
+    }
+}
+
+fn logRefusedVcpuError(ctx: *ThreadContext, err: anyerror) void {
+    std.log.err("refused losing vCPU error vcpu={d} error={s}", .{ ctx.vcpu.index, @errorName(err) });
 }
 
 fn completePending(ctx: *ThreadContext, pending: *bool) !void {
@@ -431,16 +580,73 @@ fn completePending(ctx: *ThreadContext, pending: *bool) !void {
     pending.* = false;
 }
 
-fn handlePio(vcpu_index: u8, run_bytes: []u8) !void {
+fn completeTerminal(ctx: *ThreadContext, pending: *bool, owns_terminal: bool) void {
+    // Reservation happens under device_lock, but deliberately does not stop or
+    // wake any vCPU. The owner first completes its KVM exit; a losing terminal
+    // also completes its own exit and returns without attempting publication.
+    std.debug.assert(pending.*);
+    completePending(ctx, pending) catch |err| {
+        if (owns_terminal) {
+            if (ctx.state.failReserved(ctx.vcpu.index, err)) {
+                ctx.wake_set.wakeAll();
+            } else {
+                logRefusedVcpuError(ctx, err);
+            }
+        } else {
+            finishThread(ctx, err);
+        }
+        return;
+    };
+    std.debug.assert(!pending.*);
+    if (!owns_terminal) return;
+    std.debug.assert(ctx.state.markTerminalCompleted(ctx.vcpu.index));
+    if (ctx.state.publishReserved(ctx.vcpu.index)) ctx.wake_set.wakeAll();
+}
+
+fn publishSystemTerminal(ctx: *ThreadContext, terminal: lifecycle.Terminal) void {
+    ctx.device_lock.lock();
+    const owns_terminal = ctx.state.reserveTerminal(terminal);
+    ctx.device_lock.unlock();
+    if (!owns_terminal) return;
+    std.debug.assert(ctx.state.markTerminalCompleted(ctx.vcpu.index));
+    if (ctx.state.publishReserved(ctx.vcpu.index)) ctx.wake_set.wakeAll();
+}
+
+fn handlePio(vcpu_index: u8, run_bytes: []u8) !?lifecycle.Terminal {
     const exit = try kvm.decodeIoExit(run_bytes);
-    std.debug.print("sporevm kvm-boot: vcpu={d} pio direction={s} width={d} port=0x{x} count={d}\n", .{
+    const direction: pio.Direction = switch (exit.direction) {
+        .read => .read,
+        .write => .write,
+    };
+    const action = try pio.handle(.{
+        .direction = direction,
+        .width = exit.width,
+        .port = exit.port,
+        .count = exit.count,
+        .data = exit.data,
+    });
+    std.debug.print("sporevm kvm-boot: vcpu={d} pio direction={s} width={d} port=0x{x} count={d} data=0x", .{
         vcpu_index,
-        @tagName(exit.direction),
+        @tagName(direction),
         exit.width,
         exit.port,
         exit.count,
     });
-    if (exit.direction == .read) @memset(exit.data, 0);
+    for (exit.data) |byte| std.debug.print("{x:0>2}", .{byte});
+    std.debug.print(" action={s}\n", .{@tagName(action)});
+    return switch (action) {
+        .continue_guest => null,
+        .guest_reset => .{
+            .vcpu_index = vcpu_index,
+            .cause = .{ .pio_reset = .{
+                .exit_reason = kvm.KVM_EXIT_IO,
+                .width = exit.width,
+                .port = exit.port,
+                .count = exit.count,
+                .value = exit.data[0],
+            } },
+        },
+    };
 }
 
 const MmioTarget = union(enum) {
@@ -459,6 +665,7 @@ fn decodeMmioTarget(phys_addr: u64, len: u32) !MmioTarget {
     if (len != 1 and len != 2 and len != 4 and len != 8) return error.MalformedMmioExit;
     const end = std.math.add(u64, phys_addr, len) catch return error.MalformedMmioExit;
     if (phys_addr >= board.virtio_base and phys_addr < board.generation_base) {
+        if (len == 8) return error.MalformedMmioExit;
         if (phys_addr % len != 0) return error.MalformedMmioExit;
         const relative = phys_addr - board.virtio_base;
         const index: usize = @intCast(relative / board.virtio_stride);
@@ -488,12 +695,13 @@ fn decodeMmioExit(run_bytes: []u8) !MmioExit {
 }
 
 fn handleMmio(
+    vcpu_index: u8,
     vm_fd: std.c.fd_t,
     run_bytes: []u8,
     transports: *[board.max_virtio_devices]mmio.Transport,
     gen_dev: *generation.Device,
     ram: guestmem.GuestRam,
-) !void {
+) !?lifecycle.Terminal {
     const exit = try decodeMmioExit(run_bytes);
     switch (exit.target) {
         .virtio => |access| {
@@ -501,11 +709,17 @@ fn handleMmio(
             const slot = board.virtio_slots[access.index];
             if (exit.is_write) {
                 const value: u32 = @truncate(readMmioValue(exit.data, exit.len));
-                if (transport.write(access.offset, value, ram)) try kvm.setIrq(vm_fd, slot.gsi, true);
-                if (access.offset == 0x064 and transport.interrupt_status == 0) try kvm.setIrq(vm_fd, slot.gsi, false);
+                const before = transport.interrupt_status;
+                const raised = transport.write(access.offset, value, ram);
+                switch (transportIrqAction(before, transport.interrupt_status, raised)) {
+                    .none => {},
+                    .raise => try kvm.setIrq(vm_fd, slot.gsi, true),
+                    .lower => try kvm.setIrq(vm_fd, slot.gsi, false),
+                }
             } else {
                 writeMmioValue(exit.data, exit.len, transport.read(access.offset));
             }
+            return null;
         },
         .generation => |offset| {
             const size_log2: u2 = switch (exit.len) {
@@ -515,14 +729,36 @@ fn handleMmio(
                 8 => 3,
                 else => unreachable,
             };
-            if (exit.is_write) {
-                const value = readMmioValue(exit.data, exit.len);
-                if (gen_dev.write(offset, value, size_log2)) try kvm.setIrq(vm_fd, board.generation_gsi, false);
-            } else {
-                writeMmioValue(exit.data, exit.len, gen_dev.read(offset, size_log2));
+            const value = readMmioValue(exit.data, exit.len);
+            switch (try board.generationControlAction(offset, exit.len, exit.is_write, value)) {
+                .none => if (exit.is_write) {
+                    if (gen_dev.write(offset, value, size_log2)) try kvm.setIrq(vm_fd, board.generation_gsi, false);
+                } else {
+                    writeMmioValue(exit.data, exit.len, gen_dev.read(offset, size_log2));
+                },
+                .read_zero => writeMmioValue(exit.data, exit.len, 0),
+                .guest_off => return .{
+                    .vcpu_index = vcpu_index,
+                    .cause = .{ .board_poweroff = .{
+                        .exit_reason = kvm.KVM_EXIT_MMIO,
+                        .gpa = board.generation_base + offset,
+                        .offset = offset,
+                        .len = exit.len,
+                        .value = value,
+                    } },
+                },
             }
+            return null;
         },
     }
+}
+
+const TransportIrqAction = enum { none, raise, lower };
+
+fn transportIrqAction(before: u32, after: u32, raised: bool) TransportIrqAction {
+    if (before != 0 and after == 0) return .lower;
+    if (raised) return .raise;
+    return .none;
 }
 
 fn readMmioValue(data: []const u8, len: u32) u64 {
@@ -603,14 +839,13 @@ test "MMIO router accepts only complete aligned board windows" {
     const config_word = try decodeMmioTarget(board.virtio_slots[5].base + 0x102, 2);
     try std.testing.expectEqual(@as(usize, 5), config_word.virtio.index);
     try std.testing.expectEqual(@as(u64, 0x102), config_word.virtio.offset);
-    const config_double = try decodeMmioTarget(board.virtio_slots[6].base + 0x100, 8);
-    try std.testing.expectEqual(@as(usize, 6), config_double.virtio.index);
-    try std.testing.expectEqual(@as(u64, 0x100), config_double.virtio.offset);
     const last = try decodeMmioTarget(board.virtio_slots[7].base + 0x1fc, 4);
     try std.testing.expectEqual(@as(usize, 7), last.virtio.index);
     try std.testing.expectEqual(@as(u64, 0x1fc), last.virtio.offset);
     try std.testing.expectEqual(@as(u64, 0x18), (try decodeMmioTarget(board.generation_base + 0x18, 8)).generation);
     try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_base + 1, 2));
+    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_base + 0xf8, 8));
+    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_slots[6].base + 0x100, 8));
     try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_slots[0].base + 0x1ff, 2));
     try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_slots[7].base + 0x1fc, 8));
     try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.generation_base + board.generation_size - 4, 8));
@@ -639,6 +874,7 @@ fn fuzzMmioExit(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expect(exit.data.len == 8);
     switch (exit.target) {
         .virtio => |access| {
+            try std.testing.expect(exit.len != 8);
             try std.testing.expect(access.index < board.max_virtio_devices);
             try std.testing.expect(access.offset % exit.len == 0);
             try std.testing.expect(access.offset + exit.len <= board.virtio_window_size);
@@ -679,6 +915,121 @@ test "post-run dispatch retries an uninitialized AP without losing real exits" {
     try std.testing.expectEqual(KvmPostRunAction.dispatch_exit, kvmPostRunAction(.completed));
     try std.testing.expectEqual(KvmPostRunAction.handle_async_wake, kvmPostRunAction(.interrupted));
     try std.testing.expectEqual(KvmPostRunAction.retry_not_runnable, kvmPostRunAction(.not_runnable));
+}
+
+const TeardownProbe = struct {
+    joined: *usize,
+    released: *usize,
+    entry_count: usize,
+
+    fn joinThread(self: *TeardownProbe) void {
+        self.joined.* += 1;
+    }
+
+    fn releaseResources(self: *TeardownProbe) void {
+        std.debug.assert(self.joined.* == self.entry_count);
+        self.released.* += 1;
+    }
+};
+
+test "vCPU teardown joins the collection before releasing any run mapping" {
+    const entry_count = 3;
+    var joined: usize = 0;
+    var released: usize = 0;
+    var entries: [entry_count]TeardownProbe = @splat(.{
+        .joined = &joined,
+        .released = &released,
+        .entry_count = entry_count,
+    });
+
+    teardownThreadResources(entries[0..]);
+
+    try std.testing.expectEqual(entry_count, joined);
+    try std.testing.expectEqual(entry_count, released);
+}
+
+test "transport IRQ transitions preserve level semantics" {
+    try std.testing.expectEqual(TransportIrqAction.none, transportIrqAction(0, 0, false));
+    try std.testing.expectEqual(TransportIrqAction.none, transportIrqAction(1, 1, false));
+    try std.testing.expectEqual(TransportIrqAction.raise, transportIrqAction(0, 1, true));
+    try std.testing.expectEqual(TransportIrqAction.raise, transportIrqAction(1, 1, true));
+    try std.testing.expectEqual(TransportIrqAction.lower, transportIrqAction(1, 0, false));
+    try std.testing.expectEqual(TransportIrqAction.lower, transportIrqAction(1, 0, true));
+}
+
+fn testTerminal(vcpu_index: u8) lifecycle.Terminal {
+    return .{ .vcpu_index = vcpu_index, .cause = .{ .pio_reset = .{
+        .exit_reason = kvm.KVM_EXIT_IO,
+        .width = 1,
+        .port = 0x64,
+        .count = 1,
+        .value = 0xfe,
+    } } };
+}
+
+test "terminal reservation blocks unclaimed finish and publication before completion" {
+    var state = RunState{};
+    try std.testing.expect(state.reserveTerminal(testTerminal(0)));
+    try std.testing.expect(!state.stopped());
+    try std.testing.expect(state.publishedResult() == null);
+    try std.testing.expect(!state.finishError(error.UnclaimedError));
+    try std.testing.expect(!state.publishReserved(0));
+    try std.testing.expect(!state.stopped());
+    try std.testing.expect(state.publishedResult() == null);
+
+    try std.testing.expect(state.markTerminalCompleted(0));
+    try std.testing.expect(!state.stopped());
+    try std.testing.expect(state.publishedResult() == null);
+    try std.testing.expect(state.publishReserved(0));
+    try std.testing.expect(state.stopped());
+    switch (state.publishedResult().?) {
+        .cause => |terminal| try std.testing.expectEqual(lifecycle.Outcome.guest_reset, terminal.cause.outcome()),
+        .err => return error.TestUnexpectedResult,
+    }
+}
+
+test "terminal reservation owner can publish a completion error" {
+    var state = RunState{};
+    try std.testing.expect(state.reserveTerminal(testTerminal(0)));
+    try std.testing.expect(!state.failReserved(1, error.WrongOwner));
+    try std.testing.expect(state.failReserved(0, error.TerminalCompletionFailed));
+    try std.testing.expect(state.stopped());
+    switch (state.publishedResult().?) {
+        .cause => return error.TestUnexpectedResult,
+        .err => |err| try std.testing.expectEqual(error.TerminalCompletionFailed, err),
+    }
+}
+
+test "first terminal reservation wins" {
+    var state = RunState{};
+    try std.testing.expect(state.reserveTerminal(testTerminal(0)));
+    try std.testing.expect(!state.reserveTerminal(testTerminal(1)));
+    try std.testing.expect(!state.markTerminalCompleted(1));
+    try std.testing.expect(state.markTerminalCompleted(0));
+    try std.testing.expect(state.publishReserved(0));
+    switch (state.publishedResult().?) {
+        .cause => |terminal| try std.testing.expectEqual(@as(u8, 0), terminal.vcpu_index),
+        .err => return error.TestUnexpectedResult,
+    }
+}
+
+const ReservationRace = struct {
+    fn run(state: *RunState, wins: *std.atomic.Value(u32), owner: u8) void {
+        if (state.reserveTerminal(testTerminal(owner))) _ = wins.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "concurrent terminal reservations admit one owner" {
+    var state = RunState{};
+    var wins = std.atomic.Value(u32).init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| {
+        thread.* = try std.Thread.spawn(.{}, ReservationRace.run, .{ &state, &wins, @as(u8, @intCast(index)) });
+    }
+    for (threads) |thread| thread.join();
+    try std.testing.expectEqual(@as(u32, 1), wins.load(.acquire));
+    try std.testing.expect(!state.stopped());
+    try std.testing.expect(state.publishedResult() == null);
 }
 
 test "real transports match the exact ordinary and transient-memory inventories" {

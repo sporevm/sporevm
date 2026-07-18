@@ -52,8 +52,8 @@ throughout the work.
 
 ## Current Progress
 
-- The implementation branch starts from SporeVM `origin/main` at
-  `9b25600f350719953613bbcf4b3bfea35cc2c766`.
+- The implementation branch is rebased onto SporeVM `origin/main` at
+  `197ce717b3e5a0b62421666d5173d23852fe2132`.
 - The design has passed an external Fable architecture review. Its grounded
   findings are incorporated into the slice ordering, PIO/exit contract,
   single-VMA memory invariant, state inventory, and release-name gate.
@@ -119,6 +119,39 @@ throughout the work.
   maintainability, and Ponytail lenses with no material finding remaining. The
   final Anthropic Fable review approved the stage with no material finding;
   its three non-blocking board-freeze observations are assigned to Stage 0a.3.
+- Stage 0a.3 now has a candidate implementation and exact native proof. The
+  final harness SHA256 is
+  `1bc2485b4b6ca6c3266ba33461f39e85d86bdff302b1f1651b1fe5dbd24c22d8`,
+  the deterministic lifecycle-probe initrd SHA256 is
+  `ee05bff31ee93e51ea570f68e18e321a1c4eab0ac606b64065edd7ac30c40eb5`,
+  and every run used the Stage 0a.2 managed bzImage above. The retained final
+  evidence checksum file has SHA256
+  `5bd007e3ecb8f368500a39ec1ac4ab60a83c7887082d93316fe43e63c4be8326`
+  and verifies the artifacts, host/capability and kernel-provenance sidecars,
+  exact command lines, logs, and return codes. Idle reached `status=ready` and
+  timed out with the expected rc 124; reboot returned rc 0 as `guest_reset`
+  from raw `KVM_EXIT_IO` reason 2, vCPU 0, one-byte port `0x64`, value `0xfe`;
+  native poweroff reached `System halted` and timed out with rc 124 without a
+  terminal classification; and the board poweroff command returned rc 0 as
+  `guest_off` from raw `KVM_EXIT_MMIO` reason 6 at GPA `0xd0001020`, offset
+  `0x020`, length 4, value `0x46464f50`. The four log SHA256 values are
+  `f379459f94e7b6bee7ceee609a37c7d0c4ac1e7ad0b93035e22f0ce745014ed1`,
+  `5cfbd15d0fe1dfa2f2e98be71306e6465498645207d738ec6585593ad7e1c893`,
+  `e2b11baa036a035bc2692a80fafb3ac525a2836ff041037637ab878804deeae8`,
+  and `233396c0c7735e9c5ea041ee93c866dbced767d1c416338e0bfc975ff537e858`
+  respectively. Native evidence records KVM API 12, every required capability
+  as nonzero, 96 recommended vCPUs, 46 supported CPUID entries, GenuineIntel,
+  leaf 1 and leaf `0x0b` present, leaf `0x1f` absent, x2APIC supported with the
+  guest forced to `nox2apic`, and successful irqchip/PIT, TSS/identity-map,
+  memory-slot, per-vCPU CPUID, BSP, and AP setup. No final run emitted a failure
+  marker or raw `KVM_EXIT_SHUTDOWN`, and no harness process remained. The final
+  focused x86 suite passed 467 tests with five expected skips and 32 fuzz
+  targets; full `mise run test`, native build, x86-64 KVM-harness cross-build,
+  deterministic-initrd test, checksum verification, and diff hygiene pass. The
+  independent evidence audit approved with no findings, the final auto-review
+  ship-risk, maintainability, and Ponytail lenses approved with no findings,
+  and the final Anthropic Fable continuation approved Stage 0a.3 with no
+  material finding.
 
 ## Motivation
 
@@ -674,12 +707,58 @@ address, and GSI layout is bounded and collision-free.
   reusable modules enter the product path.
 - Before freezing the board, lower a virtio GSI after any transport write that
   clears `interrupt_status`, including device reset rather than InterruptACK
-  alone, and reject 8-byte accesses in the 32-bit virtio register window below
-  the device-specific configuration area.
+  alone. Accept only 1-, 2-, and 4-byte accesses in every virtio window; the
+  generation window may additionally accept aligned 8-byte accesses.
 - Record why the MP floating pointer's provisional GPA-zero placement is found
   by the pinned kernel's bottom-1KiB scan and remains protected as reserved low
   memory; move it to a conventional firmware search range if the final managed
   kernel or board contract cannot make that dependency explicit and stable.
+
+The Stage 0a.3 candidate freeze is `sporevm-x86_64-board-v0` at
+`device_model_version = 1`. It retains the Stage 0a.2 eight-slot virtio-mmio
+inventory at `0xd0000000..0xd0000fff`, GSIs 5 through 12, and the generation
+page at `0xd0001000`, GSI 13. The shared SPGN register protocol stays at version
+1 byte-for-byte on both architectures. The x86 board alone decodes offset
+`0x020` as a stateless, edge-triggered poweroff doorbell: the exact aligned
+32-bit command `0x46464f50` (`POFF`) yields `guest_off`; any write touching the
+register with another width, placement, or value fails closed, and reads return
+zero without a side effect. The aarch64 board has no corresponding control.
+
+The finite PIO table is value-sensitive and contains only these native-observed
+tuples:
+
+| Direction | Port | Width/count | Value/result | Action |
+|---|---:|---:|---|---|
+| write | `0x70` | 1 byte / 1 | `0x0f` | continue |
+| write | `0x71` | 1 byte / 1 | `0x0a` or `0x00` | continue |
+| read | `0x64` | 1 byte / 1 | return `0x00` | continue |
+| write | `0x64` | 1 byte / 1 | `0xfe` | `guest_reset` |
+
+Every other direction, port, width, count, or value fails closed. The reboot
+probe uses the native kernel path with `reboot=kbd nox2apic`; the first exact
+`0x64 <- 0xfe` is terminal, so the later CMOS `0x8f` write observed only after
+the trace harness ignored ten reset requests is excluded. Native ACPI-less
+poweroff reaches `System halted` without a distinct terminal exit, so it is a
+negative control rather than `guest_off`; the board doorbell supplies the
+distinct outcome. `KVM_EXIT_SYSTEM_EVENT` reset/shutdown retains its typed raw
+event classification, while raw `KVM_EXIT_SHUTDOWN` is an unclassified fatal
+exit and never means reset or poweroff. Terminal PIO/MMIO exits are completed
+before their normalized outcome is published, and evidence retains the vCPU,
+raw KVM exit reason, envelope, and value. Every normal and error teardown path
+joins the complete set of started vCPU workers before unmapping any `kvm_run`
+page or closing a vCPU fd, so a live worker cannot address another vCPU's
+released wake page.
+
+The Intel MP floating pointer remains at GPA zero because the exact managed
+Linux 6.1.155 kernel scans the bottom 1KiB in 16-byte steps. E820 reserves
+`0x000..0x3ff`, and the maximum generated MP table ends within that scan window
+below the GDT, so Linux cannot allocate over the discovery data. Replacing the
+managed kernel requires revalidating this dependency. Stage 0a.3 records the
+KVM API and required capability values, supported CPUID entry count, vendor,
+leaf 1 and topology-leaf presence, x2APIC support plus guest `nox2apic` mode,
+irqchip/PIT, TSS/identity-map, memory-slot, CPUID-install, and AP-state setup.
+XSAVE/XCRS, MSR, LAPIC-state, dirty-log, and clock capture probes remain
+explicitly deferred to Slice 0b.
 
 **Exit:** the finite PIO/device-control table produces distinct deterministic
 `guest_reset` and `guest_off` outcomes, each classification records its raw KVM
