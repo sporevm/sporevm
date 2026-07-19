@@ -17,7 +17,8 @@ Kinds:
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     kernel release tag (default: v0.6.3)
+  SPOREVM_KERNEL_RELEASE     kernel release tag (run/sporevm default: v0.7.0
+                              on x86_64, v0.6.3 on ARM64; other kinds: v0.6.3)
   SPOREVM_KERNEL_VERSION     Linux version in the asset name (default: 6.1.155)
   SPOREVM_KERNEL_REPOSITORY  GitHub repo override
                               default: sporevm/kernels for run/sporevm,
@@ -210,14 +211,15 @@ if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   exit 0
 fi
 
-release="${SPOREVM_KERNEL_RELEASE:-v0.6.3}"
 linux_version="${SPOREVM_KERNEL_VERSION:-6.1.155}"
 repo="${SPOREVM_KERNEL_REPOSITORY:-}"
+default_release="v0.6.3"
 
 case "${kind}" in
   run | sporevm)
     repo="${repo:-sporevm/kernels}"
     if [[ "${kernel_arch}" == "x86_64" ]]; then
+      default_release="v0.7.0"
       asset="sporevm-x86_64-linux-${linux_version}-bzImage"
     else
       asset="sporevm-arm64-linux-${linux_version}-Image"
@@ -235,6 +237,7 @@ case "${kind}" in
     die "kernel kind must be run, sporevm, initrd, or rootfs"
     ;;
 esac
+release="${SPOREVM_KERNEL_RELEASE:-${default_release}}"
 
 repo_cache="${repo//\//-}"
 dest_dir="$(cache_root)/${repo_cache}/${release}"

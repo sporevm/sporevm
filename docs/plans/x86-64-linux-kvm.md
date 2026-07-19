@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-19
+last_reviewed: 2026-07-20
 spec_refs:
   - docs/spore-format.md
   - docs/state-portability.md
@@ -413,7 +413,7 @@ throughout the work.
   guest agent over vsock, acknowledges generation state, exercises root block
   read/write plus immutable block reads and host-proven write rejection, reads non-zero RNG
   bytes, and enumerates the exact eight virtio-mmio slots.
-- Slice 3a has a ship-reviewed candidate implementation. Product readiness now
+- Slice 3a has a ship-reviewed implementation. Product readiness now
   runs the complete approved CPU-profile predicate before artifact work;
   `spore run`, named create, monitor exec, stdin, and TTY route through the x86
   runner; unsupported memory, vCPU, resume, capture, rootfs/OCI, network, build,
@@ -434,10 +434,24 @@ throughout the work.
   The validation archive, created before this evidence-only plan update, had
   SHA256
   `6d8a7250ca26aab7a9fe5aa6112650e8780e0020aeec388f8ec8210ef07a06ea`.
-  The transfer bucket was deleted after the exact workspace was installed. A
-  cold-cache managed run remains blocked until the approved x86 bzImage,
-  config, and checksum are published by `sporevm/kernels`; the public v0.6.3
-  and v0.6.4 releases currently contain ARM assets only.
+  The transfer bucket was deleted after the exact workspace was installed.
+  `sporevm/kernels` v0.7.0 publishes the approved x86 bzImage from commit
+  `d1ebb13477d02e73e1593555135f52cb204ac3a7`; its public image, config,
+  checksum, and manifest SHA256 digests are respectively `07a9b6d8a9efd2b7c5e886d1c010e67245fa132c8b48cf567f200099b55abee8`,
+  `d67ef9eb0cfee797d1edb09027214b312361139db2621d483edfe0debd13e95e`,
+  `c7ad2f454aa7a56cdf19f7199748c3aaea8472f0994499c03081eb6b4239f243`,
+  and `d26c201232657e3e95801395b6b1818cead3d574b6cbe2fb2a77e117c8e7a713`.
+  The exact-source native workspace
+  `/var/lib/sporevm/workspaces/slice3a-final-77760292` then passed
+  `mise run smoke:x86-slice3a` with the seed override unset. The smoke resolved
+  v0.7.0 from empty isolated caches, reproduced the approved kernel and initrd
+  digests, and passed the full frozen-board, fresh-product, and fail-closed
+  matrix. The validation archive, created before this evidence-only plan
+  update, had SHA256
+  `7776029228e06f50adce77bc34b9413f19aff2e02cd05a72e6bc2bf339fe4584`.
+  SSM command `059b12be-d5aa-4d03-92c1-d037cef04a2b` returned rc 0; no SporeVM
+  process or smoke runtime directory remained. The temporary transfer object
+  and bucket were deleted and the bucket returned 404.
 
 ## Motivation
 

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
-release="${SPOREVM_KERNEL_RELEASE:-v0.6.3}"
+release="${SPOREVM_KERNEL_RELEASE:-v0.7.0}"
 asset="sporevm-x86_64-linux-6.1.155-bzImage"
 
 die() {
@@ -27,7 +27,11 @@ expect_failure() {
 
 [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 fail-closed smoke requires Linux/x86_64"
 [[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
-[[ -n "${seed_dir}" ]] || die "set SPOREVM_X86_MANAGED_KERNEL_SEED_DIR"
+if [[ -n "${seed_dir}" ]]; then
+  for suffix in "" .config .sha256; do
+    [[ -f "${seed_dir}/${asset}${suffix}" ]] || die "missing managed seed asset: ${seed_dir}/${asset}${suffix}"
+  done
+fi
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-closed.XXXXXX")"
 runtime_dir="${workdir}/runtime"
@@ -74,13 +78,16 @@ expect_failure attach "X86ResumeUnsupported" \
 expect_failure build "X86BuildUnsupported" \
   "${run_env[@]}" "${spore_bin}" build -t local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
 [[ ! -e "${workdir}/saved.spore" ]] || die "rejected save created output"
+[[ ! -e "${kernel_cache}" ]] || die "rejected requests performed managed kernel work"
 
 managed_dir="${kernel_cache}/sporevm-kernels/${release}"
-mkdir -p "${managed_dir}"
-for suffix in "" .config .sha256; do
-  cp "${seed_dir}/${asset}${suffix}" "${managed_dir}/${asset}${suffix}"
-  chmod 0444 "${managed_dir}/${asset}${suffix}"
-done
+if [[ -n "${seed_dir}" ]]; then
+  mkdir -p "${managed_dir}"
+  for suffix in "" .config .sha256; do
+    cp "${seed_dir}/${asset}${suffix}" "${managed_dir}/${asset}${suffix}"
+    chmod 0444 "${managed_dir}/${asset}${suffix}"
+  done
+fi
 "${run_env[@]}" "${spore_bin}" create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 >/dev/null
 created=1
 expect_failure named-save "capture is unavailable" \

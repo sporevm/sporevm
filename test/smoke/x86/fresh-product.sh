@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
-release="${SPOREVM_KERNEL_RELEASE:-v0.6.3}"
+release="${SPOREVM_KERNEL_RELEASE:-v0.7.0}"
 asset="sporevm-x86_64-linux-6.1.155-bzImage"
 
 die() {
@@ -14,10 +14,11 @@ die() {
 
 [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 product smoke requires Linux/x86_64"
 [[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
-[[ -n "${seed_dir}" ]] || die "set SPOREVM_X86_MANAGED_KERNEL_SEED_DIR to the approved managed asset directory"
-for suffix in "" .config .sha256; do
-  [[ -f "${seed_dir}/${asset}${suffix}" ]] || die "missing managed seed asset: ${seed_dir}/${asset}${suffix}"
-done
+if [[ -n "${seed_dir}" ]]; then
+  for suffix in "" .config .sha256; do
+    [[ -f "${seed_dir}/${asset}${suffix}" ]] || die "missing managed seed asset: ${seed_dir}/${asset}${suffix}"
+  done
+fi
 [[ -z "${SPOREVM_KERNEL_IMAGE:-}" && -z "${SPOREVM_RUN_INITRD:-}" ]] || die "boot artifact overrides must be unset"
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-product.XXXXXX")"
@@ -34,19 +35,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-managed_dir="${kernel_cache}/sporevm-kernels/${release}"
-mkdir -p "${managed_dir}" "${runtime_dir}"
+mkdir -p "${runtime_dir}"
 chmod 0700 "${runtime_dir}"
-for suffix in "" .config .sha256; do
-  cp "${seed_dir}/${asset}${suffix}" "${managed_dir}/${asset}${suffix}"
-  chmod 0444 "${managed_dir}/${asset}${suffix}"
-done
+if [[ -n "${seed_dir}" ]]; then
+  managed_dir="${kernel_cache}/sporevm-kernels/${release}"
+  mkdir -p "${managed_dir}"
+  for suffix in "" .config .sha256; do
+    cp "${seed_dir}/${asset}${suffix}" "${managed_dir}/${asset}${suffix}"
+    chmod 0444 "${managed_dir}/${asset}${suffix}"
+  done
+fi
 
 run_env=(env SPOREVM_RUNTIME_DIR="${runtime_dir}" SPOREVM_KERNEL_CACHE_DIR="${kernel_cache}")
 
 "${run_env[@]}" "${spore_bin}" run --backend kvm --memory 512mib --vcpus 1 \
   --env SPORE_X86_PRODUCT=ok -- /bin/sh -lc \
-  'test "$(/bin/nproc)" = 1; /usr/bin/env; /bin/writeout; /bin/rngcheck' \
+  'set -e; test "$(/bin/nproc)" = 1; /usr/bin/env; /bin/writeout; /bin/rngcheck' \
   >"${workdir}/run.stdout" 2>"${workdir}/run.stderr"
 grep -Fxq "SPORE_X86_PRODUCT=ok" "${workdir}/run.stdout" || die "literal environment was not delivered"
 grep -Fxq "spore stdout" "${workdir}/run.stdout" || die "one-shot stdout was not delivered"

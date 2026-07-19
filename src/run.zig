@@ -62,6 +62,7 @@ const embedded_run_initrd_sha256 = blk: {
 };
 const default_kernel_repository = "sporevm/kernels";
 const default_kernel_release = "v0.6.3";
+const default_x86_kernel_release = "v0.7.0";
 const default_kernel_version = "6.1.155";
 pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
 const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
@@ -2514,9 +2515,13 @@ const ManagedKernelOptions = struct {
 fn managedKernelOptions(init: std.process.Init) ManagedKernelOptions {
     return .{
         .repository = init.environ_map.get("SPOREVM_KERNEL_REPOSITORY") orelse default_kernel_repository,
-        .release = init.environ_map.get("SPOREVM_KERNEL_RELEASE") orelse default_kernel_release,
+        .release = init.environ_map.get("SPOREVM_KERNEL_RELEASE") orelse defaultManagedKernelReleaseFor(builtin.cpu.arch),
         .linux_version = init.environ_map.get("SPOREVM_KERNEL_VERSION") orelse default_kernel_version,
     };
+}
+
+fn defaultManagedKernelReleaseFor(zig_arch: std.Target.Cpu.Arch) []const u8 {
+    return if (zig_arch == .x86_64) default_x86_kernel_release else default_kernel_release;
 }
 
 fn managedRunKernelAssetName(allocator: std.mem.Allocator, linux_version: []const u8) ![]const u8 {
@@ -6052,6 +6057,11 @@ test "managed run kernel asset names validate input" {
     try std.testing.expectEqualStrings(native_config_expected, config_asset);
 
     try std.testing.expectError(error.BadManagedKernelVersion, managedRunKernelAssetName(allocator, "../bad"));
+}
+
+test "managed kernel release defaults are architecture specific" {
+    try std.testing.expectEqualStrings("v0.7.0", defaultManagedKernelReleaseFor(.x86_64));
+    try std.testing.expectEqualStrings("v0.6.3", defaultManagedKernelReleaseFor(.aarch64));
 }
 
 test "managed kernel repository cache name validates owner and repo" {
