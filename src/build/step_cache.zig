@@ -318,7 +318,7 @@ pub fn stepKey(allocator: std.mem.Allocator, input: StepInput) ![]const u8 {
     var h = Blake3.init(.{});
     hashField(&h, builder_version);
     hashField(&h, input.platform.os);
-    hashField(&h, input.platform.arch);
+    hashField(&h, input.platform.arch.name());
     hashField(&h, input.parent_index_digest);
     hashField(&h, fields.instruction_kind);
     hashField(&h, input.canonical_instruction);
@@ -548,7 +548,7 @@ fn stepInputEql(a: StepInput, b: StepInput) bool {
     const af = a.flatFields();
     const bf = b.flatFields();
     return std.mem.eql(u8, a.platform.os, b.platform.os) and
-        std.mem.eql(u8, a.platform.arch, b.platform.arch) and
+        a.platform.arch == b.platform.arch and
         std.mem.eql(u8, a.parent_index_digest, b.parent_index_digest) and
         std.mem.eql(u8, a.canonical_instruction, b.canonical_instruction) and
         std.mem.eql(u8, af.instruction_kind, bf.instruction_kind) and
@@ -690,7 +690,7 @@ fn currentRecordRetainedByGc(input: StepInput) bool {
 }
 
 fn validateInput(input: StepInput, fields: StepInput.FlatFields) !void {
-    if (!std.mem.eql(u8, input.platform.os, "linux") or !std.mem.eql(u8, input.platform.arch, "arm64")) {
+    if (!std.mem.eql(u8, input.platform.os, "linux")) {
         return error.BadBuildCacheInput;
     }
     validateBlake3Identity(input.parent_index_digest) catch return error.BadBuildCacheInput;
@@ -940,6 +940,17 @@ test "prepare input is canonical and key changes with target and producer" {
     defer allocator.free(producer_key);
     try std.testing.expect(!std.mem.eql(u8, base_key, target_key));
     try std.testing.expect(!std.mem.eql(u8, base_key, producer_key));
+}
+
+test "step cache identity distinguishes both OCI architectures" {
+    const allocator = std.testing.allocator;
+    const parent = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const producer = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const arm64 = try stepKey(allocator, try prepareInput(.{ .arch = .arm64 }, parent, 4096, producer));
+    defer allocator.free(arm64);
+    const amd64 = try stepKey(allocator, try prepareInput(.{ .arch = .amd64 }, parent, 4096, producer));
+    defer allocator.free(amd64);
+    try std.testing.expect(!std.mem.eql(u8, arm64, amd64));
 }
 
 test "step key frames variable length fields" {

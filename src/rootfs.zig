@@ -46,7 +46,7 @@ pub const usage =
     \\  resolve <image:tag>
     \\
     \\Options:
-    \\  --platform <os/arch>       Target platform (default: linux/arm64)
+    \\  --platform <os/arch>       Target platform: linux/arm64 or linux/amd64 (default: linux/arm64)
     \\  --metadata <path>          Metadata sidecar path (default: <output>.json)
     \\  --mkfs <path>              external writer mkfs.ext4 binary (auto-detect)
     \\  --debugfs <path>           external writer debugfs binary (auto-detect)
@@ -1934,7 +1934,7 @@ fn resolveManifestDigest(
 fn validateConfigPlatform(config: ImageConfig, platform: Platform) !void {
     const os = config.os orelse return error.UnsupportedPlatform;
     const arch = config.architecture orelse return error.UnsupportedPlatform;
-    if (!std.mem.eql(u8, os, platform.os) or !std.mem.eql(u8, arch, platform.arch)) {
+    if (!std.mem.eql(u8, os, platform.os) or arch != platform.arch) {
         return error.UnsupportedPlatform;
     }
 }
@@ -2074,7 +2074,7 @@ pub fn resolveLocalCachedRef(
     if (!std.mem.eql(u8, value.kind, local_ref_cache_kind)) return error.LocalRefCacheMismatch;
     if (!std.mem.eql(u8, value.ref, raw_ref)) return error.LocalRefCacheMismatch;
     if (!std.mem.eql(u8, value.builder_version, builder_version)) return error.LocalRefCacheMismatch;
-    if (!std.mem.eql(u8, value.platform.os, platform.os) or !std.mem.eql(u8, value.platform.arch, platform.arch)) {
+    if (!std.mem.eql(u8, value.platform.os, platform.os) or value.platform.arch != platform.arch) {
         return error.UnsupportedPlatform;
     }
     if (!try localResolvedRefMatchesDigest(allocator, raw_ref, value.resolved_image_ref, value.image_manifest_digest)) return error.LocalRefCacheMismatch;
@@ -2159,7 +2159,7 @@ pub fn localRefCachePath(
     h.update("\n");
     h.update(platform.os);
     h.update("/");
-    h.update(platform.arch);
+    h.update(platform.arch.name());
     h.update("\n");
     h.update(raw_ref);
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -2176,7 +2176,7 @@ pub fn rootfsCacheKeyAlloc(allocator: std.mem.Allocator, resolved: ResolvedImage
     h.update("\n");
     h.update(resolved.platform.os);
     h.update("/");
-    h.update(resolved.platform.arch);
+    h.update(resolved.platform.arch.name());
     h.update("\n");
     h.update(resolved.manifest_digest);
     h.update("\n");
@@ -2454,7 +2454,7 @@ fn imageRefCacheKeyAlloc(
     h.update("\n");
     h.update(platform.os);
     h.update("/");
-    h.update(platform.arch);
+    h.update(platform.arch.name());
     h.update("\n");
     h.update(requested_ref);
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -2464,7 +2464,7 @@ fn imageRefCacheKeyAlloc(
 }
 
 fn platformTextAlloc(allocator: std.mem.Allocator, platform: Platform) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ platform.os, platform.arch });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ platform.os, platform.arch.name() });
 }
 
 pub fn buildCachedImageRootfs(
@@ -2621,7 +2621,7 @@ fn cachedRootfsIdentityMatches(
         else => return false,
     };
     return jsonStringEquals(platform_object.get("os"), resolved.platform.os) and
-        jsonStringEquals(platform_object.get("arch"), resolved.platform.arch);
+        jsonStringEquals(platform_object.get("arch"), resolved.platform.arch.name());
 }
 
 fn cachedRootfsExt4WriterMatches(
@@ -2942,7 +2942,7 @@ test "materialize rootfs uses native ext4 writer by default" {
         .resolved_image_ref = "local/native@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         .config_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .layers = &layers,
         .output = output,
         .metadata = metadata,
@@ -3036,7 +3036,7 @@ test "native and external rootfs materialization expose matching files" {
         .resolved_image_ref = "local/native@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         .manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         .config_digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .layers = &layers,
         .output = external_output,
         .metadata = tmp ++ "/external.json",
@@ -3147,7 +3147,7 @@ test "resolve options parse image tag and platform" {
     }, &stdout.writer);
     try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
     try std.testing.expectEqualStrings("linux", parsed.platform.os);
-    try std.testing.expectEqualStrings("arm64", parsed.platform.arch);
+    try std.testing.expectEqual(.arm64, parsed.platform.arch);
     try std.testing.expectError(
         error.TooManyRootFSArguments,
         parseResolveOptions(&.{ "registry.example/repo:latest", "extra" }, &stdout.writer),
@@ -3416,11 +3416,11 @@ test "local ref cache resolves to digest-pinned local identity" {
 
     try std.testing.expectError(
         error.FileNotFound,
-        resolveLocalCachedRef(io, allocator, cache_root, "local/sporevm-app:dev", .{ .os = "linux", .arch = "amd64" }),
+        resolveLocalCachedRef(io, allocator, cache_root, "local/sporevm-app:dev", .{ .os = "linux", .arch = .amd64 }),
     );
 
     const arm64_path = try localRefCachePath(allocator, cache_root, "local/sporevm-app:dev", .{});
-    const amd64_path = try localRefCachePath(allocator, cache_root, "local/sporevm-app:dev", .{ .os = "linux", .arch = "amd64" });
+    const amd64_path = try localRefCachePath(allocator, cache_root, "local/sporevm-app:dev", .{ .os = "linux", .arch = .amd64 });
     try std.testing.expect(!std.mem.eql(u8, arm64_path, amd64_path));
 }
 
@@ -3491,7 +3491,7 @@ test "image rootfs cache key is deterministic and scoped to resolved image ident
     const changed_platform = try rootfsCacheKeyAlloc(allocator, .{
         .ref = resolved.ref,
         .manifest_digest = resolved.manifest_digest,
-        .platform = .{ .os = "linux", .arch = "amd64" },
+        .platform = .{ .os = "linux", .arch = .amd64 },
     });
     defer allocator.free(changed_platform);
     try std.testing.expect(!std.mem.eql(u8, same, changed_platform));
@@ -3849,7 +3849,7 @@ test "imported rootfs flat-only cache metadata misses" {
         \\  "rootfs_path": "{s}",
         \\  "rootfs_size": {d}
         \\}}
-    , .{ builder_version, resolved.ref, resolved.manifest_digest, resolved.platform.os, resolved.platform.arch, rootfs_path, "cached rootfs bytes".len });
+    , .{ builder_version, resolved.ref, resolved.manifest_digest, resolved.platform.os, resolved.platform.arch.name(), rootfs_path, "cached rootfs bytes".len });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
 
     var env = std.process.Environ.Map.init(allocator);
@@ -3961,7 +3961,7 @@ test "imported rootfs cache treats metadata identity mismatch as miss" {
         \\  "rootfs_path": "{s}",
         \\  "rootfs_size": {d}
         \\}}
-    , .{ builder_version, cached_resolved.ref, cached_resolved.manifest_digest, cached_resolved.platform.os, cached_resolved.platform.arch, rootfs_path, "cached rootfs bytes".len });
+    , .{ builder_version, cached_resolved.ref, cached_resolved.manifest_digest, cached_resolved.platform.os, cached_resolved.platform.arch.name(), rootfs_path, "cached rootfs bytes".len });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
 
     var env = std.process.Environ.Map.init(allocator);
@@ -4015,7 +4015,7 @@ test "image ref cache key is deterministic and scoped to requested tag" {
     defer allocator.free(changed_tag);
     try std.testing.expect(!std.mem.eql(u8, key, changed_tag));
 
-    const changed_platform = try imageRefCacheKeyAlloc(allocator, "docker.io/library/alpine:3.20", .{ .os = "linux", .arch = "amd64" });
+    const changed_platform = try imageRefCacheKeyAlloc(allocator, "docker.io/library/alpine:3.20", .{ .os = "linux", .arch = .amd64 });
     defer allocator.free(changed_platform);
     try std.testing.expect(!std.mem.eql(u8, key, changed_platform));
 }
@@ -4341,14 +4341,14 @@ test "rootfs materialization does not follow etc symlink for resolver placeholde
 }
 
 test "direct image config must match requested platform" {
-    try validateConfigPlatform(.{ .os = "linux", .architecture = "arm64" }, .{ .os = "linux", .arch = "arm64" });
+    try validateConfigPlatform(.{ .os = "linux", .architecture = .arm64 }, .{ .os = "linux", .arch = .arm64 });
     try std.testing.expectError(
         error.UnsupportedPlatform,
-        validateConfigPlatform(.{ .os = "linux", .architecture = "amd64" }, .{ .os = "linux", .arch = "arm64" }),
+        validateConfigPlatform(.{ .os = "linux", .architecture = .amd64 }, .{ .os = "linux", .arch = .arm64 }),
     );
     try std.testing.expectError(
         error.UnsupportedPlatform,
-        validateConfigPlatform(.{ .os = null, .architecture = "arm64" }, .{ .os = "linux", .arch = "arm64" }),
+        validateConfigPlatform(.{ .os = null, .architecture = .arm64 }, .{ .os = "linux", .arch = .arm64 }),
     );
 }
 

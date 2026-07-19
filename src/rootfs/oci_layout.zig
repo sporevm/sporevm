@@ -185,7 +185,7 @@ fn selectManifestDescriptor(allocator: std.mem.Allocator, index_bytes: []const u
 
     for (parsed.value.manifests) |desc| {
         const p = desc.platform orelse continue;
-        if (!std.mem.eql(u8, p.os, platform.os) or !std.mem.eql(u8, p.architecture, platform.arch)) continue;
+        if (!std.mem.eql(u8, p.os, platform.os) or !std.mem.eql(u8, p.architecture, platform.arch.name())) continue;
         if (!oci.isManifestMediaType(desc.mediaType)) return error.UnsupportedManifestMediaType;
         if (!oci.isSha256Digest(desc.digest)) return error.UnsupportedDigest;
         return .{

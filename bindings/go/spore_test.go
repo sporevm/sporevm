@@ -85,8 +85,14 @@ func TestClientHostInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Schema != "spore.host-info.v1" {
+	if info.Schema != "spore.host-info.v2" {
 		t.Fatalf("schema = %q", info.Schema)
+	}
+	if info.Platform.Arch != "arm64" {
+		t.Fatalf("platform arch = %q", info.Platform.Arch)
+	}
+	if strings.Contains(info.HostClass, "aarch64") {
+		t.Fatalf("host class uses backend architecture spelling: %q", info.HostClass)
 	}
 	if len(info.Backends) == 0 {
 		t.Fatal("expected backend facts")

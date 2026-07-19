@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig 0.16.0](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](mise.toml)
 
-SporeVM is a small aarch64 virtual machine monitor for saving and forking Linux
+SporeVM is a small arm64 virtual machine monitor for saving and forking Linux
 microVM state.
 
 A spore is sealed VM state with normalized machine state, device state,
@@ -22,7 +22,7 @@ The useful shape is:
 2. Warm it up until the expensive boring work is done.
 3. Save it at a clean point.
 4. Fork cheap child spores.
-5. Attach the children on compatible aarch64 hosts without copying all RAM for
+5. Attach the children on compatible arm64 hosts without copying all RAM for
    every child.
 
 SporeVM 1.0 expects spores to restore on the same backend and compatible host
@@ -397,7 +397,7 @@ named live fork, and limits.
 
 SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
-named lifecycle on supported aarch64 HVF/KVM hosts.
+named lifecycle on supported arm64 HVF/KVM hosts.
 
 Known limits: compatible host-class restore only, rootfs-bound writable disk
 state only, diskless named live fork, and no hardened public-cloud

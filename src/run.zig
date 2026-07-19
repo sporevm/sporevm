@@ -2139,7 +2139,7 @@ fn indexedImageRootfsInput(
 
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
     indexed.storage.device = rootfs_device;
-    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
+    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch.name() });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     allocator.free(indexed.metadata_path);
     indexed.metadata_path = &.{};
@@ -2188,7 +2188,7 @@ fn resolvedImageRootfsInput(
     errdefer rootfs_mod.deinitRootfsStorageDescriptor(allocator, storage);
     storage.device = rootfs_device;
     if (!storage_prevalidated and !try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
-    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch });
+    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch.name() });
     const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
     return .{
         .path = rootfs_path,
@@ -2244,7 +2244,7 @@ fn readCachedImageRunConfig(io: Io, allocator: std.mem.Allocator, metadata_path:
 
 fn cloneImageConfig(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig) !rootfs_mod.ImageConfig {
     return .{
-        .architecture = if (config.architecture) |value| try allocator.dupe(u8, value) else null,
+        .architecture = config.architecture,
         .os = if (config.os) |value| try allocator.dupe(u8, value) else null,
         .config = if (config.config) |runtime| .{
             .Env = if (runtime.Env) |entries| try cloneStringListMutable(allocator, entries) else null,
@@ -4469,7 +4469,7 @@ test "image rootfs metadata supplies run env and working directory" {
     try std.testing.expectEqualStrings("GEM_HOME=/usr/local/bundle", input.guest_env[0]);
     try std.testing.expectEqualStrings("BUNDLE_APP_CONFIG=/usr/local/bundle", input.guest_env[1]);
     try std.testing.expectEqualStrings("/app", input.guest_working_dir.?);
-    try std.testing.expectEqualStrings("arm64", input.image_config.?.architecture.?);
+    try std.testing.expectEqual(.arm64, input.image_config.?.architecture.?);
     try std.testing.expectEqualStrings("linux", input.image_config.?.os.?);
     try std.testing.expectEqualStrings("/usr/bin/env", input.image_config.?.config.?.Entrypoint.?[0]);
     try std.testing.expectEqualStrings("bundle", input.image_config.?.config.?.Cmd.?[0]);

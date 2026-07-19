@@ -2,13 +2,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const architecture = @import("architecture.zig");
 const board = @import("board.zig");
 const local_paths = @import("local_paths.zig");
 const spore = @import("spore.zig");
 
-pub const arch = "aarch64";
-pub const host_info_schema = "spore.host-info.v1";
-pub const host_info_schema_version: u32 = 1;
+pub const machine_arch = "aarch64";
+pub const host_info_schema = "spore.host-info.v2";
+pub const host_info_schema_version: u32 = 2;
 pub const default_gic_dist_base: u64 = 0x0800_0000;
 pub const default_gic_redist_base: u64 = 0x0802_0000;
 
@@ -23,7 +24,7 @@ pub const HostInfo = struct {
 
 pub const PlatformFacts = struct {
     os: []const u8,
-    arch: []const u8,
+    arch: architecture.Architecture,
     cpu_profile: []const u8,
     device_model_version: u32,
     ram_base: u64,
@@ -54,7 +55,7 @@ pub const PathFact = struct {
 };
 
 pub const Expected = struct {
-    arch: []const u8 = arch,
+    arch: []const u8 = machine_arch,
     cpu_profile: []const u8 = board.cpu_profile,
     device_model_version: u32 = board.device_model_version,
     ram_base: u64 = board.ram_base,
@@ -82,7 +83,7 @@ pub fn hostInfo(
         .host_class = hostClass(),
         .platform = .{
             .os = @tagName(builtin.os.tag),
-            .arch = @tagName(builtin.cpu.arch),
+            .arch = architecture.fromTarget(builtin.cpu.arch) orelse return error.UnsupportedHost,
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
             .ram_base = board.ram_base,
@@ -113,8 +114,8 @@ fn freePathFact(allocator: std.mem.Allocator, fact: PathFact) void {
 }
 
 fn hostClass() []const u8 {
-    if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return "macos-aarch64-hvf";
-    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) return "linux-aarch64-kvm";
+    if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return "macos-arm64-hvf";
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) return "linux-arm64-kvm";
     return "unsupported";
 }
 
@@ -287,6 +288,9 @@ test "host info exposes schema and cache roots" {
 
     try std.testing.expectEqualStrings(host_info_schema, info.schema);
     try std.testing.expectEqual(host_info_schema_version, info.schema_version);
+    try std.testing.expectEqual(architecture.Architecture.arm64, info.platform.arch);
+    try std.testing.expect(std.mem.indexOf(u8, info.host_class, "aarch64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, info.host_class, "arm64") != null);
     try std.testing.expect(info.backends.len >= 2);
     try std.testing.expectEqualStrings("/tmp/sporevm-cache/sporevm/kernels", info.cache_roots.kernels.path.?);
     try std.testing.expectEqualStrings("/tmp/sporevm-cache/sporevm/rootfs", info.cache_roots.rootfs.path.?);

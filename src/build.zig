@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
+const architecture = @import("architecture.zig");
 const dockerfile = @import("build/dockerfile.zig");
 const build_context = @import("build/context.zig");
 const build_context_disk = @import("build/context_disk.zig");
@@ -191,6 +192,8 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     const diagnostic = options.diagnostic orelse &local_diagnostic;
     diagnostic.* = .{};
 
+    if (architecture.selectBackend(options.platform.arch) != .aarch64) return error.UnsupportedPlatform;
+
     const dockerfile_bytes = Io.Dir.cwd().readFileAlloc(init.io, options.dockerfile_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => {
             diagnostic.missing_input = .{ .kind = .dockerfile, .path = options.dockerfile_path };
@@ -211,11 +214,15 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         error.DockerfilePlanFailed => return error.DockerfilePlanFailed,
         else => |e| return e,
     };
+    const selected_platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ options.platform.os, options.platform.arch.name() });
     for (plan.order) |stage_index| {
         const stage = plan.stages[stage_index];
         if (stage.platform) |platform| {
-            if (!std.mem.eql(u8, platform, "linux/arm64")) {
-                diagnostic.dockerfile = .{ .line = stage.source.from.line, .message = "spore build currently supports only FROM --platform=linux/arm64" };
+            if (!std.mem.eql(u8, platform, selected_platform)) {
+                diagnostic.dockerfile = .{
+                    .line = stage.source.from.line,
+                    .message = try std.fmt.allocPrint(allocator, "spore build FROM --platform must match {s}", .{selected_platform}),
+                };
                 return error.DockerfilePlanFailed;
             }
         }
@@ -1026,17 +1033,17 @@ fn globalBuildArgs(
     diagnostic: *dockerfile.Diagnostic,
 ) !std.array_list.Managed(ArgValue) {
     var args = std.array_list.Managed(ArgValue).init(allocator);
-    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ options.platform.os, options.platform.arch });
+    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ options.platform.os, options.platform.arch.name() });
     const automatic = [_]ArgValue{
         .{ .key = "BUILDPLATFORM", .value = platform },
         .{ .key = "BUILDOS", .value = options.platform.os },
         .{ .key = "BUILDOSVERSION", .value = "" },
-        .{ .key = "BUILDARCH", .value = options.platform.arch },
+        .{ .key = "BUILDARCH", .value = options.platform.arch.name() },
         .{ .key = "BUILDVARIANT", .value = "" },
         .{ .key = "TARGETPLATFORM", .value = platform },
         .{ .key = "TARGETOS", .value = options.platform.os },
         .{ .key = "TARGETOSVERSION", .value = "" },
-        .{ .key = "TARGETARCH", .value = options.platform.arch },
+        .{ .key = "TARGETARCH", .value = options.platform.arch.name() },
         .{ .key = "TARGETVARIANT", .value = "" },
         .{ .key = "TARGETSTAGE", .value = options.target orelse "default" },
     };
@@ -1849,7 +1856,7 @@ fn readCachedMetadata(allocator: std.mem.Allocator, io: Io, path: []const u8) !C
 fn cloneImageConfig(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig) !rootfs_mod.ImageConfig {
     const runtime = config.config;
     return .{
-        .architecture = if (config.architecture) |arch| try allocator.dupe(u8, arch) else null,
+        .architecture = config.architecture,
         .os = if (config.os) |os| try allocator.dupe(u8, os) else null,
         .config = if (runtime) |rt| .{
             .Env = if (rt.Env) |entries| try cloneStringList(allocator, entries) else null,
@@ -3038,7 +3045,7 @@ test "stage config inheritance preserves entrypoint cmd user env and workdir" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     var state = try stateFromBase(allocator, .{
-        .architecture = "arm64",
+        .architecture = .arm64,
         .os = "linux",
         .config = .{
             .Env = @constCast(&[_][]const u8{"A=one"}),
@@ -3774,7 +3781,7 @@ test "multi-stage target inherits config and prunes unreachable bases" {
     _ = try rootfs_mod.publishIndexedImage(init, arena, .{
         .ref = "local/base:dev",
         .platform = .{},
-        .config = .{ .architecture = "arm64", .os = "linux", .config = .{ .WorkingDir = "/build" } },
+        .config = .{ .architecture = .arm64, .os = "linux", .config = .{ .WorkingDir = "/build" } },
         .rootfs_storage = storage,
     });
 
@@ -3827,7 +3834,24 @@ test "unsupported reachable platform fails before context or base resolution" {
         .dockerfile_path = dockerfile_path,
         .diagnostic = &diagnostic,
     }));
-    try std.testing.expectEqualStrings("spore build currently supports only FROM --platform=linux/arm64", diagnostic.dockerfile.message);
+    try std.testing.expectEqualStrings("spore build FROM --platform must match linux/arm64", diagnostic.dockerfile.message);
+}
+
+test "amd64 product platform fails at the unavailable backend before input IO" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const init = testInit(allocator, io, &arena_state, &env);
+
+    try std.testing.expectError(error.UnsupportedPlatform, build(init, arena_state.allocator(), .{
+        .tag = "local/app:amd64",
+        .context_dir = "missing-context",
+        .dockerfile_path = "missing-Dockerfile",
+        .platform = .{ .arch = .amd64 },
+    }));
 }
 
 test "a stage with three distinct COPY inputs fails before boot with the third instruction line" {

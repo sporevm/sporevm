@@ -19,6 +19,13 @@ streams.
 same product APIs and JSON result schemas; they should not reimplement command
 behavior or depend on CLI parsing.
 
+`libspore.Architecture` and `RootfsPlatform.arch` use OCI names: `.arm64` and
+`.amd64`. Backend spellings are intentionally absent from the product API.
+`HostInfo` uses the `spore.host-info.v2` JSON schema for the same reason, with
+`platform.arch: "arm64"` on current supported hosts. Serialized spore machine
+state retains `aarch64` and `sporevm-aarch64-v0`; those are format and backend
+identifiers rather than product platform values.
+
 The public vocabulary is `save`, `attach`, and `restore` across Zig, C, and Go.
 JSONL run events keep their original `capture` event and `capture_path` fields
 for schema compatibility.
@@ -156,6 +163,7 @@ defer libspore.deinitRootfsBuildResult(allocator, built);
 
 const resolved = try libspore.rootfsResolve(init, allocator, .{
     .ref = "docker.io/library/alpine:3.20",
+    .platform = .{ .arch = .amd64 },
 });
 defer libspore.deinitRootfsResolveResult(allocator, resolved);
 ```

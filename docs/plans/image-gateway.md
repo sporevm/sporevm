@@ -104,7 +104,7 @@ The product gap is a service that owns conversion admission, immutable image
 discovery, efficient CAS transfer, and repository policy while preserving the
 client's existing verification and publication boundary.
 
-The current runtime and builder still fail closed outside aarch64, but platform
+The current runtime and builder still fail closed outside arm64, but platform
 already participates in OCI selection and local image-ref cache keys. With an
 x86_64 backend planned, an arm64-only gateway schema would turn a known product
 requirement into a repository migration. Multi-platform tags and per-platform
@@ -117,8 +117,8 @@ arm64 runtime preview becomes usable first.
   contract and reuse the result across hosts.
 - Treat `linux/arm64` and `linux/amd64` as core platform values in the first
   protocol, conversion key, repository tag, local-ref, and conformance design.
-  OCI uses `amd64`; SporeVM maps that to its future `x86_64` machine backend at
-  the runtime boundary.
+  The shared product `Architecture` type maps OCI `amd64` to the future
+  `x86_64` machine backend only at the runtime boundary.
 - Let one gateway repository tag atomically describe the available
   per-platform image manifests without mixing entries from different
   generations of a mutable upstream OCI index.
@@ -210,6 +210,11 @@ SporeVM owns:
   policy without making attachments native content authority;
 - CLI behavior and pull-policy integration;
 - conformance fixtures shared with a gateway implementation.
+
+The client implementation reuses `src/architecture.zig`: protocol and image
+types carry `arm64` or `amd64`, then backend selection calls its exhaustive
+`selectBackend` mapping. The gateway must not add a parallel
+runtime-architecture enum with `aarch64` or `x86_64` product tags.
 
 The gateway service owns:
 

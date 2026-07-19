@@ -8,6 +8,7 @@ const api = @import("api.zig");
 pub const version = @import("version.zig").value;
 
 pub const Backend = api.Backend;
+pub const Architecture = api.Architecture;
 pub const CacheRoot = api.CacheRoot;
 pub const CacheState = api.CacheState;
 pub const ChildRange = api.ChildRange;

@@ -1723,7 +1723,7 @@ pub fn createCli(
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
         error.HostUnsupported => {
-            const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+            const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/arm64";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
         },
         error.NamedVmExists => {
@@ -2311,7 +2311,7 @@ pub fn restoreCli(
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.HostUnsupported => {
-                const message = "spore restore: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64";
+                const message = "spore restore: monitor mode requires HVF on Apple Silicon or KVM on Linux/arm64";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "restore"), message);
             },
             error.NamedVmExists => {

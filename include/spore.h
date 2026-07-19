@@ -385,7 +385,7 @@ SPORE_API SporeResult spore_context_set_env(SporeContext context, SporeString na
 SPORE_API void spore_free_string(SporeContext context, SporeOwnedString string);
 
 /**
- * Return host information as `spore.host-info.v1` JSON.
+ * Return host information as `spore.host-info.v2` JSON.
  *
  * The returned string is NUL-terminated for C convenience. `len` excludes the
  * trailing NUL and includes the final newline, matching CLI JSON output.

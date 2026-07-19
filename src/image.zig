@@ -6,6 +6,7 @@
 //! so every producer can use the same canonical bytes and digest preimages.
 
 const std = @import("std");
+const architecture = @import("architecture.zig");
 const Blake3 = std.crypto.hash.Blake3;
 
 pub const config_identity_domain = "sporevm-indexed-image-config-v1";
@@ -17,7 +18,7 @@ pub const digest_prefix = "blake3:";
 /// OCI readers also parse untrusted config JSON directly into this type while
 /// ignoring unknown fields, so additions widen that projection deliberately.
 pub const Config = struct {
-    architecture: ?[]const u8 = null,
+    architecture: ?architecture.Architecture = null,
     os: ?[]const u8 = null,
     config: ?RuntimeConfig = null,
 };
@@ -79,7 +80,7 @@ test "canonical config and native identities have stable golden bytes" {
     var cmd = [_][]const u8{ "echo", "hello" };
     var on_build = [_][]const u8{"RUN echo later"};
     const canonical = try canonicalConfigJson(allocator, .{
-        .architecture = "arm64",
+        .architecture = .arm64,
         .os = "linux",
         .config = .{
             .Env = &env,
@@ -116,9 +117,9 @@ test "canonical config and native identities have stable golden bytes" {
 
 test "arm64 and amd64 have distinct golden native image identities" {
     const allocator = std.testing.allocator;
-    const arm64 = try canonicalConfigJson(allocator, .{ .architecture = "arm64", .os = "linux" });
+    const arm64 = try canonicalConfigJson(allocator, .{ .architecture = .arm64, .os = "linux" });
     defer allocator.free(arm64);
-    const amd64 = try canonicalConfigJson(allocator, .{ .architecture = "amd64", .os = "linux" });
+    const amd64 = try canonicalConfigJson(allocator, .{ .architecture = .amd64, .os = "linux" });
     defer allocator.free(amd64);
 
     const index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -142,7 +143,7 @@ test "canonical config pins escaping and empty object semantics" {
     const allocator = std.testing.allocator;
     var env = [_][]const u8{"QUOTE=\" BACKSLASH=\\ NEWLINE=\n UTF8=☃"};
     const escaped = try canonicalConfigJson(allocator, .{
-        .architecture = "arm64",
+        .architecture = .arm64,
         .os = "linux",
         .config = .{ .Env = &env },
     });

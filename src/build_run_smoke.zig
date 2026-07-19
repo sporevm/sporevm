@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try rootfs.publishIndexedImage(init, allocator, .{
         .ref = "local/build-smoke-base:dev",
         .platform = .{},
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .rootfs_storage = base_storage,
     });
 
@@ -142,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try rootfs.publishIndexedImage(init, allocator, .{
         .ref = "local/build-smoke-base-two:dev",
         .platform = .{},
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .rootfs_storage = second_base_storage,
     });
     const third_emitted = try ext4_writer.emit(allocator, io, third_rootfs_path, &entries, .{
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try rootfs.publishIndexedImage(init, allocator, .{
         .ref = "local/build-smoke-base-three:dev",
         .platform = .{},
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .rootfs_storage = third_base_storage,
     });
 
@@ -621,7 +621,7 @@ fn runLaterStageFailureRetrySmoke(
     _ = try rootfs.publishIndexedImage(init, allocator, .{
         .ref = destination,
         .platform = .{},
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .rootfs_storage = base_storage,
     });
     const destination_ref_path = try rootfs.localRefCachePath(allocator, cache_root, destination, .{});
@@ -904,7 +904,7 @@ fn runShelllessResizeSmoke(
     _ = try rootfs.publishIndexedImage(init, allocator, .{
         .ref = "local/build-smoke-shellless-base:dev",
         .platform = .{},
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
     });
 
@@ -1221,7 +1221,7 @@ fn runEnospcSmoke(
     _ = try rootfs.publishIndexedImage(init, allocator, .{
         .ref = destination,
         .platform = .{},
-        .config = .{ .architecture = "arm64", .os = "linux" },
+        .config = .{ .architecture = .arm64, .os = "linux" },
         .rootfs_storage = base_storage,
     });
     const destination_ref_path = try rootfs.localRefCachePath(allocator, cache_root, destination, .{});
