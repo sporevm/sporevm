@@ -36,6 +36,7 @@ steps:
         command: "scripts/ci/run.sh scripts/ci/spore-build-conformance.sh"
         artifact_paths:
           - "zig-cache/spore-build-conformance/*.release-build.log"
+          - "zig-cache/spore-build-conformance/*.buildx-install.log"
           - "zig-cache/spore-build-conformance/*/logs/*"
           - "zig-cache/spore-build-conformance/*/cases/**/*.command"
           - "zig-cache/spore-build-conformance/*/cases/**/*.stdout"

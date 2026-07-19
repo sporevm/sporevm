@@ -21,7 +21,6 @@ else
 fi
 
 conformance_root="zig-cache/spore-build-conformance/${BUILDKITE_JOB_ID}"
-mkdir -p "${conformance_root}/logs"
 buildx_root="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-buildx.XXXXXX")"
 trap 'rm -rf "${buildx_root}"' EXIT
 export DOCKER_CONFIG="${buildx_root}/docker"
@@ -33,7 +32,7 @@ agent_cache_key="$(printf '%s' "${BUILDKITE_AGENT_NAME}" | sha256sum | cut -c1-1
 agent_scratch="$(cd "${repo_root}/../.." && pwd)"
 fast_scratch="${SPOREVM_CI_FAST_SCRATCH:-${agent_scratch}}"
 buildx_mise_root="${fast_scratch}/mise-buildx/${agent_cache_key}"
-buildx_install_log="${conformance_root}/logs/mise-buildx-install.log"
+buildx_install_log="${conformance_root}.buildx-install.log"
 mkdir -p "${buildx_mise_root}/data" "${buildx_mise_root}/cache" "${buildx_mise_root}/state"
 if env \
   MISE_DATA_DIR="${buildx_mise_root}/data" \
