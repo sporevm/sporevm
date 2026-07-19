@@ -92,6 +92,7 @@ class Transition:
     expect_boot_count: int
     expect_resize_count: int
     compare: bool
+    docker_no_cache: bool
     no_cache: bool
 
 
@@ -263,6 +264,7 @@ def parse_transition(value: Any, label: str) -> Transition:
             "expect_boot_count",
             "expect_resize_count",
             "compare",
+            "docker_no_cache",
             "no_cache",
         },
         label,
@@ -282,6 +284,11 @@ def parse_transition(value: Any, label: str) -> Transition:
     compare = raw.get("compare", False)
     if type(compare) is not bool:
         raise HarnessError(f"{label}.compare must be a boolean")
+    docker_no_cache = raw.get("docker_no_cache", False)
+    if type(docker_no_cache) is not bool:
+        raise HarnessError(f"{label}.docker_no_cache must be a boolean")
+    if docker_no_cache and not compare:
+        raise HarnessError(f"{label}.docker_no_cache requires compare=true")
     no_cache = raw.get("no_cache", False)
     if type(no_cache) is not bool:
         raise HarnessError(f"{label}.no_cache must be a boolean")
@@ -335,6 +342,7 @@ def parse_transition(value: Any, label: str) -> Transition:
             raw.get("expect_resize_count", 0), f"{label}.expect_resize_count"
         ),
         compare=compare,
+        docker_no_cache=docker_no_cache,
         no_cache=no_cache,
     )
 
@@ -491,6 +499,33 @@ def self_test_schema(cases: list[Case]) -> None:
                     "expect_boot_count": 1,
                     "expect_resize_count": 0,
                     "no_cache": "yes",
+                }
+            ],
+        },
+        {
+            **valid,
+            "transitions": [
+                {
+                    "name": "bad-docker-no-cache",
+                    "expect_cache": "miss",
+                    "expect_executed_steps": 1,
+                    "expect_boot_count": 1,
+                    "expect_resize_count": 0,
+                    "compare": True,
+                    "docker_no_cache": "yes",
+                }
+            ],
+        },
+        {
+            **valid,
+            "transitions": [
+                {
+                    "name": "unused-docker-no-cache",
+                    "expect_cache": "miss",
+                    "expect_executed_steps": 1,
+                    "expect_boot_count": 1,
+                    "expect_resize_count": 0,
+                    "docker_no_cache": True,
                 }
             ],
         },

@@ -48,7 +48,8 @@
       "expect_executed_steps": 2,
       "expect_boot_count": 1,
       "expect_resize_count": 0,
-      "compare": true
+      "compare": true,
+      "docker_no_cache": true
     },
     {
       "name": "changed-source-mode",
@@ -60,7 +61,8 @@
       "expect_executed_steps": 2,
       "expect_boot_count": 1,
       "expect_resize_count": 0,
-      "compare": true
+      "compare": true,
+      "docker_no_cache": true
     },
     {
       "name": "changed-source-content",
@@ -72,7 +74,8 @@
       "expect_executed_steps": 2,
       "expect_boot_count": 1,
       "expect_resize_count": 0,
-      "compare": true
+      "compare": true,
+      "docker_no_cache": true
     },
     {
       "name": "warm-after-source-change",
