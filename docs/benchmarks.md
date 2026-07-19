@@ -755,10 +755,10 @@ answer different questions.
 Buildkite publishes the website projection to:
 
 ```text
-s3://sporevm-benchmarks/site/data.json
-s3://sporevm-benchmarks/site/data.js
-s3://sporevm-benchmarks/site/homepage-summary.json
-s3://sporevm-benchmarks/site/homepage-summary.js
+s3://sporevm-benchmarks-data/site/data.json
+s3://sporevm-benchmarks-data/site/data.js
+s3://sporevm-benchmarks-data/site/homepage-summary.json
+s3://sporevm-benchmarks-data/site/homepage-summary.js
 ```
 
 Only successful `main` benchmark builds update those files. The publisher merges
@@ -810,12 +810,12 @@ buildkite-agent pipeline upload .buildkite/pipeline.benchmarks.yaml
 That dedicated pipeline also uploads durable benchmark data to:
 
 ```text
-s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/
-s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/
+s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/
+s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/
 ```
 
 After both benchmark jobs finish on `main`, a serialized publish step rebuilds
-and uploads the stable website files under `s3://sporevm-benchmarks/site/`.
+and uploads the stable website files under `s3://sporevm-benchmarks-data/site/`.
 
 If `SPOREVM_BENCHMARK_BASELINE` points to a summary JSON available in the job
 workspace, the step compares the new `latest-summary.json` against that
