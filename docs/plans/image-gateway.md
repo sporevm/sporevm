@@ -2,6 +2,7 @@
 status: active
 last_reviewed: 2026-07-19
 spec_refs:
+  - docs/image-gateway-protocol.md
   - docs/filesystem.md
   - docs/rootfs.md
   - docs/spore-build.md
@@ -197,8 +198,7 @@ arm64 runtime preview becomes usable first.
 SporeVM owns:
 
 - the native image identity and canonical image configuration;
-- normalized image-platform selection and the mapping from OCI `amd64` to the
-  future SporeVM `x86_64` runtime backend;
+- normalized image-platform selection using OCI `arm64` and `amd64` names;
 - rootfs storage descriptor and disk-index validation;
 - the gateway platform index, image manifest, and object-transfer wire parsers
   used by the client;
@@ -894,7 +894,7 @@ diagnose.
 
 ## Current Progress
 
-The first behavior-preserving extraction is implemented in this change.
+The first behavior-preserving extraction has landed.
 `src/image.zig` now owns the canonical native image configuration, exact JSON
 bytes, config digest, and indexed-image digest. Existing OCI parsing retains
 its public type aliases, while local indexed-image publication delegates to
@@ -910,7 +910,20 @@ goldens pin JSON escaping, empty-versus-present config objects, and the existing
 unknown-field-dropping OCI projection so later Zig or schema changes cannot
 silently move native image identity.
 
-The rest of G0 remains open: gateway schemas and malformed fixtures, transport
+The immutable platform-index portion of G0 is also implemented. The bounded
+canonical v1 schema represents one or both required OCI platforms, freezes
+arm64 variant normalization, rejects ambiguous or noncanonical input, and ships
+reusable golden and malformed fixtures plus fuzz coverage. The protocol remains
+data-only: it adds no gateway lookup, network path, backend mapping, or runtime
+dependency.
+
+The current direct OCI selector still ignores descriptor variants and accepts
+the first architecture match. Before gateway/direct conversion equivalence is
+claimed, that path must share the gateway protocol's arm64 normalization and
+ambiguity rule; changing local OCI selection is intentionally outside this
+data-only slice.
+
+The rest of G0 remains open: image-manifest and attachment schemas, transport
 benchmarking, authorization-bound object fetch, cross-repository conformance,
 and converter-worker equivalence have not started.
 
@@ -918,7 +931,7 @@ and converter-worker equivalence have not started.
 
 ### G0 — Freeze the protocol and benchmark fixture
 
-Status: proposed prerequisite.
+Status: active prerequisite; native identity and platform-index slices landed.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -928,10 +941,10 @@ Status: proposed prerequisite.
 - Freeze the minimal typed attachment envelope and server-owned immutable-
   subject relation semantics, with golden and malformed fixtures, while
   deferring the attachment service surface to G3.
-- Define the immutable platform-index schema, OCI platform normalization, and
-  the `linux/amd64` to SporeVM `x86_64` runtime mapping. The first schema must
-  represent both required platforms without a version bump or architecture-
-  specific field names.
+- Define the immutable platform-index schema and OCI platform normalization.
+  The first schema must represent both required platforms without a version
+  bump or architecture-specific field names; runtime-backend naming remains a
+  separate SporeVM boundary.
 - Publish byte-level golden vectors for canonical image-config JSON,
   `sporevm-indexed-image-config-v1`, and `sporevm-indexed-image-v1`, generated
   from current code. Reconcile the durable format doc's canonical config field

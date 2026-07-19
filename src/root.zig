@@ -30,6 +30,7 @@ pub const fanout = @import("fanout.zig");
 pub const guestmem = @import("guestmem.zig");
 pub const host_fetch_policy = @import("host_fetch_policy.zig");
 pub const image = @import("image.zig");
+pub const image_gateway = @import("image_gateway.zig");
 pub const lifecycle = @import("lifecycle.zig");
 pub const local_paths = @import("local_paths.zig");
 pub const memory = @import("memory.zig");
@@ -104,6 +105,7 @@ test {
     testing.refAllDecls(gicv3);
     testing.refAllDecls(host_fetch_policy);
     testing.refAllDecls(image);
+    testing.refAllDecls(image_gateway);
     testing.refAllDecls(lifecycle);
     testing.refAllDecls(local_paths);
     testing.refAllDecls(memory);
