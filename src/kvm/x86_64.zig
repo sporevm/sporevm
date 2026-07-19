@@ -24,6 +24,7 @@ pub const KVM_CREATE_IRQCHIP: u32 = 0xae60;
 pub const KVM_IRQ_LINE = common.KVM_IRQ_LINE;
 pub const KVM_CREATE_PIT2: u32 = 0x4040ae77;
 pub const KVM_RUN = common.KVM_RUN;
+pub const KVM_GET_REGS: u32 = 0x8090ae81;
 pub const KVM_GET_SREGS: u32 = 0x8138ae83;
 pub const KVM_SET_REGS: u32 = 0x4090ae82;
 pub const KVM_SET_SREGS: u32 = 0x4138ae84;
@@ -38,6 +39,9 @@ pub const KVM_GET_XCRS: u32 = 0x8188aea6;
 pub const KVM_SET_XCRS: u32 = 0x4188aea7;
 pub const KVM_KVMCLOCK_CTRL: u32 = 0xaead;
 pub const KVM_GET_XSAVE2: u32 = 0x9000aecf;
+pub const KVM_SET_DEVICE_ATTR = common.KVM_SET_DEVICE_ATTR;
+pub const KVM_GET_DEVICE_ATTR = common.KVM_GET_DEVICE_ATTR;
+pub const KVM_HAS_DEVICE_ATTR = common.KVM_HAS_DEVICE_ATTR;
 
 pub const KVM_SET_CLOCK: u32 = 0x4030ae7b;
 pub const KVM_GET_CLOCK: u32 = 0x8030ae7c;
@@ -92,6 +96,8 @@ pub const KVM_MP_STATE_UNINITIALIZED: u32 = 1;
 pub const KVM_MP_STATE_INIT_RECEIVED: u32 = 2;
 pub const KVM_MP_STATE_HALTED: u32 = 3;
 pub const KVM_MP_STATE_SIPI_RECEIVED: u32 = 4;
+pub const KVM_VCPU_TSC_CTRL: u32 = 0;
+pub const KVM_VCPU_TSC_OFFSET: u64 = 0;
 
 pub const max_cpuid_entries: usize = 256;
 pub const max_xcrs: usize = 16;
@@ -182,6 +188,7 @@ pub fn decodeIoExit(run: []u8) IoDecodeError!IoExit {
 pub const UserspaceMemoryRegion = common.UserspaceMemoryRegion;
 
 pub const IrqLevel = common.IrqLevel;
+pub const DeviceAttr = common.DeviceAttr;
 
 pub const PitConfig = extern struct {
     flags: u32 = 0,
@@ -580,6 +587,18 @@ pub fn getMpState(vcpu_fd: std.c.fd_t) Error!MpState {
 
 pub fn setIrq(vm_fd: std.c.fd_t, gsi: u32, level: bool) Error!void {
     return common.setIrqLine(vm_fd, gsi, level);
+}
+
+pub fn hasTscOffset(vcpu_fd: std.c.fd_t) Error!bool {
+    return common.hasDeviceAttr(vcpu_fd, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, "KVM_HAS_DEVICE_ATTR TSC offset");
+}
+
+pub fn getTscOffset(vcpu_fd: std.c.fd_t) Error!u64 {
+    return common.getDeviceAttrU64(vcpu_fd, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, "KVM_GET_DEVICE_ATTR TSC offset");
+}
+
+pub fn setTscOffset(vcpu_fd: std.c.fd_t, value: u64) Error!void {
+    return common.setDeviceAttrU64(vcpu_fd, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, value, "KVM_SET_DEVICE_ATTR TSC offset");
 }
 
 pub const RunResult = enum {

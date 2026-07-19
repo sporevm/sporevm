@@ -299,6 +299,45 @@ throughout the work.
   evidence contract. The final Anthropic Fable deep-analysis approved Stage
   0b.1 with no material finding; its residual risks are the Stage 0b.2 work
   named below rather than omissions from this reset-state inventory.
+- Stage 0b.2 now has a candidate implementation and exact native evidence. The
+  deterministic guest dirties host-owned x87, XMM, and YMM patterns behind an
+  exact x87/SSE/AVX-only CPUID and XCR0 contract, samples TSC and all three
+  plan-named clocks, and crosses CAPT/RSTR generation-device barriers through
+  a shared, fuzzed mailbox ABI. The task-local state codec encodes normalized
+  architectural fields with bounded inventories and a SHA-256 footer; restore
+  requires a regular, single-link, owner-only file and matches its XSAVE length
+  to the destination KVM capability before any CPU-state ioctl. The final
+  ReleaseSafe static harness SHA256 is
+  `a73c7a6e2832548dfd7ce9aa3309c70aea73da5d6aecbcaca46fb1579f0a5a1e`,
+  the deterministic initrd SHA256 is
+  `e74c394ec802ff9567f04021f3e9f7f8b72d19042f08e140584e3aae7ba87442`,
+  and the proof used the Stage 0a.2 managed bzImage above. Capture PID 124955
+  exited before restore PID 124964 started. The resulting 67,119,212-byte
+  mode-0600, single-link state file is owned by the task user and has SHA256
+  `347f5bfcffc3ec626c40c687b929cc6158cf43ee171dc0e70516e7a21abf2c6a`,
+  matching the digest emitted by capture. Captured xstate was exactly `0x7`
+  with uncompacted layout and a 4,096-byte KVM XSAVE buffer; all 21 classified
+  MSRs restored and read back. Guest TSC advanced from 869132316 to 4573046988;
+  monotonic time advanced from 11307879ns to 1245966648ns, boot time from
+  11307945ns to 1245966728ns, and realtime from 1784446571161109000ns to
+  1784446572395767855ns. Capture and restore strace SHA256 values are
+  `9657ac81f84343fe4cbb4391125553ff1c0eb528e457ddd816d128bb23bc9c5d`
+  and `5e18c40a5693d5665f0ee86a22eca5fd6f7d7bed21b891d66abb3bafd39ff79e`.
+  Only BSP vCPU fd 5 entered `KVM_RUN`; restore applied CPU and clock state on
+  trace lines 149-160, read back both MP states and every restored CPU/clock
+  class on lines 161-172, then made its first and only `KVM_RUN` on line 173.
+  No source process existed before restore and no process remained afterward.
+  The focused profile suite passes 24/24 with two registered fuzz targets;
+  `mise run test`, the exact flaky-listener binary and seed, `mise run build`,
+  the ReleaseSafe static cross-build, deterministic-initrd test, formatting,
+  and diff hygiene pass. Final ship-risk and maintainability reviews approve
+  with no finding remaining. Anthropic Fable independently returned `SHIP`
+  with no milestone blocker; its grounded CPUID/MP/SREGS cleanups are included,
+  while the native oracle correctly rejected its optional whole-RAM equality
+  suggestion because restoring `MSR_KVM_WALL_CLOCK_NEW` rewrites the pvclock
+  page before first run. The transient transfer objects and bucket were deleted
+  and the bucket is proven absent; the task-owned native evidence remains
+  retained on the dedicated host.
 
 ## Motivation
 

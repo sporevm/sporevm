@@ -22,6 +22,9 @@ pub const KVM_CREATE_VCPU: u32 = 0xae41;
 pub const KVM_SET_USER_MEMORY_REGION: u32 = 0x4020ae46;
 pub const KVM_IRQ_LINE: u32 = 0x4008ae61;
 pub const KVM_RUN: u32 = 0xae80;
+pub const KVM_SET_DEVICE_ATTR: u32 = 0x4018aee1;
+pub const KVM_GET_DEVICE_ATTR: u32 = 0x4018aee2;
+pub const KVM_HAS_DEVICE_ATTR: u32 = 0x4018aee3;
 
 pub const KVM_EXIT_MMIO: u32 = 6;
 pub const KVM_EXIT_SHUTDOWN: u32 = 8;
@@ -59,6 +62,13 @@ pub const IrqLevel = extern struct {
     level: u32,
 };
 
+pub const DeviceAttr = extern struct {
+    flags: u32,
+    group: u32,
+    attr: u64,
+    addr: u64,
+};
+
 pub const OpenOptions = struct {
     close_on_exec: bool,
 };
@@ -86,6 +96,63 @@ pub fn setIrqLine(vm_fd: std.c.fd_t, irq: u32, level: bool) Error!void {
     _ = try ioctl(vm_fd, KVM_IRQ_LINE, @intFromPtr(&irq_level), "KVM_IRQ_LINE");
 }
 
+pub fn hasDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!bool {
+    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = 0 };
+    const rc = linux.ioctl(fd, KVM_HAS_DEVICE_ATTR, @intFromPtr(&attr));
+    return switch (linux.errno(rc)) {
+        .SUCCESS => true,
+        .NOENT, .INVAL, .NXIO => false,
+        else => |err| {
+            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, KVM_HAS_DEVICE_ATTR, @tagName(err) });
+            return error.KvmIoctlFailed;
+        },
+    };
+}
+
+pub fn setDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *const anyopaque, op: []const u8) Error!void {
+    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(value) };
+    _ = try ioctl(fd, KVM_SET_DEVICE_ATTR, @intFromPtr(&attr), op);
+}
+
+fn getDeviceAttrMaybe(comptime T: type, fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?T {
+    var value: T = 0;
+    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(&value) };
+    const rc = linux.ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr));
+    return switch (linux.errno(rc)) {
+        .SUCCESS => value,
+        .INVAL => null,
+        else => |err| {
+            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, KVM_GET_DEVICE_ATTR, @tagName(err) });
+            return error.KvmIoctlFailed;
+        },
+    };
+}
+
+pub fn getDeviceAttrMaybeU32(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u32 {
+    return getDeviceAttrMaybe(u32, fd, group, attr_id, op);
+}
+
+pub fn setDeviceAttrU32(fd: std.c.fd_t, group: u32, attr_id: u64, value: u32, op: []const u8) Error!void {
+    var mutable_value = value;
+    return setDeviceAttr(fd, group, attr_id, &mutable_value, op);
+}
+
+pub fn getDeviceAttrMaybeU64(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u64 {
+    return getDeviceAttrMaybe(u64, fd, group, attr_id, op);
+}
+
+pub fn getDeviceAttrU64(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!u64 {
+    var value: u64 = 0;
+    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(&value) };
+    _ = try ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr), op);
+    return value;
+}
+
+pub fn setDeviceAttrU64(fd: std.c.fd_t, group: u32, attr_id: u64, value: u64, op: []const u8) Error!void {
+    var mutable_value = value;
+    return setDeviceAttr(fd, group, attr_id, &mutable_value, op);
+}
+
 fn openFlags(options: OpenOptions) std.c.O {
     return .{
         .ACCMODE = .RDWR,
@@ -103,6 +170,9 @@ test "common KVM UAPI values" {
     try std.testing.expectEqual(@as(u32, 0x4020ae46), KVM_SET_USER_MEMORY_REGION);
     try std.testing.expectEqual(@as(u32, 0x4008ae61), KVM_IRQ_LINE);
     try std.testing.expectEqual(@as(u32, 0xae80), KVM_RUN);
+    try std.testing.expectEqual(@as(u32, 0x4018aee1), KVM_SET_DEVICE_ATTR);
+    try std.testing.expectEqual(@as(u32, 0x4018aee2), KVM_GET_DEVICE_ATTR);
+    try std.testing.expectEqual(@as(u32, 0x4018aee3), KVM_HAS_DEVICE_ATTR);
     try std.testing.expectEqual(@as(usize, 1), RunLayout.immediate_exit);
     try std.testing.expectEqual(@as(usize, 8), RunLayout.exit_reason);
     try std.testing.expectEqual(@as(usize, 32), RunLayout.mmio_phys_addr);
@@ -125,6 +195,7 @@ test "common KVM ABI layouts" {
     try std.testing.expectEqual(@as(usize, 4), @alignOf(IrqLevel));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(IrqLevel, "irq"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(IrqLevel, "level"));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(DeviceAttr));
 }
 
 test "open options preserve close-on-exec choice" {

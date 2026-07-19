@@ -34,9 +34,9 @@ pub const KVM_SET_ONE_REG: u32 = 0x4010aeac;
 pub const KVM_ARM_VCPU_INIT: u32 = 0x4020aeae;
 pub const KVM_ARM_PREFERRED_TARGET: u32 = 0x8020aeaf;
 pub const KVM_CREATE_DEVICE: u32 = 0xc00caee0;
-pub const KVM_SET_DEVICE_ATTR: u32 = 0x4018aee1;
-pub const KVM_GET_DEVICE_ATTR: u32 = 0x4018aee2;
-pub const KVM_HAS_DEVICE_ATTR: u32 = 0x4018aee3;
+pub const KVM_SET_DEVICE_ATTR = common.KVM_SET_DEVICE_ATTR;
+pub const KVM_GET_DEVICE_ATTR = common.KVM_GET_DEVICE_ATTR;
+pub const KVM_HAS_DEVICE_ATTR = common.KVM_HAS_DEVICE_ATTR;
 pub const KVM_ARM_SET_COUNTER_OFFSET: u32 = 0x4010aeb5;
 
 pub const KVM_EXIT_MMIO = common.KVM_EXIT_MMIO;
@@ -120,12 +120,7 @@ pub const CreateDevice = extern struct {
     flags: u32,
 };
 
-pub const DeviceAttr = extern struct {
-    flags: u32,
-    group: u32,
-    attr: u64,
-    addr: u64,
-};
+pub const DeviceAttr = common.DeviceAttr;
 
 pub const IrqLevel = common.IrqLevel;
 
@@ -229,48 +224,11 @@ pub fn setIrq(vm_fd: std.c.fd_t, intid: u32, level: bool) Error!void {
     return common.setIrqLine(vm_fd, (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | intid, level);
 }
 
-pub fn setDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *const anyopaque, op: []const u8) Error!void {
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(value) };
-    _ = try ioctl(fd, KVM_SET_DEVICE_ATTR, @intFromPtr(&attr), op);
-}
-
-pub fn getDeviceAttrMaybeU32(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u32 {
-    var value: u32 = 0;
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(&value) };
-    const rc = linux.ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr));
-    switch (linux.errno(rc)) {
-        .SUCCESS => return value,
-        .INVAL => return null,
-        else => |err| {
-            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, KVM_GET_DEVICE_ATTR, @tagName(err) });
-            return error.KvmIoctlFailed;
-        },
-    }
-}
-
-pub fn setDeviceAttrU32(fd: std.c.fd_t, group: u32, attr_id: u64, value: u32, op: []const u8) Error!void {
-    var v = value;
-    try setDeviceAttr(fd, group, attr_id, &v, op);
-}
-
-pub fn getDeviceAttrMaybeU64(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u64 {
-    var value: u64 = 0;
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(&value) };
-    const rc = linux.ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr));
-    switch (linux.errno(rc)) {
-        .SUCCESS => return value,
-        .INVAL => return null,
-        else => |err| {
-            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, KVM_GET_DEVICE_ATTR, @tagName(err) });
-            return error.KvmIoctlFailed;
-        },
-    }
-}
-
-pub fn setDeviceAttrU64(fd: std.c.fd_t, group: u32, attr_id: u64, value: u64, op: []const u8) Error!void {
-    var v = value;
-    try setDeviceAttr(fd, group, attr_id, &v, op);
-}
+pub const setDeviceAttr = common.setDeviceAttr;
+pub const getDeviceAttrMaybeU32 = common.getDeviceAttrMaybeU32;
+pub const setDeviceAttrU32 = common.setDeviceAttrU32;
+pub const getDeviceAttrMaybeU64 = common.getDeviceAttrMaybeU64;
+pub const setDeviceAttrU64 = common.setDeviceAttrU64;
 
 pub fn setCounterOffset(vm_fd: std.c.fd_t, counter_offset: u64) Error!void {
     var offset = CounterOffset{ .counter_offset = counter_offset };

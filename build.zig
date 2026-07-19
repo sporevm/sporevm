@@ -511,6 +511,21 @@ pub fn build(b: *std.Build) void {
             const install_profile_probe = b.addInstallArtifact(profile_probe_exe, .{});
             const profile_probe_step = b.step("kvm-profile-probe", "Build the no-KVM_RUN x86 KVM profile probe");
             profile_probe_step.dependOn(&install_profile_probe.step);
+
+            const profile_roundtrip_mod = b.createModule(.{
+                .root_source_file = b.path("src/x86_64_profile_roundtrip.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = optimize != .Debug,
+                .link_libc = true,
+            });
+            const profile_roundtrip_exe = b.addExecutable(.{
+                .name = "kvm-profile-roundtrip",
+                .root_module = profile_roundtrip_mod,
+            });
+            const install_profile_roundtrip = b.addInstallArtifact(profile_roundtrip_exe, .{});
+            const profile_roundtrip_step = b.step("kvm-profile-roundtrip", "Build the x86 KVM process-boundary profile proof");
+            profile_roundtrip_step.dependOn(&install_profile_roundtrip.step);
         }
     }
 }
