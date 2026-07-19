@@ -112,7 +112,8 @@ int main(void) {
   SporeOwnedString json = {0};
   if (expect_success(spore_host_info_json(context, &json)) != 0) return 1;
   if (json.ptr == 0 || json.len == 0) return 1;
-  if (strstr(json.ptr, "\"schema\": \"spore.host-info.v1\"") == 0) return 1;
+  if (strstr(json.ptr, "\"schema\": \"spore.host-info.v2\"") == 0) return 1;
+  if (strstr(json.ptr, "\"arch\": \"arm64\"") == 0) return 1;
 
   spore_free_string(context, json);
 

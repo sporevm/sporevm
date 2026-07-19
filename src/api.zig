@@ -6,6 +6,7 @@
 
 const std = @import("std");
 
+const architecture = @import("architecture.zig");
 const bundle = @import("bundle.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
@@ -57,7 +58,7 @@ pub const HostInfo = struct {
 
 pub const PlatformFacts = struct {
     os: []const u8,
-    arch: []const u8,
+    arch: architecture.Architecture,
     cpu_profile: []const u8,
     device_model_version: u32,
     ram_base: u64,
@@ -155,6 +156,7 @@ pub const RootfsImportOciResult = rootfs_mod.ImportOciResult;
 pub const RootfsImportTarOptions = rootfs_mod.ImportTarRequest;
 pub const RootfsImportTarResult = rootfs_mod.ImportTarResult;
 pub const RootfsPlatform = rootfs_mod.Platform;
+pub const Architecture = architecture.Architecture;
 pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
 pub const RootfsStoragePolicy = rootfs_mod.RootfsStoragePolicy;
 pub const Disk = run_mod.Disk;

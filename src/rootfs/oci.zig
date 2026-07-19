@@ -1,4 +1,5 @@
 const std = @import("std");
+const architecture = @import("../architecture.zig");
 const image = @import("../image.zig");
 
 const Io = std.Io;
@@ -6,17 +7,16 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Platform = struct {
     os: []const u8 = "linux",
-    arch: []const u8 = "arm64",
+    arch: architecture.Architecture = .arm64,
 
     pub fn parse(raw: []const u8) !Platform {
         const slash = std.mem.indexOfScalar(u8, raw, '/') orelse return error.BadPlatform;
         const os = raw[0..slash];
         const arch = raw[slash + 1 ..];
         if (os.len == 0 or arch.len == 0) return error.BadPlatform;
-        if (!std.mem.eql(u8, os, "linux") or !std.mem.eql(u8, arch, "arm64")) {
-            return error.UnsupportedPlatform;
-        }
-        return .{ .os = os, .arch = arch };
+        if (!std.mem.eql(u8, os, "linux")) return error.UnsupportedPlatform;
+        const parsed_arch = architecture.Architecture.parse(arch) catch return error.UnsupportedPlatform;
+        return .{ .os = os, .arch = parsed_arch };
     }
 };
 
@@ -142,7 +142,7 @@ pub fn selectedManifestDigest(allocator: std.mem.Allocator, bytes: []const u8, p
     for (parsed.value.manifests) |desc| {
         if (!isManifestMediaType(desc.mediaType)) continue;
         const p = desc.platform orelse continue;
-        if (std.mem.eql(u8, p.os, platform.os) and std.mem.eql(u8, p.architecture, platform.arch)) {
+        if (std.mem.eql(u8, p.os, platform.os) and std.mem.eql(u8, p.architecture, platform.arch.name())) {
             if (!isSha256Digest(desc.digest)) return error.UnsupportedDigest;
             return try allocator.dupe(u8, desc.digest);
         }
@@ -316,6 +316,13 @@ test "docker.io references fetch from Docker Hub registry API" {
     );
 }
 
+test "platform parsing accepts OCI names and rejects backend aliases" {
+    try std.testing.expectEqual(architecture.Architecture.arm64, (try Platform.parse("linux/arm64")).arch);
+    try std.testing.expectEqual(architecture.Architecture.amd64, (try Platform.parse("linux/amd64")).arch);
+    try std.testing.expectError(error.UnsupportedPlatform, Platform.parse("linux/aarch64"));
+    try std.testing.expectError(error.UnsupportedPlatform, Platform.parse("linux/x86_64"));
+}
+
 test "pinned manifest bytes must match requested digest" {
     const index =
         \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}
@@ -352,6 +359,19 @@ test "selected manifest digest is caller-owned" {
     ) orelse return error.TestExpectedEqual;
     defer allocator.free(selected);
     try std.testing.expectEqualStrings("sha256:0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", selected);
+}
+
+test "manifest selection distinguishes both OCI architectures" {
+    const allocator = std.testing.allocator;
+    const index =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","platform":{"os":"linux","architecture":"amd64"}}]}
+    ;
+    const arm64 = (try selectedManifestDigest(allocator, index, .{ .arch = .arm64 })).?;
+    defer allocator.free(arm64);
+    const amd64 = (try selectedManifestDigest(allocator, index, .{ .arch = .amd64 })).?;
+    defer allocator.free(amd64);
+    try std.testing.expectEqualStrings("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", arm64);
+    try std.testing.expectEqualStrings("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", amd64);
 }
 
 test "OCI index detection accepts manifest arrays without mediaType" {

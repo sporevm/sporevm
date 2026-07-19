@@ -16,7 +16,7 @@ const build_usage =
     \\Options:
     \\  --output <path>        Rootfs ext4 output path
     \\  --metadata <path>      Metadata sidecar path (default: <output>.json)
-    \\  --platform <os/arch>   Target platform (default: linux/arm64)
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
     \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
     \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
@@ -29,7 +29,7 @@ const import_oci_usage =
     \\
     \\Options:
     \\  --ref <name:tag>       Local mutable image ref to record
-    \\  --platform <os/arch>   Target platform (default: linux/arm64)
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked (default: chunked)
     \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
@@ -44,7 +44,7 @@ const import_tar_usage =
     \\
     \\Options:
     \\  --ref <name:tag>       Local mutable image ref to record
-    \\  --platform <os/arch>   Target platform (default: linux/arm64)
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked (default: chunked)
     \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
@@ -58,7 +58,7 @@ const resolve_usage =
     \\  spore rootfs resolve <image:tag>
     \\
     \\Options:
-    \\  --platform <os/arch>   Target platform (default: linux/arm64)
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
     \\  -h, --help             Show this help
     \\
 ;

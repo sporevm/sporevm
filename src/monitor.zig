@@ -171,7 +171,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     const opts = try parseMonitorArgs(args);
     const parsed_ms = lifecycle.monotonicMs();
     if (!lifecycle.monitorBackendSupported(opts.backend.name())) {
-        std.debug.print("spore monitor: monitor mode requires HVF on Apple Silicon or KVM on Linux/aarch64\n", .{});
+        std.debug.print("spore monitor: monitor mode requires HVF on Apple Silicon or KVM on Linux/arm64\n", .{});
         std.process.exit(2);
     }
     if (opts.resume_dir != null and opts.rootfs_path != null) {

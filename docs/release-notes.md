@@ -2,6 +2,17 @@
 
 ## Next
 
+Product architecture values now use OCI vocabulary consistently. The shared
+`Architecture` type admits only `arm64` and `amd64` for CLI/API platforms,
+canonical image configuration, OCI selection, and cache identity, then maps to
+`aarch64` or `x86_64` in one exhaustive backend-selection switch. Rootfs-only
+operations can select both OCI platforms; `spore build` still fails closed
+before input I/O for amd64 until the x86_64 runtime backend lands. Host facts
+move to `spore.host-info.v2`, reporting `arm64` and host classes such as
+`macos-arm64-hvf` or `linux-arm64-kvm`. Serialized spore machine state remains
+`aarch64` with `sporevm-aarch64-v0`, so existing manifests and canonical cache
+bytes are unchanged.
+
 `spore build` now keeps large accepted COPY heredocs cacheable. Step-record
 publication and both record readers share a 16 MiB bound, so a record larger
 than the previous 256 KiB read cap can be reused by a warm build and inspected

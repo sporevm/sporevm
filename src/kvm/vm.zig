@@ -1479,7 +1479,7 @@ fn restoreMemory(
 
 fn checkKvmManifestV1(manifest: spore.ManifestV1, config: Config, device_count: usize, host_counter_frequency_hz: u64) !void {
     if (manifest.version != spore.format_version_v1) return error.PlatformMismatch;
-    if (!std.mem.eql(u8, manifest.platform.arch, platform.arch)) return error.PlatformMismatch;
+    if (!std.mem.eql(u8, manifest.platform.arch, platform.machine_arch)) return error.PlatformMismatch;
     if (!std.mem.eql(u8, manifest.platform.cpu_profile, board.cpu_profile)) return error.PlatformMismatch;
     if (manifest.platform.device_model_version != board.device_model_version) return error.PlatformMismatch;
     if (manifest.platform.vcpu_count != config.vcpus) return error.PlatformMismatch;

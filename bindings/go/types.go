@@ -1,6 +1,6 @@
 package spore
 
-// HostInfo is the decoded spore.host-info.v1 contract.
+// HostInfo is the decoded spore.host-info.v2 contract.
 type HostInfo struct {
 	Schema        string                `json:"schema"`
 	SchemaVersion uint32                `json:"schema_version"`

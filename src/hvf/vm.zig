@@ -1991,7 +1991,7 @@ fn restoreMemory(
 
 fn checkHvfManifestV1(manifest: spore.ManifestV1, config: Config, device_count: usize, host_counter_frequency_hz: u64, dist_base: u64, redist_base: u64, redist_stride: u64) !void {
     if (manifest.version != spore.format_version_v1) return error.PlatformMismatch;
-    if (!std.mem.eql(u8, manifest.platform.arch, platform_contract.arch)) return error.PlatformMismatch;
+    if (!std.mem.eql(u8, manifest.platform.arch, platform_contract.machine_arch)) return error.PlatformMismatch;
     if (!std.mem.eql(u8, manifest.platform.cpu_profile, board.cpu_profile)) return error.PlatformMismatch;
     if (manifest.platform.device_model_version != board.device_model_version) return error.PlatformMismatch;
     if (manifest.platform.vcpu_count != config.vcpus) return error.PlatformMismatch;

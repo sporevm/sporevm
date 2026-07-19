@@ -341,7 +341,7 @@ fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
         error.BadVcpus => "spore build: --vcpus must be an integer from 1 through 8",
         error.BadTimeout => "spore build: --timeout must be a positive duration like 30s, 5m, or 500ms",
         error.BadUlimit => "spore build: --ulimit currently accepts only nofile=SOFT:HARD up to 1048576",
-        error.BadPlatform, error.UnsupportedPlatform => "spore build: --platform must be linux/arm64",
+        error.BadPlatform, error.UnsupportedPlatform => "spore build: --platform must be linux/arm64 or linux/amd64",
         else => "spore build: invalid arguments",
     };
     try stderr.print("{s}\n", .{message});
@@ -349,6 +349,9 @@ fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
 
 fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diagnostic) !void {
     switch (err) {
+        error.UnsupportedPlatform => {
+            try stderr.writeAll("spore build: runtime execution currently supports only linux/arm64\n");
+        },
         error.DockerfileParseFailed, error.DockerfilePlanFailed => {
             if (diagnostic.dockerfile.message.len != 0) {
                 if (diagnostic.dockerfile.line != 0) {
@@ -707,6 +710,8 @@ test "build CLI parses M1 options" {
         "base=oci-layout://zig-cache/base",
         "--build-arg",
         "MODE=test",
+        "--platform",
+        "linux/amd64",
         ".",
     });
     defer parsed.build_contexts.deinit();
@@ -719,6 +724,7 @@ test "build CLI parses M1 options" {
     try std.testing.expectEqual(@as(usize, 1), parsed.build_args.items.len);
     try std.testing.expectEqualStrings("MODE", parsed.build_args.items[0].key);
     try std.testing.expectEqualStrings("test", parsed.build_args.items[0].value);
+    try std.testing.expectEqual(.amd64, parsed.platform.arch);
     try std.testing.expect(std.mem.indexOf(u8, usage, "--disk-grow-target") == null);
     for ([_][]const u8{ "--memory", "--vcpus", "--timeout", "--ulimit" }) |option| {
         try std.testing.expect(std.mem.indexOf(u8, usage, option) != null);
@@ -726,6 +732,17 @@ test "build CLI parses M1 options" {
 
     try std.testing.expectError(error.UnknownArgument, parseArgs(allocator, &.{ "--disk-grow-target", "67108864", "." }));
     try std.testing.expectError(error.UnknownArgument, parseArgs(allocator, &.{ "--disk-grow-target=67108864", "." }));
+}
+
+test "build CLI reports a recognized platform with no runtime backend" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    try writeBuildError(&stderr.writer, error.UnsupportedPlatform, .{});
+    try std.testing.expectEqualStrings(
+        "spore build: runtime execution currently supports only linux/arm64\n",
+        stderr.written(),
+    );
 }
 
 test "build CLI bounds nofile ulimit" {

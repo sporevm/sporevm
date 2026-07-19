@@ -830,7 +830,7 @@ fn parseRootfsBundlePolicy(value: []const u8) ?spore_api.RootfsBundlePolicy {
 fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
     try writer.writeAll("Host info\n");
     try writer.print("  Class: {s}\n", .{info.host_class});
-    try writer.print("  Platform: {s}/{s}\n", .{ info.platform.os, info.platform.arch });
+    try writer.print("  Platform: {s}/{s}\n", .{ info.platform.os, info.platform.arch.name() });
     try writer.print("  CPU profile: {s}\n", .{info.platform.cpu_profile});
     try writer.print("  Device model version: {d}\n", .{info.platform.device_model_version});
     try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ info.platform.counter_frequency_hz, info.platform.counter_frequency_source });
