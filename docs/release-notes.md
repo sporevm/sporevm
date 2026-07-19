@@ -325,8 +325,10 @@ approximately 3.94 seconds to 1.82 seconds.
 Compatibility: the host-local builder cache ABI advanced from v7 in v0.13.1 to
 v9. Complete v6, v7, and v8 records remain conservative GC roots, but the first
 v9 build misses them and writes new v9 records; existing rootfs indexes and
-local images remain readable. `SPORE_ABI_VERSION` remains 15, and no portable
-spore, device, or manifest format changed after v0.13.1.
+local images remain readable. `SPORE_ABI_VERSION` remains 15, and the device and
+manifest versions are unchanged. Image-context saves may now include optional
+`exec_defaults` manifest metadata; older strict readers reject manifests that
+contain this field, while saves without it remain compatible.
 
 Bounded named exec now has a documented lossless JSON representation for
 arbitrary stdout and stderr bytes. Valid UTF-8 remains a JSON string, while an
