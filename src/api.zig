@@ -189,6 +189,7 @@ pub const RemoveNamedOptions = lifecycle.RemoveNamedOptions;
 pub const RemovedSavedSpore = lifecycle.RemovedSavedSpore;
 pub const ListNamedOptions = lifecycle.ListNamedOptions;
 pub const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
+pub const NamedExecTiming = lifecycle.NamedExecTiming;
 pub const ExecNamedResult = lifecycle.ExecNamedResult;
 pub const NamedForkResult = lifecycle.NamedForkResult;
 pub const NamedListEntry = lifecycle.ListEntry;
