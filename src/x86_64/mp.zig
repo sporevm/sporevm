@@ -9,7 +9,7 @@ const std = @import("std");
 const topology = @import("../topology.zig");
 const board = @import("board.zig");
 
-pub const min_cpu_count: u8 = 2;
+pub const min_cpu_count: u8 = 1;
 pub const max_cpu_count: u8 = @intCast(topology.max_vcpus);
 
 pub const floating_pointer_size: usize = 16;
@@ -350,6 +350,25 @@ test "MP table describes two enabled CPUs with one BSP" {
     try std.testing.expectEqual(@as(u8, cpu_enabled | cpu_boot_processor), cpu0[3]);
     try std.testing.expectEqual(@as(u8, 1), cpu1[1]);
     try std.testing.expectEqual(@as(u8, cpu_enabled), cpu1[3]);
+    try std.testing.expectEqual(@as(u8, 0xa5), memory[end]);
+}
+
+test "MP table describes one enabled BSP for single-vCPU product boot" {
+    var memory: [@intCast(board.gdt_addr)]u8 = @splat(0xa5);
+    const end = try write(&memory, 1);
+    try validate(memory[0..end], 1);
+
+    try std.testing.expectEqual(@as(usize, 224), try configurationTableSize(1));
+    try std.testing.expectEqual(@as(usize, 240), end);
+
+    const config_addr: usize = @intCast(board.mp_config_table_addr);
+    const table = memory[config_addr..end];
+    try std.testing.expectEqual(@as(u8, 0), byteSum(table));
+    try std.testing.expectEqual(@as(u16, 21), readInt(u16, table, 34));
+
+    const cpu0 = table[configuration_header_size..][0..processor_entry_size];
+    try std.testing.expectEqual(@as(u8, 0), cpu0[1]);
+    try std.testing.expectEqual(@as(u8, cpu_enabled | cpu_boot_processor), cpu0[3]);
     try std.testing.expectEqual(@as(u8, 0xa5), memory[end]);
 }
 

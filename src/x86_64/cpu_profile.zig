@@ -278,9 +278,7 @@ pub fn compatibility(facts: HostFacts, requested_vcpus: topology.VcpuCount) ?Inc
         if (!cpuidFeatureLeaf(requested.function)) continue;
         const supported = findCpuid(facts.supported_cpuid, requested.function, requested.index) orelse
             return .{ .unsupported_cpuid = .{ .function = requested.function, .index = requested.index } };
-        if ((requested.eax & ~supported.eax) != 0 or (requested.ebx & ~supported.ebx) != 0 or
-            (requested.ecx & ~supported.ecx) != 0 or (requested.edx & ~supported.edx) != 0)
-        {
+        if (!cpuidFeaturesSupported(requested, supported)) {
             return .{ .unsupported_cpuid = .{ .function = requested.function, .index = requested.index } };
         }
     }
@@ -292,6 +290,30 @@ pub fn compatibility(facts: HostFacts, requested_vcpus: topology.VcpuCount) ?Inc
 
 fn cpuidFeatureLeaf(function: u32) bool {
     return function == 1 or function == 7 or function == 0x4000_0001 or function == 0x8000_0001 or function == 0x8000_0007;
+}
+
+fn cpuidFeaturesSupported(requested: kvm.CpuidEntry, supported: kvm.CpuidEntry) bool {
+    const subset = struct {
+        fn of(wanted: u32, available: u32) bool {
+            return wanted & ~available == 0;
+        }
+    }.of;
+    return switch (requested.function) {
+        // EAX is the CPU signature and EBX contains topology/cache-line
+        // values. EDX.HTT is synthesized with the requested topology and
+        // ECX.OSXSAVE is guest-CR4-dependent, so KVM deliberately
+        // omits it from KVM_GET_SUPPORTED_CPUID even though KVM_SET_CPUID2
+        // accepts it and updates the visible bit with CR4.OSXSAVE.
+        1 => subset(requested.ecx & ~@as(u32, 1 << 27), supported.ecx) and
+            subset(requested.edx & ~@as(u32, 1 << 28), supported.edx),
+        // Leaf 7 EAX is the maximum subleaf; EBX, ECX, and EDX are features.
+        7 => subset(requested.ebx, supported.ebx) and subset(requested.ecx, supported.ecx) and subset(requested.edx, supported.edx),
+        0x4000_0001 => subset(requested.eax, supported.eax) and subset(requested.ebx, supported.ebx) and
+            subset(requested.ecx, supported.ecx) and subset(requested.edx, supported.edx),
+        0x8000_0001 => subset(requested.ecx, supported.ecx) and subset(requested.edx, supported.edx),
+        0x8000_0007 => subset(requested.edx, supported.edx),
+        else => unreachable,
+    };
 }
 
 fn findCpuid(entries: []const kvm.CpuidEntry, function: u32, index: u32) ?kvm.CpuidEntry {
@@ -497,6 +519,19 @@ test "candidate compatibility returns typed first failures" {
     const supported = try candidateCpuid(2, 0);
     facts.supported_cpuid = supported.entries[0..supported.nent];
     try std.testing.expectEqual(@as(?Incompatibility, null), compatibility(facts, 2));
+    var host_shaped = supported;
+    for (host_shaped.entries[0..host_shaped.nent]) |*entry| {
+        if (entry.function == 1) {
+            entry.eax = 0;
+            entry.ebx = 0;
+            entry.ecx &= ~@as(u32, 1 << 27);
+            entry.edx &= ~@as(u32, 1 << 28);
+        }
+        if (entry.function == 7) entry.eax = 0;
+    }
+    facts.supported_cpuid = host_shaped.entries[0..host_shaped.nent];
+    try std.testing.expectEqual(@as(?Incompatibility, null), compatibility(facts, 2));
+    facts.supported_cpuid = supported.entries[0..supported.nent];
     facts.api_version = 11;
     try std.testing.expectEqual(@as(u32, 11), compatibility(facts, 2).?.api_version);
     facts.api_version = kvm.KVM_API_VERSION;

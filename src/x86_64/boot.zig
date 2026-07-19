@@ -476,7 +476,8 @@ test "bzImage parser and planner fail closed on malformed fields" {
     image = makeTestImage(&image_buf, 4);
     try std.testing.expectError(error.CommandLineContainsNul, plan(image, 0, "bad\x00line", board.min_ram_size, 2));
     try std.testing.expectError(error.InvalidRamSize, plan(image, 0, "ok", board.max_ram_size + board.page_size, 2));
-    try std.testing.expectError(error.InvalidCpuCount, plan(image, 0, "ok", board.min_ram_size, 1));
+    _ = try plan(image, 0, "ok", board.min_ram_size, 1);
+    try std.testing.expectError(error.InvalidCpuCount, plan(image, 0, "ok", board.min_ram_size, 0));
     try std.testing.expectError(error.InvalidCpuCount, plan(image, 0, "ok", board.min_ram_size, mp.max_cpu_count + 1));
 }
 

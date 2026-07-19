@@ -1,8 +1,8 @@
-//! Provisional x86-64 board constants for the host-only KVM boot harness.
+//! Frozen `sporevm-x86_64-board-v0` machine constants.
 //!
-//! Stage 0a.2 reserves the complete eight-slot virtio-mmio inventory and the
-//! generation-device page. The harness may leave slots unpopulated, but their
-//! addresses and GSIs stay stable while the board contract is being proven.
+//! Slice 2a promotes the reviewed eight-slot virtio-mmio inventory and
+//! generation-device page into the fresh-only KVM runner. Slots may remain
+//! unpopulated, but their addresses, roles, and GSIs are product contracts.
 
 const std = @import("std");
 const generation = @import("../generation.zig");
@@ -72,8 +72,8 @@ pub const VirtioSlot = struct {
     gsi: u32,
 };
 
-/// Device roles used by the two exact Stage 0a.2 inventories. These are
-/// provisional harness layouts, not permanent product slot promises.
+/// Frozen board-v0 roles, including the cache-to-transient-memory substitution
+/// used by the reviewed probe inventory.
 pub const ProbeRole = enum {
     console,
     root,
@@ -280,14 +280,14 @@ pub fn validateLayout(ram_size: u64) Error!void {
     }
 }
 
-test "provisional board keeps low RAM, device windows, and KVM holes disjoint" {
+test "frozen board keeps low RAM, device windows, and KVM holes disjoint" {
     try validateLayout(max_ram_size);
     try std.testing.expect(identity_map_addr + page_size == tss_addr);
     try std.testing.expect(tss_addr + tss_size <= std.math.maxInt(u32));
     try std.testing.expect(mp_config_table_addr < gdt_addr);
 }
 
-test "provisional board rejects unaligned and oversized RAM" {
+test "frozen board rejects unaligned and oversized RAM" {
     try std.testing.expectError(error.InvalidRamSize, validateLayout(min_ram_size - page_size));
     try std.testing.expectError(error.InvalidRamSize, validateLayout(max_ram_size + page_size));
     try std.testing.expectError(error.InvalidRamSize, validateLayout(min_ram_size + 1));

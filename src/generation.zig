@@ -65,9 +65,9 @@ pub const Device = struct {
         return was_pending and self.interrupt_status & irq_generation_changed == 0;
     }
 
-    /// Future fork/resume hook. This first slice does not call it from the VM
-    /// lifecycle yet, but tests lock the interrupt semantics before the guest
-    /// driver exists.
+    /// Seed or refresh resume identity before guest execution. Fresh x86 runs
+    /// use this for generation-aware agent startup; capture/restore paths use
+    /// the same pending-bit and acknowledgement semantics.
     pub fn setResume(self: *Device, generation: u64, params: []const u8) Error!bool {
         if (params.len > params_size) return error.BadState;
 

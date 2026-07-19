@@ -1194,6 +1194,39 @@ unit/native tests remain unchanged. Completing Stage 1.5 completes Slice 1.
 and device set with no architecture-specific device fork. Capture and
 auto-memory remain unavailable.
 
+**Completed 2026-07-19.** The mechanically extracted fresh-only runner uses
+the approved `sporevm-x86_64-v0` CPUID/TSC profile, the frozen board-v0 device
+slots, and the shared console, block, net, vsock, RNG, generation, and
+guest-agent implementations. A ReleaseSafe smoke with SHA-256
+`9b25841524e6d3fde77a3d447d53345ff20134ea841b5888b75faace7cebce68`
+ran on the dedicated x86 bare-metal development host against the approved
+managed kernel
+`07a9b6d8a9efd2b7c5e886d1c010e67245fa132c8b48cf567f200099b55abee8`
+and embedded initrd
+`e81e3d071f25adb384838e45b4353c549c5b55db949a40dac124e9eb469d7fc6`.
+The guest-agent command completed with distinct stdout and stderr, observed
+generation 1 and acknowledged its interrupt, and enumerated all eight frozen
+virtio-mmio slots before the host reported `probe_complete`. A second run with
+an unconnectable probe returned the typed `ExecProbeTimeout` in 642 ms and
+joined its worker without process residue.
+
+Because the runner extraction changed the default-Debug harness, the complete
+Stage 0a.3 lifecycle matrix was rerun with harness SHA-256
+`058bfdc128e83e0df5ba284ae3c8331096b7f3423f2080f74b06a05b16a45b77`,
+the managed kernel above, and lifecycle initrd
+`ee05bff31ee93e51ea570f68e18e321a1c4eab0ac606b64065edd7ac30c40eb5`.
+Every case reported CPUs `0-1`, eight transports, and the exact device IDs per
+slot. Idle reached ready and timed out with rc 124; reboot returned rc 0 as
+`guest_reset` from one-byte PIO port `0x64`, value `0xfe`; native poweroff
+reached `System halted` and timed out with rc 124 without a terminal outcome;
+and doorbell poweroff returned rc 0 as `guest_off` from MMIO GPA `0xd0001020`,
+value `0x46464f50`. No case emitted a failure marker or raw
+`KVM_EXIT_SHUTDOWN`, no process remained, and the retained evidence checksum
+file has SHA-256
+`a3e71872052382a19fdb07f813d8516f55e842359fcfdae3c14acead069ffe0b`.
+All proofs used 512 MiB fixed RAM. Product routing, capture, resume, and
+automatic memory remain disabled for the next slices.
+
 ### Slice 3a: Integrate managed artifacts and fresh product execution
 
 - Add managed x86 kernel/initrd resolution and verification. Publish exactly

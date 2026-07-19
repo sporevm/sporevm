@@ -103,7 +103,7 @@ pub fn availability(requested: Backend) Availability {
 
 /// Resolve the requested backend before any artifact, disk, or VM work.
 /// Linux/x86_64 reaches the reviewed KVM probe but remains fail-closed until
-/// the product runner lands in Slice 2a.
+/// Slice 3a routes the fresh product path through the Slice 2a runner.
 pub fn requireProductRunner(requested: Backend) Error!Backend {
     return switch (availability(requested)) {
         .available => |selected| selected,

@@ -520,6 +520,25 @@ pub fn build(b: *std.Build) void {
         kvm_boot_step.dependOn(&install_kvm_boot.step);
 
         if (target_arch == .x86_64) {
+            const slice2a_smoke_mod = b.createModule(.{
+                .root_source_file = b.path("src/x86_64_slice2a_smoke.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = optimize != .Debug,
+                .link_libc = true,
+            });
+            slice2a_smoke_mod.addAnonymousImport("run_assets", .{
+                .root_source_file = minimal_exec_initrd_module,
+            });
+            slice2a_smoke_mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+            const slice2a_smoke_exe = b.addExecutable(.{
+                .name = "x86-slice2a-smoke",
+                .root_module = slice2a_smoke_mod,
+            });
+            const install_slice2a_smoke = b.addInstallArtifact(slice2a_smoke_exe, .{});
+            const slice2a_smoke_step = b.step("x86-slice2a-smoke", "Build the native x86 Slice 2a guest-agent smoke");
+            slice2a_smoke_step.dependOn(&install_slice2a_smoke.step);
+
             const profile_probe_mod = b.createModule(.{
                 .root_source_file = b.path("src/x86_64_profile_probe.zig"),
                 .target = target,

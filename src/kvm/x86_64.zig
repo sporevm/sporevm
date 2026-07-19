@@ -1,7 +1,7 @@
-//! Minimal Linux KVM UAPI used by the host-only x86-64 boot harness.
+//! Minimal Linux KVM UAPI used by the x86-64 profile and fresh VM runner.
 //!
-//! Product KVM boundaries remain aarch64-only until Slice 1. This module owns
-//! only the x86 bring-up ioctls and the bounded KVM_EXIT_IO decoder.
+//! Architecture-neutral literals live in `common.zig`; this module owns the
+//! x86-specific profile, machine-state, and bounded exit-decoder surface.
 
 const std = @import("std");
 const linux = std.os.linux;
