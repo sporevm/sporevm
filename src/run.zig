@@ -15,6 +15,11 @@ const generation = @import("generation.zig");
 const hvf = @import("hvf/hvf.zig");
 const kvm_native = @import("kvm/native.zig");
 const kvm = kvm_native.binding;
+const x86_board = @import("x86_64/board.zig");
+const x86_vm = if (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
+    @import("x86_64/vm.zig")
+else
+    struct {};
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
@@ -88,9 +93,43 @@ const managed_run_kernel_required_config_symbols = [_][]const u8{
     "CONFIG_EXCLUSIVE_SYSTEM_RAM",
     "CONFIG_VIRTIO_MEM",
 };
+const managed_x86_kernel_required_config_symbols = [_][]const u8{
+    "CONFIG_X86_64",
+    "CONFIG_SMP",
+    "CONFIG_X86_LOCAL_APIC",
+    "CONFIG_X86_IO_APIC",
+    "CONFIG_X86_MPPARSE",
+    "CONFIG_HYPERVISOR_GUEST",
+    "CONFIG_PARAVIRT",
+    "CONFIG_PARAVIRT_CLOCK",
+    "CONFIG_KVM_GUEST",
+    "CONFIG_RELOCATABLE",
+    "CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES",
+    "CONFIG_DEVMEM",
+    "CONFIG_STRICT_DEVMEM",
+};
+const managed_x86_kernel_forbidden_config_symbols = [_][]const u8{
+    "CONFIG_IO_STRICT_DEVMEM",
+    "CONFIG_ACPI",
+    "CONFIG_EFI",
+    "CONFIG_PCI",
+    "CONFIG_VIRTIO_PCI",
+    "CONFIG_RTC_CLASS",
+    "CONFIG_SERIAL_8250",
+    "CONFIG_KEYBOARD_ATKBD",
+    "CONFIG_MOUSE_PS2",
+    "CONFIG_SERIO_I8042",
+};
+const approved_x86_kernel_sha256 = [_]u8{
+    0x07, 0xa9, 0xb6, 0xd8, 0xa9, 0xef, 0xd2, 0xb7,
+    0xc5, 0xe8, 0x86, 0xd1, 0xc0, 0x10, 0xe6, 0x72,
+    0x45, 0xfa, 0x13, 0x2c, 0x8b, 0x48, 0xcf, 0x56,
+    0x7f, 0x20, 0x00, 0x99, 0xb5, 0x5a, 0xbe, 0xe8,
+};
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const auto_boot_memory_bytes: u64 = 512 * 1024 * 1024;
+pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
 
 pub const MemoryConfig = memory_config.Config;
 pub const SaveTrigger = capture.Trigger;
@@ -103,10 +142,42 @@ pub const FailureScope = machine_output.Scope;
 
 pub const Backend = backend_mod.Backend;
 
+pub const FreshProductPolicy = struct {
+    memory: memory_config.Config,
+    vcpus: topology.VcpuCount,
+    resuming: bool = false,
+    capture: bool = false,
+    rootfs: bool = false,
+    network: bool = false,
+    build: bool = false,
+};
+
+/// Slice 3a exposes one deliberately narrow x86 product profile. Keep this
+/// pure so API and lifecycle callers can reject unsupported work before
+/// downloads, rootfs resolution, gateway startup, or monitor state creation.
+pub fn validateFreshProductPolicy(selected_backend: Backend, policy: FreshProductPolicy) !void {
+    if (comptime builtin.os.tag != .linux) return;
+    return validateFreshProductPolicyFor(builtin.cpu.arch, selected_backend, policy);
+}
+
+fn validateFreshProductPolicyFor(zig_arch: std.Target.Cpu.Arch, selected_backend: Backend, policy: FreshProductPolicy) !void {
+    if (zig_arch != .x86_64) return;
+    if (selected_backend != .kvm) return error.UnsupportedBackend;
+    if (policy.resuming) return error.X86ResumeUnsupported;
+    if (policy.capture) return error.X86CaptureUnsupported;
+    if (policy.rootfs) return error.X86RootfsUnsupported;
+    if (policy.network) return error.X86NetworkUnsupported;
+    if (policy.build) return error.X86BuildUnsupported;
+    if (policy.memory.policy != .explicit) return error.X86ExplicitMemoryRequired;
+    if (policy.memory.bytes != x86_experimental_memory_bytes) return error.X86ExperimentalMemorySizeUnsupported;
+    if (policy.vcpus != 1) return error.X86VcpuCountUnsupported;
+}
+
 pub const Options = struct {
     backend: Backend = .auto,
     kernel_path: []const u8,
     initrd_path: ?[]const u8 = null,
+    boot_artifacts: ?MonitorBootArtifacts = null,
     auto_memory_hotplug_capable: bool = false,
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
@@ -918,6 +989,34 @@ pub const EventWriter = struct {
 };
 
 pub fn classifyFailure(err: anyerror) ClassifiedFailure {
+    if (err == error.X86ExplicitMemoryRequired or err == error.X86ExperimentalMemorySizeUnsupported) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: experimental x86-64 KVM requires explicit --memory 512mib; omitted and automatic memory are unavailable",
+            @errorName(err),
+        );
+    }
+    if (err == error.X86ResumeUnsupported or err == error.X86CaptureUnsupported) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: x86-64 KVM currently supports fresh execution only; resume, save, capture, fork, and image commit are unavailable",
+            @errorName(err),
+        );
+    }
+    if (err == error.X86RootfsUnsupported or err == error.X86NetworkUnsupported or err == error.X86BuildUnsupported) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: x86-64 KVM rootfs, OCI, networking, and build integration have not landed yet",
+            @errorName(err),
+        );
+    }
+    if (err == error.X86VcpuCountUnsupported) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: the experimental x86-64 product path currently requires --vcpus 1",
+            @errorName(err),
+        );
+    }
     if (err == error.InvalidRunCommitOptions or err == error.RunCommitImageConfigUnavailable or err == error.RunCommitRootfsNotSnapshotable) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
@@ -996,6 +1095,17 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
         );
     }
     return machine_output.fromZigError(err);
+}
+
+pub fn isX86ProductPolicyError(err: anyerror) bool {
+    return err == error.X86ExplicitMemoryRequired or
+        err == error.X86ExperimentalMemorySizeUnsupported or
+        err == error.X86VcpuCountUnsupported or
+        err == error.X86ResumeUnsupported or
+        err == error.X86CaptureUnsupported or
+        err == error.X86RootfsUnsupported or
+        err == error.X86NetworkUnsupported or
+        err == error.X86BuildUnsupported;
 }
 
 pub const MonitorExit = enum {
@@ -2354,6 +2464,7 @@ fn resolveManagedRunKernel(init: std.process.Init, allocator: std.mem.Allocator)
     const config_dest = try std.fmt.allocPrint(allocator, "{s}.config", .{dest});
 
     if (try managedKernelCacheDigest(init.io, allocator, dest, sha_dest, config_dest, asset)) |digest| {
+        try validateManagedKernelArchitectureDigest(digest);
         return .{ .path = dest, .sha256 = digest };
     }
 
@@ -2379,6 +2490,7 @@ fn resolveManagedRunKernel(init: std.process.Init, allocator: std.mem.Allocator)
     try fetchManagedKernelAsset(allocator, init.io, &client, opts.repository, opts.release, config_asset, temp_config, max_kernel_config_asset_size);
     const expected_digest = (try verifiedManagedKernelDigest(init.io, allocator, temp_image, temp_sha, asset)) orelse
         return error.ManagedKernelChecksumMismatch;
+    try validateManagedKernelArchitectureDigest(expected_digest);
     if (try missingManagedRunKernelConfigSymbolFromPath(init.io, allocator, temp_config)) |missing| {
         defer allocator.free(missing);
         return error.ManagedKernelConfigMissing;
@@ -2408,8 +2520,21 @@ fn managedKernelOptions(init: std.process.Init) ManagedKernelOptions {
 }
 
 fn managedRunKernelAssetName(allocator: std.mem.Allocator, linux_version: []const u8) ![]const u8 {
+    return managedRunKernelAssetNameFor(allocator, builtin.cpu.arch, linux_version);
+}
+
+fn managedRunKernelAssetNameFor(allocator: std.mem.Allocator, zig_arch: std.Target.Cpu.Arch, linux_version: []const u8) ![]const u8 {
     try validateManagedKernelVersion(linux_version);
+    if (zig_arch == .x86_64) {
+        return std.fmt.allocPrint(allocator, "sporevm-x86_64-linux-{s}-bzImage", .{linux_version});
+    }
     return std.fmt.allocPrint(allocator, "sporevm-arm64-linux-{s}-Image", .{linux_version});
+}
+
+fn validateManagedKernelArchitectureDigest(digest: [Sha256.digest_length]u8) !void {
+    if (comptime builtin.cpu.arch == .x86_64) {
+        if (!std.mem.eql(u8, &digest, &approved_x86_kernel_sha256)) return error.ManagedKernelArchitectureDigestMismatch;
+    }
 }
 
 fn managedRunKernelConfigAssetName(allocator: std.mem.Allocator, image_asset: []const u8) ![]const u8 {
@@ -2521,8 +2646,20 @@ fn missingManagedRunKernelConfigSymbolFromPath(io: Io, allocator: std.mem.Alloca
 }
 
 fn missingManagedRunKernelConfigSymbol(allocator: std.mem.Allocator, config: []const u8) !?[]const u8 {
+    return missingManagedRunKernelConfigSymbolFor(allocator, builtin.cpu.arch, config);
+}
+
+fn missingManagedRunKernelConfigSymbolFor(allocator: std.mem.Allocator, zig_arch: std.Target.Cpu.Arch, config: []const u8) !?[]const u8 {
     for (&managed_run_kernel_required_config_symbols) |symbol| {
         if (!kernelConfigHasBuiltin(config, symbol)) return try allocator.dupe(u8, symbol);
+    }
+    if (zig_arch == .x86_64) {
+        for (&managed_x86_kernel_required_config_symbols) |symbol| {
+            if (!kernelConfigHasBuiltin(config, symbol)) return try allocator.dupe(u8, symbol);
+        }
+        for (&managed_x86_kernel_forbidden_config_symbols) |symbol| {
+            if (kernelConfigEnabled(config, symbol)) return try allocator.dupe(u8, symbol);
+        }
     }
     return null;
 }
@@ -2536,6 +2673,16 @@ fn kernelConfigHasBuiltin(config: []const u8, symbol: []const u8) bool {
         if (line[symbol.len] != '=') continue;
         if (line[symbol.len + 1] != 'y') continue;
         return true;
+    }
+    return false;
+}
+
+fn kernelConfigEnabled(config: []const u8, symbol: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, config, '\n');
+    while (lines.next()) |raw_line| {
+        const line = if (std.mem.endsWith(u8, raw_line, "\r")) raw_line[0 .. raw_line.len - 1] else raw_line;
+        if (line.len != symbol.len + 2 or !std.mem.startsWith(u8, line, symbol) or line[symbol.len] != '=') continue;
+        return line[symbol.len + 1] == 'y' or line[symbol.len + 1] == 'm';
     }
     return false;
 }
@@ -3047,6 +3194,15 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
 
     const backend = try backend_mod.requireProductRunner(opts.backend);
     events.setBackend(backend);
+    try validateFreshProductPolicy(backend, .{
+        .memory = opts.memory,
+        .vcpus = opts.vcpus,
+        .resuming = opts.resume_dir != null,
+        .capture = opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save or opts.commit != null,
+        .rootfs = opts.rootfs_path != null or opts.rootfs != null or opts.disk != null or opts.rootfs_grow_target != 0,
+        .network = opts.network != .disabled or opts.network_runtime != null,
+        .build = opts.context_disk_path != null or opts.build_input_rootfs.len != 0 or opts.build_cache_disk_fd != null or opts.build_mode or opts.runtime_disk_head != null,
+    });
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (opts.network == .spore) {
@@ -3070,12 +3226,22 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     defer ram_plan.deinit();
     if (resuming) std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     const kernel_start = monotonicMs();
-    const kernel = if (resuming) "" else try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
+    const kernel = if (resuming)
+        ""
+    else if (opts.boot_artifacts) |artifacts|
+        artifacts.kernel
+    else
+        try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(max_file_size));
     const kernel_ms = monotonicMs() -| kernel_start;
     const initrd_start = monotonicMs();
     if (resuming and opts.injected_files.len != 0) return error.InjectedFileResumeUnsupported;
     if (opts.save_path != null and opts.injected_files.len != 0) return error.InjectedFileCaptureUnsupported;
-    const initrd: ?[]const u8 = if (resuming) null else try loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files);
+    const initrd: ?[]const u8 = if (resuming)
+        null
+    else if (opts.boot_artifacts) |artifacts|
+        if (opts.injected_files.len == 0) artifacts.initrd else try loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files)
+    else
+        try loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files);
     const initrd_ms = monotonicMs() -| initrd_start;
     const disk_start = monotonicMs();
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
@@ -3089,7 +3255,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     defer runtime_disk.deinit();
     const growth_session = opts.rootfs_grow_target != 0;
     const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, false, false, 0);
+    const base_boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, false, false, 0);
+    const boot_args = if (resuming) "" else try productBootArgs(allocator, base_boot_args);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
     var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
@@ -3205,38 +3372,55 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             });
         },
         .kvm => blk: {
-            if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk kvm.vm.run(allocator, .{
-                .kernel = kernel,
-                .ram_size = memory_plan.boot_ram_size,
-                .vcpus = opts.vcpus,
-                .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
-                .cmdline = boot_args,
-                .initrd = initrd,
-                .console_sink = consoleSink,
-                .disk_backend = runtime_disk.backend(),
-                .root_blk_options = root_blk_options,
-                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                .rootfs = opts.rootfs,
-                .network_manifest = network_manifest,
-                .annotations = opts.annotations,
-                .sessions = saved_sessions,
-                .resume_dir = opts.resume_dir,
-                .resume_generation = opts.resume_generation,
-                .ram_restore = ram_plan.strategy,
-                .exec_probe = &stream,
-                .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
-                .exec_probe_completes_run = opts.commit == null,
-                .exec_control = exec_control,
-                .exec_probe_timeout_ms = opts.timeout_ms,
-                .snapshot_dir = capture_plan.snapshot_dir,
-                .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
-                .capture_request = capture_plan.request,
-                .continue_after_capture = capture_plan.continue_after_capture,
-                .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
-                .network = network,
-                .environ_map = context.environ_map,
-            });
+            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
+                break :blk kvm.vm.run(allocator, .{
+                    .kernel = kernel,
+                    .ram_size = memory_plan.boot_ram_size,
+                    .vcpus = opts.vcpus,
+                    .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
+                    .cmdline = boot_args,
+                    .initrd = initrd,
+                    .console_sink = consoleSink,
+                    .disk_backend = runtime_disk.backend(),
+                    .root_blk_options = root_blk_options,
+                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
+                    .rootfs = opts.rootfs,
+                    .network_manifest = network_manifest,
+                    .annotations = opts.annotations,
+                    .sessions = saved_sessions,
+                    .resume_dir = opts.resume_dir,
+                    .resume_generation = opts.resume_generation,
+                    .ram_restore = ram_plan.strategy,
+                    .exec_probe = &stream,
+                    .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
+                    .exec_probe_completes_run = opts.commit == null,
+                    .exec_control = exec_control,
+                    .exec_probe_timeout_ms = opts.timeout_ms,
+                    .snapshot_dir = capture_plan.snapshot_dir,
+                    .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
+                    .capture_request = capture_plan.request,
+                    .continue_after_capture = capture_plan.continue_after_capture,
+                    .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
+                    .network = network,
+                    .environ_map = context.environ_map,
+                });
+            }
+            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+                break :blk x86_vm.run(allocator, .{
+                    .kernel = kernel,
+                    .ram_size = memory_plan.boot_ram_size,
+                    .vcpu_count = @intCast(opts.vcpus),
+                    .cmdline = boot_args,
+                    .initrd = initrd,
+                    .console_sink = consoleSink,
+                    .root_disk = runtime_disk.backend(),
+                    .network = network,
+                    .exec_probe = &stream,
+                    .exec_control = exec_control,
+                    .exec_probe_timeout_ms = opts.timeout_ms,
+                });
+            }
+            return error.UnsupportedBackend;
         },
     }) catch |err| {
         if ((opts.interactive or opts.tty) and err == error.VsockProbeFailed) return error.InteractiveStreamProtocolFailed;
@@ -3454,6 +3638,14 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     try spore.validateAnnotations(opts.annotations);
 
     const backend = try backend_mod.requireProductRunner(opts.backend);
+    try validateFreshProductPolicy(backend, .{
+        .memory = opts.memory,
+        .vcpus = opts.vcpus,
+        .resuming = opts.resume_dir != null or opts.resume_generation != null or opts.resume_sessions.len != 0,
+        .rootfs = opts.rootfs_path != null or opts.rootfs != null or opts.disk != null or opts.rootfs_grow_target != 0,
+        .network = opts.network != .disabled or opts.network_runtime != null,
+        .build = opts.context_disk_path != null or opts.build_input_rootfs.len != 0 or opts.build_cache_disk_fd != null or opts.build_mode or opts.runtime_disk_head != null,
+    });
     var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes);
     defer ram_plan.deinit();
     if (opts.resume_dir != null) std.log.info("named monitor memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
@@ -3500,7 +3692,8 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     for (build_input_disks, 0..) |*disk, index| build_input_backends[index] = disk.backend() orelse return error.BadManifest;
     const growth_session = opts.rootfs_grow_target != 0;
     const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
+    const base_boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
+    const boot_args = try productBootArgs(allocator, base_boot_args);
     var root_blk_stats: virtio_blk.Stats = .{};
     const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
     defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
@@ -3538,34 +3731,52 @@ fn executeMonitorWithOptionalRootfsCacheLock(
             });
         },
         .kvm => blk: {
-            if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try kvm.vm.run(allocator, .{
-                .kernel = artifacts.kernel,
-                .ram_size = opts.memory.bytes,
-                .vcpus = opts.vcpus,
-                .cmdline = boot_args,
-                .initrd = artifacts.initrd,
-                .console_sink = consoleSink,
-                .disk_backend = runtime_disk.backend(),
-                .root_blk_options = root_blk_options,
-                .context_disk_fd = context_disk_fd,
-                .build_input_disk_backends = build_input_backends,
-                .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
-                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                .rootfs = opts.rootfs,
-                .network_manifest = network_manifest,
-                .annotations = opts.annotations,
-                .sessions = opts.resume_sessions,
-                .resume_dir = opts.resume_dir,
-                .resume_generation = opts.resume_generation,
-                .ram_restore = ram_plan.strategy,
-                .exec_probe = startup_probe,
-                .exec_probe_timeout_ms = opts.timeout_ms,
-                .exec_probe_completes_run = false,
-                .exec_control = control,
-                .network = network,
-                .environ_map = context.environ_map,
-            });
+            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
+                break :blk try kvm.vm.run(allocator, .{
+                    .kernel = artifacts.kernel,
+                    .ram_size = opts.memory.bytes,
+                    .vcpus = opts.vcpus,
+                    .cmdline = boot_args,
+                    .initrd = artifacts.initrd,
+                    .console_sink = consoleSink,
+                    .disk_backend = runtime_disk.backend(),
+                    .root_blk_options = root_blk_options,
+                    .context_disk_fd = context_disk_fd,
+                    .build_input_disk_backends = build_input_backends,
+                    .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
+                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
+                    .rootfs = opts.rootfs,
+                    .network_manifest = network_manifest,
+                    .annotations = opts.annotations,
+                    .sessions = opts.resume_sessions,
+                    .resume_dir = opts.resume_dir,
+                    .resume_generation = opts.resume_generation,
+                    .ram_restore = ram_plan.strategy,
+                    .exec_probe = startup_probe,
+                    .exec_probe_timeout_ms = opts.timeout_ms,
+                    .exec_probe_completes_run = false,
+                    .exec_control = control,
+                    .network = network,
+                    .environ_map = context.environ_map,
+                });
+            }
+            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+                break :blk try x86_vm.run(allocator, .{
+                    .kernel = artifacts.kernel,
+                    .ram_size = opts.memory.bytes,
+                    .vcpu_count = @intCast(opts.vcpus),
+                    .cmdline = boot_args,
+                    .initrd = artifacts.initrd,
+                    .console_sink = consoleSink,
+                    .root_disk = runtime_disk.backend(),
+                    .network = network,
+                    .exec_probe = startup_probe,
+                    .exec_probe_completes_run = false,
+                    .exec_control = control,
+                    .exec_probe_timeout_ms = opts.timeout_ms,
+                });
+            }
+            return error.UnsupportedBackend;
         },
     };
     if (network.failed()) return error.NetworkGatewayFailed;
@@ -4037,6 +4248,15 @@ pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, root
         "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}{s}{s}{s}{s}",
         .{ guest_port, rootfs_flag, rootfs_rw_flag, rootfs_growth_flag, noinit_itable_flag, network_flag, build_context_flag, build_mode_flag, build_inputs_flag orelse "" },
     );
+}
+
+fn productBootArgs(allocator: std.mem.Allocator, base: []const u8) ![]const u8 {
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+        var descriptors_buf: [x86_board.max_virtio_command_line_len]u8 = undefined;
+        const descriptors = try x86_board.formatVirtioCommandLine(&descriptors_buf);
+        return std.fmt.allocPrint(allocator, "{s} {s}", .{ base, descriptors });
+    }
+    return base;
 }
 
 fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostStream, saved: bool) !Result {
@@ -5013,6 +5233,30 @@ test "run memory plan selects virtio-mem only for capable fresh auto runs" {
     try std.testing.expectEqual(@as(u64, 0), explicit_plan.virtio_mem_region_size);
 }
 
+test "x86 fresh product policy is explicit and fail closed" {
+    const accepted = FreshProductPolicy{
+        .memory = .{ .policy = .explicit, .bytes = x86_experimental_memory_bytes },
+        .vcpus = 1,
+    };
+    try validateFreshProductPolicyFor(.x86_64, .kvm, accepted);
+    try validateFreshProductPolicyFor(.aarch64, .kvm, .{ .memory = .{}, .vcpus = 8, .resuming = true, .capture = true });
+    try std.testing.expectError(error.UnsupportedBackend, validateFreshProductPolicyFor(.x86_64, .hvf, accepted));
+    try std.testing.expectError(error.X86ExplicitMemoryRequired, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = .{}, .vcpus = 1 }));
+    try std.testing.expectError(error.X86ExperimentalMemorySizeUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
+        .memory = .{ .policy = .explicit, .bytes = 1024 * 1024 * 1024 },
+        .vcpus = 1,
+    }));
+    try std.testing.expectError(error.X86VcpuCountUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
+        .memory = accepted.memory,
+        .vcpus = 2,
+    }));
+    try std.testing.expectError(error.X86ResumeUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .resuming = true }));
+    try std.testing.expectError(error.X86CaptureUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .capture = true }));
+    try std.testing.expectError(error.X86RootfsUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .rootfs = true }));
+    try std.testing.expectError(error.X86NetworkUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .network = true }));
+    try std.testing.expectError(error.X86BuildUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .build = true }));
+}
+
 test "run cli parser accepts rootfs path" {
     const opts = try parseCliArgs(&.{ "--rootfs", "rootfs.ext4", "--", "/bin/echo", "hi" });
     try std.testing.expectEqualStrings("rootfs.ext4", opts.rootfs_path.?);
@@ -5784,14 +6028,28 @@ test "run embeds default initrd with its generated canonical digest" {
 }
 
 test "managed run kernel asset names validate input" {
+    const x86 = try managedRunKernelAssetNameFor(std.testing.allocator, .x86_64, "6.1.155");
+    defer std.testing.allocator.free(x86);
+    try std.testing.expectEqualStrings("sporevm-x86_64-linux-6.1.155-bzImage", x86);
+    const arm = try managedRunKernelAssetNameFor(std.testing.allocator, .aarch64, "6.1.155");
+    defer std.testing.allocator.free(arm);
+    try std.testing.expectEqualStrings("sporevm-arm64-linux-6.1.155-Image", arm);
     const allocator = std.testing.allocator;
     const asset = try managedRunKernelAssetName(allocator, "6.1.155");
     defer allocator.free(asset);
-    try std.testing.expectEqualStrings("sporevm-arm64-linux-6.1.155-Image", asset);
+    const native_expected = if (builtin.cpu.arch == .x86_64)
+        "sporevm-x86_64-linux-6.1.155-bzImage"
+    else
+        "sporevm-arm64-linux-6.1.155-Image";
+    try std.testing.expectEqualStrings(native_expected, asset);
 
     const config_asset = try managedRunKernelConfigAssetName(allocator, asset);
     defer allocator.free(config_asset);
-    try std.testing.expectEqualStrings("sporevm-arm64-linux-6.1.155-Image.config", config_asset);
+    const native_config_expected = if (builtin.cpu.arch == .x86_64)
+        "sporevm-x86_64-linux-6.1.155-bzImage.config"
+    else
+        "sporevm-arm64-linux-6.1.155-Image.config";
+    try std.testing.expectEqualStrings(native_config_expected, config_asset);
 
     try std.testing.expectError(error.BadManagedKernelVersion, managedRunKernelAssetName(allocator, "../bad"));
 }
@@ -5885,7 +6143,20 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
             "CONFIG_MEMORY_HOTREMOVE=y\n" ++
             "CONFIG_CONTIG_ALLOC=y\n" ++
             "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
-            "CONFIG_VIRTIO_MEM=y\n",
+            "CONFIG_VIRTIO_MEM=y\n" ++
+            "CONFIG_X86_64=y\n" ++
+            "CONFIG_SMP=y\n" ++
+            "CONFIG_X86_LOCAL_APIC=y\n" ++
+            "CONFIG_X86_IO_APIC=y\n" ++
+            "CONFIG_X86_MPPARSE=y\n" ++
+            "CONFIG_HYPERVISOR_GUEST=y\n" ++
+            "CONFIG_PARAVIRT=y\n" ++
+            "CONFIG_PARAVIRT_CLOCK=y\n" ++
+            "CONFIG_KVM_GUEST=y\n" ++
+            "CONFIG_RELOCATABLE=y\n" ++
+            "CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y\n" ++
+            "CONFIG_DEVMEM=y\n" ++
+            "CONFIG_STRICT_DEVMEM=y\n",
     });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_sha_path, .data = "not-a-sha\n" });
 
@@ -5979,7 +6250,7 @@ test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime 
         "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
         "CONFIG_VIRTIO_MEM=y\n";
 
-    try std.testing.expect(try missingManagedRunKernelConfigSymbol(allocator, good_config) == null);
+    try std.testing.expect(try missingManagedRunKernelConfigSymbolFor(allocator, .aarch64, good_config) == null);
 
     const missing_virtio_blk = try std.mem.replaceOwned(
         u8,
@@ -5989,7 +6260,7 @@ test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime 
         "# CONFIG_VIRTIO_BLK is not set",
     );
     defer allocator.free(missing_virtio_blk);
-    const missing_rootfs_symbol = (try missingManagedRunKernelConfigSymbol(allocator, missing_virtio_blk)).?;
+    const missing_rootfs_symbol = (try missingManagedRunKernelConfigSymbolFor(allocator, .aarch64, missing_virtio_blk)).?;
     defer allocator.free(missing_rootfs_symbol);
     try std.testing.expectEqualStrings("CONFIG_VIRTIO_BLK", missing_rootfs_symbol);
 
@@ -6015,7 +6286,7 @@ test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime 
         "CONFIG_CONTIG_ALLOC=y\n" ++
         "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
         "CONFIG_VIRTIO_MEM=y\n";
-    const missing = (try missingManagedRunKernelConfigSymbol(allocator, missing_file_locking)).?;
+    const missing = (try missingManagedRunKernelConfigSymbolFor(allocator, .aarch64, missing_file_locking)).?;
     defer allocator.free(missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", missing);
 
@@ -6039,7 +6310,27 @@ test "managed run kernel config requires rootfs, Docker, and virtio-mem runtime 
         "CONFIG_CONTIG_ALLOC=y\n" ++
         "CONFIG_EXCLUSIVE_SYSTEM_RAM=y\n" ++
         "CONFIG_VIRTIO_MEM=y\n";
-    const module_missing = (try missingManagedRunKernelConfigSymbol(allocator, module_value)).?;
+    const module_missing = (try missingManagedRunKernelConfigSymbolFor(allocator, .aarch64, module_value)).?;
     defer allocator.free(module_missing);
     try std.testing.expectEqualStrings("CONFIG_FILE_LOCKING", module_missing);
+}
+
+test "managed x86 kernel config enforces the frozen direct boot profile" {
+    var buffer: [8192]u8 = undefined;
+    var used: usize = 0;
+    for (managed_run_kernel_required_config_symbols ++ managed_x86_kernel_required_config_symbols) |symbol| {
+        const line = try std.fmt.bufPrint(buffer[used..], "{s}=y\n", .{symbol});
+        used += line.len;
+    }
+    for (managed_x86_kernel_forbidden_config_symbols) |symbol| {
+        const line = try std.fmt.bufPrint(buffer[used..], "# {s} is not set\n", .{symbol});
+        used += line.len;
+    }
+    try std.testing.expect(try missingManagedRunKernelConfigSymbolFor(std.testing.allocator, .x86_64, buffer[0..used]) == null);
+
+    const enabled = try std.fmt.bufPrint(buffer[used..], "CONFIG_ACPI=y\n", .{});
+    used += enabled.len;
+    const forbidden = (try missingManagedRunKernelConfigSymbolFor(std.testing.allocator, .x86_64, buffer[0..used])).?;
+    defer std.testing.allocator.free(forbidden);
+    try std.testing.expectEqualStrings("CONFIG_ACPI", forbidden);
 }

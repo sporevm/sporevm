@@ -866,7 +866,13 @@ fn createNamedWithTiming(
 ) !NamedLifecycleResult {
     clearLastError();
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
-    _ = try backend_mod.requireProductRunner(options.backend);
+    const selected_backend = try backend_mod.requireProductRunner(options.backend);
+    try run_mod.validateFreshProductPolicy(selected_backend, .{
+        .memory = options.memory,
+        .vcpus = options.vcpus,
+        .rootfs = options.rootfs_path != null or options.image_ref != null,
+        .network = options.network.enabled,
+    });
     try topology.validateVcpuCount(options.vcpus);
     try spore.validateAnnotations(options.annotations);
 
@@ -954,7 +960,12 @@ pub fn restoreNamed(
     const start_ms = monotonicMs();
     clearLastError();
     const requested_backend = options.backend orelse run_mod.Backend.auto;
-    _ = try backend_mod.requireProductRunner(requested_backend);
+    const selected_backend = try backend_mod.requireProductRunner(requested_backend);
+    try run_mod.validateFreshProductPolicy(selected_backend, .{
+        .memory = .{},
+        .vcpus = 1,
+        .resuming = true,
+    });
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1311,6 +1322,7 @@ fn saveContinueNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
+    try rejectX86NamedPersistence(spec.value);
     // Non-destructive save supports multi-vCPU VMs: both KVM and HVF quiesce
     // every vCPU at one barrier, capture manifest-v1 state, and resume the
     // guest through the monitor snapshot-and-continue path (the same path
@@ -1352,6 +1364,16 @@ pub fn saveNamed(
     });
 }
 
+fn rejectX86NamedPersistence(spec: Spec) !void {
+    const requested = run_mod.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
+    const selected = try backend_mod.requireProductRunner(requested);
+    try run_mod.validateFreshProductPolicy(selected, .{
+        .memory = spec.memory,
+        .vcpus = spec.vcpus,
+        .capture = true,
+    });
+}
+
 fn saveStopNamed(
     context: Context,
     allocator: std.mem.Allocator,
@@ -1370,6 +1392,7 @@ fn saveStopNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
+    try rejectX86NamedPersistence(spec.value);
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }
@@ -1475,6 +1498,7 @@ pub fn forkNamed(
 
     var source_spec = readSpec(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, .incomplete);
     defer source_spec.deinit();
+    try rejectX86NamedPersistence(source_spec.value);
     const disk_backed = source_spec.value.rootfs != null or source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.disk != null;
     if (disk_backed and source_spec.value.rootfs == null) return error.UnsupportedNamedForkDisk;
     if (source_spec.value.network != null) return error.UnsupportedNamedForkNetwork;
@@ -1726,7 +1750,7 @@ pub fn createCli(
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
         error.HostUnsupported => {
-            const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on Linux/arm64";
+            const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on supported Linux hosts";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
         },
         error.NamedVmExists => {
@@ -1737,6 +1761,14 @@ pub fn createCli(
         error.UnsupportedVcpuCount => {
             const message = "spore create: unsupported vCPU/backend combination";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+        },
+        error.X86ExplicitMemoryRequired, error.X86ExperimentalMemorySizeUnsupported => {
+            const message = "spore create: experimental x86-64 KVM requires explicit --memory 512mib; omitted and automatic memory are unavailable";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
+        },
+        error.X86VcpuCountUnsupported, error.X86RootfsUnsupported, error.X86NetworkUnsupported, error.X86BuildUnsupported => {
+            const message = allocLifecycleMessage(allocator, "spore create: request is outside the fresh x86-64 KVM profile: {s}", .{@errorName(err)});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },
         error.InvalidNetworkPolicy, error.InvalidRootfsInput => {
             const message = allocLifecycleMessage(allocator, "spore create: invalid configuration: {s}", .{@errorName(err)});
@@ -2091,6 +2123,10 @@ pub fn saveCli(
             const message = "spore save: this save mode is not supported; use `spore save NAME --out DIR --stop` for a consuming save";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
+        error.X86CaptureUnsupported => {
+            const message = "spore save: x86-64 KVM capture is unavailable; the named VM remains running";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
+        },
         error.OutputDirExists => {
             const message = allocLifecycleMessage(allocator, "spore save: output directory already exists: {s}; choose a new --out DIR", .{parsed.out_dir});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
@@ -2187,6 +2223,10 @@ pub fn forkCli(
             const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: source uses a fork topology or GIC state this backend cannot mint safely yet");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
+        error.X86CaptureUnsupported => {
+            const message = "spore fork: capture is unavailable for the experimental x86-64 KVM fresh profile";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "X86CaptureUnsupported"), message);
+        },
         error.NamedVmExists => {
             const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: VM already exists or has stale state");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
@@ -2265,6 +2305,10 @@ pub fn restoreCli(
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
             error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "restore", err),
+            error.X86ResumeUnsupported => {
+                const message = "spore restore: x86-64 KVM resume is unavailable; only fresh execution is supported";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
+            },
             error.FileNotFound => {
                 const message = "spore restore: spore directory is not available";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "restore"), message);
@@ -2314,7 +2358,7 @@ pub fn restoreCli(
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "restore"), message);
             },
             error.HostUnsupported => {
-                const message = "spore restore: monitor mode requires HVF on Apple Silicon or KVM on Linux/arm64";
+                const message = "spore restore: this host or restore profile is unavailable; x86-64 KVM currently supports fresh execution only";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "restore"), message);
             },
             error.NamedVmExists => {
@@ -4587,6 +4631,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
         .preopens = .empty,
     }, allocator, .{
         .name = "bench-1",
+        .memory = .{ .policy = .explicit, .bytes = run_mod.x86_experimental_memory_bytes },
     }));
 
     const detail = lastErrorMessage();
@@ -6152,7 +6197,8 @@ test "lifecycle fork help routes through named fork cli" {
 
 test "lifecycle monitor backend support is explicit" {
     const hvf_supported = comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
-    const kvm_supported = comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
+    const kvm_supported = comptime builtin.os.tag == .linux and
+        (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .x86_64);
     try std.testing.expectEqual(hvf_supported or kvm_supported, monitorBackendSupported("auto"));
     try std.testing.expectEqual(hvf_supported, monitorBackendSupported("hvf"));
     try std.testing.expectEqual(kvm_supported, monitorBackendSupported("kvm"));

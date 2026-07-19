@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
     minimal_exec_assets.addArg(b.fmt("0x{x}", .{guest_generation_base}));
     minimal_exec_assets.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
     minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
-    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
+    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "rngcheck", "blkcheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
     for (minimal_exec_sources) |src| {
         minimal_exec_assets.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
     }
@@ -274,6 +274,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
         }),
     });
+    x86_64_tests.root_module.link_libc = true;
     const run_x86_64_tests = b.addRunArtifact(x86_64_tests);
 
     // ponytail: test artifacts share fixed zig-cache paths; serialize until tests use per-process temp dirs.

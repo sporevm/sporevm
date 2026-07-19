@@ -52,6 +52,10 @@ description = "Build local release archives without publishing"
 run = "mise run build && test/smoke/run/basic.sh"
 description = "Smoke product spore run streaming and exit status"
 
+[tasks."smoke:x86-slice3a"]
+run = "mise run build:release && zig build x86-slice2a-smoke --release=safe && test/smoke/x86/slice3a.sh"
+description = "Run the native x86 frozen-board, fresh-product, and fail-closed Slice 3a matrix"
+
 [tasks."smoke:run-stdin"]
 run = "mise run build && test/smoke/run/stdin.sh"
 description = "Smoke product spore run interactive stdin forwarding"

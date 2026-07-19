@@ -12,6 +12,7 @@ const max_kernel_file = 256 * 1024 * 1024;
 const guest_port: u32 = 10700;
 const ram_size: u64 = 512 * 1024 * 1024;
 const probe_disk_size = 1024 * 1024;
+const block_pattern = "sporevm-x86-block\x00";
 
 const generation_params =
     \\{"schema_version":0,"parent_generation":0,"generation":1,"fork_index":0,"fork_count":1,"parallel_index":0,"parallel_count":1,"fork_batch_id":"slice2a-proof","vm_id":"slice2a-vm","hostname":"slice2a-vm","mac_seed":"00112233445566778899aabbccddeeff","mac_address":"02:00:00:00:00:2a","resume_time_unix_ns":1700000000000000000,"resume_entropy_seed":"00112233445566778899aabbccddeeff"}
@@ -20,6 +21,8 @@ const generation_params =
 const guest_command =
     \\/bin/writeout
     \\/bin/gencheck
+    \\/bin/rngcheck
+    \\/bin/blkcheck
     \\printf 'devices='
     \\for d in /sys/bus/virtio/devices/virtio*; do printf '%s,' "${d##*/}"; done
     \\printf '\n'
@@ -87,12 +90,21 @@ pub fn main(init: std.process.Init) !void {
     });
     if (result != .probe_complete) return error.UnexpectedVmExit;
     if (stream.state != .complete or stream.exit_code == null or stream.exit_code.? != 0) return error.ExecProbeFailed;
+    if (!std.mem.eql(u8, disks[0][4096..][0..block_pattern.len], block_pattern)) return error.RootBlockWriteNotObserved;
+    for (disks[1..]) |disk| {
+        if (!std.mem.allEqual(u8, disk, 0)) return error.ImmutableBlockMutated;
+    }
 
     const stdout = capture.stdout[0..capture.stdout_len];
     const stderr = capture.stderr[0..capture.stderr_len];
     if (std.mem.indexOf(u8, stdout, "spore stdout\n") == null) return error.MissingStdout;
     if (std.mem.indexOf(u8, stderr, "spore stderr\n") == null) return error.MissingStderr;
     if (std.mem.indexOf(u8, stdout, "spore generation ready generation=1 vm_id=slice2a-vm entropy_len=32\n") == null) return error.GenerationNotObserved;
+    if (std.mem.indexOf(u8, stdout, "rng ok\n") == null) return error.RngNotObserved;
+    if (std.mem.indexOf(u8, stdout, "block ok devices=4 root_rw=ok immutable_write_attempted=3\n") == null) {
+        std.debug.print("slice2a smoke: block contract missing stdout={s} stderr={s}\n", .{ stdout, stderr });
+        return error.BlockContractNotObserved;
+    }
     inline for (0..8) |index| {
         const device = std.fmt.comptimePrint("virtio{d}", .{index});
         if (std.mem.indexOf(u8, stdout, device) == null) return error.DeviceNotEnumerated;

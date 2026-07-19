@@ -339,32 +339,17 @@ fn unsupportedBackend(name: []const u8) BackendAvailability {
 }
 
 fn x86KvmAvailability(capabilities: [x86_cpu_profile.required_capabilities.len]KvmCapabilityFact) BackendAvailability {
+    _ = capabilities;
     const availability = backend_mod.availability(.kvm);
     return switch (availability) {
         .available => .{ .name = "kvm", .supported = true, .available = true, .reason = "available" },
-        .unavailable => |result| blk: {
-            var reason = unavailableReasonName(result.reason);
-            if (result.reason == .runner_not_landed) {
-                reason = x86ProfileAvailabilityReason(capabilities);
-            }
-            break :blk .{
-                .name = "kvm",
-                .supported = result.reason != .unsupported_host,
-                .available = false,
-                .reason = reason,
-            };
+        .unavailable => |result| .{
+            .name = "kvm",
+            .supported = result.reason != .unsupported_host,
+            .available = false,
+            .reason = unavailableReasonName(result.reason),
         },
     };
-}
-
-fn x86ProfileAvailabilityReason(capabilities: [x86_cpu_profile.required_capabilities.len]KvmCapabilityFact) []const u8 {
-    for (capabilities) |capability| {
-        if (capability.value == null) return "kvm_probe_failed";
-    }
-    for (capabilities) |capability| {
-        if (!capability.satisfied) return "profile_capability_missing";
-    }
-    return "runner_not_landed";
 }
 
 fn unavailableReasonName(reason: backend_mod.UnavailableReason) []const u8 {
@@ -375,7 +360,6 @@ fn unavailableReasonName(reason: backend_mod.UnavailableReason) []const u8 {
         .api_version_mismatch => "api_version_mismatch",
         .missing_capability => "kvm_capability_missing",
         .kvm_probe_failed => "kvm_probe_failed",
-        .runner_not_landed => "runner_not_landed",
     };
 }
 
@@ -585,7 +569,7 @@ test "v2 offline renderer discriminates ARM and x86 without host probing" {
     const unavailable_hvf = unsupportedBackend("hvf");
     const available_hvf = BackendAvailability{ .name = "hvf", .supported = true, .available = true, .reason = "supported_host" };
     const unavailable_kvm = unsupportedBackend("kvm");
-    const runner_not_landed = BackendAvailability{ .name = "kvm", .supported = true, .available = false, .reason = "runner_not_landed" };
+    const available_kvm = BackendAvailability{ .name = "kvm", .supported = true, .available = true, .reason = "available" };
 
     const arm = try hostInfoV2FromSnapshot(allocator, &env, .{
         .os = "macos",
@@ -609,14 +593,14 @@ test "v2 offline renderer discriminates ARM and x86 without host probing" {
         .architecture = .x86_64,
         .host_class = "linux-x86_64-kvm",
         .x86_kvm_capabilities = capabilities,
-        .backends = .{ unavailable_hvf, runner_not_landed },
+        .backends = .{ unavailable_hvf, available_kvm },
     });
     defer deinitHostInfoV2(allocator, x86);
     try std.testing.expectEqualStrings("x86_64", x86.architecture);
     try std.testing.expectEqualStrings(x86_board.board_profile, x86.platform.x86_64.board_profile);
     try std.testing.expectEqualStrings(x86_cpu_profile.profile_name, x86.platform.x86_64.cpu_profile);
     try std.testing.expectEqualStrings("approved_same_host", x86.platform.x86_64.cpu_profile_status);
-    try std.testing.expectEqualStrings("runner_not_landed", x86.backends[1].reason);
+    try std.testing.expectEqualStrings("available", x86.backends[1].reason);
     for (x86.platform.x86_64.kvm_capabilities) |capability| try std.testing.expect(capability.satisfied);
 
     const arm_json = try std.json.Stringify.valueAlloc(allocator, arm, .{});
@@ -635,40 +619,10 @@ test "v2 offline renderer discriminates ARM and x86 without host probing" {
             "\"interrupt_controller\":{\"kind\":\"kvm_irqchip\",\"local_apic_base\":4276092928,\"ioapic_base\":4273995776,\"pit\":\"kvm_pit2\"}," ++
             "\"virtio_mmio\":{\"base\":3489660928,\"window_size\":512,\"slot_count\":8,\"first_gsi\":5},\"generation\":{\"base\":3489665024,\"size\":4096,\"gsi\":13,\"poweroff_doorbell_offset\":32,\"poweroff_command\":1179012944}," ++
             "\"kvm_capabilities\":[{\"name\":\"irqchip\",\"id\":0,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"user_memory\",\"id\":3,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"set_tss_addr\",\"id\":4,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"ext_cpuid\",\"id\":7,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"mp_state\",\"id\":14,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"pit2\",\"id\":33,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"pit_state2\",\"id\":35,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"set_identity_map_addr\",\"id\":37,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"adjust_clock\",\"id\":39,\"minimum\":1,\"required_bits\":14,\"value\":14,\"satisfied\":true},{\"name\":\"vcpu_events\",\"id\":41,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"debugregs\",\"id\":50,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"enable_cap_vm\",\"id\":98,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"xsave\",\"id\":55,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"xcrs\",\"id\":56,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"tsc_control\",\"id\":60,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"get_tsc_khz\",\"id\":61,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"kvmclock_ctrl\",\"id\":76,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"immediate_exit\",\"id\":136,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"exception_payload\",\"id\":164,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"enforce_pv_feature_cpuid\",\"id\":190,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"vm_tsc_control\",\"id\":214,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true}]}}" ++
-            ",\"backends\":[{\"name\":\"hvf\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"},{\"name\":\"kvm\",\"supported\":true,\"available\":false,\"reason\":\"runner_not_landed\"}]," ++
+            ",\"backends\":[{\"name\":\"hvf\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"},{\"name\":\"kvm\",\"supported\":true,\"available\":true,\"reason\":\"available\"}]," ++
             "\"cache_roots\":{\"kernels\":{\"path\":\"/tmp/sporevm-cache/sporevm/kernels\",\"resolved\":true,\"source\":\"environment\"},\"rootfs\":{\"path\":\"/tmp/sporevm-cache/sporevm/rootfs\",\"resolved\":true,\"source\":\"environment\"},\"bundles\":{\"path\":\"/tmp/sporevm-cache/sporevm/bundles\",\"resolved\":true,\"source\":\"environment\"},\"runtime\":{\"path\":\"/tmp/sporevm-runtime/sporevm\",\"resolved\":true,\"source\":\"environment\"}}}",
         x86_json,
     );
-}
-
-test "x86 profile availability distinguishes probe failure from insufficient values" {
-    var capabilities = emptyX86KvmCapabilities();
-    for (&capabilities) |*capability| {
-        capability.value = @max(capability.minimum, capability.required_bits);
-        capability.satisfied = true;
-    }
-    try std.testing.expectEqualStrings("runner_not_landed", x86ProfileAvailabilityReason(capabilities));
-
-    capabilities[0].value = null;
-    capabilities[0].satisfied = false;
-    try std.testing.expectEqualStrings("kvm_probe_failed", x86ProfileAvailabilityReason(capabilities));
-
-    capabilities[0].value = 0;
-    try std.testing.expectEqualStrings("profile_capability_missing", x86ProfileAvailabilityReason(capabilities));
-
-    for (&capabilities) |*capability| {
-        capability.value = @max(capability.minimum, capability.required_bits);
-        capability.satisfied = true;
-    }
-    const adjust_clock_index = comptime blk: {
-        for (x86_cpu_profile.required_capabilities, 0..) |requirement, index| {
-            if (requirement.required_bits != 0) break :blk index;
-        }
-        @compileError("x86 profile needs a required-bits capability for this test");
-    };
-    capabilities[adjust_clock_index].value = 1;
-    capabilities[adjust_clock_index].satisfied = false;
-    try std.testing.expectEqualStrings("profile_capability_missing", x86ProfileAvailabilityReason(capabilities));
 }
 
 test "v1 schema remains the original ARM-shaped contract" {

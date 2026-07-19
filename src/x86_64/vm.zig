@@ -47,6 +47,8 @@ pub const Config = struct {
     cache_disk: ?virtio_blk.Backend = null,
     network: virtio_net.Runtime = .{},
     exec_probe: ?*virtio_vsock.HostStream = null,
+    exec_probe_completes_run: bool = true,
+    exec_control: ?virtio_vsock.Control = null,
     exec_probe_timeout_ms: u64 = 30_000,
     generation_seed: ?GenerationSeed = null,
 };
@@ -54,6 +56,8 @@ pub const Config = struct {
 pub const ExitCause = union(enum) {
     terminal: lifecycle.Terminal,
     probe_complete,
+    monitor_stopped,
+    snapshotted,
 };
 
 pub fn formatTerminalEvidence(buffer: []u8, terminal: lifecycle.Terminal) ![]const u8 {
@@ -136,6 +140,14 @@ fn wakeNetwork(context: ?*anyopaque) void {
     wake_set.wakeAll();
 }
 
+var cleared_control_wake_context: u8 = 0;
+
+fn ignoreControlWake(_: *anyopaque) void {}
+
+fn clearControlWake(control: virtio_vsock.Control) void {
+    control.setWake(.{ .context = &cleared_control_wake_context, .wakeFn = ignoreControlWake });
+}
+
 const WakeSignal = struct {
     old_action: posix.Sigaction,
     active: bool = false,
@@ -198,6 +210,19 @@ const RunState = struct {
         return switch (self.phase) {
             .open => blk: {
                 self.phase = .{ .published = .{ .err = err } };
+                self.stop.store(true, .release);
+                break :blk true;
+            },
+            .reserved, .published => false,
+        };
+    }
+
+    fn finishCause(self: *RunState, cause: ExitCause) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (self.phase) {
+            .open => blk: {
+                self.phase = .{ .published = .{ .cause = cause } };
                 self.stop.store(true, .release);
                 break :blk true;
             },
@@ -289,6 +314,9 @@ const ThreadContext = struct {
     transports: *[board.max_virtio_devices]mmio.Transport,
     gen_dev: *generation.Device,
     exec_probe: ?*virtio_vsock.HostStream,
+    exec_probe_completes_run: bool,
+    exec_control: ?virtio_vsock.Control,
+    vsock_dev: *virtio_vsock.Vsock,
     network: virtio_net.Runtime,
     net_dev: *virtio_net.Net,
     ram: guestmem.GuestRam,
@@ -355,14 +383,14 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     }
     const capabilities = try host_evidence.collectCapabilities(kvm_fd);
     var host_buffer: [512]u8 = undefined;
-    std.debug.print("sporevm kvm-boot: {s}\n", .{try host_evidence.formatCapabilities(&host_buffer, capabilities)});
+    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCapabilities(&host_buffer, capabilities)});
     if (capabilities.nrVcpus() < config.vcpu_count) {
         return error.UnsupportedVcpuCount;
     }
 
     const supported_cpuid = try kvm.getSupportedCpuid(kvm_fd);
     const cpuid_evidence = try host_evidence.collectCpuid(&supported_cpuid);
-    std.debug.print("sporevm kvm-boot: {s}\n", .{try host_evidence.formatCpuid(&host_buffer, cpuid_evidence)});
+    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCpuid(&host_buffer, cpuid_evidence)});
     var msr_list = kvm.MsrList(msr_capacity){};
     const msr_indices = try kvm.getMsrIndexList(kvm_fd, kvm.KVM_GET_MSR_INDEX_LIST, msr_capacity, &msr_list, "KVM_GET_MSR_INDEX_LIST fresh runner");
     const xsave2_bytes = try kvm.checkExtension(kvm_fd, kvm.KVM_CAP_XSAVE2);
@@ -396,7 +424,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_IRQCHIP, 0, "KVM_CREATE_IRQCHIP");
     var pit = kvm.PitConfig{};
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_PIT2, @intFromPtr(&pit), "KVM_CREATE_PIT2");
-    std.debug.print("sporevm kvm-boot: setup tss=0x{x} identity_map=0x{x} irqchip=ok pit2=ok\n", .{ board.tss_addr, board.identity_map_addr });
+    std.log.debug("sporevm kvm-boot: setup tss=0x{x} identity_map=0x{x} irqchip=ok pit2=ok", .{ board.tss_addr, board.identity_map_addr });
 
     const ram = try std.posix.mmap(
         null,
@@ -418,7 +446,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         .userspace_addr = @intFromPtr(ram.ptr),
     };
     _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&memory_region), "KVM_SET_USER_MEMORY_REGION");
-    std.debug.print("sporevm kvm-boot: setup memslot=ok guest_phys=0x0 size={d}\n", .{config.ram_size});
+    std.log.debug("sporevm kvm-boot: setup memslot=ok guest_phys=0x0 size={d}", .{config.ram_size});
 
     const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
     if (run_size < kvm.RunLayout.mmio_end) return error.KvmRunMappingTooSmall;
@@ -461,14 +489,14 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         }
         _ = try kvm.ioctl(vcpu_fd, kvm.KVM_SET_CPUID2, @intFromPtr(&cpuid), "KVM_SET_CPUID2");
     }
-    std.debug.print("sporevm kvm-boot: setup profile={s} tsc_khz={d} set_cpuid2_vcpus={d}\n", .{ cpu_profile.profile_name, cpu_profile.guest_tsc_khz, initialized });
+    std.log.debug("sporevm kvm-boot: setup profile={s} tsc_khz={d} set_cpuid2_vcpus={d}", .{ cpu_profile.profile_name, cpu_profile.guest_tsc_khz, initialized });
     try configureProtectedMode(vcpus[0].fd, layout);
     for (vcpus[1..initialized]) |*vcpu| {
         if ((try kvm.getMpState(vcpu.fd)).mp_state != kvm.KVM_MP_STATE_UNINITIALIZED) {
             return error.UnexpectedApState;
         }
     }
-    std.debug.print("sporevm kvm-boot: setup bsp=protected-mode ap_initial_state=uninitialized ap_count={d}\n", .{initialized - 1});
+    std.log.debug("sporevm kvm-boot: setup bsp=protected-mode ap_initial_state=uninitialized ap_count={d}", .{initialized - 1});
 
     var console_dev = virtio_console.Console{ .sink = config.console_sink };
     var block_devs: [4]virtio_blk.Blk = undefined;
@@ -502,6 +530,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var wake_set = WakeSet{ .vcpus = vcpus[0..initialized] };
     config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetwork });
     defer config.network.clearWake();
+    if (config.exec_control) |control| {
+        control.setWake(.{ .context = &wake_set, .wakeFn = wakeNetwork });
+    }
+    defer if (config.exec_control) |control| clearControlWake(control);
     var device_lock = SpinLock{};
     var contexts: [topology.max_vcpus]ThreadContext = undefined;
     var started: usize = 0;
@@ -515,6 +547,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .transports = &transports,
             .gen_dev = &gen_dev,
             .exec_probe = config.exec_probe,
+            .exec_probe_completes_run = config.exec_probe_completes_run,
+            .exec_control = config.exec_control,
+            .vsock_dev = &vsock_dev,
             .network = config.network,
             .net_dev = &net_dev,
             .ram = guest_ram,
@@ -530,7 +565,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         .wake_set = &wake_set,
         .timeout_ms = config.exec_probe_timeout_ms,
     };
-    const watchdog = if (config.exec_probe != null)
+    const watchdog = if (config.exec_probe != null and config.exec_probe_completes_run)
         std.Thread.spawn(.{}, probeWatchdogMain, .{&watchdog_context}) catch |err| {
             if (state.finishError(err)) wake_set.wakeAll();
             return err;
@@ -593,6 +628,14 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                         return;
                     };
                 }
+                if (pollControlLocked(ctx) catch |err| {
+                    ctx.device_lock.unlock();
+                    finishThread(ctx, err);
+                    return;
+                }) {
+                    ctx.device_lock.unlock();
+                    return;
+                }
                 ctx.device_lock.unlock();
                 continue;
             },
@@ -634,11 +677,13 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                 var probe_failed = false;
                 const owns_terminal = if (terminal) |result| ctx.state.reserveTerminal(result) else blk: {
                     if (ctx.exec_probe) |probe| switch (probe.state) {
-                        .complete => {
+                        .complete => if (ctx.exec_probe_completes_run) {
                             completes_run = true;
                             break :blk ctx.state.reserveProbeComplete(ctx.vcpu.index);
                         },
-                        .failed => probe_failed = true,
+                        .failed => if (ctx.exec_probe_completes_run) {
+                            probe_failed = true;
+                        },
                         .idle, .connecting, .connected => {},
                     };
                     break :blk false;
@@ -655,6 +700,22 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                 if (completes_run) {
                     completeTerminal(ctx, &pending_completion, owns_terminal);
                     return;
+                }
+                if (ctx.vcpu.index == 0 and ctx.exec_control != null) {
+                    completePending(ctx, &pending_completion) catch |err| {
+                        finishThread(ctx, err);
+                        return;
+                    };
+                    ctx.device_lock.lock();
+                    if (pollControlLocked(ctx) catch |err| {
+                        ctx.device_lock.unlock();
+                        finishThread(ctx, err);
+                        return;
+                    }) {
+                        ctx.device_lock.unlock();
+                        return;
+                    }
+                    ctx.device_lock.unlock();
                 }
             },
             kvm.KVM_EXIT_HLT => std.Thread.yield() catch {},
@@ -703,6 +764,37 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
             return;
         }
     }
+}
+
+/// Polling is serialized with virtqueue MMIO because monitor control may
+/// attach or reset the active host stream. Slice 3a deliberately accepts only
+/// exec and stop actions; snapshot-family actions remain fail-closed.
+fn pollControlLocked(ctx: *ThreadContext) !bool {
+    if (ctx.vcpu.index != 0) return false;
+    const control = ctx.exec_control orelse return false;
+    switch (try x86ControlDecision(try control.poll(ctx.vsock_dev))) {
+        .keep_running => {},
+        .stop => {
+            if (ctx.state.finishCause(.monitor_stopped)) ctx.wake_set.wakeAll();
+            return true;
+        },
+    }
+    const transport = &ctx.transports[6];
+    if (ctx.vsock_dev.flushPendingRx(&transport.queues, ctx.ram)) {
+        transport.interrupt_status |= 1;
+        try kvm.setIrq(ctx.vm_fd, board.virtio_slots[6].gsi, true);
+    }
+    return false;
+}
+
+const X86ControlDecision = enum { keep_running, stop };
+
+fn x86ControlDecision(action: virtio_vsock.ControlAction) !X86ControlDecision {
+    return switch (action) {
+        .keep_running => .keep_running,
+        .stop => .stop,
+        .snapshot, .rootfs_snapshot, .disk_fork => error.X86CaptureUnsupported,
+    };
 }
 
 fn finishThread(ctx: *ThreadContext, err: anyerror) void {
@@ -1120,10 +1212,18 @@ test "terminal reservation blocks unclaimed finish and publication before comple
     switch (state.publishedResult().?) {
         .cause => |cause| switch (cause) {
             .terminal => |terminal| try std.testing.expectEqual(lifecycle.Outcome.guest_reset, terminal.cause.outcome()),
-            .probe_complete => return error.TestUnexpectedResult,
+            .probe_complete, .monitor_stopped, .snapshotted => return error.TestUnexpectedResult,
         },
         .err => return error.TestUnexpectedResult,
     }
+}
+
+test "x86 monitor control accepts only exec continuation and stop" {
+    try std.testing.expectEqual(X86ControlDecision.keep_running, try x86ControlDecision(.keep_running));
+    try std.testing.expectEqual(X86ControlDecision.stop, try x86ControlDecision(.stop));
+    try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .snapshot = .{ .dir = "out.spore" } }));
+    try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .rootfs_snapshot = .{ .dir = "root" } }));
+    try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .disk_fork = .{ .dir = "fork", .count = 1 } }));
 }
 
 test "terminal reservation owner can publish a completion error" {
@@ -1148,7 +1248,7 @@ test "probe completion uses the same reservation and publication barrier" {
     switch (state.publishedResult().?) {
         .cause => |cause| switch (cause) {
             .probe_complete => {},
-            .terminal => return error.TestUnexpectedResult,
+            .terminal, .monitor_stopped, .snapshotted => return error.TestUnexpectedResult,
         },
         .err => return error.TestUnexpectedResult,
     }
@@ -1205,7 +1305,7 @@ test "first terminal reservation wins" {
     switch (state.publishedResult().?) {
         .cause => |cause| switch (cause) {
             .terminal => |terminal| try std.testing.expectEqual(@as(u8, 0), terminal.vcpu_index),
-            .probe_complete => return error.TestUnexpectedResult,
+            .probe_complete, .monitor_stopped, .snapshotted => return error.TestUnexpectedResult,
         },
         .err => return error.TestUnexpectedResult,
     }

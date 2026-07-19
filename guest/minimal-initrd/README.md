@@ -38,6 +38,10 @@ Docker and containerd metadata databases.
 startup.
 `gencheck.c` verifies forked `spore run --from` commands start after generation
 metadata and resume entropy are visible in `/run/sporevm/env`.
+`rngcheck.c` performs a bounded non-zero read from `/dev/hwrng`.
+`blkcheck.c` reads all four frozen block slots, verifies root-disk write/readback,
+and attempts writes against the three immutable source slots; the host smoke
+proves their backends remain byte-for-byte unchanged.
 
 Keep this directory source-only. `scripts/kernel/make-minimal-exec-initrd.sh` owns
 compiling these files, building the pinned Toybox source dependency into a

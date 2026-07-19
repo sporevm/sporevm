@@ -6,8 +6,8 @@ usage() {
 usage:
   scripts/kernel/ensure-managed-kernel.sh run|sporevm|initrd|rootfs
 
-Resolve, download, cache, and verify a managed aarch64 Linux kernel Image from
-GitHub releases. Prints the absolute Image path on stdout.
+Resolve, download, cache, and verify the managed native Linux kernel from
+GitHub releases. Prints the absolute Image or bzImage path on stdout.
 
 Kinds:
   run      SporeVM kernel with initrd, virtio-blk, ext4, and Docker runtime support
@@ -94,6 +94,25 @@ required_run_config_symbols=(
   CONFIG_VIRTIO_MEM
 )
 
+kernel_arch="${SPOREVM_KERNEL_ARCH:-$(uname -m)}"
+case "${kernel_arch}" in
+  arm64 | aarch64) kernel_arch="arm64" ;;
+  x86_64 | amd64) kernel_arch="x86_64" ;;
+  *) die "unsupported managed kernel architecture: ${kernel_arch}" ;;
+esac
+
+required_x86_config_symbols=(
+  CONFIG_X86_64 CONFIG_SMP CONFIG_X86_LOCAL_APIC CONFIG_X86_IO_APIC
+  CONFIG_X86_MPPARSE CONFIG_HYPERVISOR_GUEST CONFIG_PARAVIRT
+  CONFIG_PARAVIRT_CLOCK CONFIG_KVM_GUEST CONFIG_RELOCATABLE
+  CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES CONFIG_DEVMEM CONFIG_STRICT_DEVMEM
+)
+forbidden_x86_config_symbols=(
+  CONFIG_IO_STRICT_DEVMEM CONFIG_ACPI CONFIG_EFI CONFIG_PCI CONFIG_VIRTIO_PCI
+  CONFIG_RTC_CLASS CONFIG_SERIAL_8250 CONFIG_KEYBOARD_ATKBD CONFIG_MOUSE_PS2
+  CONFIG_SERIO_I8042
+)
+
 verify_run_kernel_config() {
   local config_file="$1"
   [[ -f "${config_file}" ]] || return 1
@@ -105,6 +124,20 @@ verify_run_kernel_config() {
       return 1
     fi
   done
+  if [[ "${kernel_arch}" == "x86_64" ]]; then
+    for symbol in "${required_x86_config_symbols[@]}"; do
+      if ! grep -Fxq "${symbol}=y" "${config_file}"; then
+        echo "error: managed x86 kernel config ${config_file} is missing ${symbol}=y" >&2
+        return 1
+      fi
+    done
+    for symbol in "${forbidden_x86_config_symbols[@]}"; do
+      if grep -Eq "^${symbol}=(y|m)$" "${config_file}"; then
+        echo "error: managed x86 kernel config ${config_file} enables forbidden ${symbol}" >&2
+        return 1
+      fi
+    done
+  fi
   if ! grep -Fxq "# CONFIG_SECURITY is not set" "${config_file}"; then
     echo "error: managed run kernel config ${config_file} unexpectedly enables CONFIG_SECURITY" >&2
     return 1
@@ -122,6 +155,12 @@ verify_kernel() {
   [[ -n "${expected}" ]] || return 1
   actual="$(sha256_file "${image}")"
   [[ "${actual}" == "${expected}" ]] || return 1
+  if [[ "${kernel_arch}" == "x86_64" && "$(basename "${image}")" == sporevm-x86_64-* ]]; then
+    [[ "${actual}" == "07a9b6d8a9efd2b7c5e886d1c010e67245fa132c8b48cf567f200099b55abee8" ]] || {
+      echo "error: managed x86 kernel does not match the approved candidate digest" >&2
+      return 1
+    }
+  fi
   if [[ -n "${config_file}" ]]; then
     verify_run_kernel_config "${config_file}" || return 1
   fi
@@ -178,7 +217,11 @@ repo="${SPOREVM_KERNEL_REPOSITORY:-}"
 case "${kind}" in
   run | sporevm)
     repo="${repo:-sporevm/kernels}"
-    asset="sporevm-arm64-linux-${linux_version}-Image"
+    if [[ "${kernel_arch}" == "x86_64" ]]; then
+      asset="sporevm-x86_64-linux-${linux_version}-bzImage"
+    else
+      asset="sporevm-arm64-linux-${linux_version}-Image"
+    fi
     ;;
   initrd)
     repo="${repo:-buildkite/cleanroom-kernels}"

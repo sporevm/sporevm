@@ -57,6 +57,12 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
             writeStderr("\n");
             std.process.exit(classified.exit_code);
         }
+        if (run_mod.isX86ProductPolicyError(err)) {
+            const classified = api.classifyFailure(err);
+            writeStderr(classified.message);
+            writeStderr("\n");
+            std.process.exit(classified.exit_code);
+        }
         if (parsed.commit_ref != null) {
             const classified = api.classifyFailure(err);
             writeStderr(classified.message);

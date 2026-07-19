@@ -408,6 +408,36 @@ throughout the work.
   transient transfer bucket was deleted and proved absent; private task
   evidence retains the exact host outputs. Completing Stage 1.5 completes
   Slice 1.
+- Slice 2a is committed at `d3115857`. The fresh x86 runner boots the frozen
+  board and approved CPU profile with one vCPU and 512 MiB, reaches the shared
+  guest agent over vsock, acknowledges generation state, exercises root block
+  read/write plus immutable block reads and host-proven write rejection, reads non-zero RNG
+  bytes, and enumerates the exact eight virtio-mmio slots.
+- Slice 3a has a ship-reviewed candidate implementation. Product readiness now
+  runs the complete approved CPU-profile predicate before artifact work;
+  `spore run`, named create, monitor exec, stdin, and TTY route through the x86
+  runner; unsupported memory, vCPU, resume, capture, rootfs/OCI, network, build,
+  commit, fork, libspore, C ABI, and raw monitor-control requests fail before
+  their side effects. `mise run smoke:x86-slice3a` is the shared native
+  acceptance command. Seeded managed-cache validation is supported, but a
+  clean exact-source native run on the dedicated x86 host passed that command
+  with kernel SHA256
+  `07a9b6d8a9efd2b7c5e886d1c010e67245fa132c8b48cf567f200099b55abee8`,
+  initrd SHA256
+  `619d15ae091f5d966facdafed623c0e88d950f6c3e6cf261e121972a9a157400`,
+  writable-root readback, host-proven immutable-source write rejection, RNG,
+  all eight frozen virtio-mmio slots, generation acknowledgement, and monitor
+  exec. The native Zig suite and local repository-aware `mise run test` pass;
+  the ReleaseSafe `spore` and `x86-slice2a-smoke` SHA256 digests are
+  `70c8412e287085817ef1a9b65f1e01a14c41e9e2f9cf8b9360fc73b6db38e514`
+  and `5e70293582259573d7501beb57ecc36d1744fb6a854e174e2328f886a20d4f05`.
+  The validation archive, created before this evidence-only plan update, had
+  SHA256
+  `6d8a7250ca26aab7a9fe5aa6112650e8780e0020aeec388f8ec8210ef07a06ea`.
+  The transfer bucket was deleted after the exact workspace was installed. A
+  cold-cache managed run remains blocked until the approved x86 bzImage,
+  config, and checksum are published by `sporevm/kernels`; the public v0.6.3
+  and v0.6.4 releases currently contain ARM assets only.
 
 ## Motivation
 

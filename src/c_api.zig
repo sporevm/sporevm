@@ -741,6 +741,9 @@ pub export fn spore_create_named_json(
     if (opts.version != create_named_options_version or opts.size < @sizeOf(SporeCreateNamedOptions)) {
         return fail(ctx, error.InvalidValue);
     }
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+        return fail(ctx, error.X86LibsporeFreshRunUnsupported);
+    }
 
     var process_arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer process_arena.deinit();
@@ -1597,6 +1600,22 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeRemoveSavedOptions))), remove_saved.size);
     try std.testing.expectEqual(remove_saved_options_version, remove_saved.version);
     try std.testing.expectEqual(@as(usize, 0), remove_saved.spore_dir.len);
+}
+
+test "x86 C ABI named creation remains gated until Slice 3c" {
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+    var options: SporeCreateNamedOptions = undefined;
+    spore_create_named_options_init(&options);
+    const name = "x86-c-api-rejected";
+    options.name = .{ .ptr = name.ptr, .len = name.len };
+    var output = SporeOwnedString{};
+    try std.testing.expectEqual(result_error, spore_create_named_json(context, &options, &output));
+    try std.testing.expectEqualStrings("X86LibsporeFreshRunUnsupported", context.?.last_error);
+    try std.testing.expectEqual(@as(usize, 0), output.len);
 }
 
 test "C ABI exposes network capabilities JSON" {

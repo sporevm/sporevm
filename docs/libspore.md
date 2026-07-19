@@ -671,13 +671,18 @@ Use `spore_host_info_json_v2` for the architecture-discriminated contract on
 either architecture. V2 reports GIC and counter facts only in its `aarch64`
 platform variant; its `x86_64` variant instead reports the frozen board and CPU
 profiles, low-RAM board limits, irqchip/PIT, virtio and generation layout, and
-the bounded KVM capability predicate. An approved x86 profile remains
-`available: false` with reason `runner_not_landed` until the product runner is
-wired.
+the bounded KVM capability predicate. The x86 KVM backend reports `available`
+only when the complete approved capability predicate passes. Product execution
+is still an experimental fresh-only profile requiring one vCPU and explicit
+512 MiB memory; capture, resume, rootfs, networking, and build integration
+remain unavailable until their later implementation slices land.
 
 The Zig API follows the same split: `hostInfo` is the ARM-only v1
 compatibility function and returns `error.UnsupportedArchitecture` on x86-64,
 while `hostInfoV2` returns the discriminated contract on either architecture.
+The standalone `libspore.run`, `runManaged`, and `createNamed` x86 paths remain
+gated until Slice 3c; Slice 3a enables the shared implementation only for the
+product CLI.
 
 Options structs use `size` and `version` fields and should be initialized with
 their matching helper:

@@ -166,6 +166,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
 
     const backend = try backend_mod.requireProductRunner(opts.backend);
     events.setBackend(backend);
+    try run_mod.validateFreshProductPolicy(backend, .{
+        .memory = .{},
+        .vcpus = 1,
+        .resuming = true,
+    });
 
     var parsed: ?std.json.Parsed(spore.Manifest) = spore.loadManifest(allocator, opts.spore_dir) catch |err| blk: {
         if (err != error.BadManifest) return @errorCast(err);
@@ -508,6 +513,20 @@ test "attach cli parser accepts bound service bindings" {
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
 }
 
+test "x86 attach rejects resume before reading the spore" {
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.X86ResumeUnsupported, execute(.{
+        .io = std.testing.io,
+        .environ_map = &env,
+    }, std.testing.allocator, .{
+        .backend = .kvm,
+        .spore_dir = "zig-cache/test-x86-attach-gate/definitely-missing.spore",
+    }));
+}
+
 test "attach validates saved sessions before bound service bindings" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -532,7 +551,11 @@ test "attach validates saved sessions before bound service bindings" {
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
-    try std.testing.expectError(error.NoSavedSession, execute(.{
+    const expected_error = if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
+        error.X86ResumeUnsupported
+    else
+        error.NoSavedSession;
+    try std.testing.expectError(expected_error, execute(.{
         .io = std.testing.io,
         .environ_map = &env,
     }, arena, .{
