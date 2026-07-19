@@ -5,6 +5,7 @@
 //! runtime dependency.
 
 const std = @import("std");
+const architecture = @import("architecture.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const platform_index_kind = "spore-image-gateway-index-v1";
@@ -21,10 +22,10 @@ pub const Error = error{
 /// OCI vocabulary used on the wire and throughout image-platform selection.
 pub const Platform = struct {
     os: []const u8,
-    arch: []const u8,
+    arch: architecture.Architecture,
 
     pub fn eql(a: Platform, b: Platform) bool {
-        return std.mem.eql(u8, a.os, b.os) and std.mem.eql(u8, a.arch, b.arch);
+        return std.mem.eql(u8, a.os, b.os) and a.arch == b.arch;
     }
 };
 
@@ -64,11 +65,11 @@ pub fn normalizeOciPlatform(platform: OciPlatform) Error!Platform {
         if (platform.variant) |variant| {
             if (!std.mem.eql(u8, variant, "v8")) return error.UnsupportedPlatform;
         }
-        return .{ .os = "linux", .arch = "arm64" };
+        return .{ .os = "linux", .arch = .arm64 };
     }
     if (std.mem.eql(u8, platform.architecture, "amd64")) {
         if (platform.variant != null) return error.UnsupportedPlatform;
-        return .{ .os = "linux", .arch = "amd64" };
+        return .{ .os = "linux", .arch = .amd64 };
     }
     return error.UnsupportedPlatform;
 }
@@ -81,7 +82,7 @@ pub fn selectOciPlatformDescriptor(platforms: []const OciPlatform, requested: Pl
     var selected: ?usize = null;
     for (platforms, 0..) |candidate, index| {
         if (!std.mem.eql(u8, candidate.os, requested.os) or
-            !std.mem.eql(u8, candidate.architecture, requested.arch)) continue;
+            !std.mem.eql(u8, candidate.architecture, requested.arch.name())) continue;
         const normalized = try normalizeOciPlatform(candidate);
         if (!normalized.eql(requested)) continue;
         if (selected != null) return error.BadProtocol;
@@ -168,14 +169,12 @@ fn canonicalPlatformIndexAlloc(allocator: std.mem.Allocator, index: PlatformInde
 
 fn validatePlatform(platform: Platform) Error!void {
     if (!std.mem.eql(u8, platform.os, "linux")) return error.UnsupportedPlatform;
-    if (std.mem.eql(u8, platform.arch, "amd64") or std.mem.eql(u8, platform.arch, "arm64")) return;
-    return error.UnsupportedPlatform;
 }
 
 fn platformLessThan(a: Platform, b: Platform) bool {
     const os_order = std.mem.order(u8, a.os, b.os);
     if (os_order != .eq) return os_order == .lt;
-    return std.mem.order(u8, a.arch, b.arch) == .lt;
+    return std.mem.order(u8, a.arch.name(), b.arch.name()) == .lt;
 }
 
 fn validateDigest(digest: []const u8, prefix: []const u8) Error!void {
@@ -219,16 +218,16 @@ test "multi-platform index golden encoding and selection" {
         encoded.transport_digest,
     );
 
-    const amd64 = try selectManifest(parsed.value, .{ .os = "linux", .arch = "amd64" });
-    const arm64 = try selectManifest(parsed.value, .{ .os = "linux", .arch = "arm64" });
+    const amd64 = try selectManifest(parsed.value, .{ .os = "linux", .arch = .amd64 });
+    const arm64 = try selectManifest(parsed.value, .{ .os = "linux", .arch = .arm64 });
     try std.testing.expectEqualStrings("blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", amd64.image_digest);
     try std.testing.expectEqualStrings("blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", arm64.image_digest);
-    try std.testing.expectError(error.UnsupportedPlatform, selectManifest(parsed.value, .{ .os = "linux", .arch = "riscv64" }));
+    try std.testing.expectError(error.UnsupportedPlatform, selectManifest(parsed.value, .{ .os = "windows", .arch = .arm64 }));
     const arm64_only = PlatformIndex{
         .kind = platform_index_kind,
         .manifests = parsed.value.manifests[1..],
     };
-    try std.testing.expectError(error.PlatformNotFound, selectManifest(arm64_only, .{ .os = "linux", .arch = "amd64" }));
+    try std.testing.expectError(error.PlatformNotFound, selectManifest(arm64_only, .{ .os = "linux", .arch = .amd64 }));
 }
 
 test "native single-platform index golden omits source provenance" {
@@ -255,12 +254,12 @@ test "OCI platform normalization freezes amd64 and arm64 variants" {
     const arm64_v8 = try normalizeOciPlatform(.{ .os = "linux", .architecture = "arm64", .variant = "v8" });
     const amd64 = try normalizeOciPlatform(.{ .os = "linux", .architecture = "amd64" });
     try std.testing.expect(arm64.eql(arm64_v8));
-    try std.testing.expectEqualStrings("amd64", amd64.arch);
+    try std.testing.expectEqual(architecture.Architecture.amd64, amd64.arch);
     try std.testing.expectError(error.UnsupportedPlatform, normalizeOciPlatform(.{ .os = "linux", .architecture = "arm64", .variant = "v9" }));
     try std.testing.expectError(error.UnsupportedPlatform, normalizeOciPlatform(.{ .os = "linux", .architecture = "amd64", .variant = "v1" }));
     try std.testing.expectError(error.UnsupportedPlatform, normalizeOciPlatform(.{ .os = "windows", .architecture = "amd64" }));
 
-    const requested = Platform{ .os = "linux", .arch = "arm64" };
+    const requested = Platform{ .os = "linux", .arch = .arm64 };
     const one = [_]OciPlatform{
         .{ .os = "windows", .architecture = "arm64" },
         .{ .os = "linux", .architecture = "arm64", .variant = "v8" },
@@ -299,7 +298,7 @@ test "platform-index byte and descriptor bounds fail closed" {
     try std.testing.expectError(error.BadProtocol, parsePlatformIndex(allocator, oversized));
 
     const descriptor = ManifestDescriptor{
-        .platform = .{ .os = "linux", .arch = "arm64" },
+        .platform = .{ .os = "linux", .arch = .arm64 },
         .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         .image_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     };
