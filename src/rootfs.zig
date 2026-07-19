@@ -7,10 +7,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const Blake3 = std.crypto.hash.Blake3;
 const chunk = @import("chunk.zig");
 const ext4 = @import("rootfs/ext4.zig");
 pub const ext4_writer = @import("rootfs/ext4_writer.zig");
+const image_mod = @import("image.zig");
 const local_paths = @import("local_paths.zig");
 const oci = @import("rootfs/oci.zig");
 const oci_layout = @import("rootfs/oci_layout.zig");
@@ -180,7 +180,6 @@ pub const local_ref_cache_kind = "sporevm-local-rootfs-ref-v1";
 const image_ref_cache_record_version: u32 = 1;
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_image_ref_cache_record_bytes = 64 * 1024;
-const indexed_image_identity_domain = "sporevm-indexed-image-v1";
 const rootfs_cache_lock_name = ".sporevm-rootfs-cache.lock";
 const flock_exclusive: c_int = 2;
 const flock_nonblocking: c_int = 4;
@@ -660,7 +659,7 @@ pub const Platform = oci.Platform;
 pub const ImageRef = oci.ImageRef;
 const ImageTag = oci.ImageTag;
 const ImageManifest = oci.ImageManifest;
-pub const ImageConfig = oci.ImageConfig;
+pub const ImageConfig = image_mod.Config;
 
 pub const BuildResult = struct {
     rootfs_storage: spore.RootfsStorage,
@@ -1183,22 +1182,26 @@ pub fn publishIndexedImageWithCacheLockHeld(
 ) !PublishIndexedImageResult {
     _ = try parseLocalTagRef(request.ref);
     try spore.validateRootfsStorageDescriptor(request.rootfs_storage);
+    try spore.validateRootfsDeviceShape(request.rootfs_storage.device);
     if (!std.mem.eql(u8, request.rootfs_storage.index_digest, request.rootfs_storage.base_identity)) return error.BadManifest;
 
     if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, request.rootfs_storage)) return error.RootFSDigestCacheMiss;
 
-    const canonical_config_json = try canonicalImageConfigJson(allocator, request.config);
+    const canonical_config_json = try image_mod.canonicalConfigJson(allocator, request.config);
     defer allocator.free(canonical_config_json);
-    const config_digest = try indexedImageConfigDigest(allocator, canonical_config_json);
+    const config_digest = try image_mod.configDigestAlloc(allocator, canonical_config_json);
     defer allocator.free(config_digest);
-    const image_digest = try indexedImageDigest(allocator, request.rootfs_storage.index_digest, canonical_config_json);
+    const image_digest = try image_mod.imageDigestAlloc(allocator, request.rootfs_storage.index_digest, canonical_config_json);
+    errdefer allocator.free(image_digest);
     const resolved_image_ref = try localResolvedBlake3Ref(allocator, request.ref, image_digest);
+    errdefer allocator.free(resolved_image_ref);
     const resolved = ResolvedImage{
         .ref = resolved_image_ref,
         .manifest_digest = image_digest,
         .platform = request.platform,
     };
     const metadata_path = try cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
+    errdefer allocator.free(metadata_path);
     const metadata = RootFSMetadata{
         .builder_version = builder_version,
         .ext4_writer = "built-index",
@@ -1220,11 +1223,13 @@ pub fn publishIndexedImageWithCacheLockHeld(
         .whitespace = .indent_2,
         .emit_null_optional_fields = false,
     });
+    defer allocator.free(metadata_json);
     try ext4.ensureParentDir(io, metadata_path);
     try writeFileAtomicPath(io, allocator, metadata_path, metadata_json);
 
+    const result_storage = try cloneRootfsStorageDigestFields(allocator, request.rootfs_storage);
+    errdefer deinitStorageDigestFields(allocator, result_storage);
     const local_ref_path = try writeLocalRefCacheAnyDigestWithCacheLockHeld(io, allocator, cache_root, request.ref, resolved);
-    const result_storage = try spore.cloneRootfsStorage(allocator, request.rootfs_storage);
     return .{
         .metadata_path = metadata_path,
         .local_ref_path = local_ref_path,
@@ -1276,6 +1281,7 @@ pub fn deinitPublishIndexedImageResult(allocator: std.mem.Allocator, result: Pub
     allocator.free(result.metadata_path);
     allocator.free(result.local_ref_path);
     allocator.free(result.resolved_image_ref);
+    allocator.free(result.image_manifest_digest);
     deinitStorageDigestFields(allocator, result.rootfs_storage);
 }
 
@@ -1299,6 +1305,24 @@ pub fn deinitRootfsStorageDescriptor(allocator: std.mem.Allocator, storage: spor
     deinitStorageDigestFields(allocator, storage);
 }
 
+/// Own only the digest strings; validated invariant fields are normalized to
+/// static format constants so every rootfs result has one deinit discipline.
+pub fn cloneRootfsStorageDigestFields(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
+    try spore.validateRootfsStorageDescriptor(storage);
+    try spore.validateRootfsDeviceShape(storage.device);
+    const index_digest = try allocator.dupe(u8, storage.index_digest);
+    return .{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = storage.device.mmio_slot },
+        .logical_size = storage.logical_size,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = index_digest,
+        .base_identity = index_digest,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    };
+}
+
 fn deinitStorageDigestFields(allocator: std.mem.Allocator, storage: spore.RootfsStorage) void {
     if (storage.index_digest.ptr == storage.base_identity.ptr and storage.index_digest.len == storage.base_identity.len) {
         allocator.free(storage.index_digest);
@@ -1306,6 +1330,27 @@ fn deinitStorageDigestFields(allocator: std.mem.Allocator, storage: spore.Rootfs
         allocator.free(storage.index_digest);
         allocator.free(storage.base_identity);
     }
+}
+
+test "publish indexed image result deinit frees every owned field" {
+    const allocator = std.testing.allocator;
+    const storage = try cloneRootfsStorageDigestFields(allocator, .{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = 4096,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    });
+    deinitPublishIndexedImageResult(allocator, .{
+        .metadata_path = try allocator.dupe(u8, "metadata.json"),
+        .local_ref_path = try allocator.dupe(u8, "refs/local/app"),
+        .resolved_image_ref = try allocator.dupe(u8, "local/app@blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .image_manifest_digest = try allocator.dupe(u8, "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .rootfs_storage = storage,
+    });
 }
 
 const LayoutBuildOptions = struct {
@@ -1894,41 +1939,6 @@ fn validateConfigPlatform(config: ImageConfig, platform: Platform) !void {
     }
 }
 
-fn canonicalImageConfigJson(allocator: std.mem.Allocator, config: ImageConfig) ![]const u8 {
-    return std.json.Stringify.valueAlloc(allocator, config, .{
-        .emit_null_optional_fields = false,
-    });
-}
-
-fn indexedImageConfigDigest(allocator: std.mem.Allocator, canonical_config_json: []const u8) ![]const u8 {
-    var h = Blake3.init(.{});
-    updateFramed(&h, "sporevm-indexed-image-config-v1");
-    updateFramed(&h, canonical_config_json);
-    return blake3DigestAlloc(allocator, &h);
-}
-
-fn indexedImageDigest(allocator: std.mem.Allocator, index_digest: []const u8, canonical_config_json: []const u8) ![]const u8 {
-    var h = Blake3.init(.{});
-    updateFramed(&h, indexed_image_identity_domain);
-    updateFramed(&h, index_digest);
-    updateFramed(&h, canonical_config_json);
-    return blake3DigestAlloc(allocator, &h);
-}
-
-fn updateFramed(h: *Blake3, bytes: []const u8) void {
-    var len_buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &len_buf, bytes.len, .little);
-    h.update(&len_buf);
-    h.update(bytes);
-}
-
-fn blake3DigestAlloc(allocator: std.mem.Allocator, h: *Blake3) ![]const u8 {
-    var digest: [Blake3.digest_length]u8 = undefined;
-    h.final(&digest);
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, &hex });
-}
-
 fn layerBlobPath(allocator: std.mem.Allocator, layers_dir: []const u8, digest: []const u8) ![]u8 {
     if (!oci.isSha256Digest(digest)) return error.UnsupportedDigest;
     return std.fmt.allocPrint(allocator, "{s}/{s}.blob", .{ layers_dir, digest["sha256:".len..] });
@@ -2113,12 +2123,14 @@ fn writeLocalRefCacheAnyDigestWithCacheLockHeld(
     if (!try localResolvedRefMatchesDigest(allocator, raw_ref, resolved.ref, resolved.manifest_digest)) return error.LocalRefCacheMismatch;
 
     const path = try localRefCachePath(allocator, cache_root, raw_ref, resolved.platform);
+    errdefer allocator.free(path);
     try ext4.ensureParentDir(io, path);
 
     var nonce_bytes: [8]u8 = undefined;
     io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     const temp_path = try std.fmt.allocPrint(allocator, "{s}.{x}.tmp", .{ path, nonce });
+    defer allocator.free(temp_path);
     defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
     const metadata = LocalRefMetadata{
         .ref = raw_ref,
@@ -2127,6 +2139,7 @@ fn writeLocalRefCacheAnyDigestWithCacheLockHeld(
         .platform = resolved.platform,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
+    defer allocator.free(json);
     try ext4.writeFileAtPath(io, temp_path, json);
     try renameCachePath(io, temp_path, path);
     return path;
@@ -2529,7 +2542,7 @@ fn readCachedRootfsStorageDescriptor(
     spore.validateRootfsStorageDescriptor(storage) catch return null;
     if (storage.logical_size != parsed.value.rootfs_size) return null;
     if (!std.mem.eql(u8, storage.index_digest, storage.base_identity)) return null;
-    return try spore.cloneRootfsStorage(allocator, storage);
+    return try cloneRootfsStorageDigestFields(allocator, storage);
 }
 
 fn rootfsArtifactDigestSuffix(artifact_digest: []const u8) ?[]const u8 {
@@ -2558,7 +2571,7 @@ pub fn readCachedRootfsStorage(
     spore.validateRootfsStorageDescriptor(storage) catch return null;
     if (storage.logical_size != artifact.size) return null;
     if (!std.mem.eql(u8, storage.index_digest, artifact.digest)) return null;
-    return try spore.cloneRootfsStorage(allocator, storage);
+    return try cloneRootfsStorageDigestFields(allocator, storage);
 }
 
 fn writeFileAtomicPath(io: Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {

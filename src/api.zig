@@ -692,20 +692,7 @@ pub fn deinitRootfsCasPreloadResult(allocator: std.mem.Allocator, result: Rootfs
 }
 
 fn ownRootfsStorageDigestFields(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
-    const index_digest = try allocator.dupe(u8, storage.index_digest);
-    errdefer allocator.free(index_digest);
-    const same_base = storage.index_digest.ptr == storage.base_identity.ptr and storage.index_digest.len == storage.base_identity.len;
-    const base_identity = if (same_base) index_digest else try allocator.dupe(u8, storage.base_identity);
-    return .{
-        .kind = storage.kind,
-        .device = storage.device,
-        .logical_size = storage.logical_size,
-        .chunk_size = storage.chunk_size,
-        .hash_algorithm = storage.hash_algorithm,
-        .index_digest = index_digest,
-        .base_identity = base_identity,
-        .object_namespace = storage.object_namespace,
-    };
+    return rootfs_mod.cloneRootfsStorageDigestFields(allocator, storage);
 }
 
 fn ownRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOciResult) !RootfsImportOciResult {
