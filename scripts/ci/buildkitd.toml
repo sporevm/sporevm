@@ -1,0 +1,5 @@
+[worker.oci]
+  gc = true
+  reservedSpace = "2GB"
+  maxUsedSpace = "4GB"
+  minFreeSpace = "20GB"

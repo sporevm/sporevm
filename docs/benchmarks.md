@@ -779,10 +779,12 @@ Linux and macOS test jobs always run the named-restore parser, cleanup/signal,
 path-sanitization, and pinned-release-input self-tests.
 
 The dedicated benchmark pipeline runs macOS and Linux ARM64 benchmark jobs in
-parallel on `sporevm-mac` and `sporevm-linux-arm64`. Each platform job uses a
-per-platform concurrency group so two benchmark builds do not share the same
-runner class at once. It defaults to `nightly` for Buildkite schedules,
-`comparison` on `main`, and `ci` otherwise. Override with
+parallel on `sporevm-mac` and `sporevm-linux-arm64`. The macOS job uses a
+concurrency group for its single-agent host. Linux ARM64 benchmarks may overlap
+ordinary CI on the multi-agent host; scheduled runs rely on their off-hours
+timing and the load gate below rather than reserving the queue. The pipeline
+defaults to `nightly` for Buildkite schedules, `comparison` on `main`, and `ci`
+otherwise. Override with
 `SPOREVM_BENCHMARK_PROFILE=ci` for a short cold/warm run, `nightly` for the
 guardrail selection, or `full` when a build should pay for the full benchmark
 matrix.

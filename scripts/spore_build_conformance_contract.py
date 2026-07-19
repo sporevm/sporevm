@@ -538,6 +538,73 @@ def select_cases(cases: list[Case], requested: list[str] | None) -> list[Case]:
     return selected
 
 
+def shard_cases(
+    cases: list[Case],
+    shard_index: int | None,
+    shard_count: int | None,
+) -> list[Case]:
+    if (shard_index is None) != (shard_count is None):
+        raise HarnessError("--shard-index and --shard-count must be provided together")
+    if shard_index is None or shard_count is None:
+        return cases
+    if shard_count < 1:
+        raise HarnessError("--shard-count must be at least 1")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise HarnessError(
+            f"--shard-index must be between 0 and {shard_count - 1}"
+        )
+    shards: list[list[Case]] = [[] for _ in range(shard_count)]
+    weights = [0] * shard_count
+    for case in sorted(
+        cases,
+        key=lambda item: (-(1 + len(item.spec.transitions)), item.name),
+    ):
+        target = min(
+            range(shard_count),
+            key=lambda index: (weights[index], len(shards[index]), index),
+        )
+        shards[target].append(case)
+        weights[target] += 1 + len(case.spec.transitions)
+    selected_names = {case.name for case in shards[shard_index]}
+    selected = [case for case in cases if case.name in selected_names]
+    if not selected:
+        raise HarnessError(
+            f"shard {shard_index} of {shard_count} has no conformance cases"
+        )
+    return selected
+
+
+def self_test_sharding(cases: list[Case]) -> None:
+    shards = [shard_cases(cases, index, 4) for index in range(4)]
+    flattened = [case.name for shard in shards for case in shard]
+    expected = [case.name for case in cases]
+    if len(flattened) != len(expected) or set(flattened) != set(expected):
+        raise HarnessError("self-test: four-way sharding did not cover every case once")
+    weights = [
+        sum(1 + len(case.spec.transitions) for case in shard)
+        for shard in shards
+    ]
+    if max(weights) - min(weights) > 1:
+        raise HarnessError("self-test: four-way sharding is not balanced")
+
+    invalid = [(-1, 4), (4, 4), (0, 0), (len(cases), len(cases) + 1)]
+    for shard_index, shard_count in invalid:
+        try:
+            shard_cases(cases, shard_index, shard_count)
+        except HarnessError:
+            continue
+        raise HarnessError(
+            f"self-test: accepted invalid shard {shard_index} of {shard_count}"
+        )
+
+    for shard_index, shard_count in ((None, 4), (0, None)):
+        try:
+            shard_cases(cases, shard_index, shard_count)
+        except HarnessError:
+            continue
+        raise HarnessError("self-test: accepted an incomplete shard selection")
+
+
 def parse_spore_build(result: CommandResult) -> SporeBuildResult:
     fields: dict[str, str] = {}
     executor: dict[str, int] = {}

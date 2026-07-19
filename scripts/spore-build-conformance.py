@@ -46,6 +46,8 @@ from spore_build_conformance_contract import (
     parse_spore_build,
     select_cases,
     self_test_schema,
+    self_test_sharding,
+    shard_cases,
     write_json,
 )
 
@@ -69,15 +71,38 @@ def parse_args() -> argparse.Namespace:
         default=repo_root / "test/build/conformance",
         help="fixture root (default: %(default)s)",
     )
-    parser.add_argument(
+    builder = parser.add_mutually_exclusive_group()
+    builder.add_argument(
         "--builder",
         help="existing docker buildx builder; otherwise create a temporary docker-container builder",
+    )
+    builder.add_argument(
+        "--builder-cache-scope",
+        help=(
+            "create a managed docker-container builder whose BuildKit volume is "
+            "retained for this stable, non-concurrent scope"
+        ),
+    )
+    parser.add_argument(
+        "--buildkitd-config",
+        type=pathlib.Path,
+        help="BuildKit daemon config for a managed builder",
     )
     parser.add_argument(
         "--case",
         action="append",
         dest="cases",
         help="run one named case (repeatable; default: all)",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        help="zero-based shard to run (requires --shard-count)",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        help="number of deterministic case shards (requires --shard-index)",
     )
     parser.add_argument("--list", action="store_true", help="list cases and exit")
     parser.add_argument(
@@ -150,6 +175,109 @@ def run_best_effort(command: Iterable[str]) -> None:
         pass
 
 
+def managed_builder_name(cache_scope: str) -> str:
+    if not cache_scope:
+        raise HarnessError("--builder-cache-scope must not be empty")
+    version = "".join(
+        character if character.isalnum() else "-" for character in BUILDKIT_VERSION
+    ).strip("-")
+    scope_digest = hashlib.sha256(cache_scope.encode()).hexdigest()[:16]
+    return f"spore-conformance-{version}-{scope_digest}"
+
+
+def managed_builder_volume_name(builder: str) -> str:
+    return f"buildx_buildkit_{builder}0_state"
+
+
+def self_test_managed_builder_name() -> None:
+    first = managed_builder_name("agent-one")
+    if first != managed_builder_name("agent-one"):
+        raise HarnessError("self-test: managed builder name is not deterministic")
+    if first == managed_builder_name("agent-two"):
+        raise HarnessError("self-test: managed builder scopes collide")
+    if any(not (character.isalnum() or character in "-_.") for character in first):
+        raise HarnessError("self-test: managed builder name is not Docker-safe")
+    if managed_builder_volume_name(first) != f"buildx_buildkit_{first}0_state":
+        raise HarnessError("self-test: managed builder volume name is malformed")
+    try:
+        managed_builder_name("")
+    except HarnessError:
+        pass
+    else:
+        raise HarnessError("self-test: accepted an empty managed builder scope")
+
+
+def remove_builder(builder: str, *, keep_state: bool) -> None:
+    command = ["docker", "buildx", "rm", "--force"]
+    if keep_state:
+        command.append("--keep-state")
+    command.append(builder)
+    run_best_effort(command)
+    # A killed job can lose its temporary Buildx metadata while leaving the
+    # builder container behind. Remove it directly so the stable cache scope
+    # can be recreated; the named state volume remains intact when requested.
+    run_best_effort(["docker", "rm", "--force", f"buildx_buildkit_{builder}0"])
+    if not keep_state:
+        run_best_effort(
+            ["docker", "volume", "rm", "--force", managed_builder_volume_name(builder)]
+        )
+
+
+def prune_mutable_builder_cache(builder: str, logs: pathlib.Path) -> None:
+    result = run_command(
+        [
+            "docker",
+            "buildx",
+            "prune",
+            "--builder",
+            builder,
+            "--force",
+            "--filter",
+            "type=exec.cachemount",
+        ],
+        log_prefix=logs / "builder-prune",
+    )
+    require_success(result)
+
+
+def prune_managed_builder_cache(builder: str, logs: pathlib.Path) -> None:
+    result = run_command(
+        [
+            "docker",
+            "buildx",
+            "prune",
+            "--builder",
+            builder,
+            "--force",
+            "--reserved-space",
+            "2GB",
+            "--max-used-space",
+            "4GB",
+            "--min-free-space",
+            "20GB",
+        ],
+        log_prefix=logs / "builder-prune-space",
+    )
+    require_success(result)
+    prune_mutable_builder_cache(builder, logs)
+
+
+def capture_docker_storage(builder: str | None, logs: pathlib.Path, suffix: str) -> None:
+    run_command(
+        ["docker", "system", "df"],
+        log_prefix=logs / f"docker-system-df-{suffix}",
+    )
+    run_command(
+        ["df", "-h", "/var/lib/docker", "/var/tmp/nvme"],
+        log_prefix=logs / f"storage-df-{suffix}",
+    )
+    if builder is not None:
+        run_command(
+            ["docker", "buildx", "du", "--builder", builder],
+            log_prefix=logs / f"builder-du-{suffix}",
+        )
+
+
 def resolve_executable(raw: str) -> str:
     path = pathlib.Path(raw).expanduser()
     if path.parent != pathlib.Path(".") or "/" in raw:
@@ -164,7 +292,11 @@ def resolve_executable(raw: str) -> str:
 
 
 def create_builder(
-    requested: str | None, run_id: str, logs: pathlib.Path
+    requested: str | None,
+    cache_scope: str | None,
+    buildkitd_config: pathlib.Path | None,
+    run_id: str,
+    logs: pathlib.Path,
 ) -> tuple[str, bool, str, str]:
     require_success(run_command(["docker", "info"], log_prefix=logs / "docker-info"))
     buildx_version = require_success(
@@ -175,19 +307,28 @@ def create_builder(
         builder = requested
         owned = False
     else:
-        builder = f"spore-conformance-{run_id}"
+        builder = (
+            managed_builder_name(cache_scope)
+            if cache_scope is not None
+            else f"spore-conformance-{run_id}"
+        )
+        if cache_scope is not None:
+            remove_builder(builder, keep_state=True)
+        command = [
+            "docker",
+            "buildx",
+            "create",
+            "--name",
+            builder,
+            "--driver",
+            "docker-container",
+            "--driver-opt",
+            f"image={BUILDKIT_IMAGE}",
+        ]
+        if buildkitd_config is not None:
+            command.extend(["--buildkitd-config", str(buildkitd_config)])
         created = run_command(
-            [
-                "docker",
-                "buildx",
-                "create",
-                "--name",
-                builder,
-                "--driver",
-                "docker-container",
-                "--driver-opt",
-                f"image={BUILDKIT_IMAGE}",
-            ],
+            command,
             log_prefix=logs / "builder-create",
         )
         require_success(created)
@@ -205,7 +346,7 @@ def create_builder(
             )
     except HarnessError:
         if owned:
-            run_best_effort(["docker", "buildx", "rm", "--force", builder])
+            remove_builder(builder, keep_state=cache_scope is not None)
         raise
     buildkit_version = "unknown"
     for line in inspected.stdout.splitlines():
@@ -214,11 +355,19 @@ def create_builder(
             break
     if buildkit_version != BUILDKIT_VERSION:
         if owned:
-            run_best_effort(["docker", "buildx", "rm", "--force", builder])
+            remove_builder(builder, keep_state=cache_scope is not None)
         raise HarnessError(
             f"buildx builder {builder!r} uses BuildKit {buildkit_version!r}; "
             f"the conformance oracle requires {BUILDKIT_VERSION!r}"
         )
+    if cache_scope is not None:
+        require_success(
+            run_command(
+                ["docker", "volume", "inspect", managed_builder_volume_name(builder)],
+                log_prefix=logs / "builder-volume",
+            )
+        )
+        prune_managed_builder_cache(builder, logs)
     return builder, owned, buildx_version, buildkit_version
 
 
@@ -684,13 +833,30 @@ def main() -> int:
         all_cases = load_cases(args.fixtures.resolve())
         if args.self_test_schema:
             self_test_schema(all_cases)
-            print("spore-build-conformance schema self-test ok")
+            self_test_sharding(all_cases)
+            self_test_managed_builder_name()
+            print(
+                "spore-build-conformance schema, sharding, and builder-cache self-tests ok"
+            )
             return 0
         if args.list:
             for case in all_cases:
                 print(f"{case.name}\t{case.spec.description}")
             return 0
-        cases = select_cases(all_cases, args.cases)
+        cases = shard_cases(
+            select_cases(all_cases, args.cases),
+            args.shard_index,
+            args.shard_count,
+        )
+        if args.builder is not None and args.buildkitd_config is not None:
+            raise HarnessError("--buildkitd-config cannot be used with --builder")
+        buildkitd_config = (
+            args.buildkitd_config.expanduser().resolve()
+            if args.buildkitd_config is not None
+            else None
+        )
+        if buildkitd_config is not None and not buildkitd_config.is_file():
+            raise HarnessError(f"BuildKit config is not a file: {buildkitd_config}")
         spore_bin = resolve_executable(args.spore_bin)
     except HarnessError as error:
         print(f"spore-build-conformance: {error}", file=sys.stderr)
@@ -718,13 +884,17 @@ def main() -> int:
     run_id = uuid.uuid4().hex[:12]
     builder: str | None = None
     owned_builder = False
-    docker_tags: list[str] = []
     succeeded = False
 
     try:
         builder, owned_builder, buildx_version, buildkit_version = create_builder(
-            args.builder, run_id, logs
+            args.builder,
+            args.builder_cache_scope,
+            buildkitd_config,
+            run_id,
+            logs,
         )
+        capture_docker_storage(builder, logs, "initial")
         hypervisors = check_spore_host(spore_bin, logs)
         print(
             f"preflight: {buildx_version}; BuildKit {buildkit_version}; "
@@ -753,7 +923,6 @@ def main() -> int:
             spore_env["SPOREVM_RUNTIME_DIR"] = str(spore_runtime)
             docker_tag = f"spore-build-conformance-{run_id}-{case.name}:docker"
             spore_tag = f"local/spore-build-conformance-{run_id}-{case.name}:dev"
-            docker_tags.append(docker_tag)
             print(f"case {case.name}: {case.spec.description}")
             try:
                 run_case(
@@ -771,6 +940,10 @@ def main() -> int:
                 print(f"case {case.name}: FAIL", file=sys.stderr)
             else:
                 print(f"case {case.name}: ok")
+            finally:
+                # BuildKit retains the reusable layers. The loaded Docker image
+                # is only needed while this case is being inspected and run.
+                run_best_effort(["docker", "image", "rm", "--force", docker_tag])
 
         if failures:
             for name, error in failures:
@@ -783,10 +956,17 @@ def main() -> int:
         print(f"spore-build-conformance: {error}", file=sys.stderr)
         return 1
     finally:
-        for tag in docker_tags:
-            run_best_effort(["docker", "image", "rm", "--force", tag])
+        capture_docker_storage(builder, logs, "final")
         if owned_builder and builder is not None:
-            run_best_effort(["docker", "buildx", "rm", "--force", builder])
+            remove_builder(
+                builder,
+                keep_state=args.builder_cache_scope is not None,
+            )
+            if args.builder_cache_scope is not None:
+                run_command(
+                    ["docker", "volume", "inspect", managed_builder_volume_name(builder)],
+                    log_prefix=logs / "builder-volume-retained",
+                )
         keep_work = args.keep_work or explicit_work_dir or not succeeded
         if keep_work:
             print(f"artifacts: {work_dir}", file=sys.stderr if not succeeded else sys.stdout)

@@ -1,263 +1,148 @@
 steps:
-  - label: ":zig: Build & Test (Linux)"
-    key: "test-linux"
-    command: |
-      mise install
-      mise exec -- zig build test --summary all
-      mise exec -- zig fmt --check build.zig src
-      python3 scripts/benchmark/named-restore-readiness.py --self-test
-      python3 scripts/benchmark/named-restore-readiness-test.py
-      bash scripts/ci/named-restore-release-inputs-test.sh
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
-    agents:
-      queue: sporevm-linux-arm64
+  - group: ":test_tube: Tests"
+    key: "tests"
+    steps:
+      - label: ":zig: Build & Test (Linux)"
+        key: "test-linux"
+        command: "scripts/ci/run.sh scripts/ci/test.sh"
+        plugins: &mise_plugins
+          - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+              version: "2026.5.12"
+        cache: &mise_cache
+          paths:
+            - "~/.local/share/mise"
+            - "~/.cache/mise"
+            - "~/.local/state/mise"
+          size: "20g"
+          name: "mise-cache"
+        agents: &linux_agents
+          queue: sporevm-linux-arm64
 
-  - label: ":zig: Build & Test (macOS)"
-    key: "test-macos"
-    command: |
-      mise install
-      mise exec -- zig build test --summary all
-      python3 scripts/benchmark/named-restore-readiness.py --self-test
-      python3 scripts/benchmark/named-restore-readiness-test.py
-      bash scripts/ci/named-restore-release-inputs-test.sh
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/macos"
-    agents:
-      queue: sporevm-mac
+      - label: ":zig: Build & Test (macOS)"
+        key: "test-macos"
+        command: "scripts/ci/run.sh scripts/ci/test.sh"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        concurrency: 1
+        concurrency_group: "sporevm-benchmarks/macos"
+        agents: &mac_agents
+          queue: sporevm-mac
 
-  - label: ":docker: Spore build conformance (Linux ARM64)"
-    key: "spore-build-conformance-linux-arm64"
-    command: |
-      set -euo pipefail
-      mise install
-      mise exec -- zig build --release=safe
-      mise exec -- zig build spore-build-run-smoke
-      conformance_root="zig-cache/spore-build-conformance/$${BUILDKITE_JOB_ID}"
-      buildx_root="$$(mktemp -d "$${TMPDIR:-/tmp}/sporevm-buildx.XXXXXX")"
-      trap 'rm -rf "$${buildx_root}"' EXIT
-      export DOCKER_CONFIG="$${buildx_root}/docker"
-      buildx_asset="$${buildx_root}/buildx-v0.33.0.linux-arm64"
-      mkdir -p "$${DOCKER_CONFIG}/cli-plugins"
-      curl --fail --location --silent --show-error --retry 3 \
-        --proto '=https' --proto-redir '=https' \
-        https://github.com/docker/buildx/releases/download/v0.33.0/buildx-v0.33.0.linux-arm64 \
-        --output "$${buildx_asset}"
-      printf '%s  %s\n' \
-        204dc28447d3bb48f42ed1ce5747e0885cd57e306506a39029311becdb1ef786 \
-        "$${buildx_asset}" | sha256sum --check --strict
-      install -m 0755 \
-        "$${buildx_asset}" \
-        "$${DOCKER_CONFIG}/cli-plugins/docker-buildx"
-      docker buildx version | grep -F 'github.com/docker/buildx v0.33.0 '
-      scripts/spore-build-conformance.py \
-        --spore-bin zig-out/bin/spore \
-        --work-dir "$${conformance_root}"
-    artifact_paths:
-      - "zig-cache/spore-build-conformance/*/logs/*"
-      - "zig-cache/spore-build-conformance/*/cases/**/*.command"
-      - "zig-cache/spore-build-conformance/*/cases/**/*.stdout"
-      - "zig-cache/spore-build-conformance/*/cases/**/*.stderr"
-      - "zig-cache/spore-build-conformance/*/cases/**/docker-filesystem.json"
-      - "zig-cache/spore-build-conformance/*/cases/**/spore-filesystem.json"
-      - "zig-cache/spore-build-conformance/*/cases/**/docker-config.json"
-      - "zig-cache/spore-build-conformance/*/cases/**/spore-config.json"
-      - "zig-cache/spore-build-conformance/*/cases/**/*.diff"
-    timeout_in_minutes: 30
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
-    agents:
-      queue: sporevm-linux-arm64
+  - group: ":docker: Spore build"
+    key: "spore-build"
+    steps:
+      - label: ":docker: Conformance (Linux ARM64)"
+        key: "spore-build-conformance-linux-arm64"
+        command: "scripts/ci/run.sh scripts/ci/spore-build-conformance.sh"
+        artifact_paths:
+          - "zig-cache/spore-build-conformance/*.release-build.log"
+          - "zig-cache/spore-build-conformance/*.buildx-install.log"
+          - "zig-cache/spore-build-conformance/*/logs/*"
+          - "zig-cache/spore-build-conformance/*/cases/**/*.command"
+          - "zig-cache/spore-build-conformance/*/cases/**/*.stdout"
+          - "zig-cache/spore-build-conformance/*/cases/**/*.stderr"
+          - "zig-cache/spore-build-conformance/*/cases/**/docker-filesystem.json"
+          - "zig-cache/spore-build-conformance/*/cases/**/spore-filesystem.json"
+          - "zig-cache/spore-build-conformance/*/cases/**/docker-config.json"
+          - "zig-cache/spore-build-conformance/*/cases/**/spore-config.json"
+          - "zig-cache/spore-build-conformance/*/cases/**/*.diff"
+        timeout_in_minutes: 30
+        parallelism: 4
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
 
-  - label: ":stopwatch: Named restore readiness (Linux ARM64)"
-    key: "named-restore-readiness-linux-arm64"
-    if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
-    command: |
-      mise install
-      SPOREVM_NAMED_RESTORE_SCRATCH_ROOT="/var/tmp/sporevm-named-restore-verity" \
-        scripts/ci/buildkite-named-restore-readiness.sh
-    artifact_paths:
-      - "zig-cache/named-restore-readiness/*.jsonl"
-      - "zig-cache/named-restore-readiness/*.json"
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
-    agents:
-      queue: sporevm-linux-arm64
+      - label: ":fire: VM smoke (Linux ARM64)"
+        key: "spore-build-run-smoke-linux-arm64"
+        command: "scripts/ci/run.sh scripts/ci/spore-build-smoke.sh"
+        artifact_paths:
+          - "zig-cache/spore-build-run-smoke/*/smoke.log"
+        timeout_in_minutes: 15
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
 
-  - label: ":stopwatch: Named restore readiness (macOS ARM64)"
-    key: "named-restore-readiness-macos-arm64"
-    if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
-    command: |
-      mise install
-      scripts/ci/buildkite-named-restore-readiness.sh
-    artifact_paths:
-      - "zig-cache/named-restore-readiness/*.jsonl"
-      - "zig-cache/named-restore-readiness/*.json"
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/macos"
-    agents:
-      queue: sporevm-mac
+  - group: ":microscope: Opt-in validation"
+    key: "opt-in-validation"
+    steps:
+      - label: ":stopwatch: Named restore readiness (Linux ARM64)"
+        key: "named-restore-readiness-linux-arm64"
+        if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
+        env:
+          SPOREVM_NAMED_RESTORE_SCRATCH_ROOT: "/var/tmp/sporevm-named-restore-verity"
+        command: "scripts/ci/run.sh scripts/ci/buildkite-named-restore-readiness.sh"
+        artifact_paths:
+          - "zig-cache/named-restore-readiness/*.jsonl"
+          - "zig-cache/named-restore-readiness/*.json"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
 
-  - label: ":ext4: Slow Rootfs Tests (Linux)"
-    key: "rootfs-slow-test-linux"
-    if: build.env("SPOREVM_RUN_ROOTFS_SLOW_TESTS") == "1"
-    command: |
-      mise install
-      mise exec -- zig build rootfs-slow-test --summary all
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
-    agents:
-      queue: sporevm-linux-arm64
+      - label: ":stopwatch: Named restore readiness (macOS ARM64)"
+        key: "named-restore-readiness-macos-arm64"
+        if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
+        command: "scripts/ci/run.sh scripts/ci/buildkite-named-restore-readiness.sh"
+        artifact_paths:
+          - "zig-cache/named-restore-readiness/*.jsonl"
+          - "zig-cache/named-restore-readiness/*.json"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        concurrency: 1
+        concurrency_group: "sporevm-benchmarks/macos"
+        agents: *mac_agents
 
-  - label: ":package: Diskless saved-spore removal (Linux ARM64)"
-    key: "diskless-remove-packaged-linux-arm64"
-    if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
-    command: |
-      mise install
-      mise exec -- scripts/ci/diskless-remove-packaged-smoke.sh
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
-    agents:
-      queue: sporevm-linux-arm64
+      - label: ":ext4: Slow rootfs tests (Linux ARM64)"
+        key: "rootfs-slow-test-linux"
+        if: build.env("SPOREVM_RUN_ROOTFS_SLOW_TESTS") == "1"
+        command: "scripts/ci/run.sh zig build rootfs-slow-test --summary all"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
 
-  - label: ":package: Diskless saved-spore removal (macOS ARM64)"
-    key: "diskless-remove-packaged-macos-arm64"
-    if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
-    command: |
-      mise install
-      mise exec -- scripts/ci/diskless-remove-packaged-smoke.sh
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/macos"
-    agents:
-      queue: sporevm-mac
+      - label: ":package: Diskless saved-spore removal (Linux ARM64)"
+        key: "diskless-remove-packaged-linux-arm64"
+        if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
+        command: "scripts/ci/run.sh scripts/ci/diskless-remove-packaged-smoke.sh"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
 
-  - label: ":package: Build Linux ARM64 release archive"
-    key: "release-linux-arm64"
-    if: build.tag != null
-    command: |
-      mise install
-      scripts/release/build-assets.sh --target linux-arm64 --output dist
-    artifact_paths:
-      - "dist/spore_Linux_arm64.tar.gz"
-      - "dist/libspore_Linux.tar.gz"
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
-    agents:
-      queue: sporevm-linux-arm64
+      - label: ":package: Diskless saved-spore removal (macOS ARM64)"
+        key: "diskless-remove-packaged-macos-arm64"
+        if: build.env("SPOREVM_RUN_DISKLESS_REMOVE_PACKAGED_SMOKE") == "1"
+        command: "scripts/ci/run.sh scripts/ci/diskless-remove-packaged-smoke.sh"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        concurrency: 1
+        concurrency_group: "sporevm-benchmarks/macos"
+        agents: *mac_agents
 
-  - label: ":package: Build macOS ARM64 release archive"
-    key: "release-darwin-arm64"
-    if: build.tag != null
-    command: |
-      mise install
-      scripts/release/build-assets.sh --target darwin-arm64 --output dist
-    artifact_paths:
-      - "dist/spore_Darwin_arm64.tar.gz"
-      - "dist/libspore_Darwin.tar.gz"
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/macos"
-    agents:
-      queue: sporevm-mac
+  - group: ":package: Release assets"
+    key: "release-assets"
+    steps:
+      - label: ":linux: Linux ARM64 archive"
+        key: "release-linux-arm64"
+        if: build.tag != null
+        command: "scripts/ci/run.sh scripts/release/build-assets.sh --target linux-arm64 --output dist"
+        artifact_paths:
+          - "dist/spore_Linux_arm64.tar.gz"
+          - "dist/libspore_Linux.tar.gz"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
+
+      - label: ":mac: macOS ARM64 archive"
+        key: "release-darwin-arm64"
+        if: build.tag != null
+        command: "scripts/ci/run.sh scripts/release/build-assets.sh --target darwin-arm64 --output dist"
+        artifact_paths:
+          - "dist/spore_Darwin_arm64.tar.gz"
+          - "dist/libspore_Darwin.tar.gz"
+        plugins: *mise_plugins
+        cache: *mise_cache
+        concurrency: 1
+        concurrency_group: "sporevm-benchmarks/macos"
+        agents: *mac_agents
 
   - wait
 
@@ -269,18 +154,8 @@ steps:
       - "release-linux-arm64"
       - "release-darwin-arm64"
     if: build.tag != null
-    command: |
-      mise install
-      scripts/ci/buildkite-release.sh
-    plugins:
-      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-          version: "2026.5.12"
-    cache:
-      paths:
-        - "~/.local/share/mise"
-        - "~/.cache/mise"
-        - "~/.local/state/mise"
-      size: "20g"
-      name: "mise-cache"
+    command: "scripts/ci/run.sh scripts/ci/buildkite-release.sh"
+    plugins: *mise_plugins
+    cache: *mise_cache
     agents:
       queue: hosted
