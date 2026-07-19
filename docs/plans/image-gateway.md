@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-19
+last_reviewed: 2026-07-20
 spec_refs:
   - docs/image-gateway-protocol.md
   - docs/filesystem.md
@@ -917,11 +917,11 @@ reusable golden and malformed fixtures plus fuzz coverage. The protocol remains
 data-only: it adds no gateway lookup, network path, backend mapping, or runtime
 dependency.
 
-The current direct OCI selector still ignores descriptor variants and accepts
-the first architecture match. Before gateway/direct conversion equivalence is
-claimed, that path must share the gateway protocol's arm64 normalization and
-ambiguity rule; changing local OCI selection is intentionally outside this
-data-only slice.
+The gateway source selector, direct registry pulls, and local OCI-layout
+imports now share the protocol's arm64 normalization and ambiguity rule. All
+three selection paths accept an absent or `v8` arm64 variant, require amd64 to
+omit its variant, and reject multiple eligible descriptors that normalize to
+the requested platform.
 
 The rest of G0 remains open: image-manifest and attachment schemas, transport
 benchmarking, authorization-bound object fetch, cross-repository conformance,

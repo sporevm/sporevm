@@ -12,11 +12,17 @@ Protocol values use OCI names. Version 1 supports `linux/arm64` and
 runtime-backend selection is a separate SporeVM boundary and is not represented
 in gateway JSON.
 
-An OCI arm64 descriptor may omit `variant` or set it to `v8`. Both normalize to
-`linux/arm64`, so source selection containing both is ambiguous and is rejected
-before a gateway platform index can be produced.
-An amd64 descriptor must omit `variant`. Other operating systems,
-architectures, and variants are unsupported.
+An OCI arm64 descriptor may omit `variant` or set it to `v8`; both normalize to
+`linux/arm64`. Any two eligible descriptors that normalize to the requested
+platform are ambiguous and rejected before a gateway platform index can be
+produced. An amd64 descriptor must omit `variant`. Descriptors for other
+operating systems or architectures are ignored. A descriptor for the requested
+operating system and architecture with any other variant fails the complete
+selection, even when another eligible descriptor would otherwise match.
+Direct registry pulls and local OCI-layout imports use the same normalization
+and ambiguity rule as the gateway source selector, so a source index cannot
+resolve differently depending on whether it is converted locally or through a
+future gateway.
 
 ## Immutable platform index
 

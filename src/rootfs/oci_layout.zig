@@ -183,17 +183,11 @@ fn selectManifestDescriptor(allocator: std.mem.Allocator, index_bytes: []const u
     defer parsed.deinit();
     if (parsed.value.schemaVersion != 2) return error.UnsupportedManifestSchema;
 
-    for (parsed.value.manifests) |desc| {
-        const p = desc.platform orelse continue;
-        if (!std.mem.eql(u8, p.os, platform.os) or !std.mem.eql(u8, p.architecture, platform.arch.name())) continue;
-        if (!oci.isManifestMediaType(desc.mediaType)) return error.UnsupportedManifestMediaType;
-        if (!oci.isSha256Digest(desc.digest)) return error.UnsupportedDigest;
-        return .{
-            .digest = try allocator.dupe(u8, desc.digest),
-            .size = desc.size,
-        };
-    }
-    return error.PlatformManifestNotFound;
+    const desc = parsed.value.manifests[try oci.selectImageManifestIndex(parsed.value.manifests, platform)];
+    return .{
+        .digest = try allocator.dupe(u8, desc.digest),
+        .size = desc.size,
+    };
 }
 
 fn verifyAllBlobs(allocator: std.mem.Allocator, io: Io, layout_dir: []const u8) !void {
@@ -448,6 +442,26 @@ test "OCI layout reader selects platform manifest and verifies blobs" {
     try std.testing.expectEqualStrings(config_digest, selected.config_digest);
     try std.testing.expectEqual(@as(usize, 1), selected.layers.len);
     try std.testing.expectEqualStrings(layer_digest, selected.layers[0].digest);
+}
+
+test "OCI layout selection shares gateway variant and ambiguity rules" {
+    const allocator = std.testing.allocator;
+    const arm64_v8 =
+        \\{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]}
+    ;
+    const selected = try selectManifestDescriptor(allocator, arm64_v8, .{});
+    defer allocator.free(selected.digest);
+    try std.testing.expectEqualStrings("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", selected.digest);
+
+    const ambiguous =
+        \\{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]}
+    ;
+    try std.testing.expectError(error.AmbiguousPlatformManifest, selectManifestDescriptor(allocator, ambiguous, .{}));
+
+    const unsupported =
+        \\{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"amd64","variant":"v1"}}]}
+    ;
+    try std.testing.expectError(error.UnsupportedPlatform, selectManifestDescriptor(allocator, unsupported, .{ .arch = .amd64 }));
 }
 
 test "OCI layout reader fails on digest mismatch" {

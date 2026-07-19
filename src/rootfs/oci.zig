@@ -1,6 +1,7 @@
 const std = @import("std");
 const architecture = @import("../architecture.zig");
 const image = @import("../image.zig");
+const image_gateway = @import("../image_gateway.zig");
 
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -105,11 +106,8 @@ pub const Descriptor = struct {
     platform: ?DescriptorPlatform = null,
 };
 
-pub const DescriptorPlatform = struct {
-    architecture: []const u8,
-    os: []const u8,
-    variant: ?[]const u8 = null,
-};
+pub const DescriptorPlatform = image_gateway.OciPlatform;
+const PlatformSelector = image_gateway.OciPlatformSelector;
 
 pub const ImageIndex = struct {
     schemaVersion: u32,
@@ -132,6 +130,27 @@ pub const LayerMetadata = struct {
     digest: []const u8,
 };
 
+/// Select one eligible image manifest using the gateway's platform
+/// normalization and ambiguity rules. Non-image descriptors and descriptors
+/// without platform metadata are not runtime image candidates.
+pub fn selectImageManifestIndex(manifests: []const Descriptor, platform: Platform) !usize {
+    var selector = try PlatformSelector.init(.{ .os = platform.os, .arch = platform.arch });
+    for (manifests, 0..) |desc, index| {
+        if (!isManifestMediaType(desc.mediaType)) continue;
+        const candidate = desc.platform orelse continue;
+        selector.consider(candidate, index) catch |err| return switch (err) {
+            error.AmbiguousPlatform => error.AmbiguousPlatformManifest,
+            else => err,
+        };
+    }
+    const index = selector.finish() catch |err| return switch (err) {
+        error.PlatformNotFound => error.PlatformManifestNotFound,
+        else => err,
+    };
+    if (!isSha256Digest(manifests[index].digest)) return error.UnsupportedDigest;
+    return index;
+}
+
 pub fn selectedManifestDigest(allocator: std.mem.Allocator, bytes: []const u8, platform: Platform) !?[]const u8 {
     if (!try jsonIsIndexMediaType(allocator, bytes)) return null;
 
@@ -139,15 +158,8 @@ pub fn selectedManifestDigest(allocator: std.mem.Allocator, bytes: []const u8, p
     defer parsed.deinit();
     if (parsed.value.schemaVersion != 2) return error.UnsupportedManifestSchema;
 
-    for (parsed.value.manifests) |desc| {
-        if (!isManifestMediaType(desc.mediaType)) continue;
-        const p = desc.platform orelse continue;
-        if (std.mem.eql(u8, p.os, platform.os) and std.mem.eql(u8, p.architecture, platform.arch.name())) {
-            if (!isSha256Digest(desc.digest)) return error.UnsupportedDigest;
-            return try allocator.dupe(u8, desc.digest);
-        }
-    }
-    return error.PlatformManifestNotFound;
+    const desc = parsed.value.manifests[try selectImageManifestIndex(parsed.value.manifests, platform)];
+    return try allocator.dupe(u8, desc.digest);
 }
 
 pub fn jsonIsIndexMediaType(allocator: std.mem.Allocator, bytes: []const u8) !bool {
@@ -374,6 +386,39 @@ test "manifest selection distinguishes both OCI architectures" {
     try std.testing.expectEqualStrings("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", amd64);
 }
 
+test "manifest selection normalizes variants and rejects ambiguity" {
+    const allocator = std.testing.allocator;
+    const arm64_v8 =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]}
+    ;
+    const selected = (try selectedManifestDigest(allocator, arm64_v8, .{})).?;
+    defer allocator.free(selected);
+    try std.testing.expectEqualStrings("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", selected);
+
+    const ambiguous =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]}
+    ;
+    try std.testing.expectError(error.AmbiguousPlatformManifest, selectedManifestDigest(allocator, ambiguous, .{}));
+
+    const unsupported =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64","variant":"v9"}}]}
+    ;
+    try std.testing.expectError(error.UnsupportedPlatform, selectedManifestDigest(allocator, unsupported, .{}));
+}
+
+test "manifest selection ignores non-runtime descriptors in a multi-platform index" {
+    const allocator = std.testing.allocator;
+    const index =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","platform":{"os":"unknown","architecture":"unknown"}},{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","platform":{"os":"linux","architecture":"arm64"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333","platform":{"os":"linux","architecture":"arm","variant":"v7"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"amd64"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]}
+    ;
+    const amd64 = (try selectedManifestDigest(allocator, index, .{ .arch = .amd64 })).?;
+    defer allocator.free(amd64);
+    const arm64 = (try selectedManifestDigest(allocator, index, .{ .arch = .arm64 })).?;
+    defer allocator.free(arm64);
+    try std.testing.expectEqualStrings("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", amd64);
+    try std.testing.expectEqualStrings("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", arm64);
+}
+
 test "OCI index detection accepts manifest arrays without mediaType" {
     const allocator = std.testing.allocator;
     try std.testing.expect(try jsonIsIndexMediaType(allocator,
@@ -406,6 +451,9 @@ fn fuzzOCIManifestJson(_: void, s: *std.testing.Smith) !void {
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);
     _ = jsonIsIndexMediaType(std.testing.allocator, buf[0..len]) catch {};
+    if (selectedManifestDigest(std.testing.allocator, buf[0..len], .{})) |selected| {
+        if (selected) |digest| std.testing.allocator.free(digest);
+    } else |_| {}
     const parsed = std.json.parseFromSlice(ImageManifest, std.testing.allocator, buf[0..len], .{
         .ignore_unknown_fields = true,
     }) catch return;
