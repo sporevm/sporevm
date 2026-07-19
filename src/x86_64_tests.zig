@@ -11,6 +11,7 @@ const profile_probe = @import("x86_64/profile_probe.zig");
 const profile_mailbox = @import("x86_64/profile_mailbox.zig");
 const profile_roundtrip = @import("x86_64/profile_roundtrip.zig");
 const profile_roundtrip_state = @import("x86_64/profile_roundtrip_state.zig");
+const profile_roundtrip_state_tests = @import("x86_64/profile_roundtrip_state_tests.zig");
 const kvm = @import("kvm/x86_64.zig");
 
 test {
@@ -27,5 +28,6 @@ test {
     _ = profile_mailbox;
     _ = profile_roundtrip;
     _ = profile_roundtrip_state;
+    _ = profile_roundtrip_state_tests;
     _ = kvm;
 }

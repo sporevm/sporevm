@@ -338,6 +338,47 @@ throughout the work.
   page before first run. The transient transfer objects and bucket were deleted
   and the bucket is proven absent; the task-owned native evidence remains
   retained on the dedicated host.
+- Stage 0b.3 approves `sporevm-x86_64-v0` for same-host capture and restore.
+  The profile fixes GenuineIntel CPUID with xAPIC topology, x87/SSE/AVX state
+  (`XCR0=0x7`, 832 architectural XSAVE bytes), a 3,000,000 kHz guest TSC, the
+  two proved KVM clock flags policies, 15 ordered MSRs, and a typed capability,
+  CPUID, MSR, XSAVE, TSC, and offset compatibility predicate. Its v3 task-local
+  codec records two complete, independent per-vCPU CPU/TSC/LAPIC/event/debug/MP
+  inventories plus VM-wide clock, PIC, IOAPIC, and PIT2 state without persisting
+  KVM structs or transfer-buffer padding. The configured CPUID remains distinct
+  from KVM's CR4/XCR0-derived effective readback, XSAVE records contain exactly
+  832 architectural bytes with checked metadata and reserved bytes, and active
+  SMM/SMI and triple-fault state fail closed. The dedicated host reports
+  `KVM_CAP_INTR_SHADOW=0`, but `KVM_GET_VCPU_EVENTS` supplies the canonical
+  validity flag and interrupt-shadow value, and the exact SET/GET round trip
+  succeeds through that API, so the absent legacy capability is not claimed.
+  The final ReleaseSafe harness SHA256 is
+  `a50a132bac47f2a55dab0c4e0bce9e1ed63834764f18e0318b557b52795f32d1`;
+  the initrd and managed bzImage retain their Stage 0b.2 hashes. Capture PID
+  126470 exited before restore PID 126479 started, and no source or residual
+  harness process existed at either boundary. The 67,117,792-byte private
+  single-link state file has SHA256
+  `627385f3a3b8d6eb1849d6fdd60e189721da034094e6db7c47b90ce8479adba1`.
+  Guest TSC advanced from 1490755458 to 5184221008, monotonic time from
+  223116978ns to 1454292198ns, boot time from 223117041ns to 1454292287ns,
+  and realtime from 1784452534772147745ns to 1784452536003322978ns. Capture
+  and restore strace SHA256 values are
+  `fe7199cc1a9f0f41c1b1814add01ae0068939fe888efb9d44fb0a29af7d0a2d6`
+  and `94d3fcad185734b2dc261e37d11dd152307e30c6c490ac9baf8b42478711577f`.
+  Restore sets both configured CPUID tables on lines 156 and 158, applies all
+  VM devices on lines 162-165, applies every BSP CPU/device class on lines
+  166-179 and every AP class on lines 180-193, then sets the clock on lines
+  194-195. It reads back the full BSP inventory on lines 199-211, the full AP
+  inventory on lines 212-224, and all VM devices on lines 225-228 before its
+  first and only `KVM_RUN` on line 229. The narrow candidate caused Linux to
+  issue one exact
+  `0x80 <- 0x00` legacy I/O-delay write while programming the in-kernel PIC;
+  that measured no-op tuple is now part of the finite PIO policy, while every
+  neighboring value and shape still fails closed. Anthropic Fable's first
+  review found the decode cleanup, XSAVE normalization, and duplicated LAPIC
+  validation defects fixed here; two post-fix Fable attempts were refused by
+  Anthropic's classifier before analysis, while the final local ship and
+  maintainability reviews approve with no material finding.
 
 ## Motivation
 
@@ -920,8 +961,11 @@ tuples:
 | write | `0x71` | 1 byte / 1 | `0x0a` or `0x00` | continue |
 | read | `0x64` | 1 byte / 1 | return `0x00` | continue |
 | write | `0x64` | 1 byte / 1 | `0xfe` | `guest_reset` |
+| write | `0x80` | 1 byte / 1 | `0x00` | continue (legacy I/O delay) |
 
-Every other direction, port, width, count, or value fails closed. The reboot
+Every other direction, port, width, count, or value fails closed. The port
+`0x80` tuple was added only after the Stage 0b.3 candidate profile produced it
+while initializing the in-kernel PIC; it carries no device state. The reboot
 probe uses the native kernel path with `reboot=kbd nox2apic`; the first exact
 `0x64 <- 0xfe` is terminal, so the later CMOS `0x8f` write observed only after
 the trace harness ignored ten reset requests is excluded. Native ACPI-less

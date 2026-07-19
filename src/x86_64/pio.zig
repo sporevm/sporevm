@@ -37,6 +37,9 @@ pub fn handle(access: Access) Error!Action {
             0x64 => if (access.data[0] == 0xfe) .guest_reset else error.UnsupportedPio,
             0x70 => if (access.data[0] == 0x0f) .continue_guest else error.UnsupportedPio,
             0x71 => if (access.data[0] == 0x0a or access.data[0] == 0x00) .continue_guest else error.UnsupportedPio,
+            // Linux uses a zero write to the legacy POST port as an I/O delay
+            // while programming the in-kernel PIC under the narrow v0 CPUID.
+            0x80 => if (access.data[0] == 0x00) .continue_guest else error.UnsupportedPio,
             else => error.UnsupportedPio,
         },
     };
@@ -49,6 +52,7 @@ test "finite policy accepts only the native boot and reset tuples" {
         .{ .direction = .write, .port = 0x71, .value = 0x0a, .action = .continue_guest },
         .{ .direction = .write, .port = 0x71, .value = 0x00, .action = .continue_guest },
         .{ .direction = .write, .port = 0x64, .value = 0xfe, .action = .guest_reset },
+        .{ .direction = .write, .port = 0x80, .value = 0x00, .action = .continue_guest },
     };
     for (cases) |case| {
         var data = [1]u8{case.value};
@@ -85,6 +89,7 @@ test "finite policy rejects nearby ports shapes directions and values" {
         .{ .direction = .read, .port = 0x71, .value = 0 },
         .{ .port = 0x70, .value = 0x8f },
         .{ .port = 0x71, .value = 0x01 },
+        .{ .port = 0x80, .value = 0x01 },
         .{ .data_len = 0 },
     };
     for (cases) |case| {
@@ -130,6 +135,7 @@ fn fuzzFinitePolicy(_: void, smith: *std.testing.Smith) !void {
             },
             0x70 => try std.testing.expectEqual(@as(u8, 0x0f), data[0]),
             0x71 => try std.testing.expect(data[0] == 0x0a or data[0] == 0x00),
+            0x80 => try std.testing.expectEqual(@as(u8, 0), data[0]),
             else => return error.TestUnexpectedResult,
         },
     }

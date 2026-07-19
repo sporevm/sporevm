@@ -21,6 +21,8 @@ pub const KVM_SET_USER_MEMORY_REGION = common.KVM_SET_USER_MEMORY_REGION;
 pub const KVM_SET_TSS_ADDR: u32 = 0xae47;
 pub const KVM_SET_IDENTITY_MAP_ADDR: u32 = 0x4008ae48;
 pub const KVM_CREATE_IRQCHIP: u32 = 0xae60;
+pub const KVM_GET_IRQCHIP: u32 = 0xc208ae62;
+pub const KVM_SET_IRQCHIP: u32 = 0x8208ae63;
 pub const KVM_IRQ_LINE = common.KVM_IRQ_LINE;
 pub const KVM_CREATE_PIT2: u32 = 0x4040ae77;
 pub const KVM_RUN = common.KVM_RUN;
@@ -33,6 +35,15 @@ pub const KVM_SET_MSRS: u32 = 0x4008ae89;
 pub const KVM_SET_CPUID2: u32 = 0x4008ae90;
 pub const KVM_GET_CPUID2: u32 = 0xc008ae91;
 pub const KVM_GET_MP_STATE: u32 = 0x8004ae98;
+pub const KVM_SET_MP_STATE: u32 = 0x4004ae99;
+pub const KVM_GET_LAPIC: u32 = 0x8400ae8e;
+pub const KVM_SET_LAPIC: u32 = 0x4400ae8f;
+pub const KVM_GET_PIT2: u32 = 0x8070ae9f;
+pub const KVM_SET_PIT2: u32 = 0x4070aea0;
+pub const KVM_GET_VCPU_EVENTS: u32 = 0x8040ae9f;
+pub const KVM_SET_VCPU_EVENTS: u32 = 0x4040aea0;
+pub const KVM_GET_DEBUGREGS: u32 = 0x8080aea1;
+pub const KVM_SET_DEBUGREGS: u32 = 0x4080aea2;
 pub const KVM_GET_XSAVE: u32 = 0x9000aea4;
 pub const KVM_SET_XSAVE: u32 = 0x5000aea5;
 pub const KVM_GET_XCRS: u32 = 0x8188aea6;
@@ -47,6 +58,7 @@ pub const KVM_SET_CLOCK: u32 = 0x4030ae7b;
 pub const KVM_GET_CLOCK: u32 = 0x8030ae7c;
 pub const KVM_SET_TSC_KHZ: u32 = 0xaea2;
 pub const KVM_GET_TSC_KHZ: u32 = 0xaea3;
+pub const KVM_ENABLE_CAP: u32 = 0x4068aea3;
 
 pub const KVM_EXIT_IO: u32 = 2;
 pub const KVM_EXIT_HLT: u32 = 5;
@@ -66,8 +78,13 @@ pub const KVM_CAP_CLOCKSOURCE: u32 = 8;
 pub const KVM_CAP_NR_VCPUS: u32 = 9;
 pub const KVM_CAP_MP_STATE: u32 = 14;
 pub const KVM_CAP_PIT2: u32 = 33;
+pub const KVM_CAP_PIT_STATE2: u32 = 35;
 pub const KVM_CAP_SET_IDENTITY_MAP_ADDR: u32 = 37;
 pub const KVM_CAP_ADJUST_CLOCK: u32 = 39;
+pub const KVM_CAP_VCPU_EVENTS: u32 = 41;
+pub const KVM_CAP_INTR_SHADOW: u32 = 49;
+pub const KVM_CAP_DEBUGREGS: u32 = 50;
+pub const KVM_CAP_ENABLE_CAP: u32 = 54;
 pub const KVM_CAP_XSAVE: u32 = 55;
 pub const KVM_CAP_XCRS: u32 = 56;
 pub const KVM_CAP_ASYNC_PF: u32 = 59;
@@ -76,9 +93,11 @@ pub const KVM_CAP_GET_TSC_KHZ: u32 = 61;
 pub const KVM_CAP_TSC_DEADLINE_TIMER: u32 = 72;
 pub const KVM_CAP_KVMCLOCK_CTRL: u32 = 76;
 pub const KVM_CAP_CHECK_EXTENSION_VM: u32 = 105;
+pub const KVM_CAP_ENABLE_CAP_VM: u32 = 98;
 pub const KVM_CAP_X2APIC_API: u32 = 129;
 pub const KVM_CAP_IMMEDIATE_EXIT: u32 = 136;
 pub const KVM_CAP_GET_MSR_FEATURES: u32 = 153;
+pub const KVM_CAP_EXCEPTION_PAYLOAD: u32 = 164;
 pub const KVM_CAP_ASYNC_PF_INT: u32 = 183;
 pub const KVM_CAP_STEAL_TIME: u32 = 187;
 pub const KVM_CAP_ENFORCE_PV_FEATURE_CPUID: u32 = 190;
@@ -96,6 +115,16 @@ pub const KVM_MP_STATE_UNINITIALIZED: u32 = 1;
 pub const KVM_MP_STATE_INIT_RECEIVED: u32 = 2;
 pub const KVM_MP_STATE_HALTED: u32 = 3;
 pub const KVM_MP_STATE_SIPI_RECEIVED: u32 = 4;
+pub const KVM_VCPUEVENT_VALID_NMI_PENDING: u32 = 1 << 0;
+pub const KVM_VCPUEVENT_VALID_SIPI_VECTOR: u32 = 1 << 1;
+pub const KVM_VCPUEVENT_VALID_SHADOW: u32 = 1 << 2;
+pub const KVM_VCPUEVENT_VALID_SMM: u32 = 1 << 3;
+pub const KVM_VCPUEVENT_VALID_PAYLOAD: u32 = 1 << 4;
+pub const KVM_VCPUEVENT_VALID_TRIPLE_FAULT: u32 = 1 << 5;
+pub const KVM_VCPUEVENT_VALID_MASK: u32 = (1 << 6) - 1;
+pub const KVM_IRQCHIP_PIC_MASTER: u32 = 0;
+pub const KVM_IRQCHIP_PIC_SLAVE: u32 = 1;
+pub const KVM_IRQCHIP_IOAPIC: u32 = 2;
 pub const KVM_VCPU_TSC_CTRL: u32 = 0;
 pub const KVM_VCPU_TSC_OFFSET: u64 = 0;
 
@@ -193,6 +222,125 @@ pub const DeviceAttr = common.DeviceAttr;
 pub const PitConfig = extern struct {
     flags: u32 = 0,
     padding: [15]u32 = @splat(0),
+};
+
+pub const PicState = extern struct {
+    last_irr: u8 = 0,
+    irr: u8 = 0,
+    imr: u8 = 0,
+    isr: u8 = 0,
+    priority_add: u8 = 0,
+    irq_base: u8 = 0,
+    read_reg_select: u8 = 0,
+    poll: u8 = 0,
+    special_mask: u8 = 0,
+    init_state: u8 = 0,
+    auto_eoi: u8 = 0,
+    rotate_on_auto_eoi: u8 = 0,
+    special_fully_nested_mode: u8 = 0,
+    init4: u8 = 0,
+    elcr: u8 = 0,
+    elcr_mask: u8 = 0,
+};
+
+pub const IoapicState = extern struct {
+    base_address: u64 = 0,
+    ioregsel: u32 = 0,
+    id: u32 = 0,
+    irr: u32 = 0,
+    padding: u32 = 0,
+    redirection_table: [24]u64 = @splat(0),
+};
+
+pub const Irqchip = extern struct {
+    chip_id: u32 = 0,
+    padding: u32 = 0,
+    chip: extern union {
+        dummy: [512]u8,
+        pic: PicState,
+        ioapic: IoapicState,
+    } = .{ .dummy = @splat(0) },
+};
+
+pub const PitChannelState = extern struct {
+    count: u32 = 0,
+    latched_count: u16 = 0,
+    count_latched: u8 = 0,
+    status_latched: u8 = 0,
+    status: u8 = 0,
+    read_state: u8 = 0,
+    write_state: u8 = 0,
+    write_latch: u8 = 0,
+    rw_mode: u8 = 0,
+    mode: u8 = 0,
+    bcd: u8 = 0,
+    gate: u8 = 0,
+    count_load_time: i64 = 0,
+};
+
+pub const PitState2 = extern struct {
+    channels: [3]PitChannelState = @splat(.{}),
+    flags: u32 = 0,
+    reserved: [9]u32 = @splat(0),
+};
+
+pub const LapicState = extern struct {
+    regs: [1024]u8 = @splat(0),
+};
+
+pub const VcpuEvents = extern struct {
+    pub const Exception = extern struct {
+        injected: u8 = 0,
+        nr: u8 = 0,
+        has_error_code: u8 = 0,
+        pending: u8 = 0,
+        error_code: u32 = 0,
+    };
+    pub const Interrupt = extern struct {
+        injected: u8 = 0,
+        nr: u8 = 0,
+        soft: u8 = 0,
+        shadow: u8 = 0,
+    };
+    pub const Nmi = extern struct {
+        injected: u8 = 0,
+        pending: u8 = 0,
+        masked: u8 = 0,
+        padding: u8 = 0,
+    };
+    pub const Smi = extern struct {
+        smm: u8 = 0,
+        pending: u8 = 0,
+        smm_inside_nmi: u8 = 0,
+        latched_init: u8 = 0,
+    };
+    pub const TripleFault = extern struct { pending: u8 = 0 };
+
+    exception: Exception = .{},
+    interrupt: Interrupt = .{},
+    nmi: Nmi = .{},
+    sipi_vector: u32 = 0,
+    flags: u32 = 0,
+    smi: Smi = .{},
+    triple_fault: TripleFault = .{},
+    reserved: [26]u8 = @splat(0),
+    exception_has_payload: u8 = 0,
+    exception_payload: u64 = 0,
+};
+
+pub const DebugRegs = extern struct {
+    db: [4]u64 = @splat(0),
+    dr6: u64 = 0,
+    dr7: u64 = 0,
+    flags: u64 = 0,
+    reserved: [9]u64 = @splat(0),
+};
+
+pub const EnableCap = extern struct {
+    cap: u32 = 0,
+    flags: u32 = 0,
+    args: [4]u64 = @splat(0),
+    padding: [64]u8 = @splat(0),
 };
 
 pub const Regs = extern struct {
@@ -672,6 +820,15 @@ test "x86 KVM UAPI layouts match Linux" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(UserspaceMemoryRegion));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(IrqLevel));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(PitConfig));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(PicState));
+    try std.testing.expectEqual(@as(usize, 216), @sizeOf(IoapicState));
+    try std.testing.expectEqual(@as(usize, 520), @sizeOf(Irqchip));
+    try std.testing.expectEqual(@as(usize, 24), @sizeOf(PitChannelState));
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(PitState2));
+    try std.testing.expectEqual(@as(usize, 1024), @sizeOf(LapicState));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(VcpuEvents));
+    try std.testing.expectEqual(@as(usize, 128), @sizeOf(DebugRegs));
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(EnableCap));
     try std.testing.expectEqual(@as(usize, 144), @sizeOf(Regs));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Segment));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Dtable));
@@ -679,6 +836,20 @@ test "x86 KVM UAPI layouts match Linux" {
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(CpuidEntry));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(MpState));
     try std.testing.expectEqual(@as(u32, 0x8004_ae98), KVM_GET_MP_STATE);
+    try std.testing.expectEqual(@as(u32, 0x4004_ae99), KVM_SET_MP_STATE);
+    try std.testing.expectEqual(@as(u32, 0xc208_ae62), KVM_GET_IRQCHIP);
+    try std.testing.expectEqual(@as(u32, 0x8208_ae63), KVM_SET_IRQCHIP);
+    try std.testing.expectEqual(@as(u32, 0x8070_ae9f), KVM_GET_PIT2);
+    try std.testing.expectEqual(@as(u32, 0x4070_aea0), KVM_SET_PIT2);
+    try std.testing.expectEqual(@as(u32, 0x8400_ae8e), KVM_GET_LAPIC);
+    try std.testing.expectEqual(@as(u32, 0x4400_ae8f), KVM_SET_LAPIC);
+    try std.testing.expectEqual(@as(u32, 0x8040_ae9f), KVM_GET_VCPU_EVENTS);
+    try std.testing.expectEqual(@as(u32, 0x4040_aea0), KVM_SET_VCPU_EVENTS);
+    try std.testing.expectEqual(@as(u32, 0x8080_aea1), KVM_GET_DEBUGREGS);
+    try std.testing.expectEqual(@as(u32, 0x4080_aea2), KVM_SET_DEBUGREGS);
+    try std.testing.expectEqual(@as(u32, 0x4068_aea3), KVM_ENABLE_CAP);
+    try std.testing.expectEqual(@as(usize, 20), @offsetOf(VcpuEvents, "flags"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(VcpuEvents, "exception_payload"));
     try std.testing.expectEqual(@as(u32, 136), KVM_CAP_IMMEDIATE_EXIT);
     try std.testing.expectEqual(@as(usize, 1), RunLayout.immediate_exit);
 }

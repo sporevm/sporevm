@@ -1,4 +1,4 @@
-//! Host-only Stage 0b.2 dirty-xstate and clock process-boundary proof.
+//! Host-only Stage 0b.3 candidate profile process-boundary proof.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -16,8 +16,6 @@ const ram_size: usize = 64 * 1024 * 1024;
 const board_vcpu_count: u8 = 2;
 const max_boot_file = 256 * 1024 * 1024;
 const msr_capacity = 256;
-const stage0b2_xcr0: u64 = 0x7;
-const stage0b2_xsave_layout_size: u32 = 832;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
@@ -67,15 +65,20 @@ fn capture(allocator: std.mem.Allocator, io: std.Io, kernel_path: []const u8, in
 
     var state = try captureState(allocator, &machine);
     defer state.deinit(allocator);
-    try validateStage0b2State(&state);
-    std.debug.print("sporevm kvm-profile-roundtrip: captured xstate_bv=0x{x} xcomp_bv=0x{x} xsave_bytes={d}\n", .{ state.xstate_bv, state.xcomp_bv, state.xsave.len });
+    try validateCandidateState(&state);
+    std.debug.print("sporevm kvm-profile-roundtrip: captured bsp_xstate_bv=0x{x} ap_xstate_bv=0x{x} bsp_xsave_bytes={d} ap_xsave_bytes={d}\n", .{ state.vcpus[0].xstate_bv, state.vcpus[1].xstate_bv, state.vcpus[0].xsave.len, state.vcpus[1].xsave.len });
+    std.debug.print("sporevm kvm-profile-roundtrip: machine bsp_mp={d} ap_mp={d} bsp_event_flags=0x{x} ap_event_flags=0x{x} bsp_shadow={d} ap_shadow={d} bsp_lapic_svr=0x{x} ap_lapic_svr=0x{x} ioapic_base=0x{x} pit0_mode={d} pit0_count={d}\n", .{
+        state.vcpus[0].mp_state,                state.vcpus[1].mp_state,                state.vcpus[0].events.flags,  state.vcpus[1].events.flags,
+        state.vcpus[0].events.interrupt_shadow, state.vcpus[1].events.interrupt_shadow, state.vcpus[0].lapic.svr,     state.vcpus[1].lapic.svr,
+        state.ioapic.base_address,              state.pit2.channels[0].mode,            state.pit2.channels[0].count,
+    });
     const capture_message = try mailbox.decode(@ptrCast(machine.mailbox_page.ptr), .capture_ready, nonce);
     if (capture_message.capture_tsc != result.capture_tsc) return error.MailboxChangedAfterBarrier;
     const encoded = try state_file.encode(allocator, &state);
     try writePrivateExclusive(allocator, output_path, encoded);
     const digest = sha256(encoded);
     std.debug.print("sporevm kvm-profile-roundtrip: phase=capture pid={d} nonce={x:0>16} state_bytes={d} state_sha256={s} xsave_bytes={d} msrs={d} capture_tsc={d} monotonic_ns={d} boottime_ns={d} realtime_ns={d} complete=true\n", .{
-        linux.getpid(),                             nonce,                                      encoded.len,                                &digest, state.xsave.len, state.msrs.len, capture_message.capture_tsc,
+        linux.getpid(),                             nonce,                                      encoded.len,                                &digest, state.vcpus[0].xsave.len, state.vcpus[0].msrs.len, capture_message.capture_tsc,
         clockNs(capture_message.capture_clocks[0]), clockNs(capture_message.capture_clocks[1]), clockNs(capture_message.capture_clocks[2]),
     });
 }
@@ -85,7 +88,7 @@ fn restore(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8) !vo
     const encoded = try readPrivateState(allocator, input_path);
     var state = try state_file.decode(allocator, encoded);
     defer state.deinit(allocator);
-    try validateStage0b2State(&state);
+    try validateCandidateState(&state);
     const capture_message = try mailbox.decode(&state.mailbox, .capture_ready, std.mem.readInt(u64, state.mailbox[24..32], .little));
 
     var machine = try createRestoredMachine(&state);
@@ -100,43 +103,56 @@ fn restore(allocator: std.mem.Allocator, io: std.Io, input_path: []const u8) !vo
     });
 }
 
-fn validateStage0b2State(state: *const state_file.State) !void {
-    if (state.ram.len != ram_size or state.cpuid.len == 0 or state.xstate_bv != 0x7 or state.xcomp_bv != 0) {
-        return error.UnexpectedStage0b2State;
+fn validateCandidateState(state: *const state_file.State) !void {
+    if (state.ram.len != ram_size) return error.UnexpectedCandidateState;
+    if (state.clock.flags != cpu_profile.capture_clock_flags) return error.UnexpectedClockFlags;
+    for (state.vcpus, 0..) |vcpu, index| try validateCandidateVcpu(vcpu, @intCast(index));
+    if (state.vcpus[0].mp_state != kvm.KVM_MP_STATE_RUNNABLE or state.vcpus[1].mp_state != kvm.KVM_MP_STATE_UNINITIALIZED) return error.UnexpectedMpState;
+    for (state.vcpus) |vcpu| {
+        if (vcpu.events.smm != 0 or vcpu.events.pending_smi != 0 or vcpu.events.smm_inside_nmi != 0 or vcpu.events.latched_init != 0 or vcpu.events.triple_fault_pending != 0) return error.UnsupportedVcpuEvent;
+        if (vcpu.events.flags & kvm.KVM_VCPUEVENT_VALID_SHADOW == 0 or vcpu.events.flags & kvm.KVM_VCPUEVENT_VALID_PAYLOAD == 0) return error.IncompleteVcpuEventState;
     }
-    if (state.xcrs.len != 1 or state.xcrs[0].index != 0 or state.xcrs[0].value != stage0b2_xcr0) {
-        return error.UnexpectedStage0b2State;
-    }
+    if (state.ioapic.base_address == 0) return error.ResetDeviceState;
+    for (state.vcpus) |vcpu| if (vcpu.lapic.version == 0 or vcpu.lapic.svr == 0) return error.ResetDeviceState;
+}
+
+fn validateCandidateVcpu(vcpu: state_file.VcpuMachineState, index: u8) !void {
+    if (vcpu.cpuid.len == 0 or vcpu.xcomp_bv != 0 or
+        vcpu.xcrs.len != 1 or vcpu.xcrs[0].index != 0 or vcpu.xcrs[0].value & 1 == 0 or
+        vcpu.xcrs[0].value & ~cpu_profile.xcr0 != 0 or vcpu.xstate_bv & ~vcpu.xcrs[0].value != 0 or
+        vcpu.tsc_khz != cpu_profile.guest_tsc_khz) return error.UnexpectedCandidateState;
     var saw_xsave_layout = false;
     var saw_ymm_layout = false;
-    for (state.cpuid) |entry| {
+    for (vcpu.cpuid) |entry| {
         if (entry.function == 7) {
             const ebx = if (entry.index == 0) @as(u32, 1) << 1 else 0;
-            if (entry.eax != 0 or entry.ebx != ebx or entry.ecx != 0 or entry.edx != 0) return error.UnexpectedStage0b2State;
+            if (entry.eax != 0 or entry.ebx != ebx or entry.ecx != 0 or entry.edx != 0) return error.UnexpectedCandidateState;
         } else if (entry.function == 0x0d) switch (entry.index) {
             0 => {
                 saw_xsave_layout = true;
-                if (entry.eax != @as(u32, @intCast(stage0b2_xcr0)) or entry.ebx != stage0b2_xsave_layout_size or entry.ecx != stage0b2_xsave_layout_size or entry.edx != 0) return error.UnexpectedStage0b2State;
+                if (entry.eax != @as(u32, @intCast(cpu_profile.xcr0)) or entry.ebx != cpu_profile.architectural_xsave_bytes or entry.ecx != cpu_profile.architectural_xsave_bytes or entry.edx != 0) return error.UnexpectedCandidateState;
             },
             2 => {
                 saw_ymm_layout = true;
-                if (entry.eax != 256 or entry.ebx != 576 or entry.ecx != 0 or entry.edx != 0) return error.UnexpectedStage0b2State;
+                if (entry.eax != 256 or entry.ebx != 576 or entry.ecx != 0 or entry.edx != 0) return error.UnexpectedCandidateState;
             },
-            else => if (entry.eax != 0 or entry.ebx != 0 or entry.ecx != 0 or entry.edx != 0) return error.UnexpectedStage0b2State,
+            else => if (entry.eax != 0 or entry.ebx != 0 or entry.ecx != 0 or entry.edx != 0) return error.UnexpectedCandidateState,
         };
     }
-    if (!saw_xsave_layout or !saw_ymm_layout) return error.UnexpectedStage0b2State;
-    for (state.msrs) |value| {
+    if (!saw_xsave_layout or !saw_ymm_layout) return error.UnexpectedCandidateState;
+    const expected_cpuid = try cpu_profile.candidateCpuid(board_vcpu_count, index);
+    const observed_cpuid = try stateCpuidToKvm(vcpu.cpuid);
+    if (!cpuidSetEqual(&expected_cpuid, &observed_cpuid)) return error.UnexpectedCandidateCpuid;
+    for (vcpu.msrs) |value| {
         var allowed = false;
-        for (cpu_profile.stage0b2_msr_inventory) |descriptor| {
-            if (descriptor.index == value.index and descriptor.disposition != .excluded) allowed = true;
+        for (cpu_profile.candidate_msrs) |descriptor| {
+            if (descriptor.index == value.index) allowed = true;
         }
-        if (!allowed) return error.UnexpectedStage0b2State;
+        if (!allowed) return error.UnexpectedCandidateState;
     }
-    for (cpu_profile.stage0b2_msr_inventory) |descriptor| {
-        if (descriptor.disposition != .required) continue;
+    for (cpu_profile.candidate_msrs) |descriptor| {
         var present = false;
-        for (state.msrs) |value| if (value.index == descriptor.index) {
+        for (vcpu.msrs) |value| if (value.index == descriptor.index) {
             present = true;
         };
         if (!present) return error.RequiredMsrMissing;
@@ -144,7 +160,7 @@ fn validateStage0b2State(state: *const state_file.State) !void {
 }
 
 fn createFreshMachine(kernel: []const u8, initrd: []const u8, cmdline: []const u8) !Machine {
-    var machine = try createBaseMachine(null, null);
+    var machine = try createBaseMachine(null);
     errdefer machine.deinit();
     _ = try boot.load(machine.ram, kernel, initrd, cmdline, board_vcpu_count);
     try configureProtectedMode(machine.vcpu_fds[0], try boot.plan(kernel, initrd.len, cmdline, ram_size, board_vcpu_count));
@@ -154,26 +170,32 @@ fn createFreshMachine(kernel: []const u8, initrd: []const u8, cmdline: []const u
 
 fn createRestoredMachine(state: *const state_file.State) !Machine {
     if (state.ram.len != ram_size) return error.UnexpectedRamSize;
-    var machine = try createBaseMachine(state.tsc_khz, state);
+    var machine = try createBaseMachine(state);
     errdefer machine.deinit();
-    if (state.xsave.len != machine.xsave_size) return error.XsaveSizeMismatch;
-    const xsave = try kvm.xsave2Buffer(state.xsave, machine.xsave_size);
     @memcpy(machine.ram, state.ram);
     @memcpy(machine.mailbox_page, &state.mailbox);
-    try applyCpuState(&machine, state, xsave);
+    try applyVmState(&machine, state);
+    try applyCpuState(&machine, state);
     return machine;
 }
 
-fn createBaseMachine(saved_tsc_khz: ?u64, saved: ?*const state_file.State) !Machine {
+fn createBaseMachine(saved: ?*const state_file.State) !Machine {
     const kvm_fd = try kvm.openDevKvm();
     errdefer _ = std.c.close(kvm_fd);
     try kvm.checkApiVersion(kvm_fd);
-    inline for (.{ kvm.KVM_CAP_USER_MEMORY, kvm.KVM_CAP_IRQCHIP, kvm.KVM_CAP_PIT2, kvm.KVM_CAP_EXT_CPUID, kvm.KVM_CAP_XSAVE, kvm.KVM_CAP_XCRS, kvm.KVM_CAP_IMMEDIATE_EXIT, kvm.KVM_CAP_KVMCLOCK_CTRL }) |cap| {
-        if (try kvm.checkExtension(kvm_fd, cap) == 0) return error.RequiredCapabilityMissing;
+    for (cpu_profile.required_capabilities) |required| {
+        const value = try kvm.checkExtension(kvm_fd, required.id);
+        if (value < required.minimum or value & required.required_bits != required.required_bits) {
+            std.debug.print("sporevm kvm-profile-roundtrip: required capability {s} ({d}) value={d} required_bits=0x{x}\n", .{ required.name, required.id, value, required.required_bits });
+            return error.RequiredCapabilityMissing;
+        }
     }
     const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
     errdefer _ = std.c.close(vm_fd);
-    const tsc_khz = saved_tsc_khz orelse try positiveIoctl(vm_fd, kvm.KVM_GET_TSC_KHZ, "KVM_GET_TSC_KHZ fresh VM");
+    var exception_payload = kvm.EnableCap{ .cap = kvm.KVM_CAP_EXCEPTION_PAYLOAD, .args = .{ 1, 0, 0, 0 } };
+    _ = try kvm.ioctl(vm_fd, kvm.KVM_ENABLE_CAP, @intFromPtr(&exception_payload), "KVM_ENABLE_CAP exception payload");
+    const tsc_khz = if (saved) |value| value.vcpus[0].tsc_khz else cpu_profile.guest_tsc_khz;
+    if (tsc_khz != cpu_profile.guest_tsc_khz) return error.UnexpectedTscFrequency;
     _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_TSC_KHZ, tsc_khz, "KVM_SET_TSC_KHZ VM before vCPUs");
     _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_TSS_ADDR, board.tss_addr, "KVM_SET_TSS_ADDR");
     var identity = board.identity_map_addr;
@@ -196,7 +218,6 @@ fn createBaseMachine(saved_tsc_khz: ?u64, saved: ?*const state_file.State) !Mach
     try installMemslot(vm_fd, 0, 0, ram);
     try installMemslot(vm_fd, 1, mailbox.mailbox_gpa, mailbox_page);
 
-    const supported = try kvm.getSupportedCpuid(kvm_fd);
     var cpuid: [board_vcpu_count]kvm.Cpuid = undefined;
     var fds: [board_vcpu_count]std.c.fd_t = @splat(-1);
     var created: usize = 0;
@@ -205,11 +226,11 @@ fn createBaseMachine(saved_tsc_khz: ?u64, saved: ?*const state_file.State) !Mach
     }
     while (created < board_vcpu_count) : (created += 1) {
         fds[created] = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, created, "KVM_CREATE_VCPU"));
-        cpuid[created] = if (created == 0 and saved != null)
-            try stateCpuidToKvm(saved.?.cpuid)
-        else
-            try kvm.normalizeSupportedCpuidTopology(supported, board_vcpu_count, @intCast(created));
-        if (saved == null or created != 0) filterStage0b2Cpuid(&cpuid[created]);
+        cpuid[created] = try cpu_profile.candidateCpuid(board_vcpu_count, @intCast(created));
+        if (saved) |value| {
+            const saved_cpuid = try stateCpuidToKvm(value.vcpus[created].cpuid);
+            if (!cpuidSetEqual(&cpuid[created], &saved_cpuid)) return error.SavedCpuidMismatch;
+        }
         _ = try kvm.ioctl(fds[created], kvm.KVM_SET_CPUID2, @intFromPtr(&cpuid[created]), "KVM_SET_CPUID2");
     }
     const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
@@ -220,92 +241,146 @@ fn createBaseMachine(saved_tsc_khz: ?u64, saved: ?*const state_file.State) !Mach
     return .{ .kvm_fd = kvm_fd, .vm_fd = vm_fd, .vcpu_fds = fds, .run = run, .ram = ram, .mailbox_page = mailbox_page, .cpuid = cpuid, .xsave_size = xsave_size };
 }
 
-fn filterStage0b2Cpuid(cpuid: *kvm.Cpuid) void {
-    for (cpuid.entries[0..cpuid.nent]) |*entry| {
-        if (entry.function == 7) {
-            // Keep only TSC_ADJUST. Structured extended features include
-            // stateful families such as AVX-512, PKRU, CET, UINTR, LBR, and
-            // AMX; the evidence-only 0b.2 contract does not expose them.
-            entry.eax = 0;
-            entry.ebx = if (entry.index == 0) @as(u32, 1) << 1 else 0;
-            entry.ecx = 0;
-            entry.edx = 0;
-        } else if (entry.function == 0x0d and entry.index == 0) {
-            entry.eax = @intCast(stage0b2_xcr0);
-            entry.ebx = stage0b2_xsave_layout_size;
-            entry.ecx = stage0b2_xsave_layout_size;
-            entry.edx = 0;
-        } else if (entry.function == 0x0d and entry.index == 2) {
-            entry.eax = 256;
-            entry.ebx = 576;
-            entry.ecx = 0;
-            entry.edx = 0;
-        } else if (entry.function == 0x0d) {
-            entry.eax = 0;
-            entry.ebx = 0;
-            entry.ecx = 0;
-            entry.edx = 0;
-        }
+fn applyCpuState(machine: *Machine, state: *const state_file.State) !void {
+    for (machine.vcpu_fds, state.vcpus) |fd, vcpu| {
+        const sregs = stateSregsToKvm(vcpu.sregs);
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_SREGS, @intFromPtr(&sregs), "KVM_SET_SREGS restore");
+        var xcrs = stateXcrsToKvm(vcpu.xcrs);
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_XCRS, @intFromPtr(&xcrs), "KVM_SET_XCRS restore");
+        var xsave_transfer: [state_file.max_xsave_bytes]u8 = @splat(0);
+        @memcpy(xsave_transfer[0..vcpu.xsave.len], vcpu.xsave);
+        const xsave = try kvm.xsave2Buffer(&xsave_transfer, machine.xsave_size);
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_XSAVE, @intFromPtr(xsave.ptr), "KVM_SET_XSAVE restore");
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_TSC_KHZ, vcpu.tsc_khz, "KVM_SET_TSC_KHZ restore");
+        try restoreMsrs(fd, vcpu.msrs);
+        try kvm.setTscOffset(fd, @bitCast(vcpu.tsc_offset));
+        var regs = stateGprsToKvm(vcpu.gprs);
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_REGS, @intFromPtr(&regs), "KVM_SET_REGS restore");
+        var lapic = stateLapicToKvm(vcpu.lapic);
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_LAPIC, @intFromPtr(&lapic), "KVM_SET_LAPIC restore");
+        var debug = stateDebugToKvm(vcpu.debug);
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_DEBUGREGS, @intFromPtr(&debug), "KVM_SET_DEBUGREGS restore");
+        var events = try stateEventsToKvm(vcpu.events);
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_VCPU_EVENTS, @intFromPtr(&events), "KVM_SET_VCPU_EVENTS restore");
+        var mp = kvm.MpState{ .mp_state = vcpu.mp_state };
+        _ = try kvm.ioctl(fd, kvm.KVM_SET_MP_STATE, @intFromPtr(&mp), "KVM_SET_MP_STATE restore");
     }
-}
-
-fn applyCpuState(machine: *Machine, state: *const state_file.State, xsave: []const u8) !void {
-    const sregs = stateSregsToKvm(state.sregs);
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_SET_SREGS, @intFromPtr(&sregs), "KVM_SET_SREGS restore");
-    var xcrs = stateXcrsToKvm(state.xcrs);
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_SET_XCRS, @intFromPtr(&xcrs), "KVM_SET_XCRS restore");
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_SET_XSAVE, @intFromPtr(xsave.ptr), "KVM_SET_XSAVE restore");
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_SET_TSC_KHZ, state.tsc_khz, "KVM_SET_TSC_KHZ BSP");
-    try restoreMsrs(machine.vcpu_fds[0], state.msrs);
-    try kvm.setTscOffset(machine.vcpu_fds[0], @bitCast(state.tsc_offset));
-    var regs = stateGprsToKvm(state.gprs);
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_SET_REGS, @intFromPtr(&regs), "KVM_SET_REGS restore");
     var clock = stateClockToKvm(state.clock);
     _ = try kvm.ioctl(machine.vm_fd, kvm.KVM_SET_CLOCK, @intFromPtr(&clock), "KVM_SET_CLOCK restore");
     _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_KVMCLOCK_CTRL, 0, "KVM_KVMCLOCK_CTRL restore");
 }
 
 fn captureState(allocator: std.mem.Allocator, machine: *Machine) !state_file.State {
-    var regs: kvm.Regs = undefined;
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_GET_REGS, @intFromPtr(&regs), "KVM_GET_REGS capture");
-    var sregs: kvm.Sregs = undefined;
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_GET_SREGS, @intFromPtr(&sregs), "KVM_GET_SREGS capture");
-    var effective = kvm.Cpuid{};
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_GET_CPUID2, @intFromPtr(&effective), "KVM_GET_CPUID2 capture");
-    const cpuid = try kvmCpuidToState(allocator, &effective);
-    errdefer allocator.free(cpuid);
-    var xcrs_raw = kvm.Xcrs{};
-    _ = try kvm.ioctl(machine.vcpu_fds[0], kvm.KVM_GET_XCRS, @intFromPtr(&xcrs_raw), "KVM_GET_XCRS capture");
-    const xcrs = try kvmXcrsToState(allocator, &xcrs_raw);
-    errdefer allocator.free(xcrs);
-    const xsave_storage = try allocator.alloc(u8, machine.xsave_size);
-    const xsave = try kvm.xsave2Buffer(xsave_storage, machine.xsave_size);
-    errdefer allocator.free(xsave);
-    const get_xsave = if (machine.xsave_size == @sizeOf(kvm.Xsave)) kvm.KVM_GET_XSAVE else kvm.KVM_GET_XSAVE2;
-    _ = try kvm.ioctl(machine.vcpu_fds[0], get_xsave, @intFromPtr(xsave.ptr), "KVM_GET_XSAVE capture");
-    const msrs = try captureMsrs(allocator, machine.kvm_fd, machine.vcpu_fds[0]);
-    errdefer allocator.free(msrs);
-    const tsc_khz = try positiveIoctl(machine.vcpu_fds[0], kvm.KVM_GET_TSC_KHZ, "KVM_GET_TSC_KHZ capture");
-    const tsc_offset: i64 = @bitCast(try kvm.getTscOffset(machine.vcpu_fds[0]));
     var clock: kvm.ClockData = .{};
     _ = try kvm.ioctl(machine.vm_fd, kvm.KVM_GET_CLOCK, @intFromPtr(&clock), "KVM_GET_CLOCK capture");
+    var vcpus: [board_vcpu_count]state_file.VcpuMachineState = undefined;
+    var captured: usize = 0;
+    errdefer for (&vcpus, 0..) |*vcpu, index| {
+        if (index >= captured) break;
+        vcpu.deinit(allocator);
+    };
+    while (captured < board_vcpu_count) : (captured += 1) {
+        vcpus[captured] = try captureVcpuMachineState(allocator, machine, captured);
+    }
+    const pic_master = try capturePic(machine.vm_fd, kvm.KVM_IRQCHIP_PIC_MASTER);
+    const pic_slave = try capturePic(machine.vm_fd, kvm.KVM_IRQCHIP_PIC_SLAVE);
+    const ioapic = try captureIoapic(machine.vm_fd);
+    var pit_raw = kvm.PitState2{};
+    _ = try kvm.ioctl(machine.vm_fd, kvm.KVM_GET_PIT2, @intFromPtr(&pit_raw), "KVM_GET_PIT2 capture");
+    for (pit_raw.reserved) |word| if (word != 0) return error.UnsupportedPitState;
     const ram = try allocator.dupe(u8, machine.ram);
     errdefer allocator.free(ram);
+    return .{
+        .clock = kvmClockToState(clock),
+        .vcpus = vcpus,
+        .pic_master = pic_master,
+        .pic_slave = pic_slave,
+        .ioapic = ioapic,
+        .pit2 = kvmPitToState(pit_raw),
+        .mailbox = machine.mailbox_page[0..mailbox.page_size].*,
+        .ram = ram,
+    };
+}
+
+fn applyVmState(machine: *Machine, state: *const state_file.State) !void {
+    var master = statePicToKvm(kvm.KVM_IRQCHIP_PIC_MASTER, state.pic_master);
+    _ = try kvm.ioctl(machine.vm_fd, kvm.KVM_SET_IRQCHIP, @intFromPtr(&master), "KVM_SET_IRQCHIP PIC master");
+    var slave = statePicToKvm(kvm.KVM_IRQCHIP_PIC_SLAVE, state.pic_slave);
+    _ = try kvm.ioctl(machine.vm_fd, kvm.KVM_SET_IRQCHIP, @intFromPtr(&slave), "KVM_SET_IRQCHIP PIC slave");
+    var ioapic = stateIoapicToKvm(state.ioapic);
+    _ = try kvm.ioctl(machine.vm_fd, kvm.KVM_SET_IRQCHIP, @intFromPtr(&ioapic), "KVM_SET_IRQCHIP IOAPIC");
+    var pit = statePitToKvm(state.pit2);
+    _ = try kvm.ioctl(machine.vm_fd, kvm.KVM_SET_PIT2, @intFromPtr(&pit), "KVM_SET_PIT2 restore");
+}
+
+fn captureVcpuMachineState(allocator: std.mem.Allocator, machine: *Machine, index: usize) !state_file.VcpuMachineState {
+    const fd = machine.vcpu_fds[index];
+    var regs: kvm.Regs = undefined;
+    _ = try kvm.ioctl(fd, kvm.KVM_GET_REGS, @intFromPtr(&regs), "KVM_GET_REGS capture");
+    var sregs: kvm.Sregs = undefined;
+    _ = try kvm.ioctl(fd, kvm.KVM_GET_SREGS, @intFromPtr(&sregs), "KVM_GET_SREGS capture");
+    var xcrs_raw = kvm.Xcrs{};
+    _ = try kvm.ioctl(fd, kvm.KVM_GET_XCRS, @intFromPtr(&xcrs_raw), "KVM_GET_XCRS capture");
+    const xcrs = try kvmXcrsToState(allocator, &xcrs_raw);
+    errdefer allocator.free(xcrs);
+    var effective = kvm.Cpuid{};
+    _ = try kvm.ioctl(fd, kvm.KVM_GET_CPUID2, @intFromPtr(&effective), "KVM_GET_CPUID2 capture");
+    if (!effectiveCpuidMatches(&machine.cpuid[index], &effective, sregs, xcrs)) {
+        logCpuidDifference(index, &machine.cpuid[index], &effective);
+        return error.EffectiveCpuidMismatch;
+    }
+    const cpuid = try kvmCpuidToState(allocator, &machine.cpuid[index]);
+    errdefer allocator.free(cpuid);
+    const xsave_transfer_storage = try allocator.alloc(u8, machine.xsave_size);
+    defer allocator.free(xsave_transfer_storage);
+    @memset(xsave_transfer_storage, 0);
+    const xsave_transfer = try kvm.xsave2Buffer(xsave_transfer_storage, machine.xsave_size);
+    const get_xsave = if (machine.xsave_size == @sizeOf(kvm.Xsave)) kvm.KVM_GET_XSAVE else kvm.KVM_GET_XSAVE2;
+    _ = try kvm.ioctl(fd, get_xsave, @intFromPtr(xsave_transfer.ptr), "KVM_GET_XSAVE capture");
+    const xstate_bv = readInt(u64, xsave_transfer, 512);
+    const xcomp_bv = readInt(u64, xsave_transfer, 520);
+    try state_file.validateXsaveBytes(xsave_transfer[0..state_file.xsave_avx_end], xstate_bv, xcomp_bv);
+    for (xsave_transfer[state_file.xsave_avx_end..]) |byte| if (byte != 0) return error.NonzeroXsavePadding;
+    const xsave = try allocator.dupe(u8, xsave_transfer[0..state_file.xsave_avx_end]);
+    errdefer allocator.free(xsave);
+    const msrs = try captureMsrs(allocator, machine.kvm_fd, fd);
+    errdefer allocator.free(msrs);
+    var lapic = kvm.LapicState{};
+    _ = try kvm.ioctl(fd, kvm.KVM_GET_LAPIC, @intFromPtr(&lapic), "KVM_GET_LAPIC capture");
+    var events = kvm.VcpuEvents{};
+    _ = try kvm.ioctl(fd, kvm.KVM_GET_VCPU_EVENTS, @intFromPtr(&events), "KVM_GET_VCPU_EVENTS capture");
+    var debug = kvm.DebugRegs{};
+    _ = try kvm.ioctl(fd, kvm.KVM_GET_DEBUGREGS, @intFromPtr(&debug), "KVM_GET_DEBUGREGS capture");
     return .{
         .cpuid = cpuid,
         .gprs = kvmGprsToState(regs),
         .sregs = kvmSregsToState(sregs),
         .xcrs = xcrs,
         .xsave = xsave,
-        .xstate_bv = readInt(u64, xsave, 512),
-        .xcomp_bv = readInt(u64, xsave, 520),
+        .xstate_bv = xstate_bv,
+        .xcomp_bv = xcomp_bv,
         .msrs = msrs,
-        .tsc_khz = tsc_khz,
-        .tsc_offset = tsc_offset,
-        .clock = kvmClockToState(clock),
-        .mailbox = machine.mailbox_page[0..mailbox.page_size].*,
-        .ram = ram,
+        .tsc_khz = try positiveIoctl(fd, kvm.KVM_GET_TSC_KHZ, "KVM_GET_TSC_KHZ capture"),
+        .tsc_offset = @bitCast(try kvm.getTscOffset(fd)),
+        .mp_state = (try kvm.getMpState(fd)).mp_state,
+        .lapic = kvmLapicToState(lapic),
+        .events = try kvmEventsToState(events),
+        .debug = try kvmDebugToState(debug),
     };
+}
+
+fn capturePic(vm_fd: std.c.fd_t, chip_id: u32) !state_file.Pic {
+    var chip = kvm.Irqchip{ .chip_id = chip_id };
+    _ = try kvm.ioctl(vm_fd, kvm.KVM_GET_IRQCHIP, @intFromPtr(&chip), "KVM_GET_IRQCHIP PIC capture");
+    if (chip.padding != 0) return error.UnsupportedIrqchipState;
+    return kvmPicToState(chip.chip.pic);
+}
+
+fn captureIoapic(vm_fd: std.c.fd_t) !state_file.Ioapic {
+    var chip = kvm.Irqchip{ .chip_id = kvm.KVM_IRQCHIP_IOAPIC };
+    _ = try kvm.ioctl(vm_fd, kvm.KVM_GET_IRQCHIP, @intFromPtr(&chip), "KVM_GET_IRQCHIP IOAPIC capture");
+    if (chip.padding != 0 or chip.chip.ioapic.padding != 0) return error.UnsupportedIrqchipState;
+    return kvmIoapicToState(chip.chip.ioapic);
 }
 
 fn runUntilDoorbell(machine: *Machine, phase: mailbox.Phase, nonce: u64) !mailbox.Message {
@@ -315,13 +390,16 @@ fn runUntilDoorbell(machine: *Machine, phase: mailbox.Phase, nonce: u64) !mailbo
         switch (kvm.exitReason(machine.run)) {
             kvm.KVM_EXIT_IO => {
                 const exit = try kvm.decodeIoExit(machine.run);
-                const action = try pio.handle(.{
+                const action = pio.handle(.{
                     .direction = if (exit.direction == .read) .read else .write,
                     .width = exit.width,
                     .port = exit.port,
                     .count = exit.count,
                     .data = exit.data,
-                });
+                }) catch |err| {
+                    std.debug.print("sporevm kvm-profile-roundtrip: rejected PIO direction={s} width={d} port=0x{x} count={d} data={any}\n", .{ @tagName(exit.direction), exit.width, exit.port, exit.count, exit.data });
+                    return err;
+                };
                 if (action != .continue_guest) return error.UnexpectedGuestReset;
             },
             kvm.KVM_EXIT_MMIO => {
@@ -353,11 +431,9 @@ fn captureMsrs(allocator: std.mem.Allocator, kvm_fd: std.c.fd_t, vcpu_fd: std.c.
     const advertised = try kvm.getMsrIndexList(kvm_fd, kvm.KVM_GET_MSR_INDEX_LIST, msr_capacity, &list, "KVM_GET_MSR_INDEX_LIST roundtrip");
     var batch = kvm.MsrBatch(msr_capacity){};
     var count: usize = 0;
-    for (cpu_profile.stage0b2_msr_inventory) |descriptor| {
-        if (descriptor.disposition == .excluded) continue;
+    for (cpu_profile.candidate_msrs) |descriptor| {
         const present = std.mem.indexOfScalar(u32, advertised, descriptor.index) != null;
-        if (!present and descriptor.disposition == .required) return error.RequiredMsrMissing;
-        if (!present) continue;
+        if (!present) return error.RequiredMsrMissing;
         batch.entries[count].index = descriptor.index;
         count += 1;
     }
@@ -375,11 +451,11 @@ fn captureMsrs(allocator: std.mem.Allocator, kvm_fd: std.c.fd_t, vcpu_fd: std.c.
 }
 
 fn restoreMsrs(vcpu_fd: std.c.fd_t, values: []const state_file.Msr) !void {
-    for ([_]cpu_profile.Stage0b2MsrOrder{ .kernel, .paravirtual, .tsc_adjust, .tsc }) |order| {
+    for ([_]cpu_profile.MsrRestoreOrder{ .kernel, .paravirtual, .tsc_adjust, .tsc }) |order| {
         var batch = kvm.MsrBatch(msr_capacity){};
         var count: usize = 0;
-        for (cpu_profile.stage0b2_msr_inventory) |descriptor| {
-            if (descriptor.order != order or descriptor.disposition == .excluded) continue;
+        for (cpu_profile.candidate_msrs) |descriptor| {
+            if (descriptor.order != order) continue;
             for (values) |value| if (value.index == descriptor.index) {
                 batch.entries[count] = .{ .index = value.index, .data = value.value };
                 count += 1;
@@ -395,14 +471,17 @@ fn restoreMsrs(vcpu_fd: std.c.fd_t, values: []const state_file.Msr) !void {
 fn compareRestoredState(allocator: std.mem.Allocator, machine: *Machine, expected: *const state_file.State) !void {
     var actual = try captureState(allocator, machine);
     defer actual.deinit(allocator);
-    const gprs_equal = std.meta.eql(expected.gprs, actual.gprs);
-    const sregs_equal = stage0b2SregsEqual(expected.sregs, actual.sregs);
-    const cpuid_equal = structSlicesEqual(state_file.CpuidEntry, expected.cpuid, actual.cpuid);
-    const xcrs_equal = structSlicesEqual(state_file.Xcr, expected.xcrs, actual.xcrs);
-    const xsave_equal = std.mem.eql(u8, expected.xsave, actual.xsave);
-    const msrs_equal = stage0b2MsrsEqual(expected.msrs, actual.msrs);
-    const tsc_equal = expected.tsc_khz == actual.tsc_khz and expected.tsc_offset == actual.tsc_offset;
     const mailbox_equal = std.mem.eql(u8, &expected.mailbox, &actual.mailbox);
+    var vcpus_equal = true;
+    for (expected.vcpus, actual.vcpus, 0..) |left, right, index| {
+        if (!vcpuStateEqual(left, right)) {
+            vcpus_equal = false;
+            std.debug.print("sporevm kvm-profile-roundtrip: vcpu={d} restore-readback mismatch expected_rip=0x{x} actual_rip=0x{x}\n", .{ index, left.gprs.rip, right.gprs.rip });
+            if (!candidateSregsEqual(left.sregs, right.sregs)) logSregsDifference(left.sregs, right.sregs);
+        }
+    }
+    const irqchip_equal = std.meta.eql(expected.pic_master, actual.pic_master) and std.meta.eql(expected.pic_slave, actual.pic_slave) and std.meta.eql(expected.ioapic, actual.ioapic);
+    const pit_equal = pitStateEqual(expected.pit2, actual.pit2);
     // Restoring MSR_KVM_WALL_CLOCK_NEW synchronously rewrites its guest
     // pvclock page, so whole-RAM byte equality is not a valid pre-run
     // invariant after restoreMsrs. The state checksum protects the saved RAM;
@@ -411,17 +490,59 @@ fn compareRestoredState(allocator: std.mem.Allocator, machine: *Machine, expecte
     // following GET_CLOCK reports flags=0 on this kernel. The comparable
     // invariant is the guest clock value; Stage 0b.3 owns the final flag policy.
     const clock_valid = actual.clock.clock >= expected.clock.clock;
-    if (!gprs_equal or !sregs_equal or !cpuid_equal or !xcrs_equal or !xsave_equal or !msrs_equal or !tsc_equal or !mailbox_equal or !clock_valid) {
-        std.debug.print("sporevm kvm-profile-roundtrip: restore-readback gprs={} sregs={} cpuid={} xcrs={} xsave={} msrs={} tsc={} mailbox={} clock={} expected_rip=0x{x} actual_rip=0x{x}\n", .{
-            gprs_equal, sregs_equal, cpuid_equal, xcrs_equal, xsave_equal, msrs_equal, tsc_equal, mailbox_equal, clock_valid, expected.gprs.rip, actual.gprs.rip,
-        });
-        if (!sregs_equal) logSregsDifference(expected.sregs, actual.sregs);
+    if (!mailbox_equal or !vcpus_equal or !irqchip_equal or !pit_equal or !clock_valid) {
+        std.debug.print("sporevm kvm-profile-roundtrip: restore-readback mailbox={} vcpus={} irqchip={} pit={} clock={}\n", .{ mailbox_equal, vcpus_equal, irqchip_equal, pit_equal, clock_valid });
         if (!clock_valid) std.debug.print("clock expected={any} actual={any}\n", .{ expected.clock, actual.clock });
         return error.RestoreReadbackMismatch;
     }
 }
 
-fn stage0b2MsrsEqual(expected: []const state_file.Msr, actual: []const state_file.Msr) bool {
+fn vcpuStateEqual(expected_value: state_file.VcpuMachineState, actual_value: state_file.VcpuMachineState) bool {
+    if (!std.meta.eql(expected_value.gprs, actual_value.gprs) or
+        !candidateSregsEqual(expected_value.sregs, actual_value.sregs) or
+        !structSlicesEqual(state_file.CpuidEntry, expected_value.cpuid, actual_value.cpuid) or
+        !structSlicesEqual(state_file.Xcr, expected_value.xcrs, actual_value.xcrs) or
+        !std.mem.eql(u8, expected_value.xsave, actual_value.xsave) or
+        !candidateMsrsEqual(expected_value.msrs, actual_value.msrs) or
+        expected_value.tsc_khz != actual_value.tsc_khz or
+        expected_value.tsc_offset != actual_value.tsc_offset) return false;
+    var left = expected_value;
+    var right = actual_value;
+    // Dynamic slices were compared above and are not part of the semantic
+    // scalar/device comparison below.
+    left.cpuid = &.{};
+    right.cpuid = &.{};
+    left.xcrs = &.{};
+    right.xcrs = &.{};
+    left.xsave = &.{};
+    right.xsave = &.{};
+    left.msrs = &.{};
+    right.msrs = &.{};
+    // The running LAPIC timer advances between SET_LAPIC and GET_LAPIC;
+    // its programmed mode and initial count remain exact.
+    left.lapic.current_count = 0;
+    right.lapic.current_count = 0;
+    // APR/PPR are derived by KVM from TPR and the in-service bitmap.
+    left.lapic.apr = 0;
+    right.lapic.apr = 0;
+    left.lapic.ppr = 0;
+    right.lapic.ppr = 0;
+    return std.meta.eql(left, right);
+}
+
+fn pitStateEqual(expected_value: state_file.Pit2, actual_value: state_file.Pit2) bool {
+    var expected = expected_value;
+    var actual = actual_value;
+    // KVM re-anchors the host monotonic timestamp used to advance each PIT
+    // channel while preserving the guest-visible counter and mode.
+    for (&expected.channels, &actual.channels) |*left, *right| {
+        left.count_load_time = 0;
+        right.count_load_time = 0;
+    }
+    return std.meta.eql(expected, actual);
+}
+
+fn candidateMsrsEqual(expected: []const state_file.Msr, actual: []const state_file.Msr) bool {
     if (expected.len != actual.len) return false;
     for (expected, actual) |left, right| {
         if (left.index != right.index) return false;
@@ -444,7 +565,7 @@ fn logSregsDifference(expected: state_file.Sregs, actual: state_file.Sregs) void
     if (!std.meta.eql(expected.idt, actual.idt)) std.debug.print("sregs idt expected={any} actual={any}\n", .{ expected.idt, actual.idt });
 }
 
-fn stage0b2SregsEqual(expected_value: state_file.Sregs, actual_value: state_file.Sregs) bool {
+fn candidateSregsEqual(expected_value: state_file.Sregs, actual_value: state_file.Sregs) bool {
     var expected = expected_value;
     var actual = actual_value;
     // Pending interrupts belong to the LAPIC/event inventory deferred to
@@ -538,6 +659,66 @@ fn stateCpuidToKvm(entries: []const state_file.CpuidEntry) !kvm.Cpuid {
     return result;
 }
 
+fn cpuidEqual(left: *const kvm.Cpuid, right: *const kvm.Cpuid) bool {
+    if (left.nent != right.nent) return false;
+    for (left.entries[0..left.nent], right.entries[0..right.nent]) |a, b| {
+        inline for (.{ "function", "index", "flags", "eax", "ebx", "ecx", "edx" }) |name| {
+            if (@field(a, name) != @field(b, name)) return false;
+        }
+    }
+    return true;
+}
+
+fn cpuidSetEqual(left: *const kvm.Cpuid, right: *const kvm.Cpuid) bool {
+    if (left.nent != right.nent) return false;
+    for (left.entries[0..left.nent]) |a| {
+        var found = false;
+        for (right.entries[0..right.nent]) |b| {
+            if (a.function != b.function or a.index != b.index) continue;
+            found = true;
+            inline for (.{ "flags", "eax", "ebx", "ecx", "edx" }) |name| {
+                if (@field(a, name) != @field(b, name)) return false;
+            }
+            break;
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn effectiveCpuidMatches(configured: *const kvm.Cpuid, effective: *const kvm.Cpuid, sregs: kvm.Sregs, xcrs: []const state_file.Xcr) bool {
+    var expected = configured.*;
+    var xcr0: u64 = 1;
+    for (xcrs) |entry| {
+        if (entry.index == 0) xcr0 = entry.value;
+    }
+    for (expected.entries[0..expected.nent]) |*entry| {
+        if (entry.function == 1 and entry.index == 0) {
+            const osxsave = @as(u32, 1) << 27;
+            if (sregs.cr4 & (@as(u64, 1) << 18) == 0) entry.ecx &= ~osxsave else entry.ecx |= osxsave;
+        } else if (entry.function == 0x0d and entry.index == 0) {
+            entry.ebx = @as(u32, state_file.xsave_legacy_and_header_bytes) + if (xcr0 & 0b100 != 0) @as(u32, 256) else 0;
+        }
+    }
+    return cpuidSetEqual(&expected, effective);
+}
+
+fn logCpuidDifference(index: usize, expected: *const kvm.Cpuid, actual: *const kvm.Cpuid) void {
+    std.debug.print("sporevm kvm-profile-roundtrip: vcpu={d} effective CPUID mismatch expected_entries={d} actual_entries={d}\n", .{ index, expected.nent, actual.nent });
+    for (expected.entries[0..expected.nent]) |entry| {
+        var found: ?kvm.CpuidEntry = null;
+        for (actual.entries[0..actual.nent]) |candidate| {
+            if (candidate.function == entry.function and candidate.index == entry.index) {
+                found = candidate;
+                break;
+            }
+        }
+        if (found == null or !std.meta.eql(entry, found.?)) {
+            std.debug.print("expected cpuid fn=0x{x} index={d} value={any} actual={any}\n", .{ entry.function, entry.index, entry, found });
+        }
+    }
+}
+
 fn kvmXcrsToState(allocator: std.mem.Allocator, raw: *const kvm.Xcrs) ![]state_file.Xcr {
     const count: usize = @intCast(raw.nr_xcrs);
     if (count > raw.xcrs.len) return error.XcrsTooLarge;
@@ -599,7 +780,127 @@ fn kvmClockToState(v: kvm.ClockData) state_file.Clock {
     return .{ .clock = v.clock, .flags = v.flags, .realtime = v.realtime, .host_tsc = v.host_tsc };
 }
 fn stateClockToKvm(v: state_file.Clock) kvm.ClockData {
-    return .{ .clock = v.clock, .flags = v.flags, .realtime = v.realtime, .host_tsc = v.host_tsc };
+    return .{ .clock = v.clock, .flags = cpu_profile.restore_clock_flags, .realtime = v.realtime };
+}
+
+fn lapicRead(raw: *const kvm.LapicState, offset: usize) u32 {
+    return std.mem.readInt(u32, raw.regs[offset..][0..4], .little);
+}
+
+fn lapicWrite(raw: *kvm.LapicState, offset: usize, value: u32) void {
+    std.mem.writeInt(u32, raw.regs[offset..][0..4], value, .little);
+}
+
+const lapic_scalar_mappings = .{
+    .{ 0x20, "id" },         .{ 0x30, "version" },        .{ 0x80, "tpr" },            .{ 0x90, "apr" },              .{ 0xa0, "ppr" },        .{ 0xb0, "eoi" },
+    .{ 0xd0, "ldr" },        .{ 0xe0, "dfr" },            .{ 0xf0, "svr" },            .{ 0x280, "esr" },             .{ 0x2f0, "lvt_cmci" },  .{ 0x300, "icr_low" },
+    .{ 0x310, "icr_high" },  .{ 0x320, "lvt_timer" },     .{ 0x330, "lvt_thermal" },   .{ 0x340, "lvt_performance" }, .{ 0x350, "lvt_lint0" }, .{ 0x360, "lvt_lint1" },
+    .{ 0x370, "lvt_error" }, .{ 0x380, "initial_count" }, .{ 0x390, "current_count" }, .{ 0x3e0, "divide_config" },
+};
+
+const lapic_bank_mappings = .{ .{ 0x100, "isr" }, .{ 0x180, "tmr" }, .{ 0x200, "irr" } };
+
+fn kvmLapicToState(raw: kvm.LapicState) state_file.Lapic {
+    var out = state_file.Lapic{};
+    inline for (lapic_scalar_mappings) |mapping| @field(out, mapping[1]) = lapicRead(&raw, mapping[0]);
+    inline for (lapic_bank_mappings) |mapping| {
+        for (0..8) |index| @field(out, mapping[1])[index] = lapicRead(&raw, mapping[0] + index * 0x10);
+    }
+    return out;
+}
+
+fn stateLapicToKvm(value: state_file.Lapic) kvm.LapicState {
+    var raw = kvm.LapicState{};
+    inline for (lapic_scalar_mappings) |mapping| lapicWrite(&raw, mapping[0], @field(value, mapping[1]));
+    inline for (lapic_bank_mappings) |mapping| {
+        for (0..8) |index| lapicWrite(&raw, mapping[0] + index * 0x10, @field(value, mapping[1])[index]);
+    }
+    return raw;
+}
+
+fn kvmEventsToState(v: kvm.VcpuEvents) !state_file.VcpuEvents {
+    if (v.smi.smm != 0 or v.smi.pending != 0 or v.smi.smm_inside_nmi != 0 or v.smi.latched_init != 0 or v.triple_fault.pending != 0) return error.UnsupportedVcpuEvent;
+    if (v.flags & ~kvm.KVM_VCPUEVENT_VALID_MASK != 0) return error.UnsupportedVcpuEvent;
+    if (v.nmi.padding != 0) return error.UnsupportedVcpuEvent;
+    for (v.reserved) |byte| if (byte != 0) return error.UnsupportedVcpuEvent;
+    return .{
+        .exception_injected = v.exception.injected,
+        .exception_number = v.exception.nr,
+        .exception_has_error_code = v.exception.has_error_code,
+        .exception_pending = v.exception.pending,
+        .exception_error_code = v.exception.error_code,
+        .interrupt_injected = v.interrupt.injected,
+        .interrupt_number = v.interrupt.nr,
+        .interrupt_is_soft = v.interrupt.soft,
+        .interrupt_shadow = v.interrupt.shadow,
+        .nmi_injected = v.nmi.injected,
+        .nmi_pending = v.nmi.pending,
+        .nmi_masked = v.nmi.masked,
+        .sipi_vector = v.sipi_vector,
+        .flags = v.flags,
+        .exception_has_payload = v.exception_has_payload,
+        .exception_payload = v.exception_payload,
+    };
+}
+
+fn stateEventsToKvm(v: state_file.VcpuEvents) !kvm.VcpuEvents {
+    if (v.flags & ~kvm.KVM_VCPUEVENT_VALID_MASK != 0) return error.UnsupportedVcpuEvent;
+    if (v.smm != 0 or v.pending_smi != 0 or v.smm_inside_nmi != 0 or v.latched_init != 0 or v.triple_fault_pending != 0) return error.UnsupportedVcpuEvent;
+    return .{
+        .exception = .{ .injected = @intCast(v.exception_injected), .nr = @intCast(v.exception_number), .has_error_code = @intCast(v.exception_has_error_code), .pending = @intCast(v.exception_pending), .error_code = v.exception_error_code },
+        .interrupt = .{ .injected = @intCast(v.interrupt_injected), .nr = @intCast(v.interrupt_number), .soft = @intCast(v.interrupt_is_soft), .shadow = @intCast(v.interrupt_shadow) },
+        .nmi = .{ .injected = @intCast(v.nmi_injected), .pending = @intCast(v.nmi_pending), .masked = @intCast(v.nmi_masked) },
+        .sipi_vector = v.sipi_vector,
+        .flags = v.flags,
+        .exception_has_payload = @intCast(v.exception_has_payload),
+        .exception_payload = v.exception_payload,
+    };
+}
+
+fn kvmDebugToState(v: kvm.DebugRegs) !state_file.DebugState {
+    if (v.flags != 0) return error.UnsupportedDebugState;
+    for (v.reserved) |word| if (word != 0) return error.UnsupportedDebugState;
+    return .{ .db = v.db, .dr6 = v.dr6, .dr7 = v.dr7 };
+}
+
+fn stateDebugToKvm(v: state_file.DebugState) kvm.DebugRegs {
+    return .{ .db = v.db, .dr6 = v.dr6, .dr7 = v.dr7, .flags = v.flags };
+}
+
+fn kvmPicToState(v: kvm.PicState) state_file.Pic {
+    var out = state_file.Pic{};
+    inline for (std.meta.fields(state_file.Pic)) |field| @field(out, field.name) = @field(v, field.name);
+    return out;
+}
+
+fn statePicToKvm(chip_id: u32, v: state_file.Pic) kvm.Irqchip {
+    var pic = kvm.PicState{};
+    inline for (std.meta.fields(state_file.Pic)) |field| @field(pic, field.name) = @field(v, field.name);
+    return .{ .chip_id = chip_id, .chip = .{ .pic = pic } };
+}
+
+fn kvmIoapicToState(v: kvm.IoapicState) state_file.Ioapic {
+    return .{ .base_address = v.base_address, .ioregsel = v.ioregsel, .id = v.id, .irr = v.irr, .redirection_table = v.redirection_table };
+}
+
+fn stateIoapicToKvm(v: state_file.Ioapic) kvm.Irqchip {
+    return .{ .chip_id = kvm.KVM_IRQCHIP_IOAPIC, .chip = .{ .ioapic = .{ .base_address = v.base_address, .ioregsel = v.ioregsel, .id = v.id, .irr = v.irr, .redirection_table = v.redirection_table } } };
+}
+
+fn kvmPitToState(v: kvm.PitState2) state_file.Pit2 {
+    var out = state_file.Pit2{ .flags = v.flags };
+    for (v.channels, &out.channels) |channel, *dest| {
+        inline for (std.meta.fields(state_file.PitChannel)) |field| @field(dest, field.name) = @bitCast(@field(channel, field.name));
+    }
+    return out;
+}
+
+fn statePitToKvm(v: state_file.Pit2) kvm.PitState2 {
+    var out = kvm.PitState2{ .flags = v.flags };
+    for (v.channels, &out.channels) |channel, *dest| {
+        inline for (std.meta.fields(state_file.PitChannel)) |field| @field(dest, field.name) = @bitCast(@field(channel, field.name));
+    }
+    return out;
 }
 fn sha256(bytes: []const u8) [Sha256.digest_length * 2]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
@@ -630,28 +931,7 @@ test "profile roundtrip constants stay inside the frozen board holes" {
     try std.testing.expect(mailbox.mailbox_gpa + mailbox.page_size <= board.virtio_base);
 }
 
-test "Stage 0b.2 CPUID exposes only the proved extended-state layout" {
-    var cpuid = kvm.Cpuid{ .nent = 6 };
-    cpuid.entries[0] = .{ .function = 7, .index = 0, .eax = std.math.maxInt(u32), .ebx = std.math.maxInt(u32), .ecx = std.math.maxInt(u32), .edx = std.math.maxInt(u32) };
-    cpuid.entries[1] = .{ .function = 7, .index = 1, .eax = std.math.maxInt(u32), .ebx = std.math.maxInt(u32), .ecx = std.math.maxInt(u32), .edx = std.math.maxInt(u32) };
-    cpuid.entries[2] = .{ .function = 0x0d, .index = 0, .eax = std.math.maxInt(u32), .ebx = 4096, .ecx = 4096, .edx = std.math.maxInt(u32) };
-    cpuid.entries[3] = .{ .function = 0x0d, .index = 1, .eax = std.math.maxInt(u32), .ebx = 4096, .ecx = std.math.maxInt(u32), .edx = std.math.maxInt(u32) };
-    cpuid.entries[4] = .{ .function = 0x0d, .index = 2, .eax = 128, .ebx = 128, .ecx = std.math.maxInt(u32), .edx = std.math.maxInt(u32) };
-    cpuid.entries[5] = .{ .function = 0x0d, .index = 9, .eax = 8, .ebx = 2688, .ecx = 0, .edx = 0 };
-    filterStage0b2Cpuid(&cpuid);
-
-    try std.testing.expectEqual(@as(u32, 1 << 1), cpuid.entries[0].ebx);
-    inline for (.{ 0, 1, 2, 3 }) |field_index| {
-        const field = std.meta.fields(kvm.CpuidEntry)[3 + field_index].name;
-        if (!std.mem.eql(u8, field, "ebx")) try std.testing.expectEqual(@as(u32, 0), @field(cpuid.entries[0], field));
-        try std.testing.expectEqual(@as(u32, 0), @field(cpuid.entries[1], field));
-    }
-    try std.testing.expectEqual(@as(u32, 7), cpuid.entries[2].eax);
-    try std.testing.expectEqual(stage0b2_xsave_layout_size, cpuid.entries[2].ebx);
-    try std.testing.expectEqual(stage0b2_xsave_layout_size, cpuid.entries[2].ecx);
-    try std.testing.expectEqual(@as(u32, 0), cpuid.entries[2].edx);
-    try std.testing.expectEqual(@as(u32, 256), cpuid.entries[4].eax);
-    try std.testing.expectEqual(@as(u32, 576), cpuid.entries[4].ebx);
-    inline for (.{ cpuid.entries[3].eax, cpuid.entries[3].ebx, cpuid.entries[3].ecx, cpuid.entries[3].edx }) |value| try std.testing.expectEqual(@as(u32, 0), value);
-    inline for (.{ cpuid.entries[5].eax, cpuid.entries[5].ebx, cpuid.entries[5].ecx, cpuid.entries[5].edx }) |value| try std.testing.expectEqual(@as(u32, 0), value);
+test "candidate restore rejects SMM and triple-fault events" {
+    try std.testing.expectError(error.UnsupportedVcpuEvent, stateEventsToKvm(.{ .smm = 1, .flags = kvm.KVM_VCPUEVENT_VALID_SMM }));
+    try std.testing.expectError(error.UnsupportedVcpuEvent, stateEventsToKvm(.{ .triple_fault_pending = 1, .flags = kvm.KVM_VCPUEVENT_VALID_TRIPLE_FAULT }));
 }
