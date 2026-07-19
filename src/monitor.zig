@@ -970,10 +970,7 @@ const ExecServer = struct {
             schema_version: u32 = lifecycle.named_exec_timing_schema_version,
             timing: lifecycle.NamedExecTiming,
         }{ .timing = timing };
-        const json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch {
-            self.sendStreamingErrorLocked("cannot encode named exec timing");
-            return;
-        };
+        const json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch return;
         defer self.allocator.free(json);
         if (json.len > spore_stream.max_payload_len or
             writeSpioFrameFdBounded(self.streaming_client_fd, .event, .control, 0, json) != 0)

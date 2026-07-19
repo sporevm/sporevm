@@ -40,6 +40,7 @@ pub const RestoreNamedOptions = api.RestoreNamedOptions;
 pub const ForkNamedOptions = api.ForkNamedOptions;
 pub const ExecNamedOptions = api.ExecNamedOptions;
 pub const CopyNamedOptions = api.CopyNamedOptions;
+pub const NamedExecTiming = api.NamedExecTiming;
 pub const ExecNamedResult = api.ExecNamedResult;
 pub const ExecNamedStream = api.ExecNamedStream;
 pub const ExecNamedStreamEvent = api.ExecNamedStreamEvent;

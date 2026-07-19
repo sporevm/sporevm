@@ -140,9 +140,7 @@ pub const HostStream = struct {
     first_output_ms: ?u64 = null,
     response_ms: ?u64 = null,
     guest_timing_ms: ?u64 = null,
-    guest_listen_ms: ?u64 = null,
     guest_accept_ms: ?u64 = null,
-    guest_decode_ms: ?u64 = null,
     guest_spawn_ms: ?u64 = null,
     guest_exit_ms: ?u64 = null,
     guest_now_ms: ?u64 = null,
@@ -682,12 +680,8 @@ fn parseGuestTiming(payload: []const u8, stream: *HostStream) void {
         if (value < 0) continue;
         const unsigned: u64 = @intCast(value);
         const key = field[0..separator];
-        if (std.mem.eql(u8, key, "listen")) {
-            stream.guest_listen_ms = unsigned;
-        } else if (std.mem.eql(u8, key, "accept")) {
+        if (std.mem.eql(u8, key, "accept")) {
             stream.guest_accept_ms = unsigned;
-        } else if (std.mem.eql(u8, key, "decode")) {
-            stream.guest_decode_ms = unsigned;
         } else if (std.mem.eql(u8, key, "spawn")) {
             stream.guest_spawn_ms = unsigned;
         } else if (std.mem.eql(u8, key, "exit")) {
