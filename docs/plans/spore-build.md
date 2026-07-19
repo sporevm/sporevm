@@ -230,7 +230,23 @@ Buildkite runs the same differential fixture set as four deterministic shards,
 balanced by initial builds and transitions. Sharding changes only CI scheduling;
 the local command above remains the complete serial conformance gate. The
 VM-backed build smoke runs once alongside those shards, retaining its full log
-as an artifact while successful jobs print only the final summary.
+as an artifact while successful jobs print only the final summary. Buildkite
+collapses the ReleaseSafe and Buildx setup sections and leaves the conformance
+case section expanded, so the job log opens on the useful output.
+
+Each Linux agent retains its pinned BuildKit v0.30.0 builder state in a bounded
+Docker volume. The agent name scopes the volume so concurrent jobs never share
+a live builder, while later jobs on that agent reuse BuildKit layers. Startup
+removes any stale builder container left by an interrupted job before attaching
+the retained volume. BuildKit garbage collection caps each agent cache at 4 GB,
+reserves 2 GB from
+reclamation, and preserves 20 GB of host free space. The harness applies those
+limits when it starts the builder, then prunes mutable `RUN` cache-mount state
+so cross-build reuse cannot change the fixtures' cold-cache semantics. It also
+removes each Docker-loaded oracle image as soon as the case finishes, while the
+immutable BuildKit layers remain reusable in the retained volume.
+Buildx v0.33.0 is installed by mise only for these jobs and retained in a
+per-agent cache on the host's fast scratch disk.
 
 Capacity and publication changes additionally run:
 
