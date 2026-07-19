@@ -18,8 +18,6 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -51,8 +49,15 @@ steps:
     command: |
       set -euo pipefail
       mise install
-      mise exec -- zig build --release=safe
-      mise exec -- zig build spore-build-run-smoke
+      release_build_log="zig-cache/spore-build-conformance/$${BUILDKITE_JOB_ID}.release-build.log"
+      mkdir -p "$$(dirname "$${release_build_log}")"
+      if mise exec -- zig build --release=safe >"$${release_build_log}" 2>&1; then
+        echo "ReleaseSafe build complete"
+      else
+        status=$$?
+        tail -n 200 "$${release_build_log}"
+        exit "$${status}"
+      fi
       conformance_root="zig-cache/spore-build-conformance/$${BUILDKITE_JOB_ID}"
       buildx_root="$$(mktemp -d "$${TMPDIR:-/tmp}/sporevm-buildx.XXXXXX")"
       trap 'rm -rf "$${buildx_root}"' EXIT
@@ -72,8 +77,11 @@ steps:
       docker buildx version | grep -F 'github.com/docker/buildx v0.33.0 '
       scripts/spore-build-conformance.py \
         --spore-bin zig-out/bin/spore \
-        --work-dir "$${conformance_root}"
+        --work-dir "$${conformance_root}" \
+        --shard-index "$${BUILDKITE_PARALLEL_JOB}" \
+        --shard-count "$${BUILDKITE_PARALLEL_JOB_COUNT}"
     artifact_paths:
+      - "zig-cache/spore-build-conformance/*.release-build.log"
       - "zig-cache/spore-build-conformance/*/logs/*"
       - "zig-cache/spore-build-conformance/*/cases/**/*.command"
       - "zig-cache/spore-build-conformance/*/cases/**/*.stdout"
@@ -84,6 +92,7 @@ steps:
       - "zig-cache/spore-build-conformance/*/cases/**/spore-config.json"
       - "zig-cache/spore-build-conformance/*/cases/**/*.diff"
     timeout_in_minutes: 30
+    parallelism: 4
     plugins:
       - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
           version: "2026.5.12"
@@ -94,8 +103,37 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
+    agents:
+      queue: sporevm-linux-arm64
+
+  - label: ":fire: Spore build VM smoke (Linux ARM64)"
+    key: "spore-build-run-smoke-linux-arm64"
+    command: |
+      set -euo pipefail
+      mise install
+      smoke_root="zig-cache/spore-build-run-smoke/$${BUILDKITE_JOB_ID}"
+      smoke_log="$${smoke_root}/smoke.log"
+      mkdir -p "$${smoke_root}"
+      if mise exec -- zig build spore-build-run-smoke >"$${smoke_log}" 2>&1; then
+        tail -n 1 "$${smoke_log}"
+      else
+        status=$$?
+        tail -n 200 "$${smoke_log}"
+        exit "$${status}"
+      fi
+    artifact_paths:
+      - "zig-cache/spore-build-run-smoke/*/smoke.log"
+    timeout_in_minutes: 15
+    plugins:
+      - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          version: "2026.5.12"
+    cache:
+      paths:
+        - "~/.local/share/mise"
+        - "~/.cache/mise"
+        - "~/.local/state/mise"
+      size: "20g"
+      name: "mise-cache"
     agents:
       queue: sporevm-linux-arm64
 
@@ -119,8 +157,6 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -164,8 +200,6 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -185,8 +219,6 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 
@@ -230,8 +262,6 @@ steps:
         - "~/.local/state/mise"
       size: "20g"
       name: "mise-cache"
-    concurrency: 1
-    concurrency_group: "sporevm-benchmarks/linux-arm64"
     agents:
       queue: sporevm-linux-arm64
 

@@ -226,6 +226,12 @@ mise run build
 mise run test:spore-build-conformance
 ```
 
+Buildkite runs the same differential fixture set as four deterministic shards,
+balanced by initial builds and transitions. Sharding changes only CI scheduling;
+the local command above remains the complete serial conformance gate. The
+VM-backed build smoke runs once alongside those shards, retaining its full log
+as an artifact while successful jobs print only the final summary.
+
 Capacity and publication changes additionally run:
 
 ```bash

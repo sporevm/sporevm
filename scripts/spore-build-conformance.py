@@ -46,6 +46,8 @@ from spore_build_conformance_contract import (
     parse_spore_build,
     select_cases,
     self_test_schema,
+    self_test_sharding,
+    shard_cases,
     write_json,
 )
 
@@ -78,6 +80,16 @@ def parse_args() -> argparse.Namespace:
         action="append",
         dest="cases",
         help="run one named case (repeatable; default: all)",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        help="zero-based shard to run (requires --shard-count)",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        help="number of deterministic case shards (requires --shard-index)",
     )
     parser.add_argument("--list", action="store_true", help="list cases and exit")
     parser.add_argument(
@@ -684,13 +696,18 @@ def main() -> int:
         all_cases = load_cases(args.fixtures.resolve())
         if args.self_test_schema:
             self_test_schema(all_cases)
-            print("spore-build-conformance schema self-test ok")
+            self_test_sharding(all_cases)
+            print("spore-build-conformance schema and sharding self-tests ok")
             return 0
         if args.list:
             for case in all_cases:
                 print(f"{case.name}\t{case.spec.description}")
             return 0
-        cases = select_cases(all_cases, args.cases)
+        cases = shard_cases(
+            select_cases(all_cases, args.cases),
+            args.shard_index,
+            args.shard_count,
+        )
         spore_bin = resolve_executable(args.spore_bin)
     except HarnessError as error:
         print(f"spore-build-conformance: {error}", file=sys.stderr)
