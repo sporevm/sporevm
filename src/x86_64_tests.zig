@@ -7,6 +7,7 @@ const kvm_boot = @import("x86_64/kvm_boot.zig");
 const lifecycle = @import("x86_64/lifecycle.zig");
 const mp = @import("x86_64/mp.zig");
 const pio = @import("x86_64/pio.zig");
+const profile_probe = @import("x86_64/profile_probe.zig");
 const kvm = @import("kvm/x86_64.zig");
 
 test {
@@ -19,5 +20,6 @@ test {
     _ = lifecycle;
     _ = mp;
     _ = pio;
+    _ = profile_probe;
     _ = kvm;
 }

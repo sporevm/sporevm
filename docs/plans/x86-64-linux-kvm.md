@@ -263,6 +263,42 @@ throughout the work.
   adversarial and
   minimality reviews approved the exact pre-native patch, and the Anthropic
   Fable continuation approved it with no material finding.
+- Stage 0b.1 now has a candidate implementation and exact native evidence. The
+  five-file probe source-set manifest has SHA256
+  `c2d2a695e9b5065fb4ac29ed6b82011b96cbf9c1c3c58a89b708409bec8cb19a`;
+  its static x86-64 artifact has SHA256
+  `df8bc5a0186f3c00441bf6d707d944bed31aab78fadcbb0330f2508591121881`.
+  On the dedicated Intel bare-metal host running Linux 6.17.0-1019-aws, the
+  probe observed KVM API 12, all 15 required capabilities plus both contextual
+  capability checks, canonical raw/requested/effective CPUID sets with
+  46/47/47 entries, all 22 feature MSRs, and all 96 ordinary advertised MSRs.
+  Both MSR reads completed exactly; the no-irqchip probe deliberately did not
+  infer that the advertised ordinary inventory was a context-free writable
+  restore set. The 4096-byte XSAVE state and one XCR round-tripped exactly,
+  VM/vCPU TSC frequency remained 3000000 kHz, and the VM clock remained
+  nondecreasing. The terminal evidence ledger has SHA256
+  `d4909f661e5bc23eab689bb45f50618e9f559c7a1ca471ee2e71c2e2b5eca605`;
+  complete stdout and strace have SHA256
+  `b5129a615976c5dbfe3ae1fae57c9c9bc9979fb18c64017f5c6d4e73d47f01b4`
+  and
+  `8e2ca51ba4d9ca8e1226e324a4930da54462fa94b626a86895a04147c2ce9d01`.
+  Independent validation found zero stderr bytes and no `KVM_RUN` across 58
+  traced ioctls, while the result remained fail-closed as
+  `profile_approved=false`. The first native attempt also proved why the
+  narrower contract matters: an advertised `MSR_KVM_ASYNC_PF_INT` zero write
+  is rejected without an in-kernel irqchip. Stage 0b.2 therefore owns the
+  explicit restore-list classification and write-order proof under the real
+  irqchip-owning machine. The transient private transfer object and bucket
+  were deleted and proven absent; the task-owned native evidence remains
+  retained on the dedicated host. The focused x86 suite passed 487 tests with
+  five expected skips and 32 fuzz targets; the full `mise run test`, product
+  build, x86-64 compile-only suite, static probe cross-build, formatting, and
+  diff hygiene all pass. The final auto-review ship-risk and maintainability
+  lenses approved after one low-severity shared MSR-batch cleanup; the
+  Ponytail lens found no additional simplification that preserved the bounded
+  evidence contract. The final Anthropic Fable deep-analysis approved Stage
+  0b.1 with no material finding; its residual risks are the Stage 0b.2 work
+  named below rather than omissions from this reset-state inventory.
 
 ## Motivation
 
@@ -569,8 +605,8 @@ unimplementable premature total order. Validate that the host can instantiate
 the named profile first. Create the VM, configure the TSS and identity-map
 addresses, and create the in-kernel irqchip before any vCPU. Then create every
 vCPU and install its CPUID and remaining normalized state before any
-`KVM_RUN`. Slice 0b determines and tests the exact TSC/VM-clock ordering; the
-candidate rule is per-vCPU TSC state before `KVM_SET_CLOCK`. Restore device
+`KVM_RUN`. Stage 0b.2 determines and tests the exact TSC/VM-clock ordering
+instead of freezing one from reset-state observations. Restore device
 transports and RAM, then inject any pending generation interrupt last. Slice
 4b freezes the full order from native evidence and includes a test that fails
 if any vCPU can run before all VM-wide and per-vCPU phases complete.
@@ -885,16 +921,49 @@ it does not approve capture.
 
 ### Slice 0b: Build and approve the capture CPU/clock profile on bare metal
 
-- Starting from Slice 1's bounded profile module and Stage 0a.3 evidence,
-  finalize the CPUID allowlist, topology, required MSRs, XSAVE/XCRS policy,
-  capability predicate, profile name, and host compatibility tests. Product
-  fresh runs may use the visibly experimental candidate profile; capture may
-  use it only after this slice approves it.
-- On the dedicated x86 host, measure TSC stability and probe
-  `KVM_CAP_TSC_CONTROL`, `KVM_SET/GET_TSC_KHZ`, `KVM_GET/SET_CLOCK`, and
-  `KVM_KVMCLOCK_CTRL` behavior across pause and process-boundary restore.
-- Round-trip the candidate CPUID, MSR, XSAVE/XCRS, LAPIC/x2APIC, vCPU-event,
-  MP, irqchip/PIT, and clock inventory without running a vCPU early.
+#### Stage 0b.1: Freeze the profile-probe UAPI and reset-state inventory
+
+- Extend only the x86 KVM binding with the exact CPUID2, MSR-list/batch,
+  XSAVE/XSAVE2, XCRS, TSC-frequency, VM-clock, and pvclock-pause UAPI. Bound
+  every flexible buffer and reject short MSR transfers as incomplete state.
+- Add one narrow host-only probe that records canonical capability values, raw
+  and effective CPUID, leaf-D layout, ordinary and feature MSR inventories,
+  reset-state XSAVE/XCRS round trips, TSC kHz, and VM-clock observations from
+  disposable VM/vCPU fds. It must perform no `KVM_RUN` and cannot approve a
+  profile. The no-irqchip probe reads the complete advertised MSR inventory but
+  does not treat it as a writable restore set; MSR writeability and ordering are
+  proven against the real irqchip-owning machine in Stage 0b.2.
+
+**Exit:** pure ABI and evidence validators pass on both architectures, and the
+dedicated x86 host reproduces a bounded reset-state inventory whose exact
+counts and KVM-reported sizes match the emitted evidence.
+
+#### Stage 0b.2: Prove dirty CPU state and clocks across a new process
+
+- Reuse the existing x86 boot lifecycle with a tiny deterministic guest probe
+  that dirties known x87, SSE, and AVX values; reports CPUID and XCR0; and
+  samples serialized TSC plus `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, and
+  `CLOCK_REALTIME` at a host-controlled capture barrier.
+- Capture into a bounded task-owned state file, exit the VMM process, restore
+  into a new process without allowing any vCPU to run early, and prove the
+  guest state patterns and monotonic clocks survive. Treat reset-state byte
+  equality as ABI evidence only, never migration evidence.
+
+**Exit:** the candidate xstate and time contract survives a complete
+process-boundary restore on the dedicated host with no backward monotonic or
+boot-time observation.
+
+#### Stage 0b.3: Approve the concrete candidate profile
+
+- Starting from Stage 1.3's audit contract and the prior two native proofs,
+  finalize the CPUID allowlist/topology, required/default/excluded MSRs,
+  XSAVE/XCRS layout, capability predicate, clock policy, profile identity, and
+  typed host compatibility tests. Product fresh runs may use the visibly
+  experimental candidate; capture may use it only after this stage approves
+  it.
+- Round-trip the candidate LAPIC/x2APIC, vCPU-event, MP, irqchip/PIT, CPU, and
+  clock inventory, with every VM-wide and per-vCPU phase complete before the
+  first `KVM_RUN`.
 
 **Exit:** the named CPU/clock profile is instantiable on dedicated hardware and
 guest monotonic time does not move backwards across the proposed restore. This
@@ -1342,6 +1411,9 @@ original host class. Benchmark and correctness history stay keyed by profile.
   the bare-metal TSC gate blocks capture rather than fresh-run work.
 - x86 snapshot correctness depends on named KVM clock/MSR/LAPIC/XSAVE state,
   not raw ioctl blobs or a vague same-host promise.
+- KVM's advertised ordinary MSR list is a readable inventory, not a
+  context-free restore batch. Writable profile MSRs must be classified
+  explicitly and proven under the final irqchip-owning vCPU context.
 - Release asset names stay undecided until real supported mise/ubi selectors
   prove that CLI and libspore archives remain unambiguous.
 

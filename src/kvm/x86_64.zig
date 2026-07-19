@@ -11,7 +11,9 @@ const topology = @import("../topology.zig");
 pub const KVM_API_VERSION = common.KVM_API_VERSION;
 pub const KVM_GET_API_VERSION = common.KVM_GET_API_VERSION;
 pub const KVM_CREATE_VM = common.KVM_CREATE_VM;
+pub const KVM_GET_MSR_INDEX_LIST: u32 = 0xc004ae02;
 pub const KVM_GET_SUPPORTED_CPUID: u32 = 0xc008ae05;
+pub const KVM_GET_MSR_FEATURE_INDEX_LIST: u32 = 0xc004ae0a;
 pub const KVM_CHECK_EXTENSION = common.KVM_CHECK_EXTENSION;
 pub const KVM_GET_VCPU_MMAP_SIZE = common.KVM_GET_VCPU_MMAP_SIZE;
 pub const KVM_CREATE_VCPU = common.KVM_CREATE_VCPU;
@@ -25,8 +27,22 @@ pub const KVM_RUN = common.KVM_RUN;
 pub const KVM_GET_SREGS: u32 = 0x8138ae83;
 pub const KVM_SET_REGS: u32 = 0x4090ae82;
 pub const KVM_SET_SREGS: u32 = 0x4138ae84;
+pub const KVM_GET_MSRS: u32 = 0xc008ae88;
+pub const KVM_SET_MSRS: u32 = 0x4008ae89;
 pub const KVM_SET_CPUID2: u32 = 0x4008ae90;
+pub const KVM_GET_CPUID2: u32 = 0xc008ae91;
 pub const KVM_GET_MP_STATE: u32 = 0x8004ae98;
+pub const KVM_GET_XSAVE: u32 = 0x9000aea4;
+pub const KVM_SET_XSAVE: u32 = 0x5000aea5;
+pub const KVM_GET_XCRS: u32 = 0x8188aea6;
+pub const KVM_SET_XCRS: u32 = 0x4188aea7;
+pub const KVM_KVMCLOCK_CTRL: u32 = 0xaead;
+pub const KVM_GET_XSAVE2: u32 = 0x9000aecf;
+
+pub const KVM_SET_CLOCK: u32 = 0x4030ae7b;
+pub const KVM_GET_CLOCK: u32 = 0x8030ae7c;
+pub const KVM_SET_TSC_KHZ: u32 = 0xaea2;
+pub const KVM_GET_TSC_KHZ: u32 = 0xaea3;
 
 pub const KVM_EXIT_IO: u32 = 2;
 pub const KVM_EXIT_HLT: u32 = 5;
@@ -42,11 +58,32 @@ pub const KVM_CAP_IRQCHIP: u32 = 0;
 pub const KVM_CAP_USER_MEMORY = common.KVM_CAP_USER_MEMORY;
 pub const KVM_CAP_SET_TSS_ADDR: u32 = 4;
 pub const KVM_CAP_EXT_CPUID: u32 = 7;
+pub const KVM_CAP_CLOCKSOURCE: u32 = 8;
 pub const KVM_CAP_NR_VCPUS: u32 = 9;
 pub const KVM_CAP_MP_STATE: u32 = 14;
 pub const KVM_CAP_PIT2: u32 = 33;
 pub const KVM_CAP_SET_IDENTITY_MAP_ADDR: u32 = 37;
+pub const KVM_CAP_ADJUST_CLOCK: u32 = 39;
+pub const KVM_CAP_XSAVE: u32 = 55;
+pub const KVM_CAP_XCRS: u32 = 56;
+pub const KVM_CAP_ASYNC_PF: u32 = 59;
+pub const KVM_CAP_TSC_CONTROL: u32 = 60;
+pub const KVM_CAP_GET_TSC_KHZ: u32 = 61;
+pub const KVM_CAP_TSC_DEADLINE_TIMER: u32 = 72;
+pub const KVM_CAP_KVMCLOCK_CTRL: u32 = 76;
+pub const KVM_CAP_CHECK_EXTENSION_VM: u32 = 105;
+pub const KVM_CAP_X2APIC_API: u32 = 129;
 pub const KVM_CAP_IMMEDIATE_EXIT: u32 = 136;
+pub const KVM_CAP_GET_MSR_FEATURES: u32 = 153;
+pub const KVM_CAP_ASYNC_PF_INT: u32 = 183;
+pub const KVM_CAP_STEAL_TIME: u32 = 187;
+pub const KVM_CAP_ENFORCE_PV_FEATURE_CPUID: u32 = 190;
+pub const KVM_CAP_XSAVE2: u32 = 208;
+pub const KVM_CAP_VM_TSC_CONTROL: u32 = 214;
+
+pub const KVM_CLOCK_TSC_STABLE: u32 = 2;
+pub const KVM_CLOCK_REALTIME: u32 = 1 << 2;
+pub const KVM_CLOCK_HOST_TSC: u32 = 1 << 3;
 
 pub const KVM_CPUID_FLAG_SIGNIFCANT_INDEX: u32 = 1 << 0;
 
@@ -57,6 +94,7 @@ pub const KVM_MP_STATE_HALTED: u32 = 3;
 pub const KVM_MP_STATE_SIPI_RECEIVED: u32 = 4;
 
 pub const max_cpuid_entries: usize = 256;
+pub const max_xcrs: usize = 16;
 pub const max_io_payload: usize = 4096;
 
 pub const Error = common.Error || error{
@@ -67,6 +105,11 @@ pub const Error = common.Error || error{
     InvalidVcpuIndex,
     CpuidTopologyMissing,
     MalformedCpuidTopology,
+    MsrListTooLarge,
+    MsrBatchTooLarge,
+    MsrShortCount,
+    XsaveSizeInvalid,
+    XsaveBufferTooSmall,
     KvmRunTooSmall,
 };
 
@@ -226,6 +269,57 @@ pub const Cpuid = extern struct {
     entries: [max_cpuid_entries]CpuidEntry = @splat(.{}),
 };
 
+pub const MsrEntry = extern struct {
+    index: u32 = 0,
+    reserved: u32 = 0,
+    data: u64 = 0,
+};
+
+/// Fixed-capacity storage for the flexible `struct kvm_msr_list` UAPI.
+pub fn MsrList(comptime capacity: usize) type {
+    if (capacity > std.math.maxInt(u32)) @compileError("MSR list capacity exceeds the KVM u32 count");
+    return extern struct {
+        nmsrs: u32 = @intCast(capacity),
+        indices: [capacity]u32 = @splat(0),
+    };
+}
+
+/// Fixed-capacity storage for the flexible `struct kvm_msrs` UAPI.
+pub fn MsrBatch(comptime capacity: usize) type {
+    if (capacity > std.math.maxInt(u32)) @compileError("MSR batch capacity exceeds the KVM u32 count");
+    return extern struct {
+        nmsrs: u32 = @intCast(capacity),
+        padding: u32 = 0,
+        entries: [capacity]MsrEntry = @splat(.{}),
+    };
+}
+
+pub const Xsave = extern struct {
+    region: [1024]u32 = @splat(0),
+};
+
+pub const Xcr = extern struct {
+    xcr: u32 = 0,
+    reserved: u32 = 0,
+    value: u64 = 0,
+};
+
+pub const Xcrs = extern struct {
+    nr_xcrs: u32 = 0,
+    flags: u32 = 0,
+    xcrs: [max_xcrs]Xcr = @splat(.{}),
+    padding: [16]u64 = @splat(0),
+};
+
+pub const ClockData = extern struct {
+    clock: u64 = 0,
+    flags: u32 = 0,
+    padding0: u32 = 0,
+    realtime: u64 = 0,
+    host_tsc: u64 = 0,
+    padding: [4]u32 = @splat(0),
+};
+
 pub const MpState = extern struct {
     mp_state: u32,
 };
@@ -260,6 +354,73 @@ pub fn getSupportedCpuid(kvm_fd: std.c.fd_t) Error!Cpuid {
     _ = try ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, @intFromPtr(&cpuid), "KVM_GET_SUPPORTED_CPUID");
     if (cpuid.nent > max_cpuid_entries) return error.CpuidTooLarge;
     return cpuid;
+}
+
+pub fn msrIndices(comptime capacity: usize, list: *const MsrList(capacity)) Error![]const u32 {
+    const count = std.math.cast(usize, list.nmsrs) orelse return error.MsrListTooLarge;
+    if (count > list.indices.len) return error.MsrListTooLarge;
+    return list.indices[0..count];
+}
+
+/// Execute one of KVM's flexible MSR-list ioctls without losing the required
+/// count that KVM writes back on E2BIG. A list larger than the caller's fixed
+/// storage is an explicit bounded-probe failure, not a generic ioctl error.
+pub fn getMsrIndexList(
+    fd: std.c.fd_t,
+    request: u32,
+    comptime capacity: usize,
+    list: *MsrList(capacity),
+    op: []const u8,
+) Error![]const u32 {
+    const rc = linux.ioctl(fd, request, @intFromPtr(list));
+    switch (linux.errno(rc)) {
+        .SUCCESS => return msrIndices(capacity, list),
+        .@"2BIG" => {
+            std.log.err("{s}: KVM requires {d} MSR indices, fixed bound is {d}", .{ op, list.nmsrs, capacity });
+            return error.MsrListTooLarge;
+        },
+        else => |err| {
+            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, request, @tagName(err) });
+            return error.KvmIoctlFailed;
+        },
+    }
+}
+
+/// Populate a bounded MSR batch from an explicit ordered index list. Reusing a
+/// batch cannot retain values or reserved bits from an earlier transfer.
+pub fn prepareMsrBatch(
+    comptime capacity: usize,
+    batch: *MsrBatch(capacity),
+    indices: []const u32,
+) Error!void {
+    if (indices.len > batch.entries.len) return error.MsrBatchTooLarge;
+    batch.nmsrs = @intCast(indices.len);
+    batch.padding = 0;
+    for (batch.entries[0..indices.len], indices) |*entry, index| {
+        entry.* = .{ .index = index };
+    }
+}
+
+/// Validate KVM_GET_MSRS/KVM_SET_MSRS' returned completion count. KVM stops at
+/// the first unsupported entry, so accepting a short count would publish
+/// partial state as a complete profile observation.
+pub fn completedMsrEntries(
+    comptime capacity: usize,
+    batch: *MsrBatch(capacity),
+    completed: usize,
+) Error![]MsrEntry {
+    const requested = std.math.cast(usize, batch.nmsrs) orelse return error.MsrBatchTooLarge;
+    if (requested > batch.entries.len) return error.MsrBatchTooLarge;
+    if (completed != requested) return error.MsrShortCount;
+    return batch.entries[0..requested];
+}
+
+/// KVM_GET_XSAVE2 and extended KVM_SET_XSAVE transfer the byte count returned
+/// by KVM_CAP_XSAVE2 even though their ioctl numbers encode only 4 KiB.
+pub fn xsave2Buffer(buffer: []u8, capability_size: usize) Error![]u8 {
+    if (capability_size < @sizeOf(Xsave)) return error.XsaveSizeInvalid;
+    if (capability_size > buffer.len) return error.XsaveBufferTooSmall;
+    return buffer[0..capability_size];
 }
 
 /// Derive a per-vCPU topology from KVM's supported CPUID table without
@@ -501,6 +662,123 @@ test "x86 KVM UAPI layouts match Linux" {
     try std.testing.expectEqual(@as(u32, 0x8004_ae98), KVM_GET_MP_STATE);
     try std.testing.expectEqual(@as(u32, 136), KVM_CAP_IMMEDIATE_EXIT);
     try std.testing.expectEqual(@as(usize, 1), RunLayout.immediate_exit);
+}
+
+test "x86 profile probe KVM UAPI values match Linux" {
+    try std.testing.expectEqual(@as(u32, 0xc004_ae02), KVM_GET_MSR_INDEX_LIST);
+    try std.testing.expectEqual(@as(u32, 0xc004_ae0a), KVM_GET_MSR_FEATURE_INDEX_LIST);
+    try std.testing.expectEqual(@as(u32, 0xc008_ae88), KVM_GET_MSRS);
+    try std.testing.expectEqual(@as(u32, 0x4008_ae89), KVM_SET_MSRS);
+    try std.testing.expectEqual(@as(u32, 0xc008_ae91), KVM_GET_CPUID2);
+    try std.testing.expectEqual(@as(u32, 0x9000_aea4), KVM_GET_XSAVE);
+    try std.testing.expectEqual(@as(u32, 0x5000_aea5), KVM_SET_XSAVE);
+    try std.testing.expectEqual(@as(u32, 0x8188_aea6), KVM_GET_XCRS);
+    try std.testing.expectEqual(@as(u32, 0x4188_aea7), KVM_SET_XCRS);
+    try std.testing.expectEqual(@as(u32, 0x0000_aead), KVM_KVMCLOCK_CTRL);
+    try std.testing.expectEqual(@as(u32, 0x9000_aecf), KVM_GET_XSAVE2);
+    try std.testing.expectEqual(@as(u32, 0x4030_ae7b), KVM_SET_CLOCK);
+    try std.testing.expectEqual(@as(u32, 0x8030_ae7c), KVM_GET_CLOCK);
+    try std.testing.expectEqual(@as(u32, 0x0000_aea2), KVM_SET_TSC_KHZ);
+    try std.testing.expectEqual(@as(u32, 0x0000_aea3), KVM_GET_TSC_KHZ);
+
+    const capabilities = [_]struct { actual: u32, expected: u32 }{
+        .{ .actual = KVM_CAP_CLOCKSOURCE, .expected = 8 },
+        .{ .actual = KVM_CAP_ADJUST_CLOCK, .expected = 39 },
+        .{ .actual = KVM_CAP_XSAVE, .expected = 55 },
+        .{ .actual = KVM_CAP_XCRS, .expected = 56 },
+        .{ .actual = KVM_CAP_ASYNC_PF, .expected = 59 },
+        .{ .actual = KVM_CAP_TSC_CONTROL, .expected = 60 },
+        .{ .actual = KVM_CAP_GET_TSC_KHZ, .expected = 61 },
+        .{ .actual = KVM_CAP_TSC_DEADLINE_TIMER, .expected = 72 },
+        .{ .actual = KVM_CAP_KVMCLOCK_CTRL, .expected = 76 },
+        .{ .actual = KVM_CAP_CHECK_EXTENSION_VM, .expected = 105 },
+        .{ .actual = KVM_CAP_X2APIC_API, .expected = 129 },
+        .{ .actual = KVM_CAP_GET_MSR_FEATURES, .expected = 153 },
+        .{ .actual = KVM_CAP_ASYNC_PF_INT, .expected = 183 },
+        .{ .actual = KVM_CAP_STEAL_TIME, .expected = 187 },
+        .{ .actual = KVM_CAP_ENFORCE_PV_FEATURE_CPUID, .expected = 190 },
+        .{ .actual = KVM_CAP_XSAVE2, .expected = 208 },
+        .{ .actual = KVM_CAP_VM_TSC_CONTROL, .expected = 214 },
+    };
+    for (capabilities) |capability| {
+        try std.testing.expectEqual(capability.expected, capability.actual);
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), KVM_CLOCK_TSC_STABLE);
+    try std.testing.expectEqual(@as(u32, 1 << 2), KVM_CLOCK_REALTIME);
+    try std.testing.expectEqual(@as(u32, 1 << 3), KVM_CLOCK_HOST_TSC);
+}
+
+test "x86 profile probe KVM ABI layouts match Linux" {
+    const MsrListHeader = MsrList(0);
+    const MsrList2 = MsrList(2);
+    const MsrBatchHeader = MsrBatch(0);
+    const MsrBatch2 = MsrBatch(2);
+
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(MsrEntry));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(MsrEntry));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MsrEntry, "index"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(MsrEntry, "reserved"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(MsrEntry, "data"));
+
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(MsrListHeader));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(MsrList2));
+    try std.testing.expectEqual(@as(usize, 4), @alignOf(MsrList2));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MsrList2, "nmsrs"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(MsrList2, "indices"));
+
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(MsrBatchHeader));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(MsrBatch2));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(MsrBatch2));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MsrBatch2, "nmsrs"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(MsrBatch2, "padding"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(MsrBatch2, "entries"));
+
+    try std.testing.expectEqual(@as(usize, 4096), @sizeOf(Xsave));
+    try std.testing.expectEqual(@as(usize, 4), @alignOf(Xsave));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Xcr));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(Xcr));
+    try std.testing.expectEqual(@as(usize, 392), @sizeOf(Xcrs));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(Xcrs));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(Xcrs, "xcrs"));
+    try std.testing.expectEqual(@as(usize, 264), @offsetOf(Xcrs, "padding"));
+
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(ClockData));
+    try std.testing.expectEqual(@as(usize, 8), @alignOf(ClockData));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(ClockData, "clock"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ClockData, "flags"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ClockData, "realtime"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ClockData, "host_tsc"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(ClockData, "padding"));
+}
+
+test "profile probe variable length UAPI fails closed" {
+    var list = MsrList(2){};
+    list.indices = .{ 0x10, 0x3b };
+    try std.testing.expectEqualSlices(u32, &.{ 0x10, 0x3b }, try msrIndices(2, &list));
+    list.nmsrs = 3;
+    try std.testing.expectError(error.MsrListTooLarge, msrIndices(2, &list));
+
+    var batch = MsrBatch(2){};
+    batch.entries[0] = .{ .index = 1, .reserved = 2, .data = 3 };
+    try prepareMsrBatch(2, &batch, &.{ 0x10, 0x3b });
+    try std.testing.expectEqual(@as(u32, 2), batch.nmsrs);
+    try std.testing.expectEqualDeep(MsrEntry{ .index = 0x10 }, batch.entries[0]);
+    try std.testing.expectEqualDeep(MsrEntry{ .index = 0x3b }, batch.entries[1]);
+    const completed_entries = try completedMsrEntries(2, &batch, 2);
+    try std.testing.expectEqual(@as(usize, 2), completed_entries.len);
+    completed_entries[0].data = 4;
+    try std.testing.expectEqual(@as(u64, 4), batch.entries[0].data);
+    try std.testing.expectError(error.MsrShortCount, completedMsrEntries(2, &batch, 1));
+    try std.testing.expectError(error.MsrBatchTooLarge, prepareMsrBatch(2, &batch, &.{ 0x10, 0x3b, 0x11 }));
+    batch.nmsrs = 3;
+    try std.testing.expectError(error.MsrBatchTooLarge, completedMsrEntries(2, &batch, 3));
+
+    var xsave2: [4097]u8 = undefined;
+    try std.testing.expectError(error.XsaveSizeInvalid, xsave2Buffer(&xsave2, 4095));
+    try std.testing.expectEqual(@as(usize, 4096), (try xsave2Buffer(&xsave2, 4096)).len);
+    try std.testing.expectEqual(@as(usize, 4097), (try xsave2Buffer(&xsave2, 4097)).len);
+    try std.testing.expectError(error.XsaveBufferTooSmall, xsave2Buffer(xsave2[0..4096], 4097));
 }
 
 fn makeTopologyCpuid() Cpuid {

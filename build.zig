@@ -495,6 +495,23 @@ pub fn build(b: *std.Build) void {
 
         const kvm_boot_step = b.step("kvm-boot", "Build the Linux KVM kernel boot harness");
         kvm_boot_step.dependOn(&install_kvm_boot.step);
+
+        if (target_arch == .x86_64) {
+            const profile_probe_mod = b.createModule(.{
+                .root_source_file = b.path("src/x86_64_profile_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = optimize != .Debug,
+                .link_libc = true,
+            });
+            const profile_probe_exe = b.addExecutable(.{
+                .name = "kvm-profile-probe",
+                .root_module = profile_probe_mod,
+            });
+            const install_profile_probe = b.addInstallArtifact(profile_probe_exe, .{});
+            const profile_probe_step = b.step("kvm-profile-probe", "Build the no-KVM_RUN x86 KVM profile probe");
+            profile_probe_step.dependOn(&install_profile_probe.step);
+        }
     }
 }
 
