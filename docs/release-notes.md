@@ -6,8 +6,9 @@
 publication and both record readers share a 16 MiB bound, so a record larger
 than the previous 256 KiB read cap can be reused by a warm build and inspected
 as a normal GC root instead of becoming a perpetual miss and an unknown
-conservative record. The writer rejects any serialized record beyond the
-shared bound before atomic replacement.
+conservative record. The bound is inclusive: the shared reader reserves one
+extra byte as its overflow sentinel, so an exact 16 MiB record remains readable
+while the writer rejects anything larger before atomic replacement.
 
 Image-backed named VMs now retain OCI `Config.Env` and `WorkingDir` for the
 detached create command and every normal, interactive, and TTY exec. `spore

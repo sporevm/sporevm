@@ -15,6 +15,9 @@ const stale_record_kind_v2 = "sporevm-build-step-v2";
 // input byte covers worst-case JSON string escaping, with the remainder
 // reserved for the fixed envelope and bounded typed fields.
 const max_step_record_bytes = 16 * 1024 * 1024;
+// std.Io's limited reader reserves the limit value as the overflow sentinel,
+// so add one to preserve max_step_record_bytes as an inclusive contract.
+const step_record_read_limit = max_step_record_bytes + 1;
 const test_executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 // SCRATCH has no filesystem parent. This reserved identity occupies the
 // parent-key domain without pretending that a user-visible image exists.
@@ -434,7 +437,7 @@ pub fn readHit(
     if (!std.mem.eql(u8, computed_key, expected_key)) return error.BuildCacheKeyMismatch;
     const path = try recordPath(allocator, cache_root, expected_key);
     defer allocator.free(path);
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_step_record_bytes)) catch |err| switch (err) {
+    const bytes = readRecordAlloc(io, allocator, path) catch |err| switch (err) {
         error.FileNotFound, error.StreamTooLong => return null,
         else => |e| return e,
     };
@@ -457,7 +460,7 @@ pub fn inspectRecordForGc(
     path: []const u8,
     expected_key: []const u8,
 ) !GcRecordInspection {
-    const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_step_record_bytes)) catch |err| switch (err) {
+    const bytes = readRecordAlloc(io, allocator, path) catch |err| switch (err) {
         error.FileNotFound => return .stale,
         error.StreamTooLong => return .unknown,
         else => |e| return e,
@@ -485,6 +488,10 @@ pub fn inspectRecordForGc(
         .root => .{ .root = cloned },
         .legacy => .{ .legacy = cloned },
     };
+}
+
+fn readRecordAlloc(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(step_record_read_limit));
 }
 
 fn decodeRecord(allocator: std.mem.Allocator, bytes: []const u8, expected_key: []const u8) !DecodedRecord {
@@ -1097,29 +1104,29 @@ test "large COPY heredoc record is a warm hit and a GC root" {
     }
 }
 
-test "step record writer rejects output beyond the reader bound" {
+test "inclusive step record bound is readable and one byte beyond fails closed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-record-bound";
+    const tmp = "zig-cache/test-build-step-cache-inclusive-record-bound";
     const cache_root = tmp ++ "/cache";
     const child_rootfs = tmp ++ "/child.ext4";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "bounded record child rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "inclusive record child rootfs bytes" });
 
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
-    const instruction = try arena.alloc(u8, max_step_record_bytes);
-    @memset(instruction, 'x');
-    @memcpy(instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
-    const input = StepInput{
+    const base_instruction = try arena.alloc(u8, max_step_record_bytes - 4096);
+    @memset(base_instruction, 'x');
+    @memcpy(base_instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
+    const base_input = StepInput{
         .platform = .{},
         .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .canonical_instruction = instruction,
+        .canonical_instruction = base_instruction,
         .executor_identity = test_executor_identity,
         .operation = .{ .copy = .{
             .input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -1127,13 +1134,50 @@ test "step record writer rejects output beyond the reader bound" {
             .destination_policy = .follow,
         } },
     };
-    const key = try stepKey(arena, input);
+    const base_key = try stepKey(arena, base_input);
+    const base_path = try writeRecord(io, arena, cache_root, base_input, base_key, storage);
+    const base_bytes = try readRecordAlloc(io, arena, base_path);
+    try std.testing.expect(base_bytes.len < max_step_record_bytes);
+
+    const exact_instruction = try arena.alloc(u8, base_instruction.len + max_step_record_bytes - base_bytes.len);
+    @memset(exact_instruction, 'x');
+    @memcpy(exact_instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
+    var exact_input = base_input;
+    exact_input.canonical_instruction = exact_instruction;
+    const exact_key = try stepKey(arena, exact_input);
+    const exact_path = try writeRecord(io, arena, cache_root, exact_input, exact_key, storage);
+    const exact_bytes = try readRecordAlloc(io, arena, exact_path);
+    try std.testing.expectEqual(max_step_record_bytes, exact_bytes.len);
+
+    const hit = (try readHit(io, arena, cache_root, exact_input, exact_key)) orelse return error.MissingBuildCacheRecord;
+    try std.testing.expectEqualStrings(storage.index_digest, hit.index_digest);
+    switch (try inspectRecordForGc(io, arena, cache_root, exact_path, exact_key)) {
+        .root => |root| try std.testing.expectEqualStrings(storage.index_digest, root.index_digest),
+        .legacy, .stale, .unknown => return error.MissingBuildCacheRecord,
+    }
+
+    const oversized_instruction = try arena.alloc(u8, exact_instruction.len + 1);
+    @memset(oversized_instruction, 'x');
+    @memcpy(oversized_instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
+    var oversized_input = base_input;
+    oversized_input.canonical_instruction = oversized_instruction;
+    const oversized_key = try stepKey(arena, oversized_input);
     try std.testing.expectError(
         error.BuildCacheRecordTooLarge,
-        writeRecord(io, arena, cache_root, input, key, storage),
+        writeRecord(io, arena, cache_root, oversized_input, oversized_key, storage),
     );
-    const path = try recordPath(arena, cache_root, key);
-    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, path, .{}));
+    const oversized_path = try recordPath(arena, cache_root, oversized_key);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, oversized_path, .{}));
+
+    const foreign_bytes = try arena.alloc(u8, exact_bytes.len + 1);
+    @memcpy(foreign_bytes[0..exact_bytes.len], exact_bytes);
+    foreign_bytes[exact_bytes.len] = '\n';
+    try chunk_sealer.replaceFileAtomicDurable(arena, exact_path, foreign_bytes, 0o444);
+    try std.testing.expect((try readHit(io, arena, cache_root, exact_input, exact_key)) == null);
+    switch (try inspectRecordForGc(io, arena, cache_root, exact_path, exact_key)) {
+        .unknown => {},
+        .root, .legacy, .stale => return error.OversizedBuildCacheRecordAccepted,
+    }
 }
 
 test "prepare record round trips typed identity and exact target" {
