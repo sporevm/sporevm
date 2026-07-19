@@ -245,6 +245,9 @@ limits when it starts the builder, then prunes mutable `RUN` cache-mount state
 so cross-build reuse cannot change the fixtures' cold-cache semantics. It also
 removes each Docker-loaded oracle image as soon as the case finishes, while the
 immutable BuildKit layers remain reusable in the retained volume.
+Transitions that inspect cache-excluded transport metadata, such as bind-source
+mtime, first prove the semantic cache hit and then request a fresh Docker
+comparison so a retained layer cannot replay an earlier job's oracle bytes.
 Buildx v0.33.0 is installed by mise only for these jobs and retained in a
 per-agent cache on the host's fast scratch disk.
 

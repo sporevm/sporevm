@@ -535,6 +535,8 @@ def docker_build(
     base_layout: pathlib.Path,
     tag: str,
     log_prefix: pathlib.Path,
+    *,
+    no_cache: bool = False,
 ) -> CommandResult:
     command = [
         "docker",
@@ -551,6 +553,7 @@ def docker_build(
         "--load",
         "--tag",
         tag,
+        *(["--no-cache"] if no_cache else []),
         *build_args(case.spec),
         str(context),
     ]
@@ -813,6 +816,7 @@ def run_case(
                 base_layout,
                 docker_tag,
                 transition_dir / "docker-build",
+                no_cache=transition.docker_no_cache,
             )
             if rebuilt.returncode != 0:
                 raise CaseError(f"transition {name}: {command_failure(rebuilt)}")
