@@ -233,7 +233,7 @@ publish_benchmark_history() {
     Linux) platform="linux-arm64" ;;
     *) return 0 ;;
   esac
-  local history_uri="${SPOREVM_BENCHMARK_HISTORY_S3_URI:-s3://sporevm-benchmarks/history}"
+  local history_uri="${SPOREVM_BENCHMARK_HISTORY_S3_URI:-s3://sporevm-benchmarks-data/history}"
   aws s3 sync zig-cache/sporevm-benchmarks/ "${history_uri%/}/main/${platform}/" \
     --no-progress \
     --exclude "*" \

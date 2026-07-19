@@ -9,7 +9,7 @@ steps:
     key: "benchmarks-macos"
     plugins:
       - aws-assume-role-with-web-identity#v1.4.0:
-          role-arn: "arn:aws:iam::724772075326:role/sporevm-benchmarks-writer"
+          role-arn: "arn:aws:iam::907480720934:role/sporevm-benchmarks-writer"
           session-tags:
             - organization_slug
             - pipeline_slug
@@ -26,7 +26,7 @@ steps:
     command: |
       set -euo pipefail
       scripts/ci/buildkite-benchmarks.sh
-      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/" \
+      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/macos/" \
         --no-progress \
         --exclude "*" \
         --include "latest-summary.json" \
@@ -53,7 +53,7 @@ steps:
     key: "benchmarks-linux-arm64"
     plugins:
       - aws-assume-role-with-web-identity#v1.4.0:
-          role-arn: "arn:aws:iam::724772075326:role/sporevm-benchmarks-writer"
+          role-arn: "arn:aws:iam::907480720934:role/sporevm-benchmarks-writer"
           session-tags:
             - organization_slug
             - pipeline_slug
@@ -70,7 +70,7 @@ steps:
     command: |
       set -euo pipefail
       scripts/ci/buildkite-benchmarks.sh
-      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/" \
+      aws s3 sync zig-cache/sporevm-benchmarks/ "s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/linux-arm64/" \
         --no-progress \
         --exclude "*" \
         --include "latest-summary.json" \
@@ -98,7 +98,7 @@ steps:
     if: build.branch == "main"
     plugins:
       - aws-assume-role-with-web-identity#v1.4.0:
-          role-arn: "arn:aws:iam::724772075326:role/sporevm-benchmarks-writer"
+          role-arn: "arn:aws:iam::907480720934:role/sporevm-benchmarks-writer"
           session-tags:
             - organization_slug
             - pipeline_slug

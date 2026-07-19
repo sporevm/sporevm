@@ -44,7 +44,7 @@ dest="$1"
 limit="$2"
 branch="$3"
 platform="$4"
-history_uri="${SPOREVM_BENCHMARK_HISTORY_S3_URI:-s3://sporevm-benchmarks/history}"
+history_uri="${SPOREVM_BENCHMARK_HISTORY_S3_URI:-s3://sporevm-benchmarks-data/history}"
 
 [[ "${limit}" =~ ^[0-9]+$ ]] || usage
 

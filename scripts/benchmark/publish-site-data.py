@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 
-DEFAULT_BUCKET = "sporevm-benchmarks"
+DEFAULT_BUCKET = "sporevm-benchmarks-data"
 DEFAULT_PLATFORMS = ("macos", "linux-arm64")
 DEFAULT_OUTPUT_DIR = Path("zig-cache/sporevm-benchmarks/published-site")
 DEFAULT_MAX_RUNS = 500
