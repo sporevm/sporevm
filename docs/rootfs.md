@@ -506,4 +506,5 @@ The first native writer profile uses block maps without extents or
 triple-indirect blocks, so a single regular file larger than about 4 GiB fails
 closed with `UnsupportedExt4FileSize`. Set `SPOREVM_EXT4_WRITER=external` for
 images that need such files until native extents or triple-indirect support
-lands.
+lands. The native profile also omits `dir_index`, so lookup in unusually large
+directories remains linear.
