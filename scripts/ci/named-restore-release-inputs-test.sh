@@ -35,7 +35,7 @@ unset SPOREVM_BENCHMARK_SCRATCH_ROOT SPOREVM_NAMED_RESTORE_SCRATCH_ROOT
 export TMPDIR=/private/runner/path/that/must/not/own/named-restore
 [[ "$(named_restore_scratch_root hvf "${repo_root}")" == "/tmp" ]]
 unset TMPDIR
-grep -F 'SPOREVM_NAMED_RESTORE_SCRATCH_ROOT="/var/tmp/sporevm-named-restore-verity"' \
+grep -F 'SPOREVM_NAMED_RESTORE_SCRATCH_ROOT: "/var/tmp/sporevm-named-restore-verity"' \
   "${repo_root}/.buildkite/pipeline.yml" >/dev/null
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-release-inputs-test.XXXXXX")"
