@@ -33,7 +33,7 @@
 #define SPORE_ENUM_TYPED
 #endif
 #define SPORE_ENUM_MAX_VALUE INT_MAX
-#define SPORE_ABI_VERSION 15u
+#define SPORE_ABI_VERSION 16u
 
 #ifdef __cplusplus
 extern "C" {
@@ -387,10 +387,23 @@ SPORE_API void spore_free_string(SporeContext context, SporeOwnedString string);
 /**
  * Return host information as `spore.host-info.v2` JSON.
  *
+ * This compatibility entry point is supported on aarch64 hosts. On x86-64 it
+ * returns SPORE_ERROR and sets the context error to
+ * `UnsupportedArchitecture`; use spore_host_info_json_v2() there.
+ *
  * The returned string is NUL-terminated for C convenience. `len` excludes the
  * trailing NUL and includes the final newline, matching CLI JSON output.
  */
 SPORE_API SporeResult spore_host_info_json(SporeContext context, SporeOwnedString *out_json);
+
+/**
+ * Return architecture-discriminated host information as
+ * `spore.host-info.v2` JSON on aarch64 or x86-64.
+ *
+ * The returned string is NUL-terminated for C convenience. `len` excludes the
+ * trailing NUL and includes the final newline, matching CLI JSON output.
+ */
+SPORE_API SporeResult spore_host_info_json_v2(SporeContext context, SporeOwnedString *out_json);
 
 /** Return libspore network capability facts as JSON. */
 SPORE_API SporeResult spore_network_capabilities_json(SporeContext context, SporeOwnedString *out_json);

@@ -58,11 +58,15 @@ Pass the same allocator to the operation and its matching deinit helper:
 ```zig
 const info = try libspore.hostInfo(context, allocator);
 defer libspore.deinitHostInfo(allocator, info);
+
+const info_v2 = try libspore.hostInfoV2(context, allocator);
+defer libspore.deinitHostInfoV2(allocator, info_v2);
 ```
 
 Use the matching helper for owned results:
 
 - `deinitHostInfo`
+- `deinitHostInfoV2`
 - `deinitSporeInspectResult`
 - `deinitForkResult`
 - `deinitPackResult`
@@ -600,9 +604,10 @@ The C ABI is declared in [`include/spore.h`](../include/spore.h). The current
 surface exposes context management, build info, context-local environment
 overrides, context-local last errors, owned string cleanup, host-info JSON,
 inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
-named copy side-effect calls. ABI version 15 adds saved-spore removal through
-`spore_remove_saved_json`; clients should compare the runtime build-info ABI
-with `SPORE_ABI_VERSION` before calling it.
+named copy side-effect calls. ABI version 15 added saved-spore removal through
+`spore_remove_saved_json`; ABI version 16 adds the architecture-discriminated
+`spore_host_info_json_v2` entry point. Clients should compare the runtime
+build-info ABI with `SPORE_ABI_VERSION` before calling a newly added symbol.
 
 Release builds publish separate `libspore_Linux` and `libspore_Darwin`
 archives so CLI-only installs do not carry development files. Each libspore
@@ -659,6 +664,20 @@ if (spore_host_info_json(context, &json) != SPORE_SUCCESS) return 1;
 spore_free_string(context, json);
 spore_context_free(context);
 ```
+
+`spore_host_info_json` preserves the ARM-shaped `spore.host-info.v1`
+contract and returns `SPORE_ERROR` with `UnsupportedArchitecture` on x86-64.
+Use `spore_host_info_json_v2` for the architecture-discriminated contract on
+either architecture. V2 reports GIC and counter facts only in its `aarch64`
+platform variant; its `x86_64` variant instead reports the frozen board and CPU
+profiles, low-RAM board limits, irqchip/PIT, virtio and generation layout, and
+the bounded KVM capability predicate. An approved x86 profile remains
+`available: false` with reason `runner_not_landed` until the product runner is
+wired.
+
+The Zig API follows the same split: `hostInfo` is the ARM-only v1
+compatibility function and returns `error.UnsupportedArchitecture` on x86-64,
+while `hostInfoV2` returns the discriminated contract on either architecture.
 
 Options structs use `size` and `version` fields and should be initialized with
 their matching helper:

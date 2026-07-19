@@ -41,4 +41,7 @@ metadata and resume entropy are visible in `/run/sporevm/env`.
 
 Keep this directory source-only. `scripts/kernel/make-minimal-exec-initrd.sh` owns
 compiling these files, building the pinned Toybox source dependency into a
-static aarch64 binary, and packing the initrd.
+static binary for the selected `aarch64` or `x86_64` Linux guest, and packing
+the initrd. The build supplies the generation-device GPA from the selected Zig
+board definition, so the guest agent does not carry an architecture-specific
+handwritten address.

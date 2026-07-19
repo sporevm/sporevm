@@ -13,7 +13,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 15;
+const c_abi_version: u32 = 16;
 const reexec_contract_version: u32 = 1;
 const reexec_role_env = "SPORE_REEXEC_ROLE";
 const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
@@ -556,6 +556,19 @@ pub export fn spore_host_info_json(context: ?*SporeContextImpl, out_json: ?*Spor
 
     const info = libspore.hostInfo(ctx.productContext(), ctx.allocator) catch |err| return fail(ctx, err);
     defer libspore.deinitHostInfo(ctx.allocator, info);
+
+    out.* = jsonOwned(ctx, info) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_host_info_json_v2(context: ?*SporeContextImpl, out_json: ?*SporeOwnedString) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+
+    const info = libspore.hostInfoV2(ctx.productContext(), ctx.allocator) catch |err| return fail(ctx, err);
+    defer libspore.deinitHostInfoV2(ctx.allocator, info);
 
     out.* = jsonOwned(ctx, info) catch |err| return fail(ctx, err);
     return result_success;
@@ -1409,6 +1422,68 @@ test "build info exposes version" {
     var abi: u32 = 0;
     try std.testing.expectEqual(result_success, spore_build_info(build_info_abi_version, &abi));
     try std.testing.expectEqual(c_abi_version, abi);
+}
+
+test "C v1 host info API preserves final newline and NUL" {
+    if (comptime builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+    const ctx = context.?;
+
+    const info = try libspore.hostInfo(ctx.productContext(), ctx.allocator);
+    defer libspore.deinitHostInfo(ctx.allocator, info);
+    const expected_json = try std.json.Stringify.valueAlloc(ctx.allocator, info, .{ .whitespace = .indent_2 });
+    defer ctx.allocator.free(expected_json);
+    const expected = try std.fmt.allocPrint(ctx.allocator, "{s}\n", .{expected_json});
+    defer ctx.allocator.free(expected);
+
+    var actual: SporeOwnedString = .{};
+    try std.testing.expectEqual(result_success, spore_host_info_json(context, &actual));
+    defer spore_free_string(context, actual);
+    try std.testing.expectEqualSlices(u8, expected, actual.ptr.?[0..actual.len]);
+    try std.testing.expectEqual(@as(u8, '\n'), actual.ptr.?[actual.len - 1]);
+    try std.testing.expectEqual(@as(u8, 0), actual.ptr.?[actual.len]);
+}
+
+test "C v1 host info serializer preserves checked-in pretty JSON bytes" {
+    const backends = [_]libspore.BackendAvailability{
+        .{ .name = "hvf", .supported = false, .available = false, .reason = "unsupported_os_or_arch" },
+        .{ .name = "kvm", .supported = true, .available = true, .reason = "available" },
+    };
+    const info = libspore.HostInfo{
+        .host_class = "linux-aarch64-kvm",
+        .platform = .{
+            .os = "linux",
+            .arch = "aarch64",
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .ram_base = 0x8000_0000,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0802_0000,
+            .counter_frequency_source = "cntfrq_el0",
+            .counter_frequency_hz = 24_000_000,
+        },
+        .backends = &backends,
+        .cache_roots = .{
+            .kernels = .{ .path = null, .resolved = false, .source = "missing_home" },
+            .rootfs = .{ .path = null, .resolved = false, .source = "missing_home" },
+            .bundles = .{ .path = null, .resolved = false, .source = "missing_home" },
+            .runtime = .{ .path = null, .resolved = false, .source = "invalid_runtime_dir" },
+        },
+    };
+
+    var context: ?*SporeContextImpl = null;
+    try std.testing.expectEqual(result_success, spore_context_new(&context));
+    defer spore_context_free(context);
+    const ctx = context.?;
+
+    const actual = try jsonOwned(ctx, info);
+    defer spore_free_string(context, actual);
+    const expected = @embedFile("fixtures/host-info-v1-pretty.json");
+    try std.testing.expectEqualSlices(u8, expected, actual.ptr.?[0..actual.len]);
+    try std.testing.expectEqual(@as(u8, 0), actual.ptr.?[actual.len]);
 }
 
 test "reexec role validation fails closed" {

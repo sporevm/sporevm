@@ -379,6 +379,35 @@ throughout the work.
   validation defects fixed here; two post-fix Fable attempts were refused by
   Anthropic's classifier before analysis, while the final local ship and
   maintainability reviews approve with no material finding.
+- Stage 1.4 completes the `spore.host-info.v2` contract. It preserves the
+  ARM-shaped v1 Zig/JSON contract and C symbol, adds the ABI-version-16
+  `spore_host_info_json_v2` entry point, and reports tagged ARM or x86
+  board/profile/KVM-capability facts without executing host-specific
+  instructions in the fixture renderer. Exact compact JSON goldens cover both
+  architecture variants, a checked-in pretty-JSON golden pins the C v1
+  serializer bytes, and the live C v1 test pins its final newline and NUL.
+  Missing or invalid probe values now report `kvm_probe_failed`, while observed
+  insufficient values report `profile_capability_missing`. On the dedicated
+  x86 host (c5d.metal, Linux 6.17.0-1019-aws), exact ReleaseSafe CLI SHA256
+  `1336168f105086bc6843b173e73c076cf2ed4a864f7719a38f0806e764dd8427`
+  reports all 21 profile capabilities satisfied and the intentional
+  `runner_not_landed` backend state; exact static C smoke SHA256
+  `8ec4c676d7de28b943dbc0b458bc84d24da907ce809a217d46bfcb3f734acc17`
+  executes successfully, with no residual `spore` process.
+- Stage 1.5 completes architecture-specific embedded guest artifacts and the
+  x86 cross-build lane. `build.zig` derives the guest architecture and
+  generation GPA from the canonical board, the generator rejects mismatched
+  pairs and dynamically linked or wrong-machine executables, and its direct
+  newc writer fixes ordering, modes, ownership, mtimes, and padding. The wired
+  test byte-compares ARM and x86 archives across different umasks,
+  `SOURCE_DATE_EPOCH` values, and compiler selection paths, then parses every
+  archive member and executable. The full native suite, deterministic-initrd
+  test, native build, ReleaseSafe ARM and x86 musl builds, formatting, and diff
+  checks pass. Anthropic Fable and the local reviews return `SHIP`; the
+  adversarial review's probe-diagnostic and C-golden findings are fixed. The
+  transient transfer bucket was deleted and proved absent; private task
+  evidence retains the exact host outputs. Completing Stage 1.5 completes
+  Slice 1.
 
 ## Motivation
 

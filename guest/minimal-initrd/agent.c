@@ -147,7 +147,10 @@
 #define AT_EMPTY_PATH 0x1000
 #endif
 #define MAX_SYMLINK_DEPTH 40
-#define GEN_BASE 0x0c001000ULL
+#ifndef SPORE_GENERATION_BASE
+#error "SPORE_GENERATION_BASE must come from the selected SporeVM board"
+#endif
+#define GEN_BASE SPORE_GENERATION_BASE
 #define GEN_WINDOW_SIZE 0x1000U
 #define GEN_MAGIC 0x4e475053U
 #define GEN_IRQ_GENERATION_CHANGED 1U

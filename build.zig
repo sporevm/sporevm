@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const aarch64_board = @import("src/board.zig");
+const x86_64_board = @import("src/x86_64/board.zig");
 
 const macos_deployment_target = std.SemanticVersion{ .major = 13, .minor = 0, .patch = 0 };
 
@@ -32,11 +34,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const toybox_dep = b.dependency("toybox", .{});
+    const guest_arch = guestArchitecture(target_arch) orelse
+        std.debug.panic("unsupported embedded guest architecture: {s}", .{@tagName(target_arch)});
+    const guest_generation_base = generationBase(target_arch) orelse unreachable;
     const minimal_exec_assets = b.addSystemCommand(&.{
         "bash",
         "-c",
         \\set -euo pipefail
-        \\scripts/kernel/make-minimal-exec-initrd.sh --toybox-source "$3" "$1"
+        \\scripts/kernel/make-minimal-exec-initrd.sh --arch "$4" --generation-base "$5" --toybox-source "$3" "$1"
         \\if command -v sha256sum >/dev/null 2>&1; then
         \\  initrd_sha256="$(sha256sum "$1" | awk '{print $1}')"
         \\else
@@ -52,6 +57,8 @@ pub fn build(b: *std.Build) void {
     _ = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.cpio");
     const minimal_exec_initrd_module = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.zig");
     minimal_exec_assets.addDirectoryArg(toybox_dep.path(""));
+    minimal_exec_assets.addArg(guest_arch);
+    minimal_exec_assets.addArg(b.fmt("0x{x}", .{guest_generation_base}));
     minimal_exec_assets.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
     minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
     const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
@@ -279,6 +286,22 @@ pub fn build(b: *std.Build) void {
     run_x86_64_tests.step.dependOn(&run_c_smoke.step);
 
     const test_step = b.step("test", "Run unit tests");
+    const minimal_exec_initrd_tests = b.addSystemCommand(&.{
+        "bash", "scripts/kernel/test-minimal-exec-initrd.sh", "--toybox-source",
+    });
+    minimal_exec_initrd_tests.addDirectoryArg(toybox_dep.path(""));
+    minimal_exec_initrd_tests.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
+    for (minimal_exec_sources) |src| {
+        minimal_exec_initrd_tests.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
+    }
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_copy.c"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_copy.h"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.c"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.h"));
+    const minimal_exec_initrd_test_step = b.step("minimal-exec-initrd-test", "Build and validate deterministic embedded initrds for every guest architecture");
+    minimal_exec_initrd_test_step.dependOn(&minimal_exec_initrd_tests.step);
+    test_step.dependOn(minimal_exec_initrd_test_step);
     test_step.dependOn(&run_libspore_tests.step);
     test_step.dependOn(&run_libspore_smoke_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
@@ -528,6 +551,25 @@ pub fn build(b: *std.Build) void {
             profile_roundtrip_step.dependOn(&install_profile_roundtrip.step);
         }
     }
+}
+
+fn guestArchitecture(arch: std.Target.Cpu.Arch) ?[]const u8 {
+    return switch (arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => null,
+    };
+}
+
+/// Keep the guest agent's MMIO definition tied to the selected, validated
+/// board instead of accepting a user-supplied build option or a second C
+/// constant that can drift from the VMM.
+fn generationBase(arch: std.Target.Cpu.Arch) ?u64 {
+    return switch (arch) {
+        .aarch64 => aarch64_board.generation_base,
+        .x86_64 => x86_64_board.generation_base,
+        else => null,
+    };
 }
 
 fn macosFrameworkPath(b: *std.Build) ?std.Build.LazyPath {
