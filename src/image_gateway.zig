@@ -14,6 +14,7 @@ pub const max_platform_manifests: usize = 2;
 
 pub const Error = error{
     BadProtocol,
+    AmbiguousPlatform,
     UnsupportedPlatform,
     PlatformNotFound,
     OutOfMemory,
@@ -33,6 +34,33 @@ pub const OciPlatform = struct {
     os: []const u8,
     architecture: []const u8,
     variant: ?[]const u8 = null,
+};
+
+/// Allocation-free source-platform selection shared by gateway protocol code
+/// and direct OCI imports. Callers decide which descriptor media types are
+/// eligible before passing their platform metadata here.
+pub const OciPlatformSelector = struct {
+    requested: Platform,
+    selected: ?usize = null,
+
+    pub fn init(requested: Platform) Error!OciPlatformSelector {
+        try validatePlatform(requested);
+        return .{ .requested = requested };
+    }
+
+    pub fn consider(self: *OciPlatformSelector, candidate: OciPlatform, index: usize) Error!void {
+        // Ignore unrelated OCI targets before normalization so multi-platform
+        // indexes and same-media-type attestation descriptors remain usable.
+        if (!std.mem.eql(u8, candidate.os, self.requested.os) or
+            !std.mem.eql(u8, candidate.architecture, self.requested.arch.name())) return;
+        _ = try normalizeOciPlatform(candidate);
+        if (self.selected != null) return error.AmbiguousPlatform;
+        self.selected = index;
+    }
+
+    pub fn finish(self: OciPlatformSelector) Error!usize {
+        return self.selected orelse error.PlatformNotFound;
+    }
 };
 
 pub const ManifestDescriptor = struct {
@@ -78,17 +106,14 @@ pub fn normalizeOciPlatform(platform: OciPlatform) Error!Platform {
 /// platforms are ignored, but two descriptors that normalize to the requested
 /// platform are ambiguous and fail closed.
 pub fn selectOciPlatformDescriptor(platforms: []const OciPlatform, requested: Platform) Error!usize {
-    try validatePlatform(requested);
-    var selected: ?usize = null;
+    var selector = try OciPlatformSelector.init(requested);
     for (platforms, 0..) |candidate, index| {
-        if (!std.mem.eql(u8, candidate.os, requested.os) or
-            !std.mem.eql(u8, candidate.architecture, requested.arch.name())) continue;
-        const normalized = try normalizeOciPlatform(candidate);
-        if (!normalized.eql(requested)) continue;
-        if (selected != null) return error.BadProtocol;
-        selected = index;
+        selector.consider(candidate, index) catch |err| return switch (err) {
+            error.AmbiguousPlatform => error.BadProtocol,
+            else => err,
+        };
     }
-    return selected orelse error.PlatformNotFound;
+    return selector.finish();
 }
 
 /// Parse one exact canonical platform-index representation. Unknown or
