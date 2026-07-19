@@ -1,4 +1,5 @@
 const std = @import("std");
+const image = @import("../image.zig");
 
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -123,20 +124,8 @@ pub const ImageManifest = struct {
     layers: []Descriptor,
 };
 
-pub const ImageConfig = struct {
-    architecture: ?[]const u8 = null,
-    os: ?[]const u8 = null,
-    config: ?RuntimeConfig = null,
-};
-
-pub const RuntimeConfig = struct {
-    Env: ?[][]const u8 = null,
-    Entrypoint: ?[][]const u8 = null,
-    Cmd: ?[][]const u8 = null,
-    WorkingDir: ?[]const u8 = null,
-    User: ?[]const u8 = null,
-    OnBuild: ?[][]const u8 = null,
-};
+pub const ImageConfig = image.Config;
+pub const RuntimeConfig = image.RuntimeConfig;
 
 pub const LayerMetadata = struct {
     media_type: []const u8,

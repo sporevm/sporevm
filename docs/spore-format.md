@@ -103,12 +103,13 @@ as roots. Malformed or incomplete known records and semantically stale
 builder-v9 records are pruneable. Unknown future record kinds or schema versions are preserved and
 conservatively retain the rootfs CAS namespace.
 
-The local image identity published by `spore build` is distinct from the raw
-rootfs storage identity. `spore build` first serializes the final
+The local image identity published by indexed-image producers such as
+`spore build` and `spore run --commit` is distinct from the raw rootfs storage
+identity. Publication first serializes the final
 `ImageConfig` as canonical JSON with optional null fields omitted and the
-deterministic struct field order used by `src/rootfs/oci.zig`
+deterministic struct field order owned by `src/image.zig`
 (`architecture`, `os`, `config`, then runtime config fields `Env`,
-`Entrypoint`, `Cmd`, `WorkingDir`, `User`). `config_digest` is
+`Entrypoint`, `Cmd`, `WorkingDir`, `User`, `OnBuild`). `config_digest` is
 `blake3:<hex>` over two length-prefixed fields: the ASCII domain
 `sporevm-indexed-image-config-v1` and those canonical config JSON bytes. The
 published image digest is `blake3:<hex>` over three length-prefixed fields: the
