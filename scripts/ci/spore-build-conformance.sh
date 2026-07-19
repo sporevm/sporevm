@@ -3,7 +3,6 @@ set -euo pipefail
 
 : "${BUILDKITE_JOB_ID:?BUILDKITE_JOB_ID is required}"
 : "${BUILDKITE_AGENT_NAME:?BUILDKITE_AGENT_NAME is required}"
-: "${BUILDKITE_FAST_SCRATCH:?BUILDKITE_FAST_SCRATCH is required}"
 : "${BUILDKITE_PARALLEL_JOB:?BUILDKITE_PARALLEL_JOB is required}"
 : "${BUILDKITE_PARALLEL_JOB_COUNT:?BUILDKITE_PARALLEL_JOB_COUNT is required}"
 
@@ -31,7 +30,8 @@ mkdir -p "${DOCKER_CONFIG}/cli-plugins"
 echo "--- :docker: Install the pinned Buildx oracle"
 buildx_tool="aqua:docker/buildx@0.33.0"
 agent_cache_key="$(printf '%s' "${BUILDKITE_AGENT_NAME}" | sha256sum | cut -c1-16)"
-buildx_mise_root="${BUILDKITE_FAST_SCRATCH}/mise-buildx/${agent_cache_key}"
+fast_scratch="${SPOREVM_CI_FAST_SCRATCH:-/var/tmp/nvme}"
+buildx_mise_root="${fast_scratch}/mise-buildx/${agent_cache_key}"
 buildx_install_log="${conformance_root}/logs/mise-buildx-install.log"
 mkdir -p "${buildx_mise_root}/data" "${buildx_mise_root}/cache" "${buildx_mise_root}/state"
 if env \
