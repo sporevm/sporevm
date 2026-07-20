@@ -149,7 +149,7 @@ the schema bounds above. Objects must have the exact index-derived length and
 their BLAKE3 digest is rechecked by the CAS installer before publication.
 
 Production gateways require HTTPS. `--allow-insecure-http` accepts only an
-explicit loopback origin and exists for the static fixture server. This proof
+explicit `127.0.0.1` or `[::1]` origin and exists for the static fixture server. This proof
 has no authentication or credential handling, so it is not a production
 gateway client contract yet. `spore image export-fixture` writes a new static
 repository tree from existing indexed-rootfs metadata and verified local CAS

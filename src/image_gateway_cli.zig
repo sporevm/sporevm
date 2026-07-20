@@ -11,10 +11,6 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         try stdout.writeAll(gateway_pull.usage);
         return;
     }
-    if (wantsHelp(args[1..])) {
-        try stdout.writeAll(gateway_pull.usage);
-        return;
-    }
     if (std.mem.eql(u8, args[0], "pull")) {
         const options = try parsePullOptions(args[1..]);
         const result = try api.imageGatewayPull(init, init.arena.allocator(), options);
@@ -43,7 +39,10 @@ pub fn parsePullOptions(args: []const []const u8) !api.ImageGatewayPullOptions {
     var gateway_url: ?[]const u8 = null;
     var repository: ?[]const u8 = null;
     var ref: ?[]const u8 = null;
-    var platform: rootfs.Platform = .{};
+    var platform = rootfs.Platform{
+        .os = gateway_pull.default_platform.os,
+        .arch = gateway_pull.default_platform.arch,
+    };
     var allow_insecure_http = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -146,6 +145,16 @@ test "image pull options require explicit gateway repository and local ref" {
         "--ref",
         "local/alpine:gateway",
     }));
+    const defaults = try parsePullOptions(&.{
+        "docker.io/library/alpine:3.20",
+        "--gateway",
+        "https://images.example.test",
+        "--repository",
+        "team/base-images",
+        "--ref",
+        "local/alpine:gateway",
+    });
+    try std.testing.expectEqual(gateway_pull.default_platform.arch, defaults.platform.arch);
 }
 
 test "fixture export options require an existing metadata input and new output" {

@@ -40,9 +40,11 @@ pub const PullOptions = struct {
     gateway_url: []const u8,
     repository: []const u8,
     ref: []const u8,
-    platform: gateway.Platform = .{ .os = "linux", .arch = .arm64 },
+    platform: gateway.Platform = default_platform,
     allow_insecure_http: bool = false,
 };
+
+pub const default_platform = gateway.Platform{ .os = "linux", .arch = .arm64 };
 
 pub const PullResult = struct {
     resolved_image_ref: []const u8,
@@ -77,6 +79,20 @@ const StagedObject = struct {
 };
 
 pub fn pull(init: std.process.Init, allocator: std.mem.Allocator, options: PullOptions) !PullResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const result = try pullInner(init, arena_state.allocator(), options);
+    const resolved_image_ref = try allocator.dupe(u8, result.resolved_image_ref);
+    errdefer allocator.free(resolved_image_ref);
+    return .{
+        .resolved_image_ref = resolved_image_ref,
+        .image_digest = try allocator.dupe(u8, result.image_digest),
+        .objects_fetched = result.objects_fetched,
+        .bytes_fetched = result.bytes_fetched,
+    };
+}
+
+fn pullInner(init: std.process.Init, allocator: std.mem.Allocator, options: PullOptions) !PullResult {
     try validateGatewayUrl(options.gateway_url, options.allow_insecure_http);
     try validateRepository(options.repository);
     try rootfs.validateLocalTagRef(options.ref);
@@ -148,7 +164,7 @@ pub fn pull(init: std.process.Init, allocator: std.mem.Allocator, options: PullO
     var staged_by_digest = std.StringHashMap(usize).init(allocator);
     defer staged_by_digest.deinit();
     var staged_count: usize = 0;
-    errdefer for (staged[0..staged_count]) |entry| {
+    defer for (staged[0..staged_count]) |entry| {
         allocator.free(entry.digest);
         allocator.free(entry.path);
     };
@@ -168,19 +184,17 @@ pub fn pull(init: std.process.Init, allocator: std.mem.Allocator, options: PullO
         const path = try std.fmt.allocPrint(allocator, "{s}/{d}.chunk", .{ stage_dir, staged_count });
         errdefer allocator.free(path);
         try Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = object_bytes });
+        const digest = try allocator.dupe(u8, entry.digest);
+        errdefer allocator.free(digest);
+        try staged_by_digest.put(digest, staged_count);
         staged[staged_count] = .{
-            .digest = try allocator.dupe(u8, entry.digest),
+            .digest = digest,
             .expected_size = expected_size,
             .path = path,
         };
         staged_count += 1;
-        try staged_by_digest.put(staged[staged_count - 1].digest, staged_count - 1);
         bytes_fetched += @intCast(object_bytes.len);
     }
-    defer for (staged[0..staged_count]) |entry| {
-        allocator.free(entry.digest);
-        allocator.free(entry.path);
-    };
 
     var cache_lock = try rootfs.lockRootfsCacheExclusive(init.io, allocator, cache_root);
     defer cache_lock.deinit();
@@ -203,11 +217,11 @@ pub fn pull(init: std.process.Init, allocator: std.mem.Allocator, options: PullO
         .platform = .{ .os = options.platform.os, .arch = options.platform.arch },
         .config = parsed_config.value,
         .rootfs_storage = storage,
+        .expected_image_digest = manifest.image.digest,
     });
-    defer rootfs.deinitPublishIndexedImageResult(allocator, published);
     return .{
-        .resolved_image_ref = try allocator.dupe(u8, published.resolved_image_ref),
-        .image_digest = try allocator.dupe(u8, published.image_manifest_digest),
+        .resolved_image_ref = published.resolved_image_ref,
+        .image_digest = published.image_manifest_digest,
         .objects_fetched = staged_count,
         .bytes_fetched = bytes_fetched,
     };
@@ -458,9 +472,9 @@ fn validateGatewayUrl(raw: []const u8, allow_insecure_http: bool) !void {
     const host = uri.getHost(&host_buffer) catch return error.InvalidGatewayUrl;
     if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return;
     if (!allow_insecure_http or !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return error.InsecureGatewayUrl;
-    if (!std.ascii.eqlIgnoreCase(host.bytes, "localhost") and
-        !std.mem.eql(u8, host.bytes, "127.0.0.1") and
-        !std.mem.eql(u8, host.bytes, "::1")) return error.InsecureGatewayUrl;
+    if (!std.mem.eql(u8, host.bytes, "127.0.0.1") and
+        !std.mem.eql(u8, host.bytes, "::1") and
+        !std.mem.eql(u8, host.bytes, "[::1]")) return error.InsecureGatewayUrl;
 }
 
 fn stageDirPath(allocator: std.mem.Allocator, io: Io, cache_root: []const u8) ![]u8 {
@@ -498,10 +512,94 @@ fn httpGetAlloc(allocator: std.mem.Allocator, client: *std.http.Client, url: []c
     return writer.toOwnedSlice();
 }
 
+const StaticGatewayServer = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+    server: Io.net.Server,
+    thread: std.Thread,
+    closed: std.atomic.Value(bool),
+
+    fn init(self: *StaticGatewayServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
+        var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .root = root,
+            .server = try address.listen(io, .{ .kernel_backlog = 8, .reuse_address = true }),
+            .thread = undefined,
+            .closed = .init(false),
+        };
+        self.thread = try std.Thread.spawn(.{}, serveThread, .{self});
+    }
+
+    fn deinit(self: *StaticGatewayServer) void {
+        const wake_address = self.server.socket.address;
+        self.closed.store(true, .release);
+        if (wake_address.connect(self.io, .{ .mode = .stream })) |stream| {
+            stream.close(self.io);
+        } else |_| {}
+        self.server.deinit(self.io);
+        self.thread.join();
+    }
+
+    fn url(self: *StaticGatewayServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn serveThread(self: *StaticGatewayServer) void {
+        while (!self.closed.load(.acquire)) {
+            var stream = self.server.accept(self.io) catch {
+                if (self.closed.load(.acquire)) return;
+                continue;
+            };
+            self.handle(stream) catch {};
+            stream.close(self.io);
+        }
+    }
+
+    fn handle(self: *StaticGatewayServer, stream: Io.net.Stream) !void {
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        const request_line_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
+        const request_line = std.mem.trimEnd(u8, request_line_raw, "\r");
+        while (true) {
+            const header_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
+            if (std.mem.trimEnd(u8, header_raw, "\r").len == 0) break;
+        }
+        if (!std.mem.startsWith(u8, request_line, "GET ")) return self.writeStatus(stream, 405);
+        const rest = request_line["GET ".len..];
+        const path_end = std.mem.indexOfScalar(u8, rest, ' ') orelse return self.writeStatus(stream, 400);
+        const path = rest[0..path_end];
+        if (path.len < 2 or path[0] != '/' or std.mem.indexOfAny(u8, path, "?%") != null or
+            std.mem.indexOf(u8, path, "..") != null) return self.writeStatus(stream, 404);
+        const file_path = try std.fs.path.join(self.allocator, &.{ self.root, path[1..] });
+        defer self.allocator.free(file_path);
+        const data = Io.Dir.cwd().readFileAlloc(self.io, file_path, self.allocator, .limited(disk_index.max_index_bytes + 1)) catch
+            return self.writeStatus(stream, 404);
+        defer self.allocator.free(data);
+
+        var write_buffer: [8 * 1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{data.len});
+        try writer.interface.writeAll(data);
+        try writer.interface.flush();
+    }
+
+    fn writeStatus(self: *StaticGatewayServer, stream: Io.net.Stream, status: u16) !void {
+        var write_buffer: [256]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        try writer.interface.print("HTTP/1.1 {d} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{status});
+        try writer.interface.flush();
+    }
+};
+
 test "gateway URL and repository validation fail closed" {
     try validateGatewayUrl("https://images.example.test", false);
     try validateGatewayUrl("http://127.0.0.1:8080", true);
+    try validateGatewayUrl("http://[::1]:8080", true);
     try std.testing.expectError(error.InsecureGatewayUrl, validateGatewayUrl("http://127.0.0.1:8080", false));
+    try std.testing.expectError(error.InsecureGatewayUrl, validateGatewayUrl("http://localhost:8080", true));
     try std.testing.expectError(error.InsecureGatewayUrl, validateGatewayUrl("http://10.0.0.1:8080", true));
     try validateRepository("team/base-images");
     try std.testing.expectError(error.InvalidGatewayRepository, validateRepository("team//base"));
@@ -612,4 +710,53 @@ test "static fixture export produces a verified repository-bound closure" {
     const selected = try gateway.selectManifest(parsed.value, .{ .os = "linux", .arch = .arm64 });
     try std.testing.expectEqualStrings(result.manifest_digest, selected.manifest_digest);
     try std.testing.expectEqualStrings(result.image_digest, selected.image_digest);
+
+    var server: StaticGatewayServer = undefined;
+    try server.init(allocator, io, tmp ++ "/gateway");
+    defer server.deinit();
+    const gateway_url = try server.url(allocator);
+    defer allocator.free(gateway_url);
+
+    const pull_cache = tmp ++ "/pull-cache";
+    try env.put(local_paths.rootfs_cache_env, pull_cache);
+    const pulled = try pull(init, allocator, .{
+        .source = "docker.io/library/alpine:3.20",
+        .gateway_url = gateway_url,
+        .repository = "fixture",
+        .ref = "local/alpine:gateway",
+        .allow_insecure_http = true,
+    });
+    defer deinitPullResult(allocator, pulled);
+    try std.testing.expectEqualStrings(result.image_digest, pulled.image_digest);
+    try std.testing.expectEqual(@as(usize, 1), pulled.objects_fetched);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, pull_cache, storage));
+    try Io.Dir.cwd().access(io, pull_cache ++ "/refs", .{});
+    try rootfs_cas.removeStorageCompleteStamp(io, allocator, pull_cache, storage.index_digest);
+    var read_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer read_arena_state.deinit();
+    const read_arena = read_arena_state.allocator();
+    const cached = try rootfs.cachedImageIndexedRootfs(io, read_arena, pull_cache, .{
+        .ref = pulled.resolved_image_ref,
+        .manifest_digest = pulled.image_digest,
+        .platform = .{},
+    });
+    try std.testing.expect(cached != null);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, pull_cache, storage));
+
+    const failed_cache = tmp ++ "/failed-cache";
+    try env.put(local_paths.rootfs_cache_env, failed_cache);
+    try Io.Dir.cwd().createDirPath(io, failed_cache ++ "/cas/rootfs/blake3");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = failed_cache ++ "/cas/rootfs/blake3/objects", .data = "blocks object installation" });
+    if (pull(init, allocator, .{
+        .source = "docker.io/library/alpine:3.20",
+        .gateway_url = gateway_url,
+        .repository = "fixture",
+        .ref = "local/alpine:gateway",
+        .allow_insecure_http = true,
+    })) |unexpected| {
+        deinitPullResult(allocator, unexpected);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, allocator, failed_cache, storage));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, failed_cache ++ "/refs", .{}));
 }
