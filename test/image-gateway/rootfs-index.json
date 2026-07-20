@@ -1,0 +1,18 @@
+{
+  "kind": "spore-disk-index-v1",
+  "logical_size": 65537,
+  "chunk_size": 65536,
+  "hash_algorithm": "blake3",
+  "object_namespace": "rootfs/blake3",
+  "chunks": [
+    {
+      "logical_chunk": 0,
+      "digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "logical_chunk": 1,
+      "digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "zero_chunks": []
+}

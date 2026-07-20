@@ -352,7 +352,7 @@ Spore's immutable identity rather than creating a second rootfs format:
     "config_blob": {
       "transport_digest": "sha256:<canonical-config-json>",
       "config_digest": "blake3:<indexed-image-config-digest>",
-      "bytes": 0
+      "bytes": 37
     },
     "rootfs_storage": {
       "kind": "chunked-ext4-rootfs-v0",
@@ -362,11 +362,11 @@ Spore's immutable identity rather than creating a second rootfs format:
         "virtio_device_id": 2,
         "mmio_slot": 1
       },
-      "logical_size": 0,
+      "logical_size": 65537,
       "chunk_size": 65536,
       "hash_algorithm": "blake3",
       "index_digest": "blake3:<rootfs-index-digest>",
-      "base_identity": "<current bounded base identity>",
+      "base_identity": "blake3:<rootfs-index-digest>",
       "object_namespace": "rootfs/blake3"
     }
   },
@@ -383,17 +383,16 @@ Spore's immutable identity rather than creating a second rootfs format:
   },
   "rootfs_index": {
     "digest": "blake3:<rootfs-index-digest>",
-    "bytes": 0,
-    "object_count": 0,
-    "object_bytes": 0
+    "bytes": 449,
+    "object_count": 2,
+    "object_bytes": 65537
   }
 }
 ```
 
 The durable schema carries every current `RootfsStorage` field, including the
-complete virtio-mmio device binding. The exact bounds belong in a durable
-protocol document before implementation.
-The parser must reject unknown kinds and versions, duplicate fields, invalid
+complete virtio-mmio device binding. The parser rejects unknown kinds and
+versions, duplicate fields, invalid
 UTF-8, trailing input, non-canonical digests, unsupported platform or storage
 values, inconsistent index/base identities, oversized configuration, and
 values beyond current local rootfs/index bounds.
@@ -406,7 +405,11 @@ byte-for-byte equality. It then verifies the rootfs index BLAKE3 digest, the
 index's full-coverage invariants, and the current native image digest over the
 index plus those exact canonical config bytes.
 The selected platform-index descriptor, image-manifest platform, and canonical
-config `os` and `architecture` must agree exactly after v1 normalization.
+config `os` and `architecture` must agree exactly after v1 normalization. This
+schema and verification path are implemented; object transfer and local image
+installation are not. The verifier also binds optional source provenance to the
+platform index's source generation, so a mutable upstream tag cannot produce a
+mixed-generation multi-platform index.
 
 ## Provenance And Attachments
 
@@ -923,15 +926,22 @@ three selection paths accept an absent or `v8` arm64 variant, require amd64 to
 omit its variant, and reject multiple eligible descriptors that normalize to
 the requested platform.
 
-The rest of G0 remains open: image-manifest and attachment schemas, transport
-benchmarking, authorization-bound object fetch, cross-repository conformance,
-and converter-worker equivalence have not started.
+The bounded canonical image-manifest schema has also landed as a distinct,
+data-only protocol module. Its arm64, amd64, and native fixtures exercise exact
+config, index, platform, object-summary, and native-image closure verification;
+the final short chunk keeps the summary contract honest for a future lazy pull.
+The module has no network, registry, filesystem, CAS, or runtime dependency.
+
+The rest of G0 remains open: the attachment schema, transport benchmarking,
+authorization-bound object fetch, cross-repository conformance, and converter-
+worker equivalence have not started.
 
 ## Delivery Strategy
 
 ### G0 — Freeze the protocol and benchmark fixture
 
-Status: active prerequisite; native identity and platform-index slices landed.
+Status: active prerequisite; native identity, platform-index, and image-manifest
+slices landed.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -954,6 +964,8 @@ Status: active prerequisite; native identity and platform-index slices landed.
   native `spore build` image, including a multi-platform index, same-tag
   platform selection, malformed cases, and the concrete 64 MiB canonical-index
   bound.
+  The schema fixtures and closure verifier have landed; the converter-worker
+  equivalence run and broader malformed fixture exchange remain open.
 - Run at least one selected target-manifest fixture through arm64 and amd64
   converter workers and require byte-identical config, index, and image digests;
   the worker architecture must not leak into native output.
