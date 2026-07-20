@@ -208,7 +208,15 @@ pub fn build(b: *std.Build) void {
         mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
         mod.addCSourceFile(.{
             .file = b.path("guest/minimal-initrd/agent.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
+            .flags = &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-Wno-unused-function",
+                "-DSPORE_AGENT_REQUEST_FUZZ",
+                b.fmt("-DSPORE_GENERATION_BASE=0x{x}ULL", .{guest_generation_base}),
+            },
         });
         mod.addCSourceFile(.{
             .file = b.path("guest/minimal-initrd/build_copy.c"),
