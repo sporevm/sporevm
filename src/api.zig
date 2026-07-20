@@ -6,6 +6,7 @@
 
 const std = @import("std");
 
+const aarch64_topology = @import("aarch64/topology.zig");
 const architecture = @import("architecture.zig");
 const backend_mod = @import("backend.zig");
 const bundle = @import("bundle.zig");
@@ -22,7 +23,7 @@ const rootfs_mod = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const saved_spore_fork = @import("saved_spore_fork.zig");
 const run_mod = @import("run.zig");
-const gicv3 = @import("gicv3.zig");
+const gicv3 = @import("aarch64/gicv3.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
@@ -1753,7 +1754,7 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
 fn testVcpuState(index: u32) spore.VcpuState {
     return .{
         .index = index,
-        .mpidr = topology.mpidrForIndex(index),
+        .mpidr = aarch64_topology.mpidrForIndex(index),
         .gprs = [_]u64{0} ** 31,
         .pc = 0,
         .cpsr = 0,

@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const aarch64_board = @import("src/board.zig");
+const aarch64_board = @import("src/aarch64/board.zig");
 const x86_64_board = @import("src/x86_64/board.zig");
 
 const macos_deployment_target = std.SemanticVersion{ .major = 13, .minor = 0, .patch = 0 };

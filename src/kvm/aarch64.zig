@@ -1,4 +1,4 @@
-//! Linux KVM bindings for the aarch64 backend.
+//! Linux KVM bindings for the AArch64 backend.
 //!
 //! This module deliberately mirrors only the small KVM UAPI surface SporeVM
 //! needs for bring-up: VM/vCPU creation, one-reg access, userspace VGICv3,

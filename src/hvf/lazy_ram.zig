@@ -8,7 +8,7 @@
 //! work.
 
 const std = @import("std");
-const board = @import("../board.zig");
+const board = @import("../aarch64/board.zig");
 const fd_util = @import("../fd.zig");
 const guestmem = @import("../guestmem.zig");
 const hvf = @import("hvf.zig");

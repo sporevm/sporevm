@@ -6,9 +6,10 @@
 //! lands in the cross-hypervisor slice.
 
 const std = @import("std");
+const aarch64_topology = @import("../aarch64/topology.zig");
 const hvf = @import("hvf.zig");
-const board = @import("../board.zig");
-const gicv3 = @import("../gicv3.zig");
+const board = @import("../aarch64/board.zig");
+const gicv3 = @import("../aarch64/gicv3.zig");
 const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
 
@@ -103,7 +104,7 @@ pub fn captureMachineV1(allocator: std.mem.Allocator, vcpus: []spore.VcpuState) 
 pub fn captureVcpuState(allocator: std.mem.Allocator, vcpu: VcpuRef) !spore.VcpuState {
     var state: spore.VcpuState = undefined;
     state.index = vcpu.index;
-    state.mpidr = topology.mpidrForIndex(vcpu.index);
+    state.mpidr = aarch64_topology.mpidrForIndex(vcpu.index);
 
     for (0..31) |i| {
         try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, @enumFromInt(@as(u32, @intCast(i))), &state.gprs[i]), "get gpr");
@@ -168,7 +169,7 @@ pub fn applyMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle, state: s
     try applyGicState(allocator, vcpu, state.gic);
     try applyVcpuState(vcpu, .{
         .index = 0,
-        .mpidr = topology.mpidrForIndex(0),
+        .mpidr = aarch64_topology.mpidrForIndex(0),
         .gprs = state.gprs,
         .pc = state.pc,
         .cpsr = state.cpsr,
@@ -186,7 +187,7 @@ pub fn applyVcpuState(vcpu: hvf.VcpuHandle, state: spore.VcpuState) !void {
 }
 
 pub fn applyVcpuStateWithOffset(vcpu: hvf.VcpuHandle, state: spore.VcpuState, shared_vtimer_offset: u64) !void {
-    if (state.mpidr != topology.mpidrForIndex(state.index)) return error.PlatformMismatch;
+    if (state.mpidr != aarch64_topology.mpidrForIndex(state.index)) return error.PlatformMismatch;
 
     for (0..31) |i| {
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, @intCast(i))), state.gprs[i]), "set gpr");

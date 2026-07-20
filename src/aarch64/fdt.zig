@@ -1,6 +1,6 @@
 //! Flattened Device Tree (FDT/DTB) builder.
 //!
-//! Builds the device tree blob handed to an aarch64 Linux guest at boot (the
+//! Builds the device tree blob handed to an AArch64 Linux guest at boot (the
 //! kernel expects the DTB physical address in x0). Emits DTB format version
 //! 17 per the devicetree specification v0.4: header, empty memory
 //! reservation block, structure block, and a deduplicated strings block.

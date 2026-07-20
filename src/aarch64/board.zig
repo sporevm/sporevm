@@ -1,14 +1,14 @@
-//! The SporeVM board: memory map and device tree.
+//! The SporeVM AArch64 board: memory map and device tree.
 //!
-//! One fixed, versioned guest platform shared by every hypervisor backend.
-//! The DTB generated here is part of the portability contract: KVM and HVF
-//! guests must see the same topology or spores cannot move between them.
+//! One fixed, versioned guest platform shared by the KVM and HVF AArch64
+//! backends. The DTB generated here is part of the portability contract: both
+//! backends must expose the same topology or spores cannot move between them.
 //! Changes here are platform contract changes (see docs/spore-format.md).
 
 const std = @import("std");
 const fdt = @import("fdt.zig");
-const generation = @import("generation.zig");
-const topology = @import("topology.zig");
+const generation = @import("../generation.zig");
+const topology = @import("../topology.zig");
 
 /// Device model version recorded in spore manifests.
 pub const device_model_version = 4;

@@ -39,7 +39,7 @@ help="$(${generator} --help)"
 [[ "${help}" == *"aarch64|x86_64"* ]] || fail "help omits supported architectures"
 [[ "${help}" == *"mtime is pinned to zero"* ]] || fail "help omits pinned archive timestamp contract"
 
-grep -Fq 'const aarch64_board = @import("src/board.zig");' "${repo_root}/build.zig" || fail "build does not source the ARM generation GPA from its board"
+grep -Fq 'const aarch64_board = @import("src/aarch64/board.zig");' "${repo_root}/build.zig" || fail "build does not source the ARM generation GPA from its board"
 grep -Fq 'const x86_64_board = @import("src/x86_64/board.zig");' "${repo_root}/build.zig" || fail "build does not source the x86 generation GPA from its board"
 grep -Fq '#error "SPORE_GENERATION_BASE must come from the selected SporeVM board"' "${repo_root}/guest/minimal-initrd/agent.c" || fail "agent permits an implicit generation GPA"
 if grep -Fq '#define GEN_BASE 0x0c001000ULL' "${repo_root}/guest/minimal-initrd/agent.c"; then

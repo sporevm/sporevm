@@ -13,11 +13,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const board = @import("board.zig");
+const board = @import("aarch64/board.zig");
+const aarch64_topology = @import("aarch64/topology.zig");
 const chunklib = @import("chunk.zig");
 const disk_index = @import("disk_index.zig");
 const generation = @import("generation.zig");
-const gicv3 = @import("gicv3.zig");
+const gicv3 = @import("aarch64/gicv3.zig");
 const local_paths = @import("local_paths.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
@@ -139,7 +140,7 @@ pub const MachineState = struct {
 
 pub const VcpuState = struct {
     index: topology.VcpuIndex,
-    mpidr: topology.Mpidr,
+    mpidr: aarch64_topology.Mpidr,
     gprs: [31]u64,
     pc: u64,
     cpsr: u64,
@@ -2800,7 +2801,7 @@ fn validateMachineV1(platform: PlatformV1, machine: MachineStateV1) Error!void {
     for (machine.vcpus, 0..) |vcpu, i| {
         if (vcpu.index != i) return error.BadManifest;
         if (vcpu.index >= platform.vcpu_count) return error.BadManifest;
-        if (vcpu.mpidr != topology.mpidrForIndex(vcpu.index)) return error.BadManifest;
+        if (vcpu.mpidr != aarch64_topology.mpidrForIndex(vcpu.index)) return error.BadManifest;
         for (machine.vcpus[0..i]) |prev| {
             if (prev.index == vcpu.index or prev.mpidr == vcpu.mpidr) return error.BadManifest;
         }
@@ -2810,7 +2811,7 @@ fn validateMachineV1(platform: PlatformV1, machine: MachineStateV1) Error!void {
     }
 }
 
-fn gicHasRedistributor(gic: gicv3.GicV3MultiState, mpidr: topology.Mpidr) bool {
+fn gicHasRedistributor(gic: gicv3.GicV3MultiState, mpidr: aarch64_topology.Mpidr) bool {
     for (gic.redistributors) |redist| {
         if (redist.mpidr == mpidr) return true;
     }
@@ -3854,8 +3855,8 @@ test "manifest loaders preserve format-too-old errors" {
     const multi_dir = try testDir(arena);
     var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
     const redists = [_]gicv3.RedistributorState{
-        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
-        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
     var multi = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
     multi.version = format_version_legacy_v1;
@@ -3894,8 +3895,8 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
     var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
     var redist_regs = [_]gicv3.MmioReg{.{ .offset = 0x10080, .width_bits = 32, .value = 0 }};
     var redists = [_]gicv3.RedistributorState{
-        .{ .mpidr = topology.mpidrForIndex(0), .regs = &redist_regs },
-        .{ .mpidr = topology.mpidrForIndex(1), .regs = &redist_regs },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &redist_regs },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &redist_regs },
     };
     const manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
 
@@ -3907,7 +3908,7 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
     try std.testing.expectEqual(@as(u32, format_version_v1), parsed.value.version);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), parsed.value.platform.vcpu_count);
     try std.testing.expectEqual(@as(u64, 0x2_0000), parsed.value.platform.gic_redist_stride);
-    try std.testing.expectEqual(@as(topology.Mpidr, 0x8000_0001), parsed.value.machine.vcpus[1].mpidr);
+    try std.testing.expectEqual(@as(aarch64_topology.Mpidr, 0x8000_0001), parsed.value.machine.vcpus[1].mpidr);
     try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, parsed.value.machine.gic.kind);
 
     var private_manifest = manifest;
@@ -3924,8 +3925,8 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
 
 test "manifest v1 rejects invalid vCPU topology" {
     var redists = [_]gicv3.RedistributorState{
-        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
-        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
 
     var count_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
@@ -4056,7 +4057,7 @@ fn testDisk(mmio_slot: u32) Disk {
 fn testVcpuState(index: topology.VcpuIndex) VcpuState {
     return .{
         .index = index,
-        .mpidr = topology.mpidrForIndex(index),
+        .mpidr = aarch64_topology.mpidrForIndex(index),
         .gprs = [_]u64{0} ** 31,
         .pc = 0,
         .cpsr = 0,
@@ -4645,8 +4646,8 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     try writeLocalMemoryBackingProof(arena, &env, parent_dir, memory, ram.len);
     var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
     const redists = [_]gicv3.RedistributorState{
-        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
-        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
     var parent_manifest = testManifestV1(memory, ram.len, &vcpus, &redists);
     var devices = [_]TransportState{
@@ -4741,8 +4742,8 @@ test "fork preserves backend-private manifest v1 gic state" {
     const memory = try saveMemory(arena, parent_dir, ram);
     var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
     const redists = [_]gicv3.RedistributorState{
-        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
-        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
     var manifest = testManifestV1(memory, ram.len, &vcpus, &redists);
     manifest.machine.gic = .{
