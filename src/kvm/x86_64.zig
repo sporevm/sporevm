@@ -144,8 +144,10 @@ pub const Error = common.Error || error{
     MsrBatchTooLarge,
     MsrShortCount,
     XsaveSizeInvalid,
+    XsaveSizeTooLarge,
     XsaveBufferTooSmall,
     KvmRunTooSmall,
+    UnexpectedKvmExitDuringCompletion,
 };
 
 pub const IoDecodeError = error{
@@ -578,6 +580,17 @@ pub fn xsave2Buffer(buffer: []u8, capability_size: usize) Error![]u8 {
     return buffer[0..capability_size];
 }
 
+fn xsaveSizeFromCapability(capability_size: usize) Error!u32 {
+    if (capability_size == 0) return @sizeOf(Xsave);
+    return std.math.cast(u32, capability_size) orelse error.XsaveSizeTooLarge;
+}
+
+/// Query XSAVE storage from the system KVM fd. VM-scoped extension queries
+/// are optional and cannot be assumed merely because XSAVE2 is available.
+pub fn xsaveSize(kvm_fd: std.c.fd_t) Error!u32 {
+    return xsaveSizeFromCapability(try checkExtension(kvm_fd, KVM_CAP_XSAVE2));
+}
+
 /// Derive a per-vCPU topology from KVM's supported CPUID table without
 /// constraining its feature bits. KVM deliberately returns topology leaves
 /// without subleaf 1; adding that subleaf is what makes leaf 0xB/0x1F valid.
@@ -773,21 +786,42 @@ pub fn consumeImmediateExit(run: []u8) Error!bool {
     return (try immediateExitFlag(run)).swap(0, .acq_rel) != 0;
 }
 
+fn checkPendingExitCompletion(result: linux.E) Error!void {
+    switch (result) {
+        .INTR => {},
+        // immediate_exit is set before KVM_RUN, after KVM has completed the
+        // pending userspace I/O. A successful return therefore exposes a new
+        // exit that this completion-only path cannot safely dispatch.
+        .SUCCESS => return error.UnexpectedKvmExitDuringCompletion,
+        else => return error.KvmIoctlFailed,
+    }
+}
+
 /// Complete the current PIO/MMIO exit without allowing the vCPU to execute the
 /// next guest instruction. KVM requires one re-entry after userspace fills a
-/// read response, even when another thread has already requested an exit.
+/// read response, even when another thread has already requested an exit. Keep
+/// immediate_exit asserted: a continuing caller consumes it on its next normal
+/// KVM_RUN, so a concurrent network/control wake cannot be cleared here.
 pub fn completePendingExit(vcpu_fd: std.c.fd_t, run: []u8) Error!void {
     try requestImmediateExit(run);
-    defer _ = consumeImmediateExit(run) catch {};
 
     const rc = linux.ioctl(vcpu_fd, KVM_RUN, 0);
-    switch (linux.errno(rc)) {
-        .SUCCESS, .INTR => {},
-        else => |err| {
-            std.log.err("KVM_RUN immediate_exit failed: {s}", .{@tagName(err)});
-            return error.KvmIoctlFailed;
-        },
-    }
+    checkPendingExitCompletion(linux.errno(rc)) catch |err| {
+        std.log.err("KVM_RUN immediate_exit failed: {s}", .{@tagName(linux.errno(rc))});
+        return err;
+    };
+}
+
+test "pending exit completion accepts only immediate-exit interruption" {
+    try checkPendingExitCompletion(.INTR);
+    try std.testing.expectError(
+        error.UnexpectedKvmExitDuringCompletion,
+        checkPendingExitCompletion(.SUCCESS),
+    );
+    try std.testing.expectError(
+        error.KvmIoctlFailed,
+        checkPendingExitCompletion(.BADF),
+    );
 }
 
 pub fn runVcpu(vcpu_fd: std.c.fd_t) Error!RunResult {
@@ -969,6 +1003,17 @@ test "profile probe variable length UAPI fails closed" {
     try std.testing.expectEqual(@as(usize, 4096), (try xsave2Buffer(&xsave2, 4096)).len);
     try std.testing.expectEqual(@as(usize, 4097), (try xsave2Buffer(&xsave2, 4097)).len);
     try std.testing.expectError(error.XsaveBufferTooSmall, xsave2Buffer(xsave2[0..4096], 4097));
+}
+
+test "XSAVE size uses the legacy area only when XSAVE2 is absent" {
+    try std.testing.expectEqual(@as(u32, @sizeOf(Xsave)), try xsaveSizeFromCapability(0));
+    try std.testing.expectEqual(@as(u32, 8192), try xsaveSizeFromCapability(8192));
+    if (@sizeOf(usize) > @sizeOf(u32)) {
+        try std.testing.expectError(
+            error.XsaveSizeTooLarge,
+            xsaveSizeFromCapability(@as(usize, std.math.maxInt(u32)) + 1),
+        );
+    }
 }
 
 fn makeTopologyCpuid() Cpuid {

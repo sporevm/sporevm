@@ -58,6 +58,9 @@ second="${workdir}/second.cpio"
 SOURCE_DATE_EPOCH=0 "${generator}" "${first}" >/dev/null
 SOURCE_DATE_EPOCH=0 "${generator}" "${second}" >/dev/null
 cmp -s "${first}" "${second}" || fail "repeated builds are not deterministic"
+if SOURCE_DATE_EPOCH=+1 "${generator}" "${workdir}/invalid.cpio" >/dev/null 2>&1; then
+  fail "accepted a non-decimal SOURCE_DATE_EPOCH"
+fi
 
 if command -v cpio >/dev/null 2>&1; then
   listing="$(cpio -it <"${first}" 2>/dev/null | LC_ALL=C sort)"

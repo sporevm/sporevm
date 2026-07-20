@@ -71,6 +71,8 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("\nsporevm kvm-boot: {s}\n", .{try vm.formatTerminalEvidence(&evidence_buffer, terminal)});
         },
         .probe_complete => return error.UnexpectedProbeCompletion,
+        .monitor_stopped => return error.UnexpectedMonitorStop,
+        .snapshotted => return error.UnexpectedSnapshot,
     }
 }
 

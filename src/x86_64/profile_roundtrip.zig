@@ -203,10 +203,7 @@ fn createBaseMachine(saved: ?*const state_file.State) !Machine {
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_IRQCHIP, 0, "KVM_CREATE_IRQCHIP");
     var pit = kvm.PitConfig{};
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_PIT2, @intFromPtr(&pit), "KVM_CREATE_PIT2");
-    const xsave_size = blk: {
-        const size = try kvm.checkExtension(vm_fd, kvm.KVM_CAP_XSAVE2);
-        break :blk if (size == 0) @sizeOf(kvm.Xsave) else size;
-    };
+    const xsave_size = try kvm.xsaveSize(kvm_fd);
     if (xsave_size > state_file.max_xsave_bytes) return error.XsaveTooLarge;
 
     const ram = try mapAnonymous(ram_size);

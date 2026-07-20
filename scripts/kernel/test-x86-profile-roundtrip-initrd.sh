@@ -80,6 +80,9 @@ ambient="${workdir}/ambient-cc.cpio"
 SOURCE_DATE_EPOCH=0 "${generator}" "${first}" >/dev/null
 SOURCE_DATE_EPOCH=0 "${generator}" "${second}" >/dev/null
 cmp -s "${first}" "${second}" || fail "repeated builds are not deterministic"
+if SOURCE_DATE_EPOCH=+1 "${generator}" "${workdir}/invalid.cpio" >/dev/null 2>&1; then
+  fail "accepted a non-decimal SOURCE_DATE_EPOCH"
+fi
 
 # A common ambient macOS CC must not redirect the probe away from the pinned
 # x86_64-linux-musl compiler.

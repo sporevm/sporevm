@@ -24,10 +24,10 @@ const cpu_profile = @import("cpu_profile.zig");
 const host_evidence = @import("host_evidence.zig");
 const lifecycle = @import("lifecycle.zig");
 const pio = @import("pio.zig");
+const product_preflight = @import("product_preflight.zig");
 
 pub const default_vcpu_count: u8 = 2;
 const wake_signal = posix.SIG.URG;
-const msr_capacity = 256;
 
 pub const GenerationSeed = struct {
     generation: u64,
@@ -83,11 +83,6 @@ fn requireCompatibleProfile(facts: cpu_profile.HostFacts, requested_vcpus: u8) !
         }
         return error.IncompatibleCpuProfile;
     }
-}
-
-fn profileCapabilityAvailable(facts: []const cpu_profile.CapabilityFact, id: u32) bool {
-    for (facts) |fact| if (fact.id == id) return fact.value != 0;
-    return false;
 }
 
 const Vcpu = struct {
@@ -357,16 +352,6 @@ fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
     }
 }
 
-const KvmPostRunAction = enum { dispatch_exit, handle_async_wake, retry_not_runnable };
-
-fn kvmPostRunAction(result: kvm.RunResult) KvmPostRunAction {
-    return switch (result) {
-        .completed => .dispatch_exit,
-        .interrupted => .handle_async_wake,
-        .not_runnable => .retry_not_runnable,
-    };
-}
-
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     _ = allocator;
     try board.validateLayout(config.ram_size);
@@ -376,41 +361,20 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     const kvm_fd = try kvm.openDevKvm();
     defer _ = std.c.close(kvm_fd);
     try kvm.checkApiVersion(kvm_fd);
-    var profile_capabilities: [cpu_profile.required_capabilities.len]cpu_profile.CapabilityFact = undefined;
-    for (cpu_profile.required_capabilities, &profile_capabilities) |required, *fact| {
-        const value = try kvm.checkExtension(kvm_fd, required.id);
-        fact.* = .{ .id = required.id, .value = std.math.cast(u32, value) orelse return error.CapabilityValueTooLarge };
-    }
-    const capabilities = try host_evidence.collectCapabilities(kvm_fd);
+    const profile = try product_preflight.collectHostProfile(kvm_fd);
     var host_buffer: [512]u8 = undefined;
-    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCapabilities(&host_buffer, capabilities)});
-    if (capabilities.nrVcpus() < config.vcpu_count) {
+    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCapabilities(&host_buffer, profile.capabilities)});
+    if (profile.capabilities.nrVcpus() < config.vcpu_count) {
         return error.UnsupportedVcpuCount;
     }
 
-    const supported_cpuid = try kvm.getSupportedCpuid(kvm_fd);
-    const cpuid_evidence = try host_evidence.collectCpuid(&supported_cpuid);
-    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCpuid(&host_buffer, cpuid_evidence)});
-    var msr_list = kvm.MsrList(msr_capacity){};
-    const msr_indices = try kvm.getMsrIndexList(kvm_fd, kvm.KVM_GET_MSR_INDEX_LIST, msr_capacity, &msr_list, "KVM_GET_MSR_INDEX_LIST fresh runner");
-    const xsave2_bytes = try kvm.checkExtension(kvm_fd, kvm.KVM_CAP_XSAVE2);
-    const xsave_bytes = if (xsave2_bytes == 0)
-        @as(u32, @sizeOf(kvm.Xsave))
-    else
-        std.math.cast(u32, xsave2_bytes) orelse return error.XsaveSizeTooLarge;
-    var profile_facts = cpu_profile.HostFacts{
-        .api_version = kvm.KVM_API_VERSION,
-        .vendor = cpuid_evidence.vendor,
-        .max_vcpus = std.math.cast(u32, capabilities.nrVcpus()) orelse return error.VcpuCapacityTooLarge,
-        .capabilities = &profile_capabilities,
-        .msr_indices = msr_indices,
-        .supported_cpuid = supported_cpuid.entries[0..supported_cpuid.nent],
-        .xsave_bytes = xsave_bytes,
+    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCpuid(&host_buffer, profile.cpuid_evidence)});
+    var profile_facts = try profile.facts(
         // The VM-scoped frequency is verified on the first vCPU below.
-        .tsc_khz = cpu_profile.guest_tsc_khz,
-        .has_tsc_offset = profileCapabilityAvailable(&profile_capabilities, kvm.KVM_CAP_TSC_CONTROL) and
-            profileCapabilityAvailable(&profile_capabilities, kvm.KVM_CAP_VM_TSC_CONTROL),
-    };
+        cpu_profile.guest_tsc_khz,
+        profile.capabilityAvailable(kvm.KVM_CAP_TSC_CONTROL) and
+            profile.capabilityAvailable(kvm.KVM_CAP_VM_TSC_CONTROL),
+    );
     try requireCompatibleProfile(profile_facts, config.vcpu_count);
     const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
     defer _ = std.c.close(vm_fd);
@@ -505,18 +469,18 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var vsock_dev = virtio_vsock.Vsock.init(.{});
     var rng_dev = virtio_rng.Rng{};
     var transports: [board.max_virtio_devices]mmio.Transport = undefined;
-    transports[0] = .init(console_dev.device());
-    for (disk_backends, 0..) |maybe_backend, index| {
+    transports[board.console_slot.index] = .init(console_dev.device());
+    for (disk_backends, board.disk_slots, 0..) |maybe_backend, slot, index| {
         if (maybe_backend) |backend| {
             block_devs[index] = if (index == 0) .init(backend) else .initImmutableSource(backend);
-            transports[index + 1] = .init(block_devs[index].device());
+            transports[slot.index] = .init(block_devs[index].device());
         } else {
-            transports[index + 1] = .init(empty_devs[index].device());
+            transports[slot.index] = .init(empty_devs[index].device());
         }
     }
-    transports[5] = .init(net_dev.device());
-    transports[6] = .init(vsock_dev.device());
-    transports[7] = .init(rng_dev.device());
+    transports[board.net_slot.index] = .init(net_dev.device());
+    transports[board.vsock_slot.index] = .init(vsock_dev.device());
+    transports[board.rng_slot.index] = .init(rng_dev.device());
     try validateTransportSlots(&transports, disk_backends);
     var gen_dev = generation.Device{};
     if (config.generation_seed) |seed| {
@@ -577,7 +541,12 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     // Joining is safe because the first terminal/error result wakes every
     // KVM_RUN with immediate_exit plus a thread-directed SIGURG.
     joinThreads(vcpus[0..started]);
-    const result = state.publishedResult() orelse return error.MissingVcpuResult;
+    const result = state.publishedResult() orelse {
+        // Keep the defensive invariant failure from blocking forever in the
+        // deferred watchdog join.
+        state.stop.store(true, .release);
+        return error.MissingVcpuResult;
+    };
     const cause: ExitCause = switch (result) {
         .cause => |cause| cause,
         .err => |err| return err,
@@ -612,9 +581,9 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
         // A successful KVM_RUN publishes an authoritative exit_reason. A
         // racing immediate_exit stays set until the following re-entry so it
         // cannot make userspace discard the completed PIO/MMIO envelope.
-        switch (kvmPostRunAction(run_result)) {
-            .dispatch_exit => {},
-            .handle_async_wake => {
+        switch (run_result) {
+            .completed => {},
+            .interrupted => {
                 _ = consumeWake(ctx.vcpu.run_bytes);
                 if (ctx.network.failed()) {
                     finishThread(ctx, error.NetworkGatewayFailed);
@@ -622,7 +591,7 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                 }
                 ctx.device_lock.lock();
                 if (ctx.network.consumeWake()) {
-                    flushNetworkRx(ctx.vm_fd, ctx.net_dev, &ctx.transports[5], ctx.ram) catch |err| {
+                    flushNetworkRx(ctx.vm_fd, ctx.net_dev, &ctx.transports[board.net_slot.index], ctx.ram) catch |err| {
                         ctx.device_lock.unlock();
                         finishThread(ctx, err);
                         return;
@@ -639,7 +608,7 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                 ctx.device_lock.unlock();
                 continue;
             },
-            .retry_not_runnable => {
+            .not_runnable => {
                 _ = consumeWake(ctx.vcpu.run_bytes);
                 if (!ctx.state.stopped()) sleepNotRunnableAp();
                 continue;
@@ -694,7 +663,7 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                         finishThread(ctx, err);
                         return;
                     };
-                    finishThread(ctx, error.ExecProbeFailed);
+                    finishThread(ctx, error.VsockProbeFailed);
                     return;
                 }
                 if (completes_run) {
@@ -779,10 +748,10 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
             return true;
         },
     }
-    const transport = &ctx.transports[6];
+    const transport = &ctx.transports[board.vsock_slot.index];
     if (ctx.vsock_dev.flushPendingRx(&transport.queues, ctx.ram)) {
         transport.interrupt_status |= 1;
-        try kvm.setIrq(ctx.vm_fd, board.virtio_slots[6].gsi, true);
+        try kvm.setIrq(ctx.vm_fd, board.vsock_slot.gsi, true);
     }
     return false;
 }
@@ -995,7 +964,7 @@ fn flushNetworkRx(
 ) !void {
     if (net_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
-        try kvm.setIrq(vm_fd, board.virtio_slots[5].gsi, true);
+        try kvm.setIrq(vm_fd, board.net_slot.gsi, true);
     }
 }
 
@@ -1024,12 +993,15 @@ fn validateTransportSlots(
     disk_backends: [4]?virtio_blk.Backend,
 ) !void {
     try board.validateDeviceInventory();
-    const fixed = [_]u32{ virtio_console.device_id, 0, 0, 0, 0, virtio_net.device_id, virtio_vsock.device_id, virtio_rng.device_id };
-    for (transports, 0..) |transport, index| {
-        const expected = if (index >= 1 and index <= 4 and disk_backends[index - 1] != null)
-            virtio_blk.device_id
-        else
-            fixed[index];
+    for (transports, board.stage0a2_ordinary_inventory) |transport, attachment| {
+        const expected = switch (attachment.role) {
+            .root => if (disk_backends[0] != null) @intFromEnum(attachment.device) else 0,
+            .context => if (disk_backends[1] != null) @intFromEnum(attachment.device) else 0,
+            .build => if (disk_backends[2] != null) @intFromEnum(attachment.device) else 0,
+            .cache => if (disk_backends[3] != null) @intFromEnum(attachment.device) else 0,
+            .console, .net, .vsock, .rng => @intFromEnum(attachment.device),
+            .transient_memory => unreachable,
+        };
         if (transport.dev.device_id != expected) return error.InvalidDeviceInventory;
     }
 }
@@ -1063,18 +1035,18 @@ test "MMIO router accepts only complete aligned board windows" {
     const first = try decodeMmioTarget(board.virtio_base + 1, 1);
     try std.testing.expectEqual(@as(usize, 0), first.virtio.index);
     try std.testing.expectEqual(@as(u64, 1), first.virtio.offset);
-    const config_word = try decodeMmioTarget(board.virtio_slots[5].base + 0x102, 2);
+    const config_word = try decodeMmioTarget(board.net_slot.base + 0x102, 2);
     try std.testing.expectEqual(@as(usize, 5), config_word.virtio.index);
     try std.testing.expectEqual(@as(u64, 0x102), config_word.virtio.offset);
-    const last = try decodeMmioTarget(board.virtio_slots[7].base + 0x1fc, 4);
+    const last = try decodeMmioTarget(board.rng_slot.base + 0x1fc, 4);
     try std.testing.expectEqual(@as(usize, 7), last.virtio.index);
     try std.testing.expectEqual(@as(u64, 0x1fc), last.virtio.offset);
     try std.testing.expectEqual(@as(u64, 0x18), (try decodeMmioTarget(board.generation_base + 0x18, 8)).generation);
     try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_base + 1, 2));
     try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_base + 0xf8, 8));
-    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_slots[6].base + 0x100, 8));
-    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_slots[0].base + 0x1ff, 2));
-    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.virtio_slots[7].base + 0x1fc, 8));
+    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.vsock_slot.base + 0x100, 8));
+    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.console_slot.base + 0x1ff, 2));
+    try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.rng_slot.base + 0x1fc, 8));
     try std.testing.expectError(error.MalformedMmioExit, decodeMmioTarget(board.generation_base + board.generation_size - 4, 8));
     try std.testing.expectError(error.UnhandledMmio, decodeMmioTarget(board.generation_base + board.generation_size, 4));
 }
@@ -1136,12 +1108,6 @@ test "wake state requests and consumes immediate exit once" {
     requestWake(&run_bytes);
     try std.testing.expect(consumeWake(&run_bytes));
     try std.testing.expect(!consumeWake(&run_bytes));
-}
-
-test "post-run dispatch retries an uninitialized AP without losing real exits" {
-    try std.testing.expectEqual(KvmPostRunAction.dispatch_exit, kvmPostRunAction(.completed));
-    try std.testing.expectEqual(KvmPostRunAction.handle_async_wake, kvmPostRunAction(.interrupted));
-    try std.testing.expectEqual(KvmPostRunAction.retry_not_runnable, kvmPostRunAction(.not_runnable));
 }
 
 const TeardownProbe = struct {

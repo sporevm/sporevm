@@ -124,6 +124,24 @@ pub const stage0a2_ordinary_inventory = blk: {
     break :blk attachments;
 };
 
+fn ordinarySlot(comptime role: ProbeRole) VirtioSlot {
+    inline for (stage0a2_ordinary_inventory) |attachment| {
+        if (attachment.role == role) return attachment.slot;
+    }
+    @compileError("role is not present in the ordinary x86 board inventory");
+}
+
+pub const console_slot = ordinarySlot(.console);
+pub const disk_slots = [_]VirtioSlot{
+    ordinarySlot(.root),
+    ordinarySlot(.context),
+    ordinarySlot(.build),
+    ordinarySlot(.cache),
+};
+pub const net_slot = ordinarySlot(.net);
+pub const vsock_slot = ordinarySlot(.vsock);
+pub const rng_slot = ordinarySlot(.rng);
+
 /// The transient-memory probe keeps the same eight-slot board and replaces the
 /// optional cache attachment at slot 4 with virtio-mem.
 pub const stage0a2_transient_memory_inventory = blk: {
