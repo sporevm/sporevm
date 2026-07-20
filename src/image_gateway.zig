@@ -1,8 +1,8 @@
 //! Bounded, canonical image-gateway protocol values.
 //!
-//! This first protocol slice owns only immutable platform indexes and platform
-//! normalization. It deliberately has no HTTP, registry, filesystem, CAS, or
-//! runtime dependency.
+//! This module owns immutable platform indexes, platform normalization, and
+//! transport digests shared by the gateway protocol. It deliberately has no
+//! HTTP, registry, filesystem, CAS, or runtime dependency.
 
 const std = @import("std");
 const architecture = @import("architecture.zig");
@@ -151,7 +151,7 @@ pub fn encodePlatformIndexAlloc(
     errdefer allocator.free(bytes);
     return .{
         .bytes = bytes,
-        .transport_digest = try sha256DigestAlloc(allocator, bytes),
+        .transport_digest = try transportDigestAlloc(allocator, bytes),
     };
 }
 
@@ -202,7 +202,7 @@ fn platformLessThan(a: Platform, b: Platform) bool {
     return std.mem.order(u8, a.arch.name(), b.arch.name()) == .lt;
 }
 
-fn validateDigest(digest: []const u8, prefix: []const u8) Error!void {
+pub fn validateDigest(digest: []const u8, prefix: []const u8) Error!void {
     if (!std.mem.startsWith(u8, digest, prefix)) return error.BadProtocol;
     const hex = digest[prefix.len..];
     if (hex.len != 64) return error.BadProtocol;
@@ -212,7 +212,8 @@ fn validateDigest(digest: []const u8, prefix: []const u8) Error!void {
     }
 }
 
-fn sha256DigestAlloc(allocator: std.mem.Allocator, bytes: []const u8) Error![]u8 {
+/// Name exact protocol bytes by their lowercase SHA-256 transport digest.
+pub fn transportDigestAlloc(allocator: std.mem.Allocator, bytes: []const u8) Error![]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
