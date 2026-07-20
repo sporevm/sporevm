@@ -147,6 +147,10 @@ lowercase ASCII letters, digits, dot, underscore, hyphen, and slash-separated
 nonempty components; dot-dot is rejected. Responses do not redirect and retain
 the schema bounds above. Objects must have the exact index-derived length and
 their BLAKE3 digest is rechecked by the CAS installer before publication.
+The eager proof rejects rootfs values above 16 GiB logical size, 65,536 distinct
+nonzero objects, or 4 GiB of nonzero object payload before fetching any object.
+These are client resource bounds for the initial one-request-per-object
+transport, not native image-format limits.
 
 Production gateways require HTTPS. `--allow-insecure-http` accepts only an
 explicit `127.0.0.1` or `[::1]` origin and exists for the static fixture server. This proof

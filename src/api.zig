@@ -32,8 +32,6 @@ const system = @import("system.zig");
 
 pub const ImageGatewayPullOptions = image_gateway_pull.PullOptions;
 pub const ImageGatewayPullResult = image_gateway_pull.PullResult;
-pub const ImageGatewayExportFixtureOptions = image_gateway_pull.ExportFixtureOptions;
-pub const ImageGatewayExportFixtureResult = image_gateway_pull.ExportFixtureResult;
 
 /// Process context shared by product operations.
 ///
@@ -720,18 +718,6 @@ pub fn imageGatewayPull(
 
 pub fn deinitImageGatewayPullResult(allocator: std.mem.Allocator, result: ImageGatewayPullResult) void {
     image_gateway_pull.deinitPullResult(allocator, result);
-}
-
-pub fn imageGatewayExportFixture(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: ImageGatewayExportFixtureOptions,
-) !ImageGatewayExportFixtureResult {
-    return image_gateway_pull.exportFixture(init, allocator, options);
-}
-
-pub fn deinitImageGatewayExportFixtureResult(allocator: std.mem.Allocator, result: ImageGatewayExportFixtureResult) void {
-    image_gateway_pull.deinitExportFixtureResult(allocator, result);
 }
 
 /// Preload a cached rootfs into chunked CAS storage.

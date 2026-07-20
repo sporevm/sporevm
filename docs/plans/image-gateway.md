@@ -945,7 +945,10 @@ and loopback-only insecure flag make the complete HTTP path reproducible without
 pretending to provide a gateway service.
 
 The proof intentionally uses one manifest-bound GET per object, so it measures
-correctness rather than the final eager transport. It has no authentication,
+correctness rather than the final eager transport. Before object transfer, it
+rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
+4 GiB of nonzero payload. These are client resource bounds for the eager proof,
+not native image-format limits. It has no authentication,
 conversion admission, server authorization, missing-object optimization,
 redirects, retries, or gateway provenance record. The rest of G0 remains open:
 the attachment schema, transport benchmarking, authorization and cross-

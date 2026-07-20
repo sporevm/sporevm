@@ -18,6 +18,10 @@ const spore = @import("spore.zig");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+pub const max_eager_rootfs_logical_bytes: u64 = 16 * 1024 * 1024 * 1024;
+pub const max_eager_object_count: u64 = 65_536;
+pub const max_eager_object_bytes: u64 = 4 * 1024 * 1024 * 1024;
+
 pub const usage =
     \\Usage:
     \\  spore image pull SOURCE --gateway URL --repository NAME --ref local/name:tag [--platform os/arch]
@@ -146,6 +150,11 @@ fn pullInner(init: std.process.Init, allocator: std.mem.Allocator, options: Pull
     );
     defer verified.deinit();
     const manifest = verified.value;
+    try validateEagerTransferBounds(
+        manifest.image.rootfs_storage.logical_size,
+        manifest.rootfs_index.object_count,
+        manifest.rootfs_index.object_bytes,
+    );
     const storage = gatewayStorage(manifest.image.rootfs_storage);
 
     var parsed_config = try gateway_manifest.parseCanonicalConfig(allocator, config_bytes);
@@ -431,6 +440,12 @@ fn gatewayStorage(value: gateway_manifest.RootfsStorage) spore.RootfsStorage {
     };
 }
 
+fn validateEagerTransferBounds(logical_bytes: u64, object_count: u64, object_bytes: u64) !void {
+    if (logical_bytes > max_eager_rootfs_logical_bytes or
+        object_count > max_eager_object_count or
+        object_bytes > max_eager_object_bytes) return error.GatewayImageTooLarge;
+}
+
 fn sourceKeyAlloc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(source, &digest, .{});
@@ -624,6 +639,13 @@ test "staged gateway objects are verified before cache installation" {
     const digest = try std.fmt.bufPrint(&digest_buffer, "blake3:{s}", .{hex[0..]});
     try verifyObjectBytes(digest, bytes);
     try std.testing.expectError(error.BadGatewayObject, verifyObjectBytes(digest, "changed"));
+}
+
+test "eager gateway transfer has aggregate image bounds" {
+    try validateEagerTransferBounds(max_eager_rootfs_logical_bytes, max_eager_object_count, max_eager_object_bytes);
+    try std.testing.expectError(error.GatewayImageTooLarge, validateEagerTransferBounds(max_eager_rootfs_logical_bytes + 1, 1, 1));
+    try std.testing.expectError(error.GatewayImageTooLarge, validateEagerTransferBounds(1, max_eager_object_count + 1, 1));
+    try std.testing.expectError(error.GatewayImageTooLarge, validateEagerTransferBounds(1, 1, max_eager_object_bytes + 1));
 }
 
 test "static fixture export produces a verified repository-bound closure" {

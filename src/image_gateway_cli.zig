@@ -22,7 +22,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
     if (std.mem.eql(u8, args[0], "export-fixture")) {
         const options = try parseExportFixtureOptions(args[1..]);
-        const result = try api.imageGatewayExportFixture(init, init.arena.allocator(), options);
+        const result = try gateway_pull.exportFixture(init, init.arena.allocator(), options);
         try stdout.print("fixture: {s}\nmanifest: {s}\nimage: {s}\nobjects: {d}\n", .{
             options.output_dir,
             result.manifest_digest,
@@ -83,7 +83,7 @@ pub fn parsePullOptions(args: []const []const u8) !api.ImageGatewayPullOptions {
     };
 }
 
-pub fn parseExportFixtureOptions(args: []const []const u8) !api.ImageGatewayExportFixtureOptions {
+pub fn parseExportFixtureOptions(args: []const []const u8) !gateway_pull.ExportFixtureOptions {
     var source: ?[]const u8 = null;
     var repository: ?[]const u8 = null;
     var metadata_path: ?[]const u8 = null;
