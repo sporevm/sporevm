@@ -191,6 +191,14 @@ pub fn fromZigError(err: anyerror) CliError {
         error.InjectedFileResumeUnsupported,
         error.InjectedFileMonitorUnsupported,
         error.UnsupportedExt4Writer,
+        error.X86ExplicitMemoryRequired,
+        error.X86ExperimentalMemorySizeUnsupported,
+        error.X86VcpuCountUnsupported,
+        error.X86ResumeUnsupported,
+        error.X86CaptureUnsupported,
+        error.X86RootfsUnsupported,
+        error.X86NetworkUnsupported,
+        error.X86BuildUnsupported,
         => CliError.init(.usage_invalid_argument, ErrorCode.usage_invalid_argument.defaultMessage(), @errorName(err)),
         error.FileNotFound => CliError.init(.object_not_found, ErrorCode.object_not_found.defaultMessage(), @errorName(err)),
         error.AccessDenied,
@@ -211,7 +219,13 @@ pub fn fromZigError(err: anyerror) CliError {
         => CliError.init(.object_invalid, if (err == error.FormatTooOld) format_too_old_message else ErrorCode.object_invalid.defaultMessage(), @errorName(err)),
         error.UnsupportedHost,
         error.UnsupportedBackend,
+        error.ApiVersionMismatch,
+        error.KvmCapabilityMissing,
         => CliError.init(.host_unsupported, ErrorCode.host_unsupported.defaultMessage(), @errorName(err)),
+        error.MissingKvmDevice,
+        error.KvmOpenFailed,
+        error.KvmProbeFailed,
+        => CliError.init(.host_unavailable, ErrorCode.host_unavailable.defaultMessage(), @errorName(err)),
         error.RootfsCacheUnavailable,
         error.MissingHome,
         => CliError.init(.cache_unavailable, ErrorCode.cache_unavailable.defaultMessage(), @errorName(err)),
@@ -220,6 +234,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.BadRootfsDigest,
         error.BadManagedKernelChecksum,
         error.ManagedKernelChecksumMismatch,
+        error.ManagedKernelArchitectureDigestMismatch,
         => CliError.init(.cache_integrity_failed, ErrorCode.cache_integrity_failed.defaultMessage(), @errorName(err)),
         else => CliError.init(.runtime_execution_failed, ErrorCode.runtime_execution_failed.defaultMessage(), @errorName(err)),
     };
@@ -257,6 +272,9 @@ test "setup errors classify for API callers" {
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.MissingRootfsArtifact).code);
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.UnsupportedExt4FileSize).code);
     try std.testing.expectEqual(ErrorCode.cache_integrity_failed, fromZigError(error.ManagedKernelChecksumMismatch).code);
+    try std.testing.expectEqual(ErrorCode.host_unsupported, fromZigError(error.KvmCapabilityMissing).code);
+    try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.MissingKvmDevice).code);
+    try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.KvmProbeFailed).code);
 }
 
 test "error envelope uses shared schema" {

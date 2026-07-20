@@ -222,6 +222,89 @@ object-store sources, `remote.peer_bytes_read` for HTTP(S) peer sources,
 `materialization.cache.bytes_reused`, and rootfs cache hit/fetch/reuse counters
 under `rootfs.cache`.
 
+## x86-64 Board Profile v0
+
+`sporevm-x86_64-board-v0`, device-model version 1, is the frozen x86-64
+Linux/KVM machine contract. It applies to the fresh-run product path and is the
+board identity that a future x86 manifest must name; it does not change the
+aarch64-only v2/v3 manifest layouts documented below. Board-v0 supports one
+through eight vCPUs. Local APIC IDs are consecutive from zero, vCPU 0 is the
+bootstrap processor, and IOAPIC ID 8 remains outside the vCPU ID range.
+
+RAM is one page-aligned low-memory region starting at GPA zero, with a minimum
+size of 64 MiB (`0x04000000`) and a maximum size of 2 GiB (`0x80000000`). The
+current execution profile uses one KVM memory slot. The direct-boot E820 table
+is exactly:
+
+| GPA range | E820 kind | Purpose |
+|---|---|---|
+| `0x00000000..0x000003ff` | reserved | managed-kernel MP-table scan window |
+| `0x00000400..0x0009fbff` | RAM | low conventional RAM |
+| `0x0009fc00..0x000fffff` | reserved | legacy hole |
+| `0x00100000..<ram_size` | RAM | remaining low RAM |
+
+The Intel MP 1.4 floating pointer is at GPA `0x00000000` and names the
+configuration table at `0x00000010`. The table publishes one through eight
+enabled processors, the ISA bus, IOAPIC ID 8 at `0xfec00000`, identity-routed
+ISA IRQs 0 through 15, ExtINT to BSP LINT0, and NMI to every LAPIC LINT1. KVM's
+default routing maps GSI `i` to IOAPIC INTIN `i`, including PIT output on GSI
+0. The maximum eight-vCPU table ends at `0x0000017c`, inside the reserved
+bottom-1-KiB scan window and below the GDT.
+
+Direct boot uses these fixed placements:
+
+| Object | GPA | Contract |
+|---|---:|---|
+| GDT | `0x00000500` | 32-byte flat protected-mode GDT |
+| zero page | `0x00007000` | one 4-KiB Linux boot-parameter page |
+| kernel command line | `0x00020000` | at most 4096 bytes plus NUL, bounded by the bzImage header |
+| protected-mode kernel payload | `0x00100000` | Linux 32-bit boot protocol 2.10 or newer |
+| initrd | dynamically below the kernel/header ceiling | page-aligned, below `ram_size`, and disjoint from kernel load/runtime ranges |
+
+The permanent non-RAM board ranges are:
+
+| Range | Owner |
+|---|---|
+| `0xd0000000..0xd0000fff` | eight 512-byte virtio-mmio windows |
+| `0xd0001000..0xd0001fff` | generation-device page |
+| `0xfec00000..0xfecfffff` | IOAPIC |
+| `0xfee00000..0xfeefffff` | local APIC |
+| `0xfffbc000..0xfffbcfff` | KVM identity-map page |
+| `0xfffbd000..0xfffbffff` | KVM three-page TSS region |
+
+The eight virtio-mmio transport positions are fixed even when a transport is
+unpopulated. The ordinary inventory and the one allowed transient-memory
+substitution are:
+
+| Slot | MMIO base | GSI | Ordinary role/device | Transient-memory role/device |
+|---:|---:|---:|---|---|
+| 0 | `0xd0000000` | 5 | console (`3`) | console (`3`) |
+| 1 | `0xd0000200` | 6 | root block (`2`) | root block (`2`) |
+| 2 | `0xd0000400` | 7 | context block (`2`) | context block (`2`) |
+| 3 | `0xd0000600` | 8 | build block (`2`) | build block (`2`) |
+| 4 | `0xd0000800` | 9 | cache block (`2`) | transient virtio-mem (`24`) |
+| 5 | `0xd0000a00` | 10 | network (`1`) | network (`1`) |
+| 6 | `0xd0000c00` | 11 | vsock (`19`) | vsock (`19`) |
+| 7 | `0xd0000e00` | 12 | RNG (`4`) | RNG (`4`) |
+
+Virtio windows accept only 1-, 2-, and 4-byte MMIO accesses. Each transport
+uses level-sensitive interrupt state: any write, including device reset, that
+clears `interrupt_status` must lower its GSI. The generation device is at
+`0xd0001000`, size `0x1000`, GSI 13, and retains the shared SPGN register
+protocol version 1. It may additionally accept aligned 8-byte accesses. Its
+x86-only poweroff doorbell is the exact aligned 32-bit write of `0x46464f50`
+(`POFF`) at offset `0x020`; reads return zero, and any write touching that
+register with another placement, width, or value fails closed.
+
+Board-v0's complete permitted PIO set is value-sensitive: writes
+`0x70 <- 0x0f`, `0x71 <- 0x0a`, `0x71 <- 0x00`, and `0x80 <- 0x00` continue;
+a read from `0x64` returns zero; and `0x64 <- 0xfe` reports `guest_reset`.
+Every tuple uses width 1 and count 1, and every other direction, port, width,
+count, or value fails closed. The generation doorbell reports `guest_off`.
+`KVM_EXIT_SYSTEM_EVENT` reset/shutdown remains a typed raw event, while raw
+`KVM_EXIT_SHUTDOWN`, triple fault, and a halted guest are never reclassified as
+reset or poweroff.
+
 ## Manifest Format v2
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
@@ -296,7 +379,12 @@ under `rootfs.cache`.
   `parallel_count`; distributed offset/range partitioning is deferred. Backend
   restore refreshes the params page at actual resume time with volatile
   `resume_time_unix_ns` and `resume_entropy_seed` values before reasserting the
-  generation interrupt.
+  generation interrupt. The shared SPGN register protocol remains version 1
+  and occupies offsets `0x000..0x01f`; offsets `0x020..0x0ff` are reserved for
+  architecture-owned board controls decoded before the shared device. The
+  current aarch64 board defines no such controls, so those bytes remain inert.
+  The frozen x86 controls are documented by the x86-64 Board Profile v0 above;
+  no portable manifest names that board before a later format revision.
 - `sessions`: optional low-level process/session handles captured with the VM.
   A handle is generic: `id`, `kind: "process"`, and stream capabilities for
   `stdin`, `stdout`, `stderr`, and `terminal`. `spore run --from` uses the

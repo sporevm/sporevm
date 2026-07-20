@@ -22,6 +22,10 @@ const irq_status_offset: u64 = 0x010;
 const irq_ack_offset: u64 = 0x014;
 const generation_offset: u64 = 0x018;
 
+// The shared SPGN v1 register protocol ends at 0x01f. Architecture-owned
+// boards may decode controls in 0x020..0x0ff before delegating the remaining
+// window here; this backend-neutral device keeps those bytes inert.
+
 pub const irq_generation_changed: u32 = 1;
 
 pub const Error = error{
@@ -61,9 +65,9 @@ pub const Device = struct {
         return was_pending and self.interrupt_status & irq_generation_changed == 0;
     }
 
-    /// Future fork/resume hook. This first slice does not call it from the VM
-    /// lifecycle yet, but tests lock the interrupt semantics before the guest
-    /// driver exists.
+    /// Seed or refresh resume identity before guest execution. Fresh x86 runs
+    /// use this for generation-aware agent startup; capture/restore paths use
+    /// the same pending-bit and acknowledgement semantics.
     pub fn setResume(self: *Device, generation: u64, params: []const u8) Error!bool {
         if (params.len > params_size) return error.BadState;
 

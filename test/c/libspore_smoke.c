@@ -104,11 +104,12 @@ int main(void) {
   if (remove_saved_options.size != sizeof(remove_saved_options)) return 1;
   if (remove_saved_options.version != SPORE_REMOVE_SAVED_OPTIONS_VERSION) return 1;
 
-#if defined(SPORE_SMOKE_HOST_INFO)
+#if defined(SPORE_SMOKE_HOST_INFO) || defined(__x86_64__)
   SporeContext context = 0;
   if (expect_success(spore_context_new(&context)) != 0) return 1;
   if (context == 0) return 1;
 
+#if defined(__aarch64__)
   SporeOwnedString json = {0};
   if (expect_success(spore_host_info_json(context, &json)) != 0) return 1;
   if (json.ptr == 0 || json.len == 0) return 1;
@@ -116,7 +117,22 @@ int main(void) {
   if (strstr(json.ptr, "\"arch\": \"arm64\"") == 0) return 1;
 
   spore_free_string(context, json);
+#endif
 
+  SporeOwnedString json_v3 = {0};
+  if (expect_success(spore_host_info_json_v3(context, &json_v3)) != 0) return 1;
+  if (json_v3.ptr == 0 || json_v3.len == 0) return 1;
+  if (strstr(json_v3.ptr, "\"schema\": \"spore.host-info.v3\"") == 0) return 1;
+#if defined(__aarch64__)
+  if (strstr(json_v3.ptr, "\"architecture\": \"arm64\"") == 0) return 1;
+#elif defined(__x86_64__)
+  if (strstr(json_v3.ptr, "\"architecture\": \"amd64\"") == 0) return 1;
+#else
+#error "libspore host-info smoke requires a supported target architecture"
+#endif
+  spore_free_string(context, json_v3);
+
+#if defined(SPORE_SMOKE_HOST_INFO)
   SporeOwnedString capabilities_json = {0};
   if (expect_success(spore_network_capabilities_json(context, &capabilities_json)) != 0) return 1;
   if (capabilities_json.ptr == 0 || strstr(capabilities_json.ptr, "\"exact_host_port\": true") == 0) return 1;
@@ -142,6 +158,7 @@ int main(void) {
   if (expect_success(spore_list_named_json(context, &named_json)) != 0) return 1;
   if (named_json.ptr == 0 || strcmp(named_json.ptr, "[]\n") != 0) return 1;
   spore_free_string(context, named_json);
+#endif
 
   spore_context_free(context);
 #endif

@@ -250,11 +250,20 @@ fn runCommand(
             }
             exitUnexpectedArgument(arena, stderr, mode, "host-info", command_args[0]);
         }
-        const info = try spore_api.hostInfo(context, arena);
-        if (mode == .json) {
-            try machine_output.writeJson(arena, stdout, info);
+        if (comptime builtin.cpu.arch == .aarch64) {
+            const info = try spore_api.hostInfo(context, arena);
+            if (mode == .json) {
+                try machine_output.writeJson(arena, stdout, info);
+            } else {
+                try writeHostInfo(stdout, info);
+            }
         } else {
-            try writeHostInfo(stdout, info);
+            const info = try spore_api.hostInfoV3(context, arena);
+            if (mode == .json) {
+                try machine_output.writeJson(arena, stdout, info);
+            } else {
+                try writeHostInfoV3(stdout, info);
+            }
         }
     } else if (std.mem.eql(u8, command, "inspect")) {
         if (wantsCommandHelp(command_args)) {
@@ -850,7 +859,54 @@ fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
     try writePathFact(writer, "runtime", info.cache_roots.runtime);
 }
 
-fn writePathFact(writer: *Io.Writer, label: []const u8, fact: spore_api.PathFact) !void {
+fn writeHostInfoV3(writer: *Io.Writer, info: spore_api.HostInfoV3) !void {
+    try writer.writeAll("Host info\n");
+    try writer.print("  Class: {s}\n", .{info.host_class});
+    try writer.print("  Architecture: {s}\n", .{info.architecture});
+    switch (info.platform) {
+        .arm64 => |platform| {
+            try writer.print("  Platform: {s}/arm64\n", .{platform.os});
+            try writer.print("  CPU profile: {s}\n", .{platform.cpu_profile});
+            try writer.print("  Device model version: {d}\n", .{platform.device_model_version});
+            try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ platform.counter.frequency_hz, platform.counter.source });
+        },
+        .amd64 => |platform| {
+            try writer.print("  Platform: {s}/amd64\n", .{platform.os});
+            try writer.print("  Board profile: {s}\n", .{platform.board_profile});
+            try writer.print("  CPU profile: {s} ({s})\n", .{ platform.cpu_profile, platform.cpu_profile_status });
+            try writer.print("  Device model version: {d}\n", .{platform.device_model_version});
+            try writer.writeAll("  KVM capabilities:\n");
+            for (platform.kvm_capabilities) |capability| {
+                if (capability.value) |value| {
+                    try writer.print("    {s}: value={d} minimum={d} satisfied={s}\n", .{
+                        capability.name,
+                        value,
+                        capability.minimum,
+                        yesNo(capability.satisfied),
+                    });
+                } else {
+                    try writer.print("    {s}: unavailable satisfied=no\n", .{capability.name});
+                }
+            }
+        },
+    }
+    try writer.writeAll("  Backends:\n");
+    for (info.backends) |backend| {
+        try writer.print("    {s}: supported={s} available={s} reason={s}\n", .{
+            backend.name,
+            yesNo(backend.supported),
+            yesNo(backend.available),
+            backend.reason,
+        });
+    }
+    try writer.writeAll("  Cache roots:\n");
+    try writePathFact(writer, "kernels", info.cache_roots.kernels);
+    try writePathFact(writer, "rootfs", info.cache_roots.rootfs);
+    try writePathFact(writer, "bundles", info.cache_roots.bundles);
+    try writePathFact(writer, "runtime", info.cache_roots.runtime);
+}
+
+fn writePathFact(writer: *Io.Writer, label: []const u8, fact: anytype) !void {
     if (fact.path) |path| {
         try writer.print("    {s}: {s}\n", .{ label, path });
     } else {

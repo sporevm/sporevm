@@ -7,49 +7,48 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const common = @import("common.zig");
 
 pub const vm = @import("vm.zig");
 
-pub const Error = error{
+pub const Error = common.Error || error{
     ApiVersionMismatch,
     KvmCapabilityMissing,
-    KvmIoctlFailed,
-    OpenFailed,
     UnexpectedExit,
     UnhandledMmio,
 };
 
-pub const KVM_API_VERSION: u32 = 12;
+pub const KVM_API_VERSION = common.KVM_API_VERSION;
 
-pub const KVM_GET_API_VERSION: u32 = 0xae00;
-pub const KVM_CREATE_VM: u32 = 0xae01;
-pub const KVM_CHECK_EXTENSION: u32 = 0xae03;
-pub const KVM_GET_VCPU_MMAP_SIZE: u32 = 0xae04;
-pub const KVM_CREATE_VCPU: u32 = 0xae41;
+pub const KVM_GET_API_VERSION = common.KVM_GET_API_VERSION;
+pub const KVM_CREATE_VM = common.KVM_CREATE_VM;
+pub const KVM_CHECK_EXTENSION = common.KVM_CHECK_EXTENSION;
+pub const KVM_GET_VCPU_MMAP_SIZE = common.KVM_GET_VCPU_MMAP_SIZE;
+pub const KVM_CREATE_VCPU = common.KVM_CREATE_VCPU;
 pub const KVM_GET_DIRTY_LOG: u32 = 0x4010ae42;
-pub const KVM_SET_USER_MEMORY_REGION: u32 = 0x4020ae46;
-pub const KVM_RUN: u32 = 0xae80;
-pub const KVM_IRQ_LINE: u32 = 0x4008ae61;
+pub const KVM_SET_USER_MEMORY_REGION = common.KVM_SET_USER_MEMORY_REGION;
+pub const KVM_RUN = common.KVM_RUN;
+pub const KVM_IRQ_LINE = common.KVM_IRQ_LINE;
 pub const KVM_GET_ONE_REG: u32 = 0x4010aeab;
 pub const KVM_SET_ONE_REG: u32 = 0x4010aeac;
 pub const KVM_ARM_VCPU_INIT: u32 = 0x4020aeae;
 pub const KVM_ARM_PREFERRED_TARGET: u32 = 0x8020aeaf;
 pub const KVM_CREATE_DEVICE: u32 = 0xc00caee0;
-pub const KVM_SET_DEVICE_ATTR: u32 = 0x4018aee1;
-pub const KVM_GET_DEVICE_ATTR: u32 = 0x4018aee2;
-pub const KVM_HAS_DEVICE_ATTR: u32 = 0x4018aee3;
+pub const KVM_SET_DEVICE_ATTR = common.KVM_SET_DEVICE_ATTR;
+pub const KVM_GET_DEVICE_ATTR = common.KVM_GET_DEVICE_ATTR;
+pub const KVM_HAS_DEVICE_ATTR = common.KVM_HAS_DEVICE_ATTR;
 pub const KVM_ARM_SET_COUNTER_OFFSET: u32 = 0x4010aeb5;
 
-pub const KVM_EXIT_MMIO: u32 = 6;
-pub const KVM_EXIT_SHUTDOWN: u32 = 8;
-pub const KVM_EXIT_FAIL_ENTRY: u32 = 9;
-pub const KVM_EXIT_INTERNAL_ERROR: u32 = 17;
-pub const KVM_EXIT_SYSTEM_EVENT: u32 = 24;
+pub const KVM_EXIT_MMIO = common.KVM_EXIT_MMIO;
+pub const KVM_EXIT_SHUTDOWN = common.KVM_EXIT_SHUTDOWN;
+pub const KVM_EXIT_FAIL_ENTRY = common.KVM_EXIT_FAIL_ENTRY;
+pub const KVM_EXIT_INTERNAL_ERROR = common.KVM_EXIT_INTERNAL_ERROR;
+pub const KVM_EXIT_SYSTEM_EVENT = common.KVM_EXIT_SYSTEM_EVENT;
 
-pub const KVM_SYSTEM_EVENT_SHUTDOWN: u32 = 1;
-pub const KVM_SYSTEM_EVENT_RESET: u32 = 2;
+pub const KVM_SYSTEM_EVENT_SHUTDOWN = common.KVM_SYSTEM_EVENT_SHUTDOWN;
+pub const KVM_SYSTEM_EVENT_RESET = common.KVM_SYSTEM_EVENT_RESET;
 
-pub const KVM_CAP_USER_MEMORY: u32 = 3;
+pub const KVM_CAP_USER_MEMORY = common.KVM_CAP_USER_MEMORY;
 pub const KVM_CAP_ONE_REG: u32 = 70;
 pub const KVM_CAP_ARM_PSCI_0_2: u32 = 102;
 pub const KVM_CAP_DEVICE_CTRL: u32 = 89;
@@ -95,23 +94,9 @@ pub const KVM_REG_ARM_TIMER_CTL: u64 = 0x6030_0000_0013_df19;
 pub const KVM_REG_ARM_TIMER_CVAL: u64 = 0x6030_0000_0013_df02;
 pub const KVM_REG_ARM_TIMER_CNT: u64 = 0x6030_0000_0013_df1a;
 
-pub const RunLayout = struct {
-    pub const immediate_exit: usize = 1;
-    pub const exit_reason: usize = 8;
-    pub const mmio_phys_addr: usize = 32;
-    pub const mmio_data: usize = 40;
-    pub const mmio_len: usize = 48;
-    pub const mmio_is_write: usize = 52;
-    pub const system_event_type: usize = 32;
-};
+pub const RunLayout = common.RunLayout;
 
-pub const UserspaceMemoryRegion = extern struct {
-    slot: u32,
-    flags: u32,
-    guest_phys_addr: u64,
-    memory_size: u64,
-    userspace_addr: u64,
-};
+pub const UserspaceMemoryRegion = common.UserspaceMemoryRegion;
 
 pub const DirtyLog = extern struct {
     slot: u32,
@@ -135,17 +120,9 @@ pub const CreateDevice = extern struct {
     flags: u32,
 };
 
-pub const DeviceAttr = extern struct {
-    flags: u32,
-    group: u32,
-    attr: u64,
-    addr: u64,
-};
+pub const DeviceAttr = common.DeviceAttr;
 
-pub const IrqLevel = extern struct {
-    irq: u32,
-    level: u32,
-};
+pub const IrqLevel = common.IrqLevel;
 
 pub const CounterOffset = extern struct {
     counter_offset: u64,
@@ -153,21 +130,11 @@ pub const CounterOffset = extern struct {
 };
 
 pub fn openDevKvm() Error!std.c.fd_t {
-    const path: [:0]const u8 = "/dev/kvm";
-    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDWR }, @as(c_uint, 0));
-    if (fd < 0) return error.OpenFailed;
-    return fd;
+    return common.openDevKvm(.{ .close_on_exec = false });
 }
 
 pub fn ioctl(fd: std.c.fd_t, request: u32, arg: usize, op: []const u8) Error!usize {
-    const rc = linux.ioctl(fd, request, arg);
-    switch (linux.errno(rc)) {
-        .SUCCESS => return rc,
-        else => |err| {
-            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, request, @tagName(err) });
-            return error.KvmIoctlFailed;
-        },
-    }
+    return common.ioctl(fd, request, arg, op);
 }
 
 pub fn checkExtension(kvm_fd: std.c.fd_t, cap: u32) Error!u64 {
@@ -254,52 +221,14 @@ pub fn setOneRegU32(vcpu_fd: std.c.fd_t, id: u64, value: u32) Error!void {
 }
 
 pub fn setIrq(vm_fd: std.c.fd_t, intid: u32, level: bool) Error!void {
-    var irq = IrqLevel{ .irq = (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | intid, .level = @intFromBool(level) };
-    _ = try ioctl(vm_fd, KVM_IRQ_LINE, @intFromPtr(&irq), "KVM_IRQ_LINE");
+    return common.setIrqLine(vm_fd, (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | intid, level);
 }
 
-pub fn setDeviceAttr(fd: std.c.fd_t, group: u32, attr_id: u64, value: *const anyopaque, op: []const u8) Error!void {
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(value) };
-    _ = try ioctl(fd, KVM_SET_DEVICE_ATTR, @intFromPtr(&attr), op);
-}
-
-pub fn getDeviceAttrMaybeU32(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u32 {
-    var value: u32 = 0;
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(&value) };
-    const rc = linux.ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr));
-    switch (linux.errno(rc)) {
-        .SUCCESS => return value,
-        .INVAL => return null,
-        else => |err| {
-            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, KVM_GET_DEVICE_ATTR, @tagName(err) });
-            return error.KvmIoctlFailed;
-        },
-    }
-}
-
-pub fn setDeviceAttrU32(fd: std.c.fd_t, group: u32, attr_id: u64, value: u32, op: []const u8) Error!void {
-    var v = value;
-    try setDeviceAttr(fd, group, attr_id, &v, op);
-}
-
-pub fn getDeviceAttrMaybeU64(fd: std.c.fd_t, group: u32, attr_id: u64, op: []const u8) Error!?u64 {
-    var value: u64 = 0;
-    var attr = DeviceAttr{ .flags = 0, .group = group, .attr = attr_id, .addr = @intFromPtr(&value) };
-    const rc = linux.ioctl(fd, KVM_GET_DEVICE_ATTR, @intFromPtr(&attr));
-    switch (linux.errno(rc)) {
-        .SUCCESS => return value,
-        .INVAL => return null,
-        else => |err| {
-            std.log.err("{s}: KVM ioctl 0x{x} failed: {s}", .{ op, KVM_GET_DEVICE_ATTR, @tagName(err) });
-            return error.KvmIoctlFailed;
-        },
-    }
-}
-
-pub fn setDeviceAttrU64(fd: std.c.fd_t, group: u32, attr_id: u64, value: u64, op: []const u8) Error!void {
-    var v = value;
-    try setDeviceAttr(fd, group, attr_id, &v, op);
-}
+pub const setDeviceAttr = common.setDeviceAttr;
+pub const getDeviceAttrMaybeU32 = common.getDeviceAttrMaybeU32;
+pub const setDeviceAttrU32 = common.setDeviceAttrU32;
+pub const getDeviceAttrMaybeU64 = common.getDeviceAttrMaybeU64;
+pub const setDeviceAttrU64 = common.setDeviceAttrU64;
 
 pub fn setCounterOffset(vm_fd: std.c.fd_t, counter_offset: u64) Error!void {
     var offset = CounterOffset{ .counter_offset = counter_offset };

@@ -4,6 +4,8 @@
 //! operations and result contracts; backend, device, storage, daemon, and CLI
 //! modules stay behind the in-repo implementation module.
 
+const std = @import("std");
+const builtin = @import("builtin");
 const api = @import("api.zig");
 pub const version = @import("version.zig").value;
 
@@ -31,6 +33,11 @@ pub const DigestRef = api.DigestRef;
 pub const ForkOptions = api.ForkOptions;
 pub const ForkResult = api.ForkResult;
 pub const HostInfo = api.HostInfo;
+pub const HostInfoV3 = api.HostInfoV3;
+pub const PlatformFactsV3 = api.PlatformFactsV3;
+pub const Aarch64PlatformFacts = api.Aarch64PlatformFacts;
+pub const X86PlatformFacts = api.X86PlatformFacts;
+pub const KvmCapabilityFact = api.KvmCapabilityFact;
 pub const ImagePullPolicy = api.ImagePullPolicy;
 pub const InspectBundleOptions = api.InspectBundleOptions;
 pub const InspectBundleResult = api.InspectBundleResult;
@@ -119,10 +126,14 @@ pub const UnpackResult = api.UnpackResult;
 pub const classifyFailure = api.classifyFailure;
 pub const copyInNamed = api.copyInNamed;
 pub const copyOutNamed = api.copyOutNamed;
-pub const createNamed = api.createNamed;
+pub fn createNamed(init: std.process.Init, allocator: std.mem.Allocator, options: CreateNamedOptions) !NamedLifecycleResult {
+    try requireFreshRunApi();
+    return api.createNamed(init, allocator, options);
+}
 pub const deinitExecNamedResult = api.deinitExecNamedResult;
 pub const deinitForkResult = api.deinitForkResult;
 pub const deinitHostInfo = api.deinitHostInfo;
+pub const deinitHostInfoV3 = api.deinitHostInfoV3;
 pub const deinitInspectBundleResult = api.deinitInspectBundleResult;
 pub const deinitNamedForkResult = api.deinitNamedForkResult;
 pub const deinitNamedLifecycleResult = api.deinitNamedLifecycleResult;
@@ -144,6 +155,7 @@ pub const execNamed = api.execNamed;
 pub const fork = api.fork;
 pub const forkNamed = api.forkNamed;
 pub const hostInfo = api.hostInfo;
+pub const hostInfoV3 = api.hostInfoV3;
 pub const inspectBundle = api.inspectBundle;
 pub const inspectSpore = api.inspectSpore;
 pub const validateAnnotations = api.validateAnnotations;
@@ -162,9 +174,23 @@ pub const rootfsCasPreload = api.rootfsCasPreload;
 pub const rootfsImportOci = api.rootfsImportOci;
 pub const rootfsImportTar = api.rootfsImportTar;
 pub const rootfsResolve = api.rootfsResolve;
-pub const run = api.run;
+fn requireFreshRunApi() !void {
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+        return error.X86LibsporeFreshRunUnsupported;
+    }
+}
+
+pub fn run(context: Context, allocator: std.mem.Allocator, options: RunOptions) !RunResult {
+    try requireFreshRunApi();
+    return api.run(context, allocator, options);
+}
 pub const runFromSpore = api.runFromSpore;
-pub const runManaged = api.runManaged;
+/// Slice 3a routes the CLI through the x86 fresh runner, while standalone
+/// libspore execution remains gated until its Slice 3c acceptance work.
+pub fn runManaged(init: std.process.Init, allocator: std.mem.Allocator, options: ManagedRunOptions) !RunResult {
+    try requireFreshRunApi();
+    return api.runManaged(init, allocator, options);
+}
 pub const saveNamed = api.saveNamed;
 pub const systemDf = api.systemDf;
 pub const systemPrune = api.systemPrune;
@@ -174,4 +200,36 @@ test {
     const testing = @import("std").testing;
     testing.refAllDecls(@This());
     testing.refAllDecls(api);
+}
+
+test "x86 libspore fresh run entrypoints remain gated until Slice 3c" {
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &arena_state,
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+    const command = [_][]const u8{"/bin/true"};
+
+    try std.testing.expectError(error.X86LibsporeFreshRunUnsupported, run(.{
+        .io = std.testing.io,
+        .environ_map = &env,
+    }, std.testing.allocator, .{
+        .kernel_path = "missing-bzImage",
+        .command = &command,
+    }));
+    try std.testing.expectError(error.X86LibsporeFreshRunUnsupported, runManaged(init, std.testing.allocator, .{
+        .command = &command,
+    }));
+    try std.testing.expectError(error.X86LibsporeFreshRunUnsupported, createNamed(init, std.testing.allocator, .{
+        .name = "x86-libspore-rejected",
+    }));
 }

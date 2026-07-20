@@ -28,6 +28,15 @@ steps:
         agents: &mac_agents
           queue: sporevm-mac
 
+      - label: ":computer: x86-64 Slice 3a (Linux AMD64)"
+        key: "x86-slice3a-linux-amd64"
+        command: "scripts/ci/run.sh mise run smoke:x86-slice3a"
+        timeout_in_minutes: 15
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents:
+          queue: sporevm-linux-amd64
+
   - group: ":docker: Spore build"
     key: "spore-build"
     steps:

@@ -3,21 +3,33 @@ const builtin = @import("builtin");
 const libspore = @import("libspore");
 
 test "external import can inspect host info" {
-    if (comptime builtin.cpu.arch != .aarch64) return;
-
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put("XDG_CACHE_HOME", "/tmp/sporevm-cache");
     try env.put("XDG_RUNTIME_DIR", "/tmp/sporevm-runtime");
 
-    const info = try libspore.hostInfo(.{
+    if (comptime builtin.cpu.arch == .aarch64) {
+        const info = try libspore.hostInfo(.{
+            .io = std.testing.io,
+            .environ_map = &env,
+        }, allocator);
+        defer libspore.deinitHostInfo(allocator, info);
+        try std.testing.expect(info.backends.len > 0);
+    }
+
+    const info_v3 = try libspore.hostInfoV3(.{
         .io = std.testing.io,
         .environ_map = &env,
     }, allocator);
-    defer libspore.deinitHostInfo(allocator, info);
-
-    try std.testing.expect(info.backends.len > 0);
+    defer libspore.deinitHostInfoV3(allocator, info_v3);
+    try std.testing.expectEqualStrings("spore.host-info.v3", info_v3.schema);
+    const expected_arch = switch (builtin.cpu.arch) {
+        .aarch64 => "arm64",
+        .x86_64 => "amd64",
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings(expected_arch, info_v3.architecture);
 }
 
 test "external import can consume classified failure events" {

@@ -15,6 +15,7 @@ const net = std.Io.net;
 
 const generation = @import("generation.zig");
 const lifecycle = @import("lifecycle.zig");
+const backend_mod = @import("backend.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
@@ -170,10 +171,20 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
 
     const opts = try parseMonitorArgs(args);
     const parsed_ms = lifecycle.monotonicMs();
-    if (!lifecycle.monitorBackendSupported(opts.backend.name())) {
-        std.debug.print("spore monitor: monitor mode requires HVF on Apple Silicon or KVM on Linux/arm64\n", .{});
+    const selected_backend = backend_mod.requireProductRunner(opts.backend) catch |err| {
+        std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
         std.process.exit(2);
-    }
+    };
+    run.validateFreshProductPolicy(selected_backend, .{
+        .memory = opts.memory,
+        .vcpus = opts.vcpus,
+        .resuming = opts.resume_dir != null,
+        .rootfs = opts.rootfs_path != null or opts.image_ref != null,
+        .network = opts.network != .disabled,
+    }) catch |err| {
+        std.debug.print("spore monitor: x86 fresh profile rejected request: {s}\n", .{@errorName(err)});
+        std.process.exit(2);
+    };
     if (opts.resume_dir != null and opts.rootfs_path != null) {
         std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
@@ -189,6 +200,21 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         else => |e| return e,
     };
     defer if (existing_spec) |*spec| spec.deinit();
+    if (existing_spec) |spec| {
+        run.validateFreshProductPolicy(selected_backend, .{
+            .memory = spec.value.memory,
+            .vcpus = spec.value.vcpus,
+            .resuming = spec.value.resume_dir != null or spec.value.resume_generation != null or
+                spec.value.sessions.len != 0 or spec.value.disk != null or
+                spec.value.disk_baseline_lease != null or spec.value.disk_fork_claim != null,
+            .rootfs = spec.value.rootfs_path != null or spec.value.rootfs != null or
+                spec.value.image_ref != null or spec.value.disk != null,
+            .network = spec.value.network != null,
+        }) catch |err| {
+            std.debug.print("spore monitor: stored state is outside the x86 fresh profile: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+    }
     const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
     if (!monitorImageRootfsAvailable(opts.image_ref, opts.rootfs_path, spec_rootfs != null)) {
         std.debug.print("spore monitor: --image requires an explicit --rootfs path or lifecycle rootfs metadata\n", .{});
@@ -217,11 +243,29 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         if (spec.value.sessions.len != 0) spec.value.sessions else sessionHandlesForResume(allocator, opts.resume_dir)
     else
         sessionHandlesForResume(allocator, opts.resume_dir);
-    const kernel_path = opts.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
-        std.debug.print("spore monitor: kernel setup failed: {s}\n", .{@errorName(err)});
-        std.process.exit(2);
-    };
-    const initrd_path = run.resolveConfiguredInitrdPath(init, opts.initrd_path) catch |err| {
+    const managed_boot_descriptor = if (opts.kernel_path == null and opts.initrd_path == null and
+        init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null)
+        run.resolveManagedMonitorBootDescriptor(init, allocator) catch |err| {
+            std.debug.print("spore monitor: managed boot setup failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        }
+    else
+        null;
+    const managed_boot_artifacts = if (managed_boot_descriptor) |descriptor|
+        run.materializeManagedMonitorBootArtifacts(init.io, allocator, descriptor) catch |err| {
+            std.debug.print("spore monitor: managed boot verification failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        }
+    else
+        null;
+    const kernel_path = if (managed_boot_descriptor) |descriptor|
+        descriptor.kernel_path
+    else
+        opts.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
+            std.debug.print("spore monitor: kernel setup failed: {s}\n", .{@errorName(err)});
+            std.process.exit(2);
+        };
+    const initrd_path = if (managed_boot_descriptor != null) null else run.resolveConfiguredInitrdPath(init, opts.initrd_path) catch |err| {
         std.debug.print("spore monitor: initrd setup failed: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };
@@ -288,7 +332,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     try run.openConsoleLog(opts.console_log_path);
     defer run.closeConsoleLog();
 
-    const result = run.executeMonitor(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
+    const monitor_options = run.Options{
         .backend = opts.backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
@@ -311,7 +355,11 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .network_policy = opts.network_policy,
         .network_runtime = if (gateway_active) gateway.runtime() else null,
         .spore_executable = spore_executable,
-    }, server.control(), readiness_probe);
+    };
+    const result = if (managed_boot_artifacts) |artifacts|
+        run.executeMonitorWithBootArtifacts(.{ .io = init.io, .environ_map = init.environ_map }, allocator, monitor_options, artifacts, server.control(), readiness_probe)
+    else
+        run.executeMonitor(.{ .io = init.io, .environ_map = init.environ_map }, allocator, monitor_options, server.control(), readiness_probe);
     if (result) |monitor_result| {
         switch (monitor_result.exit) {
             .stopped => {},
@@ -1707,6 +1755,10 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         return false;
     }
     if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.prepare_type)) {
+        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
+            return false;
+        }
         var request = runtime_disk_fork_control.parsePrepareBytes(server.allocator, line) catch {
             try writeControlError(server.io, stream, "bad disk fork prepare request");
             return false;
@@ -1736,6 +1788,10 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         return false;
     }
     if (std.mem.eql(u8, parsed.value.type, "suspend")) {
+        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
+            return false;
+        }
         const out_dir = parsed.value.out_dir orelse {
             try writeControlError(server.io, stream, "suspend request missing out_dir");
             return false;
@@ -1748,6 +1804,10 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         return true;
     }
     if (std.mem.eql(u8, parsed.value.type, "snapshot")) {
+        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
+            return false;
+        }
         const out_dir = parsed.value.out_dir orelse {
             try writeControlError(server.io, stream, "snapshot request missing out_dir");
             return false;

@@ -397,7 +397,10 @@ named live fork, and limits.
 
 SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
-named lifecycle on supported arm64 HVF/KVM hosts.
+named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM has an
+experimental fresh-only development profile with one vCPU and explicit 512 MiB
+memory; capture, resume, rootfs, networking, build, and standalone libspore
+execution remain gated.
 
 Known limits: compatible host-class restore only, rootfs-bound writable disk
 state only, diskless named live fork, and no hardened public-cloud

@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const aarch64_board = @import("src/board.zig");
+const x86_64_board = @import("src/x86_64/board.zig");
 
 const macos_deployment_target = std.SemanticVersion{ .major = 13, .minor = 0, .patch = 0 };
 
@@ -11,6 +13,7 @@ pub fn build(b: *std.Build) void {
     const target_arch = target.result.cpu.arch;
     const target_is_hvf = target_os == .macos and target_arch == .aarch64;
     const target_is_kvm = target_os == .linux and target_arch == .aarch64;
+    const target_is_kvm_boot = target_os == .linux and (target_arch == .aarch64 or target_arch == .x86_64);
     const host_is_hvf = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
     const host_is_kvm = builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
     const optimize = b.standardOptimizeOption(.{
@@ -31,11 +34,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const toybox_dep = b.dependency("toybox", .{});
+    const guest_arch = guestArchitecture(target_arch) orelse
+        std.debug.panic("unsupported embedded guest architecture: {s}", .{@tagName(target_arch)});
+    const guest_generation_base = generationBase(target_arch) orelse unreachable;
     const minimal_exec_assets = b.addSystemCommand(&.{
         "bash",
         "-c",
         \\set -euo pipefail
-        \\scripts/kernel/make-minimal-exec-initrd.sh --toybox-source "$3" "$1"
+        \\scripts/kernel/make-minimal-exec-initrd.sh --arch "$4" --generation-base "$5" --toybox-source "$3" "$1"
         \\if command -v sha256sum >/dev/null 2>&1; then
         \\  initrd_sha256="$(sha256sum "$1" | awk '{print $1}')"
         \\else
@@ -51,9 +57,11 @@ pub fn build(b: *std.Build) void {
     _ = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.cpio");
     const minimal_exec_initrd_module = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.zig");
     minimal_exec_assets.addDirectoryArg(toybox_dep.path(""));
+    minimal_exec_assets.addArg(guest_arch);
+    minimal_exec_assets.addArg(b.fmt("0x{x}", .{guest_generation_base}));
     minimal_exec_assets.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
     minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
-    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
+    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "rngcheck", "blkcheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
     for (minimal_exec_sources) |src| {
         minimal_exec_assets.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
     }
@@ -200,7 +208,15 @@ pub fn build(b: *std.Build) void {
         mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
         mod.addCSourceFile(.{
             .file = b.path("guest/minimal-initrd/agent.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
+            .flags = &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-Wno-unused-function",
+                "-DSPORE_AGENT_REQUEST_FUZZ",
+                b.fmt("-DSPORE_GENERATION_BASE=0x{x}ULL", .{guest_generation_base}),
+            },
         });
         mod.addCSourceFile(.{
             .file = b.path("guest/minimal-initrd/build_copy.c"),
@@ -260,6 +276,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_c_smoke = b.addRunArtifact(c_smoke);
 
+    const x86_64_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/x86_64_tests.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    x86_64_tests.root_module.link_libc = true;
+    const run_x86_64_tests = b.addRunArtifact(x86_64_tests);
+
     // ponytail: test artifacts share fixed zig-cache paths; serialize until tests use per-process temp dirs.
     run_libspore_smoke_tests.step.dependOn(&run_libspore_tests.step);
     run_c_api_tests.step.dependOn(&run_libspore_smoke_tests.step);
@@ -267,8 +292,25 @@ pub fn build(b: *std.Build) void {
     run_durable_crash_tests_suite.step.dependOn(&run_internal_tests.step);
     run_exe_tests.step.dependOn(&run_durable_crash_tests_suite.step);
     run_c_smoke.step.dependOn(&run_exe_tests.step);
+    run_x86_64_tests.step.dependOn(&run_c_smoke.step);
 
     const test_step = b.step("test", "Run unit tests");
+    const minimal_exec_initrd_tests = b.addSystemCommand(&.{
+        "bash", "scripts/kernel/test-minimal-exec-initrd.sh", "--toybox-source",
+    });
+    minimal_exec_initrd_tests.addDirectoryArg(toybox_dep.path(""));
+    minimal_exec_initrd_tests.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
+    for (minimal_exec_sources) |src| {
+        minimal_exec_initrd_tests.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
+    }
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_copy.c"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_copy.h"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.c"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.h"));
+    const minimal_exec_initrd_test_step = b.step("minimal-exec-initrd-test", "Build and validate deterministic embedded initrds for every guest architecture");
+    minimal_exec_initrd_test_step.dependOn(&minimal_exec_initrd_tests.step);
+    test_step.dependOn(minimal_exec_initrd_test_step);
     test_step.dependOn(&run_libspore_tests.step);
     test_step.dependOn(&run_libspore_smoke_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
@@ -276,6 +318,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_durable_crash_tests_suite.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_c_smoke.step);
+    test_step.dependOn(&run_x86_64_tests.step);
 
     const rootfs_slow_test_step = b.step("rootfs-slow-test", "Run slow rootfs/ext4 conformance tests");
     rootfs_slow_test_step.dependOn(&run_rootfs_slow_tests.step);
@@ -463,14 +506,15 @@ pub fn build(b: *std.Build) void {
         boot_step.dependOn(&sign_boot.step);
     }
 
-    // Linux KVM boot harness: host-only, needs /dev/kvm on aarch64 Linux.
-    if (target_is_kvm) {
+    // Linux KVM boot harness: host-only, needs /dev/kvm on the target architecture.
+    if (target_is_kvm_boot) {
         const kvm_boot_mod = b.createModule(.{
-            .root_source_file = b.path("src/kvm_boot.zig"),
+            .root_source_file = b.path(if (target_arch == .x86_64) "src/x86_64_kvm_boot.zig" else "src/kvm_boot.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = optimize != .Debug,
             .link_libc = true,
-            .imports = &.{
+            .imports = if (target_arch == .x86_64) &.{} else &.{
                 .{ .name = "spore_internal", .module = internal_mod },
             },
         });
@@ -483,7 +527,77 @@ pub fn build(b: *std.Build) void {
 
         const kvm_boot_step = b.step("kvm-boot", "Build the Linux KVM kernel boot harness");
         kvm_boot_step.dependOn(&install_kvm_boot.step);
+
+        if (target_arch == .x86_64) {
+            const slice2a_smoke_mod = b.createModule(.{
+                .root_source_file = b.path("src/x86_64_slice2a_smoke.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = optimize != .Debug,
+                .link_libc = true,
+            });
+            slice2a_smoke_mod.addAnonymousImport("run_assets", .{
+                .root_source_file = minimal_exec_initrd_module,
+            });
+            slice2a_smoke_mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+            const slice2a_smoke_exe = b.addExecutable(.{
+                .name = "x86-slice2a-smoke",
+                .root_module = slice2a_smoke_mod,
+            });
+            const install_slice2a_smoke = b.addInstallArtifact(slice2a_smoke_exe, .{});
+            const slice2a_smoke_step = b.step("x86-slice2a-smoke", "Build the native x86 Slice 2a guest-agent smoke");
+            slice2a_smoke_step.dependOn(&install_slice2a_smoke.step);
+
+            const profile_probe_mod = b.createModule(.{
+                .root_source_file = b.path("src/x86_64_profile_probe.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = optimize != .Debug,
+                .link_libc = true,
+            });
+            const profile_probe_exe = b.addExecutable(.{
+                .name = "kvm-profile-probe",
+                .root_module = profile_probe_mod,
+            });
+            const install_profile_probe = b.addInstallArtifact(profile_probe_exe, .{});
+            const profile_probe_step = b.step("kvm-profile-probe", "Build the no-KVM_RUN x86 KVM profile probe");
+            profile_probe_step.dependOn(&install_profile_probe.step);
+
+            const profile_roundtrip_mod = b.createModule(.{
+                .root_source_file = b.path("src/x86_64_profile_roundtrip.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = optimize != .Debug,
+                .link_libc = true,
+            });
+            const profile_roundtrip_exe = b.addExecutable(.{
+                .name = "kvm-profile-roundtrip",
+                .root_module = profile_roundtrip_mod,
+            });
+            const install_profile_roundtrip = b.addInstallArtifact(profile_roundtrip_exe, .{});
+            const profile_roundtrip_step = b.step("kvm-profile-roundtrip", "Build the x86 KVM process-boundary profile proof");
+            profile_roundtrip_step.dependOn(&install_profile_roundtrip.step);
+        }
     }
+}
+
+fn guestArchitecture(arch: std.Target.Cpu.Arch) ?[]const u8 {
+    return switch (arch) {
+        .aarch64 => "aarch64",
+        .x86_64 => "x86_64",
+        else => null,
+    };
+}
+
+/// Keep the guest agent's MMIO definition tied to the selected, validated
+/// board instead of accepting a user-supplied build option or a second C
+/// constant that can drift from the VMM.
+fn generationBase(arch: std.Target.Cpu.Arch) ?u64 {
+    return switch (arch) {
+        .aarch64 => aarch64_board.generation_base,
+        .x86_64 => x86_64_board.generation_base,
+        else => null,
+    };
 }
 
 fn macosFrameworkPath(b: *std.Build) ?std.Build.LazyPath {

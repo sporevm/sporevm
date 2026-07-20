@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const architecture = @import("architecture.zig");
+const backend_mod = @import("backend.zig");
 const bundle = @import("bundle.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
@@ -43,10 +44,12 @@ pub const CacheRoot = union(enum) {
     path: []const u8,
 };
 
-/// Host capability and cache summary returned by `hostInfo`.
+/// ARM host capability and cache summary returned by `hostInfo`.
 ///
 /// The result owns `backends` and any resolved cache-root paths. Release it with
-/// `deinitHostInfo` using the same allocator passed to `hostInfo`.
+/// `deinitHostInfo` using the same allocator passed to `hostInfo`. This v2
+/// compatibility surface returns `error.UnsupportedArchitecture` on x86-64;
+/// use `HostInfoV3` and `hostInfoV3` for either supported architecture.
 pub const HostInfo = struct {
     schema: []const u8 = platform.host_info_schema,
     schema_version: u32 = platform.host_info_schema_version,
@@ -87,6 +90,15 @@ pub const PathFact = struct {
     resolved: bool,
     source: []const u8,
 };
+
+/// Versioned architecture-discriminated host information. Unlike v2, this
+/// surface is valid on both aarch64 and x86-64 and never represents
+/// not-applicable architecture fields with sentinel zeroes.
+pub const HostInfoV3 = platform.HostInfoV3;
+pub const PlatformFactsV3 = platform.PlatformFactsV3;
+pub const Aarch64PlatformFacts = platform.Aarch64PlatformFacts;
+pub const X86PlatformFacts = platform.X86PlatformFacts;
+pub const KvmCapabilityFact = platform.KvmCapabilityFact;
 
 /// Rootfs storage policy used when packing a spore into a bundle.
 pub const RootfsBundlePolicy = enum {
@@ -492,10 +504,12 @@ pub const SporeInspectResult = struct {
     annotation_keys: []const []const u8 = &.{},
 };
 
-/// Return host facts, backend availability, and cache roots.
+/// Return ARM-shaped v2 host facts, backend availability, and cache roots.
 ///
 /// The caller owns returned slices and optional paths. Call `deinitHostInfo`
-/// with the same allocator when done.
+/// with the same allocator when done. This compatibility function returns
+/// `error.UnsupportedArchitecture` on x86-64; use `hostInfoV3` for either
+/// supported architecture.
 pub fn hostInfo(
     context: Context,
     allocator: std.mem.Allocator,
@@ -537,6 +551,15 @@ pub fn hostInfo(
     };
 }
 
+/// Return architecture-discriminated `spore.host-info.v3` facts on either
+/// aarch64 or x86-64.
+pub fn hostInfoV3(
+    context: Context,
+    allocator: std.mem.Allocator,
+) !HostInfoV3 {
+    return platform.hostInfoV3(allocator, context.environ_map);
+}
+
 /// Release memory owned by a `HostInfo` result.
 pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     allocator.free(info.backends);
@@ -544,6 +567,10 @@ pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     freePathFact(allocator, info.cache_roots.rootfs);
     freePathFact(allocator, info.cache_roots.bundles);
     freePathFact(allocator, info.cache_roots.runtime);
+}
+
+pub fn deinitHostInfoV3(allocator: std.mem.Allocator, info: HostInfoV3) void {
+    platform.deinitHostInfoV3(allocator, info);
 }
 
 /// Summarize the local rootfs cache.
@@ -862,6 +889,14 @@ pub fn runManaged(
     if (options.disk_size) |disk_size| {
         if (options.commit_ref == null or disk_size == 0 or disk_size % rootfs_cas.default_chunk_size != 0) return error.InvalidRunDiskSize;
     }
+    const selected_backend = try backend_mod.requireProductRunner(options.backend);
+    try run_mod.validateFreshProductPolicy(selected_backend, .{
+        .memory = options.memory,
+        .vcpus = options.vcpus,
+        .capture = options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.commit_ref != null,
+        .rootfs = options.rootfs_path != null or options.image_ref != null or options.disk_size != null,
+        .network = options.network != .disabled,
+    });
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -876,8 +911,19 @@ pub fn runManaged(
     });
     const default_kernel = options.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
     const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
-    const kernel_path = options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
-    const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
+    const managed_boot_descriptor = if (default_kernel and default_initrd)
+        try run_mod.resolveManagedMonitorBootDescriptor(init, arena)
+    else
+        null;
+    const boot_artifacts = if (managed_boot_descriptor) |descriptor|
+        try run_mod.materializeManagedMonitorBootArtifacts(init.io, arena, descriptor)
+    else
+        null;
+    const kernel_path = if (managed_boot_descriptor) |descriptor|
+        descriptor.kernel_path
+    else
+        options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
+    const initrd_path = if (managed_boot_descriptor != null) null else try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
     const guest_env = try run_mod.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
     const rootfs_grow_target = if (options.disk_size) |target| blk: {
         const resolved_rootfs = rootfs.rootfs orelse return error.RunCommitRootfsNotSnapshotable;
@@ -889,6 +935,7 @@ pub fn runManaged(
         .backend = options.backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
+        .boot_artifacts = boot_artifacts,
         .auto_memory_hotplug_capable = default_kernel and default_initrd,
         .rootfs_path = rootfs.path,
         .rootfs = rootfs.rootfs,
@@ -927,6 +974,13 @@ pub fn runFromSpore(
     allocator: std.mem.Allocator,
     options: RunFromSporeOptions,
 ) !RunResult {
+    const selected_backend = try backend_mod.requireProductRunner(options.backend);
+    try run_mod.validateFreshProductPolicy(selected_backend, .{
+        .memory = .{},
+        .vcpus = options.vcpus,
+        .resuming = true,
+    });
+
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

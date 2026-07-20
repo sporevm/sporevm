@@ -180,6 +180,10 @@ fn seekFileSize(fd: std.c.fd_t) ?u64 {
 }
 
 pub const Options = struct {
+    /// Reject ordinary guest writes before they reach any backend, including
+    /// writable in-memory test backends, while preserving the frozen feature
+    /// surface used by existing immutable product attachments.
+    read_only: bool = false,
     /// Advertise and serve VIRTIO_BLK_F_WRITE_ZEROES. This is reserved for
     /// writable growth sessions; ordinary attachments keep the frozen
     /// feature surface by using the default.
@@ -258,7 +262,7 @@ pub const Blk = struct {
     /// their feature surface frozen even when the writable root disk opts in
     /// to transient growth features.
     pub fn initImmutableSource(backend: Backend) Blk {
-        return init(backend);
+        return initWithOptions(backend, .{ .read_only = true });
     }
 
     pub fn initWithOptions(backend: Backend, options: Options) Blk {
@@ -341,6 +345,7 @@ pub const Blk = struct {
         switch (req_type) {
             req_in, req_out => {
                 const want_writable = req_type == req_in;
+                if (!want_writable and self.options.read_only) return failStatus(status);
                 const capacity_bytes = self.capacity_sectors * sector_size;
                 const request_offset = std.math.mul(u64, sector, sector_size) catch return failStatus(status);
                 var offset = request_offset;
@@ -735,6 +740,24 @@ test "immutable build input rejects WRITE_ZEROES negotiation without mutation" {
     _ = transport.write(0x070, mmio.status_features_ok, ram);
     try std.testing.expectEqual(@as(u32, 0), transport.read(0x070) & mmio.status_features_ok);
     try std.testing.expectEqual(@as(u64, 0), source.accepted_features);
+    try std.testing.expect(std.mem.allEqual(u8, &disk, 0x5a));
+}
+
+test "immutable memory source rejects ordinary OUT without mutation" {
+    var disk = [_]u8{0x5a} ** (2 * sector_size);
+    var source = Blk.initImmutableSource(.{ .memory = &disk });
+    var header = [_]u8{0} ** 16;
+    std.mem.writeInt(u32, header[0..4], req_out, .little);
+    std.mem.writeInt(u64, header[8..16], 0, .little);
+    var attempted = [_]u8{0xa5} ** sector_size;
+    var status: [1]u8 = .{0xff};
+    const chain = makeChain(&.{
+        .{ .data = &header, .writable = false },
+        .{ .data = &attempted, .writable = false },
+        .{ .data = &status, .writable = true },
+    });
+    try std.testing.expectEqual(@as(u32, 1), source.handleRequest(&chain));
+    try std.testing.expectEqual(status_ioerr, status[0]);
     try std.testing.expect(std.mem.allEqual(u8, &disk, 0x5a));
 }
 

@@ -1,0 +1,52 @@
+{
+  "schema": "spore.host-info.v2",
+  "schema_version": 2,
+  "host_class": "linux-arm64-kvm",
+  "platform": {
+    "os": "linux",
+    "arch": "arm64",
+    "cpu_profile": "sporevm-aarch64-v0",
+    "device_model_version": 4,
+    "ram_base": 2147483648,
+    "gic_dist_base": 134217728,
+    "gic_redist_base": 134348800,
+    "counter_frequency_source": "cntfrq_el0",
+    "counter_frequency_hz": 24000000
+  },
+  "backends": [
+    {
+      "name": "hvf",
+      "supported": false,
+      "available": false,
+      "reason": "unsupported_os_or_arch"
+    },
+    {
+      "name": "kvm",
+      "supported": true,
+      "available": true,
+      "reason": "available"
+    }
+  ],
+  "cache_roots": {
+    "kernels": {
+      "path": null,
+      "resolved": false,
+      "source": "missing_home"
+    },
+    "rootfs": {
+      "path": null,
+      "resolved": false,
+      "source": "missing_home"
+    },
+    "bundles": {
+      "path": null,
+      "resolved": false,
+      "source": "missing_home"
+    },
+    "runtime": {
+      "path": null,
+      "resolved": false,
+      "source": "invalid_runtime_dir"
+    }
+  }
+}
