@@ -475,8 +475,9 @@ be repeated from the recorded digest-pinned ref.
 
 Rootfs product platforms use OCI names. `--platform` accepts `linux/arm64` and
 `linux/amd64`; backend aliases such as `linux/aarch64` and `linux/x86_64` are
-rejected so image metadata and cache identity have one spelling. Materializing
-an amd64 rootfs does not imply that the current arm64 runtime can execute it.
+rejected so image metadata and cache identity have one spelling. Platform
+metadata support does not imply runtime support: the experimental AMD64
+backend currently rejects image and rootfs execution.
 
 `spore rootfs resolve` prints the digest-pinned ref without building a rootfs:
 

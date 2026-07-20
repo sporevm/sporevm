@@ -15,9 +15,16 @@ spore ps
 spore rm bench-2
 ```
 
-`spore run` remains the one-shot command. The stable named surface is
-`create`, `exec`, `copy-in`, `copy-out`, `save`, `restore`,
-`fork --vm`, `ls`/`ps`, and `rm` on supported HVF and KVM hosts.
+`spore run` remains the one-shot command. On ARM64 HVF/KVM hosts, the stable
+named surface is `create`, `exec`, `copy-in`, `copy-out`, `save`, `restore`,
+`fork --vm`, `ls`/`ps`, and `rm`.
+
+Linux/AMD64 KVM currently exposes an experimental fresh-execution subset:
+`create`, `exec`, and `rm` with the managed kernel, embedded minimal exec
+initrd, one vCPU, and explicit 512 MiB memory. Image and rootfs execution,
+networking, build, copy, save, restore, resume, and fork are unavailable on
+that profile.
+
 One-shot `spore run --image SOURCE --commit local/name:tag -- COMMAND` publishes
 successful disk preparation as an image; it does not create or name a live VM.
 Use named `create`/`copy-in`/`exec`/`save` when preparation needs multiple

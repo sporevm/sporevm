@@ -182,4 +182,4 @@ mise run test:spore-build-conformance
 
 The complete unit and parser/fuzz graph runs under `mise run test`. Real-hardware
 capacity and publication checks use `mise run smoke:build-rootfs-capacity` and
-`mise run smoke:build-publication` on supported HVF and KVM hosts.
+`mise run smoke:build-publication` on ARM64 HVF and KVM hosts.
