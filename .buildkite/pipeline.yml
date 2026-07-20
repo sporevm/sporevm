@@ -31,10 +31,6 @@ steps:
       - label: ":computer: x86-64 Slice 3a (Linux AMD64)"
         key: "x86-slice3a-linux-amd64"
         command: "scripts/ci/run.sh mise run smoke:x86-slice3a"
-        env:
-          SPOREVM_X86_MANAGED_KERNEL_SEED_DIR: ""
-          SPOREVM_KERNEL_IMAGE: ""
-          SPOREVM_RUN_INITRD: ""
         timeout_in_minutes: 15
         plugins: *mise_plugins
         cache: *mise_cache
