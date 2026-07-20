@@ -53,7 +53,9 @@ throughout the work.
 ## Current Progress
 
 - The implementation branch is rebased onto SporeVM `origin/main` at
-  `197ce717b3e5a0b62421666d5173d23852fe2132`.
+  `b009432a5a36f206efa311985f90b12e419a41f3`.
+- Buildkite runs the exact `mise run smoke:x86-slice3a` acceptance command on
+  the native `sporevm-linux-amd64` queue with artifact overrides disabled.
 - The design has passed an external Fable architecture review. Its grounded
   findings are incorporated into the slice ordering, PIO/exit contract,
   single-VMA memory invariant, state inventory, and release-name gate.
@@ -379,13 +381,13 @@ throughout the work.
   validation defects fixed here; two post-fix Fable attempts were refused by
   Anthropic's classifier before analysis, while the final local ship and
   maintainability reviews approve with no material finding.
-- Stage 1.4 completes the `spore.host-info.v2` contract. It preserves the
-  ARM-shaped v1 Zig/JSON contract and C symbol, adds the ABI-version-16
-  `spore_host_info_json_v2` entry point, and reports tagged ARM or x86
+- Stage 1.4 completes the `spore.host-info.v3` contract. It preserves the
+  ARM-shaped v2 Zig/JSON contract and C symbol, adds the ABI-version-16
+  `spore_host_info_json_v3` entry point, and reports tagged ARM or x86
   board/profile/KVM-capability facts without executing host-specific
   instructions in the fixture renderer. Exact compact JSON goldens cover both
-  architecture variants, a checked-in pretty-JSON golden pins the C v1
-  serializer bytes, and the live C v1 test pins its final newline and NUL.
+  architecture variants, a checked-in pretty-JSON golden pins the C v2
+  serializer bytes, and the live C v2 test pins its final newline and NUL.
   Missing or invalid probe values now report `kvm_probe_failed`, while observed
   insufficient values report `profile_capability_missing`. On the dedicated
   x86 host (c5d.metal, Linux 6.17.0-1019-aws), exact ReleaseSafe CLI SHA256
@@ -455,7 +457,7 @@ throughout the work.
 
 ## Motivation
 
-SporeVM currently compiles its KVM product backend only for aarch64 Linux. The
+Before this work, SporeVM compiled its KVM product backend only for aarch64 Linux. The
 shared device, storage, bundle, network, guest-agent, and product lifecycle
 layers are mostly architecture-neutral, but the boundaries below them are
 explicitly ARM-shaped:
@@ -526,7 +528,7 @@ One module must own the spelling conversions so platform strings do not drift:
 | Spore manifest | `aarch64` | `x86_64` |
 | OCI and CLI platform | `linux/arm64` | `linux/amd64` |
 | Zig target | `aarch64-linux-musl` | `x86_64-linux-musl` |
-| Host class prefix | `linux-aarch64-kvm` | `linux-x86_64-kvm` |
+| Host class prefix | `linux-arm64-kvm` | `linux-amd64-kvm` |
 | Release archive | `spore_Linux_arm64` | `spore_Linux_x86_64` |
 
 Aliases may be accepted at host-detection boundaries, but manifests and cache
@@ -700,20 +702,20 @@ PIO-decoded reset or poweroff.
 
 ### Version host-info around architecture-specific facts
 
-The current `spore.host-info.v1` schema is ARM-shaped: it reports aarch64 and
+The current `spore.host-info.v2` schema is ARM-shaped: it reports arm64 and
 GIC addresses, and the Zig `PlatformFacts` surface exposes those fields. Add a
-`spore.host-info.v2` architecture discriminator and architecture-specific
+`spore.host-info.v3` architecture discriminator and architecture-specific
 facts rather than filling GIC values with misleading zeroes on x86. JSON
 consumers receive either ARM interrupt-controller/counter facts or x86
 board/CPU/KVM capability facts with an explicit not-applicable shape.
 
-Preserve the existing C `spore_host_info_json` v1 contract on ARM and add an
-explicit versioned v2 API for both architectures; the v1 entry point fails with
+Preserve the existing C `spore_host_info_json` v2 contract on ARM and add an
+explicit versioned v3 API for both architectures; the v2 entry point fails with
 a documented unsupported-architecture error on x86 rather than returning a
-different schema. The Zig API changes deliberately to a discriminated v2 type.
-V2 uses its final platform/profile shape from the start; until native approval,
+different schema. The Zig API changes deliberately to a discriminated v3 type.
+V3 uses its final platform/profile shape from the start; until native approval,
 the existing backend availability fields report `available: false` with a
-precise profile-not-approved reason. Add independent v1 compatibility and v2
+precise profile-not-approved reason. Add independent v2 compatibility and v3
 rendering tests. An offline inspect on either host must render both
 architectures without executing host-specific instructions.
 
@@ -1194,17 +1196,17 @@ and atomically pending Slice 0b, with VMX/SVM exposure explicitly forbidden
 and no runtime or public availability claim. Native values and compatibility
 remain unavailable until Slice 0b closes them with bare-metal evidence.
 
-#### Stage 1.4: Add the host-info v2 contract
+#### Stage 1.4: Add the host-info v3 contract
 
-- Add `spore.host-info.v2` with architecture-discriminated facts and the final
-  profile field shape. Preserve C v1 on ARM, add the versioned C v2 entry point,
+- Add `spore.host-info.v3` with architecture-discriminated facts and the final
+  profile field shape. Preserve C v2 on ARM, add the versioned C v3 entry point,
   update the Zig API deliberately, and report the unapproved candidate through
   backend availability rather than a transitional public schema state.
-- Add exact JSON, Zig, and C schema/ABI tests, including byte-for-byte C v1 ARM
+- Add exact JSON, Zig, and C schema/ABI tests, including byte-for-byte C v2 ARM
   compatibility.
 
 **Exit:** the x86 binary reports the exact missing capability or candidate
-profile fact, and the v1 ARM host-info ABI remains byte-for-byte compatible.
+profile fact, and the v2 ARM host-info ABI remains byte-for-byte compatible.
 
 #### Stage 1.5: Parameterize embedded guest artifacts and CI builds
 

@@ -59,14 +59,14 @@ Pass the same allocator to the operation and its matching deinit helper:
 const info = try libspore.hostInfo(context, allocator);
 defer libspore.deinitHostInfo(allocator, info);
 
-const info_v2 = try libspore.hostInfoV2(context, allocator);
-defer libspore.deinitHostInfoV2(allocator, info_v2);
+const info_v3 = try libspore.hostInfoV3(context, allocator);
+defer libspore.deinitHostInfoV3(allocator, info_v3);
 ```
 
 Use the matching helper for owned results:
 
 - `deinitHostInfo`
-- `deinitHostInfoV2`
+- `deinitHostInfoV3`
 - `deinitSporeInspectResult`
 - `deinitForkResult`
 - `deinitPackResult`
@@ -606,7 +606,7 @@ overrides, context-local last errors, owned string cleanup, host-info JSON,
 inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
 named copy side-effect calls. ABI version 15 added saved-spore removal through
 `spore_remove_saved_json`; ABI version 16 adds the architecture-discriminated
-`spore_host_info_json_v2` entry point. Clients should compare the runtime
+`spore_host_info_json_v3` entry point. Clients should compare the runtime
 build-info ABI with `SPORE_ABI_VERSION` before calling a newly added symbol.
 
 Release builds publish separate `libspore_Linux` and `libspore_Darwin`
@@ -665,11 +665,11 @@ spore_free_string(context, json);
 spore_context_free(context);
 ```
 
-`spore_host_info_json` preserves the ARM-shaped `spore.host-info.v1`
+`spore_host_info_json` preserves the ARM-shaped `spore.host-info.v2`
 contract and returns `SPORE_ERROR` with `UnsupportedArchitecture` on x86-64.
-Use `spore_host_info_json_v2` for the architecture-discriminated contract on
-either architecture. V2 reports GIC and counter facts only in its `aarch64`
-platform variant; its `x86_64` variant instead reports the frozen board and CPU
+Use `spore_host_info_json_v3` for the architecture-discriminated contract on
+either architecture. V3 reports GIC and counter facts only in its `arm64`
+platform variant; its `amd64` variant instead reports the frozen board and CPU
 profiles, low-RAM board limits, irqchip/PIT, virtio and generation layout, and
 the bounded KVM capability predicate. The x86 KVM backend reports `available`
 only when the complete approved capability predicate passes. Product execution
@@ -677,9 +677,9 @@ is still an experimental fresh-only profile requiring one vCPU and explicit
 512 MiB memory; capture, resume, rootfs, networking, and build integration
 remain unavailable until their later implementation slices land.
 
-The Zig API follows the same split: `hostInfo` is the ARM-only v1
+The Zig API follows the same split: `hostInfo` is the ARM-only v2
 compatibility function and returns `error.UnsupportedArchitecture` on x86-64,
-while `hostInfoV2` returns the discriminated contract on either architecture.
+while `hostInfoV3` returns the discriminated contract on either architecture.
 The standalone `libspore.run`, `runManaged`, and `createNamed` x86 paths remain
 gated until Slice 3c; Slice 3a enables the shared implementation only for the
 product CLI.

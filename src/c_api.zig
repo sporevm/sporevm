@@ -561,14 +561,14 @@ pub export fn spore_host_info_json(context: ?*SporeContextImpl, out_json: ?*Spor
     return result_success;
 }
 
-pub export fn spore_host_info_json_v2(context: ?*SporeContextImpl, out_json: ?*SporeOwnedString) c_int {
+pub export fn spore_host_info_json_v3(context: ?*SporeContextImpl, out_json: ?*SporeOwnedString) c_int {
     const ctx = context orelse return result_invalid_value;
     const out = out_json orelse return fail(ctx, error.InvalidValue);
     out.* = .{};
     ctx.clearLastError();
 
-    const info = libspore.hostInfoV2(ctx.productContext(), ctx.allocator) catch |err| return fail(ctx, err);
-    defer libspore.deinitHostInfoV2(ctx.allocator, info);
+    const info = libspore.hostInfoV3(ctx.productContext(), ctx.allocator) catch |err| return fail(ctx, err);
+    defer libspore.deinitHostInfoV3(ctx.allocator, info);
 
     out.* = jsonOwned(ctx, info) catch |err| return fail(ctx, err);
     return result_success;
@@ -1427,7 +1427,7 @@ test "build info exposes version" {
     try std.testing.expectEqual(c_abi_version, abi);
 }
 
-test "C v1 host info API preserves final newline and NUL" {
+test "C v2 host info API preserves final newline and NUL" {
     if (comptime builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
     var context: ?*SporeContextImpl = null;
@@ -1450,16 +1450,16 @@ test "C v1 host info API preserves final newline and NUL" {
     try std.testing.expectEqual(@as(u8, 0), actual.ptr.?[actual.len]);
 }
 
-test "C v1 host info serializer preserves checked-in pretty JSON bytes" {
+test "C v2 host info serializer preserves checked-in pretty JSON bytes" {
     const backends = [_]libspore.BackendAvailability{
         .{ .name = "hvf", .supported = false, .available = false, .reason = "unsupported_os_or_arch" },
         .{ .name = "kvm", .supported = true, .available = true, .reason = "available" },
     };
     const info = libspore.HostInfo{
-        .host_class = "linux-aarch64-kvm",
+        .host_class = "linux-arm64-kvm",
         .platform = .{
             .os = "linux",
-            .arch = "aarch64",
+            .arch = .arm64,
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
             .ram_base = 0x8000_0000,
@@ -1484,7 +1484,7 @@ test "C v1 host info serializer preserves checked-in pretty JSON bytes" {
 
     const actual = try jsonOwned(ctx, info);
     defer spore_free_string(context, actual);
-    const expected = @embedFile("fixtures/host-info-v1-pretty.json");
+    const expected = @embedFile("fixtures/host-info-v2-pretty.json");
     try std.testing.expectEqualSlices(u8, expected, actual.ptr.?[0..actual.len]);
     try std.testing.expectEqual(@as(u8, 0), actual.ptr.?[actual.len]);
 }

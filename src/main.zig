@@ -258,11 +258,11 @@ fn runCommand(
                 try writeHostInfo(stdout, info);
             }
         } else {
-            const info = try spore_api.hostInfoV2(context, arena);
+            const info = try spore_api.hostInfoV3(context, arena);
             if (mode == .json) {
                 try machine_output.writeJson(arena, stdout, info);
             } else {
-                try writeHostInfoV2(stdout, info);
+                try writeHostInfoV3(stdout, info);
             }
         }
     } else if (std.mem.eql(u8, command, "inspect")) {
@@ -859,19 +859,19 @@ fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
     try writePathFact(writer, "runtime", info.cache_roots.runtime);
 }
 
-fn writeHostInfoV2(writer: *Io.Writer, info: spore_api.HostInfoV2) !void {
+fn writeHostInfoV3(writer: *Io.Writer, info: spore_api.HostInfoV3) !void {
     try writer.writeAll("Host info\n");
     try writer.print("  Class: {s}\n", .{info.host_class});
     try writer.print("  Architecture: {s}\n", .{info.architecture});
     switch (info.platform) {
-        .aarch64 => |platform| {
-            try writer.print("  Platform: {s}/aarch64\n", .{platform.os});
+        .arm64 => |platform| {
+            try writer.print("  Platform: {s}/arm64\n", .{platform.os});
             try writer.print("  CPU profile: {s}\n", .{platform.cpu_profile});
             try writer.print("  Device model version: {d}\n", .{platform.device_model_version});
             try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ platform.counter.frequency_hz, platform.counter.source });
         },
-        .x86_64 => |platform| {
-            try writer.print("  Platform: {s}/x86_64\n", .{platform.os});
+        .amd64 => |platform| {
+            try writer.print("  Platform: {s}/amd64\n", .{platform.os});
             try writer.print("  Board profile: {s}\n", .{platform.board_profile});
             try writer.print("  CPU profile: {s} ({s})\n", .{ platform.cpu_profile, platform.cpu_profile_status });
             try writer.print("  Device model version: {d}\n", .{platform.device_model_version});

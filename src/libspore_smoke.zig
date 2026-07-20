@@ -18,13 +18,18 @@ test "external import can inspect host info" {
         try std.testing.expect(info.backends.len > 0);
     }
 
-    const info_v2 = try libspore.hostInfoV2(.{
+    const info_v3 = try libspore.hostInfoV3(.{
         .io = std.testing.io,
         .environ_map = &env,
     }, allocator);
-    defer libspore.deinitHostInfoV2(allocator, info_v2);
-    try std.testing.expectEqualStrings("spore.host-info.v2", info_v2.schema);
-    try std.testing.expectEqualStrings(@tagName(builtin.cpu.arch), info_v2.architecture);
+    defer libspore.deinitHostInfoV3(allocator, info_v3);
+    try std.testing.expectEqualStrings("spore.host-info.v3", info_v3.schema);
+    const expected_arch = switch (builtin.cpu.arch) {
+        .aarch64 => "arm64",
+        .x86_64 => "amd64",
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings(expected_arch, info_v3.architecture);
 }
 
 test "external import can consume classified failure events" {

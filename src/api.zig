@@ -47,9 +47,9 @@ pub const CacheRoot = union(enum) {
 /// ARM host capability and cache summary returned by `hostInfo`.
 ///
 /// The result owns `backends` and any resolved cache-root paths. Release it with
-/// `deinitHostInfo` using the same allocator passed to `hostInfo`. This v1
+/// `deinitHostInfo` using the same allocator passed to `hostInfo`. This v2
 /// compatibility surface returns `error.UnsupportedArchitecture` on x86-64;
-/// use `HostInfoV2` and `hostInfoV2` for either supported architecture.
+/// use `HostInfoV3` and `hostInfoV3` for either supported architecture.
 pub const HostInfo = struct {
     schema: []const u8 = platform.host_info_schema,
     schema_version: u32 = platform.host_info_schema_version,
@@ -91,11 +91,11 @@ pub const PathFact = struct {
     source: []const u8,
 };
 
-/// Versioned architecture-discriminated host information. Unlike v1, this
+/// Versioned architecture-discriminated host information. Unlike v2, this
 /// surface is valid on both aarch64 and x86-64 and never represents
 /// not-applicable architecture fields with sentinel zeroes.
-pub const HostInfoV2 = platform.HostInfoV2;
-pub const PlatformFactsV2 = platform.PlatformFactsV2;
+pub const HostInfoV3 = platform.HostInfoV3;
+pub const PlatformFactsV3 = platform.PlatformFactsV3;
 pub const Aarch64PlatformFacts = platform.Aarch64PlatformFacts;
 pub const X86PlatformFacts = platform.X86PlatformFacts;
 pub const KvmCapabilityFact = platform.KvmCapabilityFact;
@@ -504,11 +504,11 @@ pub const SporeInspectResult = struct {
     annotation_keys: []const []const u8 = &.{},
 };
 
-/// Return ARM-shaped v1 host facts, backend availability, and cache roots.
+/// Return ARM-shaped v2 host facts, backend availability, and cache roots.
 ///
 /// The caller owns returned slices and optional paths. Call `deinitHostInfo`
 /// with the same allocator when done. This compatibility function returns
-/// `error.UnsupportedArchitecture` on x86-64; use `hostInfoV2` for either
+/// `error.UnsupportedArchitecture` on x86-64; use `hostInfoV3` for either
 /// supported architecture.
 pub fn hostInfo(
     context: Context,
@@ -551,13 +551,13 @@ pub fn hostInfo(
     };
 }
 
-/// Return architecture-discriminated `spore.host-info.v2` facts on either
+/// Return architecture-discriminated `spore.host-info.v3` facts on either
 /// aarch64 or x86-64.
-pub fn hostInfoV2(
+pub fn hostInfoV3(
     context: Context,
     allocator: std.mem.Allocator,
-) !HostInfoV2 {
-    return platform.hostInfoV2(allocator, context.environ_map);
+) !HostInfoV3 {
+    return platform.hostInfoV3(allocator, context.environ_map);
 }
 
 /// Release memory owned by a `HostInfo` result.
@@ -569,8 +569,8 @@ pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     freePathFact(allocator, info.cache_roots.runtime);
 }
 
-pub fn deinitHostInfoV2(allocator: std.mem.Allocator, info: HostInfoV2) void {
-    platform.deinitHostInfoV2(allocator, info);
+pub fn deinitHostInfoV3(allocator: std.mem.Allocator, info: HostInfoV3) void {
+    platform.deinitHostInfoV3(allocator, info);
 }
 
 /// Summarize the local rootfs cache.

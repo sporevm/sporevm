@@ -14,8 +14,8 @@ const x86_kvm = @import("kvm/x86_64.zig");
 pub const machine_arch = "aarch64";
 pub const host_info_schema = "spore.host-info.v2";
 pub const host_info_schema_version: u32 = 2;
-pub const host_info_v2_schema = "spore.host-info.v2";
-pub const host_info_v2_schema_version: u32 = 2;
+pub const host_info_v3_schema = "spore.host-info.v3";
+pub const host_info_v3_schema_version: u32 = 3;
 pub const default_gic_dist_base: u64 = 0x0800_0000;
 pub const default_gic_redist_base: u64 = 0x0802_0000;
 
@@ -63,19 +63,19 @@ pub const PathFact = struct {
 /// Architecture-discriminated host facts. The union tag is intentionally part
 /// of the JSON shape, so an ARM consumer never has to interpret zero-valued x86
 /// fields (or vice versa) as "not applicable".
-pub const HostInfoV2 = struct {
-    schema: []const u8 = host_info_v2_schema,
-    schema_version: u32 = host_info_v2_schema_version,
+pub const HostInfoV3 = struct {
+    schema: []const u8 = host_info_v3_schema,
+    schema_version: u32 = host_info_v3_schema_version,
     host_class: []const u8,
     architecture: []const u8,
-    platform: PlatformFactsV2,
+    platform: PlatformFactsV3,
     backends: [2]BackendAvailability,
     cache_roots: CacheRoots,
 };
 
-pub const PlatformFactsV2 = union(enum) {
-    aarch64: Aarch64PlatformFacts,
-    x86_64: X86PlatformFacts,
+pub const PlatformFactsV3 = union(enum) {
+    arm64: Aarch64PlatformFacts,
+    amd64: X86PlatformFacts,
 };
 
 pub const Aarch64PlatformFacts = struct {
@@ -151,12 +151,12 @@ pub const KvmCapabilityFact = struct {
     satisfied: bool,
 };
 
-/// Pure input to the v2 renderer. Offline tools and tests can render either
+/// Pure input to the v3 renderer. Offline tools and tests can render either
 /// architecture without executing an architecture-specific instruction or
 /// opening `/dev/kvm`.
-pub const HostInfoV2Snapshot = struct {
+pub const HostInfoV3Snapshot = struct {
     os: []const u8,
-    architecture: architecture.BackendArchitecture,
+    architecture: architecture.Architecture,
     host_class: []const u8,
     aarch64_counter_frequency_hz: u64 = 0,
     x86_kvm_capabilities: [x86_cpu_profile.required_capabilities.len]KvmCapabilityFact = emptyX86KvmCapabilities(),
@@ -179,7 +179,7 @@ pub fn hostInfo(
     allocator: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
 ) !HostInfo {
-    if (!supportsHostInfoV1(builtin.cpu.arch)) return error.UnsupportedArchitecture;
+    if (!supportsHostInfoV2(builtin.cpu.arch)) return error.UnsupportedArchitecture;
     const kernels = try cacheRootFact(allocator, environ, .kernels);
     errdefer freePathFact(allocator, kernels);
     const rootfs = try cacheRootFact(allocator, environ, .rootfs);
@@ -212,26 +212,26 @@ pub fn hostInfo(
     };
 }
 
-pub fn supportsHostInfoV1(zig_arch: std.Target.Cpu.Arch) bool {
+pub fn supportsHostInfoV2(zig_arch: std.Target.Cpu.Arch) bool {
     return zig_arch == .aarch64;
 }
 
 /// Return the versioned host-info contract on either supported architecture.
 /// Architecture-specific probing is confined to snapshot construction; JSON
-/// rendering and fixture inspection use `hostInfoV2FromSnapshot` directly.
-pub fn hostInfoV2(
+/// rendering and fixture inspection use `hostInfoV3FromSnapshot` directly.
+pub fn hostInfoV3(
     allocator: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
-) !HostInfoV2 {
-    const snapshot = try currentHostInfoV2Snapshot();
-    return hostInfoV2FromSnapshot(allocator, environ, snapshot);
+) !HostInfoV3 {
+    const snapshot = try currentHostInfoV3Snapshot();
+    return hostInfoV3FromSnapshot(allocator, environ, snapshot);
 }
 
-pub fn hostInfoV2FromSnapshot(
+pub fn hostInfoV3FromSnapshot(
     allocator: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
-    snapshot: HostInfoV2Snapshot,
-) !HostInfoV2 {
+    snapshot: HostInfoV3Snapshot,
+) !HostInfoV3 {
     const kernels = try cacheRootFact(allocator, environ, .kernels);
     errdefer freePathFact(allocator, kernels);
     const rootfs = try cacheRootFact(allocator, environ, .rootfs);
@@ -244,7 +244,7 @@ pub fn hostInfoV2FromSnapshot(
     return .{
         .host_class = snapshot.host_class,
         .architecture = @tagName(snapshot.architecture),
-        .platform = platformFactsV2(snapshot),
+        .platform = platformFactsV3(snapshot),
         .backends = snapshot.backends,
         .cache_roots = .{
             .kernels = kernels,
@@ -255,9 +255,9 @@ pub fn hostInfoV2FromSnapshot(
     };
 }
 
-fn platformFactsV2(snapshot: HostInfoV2Snapshot) PlatformFactsV2 {
+fn platformFactsV3(snapshot: HostInfoV3Snapshot) PlatformFactsV3 {
     return switch (snapshot.architecture) {
-        .aarch64 => .{ .aarch64 = .{
+        .arm64 => .{ .arm64 = .{
             .os = snapshot.os,
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
@@ -268,25 +268,25 @@ fn platformFactsV2(snapshot: HostInfoV2Snapshot) PlatformFactsV2 {
             },
             .counter = .{ .frequency_hz = snapshot.aarch64_counter_frequency_hz },
         } },
-        .x86_64 => .{ .x86_64 = .{
+        .amd64 => .{ .amd64 = .{
             .os = snapshot.os,
             .kvm_capabilities = snapshot.x86_kvm_capabilities,
         } },
     };
 }
 
-pub fn deinitHostInfoV2(allocator: std.mem.Allocator, info: HostInfoV2) void {
+pub fn deinitHostInfoV3(allocator: std.mem.Allocator, info: HostInfoV3) void {
     freePathFact(allocator, info.cache_roots.kernels);
     freePathFact(allocator, info.cache_roots.rootfs);
     freePathFact(allocator, info.cache_roots.bundles);
     freePathFact(allocator, info.cache_roots.runtime);
 }
 
-fn currentHostInfoV2Snapshot() !HostInfoV2Snapshot {
+fn currentHostInfoV3Snapshot() !HostInfoV3Snapshot {
     if (comptime builtin.cpu.arch == .aarch64) {
         return .{
             .os = @tagName(builtin.os.tag),
-            .architecture = .aarch64,
+            .architecture = .arm64,
             .host_class = hostClass(),
             .aarch64_counter_frequency_hz = try hostCounterFrequencyHz(),
             .backends = .{ hvfAvailability(), kvmAvailability() },
@@ -296,8 +296,8 @@ fn currentHostInfoV2Snapshot() !HostInfoV2Snapshot {
         const capabilities = collectX86KvmCapabilities();
         return .{
             .os = @tagName(builtin.os.tag),
-            .architecture = .x86_64,
-            .host_class = "linux-x86_64-kvm",
+            .architecture = .amd64,
+            .host_class = "linux-amd64-kvm",
             .x86_kvm_capabilities = capabilities,
             .backends = .{ unsupportedBackend("hvf"), x86KvmAvailability(capabilities) },
         };
@@ -559,7 +559,7 @@ test "host info exposes schema and cache roots" {
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/sporevm", info.cache_roots.runtime.path.?);
 }
 
-test "v2 offline renderer discriminates ARM and x86 without host probing" {
+test "v3 offline renderer discriminates ARM and x86 without host probing" {
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -571,50 +571,50 @@ test "v2 offline renderer discriminates ARM and x86 without host probing" {
     const unavailable_kvm = unsupportedBackend("kvm");
     const available_kvm = BackendAvailability{ .name = "kvm", .supported = true, .available = true, .reason = "available" };
 
-    const arm = try hostInfoV2FromSnapshot(allocator, &env, .{
+    const arm = try hostInfoV3FromSnapshot(allocator, &env, .{
         .os = "macos",
-        .architecture = .aarch64,
-        .host_class = "macos-aarch64-hvf",
+        .architecture = .arm64,
+        .host_class = "macos-arm64-hvf",
         .aarch64_counter_frequency_hz = 24_000_000,
         .backends = .{ available_hvf, unavailable_kvm },
     });
-    defer deinitHostInfoV2(allocator, arm);
-    try std.testing.expectEqualStrings(host_info_v2_schema, arm.schema);
-    try std.testing.expectEqualStrings("aarch64", arm.architecture);
-    try std.testing.expectEqual(@as(u64, 24_000_000), arm.platform.aarch64.counter.frequency_hz);
+    defer deinitHostInfoV3(allocator, arm);
+    try std.testing.expectEqualStrings(host_info_v3_schema, arm.schema);
+    try std.testing.expectEqualStrings("arm64", arm.architecture);
+    try std.testing.expectEqual(@as(u64, 24_000_000), arm.platform.arm64.counter.frequency_hz);
 
     var capabilities = emptyX86KvmCapabilities();
     for (&capabilities) |*capability| {
         capability.value = @max(capability.minimum, capability.required_bits);
         capability.satisfied = true;
     }
-    const x86 = try hostInfoV2FromSnapshot(allocator, &env, .{
+    const x86 = try hostInfoV3FromSnapshot(allocator, &env, .{
         .os = "linux",
-        .architecture = .x86_64,
-        .host_class = "linux-x86_64-kvm",
+        .architecture = .amd64,
+        .host_class = "linux-amd64-kvm",
         .x86_kvm_capabilities = capabilities,
         .backends = .{ unavailable_hvf, available_kvm },
     });
-    defer deinitHostInfoV2(allocator, x86);
-    try std.testing.expectEqualStrings("x86_64", x86.architecture);
-    try std.testing.expectEqualStrings(x86_board.board_profile, x86.platform.x86_64.board_profile);
-    try std.testing.expectEqualStrings(x86_cpu_profile.profile_name, x86.platform.x86_64.cpu_profile);
-    try std.testing.expectEqualStrings("approved_same_host", x86.platform.x86_64.cpu_profile_status);
+    defer deinitHostInfoV3(allocator, x86);
+    try std.testing.expectEqualStrings("amd64", x86.architecture);
+    try std.testing.expectEqualStrings(x86_board.board_profile, x86.platform.amd64.board_profile);
+    try std.testing.expectEqualStrings(x86_cpu_profile.profile_name, x86.platform.amd64.cpu_profile);
+    try std.testing.expectEqualStrings("approved_same_host", x86.platform.amd64.cpu_profile_status);
     try std.testing.expectEqualStrings("available", x86.backends[1].reason);
-    for (x86.platform.x86_64.kvm_capabilities) |capability| try std.testing.expect(capability.satisfied);
+    for (x86.platform.amd64.kvm_capabilities) |capability| try std.testing.expect(capability.satisfied);
 
     const arm_json = try std.json.Stringify.valueAlloc(allocator, arm, .{});
     defer allocator.free(arm_json);
     const x86_json = try std.json.Stringify.valueAlloc(allocator, x86, .{});
     defer allocator.free(x86_json);
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"spore.host-info.v2\",\"schema_version\":2,\"host_class\":\"macos-aarch64-hvf\",\"architecture\":\"aarch64\",\"platform\":{\"aarch64\":{\"os\":\"macos\",\"cpu_profile\":\"sporevm-aarch64-v0\",\"device_model_version\":4,\"ram_base\":2147483648,\"interrupt_controller\":{\"kind\":\"gicv3\",\"distributor_base\":134217728,\"redistributor_base\":134348800},\"counter\":{\"source\":\"cntfrq_el0\",\"frequency_hz\":24000000}}}," ++
+        "{\"schema\":\"spore.host-info.v3\",\"schema_version\":3,\"host_class\":\"macos-arm64-hvf\",\"architecture\":\"arm64\",\"platform\":{\"arm64\":{\"os\":\"macos\",\"cpu_profile\":\"sporevm-aarch64-v0\",\"device_model_version\":4,\"ram_base\":2147483648,\"interrupt_controller\":{\"kind\":\"gicv3\",\"distributor_base\":134217728,\"redistributor_base\":134348800},\"counter\":{\"source\":\"cntfrq_el0\",\"frequency_hz\":24000000}}}," ++
             "\"backends\":[{\"name\":\"hvf\",\"supported\":true,\"available\":true,\"reason\":\"supported_host\"},{\"name\":\"kvm\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"}]," ++
             "\"cache_roots\":{\"kernels\":{\"path\":\"/tmp/sporevm-cache/sporevm/kernels\",\"resolved\":true,\"source\":\"environment\"},\"rootfs\":{\"path\":\"/tmp/sporevm-cache/sporevm/rootfs\",\"resolved\":true,\"source\":\"environment\"},\"bundles\":{\"path\":\"/tmp/sporevm-cache/sporevm/bundles\",\"resolved\":true,\"source\":\"environment\"},\"runtime\":{\"path\":\"/tmp/sporevm-runtime/sporevm\",\"resolved\":true,\"source\":\"environment\"}}}",
         arm_json,
     );
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"spore.host-info.v2\",\"schema_version\":2,\"host_class\":\"linux-x86_64-kvm\",\"architecture\":\"x86_64\",\"platform\":{\"x86_64\":{\"os\":\"linux\",\"board_profile\":\"sporevm-x86_64-board-v0\",\"cpu_profile\":\"sporevm-x86_64-v0\",\"cpu_profile_status\":\"approved_same_host\",\"device_model_version\":1," ++
+        "{\"schema\":\"spore.host-info.v3\",\"schema_version\":3,\"host_class\":\"linux-amd64-kvm\",\"architecture\":\"amd64\",\"platform\":{\"amd64\":{\"os\":\"linux\",\"board_profile\":\"sporevm-x86_64-board-v0\",\"cpu_profile\":\"sporevm-x86_64-v0\",\"cpu_profile_status\":\"approved_same_host\",\"device_model_version\":1," ++
             "\"ram\":{\"base\":0,\"minimum_bytes\":67108864,\"maximum_low_bytes\":2147483648,\"identity_map_address\":4294688768,\"tss_address\":4294692864,\"tss_size\":12288}," ++
             "\"interrupt_controller\":{\"kind\":\"kvm_irqchip\",\"local_apic_base\":4276092928,\"ioapic_base\":4273995776,\"pit\":\"kvm_pit2\"}," ++
             "\"virtio_mmio\":{\"base\":3489660928,\"window_size\":512,\"slot_count\":8,\"first_gsi\":5},\"generation\":{\"base\":3489665024,\"size\":4096,\"gsi\":13,\"poweroff_doorbell_offset\":32,\"poweroff_command\":1179012944}," ++
@@ -625,14 +625,14 @@ test "v2 offline renderer discriminates ARM and x86 without host probing" {
     );
 }
 
-test "v1 schema remains the original ARM-shaped contract" {
-    try std.testing.expectEqualStrings("spore.host-info.v1", host_info_schema);
-    try std.testing.expectEqual(@as(u32, 1), host_info_schema_version);
+test "v2 schema remains the OCI-named ARM-shaped contract" {
+    try std.testing.expectEqualStrings("spore.host-info.v2", host_info_schema);
+    try std.testing.expectEqual(@as(u32, 2), host_info_schema_version);
     const info = HostInfo{
-        .host_class = "linux-aarch64-kvm",
+        .host_class = "linux-arm64-kvm",
         .platform = .{
             .os = "linux",
-            .arch = "aarch64",
+            .arch = .arm64,
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
             .ram_base = 0x8000_0000,
@@ -655,13 +655,13 @@ test "v1 schema remains the original ARM-shaped contract" {
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, info, .{});
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"spore.host-info.v1\",\"schema_version\":1,\"host_class\":\"linux-aarch64-kvm\",\"platform\":{\"os\":\"linux\",\"arch\":\"aarch64\",\"cpu_profile\":\"sporevm-aarch64-v0\",\"device_model_version\":4,\"ram_base\":2147483648,\"gic_dist_base\":134217728,\"gic_redist_base\":134348800,\"counter_frequency_source\":\"cntfrq_el0\",\"counter_frequency_hz\":24000000},\"backends\":[{\"name\":\"hvf\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"},{\"name\":\"kvm\",\"supported\":true,\"available\":true,\"reason\":\"available\"}],\"cache_roots\":{\"kernels\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"rootfs\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"bundles\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"runtime\":{\"path\":null,\"resolved\":false,\"source\":\"invalid_runtime_dir\"}}}",
+        "{\"schema\":\"spore.host-info.v2\",\"schema_version\":2,\"host_class\":\"linux-arm64-kvm\",\"platform\":{\"os\":\"linux\",\"arch\":\"arm64\",\"cpu_profile\":\"sporevm-aarch64-v0\",\"device_model_version\":4,\"ram_base\":2147483648,\"gic_dist_base\":134217728,\"gic_redist_base\":134348800,\"counter_frequency_source\":\"cntfrq_el0\",\"counter_frequency_hz\":24000000},\"backends\":[{\"name\":\"hvf\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"},{\"name\":\"kvm\",\"supported\":true,\"available\":true,\"reason\":\"available\"}],\"cache_roots\":{\"kernels\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"rootfs\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"bundles\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"runtime\":{\"path\":null,\"resolved\":false,\"source\":\"invalid_runtime_dir\"}}}",
         json,
     );
 }
 
-test "v1 host info is explicitly ARM only" {
-    try std.testing.expect(supportsHostInfoV1(.aarch64));
-    try std.testing.expect(!supportsHostInfoV1(.x86_64));
-    try std.testing.expect(!supportsHostInfoV1(.riscv64));
+test "v2 host info is explicitly ARM only" {
+    try std.testing.expect(supportsHostInfoV2(.aarch64));
+    try std.testing.expect(!supportsHostInfoV2(.x86_64));
+    try std.testing.expect(!supportsHostInfoV2(.riscv64));
 }

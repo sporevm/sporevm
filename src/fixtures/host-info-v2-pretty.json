@@ -1,10 +1,10 @@
 {
-  "schema": "spore.host-info.v1",
-  "schema_version": 1,
-  "host_class": "linux-aarch64-kvm",
+  "schema": "spore.host-info.v2",
+  "schema_version": 2,
+  "host_class": "linux-arm64-kvm",
   "platform": {
     "os": "linux",
-    "arch": "aarch64",
+    "arch": "arm64",
     "cpu_profile": "sporevm-aarch64-v0",
     "device_model_version": 4,
     "ram_base": 2147483648,

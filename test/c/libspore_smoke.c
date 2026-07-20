@@ -119,18 +119,18 @@ int main(void) {
   spore_free_string(context, json);
 #endif
 
-  SporeOwnedString json_v2 = {0};
-  if (expect_success(spore_host_info_json_v2(context, &json_v2)) != 0) return 1;
-  if (json_v2.ptr == 0 || json_v2.len == 0) return 1;
-  if (strstr(json_v2.ptr, "\"schema\": \"spore.host-info.v2\"") == 0) return 1;
+  SporeOwnedString json_v3 = {0};
+  if (expect_success(spore_host_info_json_v3(context, &json_v3)) != 0) return 1;
+  if (json_v3.ptr == 0 || json_v3.len == 0) return 1;
+  if (strstr(json_v3.ptr, "\"schema\": \"spore.host-info.v3\"") == 0) return 1;
 #if defined(__aarch64__)
-  if (strstr(json_v2.ptr, "\"architecture\": \"aarch64\"") == 0) return 1;
+  if (strstr(json_v3.ptr, "\"architecture\": \"arm64\"") == 0) return 1;
 #elif defined(__x86_64__)
-  if (strstr(json_v2.ptr, "\"architecture\": \"x86_64\"") == 0) return 1;
+  if (strstr(json_v3.ptr, "\"architecture\": \"amd64\"") == 0) return 1;
 #else
 #error "libspore host-info smoke requires a supported target architecture"
 #endif
-  spore_free_string(context, json_v2);
+  spore_free_string(context, json_v3);
 
 #if defined(SPORE_SMOKE_HOST_INFO)
   SporeOwnedString capabilities_json = {0};
