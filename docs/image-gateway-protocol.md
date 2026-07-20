@@ -2,9 +2,11 @@
 
 This document defines the interoperable Spore image gateway protocol as it is
 implemented. The current slices freeze immutable multi-platform indexes and
-platform-specific image manifests, including complete local verification of a
-selected manifest's config and rootfs index. Attachment records, object
-transfer, conversion admission, and client installation remain unimplemented.
+platform-specific image manifests, and implement an explicit eager client that
+fetches one repository-bound platform closure, verifies it, installs it through
+the existing rootfs CAS transaction, and publishes an ordinary local image ref.
+Authentication, conversion admission, batch transfer, attachment records, and
+production gateway service behavior remain unimplemented.
 
 ## Platform vocabulary
 
@@ -122,6 +124,46 @@ Their canonical-byte transport names are, respectively,
 `sha256:b887a80189c8b9c46f77e645ab0631f705b80ef5daf09168597eb0d3e6fd5431`,
 and
 `sha256:b657390a5d37e2f098694027575d44fee3e235d64d6ffa630c995d9be54a01ca`.
+
+## Experimental eager pull surface
+
+The first end-to-end proof uses an explicitly configured gateway origin and a
+repository name. A source string is named by the lowercase SHA-256 digest of
+its exact UTF-8 bytes; the mutable source alias returns a canonical platform
+index. All selected content is then fetched beneath the immutable manifest:
+
+```text
+GET /v1/repositories/<repository>/sources/sha256:<source-key>/index
+GET /v1/repositories/<repository>/manifests/sha256:<manifest>/manifest
+GET /v1/repositories/<repository>/manifests/sha256:<manifest>/config
+GET /v1/repositories/<repository>/manifests/sha256:<manifest>/rootfs-index
+GET /v1/repositories/<repository>/manifests/sha256:<manifest>/objects/blake3:<object>
+```
+
+The source alias is discovery only. The selected descriptor fixes the manifest
+transport digest and native image digest, after which the client verifies the
+complete config, index, and object closure locally. Repository names contain
+lowercase ASCII letters, digits, dot, underscore, hyphen, and slash-separated
+nonempty components; dot-dot is rejected. Responses do not redirect and retain
+the schema bounds above. Objects must have the exact index-derived length and
+their BLAKE3 digest is rechecked by the CAS installer before publication.
+
+Production gateways require HTTPS. `--allow-insecure-http` accepts only an
+explicit loopback origin and exists for the static fixture server. This proof
+has no authentication or credential handling, so it is not a production
+gateway client contract yet. `spore image export-fixture` writes a new static
+repository tree from existing indexed-rootfs metadata and verified local CAS
+objects; it is test tooling for `python3 -m http.server`, not a gateway service.
+
+The eager client downloads all distinct nonzero objects into private operation
+staging before taking the exclusive rootfs-cache lock. Under the lock it removes
+the derived completeness stamp, repairs and re-verifies objects and the index,
+recomputes completeness, then publishes image metadata and the requested local
+ref last. The resulting ref is consumed unchanged by `spore run --image ...
+--pull=never`; SporeVM remains direct-OCI and local-image capable without a
+gateway. The manifest-bound single-object path is deliberately compatible with
+a future lazy content source, but this slice never publishes partial storage or
+performs network I/O from the block path.
 
 ## Negative data-plane contract
 

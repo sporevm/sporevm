@@ -54,7 +54,8 @@ The first product slice is deliberately explicit:
 spore image pull \
   --gateway https://gateway.example \
   --platform linux/arm64 \
-  --tag local/alpine:gateway \
+  --repository team/base-images \
+  --ref local/alpine:gateway \
   docker.io/library/alpine:3.20
 
 spore run --image local/alpine:gateway --pull=never -- /bin/true
@@ -406,10 +407,11 @@ index's full-coverage invariants, and the current native image digest over the
 index plus those exact canonical config bytes.
 The selected platform-index descriptor, image-manifest platform, and canonical
 config `os` and `architecture` must agree exactly after v1 normalization. This
-schema and verification path are implemented; object transfer and local image
-installation are not. The verifier also binds optional source provenance to the
-platform index's source generation, so a mutable upstream tag cannot produce a
-mixed-generation multi-platform index.
+schema and verification path now feed the explicit eager-client proof, which
+uses manifest-bound single-object GETs and the ordinary local CAS publication
+transaction. The verifier also binds optional source provenance to the platform
+index's source generation, so a mutable upstream tag cannot produce a mixed-
+generation multi-platform index.
 
 ## Provenance And Attachments
 
@@ -932,16 +934,29 @@ config, index, platform, object-summary, and native-image closure verification;
 the final short chunk keeps the summary contract honest for a future lazy pull.
 The module has no network, registry, filesystem, CAS, or runtime dependency.
 
-The rest of G0 remains open: the attachment schema, transport benchmarking,
-authorization-bound object fetch, cross-repository conformance, and converter-
-worker equivalence have not started.
+An explicit eager pull proof has now landed. `spore image pull` fetches a
+repository-bound source alias, selects exactly one requested architecture,
+verifies the canonical manifest/config/index closure, stages every distinct
+nonzero object outside the cache lock, and publishes through the existing CAS,
+completeness-stamp, image-metadata, and local-ref transaction. The resulting
+ordinary local ref boots through `spore run --image ... --pull=never`; no run,
+create, build, or runtime path depends on a gateway. A static fixture exporter
+and loopback-only insecure flag make the complete HTTP path reproducible without
+pretending to provide a gateway service.
+
+The proof intentionally uses one manifest-bound GET per object, so it measures
+correctness rather than the final eager transport. It has no authentication,
+conversion admission, server authorization, missing-object optimization,
+redirects, retries, or gateway provenance record. The rest of G0 remains open:
+the attachment schema, transport benchmarking, authorization and cross-
+repository conformance, and converter-worker equivalence have not started.
 
 ## Delivery Strategy
 
 ### G0 — Freeze the protocol and benchmark fixture
 
-Status: active prerequisite; native identity, platform-index, and image-manifest
-slices landed.
+Status: active prerequisite; native identity, platform-index, image-manifest,
+and explicit eager-client proof slices landed.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -1012,7 +1027,8 @@ Status: proposed first product slice.
 - Prove every batch and single-object request is reachable from its authorized
   immutable manifest and that no alternate endpoint or response distinguishes
   physical CAS state.
-- Add `spore image pull --gateway ... --tag local/... SOURCE` using private
+- Promote `spore image pull --gateway ... --ref local/... SOURCE` from its
+  loopback/static proof to the authenticated G1 service using private
   staging, an explicit platform, and the existing local CAS publication
   transaction.
 - Preserve exact image config and publish an ordinary local image consumable

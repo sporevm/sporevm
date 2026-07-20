@@ -236,7 +236,7 @@ fn canonicalImageManifestAlloc(allocator: std.mem.Allocator, manifest: ImageMani
     return bytes;
 }
 
-fn parseCanonicalConfig(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(image.Config) {
+pub fn parseCanonicalConfig(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(image.Config) {
     if (bytes.len == 0 or bytes.len > max_config_blob_bytes) return error.BadProtocol;
     const parsed = try std.json.parseFromSlice(image.Config, allocator, bytes, .{
         .allocate = .alloc_always,

@@ -13,6 +13,7 @@ const bundle = @import("bundle.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
+const image_gateway_pull = @import("image_gateway_pull.zig");
 const lifecycle = @import("lifecycle.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
@@ -28,6 +29,11 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
 const system = @import("system.zig");
+
+pub const ImageGatewayPullOptions = image_gateway_pull.PullOptions;
+pub const ImageGatewayPullResult = image_gateway_pull.PullResult;
+pub const ImageGatewayExportFixtureOptions = image_gateway_pull.ExportFixtureOptions;
+pub const ImageGatewayExportFixtureResult = image_gateway_pull.ExportFixtureResult;
 
 /// Process context shared by product operations.
 ///
@@ -700,6 +706,32 @@ pub fn rootfsResolve(
 /// Release memory owned by a `rootfsResolve` result.
 pub fn deinitRootfsResolveResult(allocator: std.mem.Allocator, resolved_ref: []const u8) void {
     rootfs_mod.deinitResolvedReference(allocator, resolved_ref);
+}
+
+/// Pull and verify one platform image from an explicitly configured image
+/// gateway, then publish it into the ordinary local image cache.
+pub fn imageGatewayPull(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ImageGatewayPullOptions,
+) !ImageGatewayPullResult {
+    return image_gateway_pull.pull(init, allocator, options);
+}
+
+pub fn deinitImageGatewayPullResult(allocator: std.mem.Allocator, result: ImageGatewayPullResult) void {
+    image_gateway_pull.deinitPullResult(allocator, result);
+}
+
+pub fn imageGatewayExportFixture(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ImageGatewayExportFixtureOptions,
+) !ImageGatewayExportFixtureResult {
+    return image_gateway_pull.exportFixture(init, allocator, options);
+}
+
+pub fn deinitImageGatewayExportFixtureResult(allocator: std.mem.Allocator, result: ImageGatewayExportFixtureResult) void {
+    image_gateway_pull.deinitExportFixtureResult(allocator, result);
 }
 
 /// Preload a cached rootfs into chunked CAS storage.
