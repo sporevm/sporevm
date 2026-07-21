@@ -621,7 +621,9 @@ pub fn installChunkPath(
 
 /// Installs a verified chunk, atomically replacing an invalid entry. The
 /// caller must hold the exclusive rootfs cache lock and must have durably
-/// removed any completeness stamp that could reference the entry.
+/// removed the selected storage's completeness stamp. Other storage values may
+/// retain their stamps because replacement is atomic and the new bytes are
+/// verified against the same content digest before publication.
 pub fn installChunkPathRepairingInvalid(
     allocator: std.mem.Allocator,
     io: Io,

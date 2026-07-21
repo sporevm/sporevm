@@ -71,6 +71,7 @@ const usage =
     \\    build [options] CONTEXT
     \\                        Build a Spore image from a Dockerfile subset
     \\    rootfs              Build rootfs images from OCI images
+    \\    image pull         Pull a verified image through an image gateway
     \\    cache               Inspect and collect local content-addressed caches
     \\    system              Inspect and prune local SporeVM system state
     \\    host-info           Print this host's platform facts
@@ -203,6 +204,8 @@ fn runCommand(
         try spore_internal.system.cacheRun(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rootfs")) {
         try spore_internal.rootfs_cli.run(init, command_args, stdout);
+    } else if (std.mem.eql(u8, command, "image")) {
+        try spore_internal.image_gateway_cli.run(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "build")) {
         try spore_internal.build_cli.run(init, command_args, stdout, stderr);
     } else if (std.mem.eql(u8, command, "run")) {

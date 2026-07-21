@@ -135,6 +135,7 @@ pub const PublishIndexedImageRequest = struct {
     platform: Platform = .{},
     config: ImageConfig = .{},
     rootfs_storage: spore.RootfsStorage,
+    expected_image_digest: ?[]const u8 = null,
 };
 
 pub const PublishIndexedImageResult = struct {
@@ -1193,6 +1194,9 @@ pub fn publishIndexedImageWithCacheLockHeld(
     defer allocator.free(config_digest);
     const image_digest = try image_mod.imageDigestAlloc(allocator, request.rootfs_storage.index_digest, canonical_config_json);
     errdefer allocator.free(image_digest);
+    if (request.expected_image_digest) |expected| {
+        if (!std.mem.eql(u8, image_digest, expected)) return error.ImageIdentityMismatch;
+    }
     const resolved_image_ref = try localResolvedBlake3Ref(allocator, request.ref, image_digest);
     errdefer allocator.free(resolved_image_ref);
     const resolved = ResolvedImage{
