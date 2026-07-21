@@ -6,6 +6,7 @@
 //! Multi-vCPU capture/resume uses manifest v3 with same-HVF private GIC state.
 
 const std = @import("std");
+const aarch64_topology = @import("../aarch64/topology.zig");
 const capture = @import("../capture.zig");
 const disk_layer = @import("../disk_layer.zig");
 const local_paths = @import("../local_paths.zig");
@@ -16,8 +17,8 @@ const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
 const lazy_ram = @import("lazy_ram.zig");
-const board = @import("../board.zig");
-const boot = @import("../boot.zig");
+const board = @import("../aarch64/board.zig");
+const boot = @import("../aarch64/boot.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const mmio = @import("../virtio/mmio.zig");
@@ -467,7 +468,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     config.network.setWake(.{ .context = &vcpu, .wakeFn = wakeNetworkVcpu });
     defer config.network.clearWake();
 
-    try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .mpidr_el1, topology.mpidrForIndex(0)), "set mpidr");
+    try hvf.check(hvf.hv_vcpu_set_sys_reg(vcpu, .mpidr_el1, aarch64_topology.mpidrForIndex(0)), "set mpidr");
     var vcpu_redist_base: hvf.Ipa = 0;
     try hvf.check(hvf.hv_gic_get_redistributor_base(vcpu, &vcpu_redist_base), "gic redist base for vcpu");
     var redist_stride: usize = 0;
@@ -977,7 +978,7 @@ const HvfVcpu = struct {
     fn createOnOwnerThread(self: *HvfVcpu) !void {
         try hvf.check(hvf.hv_vcpu_create(&self.handle, &self.exit, null), "hv_vcpu_create");
         self.created = true;
-        try hvf.check(hvf.hv_vcpu_set_sys_reg(self.handle, .mpidr_el1, topology.mpidrForIndex(self.index)), "set mpidr");
+        try hvf.check(hvf.hv_vcpu_set_sys_reg(self.handle, .mpidr_el1, aarch64_topology.mpidrForIndex(self.index)), "set mpidr");
         try hvf.check(hvf.hv_gic_get_redistributor_base(self.handle, &self.redist_base), "gic redist base for vcpu");
     }
 
@@ -2380,8 +2381,9 @@ fn takeRootfsSnapshot(
     transports: []mmio.Transport,
     disk_snapshot: ?disk_layer.SnapshotState,
 ) !?spore.Disk {
-    // Keep this in sync with src/kvm/vm.zig:takeRootfsSnapshot. The transport
-    // type is backend-local, so only the quiescence/snapshot contract is shared.
+    // Keep this in sync with src/kvm/aarch64_vm.zig:takeRootfsSnapshot. The
+    // transport type is backend-local, so only the quiescence/snapshot contract
+    // is shared.
     const disk_state = disk_snapshot orelse return error.BadManifest;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3183,7 +3185,7 @@ test "restore metrics include source, RAM size, and backend timings" {
 
 test "psci target index accepts normalized mpidr affinity" {
     try std.testing.expectEqual(@as(?usize, 1), psciTargetIndex(2, 1));
-    try std.testing.expectEqual(@as(?usize, 1), psciTargetIndex(2, topology.mpidrForIndex(1)));
+    try std.testing.expectEqual(@as(?usize, 1), psciTargetIndex(2, aarch64_topology.mpidrForIndex(1)));
     try std.testing.expectEqual(@as(?usize, null), psciTargetIndex(2, 2));
     try std.testing.expectEqual(@as(?usize, null), psciTargetIndex(2, 1 << 32));
 }

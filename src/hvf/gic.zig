@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const hvf = @import("hvf.zig");
-const gicv3 = @import("../gicv3.zig");
+const gicv3 = @import("../aarch64/gicv3.zig");
 
 extern "c" fn hv_gic_get_distributor_reg(reg: u16, value: *u64) hvf.ReturnCode;
 extern "c" fn hv_gic_set_distributor_reg(reg: u16, value: u64) hvf.ReturnCode;

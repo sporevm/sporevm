@@ -114,13 +114,15 @@ CPUID, MSRs, XSAVE/XCRS, interrupt state, TSC frequency, and clock controls.
 9. **Unsupported paths fail before effects.** Reject before downloads, cache,
    disk, network, runtime publication, or VM execution.
 
-## Architecture Layout Follow-Up
+## Architecture Layout
 
-A separate mechanical change should move ARM-owned board, boot, FDT, GIC, and
-MPIDR topology code under `src/aarch64/`, and rename `src/kvm/kvm.zig` to an
-explicit aarch64 binding. It is useful but not a release gate, must preserve
-behaviour, and must not force false file parity: FDT/GIC are ARM-specific while
-MP tables, PIO, and the CPU profile are x86-specific.
+ARM-owned board, boot, FDT, GIC, and MPIDR topology code lives under
+`src/aarch64/`. Shared vCPU count validation remains in `src/topology.zig`, and
+the backend-neutral KVM selector, common ABI, and lazy RAM implementation remain
+under `src/kvm/` beside explicitly named architecture bindings and AArch64 VM
+and snapshot modules. The architecture trees do not force false file parity:
+FDT/GIC are ARM-specific while MP tables, PIO, and the CPU profile are
+x86-specific.
 
 ## Remaining Delivery Strategy
 

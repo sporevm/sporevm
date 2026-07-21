@@ -1,7 +1,7 @@
 //! Portable GICv3 state used by the spore manifest.
 //!
 //! This module is deliberately free of hypervisor calls. It defines the
-//! architectural distributor/redistributor register subset SporeVM currently
+//! AArch64 distributor/redistributor register subset SporeVM currently
 //! captures for a single-vCPU board and validates hostile manifest data before
 //! any backend maps it to KVM ioctls or Hypervisor.framework calls.
 

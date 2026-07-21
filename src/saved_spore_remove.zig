@@ -3,10 +3,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const aarch64_topology = @import("aarch64/topology.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const Context = @import("context.zig").Context;
 const disk_index = @import("disk_index.zig");
-const gicv3 = @import("gicv3.zig");
+const gicv3 = @import("aarch64/gicv3.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -214,7 +215,7 @@ fn saveDisklessManifestV1(allocator: std.mem.Allocator, dir: []const u8) !void {
 fn testVcpu(index: topology.VcpuIndex) spore.VcpuState {
     return .{
         .index = index,
-        .mpidr = topology.mpidrForIndex(index),
+        .mpidr = aarch64_topology.mpidrForIndex(index),
         .gprs = [_]u64{0} ** 31,
         .pc = 0,
         .cpsr = 0,

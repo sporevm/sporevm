@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const aarch64_topology = @import("aarch64/topology.zig");
 const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
@@ -15,7 +16,7 @@ const contracts = @import("contracts.zig");
 const chunklib = @import("chunk.zig");
 const disk_layer = @import("disk_layer.zig");
 const fetch_policy = @import("host_fetch_policy.zig");
-const gicv3 = @import("gicv3.zig");
+const gicv3 = @import("aarch64/gicv3.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
@@ -3815,7 +3816,7 @@ fn testManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation:
 fn testVcpuState(index: topology.VcpuIndex) spore.VcpuState {
     return .{
         .index = index,
-        .mpidr = topology.mpidrForIndex(index),
+        .mpidr = aarch64_topology.mpidrForIndex(index),
         .gprs = [_]u64{0} ** 31,
         .pc = 0,
         .cpsr = 0,

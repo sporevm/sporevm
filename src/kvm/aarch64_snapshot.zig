@@ -1,13 +1,14 @@
-//! KVM machine-state capture and restore.
+//! AArch64 KVM machine-state capture and restore.
 //!
 //! Converts live KVM state into SporeVM's normalized manifest shape. KVM's
 //! userspace VGICv3 ioctls are mapped to the portable architectural GICv3
 //! distributor/redistributor offsets stored in the manifest.
 
 const std = @import("std");
-const kvm = @import("kvm.zig");
-const board = @import("../board.zig");
-const gicv3 = @import("../gicv3.zig");
+const kvm = @import("aarch64.zig");
+const board = @import("../aarch64/board.zig");
+const gicv3 = @import("../aarch64/gicv3.zig");
+const aarch64_topology = @import("../aarch64/topology.zig");
 const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
 
@@ -111,7 +112,7 @@ pub fn captureMachineV1(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpus:
 fn captureVcpuState(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu: VcpuRef) !spore.VcpuState {
     var state: spore.VcpuState = undefined;
     state.index = vcpu.index;
-    state.mpidr = topology.mpidrForIndex(vcpu.index);
+    state.mpidr = aarch64_topology.mpidrForIndex(vcpu.index);
 
     for (0..31) |i| {
         state.gprs[i] = try kvm.getOneRegU64(vcpu.fd, kvm.gprReg(@intCast(i)));
@@ -158,7 +159,7 @@ pub fn applyMachine(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std
     try kvm.setCounterOffset(vm_fd, hostCounter() -% state.vtimer.cntvct);
     try applyVcpuState(gic_fd, .{ .index = 0, .fd = vcpu_fd }, .{
         .index = 0,
-        .mpidr = topology.mpidrForIndex(0),
+        .mpidr = aarch64_topology.mpidrForIndex(0),
         .gprs = state.gprs,
         .pc = state.pc,
         .cpsr = state.cpsr,
@@ -191,13 +192,13 @@ fn validateMachineV1ForKvm(vcpus: []const VcpuRef, state: spore.MachineStateV1) 
 
     for (state.vcpus, 0..) |vcpu_state, i| {
         if (vcpu_state.index != i) return error.PlatformMismatch;
-        if (vcpu_state.mpidr != topology.mpidrForIndex(vcpu_state.index)) return error.PlatformMismatch;
+        if (vcpu_state.mpidr != aarch64_topology.mpidrForIndex(vcpu_state.index)) return error.PlatformMismatch;
         if (vcpus[i].index != vcpu_state.index) return error.PlatformMismatch;
         if (!hasRedistributor(g.redistributors, vcpu_state.mpidr)) return error.PlatformMismatch;
     }
 }
 
-fn hasRedistributor(redistributors: []const gicv3.RedistributorState, mpidr: topology.Mpidr) bool {
+fn hasRedistributor(redistributors: []const gicv3.RedistributorState, mpidr: aarch64_topology.Mpidr) bool {
     for (redistributors) |redist| {
         if (redist.mpidr == mpidr) return true;
     }
@@ -289,7 +290,7 @@ fn captureGicMulti(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpus: []co
         defer regs.deinit(allocator);
         try appendRedistRegs(allocator, &regs, gic_fd, kvmMpidrAffinityForIndex(vcpu.index));
         redist.* = .{
-            .mpidr = topology.mpidrForIndex(vcpu.index),
+            .mpidr = aarch64_topology.mpidrForIndex(vcpu.index),
             .regs = try regs.toOwnedSlice(allocator),
         };
     }
@@ -387,7 +388,7 @@ fn appendLevelRegsMulti(allocator: std.mem.Allocator, levels: *std.ArrayList(gic
         if (intid < 32) {
             for (vcpus) |vcpu| {
                 if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(kvmMpidrAffinityForIndex(vcpu.index), intid), "get vgic ppi line level")) |value| {
-                    try levels.append(allocator, .{ .intid = intid, .asserted = value != 0, .mpidr = topology.mpidrForIndex(vcpu.index) });
+                    try levels.append(allocator, .{ .intid = intid, .asserted = value != 0, .mpidr = aarch64_topology.mpidrForIndex(vcpu.index) });
                 }
             }
         } else if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(0, intid), "get vgic spi line level")) |value| {
@@ -458,7 +459,7 @@ fn kvmMpidrAffinityForIndex(index: topology.VcpuIndex) u64 {
     return index;
 }
 
-fn kvmMpidrAffinityForManifest(mpidr: topology.Mpidr) u64 {
+fn kvmMpidrAffinityForManifest(mpidr: aarch64_topology.Mpidr) u64 {
     return mpidr & 0x00ff_ffff;
 }
 
@@ -480,8 +481,8 @@ test "KVM line replay skips default and generation lines" {
 }
 
 test "KVM multi line replay skips private and generation lines" {
-    try std.testing.expect(!shouldReplayMultiLineLevel(.{ .intid = 16, .asserted = false, .mpidr = topology.mpidrForIndex(0) }));
-    try std.testing.expect(!shouldReplayMultiLineLevel(.{ .intid = 27, .asserted = true, .mpidr = topology.mpidrForIndex(1) }));
+    try std.testing.expect(!shouldReplayMultiLineLevel(.{ .intid = 16, .asserted = false, .mpidr = aarch64_topology.mpidrForIndex(0) }));
+    try std.testing.expect(!shouldReplayMultiLineLevel(.{ .intid = 27, .asserted = true, .mpidr = aarch64_topology.mpidrForIndex(1) }));
     try std.testing.expect(!shouldReplayMultiLineLevel(.{ .intid = board.generationIntid(), .asserted = true }));
     try std.testing.expect(shouldReplayMultiLineLevel(.{ .intid = board.virtioDeviceIntid(0), .asserted = true }));
 }
@@ -490,7 +491,7 @@ test "KVM v1 restore preflight matches local vCPU topology" {
     var vcpu_states = [_]spore.VcpuState{
         .{
             .index = 0,
-            .mpidr = topology.mpidrForIndex(0),
+            .mpidr = aarch64_topology.mpidrForIndex(0),
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -505,11 +506,11 @@ test "KVM v1 restore preflight matches local vCPU topology" {
     };
     vcpu_states[1] = vcpu_states[0];
     vcpu_states[1].index = 1;
-    vcpu_states[1].mpidr = topology.mpidrForIndex(1);
+    vcpu_states[1].mpidr = aarch64_topology.mpidrForIndex(1);
 
     var redists = [_]gicv3.RedistributorState{
-        .{ .mpidr = topology.mpidrForIndex(0), .regs = &.{} },
-        .{ .mpidr = topology.mpidrForIndex(1), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
     var refs = [_]VcpuRef{
         .{ .index = 0, .fd = -1 },

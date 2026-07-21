@@ -1,4 +1,4 @@
-//! aarch64 Linux boot protocol (Documentation/arch/arm64/booting.rst).
+//! AArch64 Linux boot protocol (Documentation/arch/arm64/booting.rst).
 //!
 //! Parses the kernel `Image` header, places kernel and DTB in guest RAM,
 //! and computes the entry point. Kernel files are host-provided (trusted
