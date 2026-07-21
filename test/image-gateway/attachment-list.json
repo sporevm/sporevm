@@ -1,0 +1,14 @@
+{
+  "kind": "spore-image-gateway-attachment-list-v1",
+  "subject_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "attachments": [
+    {
+      "artifact_type": "conversion-attestation",
+      "attachment_digest": "sha256:eeec4cf7ace5bb3052c2cce9c554080c57103c785fb1f151f8225eb1c036cffb"
+    },
+    {
+      "artifact_type": "sbom",
+      "attachment_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ]
+}
