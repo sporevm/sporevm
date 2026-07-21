@@ -5,8 +5,8 @@ implemented. The current slices freeze immutable multi-platform indexes and
 platform-specific image manifests, and implement an explicit eager client that
 fetches one repository-bound platform closure, verifies it, installs it through
 the existing rootfs CAS transaction, and publishes an ordinary local image ref.
-Authentication, conversion admission, batch transfer, attachment records, and
-production gateway service behavior remain unimplemented.
+Authentication, conversion admission, batch transfer, and production gateway
+service behavior remain unimplemented.
 
 ## Platform vocabulary
 
@@ -124,6 +124,68 @@ Their canonical-byte transport names are, respectively,
 `sha256:b887a80189c8b9c46f77e645ab0631f705b80ef5daf09168597eb0d3e6fd5431`,
 and
 `sha256:b657390a5d37e2f098694027575d44fee3e235d64d6ffa630c995d9be54a01ca`.
+
+## Immutable attachment records
+
+Provenance, signatures, SBOMs, vulnerability reports, and policy results are
+typed attachments to an immutable gateway image manifest. They do not enter the
+native image, rootfs, platform-index, or image-manifest identities. The
+canonical record shape is:
+
+```json
+{
+  "kind": "spore-image-gateway-attachment-v1",
+  "subject_manifest_digest": "sha256:<image-manifest-digest>",
+  "artifact_type": "conversion-attestation",
+  "artifact": {
+    "media_type": "application/vnd.in-toto+json",
+    "bytes": 4096,
+    "transport_digest": "sha256:<artifact-digest>"
+  }
+}
+```
+
+Version 1 supports `conversion-attestation`, `signature`, `sbom`,
+`vulnerability-report`, and `policy-result`. Media types are nonempty lowercase
+type/subtype values without parameters, limited to 256 bytes. Artifact size is
+nonzero and limited to 64 MiB. The complete record is limited to 64 KiB and is
+named by the SHA-256 digest of its exact canonical bytes.
+
+The service-owned subject relation has this canonical response shape:
+
+```json
+{
+  "kind": "spore-image-gateway-attachment-list-v1",
+  "subject_manifest_digest": "sha256:<image-manifest-digest>",
+  "attachments": [
+    {
+      "artifact_type": "conversion-attestation",
+      "attachment_digest": "sha256:<attachment-record-digest>"
+    }
+  ]
+}
+```
+
+A list contains at most 256 descriptors and 64 KiB. Descriptors are strictly
+sorted by artifact type and then attachment digest, so duplicates and alternate
+ordering fail closed; an empty list is valid. Multiple records of one type are
+allowed. A client verifies the listed record digest, artifact type, and exact
+subject binding before using its descriptor. Publication and filtering are
+service operations: clients never derive a mutable attachment tag or update the
+relation themselves.
+
+Normative fixtures live at
+[`test/image-gateway/attachment-record.json`](../test/image-gateway/attachment-record.json)
+and
+[`test/image-gateway/attachment-list.json`](../test/image-gateway/attachment-list.json).
+Their canonical-byte transport names are
+`sha256:eeec4cf7ace5bb3052c2cce9c554080c57103c785fb1f151f8225eb1c036cffb`
+and
+`sha256:d7940e55fceac005a4b189b6cae672a325eb65582e841e58487de243d9b448e4`.
+Fixture files carry one source-control newline which is excluded from canonical
+bytes. Unknown or duplicate fields, unsupported kinds or artifact types,
+noncanonical media types or digests, alternate formatting, unsorted or
+duplicate descriptors, invalid UTF-8, and trailing input are rejected.
 
 ## Experimental eager pull surface
 

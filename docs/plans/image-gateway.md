@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-20
+last_reviewed: 2026-07-21
 spec_refs:
   - docs/image-gateway-protocol.md
   - docs/filesystem.md
@@ -944,6 +944,13 @@ create, build, or runtime path depends on a gateway. A static fixture exporter
 and loopback-only insecure flag make the complete HTTP path reproducible without
 pretending to provide a gateway service.
 
+The minimal attachment protocol has also landed as a data-only module.
+Canonical records bind one supported artifact descriptor to an immutable image
+manifest, while bounded deterministic subject lists bind record digests and
+types without creating client-maintained tags. Golden, malformed, subject-
+binding, and fuzz coverage freeze the envelope; upload, relation mutation,
+authorization, retention, and policy remain deferred to G3.
+
 The proof intentionally uses one manifest-bound GET per object, so it measures
 correctness rather than the final eager transport. Before object transfer, it
 rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
@@ -951,15 +958,15 @@ rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
 not native image-format limits. It has no authentication,
 conversion admission, server authorization, missing-object optimization,
 redirects, retries, or gateway provenance record. The rest of G0 remains open:
-the attachment schema, transport benchmarking, authorization and cross-
-repository conformance, and converter-worker equivalence have not started.
+transport benchmarking, authorization and cross-repository conformance, and
+converter-worker equivalence have not started.
 
 ## Delivery Strategy
 
 ### G0 — Freeze the protocol and benchmark fixture
 
 Status: active prerequisite; native identity, platform-index, image-manifest,
-and explicit eager-client proof slices landed.
+attachment-schema, and explicit eager-client proof slices landed.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -968,7 +975,9 @@ and explicit eager-client proof slices landed.
   missing-set request, or client-maintained attachment tag is part of v1.
 - Freeze the minimal typed attachment envelope and server-owned immutable-
   subject relation semantics, with golden and malformed fixtures, while
-  deferring the attachment service surface to G3.
+  deferring the attachment service surface to G3. The data-only schema,
+  deterministic relation list, exact subject binding, and parser fuzz coverage
+  have landed; service behavior remains deferred.
 - Define the immutable platform-index schema and OCI platform normalization.
   The first schema must represent both required platforms without a version
   bump or architecture-specific field names; runtime-backend naming remains a
