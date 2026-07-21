@@ -188,8 +188,10 @@ Their canonical-byte transport names are
 `sha256:fed4fadbb05804390e4c3922f799a2613b7e6ecc9343c426cafcf485540d6f44`
 and
 `sha256:f6a7bd7d3dfb0b68ba6c2ca4a8fca8babc20a00097a6d230e537af8218522a37`.
-Fixture files carry one source-control newline which is excluded from canonical
-bytes. Unknown or duplicate fields, unsupported kinds or artifact types,
+The record and list fixtures carry one source-control newline which is excluded
+from their canonical bytes. The artifact is opaque: its trailing newline is
+included in its declared length and digest. Unknown or duplicate fields,
+unsupported kinds or artifact types,
 noncanonical media types or digests, alternate formatting, unsorted or
 duplicate descriptors, invalid UTF-8, and trailing input are rejected.
 
