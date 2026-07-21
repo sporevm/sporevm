@@ -9,25 +9,40 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig 0.16.0](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](mise.toml)
 
-SporeVM is a small arm64 virtual machine monitor for saving and forking Linux
-microVM state.
+SporeVM is a small virtual machine monitor for saving and forking Linux
+microVM state on ARM64. Linux x86-64/KVM also has an experimental
+fresh-execution profile.
+
+| Host | Current support |
+| --- | --- |
+| macOS/ARM64 + HVF | Mature full lifecycle |
+| Linux/ARM64 + KVM | Mature full lifecycle |
+| Linux/AMD64 + KVM | Experimental fresh execution only |
+
+The full lifecycle includes run, save, attach, restore, fork, rootfs,
+networking, and build workflows. The AMD64 profile is deliberately narrower:
+it uses the managed kernel and embedded minimal exec initrd with one vCPU and
+exactly 512 MiB of memory, and supports one-shot `run` plus fresh
+`create`/`exec`/`rm`. It does not support image or rootfs execution,
+networking, build, capture, save, restore, resume, fork, or fan-out.
 
 A spore is sealed VM state with normalized machine state, device state,
 verified memory chunks, optional rootfs state, and a platform contract that
 fails closed when a host cannot restore it honestly.
 
-The useful shape is:
+The useful shape of the mature ARM64 lifecycle is:
 
 1. Start a runtime once.
 2. Warm it up until the expensive boring work is done.
 3. Save it at a clean point.
 4. Fork cheap child spores.
-5. Attach the children on compatible arm64 hosts without copying all RAM for
+5. Attach the children on compatible hosts without copying all RAM for
    every child.
 
+Saved-state manifests and the full spore lifecycle currently remain ARM64-only.
 SporeVM 1.0 expects spores to restore on the same backend and compatible host
-class they were saved for: KVM/aarch64 to KVM/aarch64, or Apple Silicon HVF
-to Apple Silicon HVF. The repo still keeps KVM/HVF restore checks because they
+class they were saved for: KVM/aarch64 to KVM/aarch64, or Apple Silicon HVF to
+Apple Silicon HVF. The repo still keeps KVM/HVF restore checks because they
 catch backend-specific state leaking into the spore format, but users should
 not plan distribution around moving one running machine between those
 hypervisors.
@@ -71,6 +86,8 @@ tar -xzf "$asset.tar.gz"
 
 Use `spore_Linux_arm64` on Linux. Add `$asset/bin` to `PATH`, or move the
 extracted directory wherever you keep standalone tools.
+Published release archives currently target ARM64; build from source to use
+the experimental Linux/AMD64 profile.
 
 ## Use as a library
 
@@ -109,6 +126,16 @@ Run one command in a throwaway VM:
 ```bash
 spore run 'echo hi'
 ```
+
+The experimental Linux/AMD64 KVM profile requires its memory size explicitly:
+
+```bash
+spore run --memory 512mib 'echo hi'
+```
+
+That profile accepts only one vCPU and the managed kernel plus embedded minimal
+exec initrd. Image, rootfs, networking, build, and saved-state options fail
+closed.
 
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
 initrd. The embedded initrd contains SporeVM helper binaries plus a small
@@ -368,7 +395,7 @@ manifest-selected memory, rootfs, and writable disk bytes. See
 
 ## Named lifecycle
 
-Named VM lifecycle is stable on supported HVF/KVM backends:
+The complete named VM lifecycle is stable on ARM64 HVF/KVM hosts:
 
 ```bash
 export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
@@ -392,6 +419,10 @@ spore create bench-net \
 Machine callers can use global `--json` for structured lifecycle state. See
 [docs/lifecycle.md](docs/lifecycle.md) for runtime layout, monitor jailing,
 named live fork, and limits.
+
+Linux/AMD64 KVM currently supports only fresh `create`, `exec`, and `rm` with
+one vCPU and explicit 512 MiB memory; the save, restore, and fork operations in
+the example above remain unavailable.
 
 ## Current scope
 

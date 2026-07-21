@@ -21,10 +21,14 @@ behavior or depend on CLI parsing.
 
 `libspore.Architecture` and `RootfsPlatform.arch` use OCI names: `.arm64` and
 `.amd64`. Backend spellings are intentionally absent from the product API.
-`HostInfo` uses the `spore.host-info.v2` JSON schema for the same reason, with
-`platform.arch: "arm64"` on current supported hosts. Serialized spore machine
-state retains `aarch64` and `sporevm-aarch64-v0`; those are format and backend
-identifiers rather than product platform values.
+`HostInfo` preserves the ARM-shaped `spore.host-info.v2` compatibility schema.
+`HostInfoV3` uses an architecture-discriminated schema: its platform is
+`arm64` on mature lifecycle hosts and `amd64` on experimental Linux/KVM
+fresh-execution hosts. Serialized spore machine state retains `aarch64` and
+`sporevm-aarch64-v0`; those are format and backend identifiers rather than
+product platform values. AMD64 host-info support does not imply standalone
+Zig, C, or Go execution support; those x86 execution paths remain gated while
+the CLI alone exposes the experimental fresh profile.
 
 The public vocabulary is `save`, `attach`, and `restore` across Zig, C, and Go.
 JSONL run events keep their original `capture` event and `capture_path` fields

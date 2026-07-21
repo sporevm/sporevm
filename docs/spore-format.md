@@ -225,11 +225,14 @@ under `rootfs.cache`.
 ## x86-64 Board Profile v0
 
 `sporevm-x86_64-board-v0`, device-model version 1, is the frozen x86-64
-Linux/KVM machine contract. It applies to the fresh-run product path and is the
-board identity that a future x86 manifest must name; it does not change the
-aarch64-only v2/v3 manifest layouts documented below. Board-v0 supports one
-through eight vCPUs. Local APIC IDs are consecutive from zero, vCPU 0 is the
-bootstrap processor, and IOAPIC ID 8 remains outside the vCPU ID range.
+Linux/KVM machine contract for fresh execution. It does not define a public
+AMD64 saved-state format: capture, save, restore, resume, and fork remain
+unavailable, and a future x86 manifest must name this board identity. The
+aarch64-only v2/v3 manifest layouts documented below are unchanged. Board-v0
+supports one through eight vCPUs. Local APIC IDs are consecutive from zero,
+vCPU 0 is the bootstrap processor, and IOAPIC ID 8 remains outside the vCPU ID
+range. The experimental product profile currently narrows this board contract
+to one vCPU and exactly 512 MiB of memory.
 
 RAM is one page-aligned low-memory region starting at GPA zero, with a minimum
 size of 64 MiB (`0x04000000`) and a maximum size of 2 GiB (`0x80000000`). The
