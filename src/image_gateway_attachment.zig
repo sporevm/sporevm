@@ -147,6 +147,17 @@ pub fn validateAttachmentList(list: AttachmentList) gateway.Error!void {
     }
 }
 
+/// Bind a parsed subject relation to the immutable manifest requested by the
+/// caller before any listed record is considered.
+pub fn verifyAttachmentListSubject(
+    expected_subject_manifest_digest: []const u8,
+    list: AttachmentList,
+) gateway.Error!void {
+    try gateway.validateDigest(expected_subject_manifest_digest, "sha256:");
+    try validateAttachmentList(list);
+    if (!std.mem.eql(u8, expected_subject_manifest_digest, list.subject_manifest_digest)) return error.BadProtocol;
+}
+
 /// Verify that canonical attachment bytes are exactly the immutable record
 /// selected by a subject relation descriptor.
 pub fn verifyListedAttachment(
@@ -158,14 +169,28 @@ pub fn verifyListedAttachment(
     try gateway.validateDigest(expected_subject_manifest_digest, "sha256:");
     try validateArtifactType(descriptor.artifact_type);
     try gateway.validateDigest(descriptor.attachment_digest, "sha256:");
-    var parsed = try parseAttachmentRecord(allocator, record_bytes);
-    errdefer parsed.deinit();
     const record_digest = try gateway.transportDigestAlloc(allocator, record_bytes);
     defer allocator.free(record_digest);
+    if (!std.mem.eql(u8, descriptor.attachment_digest, record_digest)) return error.BadProtocol;
+    var parsed = try parseAttachmentRecord(allocator, record_bytes);
+    errdefer parsed.deinit();
     if (!std.mem.eql(u8, expected_subject_manifest_digest, parsed.value.subject_manifest_digest) or
-        !std.mem.eql(u8, descriptor.artifact_type, parsed.value.artifact_type) or
-        !std.mem.eql(u8, descriptor.attachment_digest, record_digest)) return error.BadProtocol;
+        !std.mem.eql(u8, descriptor.artifact_type, parsed.value.artifact_type)) return error.BadProtocol;
     return parsed;
+}
+
+/// Verify the exact artifact bytes named by a validated attachment record.
+pub fn verifyArtifactBytes(
+    allocator: std.mem.Allocator,
+    record: AttachmentRecord,
+    artifact_bytes: []const u8,
+) gateway.Error!void {
+    try validateAttachmentRecord(record);
+    const byte_count = std.math.cast(u64, artifact_bytes.len) orelse return error.BadProtocol;
+    if (byte_count != record.artifact.bytes) return error.BadProtocol;
+    const digest = try gateway.transportDigestAlloc(allocator, artifact_bytes);
+    defer allocator.free(digest);
+    if (!std.mem.eql(u8, digest, record.artifact.transport_digest)) return error.BadProtocol;
 }
 
 fn canonicalAttachmentRecordAlloc(
@@ -173,7 +198,10 @@ fn canonicalAttachmentRecordAlloc(
     record: AttachmentRecord,
 ) gateway.Error![]u8 {
     try validateAttachmentRecord(record);
-    const bytes = std.json.Stringify.valueAlloc(allocator, record, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    const bytes = std.json.Stringify.valueAlloc(allocator, record, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    }) catch return error.OutOfMemory;
     errdefer allocator.free(bytes);
     if (bytes.len == 0 or bytes.len > max_attachment_record_bytes) return error.BadProtocol;
     return bytes;
@@ -184,7 +212,10 @@ fn canonicalAttachmentListAlloc(
     list: AttachmentList,
 ) gateway.Error![]u8 {
     try validateAttachmentList(list);
-    const bytes = std.json.Stringify.valueAlloc(allocator, list, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    const bytes = std.json.Stringify.valueAlloc(allocator, list, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    }) catch return error.OutOfMemory;
     errdefer allocator.free(bytes);
     if (bytes.len == 0 or bytes.len > max_attachment_list_bytes) return error.BadProtocol;
     return bytes;
@@ -213,6 +244,11 @@ fn validateMediaType(value: []const u8) gateway.Error!void {
     }
     const separator = slash orelse return error.BadProtocol;
     if (separator == 0 or separator + 1 == value.len) return error.BadProtocol;
+    if (!isMediaTypeFirstByte(value[0]) or !isMediaTypeFirstByte(value[separator + 1])) return error.BadProtocol;
+}
+
+fn isMediaTypeFirstByte(byte: u8) bool {
+    return (byte >= 'a' and byte <= 'z') or (byte >= '0' and byte <= '9');
 }
 
 fn attachmentDescriptorLessThan(a: AttachmentListDescriptor, b: AttachmentListDescriptor) bool {
@@ -246,7 +282,16 @@ test "attachment record golden encoding" {
     const encoded = try encodeAttachmentRecordAlloc(allocator, parsed.value);
     defer encoded.deinit(allocator);
     try std.testing.expectEqualStrings(fixture, encoded.bytes);
-    try std.testing.expectEqualStrings("sha256:eeec4cf7ace5bb3052c2cce9c554080c57103c785fb1f151f8225eb1c036cffb", encoded.transport_digest);
+    try std.testing.expectEqualStrings("sha256:fed4fadbb05804390e4c3922f799a2613b7e6ecc9343c426cafcf485540d6f44", encoded.transport_digest);
+
+    const artifact = try readFixtureAlloc(allocator, "test/image-gateway/attachment-artifact.json", max_artifact_bytes);
+    defer allocator.free(artifact);
+    try verifyArtifactBytes(allocator, parsed.value, artifact);
+    try std.testing.expectError(error.BadProtocol, verifyArtifactBytes(allocator, parsed.value, artifact[0 .. artifact.len - 1]));
+    const corrupted_artifact = try allocator.dupe(u8, artifact);
+    defer allocator.free(corrupted_artifact);
+    corrupted_artifact[0] ^= 1;
+    try std.testing.expectError(error.BadProtocol, verifyArtifactBytes(allocator, parsed.value, corrupted_artifact));
 }
 
 test "attachment list golden encoding and subject binding" {
@@ -259,19 +304,41 @@ test "attachment list golden encoding and subject binding" {
     const encoded = try encodeAttachmentListAlloc(allocator, list.value);
     defer encoded.deinit(allocator);
     try std.testing.expectEqualStrings(list_fixture, encoded.bytes);
-    try std.testing.expectEqualStrings("sha256:d7940e55fceac005a4b189b6cae672a325eb65582e841e58487de243d9b448e4", encoded.transport_digest);
+    try std.testing.expectEqualStrings("sha256:f6a7bd7d3dfb0b68ba6c2ca4a8fca8babc20a00097a6d230e537af8218522a37", encoded.transport_digest);
+    const expected_subject = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try verifyAttachmentListSubject(expected_subject, list.value);
+    try std.testing.expectError(error.BadProtocol, verifyAttachmentListSubject(
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        list.value,
+    ));
 
     const record_storage = try readFixtureAlloc(allocator, "test/image-gateway/attachment-record.json", max_attachment_record_bytes);
     defer allocator.free(record_storage);
     var record = try verifyListedAttachment(
         allocator,
-        list.value.subject_manifest_digest,
+        expected_subject,
         list.value.attachments[0],
         canonicalFixtureBytes(record_storage),
     );
     defer record.deinit();
     try std.testing.expectEqualStrings(artifact_type_conversion_attestation, record.value.artifact_type);
 
+    var wrong_descriptor = list.value.attachments[0];
+    wrong_descriptor.artifact_type = artifact_type_sbom;
+    try std.testing.expectError(error.BadProtocol, verifyListedAttachment(
+        allocator,
+        expected_subject,
+        wrong_descriptor,
+        canonicalFixtureBytes(record_storage),
+    ));
+    wrong_descriptor = list.value.attachments[0];
+    wrong_descriptor.attachment_digest = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try std.testing.expectError(error.BadProtocol, verifyListedAttachment(
+        allocator,
+        expected_subject,
+        wrong_descriptor,
+        canonicalFixtureBytes(record_storage),
+    ));
     try std.testing.expectError(error.BadProtocol, verifyListedAttachment(
         allocator,
         "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -284,7 +351,9 @@ test "attachment parsers reject malformed and oversized inputs" {
     const allocator = std.testing.allocator;
     const malformed = [_]struct { path: []const u8, list: bool }{
         .{ .path = "test/image-gateway/malformed/attachment-duplicate-field.json", .list = false },
+        .{ .path = "test/image-gateway/malformed/attachment-noncanonical.json", .list = false },
         .{ .path = "test/image-gateway/malformed/attachment-unknown-type.json", .list = false },
+        .{ .path = "test/image-gateway/malformed/attachment-list-duplicate-descriptor.json", .list = true },
         .{ .path = "test/image-gateway/malformed/attachment-list-unsorted.json", .list = true },
     };
     for (malformed) |fixture| {
@@ -301,6 +370,75 @@ test "attachment parsers reject malformed and oversized inputs" {
     defer allocator.free(oversized);
     @memset(oversized, 'x');
     try std.testing.expectError(error.BadProtocol, parseAttachmentRecord(allocator, oversized));
+}
+
+test "attachment wire validation covers canonicality and field bounds" {
+    const allocator = std.testing.allocator;
+    const storage = try readFixtureAlloc(allocator, "test/image-gateway/attachment-record.json", max_attachment_record_bytes);
+    defer allocator.free(storage);
+    const fixture = canonicalFixtureBytes(storage);
+    var parsed = try parseAttachmentRecord(allocator, fixture);
+    defer parsed.deinit();
+
+    const trailing = try std.mem.concat(allocator, u8, &.{ fixture, "\n" });
+    defer allocator.free(trailing);
+    try std.testing.expectError(error.BadProtocol, parseAttachmentRecord(allocator, trailing));
+
+    const uppercase = try std.mem.replaceOwned(u8, allocator, fixture, "sha256:aaaa", "sha256:Aaaa");
+    defer allocator.free(uppercase);
+    try std.testing.expectError(error.BadProtocol, parseAttachmentRecord(allocator, uppercase));
+
+    const overflow = try std.mem.replaceOwned(u8, allocator, fixture, "\"bytes\": 55", "\"bytes\": 18446744073709551616");
+    defer allocator.free(overflow);
+    try std.testing.expectError(error.BadProtocol, parseAttachmentRecord(allocator, overflow));
+
+    const invalid_utf8 = try allocator.dupe(u8, fixture);
+    defer allocator.free(invalid_utf8);
+    const application = std.mem.indexOf(u8, invalid_utf8, "application") orelse unreachable;
+    invalid_utf8[application] = 0xff;
+    try std.testing.expectError(error.BadProtocol, parseAttachmentRecord(allocator, invalid_utf8));
+
+    var record = parsed.value;
+    record.kind = "wrong";
+    try std.testing.expectError(error.BadProtocol, validateAttachmentRecord(record));
+    record = parsed.value;
+    record.artifact.bytes = 0;
+    try std.testing.expectError(error.BadProtocol, validateAttachmentRecord(record));
+    record.artifact.bytes = max_artifact_bytes + 1;
+    try std.testing.expectError(error.BadProtocol, validateAttachmentRecord(record));
+    record = parsed.value;
+    for ([_][]const u8{ "", "application", "application//json", "+/json", "application/-json", "Application/json" }) |media_type| {
+        record.artifact.media_type = media_type;
+        try std.testing.expectError(error.BadProtocol, validateAttachmentRecord(record));
+    }
+    const oversized_media_type = try allocator.alloc(u8, max_media_type_bytes + 1);
+    defer allocator.free(oversized_media_type);
+    @memset(oversized_media_type, 'a');
+    oversized_media_type[1] = '/';
+    record.artifact.media_type = oversized_media_type;
+    try std.testing.expectError(error.BadProtocol, validateAttachmentRecord(record));
+}
+
+test "attachment lists allow empty relations and enforce count bounds" {
+    const subject = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try validateAttachmentList(.{
+        .kind = attachment_list_kind,
+        .subject_manifest_digest = subject,
+        .attachments = &.{},
+    });
+
+    const allocator = std.testing.allocator;
+    const descriptors = try allocator.alloc(AttachmentListDescriptor, max_attachments + 1);
+    defer allocator.free(descriptors);
+    @memset(descriptors, .{
+        .artifact_type = artifact_type_sbom,
+        .attachment_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    try std.testing.expectError(error.BadProtocol, validateAttachmentList(.{
+        .kind = attachment_list_kind,
+        .subject_manifest_digest = subject,
+        .attachments = descriptors,
+    }));
 }
 
 fn fuzzAttachmentRecordParse(_: void, smith: *std.testing.Smith) !void {

@@ -4,7 +4,7 @@
   "artifact_type": "conversion-attestation",
   "artifact": {
     "media_type": "application/vnd.in-toto+json",
-    "bytes": 4096,
-    "transport_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "bytes": 55,
+    "transport_digest": "sha256:166da8f1d257c23387eef8a22dbdbef25f569661bad3bd98ba3870dcb46eac7f"
   }
 }

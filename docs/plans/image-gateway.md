@@ -947,9 +947,10 @@ pretending to provide a gateway service.
 The minimal attachment protocol has also landed as a data-only module.
 Canonical records bind one supported artifact descriptor to an immutable image
 manifest, while bounded deterministic subject lists bind record digests and
-types without creating client-maintained tags. Golden, malformed, subject-
-binding, and fuzz coverage freeze the envelope; upload, relation mutation,
-authorization, retention, and policy remain deferred to G3.
+types without creating client-maintained tags. Verification covers the
+requested subject, record bytes, type, and exact artifact bytes. Golden,
+malformed, subject-binding, and fuzz coverage freeze the envelope; upload,
+relation mutation, authorization, retention, and policy remain deferred to G3.
 
 The proof intentionally uses one manifest-bound GET per object, so it measures
 correctness rather than the final eager transport. Before object transfer, it

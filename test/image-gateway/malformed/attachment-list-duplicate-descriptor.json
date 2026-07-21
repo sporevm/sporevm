@@ -3,8 +3,8 @@
   "subject_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "attachments": [
     {
-      "artifact_type": "conversion-attestation",
-      "attachment_digest": "sha256:fed4fadbb05804390e4c3922f799a2613b7e6ecc9343c426cafcf485540d6f44"
+      "artifact_type": "sbom",
+      "attachment_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     },
     {
       "artifact_type": "sbom",
