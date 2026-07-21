@@ -1,4 +1,4 @@
-//! KVM machine-state capture and restore.
+//! AArch64 KVM machine-state capture and restore.
 //!
 //! Converts live KVM state into SporeVM's normalized manifest shape. KVM's
 //! userspace VGICv3 ioctls are mapped to the portable architectural GICv3

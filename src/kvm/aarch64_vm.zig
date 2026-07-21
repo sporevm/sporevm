@@ -1,4 +1,4 @@
-//! KVM virtual machine: aarch64 Linux bring-up path.
+//! KVM virtual machine: AArch64 Linux bring-up path.
 //!
 //! This is the first KVM slice: a single-vCPU VM using the shared SporeVM
 //! board, DTB builder, virtio-mmio devices, and generation MMIO device. KVM
@@ -17,7 +17,7 @@ const dirty_ram = @import("../dirty_ram.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const kvm = @import("aarch64.zig");
 const lazy_ram = @import("lazy_ram.zig");
-const snapshot = @import("snapshot.zig");
+const snapshot = @import("aarch64_snapshot.zig");
 const board = @import("../aarch64/board.zig");
 const boot = @import("../aarch64/boot.zig");
 const generation = @import("../generation.zig");

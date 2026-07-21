@@ -9,7 +9,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const common = @import("common.zig");
 
-pub const vm = @import("vm.zig");
+pub const vm = @import("aarch64_vm.zig");
 
 pub const Error = common.Error || error{
     ApiVersionMismatch,

@@ -118,10 +118,11 @@ CPUID, MSRs, XSAVE/XCRS, interrupt state, TSC frequency, and clock controls.
 
 ARM-owned board, boot, FDT, GIC, and MPIDR topology code lives under
 `src/aarch64/`. Shared vCPU count validation remains in `src/topology.zig`, and
-the backend-neutral KVM selector and common ABI remain under `src/kvm/` beside
-explicit AArch64 and x86-64 bindings. The architecture trees do not force false
-file parity: FDT/GIC are ARM-specific while MP tables, PIO, and the CPU profile
-are x86-specific.
+the backend-neutral KVM selector, common ABI, and lazy RAM implementation remain
+under `src/kvm/` beside explicitly named architecture bindings and AArch64 VM
+and snapshot modules. The architecture trees do not force false file parity:
+FDT/GIC are ARM-specific while MP tables, PIO, and the CPU profile are
+x86-specific.
 
 ## Remaining Delivery Strategy
 
