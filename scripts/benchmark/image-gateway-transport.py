@@ -607,7 +607,9 @@ def encode_batch(
         if executor is not None
         else [read_object(digest) for digest in digests]
     )
-    for digest, data in zip(digests, data_objects, strict=True):
+    if len(data_objects) != len(digests):
+        raise BenchmarkError("batch object reads disagreed with the request")
+    for digest, data in zip(digests, data_objects):
         encoded = digest.encode()
         output.write(struct.pack(">H", len(encoded)))
         output.write(encoded)
