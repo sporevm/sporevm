@@ -1,0 +1,36 @@
+{
+  "kind": "spore-image-gateway-manifest-v1",
+  "image": {
+    "digest": "blake3:0b44f9bb9b365e1a3612586aa6fdcd721c26cda2f7b78a34720d344e89a2e4fe",
+    "platform": {
+      "os": "linux",
+      "arch": "arm64"
+    },
+    "config_blob": {
+      "transport_digest": "sha256:d6f56bc20064075ce319ac2e6fcef5de9ea21773b0a8a4398c4405222971f9c0",
+      "config_digest": "blake3:ee7321583d1b2c5f8a267ef397029f50cebaf70a93cd34278bbcc022dbddcca9",
+      "bytes": 37
+    },
+    "rootfs_storage": {
+      "kind": "chunked-ext4-rootfs-v0",
+      "device": {
+        "kind": "virtio-mmio",
+        "role": "rootfs",
+        "virtio_device_id": 2,
+        "mmio_slot": 1
+      },
+      "logical_size": 536870912,
+      "chunk_size": 65536,
+      "hash_algorithm": "blake3",
+      "index_digest": "blake3:cfa30aeb30365d5d7ce86ce779d980e5a9c711fe19f5a1516351fcd0b5c5771f",
+      "base_identity": "blake3:cfa30aeb30365d5d7ce86ce779d980e5a9c711fe19f5a1516351fcd0b5c5771f",
+      "object_namespace": "rootfs/blake3"
+    }
+  },
+  "rootfs_index": {
+    "digest": "blake3:cfa30aeb30365d5d7ce86ce779d980e5a9c711fe19f5a1516351fcd0b5c5771f",
+    "bytes": 81617,
+    "object_count": 5,
+    "object_bytes": 327680
+  }
+}

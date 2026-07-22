@@ -125,6 +125,45 @@ Their canonical-byte transport names are, respectively,
 and
 `sha256:b657390a5d37e2f098694027575d44fee3e235d64d6ffa630c995d9be54a01ca`.
 
+## Converter-worker conformance
+
+The minimal versioned fixture at
+[`test/image-gateway/worker-conformance/bundle.json`](../test/image-gateway/worker-conformance/bundle.json)
+demonstrates that converter host architecture does not enter native image
+identity for one empty, uncompressed layer. The fixture generator constructs
+one deterministic OCI index containing
+`linux/amd64` and `linux/arm64/v8` manifests over the same empty USTAR layer.
+Each Linux worker converts both selected targets with the native ext4 writer and
+must reproduce the committed canonical config, rootfs index, gateway manifest,
+platform index, native image digest, and complete nonzero-object digest set.
+
+The bundle schema is `spore-image-gateway-worker-conformance-v1`. It records the
+input index, layer, and selected-manifest digests plus each output file's exact
+size and SHA-256 digest. Object bytes are not duplicated in source control; the
+bundle records every BLAKE3 object name, exact length, and SHA-256 transport
+digest, while the canonical rootfs index remains the authoritative logical
+mapping. The arm64 and amd64 target results are expected to differ because
+platform enters canonical image config. For one selected target, however, a
+`linux/arm64` converter worker and a `linux/amd64` converter worker must produce
+the same complete bundle bytes.
+
+The harness independently recomputes SHA-256 transport digests and exact sizes.
+BLAKE3 object names, rootfs identity, and native image identity remain outputs
+of the SporeVM implementation under test; the byte comparison proves that those
+outputs agree across workers but is not an independent implementation of the
+identity algorithms. Richer compressed and multi-layer content fixtures remain
+follow-up conformance work.
+
+Run the host-local check with:
+
+```bash
+mise run test:image-gateway-worker-conformance
+```
+
+CI runs the same two-target conversion independently on Linux arm64 and Linux
+amd64. This is a conformance fixture rather than a new gateway endpoint,
+conversion API, or runtime dependency.
+
 ## Immutable attachment records
 
 Provenance, signatures, SBOMs, vulnerability reports, and policy results are

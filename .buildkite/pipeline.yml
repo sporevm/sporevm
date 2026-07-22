@@ -37,6 +37,27 @@ steps:
         agents:
           queue: sporevm-linux-amd64
 
+      - label: ":microscope: Gateway worker conformance (Linux ARM64)"
+        key: "image-gateway-worker-conformance-linux-arm64"
+        command: "scripts/ci/run.sh scripts/ci/image-gateway-worker-conformance.sh linux/arm64"
+        artifact_paths:
+          - "zig-cache/image-gateway-worker-conformance/**/*"
+        timeout_in_minutes: 15
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
+
+      - label: ":microscope: Gateway worker conformance (Linux AMD64)"
+        key: "image-gateway-worker-conformance-linux-amd64"
+        command: "scripts/ci/run.sh scripts/ci/image-gateway-worker-conformance.sh linux/amd64"
+        artifact_paths:
+          - "zig-cache/image-gateway-worker-conformance/**/*"
+        timeout_in_minutes: 15
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents:
+          queue: sporevm-linux-amd64
+
   - group: ":docker: Spore build"
     key: "spore-build"
     steps:
