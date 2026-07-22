@@ -89,10 +89,24 @@ and batch payloads are raw chunks. `object_bytes` gives the uncompressed
 normalization point, and `archive_build_ms` records the one-time composition
 cost separately from transfer. Archive backend accounting models one read of
 that prebuilt object; batch accounting models one backend read per requested
-chunk and records the recurring composition time. The G0 choice still requires
-colocated trials against the intended object-store backend; loopback results
-validate accounting and expose the request-versus-reuse tradeoff, but do not
-predict production latency.
+chunk and records the recurring composition time. The two-platform G0 evidence
+and archive decision are recorded in
+[`docs/benchmarks/image-gateway-transport-2026-07-22.md`](benchmarks/image-gateway-transport-2026-07-22.md).
+Loopback results validate accounting and expose the request-versus-reuse
+tradeoff, but do not predict production latency; G1 still has to repeat the
+selected archive path through the authenticated service.
+
+The pinned `buildkite-sporevm` workload can use an exact local source checkout:
+
+```console
+SPOREVM_BUILDKITE_SOURCE_DIR=/path/to/buildkite \
+  scripts/ci/image-gateway-buildkite-workload-benchmark.sh linux/amd64
+```
+
+Outside Buildkite this uses the loopback backend by default. Set
+`SPOREVM_IMAGE_GATEWAY_BACKEND=s3://bucket/prefix` only with an identity that
+is authorized to publish the immutable benchmark backend. Buildkite derives
+its approved per-build S3 prefix automatically.
 
 ## Profiles
 

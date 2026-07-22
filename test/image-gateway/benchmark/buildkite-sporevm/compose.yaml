@@ -1,0 +1,301 @@
+services:
+  postgres:
+    image: buildkite-postgres:latest
+    network_mode: host
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command:
+      - postgres
+      - -c
+      - listen_addresses=127.0.0.1
+      - -p
+      - "5433"
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - synchronous_commit=off
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/postgres:/var/lib/postgresql/data
+      - /usr/local/share/sporevm-buildkite/initdb:/docker-entrypoint-initdb.d:ro
+
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    network_mode: host
+    command:
+      - valkey-server
+      - --bind
+      - 127.0.0.1
+      - --port
+      - "6379"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/valkey:/data
+
+  redis-test-isolation:
+    image: valkey/valkey:8.1-alpine
+    network_mode: host
+    command:
+      - valkey-server
+      - --bind
+      - 127.0.0.1
+      - --port
+      - "6380"
+      - --databases
+      - "256"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/redis-test-isolation:/data
+
+  redis-node-0:
+    image: valkey/valkey:8.1-alpine
+    network_mode: host
+    command:
+      - valkey-server
+      - --cluster-enabled
+      - "yes"
+      - --cluster-config-file
+      - nodes-7000.conf
+      - --cluster-node-timeout
+      - "5000"
+      - --port
+      - "7000"
+      - --bind
+      - 127.0.0.1
+      - --protected-mode
+      - "no"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --cluster-announce-ip
+      - 127.0.0.1
+      - --cluster-announce-port
+      - "7000"
+      - --cluster-announce-bus-port
+      - "17000"
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/redis-node-0:/data
+
+  redis-node-1:
+    image: valkey/valkey:8.1-alpine
+    network_mode: host
+    command:
+      - valkey-server
+      - --cluster-enabled
+      - "yes"
+      - --cluster-config-file
+      - nodes-7001.conf
+      - --cluster-node-timeout
+      - "5000"
+      - --port
+      - "7001"
+      - --bind
+      - 127.0.0.1
+      - --protected-mode
+      - "no"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --cluster-announce-ip
+      - 127.0.0.1
+      - --cluster-announce-port
+      - "7001"
+      - --cluster-announce-bus-port
+      - "17001"
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/redis-node-1:/data
+
+  redis-node-2:
+    image: valkey/valkey:8.1-alpine
+    network_mode: host
+    command:
+      - valkey-server
+      - --cluster-enabled
+      - "yes"
+      - --cluster-config-file
+      - nodes-7002.conf
+      - --cluster-node-timeout
+      - "5000"
+      - --port
+      - "7002"
+      - --bind
+      - 127.0.0.1
+      - --protected-mode
+      - "no"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --cluster-announce-ip
+      - 127.0.0.1
+      - --cluster-announce-port
+      - "7002"
+      - --cluster-announce-bus-port
+      - "17002"
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/redis-node-2:/data
+
+  redis-cluster-init:
+    image: valkey/valkey:8.1-alpine
+    network_mode: host
+    command:
+      - sh
+      - -c
+      - |
+        until valkey-cli -h 127.0.0.1 -p 7000 ping >/dev/null 2>&1 &&
+          valkey-cli -h 127.0.0.1 -p 7001 ping >/dev/null 2>&1 &&
+          valkey-cli -h 127.0.0.1 -p 7002 ping >/dev/null 2>&1; do
+          sleep 1
+        done
+        valkey-cli --cluster create 127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 --cluster-replicas 0 --cluster-yes
+    depends_on:
+      - redis-node-0
+      - redis-node-1
+      - redis-node-2
+
+  memcached:
+    image: memcached:1.6-alpine
+    network_mode: host
+    command:
+      - memcached
+      - -l
+      - 127.0.0.1
+      - -p
+      - "11211"
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    network_mode: host
+    command:
+      - server
+      - --address
+      - :3300
+      - --console-address
+      - :9001
+      - /data
+    environment:
+      MINIO_ROOT_USER: llamasecrets
+      MINIO_ROOT_PASSWORD: llamasecrets
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/minio:/data
+
+  localstack:
+    image: localstack-spore:4.8.1
+    profiles:
+      - localstack
+    network_mode: host
+    environment:
+      PERSISTENCE: "0"
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/localstack:/var/lib/localstack
+
+  kafka:
+    image: apache/kafka-native:3.9.2
+    profiles:
+      - kafka
+    network_mode: host
+    user: root
+    command:
+      - /bin/sh
+      - -c
+      - |
+        chown -R appuser:appuser /var/lib/kafka/data
+        su appuser -c /etc/kafka/docker/run
+    environment:
+      CLUSTER_ID: "dsMTVfleSpWLmLgXvnD2Qg"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://127.0.0.1:9092"
+      KAFKA_LISTENERS: "PLAINTEXT://127.0.0.1:9092,CONTROLLER://127.0.0.1:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@127.0.0.1:9093"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/kafka:/var/lib/kafka/data
+
+  kafka-pipeline:
+    image: apache/kafka-native:3.9.2
+    profiles:
+      - kafka
+    network_mode: host
+    user: root
+    command:
+      - /bin/sh
+      - -c
+      - |
+        chown -R appuser:appuser /var/lib/kafka/data
+        su appuser -c /etc/kafka/docker/run
+    environment:
+      CLUSTER_ID: "pipelineCluster001"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://127.0.0.1:9094"
+      KAFKA_LISTENERS: "PLAINTEXT://127.0.0.1:9094,CONTROLLER://127.0.0.1:9095"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "2@127.0.0.1:9095"
+      KAFKA_NODE_ID: "2"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/kafka-pipeline:/var/lib/kafka/data
+
+  schema-registry:
+    image: schema-registry-spore:7.5.3
+    profiles:
+      - kafka
+    hostname: localhost
+    network_mode: host
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: 127.0.0.1
+      SCHEMA_REGISTRY_JMX_HOSTNAME: 127.0.0.1
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8082
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://127.0.0.1:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: "1"
+      SCHEMA_REGISTRY_DEBUG: "true"
+    depends_on:
+      - kafka
+
+  clickhouse:
+    image: clickhouse:25.12
+    profiles:
+      - clickhouse
+    network_mode: host
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - ${SPOREVM_BUILDKITE_RUNTIME_ROOT:-/tmp/sporevm-buildkite}/clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  kms:
+    image: nsmithuk/local-kms:3.11.7
+    network_mode: host
+    environment:
+      KMS_REGION: us-east-1
+    volumes:
+      - /app/config/localkms_seed.yml:/init/seed.yaml:ro

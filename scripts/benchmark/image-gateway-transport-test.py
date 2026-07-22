@@ -22,7 +22,7 @@ sys.modules[SPEC.name] = transport
 SPEC.loader.exec_module(transport)
 
 
-def write_fixture(root: Path, contents: list[bytes]) -> None:
+def write_fixture(root: Path, contents: list[bytes], arch: str = "arm64") -> None:
     manifest_digest = "sha256:" + "1" * 64
     base = root / "v1" / "repositories" / "benchmark"
     manifest_base = base / "manifests" / manifest_digest
@@ -46,7 +46,7 @@ def write_fixture(root: Path, contents: list[bytes]) -> None:
             "kind": "spore-image-gateway-manifest-v1",
             "image": {
                 "digest": "blake3:" + "2" * 64,
-                "platform": {"os": "linux", "arch": "arm64"},
+                "platform": {"os": "linux", "arch": arch},
                 "rootfs_storage": {"logical_size": rootfs_index["logical_size"]},
             },
             "rootfs_index": {
@@ -55,7 +55,7 @@ def write_fixture(root: Path, contents: list[bytes]) -> None:
                 "object_bytes": rootfs_index["logical_size"],
             },
         },
-        manifest_base / "config": {"os": "linux", "architecture": "arm64"},
+        manifest_base / "config": {"os": "linux", "architecture": arch},
         manifest_base / "rootfs-index": rootfs_index,
         base / "sources" / ("sha256:" + "4" * 64) / "index": {
             "kind": "spore-image-gateway-index-v1",
@@ -72,8 +72,12 @@ def main() -> None:
         root = Path(temporary)
         fixture = root / "fixture"
         overlap = root / "overlap"
-        write_fixture(fixture, [b"a" * 64, b"b" * 64, b"c" * 17])
-        write_fixture(overlap, [b"a" * 64, b"z" * 64, b"y" * 17])
+        contents = [bytes([index]) * 64 for index in range(24)] + [b"tail"]
+        overlap_contents = contents[:8] + [
+            bytes([index]) * 64 for index in range(64, 81)
+        ]
+        write_fixture(fixture, contents)
+        write_fixture(overlap, overlap_contents)
         transport.run_benchmark(
             argparse.Namespace(
                 archive_compression="gzip",
@@ -105,6 +109,13 @@ def main() -> None:
         summary = transport.parse_object(transport.read_bounded(summary_path), summary_path)
         if summary.get("kind") != "transport-summary":
             raise RuntimeError("summary omitted its evidence kind")
+        if summary.get("transport", {}).get("backend") != "local":
+            raise RuntimeError("summary omitted its backend placement")
+        if (
+            summary.get("transport", {}).get("gateway_execution")
+            != "bounded-concurrency-cacheless"
+        ):
+            raise RuntimeError("summary misreported gateway execution")
         cases = {(case["mode"], case["cache_state"]): case for case in summary["cases"]}
         if cases[("archive", "cold")]["median_request_count"] != cases[
             ("archive", "partial")
@@ -114,8 +125,14 @@ def main() -> None:
             ("batch", "cold")
         ]["median_response_bytes"]:
             raise RuntimeError("batch did not save bytes for an overlapping cache")
-        if cases[("objects", "cold")]["median_data_request_count"] != 3:
+        if cases[("objects", "cold")]["median_data_request_count"] != len(contents):
             raise RuntimeError("objects mode request accounting is wrong")
+        if cases[("objects", "cold")]["median_connection_count"] > 17:
+            raise RuntimeError("objects mode did not reuse worker connections")
+        if cases[("batch", "cold")]["median_request_bytes"] <= 0:
+            raise RuntimeError("batch request body bytes were not counted")
+        if cases[("objects", "cold")]["median_request_bytes"] != 0:
+            raise RuntimeError("objects mode recorded a request body")
         rows = [json.loads(line) for line in (root / "output" / "results.jsonl").read_text().splitlines()]
         if any(row.get("kind") != "transport-trial" for row in rows):
             raise RuntimeError("trial omitted its evidence kind")
@@ -151,6 +168,13 @@ def main() -> None:
         profile = transport.parse_profile(profile_log)
         if profile.get("tree_merge_layer_count") != 2 or profile.get("tree_merge_layer_ms") != 10:
             raise RuntimeError("repeated layer profile lines were not aggregated")
+        if transport.METADATA_RE.search("metadata: /tmp/rootfs.json\n") is None:
+            raise RuntimeError("OCI layout import metadata output was not recognized")
+
+        amd64_fixture = root / "amd64-fixture"
+        write_fixture(amd64_fixture, [b"a" * 64, b"b" * 17], arch="amd64")
+        if transport.Closure.load(amd64_fixture).platform != "linux/amd64":
+            raise RuntimeError("benchmark fixture rejected linux/amd64")
 
         transport.run_benchmark(
             argparse.Namespace(
