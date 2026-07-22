@@ -33,7 +33,7 @@
 #define SPORE_ENUM_TYPED
 #endif
 #define SPORE_ENUM_MAX_VALUE INT_MAX
-#define SPORE_ABI_VERSION 16u
+#define SPORE_ABI_VERSION 17u
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,7 +75,7 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_PULL_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
-#define SPORE_CREATE_NAMED_OPTIONS_VERSION 4u
+#define SPORE_CREATE_NAMED_OPTIONS_VERSION 5u
 #define SPORE_RESTORE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
@@ -210,6 +210,10 @@ typedef struct SporeCreateNamedOptions {
   size_t bound_unix_service_count;
   const SporeAnnotation *annotations;
   size_t annotation_count;
+  /** Optional initial argv. Image-backed creates prepend OCI Entrypoint;
+   * empty uses OCI Entrypoint plus Cmd. */
+  const SporeString *initial_argv;
+  size_t initial_argc;
 } SporeCreateNamedOptions;
 
 /** Options for spore_exec_named_json(). */

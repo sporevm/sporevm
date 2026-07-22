@@ -18,7 +18,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 15
+const minABIVersion uint32 = 17
 const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
 const reexecRoleEnv = "SPORE_REEXEC_ROLE"
 const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
@@ -317,6 +317,8 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 	defer freeBoundServices()
 	annotations, freeAnnotations := cAnnotations(options.Annotations)
 	defer freeAnnotations()
+	initialArgv, freeInitialArgv := cStringList(options.InitialArgv)
+	defer freeInitialArgv()
 
 	var opts C.SporeCreateNamedOptions
 	C.spore_create_named_options_init(&opts)
@@ -360,6 +362,10 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 	if len(annotations) != 0 {
 		opts.annotations = &annotations[0]
 		opts.annotation_count = C.size_t(len(annotations))
+	}
+	if len(initialArgv) != 0 {
+		opts.initial_argv = &initialArgv[0]
+		opts.initial_argc = C.size_t(len(initialArgv))
 	}
 
 	var out C.SporeOwnedString

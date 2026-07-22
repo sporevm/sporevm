@@ -44,7 +44,9 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
     const spore_executable = full_args[0];
     const result = runParsed(init, arena, parsed, events, spore_executable, runtimeDebugEnabled(full_args)) catch |err| {
         if (parsed.event_mode == .jsonl) {
-            std.process.exit(api.classifyFailure(err).exit_code);
+            const classified = api.classifyFailure(err);
+            event_writer.emitFailure(classified) catch {};
+            std.process.exit(classified.exit_code);
         }
         if (run_mod.isCaptureAborted(err)) std.process.exit(130);
         if (run_mod.isNetworkGatewayError(err)) {
@@ -58,6 +60,12 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
             std.process.exit(classified.exit_code);
         }
         if (run_mod.isX86ProductPolicyError(err)) {
+            const classified = api.classifyFailure(err);
+            writeStderr(classified.message);
+            writeStderr("\n");
+            std.process.exit(classified.exit_code);
+        }
+        if (err == error.ImageCommandMissing or err == error.UnsupportedImageUser or err == error.RunArgCountUnsupported or err == error.RunArgTooLong) {
             const classified = api.classifyFailure(err);
             writeStderr(classified.message);
             writeStderr("\n");
@@ -163,10 +171,13 @@ fn runParsed(
         failRunSetup("spore run: --bind-service with --save needs manifest support first", .{});
     }
 
-    const command = run_mod.cliGuestCommand(allocator, parsed) catch |err| switch (err) {
-        error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
-        else => return err,
-    };
+    const command: []const []const u8 = if (parsed.command.len == 0)
+        &.{}
+    else
+        run_mod.cliGuestCommand(allocator, parsed) catch |err| switch (err) {
+            error.ShellCommandArgumentCountUnsupported => failRunSetup("spore run: shell command form accepts one command string; quote it or use -- for argv", .{}),
+            else => return err,
+        };
 
     return api.runManaged(init, allocator, .{
         .backend = parsed.backend,

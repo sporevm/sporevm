@@ -268,8 +268,9 @@ pub const ManagedRunOptions = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     image_pull_policy: ImagePullPolicy = .missing,
-    /// Guest command and arguments. The first element is the executable.
-    command: []const []const u8,
+    /// Guest command and arguments. Empty uses OCI Entrypoint and Cmd for an
+    /// image-backed run; non-image managed runs require an explicit command.
+    command: []const []const u8 = &.{},
     guest_env: []const []const u8 = &.{},
     /// Ephemeral files made available under /run/sporevm/injected for this fresh run.
     injected_files: []const InjectedFile = &.{},
@@ -901,7 +902,7 @@ pub fn runManaged(
     }
     if (options.commit_ref) |ref| {
         try rootfs_mod.validateLocalTagRef(ref);
-        if (options.image_ref == null or options.rootfs_path != null or options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.interactive or options.tty or options.command.len == 0) {
+        if (options.image_ref == null or options.rootfs_path != null or options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.interactive or options.tty) {
             return error.InvalidRunCommitOptions;
         }
     }
@@ -928,6 +929,12 @@ pub fn runManaged(
         .command_name = "run",
         .record_artifact = options.save_path != null or options.image_ref != null,
     });
+    const command = if (options.image_ref != null)
+        try run_mod.resolveImageRuntimeCommand(arena, rootfs.image_config, options.command)
+    else blk: {
+        if (options.command.len == 0) return error.RunArgCountUnsupported;
+        break :blk options.command;
+    };
     const default_kernel = options.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
     const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
     const managed_boot_descriptor = if (default_kernel and default_initrd)
@@ -959,7 +966,7 @@ pub fn runManaged(
         .rootfs_path = rootfs.path,
         .rootfs = rootfs.rootfs,
         .rootfs_grow_target = rootfs_grow_target,
-        .command = options.command,
+        .command = command,
         .injected_files = options.injected_files,
         .interactive = options.interactive,
         .tty = options.tty,

@@ -89,6 +89,10 @@ after bounded `PATH` selection when argv zero contains no slash. A missing
 shell or executable fails that instruction; it never falls through to a later
 binary after selecting one.
 
+Executor-backed instructions require an inherited OCI `User` that selects the
+root user and an optional root group. Other users and groups fail closed because
+the build guest cannot switch credentials yet.
+
 ## RUN Mounts
 
 The current mount surface is deliberately narrow:

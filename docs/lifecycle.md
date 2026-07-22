@@ -44,10 +44,12 @@ shell environment, while image, rootfs, and custom-initrd guests provide their
 own command environment. Use `--image` or `--rootfs` for general distro
 commands. A command passed to `spore create` is
 started in the guest and detached; stdout and stderr are discarded so the named
-VM is immediately available for `fork`, `exec`, `save`, and `rm`. `spore
-exec` always streams guest stdout and stderr live as independent ordered
-streams. Stdin is closed by default. Pass `-i` to forward host stdin, and pass
-`-t` to request a guest terminal for the exec. The usual shell spelling is:
+VM is immediately available for `fork`, `exec`, `save`, and `rm`. Create removes
+the new VM if that process cannot be started, while its eventual exit after a
+successful start does not affect the VM. `spore exec` always
+streams guest stdout and stderr live as independent ordered streams. Stdin is
+closed by default. Pass `-i` to forward host stdin, and pass `-t` to request a
+guest terminal for the exec. The usual shell spelling is:
 
 ```bash
 spore exec -it bench-1 -- /bin/sh
@@ -58,9 +60,12 @@ host terminal is not required when PTY output or input is redirected.
 
 Named VMs created with `--image` apply the image's OCI `Config.Env` and
 `WorkingDir` to every command, including the detached command passed to
-`spore create`, plain exec, interactive exec, and TTY exec. Entrypoint, Cmd,
-and User remain unapplied. Each exec can override that context before the VM
-name:
+`spore create`, plain exec, interactive exec, and TTY exec. When create has no
+command, its detached initial process uses `Entrypoint` plus `Cmd`; an explicit
+create command replaces `Cmd` but still follows `Entrypoint`. `User` must select
+root until guest credential switching is implemented. Later execs do not
+reapply `Entrypoint` or `Cmd`, and each can override the environment and working
+directory before the VM name:
 
 ```bash
 spore exec --env RACK_ENV=test --env BUNDLE_GEMFILE --workdir /app bench-1 \
@@ -430,7 +435,9 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 - Named live fork accepts at most 32 children and one writable rootfs disk.
   Networked and additional-device layouts remain unsupported.
 - No live network-flow save/restore.
-- No OCI `Entrypoint`, `Cmd`, or `User` semantics. Callers pass explicit argv.
+- `spore create --image` applies OCI Entrypoint and Cmd to its optional initial
+  command and requires a root `User`. Later `spore exec`, attach, restore, and
+  saved-spore paths do not reapply OCI command defaults.
 
 ## Validation
 

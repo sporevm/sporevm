@@ -306,9 +306,10 @@ func TestPull(t *testing.T) {
 	}
 }
 
-func TestNamedLifecycleOptionsCarryBoundServices(t *testing.T) {
+func TestNamedLifecycleOptions(t *testing.T) {
 	create := CreateNamedOptions{
 		Name:           "worker",
+		InitialArgv:    []string{"/bin/true"},
 		NetworkEnabled: true,
 		NetworkRules: []NetworkRule{{
 			Host:  "github.com",
@@ -323,6 +324,9 @@ func TestNamedLifecycleOptionsCarryBoundServices(t *testing.T) {
 	}
 	if !create.NetworkEnabled {
 		t.Fatal("expected network enabled")
+	}
+	if got := create.InitialArgv[0]; got != "/bin/true" {
+		t.Fatalf("initial argv = %q", got)
 	}
 	if got := create.BoundServices[0].UnixPath; got != "/tmp/cleanroom-gateway.sock" {
 		t.Fatalf("bound service path = %q", got)

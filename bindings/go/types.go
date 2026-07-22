@@ -295,6 +295,9 @@ type CreateNamedOptions struct {
 	NetworkRules    []NetworkRule
 	BoundServices   []BoundUnixService
 	Annotations     map[string]string
+	// InitialArgv replaces the image Cmd while preserving its Entrypoint.
+	// An empty value uses image defaults, or leaves a non-image VM idle.
+	InitialArgv []string
 }
 
 // SaveNamedOptions writes a named VM to a spore.
