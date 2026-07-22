@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import dataclasses
+import errno
 import gzip
 import hashlib
 import hmac
@@ -24,7 +26,7 @@ import tarfile
 import threading
 import time
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
@@ -281,6 +283,9 @@ class ObjectBackend:
     def close(self) -> None:
         return
 
+    def retry_count(self) -> int:
+        return 0
+
 
 class LocalObjectBackend(ObjectBackend):
     def __init__(self, closure: Closure, archive: Path):
@@ -351,7 +356,34 @@ class S3ObjectBackend(ObjectBackend):
         self.region = region
         self.access, self.secret, self.token = aws_credentials()
         self.host = f"{self.bucket}.s3.{region}.amazonaws.com"
-        self.connection = http.client.HTTPSConnection(self.host, timeout=60)
+        self.local = threading.local()
+        self.connections: list[http.client.HTTPSConnection] = []
+        self.connections_lock = threading.Lock()
+        self.retries = 0
+        self.retries_lock = threading.Lock()
+
+    def record_retry(self) -> None:
+        with self.retries_lock:
+            self.retries += 1
+
+    def retry_count(self) -> int:
+        with self.retries_lock:
+            return self.retries
+
+    def connection(self) -> http.client.HTTPSConnection:
+        connection = getattr(self.local, "connection", None)
+        if connection is None:
+            connection = http.client.HTTPSConnection(self.host, timeout=60)
+            self.local.connection = connection
+            with self.connections_lock:
+                self.connections.append(connection)
+        return connection
+
+    def reset_connection(self) -> None:
+        connection = getattr(self.local, "connection", None)
+        if connection is not None:
+            connection.close()
+            self.local.connection = None
 
     def signed_headers(self, path: str) -> dict[str, str]:
         now = datetime.now(timezone.utc)
@@ -393,16 +425,30 @@ class S3ObjectBackend(ObjectBackend):
     def open(self, relative: str, expected_size: int) -> tuple[int, Any]:
         key = f"{self.prefix}/{relative}"
         path = "/" + quote(key, safe="/-_.~")
-        try:
-            self.connection.request("GET", path, headers=self.signed_headers(path))
-            response = self.connection.getresponse()
-        except (OSError, http.client.HTTPException):
-            self.connection.close()
-            self.connection = http.client.HTTPSConnection(self.host, timeout=60)
-            self.connection.request("GET", path, headers=self.signed_headers(path))
-            response = self.connection.getresponse()
+        response = None
+        for attempt in range(3):
+            try:
+                connection = self.connection()
+                connection.request("GET", path, headers=self.signed_headers(path))
+                response = connection.getresponse()
+            except (OSError, http.client.HTTPException):
+                self.reset_connection()
+                if attempt == 2:
+                    raise
+                self.record_retry()
+                time.sleep(0.25 * (2**attempt))
+                continue
+            if response.status not in (429, 500, 502, 503, 504) or attempt == 2:
+                break
+            response.read()
+            response.close()
+            self.reset_connection()
+            self.record_retry()
+            time.sleep(0.25 * (2**attempt))
+        assert response is not None
         if response.status != 200:
             body = response.read(4096).decode("utf-8", errors="replace")
+            response.close()
             raise BenchmarkError(f"S3 backend returned HTTP {response.status} for {relative}: {body}")
         try:
             size = int(response.getheader("Content-Length", "-1"))
@@ -415,7 +461,10 @@ class S3ObjectBackend(ObjectBackend):
         return size, response
 
     def close(self) -> None:
-        self.connection.close()
+        with self.connections_lock:
+            for connection in self.connections:
+                connection.close()
+            self.connections.clear()
 
 
 def stage_backend(closure: Closure, archive: Path, destination: Path) -> None:
@@ -428,8 +477,19 @@ def stage_backend(closure: Closure, archive: Path, destination: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
     for digest, info in closure.objects.items():
-        os.link(info.path, objects / digest)
-    os.link(archive, destination / "archive")
+        target = objects / digest
+        try:
+            os.link(info.path, target)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            shutil.copyfile(info.path, target)
+    try:
+        os.link(archive, destination / "archive")
+    except OSError as error:
+        if error.errno != errno.EXDEV:
+            raise
+        shutil.copyfile(archive, destination / "archive")
 
 
 def upload_backend(source: Path, uri: str) -> None:
@@ -472,6 +532,7 @@ def write_archive(closure: Closure, path: Path, compression: str) -> None:
 @dataclasses.dataclass
 class Counters:
     requests: int = 0
+    request_bytes: int = 0
     backend_reads: int = 0
     backend_bytes: int = 0
     response_bytes: int = 0
@@ -487,20 +548,32 @@ class Counters:
 
 
 class ServerState:
-    def __init__(self, closure: Closure, archive: Path, backend: "ObjectBackend"):
+    def __init__(
+        self, closure: Closure, archive: Path, backend: "ObjectBackend", concurrency: int
+    ):
         self.closure = closure
         self.archive = archive
         self.backend = backend
         self.lock = threading.Lock()
         self.counters = Counters()
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
 
     def snapshot(self) -> Counters:
         with self.lock:
             return dataclasses.replace(self.counters)
 
-    def record(self, *, reads: int, backend_bytes: int, response_bytes: int, composition_ns: int = 0) -> None:
+    def record(
+        self,
+        *,
+        reads: int,
+        backend_bytes: int,
+        response_bytes: int,
+        request_bytes: int = 0,
+        composition_ns: int = 0,
+    ) -> None:
         with self.lock:
             self.counters.requests += 1
+            self.counters.request_bytes += request_bytes
             self.counters.backend_reads += reads
             self.counters.backend_bytes += backend_bytes
             self.counters.response_bytes += response_bytes
@@ -508,18 +581,28 @@ class ServerState:
 
 
 def encode_batch(
-    closure: Closure, digests: list[str], backend: ObjectBackend | None = None
+    closure: Closure,
+    digests: list[str],
+    backend: ObjectBackend | None = None,
+    executor: concurrent.futures.Executor | None = None,
 ) -> bytes:
     output = io.BytesIO()
     output.write(BATCH_MAGIC)
     output.write(struct.pack(">I", len(digests)))
-    for digest in digests:
+    def read_object(digest: str) -> bytes:
         info = closure.objects[digest]
-        data = (
+        return (
             read_bounded(info.path)
             if backend is None
             else backend.read(f"objects/{digest}", info.size)
         )
+
+    data_objects = (
+        list(executor.map(read_object, digests))
+        if executor is not None
+        else [read_object(digest) for digest in digests]
+    )
+    for digest, data in zip(digests, data_objects, strict=True):
         encoded = digest.encode()
         output.write(struct.pack(">H", len(encoded)))
         output.write(encoded)
@@ -631,22 +714,27 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
         if len(set(digests)) != len(digests):
             return self.send_error(404)
         started = time.perf_counter_ns()
-        data = encode_batch(self.state.closure, digests, self.state.backend)
+        data = encode_batch(
+            self.state.closure, digests, self.state.backend, self.state.executor
+        )
         composition_ns = time.perf_counter_ns() - started
         object_bytes = sum(self.state.closure.objects[digest].size for digest in digests)
         self.state.record(
             reads=len(digests),
             backend_bytes=object_bytes,
             response_bytes=len(data),
+            request_bytes=length,
             composition_ns=composition_ns,
         )
         self.send_bytes(data)
 
 
 class TransportServer:
-    def __init__(self, closure: Closure, archive: Path, backend: "ObjectBackend"):
-        self.state = ServerState(closure, archive, backend)
-        self.server = HTTPServer(("127.0.0.1", 0), BenchmarkHandler)
+    def __init__(
+        self, closure: Closure, archive: Path, backend: "ObjectBackend", concurrency: int
+    ):
+        self.state = ServerState(closure, archive, backend, concurrency)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), BenchmarkHandler)
         self.server.state = self.state  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -658,6 +746,7 @@ class TransportServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+        self.state.executor.shutdown()
         self.state.backend.close()
 
 
@@ -738,6 +827,7 @@ def run_trial(
     compression: str,
     overlap: Closure | None,
     batch_size: int,
+    concurrency: int,
     trial_order: int,
 ) -> dict[str, Any]:
     cache = output / "work" / f"{mode}-{cache_state}-{iteration}"
@@ -749,6 +839,7 @@ def run_trial(
     stage = cache / "stage"
     stage.mkdir()
     before = server.state.snapshot()
+    retries_before = server.state.backend.retry_count()
     started = time.perf_counter_ns()
     client = TransportClient(server)
     try:
@@ -778,10 +869,19 @@ def run_trial(
                     path.write_bytes(data)
                     received_paths[digest] = path
         elif mode == "objects":
-            for digest in missing:
+            def fetch_object(digest: str) -> tuple[str, Path]:
                 path = stage / digest
-                client.file(f"/objects/{quote(digest, safe='')}", path)
-                received_paths[digest] = path
+                object_client = TransportClient(server)
+                try:
+                    object_client.file(f"/objects/{quote(digest, safe='')}", path)
+                finally:
+                    object_client.close()
+                return digest, path
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                fetched = executor.map(fetch_object, missing)
+                for digest, path in fetched:
+                    received_paths[digest] = path
         else:
             raise BenchmarkError(f"unsupported transport mode: {mode}")
         transfer_ns = time.perf_counter_ns() - transfer_started
@@ -829,7 +929,9 @@ def run_trial(
         "control_request_count": len(closure.controls),
         "data_request_count": counters.requests - len(closure.controls),
         "backend_reads": counters.backend_reads,
+        "backend_retries": server.state.backend.retry_count() - retries_before,
         "backend_bytes": counters.backend_bytes,
+        "request_bytes": counters.request_bytes,
         "response_bytes": counters.response_bytes,
         "batch_composition_ms": counters.batch_composition_ns / 1_000_000,
         "control_ms": control_ns / 1_000_000,
@@ -849,6 +951,7 @@ def summarize(
     rows: list[dict[str, Any]],
     compression: str,
     batch_size: int,
+    concurrency: int,
     archive_bytes: int,
     archive_build_ms: float,
     backend_kind: str,
@@ -876,6 +979,7 @@ def summarize(
                         row["selfcheck_ms"] for row in selected
                     ),
                     "median_response_bytes": statistics.median(row["response_bytes"] for row in selected),
+                    "median_request_bytes": statistics.median(row["request_bytes"] for row in selected),
                     "median_backend_bytes": statistics.median(row["backend_bytes"] for row in selected),
                     "median_request_count": statistics.median(row["request_count"] for row in selected),
                     "median_control_request_count": statistics.median(
@@ -885,6 +989,9 @@ def summarize(
                         row["data_request_count"] for row in selected
                     ),
                     "median_backend_reads": statistics.median(row["backend_reads"] for row in selected),
+                    "median_backend_retries": statistics.median(
+                        row["backend_retries"] for row in selected
+                    ),
                     "median_objects_reused": statistics.median(
                         row["objects_reused"] for row in selected
                     ),
@@ -918,7 +1025,11 @@ def summarize(
             "archive_build_ms": archive_build_ms,
             "batch_framing": "benchmark-only-v1",
             "batch_size": batch_size,
+            "concurrency": concurrency,
             "connection_reuse": True,
+            "byte_accounting": "http-body-only",
+            "gateway_execution": "serial-cacheless",
+            "s3_transient_retry_count": 2 if backend_kind == "s3" else 0,
         },
         "overlap_fixture": (
             {
@@ -939,8 +1050,15 @@ def summarize(
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
-    if args.iterations < 1 or args.batch_size < 1 or args.batch_size > MAX_BATCH_OBJECTS:
-        raise BenchmarkError("iterations and batch size are outside supported bounds")
+    concurrency = getattr(args, "concurrency", 16)
+    if (
+        args.iterations < 1
+        or args.batch_size < 1
+        or args.batch_size > MAX_BATCH_OBJECTS
+        or concurrency < 1
+        or concurrency > 64
+    ):
+        raise BenchmarkError("iterations, batch size, or concurrency are outside supported bounds")
     output = args.output.resolve()
     if output.exists():
         raise BenchmarkError(f"output already exists: {output}")
@@ -970,7 +1088,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     else:
         backend = LocalObjectBackend(closure, archive)
     rows: list[dict[str, Any]] = []
-    with TransportServer(closure, archive, backend) as server, (output / "results.jsonl").open(
+    with TransportServer(closure, archive, backend, concurrency) as server, (output / "results.jsonl").open(
         "w", encoding="utf-8"
     ) as results:
         trial_order = 0
@@ -990,6 +1108,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
                         args.archive_compression,
                         overlap,
                         args.batch_size,
+                        concurrency,
                         trial_order,
                     )
                     rows.append(row)
@@ -1003,6 +1122,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 rows,
                 args.archive_compression,
                 args.batch_size,
+                concurrency,
                 archive.stat().st_size,
                 archive_build_ms,
                 backend.kind,
@@ -1024,6 +1144,13 @@ def run_command(argv: list[str], env: dict[str, str], cwd: Path, stdout: Path, s
             f"command failed ({completed.returncode}): {' '.join(argv)}; stderr: {stderr}"
         )
     return (time.perf_counter_ns() - started) // 1_000_000
+
+
+def redact_log(path: Path, replacements: dict[str, str]) -> None:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for original, replacement in replacements.items():
+        text = text.replace(original, replacement)
+    path.write_text(text, encoding="utf-8")
 
 
 def prepare_fixture(args: argparse.Namespace) -> None:
@@ -1091,12 +1218,19 @@ def prepare_fixture(args: argparse.Namespace) -> None:
         profile = parse_profile(stderr_log)
         if not profile:
             raise BenchmarkError("direct OCI conversion emitted no rootfs profile phases")
+        redactions = {
+            str(spore): "spore",
+            str(rootfs): "$TRIAL/rootfs.ext4",
+            str(metadata): "$TRIAL/metadata.json",
+        }
+        redact_log(stdout_log, redactions)
+        redact_log(stderr_log, redactions)
         rows.append(
             {
                 "iteration": iteration,
                 "source": trial_source,
                 "platform": args.platform,
-                "command": command,
+                "command": [redactions.get(part, part) for part in command],
                 "elapsed_ms": elapsed_ms,
                 "profile": profile,
                 "logs": {
@@ -1146,7 +1280,7 @@ def prepare_fixture(args: argparse.Namespace) -> None:
         "requested_source": requested_source,
         "resolved_source": effective_source,
         "platform": args.platform,
-        "spore_bin": str(spore),
+        "spore_bin": spore.name,
         "spore_sha256": sha256(spore.read_bytes()),
         "fixture_image_digest": closure.image_digest,
         "fixture_rootfs_index_digest": closure.rootfs_index_digest,
@@ -1208,7 +1342,8 @@ def prepare_layout_fixture(args: argparse.Namespace) -> None:
             stderr_log,
             args.timeout,
         )
-        match = METADATA_RE.search(stdout_log.read_text(encoding="utf-8", errors="replace"))
+        stdout_text = stdout_log.read_text(encoding="utf-8", errors="replace")
+        match = METADATA_RE.search(stdout_text)
         if match is None:
             raise BenchmarkError("OCI layout import did not report its metadata path")
         metadata = Path(match.group("path"))
@@ -1224,12 +1359,20 @@ def prepare_layout_fixture(args: argparse.Namespace) -> None:
         profile = parse_profile(stderr_log)
         if not profile:
             raise BenchmarkError("OCI layout conversion emitted no rootfs profile phases")
+        redactions = {
+            str(spore): "spore",
+            str(layout): "$OCI_LAYOUT",
+            str(metadata): "$TRIAL/metadata.json",
+            str(cache): "$TRIAL/cache",
+        }
+        redact_log(stdout_log, redactions)
+        redact_log(stderr_log, redactions)
         rows.append(
             {
                 "iteration": iteration,
                 "source": source,
                 "platform": args.platform,
-                "command": command,
+                "command": [redactions.get(part, part) for part in command],
                 "elapsed_ms": elapsed_ms,
                 "profile": profile,
                 "logs": {
@@ -1280,7 +1423,7 @@ def prepare_layout_fixture(args: argparse.Namespace) -> None:
         "resolved_source": source,
         "source_layout_index": file_descriptor(layout / "index.json", layout),
         "platform": args.platform,
-        "spore_bin": str(spore),
+        "spore_bin": spore.name,
         "spore_sha256": sha256(spore.read_bytes()),
         "fixture_image_digest": closure.image_digest,
         "fixture_rootfs_index_digest": closure.rootfs_index_digest,
@@ -1312,6 +1455,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_parser.add_argument("--output", type=Path, required=True)
     run_parser.add_argument("--iterations", type=int, default=5)
     run_parser.add_argument("--batch-size", type=int, default=1024)
+    run_parser.add_argument("--concurrency", type=int, default=16)
     run_parser.add_argument("--archive-compression", choices=("none", "gzip"), default="gzip")
     run_parser.add_argument("--s3-uri", help="upload and read the immutable backend from this S3 prefix")
     run_parser.add_argument("--s3-region", help="AWS region for --s3-uri")
@@ -1328,7 +1472,12 @@ def main(argv: list[str]) -> int:
                 prepare_layout_fixture(args)
         else:
             run_benchmark(args)
-    except (BenchmarkError, OSError, subprocess.SubprocessError) as error:
+    except (
+        BenchmarkError,
+        OSError,
+        http.client.HTTPException,
+        subprocess.SubprocessError,
+    ) as error:
         print(f"image-gateway-transport: {error}", file=sys.stderr)
         return 1
     return 0

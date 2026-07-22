@@ -7,37 +7,57 @@ case "${platform}" in
   *) echo "usage: scripts/ci/image-gateway-buildkite-workload-benchmark.sh linux/arm64|linux/amd64" >&2; exit 2 ;;
 esac
 
-[[ -n "${BUILDKITE_BUILD_NUMBER:-}" && -n "${BUILDKITE_COMMIT:-}" ]] || {
-  echo "buildkite-sporevm gateway benchmark must run in Buildkite" >&2
-  exit 2
-}
 command -v docker >/dev/null
-command -v buildkite-agent >/dev/null
 
 arch="${platform#linux/}"
 output="zig-cache/image-gateway-transport/${arch}/buildkite-sporevm"
-scratch="${TMPDIR:-/tmp}/image-gateway-buildkite-${BUILDKITE_JOB_ID}"
+run_id="${BUILDKITE_JOB_ID:-manual-$$}"
+sporevm_commit="${BUILDKITE_COMMIT:-$(git rev-parse HEAD)}"
+scratch="${TMPDIR:-/tmp}/image-gateway-buildkite-${run_id}"
 source_dir="${scratch}/buildkite"
 context="${scratch}/context"
 base_layout="${scratch}/base-layout"
 outer_layout="${scratch}/outer-layout"
-backend="s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${BUILDKITE_COMMIT}/image-gateway/${arch}/buildkite-sporevm"
+backend="${SPOREVM_IMAGE_GATEWAY_BACKEND:-}"
+if [[ -z "${backend}" ]]; then
+  [[ -n "${BUILDKITE_BUILD_NUMBER:-}" ]] || {
+    echo "SPOREVM_IMAGE_GATEWAY_BACKEND is required outside Buildkite" >&2
+    exit 2
+  }
+  backend="s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${sporevm_commit}/image-gateway/${arch}/buildkite-sporevm"
+fi
 buildkite_commit="e446c1b8a74d317a7abd08c42140152a5d9e8462"
 dynamodb_sha256="55b425a9a42cfc728436eaf0e4ae64d688b64d177c99c4f4c4d7e3dbb3ac6c09"
+buildkite_sporevm_commit="ad8967125968098b917090e49b6410dd5a6b19c5"
 
-mkdir -p "${output}" "${scratch}" "${context}/image/deps" "${context}/dynamodb-local"
-github_token="$(buildkite-agent secret get SPOREVM_GITHUB_TOKEN | tr -d '\r')"
-[[ -n "${github_token}" ]] || { echo "SPOREVM_GITHUB_TOKEN is required" >&2; exit 1; }
-export GITHUB_TOKEN="${github_token}"
-export GIT_TERMINAL_PROMPT=0
-gh repo clone buildkite/buildkite "${source_dir}" -- --filter=blob:none
-git -C "${source_dir}" checkout --detach "${buildkite_commit}"
-[[ "$(git -C "${source_dir}" rev-parse HEAD)" == "${buildkite_commit}" ]]
+rm -rf -- "${output}" "${scratch}"
+mkdir -p "${output}" "${scratch}" "${source_dir}" "${context}/image/deps" "${context}/dynamodb-local"
+trap 'rm -rf -- "${scratch}"' EXIT
+if [[ -n "${SPOREVM_BUILDKITE_SOURCE_DIR:-}" ]]; then
+  git -C "${SPOREVM_BUILDKITE_SOURCE_DIR}" cat-file -e "${buildkite_commit}^{commit}"
+  rmdir "${source_dir}"
+  git clone --local --no-hardlinks --no-checkout "${SPOREVM_BUILDKITE_SOURCE_DIR}" "${source_dir}"
+  git -C "${source_dir}" checkout --detach "${buildkite_commit}"
+  git -C "${source_dir}" submodule update --init --recursive
+  source_actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
+else
+  command -v buildkite-agent >/dev/null
+  github_token="$(buildkite-agent secret get SPOREVM_GITHUB_TOKEN | tr -d '\r')"
+  [[ -n "${github_token}" ]] || { echo "SPOREVM_GITHUB_TOKEN is required" >&2; exit 1; }
+  export GITHUB_TOKEN="${github_token}"
+  export GIT_TERMINAL_PROMPT=0
+  gh repo clone buildkite/buildkite "${source_dir}" -- --filter=blob:none
+  git -C "${source_dir}" checkout --detach "${buildkite_commit}"
+  source_actual_commit="$(git -C "${source_dir}" rev-parse HEAD)"
+  unset GITHUB_TOKEN github_token
+fi
+[[ "${source_actual_commit}" == "${buildkite_commit}" ]]
+printf '%s\n' "${buildkite_commit}" >"${source_dir}/REVISION"
 jq -n \
   --arg platform "${platform}" \
-  --arg sporevm_commit "${BUILDKITE_COMMIT}" \
+  --arg sporevm_commit "${sporevm_commit}" \
   --arg buildkite_commit "${buildkite_commit}" \
-  --arg buildkite_sporevm_commit "ad89671" \
+  --arg buildkite_sporevm_commit "${buildkite_sporevm_commit}" \
   --arg dynamodb_sha256 "${dynamodb_sha256}" \
   '{
     schema: "spore-image-gateway-buildkite-workload-v1",
@@ -61,7 +81,10 @@ docker buildx build \
   "${source_dir}"
 mkdir -p "${base_layout}"
 tar -xf "${scratch}/base-layout.tar" -C "${base_layout}"
-docker build --platform "${platform}" -f "${source_dir}/.buildkite/Dockerfile.postgres" -t buildkite-postgres:benchmark "${source_dir}"
+docker buildx build --load --platform "${platform}" \
+  -f "${source_dir}/.buildkite/Dockerfile.postgres" \
+  -t buildkite-postgres:latest \
+  "${source_dir}"
 
 dependency_refs=(
   "valkey/valkey@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec"
@@ -72,11 +95,20 @@ dependency_refs=(
 for ref in "${dependency_refs[@]}"; do
   docker pull --platform "${platform}" "${ref}"
 done
-docker save -o "${context}/image/deps/01-valkey.tar" "${dependency_refs[0]}"
-docker save -o "${context}/image/deps/02-memcached.tar" "${dependency_refs[1]}"
-docker save -o "${context}/image/deps/03-buildkite-postgres.tar" buildkite-postgres:benchmark
-docker save -o "${context}/image/deps/04-minio.tar" "${dependency_refs[2]}"
-docker save -o "${context}/image/deps/06-local-kms.tar" "${dependency_refs[3]}"
+dependency_tags=(
+  "valkey/valkey:8.1-alpine"
+  "memcached:1.6-alpine"
+  "minio/minio:RELEASE.2025-04-22T22-12-26Z"
+  "nsmithuk/local-kms:3.11.7"
+)
+for index in "${!dependency_refs[@]}"; do
+  docker tag "${dependency_refs[${index}]}" "${dependency_tags[${index}]}"
+done
+docker save -o "${context}/image/deps/01-valkey.tar" "${dependency_tags[0]}"
+docker save -o "${context}/image/deps/02-memcached.tar" "${dependency_tags[1]}"
+docker save -o "${context}/image/deps/03-buildkite-postgres.tar" buildkite-postgres:latest
+docker save -o "${context}/image/deps/04-minio.tar" "${dependency_tags[2]}"
+docker save -o "${context}/image/deps/06-local-kms.tar" "${dependency_tags[3]}"
 
 curl -fsSL --retry 3 \
   "https://s3.us-west-2.amazonaws.com/dynamodb-local/dynamodb_local_latest.tar.gz" \

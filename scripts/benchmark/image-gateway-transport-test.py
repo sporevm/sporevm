@@ -22,7 +22,7 @@ sys.modules[SPEC.name] = transport
 SPEC.loader.exec_module(transport)
 
 
-def write_fixture(root: Path, contents: list[bytes]) -> None:
+def write_fixture(root: Path, contents: list[bytes], arch: str = "arm64") -> None:
     manifest_digest = "sha256:" + "1" * 64
     base = root / "v1" / "repositories" / "benchmark"
     manifest_base = base / "manifests" / manifest_digest
@@ -46,7 +46,7 @@ def write_fixture(root: Path, contents: list[bytes]) -> None:
             "kind": "spore-image-gateway-manifest-v1",
             "image": {
                 "digest": "blake3:" + "2" * 64,
-                "platform": {"os": "linux", "arch": "arm64"},
+                "platform": {"os": "linux", "arch": arch},
                 "rootfs_storage": {"logical_size": rootfs_index["logical_size"]},
             },
             "rootfs_index": {
@@ -55,7 +55,7 @@ def write_fixture(root: Path, contents: list[bytes]) -> None:
                 "object_bytes": rootfs_index["logical_size"],
             },
         },
-        manifest_base / "config": {"os": "linux", "architecture": "arm64"},
+        manifest_base / "config": {"os": "linux", "architecture": arch},
         manifest_base / "rootfs-index": rootfs_index,
         base / "sources" / ("sha256:" + "4" * 64) / "index": {
             "kind": "spore-image-gateway-index-v1",
@@ -118,6 +118,10 @@ def main() -> None:
             raise RuntimeError("batch did not save bytes for an overlapping cache")
         if cases[("objects", "cold")]["median_data_request_count"] != 3:
             raise RuntimeError("objects mode request accounting is wrong")
+        if cases[("batch", "cold")]["median_request_bytes"] <= 0:
+            raise RuntimeError("batch request body bytes were not counted")
+        if cases[("objects", "cold")]["median_request_bytes"] != 0:
+            raise RuntimeError("objects mode recorded a request body")
         rows = [json.loads(line) for line in (root / "output" / "results.jsonl").read_text().splitlines()]
         if any(row.get("kind") != "transport-trial" for row in rows):
             raise RuntimeError("trial omitted its evidence kind")
@@ -155,6 +159,11 @@ def main() -> None:
             raise RuntimeError("repeated layer profile lines were not aggregated")
         if transport.METADATA_RE.search("metadata: /tmp/rootfs.json\n") is None:
             raise RuntimeError("OCI layout import metadata output was not recognized")
+
+        amd64_fixture = root / "amd64-fixture"
+        write_fixture(amd64_fixture, [b"a" * 64, b"b" * 17], arch="amd64")
+        if transport.Closure.load(amd64_fixture).platform != "linux/amd64":
+            raise RuntimeError("benchmark fixture rejected linux/amd64")
 
         transport.run_benchmark(
             argparse.Namespace(
