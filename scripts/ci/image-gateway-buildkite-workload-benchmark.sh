@@ -28,37 +28,20 @@ buildkite_sporevm_commit="ad8967125968098b917090e49b6410dd5a6b19c5"
 
 rm -rf -- "${output}" "${scratch}"
 mkdir -p "${output}" "${scratch}" "${source_dir}" "${context}/image/deps" "${context}/dynamodb-local"
-postgres_temp_tag="buildkite-postgres:gateway-benchmark-${arch}-${run_id}"
-active_tag=""
-active_previous_image=""
-restore_active_tag() {
-  [[ -n "${active_tag}" ]] || return
-  if [[ -n "${active_previous_image}" ]]; then
-    docker tag "${active_previous_image}" "${active_tag}"
-  else
-    docker image rm "${active_tag}" >/dev/null
-  fi
-  active_tag=""
-  active_previous_image=""
-}
 cleanup() {
-  restore_active_tag || true
   rm -rf -- "${scratch}"
-  docker image rm "${postgres_temp_tag}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
-save_as() {
+export_dependency() {
   local source_ref="$1"
   local expected_tag="$2"
   local output_path="$3"
-  active_tag="${expected_tag}"
-  active_previous_image="$(docker image inspect --format '{{.Id}}' "${expected_tag}" 2>/dev/null || true)"
-  docker tag "${source_ref}" "${expected_tag}"
-  local save_status=0
-  docker save -o "${output_path}" "${expected_tag}" || save_status=$?
-  restore_active_tag
-  return "${save_status}"
+  printf 'FROM %s\n' "${source_ref}" | docker buildx build \
+    --platform "${platform}" \
+    --tag "${expected_tag}" \
+    --output "type=docker,dest=${output_path}" \
+    -
 }
 if [[ -n "${SPOREVM_BUILDKITE_SOURCE_DIR:-}" ]]; then
   git -C "${SPOREVM_BUILDKITE_SOURCE_DIR}" cat-file -e "${buildkite_commit}^{commit}"
@@ -108,9 +91,10 @@ docker buildx build \
   "${source_dir}"
 mkdir -p "${base_layout}"
 tar -xf "${scratch}/base-layout.tar" -C "${base_layout}"
-docker buildx build --load --platform "${platform}" \
+docker buildx build --platform "${platform}" \
   -f "${source_dir}/.buildkite/Dockerfile.postgres" \
-  -t "${postgres_temp_tag}" \
+  --tag buildkite-postgres:latest \
+  --output "type=docker,dest=${context}/image/deps/03-buildkite-postgres.tar" \
   "${source_dir}"
 
 dependency_refs=(
@@ -119,14 +103,10 @@ dependency_refs=(
   "minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e"
   "nsmithuk/local-kms@sha256:360d7377b6f3687c89a622236791e4fa3f7316366267b437829edbdfa8a5fc60"
 )
-for ref in "${dependency_refs[@]}"; do
-  docker pull --platform "${platform}" "${ref}"
-done
-save_as "${dependency_refs[0]}" "valkey/valkey:8.1-alpine" "${context}/image/deps/01-valkey.tar"
-save_as "${dependency_refs[1]}" "memcached:1.6-alpine" "${context}/image/deps/02-memcached.tar"
-save_as "${postgres_temp_tag}" buildkite-postgres:latest "${context}/image/deps/03-buildkite-postgres.tar"
-save_as "${dependency_refs[2]}" "minio/minio:RELEASE.2025-04-22T22-12-26Z" "${context}/image/deps/04-minio.tar"
-save_as "${dependency_refs[3]}" "nsmithuk/local-kms:3.11.7" "${context}/image/deps/06-local-kms.tar"
+export_dependency "${dependency_refs[0]}" "valkey/valkey:8.1-alpine" "${context}/image/deps/01-valkey.tar"
+export_dependency "${dependency_refs[1]}" "memcached:1.6-alpine" "${context}/image/deps/02-memcached.tar"
+export_dependency "${dependency_refs[2]}" "minio/minio:RELEASE.2025-04-22T22-12-26Z" "${context}/image/deps/04-minio.tar"
+export_dependency "${dependency_refs[3]}" "nsmithuk/local-kms:3.11.7" "${context}/image/deps/06-local-kms.tar"
 
 curl -fsSL --retry 3 \
   "https://s3.us-west-2.amazonaws.com/dynamodb-local/dynamodb_local_latest.tar.gz" \
