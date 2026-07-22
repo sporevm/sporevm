@@ -166,6 +166,7 @@ pub fn verifyListedAttachment(
     descriptor: AttachmentListDescriptor,
     record_bytes: []const u8,
 ) gateway.Error!std.json.Parsed(AttachmentRecord) {
+    if (record_bytes.len == 0 or record_bytes.len > max_attachment_record_bytes) return error.BadProtocol;
     try gateway.validateDigest(expected_subject_manifest_digest, "sha256:");
     try validateArtifactType(descriptor.artifact_type);
     try gateway.validateDigest(descriptor.attachment_digest, "sha256:");
@@ -370,6 +371,16 @@ test "attachment parsers reject malformed and oversized inputs" {
     defer allocator.free(oversized);
     @memset(oversized, 'x');
     try std.testing.expectError(error.BadProtocol, parseAttachmentRecord(allocator, oversized));
+    const descriptor: AttachmentListDescriptor = .{
+        .artifact_type = artifact_type_sbom,
+        .attachment_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    try std.testing.expectError(error.BadProtocol, verifyListedAttachment(
+        allocator,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        descriptor,
+        oversized,
+    ));
 }
 
 test "attachment wire validation covers canonicality and field bounds" {
