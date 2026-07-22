@@ -147,49 +147,6 @@ steps:
         concurrency_group: "sporevm-benchmarks/macos"
         agents: *mac_agents
 
-      - label: ":satellite: Image gateway transport (Linux ARM64)"
-        key: "image-gateway-transport-linux-arm64"
-        if: build.env("SPOREVM_RUN_IMAGE_GATEWAY_TRANSPORT_BENCHMARK") == "1"
-        command: "scripts/ci/run.sh scripts/ci/image-gateway-transport-benchmark.sh linux/arm64"
-        artifact_paths:
-          - "zig-cache/image-gateway-transport/arm64/**/*.json"
-          - "zig-cache/image-gateway-transport/arm64/**/*.jsonl"
-          - "zig-cache/image-gateway-transport/arm64/**/*.log"
-        timeout_in_minutes: 45
-        plugins:
-          - aws-assume-role-with-web-identity#v1.4.0:
-              role-arn: "arn:aws:iam::907480720934:role/sporevm-benchmarks-writer"
-              session-tags:
-                - organization_slug
-                - pipeline_slug
-                - runner_environment
-          - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-              version: "2026.5.12"
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":satellite: Image gateway transport (Linux AMD64)"
-        key: "image-gateway-transport-linux-amd64"
-        if: build.env("SPOREVM_RUN_IMAGE_GATEWAY_TRANSPORT_BENCHMARK") == "1"
-        command: "scripts/ci/run.sh scripts/ci/image-gateway-transport-benchmark.sh linux/amd64"
-        artifact_paths:
-          - "zig-cache/image-gateway-transport/amd64/**/*.json"
-          - "zig-cache/image-gateway-transport/amd64/**/*.jsonl"
-          - "zig-cache/image-gateway-transport/amd64/**/*.log"
-        timeout_in_minutes: 45
-        plugins:
-          - aws-assume-role-with-web-identity#v1.4.0:
-              role-arn: "arn:aws:iam::907480720934:role/sporevm-benchmarks-writer"
-              session-tags:
-                - organization_slug
-                - pipeline_slug
-                - runner_environment
-          - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
-              version: "2026.5.12"
-        cache: *mise_cache
-        agents:
-          queue: sporevm-linux-amd64
-
   - group: ":package: Release assets"
     key: "release-assets"
     steps:
