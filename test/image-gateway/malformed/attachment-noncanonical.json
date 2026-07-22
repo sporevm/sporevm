@@ -1,0 +1,1 @@
+{"kind":"spore-image-gateway-attachment-v1","subject_manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifact_type":"conversion-attestation","artifact":{"media_type":"application/vnd.in-toto+json","bytes":4096,"transport_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}

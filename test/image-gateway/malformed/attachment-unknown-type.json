@@ -1,0 +1,10 @@
+{
+  "kind": "spore-image-gateway-attachment-v1",
+  "subject_manifest_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "artifact_type": "unknown",
+  "artifact": {
+    "media_type": "application/json",
+    "bytes": 1,
+    "transport_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}
