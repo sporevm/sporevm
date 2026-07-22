@@ -33,6 +33,67 @@ runner's raw artifact layout. The homepage summary assigns
 projection: public runner labels, default-runner latest metrics/history, and
 per-runner latest metrics/history for the public macOS and Linux ARM64 options.
 
+## Image Gateway Transport
+
+The image-gateway transport harness compares the current one-request-per-object
+proof with a deterministic static archive and bounded missing-object batches.
+It uses an exported gateway fixture, a loopback HTTP server, and a fresh local
+benchmark cache for every trial. This isolates transfer shape from service
+placement, authentication, and object-store latency; its batch framing is
+benchmark-only and is not part of the gateway protocol. Each trial reuses one
+HTTP/1.1 connection, matching the eager client's connection discipline, and
+rotates the first transport by iteration to reduce fixed-order bias.
+
+Build the release binary, record five fresh direct-OCI conversions, and export
+the first conversion as the transport fixture:
+
+```console
+mise run build:release
+scripts/benchmark/image-gateway-transport.py prepare \
+  --source docker.io/library/alpine@sha256:45e09956dc667c5eff3583c9d94830261fb1ca0be10a0a7db36266edf5de9e1d \
+  --platform linux/arm64 \
+  --output zig-cache/gateway-benchmark/alpine-arm64
+```
+
+Repeat `prepare` with a related image for an honest overlapping-cache control,
+then compare all three transports:
+
+```console
+scripts/benchmark/image-gateway-transport.py run \
+  --fixture zig-cache/gateway-benchmark/alpine-arm64/fixture \
+  --overlap-fixture zig-cache/gateway-benchmark/alpine-overlap-arm64/fixture \
+  --iterations 5 \
+  --output zig-cache/gateway-benchmark/alpine-arm64-transport
+```
+
+Without `--overlap-fixture`, the partial case preloads a deterministic half of
+the target closure. That is useful for harness checks but cannot support the G0
+transport decision because it does not measure real cross-image reuse. Run the
+same commands for `linux/amd64`, and replace Alpine with the exact digest-pinned
+base from the current `buildkite-sporevm` Dockerfile for the real-workload
+evidence.
+
+`direct-oci.json` records exact commands, binary and log digests, host and Git
+provenance, selected manifest and rootfs identities, wall time, and rootfs
+profile phases. `results.jsonl` records each cold and partial transport trial;
+`summary.json` reports phase, request, backend-read, response-byte, reuse, and
+batch-composition medians. The cache-write phase is benchmark staging, not the
+product CAS publication transaction. Every mode streams into per-trial disk
+staging, verifies from that staging, and removes it after recording the row, so
+the large workload does not accumulate complete closures in memory or across
+trials. Cold runs precede partial runs within a mode; `trial_order` preserves
+that order in the evidence.
+
+The default archive candidate is a prebuilt gzip-compressed tar, while object
+and batch payloads are raw chunks. `object_bytes` gives the uncompressed
+normalization point, and `archive_build_ms` records the one-time composition
+cost separately from transfer. Archive backend accounting models one read of
+that prebuilt object; batch accounting models one backend read per requested
+chunk and records the recurring composition time. The G0 choice still requires
+colocated trials against the intended object-store backend; loopback results
+validate accounting and expose the request-versus-reuse tradeoff, but do not
+predict production latency.
+
 ## Profiles
 
 ```console
