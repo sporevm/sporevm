@@ -12,4 +12,6 @@ python3 scripts/benchmark/named-restore-readiness-test.py
 bash scripts/ci/named-restore-release-inputs-test.sh
 python3 scripts/spore-build-conformance.py --self-test-schema
 python3 scripts/image-gateway-worker-conformance.py self-test
+python3 scripts/image-gateway-authorization-conformance.py --self-test
+python3 scripts/image-gateway-authorization-conformance.py test/image-gateway/object-authorization.json
 python3 scripts/benchmark/image-gateway-transport-test.py

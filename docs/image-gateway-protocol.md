@@ -285,3 +285,27 @@ existence `HEAD`, cross-repository mount, repository-wide missing-object query,
 or client-maintained attachment tag. Future reads remain bound to an authorized
 repository and immutable image-manifest closure. Physical CAS deduplication is
 an implementation detail and cannot become a caller-visible existence oracle.
+
+The single-object authorization contract is fixed by
+[`test/image-gateway/object-authorization.json`](../test/image-gateway/object-authorization.json).
+Missing authentication returns `401`. Once a principal is authenticated, a
+missing repository, denied repository, missing manifest, or object that is not
+reachable from that manifest all return the same empty `404` response. `HEAD`
+and repository-independent object routes also return `404`; they are not
+existence probes. A successful `GET` returns the exact index-derived object
+length and digest.
+
+The fixture grants two principals separate repositories whose canonical
+manifests reference the same two logical objects. Each principal can read the
+shared physical object only through its own repository and immutable manifest;
+using the other repository is indistinguishable from requesting missing state.
+The fixture is checked against the canonical manifest and rootfs-index vectors,
+so its logical closures cannot drift independently:
+
+```bash
+mise run test:image-gateway-authorization-conformance
+```
+
+This is a service-neutral conformance contract, not a SporeVM authorization
+implementation. Authentication, audit classification, and storage lookup stay
+owned by the separate gateway service in G1.
