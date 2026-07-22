@@ -13,6 +13,7 @@ const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
 const hvf = @import("hvf/hvf.zig");
+const image = @import("image.zig");
 const kvm_native = @import("kvm/native.zig");
 const kvm = kvm_native.binding;
 const x86_board = @import("x86_64/board.zig");
@@ -990,6 +991,34 @@ pub const EventWriter = struct {
 };
 
 pub fn classifyFailure(err: anyerror) ClassifiedFailure {
+    if (err == error.ImageCommandMissing) {
+        return machine_output.CliError.init(
+            .usage_missing_argument,
+            "spore run: image has no Entrypoint or Cmd; pass a command",
+            @errorName(err),
+        );
+    }
+    if (err == error.UnsupportedImageUser) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: image Config.User must select root (root, 0, root:root, or 0:0); guest credential switching is not supported yet",
+            @errorName(err),
+        );
+    }
+    if (err == error.RunArgCountUnsupported) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: effective command must contain between 1 and 16 arguments",
+            @errorName(err),
+        );
+    }
+    if (err == error.RunArgTooLong) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: effective command contains an argument longer than 8191 bytes",
+            @errorName(err),
+        );
+    }
     if (err == error.X86ExplicitMemoryRequired or err == error.X86ExperimentalMemorySizeUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
@@ -1021,7 +1050,7 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     if (err == error.InvalidRunCommitOptions or err == error.RunCommitImageConfigUnavailable or err == error.RunCommitRootfsNotSnapshotable) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: --commit requires a fresh non-interactive --image run with a command and cannot be combined with save options",
+            "spore run: --commit requires a fresh non-interactive --image run with an effective command and cannot be combined with save options",
             @errorName(err),
         );
     }
@@ -1165,6 +1194,7 @@ pub const CliOptions = struct {
     generation_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    image_entrypoint: ?[]const u8 = null,
     pull_policy: PullPolicy = .missing,
     commit_ref: ?[]const u8 = null,
     disk_size: ?u64 = null,
@@ -1196,6 +1226,7 @@ pub const NetworkOptions = struct {
 
 pub const cli_usage =
     \\Usage:
+    \\  spore run --image REF [options]
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] 'shell command'
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
     \\  spore run --from DIR [options] 'shell command'
@@ -1209,7 +1240,8 @@ pub const cli_usage =
     \\                          Uses spore memory/device sizing; omit --memory
     \\  --generation FILE       With --from, inject fan-out identity JSON before command
     \\  --rootfs rootfs.ext4    Attach local rootfs read-only; save unsupported
-    \\  --image REF             Build or reuse cached OCI rootfs; save preserves rootfs writes
+    \\  --image REF             Build or reuse cached OCI rootfs; default to Entrypoint + Cmd
+    \\  --entrypoint PATH       Override the OCI Entrypoint for --image
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
     \\  --commit LOCAL_REF      On command success, publish the writable root disk as an image
@@ -1261,6 +1293,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var generation_path: ?[]const u8 = null;
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
+    var image_entrypoint: ?[]const u8 = null;
     var pull_policy: PullPolicy = .missing;
     var commit_ref: ?[]const u8 = null;
     var disk_size: ?u64 = null;
@@ -1299,6 +1332,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--entrypoint")) {
+            image_entrypoint = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--commit")) {
             commit_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--disk-size")) {
@@ -1420,7 +1455,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     }
 
     const argv = command orelse &.{};
-    if (argv.len == 0 and (from_spore_dir == null or command_had_delimiter)) {
+    if (argv.len == 0 and (command_had_delimiter or (from_spore_dir == null and image_ref == null))) {
         std.debug.print("{s}", .{cli_usage});
         std.process.exit(2);
     }
@@ -1430,6 +1465,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     }
     if (image_ref == null and pull_policy != .missing) {
         std.debug.print("spore run: --pull requires --image\n", .{});
+        std.process.exit(2);
+    }
+    if (image_entrypoint != null and image_ref == null) {
+        std.debug.print("spore run: --entrypoint requires --image\n", .{});
         std.process.exit(2);
     }
     if (disk_size != null and commit_ref == null) {
@@ -1455,10 +1494,6 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         }
         if (interactive or tty) {
             std.debug.print("spore run: --commit cannot be combined with -i or -t\n", .{});
-            std.process.exit(2);
-        }
-        if (argv.len == 0) {
-            std.debug.print("spore run: --commit requires a command\n", .{});
             std.process.exit(2);
         }
     }
@@ -1532,6 +1567,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .generation_path = generation_path,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
+        .image_entrypoint = image_entrypoint,
         .pull_policy = pull_policy,
         .commit_ref = commit_ref,
         .disk_size = disk_size,
@@ -1788,6 +1824,49 @@ pub const ResolvedRootfsInput = struct {
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
 };
+
+/// Resolve OCI process metadata for a fresh image-backed invocation. The
+/// returned argv borrows strings from the image config and caller command;
+/// only the slice itself is allocated. OCI User is deliberately root-only
+/// until the guest can switch credentials.
+pub fn resolveImageRuntimeCommand(
+    allocator: std.mem.Allocator,
+    image_config: ?rootfs_mod.ImageConfig,
+    caller_command: []const []const u8,
+) ![]const []const u8 {
+    return resolveImageRuntimeCommandWithEntrypoint(allocator, image_config, caller_command, null);
+}
+
+/// Resolve OCI process metadata while replacing the image Entrypoint when an
+/// override is provided. An empty override explicitly clears the Entrypoint.
+pub fn resolveImageRuntimeCommandWithEntrypoint(
+    allocator: std.mem.Allocator,
+    image_config: ?rootfs_mod.ImageConfig,
+    caller_command: []const []const u8,
+    entrypoint_override: ?[]const []const u8,
+) ![]const []const u8 {
+    const runtime = if (image_config) |config| config.config else null;
+    const entrypoint = entrypoint_override orelse if (runtime) |config| config.Entrypoint orelse &.{} else &.{};
+    const command = if (caller_command.len != 0)
+        caller_command
+    else if (runtime) |config|
+        config.Cmd orelse &.{}
+    else
+        &.{};
+
+    if (runtime) |config| {
+        if (!image.isRootUser(config.User)) return error.UnsupportedImageUser;
+    }
+    if (entrypoint.len == 0 and command.len == 0) return error.ImageCommandMissing;
+    if (entrypoint.len > max_guest_argc or command.len > max_guest_argc - entrypoint.len) return error.RunArgCountUnsupported;
+    const len = entrypoint.len + command.len;
+    const argv = try allocator.alloc([]const u8, len);
+    errdefer allocator.free(argv);
+    @memcpy(argv[0..entrypoint.len], entrypoint);
+    @memcpy(argv[entrypoint.len..], command);
+    try validateGuestArgv(argv);
+    return argv;
+}
 
 pub const RootfsInputResolution = union(enum) {
     resolved: ResolvedRootfsInput,
@@ -4705,6 +4784,65 @@ test "image rootfs metadata supplies run env and working directory" {
     }));
 }
 
+test "image runtime command composes entrypoint defaults and caller override" {
+    const allocator = std.testing.allocator;
+    var entrypoint = [_][]const u8{ "/entry", "fixed" };
+    var cmd = [_][]const u8{ "default", "arg" };
+    const config = rootfs_mod.ImageConfig{ .config = .{ .Entrypoint = &entrypoint, .Cmd = &cmd } };
+
+    const defaults = try resolveImageRuntimeCommand(allocator, config, &.{});
+    defer allocator.free(defaults);
+    try std.testing.expectEqualSlices([]const u8, &.{ "/entry", "fixed", "default", "arg" }, defaults);
+
+    const override = try resolveImageRuntimeCommand(allocator, config, &.{ "/bin/sh", "-lc", "echo hi" });
+    defer allocator.free(override);
+    try std.testing.expectEqualSlices([]const u8, &.{ "/entry", "fixed", "/bin/sh", "-lc", "echo hi" }, override);
+}
+
+test "image runtime command permits an explicit entrypoint override" {
+    const allocator = std.testing.allocator;
+    var entrypoint = [_][]const u8{"/image-entry"};
+    var cmd = [_][]const u8{"default"};
+    var entrypoint_override = [_][]const u8{"/scanner"};
+    const config = rootfs_mod.ImageConfig{ .config = .{ .Entrypoint = &entrypoint, .Cmd = &cmd } };
+
+    const default_command = try resolveImageRuntimeCommandWithEntrypoint(allocator, config, &.{}, &entrypoint_override);
+    defer allocator.free(default_command);
+    try std.testing.expectEqualSlices([]const u8, &.{ "/scanner", "default" }, default_command);
+
+    const resolved = try resolveImageRuntimeCommandWithEntrypoint(allocator, config, &.{"/runtime"}, &entrypoint_override);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualSlices([]const u8, &.{ "/scanner", "/runtime" }, resolved);
+}
+
+test "image runtime command handles absent and empty defaults" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.ImageCommandMissing, resolveImageRuntimeCommand(allocator, null, &.{}));
+    try std.testing.expectError(error.ImageCommandMissing, resolveImageRuntimeCommand(allocator, .{ .config = .{} }, &.{}));
+    var empty = [_][]const u8{};
+    try std.testing.expectError(error.ImageCommandMissing, resolveImageRuntimeCommand(allocator, .{ .config = .{ .Entrypoint = &empty, .Cmd = &empty } }, &.{}));
+
+    var cmd = [_][]const u8{"/default"};
+    const command = try resolveImageRuntimeCommand(allocator, .{ .config = .{ .Entrypoint = &empty, .Cmd = &cmd } }, &.{});
+    defer allocator.free(command);
+    try std.testing.expectEqualStrings("/default", command[0]);
+}
+
+test "image runtime command rejects a non-root image user" {
+    try std.testing.expectError(
+        error.UnsupportedImageUser,
+        resolveImageRuntimeCommand(std.testing.allocator, .{ .config = .{ .User = "1000:1000" } }, &.{"/bin/true"}),
+    );
+}
+
+test "image runtime command enforces guest argv bounds" {
+    const allocator = std.testing.allocator;
+    var too_many: [max_guest_argc + 1][]const u8 = @splat("x");
+    try std.testing.expectError(error.RunArgCountUnsupported, resolveImageRuntimeCommand(allocator, null, &too_many));
+    var too_long: [max_guest_arg_len + 1]u8 = @splat('x');
+    try std.testing.expectError(error.RunArgTooLong, resolveImageRuntimeCommand(allocator, null, &.{&too_long}));
+}
+
 test "generation request encodes params json as a string" {
     const request = try generationRequest(std.testing.allocator, "{\"parallel_index\":2,\"parallel_count\":5}");
     defer std.testing.allocator.free(request);
@@ -5279,6 +5417,17 @@ test "run cli parser accepts image ref" {
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
     try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cli parser accepts image entrypoint override" {
+    const opts = try parseCliArgs(&.{ "--image", "local/example:dev", "--entrypoint", "/scanner", "--", "/runtime" });
+    try std.testing.expectEqualStrings("/scanner", opts.image_entrypoint.?);
+    try std.testing.expectEqualSlices([]const u8, &.{"/runtime"}, opts.command);
+}
+
+test "run cli parser permits omitted command only for images" {
+    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20" });
+    try std.testing.expectEqual(@as(usize, 0), opts.command.len);
 }
 
 test "run cli parser accepts image commit" {

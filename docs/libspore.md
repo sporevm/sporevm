@@ -197,6 +197,13 @@ const result = try libspore.runManaged(init, allocator, .{
 });
 ```
 
+For image-backed calls, an empty `.command` uses OCI Entrypoint plus Cmd. A
+non-empty command replaces Cmd and follows Entrypoint. Set `.image_entrypoint`
+to replace the image Entrypoint while retaining those Cmd rules. Image `User`
+must select root until guest credential switching is supported. Non-image
+managed runs still require a command, and saved-spore execution never applies
+OCI command defaults.
+
 Injected files are fresh-run only and appear under `/run/sporevm/injected`.
 Spore rejects them with saved runs and `runFromSpore` so caller-provided bytes
 do not accidentally become persisted spore state.
@@ -310,6 +317,16 @@ const forked = try libspore.forkNamed(init, allocator, .{
 });
 defer libspore.deinitNamedForkResult(allocator, forked);
 ```
+
+Image-backed `createNamed` starts the image's `Entrypoint` plus `Cmd` as its
+initial process. Zig callers can set `.initial_command`, C callers can set
+`initial_argv`, and Go callers can set `InitialArgv` to replace `Cmd` while
+keeping `Entrypoint`. Non-image creates with no initial command remain idle.
+The same root-only `User` restriction as `runManaged` applies. If the initial
+process cannot be started, create removes the new named VM before returning an
+error; a rollback failure is reported explicitly so the caller can remove it
+by name. Once started, the process remains detached and its eventual exit does
+not affect the create result.
 
 `forkNamed` supports diskless sources and the single writable rootfs disk used
 by image-created, explicit-rootfs, restored, and previously forked named VMs.
@@ -609,8 +626,9 @@ surface exposes context management, build info, context-local environment
 overrides, context-local last errors, owned string cleanup, host-info JSON,
 inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
 named copy side-effect calls. ABI version 15 added saved-spore removal through
-`spore_remove_saved_json`; ABI version 16 adds the architecture-discriminated
-`spore_host_info_json_v3` entry point. Clients should compare the runtime
+`spore_remove_saved_json`; ABI version 16 added the architecture-discriminated
+`spore_host_info_json_v3` entry point; ABI version 17 adds
+`SporeCreateNamedOptions.initial_argv`. Clients should compare the runtime
 build-info ABI with `SPORE_ABI_VERSION` before calling a newly added symbol.
 
 Release builds publish separate `libspore_Linux` and `libspore_Darwin`
@@ -731,6 +749,11 @@ SporeCreateNamedOptions create;
 spore_create_named_options_init(&create);
 create.name = (SporeString){ .ptr = "worker-1", .len = 8 };
 create.spore_executable = (SporeString){ .ptr = "/usr/local/bin/spore", .len = 20 };
+SporeString initial_argv[] = {
+    { .ptr = "/bin/worker", .len = 11 },
+};
+create.initial_argv = initial_argv;
+create.initial_argc = 1;
 
 uint16_t github_ports[] = {443};
 SporeString allow_cidrs[] = {
@@ -866,6 +889,7 @@ if err != nil {
 
 created, err := client.CreateNamed(ctx, spore.CreateNamedOptions{
     Name: "worker",
+    InitialArgv: []string{"/bin/worker"},
     NetworkEnabled: true,
     AllowCIDRs: []string{"93.184.216.34/32"},
     AllowHosts: []string{"example.com"},
@@ -975,11 +999,12 @@ capabilities, inspect-bundle, inspect-spore, pull, context-local environment
 variables through `SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`,
 `OpenExecNamedStream`, `CopyInNamed`, `CopyOutNamed`, `SaveNamed`,
 `RestoreNamed`, `RemoveNamed`, `RemoveSaved`, and `ListNamed`.
-`CreateNamedOptions` exposes the create-time network policy supported by the C
-ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact host/port
-`NetworkRules`, and `BoundServices` for host Unix sockets exposed to the guest.
-Passing CIDRs, hosts, exact rules, or bound services while `NetworkEnabled` is
-false is rejected by libspore instead of being silently ignored.
+`CreateNamedOptions` exposes `InitialArgv` plus the create-time network policy
+supported by the C ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact
+host/port `NetworkRules`, and `BoundServices` for host Unix sockets exposed to
+the guest. Passing CIDRs, hosts, exact rules, or bound services while
+`NetworkEnabled` is false is rejected by libspore instead of being silently
+ignored.
 
 `NetworkCapabilities` is the typed wrapper around
 `spore_network_capabilities_json`. Call it before accepting a higher-level
@@ -996,7 +1021,7 @@ is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
 return JSON, and exposes named copy as error-returning side-effect methods. It
-requires C ABI version 15 or newer. Go context cancellation is checked before
+requires C ABI version 17 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

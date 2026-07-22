@@ -403,10 +403,11 @@ reset or poweroff.
   bytes. Named save and fork persist these defaults so restore, bundle
   transport, and child VMs execute like the source image. The field is
   optional within v2 and v3: producers omit it when no defaults exist, and
-  absence means no saved command defaults. Readers from releases predating
-  this field use strict manifest parsing and reject a manifest that contains
-  it, so only image-context saves cross that reader-version boundary. Per-exec
-  environment and working-directory overrides are intentionally excluded.
+  absence means no saved execution-context defaults. Readers from releases
+  predating this field use strict manifest parsing and reject a manifest that
+  contains it, so only image-context saves cross that reader-version boundary.
+  Per-exec environment and working-directory overrides are intentionally
+  excluded.
 
 Every `spore-disk-index-v1` identity is the BLAKE3 digest of one exact canonical
 JSON encoding. The top-level fields appear in this order: `kind`,

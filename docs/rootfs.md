@@ -44,12 +44,21 @@ attached read-only:
 spore run --image docker.io/library/alpine:3.20 'echo hi'
 ```
 
-Without `--`, the command runs as `/bin/sh -lc` in the guest. Use
-`-- <argv...>` for exact argv. `--image` applies OCI image `Env` and
-`WorkingDir` when present. It does not apply OCI Entrypoint, Cmd, or User.
-`spore create --image` now uses the same context for its detached initial
-command and every later `spore exec`; named exec can override it per request
-with `--env` and `--workdir`.
+Without `--`, a caller command is represented as `/bin/sh -lc <string>`; use
+`-- <argv...>` for exact argv. For `--image`, SporeVM prepends OCI Entrypoint
+and uses OCI Cmd when no caller command is supplied. A caller command replaces
+Cmd but keeps Entrypoint. `--entrypoint PATH` replaces the image Entrypoint;
+the caller command still replaces Cmd, or the image Cmd is used when no command
+is supplied. Empty or absent arrays contribute no arguments, and an image with
+no effective command is rejected before boot. `spore create --image` applies
+the same default rules to its optional initial command; plain create without an
+image remains an idle VM.
+
+Image `Env` and `WorkingDir` are also applied. `User` currently fails closed:
+only empty, `root`, `0`, and those users with an empty, `root`, or `0` group are
+accepted because guest credential switching is not implemented. Later named
+`spore exec` commands use the saved environment and working directory, but do
+not reapply Entrypoint or Cmd.
 
 `spore build` prepares capacity automatically before the first executor-backed
 Dockerfile instruction. A supported journal-less rootfs smaller than 16 GiB
@@ -258,8 +267,7 @@ spore rootfs import-tar /tmp/sporevm-app-rootfs.tar \
 uses the same deterministic ext4, digest-cache, and `rootfs.storage` path as
 `import-oci`. It accepts the BuildKit rootfs tar shape and fails closed on
 unsupported PAX xattrs. It does not record OCI `Env`, `WorkingDir`,
-`Entrypoint`, `Cmd`, or `User`; pass the guest command explicitly when running
-the image.
+`Entrypoint`, `Cmd`, or `User`, so callers must pass a guest command explicitly.
 
 Local refs use the `local/<name>:<tag>` form and are host-local mutable pointers
 only. The imported rootfs metadata records a digest-pinned local resolved

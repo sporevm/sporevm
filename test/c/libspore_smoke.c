@@ -58,6 +58,8 @@ int main(void) {
   if (create_options.network_rule_count != 0) return 1;
   if (create_options.bound_unix_service_count != 0) return 1;
   if (create_options.annotation_count != 0) return 1;
+  if (create_options.initial_argv != 0) return 1;
+  if (create_options.initial_argc != 0) return 1;
 
   SporeExecNamedOptions exec_options;
   spore_exec_named_options_init(&exec_options);

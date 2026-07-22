@@ -15,6 +15,7 @@ const variable_expansion = @import("build/variables.zig");
 const step_cache = @import("build/step_cache.zig");
 const backend_mod = @import("backend.zig");
 const disk_index = @import("disk_index.zig");
+const image = @import("image.zig");
 const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -653,7 +654,7 @@ fn preflightBuildPlan(
                 else => |other| return other,
             };
             if (metadata) continue;
-            if (!rootUser(state.user)) {
+            if (!image.isRootUser(state.user)) {
                 diagnostic.instruction_line = instruction.line;
                 return error.UnsupportedBuildUser;
             }
@@ -871,7 +872,7 @@ fn instructionTransitionResolved(
     instruction_index: usize,
 ) !?instruction_transition.InstructionTransition {
     if (try applyMetadataInstruction(allocator, options, global_args, state, instruction)) return null;
-    if (!rootUser(state.user)) {
+    if (!image.isRootUser(state.user)) {
         diagnostic.instruction_line = instruction.line;
         return error.UnsupportedBuildUser;
     }
@@ -1134,12 +1135,6 @@ fn plannerVariables(allocator: std.mem.Allocator, args: []const ArgValue) ![]con
     var variables = std.array_list.Managed(build_plan.Variable).init(allocator);
     for (args) |arg| if (arg.value) |value| try variables.append(.{ .key = arg.key, .value = value });
     return variables.toOwnedSlice();
-}
-
-fn rootUser(user: ?[]const u8) bool {
-    const value = user orelse return true;
-    if (value.len == 0 or std.mem.eql(u8, value, "root") or std.mem.eql(u8, value, "0")) return true;
-    return std.mem.startsWith(u8, value, "0:");
 }
 
 fn scratchArtifact(

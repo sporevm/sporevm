@@ -41,7 +41,13 @@ expect_rejected raw-rootfs --rootfs missing.ext4 --commit local/run-commit-smoke
 expect_rejected saved-spore --from missing.spore --commit local/run-commit-smoke:bad -- /bin/true
 expect_rejected save --image "${image_ref}" --commit local/run-commit-smoke:bad --save "${workdir}/bad.spore" -- /bin/true
 expect_rejected interactive -i --image "${image_ref}" --commit local/run-commit-smoke:bad -- /bin/true
-expect_rejected missing-command --image "${image_ref}" --commit local/run-commit-smoke:bad
+
+"${spore_bin}" run \
+  --backend "${backend}" \
+  --memory "${smoke_memory}" \
+  --image "${image_ref}" \
+  --commit local/run-commit-smoke:default-command
+"${spore_bin}" rootfs resolve local/run-commit-smoke:default-command >/dev/null
 
 payload="${workdir}/payload.txt"
 printf 'copied-from-transient-injection\n' >"${payload}"
@@ -122,7 +128,7 @@ children_dir="${workdir}/children"
   -- /bin/sh -lc 'test ! -e /failed.txt && grep -Fxq copied-from-transient-injection /committed.txt'
 "${spore_bin}" fork "${warm_spore}" --count 2 --out "${children_dir}"
 
-children=("${children_dir}"/*)
+children=("${children_dir}"/[0-9][0-9][0-9][0-9][0-9][0-9])
 [[ "${#children[@]}" -eq 2 ]] || die "fork did not create two children"
 "${spore_bin}" run \
   --backend "${backend}" \

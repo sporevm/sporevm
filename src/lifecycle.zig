@@ -109,6 +109,7 @@ const darwin_process = if (builtin.os.tag.isDarwin()) struct {
 
 const create_usage =
     \\Usage:
+    \\  spore create NAME --image REF [options]
     \\  spore create NAME [options] ['shell command']
     \\  spore create NAME [options] -- <argv...>
     \\
@@ -117,7 +118,7 @@ const create_usage =
     \\  --kernel Image          Kernel Image path
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
     \\  --rootfs rootfs.ext4    Attach rootfs image read-only as virtio-blk
-    \\  --image REF             Build or reuse cached OCI rootfs
+    \\  --image REF             Build or reuse cached OCI rootfs; default to Entrypoint + Cmd
     \\  --options @file.json    Read create options from a JSON file
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
@@ -531,6 +532,9 @@ pub const CreateNamedOptions = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     image_pull_policy: run_mod.PullPolicy = .missing,
+    /// Optional caller command. Image-backed creates prepend OCI Entrypoint;
+    /// when omitted they use OCI Entrypoint and Cmd. Non-image creates remain idle.
+    initial_command: []const []const u8 = &.{},
     network: NamedNetworkOptions = .{},
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
@@ -909,6 +913,12 @@ fn createNamedWithTiming(
         .command_name = "create",
         .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
     });
+    const initial_command: ?[]const []const u8 = if (options.image_ref != null)
+        try run_mod.resolveImageRuntimeCommand(arena, rootfs.image_config, options.initial_command)
+    else if (options.initial_command.len != 0)
+        options.initial_command
+    else
+        null;
     const rootfs_resolved_ms = monotonicMs();
     spec.rootfs_path = if (rootfs.path) |path| try std.fs.path.resolve(arena, &.{path}) else null;
     spec.rootfs = rootfs.rootfs;
@@ -935,9 +945,13 @@ fn createNamedWithTiming(
         .total_ms = ready_ms - timing.start_ms,
     }) catch {};
 
-    var ready = try readReady(arena, init.io, paths);
+    const context = Context{ .io = init.io, .environ_map = init.environ_map };
+    var ready = readReady(arena, init.io, paths) catch |err| {
+        if (initial_command != null) return rollbackCreatedNamedAfterFailure(context, arena, paths, spec.name, err);
+        return err;
+    };
     defer ready.deinit();
-    return ownedNamedLifecycleResult(allocator, .{
+    const result = ownedNamedLifecycleResult(allocator, .{
         .action = "created",
         .name = spec.name,
         .state = "ready",
@@ -949,7 +963,39 @@ fn createNamedWithTiming(
             .wait_exec_ready_ms = ready_ms - monitor_spawned_ms,
             .total_ms = ready_ms - timing.start_ms,
         },
-    });
+    }) catch |err| {
+        if (initial_command != null) return rollbackCreatedNamedAfterFailure(context, arena, paths, spec.name, err);
+        return err;
+    };
+    errdefer deinitNamedLifecycleResult(allocator, result);
+    if (initial_command) |command| {
+        const initial = startNamed(context, allocator, .{
+            .name = spec.name,
+            .command = command,
+        }) catch |err| {
+            return rollbackCreatedNamedAfterFailure(context, arena, paths, spec.name, err);
+        };
+        defer deinitExecNamedResult(allocator, initial);
+        if (initial.exit_code != 0) {
+            setLastError("named VM {s} initial command could not be started (status {d}); the VM was removed", .{ spec.name, initial.exit_code });
+            return rollbackCreatedNamedAfterFailure(context, arena, paths, spec.name, error.InitialCommandFailed);
+        }
+    }
+    return result;
+}
+
+fn rollbackCreatedNamedAfterFailure(context: Context, allocator: std.mem.Allocator, paths: Paths, name: []const u8, failure: anyerror) anyerror {
+    _ = removeNamedAtPaths(context, allocator, paths) catch |err| {
+        setLastError(
+            "named VM {s} initial command failed and automatic removal failed ({s}); remove it manually",
+            .{ name, @errorName(err) },
+        );
+        return error.InitialCommandRollbackFailed;
+    };
+    if (lastErrorMessage().len == 0) {
+        setLastError("named VM {s} initial command failed ({s}); the VM was removed", .{ name, @errorName(failure) });
+    }
+    return failure;
 }
 
 pub fn restoreNamed(
@@ -1618,28 +1664,33 @@ pub fn removeNamed(
     const arena = arena_state.allocator();
 
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
-    var removed_pid: ?i64 = null;
-    switch (state) {
-        .absent => return error.NamedVmNotFound,
-        .ready => {
-            var ready = try readReady(arena, context.io, paths);
-            defer ready.deinit();
-            removed_pid = ready.value.pid;
-            try stopReadyMonitor(arena, context.io, paths, ready.value);
-            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
-        },
-        .incomplete, .stale => {
-            removed_pid = readPid(arena, context.io, paths) catch null;
-            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
-        },
-    }
+    const removed_pid = try removeNamedAtPaths(context, arena, paths);
     return ownedNamedLifecycleResult(allocator, .{
         .action = "removed",
         .name = options.name,
         .state = "absent",
         .pid = removed_pid,
     });
+}
+
+fn removeNamedAtPaths(context: Context, allocator: std.mem.Allocator, paths: Paths) !?i64 {
+    const state = try classifyVmState(allocator, context.io, paths, pidAlive);
+    var removed_pid: ?i64 = null;
+    switch (state) {
+        .absent => return error.NamedVmNotFound,
+        .ready => {
+            var ready = try readReady(allocator, context.io, paths);
+            defer ready.deinit();
+            removed_pid = ready.value.pid;
+            try stopReadyMonitor(allocator, context.io, paths, ready.value);
+            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+        },
+        .incomplete, .stale => {
+            removed_pid = readPid(allocator, context.io, paths) catch null;
+            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+        },
+    }
+    return removed_pid;
 }
 
 pub fn listNamed(
@@ -1710,8 +1761,8 @@ pub fn createCli(
     const spec = parsed.spec;
     const network_rules = try createNetworkRulesFromConfig(allocator, &parsed.network_policy);
     const bound_services = try createBoundServicesFromConfig(allocator, &parsed.network_policy);
-    const start_command: ?[]const []const u8 = if (parsed.command.len == 0)
-        null
+    const caller_command: []const []const u8 = if (parsed.command.len == 0)
+        &.{}
     else
         run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
             error.ShellCommandArgumentCountUnsupported => {
@@ -1729,6 +1780,7 @@ pub fn createCli(
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
         .image_pull_policy = parsed.image_pull_policy,
+        .initial_command = caller_command,
         .network = .{
             .enabled = parsed.network == .spore,
             .allow_cidrs = if (parsed.network == .spore) parsed.network_policy.allowCidrSlice() else &.{},
@@ -1770,48 +1822,41 @@ pub fn createCli(
             const message = allocLifecycleMessage(allocator, "spore create: request is outside the fresh x86-64 KVM profile: {s}", .{@errorName(err)});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },
-        error.InvalidNetworkPolicy, error.InvalidRootfsInput => {
-            const message = allocLifecycleMessage(allocator, "spore create: invalid configuration: {s}", .{@errorName(err)});
+        error.InvalidNetworkPolicy, error.InvalidRootfsInput, error.ImageCommandMissing, error.UnsupportedImageUser, error.RunArgCountUnsupported, error.RunArgTooLong => {
+            const message = switch (err) {
+                error.ImageCommandMissing => "spore create: image has no Entrypoint or Cmd; pass an initial command",
+                error.UnsupportedImageUser => "spore create: image Config.User must select root (root, 0, root:root, or 0:0); guest credential switching is not supported yet",
+                error.RunArgCountUnsupported => "spore create: effective image command has too many arguments (maximum 16)",
+                error.RunArgTooLong => "spore create: effective image command contains an argument longer than 8191 bytes",
+                else => allocLifecycleMessage(allocator, "spore create: invalid configuration: {s}", .{@errorName(err)}),
+            };
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         },
         error.FileNotFound => {
             const message = "spore create: required rootfs object was not found";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "create"), message);
         },
-        error.MonitorReadyTimeout, error.MonitorVersionMismatch, error.SporeExecutableVersionUnavailable => {
+        error.MonitorReadyTimeout, error.SporeExecutableVersionUnavailable => {
             const message = allocLifecycleLastErrorMessage(allocator, "create", "spore create: timed out waiting for monitor readiness");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
+        },
+        error.MonitorVersionMismatch => {
+            const message = allocLifecycleLastErrorMessage(allocator, "create", "spore create: monitor or helper version does not match this spore build");
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
+        },
+        error.NamedVmNotReady => {
+            const fallback = allocLifecycleMessage(allocator, "spore create: VM is not ready after create: {s}", .{spec.name});
+            const message = allocLifecycleLastErrorMessage(allocator, "create", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "create"), message);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.InitialCommandFailed, error.InitialCommandRollbackFailed => {
+            const fallback = allocLifecycleMessage(allocator, "spore create: initial command failed for VM {s}: {s}", .{ spec.name, @errorName(err) });
+            const message = allocLifecycleLastErrorMessage(allocator, "create", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "create"), message);
         },
         else => |e| return e,
     };
     defer deinitNamedLifecycleResult(allocator, result);
-    if (start_command) |command| {
-        const initial = startNamed(.{
-            .io = init.io,
-            .environ_map = init.environ_map,
-        }, allocator, .{
-            .name = spec.name,
-            .command = command,
-        }) catch |err| switch (err) {
-            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
-            error.NamedVmNotReady => {
-                const fallback = allocLifecycleMessage(allocator, "spore create: VM is not ready after create: {s}", .{spec.name});
-                const message = allocLifecycleLastErrorMessage(allocator, "create", fallback);
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "create"), message);
-            },
-            error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-                const fallback = allocLifecycleMessage(allocator, "spore create: initial command failed for VM {s}: {s}", .{ spec.name, @errorName(err) });
-                const message = allocLifecycleLastErrorMessage(allocator, "create", fallback);
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "create"), message);
-            },
-            else => |e| return e,
-        };
-        defer deinitExecNamedResult(allocator, initial);
-        if (initial.exit_code != 0) {
-            const message = allocLifecycleMessage(allocator, "spore create: initial command exited {d}", .{initial.exit_code});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "create"), message);
-        }
-    }
     if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
     } else {
@@ -6470,6 +6515,17 @@ test "create parser accepts shell and exact commands" {
     try std.testing.expectEqual(@as(usize, 2), argv_opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", argv_opts.command[0]);
     try std.testing.expectEqualStrings("hi", argv_opts.command[1]);
+}
+
+test "create parser keeps image and plain creates commandless" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const image = try parseCreateArgs(&.{ "counter", "--image", "alpine:3.20" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(@as(usize, 0), image.command.len);
+    const idle = try parseCreateArgs(&.{"counter"}, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(@as(usize, 0), idle.command.len);
 }
 
 test "exec parser accepts shell and exact commands" {

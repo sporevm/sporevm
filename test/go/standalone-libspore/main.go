@@ -47,6 +47,7 @@ func run(ctx context.Context) error {
 		Backend:        *backend,
 		MemoryBytes:    *memoryMiB * 1024 * 1024,
 		TimeoutMs:      *timeoutMs,
+		InitialArgv:    []string{"/bin/true"},
 		NetworkEnabled: *network,
 	}
 	result, err := client.CreateNamed(ctx, create)

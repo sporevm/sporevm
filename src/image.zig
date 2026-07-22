@@ -33,6 +33,23 @@ pub const RuntimeConfig = struct {
     OnBuild: ?[][]const u8 = null,
 };
 
+/// Return whether an OCI user selects the root user and root group that the
+/// guest currently executes as. Other spellings must fail closed until guest
+/// credential switching is implemented.
+pub fn isRootUser(user: ?[]const u8) bool {
+    const value = user orelse return true;
+    if (value.len == 0) return true;
+    const colon = std.mem.indexOfScalar(u8, value, ':');
+    const name = if (colon) |index| value[0..index] else value;
+    if (!std.mem.eql(u8, name, "root") and !std.mem.eql(u8, name, "0")) return false;
+    if (colon) |index| {
+        const group = value[index + 1 ..];
+        if (std.mem.indexOfScalar(u8, group, ':') != null) return false;
+        if (group.len != 0 and !std.mem.eql(u8, group, "root") and !std.mem.eql(u8, group, "0")) return false;
+    }
+    return true;
+}
+
 /// Serialize the exact bytes that participate in native image identity.
 /// Struct declaration order is therefore a durable format contract.
 pub fn canonicalConfigJson(allocator: std.mem.Allocator, config: Config) ![]u8 {
@@ -137,6 +154,25 @@ test "arm64 and amd64 have distinct golden native image identities" {
         "blake3:dc61952bc6d6b5c09d69b13be688620273ccb7d3bdd5302505408f4735c305f9",
         amd64_digest,
     );
+}
+
+test "OCI root user accepts only unambiguous root spellings" {
+    for ([_]?[]const u8{ null, "", "root", "0", "root:", "0:", "root:root", "root:0", "0:root", "0:0" }) |user| {
+        try std.testing.expect(isRootUser(user));
+    }
+    for ([_]?[]const u8{ "1000", "person", "root:wheel", "0:1000", ":root", "root:root:extra" }) |user| {
+        try std.testing.expect(!isRootUser(user));
+    }
+}
+
+fn fuzzOciRootUser(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [4096]u8 = undefined;
+    const len = smith.slice(&bytes);
+    _ = isRootUser(bytes[0..len]);
+}
+
+test "fuzz OCI root user validation" {
+    try std.testing.fuzz({}, fuzzOciRootUser, .{});
 }
 
 test "canonical config pins escaping and empty object semantics" {

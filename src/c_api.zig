@@ -13,7 +13,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 16;
+const c_abi_version: u32 = 17;
 const reexec_contract_version: u32 = 1;
 const reexec_role_env = "SPORE_REEXEC_ROLE";
 const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
@@ -22,7 +22,7 @@ const inspect_spore_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
-const create_named_options_version: u32 = 4;
+const create_named_options_version: u32 = 5;
 const restore_named_options_version: u32 = 1;
 const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
@@ -169,6 +169,8 @@ const SporeCreateNamedOptions = extern struct {
     bound_unix_service_count: usize,
     annotations: ?[*]const SporeAnnotation,
     annotation_count: usize,
+    initial_argv: ?[*]const SporeString,
+    initial_argc: usize,
 };
 
 const SporeExecNamedOptions = extern struct {
@@ -374,6 +376,8 @@ pub export fn spore_create_named_options_init(options: ?*SporeCreateNamedOptions
         .bound_unix_service_count = 0,
         .annotations = null,
         .annotation_count = 0,
+        .initial_argv = null,
+        .initial_argc = 0,
     };
 }
 
@@ -754,6 +758,7 @@ pub export fn spore_create_named_json(
     const network_policy = parseNetworkPolicy(arena, opts.network_rules, opts.network_rule_count) catch |err| return fail(ctx, err);
     const bound_services = parseBoundUnixServices(arena, opts.bound_unix_services, opts.bound_unix_service_count) catch |err| return fail(ctx, err);
     const annotations = parseAnnotations(arena, opts.annotations, opts.annotation_count) catch |err| return fail(ctx, err);
+    const initial_command = parseStringList(arena, opts.initial_argv, opts.initial_argc) catch |err| return fail(ctx, err);
     const result = libspore.createNamed(init, ctx.allocator, .{
         .name = toSlice(opts.name) catch |err| return fail(ctx, err),
         .backend = parseBackend(optionalSlice(opts.backend) catch |err| return fail(ctx, err)) catch |err| return fail(ctx, err),
@@ -761,6 +766,7 @@ pub export fn spore_create_named_json(
         .initrd_path = optionalSlice(opts.initrd_path) catch |err| return fail(ctx, err),
         .rootfs_path = optionalSlice(opts.rootfs_path) catch |err| return fail(ctx, err),
         .image_ref = optionalSlice(opts.image_ref) catch |err| return fail(ctx, err),
+        .initial_command = initial_command,
         .network = .{
             .enabled = opts.network_enabled != 0,
             .allow_cidrs = allow_cidrs,
@@ -1563,6 +1569,7 @@ test "named lifecycle options initialize defaults" {
     try std.testing.expectEqual(@as(usize, 0), create.network_rule_count);
     try std.testing.expectEqual(@as(usize, 0), create.bound_unix_service_count);
     try std.testing.expectEqual(@as(usize, 0), create.annotation_count);
+    try std.testing.expectEqual(@as(usize, 0), create.initial_argc);
 
     var exec: SporeExecNamedOptions = undefined;
     spore_exec_named_options_init(&exec);

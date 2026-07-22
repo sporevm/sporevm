@@ -43,6 +43,8 @@ mkdir -p "${SPOREVM_RUNTIME_DIR}" "${SPOREVM_ROOTFS_CACHE_DIR}" "${workdir}/cont
 chmod 700 "${SPOREVM_RUNTIME_DIR}"
 
 source_name="image-context-source"
+override_name="image-context-override"
+failed_name="image-context-failed"
 child_name="image-context-child"
 restored_name="image-context-restored"
 saved_spore="${workdir}/child.spore"
@@ -58,7 +60,7 @@ cleanup() {
       tail -120 "${log}" >&2 || true
     done
   fi
-  for name in "${restored_name}" "${child_name}" "${source_name}"; do
+  for name in "${restored_name}" "${child_name}" "${failed_name}" "${override_name}" "${source_name}"; do
     "${spore_bin}" rm "${name}" >/dev/null 2>&1 || true
   done
   if [[ "${status}" == "0" && "${SPORE_KEEP_SMOKE_WORKDIR:-0}" != "1" ]]; then
@@ -72,6 +74,8 @@ cat >"${workdir}/context/Dockerfile" <<'DOCKERFILE'
 FROM docker.io/library/alpine:3.20
 ENV IMAGE_VALUE=default CLEAR_ME=inherited
 WORKDIR /workspace
+ENTRYPOINT ["/usr/bin/env"]
+CMD ["/bin/sh", "-c", "printf '%s|%s|%s' \"$IMAGE_VALUE\" \"$CLEAR_ME\" \"$PWD\" > default-context; cat default-context"]
 DOCKERFILE
 
 "${spore_bin}" build \
@@ -80,7 +84,32 @@ DOCKERFILE
   --timeout "${SPORE_SMOKE_BUILD_TIMEOUT:-120s}" \
   "${workdir}/context"
 
+expect_eq 'default|inherited|/workspace' \
+  "$("${spore_bin}" run --backend "${backend}" --image "${image_ref}" --pull never --memory "${SPORE_SMOKE_MEMORY:-512mb}" --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}")" \
+  "one-shot image command defaults"
+
+expect_eq 'override:default' \
+  "$("${spore_bin}" run --backend "${backend}" --image "${image_ref}" --pull never --memory "${SPORE_SMOKE_MEMORY:-512mb}" --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}" -- /bin/sh -lc 'printf "override:%s" "$IMAGE_VALUE"')" \
+  "one-shot image command override"
+
 "${spore_bin}" create "${source_name}" \
+  --backend "${backend}" \
+  --image "${image_ref}" \
+  --pull never \
+  --memory "${SPORE_SMOKE_MEMORY:-512mb}" \
+  --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}"
+
+default_context=""
+for _ in $(seq 1 100); do
+  if default_context="$("${spore_bin}" exec "${source_name}" -- /bin/cat default-context 2>/dev/null)" && \
+    [[ "${default_context}" == 'default|inherited|/workspace' ]]; then
+    break
+  fi
+  sleep 0.05
+done
+expect_eq 'default|inherited|/workspace' "${default_context}" "detached image command defaults"
+
+"${spore_bin}" create "${override_name}" \
   --backend "${backend}" \
   --image "${image_ref}" \
   --pull never \
@@ -90,13 +119,22 @@ DOCKERFILE
 
 detached_context=""
 for _ in $(seq 1 100); do
-  if detached_context="$("${spore_bin}" exec "${source_name}" -- /bin/cat detached-context 2>/dev/null)" && \
+  if detached_context="$("${spore_bin}" exec "${override_name}" -- /bin/cat detached-context 2>/dev/null)" && \
     [[ "${detached_context}" == 'default|inherited|/workspace' ]]; then
     break
   fi
   sleep 0.05
 done
 expect_eq 'default|inherited|/workspace' "${detached_context}" "detached create context"
+
+if "${spore_bin}" create "${failed_name}" \
+  --backend "${backend}" \
+  --memory "${SPORE_SMOKE_MEMORY:-512mb}" \
+  --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}" \
+  -- /does-not-exist >/dev/null 2>&1; then
+  die "create unexpectedly accepted an unstartable initial command"
+fi
+[[ ! -e "${SPOREVM_RUNTIME_DIR}/vms/${failed_name}" ]] || die "failed create left a named VM behind"
 
 expect_eq 'default|inherited|/workspace' \
   "$("${spore_bin}" exec "${source_name}" -- /bin/sh -lc 'printf "%s|%s|%s" "$IMAGE_VALUE" "$CLEAR_ME" "$PWD"')" \
