@@ -966,13 +966,20 @@ protocol. It records fresh direct-OCI conversions and profile logs, exports the
 current verified fixture, then compares per-object GETs, a deterministic static
 archive, and bounded benchmark-only missing-object batches across cold and
 partially populated caches. Rows include provenance, phase timings, reuse,
-requests, backend reads and bytes, response bytes, and batch-composition time;
-all client modes use bounded disk staging, while archive construction records
-its separate one-time cost so the real workload remains measurable.
-Deterministic synthetic overlap is covered in repository tests. The required
-five-sample small-image and `buildkite-sporevm` runs on both platforms, using a
-real related-image overlap fixture and the intended object-store backend,
-remain evidence work before G0 can choose the G1 transport.
+connections, requests, backend reads and bytes, response bytes, retries, and
+batch-composition time; all client modes use bounded disk staging and 16-way
+connection reuse, while archive construction records its separate one-time
+cost so the real workload remains measurable.
+
+The five-sample two-platform evidence is recorded in
+[`docs/benchmarks/image-gateway-transport-2026-07-22.md`](../benchmarks/image-gateway-transport-2026-07-22.md).
+On the S3 workload, the archive was fastest and transferred less than half the
+raw object payload on both architectures. The real workload compressed 4.5–4.8
+GB of objects to 1.6 GB, while related-image reuse covered only 1.6% of ARM64
+bytes and 6.5% of AMD64 bytes. G0 therefore selects a rebuildable immutable
+archive for G1 eager bulk transfer, retains per-object authority and the
+manifest-bound object API for future lazy pulls, and defers dynamic batch
+framing to G2 unless production telemetry shows materially higher reuse.
 
 The proof intentionally uses one manifest-bound GET per object, so it measures
 correctness rather than the final eager transport. Before object transfer, it
@@ -990,8 +997,9 @@ cross-repository conformance, and the separate gateway repository decision.
 
 Status: active prerequisite; native identity, platform-index, image-manifest,
 attachment-schema, converter-worker equivalence, and explicit eager-client proof
-slices landed. The transport harness has landed; the two-platform, two-workload
-evidence and resulting transport choice remain open.
+slices landed. The transport harness, two-platform evidence, and G1 archive
+choice have landed; authorization, cross-repository conformance, and the
+separate gateway repository decision remain open.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -1026,14 +1034,16 @@ evidence and resulting transport choice remain open.
   invariant for the empty-layer case; richer content fixtures remain open.
 - Record a reproducible direct-OCI baseline for a small public image and the
   real `buildkite-sporevm` base on an empty client cache, pinned to the native
-  writer and exact rootfs builder version. The harness records this evidence;
-  the required benchmark runs remain open.
+  writer and exact rootfs builder version. The two-platform small S3 baseline
+  and real-workload evidence are recorded in the benchmark evidence note. The
+  ARM64 real-workload conversion timing has a documented dirty-provenance
+  qualification and is not exact-head acceptance evidence.
 - Compare a prewarmed host cache and a simple immutable static image archive
   served from object storage with dynamic missing-object batches. If the G1
   acceptance workload does not benefit materially from partial-cache reuse,
   use the static archive in G1 and defer the binary batch parser to G2. The
-  local transport comparison and accounting are implemented, while the real
-  object-store and overlapping-workload evidence remain open.
+  S3 and overlapping-workload evidence selects the static archive for G1;
+  batch framing remains benchmark-only and deferred to G2.
 - Freeze the authorization-bound single-object fetch contract and prove that a
   client can fetch any reachable chunk, cannot fetch an unrelated CAS object,
   and receives bytes identical to archive or batch transport. This is a protocol
