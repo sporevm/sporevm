@@ -186,6 +186,7 @@ fn runParsed(
         .rootfs_path = parsed.rootfs_path,
         .image_ref = parsed.image_ref,
         .image_pull_policy = parsed.pull_policy,
+        .image_entrypoint = if (parsed.image_entrypoint) |entrypoint| &.{entrypoint} else null,
         .command = command,
         .guest_env = guest_env,
         .injected_files = injected_files,

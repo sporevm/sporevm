@@ -198,10 +198,11 @@ const result = try libspore.runManaged(init, allocator, .{
 ```
 
 For image-backed calls, an empty `.command` uses OCI Entrypoint plus Cmd. A
-non-empty command replaces Cmd and follows Entrypoint. Image `User` must select
-root until guest credential switching is supported. Non-image managed runs
-still require a command, and saved-spore execution never applies OCI command
-defaults.
+non-empty command replaces Cmd and follows Entrypoint. Set `.image_entrypoint`
+to replace the image Entrypoint while retaining those Cmd rules. Image `User`
+must select root until guest credential switching is supported. Non-image
+managed runs still require a command, and saved-spore execution never applies
+OCI command defaults.
 
 Injected files are fresh-run only and appear under `/run/sporevm/injected`.
 Spore rejects them with saved runs and `runFromSpore` so caller-provided bytes

@@ -47,10 +47,12 @@ spore run --image docker.io/library/alpine:3.20 'echo hi'
 Without `--`, a caller command is represented as `/bin/sh -lc <string>`; use
 `-- <argv...>` for exact argv. For `--image`, SporeVM prepends OCI Entrypoint
 and uses OCI Cmd when no caller command is supplied. A caller command replaces
-Cmd but keeps Entrypoint. Empty or absent arrays contribute no arguments, and
-an image with no effective command is rejected before boot. `spore create
---image` applies the same rules to its optional initial command; plain create
-without an image remains an idle VM.
+Cmd but keeps Entrypoint. `--entrypoint PATH` replaces the image Entrypoint;
+the caller command still replaces Cmd, or the image Cmd is used when no command
+is supplied. Empty or absent arrays contribute no arguments, and an image with
+no effective command is rejected before boot. `spore create --image` applies
+the same default rules to its optional initial command; plain create without an
+image remains an idle VM.
 
 Image `Env` and `WorkingDir` are also applied. `User` currently fails closed:
 only empty, `root`, `0`, and those users with an empty, `root`, or `0` group are

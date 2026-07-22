@@ -615,7 +615,17 @@ def capture_filesystems(
     )
     require_success(docker_result)
     spore_result = run_command(
-        [spore_bin, "run", "--image", spore_tag, "--", *scanner, *prefixes],
+        [
+            spore_bin,
+            "run",
+            "--image",
+            spore_tag,
+            "--entrypoint",
+            scanner[0],
+            "--",
+            *scanner[1:],
+            *prefixes,
+        ],
         env=spore_env,
         log_prefix=output_dir / "spore-scan",
     )

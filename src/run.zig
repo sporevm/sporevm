@@ -1194,6 +1194,7 @@ pub const CliOptions = struct {
     generation_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
+    image_entrypoint: ?[]const u8 = null,
     pull_policy: PullPolicy = .missing,
     commit_ref: ?[]const u8 = null,
     disk_size: ?u64 = null,
@@ -1240,6 +1241,7 @@ pub const cli_usage =
     \\  --generation FILE       With --from, inject fan-out identity JSON before command
     \\  --rootfs rootfs.ext4    Attach local rootfs read-only; save unsupported
     \\  --image REF             Build or reuse cached OCI rootfs; default to Entrypoint + Cmd
+    \\  --entrypoint PATH       Override the OCI Entrypoint for --image
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
     \\  --commit LOCAL_REF      On command success, publish the writable root disk as an image
@@ -1291,6 +1293,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
     var generation_path: ?[]const u8 = null;
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
+    var image_entrypoint: ?[]const u8 = null;
     var pull_policy: PullPolicy = .missing;
     var commit_ref: ?[]const u8 = null;
     var disk_size: ?u64 = null;
@@ -1329,6 +1332,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             rootfs_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--image")) {
             image_ref = takeValue(args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--entrypoint")) {
+            image_entrypoint = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--commit")) {
             commit_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--disk-size")) {
@@ -1462,6 +1467,10 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --pull requires --image\n", .{});
         std.process.exit(2);
     }
+    if (image_entrypoint != null and image_ref == null) {
+        std.debug.print("spore run: --entrypoint requires --image\n", .{});
+        std.process.exit(2);
+    }
     if (disk_size != null and commit_ref == null) {
         std.debug.print("spore run: --disk-size currently requires --commit\n", .{});
         std.process.exit(2);
@@ -1558,6 +1567,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         .generation_path = generation_path,
         .rootfs_path = rootfs_path,
         .image_ref = image_ref,
+        .image_entrypoint = image_entrypoint,
         .pull_policy = pull_policy,
         .commit_ref = commit_ref,
         .disk_size = disk_size,
@@ -1824,8 +1834,19 @@ pub fn resolveImageRuntimeCommand(
     image_config: ?rootfs_mod.ImageConfig,
     caller_command: []const []const u8,
 ) ![]const []const u8 {
+    return resolveImageRuntimeCommandWithEntrypoint(allocator, image_config, caller_command, null);
+}
+
+/// Resolve OCI process metadata while replacing the image Entrypoint when an
+/// override is provided. An empty override explicitly clears the Entrypoint.
+pub fn resolveImageRuntimeCommandWithEntrypoint(
+    allocator: std.mem.Allocator,
+    image_config: ?rootfs_mod.ImageConfig,
+    caller_command: []const []const u8,
+    entrypoint_override: ?[]const []const u8,
+) ![]const []const u8 {
     const runtime = if (image_config) |config| config.config else null;
-    const entrypoint = if (runtime) |config| config.Entrypoint orelse &.{} else &.{};
+    const entrypoint = entrypoint_override orelse if (runtime) |config| config.Entrypoint orelse &.{} else &.{};
     const command = if (caller_command.len != 0)
         caller_command
     else if (runtime) |config|
@@ -4778,6 +4799,22 @@ test "image runtime command composes entrypoint defaults and caller override" {
     try std.testing.expectEqualSlices([]const u8, &.{ "/entry", "fixed", "/bin/sh", "-lc", "echo hi" }, override);
 }
 
+test "image runtime command permits an explicit entrypoint override" {
+    const allocator = std.testing.allocator;
+    var entrypoint = [_][]const u8{"/image-entry"};
+    var cmd = [_][]const u8{"default"};
+    var entrypoint_override = [_][]const u8{"/scanner"};
+    const config = rootfs_mod.ImageConfig{ .config = .{ .Entrypoint = &entrypoint, .Cmd = &cmd } };
+
+    const default_command = try resolveImageRuntimeCommandWithEntrypoint(allocator, config, &.{}, &entrypoint_override);
+    defer allocator.free(default_command);
+    try std.testing.expectEqualSlices([]const u8, &.{ "/scanner", "default" }, default_command);
+
+    const resolved = try resolveImageRuntimeCommandWithEntrypoint(allocator, config, &.{"/runtime"}, &entrypoint_override);
+    defer allocator.free(resolved);
+    try std.testing.expectEqualSlices([]const u8, &.{ "/scanner", "/runtime" }, resolved);
+}
+
 test "image runtime command handles absent and empty defaults" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.ImageCommandMissing, resolveImageRuntimeCommand(allocator, null, &.{}));
@@ -5380,6 +5417,12 @@ test "run cli parser accepts image ref" {
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
     try std.testing.expectEqualStrings("hi", opts.command[1]);
+}
+
+test "run cli parser accepts image entrypoint override" {
+    const opts = try parseCliArgs(&.{ "--image", "local/example:dev", "--entrypoint", "/scanner", "--", "/runtime" });
+    try std.testing.expectEqualStrings("/scanner", opts.image_entrypoint.?);
+    try std.testing.expectEqualSlices([]const u8, &.{"/runtime"}, opts.command);
 }
 
 test "run cli parser permits omitted command only for images" {

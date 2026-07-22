@@ -207,9 +207,10 @@ spore run --image docker.io/library/alpine:3.20 'echo hi'
 
 `--image` applies OCI `Env`, `WorkingDir`, `Entrypoint`, and `Cmd` when present.
 With no command it runs `Entrypoint` plus `Cmd`; an explicit command replaces
-`Cmd` but follows `Entrypoint`. OCI `User` must select root until guest credential
-switching is supported. Shell commands run as `/bin/sh -lc` in the
-guest. Use `-- <argv...>` when you need exact argv.
+`Cmd` but follows `Entrypoint`. Use `--entrypoint PATH` to replace the image
+entrypoint while retaining those command rules. OCI `User` must select root
+until guest credential switching is supported. Shell commands run as
+`/bin/sh -lc` in the guest. Use `-- <argv...>` when you need exact argv.
 
 Commit the successful run's root disk as another local image when setup is more
 naturally expressed as a command than a Dockerfile:

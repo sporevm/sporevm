@@ -49,9 +49,11 @@ test "external import can consume classified failure events" {
 test "external import can name managed run-from and named lifecycle APIs" {
     const managed = libspore.ManagedRunOptions{
         .kernel_path = "Image",
+        .image_entrypoint = &.{"/entrypoint"},
         .command = &.{"/bin/true"},
     };
     try std.testing.expectEqualStrings("Image", managed.kernel_path.?);
+    try std.testing.expectEqualStrings("/entrypoint", managed.image_entrypoint.?[0]);
 
     const from = libspore.RunFromSporeOptions{
         .spore_dir = "base.spore",

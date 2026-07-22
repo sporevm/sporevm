@@ -268,6 +268,9 @@ pub const ManagedRunOptions = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     image_pull_policy: ImagePullPolicy = .missing,
+    /// Replaces the image's OCI Entrypoint when set. The image Cmd still
+    /// supplies the default command when `command` is empty.
+    image_entrypoint: ?[]const []const u8 = null,
     /// Guest command and arguments. Empty uses OCI Entrypoint and Cmd for an
     /// image-backed run; non-image managed runs require an explicit command.
     command: []const []const u8 = &.{},
@@ -900,6 +903,9 @@ pub fn runManaged(
     if (options.save_path != null and options.rootfs_path != null and options.image_ref == null) {
         return error.InvalidRootfsInput;
     }
+    if (options.image_entrypoint != null and options.image_ref == null) {
+        return error.InvalidImageEntrypointOverride;
+    }
     if (options.commit_ref) |ref| {
         try rootfs_mod.validateLocalTagRef(ref);
         if (options.image_ref == null or options.rootfs_path != null or options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.interactive or options.tty) {
@@ -930,7 +936,7 @@ pub fn runManaged(
         .record_artifact = options.save_path != null or options.image_ref != null,
     });
     const command = if (options.image_ref != null)
-        try run_mod.resolveImageRuntimeCommand(arena, rootfs.image_config, options.command)
+        try run_mod.resolveImageRuntimeCommandWithEntrypoint(arena, rootfs.image_config, options.command, options.image_entrypoint)
     else blk: {
         if (options.command.len == 0) return error.RunArgCountUnsupported;
         break :blk options.command;
