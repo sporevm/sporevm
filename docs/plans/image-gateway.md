@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-21
+last_reviewed: 2026-07-22
 spec_refs:
   - docs/image-gateway-protocol.md
   - docs/filesystem.md
@@ -952,6 +952,15 @@ requested subject, record bytes, type, and exact artifact bytes. Golden,
 malformed, subject-binding, and fuzz coverage freeze the envelope; upload,
 relation mutation, authorization, retention, and policy remain deferred to G3.
 
+The minimal converter-worker equivalence fixture has landed. One deterministic
+multi-platform OCI layout containing an empty uncompressed layer is converted
+for both target platforms on Linux arm64 and Linux amd64 workers. Each run must
+reproduce the committed canonical config, rootfs index, gateway manifest,
+platform index, native image digest, and complete object summary. The versioned bundle under
+`test/image-gateway/worker-conformance/` is the shared fixture exchange surface;
+it adds no service or runtime behavior. Compressed, multi-layer, attribute-rich,
+and non-chunk-aligned content remain follow-up conformance fixtures.
+
 The proof intentionally uses one manifest-bound GET per object, so it measures
 correctness rather than the final eager transport. Before object transfer, it
 rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
@@ -960,14 +969,15 @@ not native image-format limits. It has no authentication,
 conversion admission, server authorization, missing-object optimization,
 redirects, retries, or gateway provenance record. The rest of G0 remains open:
 transport benchmarking, authorization and cross-repository conformance, and
-converter-worker equivalence have not started.
+the separate gateway repository decision have not started.
 
 ## Delivery Strategy
 
 ### G0 — Freeze the protocol and benchmark fixture
 
 Status: active prerequisite; native identity, platform-index, image-manifest,
-attachment-schema, and explicit eager-client proof slices landed.
+attachment-schema, converter-worker equivalence, and explicit eager-client proof
+slices landed.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -992,11 +1002,14 @@ attachment-schema, and explicit eager-client proof slices landed.
   native `spore build` image, including a multi-platform index, same-tag
   platform selection, malformed cases, and the concrete 64 MiB canonical-index
   bound.
-  The schema fixtures and closure verifier have landed; the converter-worker
-  equivalence run and broader malformed fixture exchange remain open.
+  The schema fixtures, closure verifier, versioned worker-equivalence bundle,
+  and two-worker CI matrix have landed; broader malformed fixture exchange
+  remains open.
 - Run at least one selected target-manifest fixture through arm64 and amd64
   converter workers and require byte-identical config, index, and image digests;
-  the worker architecture must not leak into native output.
+  the worker architecture must not leak into native output. The committed
+  two-target minimal fixture and Linux arm64/amd64 CI jobs now enforce this
+  invariant for the empty-layer case; richer content fixtures remain open.
 - Record a reproducible direct-OCI baseline for a small public image and the
   real `buildkite-sporevm` base on an empty client cache, pinned to the native
   writer and exact rootfs builder version.
@@ -1011,8 +1024,9 @@ attachment-schema, and explicit eager-client proof slices landed.
 - Record source manifest digest, platform, conversion contract, rootfs index
   digest, object count/bytes, commands, phase logs, server-side storage requests,
   and end-to-end transfer economics.
-- Decide the separate gateway repository and pin the shared fixture exchange
-  mechanism before client and server implementations diverge.
+- Decide the separate gateway repository before service implementation begins.
+  The shared fixture exchange mechanism is pinned by the versioned conformance
+  bundle and its exact output files.
 
 Done means another implementation can produce or consume both platform fixtures
 without reading SporeVM's internal structs, the exact identity preimages are no
