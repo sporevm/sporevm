@@ -72,8 +72,12 @@ def main() -> None:
         root = Path(temporary)
         fixture = root / "fixture"
         overlap = root / "overlap"
-        write_fixture(fixture, [b"a" * 64, b"b" * 64, b"c" * 17])
-        write_fixture(overlap, [b"a" * 64, b"z" * 64, b"y" * 17])
+        contents = [bytes([index]) * 64 for index in range(24)] + [b"tail"]
+        overlap_contents = contents[:8] + [
+            bytes([index]) * 64 for index in range(64, 81)
+        ]
+        write_fixture(fixture, contents)
+        write_fixture(overlap, overlap_contents)
         transport.run_benchmark(
             argparse.Namespace(
                 archive_compression="gzip",
@@ -107,6 +111,11 @@ def main() -> None:
             raise RuntimeError("summary omitted its evidence kind")
         if summary.get("transport", {}).get("backend") != "local":
             raise RuntimeError("summary omitted its backend placement")
+        if (
+            summary.get("transport", {}).get("gateway_execution")
+            != "bounded-concurrency-cacheless"
+        ):
+            raise RuntimeError("summary misreported gateway execution")
         cases = {(case["mode"], case["cache_state"]): case for case in summary["cases"]}
         if cases[("archive", "cold")]["median_request_count"] != cases[
             ("archive", "partial")
@@ -116,8 +125,10 @@ def main() -> None:
             ("batch", "cold")
         ]["median_response_bytes"]:
             raise RuntimeError("batch did not save bytes for an overlapping cache")
-        if cases[("objects", "cold")]["median_data_request_count"] != 3:
+        if cases[("objects", "cold")]["median_data_request_count"] != len(contents):
             raise RuntimeError("objects mode request accounting is wrong")
+        if cases[("objects", "cold")]["median_connection_count"] > 17:
+            raise RuntimeError("objects mode did not reuse worker connections")
         if cases[("batch", "cold")]["median_request_bytes"] <= 0:
             raise RuntimeError("batch request body bytes were not counted")
         if cases[("objects", "cold")]["median_request_bytes"] != 0:

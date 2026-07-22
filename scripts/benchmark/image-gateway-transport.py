@@ -532,6 +532,7 @@ def write_archive(closure: Closure, path: Path, compression: str) -> None:
 @dataclasses.dataclass
 class Counters:
     requests: int = 0
+    connections: int = 0
     request_bytes: int = 0
     backend_reads: int = 0
     backend_bytes: int = 0
@@ -578,6 +579,10 @@ class ServerState:
             self.counters.backend_bytes += backend_bytes
             self.counters.response_bytes += response_bytes
             self.counters.batch_composition_ns += composition_ns
+
+    def record_connection(self) -> None:
+        with self.lock:
+            self.counters.connections += 1
 
 
 def encode_batch(
@@ -651,6 +656,10 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: object) -> None:
         return
+
+    def setup(self) -> None:
+        super().setup()
+        self.state.record_connection()
 
     def send_bytes(self, data: bytes) -> None:
         self.send_response(200)
@@ -869,19 +878,29 @@ def run_trial(
                     path.write_bytes(data)
                     received_paths[digest] = path
         elif mode == "objects":
+            object_clients: list[TransportClient] = []
+            object_clients_lock = threading.Lock()
+            worker = threading.local()
+
             def fetch_object(digest: str) -> tuple[str, Path]:
                 path = stage / digest
-                object_client = TransportClient(server)
-                try:
-                    object_client.file(f"/objects/{quote(digest, safe='')}", path)
-                finally:
-                    object_client.close()
+                object_client = getattr(worker, "client", None)
+                if object_client is None:
+                    object_client = TransportClient(server)
+                    worker.client = object_client
+                    with object_clients_lock:
+                        object_clients.append(object_client)
+                object_client.file(f"/objects/{quote(digest, safe='')}", path)
                 return digest, path
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-                fetched = executor.map(fetch_object, missing)
-                for digest, path in fetched:
-                    received_paths[digest] = path
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    fetched = executor.map(fetch_object, missing)
+                    for digest, path in fetched:
+                        received_paths[digest] = path
+            finally:
+                for object_client in object_clients:
+                    object_client.close()
         else:
             raise BenchmarkError(f"unsupported transport mode: {mode}")
         transfer_ns = time.perf_counter_ns() - transfer_started
@@ -926,6 +945,7 @@ def run_trial(
         "objects_transferred": len(actual_received),
         "control_bytes": control_bytes,
         "request_count": counters.requests,
+        "connection_count": counters.connections,
         "control_request_count": len(closure.controls),
         "data_request_count": counters.requests - len(closure.controls),
         "backend_reads": counters.backend_reads,
@@ -982,6 +1002,9 @@ def summarize(
                     "median_request_bytes": statistics.median(row["request_bytes"] for row in selected),
                     "median_backend_bytes": statistics.median(row["backend_bytes"] for row in selected),
                     "median_request_count": statistics.median(row["request_count"] for row in selected),
+                    "median_connection_count": statistics.median(
+                        row["connection_count"] for row in selected
+                    ),
                     "median_control_request_count": statistics.median(
                         row["control_request_count"] for row in selected
                     ),
@@ -1028,7 +1051,7 @@ def summarize(
             "concurrency": concurrency,
             "connection_reuse": True,
             "byte_accounting": "http-body-only",
-            "gateway_execution": "serial-cacheless",
+            "gateway_execution": "bounded-concurrency-cacheless",
             "s3_transient_retry_count": 2 if backend_kind == "s3" else 0,
         },
         "overlap_fixture": (

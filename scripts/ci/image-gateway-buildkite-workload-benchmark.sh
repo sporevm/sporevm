@@ -19,11 +19,7 @@ context="${scratch}/context"
 base_layout="${scratch}/base-layout"
 outer_layout="${scratch}/outer-layout"
 backend="${SPOREVM_IMAGE_GATEWAY_BACKEND:-}"
-if [[ -z "${backend}" ]]; then
-  [[ -n "${BUILDKITE_BUILD_NUMBER:-}" ]] || {
-    echo "SPOREVM_IMAGE_GATEWAY_BACKEND is required outside Buildkite" >&2
-    exit 2
-  }
+if [[ -z "${backend}" && -n "${BUILDKITE_BUILD_NUMBER:-}" ]]; then
   backend="s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${sporevm_commit}/image-gateway/${arch}/buildkite-sporevm"
 fi
 buildkite_commit="e446c1b8a74d317a7abd08c42140152a5d9e8462"
@@ -32,7 +28,38 @@ buildkite_sporevm_commit="ad8967125968098b917090e49b6410dd5a6b19c5"
 
 rm -rf -- "${output}" "${scratch}"
 mkdir -p "${output}" "${scratch}" "${source_dir}" "${context}/image/deps" "${context}/dynamodb-local"
-trap 'rm -rf -- "${scratch}"' EXIT
+postgres_temp_tag="buildkite-postgres:gateway-benchmark-${arch}-${run_id}"
+active_tag=""
+active_previous_image=""
+restore_active_tag() {
+  [[ -n "${active_tag}" ]] || return
+  if [[ -n "${active_previous_image}" ]]; then
+    docker tag "${active_previous_image}" "${active_tag}"
+  else
+    docker image rm "${active_tag}" >/dev/null
+  fi
+  active_tag=""
+  active_previous_image=""
+}
+cleanup() {
+  restore_active_tag || true
+  rm -rf -- "${scratch}"
+  docker image rm "${postgres_temp_tag}" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+save_as() {
+  local source_ref="$1"
+  local expected_tag="$2"
+  local output_path="$3"
+  active_tag="${expected_tag}"
+  active_previous_image="$(docker image inspect --format '{{.Id}}' "${expected_tag}" 2>/dev/null || true)"
+  docker tag "${source_ref}" "${expected_tag}"
+  local save_status=0
+  docker save -o "${output_path}" "${expected_tag}" || save_status=$?
+  restore_active_tag
+  return "${save_status}"
+}
 if [[ -n "${SPOREVM_BUILDKITE_SOURCE_DIR:-}" ]]; then
   git -C "${SPOREVM_BUILDKITE_SOURCE_DIR}" cat-file -e "${buildkite_commit}^{commit}"
   rmdir "${source_dir}"
@@ -83,7 +110,7 @@ mkdir -p "${base_layout}"
 tar -xf "${scratch}/base-layout.tar" -C "${base_layout}"
 docker buildx build --load --platform "${platform}" \
   -f "${source_dir}/.buildkite/Dockerfile.postgres" \
-  -t buildkite-postgres:latest \
+  -t "${postgres_temp_tag}" \
   "${source_dir}"
 
 dependency_refs=(
@@ -95,20 +122,11 @@ dependency_refs=(
 for ref in "${dependency_refs[@]}"; do
   docker pull --platform "${platform}" "${ref}"
 done
-dependency_tags=(
-  "valkey/valkey:8.1-alpine"
-  "memcached:1.6-alpine"
-  "minio/minio:RELEASE.2025-04-22T22-12-26Z"
-  "nsmithuk/local-kms:3.11.7"
-)
-for index in "${!dependency_refs[@]}"; do
-  docker tag "${dependency_refs[${index}]}" "${dependency_tags[${index}]}"
-done
-docker save -o "${context}/image/deps/01-valkey.tar" "${dependency_tags[0]}"
-docker save -o "${context}/image/deps/02-memcached.tar" "${dependency_tags[1]}"
-docker save -o "${context}/image/deps/03-buildkite-postgres.tar" buildkite-postgres:latest
-docker save -o "${context}/image/deps/04-minio.tar" "${dependency_tags[2]}"
-docker save -o "${context}/image/deps/06-local-kms.tar" "${dependency_tags[3]}"
+save_as "${dependency_refs[0]}" "valkey/valkey:8.1-alpine" "${context}/image/deps/01-valkey.tar"
+save_as "${dependency_refs[1]}" "memcached:1.6-alpine" "${context}/image/deps/02-memcached.tar"
+save_as "${postgres_temp_tag}" buildkite-postgres:latest "${context}/image/deps/03-buildkite-postgres.tar"
+save_as "${dependency_refs[2]}" "minio/minio:RELEASE.2025-04-22T22-12-26Z" "${context}/image/deps/04-minio.tar"
+save_as "${dependency_refs[3]}" "nsmithuk/local-kms:3.11.7" "${context}/image/deps/06-local-kms.tar"
 
 curl -fsSL --retry 3 \
   "https://s3.us-west-2.amazonaws.com/dynamodb-local/dynamodb_local_latest.tar.gz" \
@@ -138,12 +156,17 @@ scripts/benchmark/image-gateway-transport.py prepare \
   --spore-bin zig-out/bin/spore \
   --output "${output}/outer" \
   --iterations 5
+transport_output="${output}/local"
+transport_args=()
+if [[ -n "${backend}" ]]; then
+  transport_output="${output}/s3"
+  transport_args+=(--s3-uri "${backend}" --s3-region ap-southeast-2)
+fi
 scripts/benchmark/image-gateway-transport.py run \
   --fixture "${output}/outer/fixture" \
   --overlap-fixture "${output}/buildkite-ci/fixture" \
-  --output "${output}/s3" \
+  --output "${transport_output}" \
   --iterations 5 \
-  --s3-uri "${backend}" \
-  --s3-region ap-southeast-2
+  "${transport_args[@]}"
 
-echo "buildkite-sporevm gateway benchmark passed: ${platform} ${output}/s3/summary.json"
+echo "buildkite-sporevm gateway benchmark passed: ${platform} ${transport_output}/summary.json"
