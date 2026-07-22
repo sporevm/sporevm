@@ -961,6 +961,19 @@ platform index, native image digest, and complete object summary. The versioned 
 it adds no service or runtime behavior. Compressed, multi-layer, attribute-rich,
 and non-chunk-aligned content remain follow-up conformance fixtures.
 
+The transport benchmark harness has landed without adding a service or product
+protocol. It records fresh direct-OCI conversions and profile logs, exports the
+current verified fixture, then compares per-object GETs, a deterministic static
+archive, and bounded benchmark-only missing-object batches across cold and
+partially populated caches. Rows include provenance, phase timings, reuse,
+requests, backend reads and bytes, response bytes, and batch-composition time;
+all client modes use bounded disk staging, while archive construction records
+its separate one-time cost so the real workload remains measurable.
+Deterministic synthetic overlap is covered in repository tests. The required
+five-sample small-image and `buildkite-sporevm` runs on both platforms, using a
+real related-image overlap fixture and the intended object-store backend,
+remain evidence work before G0 can choose the G1 transport.
+
 The proof intentionally uses one manifest-bound GET per object, so it measures
 correctness rather than the final eager transport. Before object transfer, it
 rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
@@ -968,8 +981,8 @@ rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
 not native image-format limits. It has no authentication,
 conversion admission, server authorization, missing-object optimization,
 redirects, retries, or gateway provenance record. The rest of G0 remains open:
-transport benchmarking, authorization and cross-repository conformance, and
-the separate gateway repository decision have not started.
+production-shaped benchmark evidence and a transport choice, authorization and
+cross-repository conformance, and the separate gateway repository decision.
 
 ## Delivery Strategy
 
@@ -977,7 +990,8 @@ the separate gateway repository decision have not started.
 
 Status: active prerequisite; native identity, platform-index, image-manifest,
 attachment-schema, converter-worker equivalence, and explicit eager-client proof
-slices landed.
+slices landed. The transport harness has landed; the two-platform, two-workload
+evidence and resulting transport choice remain open.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -1012,18 +1026,22 @@ slices landed.
   invariant for the empty-layer case; richer content fixtures remain open.
 - Record a reproducible direct-OCI baseline for a small public image and the
   real `buildkite-sporevm` base on an empty client cache, pinned to the native
-  writer and exact rootfs builder version.
+  writer and exact rootfs builder version. The harness records this evidence;
+  the required benchmark runs remain open.
 - Compare a prewarmed host cache and a simple immutable static image archive
   served from object storage with dynamic missing-object batches. If the G1
   acceptance workload does not benefit materially from partial-cache reuse,
-  use the static archive in G1 and defer the binary batch parser to G2.
+  use the static archive in G1 and defer the binary batch parser to G2. The
+  local transport comparison and accounting are implemented, while the real
+  object-store and overlapping-workload evidence remain open.
 - Freeze the authorization-bound single-object fetch contract and prove that a
   client can fetch any reachable chunk, cannot fetch an unrelated CAS object,
   and receives bytes identical to archive or batch transport. This is a protocol
   prerequisite even though G1 remains eager.
 - Record source manifest digest, platform, conversion contract, rootfs index
   digest, object count/bytes, commands, phase logs, server-side storage requests,
-  and end-to-end transfer economics.
+  and end-to-end transfer economics. The harness schema covers these fields;
+  service-side queue, conversion, and production backend evidence join in G1.
 - Decide the separate gateway repository before service implementation begins.
   The shared fixture exchange mechanism is pinned by the versioned conformance
   bundle and its exact output files.

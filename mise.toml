@@ -31,6 +31,10 @@ description = "Compare the landed spore build subset with BuildKit on small fixt
 run = "mise run build:release && scripts/image-gateway-worker-conformance.py check --spore-bin zig-out/bin/spore --expected test/image-gateway/worker-conformance"
 description = "Verify native gateway conversion output against the cross-worker fixture"
 
+[tasks."test:image-gateway-transport-benchmark"]
+run = "scripts/benchmark/image-gateway-transport-test.py"
+description = "Verify image-gateway archive and missing-object benchmark accounting"
+
 [tasks.docs]
 run = "zig build docs"
 description = "Generate libspore API documentation"
