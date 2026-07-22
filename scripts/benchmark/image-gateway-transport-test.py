@@ -105,6 +105,8 @@ def main() -> None:
         summary = transport.parse_object(transport.read_bounded(summary_path), summary_path)
         if summary.get("kind") != "transport-summary":
             raise RuntimeError("summary omitted its evidence kind")
+        if summary.get("transport", {}).get("backend") != "local":
+            raise RuntimeError("summary omitted its backend placement")
         cases = {(case["mode"], case["cache_state"]): case for case in summary["cases"]}
         if cases[("archive", "cold")]["median_request_count"] != cases[
             ("archive", "partial")

@@ -7,6 +7,7 @@ import argparse
 import dataclasses
 import gzip
 import hashlib
+import hmac
 import http.client
 import io
 import json
@@ -22,9 +23,10 @@ import sys
 import tarfile
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 
 SCHEMA = "spore-image-gateway-transport-benchmark-v1"
@@ -259,6 +261,187 @@ class Closure:
         )
 
 
+class ObjectBackend:
+    kind = "local"
+
+    def read(self, relative: str, expected_size: int) -> bytes:
+        size, stream = self.open(relative, expected_size)
+        try:
+            data = stream.read(expected_size + 1)
+        finally:
+            stream.close()
+        if size != expected_size or len(data) != expected_size:
+            raise BenchmarkError(f"backend object has the wrong size: {relative}")
+        return data
+
+    def open(self, relative: str, expected_size: int) -> tuple[int, Any]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return
+
+
+class LocalObjectBackend(ObjectBackend):
+    def __init__(self, closure: Closure, archive: Path):
+        self.closure = closure
+        self.archive = archive
+
+    def path(self, relative: str) -> Path:
+        if relative == "archive":
+            return self.archive
+        if relative.startswith("controls/"):
+            control = relative.removeprefix("controls/")
+            if control not in self.closure.controls:
+                raise BenchmarkError(f"unknown control object: {control}")
+            return self.closure.root / control
+        if relative.startswith("objects/"):
+            digest = relative.removeprefix("objects/")
+            info = self.closure.objects.get(digest)
+            if info is None:
+                raise BenchmarkError(f"unknown data object: {digest}")
+            return info.path
+        raise BenchmarkError(f"unknown backend object: {relative}")
+
+    def open(self, relative: str, expected_size: int) -> tuple[int, Any]:
+        path = self.path(relative)
+        size = path.stat().st_size
+        if size != expected_size:
+            raise BenchmarkError(f"backend object has the wrong size: {relative}")
+        return size, path.open("rb")
+
+
+def signing_key(secret: str, date: str, region: str) -> bytes:
+    date_key = hmac.new(("AWS4" + secret).encode(), date.encode(), hashlib.sha256).digest()
+    region_key = hmac.new(date_key, region.encode(), hashlib.sha256).digest()
+    service_key = hmac.new(region_key, b"s3", hashlib.sha256).digest()
+    return hmac.new(service_key, b"aws4_request", hashlib.sha256).digest()
+
+
+def aws_credentials() -> tuple[str, str, str | None]:
+    access = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    token = os.environ.get("AWS_SESSION_TOKEN")
+    if access and secret:
+        return access, secret, token
+    try:
+        completed = subprocess.run(
+            ["aws", "configure", "export-credentials", "--format", "process"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+        value = json.loads(completed.stdout)
+        return value["AccessKeyId"], value["SecretAccessKey"], value.get("SessionToken")
+    except (OSError, KeyError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+        raise BenchmarkError("S3 backend could not load AWS credentials") from error
+
+
+class S3ObjectBackend(ObjectBackend):
+    kind = "s3"
+
+    def __init__(self, uri: str, region: str):
+        parsed = urlparse(uri)
+        if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+            raise BenchmarkError("--s3-uri must be s3://bucket/nonempty-prefix")
+        self.bucket = parsed.netloc
+        self.prefix = parsed.path.strip("/")
+        self.region = region
+        self.access, self.secret, self.token = aws_credentials()
+        self.host = f"{self.bucket}.s3.{region}.amazonaws.com"
+        self.connection = http.client.HTTPSConnection(self.host, timeout=60)
+
+    def signed_headers(self, path: str) -> dict[str, str]:
+        now = datetime.now(timezone.utc)
+        timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+        date = now.strftime("%Y%m%d")
+        payload_hash = hashlib.sha256(b"").hexdigest()
+        headers = {
+            "host": self.host,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": timestamp,
+        }
+        if self.token:
+            headers["x-amz-security-token"] = self.token
+        signed_names = ";".join(sorted(headers))
+        canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in sorted(headers))
+        canonical_request = "\n".join(
+            ["GET", path, "", canonical_headers, signed_names, payload_hash]
+        )
+        scope = f"{date}/{self.region}/s3/aws4_request"
+        string_to_sign = "\n".join(
+            [
+                "AWS4-HMAC-SHA256",
+                timestamp,
+                scope,
+                hashlib.sha256(canonical_request.encode()).hexdigest(),
+            ]
+        )
+        signature = hmac.new(
+            signing_key(self.secret, date, self.region),
+            string_to_sign.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        headers["authorization"] = (
+            f"AWS4-HMAC-SHA256 Credential={self.access}/{scope},"
+            f"SignedHeaders={signed_names},Signature={signature}"
+        )
+        return headers
+
+    def open(self, relative: str, expected_size: int) -> tuple[int, Any]:
+        key = f"{self.prefix}/{relative}"
+        path = "/" + quote(key, safe="/-_.~")
+        try:
+            self.connection.request("GET", path, headers=self.signed_headers(path))
+            response = self.connection.getresponse()
+        except (OSError, http.client.HTTPException):
+            self.connection.close()
+            self.connection = http.client.HTTPSConnection(self.host, timeout=60)
+            self.connection.request("GET", path, headers=self.signed_headers(path))
+            response = self.connection.getresponse()
+        if response.status != 200:
+            body = response.read(4096).decode("utf-8", errors="replace")
+            raise BenchmarkError(f"S3 backend returned HTTP {response.status} for {relative}: {body}")
+        try:
+            size = int(response.getheader("Content-Length", "-1"))
+        except ValueError as error:
+            response.close()
+            raise BenchmarkError(f"S3 backend omitted a valid length for {relative}") from error
+        if size != expected_size:
+            response.close()
+            raise BenchmarkError(f"S3 backend object has the wrong size: {relative}")
+        return size, response
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+def stage_backend(closure: Closure, archive: Path, destination: Path) -> None:
+    controls = destination / "controls"
+    objects = destination / "objects"
+    controls.mkdir(parents=True)
+    objects.mkdir()
+    for relative, data in closure.controls.items():
+        target = controls / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    for digest, info in closure.objects.items():
+        os.link(info.path, objects / digest)
+    os.link(archive, destination / "archive")
+
+
+def upload_backend(source: Path, uri: str) -> None:
+    completed = subprocess.run(
+        ["aws", "s3", "sync", str(source), uri, "--only-show-errors", "--no-progress"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise BenchmarkError(f"failed to upload S3 benchmark backend: {completed.stderr.strip()}")
+
+
 def write_archive(closure: Closure, path: Path, compression: str) -> None:
     if compression not in ("gzip", "none"):
         raise BenchmarkError(f"unsupported archive compression: {compression}")
@@ -303,9 +486,10 @@ class Counters:
 
 
 class ServerState:
-    def __init__(self, closure: Closure, archive: Path):
+    def __init__(self, closure: Closure, archive: Path, backend: "ObjectBackend"):
         self.closure = closure
         self.archive = archive
+        self.backend = backend
         self.lock = threading.Lock()
         self.counters = Counters()
 
@@ -322,13 +506,19 @@ class ServerState:
             self.counters.batch_composition_ns += composition_ns
 
 
-def encode_batch(closure: Closure, digests: list[str]) -> bytes:
+def encode_batch(
+    closure: Closure, digests: list[str], backend: ObjectBackend | None = None
+) -> bytes:
     output = io.BytesIO()
     output.write(BATCH_MAGIC)
     output.write(struct.pack(">I", len(digests)))
     for digest in digests:
         info = closure.objects[digest]
-        data = read_bounded(info.path)
+        data = (
+            read_bounded(info.path)
+            if backend is None
+            else backend.read(f"objects/{digest}", info.size)
+        )
         encoded = digest.encode()
         output.write(struct.pack(">H", len(encoded)))
         output.write(encoded)
@@ -385,25 +575,28 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_file(self, path: Path) -> None:
-        size = path.stat().st_size
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(size))
-        self.end_headers()
-        with path.open("rb") as stream:
+    def send_backend_file(self, relative: str, expected_size: int) -> None:
+        size, stream = self.state.backend.open(relative, expected_size)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
             shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
+        finally:
+            stream.close()
 
     def do_GET(self) -> None:
         if self.path == "/archive":
             size = self.state.archive.stat().st_size
             self.state.record(reads=1, backend_bytes=size, response_bytes=size)
-            return self.send_file(self.state.archive)
+            return self.send_backend_file("archive", size)
         if self.path.startswith("/control/"):
             relative = unquote(self.path.removeprefix("/control/"))
-            data = self.state.closure.controls.get(relative)
-            if data is None:
+            expected = self.state.closure.controls.get(relative)
+            if expected is None:
                 return self.send_error(404)
+            data = self.state.backend.read(f"controls/{relative}", len(expected))
             self.state.record(reads=1, backend_bytes=len(data), response_bytes=len(data))
             return self.send_bytes(data)
         if self.path.startswith("/objects/"):
@@ -411,7 +604,7 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
             info = self.state.closure.objects.get(digest)
             if info is None:
                 return self.send_error(404)
-            data = read_bounded(info.path)
+            data = self.state.backend.read(f"objects/{digest}", info.size)
             self.state.record(reads=1, backend_bytes=len(data), response_bytes=len(data))
             return self.send_bytes(data)
         self.send_error(404)
@@ -437,7 +630,7 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
         if len(set(digests)) != len(digests):
             return self.send_error(404)
         started = time.perf_counter_ns()
-        data = encode_batch(self.state.closure, digests)
+        data = encode_batch(self.state.closure, digests, self.state.backend)
         composition_ns = time.perf_counter_ns() - started
         object_bytes = sum(self.state.closure.objects[digest].size for digest in digests)
         self.state.record(
@@ -450,8 +643,8 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
 
 
 class TransportServer:
-    def __init__(self, closure: Closure, archive: Path):
-        self.state = ServerState(closure, archive)
+    def __init__(self, closure: Closure, archive: Path, backend: "ObjectBackend"):
+        self.state = ServerState(closure, archive, backend)
         self.server = HTTPServer(("127.0.0.1", 0), BenchmarkHandler)
         self.server.state = self.state  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -464,6 +657,7 @@ class TransportServer:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+        self.state.backend.close()
 
 
 class TransportClient:
@@ -656,6 +850,8 @@ def summarize(
     batch_size: int,
     archive_bytes: int,
     archive_build_ms: float,
+    backend_kind: str,
+    backend_region: str | None,
 ) -> dict[str, Any]:
     cases = []
     for mode in ("objects", "archive", "batch"):
@@ -714,6 +910,8 @@ def summarize(
             "source": closure.source,
         },
         "transport": {
+            "backend": backend_kind,
+            "backend_region": backend_region,
             "archive": f"tar+{compression}" if compression != "none" else "tar",
             "archive_bytes": archive_bytes,
             "archive_build_ms": archive_build_ms,
@@ -758,8 +956,20 @@ def run_benchmark(args: argparse.Namespace) -> None:
     archive_started = time.perf_counter_ns()
     write_archive(closure, archive, args.archive_compression)
     archive_build_ms = (time.perf_counter_ns() - archive_started) / 1_000_000
+    s3_uri = getattr(args, "s3_uri", None)
+    s3_region = getattr(args, "s3_region", None)
+    if s3_uri:
+        if not s3_region:
+            raise BenchmarkError("--s3-region is required with --s3-uri")
+        backend_stage = output / "backend-stage"
+        stage_backend(closure, archive, backend_stage)
+        upload_backend(backend_stage, s3_uri)
+        shutil.rmtree(backend_stage)
+        backend: ObjectBackend = S3ObjectBackend(s3_uri, s3_region)
+    else:
+        backend = LocalObjectBackend(closure, archive)
     rows: list[dict[str, Any]] = []
-    with TransportServer(closure, archive) as server, (output / "results.jsonl").open(
+    with TransportServer(closure, archive, backend) as server, (output / "results.jsonl").open(
         "w", encoding="utf-8"
     ) as results:
         trial_order = 0
@@ -794,6 +1004,8 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 args.batch_size,
                 archive.stat().st_size,
                 archive_build_ms,
+                backend.kind,
+                s3_region,
             )
         )
     )
@@ -964,6 +1176,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     run_parser.add_argument("--iterations", type=int, default=5)
     run_parser.add_argument("--batch-size", type=int, default=1024)
     run_parser.add_argument("--archive-compression", choices=("none", "gzip"), default="gzip")
+    run_parser.add_argument("--s3-uri", help="upload and read the immutable backend from this S3 prefix")
+    run_parser.add_argument("--s3-region", help="AWS region for --s3-uri")
     return parser.parse_args(argv)
 
 
