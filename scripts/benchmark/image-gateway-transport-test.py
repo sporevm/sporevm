@@ -153,6 +153,8 @@ def main() -> None:
         profile = transport.parse_profile(profile_log)
         if profile.get("tree_merge_layer_count") != 2 or profile.get("tree_merge_layer_ms") != 10:
             raise RuntimeError("repeated layer profile lines were not aggregated")
+        if transport.METADATA_RE.search("metadata: /tmp/rootfs.json\n") is None:
+            raise RuntimeError("OCI layout import metadata output was not recognized")
 
         transport.run_benchmark(
             argparse.Namespace(

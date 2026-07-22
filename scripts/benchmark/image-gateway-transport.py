@@ -37,6 +37,7 @@ MAX_CHUNK_BYTES = 64 * 1024
 CONTROL_NAMES = ("index", "manifest", "config", "rootfs-index")
 PROFILE_RE = re.compile(r"spore rootfs profile: phase=(?P<phase>\S+)(?P<tail>.*)")
 PROFILE_FIELD_RE = re.compile(r"(?P<name>[a-z0-9_]+)=(?P<value>\d+)")
+METADATA_RE = re.compile(r"^(?:  Metadata|metadata): (?P<path>.+)$", re.MULTILINE)
 
 
 class BenchmarkError(RuntimeError):
@@ -1158,11 +1159,147 @@ def prepare_fixture(args: argparse.Namespace) -> None:
     print(f"image-gateway direct OCI baseline passed: {output / 'direct-oci.json'}")
 
 
+def prepare_layout_fixture(args: argparse.Namespace) -> None:
+    if args.iterations < 1 or args.timeout < 1:
+        raise BenchmarkError("iterations and timeout must be positive")
+    output = args.output.resolve()
+    spore = args.spore_bin.resolve()
+    layout = args.source_layout.resolve()
+    if output.exists():
+        raise BenchmarkError(f"output already exists: {output}")
+    if not spore.is_file() or not os.access(spore, os.X_OK):
+        raise BenchmarkError(f"spore binary is not executable: {spore}")
+    if not layout.is_dir() or not (layout / "index.json").is_file():
+        raise BenchmarkError(f"OCI layout is missing index.json: {layout}")
+    output.mkdir(parents=True)
+    index_data = read_bounded(layout / "index.json")
+    source = f"oci-layout@{sha256(index_data)}"
+    rows = []
+    fixture_metadata: Path | None = None
+    fixture_env: dict[str, str] | None = None
+    for iteration in range(1, args.iterations + 1):
+        trial = output / "direct-oci" / str(iteration)
+        trial.mkdir(parents=True)
+        cache = trial / "cache"
+        env = os.environ.copy()
+        for name in list(env):
+            if name.startswith("SPOREVM_"):
+                del env[name]
+        env["SPOREVM_EXT4_WRITER"] = "native"
+        env["SPOREVM_ROOTFS_BUILD_PROFILE"] = "1"
+        env["SPOREVM_ROOTFS_CACHE_DIR"] = str(cache)
+        command = [
+            str(spore),
+            "rootfs",
+            "import-oci",
+            str(layout),
+            "--ref",
+            f"local/gateway-benchmark:trial-{iteration}",
+            "--platform",
+            args.platform,
+        ]
+        stdout_log = trial / "stdout.log"
+        stderr_log = trial / "stderr.log"
+        elapsed_ms = run_command(
+            command,
+            env,
+            Path(__file__).resolve().parents[2],
+            stdout_log,
+            stderr_log,
+            args.timeout,
+        )
+        match = METADATA_RE.search(stdout_log.read_text(encoding="utf-8", errors="replace"))
+        if match is None:
+            raise BenchmarkError("OCI layout import did not report its metadata path")
+        metadata = Path(match.group("path"))
+        value = parse_object(read_bounded(metadata), metadata)
+        if value.get("ext4_writer") != "native" or value.get("platform") != {
+            "os": "linux",
+            "arch": args.platform.removeprefix("linux/"),
+        }:
+            raise BenchmarkError("OCI layout conversion used the wrong contract or platform")
+        storage = value.get("rootfs_storage")
+        if not isinstance(storage, dict):
+            raise BenchmarkError("OCI layout conversion omitted rootfs storage metadata")
+        profile = parse_profile(stderr_log)
+        if not profile:
+            raise BenchmarkError("OCI layout conversion emitted no rootfs profile phases")
+        rows.append(
+            {
+                "iteration": iteration,
+                "source": source,
+                "platform": args.platform,
+                "command": command,
+                "elapsed_ms": elapsed_ms,
+                "profile": profile,
+                "logs": {
+                    "stdout": file_descriptor(stdout_log, output),
+                    "stderr": file_descriptor(stderr_log, output),
+                },
+                "rootfs_builder": value.get("builder_version"),
+                "ext4_writer": value.get("ext4_writer"),
+                "selected_manifest_digest": value.get("image_manifest_digest"),
+                "rootfs_index_digest": storage.get("index_digest"),
+            }
+        )
+        if iteration == 1:
+            fixture_metadata = metadata
+            fixture_env = env
+        else:
+            shutil.rmtree(cache)
+    if fixture_metadata is None or fixture_env is None:
+        raise BenchmarkError("OCI layout conversion produced no fixture metadata")
+    run_command(
+        [
+            str(spore),
+            "image",
+            "export-fixture",
+            source,
+            "--repository",
+            args.repository,
+            "--metadata",
+            str(fixture_metadata),
+            "--out",
+            str(output / "fixture"),
+        ],
+        fixture_env,
+        Path(__file__).resolve().parents[2],
+        output / "export.stdout.log",
+        output / "export.stderr.log",
+        args.timeout,
+    )
+    shutil.rmtree(output / "direct-oci" / "1" / "cache")
+    closure = Closure.load(output / "fixture")
+    profile_medians, profile_samples = median_profiles(rows)
+    result = {
+        "schema": SCHEMA,
+        "kind": "direct-oci-baseline",
+        "input": "oci-layout",
+        "provenance": provenance(),
+        "requested_source": source,
+        "resolved_source": source,
+        "source_layout_index": file_descriptor(layout / "index.json", layout),
+        "platform": args.platform,
+        "spore_bin": str(spore),
+        "spore_sha256": sha256(spore.read_bytes()),
+        "fixture_image_digest": closure.image_digest,
+        "fixture_rootfs_index_digest": closure.rootfs_index_digest,
+        "samples": rows,
+        "median_elapsed_ms": statistics.median(row["elapsed_ms"] for row in rows),
+        "median_profile": profile_medians,
+        "median_profile_samples": profile_samples,
+    }
+    (output / "direct-oci.json").write_bytes(canonical_json(result))
+    print(f"image-gateway OCI layout baseline passed: {output / 'direct-oci.json'}")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare", help="record direct OCI conversion and export a fixture")
-    prepare.add_argument("--source", required=True)
+    prepare_source = prepare.add_mutually_exclusive_group(required=True)
+    prepare_source.add_argument("--source")
+    prepare_source.add_argument("--source-layout", type=Path)
     prepare.add_argument("--platform", choices=("linux/arm64", "linux/amd64"), required=True)
     prepare.add_argument("--repository", default="benchmark")
     prepare.add_argument("--spore-bin", type=Path, default=Path("zig-out/bin/spore"))
@@ -1185,7 +1322,10 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
         if args.command == "prepare":
-            prepare_fixture(args)
+            if args.source_layout is None:
+                prepare_fixture(args)
+            else:
+                prepare_layout_fixture(args)
         else:
             run_benchmark(args)
     except (BenchmarkError, OSError, subprocess.SubprocessError) as error:
