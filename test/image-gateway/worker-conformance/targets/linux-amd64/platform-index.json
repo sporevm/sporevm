@@ -1,0 +1,13 @@
+{
+  "kind": "spore-image-gateway-index-v1",
+  "manifests": [
+    {
+      "platform": {
+        "os": "linux",
+        "arch": "amd64"
+      },
+      "manifest_digest": "sha256:ace700f2e53907c0399b77bfd5988aac5c6d0a681f32bf5e67ad6f77155f1589",
+      "image_digest": "blake3:8db6d2be4d1ed1cf8e8efbed9ba8f334f9fe53d58d2ee75b5bcf34dede9727cc"
+    }
+  ]
+}

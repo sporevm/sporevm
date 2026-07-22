@@ -1,0 +1,121 @@
+{
+  "input": {
+    "conversion_contract": {
+      "ext4_writer": "native",
+      "rootfs_builder": "sporevm-rootfs-v6"
+    },
+    "index_digest": "sha256:58f30a682366bb65bffc58ef330ef1a1faf00fbde74c4b5f5ddd4f3595fda086",
+    "layer": {
+      "bytes": 1024,
+      "digest": "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+      "kind": "empty-ustar-v1"
+    }
+  },
+  "schema": "spore-image-gateway-worker-conformance-v1",
+  "targets": [
+    {
+      "files": {
+        "config.json": {
+          "bytes": 37,
+          "sha256": "sha256:9d99a75171aea000c711b34c0e5e3f28d3d537dd99d110eafbfbc2bd8e52c2bf"
+        },
+        "image-manifest.json": {
+          "bytes": 1190,
+          "sha256": "sha256:ace700f2e53907c0399b77bfd5988aac5c6d0a681f32bf5e67ad6f77155f1589"
+        },
+        "platform-index.json": {
+          "bytes": 350,
+          "sha256": "sha256:215eed52f20193eece7e765f03e31910dbbc6ec416b6fb0e685cae8c89abb037"
+        },
+        "rootfs-index.json": {
+          "bytes": 81617,
+          "sha256": "sha256:ec84e4a2c137dc8dff099e80e054eb77c8c3dc7823f0150d7ae729faca2083a2"
+        }
+      },
+      "gateway_manifest_digest": "sha256:ace700f2e53907c0399b77bfd5988aac5c6d0a681f32bf5e67ad6f77155f1589",
+      "native_image_digest": "blake3:8db6d2be4d1ed1cf8e8efbed9ba8f334f9fe53d58d2ee75b5bcf34dede9727cc",
+      "objects": [
+        {
+          "bytes": 65536,
+          "digest": "blake3:299a39a697f4895382bce2d6967b31d178410bf000652d0660e1733a8fc5f798",
+          "sha256": "sha256:745c5594be306ec0a5b4ceb27c89db2b593de8edba55bedd9127eb2978d56f88"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:4eae6a176d4ce696684afd8afe50c391c1123d1ef1326356a8fc18977769d745",
+          "sha256": "sha256:a4e6a02384f40599c259c7a05605fe9e0ac4bb428d86bbe530204b12ff5fe897"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:814e6e5d3c9d7e87df937573c9ae8b5605b3c9fd2fe0896b33da0d73aae38e88",
+          "sha256": "sha256:591193fda1edfb645a83c5ef04a26b8ca08c3221cc4b38d749ebba613a3ce6cf"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:9df91228a896dc664465b077a9219222e1712248475fe28beefbfe5e30c2e22c",
+          "sha256": "sha256:040567d5e8249bfd5cad64c005d4b571305f7a2eb3d83ca3d26aa4bf8c7c2a16"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:f9611bc4b8a91c2ebeab4c34df9992756b2eb0de09bb89f96f75a7552c10da8e",
+          "sha256": "sha256:1865bb5d162c2b700b0b283318d6011529797557186195988ceea732e51e4bf3"
+        }
+      ],
+      "platform": "linux/amd64",
+      "rootfs_index_digest": "blake3:e8364619b7fb6341425c80deb77da1f33361b8ad31084cf2e5a220c47c66e6ee",
+      "selected_source_manifest_digest": "sha256:368e06c86f96938230afdc65da31f9b93ff66750ec687b6b9de2e615bf3707da"
+    },
+    {
+      "files": {
+        "config.json": {
+          "bytes": 37,
+          "sha256": "sha256:d6f56bc20064075ce319ac2e6fcef5de9ea21773b0a8a4398c4405222971f9c0"
+        },
+        "image-manifest.json": {
+          "bytes": 1190,
+          "sha256": "sha256:69f09c91621589a97d727ce78fd1b26d77988944a92bc79ec80598d709ba7d89"
+        },
+        "platform-index.json": {
+          "bytes": 350,
+          "sha256": "sha256:794fd9c1849b7cf4ba763c7e71c67745d0ff04db3ef200ef343a70f667beb731"
+        },
+        "rootfs-index.json": {
+          "bytes": 81617,
+          "sha256": "sha256:f6b69da6eafd29de16a23b6deedf1b9feec48cb3674ac2adebb4b3f9f66fda0f"
+        }
+      },
+      "gateway_manifest_digest": "sha256:69f09c91621589a97d727ce78fd1b26d77988944a92bc79ec80598d709ba7d89",
+      "native_image_digest": "blake3:0b44f9bb9b365e1a3612586aa6fdcd721c26cda2f7b78a34720d344e89a2e4fe",
+      "objects": [
+        {
+          "bytes": 65536,
+          "digest": "blake3:62ed9f42504197184ae9bf69a0f34f2a5c36362888cc4afbd108e531ff46474b",
+          "sha256": "sha256:8f40976074ebe89d70b1e3adc16c07658c28611c3f8868012e1da269c53d87c2"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:814e6e5d3c9d7e87df937573c9ae8b5605b3c9fd2fe0896b33da0d73aae38e88",
+          "sha256": "sha256:591193fda1edfb645a83c5ef04a26b8ca08c3221cc4b38d749ebba613a3ce6cf"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:838a4e2cd720626ee606f396690d4fbcb9e4c33b1270433cea320f9af490f932",
+          "sha256": "sha256:1f731646670b8dba58df8ca27664858763f4ccaa3fc5494dcdc2303f83c2bf47"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:a799e9eef4729f66f51ca16948e7ae24463577369607ae5d38026b4ef4400351",
+          "sha256": "sha256:649cbd008c805e1f9ffca6ae64d1b7c81ab13fc0737d24878a9deda1701b7fb6"
+        },
+        {
+          "bytes": 65536,
+          "digest": "blake3:f9611bc4b8a91c2ebeab4c34df9992756b2eb0de09bb89f96f75a7552c10da8e",
+          "sha256": "sha256:1865bb5d162c2b700b0b283318d6011529797557186195988ceea732e51e4bf3"
+        }
+      ],
+      "platform": "linux/arm64",
+      "rootfs_index_digest": "blake3:cfa30aeb30365d5d7ce86ce779d980e5a9c711fe19f5a1516351fcd0b5c5771f",
+      "selected_source_manifest_digest": "sha256:ac16a7df9a44d024a8eea0b72ded6b27dfbb4d9985bf186b552d1a7227049c95"
+    }
+  ]
+}

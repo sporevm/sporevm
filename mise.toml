@@ -27,6 +27,10 @@ description = "Run slow rootfs/ext4 conformance tests"
 run = "mise run build && scripts/spore-build-conformance.py --spore-bin zig-out/bin/spore"
 description = "Compare the landed spore build subset with BuildKit on small fixtures"
 
+[tasks."test:image-gateway-worker-conformance"]
+run = "mise run build:release && scripts/image-gateway-worker-conformance.py check --spore-bin zig-out/bin/spore --expected test/image-gateway/worker-conformance"
+description = "Verify native gateway conversion output against the cross-worker fixture"
+
 [tasks.docs]
 run = "zig build docs"
 description = "Generate libspore API documentation"
