@@ -1,5 +1,8 @@
 package spore
 
+// VMNameMaxBytes is the platform-independent maximum named VM identifier length.
+const VMNameMaxBytes = 128
+
 // HostInfo is the decoded spore.host-info.v2 contract.
 type HostInfo struct {
 	Schema        string                `json:"schema"`

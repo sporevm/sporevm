@@ -34,6 +34,7 @@
 #endif
 #define SPORE_ENUM_MAX_VALUE INT_MAX
 #define SPORE_ABI_VERSION 17u
+#define SPORE_VM_NAME_MAX_BYTES 128u
 
 #ifdef __cplusplus
 extern "C" {

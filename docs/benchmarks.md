@@ -320,9 +320,9 @@ deliberate tmpfs/schema-v1 control.
 The macOS lane defaults its task scratch to `/tmp` rather than inheriting the
 runner's potentially long `TMPDIR`. Both backends use a short work-directory
 prefix, runtime aliases, and per-iteration VM names while retaining the full
-scenario name in JSON evidence. Before each lane, the harness rejects any
-generated `runtime/vms/<name>/control.sock` path longer than the portable
-103-byte Unix-socket limit.
+scenario name in JSON evidence. Named lifecycle sockets use the runtime's
+fixed-size internal socket keys, so benchmark VM names and scratch paths do not
+consume the host Unix-socket path budget.
 
 Correctness gates run before performance gates. Same-head median public restore
 wall time, `restore_return_ms`, must be at least twice as fast with local backing

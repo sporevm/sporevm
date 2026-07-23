@@ -194,6 +194,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         std.process.exit(2);
     };
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
+    try lifecycle.validateControlSocketOwner(init.io, paths);
     const paths_ms = lifecycle.monotonicMs();
     var existing_spec = lifecycle.readSpec(allocator, init.io, paths) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -512,8 +513,8 @@ const ExecServer = struct {
                 std.debug.print("monitor: {s}\n", .{detail});
             } else {
                 std.debug.print(
-                    "monitor: control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path\n",
-                    .{ socket_path, socket_path.len, lifecycle.max_control_socket_path_len, lifecycle.runtime_dir_env },
+                    "monitor: internal control socket path {s} is {d} bytes but the platform limit is {d}\n",
+                    .{ socket_path, socket_path.len, lifecycle.max_control_socket_path_len },
                 );
             }
             return err;

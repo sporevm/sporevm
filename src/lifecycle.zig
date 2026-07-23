@@ -5,6 +5,7 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const Context = @import("context.zig").Context;
 const local_paths = @import("local_paths.zig");
@@ -50,7 +51,8 @@ const create_timing_file = "create-timing.json";
 const monitor_timing_file = "monitor-timing.json";
 const monitor_stats_file = "monitor-stats.json";
 const pid_file = "pid";
-const control_socket_file = "control.sock";
+const control_socket_hash_bytes = 16;
+const control_socket_owner_suffix = ".owner";
 const console_log_file = "console.log";
 const monitor_log_file = "monitor.log";
 const monitor_shutdown_grace_ms = 1_000;
@@ -263,7 +265,9 @@ pub const Paths = struct {
     monitor_timing_path: []const u8,
     monitor_stats_path: []const u8,
     pid_path: []const u8,
+    control_socket_root: []const u8,
     control_socket_path: []const u8,
+    control_socket_owner_path: []const u8,
     console_log_path: []const u8,
     monitor_log_path: []const u8,
 
@@ -277,7 +281,9 @@ pub const Paths = struct {
         allocator.free(self.monitor_timing_path);
         allocator.free(self.monitor_stats_path);
         allocator.free(self.pid_path);
+        allocator.free(self.control_socket_root);
         allocator.free(self.control_socket_path);
+        allocator.free(self.control_socket_owner_path);
         allocator.free(self.console_log_path);
         allocator.free(self.monitor_log_path);
     }
@@ -1450,7 +1456,7 @@ fn saveStopNamed(
     var cleanup_after_suspend = true;
     defer if (cleanup_after_suspend) {
         if (finishAcceptedMonitorStop(context.io, paths, ready.value.pid)) {
-            Io.Dir.cwd().deleteTree(context.io, paths.vm_dir) catch {};
+            deleteVmState(context.io, paths) catch {};
         } else |_| {}
     };
     var suspend_spec = spec.value;
@@ -1513,7 +1519,7 @@ fn saveStopNamed(
     const saved_sessions = if (manifest) |parsed| parsed.value.sessions.len else manifest_v1.?.value.sessions.len;
     cleanup_after_suspend = false;
     try finishAcceptedMonitorStop(context.io, paths, ready.value.pid);
-    try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+    try deleteVmState(context.io, paths);
     return ownedNamedLifecycleResult(allocator, .{
         .action = "saved_stopped",
         .name = options.name,
@@ -1574,6 +1580,7 @@ pub fn forkNamed(
     var source_pause_ms: ?u64 = null;
     var child_ready_ms: ?u64 = null;
     var started = std.array_list.Managed([]const u8).init(arena);
+    try started.ensureTotalCapacity(child_names.len);
 
     if (disk_backed) {
         const lease = try ensureDiskBaselineLease(arena, context, source_paths, &source_spec.value);
@@ -1607,16 +1614,17 @@ pub fn forkNamed(
             .environ_map = init.environ_map,
         });
         for (child_names, prepared.value.claims, 0..) |child_name, claim, index| {
-            try started.append(child_name);
             const spore_dir = try childSporeDir(arena, children_dir, index);
             startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, .{
                 .source_socket_path = ready.value.control_socket_path,
                 .batch_name = batch_name,
                 .prepared_claim = claim,
             }) catch |err| {
+                if (err != error.ControlSocketPathCollision) started.appendAssumeCapacity(child_name);
                 cleanupStartedChildren(init, arena, started.items);
                 return err;
             };
+            started.appendAssumeCapacity(child_name);
         }
         child_ready_ms = monotonicMs() -| children_start_ms;
     } else {
@@ -1632,12 +1640,13 @@ pub fn forkNamed(
             .environ_map = init.environ_map,
         });
         for (child_names, 0..) |child_name, index| {
-            try started.append(child_name);
             const spore_dir = try childSporeDir(arena, children_dir, index);
             startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, null) catch |err| {
+                if (err != error.ControlSocketPathCollision) started.appendAssumeCapacity(child_name);
                 cleanupStartedChildren(init, arena, started.items);
                 return err;
             };
+            started.appendAssumeCapacity(child_name);
         }
     }
 
@@ -1683,11 +1692,11 @@ fn removeNamedAtPaths(context: Context, allocator: std.mem.Allocator, paths: Pat
             defer ready.deinit();
             removed_pid = ready.value.pid;
             try stopReadyMonitor(allocator, context.io, paths, ready.value);
-            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+            try deleteVmState(context.io, paths);
         },
         .incomplete, .stale => {
             removed_pid = readPid(allocator, context.io, paths) catch null;
-            try Io.Dir.cwd().deleteTree(context.io, paths.vm_dir);
+            try deleteVmState(context.io, paths);
         },
     }
     return removed_pid;
@@ -1800,7 +1809,7 @@ pub fn createCli(
         .start_ms = start_ms,
         .parsed_ms = parsed_ms,
     }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong, error.ControlSocketPathCollision => exitLifecycleRuntimePathError(allocator, stderr, mode, "create", err),
         error.HostUnsupported => {
             const message = "spore create: monitor mode requires HVF on Apple Silicon or KVM on supported Linux hosts";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.host_unsupported, message, "create"), message);
@@ -2234,7 +2243,7 @@ pub fn forkCli(
         .allow_slow_copy = parsed.allow_slow_copy,
         .spore_executable = full_args[0],
     }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
+        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong, error.ControlSocketPathCollision => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
         error.InvalidForkNamePattern => {
             const message = "spore fork: --name must contain at most one %d or %0Nd placeholder";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
@@ -2349,7 +2358,7 @@ pub fn restoreCli(
                 const message = allocLifecycleMessage(allocator, "spore restore: cannot read --generation {s}: {s}", .{ parsed.generation_path orelse "", @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
-            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => exitLifecycleRuntimePathError(allocator, stderr, mode, "restore", err),
+            error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong, error.ControlSocketPathCollision => exitLifecycleRuntimePathError(allocator, stderr, mode, "restore", err),
             error.X86ResumeUnsupported => {
                 const message = "spore restore: x86-64 KVM resume is unavailable; only fresh execution is supported";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
@@ -2552,36 +2561,28 @@ pub fn validateName(name: []const u8) !void {
 /// enforce the real platform limit itself.
 pub const max_control_socket_path_len: usize = if (builtin.os.tag.isDarwin()) 103 else 107;
 
-/// Fail closed, with an actionable message, when the control socket path
-/// cannot fit a sockaddr_un. Validated before the monitor is spawned so the
-/// caller sees the real problem instead of a readiness timeout. Stale
-/// registry entries with oversized paths stay listable and removable:
-/// only spawn and connect enforce the limit, not path construction.
+/// Fail closed, with an actionable message, when a control socket path cannot
+/// fit a sockaddr_un. Public VM names do not participate in this bound: named
+/// lifecycle sockets use a fixed-size digest in a short per-user namespace.
 pub fn validateControlSocketPath(path: []const u8) error{ControlSocketPathTooLong}!void {
     if (path.len <= max_control_socket_path_len) return;
-    if (maxVmNameBytesForControlSocketPath(path)) |max_vm_name_bytes| {
-        setLastError(
-            "control socket path {s} is {d} bytes but the platform limit is {d}; this runtime dir allows VM names up to {d} bytes; shorten the VM name or set {s} to a shorter path",
-            .{ path, path.len, max_control_socket_path_len, max_vm_name_bytes, runtime_dir_env },
-        );
-    } else {
-        setLastError(
-            "control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path",
-            .{ path, path.len, max_control_socket_path_len, runtime_dir_env },
-        );
-    }
+    setLastError(
+        "control socket path {s} is {d} bytes but the platform limit is {d}",
+        .{ path, path.len, max_control_socket_path_len },
+    );
     return error.ControlSocketPathTooLong;
 }
 
-fn maxVmNameBytesForControlSocketPath(path: []const u8) ?usize {
-    const suffix = "/" ++ control_socket_file;
-    if (!std.mem.endsWith(u8, path, suffix)) return null;
-    const vm_dir = path[0 .. path.len - suffix.len];
-    const slash = std.mem.lastIndexOfScalar(u8, vm_dir, '/') orelse return null;
-    const name_len = vm_dir.len - slash - 1;
-    const fixed_len = path.len - name_len;
-    if (fixed_len > max_control_socket_path_len) return 0;
-    return @min(max_name_len, max_control_socket_path_len - fixed_len);
+fn controlSocketRootPath(allocator: std.mem.Allocator) ![]const u8 {
+    const uid: u32 = if (comptime builtin.os.tag == .windows) 0 else @intCast(std.c.getuid());
+    return std.fmt.allocPrint(allocator, "/tmp/sporevm-control-{d}", .{uid});
+}
+
+fn controlSocketKey(vm_dir: []const u8) [control_socket_hash_bytes * 2]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(vm_dir, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return hex[0 .. control_socket_hash_bytes * 2].*;
 }
 
 /// Build a validated control socket address for connecting to a monitor.
@@ -2620,8 +2621,17 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
     errdefer allocator.free(monitor_stats_path);
     const pid_path = try std.fs.path.resolve(allocator, &.{ vm_dir, pid_file });
     errdefer allocator.free(pid_path);
-    const control_socket_path = try std.fs.path.resolve(allocator, &.{ vm_dir, control_socket_file });
+    const control_socket_root = try controlSocketRootPath(allocator);
+    errdefer allocator.free(control_socket_root);
+    const socket_key = controlSocketKey(vm_dir);
+    const control_socket_name = try std.fmt.allocPrint(allocator, "{s}.sock", .{&socket_key});
+    defer allocator.free(control_socket_name);
+    const control_socket_path = try std.fs.path.resolve(allocator, &.{ control_socket_root, control_socket_name });
     errdefer allocator.free(control_socket_path);
+    const control_socket_owner_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ &socket_key, control_socket_owner_suffix });
+    defer allocator.free(control_socket_owner_name);
+    const control_socket_owner_path = try std.fs.path.resolve(allocator, &.{ control_socket_root, control_socket_owner_name });
+    errdefer allocator.free(control_socket_owner_path);
     const console_log_path = try std.fs.path.resolve(allocator, &.{ vm_dir, console_log_file });
     errdefer allocator.free(console_log_path);
     const monitor_log_path = try std.fs.path.resolve(allocator, &.{ vm_dir, monitor_log_file });
@@ -2636,7 +2646,9 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
         .monitor_timing_path = monitor_timing_path,
         .monitor_stats_path = monitor_stats_path,
         .pid_path = pid_path,
+        .control_socket_root = control_socket_root,
         .control_socket_path = control_socket_path,
+        .control_socket_owner_path = control_socket_owner_path,
         .console_log_path = console_log_path,
         .monitor_log_path = monitor_log_path,
     };
@@ -3991,7 +4003,7 @@ fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, 
             if (readPid(allocator, init.io, paths)) |pid| {
                 finishMonitorPidExit(paths, pid) catch {};
             } else |_| {}
-            Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
+            deleteVmState(init.io, paths) catch {};
             continue;
         };
         stopReadyMonitor(allocator, init.io, paths, ready.value) catch {
@@ -3999,7 +4011,7 @@ fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, 
             continue;
         };
         ready.deinit();
-        Io.Dir.cwd().deleteTree(init.io, paths.vm_dir) catch {};
+        deleteVmState(init.io, paths) catch {};
     }
 }
 
@@ -4031,8 +4043,6 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
 }
 
 fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, spec: Spec, exe: []const u8, network_policy: ?*const run_mod.NetworkPolicy) ![]const u8 {
-    // Fail before spawning: an oversized socket path would otherwise only
-    // surface as a monitor readiness timeout.
     try validateControlSocketPath(paths.control_socket_path);
     try ensureVmDir(init.io, paths);
     const resolved_exe = try resolveSpawnExecutable(allocator, init.io, init.environ_map, exe);
@@ -4105,6 +4115,11 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
         try argv.append("--console-log");
         try argv.append(path);
     }
+    try claimControlSocketPath(init.io, paths);
+    var release_socket_claim = true;
+    errdefer {
+        if (release_socket_claim) releaseControlSocketPath(init.io, paths) catch {};
+    }
     var child_env = try init.environ_map.clone(allocator);
     try child_env.put(reexec_role_env, "monitor");
     try child_env.put(reexec_contract_env, reexec_contract_value);
@@ -4116,6 +4131,7 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
         .stderr = .{ .file = monitor_log },
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
+    release_socket_claim = false;
     return resolved_exe;
 }
 
@@ -4154,6 +4170,8 @@ test "lifecycle monitor spawn receives context environment" {
     defer spawn_arena_state.deinit();
     const spawn_arena = spawn_arena_state.allocator();
     const paths = try pathsFromRoot(spawn_arena, root, "env-probe");
+    releaseControlSocketPath(io, paths) catch {};
+    defer releaseControlSocketPath(io, paths) catch {};
 
     _ = try spawnMonitorExecutable(.{
         .minimal = undefined,
@@ -5810,7 +5828,12 @@ fn exitLifecycleRuntimePathError(
         error.ControlSocketPathTooLong => allocLifecycleLastErrorMessage(
             allocator,
             command,
-            allocLifecycleMessage(allocator, "spore {s}: control socket path exceeds the platform limit; shorten the VM name or set {s} to a shorter path", .{ command, runtime_dir_env }),
+            allocLifecycleMessage(allocator, "spore {s}: internal control socket path exceeds the platform limit", .{command}),
+        ),
+        error.ControlSocketPathCollision => allocLifecycleLastErrorMessage(
+            allocator,
+            command,
+            allocLifecycleMessage(allocator, "spore {s}: internal control socket path collision", .{command}),
         ),
         else => allocLifecycleMessage(allocator, "spore {s}: runtime directory error: {s}", .{ command, @errorName(err) }),
     };
@@ -5853,8 +5876,8 @@ fn cliRuntimePathExit(command: []const u8, err: anyerror) noreturn {
                 std.debug.print("spore {s}: {s}\n", .{ command, detail });
             } else {
                 std.debug.print(
-                    "spore {s}: control socket path exceeds the platform limit; shorten the VM name or set {s} to a shorter path\n",
-                    .{ command, runtime_dir_env },
+                    "spore {s}: internal control socket path exceeds the platform limit\n",
+                    .{command},
                 );
             }
         },
@@ -5958,6 +5981,85 @@ fn ensureVmDir(io: Io, paths: Paths) !void {
     try requirePrivateDir(io, paths.vm_dir);
 }
 
+fn claimControlSocketPath(io: Io, paths: Paths) !void {
+    try ensureDirPath(io, paths.control_socket_root);
+    try requirePrivateDir(io, paths.control_socket_root);
+
+    Io.Dir.cwd().symLink(io, paths.vm_dir, paths.control_socket_owner_path, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            if (try controlSocketOwnerMatches(io, paths)) {
+                setLastError(
+                    "control socket path is already claimed by VM registry {s}: {s}",
+                    .{ paths.vm_dir, paths.control_socket_path },
+                );
+            } else {
+                setLastError(
+                    "control socket hash collision: {s} is not owned by VM registry {s}",
+                    .{ paths.control_socket_path, paths.vm_dir },
+                );
+            }
+            return error.ControlSocketPathCollision;
+        },
+        else => |e| return e,
+    };
+
+    // A socket without a pre-existing matching owner cannot safely be
+    // unlinked: it may be the only evidence of a digest collision.
+    if (try pathExists(io, paths.control_socket_path)) {
+        Io.Dir.cwd().deleteFile(io, paths.control_socket_owner_path) catch {};
+        setLastError(
+            "control socket hash collision: unowned socket already exists at {s}",
+            .{paths.control_socket_path},
+        );
+        return error.ControlSocketPathCollision;
+    }
+}
+
+pub fn validateControlSocketOwner(io: Io, paths: Paths) !void {
+    if (try controlSocketOwnerMatches(io, paths)) return;
+    setLastError(
+        "control socket ownership mismatch: {s} is not owned by VM registry {s}",
+        .{ paths.control_socket_path, paths.vm_dir },
+    );
+    return error.ControlSocketPathCollision;
+}
+
+fn controlSocketOwnerMatches(io: Io, paths: Paths) !bool {
+    const stat = Io.Dir.cwd().statFile(io, paths.control_socket_owner_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    if (stat.kind != .sym_link) return false;
+    var target: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try Io.Dir.cwd().readLink(io, paths.control_socket_owner_path, &target);
+    return std.mem.eql(u8, paths.vm_dir, target[0..len]);
+}
+
+fn releaseControlSocketPath(io: Io, paths: Paths) !void {
+    _ = Io.Dir.cwd().statFile(io, paths.control_socket_owner_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (!try pathExists(io, paths.control_socket_path)) return;
+            setLastError(
+                "control socket ownership is missing for VM registry {s}: {s}",
+                .{ paths.vm_dir, paths.control_socket_path },
+            );
+            return error.ControlSocketPathCollision;
+        },
+        else => |e| return e,
+    };
+    try validateControlSocketOwner(io, paths);
+    Io.Dir.cwd().deleteFile(io, paths.control_socket_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+    try Io.Dir.cwd().deleteFile(io, paths.control_socket_owner_path);
+}
+
+fn deleteVmState(io: Io, paths: Paths) !void {
+    try releaseControlSocketPath(io, paths);
+    try Io.Dir.cwd().deleteTree(io, paths.vm_dir);
+}
+
 fn ensureDirPath(io: Io, path: []const u8) !void {
     if (!Io.Dir.path.isAbsolute(path)) {
         _ = try Io.Dir.cwd().createDirPathStatus(io, path, private_dir_permissions);
@@ -6011,35 +6113,68 @@ fn lessListEntry(_: void, a: ListEntry, b: ListEntry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-test "lifecycle rejects control socket paths that overflow sockaddr_un" {
+test "named control socket paths ignore long runtime roots and maximum VM names" {
     const allocator = std.testing.allocator;
-
-    // A deep runtime root plus a long VM name overflows the platform's
-    // sun_path limit. Path construction still succeeds so stale registry
-    // entries stay listable and removable, but the spawn/connect validation
-    // must fail closed with an actionable message instead of timing out or
-    // crashing in the monitor.
-    const deep_root = "/var/folders/ab/c012345678901234567890123456789/T/deep-runtime-dir";
-    const long_name = "a-very-long-vm-name-that-overflows-sun-path";
-    var long_paths = try pathsFromRoot(allocator, deep_root, long_name);
+    const deep_root = "/var/folders/ab/" ++ ("r" ** 160) ++ "/deep-runtime-dir";
+    const long_name = "n" ** max_name_len;
+    const long_paths = try pathsFromRoot(allocator, deep_root, long_name);
     defer long_paths.deinit(allocator);
-    try std.testing.expect(long_paths.control_socket_path.len > max_control_socket_path_len);
+    const short_paths = try pathsFromRoot(allocator, "/tmp/sporevm-runtime", long_name);
+    defer short_paths.deinit(allocator);
 
-    clearLastError();
-    try std.testing.expectError(
-        error.ControlSocketPathTooLong,
-        validateControlSocketPath(long_paths.control_socket_path),
-    );
-    const message = lastErrorMessage();
-    try std.testing.expect(std.mem.indexOf(u8, message, "control socket path") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "allows VM names up to") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, "shorten the VM name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, message, runtime_dir_env) != null);
+    try std.testing.expect(std.mem.endsWith(u8, long_paths.vm_dir, long_name));
+    try std.testing.expect(long_paths.control_socket_path.len <= max_control_socket_path_len);
+    try std.testing.expectEqual(long_paths.control_socket_path.len, short_paths.control_socket_path.len);
+    try std.testing.expect(!std.mem.eql(u8, long_paths.control_socket_path, short_paths.control_socket_path));
+    try validateControlSocketPath(long_paths.control_socket_path);
 
     try validateControlSocketPath("/tmp/ok.sock");
     const at_limit = "/" ++ ("a" ** (max_control_socket_path_len - 1));
     try validateControlSocketPath(at_limit);
     try std.testing.expectError(error.ControlSocketPathTooLong, validateControlSocketPath(at_limit ++ "b"));
+}
+
+test "named control socket ownership detects hash collisions and cleans up" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-socket-owner"});
+    defer allocator.free(root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+    defer {
+        Io.Dir.cwd().deleteFile(io, paths.control_socket_owner_path) catch {};
+        Io.Dir.cwd().deleteFile(io, paths.control_socket_path) catch {};
+    }
+
+    try ensureVmDir(io, paths);
+    try claimControlSocketPath(io, paths);
+    try validateControlSocketOwner(io, paths);
+
+    Io.Dir.cwd().deleteFile(io, paths.control_socket_owner_path) catch unreachable;
+    try Io.Dir.cwd().symLink(io, "/tmp/a-different-vm-registry", paths.control_socket_owner_path, .{});
+    clearLastError();
+    try std.testing.expectError(error.ControlSocketPathCollision, claimControlSocketPath(io, paths));
+    try std.testing.expect(std.mem.indexOf(u8, lastErrorMessage(), "hash collision") != null);
+    try std.testing.expectError(error.ControlSocketPathCollision, deleteVmState(io, paths));
+    try std.testing.expect(try pathExists(io, paths.vm_dir));
+
+    Io.Dir.cwd().deleteFile(io, paths.control_socket_owner_path) catch unreachable;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.control_socket_path, .data = "" });
+    clearLastError();
+    try std.testing.expectError(error.ControlSocketPathCollision, deleteVmState(io, paths));
+    try std.testing.expect(std.mem.indexOf(u8, lastErrorMessage(), "ownership is missing") != null);
+    try std.testing.expect(try pathExists(io, paths.vm_dir));
+    try Io.Dir.cwd().deleteFile(io, paths.control_socket_path);
+
+    try claimControlSocketPath(io, paths);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.control_socket_path, .data = "" });
+    try deleteVmState(io, paths);
+    try std.testing.expect(!try pathExists(io, paths.vm_dir));
+    try std.testing.expect(!try pathExists(io, paths.control_socket_path));
+    try std.testing.expect(!try pathExists(io, paths.control_socket_owner_path));
 }
 
 test "lifecycle validates VM names" {
@@ -6313,7 +6448,9 @@ test "lifecycle paths are rooted under vms by name" {
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor-timing.json", paths.monitor_timing_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor-stats.json", paths.monitor_stats_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/pid", paths.pid_path);
-    try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/control.sock", paths.control_socket_path);
+    try std.testing.expect(std.mem.startsWith(u8, paths.control_socket_path, "/tmp/sporevm-control-"));
+    try std.testing.expect(std.mem.endsWith(u8, paths.control_socket_path, ".sock"));
+    try std.testing.expect(std.mem.endsWith(u8, paths.control_socket_owner_path, control_socket_owner_suffix));
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/console.log", paths.console_log_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor.log", paths.monitor_log_path);
 }
@@ -6467,7 +6604,14 @@ test "lifecycle monitor stop distinguishes accepted socket close from pid exit" 
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
+    releaseControlSocketPath(io, paths) catch {};
+    Io.Dir.cwd().deleteFile(io, paths.control_socket_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
     try ensureVmDir(io, paths);
+    try claimControlSocketPath(io, paths);
+    defer releaseControlSocketPath(io, paths) catch {};
     const start = monotonicMs();
     try std.testing.expectEqual(
         MonitorStopResult.stopped,
