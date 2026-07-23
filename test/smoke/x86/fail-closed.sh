@@ -19,7 +19,7 @@ expect_failure() {
   if "$@" >"${workdir}/${label}.stdout" 2>"${workdir}/${label}.stderr"; then
     die "${label} unexpectedly succeeded"
   fi
-  grep -Fqi "${needle}" "${workdir}/${label}.stderr" || {
+  grep -Fqi -- "${needle}" "${workdir}/${label}.stderr" || {
     cat "${workdir}/${label}.stderr" >&2 || true
     die "${label} did not explain the x86 restriction"
   }
