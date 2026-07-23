@@ -368,13 +368,13 @@ first read and then use the same hot `.base` path as a materialized image.
 
 `spore pack` follows the selected manifest. Machine-local saves may keep
 writable-disk indexes and objects only in the global rootfs CAS. A validated
-host-private durable pin, not the save path, keeps that storage reachable across
-save moves and cache GC/prune. Pack resolves saved-local storage first and then
+host-private durable pin keeps that storage reachable across save moves and
+cache GC/prune. Its hard-linked ownership anchor makes raw copies fail closed.
+Pack resolves saved-local storage first and then
 the pinned global CAS, verifies the canonical index and every object while
 copying, and emits a self-contained bundle that still restores after the source
-CAS and pin are removed. Raw copies share the source pin identity and can be
-invalidated when either copy is removed; fork or pack/unpack creates an
-independent lifecycle.
+CAS and pin are removed. `spore clone` uses this same transport encoding to
+create an independent portable lifecycle.
 
 - spores without `rootfs.storage` include exact rootfs bytes under
   `rootfs/blake3/<hex>.ext4`;

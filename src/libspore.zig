@@ -129,6 +129,8 @@ pub const TerminalSize = api.TerminalSize;
 pub const Timings = api.Timings;
 pub const UnpackOptions = api.UnpackOptions;
 pub const UnpackResult = api.UnpackResult;
+pub const CloneOptions = api.CloneOptions;
+pub const CloneResult = api.CloneResult;
 
 pub const classifyFailure = api.classifyFailure;
 pub const copyInNamed = api.copyInNamed;
@@ -202,6 +204,7 @@ pub const saveNamed = api.saveNamed;
 pub const systemDf = api.systemDf;
 pub const systemPrune = api.systemPrune;
 pub const unpack = api.unpack;
+pub const cloneSpore = api.cloneSpore;
 
 test {
     const testing = @import("std").testing;

@@ -59,6 +59,8 @@ const usage =
     \\                        Attach forked children concurrently with prefixed output
     \\    pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
     \\                        Pack portable spore chunks into a local bundle
+    \\    clone <spore-dir> --out DIR
+    \\                        Make an independently owned portable spore copy
     \\    unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
     \\                        Unpack a local spore bundle into a spore dir
     \\    push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
@@ -102,6 +104,15 @@ const unpack_usage =
     \\  --allow-metadata-only-rootfs  Allow metadata-only rootfs descriptors
     \\  --out DIR                     Write the unpacked spore to DIR
     \\  -h, --help                    Show this help
+    \\
+;
+
+const clone_usage =
+    \\Usage:
+    \\  spore clone <spore-dir> --out DIR
+    \\
+    \\Makes a portable-self-contained copy through the pack transport encoding.
+    \\The output can be moved, copied, and removed independently.
     \\
 ;
 
@@ -320,6 +331,13 @@ fn runCommand(
         } else {
             try writePackResult(stdout, result);
         }
+    } else if (std.mem.eql(u8, command, "clone")) {
+        if (wantsCommandHelp(command_args)) {
+            try stdout.writeAll(clone_usage);
+            return;
+        }
+        const result = try cloneCommand(context, arena, stderr, mode, command_args);
+        if (mode == .json) try machine_output.writeJson(arena, stdout, result) else try writeCloneResult(stdout, result);
     } else if (std.mem.eql(u8, command, "unpack")) {
         if (wantsCommandHelp(command_args)) {
             try stdout.writeAll(unpack_usage);
@@ -455,6 +473,7 @@ fn supportsJson(command: []const u8) bool {
         std.mem.eql(u8, command, "ps") or
         std.mem.eql(u8, command, "fork") or
         std.mem.eql(u8, command, "pack") or
+        std.mem.eql(u8, command, "clone") or
         std.mem.eql(u8, command, "unpack") or
         std.mem.eql(u8, command, "push") or
         std.mem.eql(u8, command, "inspect-bundle") or
@@ -594,6 +613,10 @@ fn forkCommand(
             const message = machine_output.forkUnsupportedVcpuMessage(allocator, vcpu_count);
             exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
+        error.CrossDeviceOwnershipLink => {
+            const message = "spore fork: machine-local pinned children must share a filesystem with the rootfs cache; use `spore clone` for a portable child on another filesystem";
+            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+        },
         else => |e| return e,
     };
 }
@@ -696,6 +719,34 @@ fn unpackCommand(
         .child_id = child_id,
         .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
     });
+}
+
+fn cloneCommand(
+    context: spore_api.Context,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+    args: []const []const u8,
+) !spore_api.CloneResult {
+    var spore_dir: ?[]const u8 = null;
+    var out_dir: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
+            i += 1;
+            out_dir = args[i];
+        } else if (std.mem.startsWith(u8, args[i], "--")) {
+            exitUnknownArgument(allocator, stderr, mode, "clone", args[i]);
+        } else if (spore_dir == null) {
+            spore_dir = args[i];
+        } else {
+            exitUnexpectedArgument(allocator, stderr, mode, "clone", args[i]);
+        }
+    }
+    if (spore_dir == null or out_dir == null) {
+        exitUsage(allocator, stderr, mode, "clone", "usage: spore clone <spore-dir> --out DIR");
+    }
+    return spore_api.cloneSpore(context, allocator, .{ .spore_dir = spore_dir.?, .out_dir = out_dir.? });
 }
 
 fn pushCommand(
@@ -951,6 +1002,7 @@ fn writeInspectSummary(writer: *Io.Writer, summary: spore_api.SporeInspectResult
     try writer.print("  Platform: {s}/{s}, {d} bytes RAM\n", .{ summary.platform.arch, summary.platform.cpu_profile, summary.platform.ram_size });
     try writer.print("  vCPUs: {d}\n", .{summary.vcpu_count});
     try writer.print("  Devices: {d}\n", .{summary.device_count});
+    try writer.print("  Ownership: {s}\n", .{summary.ownership});
     try writer.print("  Memory chunks: {d} present of {d}\n", .{ summary.present_memory_chunk_count, summary.memory_chunk_count });
     if (summary.memory_backing_kind) |kind| {
         try writer.print("  Memory backing: {s}", .{kind});
@@ -1017,6 +1069,13 @@ fn writeUnpackResult(writer: *Io.Writer, result: spore_api.UnpackResult) !void {
     try writer.print("  Payload bytes: {d}\n", .{result.payload_bytes});
     try writer.print("  Children: {d}\n", .{result.child_count});
     if (result.selected_child) |child| try writer.print("  Selected child: {s}\n", .{child});
+}
+
+fn writeCloneResult(writer: *Io.Writer, result: spore_api.CloneResult) !void {
+    try writer.writeAll("Spore cloned\n");
+    try writer.print("  Source: {s}\n", .{result.source});
+    try writer.print("  Output: {s}\n", .{result.out_dir});
+    try writer.print("  Ownership: {s}\n", .{result.ownership});
 }
 
 fn writePushResult(writer: *Io.Writer, result: spore_api.PushResult) !void {

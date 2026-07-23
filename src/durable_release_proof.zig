@@ -122,7 +122,7 @@ fn recoverPinPublication(allocator: std.mem.Allocator, io: std.Io, mode: []const
     const save_dir = try std.fs.path.join(allocator, &.{ root_path, "saved.spore" });
     defer allocator.free(save_dir);
     const visible = std.mem.eql(u8, mode, "pin-manifest-rename") or std.mem.eql(u8, mode, "pin-directory-sync");
-    const pinned = visible or std.mem.eql(u8, mode, "pin-record") or std.mem.eql(u8, mode, "pin-reference-rename");
+    const has_pin_record = visible or std.mem.eql(u8, mode, "pin-record") or std.mem.eql(u8, mode, "pin-reference-rename");
     const manifest_path = try std.fs.path.join(allocator, &.{ save_dir, "manifest.json" });
     defer allocator.free(manifest_path);
     if (!visible) {
@@ -130,7 +130,8 @@ fn recoverPinPublication(allocator: std.mem.Allocator, io: std.Io, mode: []const
     }
     const listings = try saved_spore_pin.list(io, allocator, cache_root);
     defer saved_spore_pin.deinitListings(allocator, listings);
-    try std.testing.expectEqual(@as(usize, if (pinned) 1 else 0), listings.len);
+    try std.testing.expectEqual(@as(usize, if (has_pin_record) 1 else 0), listings.len);
+    if (has_pin_record and !visible) try std.testing.expectEqual(saved_spore_pin.OwnerState.pending, listings[0].owner_state);
     const gc_result = try system.gc(allocator, io, .{ .cache_root = cache_root, .runtime_root = runtime_root, .dry_run = false });
     defer system.deinitRootfsGcResult(allocator, gc_result);
     const prune_result = try system.prune(allocator, io, .{
@@ -142,7 +143,7 @@ fn recoverPinPublication(allocator: std.mem.Allocator, io: std.Io, mode: []const
         .rootfs_only = true,
     }, std.Io.Clock.real.now(io).nanoseconds);
     defer system.deinitRootfsPruneResult(allocator, prune_result);
-    if (!pinned) return;
+    if (!visible) return;
     var expected_bytes: [512]u8 = undefined;
     @memset(&expected_bytes, 0x81);
     const object_id = chunk.ChunkId.fromContents(&expected_bytes);
@@ -263,6 +264,12 @@ fn recoverForkPublication(allocator: std.mem.Allocator, io: std.Io, mode: []cons
     const visible = !std.mem.eql(u8, mode, "fork-before-batch-rename");
     if (!visible) {
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, children_dir, .{ .follow_symlinks = false }));
+        var root_dir = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = true });
+        defer root_dir.close(io);
+        var iterator = root_dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            try std.testing.expect(!std.mem.startsWith(u8, entry.name, "children.pin-stage-"));
+        }
         return;
     }
     for (0..2) |index| {

@@ -20,6 +20,7 @@ const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
+const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const saved_spore_remove = @import("saved_spore_remove.zig");
 const generation = @import("generation.zig");
 const attach_mod = @import("attach.zig");
@@ -612,6 +613,7 @@ pub const NamedLifecycleResult = struct {
     console_log_path: ?[]const u8 = null,
     spore_dir: ?[]const u8 = null,
     saved_sessions: ?usize = null,
+    ownership: ?[]const u8 = null,
     timing: ?NamedLifecycleTiming = null,
 };
 
@@ -1397,6 +1399,10 @@ fn saveContinueNamed(
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }
+    if (spec.value.disk != null or spec.value.rootfs != null or spec.value.rootfs_path != null or spec.value.image_ref != null) {
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+        try saved_spore_pin.ensureOwnershipLinkCompatible(arena, cache_root, temp_dir);
+    }
     var snapshot_spec = spec.value;
     if (!spore.annotationsEmpty(options.annotations)) {
         snapshot_spec.annotations = try spore.mergeAnnotations(arena, snapshot_spec.annotations, options.annotations);
@@ -1414,6 +1420,10 @@ fn saveContinueNamed(
         .state = "ready",
         .pid = ready.value.pid,
         .spore_dir = out_dir,
+        .ownership = if (spec.value.disk != null or spec.value.rootfs != null or spec.value.rootfs_path != null or spec.value.image_ref != null)
+            saved_spore_ownership.machine_local_pinned
+        else
+            saved_spore_ownership.portable_self_contained,
     });
 }
 
@@ -1462,6 +1472,10 @@ fn saveStopNamed(
     try rejectX86NamedPersistence(spec.value);
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
+    }
+    if (spec.value.disk != null or spec.value.rootfs != null or spec.value.rootfs_path != null or spec.value.image_ref != null) {
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+        try saved_spore_pin.ensureOwnershipLinkCompatible(arena, cache_root, out_dir);
     }
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
@@ -1542,6 +1556,7 @@ fn saveStopNamed(
         .pid = ready.value.pid,
         .spore_dir = out_dir,
         .saved_sessions = saved_sessions,
+        .ownership = if (saved_disk != null) saved_spore_ownership.machine_local_pinned else saved_spore_ownership.portable_self_contained,
     });
 }
 
@@ -2232,7 +2247,17 @@ pub fn rmCli(
     }
     const allocator = init.arena.allocator();
     if (args.len == 2 and std.mem.eql(u8, args[0], "--spore")) {
-        const removed = try removeSavedSpore(.{ .io = init.io, .environ_map = init.environ_map }, allocator, args[1]);
+        const removed = removeSavedSpore(.{ .io = init.io, .environ_map = init.environ_map }, allocator, args[1]) catch |err| switch (err) {
+            error.LegacySharedPinRemovalRefused => {
+                const message = "spore rm: refusing to remove a legacy shared-pin spore because another raw copy may still depend on it; use `spore clone DIR --out PORTABLE` to make an independently owned copy, then remove the legacy pin only after accounting for every copy";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
+            },
+            error.SavedSporeOwnershipConflict => {
+                const message = "spore rm: refusing to remove a machine-local spore whose ownership link is copied or duplicated; remove the raw duplicate, or use `spore clone DIR --out PORTABLE` for an independently owned copy";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
+            },
+            else => |e| return e,
+        };
         if (mode == .json) try machine_output.writeJson(allocator, stdout, removed) else try writeRemovedSavedSpore(stdout, removed);
         return;
     }
@@ -2273,9 +2298,9 @@ pub fn removeSavedSpore(context: Context, allocator: std.mem.Allocator, raw_dir:
 
 fn writeRemovedSavedSpore(writer: *Io.Writer, result: RemovedSavedSpore) !void {
     if (result.pin_removed) {
-        try writer.print("removed spore {s} (pin {s})\n", .{ result.spore_dir, result.pin_id });
+        try writer.print("removed spore {s} ({s}; pin {s})\n", .{ result.spore_dir, result.ownership, result.pin_id });
     } else {
-        try writer.print("removed spore {s} (no disk pin)\n", .{result.spore_dir});
+        try writer.print("removed spore {s} ({s}; no disk pin)\n", .{ result.spore_dir, result.ownership });
     }
     try writer.flush();
 }
@@ -2326,6 +2351,10 @@ pub fn saveCli(
         error.OutputDirExists => {
             const message = allocLifecycleMessage(allocator, "spore save: output directory already exists: {s}; choose a new --out DIR", .{parsed.out_dir});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
+        },
+        error.CrossDeviceOwnershipLink => {
+            const message = "spore save: a machine-local pinned save must be on the same filesystem as the rootfs cache; save there first, then use `spore clone SOURCE --out DEST` for a portable copy on another filesystem";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
         },
         error.InvalidOutputDir => {
             const message = allocLifecycleMessage(allocator, "spore save: invalid --out directory: {s}; the parent directory must exist", .{parsed.out_dir});
@@ -4159,9 +4188,9 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
     } else if (std.mem.eql(u8, result.action, "restored")) {
         try writer.print("restored vm {s}\n", .{result.name});
     } else if (std.mem.eql(u8, result.action, "saved")) {
-        try writer.print("saved {s}; vm {s} is still running\n", .{ result.spore_dir orelse result.name, result.name });
+        try writer.print("saved {s} ({s}); vm {s} is still running\n", .{ result.spore_dir orelse result.name, result.ownership orelse saved_spore_ownership.portable_self_contained, result.name });
     } else if (std.mem.eql(u8, result.action, "saved_stopped")) {
-        try writer.print("saved {s} and stopped vm {s}\n", .{ result.spore_dir orelse result.name, result.name });
+        try writer.print("saved {s} ({s}) and stopped vm {s}\n", .{ result.spore_dir orelse result.name, result.ownership orelse saved_spore_ownership.portable_self_contained, result.name });
         if ((result.saved_sessions orelse 0) > 0) {
             try writer.writeAll("spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n");
         } else {
@@ -7695,7 +7724,7 @@ test "lifecycle human results render terse status lines" {
         .state = "ready",
         .spore_dir = "counter.spore",
     });
-    try std.testing.expectEqualStrings("saved counter.spore; vm counter is still running\n", out.written());
+    try std.testing.expectEqualStrings("saved counter.spore (portable-self-contained); vm counter is still running\n", out.written());
 
     out.clearRetainingCapacity();
     try writeNamedLifecycleResult(&out.writer, .{
@@ -7705,7 +7734,7 @@ test "lifecycle human results render terse status lines" {
         .spore_dir = "counter.spore",
     });
     try std.testing.expectEqualStrings(
-        "saved counter.spore and stopped vm counter\n" ++
+        "saved counter.spore (portable-self-contained) and stopped vm counter\n" ++
             "spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n",
         out.written(),
     );
@@ -7719,7 +7748,7 @@ test "lifecycle human results render terse status lines" {
         .saved_sessions = 1,
     });
     try std.testing.expectEqualStrings(
-        "saved counter.spore and stopped vm counter\n" ++
+        "saved counter.spore (portable-self-contained) and stopped vm counter\n" ++
             "spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n",
         out.written(),
     );
@@ -7738,15 +7767,16 @@ test "lifecycle human results render terse status lines" {
         .pin_id = "",
         .pin_removed = false,
     });
-    try std.testing.expectEqualStrings("removed spore diskless.spore (no disk pin)\n", out.written());
+    try std.testing.expectEqualStrings("removed spore diskless.spore (portable-self-contained; no disk pin)\n", out.written());
 
     out.clearRetainingCapacity();
     try writeRemovedSavedSpore(&out.writer, .{
         .spore_dir = "disk.spore",
+        .ownership = saved_spore_ownership.machine_local_pinned,
         .pin_id = "abc",
         .pin_removed = true,
     });
-    try std.testing.expectEqualStrings("removed spore disk.spore (pin abc)\n", out.written());
+    try std.testing.expectEqualStrings("removed spore disk.spore (machine-local-pinned; pin abc)\n", out.written());
 }
 
 test "saved-spore removal machine output distinguishes disk pin ownership" {
@@ -7765,6 +7795,7 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
             "  \"schema_version\": 1,\n" ++
             "  \"action\": \"removed_spore\",\n" ++
             "  \"spore_dir\": \"diskless.spore\",\n" ++
+            "  \"ownership\": \"portable-self-contained\",\n" ++
             "  \"pin_id\": \"\",\n" ++
             "  \"pin_removed\": false\n" ++
             "}\n",
@@ -7774,6 +7805,7 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
     out.clearRetainingCapacity();
     try machine_output.writeJson(allocator, &out.writer, RemovedSavedSpore{
         .spore_dir = "disk.spore",
+        .ownership = saved_spore_ownership.machine_local_pinned,
         .pin_id = "abc",
         .pin_removed = true,
     });
@@ -7783,6 +7815,7 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
             "  \"schema_version\": 1,\n" ++
             "  \"action\": \"removed_spore\",\n" ++
             "  \"spore_dir\": \"disk.spore\",\n" ++
+            "  \"ownership\": \"machine-local-pinned\",\n" ++
             "  \"pin_id\": \"abc\",\n" ++
             "  \"pin_removed\": true\n" ++
             "}\n",

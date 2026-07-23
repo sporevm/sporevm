@@ -53,11 +53,18 @@ lease; a failed handoff leaves the old spec and lease intact. Restore and pack
 fail closed on missing or mismatched
 pin, index, and object shape; lazy restore and pack keep content verification at
 their existing boundaries. Unknown or corrupt pin records make GC and
-destructive prune retain all CAS. Raw filesystem deletion can leak a pin but
-cannot expose live data to collection. Raw copies share a pin identity, so
-explicit removal or expert-only force-unpin can invalidate every copy; the
-cache lists exact IDs and index health but does not infer orphan status from a
-global reference registry. Portable unpack and pull instead materialize a
+destructive prune retain all CAS. New pin references are hard-linked to one
+cache-side ownership anchor: the anchor and artifact must be the only two
+links. Ordinary copies have the wrong inode, hard-link duplicates raise the
+link count, and both fail closed before restore, pack, or removal. A rename
+preserves the identity. Raw deletion leaves a one-link anchor that GC can
+diagnose and reclaim without scanning arbitrary paths. Pin records remain
+explicitly pending until the artifact directory commit is durable, so GC can
+also diagnose and reclaim a two-link reference left in an unpublished save or
+batch stage after a crash. Failed ordinary publication preserves the staged
+manifest outside loadable authority for manual recovery. Legacy v1 pins remain
+readable and packable but refuse destructive removal because duplicate
+references cannot be proven absent. Portable unpack, pull, and clone materialize a
 descriptor-bound local CAS inside the saved-spore directory. Destructive
 removal classifies that authority only after verifying the canonical index and
 every referenced object against their BLAKE3 digests; a simultaneous
@@ -65,8 +72,8 @@ host-private pin reference fails closed. Foreground and named restore publish
 host-private active saved-spore leases before releasing the registry lock that
 serializes authority selection with removal. Removal refuses any live lease
 for the canonical directory, regardless of the descriptor currently named by
-its manifest, then holds the same lock through deletion. This changes no
-portable manifest, device, or public API format.
+its manifest, then holds the same lock through deletion. Ownership reporting
+changes no portable manifest or device format.
 
 | Surface | Input source | Status |
 |---|---|---|

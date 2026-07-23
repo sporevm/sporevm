@@ -67,9 +67,10 @@ clean up the shared store; use pack/unpack when a child must be independently
 portable.
 
 Each disk-backed child gets its own durable disk pin, so removing the parent or
-a sibling cannot release that child's disk state. A raw copy of a child does not
-mint another pin and still shares the original identity; use another fork for
-an independent machine-local lifetime.
+a sibling cannot release that child's disk state. The child still reports
+`batch-relative` because its RAM chunks belong to the batch. Raw copies are not
+valid ownership transfers; use `spore clone` for an independently removable
+portable child or another fork for a machine-local lifetime.
 
 For pinned disk-backed batches, human and JSON fork results report cache-lock
 wait separately from the lock-held pin and batch publication interval. These

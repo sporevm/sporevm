@@ -29,6 +29,8 @@ const ram_restore = @import("ram_restore.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
+const saved_spore_ownership = @import("saved_spore_ownership.zig");
+const saved_spore_pin = @import("saved_spore_pin.zig");
 const runtime_disk_mod = @import("runtime_disk.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const run_assets = @import("run_assets");
@@ -374,6 +376,7 @@ pub const Result = struct {
     saved: bool = false,
     committed: bool = false,
     save_path: ?[]const u8 = null,
+    save_ownership: ?[]const u8 = null,
     /// Product restore RAM source, such as `local_backing` or `chunks`.
     memory_restore_source: ?[]const u8 = null,
     /// Product restore planner reason, such as `proof_valid` or `proof_unavailable`.
@@ -440,6 +443,7 @@ pub const SaveEvent = struct {
     command: []const u8,
     backend: Backend,
     save_path: []const u8,
+    ownership: []const u8,
 };
 
 pub const ImageCommitEvent = struct {
@@ -458,6 +462,7 @@ pub const ExitEvent = struct {
     memory_bytes: u64,
     saved: bool = false,
     save_path: ?[]const u8 = null,
+    save_ownership: ?[]const u8 = null,
     memory_restore_source: ?[]const u8 = null,
     memory_restore_reason: ?[]const u8 = null,
     timings: Timings,
@@ -659,6 +664,7 @@ fn saveEvent(command: []const u8, result: Result) ?SaveEvent {
         .command = command,
         .backend = result.backend,
         .save_path = result.save_path orelse return null,
+        .ownership = result.save_ownership orelse return null,
     };
 }
 
@@ -671,6 +677,7 @@ fn exitEvent(command: []const u8, result: Result) ExitEvent {
         .memory_bytes = result.memory_bytes,
         .saved = result.saved,
         .save_path = result.save_path,
+        .save_ownership = result.save_ownership,
         .memory_restore_source = result.memory_restore_source,
         .memory_restore_reason = result.memory_restore_reason,
         .timings = .{
@@ -834,10 +841,12 @@ pub const EventWriter = struct {
             command: []const u8,
             backend: []const u8,
             capture_path: []const u8,
+            ownership: []const u8,
         }{
             .command = value.command,
             .backend = value.backend.name(),
             .capture_path = value.save_path,
+            .ownership = value.ownership,
         };
         try self.write(event);
     }
@@ -880,6 +889,7 @@ pub const EventWriter = struct {
             memory_bytes: u64,
             captured: bool,
             capture_path: ?[]const u8,
+            capture_ownership: ?[]const u8,
             memory_restore_source: ?[]const u8,
             memory_restore_reason: ?[]const u8,
             timings: Timings,
@@ -891,6 +901,7 @@ pub const EventWriter = struct {
             .memory_bytes = value.memory_bytes,
             .captured = value.saved,
             .capture_path = value.save_path,
+            .capture_ownership = value.save_ownership,
             .memory_restore_source = value.memory_restore_source,
             .memory_restore_reason = value.memory_restore_reason,
             .timings = value.timings,
@@ -1108,6 +1119,20 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
         return machine_output.CliError.init(
             .runtime_execution_failed,
             "spore run: image commit could not seal a quiescent root disk; the destination ref was not updated",
+            @errorName(err),
+        );
+    }
+    if (err == error.CrossDeviceOwnershipLink) {
+        return machine_output.CliError.init(
+            .object_invalid,
+            "spore run: a machine-local pinned save must share a filesystem with the rootfs cache; save there first, then use `spore clone SOURCE --out DEST` for a portable copy",
+            @errorName(err),
+        );
+    }
+    if (err == error.SavedSporePublicationRecoveryRequired) {
+        return machine_output.CliError.init(
+            .object_invalid,
+            "spore run: a previous save failed after capture; recover `.sporevm-pin-stage/manifest.json` from the save directory before retrying",
             @errorName(err),
         );
     }
@@ -3424,6 +3449,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     });
     if (capture_plan.snapshot_dir) |snapshot_dir| {
         try spore.createSnapshotRoot(allocator, snapshot_dir);
+        if (hasRootfs(opts)) {
+            const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
+            defer allocator.free(cache_root);
+            try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, snapshot_dir);
+        }
     }
     var saved_session_buf: [1]spore.Session = undefined;
     const saved_sessions = if (request.attaches_existing and opts.resume_sessions.len != 0)
@@ -4401,6 +4431,7 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
         .memory_bytes = opts.memory.bytes,
         .saved = saved,
         .save_path = if (saved) opts.save_path else null,
+        .save_ownership = if (saved) saveOwnership(opts) else null,
     };
 }
 
@@ -4427,6 +4458,7 @@ fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *con
         .memory_bytes = opts.memory.bytes,
         .saved = true,
         .save_path = opts.save_path,
+        .save_ownership = saveOwnership(opts),
     };
 }
 
@@ -4445,7 +4477,15 @@ fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.H
         .memory_bytes = opts.memory.bytes,
         .saved = true,
         .save_path = opts.save_path,
+        .save_ownership = saveOwnership(opts),
     };
+}
+
+fn saveOwnership(opts: Options) []const u8 {
+    return if (opts.disk != null or opts.rootfs != null or opts.rootfs_path != null)
+        saved_spore_ownership.machine_local_pinned
+    else
+        saved_spore_ownership.portable_self_contained;
 }
 
 pub fn isCaptureAborted(err: anyerror) bool {
@@ -5110,6 +5150,7 @@ test "event writer emits capture events before exit" {
         .memory_bytes = memory_config.auto_bytes,
         .saved = true,
         .save_path = "out.spore",
+        .save_ownership = saved_spore_ownership.portable_self_contained,
     });
 
     var lines = std.mem.splitScalar(u8, out.written(), '\n');
@@ -5119,7 +5160,7 @@ test "event writer emits capture events before exit" {
     try std.testing.expectEqualStrings("", lines.next().?);
     try expectJsonStringField(allocator, ready_line, "event", "ready");
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"spore.automation.event.v1\",\"schema_version\":1,\"event\":\"capture\",\"command\":\"run\",\"backend\":\"hvf\",\"capture_path\":\"out.spore\"}",
+        "{\"schema\":\"spore.automation.event.v1\",\"schema_version\":1,\"event\":\"capture\",\"command\":\"run\",\"backend\":\"hvf\",\"capture_path\":\"out.spore\",\"ownership\":\"portable-self-contained\"}",
         capture_line,
     );
     try expectJsonStringField(allocator, exit_line, "event", "completion");
@@ -5893,6 +5934,14 @@ test "saved run result exits zero" {
         .save_path = "out.spore",
     };
     try std.testing.expectEqual(@as(u8, 0), result.processExitCode());
+}
+
+test "save ownership distinguishes disk-backed and diskless captures" {
+    const base = Options{ .kernel_path = "Image", .command = &.{} };
+    try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, saveOwnership(base));
+    var disk_backed = base;
+    disk_backed.rootfs_path = "rootfs.ext4";
+    try std.testing.expectEqualStrings(saved_spore_ownership.machine_local_pinned, saveOwnership(disk_backed));
 }
 
 test "saved run result preserves stored exit code" {

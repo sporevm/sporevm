@@ -497,7 +497,7 @@ fn writePinListings(allocator: std.mem.Allocator, writer: *Io.Writer, entries: [
         .schema_version = @as(u32, 1),
         .entries = entries,
     });
-    for (entries) |entry| try writer.print("{s}\t{s}\t{s}\n", .{ entry.id, @tagName(entry.state), entry.index_digest orelse "-" });
+    for (entries) |entry| try writer.print("{s}\t{s}\t{s}\t{s}\n", .{ entry.id, @tagName(entry.owner_state), @tagName(entry.state), entry.index_digest orelse "-" });
     try writer.flush();
 }
 
@@ -1119,6 +1119,22 @@ fn gcRootfsCache(
     var cache_mount_deleted_count: usize = 0;
     var cache_mount_deleted_bytes: u64 = 0;
 
+    var orphan_pins = std.StringHashMap(void).init(allocator);
+    defer orphan_pins.deinit();
+    const pin_registry = try saved_spore_pin.LockedRegistry.init(allocator, options.cache_root, &cache_lock);
+    try collectOrphanPinGcCandidates(
+        allocator,
+        io,
+        options.cache_root,
+        pin_registry,
+        options.dry_run,
+        &orphan_pins,
+        &result_entries,
+        &candidate_bytes,
+        &deleted_count,
+        &deleted_bytes,
+    );
+
     try collectRootfsStorageRoots(
         allocator,
         io,
@@ -1126,6 +1142,7 @@ fn gcRootfsCache(
         options.runtime_root,
         &storage_roots,
         &conservative_roots,
+        &orphan_pins,
     );
     try collectStorageRootsFromBuildStepRecords(
         allocator,
@@ -1253,12 +1270,79 @@ fn collectRootfsStorageRoots(
     runtime_root: ?[]const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
     conservative_roots: *GcConservativeRootStats,
+    ignored_pins: ?*const std.StringHashMap(void),
 ) !void {
     try collectStorageRootsFromCacheMetadata(allocator, io, cache_root, storage_roots, conservative_roots);
     try collectStorageRootsFromRefRecords(allocator, io, cache_root, storage_roots, conservative_roots);
-    try collectStorageRootsFromPins(allocator, io, cache_root, storage_roots, conservative_roots);
+    try collectStorageRootsFromPins(allocator, io, cache_root, storage_roots, conservative_roots, ignored_pins);
     if (runtime_root) |root| {
         try collectStorageRootsFromRuntimeManifests(allocator, io, cache_root, root, storage_roots);
+    }
+}
+
+fn collectOrphanPinGcCandidates(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    registry: saved_spore_pin.LockedRegistry,
+    dry_run: bool,
+    orphan_ids: *std.StringHashMap(void),
+    entries: *std.array_list.Managed(RootfsGcEntry),
+    candidate_bytes: *u64,
+    deleted_count: *usize,
+    deleted_bytes: *u64,
+) !void {
+    const pins_path = try std.fs.path.join(allocator, &.{ cache_root, saved_spore_pin.dir_name });
+    var ids = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit();
+    }
+    {
+        var dir = openDirPath(io, pins_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => |e| return e,
+        };
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+            const id = entry.name[0 .. entry.name.len - 5];
+            if (!saved_spore_pin.validId(id)) continue;
+            try ids.append(try allocator.dupe(u8, id));
+        }
+    }
+    // Snapshot the registry before replay or orphan cleanup mutates it. Some
+    // filesystems can otherwise skip the directory entry following a delete.
+    for (ids.items) |id| {
+        var record = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch continue;
+        defer record.deinit();
+        const pending_state = try saved_spore_pin.pendingPublicationState(io, allocator, cache_root, id, record.value);
+        const abandoned_publication = pending_state == .abandoned;
+        if (pending_state == .committed and !dry_run) try saved_spore_pin.clearPendingPublication(io, allocator, registry, id);
+        if (!abandoned_publication and try saved_spore_pin.ownerState(allocator, cache_root, id, record.value) != .orphaned) continue;
+
+        const owned_id = try allocator.dupe(u8, id);
+        const inserted = try orphan_ids.getOrPut(owned_id);
+        if (inserted.found_existing) allocator.free(owned_id);
+        const record_path = try saved_spore_pin.recordPath(allocator, cache_root, id);
+        const owner_path = try saved_spore_pin.ownerPath(allocator, cache_root, id);
+        const record_stat = try Io.Dir.cwd().statFile(io, record_path, .{ .follow_symlinks = false });
+        const owner_bytes = if (Io.Dir.cwd().statFile(io, owner_path, .{ .follow_symlinks = false })) |owner_stat|
+            owner_stat.size
+        else |err| switch (err) {
+            error.FileNotFound => 0,
+            else => |e| return e,
+        };
+        const bytes = record_stat.size + owner_bytes;
+        try entries.append(.{ .kind = if (abandoned_publication) "saved-spore-abandoned-pin" else "saved-spore-orphan-pin", .path = owner_path, .bytes = bytes });
+        candidate_bytes.* += bytes;
+        if (!dry_run) {
+            if (abandoned_publication) try saved_spore_pin.abandonPendingPublication(io, allocator, cache_root, id, record.value);
+            try saved_spore_pin.remove(io, allocator, registry, id);
+            deleted_count.* += 1;
+            deleted_bytes.* += bytes;
+        }
     }
 }
 
@@ -1268,36 +1352,60 @@ fn collectStorageRootsFromPins(
     cache_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
     conservative_roots: *GcConservativeRootStats,
+    ignored_pins: ?*const std.StringHashMap(void),
 ) !void {
     const pins_path = try std.fs.path.join(allocator, &.{ cache_root, saved_spore_pin.dir_name });
-    var dir = openDirPath(io, pins_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => |e| return e,
-    };
-    defer dir.close(io);
-    var removed_temp = false;
+    var ids = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (ids.items) |id| allocator.free(id);
+        ids.deinit();
+    }
+    var temp_names = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (temp_names.items) |name| allocator.free(name);
+        temp_names.deinit();
+    }
     var unique = std.StringHashMap(spore.RootfsStorage).init(allocator);
     defer unique.deinit();
     defer {
         var cleanup = unique.valueIterator();
         while (cleanup.next()) |storage| rootfs.deinitRootfsStorageDescriptor(allocator, storage.*);
     }
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind == .file and saved_spore_pin.validRecordTempName(entry.name)) {
-            try dir.deleteFile(io, entry.name);
-            removed_temp = true;
-            continue;
+    {
+        var dir = openDirPath(io, pins_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => |e| return e,
+        };
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind == .file and saved_spore_pin.validRecordTempName(entry.name)) {
+                try temp_names.append(try allocator.dupe(u8, entry.name));
+                continue;
+            }
+            if (entry.kind == .file and saved_spore_pin.validOwnerName(entry.name)) continue;
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) {
+                conservative_roots.pin_count += 1;
+                continue;
+            }
+            const id = entry.name[0 .. entry.name.len - 5];
+            if (ignored_pins) |ignored| if (ignored.contains(id)) continue;
+            if (!saved_spore_pin.validId(id)) {
+                conservative_roots.pin_count += 1;
+                continue;
+            }
+            try ids.append(try allocator.dupe(u8, id));
         }
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) {
-            conservative_roots.pin_count += 1;
-            continue;
-        }
-        const id = entry.name[0 .. entry.name.len - 5];
-        if (!saved_spore_pin.validId(id)) {
-            conservative_roots.pin_count += 1;
-            continue;
-        }
+    }
+    // Finish iteration before cleaning crash-left temporary records so no
+    // valid pin can be skipped and accidentally lose its CAS root.
+    if (temp_names.items.len != 0) {
+        var dir = try openDirPath(io, pins_path, .{});
+        defer dir.close(io);
+        for (temp_names.items) |name| try dir.deleteFile(io, name);
+        try chunk_sealer.fsyncDirPath(allocator, pins_path);
+    }
+    for (ids.items) |id| {
         var record = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch {
             conservative_roots.pin_count += 1;
             continue;
@@ -1310,7 +1418,6 @@ fn collectStorageRootsFromPins(
         const cloned = try spore.cloneRootfsStorage(allocator, record.value.storage);
         try unique.put(cloned.index_digest, cloned);
     }
-    if (removed_temp) try chunk_sealer.fsyncDirPath(allocator, pins_path);
     if (conservative_roots.pin_count != 0) return;
     var roots = unique.valueIterator();
     while (roots.next()) |storage| {
@@ -1333,7 +1440,7 @@ fn collectStorageRootsFromPins(
 fn collectPinnedProtectedPaths(allocator: std.mem.Allocator, io: Io, cache_root: []const u8, protected: *std.StringHashMap(void)) !bool {
     var roots = std.StringHashMap(spore.RootfsStorage).init(allocator);
     var conservative = GcConservativeRootStats{};
-    try collectStorageRootsFromPins(allocator, io, cache_root, &roots, &conservative);
+    try collectStorageRootsFromPins(allocator, io, cache_root, &roots, &conservative, null);
     if (conservative.pin_count != 0) return true;
     var it = roots.iterator();
     while (it.next()) |entry| {
@@ -2541,17 +2648,17 @@ test "system formats byte sizes for human output" {
 test "cache pins renders exact text and JSON health states" {
     const allocator = std.testing.allocator;
     const entries = [_]saved_spore_pin.Listing{
-        .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .state = .index_valid, .index_digest = "blake3:1111" },
-        .{ .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", .state = .missing },
-        .{ .id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", .state = .corrupt, .index_digest = "blake3:3333" },
+        .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .state = .index_valid, .owner_state = .exclusive, .index_digest = "blake3:1111" },
+        .{ .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", .state = .missing, .owner_state = .orphaned },
+        .{ .id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", .state = .corrupt, .owner_state = .legacy, .index_digest = "blake3:3333" },
     };
     var text_out: Io.Writer.Allocating = .init(allocator);
     defer text_out.deinit();
     try writePinListings(allocator, &text_out.writer, &entries, .human);
     try std.testing.expectEqualStrings(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\tindex_valid\tblake3:1111\n" ++
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tmissing\t-\n" ++
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\tcorrupt\tblake3:3333\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\texclusive\tindex_valid\tblake3:1111\n" ++
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\torphaned\tmissing\t-\n" ++
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\tlegacy\tcorrupt\tblake3:3333\n",
         text_out.written(),
     );
     var json_out: Io.Writer.Allocating = .init(allocator);
@@ -3496,7 +3603,7 @@ test "durable save pin roots GC until explicit unpin" {
     for (1..1000) |index| {
         const id = try std.fmt.allocPrint(allocator, "{x:0>64}", .{index});
         const record = saved_spore_pin.Record{
-            .schema = saved_spore_pin.schema,
+            .schema = saved_spore_pin.legacy_schema,
             .id = id,
             .manifest_sha256 = original_pin.value.manifest_sha256,
             .storage = original_pin.value.storage,
@@ -3533,6 +3640,57 @@ test "durable save pin roots GC until explicit unpin" {
     try std.testing.expectEqual(@as(usize, 2), reclaimed.deleted_count);
     try std.testing.expect(!try fileExists(io, index_path));
     try std.testing.expect(!try fileExists(io, object_path));
+}
+
+test "cache GC diagnoses and reclaims a pin orphaned by raw directory deletion" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-orphan-pin";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/save");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/save-2");
+    const fixture = try writeGcStorageFixture(allocator, io, root, null, 0x67);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save/manifest.json", .data = "manifest" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save-2/manifest.json", .data = "manifest" });
+    const disk = spore.Disk{
+        .kind = spore.disk_kind_chunk_index,
+        .device = fixture.storage.device,
+        .size = fixture.storage.logical_size,
+        .base = fixture.storage.index_digest,
+        .chunk_size = fixture.storage.chunk_size,
+        .hash_algorithm = fixture.storage.hash_algorithm,
+        .object_namespace = fixture.storage.object_namespace,
+        .layers = &.{},
+    };
+    var pin_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
+    const registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &pin_lock);
+    const pin_id = try saved_spore_pin.create(io, allocator, registry, root ++ "/save", disk);
+    const second_pin_id = try saved_spore_pin.create(io, allocator, registry, root ++ "/save-2", disk);
+    pin_lock.deinit();
+    try Io.Dir.cwd().deleteTree(io, root ++ "/save");
+    try Io.Dir.cwd().deleteTree(io, root ++ "/save-2");
+
+    const listings = try saved_spore_pin.list(io, allocator, root);
+    defer saved_spore_pin.deinitListings(allocator, listings);
+    try std.testing.expectEqual(@as(usize, 2), listings.len);
+    for (listings) |listing| try std.testing.expectEqual(saved_spore_pin.OwnerState.orphaned, listing.owner_state);
+    const dry_run = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = true });
+    try std.testing.expect(dry_run.candidate_count >= 4);
+    var orphan_entry_count: usize = 0;
+    for (dry_run.entries) |entry| {
+        if (std.mem.eql(u8, entry.kind, "saved-spore-orphan-pin")) orphan_entry_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), orphan_entry_count);
+
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expect(forced.deleted_count >= 3);
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, root, pin_id));
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, root, second_pin_id));
+    try std.testing.expect(!try fileExists(io, try rootfs_cas.manifestIndexPath(allocator, root, fixture.storage.index_digest)));
+    try std.testing.expect(!try fileExists(io, try rootfs_cas.manifestObjectPath(allocator, root, fixture.object_digest)));
 }
 
 test "corrupt save pin makes destructive prune retain all CAS" {

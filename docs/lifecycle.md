@@ -249,16 +249,25 @@ with the named monitor. A missing field means no saved exec defaults, so older
 spores retain their existing root-directory and empty-environment behavior.
 Per-exec `--env` and `--workdir` values are never copied into either metadata
 surface.
-Writable-disk saves are machine-local by default: host-private lifecycle
-metadata names an opaque durable pin in the configured rootfs cache. The pin
-roots the immutable disk index and chunks independently of the save path, so
-moving or renaming the directory is safe. A raw filesystem copy retains the
-same pin identity; it is not independently removable, and removing either copy
-through SporeVM may invalidate the other. Use `spore fork` for an independent
-machine-local lifecycle or pack/unpack for a self-contained portable artifact.
-Offline fork children instead share RAM through the batch-owned
-`shared-chunks` directory. Move the complete batch, not an individual child;
-pack/unpack is the supported independently portable child boundary.
+Writable-disk saves are `machine-local-pinned` by default. The reference to
+their durable cache pin is hard-linked to one cache-side ownership anchor, so
+moving or renaming the directory is safe while ordinary and hard-link copies
+fail closed before restore, pack, or removal. Use `spore clone SOURCE --out
+DEST` to make a `portable-self-contained` artifact through the existing pack
+encoding, or `spore fork` for another machine-local lifetime.
+The ownership anchor is a hard link, so a machine-local pinned save must share
+a filesystem with the configured rootfs cache. To cross filesystems, save on
+the cache filesystem and clone the result to the final destination.
+Offline fork children report `batch-relative` because they share RAM through
+the batch-owned `shared-chunks` directory. A disk-backed child may also carry
+a machine-local pin, so this class describes the RAM ownership boundary rather
+than the absence of a disk pin. Move the complete batch, not an individual
+child; pack/unpack is the supported independently portable child boundary.
+Pin records stay pending until the final save or batch rename is durable.
+Cache GC distinguishes an abandoned staged reference after a crash from a
+committed artifact and reclaims the former. If ordinary save publication fails
+after capture, `.sporevm-pin-stage/manifest.json` remains available for
+recovery and a retry refuses to overwrite it.
 Non-destructive save supports both single-vCPU and multi-vCPU named VMs on every
 supported backend (KVM and HVF), for diskless, image-created writable rootfs, and
 explicit `--rootfs PATH` VMs: the monitor quiesces every vCPU at one barrier,
@@ -294,19 +303,18 @@ restores publish active authority records for lazy disk faults; removal returns
 and ambiguous directories containing both local CAS and a host-private pin
 reference, fail closed without deleting either authority.
 Machine-local disk-backed removal keeps the cache lock while it validates the
-pin, deletes the visible save, syncs the parent, and unregisters the pin. Raw
-`rm -rf` cannot make live CAS data collectable, but it leaks a disk pin. `spore
-cache pins` lists pin IDs and canonical-index health; it does not track save
-paths or claim to detect orphans. An operator who already knows that an exact
-pin ID is unused may remove it with the expert-only
-`spore cache unpin PIN_ID --force`; this can invalidate every raw copy sharing
-that identity.
+exclusive ownership link, deletes the visible save, syncs the parent, and
+unregisters the pin. If `rm -rf` bypasses the command, `spore cache pins`
+reports the remaining one-link anchor as `orphaned`, and `spore cache gc
+--force` reclaims the pin and newly unrooted CAS content. Legacy v1 pins have no
+such proof, so removal refuses them; clone first, then use expert-only `spore
+cache unpin PIN_ID --force` only after accounting for every legacy copy.
 
 `spore cache pins` reports `index_valid` only after validating the record and
 canonical index. It deliberately does not stat or hash every object; lazy reads
 and `spore pack` still verify object bytes and may fail closed on missing or
-corrupt content. There is no global save-reference registry in this pre-1.0
-contract.
+corrupt content. Inspect, save, and removal output name the ownership class.
+The hard-link anchor supplies local proof without a global save-path registry.
 
 If a saved manifest declares bound services, named restore requires fresh host
 socket bindings:
