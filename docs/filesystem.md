@@ -393,8 +393,8 @@ nor recreates the derived flat ext4 materialization.
 `spore unpack` and `spore pull` fully materialize one selected child before
 resume. They verify bundle identity, selected manifests, RAM chunks, rootfs
 artifacts or CAS bytes, and disk index/object bytes before writing a resumable
-spore. The resulting disk-backed spore owns a descriptor-bound complete CAS
-locally, so `spore rm --spore` removes and syncs the self-contained directory
+checkpoint. The resulting disk-backed checkpoint owns a descriptor-bound
+complete CAS locally, so `spore checkpoint rm DIR` removes and syncs the self-contained directory
 without requiring or unregistering a host-private durable pin. Removal fails
 closed while a live runtime owns that directory as its lazy disk baseline.
 Direct S3 and digest-pinned HTTP peer pulls are byte sources only; they never

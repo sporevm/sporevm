@@ -125,7 +125,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             interactive = true;
             tty = true;
         } else if (std.mem.eql(u8, args[i], "--count")) {
-            failAttachSetup("spore attach attaches exactly one spore; use spore fork --count N --out DIR, then attach each child", .{});
+            failAttachSetup("spore attach attaches exactly one checkpoint; use spore checkpoint fork DIR --count N --out OUT_DIR, then attach each child", .{});
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failAttachSetup("unknown attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (spore_dir == null) {

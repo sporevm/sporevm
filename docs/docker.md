@@ -160,7 +160,7 @@ done
 kill -TERM "$spore_pid"
 wait "$spore_pid"
 
-spore fork docker-base.spore --count 4 --out docker-children/
+spore checkpoint fork docker-base.spore --count 4 --out docker-children/
 spore run --from docker-children/000000 -- /bin/sh -lc \
   'docker --host unix:///run/docker.sock run --rm \
     docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \

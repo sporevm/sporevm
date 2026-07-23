@@ -1327,7 +1327,7 @@ pub const cli_usage =
     \\
     \\Workflow:
     \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
-    \\  spore fork base.spore --count 2 --out children
+    \\  spore checkpoint fork base.spore --count 2 --out children
     \\  spore fanout children --for 10s
     \\
 ;
