@@ -56,12 +56,12 @@ with open(sys.argv[1], encoding="utf-8") as f:
         event = json.loads(line)
         if event.get("event") == "terminal":
             terminal.extend(base64.b64decode(event.get("data_base64", "")))
-        elif event.get("event") == "exit":
+        elif event.get("event") == "completion" and event.get("outcome") == "completed":
             exit_code = event.get("exit_code")
 if needle not in terminal:
     raise SystemExit(f"terminal payload missing {needle!r}: {bytes(terminal)!r}")
 if exit_code != 0:
-    raise SystemExit(f"missing successful exit event: exit_code={exit_code!r}")
+    raise SystemExit(f"missing successful completion event: exit_code={exit_code!r}")
 PY
 }
 

@@ -85,7 +85,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     defer cli_event_writer = null;
     const opts = try parseCliArgs(args);
     if (opts.event_mode == .jsonl) try events.emitStart(opts.backend);
-    const exit_code = execute(init, init.arena.allocator(), opts, if (opts.event_mode == .jsonl) stdout else null) catch |err| {
+    const exit_code = execute(init, init.arena.allocator(), opts, stdout) catch |err| {
         if (opts.event_mode == .jsonl) {
             const classified = run_mod.classifyFailure(err);
             try events.emitFailure(classified);
@@ -171,7 +171,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     };
 }
 
-pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, event_output: ?*Io.Writer) !u8 {
+fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, event_output: *Io.Writer) !u8 {
     const children = try listChildren(allocator, init.io, opts.children_dir);
     if (children.len == 0) {
         var buf: [2048]u8 = undefined;
@@ -217,19 +217,19 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     for (running.items) |*run| {
         const term = run.child.wait(init.io) catch |err| {
             writeStderr("spore fanout: child {s} wait failed: {s}\n", .{ run.name, @errorName(err) });
-            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
+            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
             failed = true;
             continue;
         };
         if (termExitCode(term)) |exit_code| {
-            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .completed, exit_code, null);
+            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, exit_code, null);
             if (exit_code != 0 and aggregate_exit_code == 0) aggregate_exit_code = exit_code;
         } else if (termOk(term, opts.duration_ms != null)) {
-            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
+            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
         } else {
             writeStderr("spore fanout: child {s} exited {s}\n", .{ run.name, termName(term) });
             const classified = machine_output.fromZigError(error.FanoutChildFailed);
-            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
+            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
             failed = true;
         }
     }
@@ -278,7 +278,7 @@ fn startRunningChild(
     bound_services: []const spore_net_policy.BoundServiceBinding,
     child: ChildSpec,
     event_mode: run_mod.EventMode,
-    event_output: ?*Io.Writer,
+    event_output: *Io.Writer,
     output_lock: *OutputLock,
     event_write_failed: *std.atomic.Value(bool),
 ) !RunningChild {
@@ -386,7 +386,7 @@ fn lessChildSpec(_: void, a: ChildSpec, b: ChildSpec) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_mode: run_mod.EventMode, event_output: ?*Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool)) void {
+fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_mode: run_mod.EventMode, event_output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool)) void {
     defer _ = std.c.close(fd);
 
     var buf: [4096]u8 = undefined;
@@ -400,7 +400,7 @@ fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_
             break;
         }
         if (event_mode == .jsonl) {
-            writeChildEvent(event_output.?, output_lock, event_write_failed, name, stream, offset, buf[0..@intCast(n)]);
+            writeChildEvent(event_output, output_lock, event_write_failed, name, stream, offset, buf[0..@intCast(n)]);
             offset += @intCast(n);
             continue;
         }
@@ -418,14 +418,7 @@ fn writeChildEvent(output: *Io.Writer, output_lock: *OutputLock, event_write_fai
         return;
     };
     defer allocator.free(json);
-
-    output_lock.lock();
-    defer output_lock.unlock();
-    output.writeAll(json) catch {
-        event_write_failed.store(true, .release);
-        return;
-    };
-    output.writeByte('\n') catch event_write_failed.store(true, .release);
+    writeEventLine(output, output_lock, event_write_failed, json);
 }
 
 fn childEventJson(allocator: std.mem.Allocator, name: []const u8, stream: []const u8, offset: u64, bytes: []const u8) ![]u8 {
@@ -453,13 +446,21 @@ fn writeChildCompletion(output: *Io.Writer, output_lock: *OutputLock, event_writ
         return;
     };
     defer allocator.free(json);
+    writeEventLine(output, output_lock, event_write_failed, json);
+}
+
+fn writeEventLine(output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool), json: []const u8) void {
     output_lock.lock();
     defer output_lock.unlock();
     output.writeAll(json) catch {
         event_write_failed.store(true, .release);
         return;
     };
-    output.writeByte('\n') catch event_write_failed.store(true, .release);
+    output.writeByte('\n') catch {
+        event_write_failed.store(true, .release);
+        return;
+    };
+    output.flush() catch event_write_failed.store(true, .release);
 }
 
 fn childCompletionJson(allocator: std.mem.Allocator, name: []const u8, outcome: run_mod.TerminalOutcome, exit_code: u8, failure: ?machine_output.CliError) ![]u8 {

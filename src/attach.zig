@@ -180,8 +180,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .terminal = opts.tty,
     });
 
-    var binding_diagnostic = run_mod.BoundServiceBindingDiagnostic{};
-    const network_options = run_mod.networkOptionsFromManifestWithBindingDiagnostic(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice(), &binding_diagnostic) catch |err| return @errorCast(err);
+    const network_options = try run_mod.networkOptionsFromManifestWithBindings(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice());
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (network_options.network == .spore) {

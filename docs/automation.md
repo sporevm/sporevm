@@ -23,7 +23,8 @@ with exactly one `completion` record:
 `outcome` is `completed`, `failed`, or `canceled`. `completed` means SporeVM
 delivered the operation's terminal result; a guest process can therefore be
 completed with a non-zero `exit_code`. Failed and canceled completions contain
-the same `error` body as `spore.error.v1`.
+the same `error` body as `spore.error.v1`, and their top-level `exit_code`
+matches the stable classified status in that body.
 
 An event consumer must treat EOF, a broken pipe, or a transport error before
 `completion` as `stream.interrupted`. It must not infer success from a final

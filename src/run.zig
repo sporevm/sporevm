@@ -986,11 +986,13 @@ pub const EventWriter = struct {
             outcome: []const u8,
             command: []const u8,
             backend: ?[]const u8,
+            exit_code: u8,
             @"error": machine_output.ErrorBody,
         }{
             .command = self.command,
             .backend = self.backend,
             .outcome = if (classified.code == .operation_canceled) @tagName(TerminalOutcome.canceled) else @tagName(TerminalOutcome.failed),
+            .exit_code = classified.exit_code,
             .@"error" = classified.envelope().@"error",
         };
         try self.write(event);
@@ -4983,6 +4985,7 @@ test "event writer serializes setup failure as a failed completion" {
     try std.testing.expectEqualStrings("", lines.next().?);
     try expectJsonStringField(allocator, completion_line, "event", "completion");
     try expectJsonStringField(allocator, completion_line, "outcome", "failed");
+    try expectJsonIntegerField(allocator, completion_line, "exit_code", 2);
     try expectNestedJsonStringField(allocator, completion_line, "error", "code", "usage.missing_argument");
 }
 
@@ -4999,6 +5002,7 @@ test "event writer serializes cancellation as a canceled completion" {
     try std.testing.expectEqualStrings("", lines.next().?);
     try expectJsonStringField(allocator, completion_line, "event", "completion");
     try expectJsonStringField(allocator, completion_line, "outcome", "canceled");
+    try expectJsonIntegerField(allocator, completion_line, "exit_code", 130);
     try expectNestedJsonStringField(allocator, completion_line, "error", "code", "operation.canceled");
 }
 

@@ -18,7 +18,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 18
+const requiredABIVersion uint32 = 18
 const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
 const reexecRoleEnv = "SPORE_REEXEC_ROLE"
 const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
@@ -127,9 +127,9 @@ func New() (*Client, error) {
 		c.Close()
 		return nil, err
 	}
-	if info.ABIVersion != minABIVersion {
+	if info.ABIVersion != requiredABIVersion {
 		c.Close()
-		return nil, fmt.Errorf("libspore C ABI version %d does not match required %d", info.ABIVersion, minABIVersion)
+		return nil, fmt.Errorf("libspore C ABI version %d does not match required %d", info.ABIVersion, requiredABIVersion)
 	}
 	return c, nil
 }

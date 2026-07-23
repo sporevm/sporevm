@@ -339,6 +339,9 @@ const (
 	ExecNamedStreamError
 )
 
+// ExecNamedStreamExit is the compatibility name for a completed stream.
+const ExecNamedStreamExit = ExecNamedStreamCompletion
+
 // TerminalOutcome classifies the final result of a streaming operation.
 type TerminalOutcome int
 
