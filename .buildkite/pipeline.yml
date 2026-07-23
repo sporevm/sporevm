@@ -97,6 +97,7 @@ steps:
     steps:
       - label: ":package: Publish native image archive (Linux ARM64)"
         key: "native-image-archive-publish-linux-arm64"
+        depends_on: "spore-build-conformance-linux-arm64"
         command: "scripts/ci/run.sh scripts/ci/native-image-archive-publish.sh"
         artifact_paths:
           - "zig-cache/native-image-distribution/ci-final-image.tar.gz"
