@@ -151,6 +151,7 @@ const logs_usage =
     \\  spore logs NAME
     \\
     \\Print the bounded stdout and stderr retained for the initial command.
+    \\The named VM monitor must be idle while the snapshot is retrieved.
     \\
     \\Options:
     \\  -h, --help              Show this help
@@ -1476,9 +1477,17 @@ pub fn initialOutputNamed(
 }
 
 fn initialCommandResultFromSnapshot(snapshot: ExecNamedResult) !InitialCommandResult {
+    const output_limit: usize = initial_output_limit_bytes_per_stream;
     if (snapshot.stdout.len < initial_output_protocol_header_len) return error.BadMonitorResponse;
     const header = snapshot.stdout[0..initial_output_protocol_header_len];
-    if (header[0] > 1 or (header[2] & ~@as(u8, 3)) != 0) return error.BadMonitorResponse;
+    if (header[0] > 1 or (header[0] == 0 and header[1] != 0) or (header[2] & ~@as(u8, 3)) != 0) {
+        return error.BadMonitorResponse;
+    }
+    if (snapshot.stdout.len - initial_output_protocol_header_len > output_limit or
+        snapshot.stderr.len > output_limit)
+    {
+        return error.BadMonitorResponse;
+    }
     const exited = header[0] == 1;
     return .{
         .output_disposition = .retain,
@@ -2080,7 +2089,8 @@ pub fn logsCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "logs"), message);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
-            const message = allocLifecycleMessage(allocator, "spore logs: could not retrieve initial-command output for VM {s}: {s}", .{ args[0], @errorName(err) });
+            const fallback = allocLifecycleMessage(allocator, "spore logs: could not retrieve initial-command output for VM {s}: {s}", .{ args[0], @errorName(err) });
+            const message = allocLifecycleLastErrorMessage(allocator, "logs", fallback);
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "logs"), message);
         },
         else => |e| return e,
@@ -7131,6 +7141,20 @@ test "initial output snapshot reports process state bytes and truncation" {
         .stdout = &invalid_flags,
         .stderr = &.{},
     }));
+    var invalid_running_exit = [_]u8{ 0, 7, 0 };
+    try std.testing.expectError(error.BadMonitorResponse, initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &invalid_running_exit,
+        .stderr = &.{},
+    }));
+    const oversized_stderr = try std.testing.allocator.alloc(u8, @as(usize, initial_output_limit_bytes_per_stream) + 1);
+    defer std.testing.allocator.free(oversized_stderr);
+    var bounded_stdout = [_]u8{ 0, 0, 0 };
+    try std.testing.expectError(error.BadMonitorResponse, initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &bounded_stdout,
+        .stderr = oversized_stderr,
+    }));
 }
 
 test "create parser keeps image and plain creates commandless" {
@@ -8162,6 +8186,36 @@ test "named restore machine result reports exec readiness timing" {
     try std.testing.expectEqualStrings("restored", parsed.value.action);
     try std.testing.expectEqual(@as(u64, 17), parsed.value.timing.?.wait_exec_ready_ms);
     try std.testing.expectEqual(@as(u64, 24), parsed.value.timing.?.total_ms);
+}
+
+test "initial output machine result preserves invalid UTF-8 as bytes" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var invalid_stdout = [_]u8{ 0xff, 'A' };
+
+    try machine_output.writeJson(allocator, &out.writer, NamedLifecycleResult{
+        .action = "logs",
+        .name = "worker-1",
+        .state = "ready",
+        .initial_command = .{
+            .output_disposition = .retain,
+            .output_destination = .named_logs,
+            .output_limit_bytes_per_stream = initial_output_limit_bytes_per_stream,
+            .process_status = .exited,
+            .exit_code = 0,
+            .stdout = &invalid_stdout,
+            .stderr = &.{},
+        },
+    });
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out.written(), .{});
+    defer parsed.deinit();
+    const initial = parsed.value.object.get("initial_command").?.object;
+    const stdout = initial.get("stdout").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), stdout.len);
+    try std.testing.expectEqual(@as(i64, 255), stdout[0].integer);
+    try std.testing.expectEqual(@as(i64, 65), stdout[1].integer);
 }
 
 test "lifecycle list JSON exposes memory and nullable stats" {

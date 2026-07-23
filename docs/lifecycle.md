@@ -60,9 +60,12 @@ spore --json logs bench-1
 
 Pass `--initial-output discard` when the output is intentionally disposable;
 `retain` is the default and is also accepted explicitly. Retained bytes live
-with the guest agent and disappear when the VM is removed. Create removes the
-new VM if the process cannot be started, while a non-zero exit after a
-successful start is reported by `spore logs` and does not affect VM readiness.
+with the guest agent, are copied with a live fork or saved-memory restore, and
+disappear when the VM is removed. Because retrieval uses the existing
+single-operation monitor path, `spore logs` returns a monitor-busy error while
+another exec, copy, save, or fork operation is active. Create removes the new
+VM if the process cannot be started, while a non-zero exit after a successful
+start is reported by `spore logs` and does not affect VM readiness.
 `spore exec` always
 streams guest stdout and stderr live as independent ordered streams. Stdin is
 closed by default. Pass `-i` to forward host stdin, and pass `-t` to request a
