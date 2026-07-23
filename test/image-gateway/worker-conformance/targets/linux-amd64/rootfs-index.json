@@ -7,15 +7,23 @@
   "chunks": [
     {
       "logical_chunk": 0,
-      "digest": "blake3:9df91228a896dc664465b077a9219222e1712248475fe28beefbfe5e30c2e22c"
+      "digest": "blake3:ac67e914f0b94f4e9fc399c0e92d7e93c6fc0f4fc8e03c095e34d7769468d208"
     },
     {
       "logical_chunk": 64,
-      "digest": "blake3:f9611bc4b8a91c2ebeab4c34df9992756b2eb0de09bb89f96f75a7552c10da8e"
+      "digest": "blake3:e2cb1dc733a6f0a2febc0ff47cba432d6df56e0c992f35a6df92b756de78e827"
+    },
+    {
+      "logical_chunk": 65,
+      "digest": "blake3:617588d5cab9e8b5c0753055329014b57f473492e09aec8f92f172b21b7538c1"
+    },
+    {
+      "logical_chunk": 66,
+      "digest": "blake3:76dda0f1585476a5244e778abc404f9dca8a32b8679b90cfb03079f0c70a7744"
     },
     {
       "logical_chunk": 2048,
-      "digest": "blake3:4eae6a176d4ce696684afd8afe50c391c1123d1ef1326356a8fc18977769d745"
+      "digest": "blake3:1eb5be504a7ff575f62fae86140d903f4cc9152b8ee86f3cb9c207c7146f9993"
     },
     {
       "logical_chunk": 4096,
@@ -23,7 +31,7 @@
     },
     {
       "logical_chunk": 6144,
-      "digest": "blake3:299a39a697f4895382bce2d6967b31d178410bf000652d0660e1733a8fc5f798"
+      "digest": "blake3:4b2c6dddc64e674cbe195780c51774a3f6998f4e35cad050f63a0959c9ac9d26"
     }
   ],
   "zero_chunks": [
@@ -90,8 +98,6 @@
     61,
     62,
     63,
-    65,
-    66,
     67,
     68,
     69,

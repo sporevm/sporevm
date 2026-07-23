@@ -1,15 +1,15 @@
 {
   "kind": "spore-image-gateway-manifest-v1",
   "image": {
-    "digest": "blake3:8db6d2be4d1ed1cf8e8efbed9ba8f334f9fe53d58d2ee75b5bcf34dede9727cc",
+    "digest": "blake3:61d99bacd8759410f88cee5164d8514c6c4bf04970918765d5f72bb72d138cc9",
     "platform": {
       "os": "linux",
       "arch": "amd64"
     },
     "config_blob": {
-      "transport_digest": "sha256:9d99a75171aea000c711b34c0e5e3f28d3d537dd99d110eafbfbc2bd8e52c2bf",
-      "config_digest": "blake3:aac27e967a2900e8dbb62822e610fca9c00058fbaf25a1dede98be5778786b8e",
-      "bytes": 37
+      "transport_digest": "sha256:634514f5ad9e7e75a51549105f4c946aaba2389340ef2057d3848d173a04a148",
+      "config_digest": "blake3:373741158261bb322055747bb0da2c7437d9c985db2dc50d6ab9375d1ec0d976",
+      "bytes": 186
     },
     "rootfs_storage": {
       "kind": "chunked-ext4-rootfs-v0",
@@ -22,15 +22,15 @@
       "logical_size": 536870912,
       "chunk_size": 65536,
       "hash_algorithm": "blake3",
-      "index_digest": "blake3:e8364619b7fb6341425c80deb77da1f33361b8ad31084cf2e5a220c47c66e6ee",
-      "base_identity": "blake3:e8364619b7fb6341425c80deb77da1f33361b8ad31084cf2e5a220c47c66e6ee",
+      "index_digest": "blake3:e188afe9e7c474105daa058a6361f564947f37b8c780489b4f3f0b74f4c19fe5",
+      "base_identity": "blake3:e188afe9e7c474105daa058a6361f564947f37b8c780489b4f3f0b74f4c19fe5",
       "object_namespace": "rootfs/blake3"
     }
   },
   "rootfs_index": {
-    "digest": "blake3:e8364619b7fb6341425c80deb77da1f33361b8ad31084cf2e5a220c47c66e6ee",
-    "bytes": 81617,
-    "object_count": 5,
-    "object_bytes": 327680
+    "digest": "blake3:e188afe9e7c474105daa058a6361f564947f37b8c780489b4f3f0b74f4c19fe5",
+    "bytes": 81861,
+    "object_count": 7,
+    "object_bytes": 458752
   }
 }

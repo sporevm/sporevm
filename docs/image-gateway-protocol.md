@@ -74,7 +74,13 @@ and has transport name
 Fixture files carry one source-control newline which is excluded from the
 canonical bytes. The golden fixtures are normative for separators, indentation,
 field order, and LF line endings. Malformed fixtures live beside them under
-`malformed/`.
+`malformed/`: the unprefixed cases target the platform-index parser, while
+`attachment-*` cases target the record or list parser named by the filename.
+Together with the platform, image-manifest, config, rootfs-index, attachment,
+authorization, and worker-bundle goldens in `test/image-gateway/`, this directory
+is the versioned fixture exchange for another implementation. Consumers must
+accept the goldens byte-for-byte and reject every malformed case; fixture names
+are descriptive labels rather than protocol identifiers.
 
 ## Immutable image manifest
 
@@ -127,18 +133,25 @@ and
 
 ## Converter-worker conformance
 
-The minimal versioned fixture at
+The versioned fixture at
 [`test/image-gateway/worker-conformance/bundle.json`](../test/image-gateway/worker-conformance/bundle.json)
 demonstrates that converter host architecture does not enter native image
-identity for one empty, uncompressed layer. The fixture generator constructs
-one deterministic OCI index containing
-`linux/amd64` and `linux/arm64/v8` manifests over the same empty USTAR layer.
+identity for representative OCI filesystem content. The fixture generator
+constructs one deterministic OCI index containing `linux/amd64` and
+`linux/arm64/v8` manifests over one uncompressed USTAR layer and one gzip-
+compressed USTAR layer. The layers exercise directory and file modes, numeric
+ownership, a hard link, a symbolic link, an OCI whiteout, a later-layer file
+replacement, and a 65,537-byte file that crosses the native chunk boundary.
+The OCI config also carries command, entrypoint, environment, label, signal,
+user, and working-directory metadata, exercising the canonical projection that
+preserves Spore's supported runtime fields and excludes non-identity metadata.
 Each Linux worker converts both selected targets with the native ext4 writer and
 must reproduce the committed canonical config, rootfs index, gateway manifest,
 platform index, native image digest, and complete nonzero-object digest set.
 
-The bundle schema is `spore-image-gateway-worker-conformance-v1`. It records the
-input index, layer, and selected-manifest digests plus each output file's exact
+The bundle schema is `spore-image-gateway-worker-conformance-v2`. It records the
+input index, layers, compressed and uncompressed layer digests, and selected-
+manifest digests plus each output file's exact
 size and SHA-256 digest. Object bytes are not duplicated in source control; the
 bundle records every BLAKE3 object name, exact length, and SHA-256 transport
 digest, while the canonical rootfs index remains the authoritative logical
@@ -147,12 +160,12 @@ platform enters canonical image config. For one selected target, however, a
 `linux/arm64` converter worker and a `linux/amd64` converter worker must produce
 the same complete bundle bytes.
 
-The harness independently recomputes SHA-256 transport digests and exact sizes.
+The harness independently recomputes SHA-256 transport digests and exact sizes,
+checks the OCI diff IDs, and verifies the supported runtime-metadata projection.
 BLAKE3 object names, rootfs identity, and native image identity remain outputs
 of the SporeVM implementation under test; the byte comparison proves that those
 outputs agree across workers but is not an independent implementation of the
-identity algorithms. Richer compressed and multi-layer content fixtures remain
-follow-up conformance work.
+identity algorithms.
 
 Run the host-local check with:
 

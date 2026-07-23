@@ -1,1 +1,1 @@
-{"architecture":"arm64","os":"linux"}
+{"architecture":"arm64","os":"linux","config":{"Env":["PATH=/usr/bin:/bin","SPORE_FIXTURE=1"],"Entrypoint":["/bin/sh"],"Cmd":["-c","exec ./tool"],"WorkingDir":"/opt/spore","User":"0:0"}}
