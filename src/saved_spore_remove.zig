@@ -20,6 +20,8 @@ const topology = @import("topology.zig");
 const Io = std.Io;
 
 pub const Result = struct {
+    schema: []const u8 = "spore.saved.remove.result.v1",
+    schema_version: u32 = 1,
     action: []const u8 = "removed_spore",
     spore_dir: []const u8,
     /// Empty when the removed spore had no durable disk pin.

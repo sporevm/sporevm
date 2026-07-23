@@ -118,6 +118,8 @@ pub const ScratchDiagnostic = struct {
 };
 
 pub const Result = struct {
+    schema: []const u8 = "spore.build.result.v1",
+    schema_version: u32 = 1,
     resolved_image_ref: []const u8,
     index_digest: []const u8,
     metadata_path: []const u8,

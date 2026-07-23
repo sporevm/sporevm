@@ -153,7 +153,7 @@ if [[ "${resume_rc}" != "0" ]]; then
 fi
 grep -Fq '"event":"ready"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit ready"
 grep -Fq '"event":"stdout"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit stdout"
-grep -Fq '"event":"exit"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit terminal exit"
+grep -Fq '"event":"completion","outcome":"completed"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit completed terminal outcome"
 grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore attach --events=jsonl did not report exit_code 0"
 grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore attach --events=jsonl did not report local RAM restore"
 grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore attach --events=jsonl did not report proof-backed restore"

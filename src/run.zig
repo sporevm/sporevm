@@ -141,6 +141,13 @@ pub const Disk = spore.Disk;
 pub const ClassifiedFailure = machine_output.CliError;
 pub const FailureCode = machine_output.ErrorCode;
 pub const FailureScope = machine_output.Scope;
+pub const RetryClass = machine_output.Retry;
+
+pub const TerminalOutcome = enum {
+    completed,
+    failed,
+    canceled,
+};
 
 pub const Backend = backend_mod.Backend;
 
@@ -354,6 +361,8 @@ fn useMutableImageRefCache(policy: PullPolicy) bool {
 }
 
 pub const Result = struct {
+    schema: []const u8 = "spore.run.result.v1",
+    schema_version: u32 = 1,
     backend: Backend,
     start_ms: u64,
     vsock_connect_ms: u64,
@@ -462,7 +471,8 @@ pub const FailureEvent = struct {
 
 /// Runtime lifecycle events delivered synchronously to EventSink.
 /// Output bytes are callback-scoped. Ready is emitted at most once, and exit or
-/// failure is emitted at most once as the terminal event.
+/// failure is emitted at most once as the terminal completion event. Exit means
+/// the guest operation completed, including a non-zero guest exit code.
 pub const RunEvent = union(enum) {
     start: StartEvent,
     ready: ReadyEvent,
@@ -722,8 +732,8 @@ pub const EventWriter = struct {
 
     pub fn emitStart(self: *EventWriter, requested_backend: Backend) !void {
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8 = "start",
             command: []const u8,
             requested_backend: []const u8,
@@ -741,8 +751,8 @@ pub const EventWriter = struct {
         const data_base64 = try base64Alloc(self.allocator, output.bytes);
         defer self.allocator.free(data_base64);
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8,
             command: []const u8,
             backend: ?[]const u8,
@@ -763,8 +773,8 @@ pub const EventWriter = struct {
     fn emitPortForwardEvent(self: *EventWriter, value: PortForwardEvent) !void {
         if (value.backend) |backend| self.setBackend(backend);
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8 = "port_forward",
             command: []const u8,
             backend: ?[]const u8,
@@ -795,8 +805,8 @@ pub const EventWriter = struct {
         );
         defer self.allocator.free(destination_ip);
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8 = "network",
             command: []const u8,
             backend: ?[]const u8,
@@ -818,8 +828,8 @@ pub const EventWriter = struct {
     fn emitSaveEvent(self: *EventWriter, value: SaveEvent) !void {
         self.setBackend(value.backend);
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8 = "capture",
             command: []const u8,
             backend: []const u8,
@@ -835,8 +845,8 @@ pub const EventWriter = struct {
     fn emitImageCommitEvent(self: *EventWriter, value: ImageCommitEvent) !void {
         self.setBackend(value.backend);
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8 = "image_committed",
             command: []const u8,
             backend: []const u8,
@@ -859,9 +869,10 @@ pub const EventWriter = struct {
         try self.emitReady();
         self.terminal_emitted = true;
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
-            event: []const u8 = "exit",
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
+            event: []const u8 = "completion",
+            outcome: []const u8 = @tagName(TerminalOutcome.completed),
             command: []const u8,
             backend: []const u8,
             exit_code: i32,
@@ -895,8 +906,8 @@ pub const EventWriter = struct {
         if (self.ready_emitted) return;
         self.ready_emitted = true;
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8 = "ready",
             command: []const u8,
             backend: ?[]const u8,
@@ -918,8 +929,8 @@ pub const EventWriter = struct {
         const data_base64 = try base64Alloc(self.allocator, bytes);
         defer self.allocator.free(data_base64);
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
             event: []const u8,
             command: []const u8,
             backend: ?[]const u8,
@@ -951,19 +962,35 @@ pub const EventWriter = struct {
         try self.emitExitEvent(exitEvent(self.command, result));
     }
 
+    pub fn emitExecCompletion(self: *EventWriter, exit_code: u8) !void {
+        if (self.terminal_emitted) return;
+        self.terminal_emitted = true;
+        try self.write(.{
+            .schema = machine_output.automation_event_schema,
+            .schema_version = machine_output.automation_event_schema_version,
+            .event = "completion",
+            .outcome = @tagName(TerminalOutcome.completed),
+            .command = self.command,
+            .backend = self.backend,
+            .exit_code = exit_code,
+        });
+    }
+
     pub fn emitFailure(self: *EventWriter, classified: ClassifiedFailure) !void {
         if (self.terminal_emitted) return;
         self.terminal_emitted = true;
         const event = struct {
-            schema: []const u8 = machine_output.run_events_schema,
-            schema_version: u32 = machine_output.run_events_schema_version,
-            event: []const u8 = "failure",
+            schema: []const u8 = machine_output.automation_event_schema,
+            schema_version: u32 = machine_output.automation_event_schema_version,
+            event: []const u8 = "completion",
+            outcome: []const u8,
             command: []const u8,
             backend: ?[]const u8,
             @"error": machine_output.ErrorBody,
         }{
             .command = self.command,
             .backend = self.backend,
+            .outcome = if (classified.code == .operation_canceled) @tagName(TerminalOutcome.canceled) else @tagName(TerminalOutcome.failed),
             .@"error" = classified.envelope().@"error",
         };
         try self.write(event);
@@ -2276,6 +2303,8 @@ fn rootfsInputError(code: machine_output.ErrorCode) anyerror {
         .runtime_start_failed,
         .runtime_execution_failed,
         => error.RuntimeFailed,
+        .operation_canceled => error.OperationCanceled,
+        .stream_interrupted => error.EventSinkFailed,
     };
 }
 
@@ -4879,13 +4908,14 @@ test "event writer emits JSONL lifecycle and output records" {
     const stdout_line = lines.next().?;
     const exit_line = lines.next().?;
     try std.testing.expectEqualStrings("", lines.next().?);
-    try expectJsonStringField(allocator, start_line, "schema", machine_output.run_events_schema);
+    try expectJsonStringField(allocator, start_line, "schema", machine_output.automation_event_schema);
     try expectJsonStringField(allocator, start_line, "event", "start");
     try expectJsonStringField(allocator, ready_line, "event", "ready");
     try expectJsonStringField(allocator, ready_line, "backend", "hvf");
     try expectJsonStringField(allocator, stdout_line, "event", "stdout");
     try expectJsonStringField(allocator, stdout_line, "data_base64", "aGkK");
-    try expectJsonStringField(allocator, exit_line, "event", "exit");
+    try expectJsonStringField(allocator, exit_line, "event", "completion");
+    try expectJsonStringField(allocator, exit_line, "outcome", "completed");
     try expectJsonStringField(allocator, exit_line, "memory_restore_source", "local_backing");
     try expectJsonStringField(allocator, exit_line, "memory_restore_reason", "proof_valid");
 }
@@ -4920,7 +4950,7 @@ test "event writer emits exactly one terminal failure" {
     var events = EventWriter.init(allocator, &out.writer, "run");
     const sink = events.sink();
 
-    try sink.emit(.{ .failure = .{ .command = "run", .backend = null, .classified = classifyFailure(error.BadChunk) } });
+    try sink.emit(.{ .failure = .{ .command = "run", .backend = null, .classified = classifyFailure(error.RuntimeFailed) } });
     try events.emitExit(.{
         .backend = .hvf,
         .start_ms = 1,
@@ -4935,8 +4965,41 @@ test "event writer emits exactly one terminal failure" {
     var lines = std.mem.splitScalar(u8, out.written(), '\n');
     const failure_line = lines.next().?;
     try std.testing.expectEqualStrings("", lines.next().?);
-    try expectJsonStringField(allocator, failure_line, "event", "failure");
-    try expectNestedJsonStringField(allocator, failure_line, "error", "code", "cache.integrity_failed");
+    try expectJsonStringField(allocator, failure_line, "event", "completion");
+    try expectJsonStringField(allocator, failure_line, "outcome", "failed");
+    try expectNestedJsonStringField(allocator, failure_line, "error", "code", "runtime.execution_failed");
+}
+
+test "event writer serializes setup failure as a failed completion" {
+    const allocator = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = EventWriter.init(allocator, &out.writer, "run");
+
+    try writer.emitFailure(machine_output.usageMissingArgument("missing command", "run"));
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const completion_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, completion_line, "event", "completion");
+    try expectJsonStringField(allocator, completion_line, "outcome", "failed");
+    try expectNestedJsonStringField(allocator, completion_line, "error", "code", "usage.missing_argument");
+}
+
+test "event writer serializes cancellation as a canceled completion" {
+    const allocator = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var writer = EventWriter.init(allocator, &out.writer, "exec");
+
+    try writer.emitFailure(classifyFailure(error.OperationCanceled));
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const completion_line = lines.next().?;
+    try std.testing.expectEqualStrings("", lines.next().?);
+    try expectJsonStringField(allocator, completion_line, "event", "completion");
+    try expectJsonStringField(allocator, completion_line, "outcome", "canceled");
+    try expectNestedJsonStringField(allocator, completion_line, "error", "code", "operation.canceled");
 }
 
 test "interactive stream protocol failure has a clear public message" {
@@ -5021,7 +5084,7 @@ test "event writer emits port forward events" {
     const port_forward_line = lines.next().?;
     try std.testing.expectEqualStrings("", lines.next().?);
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"spore.run-events.v1\",\"schema_version\":1,\"event\":\"port_forward\",\"command\":\"run\",\"backend\":\"hvf\",\"type\":\"bound_unix_service\",\"name\":\"gateway\",\"guest_host\":\"gateway.internal\",\"guest_port\":8170,\"target\":\"unix\"}",
+        "{\"schema\":\"spore.automation.event.v1\",\"schema_version\":1,\"event\":\"port_forward\",\"command\":\"run\",\"backend\":\"hvf\",\"type\":\"bound_unix_service\",\"name\":\"gateway\",\"guest_host\":\"gateway.internal\",\"guest_port\":8170,\"target\":\"unix\"}",
         port_forward_line,
     );
 }
@@ -5052,10 +5115,11 @@ test "event writer emits capture events before exit" {
     try std.testing.expectEqualStrings("", lines.next().?);
     try expectJsonStringField(allocator, ready_line, "event", "ready");
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"spore.run-events.v1\",\"schema_version\":1,\"event\":\"capture\",\"command\":\"run\",\"backend\":\"hvf\",\"capture_path\":\"out.spore\"}",
+        "{\"schema\":\"spore.automation.event.v1\",\"schema_version\":1,\"event\":\"capture\",\"command\":\"run\",\"backend\":\"hvf\",\"capture_path\":\"out.spore\"}",
         capture_line,
     );
-    try expectJsonStringField(allocator, exit_line, "event", "exit");
+    try expectJsonStringField(allocator, exit_line, "event", "completion");
+    try expectJsonStringField(allocator, exit_line, "outcome", "completed");
 }
 
 fn failingEventSink(_: ?*anyopaque, _: RunEvent) !void {

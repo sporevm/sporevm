@@ -15,6 +15,7 @@ const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
 const image_gateway_pull = @import("image_gateway_pull.zig");
 const lifecycle = @import("lifecycle.zig");
+const machine_output = @import("machine_output.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const memory_config = @import("memory.zig");
@@ -185,6 +186,12 @@ pub const EventSink = run_mod.EventSink;
 pub const ClassifiedFailure = run_mod.ClassifiedFailure;
 pub const FailureCode = run_mod.FailureCode;
 pub const FailureScope = run_mod.FailureScope;
+pub const RetryClass = run_mod.RetryClass;
+pub const TerminalOutcome = run_mod.TerminalOutcome;
+pub const error_schema = machine_output.error_schema;
+pub const error_schema_version = machine_output.error_schema_version;
+pub const automation_event_schema = machine_output.automation_event_schema;
+pub const automation_event_schema_version = machine_output.automation_event_schema_version;
 pub const Timings = run_mod.Timings;
 pub const StartEvent = run_mod.StartEvent;
 pub const ReadyEvent = run_mod.ReadyEvent;
@@ -208,6 +215,7 @@ pub const RemoveNamedOptions = lifecycle.RemoveNamedOptions;
 pub const RemovedSavedSpore = lifecycle.RemovedSavedSpore;
 pub const ListNamedOptions = lifecycle.ListNamedOptions;
 pub const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
+pub const NamedListResult = lifecycle.NamedListResult;
 pub const NamedExecTiming = lifecycle.NamedExecTiming;
 pub const ExecNamedResult = lifecycle.ExecNamedResult;
 pub const NamedForkResult = lifecycle.NamedForkResult;
@@ -364,6 +372,8 @@ pub const ForkOptions = struct {
 /// `first_child` and `last_child` are owned and must be released with
 /// `deinitForkResult`.
 pub const ForkResult = struct {
+    schema: []const u8 = "spore.fork.result.v1",
+    schema_version: u32 = 1,
     parent: []const u8,
     out_dir: []const u8,
     count: usize,
@@ -389,6 +399,8 @@ pub const PackOptions = struct {
 ///
 /// `bundle_digest` is owned and must be released with `deinitPackResult`.
 pub const PackResult = struct {
+    schema: []const u8 = "spore.pack.result.v1",
+    schema_version: u32 = 1,
     source: []const u8,
     out_dir: []const u8,
     bundle_digest: []const u8,
@@ -415,6 +427,8 @@ pub const UnpackOptions = struct {
 /// `bundle_digest` and `selected_child`, when present, are owned and must be
 /// released with `deinitUnpackResult`.
 pub const UnpackResult = struct {
+    schema: []const u8 = "spore.unpack.result.v1",
+    schema_version: u32 = 1,
     bundle: []const u8,
     out_dir: []const u8,
     bundle_digest: []const u8,
@@ -439,6 +453,8 @@ pub const PushOptions = struct {
 ///
 /// `bundle_digest` is owned and must be released with `deinitPushResult`.
 pub const PushResult = struct {
+    schema: []const u8 = "spore.push.result.v1",
+    schema_version: u32 = 1,
     source: []const u8,
     destination: []const u8,
     store: []const u8 = "s3",
@@ -496,6 +512,8 @@ pub const SporeNetworkSummary = struct {
 ///
 /// Owned string fields must be released with `deinitSporeInspectResult`.
 pub const SporeInspectResult = struct {
+    schema: []const u8 = "spore.inspect.result.v1",
+    schema_version: u32 = 1,
     version: u32,
     vm_state_present: bool,
     storage_mode: []const u8,

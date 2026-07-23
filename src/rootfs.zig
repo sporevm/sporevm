@@ -120,6 +120,8 @@ pub const CasPreloadRequest = struct {
 pub const CasPreloadResult = rootfs_cas.PreloadResult;
 
 pub const ImportOciResult = struct {
+    schema: []const u8 = "spore.rootfs.import.result.v1",
+    schema_version: u32 = 1,
     rootfs_path: []const u8,
     metadata_path: []const u8,
     local_ref_path: []const u8,
@@ -663,6 +665,8 @@ const ImageManifest = oci.ImageManifest;
 pub const ImageConfig = image_mod.Config;
 
 pub const BuildResult = struct {
+    schema: []const u8 = "spore.rootfs.build.result.v1",
+    schema_version: u32 = 1,
     rootfs_storage: spore.RootfsStorage,
 };
 

@@ -25,6 +25,7 @@ const vsock = @import("virtio/vsock.zig");
 pub const Backend = run_mod.Backend;
 const default_attach_guest_port: u32 = 10700;
 const default_attach_timeout_ms: u64 = 30_000;
+pub var cli_setup_events: ?run_mod.EventSink = null;
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -79,8 +80,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
             i += 1;
             backend = Backend.parse(args[i]) orelse {
-                std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--backend must be auto, hvf, or kvm", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--session") and i + 1 < args.len) {
             i += 1;
@@ -95,29 +95,24 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--bind-service") and i + 1 < args.len) {
             i += 1;
             bound_services.append(spore_net_policy.parseBoundServiceBinding(args[i]) catch |err| {
-                std.debug.print("spore attach: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
-                std.process.exit(2);
+                failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             }) catch |err| {
-                std.debug.print("spore attach: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
-                std.process.exit(2);
+                failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
             event_mode = run_mod.EventMode.parse(args[i]) orelse {
-                std.debug.print("--events must be jsonl\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--events must be jsonl", .{});
             };
         } else if (std.mem.startsWith(u8, args[i], "--events=")) {
             const raw = args[i]["--events=".len..];
             event_mode = run_mod.EventMode.parse(raw) orelse {
-                std.debug.print("--events must be jsonl\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--events must be jsonl", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout_ms = run_mod.parseDurationMs(args[i]) catch {
-                std.debug.print("--timeout expects a duration like 30s, 500ms, or 1m\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--timeout expects a duration like 30s, 500ms, or 1m", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
             i += 1;
@@ -130,16 +125,13 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             interactive = true;
             tty = true;
         } else if (std.mem.eql(u8, args[i], "--count")) {
-            std.debug.print("spore attach attaches exactly one spore; use spore fork --count N --out DIR, then attach each child\n", .{});
-            std.process.exit(2);
+            failAttachSetup("spore attach attaches exactly one spore; use spore fork --count N --out DIR, then attach each child", .{});
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
-            std.process.exit(2);
+            failAttachSetup("unknown attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (spore_dir == null) {
             spore_dir = args[i];
         } else {
-            std.debug.print("unexpected attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
-            std.process.exit(2);
+            failAttachSetup("unexpected attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
         }
     }
 
@@ -149,8 +141,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         .generation_path = generation_path,
         .event_mode = event_mode,
         .spore_dir = spore_dir orelse {
-            std.debug.print("{s}", .{cli_usage});
-            std.process.exit(2);
+            failAttachSetup("{s}", .{cli_usage});
         },
         .timeout_ms = timeout_ms,
         .bound_services = bound_services,
@@ -359,12 +350,10 @@ fn identityProbeOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes
 
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     const parsed = std.fmt.parseInt(T, raw, 10) catch {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
+        failAttachSetup("{s} must be a positive integer", .{name});
     };
     if (parsed == 0) {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
+        failAttachSetup("{s} must be a positive integer", .{name});
     }
     return parsed;
 }
@@ -467,6 +456,15 @@ fn validateAttachDiskManifestParts(devices: []const spore.TransportState, rootfs
 }
 
 fn failAttachSetup(comptime fmt: []const u8, args: anytype) noreturn {
+    if (cli_setup_events) |sink| {
+        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "spore attach: setup failed";
+        sink.emit(.{ .failure = .{
+            .command = "attach",
+            .backend = null,
+            .classified = run_mod.ClassifiedFailure.init(.usage_invalid_argument, message, "attach"),
+        } }) catch {};
+        std.process.exit(2);
+    }
     std.debug.print(fmt ++ "\n", args);
     std.process.exit(2);
 }

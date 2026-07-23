@@ -183,7 +183,7 @@ if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore --events=js
   die "named spore restore --generation failed"
 fi
 grep -Fq '"event":"ready"' "${named_resume_stdout}" || die "named spore restore --generation --events=jsonl did not emit ready"
-grep -Fq '"event":"exit"' "${named_resume_stdout}" || die "named spore restore --generation --events=jsonl did not emit exit"
+grep -Fq '"event":"completion","outcome":"completed"' "${named_resume_stdout}" || die "named spore restore --generation --events=jsonl did not emit completed terminal outcome"
 if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${named_vm}" -- /bin/gencheck \
   >"${named_exec_stdout}" 2>"${named_exec_stderr}"; then
   cat "${named_exec_stdout}" >&2 || true

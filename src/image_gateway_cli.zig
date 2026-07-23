@@ -4,16 +4,23 @@ const std = @import("std");
 const Io = std.Io;
 const api = @import("api.zig");
 const gateway_pull = @import("image_gateway_pull.zig");
+const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or wantsHelp(args)) {
+pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
+    if (args.len == 0) {
+        if (mode == .json) return error.MissingImageCommand;
+        try stdout.writeAll(gateway_pull.usage);
+        return;
+    }
+    if (wantsHelp(args)) {
         try stdout.writeAll(gateway_pull.usage);
         return;
     }
     if (std.mem.eql(u8, args[0], "pull")) {
         const options = try parsePullOptions(args[1..]);
         const result = try api.imageGatewayPull(init, init.arena.allocator(), options);
+        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
         try stdout.print(
             "ref: {s}\nresolved: {s}\nplatform: {s}/{s}\nobjects_fetched: {d}\nbytes_fetched: {d}\n",
             .{ options.ref, result.resolved_image_ref, options.platform.os, options.platform.arch.name(), result.objects_fetched, result.bytes_fetched },
@@ -23,6 +30,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     if (std.mem.eql(u8, args[0], "export-fixture")) {
         const options = try parseExportFixtureOptions(args[1..]);
         const result = try gateway_pull.exportFixture(init, init.arena.allocator(), options);
+        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
         try stdout.print("fixture: {s}\nmanifest: {s}\nimage: {s}\nobjects: {d}\n", .{
             options.output_dir,
             result.manifest_digest,

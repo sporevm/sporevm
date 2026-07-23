@@ -5,8 +5,8 @@ const Io = std.Io;
 
 pub const error_schema = "spore.error.v1";
 pub const error_schema_version: u32 = 1;
-pub const run_events_schema = "spore.run-events.v1";
-pub const run_events_schema_version: u32 = 1;
+pub const automation_event_schema = "spore.automation.event.v1";
+pub const automation_event_schema_version: u32 = 1;
 pub const format_too_old_message = "format too old: re-create this spore/image";
 
 pub const Mode = enum {
@@ -23,6 +23,8 @@ pub const Scope = enum {
     manifest,
     guest,
     runtime,
+    operation,
+    stream,
 
     pub fn text(self: Scope) []const u8 {
         return @tagName(self);
@@ -40,6 +42,8 @@ pub const ErrorCode = enum {
     cache_integrity_failed,
     runtime_start_failed,
     runtime_execution_failed,
+    operation_canceled,
+    stream_interrupted,
 
     pub fn text(self: ErrorCode) []const u8 {
         return switch (self) {
@@ -53,6 +57,8 @@ pub const ErrorCode = enum {
             .cache_integrity_failed => "cache.integrity_failed",
             .runtime_start_failed => "runtime.start_failed",
             .runtime_execution_failed => "runtime.execution_failed",
+            .operation_canceled => "operation.canceled",
+            .stream_interrupted => "stream.interrupted",
         };
     }
 
@@ -63,17 +69,33 @@ pub const ErrorCode = enum {
             .object_not_found, .object_invalid => .object,
             .cache_unavailable, .cache_integrity_failed => .cache,
             .runtime_start_failed, .runtime_execution_failed => .runtime,
+            .operation_canceled => .operation,
+            .stream_interrupted => .stream,
         };
     }
 
-    pub fn retryable(self: ErrorCode) bool {
+    pub fn retry(self: ErrorCode) Retry {
         return switch (self) {
             .host_unavailable,
             .cache_unavailable,
             .runtime_start_failed,
-            => true,
-            else => false,
+            => .transient,
+            .usage_invalid_argument,
+            .usage_missing_argument,
+            .host_unsupported,
+            .object_not_found,
+            .object_invalid,
+            .cache_integrity_failed,
+            => .after_fix,
+            .runtime_execution_failed,
+            .operation_canceled,
+            .stream_interrupted,
+            => .unknown,
         };
+    }
+
+    pub fn retryable(self: ErrorCode) bool {
+        return self.retry() == .transient;
     }
 
     pub fn exitCode(self: ErrorCode) u8 {
@@ -86,6 +108,8 @@ pub const ErrorCode = enum {
             => 22,
             .cache_unavailable => 73,
             .runtime_start_failed, .runtime_execution_failed => 1,
+            .operation_canceled => 130,
+            .stream_interrupted => 74,
         };
     }
 
@@ -101,7 +125,19 @@ pub const ErrorCode = enum {
             .cache_integrity_failed => "Cached bytes do not match the expected digest.",
             .runtime_start_failed => "Runtime setup failed before guest execution completed.",
             .runtime_execution_failed => "Guest execution reached a SporeVM-managed failure state.",
+            .operation_canceled => "The caller canceled the operation before completion.",
+            .stream_interrupted => "The event stream ended before a completion result was delivered.",
         };
+    }
+};
+
+pub const Retry = enum {
+    after_fix,
+    transient,
+    unknown,
+
+    pub fn text(self: Retry) []const u8 {
+        return @tagName(self);
     }
 };
 
@@ -109,6 +145,7 @@ pub const CliError = struct {
     code: ErrorCode,
     message: []const u8,
     source: []const u8,
+    retry: Retry,
     retryable: bool,
     scope: Scope,
     exit_code: u8,
@@ -118,6 +155,7 @@ pub const CliError = struct {
             .code = code,
             .message = message,
             .source = source,
+            .retry = code.retry(),
             .retryable = code.retryable(),
             .scope = code.scope(),
             .exit_code = code.exitCode(),
@@ -129,6 +167,7 @@ pub const CliError = struct {
             .@"error" = .{
                 .code = self.code.text(),
                 .message = self.message,
+                .retry = self.retry.text(),
                 .retryable = self.retryable,
                 .scope = self.scope.text(),
                 .exit_code = self.exit_code,
@@ -147,6 +186,7 @@ pub const ErrorEnvelope = struct {
 pub const ErrorBody = struct {
     code: []const u8,
     message: []const u8,
+    retry: []const u8,
     retryable: bool,
     scope: []const u8,
     exit_code: u8,
@@ -177,6 +217,24 @@ pub fn forkUnsupportedVcpuMessage(allocator: std.mem.Allocator, vcpu_count: u32)
 pub fn fromZigError(err: anyerror) CliError {
     return switch (err) {
         error.InvalidRootfsInput,
+        error.InvalidValue,
+        error.InvalidPruneSelection,
+        error.InvalidGuestCommand,
+        error.InvalidVMName,
+        error.InvalidMemorySize,
+        error.InvalidBackend,
+        error.UnknownArgument,
+        error.UnknownImageCommand,
+        error.UnknownImageOption,
+        error.UnknownRootFSOption,
+        error.UnknownRootFSCommand,
+        error.MissingOptionValue,
+        error.TooManyImageArguments,
+        error.TooManyRootFSArguments,
+        error.InvalidChunkSize,
+        error.InvalidNetworkPolicy,
+        error.UnsupportedRootFSStoragePolicy,
+        error.UnsupportedRootfsStorage,
         error.UnsupportedVcpuCount,
         error.BadManagedKernelRepository,
         error.BadManagedKernelVersion,
@@ -200,7 +258,25 @@ pub fn fromZigError(err: anyerror) CliError {
         error.X86NetworkUnsupported,
         error.X86BuildUnsupported,
         => CliError.init(.usage_invalid_argument, ErrorCode.usage_invalid_argument.defaultMessage(), @errorName(err)),
-        error.FileNotFound => CliError.init(.object_not_found, ErrorCode.object_not_found.defaultMessage(), @errorName(err)),
+        error.MissingGatewayUrl,
+        error.MissingGatewayRepository,
+        error.MissingImageReference,
+        error.MissingImageSource,
+        error.MissingMetadataPath,
+        error.MissingOutputPath,
+        error.MissingPlatform,
+        error.MissingRootFSStoragePolicy,
+        error.MissingMkfsPath,
+        error.MissingDebugfsPath,
+        error.MissingChunkSize,
+        error.MissingSporeDir,
+        error.MissingRootFSDigest,
+        error.MissingRootFSCommand,
+        error.MissingImageCommand,
+        => CliError.init(.usage_missing_argument, ErrorCode.usage_missing_argument.defaultMessage(), @errorName(err)),
+        error.FileNotFound,
+        error.NamedVmNotFound,
+        => CliError.init(.object_not_found, ErrorCode.object_not_found.defaultMessage(), @errorName(err)),
         error.AccessDenied,
         error.PermissionDenied,
         error.BadPathName,
@@ -216,6 +292,9 @@ pub fn fromZigError(err: anyerror) CliError {
         error.ManagedKernelHTTPStatus,
         error.ManagedKernelBodyTooLarge,
         error.UnsupportedExt4FileSize,
+        error.NamedVmNotReady,
+        error.NamedVmExists,
+        error.SavedSessionNotFound,
         => CliError.init(.object_invalid, if (err == error.FormatTooOld) format_too_old_message else ErrorCode.object_invalid.defaultMessage(), @errorName(err)),
         error.UnsupportedHost,
         error.UnsupportedBackend,
@@ -225,6 +304,9 @@ pub fn fromZigError(err: anyerror) CliError {
         error.MissingKvmDevice,
         error.KvmOpenFailed,
         error.KvmProbeFailed,
+        error.MonitorUnavailable,
+        error.MonitorReadyTimeout,
+        error.MonitorVersionMismatch,
         => CliError.init(.host_unavailable, ErrorCode.host_unavailable.defaultMessage(), @errorName(err)),
         error.RootfsCacheUnavailable,
         error.MissingHome,
@@ -236,6 +318,16 @@ pub fn fromZigError(err: anyerror) CliError {
         error.ManagedKernelChecksumMismatch,
         error.ManagedKernelArchitectureDigestMismatch,
         => CliError.init(.cache_integrity_failed, ErrorCode.cache_integrity_failed.defaultMessage(), @errorName(err)),
+        error.Canceled,
+        error.Cancelled,
+        error.OperationCanceled,
+        => CliError.init(.operation_canceled, ErrorCode.operation_canceled.defaultMessage(), @errorName(err)),
+        error.EventSinkFailed,
+        error.StreamInterrupted,
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.EndOfStream,
+        => CliError.init(.stream_interrupted, ErrorCode.stream_interrupted.defaultMessage(), @errorName(err)),
         else => CliError.init(.runtime_execution_failed, ErrorCode.runtime_execution_failed.defaultMessage(), @errorName(err)),
     };
 }
@@ -262,6 +354,8 @@ test "stable error code table matches the plan" {
     try std.testing.expectEqualStrings("cache.integrity_failed", ErrorCode.cache_integrity_failed.text());
     try std.testing.expectEqualStrings("runtime.start_failed", ErrorCode.runtime_start_failed.text());
     try std.testing.expectEqualStrings("runtime.execution_failed", ErrorCode.runtime_execution_failed.text());
+    try std.testing.expectEqualStrings("operation.canceled", ErrorCode.operation_canceled.text());
+    try std.testing.expectEqualStrings("stream.interrupted", ErrorCode.stream_interrupted.text());
 }
 
 test "setup errors classify for API callers" {
@@ -275,6 +369,7 @@ test "setup errors classify for API callers" {
     try std.testing.expectEqual(ErrorCode.host_unsupported, fromZigError(error.KvmCapabilityMissing).code);
     try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.MissingKvmDevice).code);
     try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.KvmProbeFailed).code);
+    try std.testing.expectEqual(ErrorCode.runtime_execution_failed, fromZigError(error.RuntimeFailed).code);
 }
 
 test "error envelope uses shared schema" {
@@ -284,5 +379,19 @@ test "error envelope uses shared schema" {
     try std.testing.expectEqual(error_schema_version, envelope.schema_version);
     try std.testing.expectEqualStrings("usage.invalid_argument", envelope.@"error".code);
     try std.testing.expectEqualStrings("usage", envelope.@"error".scope);
+    try std.testing.expectEqualStrings("after_fix", envelope.@"error".retry);
     try std.testing.expectEqual(@as(u8, 2), envelope.@"error".exit_code);
+}
+
+test "terminal outcomes classify cancellation and interrupted streams" {
+    const canceled = fromZigError(error.OperationCanceled);
+    try std.testing.expectEqual(ErrorCode.operation_canceled, canceled.code);
+    try std.testing.expectEqual(Scope.operation, canceled.scope);
+    try std.testing.expectEqual(Retry.unknown, canceled.retry);
+    try std.testing.expectEqual(@as(u8, 130), canceled.exit_code);
+
+    const interrupted = fromZigError(error.EventSinkFailed);
+    try std.testing.expectEqual(ErrorCode.stream_interrupted, interrupted.code);
+    try std.testing.expectEqual(Scope.stream, interrupted.scope);
+    try std.testing.expectEqual(Retry.unknown, interrupted.retry);
 }

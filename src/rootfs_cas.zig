@@ -27,6 +27,8 @@ pub const SourceError = error{
 };
 
 pub const PreloadResult = struct {
+    schema: []const u8 = "spore.rootfs.cas-preload.result.v1",
+    schema_version: u32 = 1,
     index_path: []const u8,
     index_digest: []const u8,
     rootfs_digest: []const u8,
