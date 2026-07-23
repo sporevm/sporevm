@@ -235,9 +235,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
 
     if (gateway_active) try events.emitPortForwards(&network_options.policy);
     const ram_size = if (parsed) |manifest| manifest.value.platform.ram_size else parsed_v1.?.value.platform.ram_size;
+    const memory_state = if (parsed) |manifest| manifest.value.memory_state else parsed_v1.?.value.memory_state;
+    const memory_config = try spore.memoryConfig(ram_size, memory_state);
     const vcpu_count = if (parsed) |_| @as(u32, 1) else parsed_v1.?.value.platform.vcpu_count;
     const memory = if (parsed) |manifest| manifest.value.memory else parsed_v1.?.value.memory;
-    var ram_plan = try ram_restore.Plan.fromMemory(allocator, context.environ_map, opts.spore_dir, memory, ram_size, vcpu_count);
+    var ram_plan = try ram_restore.Plan.fromMemory(allocator, context.environ_map, opts.spore_dir, memory, memory_config.maximum_bytes, vcpu_count);
     defer ram_plan.deinit();
     std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     const cause = switch (backend) {
@@ -285,7 +287,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     switch (cause) {
         .guest_off, .guest_reset => {},
         .probe_complete => {
-            var result = try resultFromAttachStream(backend, ram_size, vcpu_count, identity_stream);
+            var result = try resultFromAttachStream(backend, memory_config, vcpu_count, identity_stream);
             result = result.withMemoryRestore(&ram_plan);
             run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
             try events.emitExit(result);
@@ -307,7 +309,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = 0,
         .vcpus = vcpu_count,
-        .memory_bytes = ram_size,
+        .memory_bytes = memory_config.initial_bytes,
+        .max_memory_bytes = memory_config.maximum_bytes,
     };
     result = result.withMemoryRestore(&ram_plan);
     try events.emitExit(result);
@@ -348,7 +351,7 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     return parsed;
 }
 
-fn resultFromAttachStream(backend: Backend, ram_size: u64, vcpu_count: u32, identity_stream: ?vsock.HostStream) !run_mod.Result {
+fn resultFromAttachStream(backend: Backend, memory_config: @import("memory.zig").Config, vcpu_count: u32, identity_stream: ?vsock.HostStream) !run_mod.Result {
     const stream = identity_stream orelse return error.UnexpectedAttachExit;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -360,7 +363,8 @@ fn resultFromAttachStream(backend: Backend, ram_size: u64, vcpu_count: u32, iden
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = vcpu_count,
-        .memory_bytes = ram_size,
+        .memory_bytes = memory_config.initial_bytes,
+        .max_memory_bytes = memory_config.maximum_bytes,
     };
 }
 

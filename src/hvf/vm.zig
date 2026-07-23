@@ -185,16 +185,15 @@ const HotplugMapping = struct {
     guest_addr: u64,
     mapped_bytes: u64 = 0,
 
-    fn init(size: u64, guest_addr: u64) !HotplugMapping {
+    fn init(bytes: []align(std.heap.page_size_min) u8, guest_addr: u64) HotplugMapping {
         return .{
-            .bytes = (try mapAnonymousRam(size)).bytes,
+            .bytes = bytes,
             .guest_addr = guest_addr,
         };
     }
 
     fn deinit(self: *HotplugMapping) void {
         if (self.mapped_bytes != 0) _ = hvf.hv_vm_unmap(self.guest_addr, self.mapped_bytes);
-        std.posix.munmap(self.bytes);
     }
 
     fn mapForGuest(self: *HotplugMapping, bytes: u64) !void {
@@ -289,6 +288,11 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .start_ms = manifest_start,
             .manifest_ms = monotonicMs() - manifest_start,
         };
+        const manifest_ram_size = if (resume_parsed) |parsed| parsed.value.platform.ram_size else resume_v1_parsed.?.value.platform.ram_size;
+        const manifest_memory_state = if (resume_parsed) |parsed| parsed.value.memory_state else resume_v1_parsed.?.value.memory_state;
+        const restored_memory = try spore.memoryConfig(manifest_ram_size, manifest_memory_state);
+        config.ram_size = restored_memory.initial_bytes;
+        config.virtio_mem_region_size = restored_memory.maximum_bytes - restored_memory.initial_bytes;
     }
     try topology.validateVcpuCount(config.vcpus);
     if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
@@ -330,24 +334,25 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     defer ram_mapping.deinit();
     defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
+    const initial_ram_len: usize = @intCast(config.ram_size);
     var ram_mapped_at_start = false;
     var hv_map_ram_ms: u64 = 0;
     if (shouldMapRamAtStart(config, ram_mapping)) {
         const hv_map_ram_start = monotonicMs();
         try hvf.check(
-            hvf.hv_vm_map(ram_bytes.ptr, board.ram_base, ram_bytes.len, hvf.MemoryFlags.rwx),
+            hvf.hv_vm_map(ram_bytes.ptr, board.ram_base, initial_ram_len, hvf.MemoryFlags.rwx),
             "hv_vm_map ram",
         );
         hv_map_ram_ms = monotonicMs() - hv_map_ram_start;
         ram_mapped_at_start = true;
     }
     defer {
-        if (ram_mapped_at_start) _ = hvf.hv_vm_unmap(board.ram_base, ram_bytes.len);
+        if (ram_mapped_at_start) _ = hvf.hv_vm_unmap(board.ram_base, initial_ram_len);
     }
     defer if (dirty_tracker) |*tracker| tracker.deinit();
     var ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
     var hotplug_mapping: ?HotplugMapping = if (config.virtio_mem_region_size > 0)
-        try HotplugMapping.init(config.virtio_mem_region_size, board.ram_base + config.ram_size)
+        HotplugMapping.init(@alignCast(ram_bytes[initial_ram_len..]), board.ram_base + config.ram_size)
     else
         null;
     defer if (hotplug_mapping) |*mapping| mapping.deinit();
@@ -495,6 +500,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         });
         try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &lazy_pager, &restore_stats);
         const state_start = monotonicMs();
+        if (m.memory_state) |state| try mem_dev.restoreState(state);
         try applyTransports(transports, m.devices);
         if (lazy_pager) |*pager| try materializeAllTransportQueues(pager, transports);
         try gen_dev.restore(allocator, config.resume_generation orelse m.generation);
@@ -506,7 +512,8 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         // Fresh boot: DTB + kernel. Backend support is currently gated to one
         // vCPU, but DTB construction consumes the shared topology contract.
         const boot_start = monotonicMs();
-        const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
+        const boot_ram = ram_bytes[0..initial_ram_len];
+        const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(boot_ram.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = config.ram_size,
             .cpu_count = config.vcpus,
@@ -521,7 +528,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
         });
         defer allocator.free(dtb);
-        const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, config.initrd, dtb);
+        const layout = try boot.load(boot_ram, board.ram_base, config.kernel, config.initrd, dtb);
         var seed_ranges_buf: [3]dirty_ram.ChunkRange = undefined;
         for (layout.populatedRanges(), 0..) |range, i| {
             seed_ranges_buf[i] = .{ .start = range.start, .end = range.end };
@@ -582,7 +589,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     }
     var exec_probe_done = false;
     var handled_memory_pressure_count: u32 = 0;
-    var requested_hotplug_size: u64 = 0;
+    var requested_hotplug_size: u64 = if (mem_transport_index != null) mem_dev.requested_size else 0;
     var logged_first_vcpu_entry = false;
     var logged_first_guest_exit = false;
 
@@ -635,6 +642,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
+                        .memory_device = if (mem_transport_index != null) &mem_dev else null,
                     }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, if (preparation) |*owned| owned.cacheLock() else null);
                     if (!request.continue_after) return .snapshotted;
                     const completed_dir = if (request.publish_dir) |publish_dir| blk: {
@@ -663,6 +671,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                             .dist_base = dist_base,
                             .redist_base = vcpu_redist_base,
                             .ram_size = config.ram_size,
+                            .memory_device = if (mem_transport_index != null) &mem_dev else null,
                         },
                         config,
                         if (dirty_tracker) |*tracker| tracker else null,
@@ -680,6 +689,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
+                    .memory_device = if (mem_transport_index != null) &mem_dev else null,
                 }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -705,6 +715,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
+                                .memory_device = if (mem_transport_index != null) &mem_dev else null,
                             }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                             return .snapshotted;
                         }
@@ -728,6 +739,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
+                    .memory_device = if (mem_transport_index != null) &mem_dev else null,
                 }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 return .snapshotted;
             }
@@ -1936,14 +1948,15 @@ fn shouldMapRamAtStart(config: Config, ram_mapping: RamMapping) bool {
 }
 
 fn mapRam(config: Config, manifest_memory: ?spore.MemoryManifest) !RamMapping {
+    const maximum_size = std.math.add(u64, config.ram_size, config.virtio_mem_region_size) catch return error.BadManifest;
     return switch (config.ram_restore) {
         .local_backing => |fd| blk: {
             const memory = manifest_memory orelse return error.BadManifest;
             const backing = memory.backing orelse return error.BadManifest;
-            try spore.validateMemoryBacking(backing, config.ram_size);
-            break :blk try mapFileBackedRamFd(fd, config.ram_size);
+            try spore.validateMemoryBacking(backing, maximum_size);
+            break :blk try mapFileBackedRamFd(fd, maximum_size);
         },
-        .fresh, .eager_chunks, .lazy_chunks => mapAnonymousRam(config.ram_size),
+        .fresh, .eager_chunks, .lazy_chunks => mapAnonymousRam(maximum_size),
     };
 }
 
@@ -2373,6 +2386,7 @@ const SnapshotPlatform = struct {
     redist_base: u64,
     redist_stride: u64 = 0,
     ram_size: u64,
+    memory_device: ?*const virtio_mem.Mem = null,
 };
 
 fn takeRootfsSnapshot(
@@ -2498,8 +2512,9 @@ fn takeSnapshot(
     else
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = monotonicMs() - memory_start;
+    const memory_state = if (platform.memory_device) |device| try device.captureState(arena, platform.ram_size) else null;
     if (environ_map) |environ| {
-        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size);
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_bytes.len);
     }
     var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
     defer if (owned_cache_lock) |*lock| lock.deinit();
@@ -2515,6 +2530,7 @@ fn takeSnapshot(
     const disk_ms = monotonicMs() - disk_start;
     const manifest_start = monotonicMs();
     const saved_manifest = spore.Manifest{
+        .version = if (memory_state != null) spore.format_version_elastic else spore.format_version,
         .platform = .{
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
@@ -2532,6 +2548,7 @@ fn takeSnapshot(
         .disk = disk_manifest,
         .network = network_manifest,
         .sessions = sessions,
+        .memory_state = memory_state,
         .memory = memory,
     };
     if (disk_manifest) |disk| {

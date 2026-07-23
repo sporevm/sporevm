@@ -51,9 +51,7 @@ mkdir -p "${runtime_dir}"
 chmod 0700 "${runtime_dir}"
 run_env=(env SPOREVM_RUNTIME_DIR="${runtime_dir}" SPOREVM_KERNEL_CACHE_DIR="${kernel_cache}")
 
-expect_failure run-omitted-memory "requires explicit --memory 512mib" \
-  "${run_env[@]}" "${spore_bin}" run --backend kvm -- /bin/true
-expect_failure run-auto-memory "requires explicit --memory 512mib" \
+expect_failure run-auto-memory "--memory auto was removed" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --memory auto -- /bin/true
 expect_failure run-vcpus "requires --vcpus 1" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --memory 512mib --vcpus 2 -- /bin/true
@@ -63,9 +61,7 @@ expect_failure run-network "rootfs, OCI, networking, and build integration have 
   "${run_env[@]}" "${spore_bin}" run --backend kvm --memory 512mib --net -- /bin/true
 expect_failure run-commit "fresh execution only" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --memory 512mib --image local/missing:dev --commit local/rejected:dev -- /bin/true
-expect_failure create-omitted-memory "requires explicit --memory 512mib" \
-  "${run_env[@]}" "${spore_bin}" create rejected-$$ --backend kvm
-expect_failure create-auto-memory "requires explicit --memory 512mib" \
+expect_failure create-auto-memory "--memory auto was removed" \
   "${run_env[@]}" "${spore_bin}" create rejected-auto-$$ --backend kvm --memory auto
 expect_failure run-save "fresh execution only" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --memory 512mib --save "${workdir}/saved.spore" -- /bin/true

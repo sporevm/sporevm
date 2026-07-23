@@ -93,11 +93,21 @@ type SporeInspectResult struct {
 	PresentMemoryChunkCount uint64               `json:"present_memory_chunk_count"`
 	MemoryBackingKind       *string              `json:"memory_backing_kind"`
 	MemoryBackingSize       *uint64              `json:"memory_backing_size"`
+	InitialMemoryBytes      uint64               `json:"initial_memory_bytes"`
+	MaxMemoryBytes          uint64               `json:"max_memory_bytes"`
+	RequestedMemoryBytes    uint64               `json:"requested_memory_bytes"`
+	CapturedMemoryBytes     uint64               `json:"captured_memory_bytes"`
+	PluggedMemoryRanges     []MemoryPluggedRange `json:"plugged_memory_ranges"`
 	GICKind                 string               `json:"gic_kind"`
 	Sessions                []Session            `json:"sessions"`
 	Network                 *SporeNetworkSummary `json:"network"`
 	Annotations             map[string]string    `json:"annotations"`
 	AnnotationKeys          []string             `json:"annotation_keys"`
+}
+
+type MemoryPluggedRange struct {
+	StartBlock uint32 `json:"start_block"`
+	BlockCount uint32 `json:"block_count"`
 }
 
 type SporeNetworkSummary struct {
@@ -297,17 +307,21 @@ type CreateNamedOptions struct {
 	RootfsPath      string
 	ImageRef        string
 	SporeExecutable string
-	MemoryBytes     uint64
-	VCPUs           uint32
-	GuestPort       uint32
-	TimeoutMs       uint64
-	ConsoleLogPath  string
-	NetworkEnabled  bool
-	AllowCIDRs      []string
-	AllowHosts      []string
-	NetworkRules    []NetworkRule
-	BoundServices   []BoundUnixService
-	Annotations     map[string]string
+	// MemoryBytes is initial guest-visible memory. Zero selects 512 MiB.
+	MemoryBytes uint64
+	// MaxMemoryBytes enables elastic memory when larger than MemoryBytes.
+	// Zero means fixed memory.
+	MaxMemoryBytes uint64
+	VCPUs          uint32
+	GuestPort      uint32
+	TimeoutMs      uint64
+	ConsoleLogPath string
+	NetworkEnabled bool
+	AllowCIDRs     []string
+	AllowHosts     []string
+	NetworkRules   []NetworkRule
+	BoundServices  []BoundUnixService
+	Annotations    map[string]string
 	// InitialArgv replaces the image Cmd while preserving its Entrypoint.
 	// An empty value uses image defaults, or leaves a non-image VM idle.
 	InitialArgv []string

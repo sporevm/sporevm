@@ -5,13 +5,14 @@
 
 const std = @import("std");
 const guestmem = @import("../guestmem.zig");
+const memory = @import("../memory.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
 
 pub const device_id: u32 = 24;
 pub const default_block_size: u64 = 2 * 1024 * 1024;
 const request_queue = 0;
-const max_blocks = 8192;
+const max_blocks = memory.max_elastic_blocks;
 const pressure_growth_chunk: u64 = 1024 * 1024 * 1024;
 
 const req_plug: u16 = 0;
@@ -78,6 +79,73 @@ pub const Mem = struct {
     pub fn setRequestedSize(self: *Mem, bytes: u64) !void {
         if (bytes > self.region_size or bytes % self.block_size != 0) return error.InvalidVirtioMemRequest;
         self.requested_size = bytes;
+    }
+
+    pub fn captureState(self: *const Mem, allocator: std.mem.Allocator, initial_size: u64) !memory.CapturedState {
+        var ranges = std.array_list.Managed(memory.PluggedRange).init(allocator);
+        errdefer ranges.deinit();
+
+        const block_count: usize = @intCast(self.region_size / self.block_size);
+        var index: usize = 0;
+        while (index < block_count) {
+            if (!self.plugged.isSet(index)) {
+                index += 1;
+                continue;
+            }
+            const start = index;
+            while (index < block_count and self.plugged.isSet(index)) : (index += 1) {}
+            try ranges.append(.{
+                .start_block = @intCast(start),
+                .block_count = @intCast(index - start),
+            });
+        }
+
+        return .{
+            .initial_size = initial_size,
+            .maximum_size = initial_size + self.region_size,
+            .requested_size = initial_size + self.requested_size,
+            .captured_size = initial_size + self.plugged_size,
+            .block_size = self.block_size,
+            .plugged_ranges = try ranges.toOwnedSlice(),
+        };
+    }
+
+    pub fn restoreState(self: *Mem, captured: memory.CapturedState) !void {
+        if (captured.block_size != self.block_size or
+            captured.maximum_size < captured.initial_size or
+            captured.maximum_size - captured.initial_size != self.region_size or
+            captured.requested_size < captured.initial_size or
+            captured.requested_size > captured.maximum_size)
+        {
+            return error.InvalidVirtioMemState;
+        }
+        const requested_region_size = captured.requested_size - captured.initial_size;
+        if (requested_region_size % self.block_size != 0) return error.InvalidVirtioMemState;
+        if (requested_region_size > 0) {
+            if (self.plugFn) |plug_fn| {
+                const ctx = self.plug_context orelse return error.InvalidVirtioMemState;
+                if (!plug_fn(ctx, requested_region_size)) return error.InvalidVirtioMemState;
+            }
+        }
+
+        self.requested_size = requested_region_size;
+        self.plugged = .initEmpty();
+        self.plugged_size = 0;
+        for (captured.plugged_ranges) |range| {
+            if (range.block_count == 0) return error.InvalidVirtioMemState;
+            const start: usize = range.start_block;
+            const end = std.math.add(usize, start, range.block_count) catch return error.InvalidVirtioMemState;
+            if (end > self.region_size / self.block_size or end > requested_region_size / self.block_size) {
+                return error.InvalidVirtioMemState;
+            }
+            var index = start;
+            while (index < end) : (index += 1) {
+                if (self.plugged.isSet(index)) return error.InvalidVirtioMemState;
+                self.plugged.set(index);
+            }
+            self.plugged_size += @as(u64, range.block_count) * self.block_size;
+        }
+        if (captured.captured_size != captured.initial_size + self.plugged_size) return error.InvalidVirtioMemState;
     }
 
     pub fn device(self: *Mem) mmio.Device {
@@ -311,6 +379,36 @@ test "plug callback receives requested size" {
 
     try std.testing.expectEqual(@as(u32, 10), mem.handleRequest(&chain));
     try std.testing.expectEqual(default_block_size * 3, context.requested_size);
+}
+
+test "captured state restores requested size and exact plugged ranges" {
+    const allocator = std.testing.allocator;
+    var original = Mem.init(.{
+        .addr = 0x1000_0000,
+        .region_size = default_block_size * 4,
+        .requested_size = default_block_size * 4,
+    });
+    original.plugged.set(0);
+    original.plugged.set(1);
+    original.plugged.set(3);
+    original.plugged_size = default_block_size * 3;
+
+    const state = try original.captureState(allocator, 512 * 1024 * 1024);
+    defer allocator.free(state.plugged_ranges);
+    try std.testing.expectEqual(@as(usize, 2), state.plugged_ranges.len);
+    try std.testing.expectEqual(@as(u32, 0), state.plugged_ranges[0].start_block);
+    try std.testing.expectEqual(@as(u32, 2), state.plugged_ranges[0].block_count);
+    try std.testing.expectEqual(@as(u32, 3), state.plugged_ranges[1].start_block);
+
+    var restored = Mem.init(.{
+        .addr = original.addr,
+        .region_size = original.region_size,
+        .requested_size = 0,
+    });
+    try restored.restoreState(state);
+    try std.testing.expectEqual(original.requested_size, restored.requested_size);
+    try std.testing.expectEqual(original.plugged_size, restored.plugged_size);
+    try std.testing.expect(restored.plugged.eql(original.plugged));
 }
 
 fn fuzzMemQueue(_: void, s: *std.testing.Smith) !void {

@@ -18,7 +18,7 @@ import (
 	"unsafe"
 )
 
-const requiredABIVersion uint32 = 19
+const requiredABIVersion uint32 = 20
 const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
 const reexecRoleEnv = "SPORE_REEXEC_ROLE"
 const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
@@ -336,6 +336,7 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 	opts.image_ref = imageRef
 	opts.spore_executable = sporeExecutable
 	opts.memory_bytes = C.uint64_t(options.MemoryBytes)
+	opts.max_memory_bytes = C.uint64_t(options.MaxMemoryBytes)
 	if options.VCPUs != 0 {
 		opts.vcpus = C.uint32_t(options.VCPUs)
 	}

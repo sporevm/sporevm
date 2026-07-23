@@ -88,7 +88,8 @@ const monitor_usage =
     \\                          With --net, expose a host Unix socket as HOST:PORT
     \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
     \\                          With --net, forward host loopback TCP to a guest port
-    \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
+    \\  --memory SIZE           Initial guest memory (default: 512mb)
+    \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
@@ -2153,6 +2154,7 @@ fn sessionHandlesForResume(allocator: std.mem.Allocator, maybe_resume_dir: ?[]co
 fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
     if (args.len == 0) usageExit();
     var opts = MonitorOptions{ .name = args[0] };
+    var max_memory_set = false;
     try lifecycle.validateName(opts.name);
 
     var i: usize = 1;
@@ -2224,7 +2226,11 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
-            opts.memory = memory_config.parseCliOrExit("spore monitor", takeValue(args, &i, args[i]));
+            opts.memory.initial_bytes = memory_config.parseCliBytesOrExit("spore monitor", "--memory", takeValue(args, &i, args[i]));
+            if (!max_memory_set) opts.memory.maximum_bytes = opts.memory.initial_bytes;
+        } else if (std.mem.eql(u8, args[i], "--max-memory")) {
+            opts.memory.maximum_bytes = memory_config.parseCliBytesOrExit("spore monitor", "--max-memory", takeValue(args, &i, args[i]));
+            max_memory_set = true;
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
             memory_config.rejectMemoryMiBFlag("spore monitor");
         } else if (std.mem.eql(u8, args[i], "--vcpus")) {
@@ -2249,6 +2255,7 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
         std.debug.print("spore monitor: network flags require --net\n", .{});
         std.process.exit(2);
     }
+    memory_config.validateCliOrExit("spore monitor", opts.memory);
     return opts;
 }
 

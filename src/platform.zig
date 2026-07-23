@@ -446,8 +446,9 @@ pub fn hostCounterFrequencyHz() !u64 {
 }
 
 pub fn checkManifest(manifest: spore.Manifest, expected: Expected) !void {
-    if (manifest.version != spore.format_version) {
-        std.log.err("platform mismatch: spore version={d} expected={d}", .{ manifest.version, spore.format_version });
+    const expected_version = if (manifest.memory_state != null) spore.format_version_elastic else spore.format_version;
+    if (manifest.version != expected_version) {
+        std.log.err("platform mismatch: spore version={d} expected={d}", .{ manifest.version, expected_version });
         return error.PlatformMismatch;
     }
     if (!std.mem.eql(u8, manifest.platform.arch, expected.arch)) {

@@ -108,7 +108,8 @@ run_spore_capture idle \
   "${spore_bin}" run \
     --backend "${backend}" \
     --image "${image}" \
-    --memory auto \
+    --memory 512mb \
+    --max-memory 16gb \
     --console-log "${workdir}/idle-console.log" \
     -- /bin/sh -lc "awk '/MemTotal/ {print \$2}' /proc/meminfo; sleep ${idle_sample_seconds}"
 idle_memtotal_kb="${RUN_CAPTURE_STDOUT}"
@@ -125,7 +126,8 @@ run_spore_capture pressure \
   "${spore_bin}" run \
     --backend "${backend}" \
     --image "${image}" \
-    --memory auto \
+    --memory 512mb \
+    --max-memory 16gb \
     --console-log "${workdir}/pressure-console.log" \
     -- /usr/local/bin/node -e "${node_script}"
 pressure_memtotal_kb="${RUN_CAPTURE_STDOUT}"

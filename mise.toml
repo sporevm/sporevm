@@ -114,11 +114,11 @@ description = "Smoke product spore run guest cgroup2 support"
 
 [tasks."smoke:run-auto-memory"]
 run = "mise run build && test/smoke/run/auto-memory.sh"
-description = "Smoke product spore run automatic memory growth"
+description = "Smoke product spore run elastic memory growth"
 
 [tasks."smoke:lifecycle-auto-memory"]
 run = "mise run build && test/smoke/lifecycle/auto-memory.sh"
-description = "Smoke named lifecycle automatic memory backing and save stats"
+description = "Smoke named lifecycle elastic memory backing and save stats"
 
 [tasks."smoke:run-capture"]
 run = "mise run build && test/smoke/run/capture.sh"

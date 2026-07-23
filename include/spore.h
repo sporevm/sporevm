@@ -33,7 +33,7 @@
 #define SPORE_ENUM_TYPED
 #endif
 #define SPORE_ENUM_MAX_VALUE INT_MAX
-#define SPORE_ABI_VERSION 19u
+#define SPORE_ABI_VERSION 20u
 #define SPORE_VM_NAME_MAX_BYTES 128u
 
 #ifdef __cplusplus
@@ -76,7 +76,7 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_PULL_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
-#define SPORE_CREATE_NAMED_OPTIONS_VERSION 6u
+#define SPORE_CREATE_NAMED_OPTIONS_VERSION 7u
 #define SPORE_INITIAL_OUTPUT_NAMED_OPTIONS_VERSION 1u
 #define SPORE_RESTORE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
@@ -205,7 +205,10 @@ typedef struct SporeCreateNamedOptions {
   SporeString rootfs_path;
   SporeString image_ref;
   SporeString spore_executable;
+  /** Initial guest-visible memory. Zero selects the 512 MiB default. */
   uint64_t memory_bytes;
+  /** Elastic ceiling. Zero means fixed at memory_bytes (or the default). */
+  uint64_t max_memory_bytes;
   uint32_t vcpus;
   uint32_t guest_port;
   uint64_t timeout_ms;
