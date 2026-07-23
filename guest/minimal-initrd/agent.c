@@ -3782,6 +3782,11 @@ static const char *env_value(char *const envp[], const char *name) {
   return NULL;
 }
 
+enum exec_lookup_mode {
+  EXEC_LOOKUP_EXACT = 0,
+  EXEC_LOOKUP_PATH = 1,
+};
+
 static int resolve_exec_path(const char *command, const char *path, char *executable, size_t executable_cap) {
   if (path == NULL || path[0] == '\0') {
     errno = ENOENT;
@@ -3833,10 +3838,12 @@ static int resolve_exec_path(const char *command, const char *path, char *execut
   return -1;
 }
 
-static void execve_or_report(char *const argv[], char *const envp[], int use_rootfs, int failure_fd, int search_path) {
+static void execve_or_report(
+    char *const argv[], char *const envp[], int use_rootfs, int failure_fd,
+    enum exec_lookup_mode exec_lookup) {
   char *const empty_env[] = { NULL };
   char *const *effective_env = envp[0] != NULL ? envp : empty_env;
-  if (search_path && strchr(argv[0], '/') == NULL) {
+  if (exec_lookup == EXEC_LOOKUP_PATH && strchr(argv[0], '/') == NULL) {
     const char *path = env_value(envp, "PATH");
     char executable[MAX_EXEC_CANDIDATE_LEN];
     if (resolve_exec_path(argv[0], path, executable, sizeof(executable)) == 0) {
@@ -3856,10 +3863,6 @@ static void execve_or_report(char *const argv[], char *const envp[], int use_roo
 }
 
 static void pin_to_current_cpu(pid_t pid);
-enum exec_lookup_mode {
-  EXEC_LOOKUP_EXACT = 0,
-  EXEC_LOOKUP_PATH = 1,
-};
 
 __attribute__((noreturn)) static void exit_session_setup_error(
     int ready_fd, const char *message) {
@@ -4067,7 +4070,7 @@ static int start_session(struct session *session, const char *session_id, char *
     if (chdir(cwd) != 0) exit_session_setup_errno(ready_pipe[1], "enter working directory");
     if (write_all(ready_pipe[1], "\1", 1) != 0) _exit(127);
     close(ready_pipe[1]);
-    execve_or_report(argv, envp, use_rootfs, -1, options->exec_lookup == EXEC_LOOKUP_PATH);
+    execve_or_report(argv, envp, use_rootfs, -1, options->exec_lookup);
   }
   if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
   if (pty_slave >= 0) close(pty_slave);
@@ -4496,7 +4499,7 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
     }
     const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
     if (chdir(cwd) != 0) detached_child_fail(exec_pipe[1]);
-    execve_or_report(argv, envp, use_rootfs, exec_pipe[1], 1);
+    execve_or_report(argv, envp, use_rootfs, exec_pipe[1], EXEC_LOOKUP_PATH);
   }
 
   close_fd_if_open(&devnull);
