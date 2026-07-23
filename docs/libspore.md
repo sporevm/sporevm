@@ -278,6 +278,8 @@ values mean fixed memory; the zero/default configuration is fixed at 512 MiB.
 memory, with `max_memory_bytes` reporting the ceiling. `inspectSpore` also
 reports initial, maximum, requested, captured, and plugged-range state; legacy
 manifests return the same fixed size for all four values.
+Named list results use `spore.lifecycle.list.result.v2`, and
+`NamedListMemory` exposes `initial_bytes` and `maximum_bytes`.
 
 Use `fork` to mint an offline child batch from a saved spore. For pinned
 disk-backed parents, `ForkResult.pin_lock_wait_ms` reports time waiting for the

@@ -38,6 +38,10 @@ backends fail closed. Fixed memory remains available on every supported
 backend, including the experimental AMD64 profile at its documented 512 MiB
 size.
 
+The virtio-mem usable region grows with the requested size and never shrinks.
+The guest may plug any non-overlapping blocks inside that usable prefix until
+the requested amount is satisfied.
+
 ## Manifest Authority
 
 `manifest.memory` records fixed-size BLAKE3-addressed chunks as the same sparse

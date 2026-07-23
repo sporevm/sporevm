@@ -77,7 +77,9 @@ pub const Mem = struct {
     }
 
     pub fn setRequestedSize(self: *Mem, bytes: u64) !void {
-        if (bytes > self.region_size or bytes % self.block_size != 0) return error.InvalidVirtioMemRequest;
+        if (bytes < self.requested_size or bytes > self.region_size or bytes % self.block_size != 0) {
+            return error.InvalidVirtioMemRequest;
+        }
         self.requested_size = bytes;
     }
 
@@ -121,16 +123,9 @@ pub const Mem = struct {
         }
         const requested_region_size = captured.requested_size - captured.initial_size;
         if (requested_region_size % self.block_size != 0) return error.InvalidVirtioMemState;
-        if (requested_region_size > 0) {
-            if (self.plugFn) |plug_fn| {
-                const ctx = self.plug_context orelse return error.InvalidVirtioMemState;
-                if (!plug_fn(ctx, requested_region_size)) return error.InvalidVirtioMemState;
-            }
-        }
 
-        self.requested_size = requested_region_size;
-        self.plugged = .initEmpty();
-        self.plugged_size = 0;
+        var plugged: std.StaticBitSet(max_blocks) = .initEmpty();
+        var plugged_size: u64 = 0;
         for (captured.plugged_ranges) |range| {
             if (range.block_count == 0) return error.InvalidVirtioMemState;
             const start: usize = range.start_block;
@@ -140,12 +135,21 @@ pub const Mem = struct {
             }
             var index = start;
             while (index < end) : (index += 1) {
-                if (self.plugged.isSet(index)) return error.InvalidVirtioMemState;
-                self.plugged.set(index);
+                if (plugged.isSet(index)) return error.InvalidVirtioMemState;
+                plugged.set(index);
             }
-            self.plugged_size += @as(u64, range.block_count) * self.block_size;
+            plugged_size += @as(u64, range.block_count) * self.block_size;
         }
-        if (captured.captured_size != captured.initial_size + self.plugged_size) return error.InvalidVirtioMemState;
+        if (captured.captured_size != captured.initial_size + plugged_size) return error.InvalidVirtioMemState;
+        if (requested_region_size > 0) {
+            if (self.plugFn) |plug_fn| {
+                const ctx = self.plug_context orelse return error.InvalidVirtioMemState;
+                if (!plug_fn(ctx, requested_region_size)) return error.InvalidVirtioMemState;
+            }
+        }
+        self.requested_size = requested_region_size;
+        self.plugged = plugged;
+        self.plugged_size = plugged_size;
     }
 
     pub fn device(self: *Mem) mmio.Device {
@@ -169,8 +173,8 @@ pub const Mem = struct {
             20 => @truncate(self.addr >> 32),
             24 => @truncate(self.region_size),
             28 => @truncate(self.region_size >> 32),
-            32 => @truncate(self.region_size),
-            36 => @truncate(self.region_size >> 32),
+            32 => @truncate(self.requested_size),
+            36 => @truncate(self.requested_size >> 32),
             40 => @truncate(self.plugged_size),
             44 => @truncate(self.plugged_size >> 32),
             48 => @truncate(self.requested_size),
@@ -219,7 +223,13 @@ pub const Mem = struct {
 
     fn plug(self: *Mem, addr: u64, nb_blocks: u16) u16 {
         const range = self.blockRange(addr, nb_blocks) orelse return resp_error;
-        if (range.end_bytes > self.requested_size) return resp_error;
+        const range_size = range.end_bytes - range.start_bytes;
+        if (range.end_bytes > self.requested_size or
+            self.plugged_size > self.requested_size or
+            range_size > self.requested_size - self.plugged_size)
+        {
+            return resp_error;
+        }
         var i = range.start;
         while (i < range.end) : (i += 1) {
             if (self.plugged.isSet(i)) return resp_error;
@@ -230,7 +240,7 @@ pub const Mem = struct {
         }
         i = range.start;
         while (i < range.end) : (i += 1) self.plugged.set(i);
-        self.plugged_size += range.end_bytes - range.start_bytes;
+        self.plugged_size += range_size;
         return resp_ack;
     }
 
@@ -293,7 +303,7 @@ test "config exposes grow-only region" {
     var mem = Mem.init(.{
         .addr = 0x1_0000_0000,
         .region_size = 512 * 1024 * 1024,
-        .requested_size = 512 * 1024 * 1024,
+        .requested_size = 256 * 1024 * 1024,
     });
 
     try std.testing.expectEqual(device_id, mem.device().device_id);
@@ -302,7 +312,10 @@ test "config exposes grow-only region" {
     try std.testing.expectEqual(@as(u32, 0), Mem.configRead(&mem, 16));
     try std.testing.expectEqual(@as(u32, 1), Mem.configRead(&mem, 20));
     try std.testing.expectEqual(mem.region_size, @as(u64, Mem.configRead(&mem, 24)) | (@as(u64, Mem.configRead(&mem, 28)) << 32));
-    try std.testing.expectEqual(mem.region_size, @as(u64, Mem.configRead(&mem, 32)) | (@as(u64, Mem.configRead(&mem, 36)) << 32));
+    try std.testing.expectEqual(mem.requested_size, @as(u64, Mem.configRead(&mem, 32)) | (@as(u64, Mem.configRead(&mem, 36)) << 32));
+    try std.testing.expectError(error.InvalidVirtioMemRequest, mem.setRequestedSize(128 * 1024 * 1024));
+    try mem.setRequestedSize(384 * 1024 * 1024);
+    try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), @as(u64, Mem.configRead(&mem, 32)) | (@as(u64, Mem.configRead(&mem, 36)) << 32));
 }
 
 test "plug and state requests update plugged size" {
@@ -409,6 +422,32 @@ test "captured state restores requested size and exact plugged ranges" {
     try std.testing.expectEqual(original.requested_size, restored.requested_size);
     try std.testing.expectEqual(original.plugged_size, restored.plugged_size);
     try std.testing.expect(restored.plugged.eql(original.plugged));
+}
+
+test "invalid captured state does not mutate device state" {
+    var restored = Mem.init(.{
+        .addr = 0x1000_0000,
+        .region_size = default_block_size * 4,
+        .requested_size = default_block_size,
+    });
+    restored.plugged.set(0);
+    restored.plugged_size = default_block_size;
+    const invalid = memory.CapturedState{
+        .initial_size = 512 * 1024 * 1024,
+        .maximum_size = 512 * 1024 * 1024 + default_block_size * 4,
+        .requested_size = 512 * 1024 * 1024 + default_block_size * 4,
+        .captured_size = 512 * 1024 * 1024 + default_block_size * 2,
+        .block_size = default_block_size,
+        .plugged_ranges = &.{
+            .{ .start_block = 1, .block_count = 1 },
+            .{ .start_block = 1, .block_count = 1 },
+        },
+    };
+
+    try std.testing.expectError(error.InvalidVirtioMemState, restored.restoreState(invalid));
+    try std.testing.expectEqual(default_block_size, restored.requested_size);
+    try std.testing.expectEqual(default_block_size, restored.plugged_size);
+    try std.testing.expect(restored.plugged.isSet(0));
 }
 
 fn fuzzMemQueue(_: void, s: *std.testing.Smith) !void {

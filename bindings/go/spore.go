@@ -760,7 +760,7 @@ func (c *Client) ListNamed(ctx context.Context) ([]NamedListEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if result.Schema != "spore.lifecycle.list.result.v1" || result.SchemaVersion != 1 {
+	if result.Schema != "spore.lifecycle.list.result.v2" || result.SchemaVersion != 2 {
 		return nil, fmt.Errorf("decode named list: unsupported schema %q version %d", result.Schema, result.SchemaVersion)
 	}
 	return result.Entries, nil

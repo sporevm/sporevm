@@ -700,8 +700,8 @@ pub const NamedLifecycleTiming = struct {
 };
 
 pub const NamedListResult = struct {
-    schema: []const u8 = "spore.lifecycle.list.result.v1",
-    schema_version: u32 = 1,
+    schema: []const u8 = "spore.lifecycle.list.result.v2",
+    schema_version: u32 = 2,
     entries: []const ListEntry,
 };
 

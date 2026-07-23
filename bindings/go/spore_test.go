@@ -265,6 +265,9 @@ func TestInspectSporeAnnotations(t *testing.T) {
 	if result.StorageMode != "memory-only" {
 		t.Fatalf("storage mode = %q", result.StorageMode)
 	}
+	if result.InitialMemoryBytes != 1 || result.MaxMemoryBytes != 1 || result.RequestedMemoryBytes != 1 || result.CapturedMemoryBytes != 1 || len(result.PluggedMemoryRanges) != 0 {
+		t.Fatalf("memory contract = %#v", result)
+	}
 	if got := result.Annotations["cleanroom.workspace"]; got != "/workspaces/app" {
 		t.Fatalf("cleanroom.workspace = %q", got)
 	}
@@ -744,7 +747,7 @@ func TestDecodeNamedList(t *testing.T) {
 			"name": "worker",
 			"state": "ready",
 			"pid": 42,
-			"memory": {"policy": "auto", "bytes": 17179869184},
+			"memory": {"initial_bytes": 536870912, "maximum_bytes": 17179869184},
 			"stats": {
 				"resident_bytes": 4096,
 				"backing_logical_bytes": null,
@@ -769,7 +772,7 @@ func TestDecodeNamedList(t *testing.T) {
 	if entry.PID == nil || *entry.PID != 42 {
 		t.Fatalf("pid = %#v", entry.PID)
 	}
-	if entry.Memory == nil || entry.Memory.Policy != "auto" || entry.Memory.Bytes != 17179869184 {
+	if entry.Memory == nil || entry.Memory.InitialBytes != 536870912 || entry.Memory.MaximumBytes != 17179869184 {
 		t.Fatalf("memory = %#v", entry.Memory)
 	}
 	if entry.Stats.ResidentBytes == nil || *entry.Stats.ResidentBytes != 4096 {

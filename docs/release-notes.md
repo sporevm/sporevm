@@ -13,7 +13,9 @@ use `--memory 512mb --max-memory 16gb` to preserve its intended elastic range.
 The Zig, C, and Go APIs use the same two-size contract. Existing
 `memory_bytes`/`MemoryBytes` fields now unambiguously mean initial memory, and
 the additive maximum field enables elasticity. The C ABI advances to 20 and
-`SporeCreateNamedOptions` advances to version 7.
+`SporeCreateNamedOptions` advances to version 7. Named list output advances to
+`spore.lifecycle.list.result.v2`, where memory contains `initial_bytes` and
+`maximum_bytes`.
 
 Elastic captures use manifest v4 and persist backend-neutral initial, maximum,
 requested, captured, and exact plugged-block state. Current readers retain v2

@@ -513,8 +513,8 @@ type NamedListResult struct {
 }
 
 type NamedListMemory struct {
-	Policy string `json:"policy"`
-	Bytes  uint64 `json:"bytes"`
+	InitialBytes uint64 `json:"initial_bytes"`
+	MaximumBytes uint64 `json:"maximum_bytes"`
 }
 
 type NamedListStats struct {

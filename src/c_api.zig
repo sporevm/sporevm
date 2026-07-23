@@ -1890,7 +1890,8 @@ test "C ABI can list named VMs from context runtime env" {
     defer spore_free_string(context, json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json.ptr.?[0..json.len], .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("spore.lifecycle.list.result.v1", parsed.value.object.get("schema").?.string);
+    try std.testing.expectEqualStrings("spore.lifecycle.list.result.v2", parsed.value.object.get("schema").?.string);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("schema_version").?.integer);
     try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("entries").?.array.items.len);
 }
 

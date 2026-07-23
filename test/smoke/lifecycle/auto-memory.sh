@@ -288,7 +288,7 @@ fi
 [[ "${manifest_chunks_nonzero}" =~ ^[0-9]+$ && "${manifest_chunks_nonzero}" -gt 0 && "${manifest_chunks_nonzero}" -lt "${manifest_chunks_total}" ]] || die "manifest chunks were not sparse"
 [[ "${manifest_zero_chunks}" =~ ^[0-9]+$ && "${manifest_zero_chunks}" -gt 0 && "$((manifest_zero_chunks + manifest_chunks_nonzero))" == "${manifest_chunks_total}" ]] || die "manifest zero chunks did not cover sparse memory"
 [[ "${backing_kind}" == "map-private-file-v0" ]] || die "unexpected backing kind: ${backing_kind}"
-[[ "${backing_size}" == "${manifest_ram_size}" && "${backing_logical_bytes}" == "${manifest_ram_size}" ]] || die "backing logical size did not match configured RAM"
+[[ "${backing_size}" == "${manifest_maximum_size}" && "${backing_logical_bytes}" == "${manifest_maximum_size}" ]] || die "backing logical size did not match maximum memory"
 [[ "${backing_allocated_bytes}" =~ ^[0-9]+$ && "${backing_allocated_bytes}" -gt 0 && "${backing_allocated_bytes}" -lt "${backing_logical_bytes}" ]] || die "backing allocation did not stay sparse"
 
 echo "smoke:lifecycle-auto-memory ok backend=${backend} create_ms=${create_ms} suspend_ms=${suspend_ms} ${ls_metrics} ${manifest_metrics}"

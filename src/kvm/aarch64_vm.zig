@@ -274,6 +274,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     if (config.vcpus != 1 and (config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
+    if (config.dirty_tracking.enabled and config.virtio_mem_region_size != 0) return error.BadManifest;
 
     const kvm_fd = try kvm.openDevKvm();
     defer closeFd(kvm_fd);

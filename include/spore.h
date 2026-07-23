@@ -590,7 +590,7 @@ SPORE_API SporeResult spore_remove_saved_json(SporeContext context,
                                               const SporeRemoveSavedOptions *options,
                                               SporeOwnedString *out_json);
 
-/** List named VMs and return `spore.lifecycle.list.result.v1` JSON. */
+/** List named VMs and return `spore.lifecycle.list.result.v2` JSON. */
 SPORE_API SporeResult spore_list_named_json(SporeContext context, SporeOwnedString *out_json);
 
 #ifdef __cplusplus

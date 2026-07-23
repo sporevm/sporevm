@@ -254,6 +254,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
+    if (config.dirty_tracking.enabled and config.virtio_mem_region_size != 0) return error.BadManifest;
     const hv_vm_create_start = setup_start;
     try hvf.check(hvf.hv_vm_create(null), "hv_vm_create");
     const hv_vm_create_ms = monotonicMs() - hv_vm_create_start;
@@ -298,6 +299,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
+    if (config.dirty_tracking.enabled and config.virtio_mem_region_size != 0) return error.BadManifest;
 
     // GIC layout from runtime parameters; created before any vCPU.
     const gic_start = monotonicMs();
