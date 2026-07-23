@@ -56,6 +56,13 @@ Zig run and attach results use `spore.run.result.v1`. The bounded named-exec
 compatibility collector used by Zig, C, and Go uses `spore.exec.result.v1`;
 streaming callers should use the completion contract instead.
 
+Run and attach completion records expose `memory_bytes` as initial
+guest-visible memory and `max_memory_bytes` as the ceiling; equal values mean
+fixed memory. Checkpoint inspection adds `initial_memory_bytes`,
+`max_memory_bytes`, `requested_memory_bytes`, `captured_memory_bytes`, and
+`plugged_memory_ranges`. Legacy fixed-memory manifests report the same value
+for all four sizes and an empty range list.
+
 Named create and `logs` share `spore.lifecycle.v1`. Its optional
 `initial_command` object first reports output disposition, destination, bound,
 and startup status, then the logs result adds process status, optional exit

@@ -139,9 +139,9 @@ mixed into TTI. By default the suite also performs an untimed
 OCI-to-ext4 materialization are not mixed into TTI. Pass `--no-prewarm-rootfs`
 when intentionally measuring the full cold image path.
 
-TTI profiles default to `--memory 512mb` so startup comparisons measure the hot
-launch path rather than the first-slice `auto` memory contract. Pass
-`--memory auto` when intentionally measuring the 16GiB automatic-memory path.
+TTI profiles default to fixed `--memory 512mb`. Pass
+`--memory 512mb --max-memory 16gb` when intentionally measuring the elastic
+memory path.
 
 ## CI Defaults
 

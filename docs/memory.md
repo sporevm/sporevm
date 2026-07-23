@@ -4,6 +4,40 @@ SporeVM memory is portable through manifest chunk refs and fast locally through
 optional same-host backing files. The chunk refs are the authority. Local
 backing is acceleration metadata.
 
+## Product sizing
+
+SporeVM has two memory sizes: the initial guest-visible size and the maximum
+guest-visible size. Fixed memory is the default, so omitting `--max-memory`
+makes the two sizes equal:
+
+```bash
+# Fixed 512 MiB, the default.
+spore run -- /bin/true
+
+# Fixed 2 GiB.
+spore run --memory 2gb -- /bin/true
+
+# Grow-only virtio-mem from 512 MiB to 16 GiB.
+spore run --memory 512mb --max-memory 16gb -- /bin/true
+
+# The same elastic contract, using the documented initial default.
+spore run --max-memory 16gb -- /bin/true
+```
+
+`--memory auto` has been removed. Migrate it to an explicit initial and maximum
+pair, normally `--memory 512mb --max-memory 16gb` if the old 16 GiB elastic
+ceiling was intended. `--memory SIZE` on its own now means fixed memory, not a
+policy selection.
+
+Fixed sizes must be positive and page-aligned. Elastic initial and maximum
+sizes must also align to the 2 MiB virtio-mem block size, the maximum must be at
+least the initial size, and the elastic region may span at most 8192 blocks
+(16 GiB). Elastic memory is available only on the managed AArch64 kernel/initrd
+contract and one-vCPU HVF or KVM backends; custom kernels and unsupported
+backends fail closed. Fixed memory remains available on every supported
+backend, including the experimental AMD64 profile at its documented 512 MiB
+size.
+
 ## Manifest Authority
 
 `manifest.memory` records fixed-size BLAKE3-addressed chunks as the same sparse
@@ -18,7 +52,7 @@ its digest before guest use.
 ```text
 memory:
   kind: spore-disk-index-v1
-  logical_size: <ram_size>
+  logical_size: <maximum_memory_size>
   chunk_size: 2097152
   hash_algorithm: blake3
   object_namespace: memory/blake3
@@ -29,8 +63,26 @@ memory:
   backing:
     kind: map-private-file-v0
     path: ram.backing
-    size: <ram_size>
+    size: <maximum_memory_size>
 ```
+
+Legacy fixed-memory manifests have no `memory_state`; their platform
+`ram_size`, memory logical size, requested size, and captured guest-visible size
+are all the same. Elastic captures use manifest version 4 (single vCPU) or 5
+(multi-vCPU schema) and add backend-neutral `memory_state` containing:
+
+- `initial_size` and `maximum_size`, including initial RAM;
+- `requested_size`, the guest-visible target requested from virtio-mem at capture;
+- `captured_size`, initial RAM plus the blocks actually plugged by the guest;
+- the 2 MiB `block_size`; and
+- sorted, non-overlapping `plugged_ranges`, expressed as block offsets relative
+  to the elastic region immediately after initial RAM.
+
+Resume allocates the declared maximum, maps only initial RAM plus the captured
+requested prefix, recreates the virtio-mem device, and restores its exact
+plugged bitmap before vCPUs run. Raw KVM or Hypervisor.framework structures
+never enter the manifest. Older readers reject versions 4/5; current readers
+continue to interpret versions 2/3 as fixed memory.
 
 The backing file is never portable restore authority. Product restore maps it
 only when `ram.backing.proof` validates against the canonical memory index
@@ -76,10 +128,10 @@ Bundles must not treat proof files as distribution authority.
 
 ## Dirty Tracking
 
-Fresh product runs map guest RAM with demand-committed private mappings. The
-default product memory policy is `--memory auto`, currently a 16GiB
-guest-visible contract, so host cost must follow touched pages and dirty chunks,
-not configured RAM.
+Fresh product runs map guest RAM with demand-committed private mappings. Fixed
+VMs allocate their configured size. Elastic VMs reserve the maximum host range,
+map only the 512 MiB default (or explicit initial size) at boot, and grow the
+guest mapping when memory pressure raises the virtio-mem requested size.
 
 KVM dirty tracking uses dirty-log bitmaps plus explicit VMM-originated dirty
 marking. HVF uses write-protect faults plus explicit VMM-originated dirty
@@ -91,9 +143,13 @@ Caught-up suspend should not perform a full configured-RAM scan. Active-write
 guests are different: suspend work is proportional to the unsealed dirty tail,
 and that tail must stay visible in benchmark and runtime stats.
 
+Elastic capture currently uses the full-scan path so the maximum-sized portable
+memory index and optional local backing remain authoritative for every plugged
+range. Fixed-memory capture retains the dirty-tracking fast path.
+
 ## Current Limits
 
-- `spore ls` reports lifecycle memory policy, configured bytes, monitor process
+- `spore ls` reports initial and maximum memory, monitor process
   resident bytes on Linux/macOS, chunk size and total chunks, and local
   `ram.backing` logical/allocated bytes when a listed VM points at a local spore
   directory with a backing file. Ready dirty-tracked monitor VMs also report
@@ -103,8 +159,7 @@ and that tail must stay visible in benchmark and runtime stats.
 - On Linux filesystems with fs-verity support, schema v2 local backing proofs
   sign the kernel verity digest and restore re-measures the opened fd before
   mapping. Other filesystems keep the v1 local-provenance proof path.
-- Persisted virtio-mem plug/unplug state and access-trace/readahead contracts
-  are outside the current manifest format.
+- Virtio-mem is grow-only. Unplug and reclamation remain unsupported.
 
 ## Validation
 

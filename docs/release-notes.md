@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Explicit initial and maximum memory
+
+Memory is fixed at 512 MiB by default. `--memory SIZE` now always selects the
+initial guest-visible size and is fixed unless `--max-memory SIZE` supplies a
+larger grow-only virtio-mem ceiling. `--max-memory` may be used alone with the
+512 MiB initial default. The former `--memory auto` policy has been removed;
+use `--memory 512mb --max-memory 16gb` to preserve its intended elastic range.
+
+The Zig, C, and Go APIs use the same two-size contract. Existing
+`memory_bytes`/`MemoryBytes` fields now unambiguously mean initial memory, and
+the additive maximum field enables elasticity. The C ABI advances to 20 and
+`SporeCreateNamedOptions` advances to version 7.
+
+Elastic captures use manifest v4 and persist backend-neutral initial, maximum,
+requested, captured, and exact plugged-block state. Current readers retain v2
+and v3 compatibility by treating their `ram_size` as fixed initial, maximum,
+requested, and captured memory; old readers reject the new elastic version.
+
 ### Immutable native image archives
 
 `spore image pack` now turns a complete local native image into one immutable

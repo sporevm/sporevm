@@ -42,7 +42,7 @@ and Linux and does not shrink when `SPOREVM_RUNTIME_DIR` is a long path.
 
 Linux/AMD64 KVM currently exposes an experimental fresh-execution subset:
 `create`, `exec`, and `rm` with the managed kernel, embedded minimal exec
-initrd, one vCPU, and explicit 512 MiB memory. Image and rootfs execution,
+initrd, one vCPU, and fixed 512 MiB memory. Image and rootfs execution,
 networking, build, copy, save, restore, resume, and fork are unavailable on
 that profile.
 
@@ -172,6 +172,7 @@ spore create bench-1 --options @create-options.json
   "schema_version": 1,
   "image": "docker.io/library/alpine:3.20",
   "memory": "512mb",
+  "max_memory": "16gb",
   "vcpus": 2,
   "timeout_ms": 120000,
   "initial_output": "retain",
@@ -196,7 +197,9 @@ spore create bench-1 --options @create-options.json
 ```
 
 The file uses the same spellings as the CLI flags: `image`, `rootfs`, `kernel`,
-`initrd`, `pull`, and `memory`. Unknown fields fail closed, `schema_version`
+`initrd`, `pull`, `memory`, and `max_memory`. Omitting both memory fields
+creates a fixed 512 MiB VM; `max_memory` alone uses that initial default.
+Unknown fields fail closed, `schema_version`
 must be `1`, and `--options` cannot be combined with individual create option
 flags. Bound services default `guest_host` to `NAME.spore.internal` when it is
 omitted.
