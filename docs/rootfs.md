@@ -319,12 +319,16 @@ command when scripts need stable field names and exact byte counts. Without
 `--older-than` or
 `--max-bytes`, prune selects all default-prunable rootfs entries: rebuildable or
 reimportable image-rootfs files that are not hardlinked to digest-addressed
-artifacts, plus the host-local build cache-mount aggregate.
+artifacts, plus host-local regular build cache-mount storage.
 
 `spore system df --rootfs` also reports rootfs CAS index and object bytes. Build
-cache mounts appear as one aggregate entry with separate logical capacity and
-allocated host bytes; prune and GC likewise report their reclaimed cache-mount
-bytes separately.
+cache mounts appear as the aggregate plus any abandoned emit temp files, with
+separate logical capacity and allocated host bytes; prune and GC likewise report
+their reclaimed cache-mount bytes separately. `--max-bytes` uses allocated bytes
+for these sparse entries, so logical capacity cannot force unrelated image
+eviction. In JSON candidate entries, `bytes` remains logical and
+`reclaimable_bytes` is the allocated amount; the top-level cache-mount candidate
+and deleted byte fields use the allocated amount that cleanup can actually free.
 `spore system prune --rootfs` does not delete digest-addressed artifacts or
 rootfs CAS files by default. The two are distinct data classes with distinct
 prune selectors:
@@ -347,9 +351,11 @@ unrooted CAS indexes and chunk objects. It is the preferred command when the
 goal is to clean chunk garbage without discarding reachable chunked storage.
 The mutable cache-mount aggregate is not a step-record or image root and is
 therefore collectable as a unit. A build holds the rootfs-cache `flock` from
-cache validation through final publication, so prune and GC wait until its
-mount disk is closed. Process exit releases that lock even after a crash; a
-leftover lock file has no lease lifetime and does not retain the disk.
+cache validation through final publication and the store lock while its disk is
+open; prune and GC acquire both in the same order. Process exit releases those
+locks even after a crash, and a leftover lock file has no lease lifetime.
+Abandoned regular emit temps are reported and reclaimed by maintenance, and the
+next cache-store open scavenges them before reuse.
 
 When `spore run --image ... --save SPORE` saves a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 materialization identity, size,

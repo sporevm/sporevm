@@ -104,7 +104,8 @@ The landed foundation includes:
 - persistent build-VM execution, per-instruction freeze/snapshot/thaw,
   dirty-only chunk sealing, and atomic local-ref publication;
 - cache-mount aggregate accounting plus lock-serialized prune and GC, with
-  process-bound crash recovery and separate allocated-byte reclamation; and
+  process-bound crash recovery, stale-temp scavenging, and separate
+  allocated-byte reclamation; and
 - Docker/BuildKit differential fixtures for the supported subset.
 
 The frozen Buildkite acceptance target remains revision

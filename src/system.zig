@@ -101,6 +101,7 @@ const RootfsEntryKind = enum {
     cas_index,
     cas_object,
     build_cache_mount,
+    build_cache_mount_temp,
 
     fn label(self: RootfsEntryKind) []const u8 {
         return switch (self) {
@@ -109,6 +110,7 @@ const RootfsEntryKind = enum {
             .cas_index => "rootfs-cas-index",
             .cas_object => "rootfs-cas-object",
             .build_cache_mount => "build-cache-mount",
+            .build_cache_mount_temp => "build-cache-mount-temp",
         };
     }
 };
@@ -152,6 +154,7 @@ pub const RootfsGcEntry = struct {
     kind: []const u8,
     path: []const u8,
     bytes: u64,
+    reclaimable_bytes: ?u64 = null,
 };
 
 pub const RootfsGcResult = struct {
@@ -275,6 +278,7 @@ const PrunePlanEntry = struct {
     metadata_bytes: u64 = 0,
     link_count: u64 = 1,
     reclaimable_bytes: ?u64 = null,
+    selection_bytes: ?u64 = null,
     mtime_ns: i96,
     selected: bool = false,
 
@@ -285,6 +289,10 @@ const PrunePlanEntry = struct {
     fn reclaimableBytes(self: PrunePlanEntry) u64 {
         if (self.reclaimable_bytes) |bytes| return bytes;
         return (if (self.link_count <= 1) self.bytes else 0) + self.metadata_bytes;
+    }
+
+    fn scopeBytes(self: PrunePlanEntry) u64 {
+        return self.selection_bytes orelse self.logicalBytes();
     }
 };
 
@@ -875,13 +883,11 @@ fn summarizeRootfsCache(allocator: std.mem.Allocator, io: Io, cache_root: []cons
     summary.cas_indexes = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/indexes");
     summary.cas_objects = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/objects");
     summary.cas_complete_stamps = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/complete");
-    if (try build_cache_mount.diskStats(io, allocator, cache_root)) |stats| {
-        summary.build_cache_mounts = .{
-            .count = 1,
-            .logical_bytes = stats.logical_bytes,
-            .allocated_bytes = stats.allocated_bytes,
-        };
-        summary.default_prunable_bytes += stats.allocated_bytes;
+    for (try build_cache_mount.storageEntries(io, allocator, cache_root)) |entry| {
+        summary.build_cache_mounts.count += 1;
+        summary.build_cache_mounts.logical_bytes += entry.logical_bytes;
+        summary.build_cache_mounts.allocated_bytes += entry.allocated_bytes;
+        summary.default_prunable_bytes += entry.allocated_bytes;
     }
     summary.known_logical_bytes = summary.image_rootfs.bytes + summary.image_metadata.bytes +
         summary.digest_artifacts.bytes + summary.cas_indexes.bytes + summary.cas_objects.bytes +
@@ -903,6 +909,8 @@ fn pruneRootfsCache(
     // objects that become part of newly completed storage before deletion.
     var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, cache_root);
     defer cache_lock.deinit();
+    var cache_mount_lock = try build_cache_mount.lockStoreExclusive(io, allocator, cache_root);
+    defer cache_mount_lock.deinit();
 
     var protected_paths = std.StringHashMap(void).init(allocator);
     defer protected_paths.deinit();
@@ -917,7 +925,7 @@ fn pruneRootfsCache(
     std.mem.sort(PrunePlanEntry, plan, {}, lessPrunePlanEntry);
 
     var scope_bytes_before: u64 = 0;
-    for (plan) |entry| scope_bytes_before += entry.logicalBytes();
+    for (plan) |entry| scope_bytes_before += entry.scopeBytes();
 
     var remaining = scope_bytes_before;
     if (opts.older_than_ns) |age_ns| {
@@ -926,7 +934,7 @@ fn pruneRootfsCache(
             if (protected_paths.contains(entry.path)) continue;
             if (entry.mtime_ns < cutoff) {
                 entry.selected = true;
-                remaining -= entry.logicalBytes();
+                remaining -= entry.scopeBytes();
             }
         }
     }
@@ -936,12 +944,13 @@ fn pruneRootfsCache(
             if (remaining <= max_bytes) break;
             if (entry.selected or protected_paths.contains(entry.path)) continue;
             entry.selected = true;
-            remaining -= entry.logicalBytes();
+            remaining -= entry.scopeBytes();
         }
     }
 
     var result_entries = std.array_list.Managed(RootfsPruneEntry).init(allocator);
     var candidate_bytes: u64 = 0;
+    var candidate_scope_bytes: u64 = 0;
     var candidate_reclaimable_bytes: u64 = 0;
     var deleted_count: usize = 0;
     var deleted_bytes: u64 = 0;
@@ -960,11 +969,13 @@ fn pruneRootfsCache(
 
     for (plan) |entry| {
         if (!entry.selected) continue;
+        const scope = entry.scopeBytes();
         const logical = entry.logicalBytes();
         const reclaimable = entry.reclaimableBytes();
         candidate_bytes += logical;
+        candidate_scope_bytes += scope;
         candidate_reclaimable_bytes += reclaimable;
-        if (entry.kind == .build_cache_mount) {
+        if (isBuildCacheMountKind(entry.kind)) {
             cache_mount_candidate_count += 1;
             cache_mount_candidate_reclaimable_bytes += reclaimable;
         }
@@ -990,7 +1001,7 @@ fn pruneRootfsCache(
             deleted_count += 1;
             deleted_bytes += logical;
             deleted_reclaimable_bytes += reclaimable;
-            if (entry.kind == .build_cache_mount) {
+            if (isBuildCacheMountKind(entry.kind)) {
                 cache_mount_deleted_count += 1;
                 cache_mount_deleted_reclaimable_bytes += reclaimable;
             }
@@ -1006,7 +1017,7 @@ fn pruneRootfsCache(
         .older_than_seconds = opts.older_than_seconds,
         .max_bytes = opts.max_bytes,
         .scope_bytes_before = scope_bytes_before,
-        .scope_bytes_after = scope_bytes_before - candidate_bytes,
+        .scope_bytes_after = scope_bytes_before - candidate_scope_bytes,
         .candidate_count = entries.len,
         .candidate_bytes = candidate_bytes,
         .candidate_reclaimable_bytes = candidate_reclaimable_bytes,
@@ -1062,6 +1073,10 @@ fn deinitRootfsObjectDigestSet(allocator: std.mem.Allocator, digests: *std.Strin
     digests.deinit();
 }
 
+fn isBuildCacheMountKind(kind: RootfsEntryKind) bool {
+    return kind == .build_cache_mount or kind == .build_cache_mount_temp;
+}
+
 fn gcRootfsCache(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1069,6 +1084,8 @@ fn gcRootfsCache(
 ) !RootfsGcResult {
     var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, options.cache_root);
     defer cache_lock.deinit();
+    var cache_mount_lock = try build_cache_mount.lockStoreExclusive(io, allocator, options.cache_root);
+    defer cache_mount_lock.deinit();
 
     var storage_roots = std.StringHashMap(spore.RootfsStorage).init(allocator);
     var rooted_indexes = std.StringHashMap(void).init(allocator);
@@ -1132,21 +1149,25 @@ fn gcRootfsCache(
     }
     if (comptime builtin.is_test) if (testing.gc_mutation_barrier) |barrier| barrier.pause(io);
 
-    if (try build_cache_mount.diskStats(io, allocator, options.cache_root)) |stats| {
-        cache_mount_candidate_count = 1;
-        cache_mount_candidate_bytes = stats.allocated_bytes;
-        candidate_bytes += stats.allocated_bytes;
+    for (try build_cache_mount.storageEntries(io, allocator, options.cache_root)) |entry| {
+        cache_mount_candidate_count += 1;
+        cache_mount_candidate_bytes += entry.allocated_bytes;
+        candidate_bytes += entry.allocated_bytes;
         try result_entries.append(.{
-            .kind = RootfsEntryKind.build_cache_mount.label(),
-            .path = stats.path,
-            .bytes = stats.allocated_bytes,
+            .kind = switch (entry.kind) {
+                .aggregate => RootfsEntryKind.build_cache_mount.label(),
+                .stale_temp => RootfsEntryKind.build_cache_mount_temp.label(),
+            },
+            .path = entry.path,
+            .bytes = entry.logical_bytes,
+            .reclaimable_bytes = entry.allocated_bytes,
         });
         if (!options.dry_run) {
-            try Io.Dir.cwd().deleteFile(io, stats.path);
+            try Io.Dir.cwd().deleteFile(io, entry.path);
             deleted_count += 1;
-            deleted_bytes += stats.allocated_bytes;
-            cache_mount_deleted_count = 1;
-            cache_mount_deleted_bytes = stats.allocated_bytes;
+            deleted_bytes += entry.allocated_bytes;
+            cache_mount_deleted_count += 1;
+            cache_mount_deleted_bytes += entry.allocated_bytes;
         }
     }
 
@@ -1952,13 +1973,17 @@ fn collectPruneEntries(
         try collectCasArtifacts(allocator, io, cache_root, "cas/rootfs/blake3/objects", ".chunk", .cas_object, &entries);
     }
 
-    if (try build_cache_mount.diskStats(io, allocator, cache_root)) |stats| {
+    for (try build_cache_mount.storageEntries(io, allocator, cache_root)) |entry| {
         try entries.append(.{
-            .kind = .build_cache_mount,
-            .path = stats.path,
-            .bytes = stats.logical_bytes,
-            .reclaimable_bytes = stats.allocated_bytes,
-            .mtime_ns = stats.mtime_ns,
+            .kind = switch (entry.kind) {
+                .aggregate => .build_cache_mount,
+                .stale_temp => .build_cache_mount_temp,
+            },
+            .path = entry.path,
+            .bytes = entry.logical_bytes,
+            .reclaimable_bytes = entry.allocated_bytes,
+            .selection_bytes = entry.allocated_bytes,
+            .mtime_ns = entry.mtime_ns,
         });
     }
 
@@ -2176,7 +2201,7 @@ fn writeRootfsSummary(writer: *Io.Writer, summary: RootfsSystemSummary) !void {
     try writeStatsLine(writer, "Image metadata", summary.image_metadata);
     try writeStatsLine(writer, "Ref records", summary.ref_records);
     try writeStatsLine(writer, "Temporary entries", summary.temp_entries);
-    try writer.print("  Build cache mount disks: {d} entries, ", .{summary.build_cache_mounts.count});
+    try writer.print("  Build cache mount storage: {d} entries, ", .{summary.build_cache_mounts.count});
     try writeHumanBytes(writer, summary.build_cache_mounts.allocated_bytes);
     try writer.writeAll(" allocated (");
     try writeHumanBytes(writer, summary.build_cache_mounts.logical_bytes);
@@ -2317,6 +2342,11 @@ fn writeRootfsGcResult(writer: *Io.Writer, result: RootfsGcResult) !void {
             try writeDisplayPath(writer, entry.path);
             try writer.writeAll(": ");
             try writeHumanBytes(writer, entry.bytes);
+            if (entry.reclaimable_bytes) |reclaimable| if (reclaimable != entry.bytes) {
+                try writer.writeAll(" (reclaimable ");
+                try writeHumanBytes(writer, reclaimable);
+                try writer.writeByte(')');
+            };
             try writer.writeByte('\n');
         }
         if (result.entries.len > visible_count) {
@@ -2521,6 +2551,10 @@ fn createCacheMountFixture(io: Io, allocator: std.mem.Allocator, root: []const u
     const dir = try std.fs.path.join(allocator, &.{ root, build_cache_mount.store_rel });
     try Io.Dir.cwd().createDirPath(io, dir);
     const path = try build_cache_mount.diskPath(allocator, root);
+    return createSparseFileFixture(allocator, path, logical_bytes);
+}
+
+fn createSparseFileFixture(allocator: std.mem.Allocator, path: []const u8, logical_bytes: u64) !std.c.fd_t {
     const path_z = try allocator.dupeZ(u8, path);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
     if (fd < 0) return error.CacheMountDiskOpenFailed;
@@ -2555,26 +2589,83 @@ test "system accounts for and reclaims aggregate build cache mount storage" {
     try std.testing.expectEqual(image_size, summary.build_cache_mounts.logical_bytes);
     try std.testing.expectEqual(disk.allocated_bytes, summary.build_cache_mounts.allocated_bytes);
 
+    const image_bytes = [_]u8{0x6b} ** 8192;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, "image.ext4" }), .data = &image_bytes });
+    const bounded = try prune(allocator, io, .{ .cache_root = root, .max_bytes = disk.allocated_bytes + image_bytes.len }, Io.Clock.real.now(io).nanoseconds);
+    defer deinitRootfsPruneResult(allocator, bounded);
+    try std.testing.expectEqual(@as(usize, 0), bounded.candidate_count);
+    try Io.Dir.cwd().deleteFile(io, try std.fs.path.join(allocator, &.{ root, "image.ext4" }));
+
     const dry_prune = try prune(allocator, io, .{ .cache_root = root }, Io.Clock.real.now(io).nanoseconds);
     defer deinitRootfsPruneResult(allocator, dry_prune);
     try std.testing.expectEqual(@as(usize, 1), dry_prune.cache_mount_candidate_count);
+    try std.testing.expectEqual(image_size, dry_prune.candidate_bytes);
     try std.testing.expectEqual(disk.allocated_bytes, dry_prune.cache_mount_candidate_reclaimable_bytes);
     try std.testing.expect((try build_cache_mount.diskStats(io, allocator, root)) != null);
 
     const forced_prune = try prune(allocator, io, .{ .cache_root = root, .dry_run = false }, Io.Clock.real.now(io).nanoseconds);
     defer deinitRootfsPruneResult(allocator, forced_prune);
     try std.testing.expectEqual(@as(usize, 1), forced_prune.cache_mount_deleted_count);
+    try std.testing.expectEqual(image_size, forced_prune.deleted_bytes);
     try std.testing.expectEqual(disk.allocated_bytes, forced_prune.cache_mount_deleted_reclaimable_bytes);
     try std.testing.expect((try build_cache_mount.diskStats(io, allocator, root)) == null);
 
     const replacement_fd = try createCacheMountFixture(io, allocator, root, image_size);
     _ = std.c.close(replacement_fd);
     const replacement_disk = (try build_cache_mount.diskStats(io, allocator, root)) orelse return error.CacheMountDiskInvalid;
+    const stale_path = try std.fs.path.join(allocator, &.{ root, build_cache_mount.store_rel, ".shared.ext4.123.abcd.tmp" });
+    const stale_fd = try createSparseFileFixture(allocator, stale_path, 8 << 20);
+    _ = std.c.close(stale_fd);
+    const entries = try build_cache_mount.storageEntries(io, allocator, root);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    const expected_reclaimed = replacement_disk.allocated_bytes + entries[1].allocated_bytes;
     const forced_gc = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
     defer deinitRootfsGcResult(allocator, forced_gc);
-    try std.testing.expectEqual(@as(usize, 1), forced_gc.cache_mount_deleted_count);
-    try std.testing.expectEqual(replacement_disk.allocated_bytes, forced_gc.cache_mount_deleted_bytes);
+    try std.testing.expectEqual(@as(usize, 2), forced_gc.cache_mount_deleted_count);
+    try std.testing.expectEqual(expected_reclaimed, forced_gc.cache_mount_deleted_bytes);
+    try std.testing.expectEqual(image_size, forced_gc.entries[0].bytes);
+    try std.testing.expectEqual(replacement_disk.allocated_bytes, forced_gc.entries[0].reclaimable_bytes.?);
     try std.testing.expect((try build_cache_mount.diskStats(io, allocator, root)) == null);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, stale_path, .{}));
+}
+
+test "non-regular cache mount disk does not block system cleanup" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const relative_root = "zig-cache/test-system-cache-mount-non-regular";
+    defer Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    const root = try std.fs.path.resolve(allocator, &.{ try std.process.currentPathAlloc(io, allocator), relative_root });
+    const dir = try std.fs.path.join(allocator, &.{ root, build_cache_mount.store_rel });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const disk_path = try build_cache_mount.diskPath(allocator, root);
+    try Io.Dir.cwd().symLink(io, "missing-target", disk_path, .{});
+
+    const summary = try df(allocator, io, .{ .cache_root = root });
+    defer deinitRootfsSystemSummary(allocator, summary);
+    try std.testing.expectEqual(@as(usize, 0), summary.build_cache_mounts.count);
+    const pruned = try prune(allocator, io, .{ .cache_root = root, .dry_run = false }, Io.Clock.real.now(io).nanoseconds);
+    defer deinitRootfsPruneResult(allocator, pruned);
+    try std.testing.expectEqual(@as(usize, 0), pruned.cache_mount_deleted_count);
+    const collected = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
+    defer deinitRootfsGcResult(allocator, collected);
+    try std.testing.expectEqual(@as(usize, 0), collected.cache_mount_deleted_count);
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, disk_path, .{ .follow_symlinks = false })).kind == .sym_link);
+
+    try Io.Dir.cwd().deleteFile(io, disk_path);
+    try Io.Dir.cwd().createDir(io, disk_path, .default_dir);
+    const directory_summary = try df(allocator, io, .{ .cache_root = root });
+    defer deinitRootfsSystemSummary(allocator, directory_summary);
+    try std.testing.expectEqual(@as(usize, 0), directory_summary.build_cache_mounts.count);
+    const directory_prune = try prune(allocator, io, .{ .cache_root = root, .dry_run = false }, Io.Clock.real.now(io).nanoseconds);
+    defer deinitRootfsPruneResult(allocator, directory_prune);
+    try std.testing.expectEqual(@as(usize, 0), directory_prune.cache_mount_deleted_count);
+    const directory_gc = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
+    defer deinitRootfsGcResult(allocator, directory_gc);
+    try std.testing.expectEqual(@as(usize, 0), directory_gc.cache_mount_deleted_count);
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, disk_path, .{ .follow_symlinks = false })).kind == .directory);
 }
 
 const TestCacheCleanup = enum { prune, gc };
@@ -2592,6 +2683,7 @@ fn expectActiveBuildProtectsCacheMount(comptime operation: TestCacheCleanup) !vo
     const root = try std.fs.path.resolve(arena, &.{ try std.process.currentPathAlloc(io, arena), relative_root });
 
     var build_lock = try rootfs.lockRootfsCacheExclusive(io, arena, root);
+    var store_lock = try build_cache_mount.lockStoreExclusive(io, arena, root);
     const cache_fd = try createCacheMountFixture(io, arena, root, 64 << 20);
 
     const CleanupContext = struct {
@@ -2630,6 +2722,7 @@ fn expectActiveBuildProtectsCacheMount(comptime operation: TestCacheCleanup) !vo
     // closes its mounted disk and releases the process-bound flock.
     try std.testing.expect((try build_cache_mount.diskStats(io, arena, root)) != null);
     _ = std.c.close(cache_fd);
+    store_lock.deinit();
     build_lock.deinit();
     thread.join();
     if (context.err) |err| return err;

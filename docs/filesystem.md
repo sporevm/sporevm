@@ -70,22 +70,27 @@ instruction order, unmounts them in reverse order after killing RUN descendants,
 syncs and cleanly unmounts the cache filesystem, and removes target directories
 it created before the rootfs freeze handshake. Failed RUN writes are retained,
 but cleanup failure blocks the checkpoint and step record. One RUN accepts at
-most eight mounts. A symlinked, non-regular, size-mismatched, bad-magic, or
-host-visible unclean aggregate disk is recreated before reuse; a guest mount
-rejection remains a build error.
+most eight mounts. A symlinked or non-regular aggregate path fails closed;
+system inspection and cleanup skip it without blocking unrelated cache work.
+A regular size-mismatched, bad-magic, or host-visible unclean aggregate disk is
+recreated before reuse; a guest mount rejection remains a build error.
 
 The aggregate disk is also the retention unit. Cache-mount directories are
 mutable accelerator state rather than children owned by immutable build-step
 records, so a completed build does not make the disk reachable. `spore system
-df --rootfs` reports one cache-mount entry with separate 4 GiB logical and
-host-allocated byte counts. Default prune and root-aware GC may reclaim the
-whole aggregate, and report its allocated bytes separately from rootfs/CAS
-reclamation. Both cleanup paths take the same coarse rootfs-cache `flock` held
-for the complete build publication epoch, so they cannot select or unlink the
-disk while a build has it open. The lock is process-bound and the kernel drops
-it when a builder exits, including a crash; the inert lock file may remain, but
-it is not a lease or retention root and cannot make the cache leak forever. An
-unclean disk left by a crash is still rejected or replaced on the next open.
+df --rootfs` reports the aggregate and any abandoned emit temp files with
+separate logical and host-allocated byte counts. Default prune and root-aware GC
+may reclaim every regular cache-mount storage entry, and report its allocated
+bytes separately from rootfs/CAS reclamation. Both cleanup paths take the same
+coarse rootfs-cache `flock` held
+for the complete build publication epoch and then the aggregate-store lock, so
+they cannot select or unlink the disk while a build has it open. The store
+asserts that its caller already holds the coarse lock. Both locks are
+process-bound and the kernel drops them when a builder exits, including a crash;
+inert lock files are not leases or retention roots. A later store open removes
+abandoned emit temps and rejects or replaces an unclean aggregate, while prune
+and GC can reclaim both the aggregate and those temps without waiting for
+another build.
 BuildKit v0.30.0 retains cache options in RUN result identity only when the
 effective ID value equals the resolved destination and sharing is `shared`;
 otherwise it clears ID and sharing. Spore matches that value-based quirk: an
@@ -406,8 +411,8 @@ spores.
 
 `spore system df --rootfs` reports image ext4 files, metadata, exact digest
 artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, temporary
-entries, and the build cache-mount aggregate. Its cache-mount fields distinguish
-the sparse disk's logical capacity from allocated host bytes. `spore cache gc
+entries, and build cache-mount storage. Its cache-mount fields distinguish
+sparse logical capacity from allocated host bytes. `spore cache gc
 --rootfs` performs a mark/sweep of rootfs CAS indexes
 and objects from cache metadata, ref records, live runtime manifests, and
 process-owned lazy-runtime leases; it is dry-run by default and requires
@@ -419,7 +424,7 @@ before the CAS sweep, and preserves unknown future record kinds or schema
 versions conservatively.
 
 Default `spore system prune --rootfs` selects rebuildable image rootfs entries
-and the unreferenced build cache-mount aggregate. Flat digest artifacts are
+and unreferenced regular build cache-mount storage. Flat digest artifacts are
 skipped unless `--include-digest-artifacts`
 is passed with an age or size bound. Canonical rootfs CAS chunks are skipped
 unless `--include-rootfs-chunks` is passed.
