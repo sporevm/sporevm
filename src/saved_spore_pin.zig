@@ -267,8 +267,17 @@ pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedReg
     const stage = try std.fs.path.join(allocator, &.{ spore_dir, ".sporevm-pin-stage" });
     defer allocator.free(stage);
     try createDirectoryExclusive(allocator, stage);
-    var cleanup_stage = false;
+    var cleanup_stage = true;
     defer if (cleanup_stage) Io.Dir.cwd().deleteTree(io, stage) catch {};
+    const final_ref = try std.fs.path.join(allocator, &.{ spore_dir, reference_file });
+    defer allocator.free(final_ref);
+    const final_manifest = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
+    defer allocator.free(final_manifest);
+    try requireAbsent(io, final_ref);
+    try requireAbsent(io, final_manifest);
+    // From this point a failed publication leaves recovery material in the
+    // stage directory. The preflight above cleans its empty stage on refusal.
+    cleanup_stage = false;
     switch (@TypeOf(manifest)) {
         spore.Manifest => try spore.saveManifest(allocator, stage, manifest),
         spore.ManifestV1 => try spore.saveManifestV1(allocator, stage, manifest),
@@ -296,18 +305,22 @@ pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedReg
     crashAfterPublishBoundary(.pin_record);
     const staged_ref = try std.fs.path.join(allocator, &.{ stage, reference_file });
     defer allocator.free(staged_ref);
-    const final_ref = try std.fs.path.join(allocator, &.{ spore_dir, reference_file });
-    defer allocator.free(final_ref);
     try Io.Dir.renameAbsolute(staged_ref, final_ref, io);
     crashAfterPublishBoundary(.reference_rename);
-    const final_manifest = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
-    defer allocator.free(final_manifest);
     try Io.Dir.renameAbsolute(staged_manifest, final_manifest, io);
     crashAfterPublishBoundary(.manifest_rename);
     try chunk_sealer.fsyncDirPath(allocator, spore_dir);
     crashAfterPublishBoundary(.directory_sync);
     try clearPendingPublication(io, allocator, registry, id);
     cleanup_stage = true;
+}
+
+fn requireAbsent(io: Io, path: []const u8) !void {
+    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    return error.SavedSporeOwnershipConflict;
 }
 
 /// The caller holds the rootfs cache lock. The manifest and every CAS value

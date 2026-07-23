@@ -1443,10 +1443,21 @@ pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: Clone
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var nonce: [8]u8 = undefined;
-    context.io.random(&nonce);
-    const bundle_dir = try std.fmt.allocPrint(arena, "{s}.clone-bundle-{x}", .{ options.out_dir, std.mem.readInt(u64, &nonce, .little) });
-    defer std.Io.Dir.cwd().deleteTree(context.io, bundle_dir) catch {};
+    var stage_root: ?[]const u8 = null;
+    for (0..16) |_| {
+        var nonce: [8]u8 = undefined;
+        context.io.random(&nonce);
+        const candidate = try std.fmt.allocPrint(arena, "{s}.clone-stage-{x}", .{ options.out_dir, std.mem.readInt(u64, &nonce, .little) });
+        Io.Dir.cwd().createDir(context.io, candidate, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => |e| return e,
+        };
+        stage_root = candidate;
+        break;
+    }
+    const owned_stage_root = stage_root orelse return error.PathAlreadyExists;
+    defer std.Io.Dir.cwd().deleteTree(context.io, owned_stage_root) catch {};
+    const bundle_dir = try std.fs.path.join(arena, &.{ owned_stage_root, "bundle" });
 
     _ = try pack(context, arena, .{
         .spore_dir = options.spore_dir,
@@ -1494,6 +1505,13 @@ test "clone spore makes a pinned save independently portable" {
     defer deinitSporeInspectResult(allocator, inspected);
     try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, inspected.ownership);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, try std.fs.path.join(arena, &.{ output, saved_spore_pin.reference_file }), .{ .follow_symlinks = false }));
+
+    const occupied = try std.fs.path.join(arena, &.{ root, "occupied.spore" });
+    try Io.Dir.cwd().createDirPath(io, occupied);
+    const sentinel = try std.fs.path.join(arena, &.{ occupied, "keep" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "owned elsewhere" });
+    try std.testing.expectError(error.AlreadyExists, cloneSpore(.{ .io = io, .environ_map = &env }, allocator, .{ .spore_dir = source, .out_dir = occupied }));
+    try std.testing.expectEqualStrings("owned elsewhere", try Io.Dir.cwd().readFileAlloc(io, sentinel, arena, .limited(64)));
 }
 
 /// Push a bundle to a remote destination.

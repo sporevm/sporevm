@@ -428,10 +428,7 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     defer allocator.free(record_before_fault);
     var replacement_manifest = manifest;
     replacement_manifest.generation.generation += 1;
-    saved_spore_pin.testing.publish_fault = .{ .fail_before_complete_stamp = true };
-    defer saved_spore_pin.testing.publish_fault = .{};
-    try std.testing.expectError(error.InjectedFailure, saved_spore_pin.publishManifest(io, arena, parent_registry, parent, disk, replacement_manifest));
-    saved_spore_pin.testing.publish_fault = .{};
+    try std.testing.expectError(error.SavedSporeOwnershipConflict, saved_spore_pin.publishManifest(io, arena, parent_registry, parent, disk, replacement_manifest));
     const manifest_after_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_manifest_path, allocator, .limited(saved_spore_pin.max_manifest_bytes));
     defer allocator.free(manifest_after_fault);
     const ref_after_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_ref_path, allocator, .limited(saved_spore_pin.max_record_bytes));
@@ -442,8 +439,7 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     try std.testing.expectEqualSlices(u8, ref_before_fault, ref_after_fault);
     try std.testing.expectEqualSlices(u8, record_before_fault, record_after_fault);
     const rejected_manifest = try std.fs.path.join(arena, &.{ parent, ".sporevm-pin-stage", "manifest.json" });
-    _ = try std.Io.Dir.cwd().statFile(io, rejected_manifest, .{ .follow_symlinks = false });
-    try std.testing.expectError(error.SavedSporePublicationRecoveryRequired, saved_spore_pin.publishManifest(io, arena, parent_registry, parent, disk, replacement_manifest));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, rejected_manifest, .{ .follow_symlinks = false }));
     const pins_after_fault = try saved_spore_pin.list(io, arena, cache);
     try std.testing.expectEqual(@as(usize, 1), pins_after_fault.len);
     const failed_stamp_path = try rootfs_cas.storageCompleteStampPath(arena, cache, encoded.digest);
