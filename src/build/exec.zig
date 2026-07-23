@@ -2731,17 +2731,20 @@ test "guest exec request parser preserves Unicode and rejects invalid scalar enc
 test "builder and runtime share bounded guest PATH resolution" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.makePath("bin");
-    try tmp.dir.makePath("fallback");
-    try tmp.dir.makePath("sub");
-    const executable = try tmp.dir.createFile("bin/tool", .{ .mode = 0o755 });
-    executable.close();
-    const fallback = try tmp.dir.createFile("fallback/node", .{ .mode = 0o755 });
-    fallback.close();
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const io = std.testing.io;
+    const root = try std.fmt.allocPrint(std.testing.allocator, "/tmp/sporevm-path-resolution-{d}", .{std.c.getpid()});
     defer std.testing.allocator.free(root);
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const root_dir = try std.Io.Dir.cwd().createDirPathOpen(io, root, .{});
+    defer root_dir.close(io);
+    try root_dir.createDirPath(io, "bin");
+    try root_dir.createDirPath(io, "fallback");
+    try root_dir.createDirPath(io, "sub");
+    const executable = try root_dir.createFile(io, "bin/tool", .{ .permissions = .executable_file });
+    executable.close(io);
+    const fallback = try root_dir.createFile(io, "fallback/node", .{ .permissions = .executable_file });
+    fallback.close(io);
     const fifo_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/bin/node", .{root}, 0);
     defer std.testing.allocator.free(fifo_path);
     try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path, 0o755));
