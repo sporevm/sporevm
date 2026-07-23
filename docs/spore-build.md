@@ -86,12 +86,13 @@ current numeric-mode exception.
 
 Shell-form `RUN` uses `/bin/sh -c`. JSON-array `RUN` executes the exact argv
 after bounded `PATH` selection when argv zero contains no slash. The shared
-guest resolver accepts at most 255 `PATH` bytes, 64 entries, and a 511-byte
+guest resolver accepts at most 250 `PATH` bytes, 64 entries, and a 511-byte
 candidate plus its terminator. Missing and empty `PATH` do not search the
 working directory. Relative entries are skipped unless they name an executable,
 in which case lookup fails closed; absolute traversal remains confined by the
-guest root. A missing shell or executable fails that instruction, and execution
-never falls through to a later binary after selecting one.
+operation-owned guest sandbox. A missing shell or executable fails that
+instruction, and execution never falls through to a later binary after
+selecting one.
 
 Executor-backed instructions require an inherited OCI `User` that selects the
 root user and an optional root group. Other users and groups fail closed because

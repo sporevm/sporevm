@@ -44,6 +44,7 @@ chmod 700 "${SPOREVM_RUNTIME_DIR}"
 
 source_name="image-context-source"
 override_name="image-context-override"
+lookup_name="image-context-lookup"
 failed_name="image-context-failed"
 child_name="image-context-child"
 restored_name="image-context-restored"
@@ -60,7 +61,7 @@ cleanup() {
       tail -120 "${log}" >&2 || true
     done
   fi
-  for name in "${restored_name}" "${child_name}" "${failed_name}" "${override_name}" "${source_name}"; do
+  for name in "${restored_name}" "${child_name}" "${failed_name}" "${lookup_name}" "${override_name}" "${source_name}"; do
     "${spore_bin}" rm "${name}" >/dev/null 2>&1 || true
   done
   if [[ "${status}" == "0" && "${SPORE_KEEP_SMOKE_WORKDIR:-0}" != "1" ]]; then
@@ -74,7 +75,12 @@ cat >"${workdir}/context/Dockerfile" <<'DOCKERFILE'
 FROM docker.io/library/alpine:3.20
 ENV IMAGE_VALUE=default CLEAR_ME=inherited
 WORKDIR /workspace
-RUN mkdir -p /workspace/sub /workspace/tools && printf '%b' '#!/bin/sh\nprintf "%s|%s" "\0441" "\0442"\n' > /workspace/tools/exact-tool && chmod 0755 /workspace/tools/exact-tool
+RUN mkdir -p /workspace/fallback /workspace/sub /workspace/tools \
+    && printf '%b' '#!/bin/sh\nprintf "%s|%s" "\0441" "\0442"\n' > /workspace/tools/exact-tool \
+    && cp /workspace/tools/exact-tool /workspace/empty-tool \
+    && printf '#!/missing/interpreter\n' > /workspace/tools/broken-tool \
+    && printf '#!/bin/sh\nprintf wrong\n' > /workspace/fallback/broken-tool \
+    && chmod 0755 /workspace/empty-tool /workspace/tools/exact-tool /workspace/tools/broken-tool /workspace/fallback/broken-tool
 CMD ["/bin/sh", "-c", "printf '%s|%s|%s' \"$IMAGE_VALUE\" \"$CLEAR_ME\" \"$PWD\" > default-context; cat default-context"]
 DOCKERFILE
 
@@ -132,6 +138,24 @@ if initial["stdout"] != "default|inherited|/workspace" or initial["stderr"] != "
   --initial-output discard \
   -- /bin/sh -lc 'printf "%s|%s|%s" "$IMAGE_VALUE" "$CLEAR_ME" "$PWD" > detached-context'
 
+"${spore_bin}" create "${lookup_name}" \
+  --backend "${backend}" \
+  --image "${image_ref}" \
+  --pull never \
+  --memory "${SPORE_SMOKE_MEMORY:-512mb}" \
+  --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}" \
+  -- sh -c 'printf detached-path > detached-path; sleep 60'
+
+detached_lookup=""
+for _ in $(seq 1 100); do
+  if detached_lookup="$("${spore_bin}" exec "${lookup_name}" -- cat detached-path 2>/dev/null)" && \
+    [[ "${detached_lookup}" == 'detached-path' ]]; then
+    break
+  fi
+  sleep 0.05
+done
+expect_eq 'detached-path' "${detached_lookup}" "detached and transient PATH lookup"
+
 detached_context=""
 for _ in $(seq 1 100); do
   if detached_context="$("${spore_bin}" exec "${override_name}" -- /bin/cat detached-context 2>/dev/null)" && \
@@ -170,6 +194,20 @@ expect_eq 'relative entry skipped' \
   "$("${spore_bin}" exec --env PATH=missing:/bin "${source_name}" -- echo 'relative entry skipped')" \
   "missing relative PATH entry falls through"
 
+set +e
+"${spore_bin}" exec --env PATH=:/bin --workdir /workspace "${source_name}" -- empty-tool >"${workdir}/empty-entry.stdout" 2>"${workdir}/empty-entry.stderr"
+empty_entry_rc="$?"
+set -e
+[[ "${empty_entry_rc}" == "126" ]] || die "empty PATH entry executable match exited ${empty_entry_rc}, expected 126"
+[[ ! -s "${workdir}/empty-entry.stdout" ]] || die "empty PATH entry executable match ran the command"
+
+set +e
+"${spore_bin}" exec --env PATH=/workspace/tools:/workspace/fallback "${source_name}" -- broken-tool >"${workdir}/selected-failure.stdout" 2>"${workdir}/selected-failure.stderr"
+selected_failure_rc="$?"
+set -e
+[[ "${selected_failure_rc}" == "127" ]] || die "selected candidate exec failure exited ${selected_failure_rc}, expected 127"
+[[ ! -s "${workdir}/selected-failure.stdout" ]] || die "selected candidate exec failure fell through"
+
 for path_case in /does-not-exist ""; do
   set +e
   "${spore_bin}" exec --env "PATH=${path_case}" "${source_name}" -- echo should-not-run >"${workdir}/path-failure.stdout" 2>"${workdir}/path-failure.stderr"
@@ -191,7 +229,7 @@ for _ in $(seq 1 64); do
   too_many_path="${too_many_path}:/"
 done
 set +e
-"${spore_bin}" exec --env "PATH=${too_many_path}" "${source_name}" -- missing >"${workdir}/bounded-path.stdout" 2>"${workdir}/bounded-path.stderr"
+"${spore_bin}" exec --env "PATH=${too_many_path}" "${source_name}" -- echo should-not-run >"${workdir}/bounded-path.stdout" 2>"${workdir}/bounded-path.stderr"
 bounded_path_rc="$?"
 set -e
 [[ "${bounded_path_rc}" == "126" ]] || die "over-limit PATH entry count exited ${bounded_path_rc}, expected 126"
@@ -212,10 +250,10 @@ expect_eq 'override||/' \
 host_context="$(env HOST_CONTEXT=from-host "${spore_bin}" exec --env HOST_CONTEXT "${source_name}" -- /bin/sh -lc 'printf "%s" "$HOST_CONTEXT"')"
 expect_eq from-host "${host_context}" "host environment copy"
 
-interactive_context="$(printf 'input-ok\n' | "${spore_bin}" exec --env IMAGE_VALUE=interactive --workdir / -i "${source_name}" -- /bin/sh -lc 'read -r input; printf "%s|%s|%s" "$IMAGE_VALUE" "$PWD" "$input"')"
+interactive_context="$(printf 'input-ok\n' | "${spore_bin}" exec --env IMAGE_VALUE=interactive --workdir / -i "${source_name}" -- sh -lc 'read -r input; printf "%s|%s|%s" "$IMAGE_VALUE" "$PWD" "$input"')"
 expect_eq 'interactive|/|input-ok' "${interactive_context}" "interactive named exec context"
 
-tty_context="$("${spore_bin}" exec --env IMAGE_VALUE=tty --workdir /tmp -t "${source_name}" -- /bin/sh -lc 'printf "%s|%s" "$IMAGE_VALUE" "$PWD"')"
+tty_context="$("${spore_bin}" exec --env IMAGE_VALUE=tty --workdir /tmp -t "${source_name}" -- sh -lc 'printf "%s|%s" "$IMAGE_VALUE" "$PWD"')"
 expect_eq 'tty|/tmp' "${tty_context}" "TTY named exec context"
 
 "${spore_bin}" exec --env PER_EXEC_SECRET=ephemeral-only "${source_name}" -- /bin/sh -lc 'test "$PER_EXEC_SECRET" = ephemeral-only'

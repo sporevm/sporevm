@@ -1590,6 +1590,7 @@ const guest_agent_fuzz_other_request: c_int = 7;
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
 extern fn spore_agent_fuzz_exec_arg_equals(request: [*]const u8, request_len: usize, arg_index: usize, expected: [*]const u8, expected_len: usize) c_int;
 extern fn spore_agent_test_resolve_exec_path(command: [*]const u8, command_len: usize, path: [*]const u8, path_len: usize, path_present: c_int, resolved: [*]u8, resolved_cap: usize) c_int;
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, blocks_count: *u64, blocks_per_group: *u32, block_size: *u32) c_int;
 extern fn spore_agent_fuzz_ext4_growth_source(super: [*]const u8, super_len: usize) c_int;
 extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_blocks: u64, before_blocks_per_group: u32, before_block_size: u32, after_blocks: u64, after_blocks_per_group: u32, after_block_size: u32) c_int;
@@ -2733,11 +2734,17 @@ test "builder and runtime share bounded guest PATH resolution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.makePath("bin");
+    try tmp.dir.makePath("fallback");
     try tmp.dir.makePath("sub");
     const executable = try tmp.dir.createFile("bin/tool", .{ .mode = 0o755 });
     executable.close();
+    const fallback = try tmp.dir.createFile("fallback/node", .{ .mode = 0o755 });
+    fallback.close();
     const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root);
+    const fifo_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/bin/node", .{root}, 0);
+    defer std.testing.allocator.free(fifo_path);
+    try std.testing.expectEqual(@as(c_int, 0), mkfifo(fifo_path, 0o755));
 
     var resolved: [512]u8 = undefined;
     const empty = "";
@@ -2760,6 +2767,16 @@ test "builder and runtime share bounded guest PATH resolution" {
     defer std.testing.allocator.free(expected_normal);
     try std.testing.expectEqualStrings(expected_normal, std.mem.sliceTo(&resolved, 0));
 
+    const node_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/bin:{s}/fallback", .{ root, root });
+    defer std.testing.allocator.free(node_path);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        spore_agent_test_resolve_exec_path("node", 4, node_path.ptr, node_path.len, 1, &resolved, resolved.len),
+    );
+    const expected_node = try std.fmt.allocPrint(std.testing.allocator, "{s}/fallback/node", .{root});
+    defer std.testing.allocator.free(expected_node);
+    try std.testing.expectEqualStrings(expected_node, std.mem.sliceTo(&resolved, 0));
+
     const traversal_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sub/../bin", .{root});
     defer std.testing.allocator.free(traversal_path);
     try std.testing.expectEqual(
@@ -2770,18 +2787,45 @@ test "builder and runtime share bounded guest PATH resolution" {
     defer std.testing.allocator.free(expected_traversal);
     try std.testing.expectEqualStrings(expected_traversal, std.mem.sliceTo(&resolved, 0));
 
-    var too_many_entries: [129]u8 = undefined;
-    for (0..64) |i| {
-        too_many_entries[i * 2] = '/';
-        too_many_entries[i * 2 + 1] = ':';
+    const first_entry = try std.fmt.allocPrint(std.testing.allocator, "{s}/bin", .{root});
+    defer std.testing.allocator.free(first_entry);
+    const max_entries = try std.testing.allocator.alloc(u8, first_entry.len + 63 * 2);
+    defer std.testing.allocator.free(max_entries);
+    @memcpy(max_entries[0..first_entry.len], first_entry);
+    for (0..63) |i| {
+        max_entries[first_entry.len + i * 2] = ':';
+        max_entries[first_entry.len + i * 2 + 1] = '/';
     }
-    too_many_entries[128] = '/';
     try std.testing.expectEqual(
-        @as(c_int, @intFromEnum(std.posix.E.@"2BIG")),
-        spore_agent_test_resolve_exec_path("missing", 7, &too_many_entries, too_many_entries.len, 1, &resolved, resolved.len),
+        @as(c_int, 0),
+        spore_agent_test_resolve_exec_path("tool", 4, max_entries.ptr, max_entries.len, 1, &resolved, resolved.len),
     );
 
-    const long_path = "/" ** 256;
+    const too_many_entries = try std.testing.allocator.alloc(u8, first_entry.len + 64 * 2);
+    defer std.testing.allocator.free(too_many_entries);
+    @memcpy(too_many_entries[0..first_entry.len], first_entry);
+    for (0..64) |i| {
+        too_many_entries[first_entry.len + i * 2] = ':';
+        too_many_entries[first_entry.len + i * 2 + 1] = '/';
+    }
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.posix.E.@"2BIG")),
+        spore_agent_test_resolve_exec_path("tool", 4, too_many_entries.ptr, too_many_entries.len, 1, &resolved, resolved.len),
+    );
+
+    const max_path = try std.testing.allocator.alloc(u8, 250);
+    defer std.testing.allocator.free(max_path);
+    const prefix_len = max_path.len - first_entry.len - 1;
+    @memset(max_path[0..prefix_len], 'x');
+    max_path[0] = '/';
+    max_path[prefix_len] = ':';
+    @memcpy(max_path[prefix_len + 1 ..], first_entry);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        spore_agent_test_resolve_exec_path("tool", 4, max_path.ptr, max_path.len, 1, &resolved, resolved.len),
+    );
+
+    const long_path = "/" ** 251;
     try std.testing.expectEqual(
         @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
         spore_agent_test_resolve_exec_path("missing", 7, long_path, long_path.len, 1, &resolved, resolved.len),

@@ -88,7 +88,7 @@
 #define COPY_DESTINATION_LINK SPORE_BUILD_COPY_DESTINATION_LINK
 #define MAX_BUILD_RUN_COMMAND_LEN 65536ULL
 #define MAX_BUILD_EXEC_ARGS_BYTES 4096
-#define MAX_EXEC_PATH_LEN (MAX_ENV_LEN - 1)
+#define MAX_EXEC_PATH_LEN (MAX_ENV_LEN - sizeof("PATH="))
 #define MAX_EXEC_PATH_ENTRIES 64
 #define MAX_EXEC_CANDIDATE_LEN 512
 #define MAX_BUILD_CONTEXT_COPY_ENTRIES SPORE_BUILD_COPY_MAX_ENTRIES
@@ -3793,14 +3793,17 @@ static int resolve_exec_path(const char *command, const char *path, char *execut
     return -1;
   }
 
-  size_t command_len = strlen(command);
-  size_t entry_count = 0;
-  const char *entry = path;
-  for (;;) {
-    if (++entry_count > MAX_EXEC_PATH_ENTRIES) {
+  size_t entry_count = 1;
+  for (size_t i = 0; i < path_len; i++) {
+    if (path[i] == ':' && ++entry_count > MAX_EXEC_PATH_ENTRIES) {
       errno = E2BIG;
       return -1;
     }
+  }
+
+  size_t command_len = strlen(command);
+  const char *entry = path;
+  for (;;) {
     const char *end = strchr(entry, ':');
     size_t dir_len = end != NULL ? (size_t)(end - entry) : strlen(entry);
     const char *dir = dir_len == 0 ? "." : entry;
@@ -3816,7 +3819,7 @@ static int resolve_exec_path(const char *command, const char *path, char *execut
     memcpy(executable + dir_len + 1, command, command_len + 1);
     struct stat candidate_stat;
     if (stat(executable, &candidate_stat) == 0 &&
-        !S_ISDIR(candidate_stat.st_mode) && access(executable, X_OK) == 0) {
+        S_ISREG(candidate_stat.st_mode) && access(executable, X_OK) == 0) {
       if (dir[0] != '/') {
         errno = EACCES;
         return -1;
