@@ -35,6 +35,8 @@ documented migration window.
 - CLI tests and help probes cover both resource namespaces and legacy forms.
 - C and Go contract tests cover additive inspection and lifecycle fields.
 - `mise run check` and `mise run docs` cover the repository integration.
+- Independent deep-analysis review covered grouped-command diagnostics, stable
+  automation envelopes, attach failure classification, and binding parity.
 
 ## Resolved decisions
 

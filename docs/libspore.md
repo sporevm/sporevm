@@ -99,7 +99,8 @@ do not need deinit.
 Live VM lifecycle results and list entries use `resource_type: "live_vm"`.
 Checkpoint inspection, fork, clone, unpack, pull, and removal use
 `resource_type: "checkpoint"`, while bundle inspection, pack, and push use
-`resource_type: "bundle"`. Images contain application filesystem and OCI
+`resource_type: "bundle"`. Image gateway results use `resource_type: "image"`.
+Images contain application filesystem and OCI
 execution metadata; bundles and checkpoints contain no runnable image identity
 of their own.
 

@@ -125,11 +125,11 @@ func TestRemoveSavedValidationAndResultContract(t *testing.T) {
 	if _, err := client.RemoveSaved(ctx, RemoveSavedOptions{SporeDir: "save.spore"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled RemoveSaved error = %v", err)
 	}
-	decoded, err := decodeRemovedSavedSpore([]byte(`{"resource_type":"checkpoint","action":"removed_spore","spore_dir":"save.spore","ownership":"machine-local-pinned","pin_id":"abc","pin_removed":true}`))
+	decoded, err := decodeRemovedSavedSpore([]byte(`{"schema":"spore.saved.remove.result.v1","schema_version":1,"resource_type":"checkpoint","action":"removed_spore","spore_dir":"save.spore","ownership":"machine-local-pinned","pin_id":"abc","pin_removed":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.ResourceType != "checkpoint" || decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.Ownership != "machine-local-pinned" || decoded.PinID != "abc" || !decoded.PinRemoved {
+	if decoded.Schema != "spore.saved.remove.result.v1" || decoded.SchemaVersion != 1 || decoded.ResourceType != "checkpoint" || decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.Ownership != "machine-local-pinned" || decoded.PinID != "abc" || !decoded.PinRemoved {
 		t.Fatalf("unexpected removed save: %#v", decoded)
 	}
 	legacy, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"legacy"}`))
@@ -249,6 +249,9 @@ func TestInspectSporeAnnotations(t *testing.T) {
 	}
 	if !result.VMStatePresent {
 		t.Fatal("expected VM state")
+	}
+	if result.Schema != "spore.inspect.result.v1" || result.SchemaVersion != 1 || result.VCPUCount != 1 {
+		t.Fatalf("inspection envelope = %#v", result)
 	}
 	if result.ResourceType != "checkpoint" || result.Portability != "portable" {
 		t.Fatalf("resource classification = %#v", result)

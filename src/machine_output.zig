@@ -249,6 +249,9 @@ pub fn fromZigError(err: anyerror) CliError {
         error.InjectedFileCaptureUnsupported,
         error.InjectedFileResumeUnsupported,
         error.InjectedFileMonitorUnsupported,
+        error.SavedSessionUnavailable,
+        error.SavedSessionHasNoInteractiveStdin,
+        error.SavedSessionHasNoTerminal,
         error.UnsupportedExt4Writer,
         error.X86ExplicitMemoryRequired,
         error.X86ExperimentalMemorySizeUnsupported,
@@ -363,6 +366,9 @@ test "stable error code table matches the plan" {
 test "setup errors classify for API callers" {
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InvalidRootfsInput).code);
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.UnsupportedExt4Writer).code);
+    try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.SavedSessionUnavailable).code);
+    try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.SavedSessionHasNoInteractiveStdin).code);
+    try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.SavedSessionHasNoTerminal).code);
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InjectedFileCaptureUnsupported).code);
     try std.testing.expectEqual(ErrorCode.usage_invalid_argument, fromZigError(error.InjectedFileTooLarge).code);
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.MissingRootfsArtifact).code);

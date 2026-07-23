@@ -466,6 +466,8 @@ pub const CloneOptions = struct {
 };
 
 pub const CloneResult = struct {
+    schema: []const u8 = "spore.clone.result.v1",
+    schema_version: u32 = 1,
     resource_type: ResourceType = .checkpoint,
     portability: Portability = .portable,
     source: []const u8,

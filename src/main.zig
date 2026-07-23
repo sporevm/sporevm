@@ -346,7 +346,7 @@ fn runCommand(
         if (spore_internal.lifecycle.wantsNamedFork(command_args)) {
             try spore_internal.lifecycle.forkCli(init, command_args, stdout, stderr, mode);
         } else {
-            const result = try forkCommand(context, arena, stderr, mode, command_args);
+            const result = try forkCommand(context, arena, stderr, mode, "fork", command_args);
             if (mode == .json) {
                 try machine_output.writeJson(arena, stdout, result);
             } else {
@@ -525,16 +525,17 @@ fn vmCommand(
     stderr: *Io.Writer,
     mode: machine_output.Mode,
 ) !void {
-    if (args.len == 0 or wantsCommandHelp(args)) {
+    if (wantsCommandHelp(args)) {
         try stdout.writeAll(vm_usage);
         return;
     }
+    if (args.len == 0) exitUsage(init.arena.allocator(), stderr, mode, "vm", "usage: spore vm rm NAME | spore vm fork NAME --count N --name PATTERN");
     if (std.mem.eql(u8, args[0], "rm")) {
         if (args.len != 2) exitUsage(init.arena.allocator(), stderr, mode, "vm rm", "usage: spore vm rm NAME");
         return spore_internal.lifecycle.rmCli(init, args[1..], stdout, stderr, mode);
     }
     if (std.mem.eql(u8, args[0], "fork")) {
-        if (args.len < 2) exitUsage(init.arena.allocator(), stderr, mode, "vm fork", "usage: spore vm fork NAME --count N --name PATTERN");
+        if (args.len < 2 or std.mem.startsWith(u8, args[1], "--")) exitUsage(init.arena.allocator(), stderr, mode, "vm fork", "usage: spore vm fork NAME --count N --name PATTERN");
         const legacy_args = try init.arena.allocator().alloc([]const u8, args.len);
         legacy_args[0] = "--vm";
         @memcpy(legacy_args[1..], args[1..]);
@@ -551,17 +552,18 @@ fn checkpointCommand(
     stderr: *Io.Writer,
     mode: machine_output.Mode,
 ) !void {
-    if (args.len == 0 or wantsCommandHelp(args)) {
+    if (wantsCommandHelp(args)) {
         try stdout.writeAll(checkpoint_usage);
         return;
     }
+    if (args.len == 0) exitUsage(init.arena.allocator(), stderr, mode, "checkpoint", "usage: spore checkpoint rm DIR | spore checkpoint fork DIR --count N --out DIR");
     if (std.mem.eql(u8, args[0], "rm")) {
         if (args.len != 2) exitUsage(init.arena.allocator(), stderr, mode, "checkpoint rm", "usage: spore checkpoint rm DIR");
         return spore_internal.lifecycle.rmCli(init, &.{ "--spore", args[1] }, stdout, stderr, mode);
     }
     if (std.mem.eql(u8, args[0], "fork")) {
         if (args.len < 2) exitUsage(init.arena.allocator(), stderr, mode, "checkpoint fork", "usage: spore checkpoint fork DIR --count N --out DIR");
-        const result = try forkCommand(context, init.arena.allocator(), stderr, mode, args[1..]);
+        const result = try forkCommand(context, init.arena.allocator(), stderr, mode, "checkpoint fork", args[1..]);
         if (mode == .json) {
             try machine_output.writeJson(init.arena.allocator(), stdout, result);
         } else {
@@ -664,6 +666,7 @@ fn forkCommand(
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
     mode: machine_output.Mode,
+    command_label: []const u8,
     args: []const []const u8,
 ) !spore_api.ForkResult {
     var parent_dir: ?[]const u8 = null;
@@ -675,22 +678,26 @@ fn forkCommand(
         if (std.mem.eql(u8, args[i], "--count") and i + 1 < args.len) {
             i += 1;
             count = std.fmt.parseInt(usize, args[i], 10) catch {
-                exitInvalidValue(allocator, stderr, mode, "fork", "--count", args[i]);
+                exitInvalidValue(allocator, stderr, mode, command_label, "--count", args[i]);
             };
         } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "fork", args[i]);
+            exitUnknownArgument(allocator, stderr, mode, command_label, args[i]);
         } else if (parent_dir == null) {
             parent_dir = args[i];
         } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "fork", args[i]);
+            exitUnexpectedArgument(allocator, stderr, mode, command_label, args[i]);
         }
     }
 
     if (parent_dir == null or out_dir == null or count == null) {
-        exitUsage(allocator, stderr, mode, "fork", "usage: spore fork <spore-dir> --count N --out DIR");
+        const usage_line = if (std.mem.eql(u8, command_label, "checkpoint fork"))
+            "usage: spore checkpoint fork DIR --count N --out DIR"
+        else
+            "usage: spore fork <spore-dir> --count N --out DIR";
+        exitUsage(allocator, stderr, mode, command_label, usage_line);
     }
 
     return spore_api.fork(context, allocator, .{
@@ -702,12 +709,13 @@ fn forkCommand(
             const inspected = spore_api.inspectSpore(allocator, parent_dir.?) catch return err;
             const vcpu_count = inspected.vcpu_count;
             spore_api.deinitSporeInspectResult(allocator, inspected);
-            const message = machine_output.forkUnsupportedVcpuMessage(allocator, vcpu_count);
-            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+            const body = machine_output.forkUnsupportedVcpuBody(allocator, vcpu_count);
+            const message = allocMessage(allocator, "spore {s}: {s}", .{ command_label, body });
+            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command_label), message);
         },
         error.CrossDeviceOwnershipLink => {
-            const message = "spore fork: machine-local pinned children must share a filesystem with the rootfs cache; use `spore clone` for a portable child on another filesystem";
-            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
+            const message = allocMessage(allocator, "spore {s}: machine-local pinned children must share a filesystem with the rootfs cache; use `spore clone` for a portable child on another filesystem", .{command_label});
+            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command_label), message);
         },
         else => |e| return e,
     };
@@ -1168,7 +1176,7 @@ fn writeUnpackResult(writer: *Io.Writer, result: spore_api.UnpackResult) !void {
 }
 
 fn writeCloneResult(writer: *Io.Writer, result: spore_api.CloneResult) !void {
-    try writer.writeAll("Spore cloned\n");
+    try writer.writeAll("Checkpoint cloned\n");
     try writer.print("  Source: {s}\n", .{result.source});
     try writer.print("  Output: {s}\n", .{result.out_dir});
     try writer.print("  Ownership: {s}\n", .{result.ownership});

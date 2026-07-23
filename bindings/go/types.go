@@ -76,6 +76,8 @@ type InspectSporeOptions struct {
 
 // SporeInspectResult is the decoded local spore inspection result.
 type SporeInspectResult struct {
+	Schema                  string               `json:"schema"`
+	SchemaVersion           uint32               `json:"schema_version"`
 	ResourceType            string               `json:"resource_type"`
 	Portability             string               `json:"portability"`
 	CanAttach               bool                 `json:"can_attach"`
@@ -84,6 +86,7 @@ type SporeInspectResult struct {
 	VMStatePresent          bool                 `json:"vm_state_present"`
 	StorageMode             string               `json:"storage_mode"`
 	Ownership               string               `json:"ownership"`
+	VCPUCount               uint32               `json:"vcpu_count"`
 	Platform                SporePlatformSummary `json:"platform"`
 	DeviceCount             uint64               `json:"device_count"`
 	MemoryChunkCount        uint64               `json:"memory_chunk_count"`
@@ -421,12 +424,14 @@ type RemoveSavedOptions struct {
 
 // RemovedSavedSpore reports the removed save directory and whether a disk pin was removed.
 type RemovedSavedSpore struct {
-	ResourceType string `json:"resource_type"`
-	Action       string `json:"action"`
-	SporeDir     string `json:"spore_dir"`
-	Ownership    string `json:"ownership"`
-	PinID        string `json:"pin_id"`
-	PinRemoved   bool   `json:"pin_removed"`
+	Schema        string `json:"schema"`
+	SchemaVersion uint32 `json:"schema_version"`
+	ResourceType  string `json:"resource_type"`
+	Action        string `json:"action"`
+	SporeDir      string `json:"spore_dir"`
+	Ownership     string `json:"ownership"`
+	PinID         string `json:"pin_id"`
+	PinRemoved    bool   `json:"pin_removed"`
 }
 
 // NamedLifecycleResult is the decoded spore.lifecycle.v1 contract.
