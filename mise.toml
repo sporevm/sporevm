@@ -44,7 +44,7 @@ run = "zig build docs"
 description = "Generate libspore API documentation"
 
 [tasks.check]
-run = "mise run test && mise run build && git diff --check"
+run = "mise run test && mise run build && scripts/test/version.sh zig-out && git diff --check"
 description = "Run unit tests, build, and diff hygiene"
 
 [tasks.release]

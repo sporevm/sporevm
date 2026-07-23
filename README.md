@@ -72,7 +72,7 @@ If you use [mise](https://mise.jdx.dev), install it globally:
 
 ```bash
 mise use -g github:sporevm/sporevm@latest
-spore version
+spore --version
 ```
 
 Or download the Linux ARM64 or macOS ARM64 archive from
@@ -81,7 +81,7 @@ Or download the Linux ARM64 or macOS ARM64 archive from
 ```bash
 asset=spore_Darwin_arm64 # or spore_Linux_arm64
 tar -xzf "$asset.tar.gz"
-"$asset/bin/spore" version
+"$asset/bin/spore" --version
 ```
 
 Use `spore_Linux_arm64` on Linux. Add `$asset/bin` to `PATH`, or move the
@@ -116,7 +116,7 @@ For local iteration:
 
 ```bash
 mise run build
-zig-out/bin/spore version
+zig-out/bin/spore --version
 ```
 
 ## Run a command
@@ -491,13 +491,14 @@ git commit -am "chore: Bump version to vX.Y.Z"
 SPOREVM_RELEASE_VERSION=vX.Y.Z mise run release
 ```
 
-`release:prepare` updates `src/version.zig`, the libspore shared-library
-version, and pkg-config metadata together. `mise run release` runs local checks,
-verifies the built CLI and pkg-config metadata match the target version, and
-pushes the tag. The Buildkite tag build creates Linux ARM64 and macOS ARM64 CLI
-archives plus matching `libspore` archives, writes `checksums.txt`, and
-publishes the GitHub release. Use `mise run release:snapshot` to build release
-archives locally without publishing.
+`release:prepare` updates the authoritative version in `src/version.zig`; the
+CLI, libspore shared library, and pkg-config metadata all derive from it.
+`mise run release` runs local checks, verifies the built CLI and pkg-config
+metadata match the target version, and pushes the tag. The Buildkite tag build
+creates Linux ARM64 and macOS ARM64 CLI archives plus matching `libspore`
+archives, writes `checksums.txt`, and publishes the GitHub release. Use
+`mise run release:snapshot` to build release archives locally without
+publishing.
 
 Buildkite release builds should be triggered by GitHub `push` events only. Do
 not subscribe the Buildkite webhook to GitHub `create` events, or a pushed tag
