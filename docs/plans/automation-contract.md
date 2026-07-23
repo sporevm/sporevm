@@ -33,7 +33,7 @@ The command-by-command inventory is:
 | Bounded | `version`, `host-info`, `inspect`, artifact and named `fork`, `pack`, `unpack`, `push`, `inspect-bundle`, `pull` | One versioned result under global `--json` |
 | Bounded | `system df`, `system prune`, `cache gc`, `cache pins`, `cache unpin` | One versioned result under global `--json` |
 | Bounded | `rootfs build`, `rootfs import-oci`, `rootfs import-tar`, `rootfs resolve`, `rootfs cas-preload`, `image pull`, `image export-fixture`, `build` | One versioned result under global `--json` |
-| Bounded | `create`, `copy-in`, `copy-out`, `save`, `rm`, `ls`/`ps`, and restore without event mode | One versioned result under global `--json` |
+| Bounded | `create`, `logs`, `copy-in`, `copy-out`, `save`, `rm`, `ls`/`ps`, and restore without event mode | One versioned result under global `--json` |
 | Streaming | `run`, `attach`, restore with event mode, `exec`, `fanout` | Versioned JSONL followed by one completion |
 
 The overlapping terminal models are Zig `RunEvent`/`ExecNamedStreamEvent`, C
@@ -43,8 +43,11 @@ and C/Go adapters project those into `completed`, `failed`, or `canceled`
 completion outcomes. C `SporeResult` and Go `CallError` retain their transport
 status while exposing the same `spore.error.v1` body used by CLI failures.
 
-Initial create-log retention (#552), resource-oriented aliases (#553), and
-unrelated behavior changes are explicit non-goals.
+Initial create-log retention (#552) extends the named lifecycle result after
+the original contract work: create and logs share `spore.lifecycle.v1` and its
+optional `initial_command` object instead of adding a parallel result shape.
+Resource-oriented aliases (#553) and unrelated behavior changes remain
+non-goals.
 
 ## Delivery strategy
 
@@ -80,6 +83,10 @@ unrelated behavior changes are explicit non-goals.
   aggregate. Only an abnormal child termination fails the aggregate operation.
 - Require an exact C ABI match in Go because an additive C struct change can be
   unsafe even when a newer library still implements every older function.
+- Represent retained initial-command output as an optional nested lifecycle
+  value because create first reports disposition and startup, while logs later
+  fills process status, bounded bytes, and truncation without changing the
+  envelope or treating a guest exit as a lifecycle failure.
 
 ## Key learnings from pressure-testing
 
