@@ -1018,12 +1018,7 @@ fn runLargeCopySmoke(init: std.process.Init, allocator: std.mem.Allocator, io: I
     var parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(copy_storage));
     defer parsed.deinit();
     const last_logical_chunk = copy_storage.logical_size / copy_storage.chunk_size - 1;
-    var zero_tail = false;
-    for (parsed.value.zero_chunks) |logical_chunk| if (logical_chunk == last_logical_chunk) {
-        zero_tail = true;
-        break;
-    };
-    if (!zero_tail) return error.ExpectedLargeStageCopyZeroTailWithoutObject;
+    if (!disk_index.isZeroChunk(parsed.value, last_logical_chunk)) return error.ExpectedLargeStageCopyZeroTailWithoutObject;
 
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = dockerfile_path,

@@ -172,7 +172,7 @@ pub const MemoryBacking = struct {
 pub const MemoryChunk = disk_index.DiskIndexChunk;
 
 pub const MemoryManifest = struct {
-    kind: []const u8 = disk_index.disk_index_kind,
+    kind: []const u8 = disk_index.disk_index_kind_v1,
     logical_size: u64,
     chunk_size: u64,
     hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
@@ -2996,7 +2996,7 @@ test "memory round-trips through the chunk store with zero elision" {
     ram[ram.len - 1] = 0xEE; // tail chunk non-zero
 
     const mm = try saveMemory(arena, dir, ram);
-    try std.testing.expectEqualStrings(disk_index.disk_index_kind, mm.kind);
+    try std.testing.expectEqualStrings(disk_index.disk_index_kind_v1, mm.kind);
     try std.testing.expectEqual(@as(u64, ram.len), mm.logical_size);
     try std.testing.expectEqual(@as(usize, 3), mm.chunks.len);
     try std.testing.expectEqual(@as(u64, 0), mm.chunks[0].logical_chunk);

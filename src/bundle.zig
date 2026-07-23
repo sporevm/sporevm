@@ -1961,7 +1961,7 @@ fn loadDiskIndexForEntry(
     bundle_dir: []const u8,
     entry: RootfsStorageEntry,
     storage: spore.RootfsStorage,
-) Error!std.json.Parsed(disk_index.DiskIndex) {
+) Error!disk_index.ParsedDiskIndex {
     const expected_path = try rootfsStorageIndexRelPath(allocator, entry.index_digest);
     defer allocator.free(expected_path);
     if (!std.mem.eql(u8, entry.index_path, expected_path)) return error.BadManifest;
@@ -2159,7 +2159,7 @@ fn loadDiskIndexForDisk(
     allocator: std.mem.Allocator,
     bundle_dir: []const u8,
     storage: spore.RootfsStorage,
-) Error!std.json.Parsed(disk_index.DiskIndex) {
+) Error!disk_index.ParsedDiskIndex {
     const index_rel = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
     const disk_index_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, index_rel });
     const index_bytes = try readFileAllNoSymlink(allocator, disk_index_path, disk_index.max_index_bytes);
@@ -3244,7 +3244,7 @@ fn parseRootfsDiskIndexForStorage(
     allocator: std.mem.Allocator,
     index_bytes: []const u8,
     storage: spore.RootfsStorage,
-) Error!std.json.Parsed(disk_index.DiskIndex) {
+) Error!disk_index.ParsedDiskIndex {
     const descriptor = spore.diskIndexDescriptorForStorage(storage) catch |err| return rootfsError(err);
     return disk_index.parseDiskIndex(allocator, index_bytes, descriptor) catch |err| return rootfsError(err);
 }

@@ -542,7 +542,7 @@ fn readDiskIndex(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     storage: spore.RootfsStorage,
-) !std.json.Parsed(disk_index.DiskIndex) {
+) !disk_index.ParsedDiskIndex {
     try spore.validateRootfsStorageDescriptor(storage);
     const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);

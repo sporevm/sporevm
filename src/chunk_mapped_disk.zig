@@ -901,10 +901,6 @@ pub const ChunkMappedDisk = struct {
             const chunk_index: usize = @intCast(entry.logical_chunk);
             next_sources[chunk_index] = .cas;
         }
-        for (index.zero_chunks) |logical_chunk| {
-            if (logical_chunk >= self.sources.len) return error.BadManifest;
-        }
-
         return .{
             .sources = next_sources,
             .cas_root = next_root,
@@ -1773,10 +1769,7 @@ fn expectChunkDigest(index: disk_index.DiskIndex, logical_chunk: u64, digest: []
 }
 
 fn expectZeroChunk(index: disk_index.DiskIndex, logical_chunk: u64) !void {
-    for (index.zero_chunks) |zero_chunk| {
-        if (zero_chunk == logical_chunk) return;
-    }
-    return error.TestExpectedEqual;
+    try std.testing.expect(disk_index.isZeroChunk(index, logical_chunk));
 }
 
 test "sparse raw digest index reduces dense lazy runtime ownership" {

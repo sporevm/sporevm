@@ -509,10 +509,7 @@ pub fn removeStorageCompleteStampsReferencingObjects(
             else => |e| return e,
         };
         defer allocator.free(bytes);
-        const parsed = std.json.parseFromSlice(disk_index.DiskIndex, allocator, bytes, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        }) catch |err| switch (err) {
+        const parsed = disk_index.parseSelfDescribedDiskIndex(allocator, bytes) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => continue,
         };
@@ -768,7 +765,7 @@ fn parseStorageDiskIndex(
     allocator: std.mem.Allocator,
     bytes: []const u8,
     storage: spore.RootfsStorage,
-) !std.json.Parsed(disk_index.DiskIndex) {
+) !disk_index.ParsedDiskIndex {
     return disk_index.parseDiskIndex(allocator, bytes, try spore.diskIndexDescriptorForStorage(storage));
 }
 
