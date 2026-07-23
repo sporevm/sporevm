@@ -10,6 +10,7 @@ const aarch64_topology = @import("aarch64/topology.zig");
 const architecture = @import("architecture.zig");
 const backend_mod = @import("backend.zig");
 const bundle = @import("bundle.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
@@ -1444,11 +1445,17 @@ pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: Clone
     const arena = arena_state.allocator();
 
     var stage_root: ?[]const u8 = null;
+    if (std.Io.Dir.cwd().statFile(context.io, options.out_dir, .{ .follow_symlinks = false })) |_| {
+        return error.AlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    }
     for (0..16) |_| {
         var nonce: [8]u8 = undefined;
         context.io.random(&nonce);
         const candidate = try std.fmt.allocPrint(arena, "{s}.clone-stage-{x}", .{ options.out_dir, std.mem.readInt(u64, &nonce, .little) });
-        Io.Dir.cwd().createDir(context.io, candidate, .default_dir) catch |err| switch (err) {
+        std.Io.Dir.cwd().createDir(context.io, candidate, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => continue,
             else => |e| return e,
         };
@@ -1458,6 +1465,7 @@ pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: Clone
     const owned_stage_root = stage_root orelse return error.PathAlreadyExists;
     defer std.Io.Dir.cwd().deleteTree(context.io, owned_stage_root) catch {};
     const bundle_dir = try std.fs.path.join(arena, &.{ owned_stage_root, "bundle" });
+    const staged_output = try std.fs.path.join(arena, &.{ owned_stage_root, "output" });
 
     _ = try pack(context, arena, .{
         .spore_dir = options.spore_dir,
@@ -1466,9 +1474,15 @@ pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: Clone
     });
     _ = try unpack(context, arena, .{
         .bundle_dir = bundle_dir,
-        .out_dir = options.out_dir,
+        .out_dir = staged_output,
         .rootfs_cache = options.rootfs_cache,
     });
+    try chunk_sealer.fsyncDirPath(arena, staged_output);
+    std.Io.Dir.renamePreserve(std.Io.Dir.cwd(), staged_output, std.Io.Dir.cwd(), options.out_dir, context.io) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.AlreadyExists,
+        else => |e| return e,
+    };
+    try chunk_sealer.fsyncDirPath(arena, std.fs.path.dirname(options.out_dir) orelse ".");
     return .{ .source = options.spore_dir, .out_dir = options.out_dir };
 }
 
@@ -1507,11 +1521,11 @@ test "clone spore makes a pinned save independently portable" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, try std.fs.path.join(arena, &.{ output, saved_spore_pin.reference_file }), .{ .follow_symlinks = false }));
 
     const occupied = try std.fs.path.join(arena, &.{ root, "occupied.spore" });
-    try Io.Dir.cwd().createDirPath(io, occupied);
+    try std.Io.Dir.cwd().createDirPath(io, occupied);
     const sentinel = try std.fs.path.join(arena, &.{ occupied, "keep" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "owned elsewhere" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "owned elsewhere" });
     try std.testing.expectError(error.AlreadyExists, cloneSpore(.{ .io = io, .environ_map = &env }, allocator, .{ .spore_dir = source, .out_dir = occupied }));
-    try std.testing.expectEqualStrings("owned elsewhere", try Io.Dir.cwd().readFileAlloc(io, sentinel, arena, .limited(64)));
+    try std.testing.expectEqualStrings("owned elsewhere", try std.Io.Dir.cwd().readFileAlloc(io, sentinel, arena, .limited(64)));
 }
 
 /// Push a bundle to a remote destination.
