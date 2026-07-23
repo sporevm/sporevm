@@ -80,6 +80,8 @@ pub const BuildCacheMountStats = struct {
 };
 
 pub const RootfsSystemSummary = struct {
+    schema: []const u8 = "spore.system.df.result.v1",
+    schema_version: u32 = 1,
     cache_root: []const u8,
     image_rootfs: CacheStats = .{},
     linked_image_rootfs: CacheStats = .{},
@@ -127,6 +129,8 @@ pub const RootfsPruneEntry = struct {
 };
 
 pub const RootfsPruneResult = struct {
+    schema: []const u8 = "spore.system.prune.result.v1",
+    schema_version: u32 = 1,
     cache_root: []const u8,
     dry_run: bool,
     include_digest_artifacts: bool,
@@ -158,6 +162,8 @@ pub const RootfsGcEntry = struct {
 };
 
 pub const RootfsGcResult = struct {
+    schema: []const u8 = "spore.cache.gc.result.v1",
+    schema_version: u32 = 1,
     cache_root: []const u8,
     dry_run: bool,
     rooted_indexes: usize = 0,
@@ -229,6 +235,8 @@ pub const RuntimeForkPruneEntry = struct {
 };
 
 pub const RuntimeForkPruneResult = struct {
+    schema: []const u8 = "spore.runtime-fork.prune.result.v1",
+    schema_version: u32 = 1,
     runtime_root: []const u8,
     dry_run: bool,
     older_than_seconds: ?u64 = null,
@@ -467,7 +475,12 @@ pub fn cacheRun(
         const registry = try saved_spore_pin.LockedRegistry.init(init.arena.allocator(), root, &lock);
         if (mode != .json) try stderr.print("warning: force-unpinning {s} may invalidate every raw copy that shares this pin\n", .{args[1]});
         try saved_spore_pin.remove(init.io, init.arena.allocator(), registry, args[1]);
-        const result = struct { action: []const u8 = "unpinned", id: []const u8 }{ .id = args[1] };
+        const result = struct {
+            schema: []const u8 = "spore.cache.unpin.result.v1",
+            schema_version: u32 = 1,
+            action: []const u8 = "unpinned",
+            id: []const u8,
+        }{ .id = args[1] };
         if (mode == .json) try machine_output.writeJson(init.arena.allocator(), stdout, result) else {
             try stdout.print("unpinned {s}\n", .{args[1]});
             try stdout.flush();
@@ -479,7 +492,11 @@ pub fn cacheRun(
 }
 
 fn writePinListings(allocator: std.mem.Allocator, writer: *Io.Writer, entries: []const saved_spore_pin.Listing, mode: machine_output.Mode) !void {
-    if (mode == .json) return machine_output.writeJson(allocator, writer, entries);
+    if (mode == .json) return machine_output.writeJson(allocator, writer, .{
+        .schema = "spore.cache.pins.result.v1",
+        .schema_version = @as(u32, 1),
+        .entries = entries,
+    });
     for (entries) |entry| try writer.print("{s}\t{s}\t{s}\n", .{ entry.id, @tagName(entry.state), entry.index_digest orelse "-" });
     try writer.flush();
 }
@@ -2540,11 +2557,17 @@ test "cache pins renders exact text and JSON health states" {
     var json_out: Io.Writer.Allocating = .init(allocator);
     defer json_out.deinit();
     try writePinListings(allocator, &json_out.writer, &entries, .json);
-    var parsed = try std.json.parseFromSlice([]saved_spore_pin.Listing, allocator, json_out.written(), .{ .allocate = .alloc_always });
+    const Result = struct {
+        schema: []const u8,
+        schema_version: u32,
+        entries: []saved_spore_pin.Listing,
+    };
+    var parsed = try std.json.parseFromSlice(Result, allocator, json_out.written(), .{ .allocate = .alloc_always });
     defer parsed.deinit();
-    try std.testing.expectEqual(saved_spore_pin.ListingState.index_valid, parsed.value[0].state);
-    try std.testing.expectEqual(saved_spore_pin.ListingState.missing, parsed.value[1].state);
-    try std.testing.expectEqual(saved_spore_pin.ListingState.corrupt, parsed.value[2].state);
+    try std.testing.expectEqualStrings("spore.cache.pins.result.v1", parsed.value.schema);
+    try std.testing.expectEqual(saved_spore_pin.ListingState.index_valid, parsed.value.entries[0].state);
+    try std.testing.expectEqual(saved_spore_pin.ListingState.missing, parsed.value.entries[1].state);
+    try std.testing.expectEqual(saved_spore_pin.ListingState.corrupt, parsed.value.entries[2].state);
 }
 
 fn createCacheMountFixture(io: Io, allocator: std.mem.Allocator, root: []const u8, logical_bytes: u64) !std.c.fd_t {

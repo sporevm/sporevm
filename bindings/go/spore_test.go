@@ -26,8 +26,8 @@ func TestBuildInfo(t *testing.T) {
 	if info.Version == "" {
 		t.Fatal("empty version")
 	}
-	if info.ABIVersion < minABIVersion {
-		t.Fatalf("ABI version %d < %d", info.ABIVersion, minABIVersion)
+	if info.ABIVersion != requiredABIVersion {
+		t.Fatalf("ABI version %d != %d", info.ABIVersion, requiredABIVersion)
 	}
 }
 
@@ -116,6 +116,9 @@ func TestRemoveSavedValidationAndResultContract(t *testing.T) {
 	var callErr *CallError
 	if !errors.As(err, &callErr) || callErr.Code == Success || callErr.Message == "" {
 		t.Fatalf("RemoveSaved error = %v", err)
+	}
+	if callErr.FailureCode != "object.not_found" || callErr.Scope != "object" || callErr.Retry != "after_fix" || callErr.Retryable {
+		t.Fatalf("RemoveSaved structured error = %#v", callErr)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -632,7 +635,7 @@ func TestExecNamedStreamFakeMonitor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.Type != ExecNamedStreamExit || event.ExitCode != 7 {
+	if event.Type != ExecNamedStreamCompletion || event.Outcome != OutcomeCompleted || event.ExitCode != 7 {
 		t.Fatalf("exit event = %#v", event)
 	}
 	if err := <-serverDone; err != nil {
@@ -655,8 +658,29 @@ func TestExecNamedStreamFakeMonitor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if event.Type != ExecNamedStreamExit || event.ExitCode != 0 {
+	if event.Type != ExecNamedStreamCompletion || event.Outcome != OutcomeCompleted || event.ExitCode != 0 {
 		t.Fatalf("default-close exit event = %#v", event)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+
+	serverDone = make(chan error, 1)
+	go func() {
+		serverDone <- serveExecStreamInterruptedFakeMonitor(listener)
+	}()
+	interruptedStream, err := client.OpenExecNamedStream(context.Background(), ExecNamedStreamOptions{
+		Name: "stream-box",
+		Argv: []string{"/bin/true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer interruptedStream.Close()
+	_, err = interruptedStream.Next(context.Background())
+	var callErr *CallError
+	if !errors.As(err, &callErr) || callErr.FailureCode != "stream.interrupted" || callErr.Scope != "stream" || callErr.Retry != "unknown" {
+		t.Fatalf("interrupted stream error = %#v (%v)", callErr, err)
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
@@ -856,6 +880,30 @@ func serveExecStreamDefaultCloseFakeMonitor(listener net.Listener) error {
 
 	var exitPayload [4]byte
 	return writeSPIOFrame(conn, spioExit, spioControl, 0, exitPayload[:])
+}
+
+func serveExecStreamInterruptedFakeMonitor(listener net.Listener) error {
+	if err := serveFakeMonitorHello(listener); err != nil {
+		return err
+	}
+
+	conn, err := listener.Accept()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadBytes('\n'); err != nil {
+		return err
+	}
+	frame, err := readSPIOFrame(reader)
+	if err != nil {
+		return err
+	}
+	if frame.Type != spioClose || frame.StreamID != spioStdin {
+		return fmt.Errorf("bad interrupted-stream stdin close frame: %#v", frame)
+	}
+	return nil
 }
 
 func serveFakeMonitorHello(listener net.Listener) error {

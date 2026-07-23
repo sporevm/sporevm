@@ -51,6 +51,8 @@ pub const PullOptions = struct {
 pub const default_platform = gateway.Platform{ .os = "linux", .arch = .arm64 };
 
 pub const PullResult = struct {
+    schema: []const u8 = "spore.image.pull.result.v1",
+    schema_version: u32 = 1,
     resolved_image_ref: []const u8,
     image_digest: []const u8,
     objects_fetched: usize,
@@ -65,6 +67,8 @@ pub const ExportFixtureOptions = struct {
 };
 
 pub const ExportFixtureResult = struct {
+    schema: []const u8 = "spore.image.fixture.result.v1",
+    schema_version: u32 = 1,
     manifest_digest: []const u8,
     image_digest: []const u8,
     object_count: usize,

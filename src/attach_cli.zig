@@ -16,8 +16,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         return;
     }
 
-    const opts = try attach_mod.parseCliArgs(args);
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "attach");
+    if (requestsJsonl(args)) attach_mod.cli_setup_events = event_writer.sink();
+    defer attach_mod.cli_setup_events = null;
+    const opts = try attach_mod.parseCliArgs(args);
     const events: ?api.EventSink = if (opts.event_mode == .jsonl) event_writer.sink() else null;
     const arena = init.arena.allocator();
     const full_args = try init.minimal.args.toSlice(arena);
@@ -66,6 +68,14 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
     const code = result.processExitCode();
     if (code != 0) std.process.exit(code);
+}
+
+fn requestsJsonl(args: []const []const u8) bool {
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--events=jsonl")) return true;
+        if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
+    }
+    return false;
 }
 
 fn runtimeDebugEnabled(args: []const []const u8) bool {

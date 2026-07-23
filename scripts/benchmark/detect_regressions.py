@@ -236,7 +236,14 @@ def parse_legacy_time_log(path: Path) -> dict[str, Any]:
             event = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict) and event.get("event") == "exit" and isinstance(event.get("timings"), dict):
+        if (
+            isinstance(event, dict)
+            and (
+                event.get("event") == "exit"
+                or (event.get("event") == "completion" and event.get("outcome") == "completed")
+            )
+            and isinstance(event.get("timings"), dict)
+        ):
             for key, value in event["timings"].items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     row[str(key)] = float(value)

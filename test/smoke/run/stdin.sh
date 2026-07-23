@@ -46,9 +46,9 @@ grep -Fq '"data_base64":"aGk="' "${workdir}/events.jsonl" || {
   cat "${workdir}/events.jsonl" >&2 || true
   die "spore run -i --events=jsonl stdout payload did not match stdin"
 }
-grep -Fq '"event":"exit"' "${workdir}/events.jsonl" || {
+grep -Fq '"event":"completion","outcome":"completed"' "${workdir}/events.jsonl" || {
   cat "${workdir}/events.jsonl" >&2 || true
-  die "spore run -i --events=jsonl did not emit exit event"
+  die "spore run -i --events=jsonl did not emit a completed completion event"
 }
 [[ ! -s "${workdir}/events.stderr" ]] || {
   cat "${workdir}/events.stderr" >&2 || true

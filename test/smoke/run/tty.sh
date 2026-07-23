@@ -42,15 +42,15 @@ import re
 import sys
 
 terminal = bytearray()
-saw_exit = False
+saw_completion = False
 exit_code = None
 with open(sys.argv[1], "rb") as f:
     for raw in f:
         event = json.loads(raw)
         if event.get("event") == "terminal":
             terminal.extend(base64.b64decode(event["data_base64"]))
-        elif event.get("event") == "exit":
-            saw_exit = True
+        elif event.get("event") == "completion" and event.get("outcome") == "completed":
+            saw_completion = True
             exit_code = event.get("exit_code")
 
 data = bytes(terminal)
@@ -58,8 +58,8 @@ if b"tty-ok" not in data:
     raise SystemExit(f"terminal event payload missing tty-ok: {data!r}")
 if re.search(rb"(^|\r?\n)[0-9]+ [0-9]+(\r?\n|$)", data) is None:
     raise SystemExit(f"terminal event payload missing stty size: {data!r}")
-if not saw_exit or exit_code != 0:
-    raise SystemExit(f"missing successful exit event: saw_exit={saw_exit} exit_code={exit_code!r}")
+if not saw_completion or exit_code != 0:
+    raise SystemExit(f"missing successful completion event: saw_completion={saw_completion} exit_code={exit_code!r}")
 PY
 
 echo "smoke:run-tty ok"

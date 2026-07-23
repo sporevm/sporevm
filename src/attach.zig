@@ -25,6 +25,7 @@ const vsock = @import("virtio/vsock.zig");
 pub const Backend = run_mod.Backend;
 const default_attach_guest_port: u32 = 10700;
 const default_attach_timeout_ms: u64 = 30_000;
+pub var cli_setup_events: ?run_mod.EventSink = null;
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -79,8 +80,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
             i += 1;
             backend = Backend.parse(args[i]) orelse {
-                std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--backend must be auto, hvf, or kvm", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--session") and i + 1 < args.len) {
             i += 1;
@@ -95,29 +95,24 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--bind-service") and i + 1 < args.len) {
             i += 1;
             bound_services.append(spore_net_policy.parseBoundServiceBinding(args[i]) catch |err| {
-                std.debug.print("spore attach: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
-                std.process.exit(2);
+                failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             }) catch |err| {
-                std.debug.print("spore attach: invalid --bind-service {s}: {s}\n", .{ args[i], @errorName(err) });
-                std.process.exit(2);
+                failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
             event_mode = run_mod.EventMode.parse(args[i]) orelse {
-                std.debug.print("--events must be jsonl\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--events must be jsonl", .{});
             };
         } else if (std.mem.startsWith(u8, args[i], "--events=")) {
             const raw = args[i]["--events=".len..];
             event_mode = run_mod.EventMode.parse(raw) orelse {
-                std.debug.print("--events must be jsonl\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--events must be jsonl", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout_ms = run_mod.parseDurationMs(args[i]) catch {
-                std.debug.print("--timeout expects a duration like 30s, 500ms, or 1m\n", .{});
-                std.process.exit(2);
+                failAttachSetup("--timeout expects a duration like 30s, 500ms, or 1m", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
             i += 1;
@@ -130,16 +125,13 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             interactive = true;
             tty = true;
         } else if (std.mem.eql(u8, args[i], "--count")) {
-            std.debug.print("spore attach attaches exactly one spore; use spore fork --count N --out DIR, then attach each child\n", .{});
-            std.process.exit(2);
+            failAttachSetup("spore attach attaches exactly one spore; use spore fork --count N --out DIR, then attach each child", .{});
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
-            std.process.exit(2);
+            failAttachSetup("unknown attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (spore_dir == null) {
             spore_dir = args[i];
         } else {
-            std.debug.print("unexpected attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
-            std.process.exit(2);
+            failAttachSetup("unexpected attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
         }
     }
 
@@ -149,8 +141,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         .generation_path = generation_path,
         .event_mode = event_mode,
         .spore_dir = spore_dir orelse {
-            std.debug.print("{s}", .{cli_usage});
-            std.process.exit(2);
+            failAttachSetup("{s}", .{cli_usage});
         },
         .timeout_ms = timeout_ms,
         .bound_services = bound_services,
@@ -189,13 +180,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .terminal = opts.tty,
     });
 
-    var binding_diagnostic = run_mod.BoundServiceBindingDiagnostic{};
-    const network_options = run_mod.networkOptionsFromManifestWithBindingDiagnostic(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice(), &binding_diagnostic) catch |err| switch (err) {
-        error.MissingBoundServiceBinding => failAttachSetup("spore attach: manifest requires live bound Unix service binding '{s}'", .{binding_diagnostic.missing_name orelse "unknown"}),
-        error.UnexpectedBoundServiceBinding => failAttachSetup("spore attach: live bound Unix service binding '{s}' does not match the manifest", .{binding_diagnostic.unexpected_name orelse "unknown"}),
-        error.DuplicateBoundServiceBinding => failAttachSetup("spore attach: duplicate live bound Unix service binding '{s}'", .{binding_diagnostic.duplicate_name orelse "unknown"}),
-        else => failAttachSetup("spore attach: invalid network policy in manifest", .{}),
-    };
+    const network_options = try run_mod.networkOptionsFromManifestWithBindings(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice());
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (network_options.network == .spore) {
@@ -209,7 +194,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     const devices = if (parsed) |manifest| manifest.value.devices else parsed_v1.?.value.devices;
     const rootfs = if (parsed) |manifest| manifest.value.rootfs else parsed_v1.?.value.rootfs;
     const disk = if (parsed) |manifest| manifest.value.disk else parsed_v1.?.value.disk;
-    validateAttachDiskManifestParts(devices, rootfs, disk);
+    try validateAttachDiskManifestParts(devices, rootfs, disk);
     var runtime_disk_state = try runtime_disk.open(context, allocator, .{
         .rootfs = rootfs,
         .disk = disk,
@@ -217,11 +202,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     });
     defer runtime_disk_state.deinit();
     const generation_params = if (opts.generation_path) |path|
-        loadGenerationParams(context.io, allocator, path) catch |err| switch (err) {
-            error.BadGenerationPayload => failAttachSetup("spore attach: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id", .{}),
-            error.StreamTooLong => failAttachSetup("spore attach: --generation payload exceeds {d} bytes", .{generation.params_size}),
-            else => |e| failAttachSetup("spore attach: cannot read --generation {s}: {s}", .{ path, @errorName(e) }),
-        }
+        try loadGenerationParams(context.io, allocator, path)
     else
         null;
     const manifest_generation = if (parsed) |manifest| manifest.value.generation else parsed_v1.?.value.generation;
@@ -359,12 +340,10 @@ fn identityProbeOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes
 
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     const parsed = std.fmt.parseInt(T, raw, 10) catch {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
+        failAttachSetup("{s} must be a positive integer", .{name});
     };
     if (parsed == 0) {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
+        failAttachSetup("{s} must be a positive integer", .{name});
     }
     return parsed;
 }
@@ -447,26 +426,31 @@ fn prepareAttach(allocator: std.mem.Allocator, manifest_generation: spore.Genera
     };
 }
 
-fn validateAttachDiskManifestParts(devices: []const spore.TransportState, rootfs_opt: ?spore.Rootfs, disk_opt: ?spore.Disk) void {
+fn validateAttachDiskManifestParts(devices: []const spore.TransportState, rootfs_opt: ?spore.Rootfs, disk_opt: ?spore.Disk) !void {
     const disk_count = spore.countBlockDevices(devices);
     if (disk_count == 0) return;
     if (disk_count != 1) {
-        failAttachSetup("spore attach: only one immutable rootfs disk is supported; found {d} block devices", .{disk_count});
+        return error.UnsupportedRootfsDeviceCount;
     }
     const rootfs = rootfs_opt orelse {
-        failAttachSetup("spore attach: disk-backed spore has no immutable rootfs artifact; save with spore run --image or use the backend harness with the original disk", .{});
+        return error.MissingRootfsArtifact;
     };
-    spore.validateRootfs(rootfs, devices) catch {
-        failAttachSetup("spore attach: invalid immutable rootfs metadata in manifest", .{});
-    };
+    try spore.validateRootfs(rootfs, devices);
     if (disk_opt) |writable_disk| {
-        spore.validateDisk(writable_disk, rootfs, devices) catch {
-            failAttachSetup("spore attach: invalid writable disk metadata in manifest", .{});
-        };
+        try spore.validateDisk(writable_disk, rootfs, devices);
     }
 }
 
 fn failAttachSetup(comptime fmt: []const u8, args: anytype) noreturn {
+    if (cli_setup_events) |sink| {
+        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "spore attach: setup failed";
+        sink.emit(.{ .failure = .{
+            .command = "attach",
+            .backend = null,
+            .classified = run_mod.ClassifiedFailure.init(.usage_invalid_argument, message, "attach"),
+        } }) catch {};
+        std.process.exit(2);
+    }
     std.debug.print(fmt ++ "\n", args);
     std.process.exit(2);
 }
@@ -686,7 +670,7 @@ test "attach accepts writable disk manifests for layered runtime setup" {
         .queues = &.{},
     }};
     const without_disk = testDiskGuardManifest(&devices, false);
-    validateAttachDiskManifestParts(without_disk.devices, without_disk.rootfs, without_disk.disk);
+    try validateAttachDiskManifestParts(without_disk.devices, without_disk.rootfs, without_disk.disk);
     const with_disk = testDiskGuardManifest(&devices, true);
-    validateAttachDiskManifestParts(with_disk.devices, with_disk.rootfs, with_disk.disk);
+    try validateAttachDiskManifestParts(with_disk.devices, with_disk.rootfs, with_disk.disk);
 }

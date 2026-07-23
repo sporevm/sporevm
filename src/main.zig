@@ -195,7 +195,10 @@ fn runCommand(
     mode: machine_output.Mode,
 ) !void {
     if (mode == .json and !supportsJson(command)) {
-        const message = allocMessage(arena, "spore --json does not support command: {s}", .{command});
+        const message = if (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "exec") or std.mem.eql(u8, command, "fanout"))
+            allocMessage(arena, "spore --json {s} is not supported; use --events=jsonl for stream events", .{command})
+        else
+            allocMessage(arena, "spore --json does not support command: {s}", .{command});
         exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
     }
 
@@ -209,27 +212,23 @@ fn runCommand(
     } else if (std.mem.eql(u8, command, "cache")) {
         try spore_internal.system.cacheRun(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rootfs")) {
-        try spore_internal.rootfs_cli.run(init, command_args, stdout);
+        try spore_internal.rootfs_cli.run(init, command_args, stdout, mode);
     } else if (std.mem.eql(u8, command, "image")) {
-        try spore_internal.image_gateway_cli.run(init, command_args, stdout);
+        try spore_internal.image_gateway_cli.run(init, command_args, stdout, mode);
     } else if (std.mem.eql(u8, command, "build")) {
-        try spore_internal.build_cli.run(init, command_args, stdout, stderr);
+        try spore_internal.build_cli.run(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "run")) {
         try spore_internal.run_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "attach")) {
-        if (mode == .json) {
-            const message = "spore --json attach is not supported; use --events=jsonl for attach stream events";
-            exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "attach"), message);
-        }
         try spore_internal.attach_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "create")) {
         try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "exec")) {
         try spore_internal.lifecycle.execCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "copy-in")) {
-        try spore_internal.lifecycle.copyInCli(init, command_args, stdout);
+        try spore_internal.lifecycle.copyInCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "copy-out")) {
-        try spore_internal.lifecycle.copyOutCli(init, command_args, stdout);
+        try spore_internal.lifecycle.copyOutCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rm")) {
         try spore_internal.lifecycle.rmCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "save")) {
@@ -247,7 +246,16 @@ fn runCommand(
             try stdout.writeAll("usage: spore version\n");
             return;
         }
-        try writeVersion(stdout, builtin.mode);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, .{
+                .schema = "spore.version.result.v1",
+                .schema_version = @as(u32, 1),
+                .version = spore_internal.version,
+                .build_mode = @tagName(builtin.mode),
+            });
+        } else {
+            try writeVersion(stdout, builtin.mode);
+        }
     } else if (std.mem.eql(u8, command, "host-info")) {
         if (wantsCommandHelp(command_args)) {
             try stdout.writeAll("usage: spore host-info\n");
@@ -431,6 +439,12 @@ fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
 fn supportsJson(command: []const u8) bool {
     return std.mem.eql(u8, command, "system") or
         std.mem.eql(u8, command, "cache") or
+        std.mem.eql(u8, command, "rootfs") or
+        std.mem.eql(u8, command, "image") or
+        std.mem.eql(u8, command, "build") or
+        std.mem.eql(u8, command, "version") or
+        std.mem.eql(u8, command, "copy-in") or
+        std.mem.eql(u8, command, "copy-out") or
         std.mem.eql(u8, command, "create") or
         std.mem.eql(u8, command, "rm") or
         std.mem.eql(u8, command, "restore") or
@@ -1142,6 +1156,12 @@ test "command help accepts standard help spellings" {
 }
 
 test "stable lifecycle commands support global json where output is one document" {
+    try std.testing.expect(supportsJson("build"));
+    try std.testing.expect(supportsJson("rootfs"));
+    try std.testing.expect(supportsJson("image"));
+    try std.testing.expect(supportsJson("version"));
+    try std.testing.expect(supportsJson("copy-in"));
+    try std.testing.expect(supportsJson("copy-out"));
     try std.testing.expect(supportsJson("create"));
     try std.testing.expect(supportsJson("fork"));
     try std.testing.expect(supportsJson("ls"));

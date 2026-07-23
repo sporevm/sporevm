@@ -154,6 +154,7 @@ const exec_usage =
     \\  --workdir PATH          Override the image working directory
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
+    \\  --events=jsonl          Emit schema-versioned output and completion events
     \\  --timing-json PATH      Write named-exec phase timing as JSON
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
@@ -478,7 +479,11 @@ const ExecOptions = struct {
     interactive: bool = false,
     tty: bool = false,
     timing_json_path: ?[]const u8 = null,
+    event_mode: run_mod.EventMode = .none,
 };
+
+var exec_cli_event_writer: ?*run_mod.EventWriter = null;
+var restore_cli_event_writer: ?*run_mod.EventWriter = null;
 
 const SaveOptions = struct {
     name: []const u8,
@@ -504,6 +509,8 @@ const RestoreOptions = struct {
 };
 
 pub const NamedForkResult = struct {
+    schema: []const u8 = "spore.lifecycle.fork.result.v1",
+    schema_version: u32 = 1,
     source: []const u8,
     count: usize,
     children: []const []const u8,
@@ -615,6 +622,12 @@ pub const NamedLifecycleTiming = struct {
     total_ms: u64,
 };
 
+pub const NamedListResult = struct {
+    schema: []const u8 = "spore.lifecycle.list.result.v1",
+    schema_version: u32 = 1,
+    entries: []const ListEntry,
+};
+
 pub const named_exec_timing_schema = "spore.named-exec-timing.v1";
 pub const named_exec_timing_schema_version: u32 = 1;
 
@@ -630,6 +643,8 @@ pub const NamedExecTiming = struct {
 };
 
 pub const ExecNamedResult = struct {
+    schema: []const u8 = "spore.exec.result.v1",
+    schema_version: u32 = 1,
     exit_code: u8,
     stdout: []u8,
     stderr: []u8,
@@ -688,11 +703,11 @@ pub const ExecNamedStream = struct {
     pub fn next(self: *ExecNamedStream) !ExecNamedStreamEvent {
         while (true) {
             var header_buf: [spore_stream.header_len]u8 = undefined;
-            try readFdExact(self.stream.socket.handle, &header_buf);
+            readFdExact(self.stream.socket.handle, &header_buf) catch return error.StreamInterrupted;
             const header = try spore_stream.readHeader(&header_buf);
             if (header.flags != 0 or header.payload_len > self.payload.len) return error.BadMonitorResponse;
             const payload = self.payload[0..header.payload_len];
-            if (payload.len > 0) try readFdExact(self.stream.socket.handle, payload);
+            if (payload.len > 0) readFdExact(self.stream.socket.handle, payload) catch return error.StreamInterrupted;
             switch (header.frame_type) {
                 .data => {
                     const expected = switch (header.stream_id) {
@@ -1878,8 +1893,12 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         try stdout.writeAll(exec_usage);
         return;
     }
-    const parsed = parseExecArgs(args);
     const allocator = init.arena.allocator();
+    var events = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "exec");
+    exec_cli_event_writer = if (requestsJsonl(args)) &events else null;
+    defer exec_cli_event_writer = null;
+    const parsed = parseExecArgs(args);
+    if (parsed.event_mode == .jsonl) return execCliEvents(init, allocator, parsed, &events, stdout);
     var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
     const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
         error.MissingHostEnvironment => {
@@ -1956,21 +1975,103 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     if (result.exit_code != 0) std.process.exit(result.exit_code);
 }
 
-pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: ExecOptions, events: *run_mod.EventWriter, stdout: *Io.Writer) !void {
+    try events.emitStart(.auto);
+    if (parsed.interactive or parsed.tty) {
+        const classified = machine_output.CliError.init(.usage_invalid_argument, "spore exec: --events=jsonl does not support interactive or TTY input", "exec");
+        try events.emitFailure(classified);
+        std.process.exit(classified.exit_code);
+    }
+
+    var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
+    const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| {
+        const classified = run_mod.classifyFailure(err);
+        try events.emitFailure(classified);
+        std.process.exit(classified.exit_code);
+    };
+    const command = run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| {
+        const classified = run_mod.classifyFailure(err);
+        try events.emitFailure(classified);
+        std.process.exit(classified.exit_code);
+    };
+    var stream = openExecNamedStream(.{
+        .io = init.io,
+        .environ_map = init.environ_map,
+    }, allocator, .{
+        .name = parsed.name,
+        .command = command,
+        .guest_env = guest_env,
+        .guest_working_dir = parsed.guest_working_dir,
+    }) catch |err| {
+        const classified = run_mod.classifyFailure(err);
+        try events.emitFailure(classified);
+        std.process.exit(classified.exit_code);
+    };
+    defer stream.deinit();
+
+    var exit_code: u8 = 0;
+    while (true) {
+        const event = stream.next() catch |err| {
+            const classified = run_mod.classifyFailure(err);
+            try events.emitFailure(classified);
+            std.process.exit(classified.exit_code);
+        };
+        switch (event) {
+            .stdout => |bytes| try events.emitOutput(.stdout, bytes),
+            .stderr => |bytes| try events.emitOutput(.stderr, bytes),
+            .terminal => |bytes| try events.emitOutput(.terminal, bytes),
+            .exit => |code| {
+                exit_code = code;
+                try events.emitExecCompletion(code);
+                break;
+            },
+            .err => |bytes| {
+                const classified = machine_output.CliError.init(.runtime_execution_failed, bytes, "exec");
+                try events.emitFailure(classified);
+                std.process.exit(classified.exit_code);
+            },
+        }
+    }
+    if (parsed.timing_json_path) |path| {
+        try writeTimingJson(allocator, init.io, path, .{
+            .schema = named_exec_timing_schema,
+            .schema_version = named_exec_timing_schema_version,
+            .name = parsed.name,
+            .exit_code = exit_code,
+            .timing = stream.timing,
+        });
+    }
+    try stdout.flush();
+    if (exit_code != 0) std.process.exit(exit_code);
+}
+
+fn requestsJsonl(args: []const []const u8) bool {
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--events=jsonl")) return true;
+        if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
+    }
+    return false;
+}
+
+pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(copy_in_usage);
         return;
     }
-    const parsed = parseCopyInArgs(args);
     const allocator = init.arena.allocator();
+    if (args.len != 3) exitLifecycleCliError(allocator, stderr, mode, machine_output.usageMissingArgument(copy_in_usage, "copy-in"), copy_in_usage);
+    validateNameLifecycleCli(allocator, stderr, mode, "copy-in", args[0]);
+    const parsed = CopyNamedOptions{ .name = args[0], .host_path = args[1], .guest_path = args[2] };
 
     var archive = createCopyArchive(allocator, init.io, parsed.host_path) catch |err| {
+        if (mode == .json) return err;
         std.debug.print("spore copy-in: cannot archive host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
         std.process.exit(1);
     };
     defer archive.deinit(init.io);
 
     const source_fd = openHostFileRead(allocator, init.io, archive.path) catch |err| {
+        if (mode == .json) return err;
         std.debug.print("spore copy-in: cannot read transfer archive: {s}\n", .{@errorName(err)});
         exitAfterCopyArchiveCleanup(&archive, init.io, 1);
     };
@@ -1981,10 +2082,12 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         .environ_map = init.environ_map,
     }, allocator, parsed, "copy-in-v1", .{ .input_fd = source_fd }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
+            if (mode == .json) return err;
             archive.deinit(init.io);
             cliRuntimePathExit("copy-in", err);
         },
         error.NamedVmNotReady => {
+            if (mode == .json) return err;
             const detail = lastErrorMessage();
             if (detail.len != 0) {
                 std.debug.print("spore copy-in: {s}\n", .{detail});
@@ -1994,6 +2097,7 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
             exitAfterCopyArchiveCleanup(&archive, init.io, 2);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
+            if (mode == .json) return err;
             const detail = lastErrorMessage();
             if (detail.len != 0) {
                 std.debug.print("spore copy-in: {s}\n", .{detail});
@@ -2004,24 +2108,43 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
         },
         else => |e| return e,
     };
-    if (exit_code != 0) exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+    if (exit_code != 0) {
+        if (mode == .json) {
+            archive.deinit(init.io);
+            const message = "spore copy-in: guest copy operation failed";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "copy-in"), message);
+        }
+        exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+    }
+    if (mode == .json) try machine_output.writeJson(allocator, stdout, .{
+        .schema = "spore.copy.result.v1",
+        .schema_version = @as(u32, 1),
+        .direction = "in",
+        .name = parsed.name,
+        .host_path = parsed.host_path,
+        .guest_path = parsed.guest_path,
+    });
 }
 
-pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(copy_out_usage);
         return;
     }
-    const parsed = parseCopyOutArgs(args);
     const allocator = init.arena.allocator();
+    if (args.len != 3) exitLifecycleCliError(allocator, stderr, mode, machine_output.usageMissingArgument(copy_out_usage, "copy-out"), copy_out_usage);
+    validateNameLifecycleCli(allocator, stderr, mode, "copy-out", args[0]);
+    const parsed = CopyNamedOptions{ .name = args[0], .guest_path = args[1], .host_path = args[2] };
 
     var archive = createEmptyCopyArchive(allocator, init.io) catch |err| {
+        if (mode == .json) return err;
         std.debug.print("spore copy-out: cannot create transfer archive: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer archive.deinit(init.io);
 
     const archive_fd = openHostFileCreate(allocator, archive.path) catch |err| {
+        if (mode == .json) return err;
         std.debug.print("spore copy-out: cannot open transfer archive: {s}\n", .{@errorName(err)});
         exitAfterCopyArchiveCleanup(&archive, init.io, 1);
     };
@@ -2035,10 +2158,12 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
         .environ_map = init.environ_map,
     }, allocator, parsed, "copy-out-v1", .{ .stdout_fd = archive_fd }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
+            if (mode == .json) return err;
             archive.deinit(init.io);
             cliRuntimePathExit("copy-out", err);
         },
         error.NamedVmNotReady => {
+            if (mode == .json) return err;
             const detail = lastErrorMessage();
             if (detail.len != 0) {
                 std.debug.print("spore copy-out: {s}\n", .{detail});
@@ -2048,6 +2173,7 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
             exitAfterCopyArchiveCleanup(&archive, init.io, 2);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
+            if (mode == .json) return err;
             const detail = lastErrorMessage();
             if (detail.len != 0) {
                 std.debug.print("spore copy-out: {s}\n", .{detail});
@@ -2061,11 +2187,27 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
     _ = std.c.close(archive_fd);
     archive_fd_open = false;
 
-    if (exit_code != 0) exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+    if (exit_code != 0) {
+        if (mode == .json) {
+            archive.deinit(init.io);
+            const message = "spore copy-out: guest copy operation failed";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "copy-out"), message);
+        }
+        exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+    }
     extractCopyArchive(allocator, init.io, archive.path, parsed.host_path) catch |err| {
+        if (mode == .json) return err;
         std.debug.print("spore copy-out: cannot write host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
         exitAfterCopyArchiveCleanup(&archive, init.io, 1);
     };
+    if (mode == .json) try machine_output.writeJson(allocator, stdout, .{
+        .schema = "spore.copy.result.v1",
+        .schema_version = @as(u32, 1),
+        .direction = "out",
+        .name = parsed.name,
+        .host_path = parsed.host_path,
+        .guest_path = parsed.guest_path,
+    });
 }
 
 pub fn rmCli(
@@ -2332,9 +2474,11 @@ pub fn restoreCli(
         return;
     }
     const allocator = init.arena.allocator();
+    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
+    restore_cli_event_writer = if (requestsJsonl(args)) &event_writer else null;
+    defer restore_cli_event_writer = null;
     const parsed = parseRestoreArgs(args, allocator, stderr, mode);
     const full_args = try init.minimal.args.toSlice(allocator);
-    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
     if (parsed.event_mode == .jsonl) try event_writer.emitStart(parsed.backend orelse .auto);
     const result = restoreNamed(init, allocator, .{
         .spore_dir = parsed.spore_dir,
@@ -2506,7 +2650,7 @@ pub fn lsCli(
     };
     defer freeListEntries(allocator, entries);
     if (mode == .json) {
-        try machine_output.writeJson(allocator, stdout, entries);
+        try machine_output.writeJson(allocator, stdout, NamedListResult{ .entries = entries });
     } else {
         try writeListEntries(stdout, entries);
     }
@@ -3355,6 +3499,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var interactive = false;
     var tty = false;
     var timing_json_path: ?[]const u8 = null;
+    var event_mode: run_mod.EventMode = .none;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -3389,6 +3534,12 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
             const value = args[i]["--timing-json=".len..];
             if (value.len == 0) usageExit(exec_usage);
             timing_json_path = value;
+        } else if (std.mem.eql(u8, args[i], "--events")) {
+            i += 1;
+            if (i >= args.len) usageExit(exec_usage);
+            event_mode = run_mod.EventMode.parse(args[i]) orelse usageExit(exec_usage);
+        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
+            event_mode = run_mod.EventMode.parse(args[i]["--events=".len..]) orelse usageExit(exec_usage);
         } else if (std.mem.startsWith(u8, args[i], "-")) {
             usageExit(exec_usage);
         } else {
@@ -3407,26 +3558,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         .interactive = interactive,
         .tty = tty,
         .timing_json_path = timing_json_path,
-    };
-}
-
-fn parseCopyInArgs(args: []const []const u8) CopyNamedOptions {
-    if (args.len != 3) usageExit(copy_in_usage);
-    validateNameOrExit("copy-in", args[0]) catch unreachable;
-    return .{
-        .name = args[0],
-        .host_path = args[1],
-        .guest_path = args[2],
-    };
-}
-
-fn parseCopyOutArgs(args: []const []const u8) CopyNamedOptions {
-    if (args.len != 3) usageExit(copy_out_usage);
-    validateNameOrExit("copy-out", args[0]) catch unreachable;
-    return .{
-        .name = args[0],
-        .guest_path = args[1],
-        .host_path = args[2],
+        .event_mode = event_mode,
     };
 }
 
@@ -5784,6 +5916,11 @@ fn wantsHelp(args: []const []const u8) bool {
 }
 
 fn usageExit(comptime text: []const u8) noreturn {
+    if (exec_cli_event_writer) |events| {
+        const classified = machine_output.usageInvalidArgument(text, "exec");
+        events.emitFailure(classified) catch {};
+        std.process.exit(classified.exit_code);
+    }
     std.debug.print("{s}", .{text});
     std.process.exit(2);
 }
@@ -5805,7 +5942,9 @@ fn exitLifecycleCliError(
     err: machine_output.CliError,
     human_text: []const u8,
 ) noreturn {
-    if (mode == .json) {
+    if (restore_cli_event_writer) |events| {
+        events.emitFailure(err) catch {};
+    } else if (mode == .json) {
         machine_output.writeError(allocator, stderr, err) catch {};
     } else {
         stderr.writeAll(human_text) catch {};
@@ -5842,6 +5981,13 @@ fn exitLifecycleRuntimePathError(
 
 fn validateNameOrExit(command: []const u8, name: []const u8) !void {
     validateName(name) catch {
+        if (exec_cli_event_writer) |events| {
+            var buf: [512]u8 = undefined;
+            const message = std.fmt.bufPrint(&buf, "spore {s}: invalid VM name: {s}", .{ command, name }) catch "spore exec: invalid VM name";
+            const classified = machine_output.usageInvalidArgument(message, command);
+            events.emitFailure(classified) catch {};
+            std.process.exit(classified.exit_code);
+        }
         std.debug.print("spore {s}: invalid VM name: {s}\n", .{ command, name });
         std.process.exit(2);
     };
@@ -7037,7 +7183,8 @@ test "named restore event mode emits terminal run event" {
     try events.emitStart(.kvm);
     try emitNamedRestoreExit(&events, .kvm);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"event\":\"exit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"event\":\"completion\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"outcome\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"command\":\"restore\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"exit_code\":0") != null);
 }
@@ -7614,6 +7761,8 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
     });
     try std.testing.expectEqualStrings(
         "{\n" ++
+            "  \"schema\": \"spore.saved.remove.result.v1\",\n" ++
+            "  \"schema_version\": 1,\n" ++
             "  \"action\": \"removed_spore\",\n" ++
             "  \"spore_dir\": \"diskless.spore\",\n" ++
             "  \"pin_id\": \"\",\n" ++
@@ -7630,6 +7779,8 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
     });
     try std.testing.expectEqualStrings(
         "{\n" ++
+            "  \"schema\": \"spore.saved.remove.result.v1\",\n" ++
+            "  \"schema_version\": 1,\n" ++
             "  \"action\": \"removed_spore\",\n" ++
             "  \"spore_dir\": \"disk.spore\",\n" ++
             "  \"pin_id\": \"abc\",\n" ++

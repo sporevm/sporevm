@@ -13,7 +13,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 17;
+const c_abi_version: u32 = 18;
 const reexec_contract_version: u32 = 1;
 const reexec_role_env = "SPORE_REEXEC_ROLE";
 const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
@@ -35,8 +35,10 @@ const remove_saved_options_version: u32 = 1;
 const stream_event_stdout: c_int = 1;
 const stream_event_stderr: c_int = 2;
 const stream_event_terminal: c_int = 3;
-const stream_event_exit: c_int = 4;
-const stream_event_error: c_int = 5;
+const stream_event_completion: c_int = 4;
+const outcome_completed: c_int = 1;
+const outcome_failed: c_int = 2;
+const outcome_canceled: c_int = 3;
 
 const ReexecOptions = struct {
     cleanup_fds: bool = true,
@@ -201,6 +203,8 @@ const SporeExecNamedStreamEvent = extern struct {
     type: c_int,
     bytes: SporeString,
     exit_code: u8,
+    outcome: c_int,
+    error_json: SporeString,
 };
 
 const SporeCopyNamedOptions = extern struct {
@@ -254,6 +258,7 @@ const SporeRemoveSavedOptions = extern struct {
 
 const SporeExecNamedStreamImpl = struct {
     stream: libspore.ExecNamedStream,
+    completion_error_json: []u8 = &.{},
 };
 
 const SporeContextImpl = struct {
@@ -261,6 +266,7 @@ const SporeContextImpl = struct {
     env: std.process.Environ.Map,
     threaded: std.Io.Threaded,
     last_error: []u8 = &.{},
+    last_error_json: []u8 = &.{},
 
     fn productContext(self: *SporeContextImpl) libspore.Context {
         return .{
@@ -275,13 +281,16 @@ const SporeContextImpl = struct {
 
     fn clearLastError(self: *SporeContextImpl) void {
         if (self.last_error.len != 0) self.allocator.free(self.last_error);
+        if (self.last_error_json.len != 0) self.allocator.free(self.last_error_json);
         self.last_error = &.{};
+        self.last_error_json = &.{};
         libspore.clearLastLifecycleError();
     }
 
-    fn setLastError(self: *SporeContextImpl, message: []const u8) void {
+    fn setLastFailure(self: *SporeContextImpl, classified: libspore.ClassifiedFailure) void {
         self.clearLastError();
-        self.last_error = self.allocator.dupe(u8, message) catch &.{};
+        self.last_error = self.allocator.dupe(u8, classified.message) catch &.{};
+        self.last_error_json = std.json.Stringify.valueAlloc(self.allocator, classified.envelope(), .{}) catch &.{};
     }
 };
 
@@ -534,6 +543,11 @@ pub export fn spore_context_free(context: ?*SporeContextImpl) void {
 pub export fn spore_context_last_error(context: ?*SporeContextImpl) SporeString {
     const ctx = context orelse return .{};
     return borrowString(ctx.last_error);
+}
+
+pub export fn spore_context_last_error_json(context: ?*SporeContextImpl) SporeString {
+    const ctx = context orelse return .{};
+    return borrowString(ctx.last_error_json);
 }
 
 pub export fn spore_context_set_env(context: ?*SporeContextImpl, name: SporeString, value: SporeString) c_int {
@@ -850,11 +864,11 @@ pub export fn spore_exec_named_stream_open(
             .cols = if (opts.terminal_cols == 0) 80 else opts.terminal_cols,
         },
     }) catch |err| return fail(ctx, err);
-    errdefer {
+    const handle = ctx.allocator.create(SporeExecNamedStreamImpl) catch |err| {
         var cleanup = stream;
         cleanup.deinit();
-    }
-    const handle = ctx.allocator.create(SporeExecNamedStreamImpl) catch |err| return fail(ctx, err);
+        return fail(ctx, err);
+    };
     handle.* = .{ .stream = stream };
     out.* = handle;
     return result_success;
@@ -868,16 +882,44 @@ pub export fn spore_exec_named_stream_next(
     const ctx = context orelse return result_invalid_value;
     const handle = stream orelse return fail(ctx, error.InvalidValue);
     const out = out_event orelse return fail(ctx, error.InvalidValue);
-    out.* = .{ .type = 0, .bytes = .{}, .exit_code = 0 };
+    if (handle.completion_error_json.len != 0) {
+        ctx.allocator.free(handle.completion_error_json);
+        handle.completion_error_json = &.{};
+    }
+    out.* = .{ .type = 0, .bytes = .{}, .exit_code = 0, .outcome = 0, .error_json = .{} };
     ctx.clearLastError();
 
-    const event = handle.stream.next() catch |err| return fail(ctx, err);
+    const event = handle.stream.next() catch |err| {
+        const classified = libspore.classifyFailure(err);
+        if (classified.code == .operation_canceled) {
+            handle.completion_error_json = std.json.Stringify.valueAlloc(ctx.allocator, classified.envelope(), .{}) catch |alloc_err| return fail(ctx, alloc_err);
+            out.* = .{
+                .type = stream_event_completion,
+                .bytes = .{},
+                .exit_code = classified.exit_code,
+                .outcome = outcome_canceled,
+                .error_json = borrowString(handle.completion_error_json),
+            };
+            return result_success;
+        }
+        return fail(ctx, err);
+    };
     switch (event) {
-        .stdout => |bytes| out.* = .{ .type = stream_event_stdout, .bytes = borrowString(bytes), .exit_code = 0 },
-        .stderr => |bytes| out.* = .{ .type = stream_event_stderr, .bytes = borrowString(bytes), .exit_code = 0 },
-        .terminal => |bytes| out.* = .{ .type = stream_event_terminal, .bytes = borrowString(bytes), .exit_code = 0 },
-        .exit => |code| out.* = .{ .type = stream_event_exit, .bytes = .{}, .exit_code = code },
-        .err => |bytes| out.* = .{ .type = stream_event_error, .bytes = borrowString(bytes), .exit_code = 0 },
+        .stdout => |bytes| out.* = .{ .type = stream_event_stdout, .bytes = borrowString(bytes), .exit_code = 0, .outcome = 0, .error_json = .{} },
+        .stderr => |bytes| out.* = .{ .type = stream_event_stderr, .bytes = borrowString(bytes), .exit_code = 0, .outcome = 0, .error_json = .{} },
+        .terminal => |bytes| out.* = .{ .type = stream_event_terminal, .bytes = borrowString(bytes), .exit_code = 0, .outcome = 0, .error_json = .{} },
+        .exit => |code| out.* = .{ .type = stream_event_completion, .bytes = .{}, .exit_code = code, .outcome = outcome_completed, .error_json = .{} },
+        .err => |bytes| {
+            const classified = libspore.ClassifiedFailure.init(.runtime_execution_failed, bytes, "ExecNamedStream");
+            handle.completion_error_json = std.json.Stringify.valueAlloc(ctx.allocator, classified.envelope(), .{}) catch |err| return fail(ctx, err);
+            out.* = .{
+                .type = stream_event_completion,
+                .bytes = .{},
+                .exit_code = classified.exit_code,
+                .outcome = outcome_failed,
+                .error_json = borrowString(handle.completion_error_json),
+            };
+        },
     }
     return result_success;
 }
@@ -951,6 +993,7 @@ pub export fn spore_exec_named_stream_free(
     const ctx = context orelse return;
     const handle = stream orelse return;
     handle.stream.deinit();
+    if (handle.completion_error_json.len != 0) ctx.allocator.free(handle.completion_error_json);
     ctx.allocator.destroy(handle);
 }
 
@@ -1127,7 +1170,7 @@ pub export fn spore_list_named_json(context: ?*SporeContextImpl, out_json: ?*Spo
     const entries = libspore.listNamed(ctx.productContext(), ctx.allocator, .{}) catch |err| return fail(ctx, err);
     defer libspore.deinitNamedList(ctx.allocator, entries);
 
-    out.* = jsonOwned(ctx, entries) catch |err| return fail(ctx, err);
+    out.* = jsonOwned(ctx, libspore.NamedListResult{ .entries = entries }) catch |err| return fail(ctx, err);
     return result_success;
 }
 
@@ -1415,7 +1458,9 @@ fn resultFromError(err: anyerror) c_int {
 
 fn fail(ctx: *SporeContextImpl, err: anyerror) c_int {
     const detail = libspore.lastLifecycleErrorMessage();
-    ctx.setLastError(if (detail.len == 0) @errorName(err) else detail);
+    var classified = libspore.classifyFailure(err);
+    classified.message = if (detail.len == 0) @errorName(err) else detail;
+    ctx.setLastFailure(classified);
     return switch (err) {
         error.OutOfMemory => result_out_of_memory,
         error.InvalidPruneSelection, error.InvalidValue => result_invalid_value,
@@ -1757,6 +1802,13 @@ test "pull rejects missing required options at ABI boundary" {
     var json: SporeOwnedString = .{};
     try std.testing.expectEqual(result_invalid_value, spore_pull_json(context, &options, &json));
     try std.testing.expectEqual(@as(?[*]u8, null), json.ptr);
+    const failure = spore_context_last_error_json(context);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, failure.ptr.?[0..failure.len], .{});
+    defer parsed.deinit();
+    const body = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("usage.invalid_argument", body.get("code").?.string);
+    try std.testing.expectEqualStrings("usage", body.get("scope").?.string);
+    try std.testing.expectEqualStrings("after_fix", body.get("retry").?.string);
 }
 
 test "C ABI can list named VMs from context runtime env" {
@@ -1771,7 +1823,10 @@ test "C ABI can list named VMs from context runtime env" {
     var json: SporeOwnedString = .{};
     try std.testing.expectEqual(result_success, spore_list_named_json(context, &json));
     defer spore_free_string(context, json);
-    try std.testing.expectEqualStrings("[]\n", json.ptr.?[0..json.len]);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json.ptr.?[0..json.len], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("spore.lifecycle.list.result.v1", parsed.value.object.get("schema").?.string);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("entries").?.array.items.len);
 }
 
 test "C ABI named lifecycle last error carries state and truthful log paths" {

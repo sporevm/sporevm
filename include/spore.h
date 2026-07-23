@@ -33,7 +33,7 @@
 #define SPORE_ENUM_TYPED
 #endif
 #define SPORE_ENUM_MAX_VALUE INT_MAX
-#define SPORE_ABI_VERSION 17u
+#define SPORE_ABI_VERSION 18u
 #define SPORE_VM_NAME_MAX_BYTES 128u
 
 #ifdef __cplusplus
@@ -95,8 +95,14 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_EXEC_NAMED_STREAM_STDOUT 1
 #define SPORE_EXEC_NAMED_STREAM_STDERR 2
 #define SPORE_EXEC_NAMED_STREAM_TERMINAL 3
-#define SPORE_EXEC_NAMED_STREAM_EXIT 4
+#define SPORE_EXEC_NAMED_STREAM_COMPLETION 4
+#define SPORE_EXEC_NAMED_STREAM_EXIT SPORE_EXEC_NAMED_STREAM_COMPLETION
+/** Reserved legacy value; current streams terminate with COMPLETION. */
 #define SPORE_EXEC_NAMED_STREAM_ERROR 5
+
+#define SPORE_OUTCOME_COMPLETED 1
+#define SPORE_OUTCOME_FAILED 2
+#define SPORE_OUTCOME_CANCELED 3
 
 /** Options for spore_inspect_bundle_json(). */
 typedef struct SporeInspectBundleOptions {
@@ -252,7 +258,12 @@ typedef struct SporeExecNamedStreamOptions {
 typedef struct SporeExecNamedStreamEvent {
   int type;
   SporeString bytes;
+  /** Guest exit status for COMPLETED, or the stable classified status otherwise. */
   uint8_t exit_code;
+  /** One of SPORE_OUTCOME_* for COMPLETION; zero for data events. */
+  int outcome;
+  /** Borrowed `spore.error.v1` JSON for failed or canceled completion. */
+  SporeString error_json;
 } SporeExecNamedStreamEvent;
 
 /** Options for spore_copy_in_named() and spore_copy_out_named(). */
@@ -382,6 +393,12 @@ SPORE_API void spore_context_free(SporeContext context);
  * libspore call using the same context, or until the context is freed.
  */
 SPORE_API SporeString spore_context_last_error(SporeContext context);
+
+/**
+ * Return the latest failure as a borrowed `spore.error.v1` JSON document.
+ * The string remains valid until the next operation on the context.
+ */
+SPORE_API SporeString spore_context_last_error_json(SporeContext context);
 
 /** Set a context-local environment variable used by libspore operations. */
 SPORE_API SporeResult spore_context_set_env(SporeContext context, SporeString name, SporeString value);
@@ -548,7 +565,7 @@ SPORE_API SporeResult spore_remove_saved_json(SporeContext context,
                                               const SporeRemoveSavedOptions *options,
                                               SporeOwnedString *out_json);
 
-/** List named VMs and return JSON. */
+/** List named VMs and return `spore.lifecycle.list.result.v1` JSON. */
 SPORE_API SporeResult spore_list_named_json(SporeContext context, SporeOwnedString *out_json);
 
 #ifdef __cplusplus

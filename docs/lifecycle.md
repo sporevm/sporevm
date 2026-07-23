@@ -431,6 +431,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   backpressure: a disconnected consumer or local socket that cannot accept a
   complete frame within the 25 ms send deadline aborts that exec so it cannot
   block the VM control loop indefinitely.
+- `spore exec --events=jsonl` uses the same `spore.automation.event.v1`
+  envelope as run, attach, restore, and fanout. It emits base64 output records
+  followed by exactly one completed, failed, or canceled completion; EOF before
+  completion is `stream.interrupted`.
 - `ExecNamedStream.timing` becomes available when the timing event preceding
   the exit frame is consumed. The bounded `ExecNamedResult` carries the same
   optional timing structure.

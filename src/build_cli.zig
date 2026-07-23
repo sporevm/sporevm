@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const build_mod = @import("build.zig");
 const memory_config = @import("memory.zig");
+const machine_output = @import("machine_output.zig");
 const rootfs_mod = @import("rootfs.zig");
 const run_mod = @import("run.zig");
 const topology = @import("topology.zig");
@@ -51,7 +52,7 @@ const ParsedOptions = struct {
     debugfs: ?[]const u8 = null,
 };
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer) !void {
+pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     const allocator = init.arena.allocator();
     const full_args = try init.minimal.args.toSlice(allocator);
     const spore_executable = full_args[0];
@@ -61,6 +62,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     }
 
     const parsed = parseArgs(allocator, args) catch |err| {
+        if (mode == .json) exitMachineError(allocator, stderr, machine_output.CliError.init(.usage_invalid_argument, parseErrorMessage(err), @errorName(err)));
         try writeParseError(stderr, err);
         try stderr.writeAll("\n");
         try stderr.writeAll(usage);
@@ -69,12 +71,14 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     };
 
     const tag = parsed.tag orelse {
+        if (mode == .json) exitMachineError(allocator, stderr, machine_output.usageMissingArgument("spore build: missing required -t/--tag local image ref", "build"));
         try stderr.writeAll("spore build: missing required -t/--tag local image ref\n\n");
         try stderr.writeAll(usage);
         try stderr.flush();
         std.process.exit(2);
     };
     const context_dir = parsed.context_dir orelse {
+        if (mode == .json) exitMachineError(allocator, stderr, machine_output.usageMissingArgument("spore build: missing build context directory", "build"));
         try stderr.writeAll("spore build: missing build context directory\n\n");
         try stderr.writeAll(usage);
         try stderr.flush();
@@ -100,14 +104,16 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         .spore_executable = spore_executable,
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
-        .output = stdout,
+        .output = if (mode == .json) null else stdout,
         .diagnostic = &diagnostic,
     }) catch |err| {
+        if (mode == .json) exitMachineError(allocator, stderr, machine_output.fromZigError(err));
         try writeBuildError(stderr, err, diagnostic);
         try stderr.flush();
         std.process.exit(2);
     };
 
+    if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
     try stdout.writeAll("Image built\n");
     try stdout.print("  Ref: {s}\n", .{tag});
     try stdout.print("  Resolved: {s}\n", .{result.resolved_image_ref});
@@ -330,7 +336,11 @@ fn wantsHelp(args: []const []const u8) bool {
 }
 
 fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
-    const message = switch (err) {
+    try stderr.print("{s}\n", .{parseErrorMessage(err)});
+}
+
+fn parseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
         error.MissingOptionValue => "spore build: option requires a value",
         error.UnknownArgument => "spore build: unknown option",
         error.UnexpectedArgument => "spore build: expected exactly one build context",
@@ -344,7 +354,12 @@ fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
         error.BadPlatform, error.UnsupportedPlatform => "spore build: --platform must be linux/arm64 or linux/amd64",
         else => "spore build: invalid arguments",
     };
-    try stderr.print("{s}\n", .{message});
+}
+
+fn exitMachineError(allocator: std.mem.Allocator, stderr: *Io.Writer, classified: machine_output.CliError) noreturn {
+    machine_output.writeError(allocator, stderr, classified) catch {};
+    stderr.flush() catch {};
+    std.process.exit(classified.exit_code);
 }
 
 fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diagnostic) !void {

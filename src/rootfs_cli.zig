@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const api = @import("api.zig");
+const machine_output = @import("machine_output.zig");
 const rootfs_mod = @import("rootfs.zig");
 
 const build_usage =
@@ -76,38 +77,44 @@ const cas_preload_usage =
     \\
 ;
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or wantsTopLevelHelp(args)) {
+pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
+    if (args.len == 0) {
+        if (mode == .json) return error.MissingRootFSCommand;
+        try stdout.writeAll(rootfs_mod.usage);
+        return;
+    }
+    if (wantsTopLevelHelp(args)) {
         try stdout.writeAll(rootfs_mod.usage);
         return;
     }
     if (std.mem.eql(u8, args[0], "build")) {
-        try build(init, args[1..], stdout);
+        try build(init, args[1..], stdout, mode);
         return;
     }
     if (std.mem.eql(u8, args[0], "import-oci")) {
-        try importOci(init, args[1..], stdout);
+        try importOci(init, args[1..], stdout, mode);
         return;
     }
     if (std.mem.eql(u8, args[0], "import-tar")) {
-        try importTar(init, args[1..], stdout);
+        try importTar(init, args[1..], stdout, mode);
         return;
     }
     if (std.mem.eql(u8, args[0], "resolve")) {
-        try resolve(init, args[1..], stdout);
+        try resolve(init, args[1..], stdout, mode);
         return;
     }
     if (std.mem.eql(u8, args[0], "cas-preload")) {
-        try casPreload(init, args[1..], stdout);
+        try casPreload(init, args[1..], stdout, mode);
         return;
     }
+    if (mode == .json) return error.UnknownRootFSCommand;
     try stdout.print("unknown rootfs command: {s}\n\n", .{args[0]});
     try stdout.writeAll(rootfs_mod.usage);
     try stdout.flush();
     std.process.exit(2);
 }
 
-fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(build_usage);
         return;
@@ -122,6 +129,7 @@ fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
     }) catch |err| return rootfsBuildError(err);
+    if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_identity: {s}\nrootfs_storage: {s}\n", .{
         parsed.output,
         parsed.metadata,
@@ -131,7 +139,7 @@ fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !
     });
 }
 
-fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(import_oci_usage);
         return;
@@ -146,6 +154,7 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
     }) catch |err| return rootfsBuildError(err);
+    if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print(
         "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
         .{
@@ -158,7 +167,7 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     );
 }
 
-fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(import_tar_usage);
         return;
@@ -173,6 +182,7 @@ fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
         .mkfs = parsed.mkfs,
         .debugfs = parsed.debugfs,
     }) catch |err| return rootfsBuildError(err);
+    if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print(
         "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
         .{
@@ -195,7 +205,7 @@ fn rootfsBuildError(err: anyerror) anyerror {
     return err;
 }
 
-fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(resolve_usage);
         return;
@@ -206,10 +216,16 @@ fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .ref = parsed.ref,
         .platform = parsed.platform,
     });
+    if (mode == .json) return machine_output.writeJson(arena, stdout, .{
+        .schema = "spore.rootfs.resolve.result.v1",
+        .schema_version = @as(u32, 1),
+        .ref = parsed.ref,
+        .resolved_image_ref = resolved,
+    });
     try stdout.print("{s}\n", .{resolved});
 }
 
-fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(cas_preload_usage);
         return;
@@ -221,6 +237,7 @@ fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writ
         .chunk_size = parsed.chunk_size,
         .attach_spore = parsed.attach_spore,
     });
+    if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print(
         "index: {s}\nindex_digest: {s}\nrootfs: {s}\nrootfs_size: {d}\nchunk_size: {d}\nchunks: {d}\nzero_chunks: {d}\nnonzero_chunks: {d}\nobjects_written: {d}\nobject_bytes_written: {d}\nindex_bytes: {d}\n",
         .{

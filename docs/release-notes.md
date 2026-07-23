@@ -57,8 +57,10 @@ they migrate naturally when a later snapshot or commit publishes v2.
 - Architecture-discriminated host facts use `spore.host-info.v3`. The
   ARM-shaped `spore.host-info.v2` surface remains available for compatibility,
   and returns unsupported architecture on AMD64.
-- The public C ABI advances from 15 to 16 for
-  `spore_host_info_json_v3`. Callers should compare runtime build info with
+- The public C ABI advances to 18. Version 16 added
+  `spore_host_info_json_v3`, version 17 added initial argv for named create, and
+  version 18 adds `spore_context_last_error_json` plus explicit streaming
+  completion outcomes. Callers should compare runtime build info with
   `SPORE_ABI_VERSION` before using the new symbol.
 - Saved-state manifests remain AArch64-only and retain the existing
   `aarch64` / `sporevm-aarch64-v0` format identifiers. This release does not
@@ -75,6 +77,16 @@ separately, and serialize cleanup with active builds so a mounted cache disk is
 never unlinked. Builder crashes cannot leave a durable lease: the kernel drops
 the process-bound locks, and later cleanup or cache validation scavenges stale
 temps and recovers an unclean aggregate.
+
+### Automation contract
+
+Bounded CLI operations now return schema-versioned results under global
+`--json`, including build, rootfs, image, version, and named copy operations.
+Run, attach, restore, exec, and fanout use one
+`spore.automation.event.v1` JSONL envelope and finish with an explicit
+completed, failed, or canceled completion record. Stable failures carry a
+code, resource scope, and three-way retry classification consistently across
+CLI, Zig, C, and Go adapters. See [Automation contract](automation.md).
 
 **Full changelog:**
 [v0.14.0...v0.15.0](https://github.com/sporevm/sporevm/compare/v0.14.0...v0.15.0)

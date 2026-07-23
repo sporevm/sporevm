@@ -18,7 +18,7 @@ import (
 	"unsafe"
 )
 
-const minABIVersion uint32 = 17
+const requiredABIVersion uint32 = 18
 const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
 const reexecRoleEnv = "SPORE_REEXEC_ROLE"
 const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
@@ -81,8 +81,14 @@ const (
 
 // CallError reports a failed libspore C ABI call.
 type CallError struct {
-	Code    Result
-	Message string
+	Code        Result
+	Message     string
+	FailureCode string
+	Scope       string
+	Retry       string
+	Retryable   bool
+	ExitCode    uint8
+	Source      string
 }
 
 func (e *CallError) Error() string {
@@ -109,7 +115,7 @@ type ExecNamedStream struct {
 	stream C.SporeExecNamedStream
 }
 
-// New creates a libspore client and verifies the loaded C ABI is new enough.
+// New creates a libspore client and verifies the loaded C ABI is an exact match.
 func New() (*Client, error) {
 	var ctx C.SporeContext
 	if result := Result(C.spore_context_new(&ctx)); result != Success {
@@ -121,9 +127,9 @@ func New() (*Client, error) {
 		c.Close()
 		return nil, err
 	}
-	if info.ABIVersion < minABIVersion {
+	if info.ABIVersion != requiredABIVersion {
 		c.Close()
-		return nil, fmt.Errorf("libspore C ABI version %d is older than required %d", info.ABIVersion, minABIVersion)
+		return nil, fmt.Errorf("libspore C ABI version %d does not match required %d", info.ABIVersion, requiredABIVersion)
 	}
 	return c, nil
 }
@@ -500,11 +506,27 @@ func (s *ExecNamedStream) Next(ctx context.Context) (ExecNamedStreamEvent, error
 	if result := Result(C.spore_exec_named_stream_next(s.client.ctx, s.stream, &event)); result != Success {
 		return ExecNamedStreamEvent{}, s.client.callError(result)
 	}
-	return ExecNamedStreamEvent{
+	result := ExecNamedStreamEvent{
 		Type:     ExecNamedStreamEventType(event._type),
 		Bytes:    goBorrowedBytes(event.bytes),
 		ExitCode: uint8(event.exit_code),
-	}, nil
+		Outcome:  TerminalOutcome(event.outcome),
+	}
+	if raw := goString(event.error_json); raw != "" {
+		var envelope struct {
+			Schema        string            `json:"schema"`
+			SchemaVersion uint32            `json:"schema_version"`
+			Error         StructuredFailure `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+			return ExecNamedStreamEvent{}, fmt.Errorf("decode exec stream completion: %w", err)
+		}
+		if envelope.Schema != "spore.error.v1" || envelope.SchemaVersion != 1 {
+			return ExecNamedStreamEvent{}, fmt.Errorf("decode exec stream completion: unsupported schema %q version %d", envelope.Schema, envelope.SchemaVersion)
+		}
+		result.Failure = &envelope.Error
+	}
+	return result, nil
 }
 
 // WriteStdin sends pipe stdin bytes to the guest process.
@@ -711,7 +733,14 @@ func (c *Client) ListNamed(ctx context.Context) ([]NamedListEntry, error) {
 		return nil, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
-	return decodeJSON[[]NamedListEntry](goBytes(out), "named list")
+	result, err := decodeJSON[NamedListResult](goBytes(out), "named list")
+	if err != nil {
+		return nil, err
+	}
+	if result.Schema != "spore.lifecycle.list.result.v1" || result.SchemaVersion != 1 {
+		return nil, fmt.Errorf("decode named list: unsupported schema %q version %d", result.Schema, result.SchemaVersion)
+	}
+	return result.Entries, nil
 }
 
 func (c *Client) ready(ctx context.Context) error {
@@ -725,7 +754,32 @@ func (c *Client) ready(ctx context.Context) error {
 }
 
 func (c *Client) callError(code Result) error {
-	return &CallError{Code: code, Message: goString(C.spore_context_last_error(c.ctx))}
+	err := &CallError{Code: code, Message: goString(C.spore_context_last_error(c.ctx))}
+	var envelope struct {
+		Schema        string `json:"schema"`
+		SchemaVersion uint32 `json:"schema_version"`
+		Error         struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Scope     string `json:"scope"`
+			Retry     string `json:"retry"`
+			Retryable bool   `json:"retryable"`
+			ExitCode  uint8  `json:"exit_code"`
+			Source    string `json:"source"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(goString(C.spore_context_last_error_json(c.ctx))), &envelope) == nil && envelope.Schema == "spore.error.v1" && envelope.SchemaVersion == 1 {
+		err.FailureCode = envelope.Error.Code
+		err.Scope = envelope.Error.Scope
+		err.Retry = envelope.Error.Retry
+		err.Retryable = envelope.Error.Retryable
+		err.ExitCode = envelope.Error.ExitCode
+		err.Source = envelope.Error.Source
+		if envelope.Error.Message != "" {
+			err.Message = envelope.Error.Message
+		}
+	}
+	return err
 }
 
 func goString(s C.SporeString) string {
