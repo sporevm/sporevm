@@ -8079,7 +8079,7 @@ test "lifecycle human results render terse status lines" {
         },
     });
     try std.testing.expectEqualStrings(
-        "created vm counter\n" ++
+        "created live VM counter\n" ++
             "initial command started; output retained up to 16381 bytes per stream; retrieve with `spore logs counter`\n",
         out.written(),
     );
