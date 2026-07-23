@@ -448,14 +448,10 @@ fn gatewayStorage(value: gateway_manifest.RootfsStorage) spore.RootfsStorage {
     };
 }
 
-fn validateEagerTransferBounds(logical_bytes: u64, object_count: u64, object_bytes: u64) !void {
+pub fn validateEagerTransferBounds(logical_bytes: u64, object_count: u64, object_bytes: u64) !void {
     if (logical_bytes > max_eager_rootfs_logical_bytes or
         object_count > max_eager_object_count or
         object_bytes > max_eager_object_bytes) return error.GatewayImageTooLarge;
-}
-
-pub fn validateEagerTransferBoundsForArchive(logical_bytes: u64, object_count: u64, object_bytes: u64) !void {
-    return validateEagerTransferBounds(logical_bytes, object_count, object_bytes);
 }
 
 fn sourceKeyAlloc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {

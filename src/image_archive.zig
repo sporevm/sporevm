@@ -12,6 +12,7 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
 const gateway = @import("image_gateway.zig");
 const gateway_manifest = @import("image_gateway_manifest.zig");
+const gateway_pull = @import("image_gateway_pull.zig");
 const image = @import("image.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs = @import("rootfs.zig");
@@ -422,7 +423,7 @@ fn validateArchiveBounds(logical_bytes: u64, objects: []const ObjectDescriptor) 
     var object_bytes: u64 = 0;
     for (objects) |object|
         object_bytes = std.math.add(u64, object_bytes, object.size) catch return error.ImageArchiveTooLarge;
-    try @import("image_gateway_pull.zig").validateEagerTransferBoundsForArchive(
+    try gateway_pull.validateEagerTransferBounds(
         logical_bytes,
         objects.len,
         object_bytes,
@@ -654,7 +655,7 @@ test "image archive tar header parser is fuzzed" {
 test "native image archive import enforces eager transfer bounds" {
     try std.testing.expectError(
         error.GatewayImageTooLarge,
-        validateArchiveBounds(@import("image_gateway_pull.zig").max_eager_rootfs_logical_bytes + 1, &.{}),
+        validateArchiveBounds(gateway_pull.max_eager_rootfs_logical_bytes + 1, &.{}),
     );
 }
 
