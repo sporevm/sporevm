@@ -58,7 +58,11 @@ cache-side ownership anchor: the anchor and artifact must be the only two
 links. Ordinary copies have the wrong inode, hard-link duplicates raise the
 link count, and both fail closed before restore, pack, or removal. A rename
 preserves the identity. Raw deletion leaves a one-link anchor that GC can
-diagnose and reclaim without scanning arbitrary paths. Legacy v1 pins remain
+diagnose and reclaim without scanning arbitrary paths. Pin records remain
+explicitly pending until the artifact directory commit is durable, so GC can
+also diagnose and reclaim a two-link reference left in an unpublished save or
+batch stage after a crash. Failed ordinary publication preserves the staged
+manifest outside loadable authority for manual recovery. Legacy v1 pins remain
 readable and packable but refuse destructive removal because duplicate
 references cannot be proven absent. Portable unpack, pull, and clone materialize a
 descriptor-bound local CAS inside the saved-spore directory. Destructive

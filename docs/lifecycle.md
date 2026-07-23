@@ -258,9 +258,16 @@ encoding, or `spore fork` for another machine-local lifetime.
 The ownership anchor is a hard link, so a machine-local pinned save must share
 a filesystem with the configured rootfs cache. To cross filesystems, save on
 the cache filesystem and clone the result to the final destination.
-Offline fork children report `batch-relative` because they share RAM through the batch-owned
-`shared-chunks` directory. Move the complete batch, not an individual child;
-pack/unpack is the supported independently portable child boundary.
+Offline fork children report `batch-relative` because they share RAM through
+the batch-owned `shared-chunks` directory. A disk-backed child may also carry
+a machine-local pin, so this class describes the RAM ownership boundary rather
+than the absence of a disk pin. Move the complete batch, not an individual
+child; pack/unpack is the supported independently portable child boundary.
+Pin records stay pending until the final save or batch rename is durable.
+Cache GC distinguishes an abandoned staged reference after a crash from a
+committed artifact and reclaims the former. If ordinary save publication fails
+after capture, `.sporevm-pin-stage/manifest.json` remains available for
+recovery and a retry refuses to overwrite it.
 Non-destructive save supports both single-vCPU and multi-vCPU named VMs on every
 supported backend (KVM and HVF), for diskless, image-created writable rootfs, and
 explicit `--rootfs PATH` VMs: the monitor quiesces every vCPU at one barrier,

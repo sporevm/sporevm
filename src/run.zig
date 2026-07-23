@@ -30,6 +30,7 @@ const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
+const saved_spore_pin = @import("saved_spore_pin.zig");
 const runtime_disk_mod = @import("runtime_disk.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const run_assets = @import("run_assets");
@@ -1125,6 +1126,13 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
         return machine_output.CliError.init(
             .object_invalid,
             "spore run: a machine-local pinned save must share a filesystem with the rootfs cache; save there first, then use `spore clone SOURCE --out DEST` for a portable copy",
+            @errorName(err),
+        );
+    }
+    if (err == error.SavedSporePublicationRecoveryRequired) {
+        return machine_output.CliError.init(
+            .object_invalid,
+            "spore run: a previous save failed after capture; recover `.sporevm-pin-stage/manifest.json` from the save directory before retrying",
             @errorName(err),
         );
     }
@@ -3441,6 +3449,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     });
     if (capture_plan.snapshot_dir) |snapshot_dir| {
         try spore.createSnapshotRoot(allocator, snapshot_dir);
+        if (hasRootfs(opts)) {
+            const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
+            defer allocator.free(cache_root);
+            try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, snapshot_dir);
+        }
     }
     var saved_session_buf: [1]spore.Session = undefined;
     const saved_sessions = if (request.attaches_existing and opts.resume_sessions.len != 0)

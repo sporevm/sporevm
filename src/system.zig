@@ -1305,7 +1305,10 @@ fn collectOrphanPinGcCandidates(
         if (!saved_spore_pin.validId(id)) continue;
         var record = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch continue;
         defer record.deinit();
-        if (try saved_spore_pin.ownerState(allocator, cache_root, id, record.value) != .orphaned) continue;
+        const pending_state = try saved_spore_pin.pendingPublicationState(io, allocator, cache_root, id, record.value);
+        const abandoned_publication = pending_state == .abandoned;
+        if (pending_state == .committed and !dry_run) try saved_spore_pin.clearPendingPublication(io, allocator, registry, id);
+        if (!abandoned_publication and try saved_spore_pin.ownerState(allocator, cache_root, id, record.value) != .orphaned) continue;
 
         const owned_id = try allocator.dupe(u8, id);
         const inserted = try orphan_ids.getOrPut(owned_id);
@@ -1320,9 +1323,10 @@ fn collectOrphanPinGcCandidates(
             else => |e| return e,
         };
         const bytes = record_stat.size + owner_bytes;
-        try entries.append(.{ .kind = "saved-spore-orphan-pin", .path = owner_path, .bytes = bytes });
+        try entries.append(.{ .kind = if (abandoned_publication) "saved-spore-abandoned-pin" else "saved-spore-orphan-pin", .path = owner_path, .bytes = bytes });
         candidate_bytes.* += bytes;
         if (!dry_run) {
+            if (abandoned_publication) try saved_spore_pin.abandonPendingPublication(io, allocator, cache_root, id, record.value);
             try saved_spore_pin.remove(io, allocator, registry, id);
             deleted_count.* += 1;
             deleted_bytes.* += bytes;

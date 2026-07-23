@@ -1399,6 +1399,10 @@ fn saveContinueNamed(
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }
+    if (spec.value.disk != null or spec.value.rootfs != null or spec.value.rootfs_path != null or spec.value.image_ref != null) {
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+        try saved_spore_pin.ensureOwnershipLinkCompatible(arena, cache_root, temp_dir);
+    }
     var snapshot_spec = spec.value;
     if (!spore.annotationsEmpty(options.annotations)) {
         snapshot_spec.annotations = try spore.mergeAnnotations(arena, snapshot_spec.annotations, options.annotations);
@@ -1468,6 +1472,10 @@ fn saveStopNamed(
     try rejectX86NamedPersistence(spec.value);
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
+    }
+    if (spec.value.disk != null or spec.value.rootfs != null or spec.value.rootfs_path != null or spec.value.image_ref != null) {
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+        try saved_spore_pin.ensureOwnershipLinkCompatible(arena, cache_root, out_dir);
     }
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
