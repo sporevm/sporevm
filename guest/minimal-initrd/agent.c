@@ -88,7 +88,9 @@
 #define COPY_DESTINATION_LINK SPORE_BUILD_COPY_DESTINATION_LINK
 #define MAX_BUILD_RUN_COMMAND_LEN 65536ULL
 #define MAX_BUILD_EXEC_ARGS_BYTES 4096
-#define MAX_BUILD_EXEC_PATH_LEN 8192
+#define MAX_EXEC_PATH_LEN (MAX_ENV_LEN - sizeof("PATH="))
+#define MAX_EXEC_PATH_ENTRIES 64
+#define MAX_EXEC_CANDIDATE_LEN 512
 #define MAX_BUILD_CONTEXT_COPY_ENTRIES SPORE_BUILD_COPY_MAX_ENTRIES
 #define BUILD_AGENT_FD_BUDGET SPORE_BUILD_COPY_FD_BUDGET
 #define BUILD_CONTEXT_ROOT "/mnt/build-context"
@@ -3780,54 +3782,78 @@ static const char *env_value(char *const envp[], const char *name) {
   return NULL;
 }
 
-static void execve_or_report(char *const argv[], char *const envp[], int use_rootfs, int failure_fd, int search_path) {
+enum exec_lookup_mode {
+  EXEC_LOOKUP_EXACT = 0,
+  EXEC_LOOKUP_PATH = 1,
+};
+
+static int resolve_exec_path(const char *command, const char *path, char *executable, size_t executable_cap) {
+  if (path == NULL || path[0] == '\0') {
+    errno = ENOENT;
+    return -1;
+  }
+  size_t path_len = strnlen(path, MAX_EXEC_PATH_LEN + 1);
+  if (path_len > MAX_EXEC_PATH_LEN) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+
+  size_t entry_count = 1;
+  for (size_t i = 0; i < path_len; i++) {
+    if (path[i] == ':' && ++entry_count > MAX_EXEC_PATH_ENTRIES) {
+      errno = E2BIG;
+      return -1;
+    }
+  }
+
+  size_t command_len = strlen(command);
+  const char *entry = path;
+  for (;;) {
+    const char *end = strchr(entry, ':');
+    size_t dir_len = end != NULL ? (size_t)(end - entry) : strlen(entry);
+    const char *dir = dir_len == 0 ? "." : entry;
+    if (dir_len == 0) dir_len = 1;
+    if (dir_len + 1 + command_len + 1 > MAX_EXEC_CANDIDATE_LEN ||
+        dir_len + 1 + command_len + 1 > executable_cap) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+
+    memcpy(executable, dir, dir_len);
+    executable[dir_len] = '/';
+    memcpy(executable + dir_len + 1, command, command_len + 1);
+    struct stat candidate_stat;
+    if (stat(executable, &candidate_stat) == 0 &&
+        S_ISREG(candidate_stat.st_mode) && access(executable, X_OK) == 0) {
+      if (dir[0] != '/') {
+        errno = EACCES;
+        return -1;
+      }
+      return 0;
+    }
+    if (end == NULL) break;
+    entry = end + 1;
+  }
+  errno = ENOENT;
+  return -1;
+}
+
+static void execve_or_report(
+    char *const argv[], char *const envp[], int use_rootfs, int failure_fd,
+    enum exec_lookup_mode exec_lookup) {
   char *const empty_env[] = { NULL };
   char *const *effective_env = envp[0] != NULL ? envp : empty_env;
-  if (search_path && strchr(argv[0], '/') == NULL) {
+  if (exec_lookup == EXEC_LOOKUP_PATH && strchr(argv[0], '/') == NULL) {
     const char *path = env_value(envp, "PATH");
-    if (path != NULL && path[0] != '\0') {
-      char executable[MAX_BUILD_EXEC_PATH_LEN];
-      int found = 0;
-      const char *entry = path;
-      for (;;) {
-        const char *end = strchr(entry, ':');
-        size_t dir_len = end != NULL ? (size_t)(end - entry) : strlen(entry);
-        const char *dir = dir_len == 0 ? "." : entry;
-        if (dir_len == 0) dir_len = 1;
-        size_t command_len = strlen(argv[0]);
-        if (dir_len + 1 + command_len + 1 <= MAX_BUILD_EXEC_PATH_LEN) {
-          char candidate[MAX_BUILD_EXEC_PATH_LEN];
-          memcpy(candidate, dir, dir_len);
-          candidate[dir_len] = '/';
-          memcpy(candidate + dir_len + 1, argv[0], command_len + 1);
-          struct stat candidate_stat;
-          if (stat(candidate, &candidate_stat) == 0 &&
-              !S_ISDIR(candidate_stat.st_mode) && access(candidate, X_OK) == 0) {
-            if (dir[0] != '/') {
-              errno = EACCES;
-              goto exec_failed;
-            }
-            memcpy(executable, candidate, dir_len + 1 + command_len + 1);
-            found = 1;
-            break;
-          }
-        }
-        if (end == NULL) break;
-        entry = end + 1;
-      }
-      if (found) execve(executable, argv, effective_env);
-      else errno = ENOENT;
-    } else {
-      errno = ENOENT;
+    char executable[MAX_EXEC_CANDIDATE_LEN];
+    if (resolve_exec_path(argv[0], path, executable, sizeof(executable)) == 0) {
+      execve(executable, argv, effective_env);
     }
   } else {
     execve(argv[0], argv, effective_env);
   }
-exec_failed:;
   int err = errno;
-  if (!search_path && (err == ENOENT || err == ENOTDIR) && strchr(argv[0], '/') == NULL) {
-    dprintf(STDERR_FILENO, "spore run: exact argv command \"%s\" was not found.\nExact argv mode does not run through /bin/sh or PATH lookup. Use shell command form or pass an absolute guest path.\n", argv[0]);
-  } else if (!use_rootfs && (err == ENOENT || err == ENOTDIR)) {
+  if (!use_rootfs && (err == ENOENT || err == ENOTDIR)) {
     dprintf(STDERR_FILENO, "spore run: initrd cannot execute %s: not found; use --image, --rootfs, or provide an initrd containing the command\n", argv[0]);
   } else {
     dprintf(STDERR_FILENO, "spore run: exec %s failed: %s\n", argv[0], strerror(err));
@@ -3837,10 +3863,6 @@ exec_failed:;
 }
 
 static void pin_to_current_cpu(pid_t pid);
-enum exec_lookup_mode {
-  EXEC_LOOKUP_EXACT = 0,
-  EXEC_LOOKUP_PATH = 1,
-};
 
 __attribute__((noreturn)) static void exit_session_setup_error(
     int ready_fd, const char *message) {
@@ -4048,7 +4070,7 @@ static int start_session(struct session *session, const char *session_id, char *
     if (chdir(cwd) != 0) exit_session_setup_errno(ready_pipe[1], "enter working directory");
     if (write_all(ready_pipe[1], "\1", 1) != 0) _exit(127);
     close(ready_pipe[1]);
-    execve_or_report(argv, envp, use_rootfs, -1, options->exec_lookup == EXEC_LOOKUP_PATH);
+    execve_or_report(argv, envp, use_rootfs, -1, options->exec_lookup);
   }
   if (stdin_pipe[0] >= 0) close(stdin_pipe[0]);
   if (pty_slave >= 0) close(pty_slave);
@@ -4477,7 +4499,7 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
     }
     const char *cwd = working_dir[0] != '\0' ? working_dir : "/";
     if (chdir(cwd) != 0) detached_child_fail(exec_pipe[1]);
-    execve_or_report(argv, envp, use_rootfs, exec_pipe[1], 0);
+    execve_or_report(argv, envp, use_rootfs, exec_pipe[1], EXEC_LOOKUP_PATH);
   }
 
   close_fd_if_open(&devnull);
@@ -4968,7 +4990,7 @@ static void run_transient_exec(struct client *client, const struct run_request *
   struct session transient;
   const struct session_start_options options = {
     .use_rootfs = use_rootfs,
-    .exec_lookup = EXEC_LOOKUP_EXACT,
+    .exec_lookup = EXEC_LOOKUP_PATH,
     .terminal_rows = request->terminal_rows,
     .terminal_cols = request->terminal_cols,
   };
@@ -5683,7 +5705,7 @@ static void accept_request(int listener, struct session *session, struct client 
       .use_rootfs = use_rootfs,
       .file_stdio = file_stdio,
       .memory_pressure = request.memory_pressure,
-      .exec_lookup = EXEC_LOOKUP_EXACT,
+      .exec_lookup = EXEC_LOOKUP_PATH,
       .stdin_enabled = request.stdin_enabled,
       .tty = request.tty,
       .terminal_rows = request.terminal_rows,
@@ -5820,6 +5842,27 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_exec_arg_equals(
   if (parse_request(request, request_len, &parsed) != 0 || !parsed.build_exec_form || parsed.argv[arg_index] == NULL) return 0;
   size_t actual_len = strlen(parsed.argv[arg_index]);
   return actual_len == expected_len && memcmp(parsed.argv[arg_index], expected, expected_len) == 0;
+}
+
+__attribute__((visibility("hidden"))) int spore_agent_test_resolve_exec_path(
+    const unsigned char *command_bytes, size_t command_len,
+    const unsigned char *path_bytes, size_t path_len, int path_present,
+    unsigned char *resolved, size_t resolved_cap) {
+  if (command_len == 0 || command_len > MAX_BUILD_EXEC_ARGS_BYTES ||
+      path_len > MAX_EXEC_PATH_LEN + 1 || resolved_cap < MAX_EXEC_CANDIDATE_LEN) return EINVAL;
+  char command[MAX_BUILD_EXEC_ARGS_BYTES + 1];
+  char path[MAX_EXEC_PATH_LEN + 2];
+  memcpy(command, command_bytes, command_len);
+  command[command_len] = '\0';
+  memcpy(path, path_bytes, path_len);
+  path[path_len] = '\0';
+  if (memchr(command, '\0', command_len) != NULL || memchr(path, '\0', path_len) != NULL) return EINVAL;
+
+  char executable[MAX_EXEC_CANDIDATE_LEN];
+  if (resolve_exec_path(command, path_present ? path : NULL, executable, sizeof(executable)) != 0) return errno;
+  size_t executable_len = strlen(executable);
+  memcpy(resolved, executable, executable_len + 1);
+  return 0;
 }
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_ext4_geometry(

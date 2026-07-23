@@ -93,6 +93,8 @@ The landed foundation includes:
   previous-stage inheritance, and final `CMD`/`ENTRYPOINT` publication;
 - builder-owned ARG/ENV/platform expansion, parent-relative `WORKDIR`, shell
   and bounded exec-form RUN, and simple RUN/COPY heredocs;
+- one bounded guest `PATH` resolver shared by exec-form RUN and runtime exact
+  argv, preserving argv while keeping relative matches fail-closed;
 - immutable context COPY, cross-stage COPY, cross-stage `COPY --link`, and
   context `COPY --parents`;
 - bounded public HTTPS `ADD` with numeric `--chmod`;
@@ -267,6 +269,10 @@ Docker/BuildKit baseline. Backend-neutral builder changes also keep the normal
 HVF graph green; a change to VM execution, sandboxing, capacity, mount lifetime,
 or checkpoint publication needs matching KVM and HVF evidence.
 
+Shared exec lookup changes also run the image-context lifecycle smoke so
+one-shot, detached, plain, interactive, TTY, and transient runtime paths use the
+same guest resolver as exec-form RUN.
+
 Every newly accepted attacker-influenced syntax or guest request extends the
 owning parser fuzz target in the same change. Every cache-input rule gets a
 golden invalidation test and at least one differential fixture.
@@ -289,6 +295,9 @@ golden invalidation test and at least one differential fixture.
   of product-specific features.
 - Real credential forwarding, privileged execution, remote shared cache, and
   new persistent device state stay outside this roadmap.
+- Builder and runtime exact argv share one guest resolver: only slashless argv
+  zero is replaced for `execve`, while the original argv and argument limits
+  remain unchanged.
 
 ## Deferred Decisions And Triggers
 

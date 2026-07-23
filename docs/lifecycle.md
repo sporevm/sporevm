@@ -98,9 +98,16 @@ sets an explicit empty value so an inherited value is cleared. `--workdir`
 must be an absolute path. These overrides apply to one exec request only; the
 next exec, a fork, and a later save still use the image defaults.
 
-Exact argv does not perform guest PATH lookup. Use `-- /bin/echo hi`, not
-`-- echo hi`, unless the guest environment itself can execute `echo` at that
-exact path.
+Exact argv resolves a slashless argv zero against the effective guest `PATH`
+without invoking a shell or changing any argument. Lookup accepts at most 250
+`PATH` bytes, 64 entries, and a 511-byte candidate plus its terminator. Missing
+or empty `PATH` does not search the working directory. A relative entry is
+skipped when it has no executable match and fails closed if it would select an
+executable; use absolute entries. Absolute entries containing `..` cannot leave
+the guest VM because lookup runs after `chroot`; as with an explicitly supplied
+path, procfs can still address paths elsewhere in that VM, so this is not an
+image-root confinement boundary. An argv zero that already contains a slash is
+executed exactly as supplied.
 
 Pass `--timing-json PATH` before the VM name to retain one named-exec phase
 record without changing output streaming or exit propagation:
