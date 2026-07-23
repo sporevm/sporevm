@@ -92,6 +92,29 @@ steps:
         cache: *mise_cache
         agents: *linux_agents
 
+  - group: ":package: Native image distribution"
+    key: "native-image-distribution"
+    steps:
+      - label: ":package: Publish native image archive (Linux ARM64)"
+        key: "native-image-archive-publish-linux-arm64"
+        command: "scripts/ci/run.sh scripts/ci/native-image-archive-publish.sh"
+        artifact_paths:
+          - "zig-cache/native-image-distribution/ci-final-image.tar.gz"
+          - "zig-cache/native-image-distribution/receipt.env"
+        timeout_in_minutes: 15
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
+
+      - label: ":fire: Consume native image archive (clean Linux ARM64 worker)"
+        key: "native-image-archive-consume-linux-arm64"
+        depends_on: "native-image-archive-publish-linux-arm64"
+        command: "scripts/ci/run.sh scripts/ci/native-image-archive-consume.sh"
+        timeout_in_minutes: 15
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
+
   - group: ":microscope: Opt-in validation"
     key: "opt-in-validation"
     steps:
