@@ -409,8 +409,10 @@ enough because the monitor role is the embedder process.
 
 Named lifecycle errors carry diagnostics in addition to the error tag. Zig
 callers can read `lastLifecycleErrorMessage()` after a failed lifecycle call.
-The C ABI copies the same text into `spore_context_last_error`, and the Go
-binding returns it through `CallError`. Startup, already-exists, and not-ready
+The C ABI copies the same text into `spore_context_last_error` and exposes its
+stable `spore.error.v1` classification through
+`spore_context_last_error_json`. The Go binding decodes both into `CallError`,
+including `FailureCode`, `Scope`, `Retry`, and `Retryable`. Startup, already-exists, and not-ready
 diagnostics include the last known VM state, recorded PID when present,
 the configured console path when present, `monitor.log`, and the control socket
 path where useful. When no console log is configured, diagnostics report
@@ -457,8 +459,12 @@ while (true) {
 }
 ```
 
-Stream event byte slices are borrowed until the next stream operation.
-After `.exit` is returned, `stream.timing` contains the optional
+Stream event byte slices are borrowed until the next stream operation. C and Go
+surface event type `COMPLETION` with a completed, failed, or canceled outcome;
+failed and canceled completions borrow a `spore.error.v1` document until the
+next stream call. A transport error before completion is classified as
+`stream.interrupted` through the context error rather than as a guest result.
+After `.exit` is returned in Zig, `stream.timing` contains the optional
 `NamedExecTiming` received immediately before it. The bounded Zig
 `ExecNamedResult` carries the same value. Its phases split dispatch, guest
 process start, guest execution, guest user/system CPU, output/result delivery,
@@ -586,8 +592,10 @@ them if they must outlive the callback. TTY output arrives as `.terminal`
 events. Bound Unix services emit `.port_forward` setup events without durable
 host socket paths, and successful saves emit `.save` before `.exit`.
 Successful image commits emit `.image_commit` before `.exit`.
-Every run emits at most one completion event: `exit` for guest completion or
-`failure` for a SporeVM failure.
+Every run emits at most one terminal typed event: `.exit` for guest completion
+or `.failure` for a SporeVM failure. The shared JSONL adapter serializes either
+as one `spore.automation.event.v1` `completion` record with a `completed`,
+`failed`, or `canceled` outcome. See [Automation contract](automation.md).
 
 ## Bundles
 
@@ -627,8 +635,9 @@ overrides, context-local last errors, owned string cleanup, host-info JSON,
 inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
 named copy side-effect calls. ABI version 15 added saved-spore removal through
 `spore_remove_saved_json`; ABI version 16 added the architecture-discriminated
-`spore_host_info_json_v3` entry point; ABI version 17 adds
-`SporeCreateNamedOptions.initial_argv`. Clients should compare the runtime
+`spore_host_info_json_v3` entry point; ABI version 17 added
+`SporeCreateNamedOptions.initial_argv`; ABI version 18 adds structured last
+errors and terminal outcomes for streaming named exec. Clients should compare the runtime
 build-info ABI with `SPORE_ABI_VERSION` before calling a newly added symbol.
 
 Release builds publish separate `libspore_Linux` and `libspore_Darwin`
@@ -1021,7 +1030,7 @@ is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
 return JSON, and exposes named copy as error-returning side-effect methods. It
-requires C ABI version 17 or newer. Go context cancellation is checked before
+requires C ABI version 18 or newer. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

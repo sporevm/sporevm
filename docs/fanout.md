@@ -136,6 +136,18 @@ that arbitrary already-running workloads consumed the metadata; workload
 harnesses own the identity-before-work barrier. `spore run --from` remains the
 completed-base path for starting a fresh command inside a child spore.
 
+Automation can replace prefixed human output with the shared event contract:
+
+```bash
+spore fanout children --for 10s --events=jsonl
+```
+
+Each stdout or stderr record carries the child directory name in `child` and
+base64 bytes in `data_base64`. The aggregate stream ends with one
+`spore.automation.event.v1` completion record; child startup or runtime failure
+produces a failed completion instead of requiring callers to infer status from
+EOF or prefixed diagnostics. See [Automation contract](automation.md).
+
 ## Single-Child Resume Identity
 
 Fleet adapters that materialize one child can inject the same guest-visible

@@ -65,6 +65,8 @@ hypervisors.
 - [docs/networking.md](docs/networking.md): SporeVM-managed networking.
 - [docs/lifecycle.md](docs/lifecycle.md): named VM lifecycle.
 - [docs/libspore.md](docs/libspore.md): Zig, C, and Go embedding surface.
+- [docs/automation.md](docs/automation.md): versioned CLI and library results,
+  stream completion, and stable failure classification.
 
 ## Install
 
