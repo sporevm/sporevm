@@ -21,30 +21,36 @@ pub const max_record_bytes = 64 * 1024;
 pub const max_manifest_bytes = spore.max_manifest_bytes;
 pub const id_bytes = 32;
 
+pub const PendingPublication = struct {
+    spore_dir: []const u8,
+    reference_path: []const u8,
+    cleanup_root: ?[]const u8 = null,
+
+    fn validate(self: PendingPublication) !void {
+        if (!isAbsoluteSafePath(self.spore_dir) or
+            !isAbsoluteSafePath(self.reference_path) or
+            !std.mem.eql(u8, std.fs.path.basename(self.reference_path), reference_file)) return error.BadManifest;
+        if (self.cleanup_root) |cleanup_root| {
+            if (!validGeneratedStageRoot(cleanup_root) or !pathIsWithin(self.reference_path, cleanup_root)) return error.BadManifest;
+        }
+    }
+};
+
 pub const Record = struct {
     schema: []const u8,
     id: []const u8,
     manifest_sha256: []const u8,
     pending_manifest_sha256: ?[]const u8 = null,
-    pending_spore_dir: ?[]const u8 = null,
-    pending_reference_path: ?[]const u8 = null,
-    pending_cleanup_root: ?[]const u8 = null,
+    pending_publication: ?PendingPublication = null,
     storage: spore.RootfsStorage,
 
     pub fn validate(self: Record) !void {
         if ((!std.mem.eql(u8, self.schema, schema) and !std.mem.eql(u8, self.schema, legacy_schema)) or
             !validId(self.id) or !validId(self.manifest_sha256)) return error.BadManifest;
         if (self.pending_manifest_sha256) |digest| if (!validId(digest)) return error.BadManifest;
-        if ((self.pending_spore_dir == null) != (self.pending_reference_path == null)) return error.BadManifest;
-        if (self.pending_cleanup_root != null and self.pending_spore_dir == null) return error.BadManifest;
-        if (self.pending_spore_dir) |path| {
-            if (!isAbsoluteSafePath(path)) return error.BadManifest;
-            const reference_path = self.pending_reference_path.?;
-            if (!isAbsoluteSafePath(reference_path) or !std.mem.eql(u8, std.fs.path.basename(reference_path), reference_file)) return error.BadManifest;
-            if (self.pending_cleanup_root) |cleanup_root| {
-                if (!validGeneratedStageRoot(cleanup_root) or !pathIsWithin(reference_path, cleanup_root)) return error.BadManifest;
-            }
+        if (self.pending_publication) |pending| {
             if (!std.mem.eql(u8, self.schema, schema)) return error.BadManifest;
+            try pending.validate();
         }
         try spore.validateRootfsStorageDescriptor(self.storage);
     }
@@ -319,12 +325,6 @@ pub fn createValidated(io: Io, allocator: std.mem.Allocator, registry: LockedReg
     return createValidatedInternal(io, allocator, registry, spore_dir, disk, storage, null);
 }
 
-const PendingPublication = struct {
-    spore_dir: []const u8,
-    reference_path: []const u8,
-    cleanup_root: ?[]const u8 = null,
-};
-
 fn createPendingValidated(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, staged_spore_dir: []const u8, final_spore_dir: []const u8, disk: spore.Disk, storage: spore.RootfsStorage) ![]const u8 {
     const reference_path = try std.fs.path.join(allocator, &.{ staged_spore_dir, reference_file });
     defer allocator.free(reference_path);
@@ -407,9 +407,11 @@ pub fn publishPreparedRecord(allocator: std.mem.Allocator, registry: LockedRegis
         .schema = schema,
         .id = prepared.id,
         .manifest_sha256 = prepared.manifest_sha256,
-        .pending_spore_dir = prepared.final_spore_dir,
-        .pending_reference_path = pending_reference_path,
-        .pending_cleanup_root = std.fs.path.dirname(prepared.spore_dir) orelse return error.BadManifest,
+        .pending_publication = .{
+            .spore_dir = prepared.final_spore_dir,
+            .reference_path = pending_reference_path,
+            .cleanup_root = std.fs.path.dirname(prepared.spore_dir) orelse return error.BadManifest,
+        },
         .storage = storage,
     };
     try record.validate();
@@ -445,7 +447,7 @@ pub fn syncPreparedRecords(allocator: std.mem.Allocator, registry: LockedRegistr
 pub fn clearPendingPublication(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, id: []const u8) !void {
     var record = try loadRecord(io, allocator, registry.cache_root, id);
     defer record.deinit();
-    if (record.value.pending_spore_dir == null) return;
+    if (record.value.pending_publication == null) return;
     const path = try recordPath(allocator, registry.cache_root, id);
     defer allocator.free(path);
     const json = try std.json.Stringify.valueAlloc(allocator, Record{
@@ -467,9 +469,7 @@ fn createWithId(allocator: std.mem.Allocator, registry: LockedRegistry, spore_di
         .schema = schema,
         .id = id,
         .manifest_sha256 = manifest_sha256,
-        .pending_spore_dir = if (pending) |value| value.spore_dir else null,
-        .pending_reference_path = if (pending) |value| value.reference_path else null,
-        .pending_cleanup_root = if (pending) |value| value.cleanup_root else null,
+        .pending_publication = pending,
         .storage = storage,
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(record_json);
@@ -569,7 +569,7 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
     const digest = try sha256File(io, allocator, manifest_path);
     defer allocator.free(digest);
     var reconciled_digest = record.value.manifest_sha256;
-    var rewrite_record = record.value.pending_spore_dir != null;
+    var rewrite_record = record.value.pending_publication != null;
     if (record.value.pending_manifest_sha256) |pending| {
         const actual_is_current = std.mem.eql(u8, digest, record.value.manifest_sha256);
         const actual_is_pending = std.mem.eql(u8, digest, pending);
@@ -590,9 +590,7 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
         try replaceRecord(allocator, path, json);
         record.value.manifest_sha256 = reconciled_digest;
         record.value.pending_manifest_sha256 = null;
-        record.value.pending_spore_dir = null;
-        record.value.pending_reference_path = null;
-        record.value.pending_cleanup_root = null;
+        record.value.pending_publication = null;
     }
     return record;
 }
@@ -605,7 +603,7 @@ pub const OwnerState = enum { exclusive, pending, orphaned, duplicated, legacy, 
 
 pub fn ownerState(allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8, record: Record) !OwnerState {
     if (!isExclusive(record)) return .legacy;
-    if (record.pending_spore_dir != null) return .pending;
+    if (record.pending_publication != null) return .pending;
     const owner = try ownerPath(allocator, cache_root, id);
     defer allocator.free(owner);
     const stat = statRegularNoFollow(allocator, owner) catch |err| return switch (err) {
@@ -625,8 +623,9 @@ pub const PendingPublicationState = enum { none, committed, abandoned, unresolve
 /// directory rename. The cache lock makes a still-pending record evidence of
 /// a crashed publisher rather than an in-flight one.
 pub fn pendingPublicationState(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8, record: Record) !PendingPublicationState {
-    const final_dir = record.pending_spore_dir orelse return .none;
-    const pending_ref = record.pending_reference_path orelse return error.BadManifest;
+    const pending = record.pending_publication orelse return .none;
+    const final_dir = pending.spore_dir;
+    const pending_ref = pending.reference_path;
     const owner = try ownerPath(allocator, cache_root, id);
     defer allocator.free(owner);
     const owner_identity = statRegularNoFollow(allocator, owner) catch |err| return switch (err) {
@@ -660,7 +659,8 @@ pub fn pendingPublicationState(io: Io, allocator: std.mem.Allocator, cache_root:
 /// caller may then remove the owner and record with `remove`.
 pub fn abandonPendingPublication(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8, record: Record) !void {
     if (try pendingPublicationState(io, allocator, cache_root, id, record) != .abandoned) return error.SavedSporeOwnershipConflict;
-    if (record.pending_cleanup_root) |cleanup_root| {
+    const pending = record.pending_publication orelse return error.BadManifest;
+    if (pending.cleanup_root) |cleanup_root| {
         try Io.Dir.cwd().deleteTree(io, cleanup_root);
         try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(cleanup_root) orelse ".");
     }
@@ -670,9 +670,9 @@ pub fn abandonPendingPublication(io: Io, allocator: std.mem.Allocator, cache_roo
         error.FileNotFound => return,
         else => |e| return e,
     };
-    const final_ref = try std.fs.path.join(allocator, &.{ record.pending_spore_dir.?, reference_file });
+    const final_ref = try std.fs.path.join(allocator, &.{ pending.spore_dir, reference_file });
     defer allocator.free(final_ref);
-    for ([_][]const u8{ record.pending_reference_path.?, final_ref }) |path| {
+    for ([_][]const u8{ pending.reference_path, final_ref }) |path| {
         if (try pathIdentityMatch(allocator, path, owner_identity) != .matches) continue;
         try Io.Dir.cwd().deleteFile(io, path);
         try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(path) orelse ".");
