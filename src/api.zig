@@ -5,6 +5,7 @@
 //! contracts callers should build against.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const aarch64_topology = @import("aarch64/topology.zig");
 const architecture = @import("architecture.zig");
@@ -1478,12 +1479,38 @@ pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: Clone
         .rootfs_cache = options.rootfs_cache,
     });
     try chunk_sealer.fsyncDirPath(arena, staged_output);
-    std.Io.Dir.renamePreserve(std.Io.Dir.cwd(), staged_output, std.Io.Dir.cwd(), options.out_dir, context.io) catch |err| switch (err) {
-        error.PathAlreadyExists => return error.AlreadyExists,
-        else => |e| return e,
-    };
+    try renameDirectoryNoReplace(arena, staged_output, options.out_dir);
     try chunk_sealer.fsyncDirPath(arena, std.fs.path.dirname(options.out_dir) orelse ".");
     return .{ .source = options.spore_dir, .out_dir = options.out_dir };
+}
+
+fn renameDirectoryNoReplace(allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+    const destination_z = try allocator.dupeZ(u8, destination);
+    defer allocator.free(destination_z);
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const rc = linux.renameat2(std.c.AT.FDCWD, source_z.ptr, std.c.AT.FDCWD, destination_z.ptr, .{ .NOREPLACE = true });
+        return switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .EXIST => error.AlreadyExists,
+            .NOENT => error.FileNotFound,
+            .XDEV => error.CrossDevice,
+            else => error.IoFailed,
+        };
+    } else {
+        const Darwin = struct {
+            extern "c" fn renamex_np(old: [*:0]const u8, new: [*:0]const u8, flags: c_uint) c_int;
+        };
+        if (Darwin.renamex_np(source_z.ptr, destination_z.ptr, 0x00000004) == 0) return;
+        return switch (std.c.errno(-1)) {
+            .EXIST => error.AlreadyExists,
+            .NOENT => error.FileNotFound,
+            .XDEV => error.CrossDevice,
+            else => error.IoFailed,
+        };
+    }
 }
 
 test "clone spore makes a pinned save independently portable" {
