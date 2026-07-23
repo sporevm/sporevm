@@ -74,7 +74,7 @@ cat >"${workdir}/context/Dockerfile" <<'DOCKERFILE'
 FROM docker.io/library/alpine:3.20
 ENV IMAGE_VALUE=default CLEAR_ME=inherited
 WORKDIR /workspace
-ENTRYPOINT ["/usr/bin/env"]
+RUN mkdir -p /workspace/sub /workspace/tools && printf '%b' '#!/bin/sh\nprintf "%s|%s" "\0441" "\0442"\n' > /workspace/tools/exact-tool && chmod 0755 /workspace/tools/exact-tool
 CMD ["/bin/sh", "-c", "printf '%s|%s|%s' \"$IMAGE_VALUE\" \"$CLEAR_ME\" \"$PWD\" > default-context; cat default-context"]
 DOCKERFILE
 
@@ -91,6 +91,10 @@ expect_eq 'default|inherited|/workspace' \
 expect_eq 'override:default' \
   "$("${spore_bin}" run --backend "${backend}" --image "${image_ref}" --pull never --memory "${SPORE_SMOKE_MEMORY:-512mb}" --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}" -- /bin/sh -lc 'printf "override:%s" "$IMAGE_VALUE"')" \
   "one-shot image command override"
+
+expect_eq 'one-shot exact argv' \
+  "$("${spore_bin}" run --backend "${backend}" --image "${image_ref}" --pull never --memory "${SPORE_SMOKE_MEMORY:-512mb}" --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}" -- echo 'one-shot exact argv')" \
+  "one-shot image PATH lookup"
 
 "${spore_bin}" create "${source_name}" \
   --backend "${backend}" \
@@ -153,6 +157,53 @@ fi
 expect_eq 'default|inherited|/workspace' \
   "$("${spore_bin}" exec "${source_name}" -- /bin/sh -lc 'printf "%s|%s|%s" "$IMAGE_VALUE" "$CLEAR_ME" "$PWD"')" \
   "plain named exec defaults"
+
+expect_eq 'two words|$VALUE' \
+  "$("${spore_bin}" exec --env PATH=/workspace/tools:/bin "${source_name}" -- exact-tool 'two words' '$VALUE')" \
+  "named exec PATH lookup preserves exact argv"
+
+expect_eq 'traversal|contained' \
+  "$("${spore_bin}" exec --env PATH=/workspace/sub/../tools:/bin "${source_name}" -- exact-tool traversal contained)" \
+  "absolute PATH traversal stays inside the guest root"
+
+expect_eq 'relative entry skipped' \
+  "$("${spore_bin}" exec --env PATH=missing:/bin "${source_name}" -- echo 'relative entry skipped')" \
+  "missing relative PATH entry falls through"
+
+for path_case in /does-not-exist ""; do
+  set +e
+  "${spore_bin}" exec --env "PATH=${path_case}" "${source_name}" -- echo should-not-run >"${workdir}/path-failure.stdout" 2>"${workdir}/path-failure.stderr"
+  path_rc="$?"
+  set -e
+  [[ "${path_rc}" == "127" ]] || die "missing or empty PATH exited ${path_rc}, expected 127"
+  [[ ! -s "${workdir}/path-failure.stdout" ]] || die "missing or empty PATH executed a command"
+done
+
+set +e
+"${spore_bin}" exec --env PATH=tools:/bin --workdir /workspace "${source_name}" -- exact-tool should not-run >"${workdir}/relative-path.stdout" 2>"${workdir}/relative-path.stderr"
+relative_path_rc="$?"
+set -e
+[[ "${relative_path_rc}" == "126" ]] || die "relative executable PATH match exited ${relative_path_rc}, expected 126"
+[[ ! -s "${workdir}/relative-path.stdout" ]] || die "relative executable PATH match ran the command"
+
+too_many_path="/"
+for _ in $(seq 1 64); do
+  too_many_path="${too_many_path}:/"
+done
+set +e
+"${spore_bin}" exec --env "PATH=${too_many_path}" "${source_name}" -- missing >"${workdir}/bounded-path.stdout" 2>"${workdir}/bounded-path.stderr"
+bounded_path_rc="$?"
+set -e
+[[ "${bounded_path_rc}" == "126" ]] || die "over-limit PATH entry count exited ${bounded_path_rc}, expected 126"
+[[ ! -s "${workdir}/bounded-path.stdout" ]] || die "over-limit PATH entry count ran the command"
+
+long_command="$(printf '%0511d' 0 | tr 0 x)"
+set +e
+"${spore_bin}" exec --env PATH=/bin "${source_name}" -- "${long_command}" >"${workdir}/bounded-candidate.stdout" 2>"${workdir}/bounded-candidate.stderr"
+bounded_candidate_rc="$?"
+set -e
+[[ "${bounded_candidate_rc}" == "126" ]] || die "over-limit PATH candidate exited ${bounded_candidate_rc}, expected 126"
+[[ ! -s "${workdir}/bounded-candidate.stdout" ]] || die "over-limit PATH candidate ran the command"
 
 expect_eq 'override||/' \
   "$("${spore_bin}" exec --env IMAGE_VALUE=override --env CLEAR_ME= --workdir / "${source_name}" -- /bin/sh -lc 'printf "%s|%s|%s" "$IMAGE_VALUE" "$CLEAR_ME" "$PWD"')" \

@@ -54,6 +54,11 @@ no effective command is rejected before boot. `spore create --image` applies
 the same default rules to its optional initial command; plain create without an
 image remains an idle VM.
 
+When exact argv zero contains no slash, the guest resolves it through the
+effective image or per-exec `PATH` using the same bounded selection as
+exec-form `RUN`. This changes only the executable passed to `execve`; every
+argument remains byte-for-byte unchanged and no shell is involved.
+
 Image `Env` and `WorkingDir` are also applied. `User` currently fails closed:
 only empty, `root`, `0`, and those users with an empty, `root`, or `0` group are
 accepted because guest credential switching is not implemented. Later named

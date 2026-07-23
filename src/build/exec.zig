@@ -1589,6 +1589,7 @@ const guest_agent_fuzz_other_request: c_int = 7;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
 extern fn spore_agent_fuzz_exec_arg_equals(request: [*]const u8, request_len: usize, arg_index: usize, expected: [*]const u8, expected_len: usize) c_int;
+extern fn spore_agent_test_resolve_exec_path(command: [*]const u8, command_len: usize, path: [*]const u8, path_len: usize, path_present: c_int, resolved: [*]u8, resolved_cap: usize) c_int;
 extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, blocks_count: *u64, blocks_per_group: *u32, block_size: *u32) c_int;
 extern fn spore_agent_fuzz_ext4_growth_source(super: [*]const u8, super_len: usize) c_int;
 extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_blocks: u64, before_blocks_per_group: u32, before_block_size: u32, after_blocks: u64, after_blocks_per_group: u32, after_block_size: u32) c_int;
@@ -2724,6 +2725,73 @@ test "guest exec request parser preserves Unicode and rejects invalid scalar enc
     const lone_low = try std.mem.replaceOwned(u8, allocator, raw_utf8, "café", "\\ude00");
     defer allocator.free(lone_low);
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(lone_low.ptr, lone_low.len, lone_low[0..0].ptr, 0));
+}
+
+test "builder and runtime share bounded guest PATH resolution" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("bin");
+    try tmp.dir.makePath("sub");
+    const executable = try tmp.dir.createFile("bin/tool", .{ .mode = 0o755 });
+    executable.close();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var resolved: [512]u8 = undefined;
+    const empty = "";
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.posix.E.NOENT)),
+        spore_agent_test_resolve_exec_path("tool", 4, empty, 0, 0, &resolved, resolved.len),
+    );
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.posix.E.NOENT)),
+        spore_agent_test_resolve_exec_path("tool", 4, empty, 0, 1, &resolved, resolved.len),
+    );
+
+    const normal_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/missing:{s}/bin", .{ root, root });
+    defer std.testing.allocator.free(normal_path);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        spore_agent_test_resolve_exec_path("tool", 4, normal_path.ptr, normal_path.len, 1, &resolved, resolved.len),
+    );
+    const expected_normal = try std.fmt.allocPrint(std.testing.allocator, "{s}/bin/tool", .{root});
+    defer std.testing.allocator.free(expected_normal);
+    try std.testing.expectEqualStrings(expected_normal, std.mem.sliceTo(&resolved, 0));
+
+    const traversal_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/sub/../bin", .{root});
+    defer std.testing.allocator.free(traversal_path);
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        spore_agent_test_resolve_exec_path("tool", 4, traversal_path.ptr, traversal_path.len, 1, &resolved, resolved.len),
+    );
+    const expected_traversal = try std.fmt.allocPrint(std.testing.allocator, "{s}/sub/../bin/tool", .{root});
+    defer std.testing.allocator.free(expected_traversal);
+    try std.testing.expectEqualStrings(expected_traversal, std.mem.sliceTo(&resolved, 0));
+
+    var too_many_entries: [129]u8 = undefined;
+    for (0..64) |i| {
+        too_many_entries[i * 2] = '/';
+        too_many_entries[i * 2 + 1] = ':';
+    }
+    too_many_entries[128] = '/';
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.posix.E.@"2BIG")),
+        spore_agent_test_resolve_exec_path("missing", 7, &too_many_entries, too_many_entries.len, 1, &resolved, resolved.len),
+    );
+
+    const long_path = "/" ** 256;
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
+        spore_agent_test_resolve_exec_path("missing", 7, long_path, long_path.len, 1, &resolved, resolved.len),
+    );
+
+    const long_command = "x" ** 511;
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
+        spore_agent_test_resolve_exec_path(long_command, long_command.len, "/bin", 4, 1, &resolved, resolved.len),
+    );
 }
 
 test "build nofile limit is bounded" {
