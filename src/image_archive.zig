@@ -15,6 +15,7 @@ const gateway_manifest = @import("image_gateway_manifest.zig");
 const gateway_pull = @import("image_gateway_pull.zig");
 const image = @import("image.zig");
 const local_paths = @import("local_paths.zig");
+const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
@@ -38,6 +39,9 @@ pub const PackOptions = struct {
 };
 
 pub const PackResult = struct {
+    schema: []const u8 = "spore.image.archive.pack.result.v1",
+    schema_version: u32 = 1,
+    resource_type: resource.Type = .image,
     archive_digest: []const u8,
     manifest_digest: []const u8,
     image_digest: []const u8,
@@ -54,6 +58,9 @@ pub const UnpackOptions = struct {
 };
 
 pub const UnpackResult = struct {
+    schema: []const u8 = "spore.image.archive.unpack.result.v1",
+    schema_version: u32 = 1,
+    resource_type: resource.Type = .image,
     resolved_image_ref: []const u8,
     manifest_digest: []const u8,
     image_digest: []const u8,
@@ -729,6 +736,7 @@ test "native image archive round-trips into a clean cache and rejects substituti
         .platform = .{ .os = "linux", .arch = .arm64 },
     });
     defer deinitPackResult(allocator, pack_result);
+    try std.testing.expectEqual(resource.Type.image, pack_result.resource_type);
     try std.testing.expectEqualStrings(published.image_manifest_digest, pack_result.image_digest);
     try std.testing.expectEqual(@as(usize, 1), pack_result.object_count);
     try std.testing.expectError(error.ImageArchiveOutputExists, pack(init, allocator, .{
@@ -766,6 +774,7 @@ test "native image archive round-trips into a clean cache and rejects substituti
         .platform = .{ .os = "linux", .arch = .arm64 },
     });
     defer deinitUnpackResult(allocator, unpacked);
+    try std.testing.expectEqual(resource.Type.image, unpacked.resource_type);
     try std.testing.expectEqualStrings(pack_result.image_digest, unpacked.image_digest);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, consumer_cache, storage));
     try Io.Dir.cwd().access(io, consumer_cache ++ "/refs", .{});

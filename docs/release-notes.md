@@ -121,8 +121,9 @@ operation to reconnect to a saved session.
 The CLI adds `spore vm rm`, `spore vm fork`, `spore checkpoint rm`, and
 `spore checkpoint fork`. Removal output says whether it is deleting live
 runtime state or a checkpoint and explains the backing-ownership consequence.
-Image gateway, clone, and other lifecycle JSON results identify their resource
-type while retaining their existing schema names where one already existed.
+Image gateway, image archive, clone, and other lifecycle JSON results identify
+their resource type while retaining their existing schema names where one
+already existed.
 The older top-level `rm` and `fork` forms remain compatible throughout the 0.x
 release line.
 

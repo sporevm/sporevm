@@ -37,6 +37,8 @@ documented migration window.
 - `mise run check` and `mise run docs` cover the repository integration.
 - Independent deep-analysis review covered grouped-command diagnostics, stable
   automation envelopes, attach failure classification, and binding parity.
+- The final rebase onto merged PR #564 extends the same `image` type and stable
+  envelope to native image archive pack and unpack results.
 
 ## Resolved decisions
 
