@@ -330,7 +330,13 @@ The same root-only `User` restriction as `runManaged` applies. If the initial
 process cannot be started, create removes the new named VM before returning an
 error; a rollback failure is reported explicitly so the caller can remove it
 by name. Once started, the process remains detached and its eventual exit does
-not affect the create result.
+not affect the create result. Initial stdout and stderr default to `.retain`,
+which keeps 16,381 bytes per stream in the guest agent while continuously
+draining excess output. Set `.initial_output = .discard` to restore the
+discarding behavior. `initialOutputNamed` retrieves the bounded snapshot in the
+same `spore.lifecycle.v1` `NamedLifecycleResult.initial_command` field used by
+create, including destination, startup and process status, exit code, and
+truncation flags. `removeNamed` destroys the VM and its retained bytes.
 
 `forkNamed` supports diskless sources and the single writable rootfs disk used
 by image-created, explicit-rootfs, restored, and previously forked named VMs.
@@ -378,6 +384,7 @@ The named surface is:
 - `restoreNamed`
 - `forkNamed`
 - `execNamed`
+- `initialOutputNamed`
 - `openExecNamedStream`
 - `copyInNamed`
 - `copyOutNamed`
@@ -640,8 +647,10 @@ inspect-bundle JSON, inspect-spore JSON, pull JSON, named lifecycle JSON, and
 named copy side-effect calls. ABI version 15 added saved-spore removal through
 `spore_remove_saved_json`; ABI version 16 added the architecture-discriminated
 `spore_host_info_json_v3` entry point; ABI version 17 added
-`SporeCreateNamedOptions.initial_argv`; ABI version 18 adds structured last
-errors and terminal outcomes for streaming named exec. Clients should compare the runtime
+`SporeCreateNamedOptions.initial_argv`; ABI version 18 added structured last
+errors and terminal outcomes for streaming named exec; ABI version 19 adds
+`SporeCreateNamedOptions.initial_output` and
+`spore_initial_output_named_json`. Clients should compare the runtime
 build-info ABI with `SPORE_ABI_VERSION` before calling a newly added symbol.
 
 Release builds publish separate `libspore_Linux` and `libspore_Darwin`
@@ -767,6 +776,7 @@ SporeString initial_argv[] = {
 };
 create.initial_argv = initial_argv;
 create.initial_argc = 1;
+create.initial_output = SPORE_INITIAL_OUTPUT_RETAIN;
 
 uint16_t github_ports[] = {443};
 SporeString allow_cidrs[] = {
@@ -1009,10 +1019,11 @@ _ = removedSave
 
 The surface covers build info, context lifetime, host-info, network
 capabilities, inspect-bundle, inspect-spore, pull, context-local environment
-variables through `SetEnv`, and named lifecycle `CreateNamed`, `ExecNamed`,
+variables through `SetEnv`, and named lifecycle `CreateNamed`,
+`InitialOutputNamed`, `ExecNamed`,
 `OpenExecNamedStream`, `CopyInNamed`, `CopyOutNamed`, `SaveNamed`,
 `RestoreNamed`, `RemoveNamed`, `RemoveSaved`, and `ListNamed`.
-`CreateNamedOptions` exposes `InitialArgv` plus the create-time network policy
+`CreateNamedOptions` exposes `InitialArgv`, `InitialOutput`, and the create-time network policy
 supported by the C ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact
 host/port `NetworkRules`, and `BoundServices` for host Unix sockets exposed to
 the guest. Passing CIDRs, hosts, exact rules, or bound services while
@@ -1034,7 +1045,7 @@ is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
 return JSON, and exposes named copy as error-returning side-effect methods. It
-requires an exact C ABI version 18 match. Go context cancellation is checked before
+requires an exact C ABI version 19 match. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

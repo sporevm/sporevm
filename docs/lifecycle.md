@@ -46,11 +46,27 @@ and `-- <argv...>` for exact argv. Shell-form commands require a guest
 environment with `/bin/sh`; the managed default initrd provides a small Toybox
 shell environment, while image, rootfs, and custom-initrd guests provide their
 own command environment. Use `--image` or `--rootfs` for general distro
-commands. A command passed to `spore create` is
-started in the guest and detached; stdout and stderr are discarded so the named
-VM is immediately available for `fork`, `exec`, `save`, and `rm`. Create removes
-the new VM if that process cannot be started, while its eventual exit after a
-successful start does not affect the VM. `spore exec` always
+commands. A command passed to `spore create` is started in the guest and
+detached. By default the guest continuously drains and retains up to 16,381
+bytes from each of stdout and stderr, so an unattended process cannot block on
+a full pipe or grow host storage. Create reports the `named_logs` destination
+and `started` status; retrieve the current bounded snapshot, process status,
+exit code, and truncation flags later with:
+
+```bash
+spore logs bench-1
+spore --json logs bench-1
+```
+
+Pass `--initial-output discard` when the output is intentionally disposable;
+`retain` is the default and is also accepted explicitly. Retained bytes live
+with the guest agent, are copied with a live fork or saved-memory restore, and
+disappear when the VM is removed. Because retrieval uses the existing
+single-operation monitor path, `spore logs` returns a monitor-busy error while
+another exec, copy, save, or fork operation is active. Create removes the new
+VM if the process cannot be started, while a non-zero exit after a successful
+start is reported by `spore logs` and does not affect VM readiness.
+`spore exec` always
 streams guest stdout and stderr live as independent ordered streams. Stdin is
 closed by default. Pass `-i` to forward host stdin, and pass `-t` to request a
 guest terminal for the exec. The usual shell spelling is:
@@ -134,6 +150,7 @@ spore create bench-1 --options @create-options.json
   "memory": "512mb",
   "vcpus": 2,
   "timeout_ms": 120000,
+  "initial_output": "retain",
   "network": {
     "enabled": true,
     "allow_cidrs": ["93.184.216.34/32"],
@@ -450,6 +467,10 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   Zig. Its C JSON result keeps valid UTF-8 stdout and stderr as strings and
   represents invalid UTF-8 streams as integer byte arrays; the Go binding
   accepts both forms without changing the bytes.
+- Initial create output uses the existing `spore.lifecycle.v1` result. Create
+  populates `initial_command` with its disposition, optional destination,
+  per-stream limit, and startup status; `logs` returns the same nested object
+  with process status, optional exit code, bytes, and truncation flags.
 - `spore copy-in` and `spore copy-out` transfer explicit regular files or
   directory trees. Symlinks, special files, overwrite, and workspace sync are
   intentionally outside this primitive. Embedders use the matching

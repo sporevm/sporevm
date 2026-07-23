@@ -140,7 +140,20 @@ const create_usage =
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output to PATH
+    \\  --initial-output MODE   retain or discard initial-command output (default: retain)
     \\  -- <argv...>            Start exact argv instead of /bin/sh -lc
+    \\  -h, --help              Show this help
+    \\
+;
+
+const logs_usage =
+    \\Usage:
+    \\  spore logs NAME
+    \\
+    \\Print the bounded stdout and stderr retained for the initial command.
+    \\The named VM monitor must be idle while the snapshot is retrieved.
+    \\
+    \\Options:
     \\  -h, --help              Show this help
     \\
 ;
@@ -426,6 +439,7 @@ const CreateOptions = struct {
     spec: Spec,
     options_path: ?[]const u8 = null,
     image_pull_policy: run_mod.PullPolicy = .missing,
+    initial_output: InitialOutputDisposition = .retain,
     network: run_mod.NetworkMode = .disabled,
     network_policy: run_mod.NetworkPolicy = .{},
     command_mode: run_mod.CommandMode = .shell,
@@ -446,6 +460,7 @@ const CreateOptionsFile = struct {
     guest_port: ?u32 = null,
     timeout_ms: ?u64 = null,
     console_log_path: ?[]const u8 = null,
+    initial_output: ?InitialOutputDisposition = null,
     network: ?CreateOptionsFileNetwork = null,
     annotations: spore.Annotations = .{},
 };
@@ -538,6 +553,43 @@ pub const NamedNetworkOptions = struct {
     port_forwards: []const spore_net_policy.PortForwardConfig = &.{},
 };
 
+pub const InitialOutputDisposition = enum {
+    retain,
+    discard,
+
+    fn parse(raw: []const u8) ?InitialOutputDisposition {
+        if (std.mem.eql(u8, raw, "retain")) return .retain;
+        if (std.mem.eql(u8, raw, "discard")) return .discard;
+        return null;
+    }
+};
+
+pub const InitialOutputDestination = enum {
+    named_logs,
+};
+
+pub const InitialCommandStartupStatus = enum {
+    started,
+};
+
+pub const InitialCommandProcessStatus = enum {
+    running,
+    exited,
+};
+
+pub const InitialCommandResult = struct {
+    output_disposition: InitialOutputDisposition,
+    output_destination: ?InitialOutputDestination = null,
+    output_limit_bytes_per_stream: ?u32 = null,
+    startup_status: InitialCommandStartupStatus = .started,
+    process_status: ?InitialCommandProcessStatus = null,
+    exit_code: ?u8 = null,
+    stdout: ?[]u8 = null,
+    stderr: ?[]u8 = null,
+    stdout_truncated: bool = false,
+    stderr_truncated: bool = false,
+};
+
 pub const CreateNamedOptions = struct {
     name: []const u8,
     backend: run_mod.Backend = .auto,
@@ -555,6 +607,7 @@ pub const CreateNamedOptions = struct {
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
+    initial_output: InitialOutputDisposition = .retain,
     spore_executable: []const u8 = "spore",
     annotations: spore.Annotations = .{},
 };
@@ -582,6 +635,10 @@ pub const CopyNamedOptions = struct {
     name: []const u8,
     host_path: []const u8,
     guest_path: []const u8,
+};
+
+pub const InitialOutputNamedOptions = struct {
+    name: []const u8,
 };
 
 const SaveContinueNamedOptions = struct {
@@ -615,6 +672,7 @@ pub const NamedLifecycleResult = struct {
     saved_sessions: ?usize = null,
     ownership: ?[]const u8 = null,
     timing: ?NamedLifecycleTiming = null,
+    initial_command: ?InitialCommandResult = null,
 };
 
 pub const NamedLifecycleTiming = struct {
@@ -659,6 +717,8 @@ pub const ExecNamedResult = struct {
 /// `execNamed` is a compatibility collector and rejects output beyond this
 /// per-stream limit. Use `openExecNamedStream` for streamed command output.
 pub const exec_named_capture_limit = 16 * 1024;
+pub const initial_output_protocol_header_len = 3;
+pub const initial_output_limit_bytes_per_stream: u32 = exec_named_capture_limit - initial_output_protocol_header_len;
 
 pub const TerminalSize = spore_stream.Resize;
 
@@ -986,6 +1046,11 @@ fn createNamedWithTiming(
             .wait_exec_ready_ms = ready_ms - monitor_spawned_ms,
             .total_ms = ready_ms - timing.start_ms,
         },
+        .initial_command = if (initial_command != null) .{
+            .output_disposition = options.initial_output,
+            .output_destination = if (options.initial_output == .retain) .named_logs else null,
+            .output_limit_bytes_per_stream = if (options.initial_output == .retain) initial_output_limit_bytes_per_stream else null,
+        } else null,
     }) catch |err| {
         if (initial_command != null) return rollbackCreatedNamedAfterFailure(context, arena, paths, spec.name, err);
         return err;
@@ -995,12 +1060,20 @@ fn createNamedWithTiming(
         const initial = startNamed(context, allocator, .{
             .name = spec.name,
             .command = command,
-        }) catch |err| {
+        }, options.initial_output == .retain) catch |err| {
             return rollbackCreatedNamedAfterFailure(context, arena, paths, spec.name, err);
         };
         defer deinitExecNamedResult(allocator, initial);
         if (initial.exit_code != 0) {
-            setLastError("named VM {s} initial command could not be started (status {d}); the VM was removed", .{ spec.name, initial.exit_code });
+            setLastError(
+                "named VM {s} initial command startup failed (status {d}); output disposition={s}, destination={s}; the VM was removed",
+                .{
+                    spec.name,
+                    initial.exit_code,
+                    @tagName(options.initial_output),
+                    if (options.initial_output == .retain) "named_logs (unavailable after removal)" else "none",
+                },
+            );
             return rollbackCreatedNamedAfterFailure(context, arena, paths, spec.name, error.InitialCommandFailed);
         }
     }
@@ -1351,6 +1424,7 @@ fn startNamed(
     context: Context,
     allocator: std.mem.Allocator,
     options: ExecNamedOptions,
+    retain_output: bool,
 ) !ExecNamedResult {
     clearLastError();
     if (options.command.len == 0) return error.InvalidGuestCommand;
@@ -1366,8 +1440,66 @@ fn startNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "start", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    const response = try sendStartRequest(arena, context.io, ready.value.control_socket_path, options.command, options.guest_env, options.guest_working_dir);
+    const response = try sendStartRequest(arena, context.io, ready.value.control_socket_path, options.command, options.guest_env, options.guest_working_dir, retain_output);
     return parseExecNamedResponse(allocator, arena, response);
+}
+
+pub fn initialOutputNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: InitialOutputNamedOptions,
+) !NamedLifecycleResult {
+    clearLastError();
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const paths = try apiPaths(context, arena, options.name);
+    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    if (state != .ready) return namedVmNotReady(arena, context.io, paths, "logs", options.name, state);
+    var ready = try readReady(arena, context.io, paths);
+    defer ready.deinit();
+    const response = try sendInitialOutputRequest(arena, context.io, ready.value.control_socket_path);
+    const snapshot = try parseExecNamedResponse(allocator, arena, response);
+    defer deinitExecNamedResult(allocator, snapshot);
+    if (snapshot.exit_code != 0) {
+        setLastError("named VM {s} has no retained initial-command output", .{options.name});
+        return error.InitialOutputUnavailable;
+    }
+    const initial = try initialCommandResultFromSnapshot(snapshot);
+    return ownedNamedLifecycleResult(allocator, .{
+        .action = "logs",
+        .name = options.name,
+        .state = "ready",
+        .pid = ready.value.pid,
+        .initial_command = initial,
+    });
+}
+
+fn initialCommandResultFromSnapshot(snapshot: ExecNamedResult) !InitialCommandResult {
+    const output_limit: usize = initial_output_limit_bytes_per_stream;
+    if (snapshot.stdout.len < initial_output_protocol_header_len) return error.BadMonitorResponse;
+    const header = snapshot.stdout[0..initial_output_protocol_header_len];
+    if (header[0] > 1 or (header[0] == 0 and header[1] != 0) or (header[2] & ~@as(u8, 3)) != 0) {
+        return error.BadMonitorResponse;
+    }
+    if (snapshot.stdout.len - initial_output_protocol_header_len > output_limit or
+        snapshot.stderr.len > output_limit)
+    {
+        return error.BadMonitorResponse;
+    }
+    const exited = header[0] == 1;
+    return .{
+        .output_disposition = .retain,
+        .output_destination = .named_logs,
+        .output_limit_bytes_per_stream = initial_output_limit_bytes_per_stream,
+        .process_status = if (exited) .exited else .running,
+        .exit_code = if (exited) header[1] else null,
+        .stdout = snapshot.stdout[initial_output_protocol_header_len..],
+        .stderr = snapshot.stderr,
+        .stdout_truncated = (header[2] & 1) != 0,
+        .stderr_truncated = (header[2] & 2) != 0,
+    };
 }
 
 fn saveContinueNamed(
@@ -1748,6 +1880,10 @@ pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLif
     allocator.free(result.name);
     if (result.console_log_path) |path| allocator.free(path);
     if (result.spore_dir) |path| allocator.free(path);
+    if (result.initial_command) |initial| {
+        if (initial.stdout) |bytes| allocator.free(bytes);
+        if (initial.stderr) |bytes| allocator.free(bytes);
+    }
 }
 
 pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
@@ -1833,6 +1969,7 @@ pub fn createCli(
         .guest_port = spec.guest_port,
         .timeout_ms = spec.timeout_ms,
         .console_log_path = spec.console_log_path,
+        .initial_output = parsed.initial_output,
         .spore_executable = full_args[0],
         .annotations = spec.annotations,
     }, .{
@@ -1900,6 +2037,69 @@ pub fn createCli(
         try machine_output.writeJson(allocator, stdout, result);
     } else {
         try writeNamedLifecycleResult(stdout, result);
+    }
+}
+
+pub fn logsCli(
+    init: std.process.Init,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+    mode: machine_output.Mode,
+) !void {
+    if (wantsHelp(args)) {
+        if (mode == .json) {
+            exitLifecycleCliError(
+                init.arena.allocator(),
+                stderr,
+                mode,
+                machine_output.usageInvalidArgument("spore --json logs does not support help output", "logs"),
+                "spore --json logs does not support help output",
+            );
+        }
+        try stdout.writeAll(logs_usage);
+        return;
+    }
+    const allocator = init.arena.allocator();
+    if (args.len != 1) {
+        exitLifecycleCliError(
+            allocator,
+            stderr,
+            mode,
+            machine_output.usageMissingArgument("usage: spore logs NAME", "logs"),
+            logs_usage,
+        );
+    }
+    validateNameLifecycleCli(allocator, stderr, mode, "logs", args[0]);
+    const result = initialOutputNamed(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
+        .name = args[0],
+    }) catch |err| switch (err) {
+        error.NamedVmNotFound => {
+            const message = allocLifecycleMessage(allocator, "spore logs: VM not found: {s}", .{args[0]});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "logs"), message);
+        },
+        error.NamedVmNotReady => {
+            const fallback = allocLifecycleMessage(allocator, "spore logs: VM is not ready: {s}", .{args[0]});
+            const message = allocLifecycleLastErrorMessage(allocator, "logs", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "logs"), message);
+        },
+        error.InitialOutputUnavailable => {
+            const fallback = allocLifecycleMessage(allocator, "spore logs: VM {s} has no retained initial-command output", .{args[0]});
+            const message = allocLifecycleLastErrorMessage(allocator, "logs", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "logs"), message);
+        },
+        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
+            const fallback = allocLifecycleMessage(allocator, "spore logs: could not retrieve initial-command output for VM {s}: {s}", .{ args[0], @errorName(err) });
+            const message = allocLifecycleLastErrorMessage(allocator, "logs", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "logs"), message);
+        },
+        else => |e| return e,
+    };
+    defer deinitNamedLifecycleResult(allocator, result);
+    if (mode == .json) {
+        try machine_output.writeJson(allocator, stdout, result);
+    } else {
+        try writeInitialOutputResult(stdout, result);
     }
 }
 
@@ -3292,6 +3492,7 @@ fn parseCreateOptionsFile(
     if (file.guest_port) |port| out.spec.guest_port = port;
     if (file.timeout_ms) |timeout| out.spec.timeout_ms = timeout;
     out.spec.console_log_path = file.console_log_path;
+    out.initial_output = file.initial_output orelse out.initial_output;
     out.spec.annotations = file.annotations;
     try spore.validateAnnotations(out.spec.annotations);
 
@@ -3330,6 +3531,7 @@ fn parseCreateArgs(
     var options_path: ?[]const u8 = null;
     var field_flag_seen = false;
     var image_pull_policy: run_mod.PullPolicy = .missing;
+    var initial_output: InitialOutputDisposition = .retain;
     var network: run_mod.NetworkMode = .disabled;
     var network_policy = run_mod.NetworkPolicy{};
     var command_mode: run_mod.CommandMode = .shell;
@@ -3455,6 +3657,13 @@ fn parseCreateArgs(
         } else if (std.mem.eql(u8, args[i], "--console-log")) {
             field_flag_seen = true;
             spec.console_log_path = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--initial-output")) {
+            field_flag_seen = true;
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            initial_output = InitialOutputDisposition.parse(raw) orelse {
+                const message = "spore create: --initial-output must be retain or discard";
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
         } else if (std.mem.eql(u8, args[i], "--annotation")) {
             field_flag_seen = true;
             addAnnotationArgLifecycleCli(allocator, stderr, mode, "create", &spec.annotations, takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]));
@@ -3511,6 +3720,7 @@ fn parseCreateArgs(
         .spec = spec,
         .options_path = options_path,
         .image_pull_policy = image_pull_policy,
+        .initial_output = initial_output,
         .network = network,
         .network_policy = network_policy,
         .command_mode = command_mode,
@@ -4185,6 +4395,16 @@ fn writeNamedForkResult(writer: *Io.Writer, result: NamedForkResult) !void {
 fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !void {
     if (std.mem.eql(u8, result.action, "created")) {
         try writer.print("created vm {s}\n", .{result.name});
+        if (result.initial_command) |initial| {
+            if (initial.output_destination == .named_logs) {
+                try writer.print(
+                    "initial command started; output retained up to {d} bytes per stream; retrieve with `spore logs {s}`\n",
+                    .{ initial.output_limit_bytes_per_stream orelse 0, result.name },
+                );
+            } else {
+                try writer.writeAll("initial command started; output discarded\n");
+            }
+        }
     } else if (std.mem.eql(u8, result.action, "restored")) {
         try writer.print("restored vm {s}\n", .{result.name});
     } else if (std.mem.eql(u8, result.action, "saved")) {
@@ -4200,6 +4420,30 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
         try writer.print("removed vm {s}\n", .{result.name});
     } else {
         try writer.print("{s} vm {s}\n", .{ result.action, result.name });
+    }
+}
+
+fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !void {
+    const initial = result.initial_command orelse return error.InitialOutputUnavailable;
+    switch (initial.process_status orelse .running) {
+        .running => try writer.writeAll("initial command: running\n"),
+        .exited => try writer.print("initial command: exited ({d})\n", .{initial.exit_code orelse 255}),
+    }
+    try writer.print(
+        "stdout ({d} bytes{s}):\n",
+        .{ if (initial.stdout) |bytes| bytes.len else 0, if (initial.stdout_truncated) ", truncated" else "" },
+    );
+    if (initial.stdout) |bytes| {
+        try writer.writeAll(bytes);
+        if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') try writer.writeByte('\n');
+    }
+    try writer.print(
+        "stderr ({d} bytes{s}):\n",
+        .{ if (initial.stderr) |bytes| bytes.len else 0, if (initial.stderr_truncated) ", truncated" else "" },
+    );
+    if (initial.stderr) |bytes| {
+        try writer.writeAll(bytes);
+        if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') try writer.writeByte('\n');
     }
 }
 
@@ -4990,16 +5234,21 @@ fn openCopyNamedStreamAt(
     return .{ .io = context.io, .stream = stream };
 }
 
-fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
+fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
     const payload = struct {
         type: []const u8 = "start",
         argv: []const []const u8,
         env: []const []const u8,
         working_dir: ?[]const u8,
-    }{ .argv = argv, .env = env, .working_dir = working_dir };
+        retain_output: bool,
+    }{ .argv = argv, .env = env, .working_dir = working_dir, .retain_output = retain_output };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     return sendControlJson(allocator, io, socket_path, json);
+}
+
+fn sendInitialOutputRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) ![]const u8 {
+    return sendControlJson(allocator, io, socket_path, "{\"type\":\"initial-output\"}");
 }
 
 fn sendShutdownRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) ![]const u8 {
@@ -5436,6 +5685,13 @@ fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycl
     const console_log_path = if (result.console_log_path) |path| try allocator.dupe(u8, path) else null;
     errdefer if (console_log_path) |path| allocator.free(path);
     const spore_dir = if (result.spore_dir) |path| try allocator.dupe(u8, path) else null;
+    errdefer if (spore_dir) |path| allocator.free(path);
+    var initial_command = result.initial_command;
+    if (initial_command) |*initial| {
+        initial.stdout = if (initial.stdout) |bytes| try allocator.dupe(u8, bytes) else null;
+        errdefer if (initial.stdout) |bytes| allocator.free(bytes);
+        initial.stderr = if (initial.stderr) |bytes| try allocator.dupe(u8, bytes) else null;
+    }
     return .{
         .action = result.action,
         .name = name,
@@ -5445,6 +5701,7 @@ fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycl
         .spore_dir = spore_dir,
         .saved_sessions = result.saved_sessions,
         .timing = result.timing,
+        .initial_command = initial_command,
     };
 }
 
@@ -6836,6 +7093,70 @@ test "create parser accepts shell and exact commands" {
     try std.testing.expectEqualStrings("hi", argv_opts.command[1]);
 }
 
+test "create parser defaults to retained initial output and accepts discard" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+
+    const retained = try parseCreateArgs(&.{ "counter", "--", "/bin/true" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(InitialOutputDisposition.retain, retained.initial_output);
+
+    const discarded = try parseCreateArgs(&.{ "counter", "--initial-output", "discard", "--", "/bin/true" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(InitialOutputDisposition.discard, discarded.initial_output);
+}
+
+test "initial output snapshot reports process state bytes and truncation" {
+    var running_stdout = [_]u8{ 0, 0, 0, 'o', 'k' };
+    var running_stderr = [_]u8{'e'};
+    const running = try initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &running_stdout,
+        .stderr = &running_stderr,
+    });
+    try std.testing.expectEqual(InitialCommandProcessStatus.running, running.process_status.?);
+    try std.testing.expectEqual(@as(?u8, null), running.exit_code);
+    try std.testing.expectEqualStrings("ok", running.stdout.?);
+    try std.testing.expectEqualStrings("e", running.stderr.?);
+
+    var exited_stdout = [_]u8{ 1, 7, 3, 'x' };
+    const exited = try initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &exited_stdout,
+        .stderr = &.{},
+    });
+    try std.testing.expectEqual(InitialCommandProcessStatus.exited, exited.process_status.?);
+    try std.testing.expectEqual(@as(?u8, 7), exited.exit_code);
+    try std.testing.expect(exited.stdout_truncated);
+    try std.testing.expect(exited.stderr_truncated);
+
+    var short = [_]u8{ 1, 0 };
+    try std.testing.expectError(error.BadMonitorResponse, initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &short,
+        .stderr = &.{},
+    }));
+    var invalid_flags = [_]u8{ 1, 0, 4 };
+    try std.testing.expectError(error.BadMonitorResponse, initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &invalid_flags,
+        .stderr = &.{},
+    }));
+    var invalid_running_exit = [_]u8{ 0, 7, 0 };
+    try std.testing.expectError(error.BadMonitorResponse, initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &invalid_running_exit,
+        .stderr = &.{},
+    }));
+    const oversized_stderr = try std.testing.allocator.alloc(u8, @as(usize, initial_output_limit_bytes_per_stream) + 1);
+    defer std.testing.allocator.free(oversized_stderr);
+    var bounded_stdout = [_]u8{ 0, 0, 0 };
+    try std.testing.expectError(error.BadMonitorResponse, initialCommandResultFromSnapshot(.{
+        .exit_code = 0,
+        .stdout = &bounded_stdout,
+        .stderr = oversized_stderr,
+    }));
+}
+
 test "create parser keeps image and plain creates commandless" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
@@ -7719,6 +8040,23 @@ test "lifecycle human results render terse status lines" {
 
     out.clearRetainingCapacity();
     try writeNamedLifecycleResult(&out.writer, .{
+        .action = "created",
+        .name = "counter",
+        .state = "ready",
+        .initial_command = .{
+            .output_disposition = .retain,
+            .output_destination = .named_logs,
+            .output_limit_bytes_per_stream = initial_output_limit_bytes_per_stream,
+        },
+    });
+    try std.testing.expectEqualStrings(
+        "created vm counter\n" ++
+            "initial command started; output retained up to 16381 bytes per stream; retrieve with `spore logs counter`\n",
+        out.written(),
+    );
+
+    out.clearRetainingCapacity();
+    try writeNamedLifecycleResult(&out.writer, .{
         .action = "saved",
         .name = "counter",
         .state = "ready",
@@ -7848,6 +8186,36 @@ test "named restore machine result reports exec readiness timing" {
     try std.testing.expectEqualStrings("restored", parsed.value.action);
     try std.testing.expectEqual(@as(u64, 17), parsed.value.timing.?.wait_exec_ready_ms);
     try std.testing.expectEqual(@as(u64, 24), parsed.value.timing.?.total_ms);
+}
+
+test "initial output machine result preserves invalid UTF-8 as bytes" {
+    const allocator = std.testing.allocator;
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var invalid_stdout = [_]u8{ 0xff, 'A' };
+
+    try machine_output.writeJson(allocator, &out.writer, NamedLifecycleResult{
+        .action = "logs",
+        .name = "worker-1",
+        .state = "ready",
+        .initial_command = .{
+            .output_disposition = .retain,
+            .output_destination = .named_logs,
+            .output_limit_bytes_per_stream = initial_output_limit_bytes_per_stream,
+            .process_status = .exited,
+            .exit_code = 0,
+            .stdout = &invalid_stdout,
+            .stderr = &.{},
+        },
+    });
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, out.written(), .{});
+    defer parsed.deinit();
+    const initial = parsed.value.object.get("initial_command").?.object;
+    const stdout = initial.get("stdout").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), stdout.len);
+    try std.testing.expectEqual(@as(i64, 255), stdout[0].integer);
+    try std.testing.expectEqual(@as(i64, 65), stdout[1].integer);
 }
 
 test "lifecycle list JSON exposes memory and nullable stats" {

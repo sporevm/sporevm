@@ -50,6 +50,8 @@
 #define MAX_COPY_FULL_PATH_LEN 1024
 #define COPY_ARCHIVE_HEADER_LEN 16
 #define MAX_DETACHED_CHILDREN 32
+#define INITIAL_OUTPUT_HEADER_LEN 3
+#define INITIAL_OUTPUT_CAP (16 * 1024 - INITIAL_OUTPUT_HEADER_LEN)
 #define REPLAY_CAP 65536
 #define SESSION_ID "default"
 #define GEN_PARAMS_MAX 4096
@@ -256,6 +258,17 @@ struct client {
 struct detached_children {
   pid_t pids[MAX_DETACHED_CHILDREN];
   int count;
+  pid_t retained_pid;
+  int retained_stdout_fd;
+  int retained_stderr_fd;
+  int retained_exited;
+  int retained_exit_code;
+  int retained_stdout_truncated;
+  int retained_stderr_truncated;
+  size_t retained_stdout_len;
+  size_t retained_stderr_len;
+  unsigned char retained_stdout[INITIAL_OUTPUT_CAP];
+  unsigned char retained_stderr[INITIAL_OUTPUT_CAP];
 };
 
 struct generation_monitor {
@@ -2092,6 +2105,7 @@ enum request_kind {
   REQUEST_ROOTFS_GROW,
   REQUEST_FSFREEZE,
   REQUEST_FSTHAW,
+  REQUEST_INITIAL_OUTPUT,
 };
 
 struct run_request {
@@ -2108,6 +2122,7 @@ struct run_request {
   uint16_t terminal_cols;
   int memory_pressure;
   int detached;
+  int retain_output;
   int require_generation_ready;
   char generation_params[GEN_PARAMS_MAX];
   char copy_path[MAX_COPY_PATH_LEN + 1];
@@ -2858,6 +2873,8 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     } else if (strcmp(type, "fsthaw-v1") == 0) {
       out->kind = REQUEST_FSTHAW;
       out->protocol_v1 = 1;
+    } else if (strcmp(type, "initial-output") == 0) {
+      out->kind = REQUEST_INITIAL_OUTPUT;
     } else {
       return -1;
     }
@@ -3001,6 +3018,11 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     int detached_rc = parse_bool_field(req, "detached", &detached);
     if (detached_rc < 0) return -1;
     if (detached_rc > 0) out->detached = detached;
+    int retain_output = 0;
+    int retain_output_rc = parse_bool_field(req, "retain_output", &retain_output);
+    if (retain_output_rc < 0) return -1;
+    if (retain_output_rc > 0) out->retain_output = retain_output;
+    if (out->retain_output && !out->detached) return -1;
     int require_generation_ready = 0;
     int generation_ready_rc = parse_bool_field(req, "require_generation_ready", &require_generation_ready);
     if (generation_ready_rc < 0) return -1;
@@ -4296,6 +4318,17 @@ static void reap_detached_children(struct detached_children *children) {
     int status = 0;
     pid_t rc = waitpid(children->pids[i], &status, WNOHANG);
     if (rc == children->pids[i] || (rc < 0 && errno == ECHILD)) {
+      if (children->pids[i] == children->retained_pid && !children->retained_exited) {
+        children->retained_exited = 1;
+        if (rc == children->pids[i] && WIFEXITED(status)) {
+          children->retained_exit_code = WEXITSTATUS(status);
+        } else if (rc == children->pids[i] && WIFSIGNALED(status)) {
+          children->retained_exit_code = 128 + WTERMSIG(status);
+          if (children->retained_exit_code > 255) children->retained_exit_code = 255;
+        } else {
+          children->retained_exit_code = 255;
+        }
+      }
       children->count--;
       if (i < children->count) {
         children->pids[i] = children->pids[children->count];
@@ -4305,6 +4338,69 @@ static void reap_detached_children(struct detached_children *children) {
     if (rc < 0 && errno == EINTR) continue;
     i++;
   }
+}
+
+static void close_fd_if_open(int *fd);
+
+static void drain_retained_stream(int *fd, unsigned char *output, size_t *output_len, int *truncated) {
+  if (*fd < 0) return;
+  unsigned char discard[MAX_FRAME_PAYLOAD];
+  for (;;) {
+    unsigned char *target = discard;
+    size_t capacity = sizeof(discard);
+    if (*output_len < INITIAL_OUTPUT_CAP) {
+      target = output + *output_len;
+      capacity = INITIAL_OUTPUT_CAP - *output_len;
+    }
+    ssize_t n = read(*fd, target, capacity);
+    if (n > 0) {
+      if (target == discard) {
+        *truncated = 1;
+      } else {
+        *output_len += (size_t)n;
+      }
+      continue;
+    }
+    if (n == 0) {
+      close_fd_if_open(fd);
+      return;
+    }
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+    close_fd_if_open(fd);
+    return;
+  }
+}
+
+static void drain_retained_output(struct detached_children *children) {
+  drain_retained_stream(&children->retained_stdout_fd, children->retained_stdout,
+                        &children->retained_stdout_len, &children->retained_stdout_truncated);
+  drain_retained_stream(&children->retained_stderr_fd, children->retained_stderr,
+                        &children->retained_stderr_len, &children->retained_stderr_truncated);
+}
+
+static int send_retained_output(struct client *client, struct detached_children *children) {
+  reap_detached_children(children);
+  drain_retained_output(children);
+  if (children->retained_pid <= 0) {
+    return send_client_error_exit(client, 2, "spore create: initial output was not retained\n");
+  }
+  /* status (running/exited), exit code, then stdout/stderr truncation bits. */
+  unsigned char header[INITIAL_OUTPUT_HEADER_LEN] = {
+    children->retained_exited ? 1 : 0,
+    children->retained_exited ? (unsigned char)children->retained_exit_code : 0,
+    (unsigned char)((children->retained_stdout_truncated ? 1 : 0) |
+                    (children->retained_stderr_truncated ? 2 : 0)),
+  };
+  if (send_stream_data(client->fd, "stdout", 0, header, sizeof(header)) != 0 ||
+      send_stream_data(client->fd, "stdout", sizeof(header), children->retained_stdout,
+                       children->retained_stdout_len) != 0 ||
+      send_stream_data(client->fd, "stderr", 0, children->retained_stderr,
+                       children->retained_stderr_len) != 0 ||
+      send_exit_frame(client->fd, 0) != 0) {
+    return -1;
+  }
+  return 0;
 }
 
 static void close_fd_if_open(int *fd) {
@@ -4326,7 +4422,7 @@ static void detached_child_fail(int status_fd) {
   _exit(127);
 }
 
-static int start_detached(char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, struct detached_children *children) {
+static int start_detached(char *const argv[], char *const envp[], const char *working_dir, int use_rootfs, int retain_output, struct detached_children *children) {
   t_command_start = now_ms();
   reap_detached_children(children);
   if (children->count >= MAX_DETACHED_CHILDREN) {
@@ -4334,13 +4430,23 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
     return 127;
   }
 
+  if (retain_output && children->retained_pid > 0) {
+    t_command_exit = now_ms();
+    return 127;
+  }
+
   int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
   int start_pipe[2] = { -1, -1 };
   int exec_pipe[2] = { -1, -1 };
-  if (devnull < 0 || pipe2(start_pipe, O_CLOEXEC) != 0 || pipe2(exec_pipe, O_CLOEXEC) != 0) {
+  int stdout_pipe[2] = { -1, -1 };
+  int stderr_pipe[2] = { -1, -1 };
+  if (devnull < 0 || pipe2(start_pipe, O_CLOEXEC) != 0 || pipe2(exec_pipe, O_CLOEXEC) != 0 ||
+      (retain_output && (pipe2(stdout_pipe, O_CLOEXEC) != 0 || pipe2(stderr_pipe, O_CLOEXEC) != 0))) {
     close_fd_if_open(&devnull);
     close_pipe_if_open(start_pipe);
     close_pipe_if_open(exec_pipe);
+    close_pipe_if_open(stdout_pipe);
+    close_pipe_if_open(stderr_pipe);
     t_command_exit = now_ms();
     return 127;
   }
@@ -4349,6 +4455,8 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
   if (pid == 0) {
     close(start_pipe[1]);
     close(exec_pipe[0]);
+    close_fd_if_open(&stdout_pipe[0]);
+    close_fd_if_open(&stderr_pipe[0]);
     char start_byte = 0;
     ssize_t sr = 0;
     do {
@@ -4357,10 +4465,12 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
     if (sr != 1 || start_byte != 1) detached_child_fail(exec_pipe[1]);
     close(start_pipe[0]);
     if (dup2(devnull, STDIN_FILENO) < 0 ||
-        dup2(devnull, STDOUT_FILENO) < 0 ||
-        dup2(devnull, STDERR_FILENO) < 0) {
+        dup2(retain_output ? stdout_pipe[1] : devnull, STDOUT_FILENO) < 0 ||
+        dup2(retain_output ? stderr_pipe[1] : devnull, STDERR_FILENO) < 0) {
       detached_child_fail(exec_pipe[1]);
     }
+    close_fd_if_open(&stdout_pipe[1]);
+    close_fd_if_open(&stderr_pipe[1]);
     close(devnull);
     if (use_rootfs) {
       if (chroot("/mnt/rootfs") != 0) detached_child_fail(exec_pipe[1]);
@@ -4373,9 +4483,13 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
   close_fd_if_open(&devnull);
   close_fd_if_open(&start_pipe[0]);
   close_fd_if_open(&exec_pipe[1]);
+  close_fd_if_open(&stdout_pipe[1]);
+  close_fd_if_open(&stderr_pipe[1]);
   if (pid < 0) {
     close_pipe_if_open(start_pipe);
     close_pipe_if_open(exec_pipe);
+    close_pipe_if_open(stdout_pipe);
+    close_pipe_if_open(stderr_pipe);
     t_command_exit = now_ms();
     return 127;
   }
@@ -4383,6 +4497,8 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
   if (write_all(start_pipe[1], "\1", 1) != 0) {
     close_pipe_if_open(start_pipe);
     close_pipe_if_open(exec_pipe);
+    close_pipe_if_open(stdout_pipe);
+    close_pipe_if_open(stderr_pipe);
     (void)kill(pid, SIGKILL);
     wait_child_blocking(pid);
     t_command_exit = now_ms();
@@ -4397,6 +4513,8 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
   } while (n < 0 && errno == EINTR);
   close_fd_if_open(&exec_pipe[0]);
   if (n != 0) {
+    close_pipe_if_open(stdout_pipe);
+    close_pipe_if_open(stderr_pipe);
     (void)kill(pid, SIGKILL);
     wait_child_blocking(pid);
     t_command_exit = now_ms();
@@ -4404,6 +4522,26 @@ static int start_detached(char *const argv[], char *const envp[], const char *wo
   }
 
   children->pids[children->count++] = pid;
+  if (retain_output) {
+    if (set_nonblock(stdout_pipe[0]) != 0 || set_nonblock(stderr_pipe[0]) != 0) {
+      close_pipe_if_open(stdout_pipe);
+      close_pipe_if_open(stderr_pipe);
+      (void)kill(pid, SIGKILL);
+      wait_child_blocking(pid);
+      children->count--;
+      t_command_exit = now_ms();
+      return 127;
+    }
+    children->retained_pid = pid;
+    children->retained_stdout_fd = stdout_pipe[0];
+    children->retained_stderr_fd = stderr_pipe[0];
+    children->retained_exited = 0;
+    children->retained_exit_code = 0;
+    children->retained_stdout_truncated = 0;
+    children->retained_stderr_truncated = 0;
+    children->retained_stdout_len = 0;
+    children->retained_stderr_len = 0;
+  }
   t_command_exit = now_ms();
   return 0;
 }
@@ -5331,6 +5469,12 @@ static void accept_request(int listener, struct session *session, struct client 
     return;
   }
 
+  if (request.kind == REQUEST_INITIAL_OUTPUT) {
+    (void)send_retained_output(client, detached);
+    close_client(client);
+    return;
+  }
+
   if (request.kind == REQUEST_COPY_IN || request.kind == REQUEST_COPY_OUT) {
     if (use_rootfs && !rootfs_ready) {
       (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
@@ -5510,7 +5654,8 @@ static void accept_request(int listener, struct session *session, struct client 
     }
     apply_resume_clock(request.resume_time_unix_ns);
     if (request.detached) {
-      int rc = start_detached(request.argv, request.envp, request.working_dir, use_rootfs, detached);
+      int rc = start_detached(request.argv, request.envp, request.working_dir, use_rootfs,
+                              request.retain_output, detached);
       if (rc != 0) {
         (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
         close_client(client);
@@ -5861,6 +6006,9 @@ int main(void) {
   client.fd = -1;
   struct detached_children detached;
   memset(&detached, 0, sizeof(detached));
+  detached.retained_pid = -1;
+  detached.retained_stdout_fd = -1;
+  detached.retained_stderr_fd = -1;
   struct generation_monitor generation;
   memset(&generation, 0, sizeof(generation));
   generation.last_generation = UINT64_MAX;
@@ -5868,6 +6016,7 @@ int main(void) {
 
   for (;;) {
     reap_detached_children(&detached);
+    drain_retained_output(&detached);
     if (!use_rootfs || rootfs_ready) {
       (void)poll_generation(&generation, generation_root);
     }
@@ -5878,8 +6027,8 @@ int main(void) {
       maybe_send_session_exit(&session, &client);
     }
 
-    struct pollfd fds[8];
-    int roles[8];
+    struct pollfd fds[10];
+    int roles[10];
     nfds_t nfds = 0;
     fds[nfds].fd = listener;
     fds[nfds].events = POLLIN;
@@ -5920,6 +6069,18 @@ int main(void) {
       fds[nfds].revents = 0;
       roles[nfds++] = 6;
     }
+    if (detached.retained_stdout_fd >= 0) {
+      fds[nfds].fd = detached.retained_stdout_fd;
+      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 7;
+    }
+    if (detached.retained_stderr_fd >= 0) {
+      fds[nfds].fd = detached.retained_stderr_fd;
+      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 8;
+    }
 
     int poll_timeout_ms = session.file_stdio && session.started && !session.exited ? 10 : 100;
     int pr = poll(fds, nfds, poll_timeout_ms);
@@ -5952,6 +6113,8 @@ int main(void) {
           maybe_send_memory_pressure(&session, &client);
         } else if (roles[i] == 6) {
           drain_session_stdin(&session);
+        } else if (roles[i] == 7 || roles[i] == 8) {
+          drain_retained_output(&detached);
         }
       }
     }

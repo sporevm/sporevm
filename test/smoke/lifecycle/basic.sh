@@ -90,6 +90,8 @@ writeout_stdout="${workdir}/writeout.stdout"
 writeout_stderr="${workdir}/writeout.stderr"
 true_stdout="${workdir}/true.stdout"
 true_stderr="${workdir}/true.stderr"
+initial_output_json="${workdir}/initial-output.json"
+initial_output_stderr="${workdir}/initial-output.stderr"
 long_command_stdout="${workdir}/long-command.stdout"
 long_command_stderr="${workdir}/long-command.stderr"
 oversized_command_stdout="${workdir}/oversized-command.stdout"
@@ -175,12 +177,57 @@ if run_capture "${create_stdout}" "${create_stderr}" \
     --backend "${backend}" \
     --memory "${smoke_memory}" \
     --timeout "${timeout_ms}ms" \
-    --console-log "${console_log}"; then
+    --console-log "${console_log}" \
+    -- /bin/sh -c 'i=0; while [ "$i" -lt 10000 ]; do printf 0123456789; printf abcdefghij >&2; i=$((i+1)); done; exit 7'; then
   created=1
 else
   status=$?
   require_success "${status}" "spore create" "${create_stderr}"
 fi
+
+# The initial command writes more than a pipe buffer to both streams and exits
+# non-zero. Create must return without a reader attached, while the guest keeps
+# draining into fixed buffers so the command can finish unattended.
+for _ in $(seq 1 50); do
+  if run_capture "${initial_output_json}" "${initial_output_stderr}" \
+    env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+    "${spore_bin}" --json logs "${vm_name}"; then
+    if python3 - "${initial_output_json}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+raise SystemExit(0 if payload.get("initial_command", {}).get("process_status") == "exited" else 1)
+PY
+    then
+      break
+    fi
+  else
+    status=$?
+    require_success "${status}" "spore logs" "${initial_output_stderr}"
+  fi
+  sleep 0.1
+done
+python3 - "${initial_output_json}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+initial = payload.get("initial_command", {})
+if payload.get("schema") != "spore.lifecycle.v1" or payload.get("action") != "logs":
+    raise SystemExit("spore logs did not reuse the lifecycle result envelope")
+if initial.get("output_disposition") != "retain" or initial.get("output_destination") != "named_logs":
+    raise SystemExit("spore logs did not report retained named output")
+if initial.get("startup_status") != "started" or initial.get("process_status") != "exited" or initial.get("exit_code") != 7:
+    raise SystemExit("spore logs did not report the short-lived command exit")
+limit = initial.get("output_limit_bytes_per_stream")
+if limit != 16381 or len(initial.get("stdout", "")) != limit or len(initial.get("stderr", "")) != limit:
+    raise SystemExit("spore logs did not enforce the per-stream output bound")
+if not initial.get("stdout_truncated") or not initial.get("stderr_truncated"):
+    raise SystemExit("spore logs did not report stream truncation")
+PY
 
 if run_capture "${writeout_stdout}" "${writeout_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
@@ -317,7 +364,8 @@ import sys
 
 path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    entries = json.load(fh)
+    payload = json.load(fh)
+entries = payload.get("entries", []) if isinstance(payload, dict) else payload
 
 ready_names = {entry.get("name") for entry in entries if entry.get("state") == "ready"}
 missing = [name for name in names if name not in ready_names]
@@ -345,6 +393,10 @@ else
   status=$?
   require_success "${status}" "spore rm" "${rm_stderr}"
 fi
+if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" logs "${vm_name}" >/dev/null 2>&1; then
+  die "spore logs unexpectedly retained output after VM removal"
+fi
+[[ ! -e "${runtime_dir}/vms/${vm_name}" ]] || die "spore rm left retained initial output state behind"
 
 if run_capture "${ls_after_stdout}" "${ls_after_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
   :
@@ -358,7 +410,8 @@ import sys
 
 path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    entries = json.load(fh)
+    payload = json.load(fh)
+entries = payload.get("entries", []) if isinstance(payload, dict) else payload
 
 remaining = {entry.get("name") for entry in entries}
 unexpected = [name for name in names if name in remaining]

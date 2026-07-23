@@ -65,6 +65,8 @@ test "external import can name managed run-from and named lifecycle APIs" {
 
     const create = libspore.CreateNamedOptions{ .name = "dev-vm" };
     try std.testing.expectEqualStrings("dev-vm", create.name);
+    try std.testing.expectEqual(libspore.InitialOutputDisposition.retain, create.initial_output);
+    _ = libspore.initialOutputNamed;
 
     const network_policy = libspore.NetworkPolicy{
         .allow = &.{.{

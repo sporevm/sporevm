@@ -301,6 +301,22 @@ type CreateNamedOptions struct {
 	// InitialArgv replaces the image Cmd while preserving its Entrypoint.
 	// An empty value uses image defaults, or leaves a non-image VM idle.
 	InitialArgv []string
+	// InitialOutput controls whether the initial command's bounded stdout and
+	// stderr remain available through InitialOutputNamed. Zero retains output.
+	InitialOutput InitialOutputDisposition
+}
+
+// InitialOutputDisposition selects what happens to initial-command output.
+type InitialOutputDisposition uint32
+
+const (
+	InitialOutputRetain InitialOutputDisposition = iota
+	InitialOutputDiscard
+)
+
+// InitialOutputNamedOptions selects a named VM's retained initial output.
+type InitialOutputNamedOptions struct {
+	Name string
 }
 
 // SaveNamedOptions writes a named VM to a spore.
@@ -415,6 +431,22 @@ type NamedLifecycleResult struct {
 	ConsoleLogPath *string               `json:"console_log_path"`
 	SporeDir       *string               `json:"spore_dir"`
 	Timing         *NamedLifecycleTiming `json:"timing"`
+	InitialCommand *InitialCommandResult `json:"initial_command"`
+}
+
+// InitialCommandResult describes output disposition at create time and carries
+// retained bytes and process status when fetched later.
+type InitialCommandResult struct {
+	OutputDisposition         string  `json:"output_disposition"`
+	OutputDestination         *string `json:"output_destination"`
+	OutputLimitBytesPerStream *uint32 `json:"output_limit_bytes_per_stream"`
+	StartupStatus             string  `json:"startup_status"`
+	ProcessStatus             *string `json:"process_status"`
+	ExitCode                  *uint8  `json:"exit_code"`
+	Stdout                    string  `json:"-"`
+	Stderr                    string  `json:"-"`
+	StdoutTruncated           bool    `json:"stdout_truncated"`
+	StderrTruncated           bool    `json:"stderr_truncated"`
 }
 
 // NamedLifecycleTiming reports named VM startup phases in milliseconds.

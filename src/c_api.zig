@@ -13,7 +13,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 18;
+const c_abi_version: u32 = 19;
 const reexec_contract_version: u32 = 1;
 const reexec_role_env = "SPORE_REEXEC_ROLE";
 const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
@@ -22,7 +22,8 @@ const inspect_spore_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
-const create_named_options_version: u32 = 5;
+const create_named_options_version: u32 = 6;
+const initial_output_named_options_version: u32 = 1;
 const restore_named_options_version: u32 = 1;
 const fork_named_options_version: u32 = 1;
 const exec_named_options_version: u32 = 2;
@@ -173,6 +174,13 @@ const SporeCreateNamedOptions = extern struct {
     annotation_count: usize,
     initial_argv: ?[*]const SporeString,
     initial_argc: usize,
+    initial_output: u32,
+};
+
+const SporeInitialOutputNamedOptions = extern struct {
+    size: u32,
+    version: u32,
+    name: SporeString,
 };
 
 const SporeExecNamedOptions = extern struct {
@@ -387,6 +395,16 @@ pub export fn spore_create_named_options_init(options: ?*SporeCreateNamedOptions
         .annotation_count = 0,
         .initial_argv = null,
         .initial_argc = 0,
+        .initial_output = 0,
+    };
+}
+
+pub export fn spore_initial_output_named_options_init(options: ?*SporeInitialOutputNamedOptions) void {
+    const out = options orelse return;
+    out.* = .{
+        .size = @sizeOf(SporeInitialOutputNamedOptions),
+        .version = initial_output_named_options_version,
+        .name = .{},
     };
 }
 
@@ -773,6 +791,11 @@ pub export fn spore_create_named_json(
     const bound_services = parseBoundUnixServices(arena, opts.bound_unix_services, opts.bound_unix_service_count) catch |err| return fail(ctx, err);
     const annotations = parseAnnotations(arena, opts.annotations, opts.annotation_count) catch |err| return fail(ctx, err);
     const initial_command = parseStringList(arena, opts.initial_argv, opts.initial_argc) catch |err| return fail(ctx, err);
+    const initial_output: libspore.InitialOutputDisposition = switch (opts.initial_output) {
+        0 => .retain,
+        1 => .discard,
+        else => return fail(ctx, error.InvalidValue),
+    };
     const result = libspore.createNamed(init, ctx.allocator, .{
         .name = toSlice(opts.name) catch |err| return fail(ctx, err),
         .backend = parseBackend(optionalSlice(opts.backend) catch |err| return fail(ctx, err)) catch |err| return fail(ctx, err),
@@ -781,6 +804,7 @@ pub export fn spore_create_named_json(
         .rootfs_path = optionalSlice(opts.rootfs_path) catch |err| return fail(ctx, err),
         .image_ref = optionalSlice(opts.image_ref) catch |err| return fail(ctx, err),
         .initial_command = initial_command,
+        .initial_output = initial_output,
         .network = .{
             .enabled = opts.network_enabled != 0,
             .allow_cidrs = allow_cidrs,
@@ -795,6 +819,29 @@ pub export fn spore_create_named_json(
         .console_log_path = optionalSlice(opts.console_log_path) catch |err| return fail(ctx, err),
         .spore_executable = (optionalSlice(opts.spore_executable) catch |err| return fail(ctx, err)) orelse "spore",
         .annotations = annotations,
+    }) catch |err| return fail(ctx, err);
+    defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
+
+    out.* = jsonOwned(ctx, result) catch |err| return fail(ctx, err);
+    return result_success;
+}
+
+pub export fn spore_initial_output_named_json(
+    context: ?*SporeContextImpl,
+    options: ?*const SporeInitialOutputNamedOptions,
+    out_json: ?*SporeOwnedString,
+) c_int {
+    const ctx = context orelse return result_invalid_value;
+    const opts = options orelse return fail(ctx, error.InvalidValue);
+    const out = out_json orelse return fail(ctx, error.InvalidValue);
+    out.* = .{};
+    ctx.clearLastError();
+    if (opts.version != initial_output_named_options_version or opts.size < @sizeOf(SporeInitialOutputNamedOptions)) {
+        return fail(ctx, error.InvalidValue);
+    }
+
+    const result = libspore.initialOutputNamed(ctx.productContext(), ctx.allocator, .{
+        .name = toSlice(opts.name) catch |err| return fail(ctx, err),
     }) catch |err| return fail(ctx, err);
     defer libspore.deinitNamedLifecycleResult(ctx.allocator, result);
 
@@ -1605,6 +1652,12 @@ test "named lifecycle options initialize defaults" {
     spore_create_named_options_init(&create);
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeCreateNamedOptions))), create.size);
     try std.testing.expectEqual(create_named_options_version, create.version);
+    try std.testing.expectEqual(@as(u32, 0), create.initial_output);
+
+    var initial_output: SporeInitialOutputNamedOptions = undefined;
+    spore_initial_output_named_options_init(&initial_output);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(SporeInitialOutputNamedOptions))), initial_output.size);
+    try std.testing.expectEqual(initial_output_named_options_version, initial_output.version);
     try std.testing.expectEqual(@as(u32, 1), create.vcpus);
     try std.testing.expectEqual(@as(u32, 10700), create.guest_port);
     try std.testing.expectEqual(@as(u64, 30_000), create.timeout_ms);

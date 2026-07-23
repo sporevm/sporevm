@@ -406,6 +406,7 @@ The complete named VM lifecycle is stable on ARM64 HVF/KVM hosts:
 export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
 spore create bench-1 --image docker.io/library/alpine:3.20
+spore logs bench-1
 spore exec bench-1 'echo hi'
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 spore restore bench-1.spore --name bench-2
@@ -421,9 +422,10 @@ spore create bench-net \
   --options @create-options.json
 ```
 
-Machine callers can use global `--json` for structured lifecycle state. See
-[docs/lifecycle.md](docs/lifecycle.md) for runtime layout, monitor jailing,
-named live fork, and limits.
+Create retains bounded initial-command output by default; use `spore logs NAME`
+to retrieve it after create returns. Machine callers can use global `--json`
+for structured lifecycle state. See [docs/lifecycle.md](docs/lifecycle.md) for
+runtime layout, monitor jailing, named live fork, and limits.
 
 Linux/AMD64 KVM currently supports only fresh `create`, `exec`, and `rm` with
 one vCPU and explicit 512 MiB memory; the save, restore, and fork operations in

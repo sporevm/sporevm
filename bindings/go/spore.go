@@ -18,7 +18,7 @@ import (
 	"unsafe"
 )
 
-const requiredABIVersion uint32 = 18
+const requiredABIVersion uint32 = 19
 const reexecContractVersion uint32 = C.SPORE_REEXEC_CONTRACT_VERSION
 const reexecRoleEnv = "SPORE_REEXEC_ROLE"
 const reexecContractEnv = "SPORE_REEXEC_CONTRACT"
@@ -373,9 +373,31 @@ func (c *Client) CreateNamed(ctx context.Context, options CreateNamedOptions) (N
 		opts.initial_argv = &initialArgv[0]
 		opts.initial_argc = C.size_t(len(initialArgv))
 	}
+	opts.initial_output = C.uint32_t(options.InitialOutput)
 
 	var out C.SporeOwnedString
 	if result := Result(C.spore_create_named_json(c.ctx, &opts, &out)); result != Success {
+		return NamedLifecycleResult{}, c.callError(result)
+	}
+	defer C.spore_free_string(c.ctx, out)
+	return decodeJSON[NamedLifecycleResult](goBytes(out), "named lifecycle result")
+}
+
+// InitialOutputNamed retrieves bounded stdout and stderr retained for the
+// initial command started by CreateNamed.
+func (c *Client) InitialOutputNamed(ctx context.Context, options InitialOutputNamedOptions) (NamedLifecycleResult, error) {
+	if err := c.ready(ctx); err != nil {
+		return NamedLifecycleResult{}, err
+	}
+	name, freeName := cString(options.Name)
+	defer freeName()
+
+	var opts C.SporeInitialOutputNamedOptions
+	C.spore_initial_output_named_options_init(&opts)
+	opts.name = name
+
+	var out C.SporeOwnedString
+	if result := Result(C.spore_initial_output_named_json(c.ctx, &opts, &out)); result != Success {
 		return NamedLifecycleResult{}, c.callError(result)
 	}
 	defer C.spore_free_string(c.ctx, out)
@@ -849,6 +871,45 @@ func (r *ExecNamedResult) UnmarshalJSON(data []byte) error {
 		NetworkEventsJSONL: networkEvents,
 		StdoutTruncated:    raw.StdoutTruncated,
 		StderrTruncated:    raw.StderrTruncated,
+	}
+	return nil
+}
+
+func (r *InitialCommandResult) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		OutputDisposition         string          `json:"output_disposition"`
+		OutputDestination         *string         `json:"output_destination"`
+		OutputLimitBytesPerStream *uint32         `json:"output_limit_bytes_per_stream"`
+		StartupStatus             string          `json:"startup_status"`
+		ProcessStatus             *string         `json:"process_status"`
+		ExitCode                  *uint8          `json:"exit_code"`
+		Stdout                    json.RawMessage `json:"stdout"`
+		Stderr                    json.RawMessage `json:"stderr"`
+		StdoutTruncated           bool            `json:"stdout_truncated"`
+		StderrTruncated           bool            `json:"stderr_truncated"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	stdout, err := decodeOutputField(raw.Stdout, "initial command stdout")
+	if err != nil {
+		return err
+	}
+	stderr, err := decodeOutputField(raw.Stderr, "initial command stderr")
+	if err != nil {
+		return err
+	}
+	*r = InitialCommandResult{
+		OutputDisposition:         raw.OutputDisposition,
+		OutputDestination:         raw.OutputDestination,
+		OutputLimitBytesPerStream: raw.OutputLimitBytesPerStream,
+		StartupStatus:             raw.StartupStatus,
+		ProcessStatus:             raw.ProcessStatus,
+		ExitCode:                  raw.ExitCode,
+		Stdout:                    stdout,
+		Stderr:                    stderr,
+		StdoutTruncated:           raw.StdoutTruncated,
+		StderrTruncated:           raw.StderrTruncated,
 	}
 	return nil
 }

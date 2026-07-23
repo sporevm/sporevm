@@ -891,7 +891,7 @@ const ExecServer = struct {
         });
     }
 
-    fn detachedExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
+    fn detachedExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try self.nextSessionId(&id_buf);
         var merged_env: [run.max_guest_envc][]const u8 = undefined;
@@ -900,6 +900,7 @@ const ExecServer = struct {
             .env = exec_context.env,
             .working_dir = exec_context.working_dir,
             .resume_time_unix_ns = self.wallClockUnixNs(),
+            .retain_output = retain_output,
         });
     }
 
@@ -1878,6 +1879,14 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         }
         return false;
     }
+    if (std.mem.eql(u8, parsed.value.type, "initial-output")) {
+        const response = server.submitExec("{\"type\":\"initial-output\"}\n") catch {
+            try writeControlError(server.io, stream, "monitor busy");
+            return false;
+        };
+        try writeAll(server.io, stream, response);
+        return false;
+    }
     const detached = std.mem.eql(u8, parsed.value.type, "start");
     if (!detached and !std.mem.eql(u8, parsed.value.type, "exec")) {
         try writeControlError(server.io, stream, "unknown control request");
@@ -1888,7 +1897,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         return false;
     };
     const request = if (detached)
-        server.detachedExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir) catch |err| {
+        server.detachedExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
             try writeControlError(server.io, stream, guestCommandErrorMessage(err));
             return false;
         }
@@ -1950,6 +1959,7 @@ const ControlRequest = struct {
     term: ?[]const u8 = null,
     terminal_rows: ?u16 = null,
     terminal_cols: ?u16 = null,
+    retain_output: ?bool = null,
 };
 
 fn monotonicNs() u64 {

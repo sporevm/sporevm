@@ -38,6 +38,7 @@ const usage =
     \\                        Create a named VM lifecycle target
     \\    exec NAME 'shell command'
     \\                        Execute a command in a named VM
+    \\    logs NAME           Show retained initial-command stdout and stderr
     \\    copy-in NAME HOST_PATH GUEST_PATH
     \\                        Copy one host file or directory into a named VM
     \\    copy-out NAME GUEST_PATH HOST_PATH
@@ -235,6 +236,8 @@ fn runCommand(
         try spore_internal.attach_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "create")) {
         try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
+    } else if (std.mem.eql(u8, command, "logs")) {
+        try spore_internal.lifecycle.logsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "exec")) {
         try spore_internal.lifecycle.execCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "copy-in")) {
@@ -465,6 +468,7 @@ fn supportsJson(command: []const u8) bool {
         std.mem.eql(u8, command, "copy-in") or
         std.mem.eql(u8, command, "copy-out") or
         std.mem.eql(u8, command, "create") or
+        std.mem.eql(u8, command, "logs") or
         std.mem.eql(u8, command, "rm") or
         std.mem.eql(u8, command, "restore") or
         std.mem.eql(u8, command, "save") or
@@ -1224,6 +1228,7 @@ test "stable lifecycle commands support global json where output is one document
     try std.testing.expect(supportsJson("copy-out"));
     try std.testing.expect(supportsJson("create"));
     try std.testing.expect(supportsJson("fork"));
+    try std.testing.expect(supportsJson("logs"));
     try std.testing.expect(supportsJson("ls"));
     try std.testing.expect(supportsJson("ps"));
     try std.testing.expect(supportsJson("rm"));

@@ -33,7 +33,7 @@
 #define SPORE_ENUM_TYPED
 #endif
 #define SPORE_ENUM_MAX_VALUE INT_MAX
-#define SPORE_ABI_VERSION 18u
+#define SPORE_ABI_VERSION 19u
 #define SPORE_VM_NAME_MAX_BYTES 128u
 
 #ifdef __cplusplus
@@ -76,7 +76,8 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_PULL_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_DF_OPTIONS_VERSION 1u
 #define SPORE_SYSTEM_PRUNE_OPTIONS_VERSION 1u
-#define SPORE_CREATE_NAMED_OPTIONS_VERSION 5u
+#define SPORE_CREATE_NAMED_OPTIONS_VERSION 6u
+#define SPORE_INITIAL_OUTPUT_NAMED_OPTIONS_VERSION 1u
 #define SPORE_RESTORE_NAMED_OPTIONS_VERSION 1u
 #define SPORE_FORK_NAMED_OPTIONS_VERSION 1u
 #define SPORE_EXEC_NAMED_OPTIONS_VERSION 2u
@@ -91,6 +92,9 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_CACHE_ROOT_ENV 0u
 #define SPORE_CACHE_ROOT_NONE 1u
 #define SPORE_CACHE_ROOT_PATH 2u
+
+#define SPORE_INITIAL_OUTPUT_RETAIN 0u
+#define SPORE_INITIAL_OUTPUT_DISCARD 1u
 
 #define SPORE_EXEC_NAMED_STREAM_STDOUT 1
 #define SPORE_EXEC_NAMED_STREAM_STDERR 2
@@ -221,7 +225,16 @@ typedef struct SporeCreateNamedOptions {
    * empty uses OCI Entrypoint plus Cmd. */
   const SporeString *initial_argv;
   size_t initial_argc;
+  /** Disposition for initial-command stdout and stderr. Defaults to RETAIN. */
+  uint32_t initial_output;
 } SporeCreateNamedOptions;
+
+/** Options for spore_initial_output_named_json(). */
+typedef struct SporeInitialOutputNamedOptions {
+  uint32_t size;
+  uint32_t version;
+  SporeString name;
+} SporeInitialOutputNamedOptions;
 
 /** Options for spore_exec_named_json(). */
 typedef struct SporeExecNamedOptions {
@@ -338,6 +351,9 @@ SPORE_API void spore_system_prune_options_init(SporeSystemPruneOptions *options)
 
 /** Initialize create-named options with defaults. */
 SPORE_API void spore_create_named_options_init(SporeCreateNamedOptions *options);
+
+/** Initialize initial-output options with defaults. */
+SPORE_API void spore_initial_output_named_options_init(SporeInitialOutputNamedOptions *options);
 
 /** Initialize exec-named options with defaults. */
 SPORE_API void spore_exec_named_options_init(SporeExecNamedOptions *options);
@@ -477,6 +493,12 @@ SPORE_API SporeResult spore_system_prune_json(SporeContext context,
 SPORE_API SporeResult spore_create_named_json(SporeContext context,
                                               const SporeCreateNamedOptions *options,
                                               SporeOwnedString *out_json);
+
+/** Retrieve bounded initial-command output as `spore.lifecycle.v1` JSON. */
+SPORE_API SporeResult spore_initial_output_named_json(
+    SporeContext context,
+    const SporeInitialOutputNamedOptions *options,
+    SporeOwnedString *out_json);
 
 /**
  * Execute a command in a named VM and return JSON output. Valid UTF-8 stdout
