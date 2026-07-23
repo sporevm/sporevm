@@ -74,6 +74,7 @@ const usage =
     \\    build [options] CONTEXT
     \\                        Build a Spore image from a Dockerfile subset
     \\    rootfs              Build rootfs images from OCI images
+    \\    image pack/unpack  Distribute an immutable native image archive
     \\    image pull         Pull a verified image through an image gateway
     \\    cache               Inspect and collect local content-addressed caches
     \\    system              Inspect and prune local SporeVM system state

@@ -183,12 +183,14 @@ chunks share the source image's CAS storage. This keeps the disk backend-neutral
 and suitable for offline reuse; warm machine state remains the separate
 save-and-fork layer.
 
-Local image refs and their CAS objects are local cache state. They are not
-pushed to an OCI registry. To move prepared state, save or fork a spore and use
-SporeVM's pack/push/pull workflow; the receiving host still needs compatible
-aarch64 boot assets and backend/host class for saved machine state. A plain
-`spore run --image local/... --pull=never` also fails closed if its local ref or
-referenced storage is missing.
+Local image refs and their CAS objects remain local cache state and are not
+pushed to an OCI registry. To move the prepared disk without guest memory or
+other suspended state, export it with `spore image pack`, transport the archive
+as an immutable artifact, and import it with `spore image unpack` on the target
+architecture. The receiver can then use the resulting ordinary local ref with
+`spore run --image local/... --pull=never`. Use the separate saved-machine
+`spore pack`/`push`/`pull` workflow only when the receiver needs RAM, vCPU,
+device, or process state and has a compatible backend and host class.
 
 Remove disposable child and spore directories when finished, then inspect
 cache cleanup before forcing it:

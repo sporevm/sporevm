@@ -1,5 +1,18 @@
 # Release Notes
 
+## Unreleased
+
+### Immutable native image archives
+
+`spore image pack` now turns a complete local native image into one immutable
+gzip archive for CI or object-store publication. `spore image unpack` requires
+the archive SHA-256, expected native image BLAKE3, and platform, verifies the
+canonical native image closure and every BLAKE3 rootfs object, and publishes an
+ordinary local ref only after
+the complete image is installed. The archive carries no suspended machine
+state; existing top-level bundle `pack`, `push`, `pull`, and `unpack` commands
+remain reserved for saved spores.
+
 ## v0.15.0
 
 SporeVM v0.15.0 adds an experimental Linux/AMD64 KVM fresh-execution

@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const api = @import("api.zig");
+const image_archive = @import("image_archive.zig");
 const gateway_pull = @import("image_gateway_pull.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
@@ -27,6 +28,24 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         );
         return;
     }
+    if (std.mem.eql(u8, args[0], "pack")) {
+        const options = try parsePackOptions(args[1..]);
+        const result = try api.imageArchivePack(init, init.arena.allocator(), options);
+        try stdout.print(
+            "archive: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\nbytes: {d}\n",
+            .{ options.output_path, result.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count, result.archive_bytes },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, args[0], "unpack")) {
+        const options = try parseUnpackOptions(args[1..]);
+        const result = try api.imageArchiveUnpack(init, init.arena.allocator(), options);
+        try stdout.print(
+            "ref: {s}\nresolved: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\n",
+            .{ options.ref, result.resolved_image_ref, options.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count },
+        );
+        return;
+    }
     if (std.mem.eql(u8, args[0], "export-fixture")) {
         const options = try parseExportFixtureOptions(args[1..]);
         const result = try gateway_pull.exportFixture(init, init.arena.allocator(), options);
@@ -40,6 +59,76 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         return;
     }
     return error.UnknownImageCommand;
+}
+
+pub fn parsePackOptions(args: []const []const u8) !api.ImageArchivePackOptions {
+    var source: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var platform: ?rootfs.Platform = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--out")) {
+            i += 1;
+            if (i >= args.len) return error.MissingImageArchiveOutput;
+            output_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--platform")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPlatform;
+            platform = try rootfs.Platform.parse(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownImageOption;
+        } else if (source == null) {
+            source = arg;
+        } else return error.TooManyImageArguments;
+    }
+    const selected = platform orelse return error.MissingPlatform;
+    return .{
+        .source = source orelse return error.MissingImageSource,
+        .output_path = output_path orelse return error.MissingImageArchiveOutput,
+        .platform = .{ .os = selected.os, .arch = selected.arch },
+    };
+}
+
+pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptions {
+    var archive_path: ?[]const u8 = null;
+    var archive_digest: ?[]const u8 = null;
+    var expected_image_digest: ?[]const u8 = null;
+    var ref: ?[]const u8 = null;
+    var platform: ?rootfs.Platform = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--archive-digest")) {
+            i += 1;
+            if (i >= args.len) return error.MissingImageArchiveDigest;
+            archive_digest = args[i];
+        } else if (std.mem.eql(u8, arg, "--expected-image-digest")) {
+            i += 1;
+            if (i >= args.len) return error.MissingExpectedImageDigest;
+            expected_image_digest = args[i];
+        } else if (std.mem.eql(u8, arg, "--ref")) {
+            i += 1;
+            if (i >= args.len) return error.MissingImageReference;
+            ref = args[i];
+        } else if (std.mem.eql(u8, arg, "--platform")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPlatform;
+            platform = try rootfs.Platform.parse(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownImageOption;
+        } else if (archive_path == null) {
+            archive_path = arg;
+        } else return error.TooManyImageArguments;
+    }
+    const selected = platform orelse return error.MissingPlatform;
+    return .{
+        .archive_path = archive_path orelse return error.MissingImageArchive,
+        .archive_digest = archive_digest orelse return error.MissingImageArchiveDigest,
+        .expected_image_digest = expected_image_digest orelse return error.MissingExpectedImageDigest,
+        .ref = ref orelse return error.MissingImageReference,
+        .platform = .{ .os = selected.os, .arch = selected.arch },
+    };
 }
 
 pub fn parsePullOptions(args: []const []const u8) !api.ImageGatewayPullOptions {
@@ -177,4 +266,43 @@ test "fixture export options require an existing metadata input and new output" 
     });
     try std.testing.expectEqualStrings("fixture", parsed.repository);
     try std.testing.expectEqualStrings("/tmp/gateway", parsed.output_dir);
+}
+
+test "image archive options require immutable digest and explicit platform" {
+    const pack = try parsePackOptions(&.{
+        "local/app:ci",
+        "--out",
+        "app.spore-image.tar.gz",
+        "--platform",
+        "linux/arm64",
+    });
+    try std.testing.expectEqualStrings("local/app:ci", pack.source);
+    try std.testing.expectEqual(.arm64, pack.platform.arch);
+    try std.testing.expectError(error.MissingPlatform, parsePackOptions(&.{
+        "local/app:ci",
+        "--out",
+        "app.spore-image.tar.gz",
+    }));
+
+    const unpack = try parseUnpackOptions(&.{
+        "app.spore-image.tar.gz",
+        "--archive-digest",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--expected-image-digest",
+        "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--platform",
+        "linux/amd64",
+        "--ref",
+        "local/app:ci",
+    });
+    try std.testing.expectEqual(.amd64, unpack.platform.arch);
+    try std.testing.expectError(error.MissingImageArchiveDigest, parseUnpackOptions(&.{
+        "app.spore-image.tar.gz",
+        "--expected-image-digest",
+        "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--platform",
+        "linux/amd64",
+        "--ref",
+        "local/app:ci",
+    }));
 }
