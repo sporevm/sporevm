@@ -76,9 +76,14 @@ type InspectSporeOptions struct {
 
 // SporeInspectResult is the decoded local spore inspection result.
 type SporeInspectResult struct {
+	ResourceType            string               `json:"resource_type"`
+	Portability             string               `json:"portability"`
+	CanAttach               bool                 `json:"can_attach"`
+	CanRunFrom              bool                 `json:"can_run_from"`
 	Version                 uint32               `json:"version"`
 	VMStatePresent          bool                 `json:"vm_state_present"`
 	StorageMode             string               `json:"storage_mode"`
+	Ownership               string               `json:"ownership"`
 	Platform                SporePlatformSummary `json:"platform"`
 	DeviceCount             uint64               `json:"device_count"`
 	MemoryChunkCount        uint64               `json:"memory_chunk_count"`
@@ -154,6 +159,7 @@ type CacheRoot struct {
 type InspectBundleResult struct {
 	Schema         string                 `json:"schema"`
 	SchemaVersion  uint32                 `json:"schema_version"`
+	ResourceType   string                 `json:"resource_type"`
 	Source         string                 `json:"source"`
 	BundleDir      string                 `json:"bundle_dir"`
 	BundleDigest   DigestRef              `json:"bundle_digest"`

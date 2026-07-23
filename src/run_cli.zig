@@ -146,7 +146,6 @@ fn runParsed(
             .backend = parsed.backend,
             .spore_dir = spore_dir,
             .command = command,
-            .attach_session_id = spore.default_session_id,
             .interactive = parsed.interactive,
             .tty = parsed.tty,
             .guest_env = guest_env,

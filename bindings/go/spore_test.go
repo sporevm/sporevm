@@ -218,6 +218,9 @@ func TestInspectBundle(t *testing.T) {
 	if result.Schema != "spore.bundle.inspect.v1" {
 		t.Fatalf("schema = %q", result.Schema)
 	}
+	if result.ResourceType != "bundle" {
+		t.Fatalf("resource type = %q", result.ResourceType)
+	}
 	if !result.Indexed {
 		t.Fatal("expected indexed bundle")
 	}
@@ -246,6 +249,15 @@ func TestInspectSporeAnnotations(t *testing.T) {
 	}
 	if !result.VMStatePresent {
 		t.Fatal("expected VM state")
+	}
+	if result.ResourceType != "checkpoint" || result.Portability != "portable" {
+		t.Fatalf("resource classification = %#v", result)
+	}
+	if result.CanAttach || !result.CanRunFrom {
+		t.Fatalf("capabilities = attach:%t run-from:%t", result.CanAttach, result.CanRunFrom)
+	}
+	if result.Ownership != "portable-self-contained" {
+		t.Fatalf("ownership = %q", result.Ownership)
 	}
 	if result.StorageMode != "memory-only" {
 		t.Fatalf("storage mode = %q", result.StorageMode)
