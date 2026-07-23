@@ -6,10 +6,6 @@ const spore_version = @import("src/version.zig").value;
 
 const macos_deployment_target = std.SemanticVersion{ .major = 13, .minor = 0, .patch = 0 };
 
-fn parseVersion(comptime value: []const u8) std.SemanticVersion {
-    return std.SemanticVersion.parse(value) catch unreachable;
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{
         .default_target = defaultTarget(),
@@ -26,7 +22,7 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseSafe,
     });
     const macos_framework_path = macosFrameworkPath(b);
-    const libspore_version = parseVersion(spore_version);
+    const libspore_version = std.SemanticVersion.parse(spore_version) catch unreachable;
 
     const libspore_mod = b.addModule("libspore", .{
         .root_source_file = b.path("src/libspore.zig"),
