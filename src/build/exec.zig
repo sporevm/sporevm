@@ -456,7 +456,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     }
 
     var cache_store: ?cache_mount.Store = if (cache_run != null)
-        try cache_mount.Store.open(init.io, allocator, options.cache_root)
+        try cache_mount.Store.open(init.io, allocator, options.cache_root, options.rootfs_cache_lock)
     else
         null;
     defer if (cache_store) |*store| store.deinit();

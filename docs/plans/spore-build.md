@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-19
+last_reviewed: 2026-07-23
 spec_refs:
   - docs/spore-build.md
   - docs/filesystem.md
@@ -102,7 +102,10 @@ The landed foundation includes:
 - automatic sparse 16 GiB capacity preparation through typed `PREPARE`, with
   no selected-image shell or e2fsprogs dependency;
 - persistent build-VM execution, per-instruction freeze/snapshot/thaw,
-  dirty-only chunk sealing, and atomic local-ref publication; and
+  dirty-only chunk sealing, and atomic local-ref publication;
+- cache-mount aggregate accounting plus lock-serialized prune and GC, with
+  process-bound crash recovery, stale-temp scavenging, and separate
+  allocated-byte reclamation; and
 - Docker/BuildKit differential fixtures for the supported subset.
 
 The frozen Buildkite acceptance target remains revision
@@ -121,6 +124,7 @@ useful point measurements, not the repeatable wrapper benchmark required below.
 | Exact real-workload COPY invalidation proof | Active |
 | Wrapper integration and repeatable cold/warm/incremental measurements | Follow-up |
 | Obsolete step-record retirement and GC proof | Follow-up |
+| Build cache-mount accounting, prune, and GC | Landed |
 | Additional Dockerfile compatibility | Evidence-gated |
 
 ## Delivery Strategy
@@ -307,6 +311,9 @@ golden invalidation test and at least one differential fixture.
   performance claims must measure the complete entry point.
 - Cache records are storage roots. Retirement needs the same conservative
   reachability and publication discipline as CAS collection.
+- Mutable cache-mount bytes are not step-record children. Keeping the existing
+  aggregate as the cleanup unit avoids a second metadata graph, while the
+  build-wide process lock provides active-use safety without stale leases.
 - Mount and credential syntax can look like a small compatibility addition while
   changing host authority. Those features keep separate security and product
   decision gates.

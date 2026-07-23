@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const chunk_sealer = @import("../chunk_sealer.zig");
@@ -11,8 +12,8 @@ pub const max_target_bytes = 512;
 pub const max_id_bytes = 512;
 pub const default_disk_bytes: u64 = 4 << 30;
 const default_inode_count: u32 = 262_144;
-const store_rel = "build/cache-mounts-v1";
-const disk_name = "shared.ext4";
+pub const store_rel = "build/cache-mounts-v1";
+pub const disk_name = "shared.ext4";
 const cache_key_domain = "spore-build-cache-mount-key-v1";
 const mount_digest_domain = "spore-build-cache-mounts-v1";
 const ext4_magic: u16 = 0xef53;
@@ -38,6 +39,50 @@ pub const Mount = struct {
     key: []const u8,
     sharing: Sharing = .shared,
 };
+
+pub const StorageEntry = struct {
+    kind: Kind,
+    path: []const u8,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    mtime_ns: i96,
+
+    pub const Kind = enum { aggregate, stale_temp };
+};
+
+pub fn diskPath(allocator: std.mem.Allocator, cache_root: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ cache_root, store_rel, disk_name });
+}
+
+pub fn diskStats(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !?StorageEntry {
+    const path = try diskPath(allocator, cache_root);
+    return fileStats(io, allocator, path, .aggregate);
+}
+
+pub fn storageEntries(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) ![]StorageEntry {
+    var entries = std.array_list.Managed(StorageEntry).init(allocator);
+    if (try diskStats(io, allocator, cache_root)) |stats| try entries.append(stats);
+
+    const dir_path = try std.fs.path.join(allocator, &.{ cache_root, store_rel });
+    var dir = openDirPath(io, dir_path) catch |err| switch (err) {
+        error.FileNotFound => return entries.toOwnedSlice(),
+        else => |other| return other,
+    };
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or !isStaleTempName(entry.name)) continue;
+        const path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        const stat = (try fileStats(io, allocator, path, .stale_temp)) orelse continue;
+        try entries.append(stat);
+    }
+    return entries.toOwnedSlice();
+}
+
+pub fn lockStoreExclusive(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !rootfs_mod.RootfsCacheLock {
+    const dir = try std.fs.path.join(allocator, &.{ cache_root, store_rel });
+    return rootfs_mod.lockRootfsCacheExclusive(io, allocator, dir);
+}
 
 pub fn resolve(
     allocator: std.mem.Allocator,
@@ -162,14 +207,18 @@ pub const Store = struct {
     lock: rootfs_mod.RootfsCacheLock,
     fd: std.c.fd_t,
 
-    pub fn open(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !Store {
-        return openSized(io, allocator, cache_root, default_disk_bytes, default_inode_count);
+    pub fn open(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, cache_lock: *const rootfs_mod.RootfsCacheLock) !Store {
+        return openSized(io, allocator, cache_root, cache_lock, default_disk_bytes, default_inode_count);
     }
 
-    fn openSized(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, image_size: u64, inode_count: u32) !Store {
+    fn openSized(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, cache_lock: *const rootfs_mod.RootfsCacheLock, image_size: u64, inode_count: u32) !Store {
+        if (!try cache_lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockRequired;
         const dir = try std.fs.path.join(allocator, &.{ cache_root, store_rel });
-        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, dir);
+        var lock = try lockStoreExclusive(io, allocator, cache_root);
         errdefer lock.deinit();
+        for (try storageEntries(io, allocator, cache_root)) |entry| if (entry.kind == .stale_temp) {
+            try Io.Dir.cwd().deleteFile(io, entry.path);
+        };
         const path = try std.fs.path.join(allocator, &.{ dir, disk_name });
         if (!try validDisk(io, allocator, path, image_size)) {
             Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
@@ -199,6 +248,63 @@ pub const Store = struct {
         self.lock.deinit();
     }
 };
+
+fn fileStats(io: Io, allocator: std.mem.Allocator, path: []const u8, kind: StorageEntry.Kind) !?StorageEntry {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return switch (std.c.errno(-1)) {
+        .NOENT, .LOOP => null,
+        else => error.CacheMountDiskOpenFailed,
+    };
+    defer _ = std.c.close(fd);
+    const stat = try (Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).stat(io);
+    if (stat.kind != .file) return null;
+    return .{
+        .kind = kind,
+        .path = path,
+        .logical_bytes = stat.size,
+        .allocated_bytes = try std.math.mul(u64, try allocatedFileBlocks512(fd), 512),
+        .mtime_ns = stat.mtime.nanoseconds,
+    };
+}
+
+fn openDirPath(io: Io, path: []const u8) !Io.Dir {
+    if (Io.Dir.path.isAbsolute(path)) return Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    return Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+}
+
+fn isStaleTempName(name: []const u8) bool {
+    const prefix = "." ++ disk_name ++ ".";
+    const suffix = ".tmp";
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return false;
+    const identity = name[prefix.len .. name.len - suffix.len];
+    const dot = std.mem.indexOfScalar(u8, identity, '.') orelse return false;
+    return allAscii(identity[0..dot], std.ascii.isDigit) and allAscii(identity[dot + 1 ..], std.ascii.isHex);
+}
+
+fn allAscii(bytes: []const u8, predicate: fn (u8) bool) bool {
+    if (bytes.len == 0) return false;
+    for (bytes) |byte| if (!predicate(byte)) return false;
+    return true;
+}
+
+fn allocatedFileBlocks512(fd: std.c.fd_t) !u64 {
+    return switch (builtin.os.tag) {
+        .linux => blk: {
+            var stat: std.os.linux.Statx = undefined;
+            const requested: std.os.linux.STATX = .{ .BLOCKS = true };
+            if (std.c.statx(fd, "", std.c.AT.EMPTY_PATH, requested, &stat) != 0 or !stat.mask.BLOCKS) return error.CacheMountDiskStatFailed;
+            break :blk stat.blocks;
+        },
+        .macos => blk: {
+            var stat: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &stat) != 0 or stat.blocks < 0) return error.CacheMountDiskStatFailed;
+            break :blk @intCast(stat.blocks);
+        },
+        else => @compileError("cache mount allocation accounting requires Linux statx or Darwin fstat"),
+    };
+}
 
 fn validDisk(io: Io, allocator: std.mem.Allocator, path: []const u8, image_size: u64) !bool {
     const path_z = try allocator.dupeZ(u8, path);
@@ -410,8 +516,10 @@ test "cache store recreates a host-visible unclean aggregate" {
     const relative_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
     const root = try Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
     const image_size: u64 = 64 << 20;
+    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, root);
+    defer cache_lock.deinit();
 
-    var initial = try Store.openSized(io, allocator, root, image_size, 4096);
+    var initial = try Store.openSized(io, allocator, root, &cache_lock, image_size, 4096);
     initial.deinit();
     const path = try std.fs.path.join(allocator, &.{ root, store_rel, disk_name });
     const path_z = try allocator.dupeZ(u8, path);
@@ -424,7 +532,11 @@ test "cache store recreates a host-visible unclean aggregate" {
     }
     _ = std.c.close(fd);
 
-    var reopened = try Store.openSized(io, allocator, root, image_size, 4096);
+    const stale_path = try std.fs.path.join(allocator, &.{ root, store_rel, ".shared.ext4.123.abcd.tmp" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_path, .data = "stale" });
+
+    var reopened = try Store.openSized(io, allocator, root, &cache_lock, image_size, 4096);
     defer reopened.deinit();
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, stale_path, .{}));
     try std.testing.expect(try validOpenDisk(io, reopened.fd, image_size));
 }
