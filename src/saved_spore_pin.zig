@@ -707,27 +707,57 @@ const FileIdentity = struct { device: u64, inode: u64, nlink: u64 };
 fn statDirectoryNoFollow(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    var stat: std.c.Stat = undefined;
-    const rc = std.c.fstatat(std.c.AT.FDCWD, path_z.ptr, &stat, std.c.AT.SYMLINK_NOFOLLOW);
-    if (rc != 0) return switch (std.c.errno(rc)) {
-        .NOENT, .NOTDIR => error.FileNotFound,
-        else => error.IoFailed,
-    };
-    if (!std.c.S.ISDIR(stat.mode)) return error.BadManifest;
-    return .{ .device = @intCast(stat.dev), .inode = @intCast(stat.ino), .nlink = @intCast(stat.nlink) };
+    return statPathNoFollow(path_z, .directory);
 }
 
 fn statRegularNoFollow(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    var stat: std.c.Stat = undefined;
-    const rc = std.c.fstatat(std.c.AT.FDCWD, path_z.ptr, &stat, std.c.AT.SYMLINK_NOFOLLOW);
-    if (rc != 0) return switch (std.c.errno(rc)) {
-        .NOENT, .NOTDIR => error.FileNotFound,
-        else => error.IoFailed,
-    };
-    if (!std.c.S.ISREG(stat.mode)) return error.BadManifest;
-    return .{ .device = @intCast(stat.dev), .inode = @intCast(stat.ino), .nlink = @intCast(stat.nlink) };
+    return statPathNoFollow(path_z, .file);
+}
+
+fn statPathNoFollow(path: [:0]const u8, expected: std.Io.File.Kind) !FileIdentity {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stat: linux.Statx = undefined;
+        const rc = linux.statx(std.c.AT.FDCWD, path, std.c.AT.SYMLINK_NOFOLLOW, .{
+            .TYPE = true,
+            .MODE = true,
+            .INO = true,
+            .NLINK = true,
+        }, &stat);
+        const result = linux.errno(rc);
+        if (result != .SUCCESS) return switch (result) {
+            .NOENT, .NOTDIR => error.FileNotFound,
+            else => error.IoFailed,
+        };
+        if (!stat.mask.TYPE or !stat.mask.MODE or !stat.mask.INO or !stat.mask.NLINK) return error.IoFailed;
+        const matches = switch (expected) {
+            .directory => linux.S.ISDIR(stat.mode),
+            .file => linux.S.ISREG(stat.mode),
+            else => unreachable,
+        };
+        if (!matches) return error.BadManifest;
+        return .{
+            .device = (@as(u64, stat.dev_major) << 32) | stat.dev_minor,
+            .inode = stat.ino,
+            .nlink = stat.nlink,
+        };
+    } else {
+        var stat: std.c.Stat = undefined;
+        const rc = std.c.fstatat(std.c.AT.FDCWD, path, &stat, std.c.AT.SYMLINK_NOFOLLOW);
+        if (rc != 0) return switch (std.c.errno(rc)) {
+            .NOENT, .NOTDIR => error.FileNotFound,
+            else => error.IoFailed,
+        };
+        const matches = switch (expected) {
+            .directory => std.c.S.ISDIR(stat.mode),
+            .file => std.c.S.ISREG(stat.mode),
+            else => unreachable,
+        };
+        if (!matches) return error.BadManifest;
+        return .{ .device = @intCast(stat.dev), .inode = @intCast(stat.ino), .nlink = @intCast(stat.nlink) };
+    }
 }
 
 fn hardLink(allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
