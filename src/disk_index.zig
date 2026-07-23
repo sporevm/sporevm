@@ -841,17 +841,20 @@ test "v2 compact ranges encode a dense 32 GiB disk below the bounded index limit
     const chunk_size: u64 = 64 * 1024;
     const logical_size: u64 = 32 * 1024 * 1024 * 1024;
     const chunk_count = logical_size / chunk_size;
+    const zero_tail = [_]DiskIndexZeroRange{.{ .start = 1, .count = chunk_count - 1 }};
     const encoded = try encodeCanonicalAlloc(allocator, .{
         .kind = disk_index_kind,
-        .logical_size = chunk_size,
+        .logical_size = logical_size,
         .chunk_size = chunk_size,
         .hash_algorithm = "blake3",
         .object_namespace = "rootfs/blake3",
         .chunks = &.{.{ .logical_chunk = 0, .digest = digest_b }},
+        .zero_ranges = &zero_tail,
     });
     defer encoded.deinit(allocator);
-    // A canonical dense v2 index is one range whose only size-dependent field
-    // is the unescaped lowercase hex blob: exactly 64 bytes per logical chunk.
+    // This one-chunk index carries the same 32 GiB geometry plus a zero-range
+    // object that a dense index omits, so replacing its one digest with the
+    // complete unescaped hex blob is a conservative exact-size bound.
     const fixed_bytes = encoded.bytes.len - chunk.ChunkId.hex_len;
     const dense_bytes = try std.math.add(
         u64,
