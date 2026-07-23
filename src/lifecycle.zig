@@ -6034,7 +6034,14 @@ fn controlSocketOwnerMatches(io: Io, paths: Paths) !bool {
 
 fn releaseControlSocketPath(io: Io, paths: Paths) !void {
     _ = Io.Dir.cwd().statFile(io, paths.control_socket_owner_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => {
+            if (!try pathExists(io, paths.control_socket_path)) return;
+            setLastError(
+                "control socket ownership is missing for VM registry {s}: {s}",
+                .{ paths.vm_dir, paths.control_socket_path },
+            );
+            return error.ControlSocketPathCollision;
+        },
         else => |e| return e,
     };
     try validateControlSocketOwner(io, paths);
@@ -6152,6 +6159,13 @@ test "named control socket ownership detects hash collisions and cleans up" {
     try std.testing.expect(try pathExists(io, paths.vm_dir));
 
     Io.Dir.cwd().deleteFile(io, paths.control_socket_owner_path) catch unreachable;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.control_socket_path, .data = "" });
+    clearLastError();
+    try std.testing.expectError(error.ControlSocketPathCollision, deleteVmState(io, paths));
+    try std.testing.expect(std.mem.indexOf(u8, lastErrorMessage(), "ownership is missing") != null);
+    try std.testing.expect(try pathExists(io, paths.vm_dir));
+    try Io.Dir.cwd().deleteFile(io, paths.control_socket_path);
+
     try claimControlSocketPath(io, paths);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.control_socket_path, .data = "" });
     try deleteVmState(io, paths);
