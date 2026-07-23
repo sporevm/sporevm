@@ -172,7 +172,7 @@ pub const MemoryBacking = struct {
 pub const MemoryChunk = disk_index.DiskIndexChunk;
 
 pub const MemoryManifest = struct {
-    kind: []const u8 = disk_index.disk_index_kind,
+    kind: []const u8 = disk_index.disk_index_kind_v1,
     logical_size: u64,
     chunk_size: u64,
     hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
@@ -1925,6 +1925,9 @@ pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: Memor
 }
 
 pub fn validateMemoryForRam(manifest: MemoryManifest, ram_len: usize) Error!MemoryPlan {
+    // Memory indexes are part of normalized machine state and remain v1 even
+    // though rootfs and attached-disk storage indexes also accept v2.
+    if (!std.mem.eql(u8, manifest.kind, disk_index.disk_index_kind_v1)) return error.BadManifest;
     const expected_size: u64 = @intCast(ram_len);
     disk_index.validateDiskIndex(memoryIndex(manifest), memoryIndexDescriptor(manifest, expected_size)) catch |err| switch (err) {
         error.BadManifest => return error.BadManifest,
@@ -2996,7 +2999,7 @@ test "memory round-trips through the chunk store with zero elision" {
     ram[ram.len - 1] = 0xEE; // tail chunk non-zero
 
     const mm = try saveMemory(arena, dir, ram);
-    try std.testing.expectEqualStrings(disk_index.disk_index_kind, mm.kind);
+    try std.testing.expectEqualStrings(disk_index.disk_index_kind_v1, mm.kind);
     try std.testing.expectEqual(@as(u64, ram.len), mm.logical_size);
     try std.testing.expectEqual(@as(usize, 3), mm.chunks.len);
     try std.testing.expectEqual(@as(u64, 0), mm.chunks[0].logical_chunk);
@@ -3642,6 +3645,10 @@ test "memory manifest validation rejects non-canonical chunks" {
     var wrong_namespace = mm;
     wrong_namespace.object_namespace = rootfs_storage_object_namespace;
     try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_namespace, ram.len));
+
+    var wrong_kind = mm;
+    wrong_kind.kind = disk_index.disk_index_kind;
+    try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_kind, ram.len));
 
     var malformed_refs = try arena.dupe(MemoryChunk, mm.chunks);
     malformed_refs[0].digest = "not-a-blake3-id";

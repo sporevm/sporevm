@@ -22,6 +22,37 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def disk_index_digests(index: dict[str, object]) -> list[str]:
+    if index.get("kind") == "spore-disk-index-v1":
+        chunks = index.get("chunks")
+        if not isinstance(chunks, list):
+            raise ValueError("portable migration v1 disk index is missing chunks")
+        digests = [entry.get("digest") if isinstance(entry, dict) else None for entry in chunks]
+    elif index.get("kind") == "spore-disk-index-v2":
+        ranges = index.get("chunk_ranges")
+        if not isinstance(ranges, list):
+            raise ValueError("portable migration v2 disk index is missing chunk_ranges")
+        digests = []
+        for chunk_range in ranges:
+            if not isinstance(chunk_range, dict) or set(chunk_range) != {"start", "digests"}:
+                raise ValueError("portable migration v2 disk index has a malformed chunk range")
+            blob = chunk_range["digests"]
+            if not isinstance(blob, str) or not blob or len(blob) % 64:
+                raise ValueError("portable migration v2 disk index has invalid packed digests")
+            digests.extend(f"blake3:{blob[offset:offset + 64]}" for offset in range(0, len(blob), 64))
+    else:
+        raise ValueError("portable migration input has an unsupported disk index")
+    if any(
+        not isinstance(digest, str)
+        or not digest.startswith("blake3:")
+        or len(digest) != 71
+        or any(byte not in "0123456789abcdef" for byte in digest[7:])
+        for digest in digests
+    ):
+        raise ValueError("portable migration input has an invalid object digest")
+    return digests
+
+
 def tree_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     entries = sorted(root.rglob("*"))
@@ -66,14 +97,8 @@ def inspect(spore_dir: Path, spore_bin: Path) -> dict[str, object]:
     index_hex = index_digest.removeprefix("blake3:")
     index_path = spore_dir / "cas/rootfs/blake3/indexes" / f"{index_hex}.json"
     index = json.loads(index_path.read_text(encoding="utf-8"))
-    chunks = index.get("chunks")
-    if not isinstance(chunks, list):
-        raise ValueError("portable migration input has an invalid disk index")
     objects: dict[str, int] = {}
-    for entry in chunks:
-        digest = entry.get("digest") if isinstance(entry, dict) else None
-        if not isinstance(digest, str) or not digest.startswith("blake3:"):
-            raise ValueError("portable migration input has an invalid object digest")
+    for digest in disk_index_digests(index):
         object_path = spore_dir / "cas/rootfs/blake3/objects" / f"{digest.removeprefix('blake3:')}.chunk"
         if object_path.is_symlink() or not object_path.is_file():
             raise ValueError(f"portable migration input is missing object {digest}")
@@ -105,7 +130,7 @@ def self_test() -> None:
         index_digest = "a" * 64
         (object_dir / f"{object_digest}.chunk").write_bytes(b"payload")
         (index_dir / f"{index_digest}.json").write_text(
-            json.dumps({"chunks": [{"logical_chunk": 0, "digest": f"blake3:{object_digest}"}]}),
+            json.dumps({"kind": "spore-disk-index-v1", "chunks": [{"logical_chunk": 0, "digest": f"blake3:{object_digest}"}]}),
             encoding="utf-8",
         )
         (spore_dir / "manifest.json").write_text(

@@ -38,6 +38,16 @@ This is an eager client and data-contract release, not a production gateway
 service. Authentication, conversion admission, batch transfer, lazy remote
 reads, attachment publication, and policy evaluation remain future work.
 
+### Compact disk indexes
+
+New rootfs and writable snapshots use the canonical `spore-disk-index-v2`
+format. It packs contiguous BLAKE3 chunk digests and known-zero coverage into
+ranges, removing the former roughly 30.62 GiB dense-disk cliff caused by one
+JSON object per 64 KiB chunk. Index inputs remain capped at 64 MiB and retain
+descriptor, arithmetic, exact-coverage, canonical-byte, and BLAKE3 validation.
+Existing v1 indexes remain readable and keep their original content identity;
+they migrate naturally when a later snapshot or commit publishes v2.
+
 ### Architecture and API compatibility
 
 - Product-facing architecture values now use OCI names consistently:

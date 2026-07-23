@@ -31,20 +31,20 @@
           "sha256": "sha256:634514f5ad9e7e75a51549105f4c946aaba2389340ef2057d3848d173a04a148"
         },
         "image-manifest.json": {
-          "bytes": 1191,
-          "sha256": "sha256:1c09ab289308caf25ca6284c424f0e01d60c7a4131bb8513dc2961f10642e160"
+          "bytes": 1190,
+          "sha256": "sha256:eecbc802b63fa6ce76a3f2e911f5dfc9210ba2fbf6bb73f835a47d9600b5461c"
         },
         "platform-index.json": {
           "bytes": 350,
-          "sha256": "sha256:664f7dacfc393f94dde376add71bfdb2838e79d0bc862e9e0d93511ab7b05485"
+          "sha256": "sha256:67392a512cd9781accae41d0a67d2bbcc8d8be306f0d41e9b251050e34977dba"
         },
         "rootfs-index.json": {
-          "bytes": 81861,
-          "sha256": "sha256:7417b22a255d93d123c48dbc505662eef57c4489bf58ef21cad5c0fb8ab030b4"
+          "bytes": 1179,
+          "sha256": "sha256:00e7efdfbba0e12307721b71d9bfd33c86d010686308bf07caa0fe3b92b0d059"
         }
       },
-      "gateway_manifest_digest": "sha256:1c09ab289308caf25ca6284c424f0e01d60c7a4131bb8513dc2961f10642e160",
-      "native_image_digest": "blake3:61d99bacd8759410f88cee5164d8514c6c4bf04970918765d5f72bb72d138cc9",
+      "gateway_manifest_digest": "sha256:eecbc802b63fa6ce76a3f2e911f5dfc9210ba2fbf6bb73f835a47d9600b5461c",
+      "native_image_digest": "blake3:283d6eab204619e527805b09609a354f7a497675347068fa1ea138f9c2d49c8f",
       "objects": [
         {
           "bytes": 65536,
@@ -83,7 +83,7 @@
         }
       ],
       "platform": "linux/amd64",
-      "rootfs_index_digest": "blake3:e188afe9e7c474105daa058a6361f564947f37b8c780489b4f3f0b74f4c19fe5",
+      "rootfs_index_digest": "blake3:21e17a18cabb1da48f64fb6b4473f3983ef2dda2563959a5f753772d0ca1a4f3",
       "selected_source_manifest_digest": "sha256:7c4074a49117ee4752c2689f7faa0d5024dbdd7c09cafbc8c3e1790232e1b305"
     },
     {
@@ -93,20 +93,20 @@
           "sha256": "sha256:ad75573ee77b30c7b7e6e4c12a1023de010c2dc921be63524fb0eed018d9ad0d"
         },
         "image-manifest.json": {
-          "bytes": 1191,
-          "sha256": "sha256:7f0c33cf536a02a80b5eb2359d00acaa83f50eea985037954e4fbe52c71d556b"
+          "bytes": 1190,
+          "sha256": "sha256:50b9056f355682089e6a032dd3a17c082463caa43c79ff2d3aabeec539e4e648"
         },
         "platform-index.json": {
           "bytes": 350,
-          "sha256": "sha256:28ca44142a168f6584a06b36d2bbf0096dfe3e16afec70fd72c09da2f7391a0a"
+          "sha256": "sha256:819efebaa3fd7b86d69af907d3acdef35fad2cd23f51b4a62ac6af544ffec369"
         },
         "rootfs-index.json": {
-          "bytes": 81861,
-          "sha256": "sha256:41ac743bf740106a934a64f9d68237b038e20f965dba3e1fdd09320292b32087"
+          "bytes": 1179,
+          "sha256": "sha256:34537155bf1722103282c6ee83bd0238eeba50559dd5f7c0c294f5f316dd758b"
         }
       },
-      "gateway_manifest_digest": "sha256:7f0c33cf536a02a80b5eb2359d00acaa83f50eea985037954e4fbe52c71d556b",
-      "native_image_digest": "blake3:3e3b00b22cc9882304f5468aff760d59e7300c2a484bb4d06360832c47011860",
+      "gateway_manifest_digest": "sha256:50b9056f355682089e6a032dd3a17c082463caa43c79ff2d3aabeec539e4e648",
+      "native_image_digest": "blake3:6a0ccda9ea11767233200419b236306ae0c5b0f70ad2a05d3b8b73deac7899be",
       "objects": [
         {
           "bytes": 65536,
@@ -145,7 +145,7 @@
         }
       ],
       "platform": "linux/arm64",
-      "rootfs_index_digest": "blake3:7bdab8553d2b2cb93a433a2d5b97db8226d7466b2ee75ad1d1b541f33d9cd896",
+      "rootfs_index_digest": "blake3:74ab5bf058b0020b9e2ab84070b65308c0bbbe76838318274ce9fc17db4fa56a",
       "selected_source_manifest_digest": "sha256:7b904bf6d2b8bd5ff93c15b8af44a6732ca0e8d90191f8760965203a980feb54"
     }
   ]

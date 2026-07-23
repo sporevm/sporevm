@@ -76,10 +76,11 @@ application-level quiescence guarantee. The destination ref changes only when
 the command exits zero and disk publication succeeds.
 
 `--disk-size` is an absolute logical size. Growth is sparse, but data written by
-Docker is not. The current canonical disk index has a 64 MiB dense-index limit,
-so a sufficiently dense disk above about 30.62 GiB fails a later commit or
-snapshot closed. Start with 20 GiB and increase it only when measured use
-requires more. The memory setting is separate: `--memory` sizes guest RAM, not
+Docker is not. Current v2 indexes pack contiguous chunk digests and zero ranges,
+so snapshot capacity no longer pays for one JSON object per dense 64 KiB chunk;
+a dense 32 GiB disk is covered by focused tests. Index bytes remain bounded, so
+start with 20 GiB and increase it only when measured use requires more. The
+memory setting is separate: `--memory` sizes guest RAM, not
 Docker storage. Four GiB is a practical starting point for the daemon plus
 small builds; larger builds need a larger value. A saved runtime captures that
 RAM as well, so oversizing memory increases save, transfer, and restore work.

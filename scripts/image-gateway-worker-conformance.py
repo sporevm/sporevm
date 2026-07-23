@@ -291,6 +291,40 @@ def expected_chunk_size(index: dict[str, Any], logical_chunk: int) -> int:
     return min(chunk_size, logical_size - offset)
 
 
+def disk_index_chunks(index: dict[str, Any]) -> list[dict[str, Any]]:
+    kind = index.get("kind")
+    if kind == "spore-disk-index-v1":
+        chunks = index.get("chunks")
+        if not isinstance(chunks, list):
+            raise ConformanceError("rootfs v1 index is missing chunks")
+        return chunks
+    if kind != "spore-disk-index-v2":
+        raise ConformanceError("rootfs index has an unsupported kind")
+    ranges = index.get("chunk_ranges")
+    if not isinstance(ranges, list):
+        raise ConformanceError("rootfs v2 index is missing chunk_ranges")
+    chunks = []
+    for chunk_range in ranges:
+        if not isinstance(chunk_range, dict) or set(chunk_range) != {"start", "digests"}:
+            raise ConformanceError("rootfs v2 index contains a malformed chunk range")
+        start = chunk_range["start"]
+        digests = chunk_range["digests"]
+        if (
+            type(start) is not int
+            or start < 0
+            or not isinstance(digests, str)
+            or not digests
+            or len(digests) % 64
+            or any(byte not in "0123456789abcdef" for byte in digests)
+        ):
+            raise ConformanceError("rootfs v2 index contains invalid chunk range fields")
+        chunks.extend(
+            {"logical_chunk": start + offset, "digest": f"blake3:{digests[offset * 64:(offset + 1) * 64]}"}
+            for offset in range(len(digests) // 64)
+        )
+    return chunks
+
+
 def normalize_target(
     output: pathlib.Path,
     arch: str,
@@ -352,9 +386,7 @@ def normalize_target(
     }:
         raise ConformanceError("fixture platform descriptor disagrees with selected manifest")
 
-    chunks = index.get("chunks")
-    if not isinstance(chunks, list):
-        raise ConformanceError("rootfs index is missing chunks")
+    chunks = disk_index_chunks(index)
     logical_chunks = [chunk.get("logical_chunk") for chunk in chunks if isinstance(chunk, dict)]
     if (
         len(logical_chunks) != len(chunks)

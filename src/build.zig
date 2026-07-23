@@ -4077,7 +4077,7 @@ test "scratch stage publishes an empty native rootfs without guest execution" {
     // The empty 16 GiB filesystem remains physically compact: only metadata
     // chunks are materialized and the zero tail is represented in the index.
     try std.testing.expect(parsed_index.value.chunks.len <= 256);
-    try std.testing.expect(parsed_index.value.zero_chunks.len > parsed_index.value.chunks.len);
+    try std.testing.expect(try disk_index.zeroChunkCount(parsed_index.value) > parsed_index.value.chunks.len);
 
     var warm_diagnostic: Diagnostic = .{};
     const warm = try build(init, arena, .{

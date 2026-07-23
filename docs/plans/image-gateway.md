@@ -75,7 +75,7 @@ work.
 
 SporeVM's image and build paths are locally fast but machine-local. OCI images
 are converted into a deterministic ext4 filesystem, sealed into 64 KiB BLAKE3
-objects, published as a canonical `spore-disk-index-v1`, and then cached under
+objects, published as a canonical versioned disk index, and then cached under
 a local ref. `spore build` also checkpoints each rootfs-changing instruction
 through that same CAS and publishes its final rootfs index plus canonical image
 configuration as a local Spore image.
@@ -398,7 +398,7 @@ UTF-8, trailing input, non-canonical digests, unsupported platform or storage
 values, inconsistent index/base identities, oversized configuration, and
 values beyond current local rootfs/index bounds.
 
-The manifest references the canonical `spore-disk-index-v1`; it does not repeat
+The manifest references the canonical v1 or v2 disk index; it does not repeat
 the index's logical-chunk map. The client fetches the canonical config blob,
 verifies its SHA-256 transport digest and BLAKE3 config digest, parses it as the
 current `ImageConfig`, serializes it through the canonical writer, and requires

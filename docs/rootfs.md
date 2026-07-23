@@ -103,10 +103,10 @@ destination-ref publication; there is no slow `resize2fs` fallback.
 
 Block or inode exhaustion during COPY/ADD/RUN is terminal for that invocation.
 SporeVM does not replay a step that may have external side effects and does not
-publish the failed step or destination ref. The v1 16 GiB build cap keeps a
-fully populated rootfs index below the current canonical-index limit; a larger
-build capacity requires separate index-format/limit work rather than an unsafe
-override.
+publish the failed step or destination ref. The 16 GiB build cap keeps a fully
+populated rootfs index below the bounded canonical-index limit. The v2 ranged
+encoding removes the former roughly 30.62 GiB dense-disk cliff; a larger
+automatic build capacity remains a separate product and filesystem decision.
 
 Add `--save` to make rootfs writes part of the spore. The guest still sees a
 normal root filesystem, but writes land in a local chunk-mapped head and save
@@ -170,9 +170,11 @@ spore run \
 
 `--disk-size` is an absolute logical size, must be 64 KiB aligned, and cannot
 shrink the resolved source image. An equal size is allowed and performs no
-growth. Explicit sizes are still bounded by the 64 MiB canonical-index format:
-a sufficiently dense disk above about 30.62 GiB fails snapshot/commit closed,
-so use the smallest required capacity. The first version requires `--commit`;
+growth. Index inputs remain bounded to 64 MiB, but current v2 indexes pack
+contiguous digests and zero ranges instead of emitting a JSON object per
+logical chunk; a dense 32 GiB disk is covered by focused tests. Use the smallest
+required capacity because metadata still grows with distinct chunk digests.
+The first version requires `--commit`;
 it also requires the fresh
 `--image` source to resolve to complete indexed rootfs storage and the
 destination to be a valid mutable local ref. SporeVM resolves that immutable
@@ -345,7 +347,7 @@ prune selectors:
   `spore cache gc --rootfs` command to preserve reachable state.
 
 `spore cache gc --rootfs` is stricter than prune. It roots descriptor-selected
-`spore-disk-index-v1` indexes from cache metadata, image ref records, live
+versioned disk indexes from cache metadata, image ref records, live
 runtime manifests, and process-owned lazy-runtime leases, then selects only
 unrooted CAS indexes and chunk objects. It is the preferred command when the
 goal is to clean chunk garbage without discarding reachable chunked storage.
@@ -365,7 +367,7 @@ the flat ext4 file is a rebuildable cache. The manifest also records
 `rootfs.storage` pointing at the chunked rootfs index and CAS object namespace.
 Any rootfs writes made during
 the run are represented as a `chunk-index-disk-v0` disk: `disk.base` names a
-`spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, and each nonzero
+`spore-disk-index-v2` under `cas/rootfs/blake3/indexes/`, and each nonzero
 writable chunk is stored under `cas/rootfs/blake3/objects/`. Product
 `spore attach` and `spore run --from` serve immutable rootfs bases from the
 flat materialization cache, opened under the verify-at-install,
@@ -391,7 +393,7 @@ resumable spore.
 
 If a spore manifest has manifest-attached chunked rootfs storage under
 `rootfs.storage`, indexed bundles carry the descriptor-bound
-`spore-disk-index-v1` under `rootfs/blake3/indexes/<hex>.json` and the
+versioned disk index under `rootfs/blake3/indexes/<hex>.json` and the
 referenced nonzero rootfs chunk objects under
 `rootfs/blake3/objects/<hex>.chunk`. `spore unpack` and `spore pull` verify the
 index against the manifest descriptor, verify each chunk by BLAKE3, and install

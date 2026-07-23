@@ -17,7 +17,7 @@ $SPOREVM_ROOTFS_CACHE_DIR/
   <image-cache-key>.ext4
   <image-cache-key>.json              # includes rootfs_storage
   by-digest/blake3/<rootfs>.ext4      # exact fd-backed compatibility path
-  cas/rootfs/blake3/indexes/<id>.json # spore-disk-index-v1
+  cas/rootfs/blake3/indexes/<id>.json # spore-disk-index-v1 or -v2
   cas/rootfs/blake3/objects/<id>.chunk
 ```
 
@@ -295,7 +295,7 @@ authority.
   object namespace, `index_digest`, and `base_identity`. For this storage kind,
   `base_identity == index_digest`.
 - `disk.kind: "chunk-index-disk-v0"` records sealed writable root disk bytes as
-  a `spore-disk-index-v1` in the rootfs CAS namespace. `disk.base` is the index
+  a versioned disk index in the rootfs CAS namespace. `disk.base` is the index
   digest; `chunk_size`, `hash_algorithm`, and `object_namespace` bind the
   descriptor used to open and verify the index and objects.
 
@@ -347,15 +347,15 @@ Writable rootfs state is represented as a sealed chunk index:
 
 ```text
 chunk-index-disk-v0
-  base: blake3:<spore-disk-index-v1 bytes>
+  base: blake3:<canonical disk-index bytes>
   chunk_size: 65536
-  chunks: logical_chunk -> blake3:<chunk-bytes>
-  zero_chunks: [...]
+  chunk_ranges: start -> packed BLAKE3 digests
+  zero_ranges: start + count
 ```
 
 Active writes stay local in a sparse writable head. Capture writes nonzero
 chunks into `cas/rootfs/blake3/objects/`, writes the canonical
-`spore-disk-index-v1` under `cas/rootfs/blake3/indexes/`, then durably publishes
+`spore-disk-index-v2` under `cas/rootfs/blake3/indexes/`, then durably publishes
 its derived completeness stamp before the pin and visible save. The manifest
 disk records that index digest. Canonical indexes use the exact field order,
 two-space JSON layout, lowercase digest references, and no trailing newline
@@ -381,7 +381,7 @@ independent lifecycle.
 - spores with `rootfs.storage` include the descriptor-bound index under
   `rootfs/blake3/indexes/<hex>.json` and referenced chunks under
   `rootfs/blake3/objects/<hex>.chunk`;
-- spores with writable disk indexes include the `spore-disk-index-v1` named by
+- spores with writable disk indexes include the versioned index named by
   `disk.base` and referenced nonzero disk chunk objects under the same
   `rootfs/blake3` index/object paths.
 

@@ -292,8 +292,10 @@ golden invalidation test and at least one differential fixture.
 
 ## Deferred Decisions And Triggers
 
-- Revisit automatic build capacity above 16 GiB only after a compact index or a
-  lower proven dense-index ceiling removes the current format bound.
+- The v2 compact/ranged disk index removes the former roughly 30.62 GiB dense
+  JSON cliff and proves dense 32 GiB publication. Revisit automatic build
+  capacity above 16 GiB only with a concrete workload and filesystem-growth
+  requirement; the index format is no longer that decision's blocker.
 - Add a credential broker only for a concrete workflow whose trust, revocation,
   audit, and guest-delivery requirements justify a separate product surface.
 - Consider OCI or registry output only if a real distribution workflow cannot

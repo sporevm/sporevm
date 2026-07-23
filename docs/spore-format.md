@@ -176,7 +176,7 @@ the selected rootfs materialization cache.
 
 If `manifest.json` records `rootfs.storage.kind:
 "chunked-ext4-rootfs-v0"`, indexed bundles carry the exact
-`spore-disk-index-v1` bytes named by `rootfs.storage.index_digest` under
+versioned disk-index bytes named by `rootfs.storage.index_digest` under
 `rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero rootfs chunk
 object under `rootfs/blake3/objects/<hex>.chunk`. Unpack and pull verify the
 index against the manifest storage descriptor and verify every chunk by BLAKE3
@@ -186,7 +186,7 @@ not require the monolithic ext4 digest-cache artifact on the destination for a
 chunked rootfs child.
 
 If the selected manifest records a writable disk index, `spore pack` includes
-the exact `spore-disk-index-v1` bytes named by `disk.base` under
+the exact versioned disk-index bytes named by `disk.base` under
 `rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero disk chunk
 object under `rootfs/blake3/objects/<hex>.chunk`. `spore unpack` and
 `spore pull` copy those verified files into the materialized spore before
@@ -409,19 +409,33 @@ reset or poweroff.
   Per-exec environment and working-directory overrides are intentionally
   excluded.
 
-Every `spore-disk-index-v1` identity is the BLAKE3 digest of one exact canonical
-JSON encoding. The top-level fields appear in this order: `kind`,
-`logical_size`, `chunk_size`, `hash_algorithm`, `object_namespace`, `chunks`,
-then `zero_chunks`; chunk-entry fields are `logical_chunk` then `digest`. The
-encoding uses UTF-8, LF line endings, two-space JSON indentation, `: ` between
-names and values, decimal integers, both arrays even when empty, lowercase
-`blake3:<64 hex>` references, and no trailing newline. Parsers reject equivalent
-JSON with different member order, whitespace, escaping, omitted empty arrays,
-or digest case. This makes the index map—not producer-specific JSON choices—the
-single identity-bearing representation.
+Every disk-index identity is the BLAKE3 digest of one exact canonical JSON
+encoding. Readers accept both versions. Existing `spore-disk-index-v1` bytes
+retain their original field order and identity unchanged; new rootfs and disk
+producers write `spore-disk-index-v2`. There is no eager rewrite or alias from a
+v1 digest to v2. A new snapshot, commit, or rootfs publication over a v1 parent
+publishes a new v2 index and therefore a new content identity.
+
+V2 top-level fields appear in this order: `kind`, `logical_size`, `chunk_size`,
+`hash_algorithm`, `object_namespace`, `chunk_ranges`, then `zero_ranges`.
+Each nonempty `chunk_ranges` entry has `start` followed by `digests`, a
+concatenation of one lowercase 64-character BLAKE3 hex digest per contiguous
+logical chunk. Each nonempty `zero_ranges` entry has `start` followed by a
+positive `count`. Ranges are ordered, non-overlapping, non-adjacent within the
+same class, and together cover every logical chunk exactly once. V2 removes the
+v1 JSON object and field-name overhead per dense chunk while keeping the whole
+input bounded to 64 MiB. A dense 32 GiB disk is covered by the format's focused
+capacity test.
+
+Both versions use UTF-8, LF line endings, two-space JSON indentation, `: `
+between names and values, decimal integers, both coverage arrays even when
+empty, and no trailing newline. Parsers reject equivalent JSON with different
+member order, whitespace, escaping, omitted empty arrays, range splitting, or
+digest case. Descriptor matching, range arithmetic, exact coverage, canonical
+bytes, and index identity are validated before the index can authorize storage.
 
 Known-zero disk growth and whole-chunk write-zeroes operations are encoded as
-ordinary `zero_chunks`; they create no payload object and do not expose whether
+v2 `zero_ranges`; they create no payload object and do not expose whether
 the transient source-map entry was clean or dirty. A partial-chunk zero
 operation preserves the remaining bytes and verifies any lazy CAS boundary
 source before mutation. The resulting `logical_size`, non-zero entries, and
@@ -467,18 +481,19 @@ representation.
   For this first chunked storage kind, `base_identity` and
   `rootfs.artifact.digest` must equal `index_digest`, and the digest is the
   BLAKE3 identity of the canonical disk index bytes. The index itself records
-  index version `spore-disk-index-v1`, logical size, chunk size, hash algorithm,
-  object namespace, sorted non-zero chunk entries, and sorted explicit zero
-  chunks; it does not repeat `base_identity` because that would make the index
-  self-referential.
+  current index version `spore-disk-index-v2`, logical size, chunk size, hash
+  algorithm, object namespace, packed non-zero chunk ranges, and explicit zero
+  ranges; it does not repeat `base_identity` because that would make the index
+  self-referential. Existing v1 storage indexes remain readable.
 - `disk`: optional sealed writable root disk state for rootfs-backed captures.
   Saves use `kind: "chunk-index-disk-v0"`; `device` binds the disk to the
   same virtio-mmio rootfs slot, `size` is the full disk size, and `base` is the
-  BLAKE3 digest of a `spore-disk-index-v1` index in the rootfs CAS namespace.
+  BLAKE3 digest of a v1 or v2 disk index in the rootfs CAS namespace.
   `chunk_size`, `hash_algorithm`, and `object_namespace` mirror the index
   descriptor and must be `64KiB`, `blake3`, and `rootfs/blake3` for the current
-  disk backend. The index records sorted non-zero chunk entries plus explicit
-  zero chunks and is restore authority for the writable disk bytes.
+  disk backend. Current writers pack sorted non-zero chunks and explicit zero
+  coverage into v2 ranges; either accepted version is restore authority for the
+  writable disk bytes.
   `cow-block-v0` manifests are old-format artifacts and are rejected with a
   format-too-old error.
 - `network`: optional requested network capability and policy. `kind` is
@@ -594,7 +609,7 @@ before mutating VM state.
   materialization cache keyed by the storage index digest.
 - Manifest-bound chunked rootfs storage descriptors are the authority for
   bundle/pull CAS installation and for rebuilding a missing flat rootfs cache
-  entry. Rebuild opens the exact local `spore-disk-index-v1` named by
+  entry. Rebuild opens the exact local versioned disk index named by
   `rootfs.storage.index_digest`, validates the index against that descriptor,
   reads only BLAKE3-verified local chunk objects, then publishes the assembled
   flat cache entry under the same index identity. Unpack publishes each unique

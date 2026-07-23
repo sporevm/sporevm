@@ -1012,7 +1012,22 @@ object_count = 0
 object_bytes = 0
 logical_size = int(storage["logical_size"])
 chunk_size = int(storage["chunk_size"])
-for chunk in index.get("chunks", []):
+if index.get("kind") == "spore-disk-index-v1":
+    chunks = index.get("chunks", [])
+elif index.get("kind") == "spore-disk-index-v2":
+    chunks = []
+    for chunk_range in index.get("chunk_ranges", []):
+        start = int(chunk_range["start"])
+        digests = chunk_range["digests"]
+        if not digests or len(digests) % 64:
+            raise SystemExit("rootfs CAS v2 index has malformed packed digests")
+        chunks.extend(
+            {"logical_chunk": start + offset, "digest": "blake3:" + digests[offset * 64:(offset + 1) * 64]}
+            for offset in range(len(digests) // 64)
+        )
+else:
+    raise SystemExit(f"unsupported rootfs CAS index kind: {index.get('kind')}")
+for chunk in chunks:
     digest = chunk["digest"]
     object_hex = digest_hex(digest)
     object_path = pathlib.Path(cache_root) / "cas" / "rootfs" / "blake3" / "objects" / f"{object_hex}.chunk"

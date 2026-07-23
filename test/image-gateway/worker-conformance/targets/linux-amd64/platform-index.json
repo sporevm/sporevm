@@ -6,8 +6,8 @@
         "os": "linux",
         "arch": "amd64"
       },
-      "manifest_digest": "sha256:1c09ab289308caf25ca6284c424f0e01d60c7a4131bb8513dc2961f10642e160",
-      "image_digest": "blake3:61d99bacd8759410f88cee5164d8514c6c4bf04970918765d5f72bb72d138cc9"
+      "manifest_digest": "sha256:eecbc802b63fa6ce76a3f2e911f5dfc9210ba2fbf6bb73f835a47d9600b5461c",
+      "image_digest": "blake3:283d6eab204619e527805b09609a354f7a497675347068fa1ea138f9c2d49c8f"
     }
   ]
 }

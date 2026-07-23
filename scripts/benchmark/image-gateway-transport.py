@@ -146,6 +146,39 @@ def parse_object(data: bytes, source: Path) -> dict[str, Any]:
     return value
 
 
+def disk_index_chunks(index: dict[str, Any]) -> list[dict[str, Any]]:
+    if index.get("kind") == "spore-disk-index-v1":
+        chunks = index.get("chunks")
+        if not isinstance(chunks, list):
+            raise BenchmarkError("fixture v1 rootfs index is missing chunks")
+        return chunks
+    if index.get("kind") != "spore-disk-index-v2":
+        raise BenchmarkError("fixture rootfs index has an unsupported kind")
+    ranges = index.get("chunk_ranges")
+    if not isinstance(ranges, list):
+        raise BenchmarkError("fixture v2 rootfs index is missing chunk_ranges")
+    chunks = []
+    for chunk_range in ranges:
+        if not isinstance(chunk_range, dict) or set(chunk_range) != {"start", "digests"}:
+            raise BenchmarkError("fixture v2 rootfs index contains a malformed chunk range")
+        start = chunk_range["start"]
+        digests = chunk_range["digests"]
+        if (
+            type(start) is not int
+            or start < 0
+            or not isinstance(digests, str)
+            or not digests
+            or len(digests) % 64
+            or any(byte not in "0123456789abcdef" for byte in digests)
+        ):
+            raise BenchmarkError("fixture v2 rootfs index contains invalid chunk range fields")
+        chunks.extend(
+            {"logical_chunk": start + offset, "digest": f"blake3:{digests[offset * 64:(offset + 1) * 64]}"}
+            for offset in range(len(digests) // 64)
+        )
+    return chunks
+
+
 def only_named(root: Path, name: str) -> Path:
     matches = sorted(path for path in root.rglob(name) if path.is_file())
     if len(matches) != 1:
@@ -193,7 +226,7 @@ class Closure:
         arch = platform.get("arch")
         logical_size = rootfs_index.get("logical_size")
         chunk_size = rootfs_index.get("chunk_size")
-        chunks = rootfs_index.get("chunks")
+        chunks = disk_index_chunks(rootfs_index)
         if (
             os_name != "linux"
             or arch not in ("arm64", "amd64")
@@ -202,7 +235,6 @@ class Closure:
             or logical_size <= 0
             or chunk_size <= 0
             or chunk_size > MAX_CHUNK_BYTES
-            or not isinstance(chunks, list)
         ):
             raise BenchmarkError("fixture rootfs geometry or platform is invalid")
 
