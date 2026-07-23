@@ -981,6 +981,19 @@ archive for G1 eager bulk transfer, retains per-object authority and the
 manifest-bound object API for future lazy pulls, and defers dynamic batch
 framing to G2 unless production telemetry shows materially higher reuse.
 
+The first G1 product transport now implements that archive decision for final
+native images. `spore image pack` exports a complete local `spore build` or
+`spore run --commit` result as one immutable SHA-256-named gzip/USTAR object;
+`spore image unpack` requires that transport digest and an explicit platform,
+re-verifies the canonical gateway manifest, config, rootfs index, native image
+identity, and every BLAKE3 object, then publishes an ordinary local ref last.
+The Buildkite acceptance pipeline builds and packs on one worker, crosses the
+artifact boundary, unpacks into a clean rootfs cache on another worker, checks
+the exact native identity, and runs that image through `--pull=never`. This
+closes final native-image distribution without capturing suspended machine
+state, adding a gateway service framework, or distributing Dockerfile step
+cache records.
+
 The proof intentionally uses one manifest-bound GET per object, so it measures
 correctness rather than the final eager transport. Before object transfer, it
 rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
@@ -1082,7 +1095,21 @@ partially reused caches without removing the single-object interface.
 
 ### G1 — Read-only public OCI gateway
 
-Status: proposed first product slice.
+Status: active. The final-native-image archive and clean-worker artifact path
+are implemented as the first independently useful G1 slice. The mediated
+pull-through service work below remains proposed and is not required for native
+image artifact distribution.
+
+- Pack one complete local native image closure into the immutable compressed
+  archive selected by G0, while keeping archive bytes outside native identity.
+- Require the archive SHA-256 and explicit platform on import, then verify and
+  install through the existing CAS and local-ref publication transaction.
+- Prove CI handoff on separate workers: build and publish the artifact on the
+  producer, download into an empty rootfs cache on the consumer, compare the
+  native image identity, and run through `--pull=never` without saved state.
+- Keep artifact upload/download owned by the CI or object-store transport. The
+  product archive commands do not introduce credentials, repository policy, or
+  a general service framework.
 
 - Implement authenticated single-tenant conversion admission for configured
   public OCI repositories and both `linux/arm64` and `linux/amd64`.
@@ -1105,6 +1132,12 @@ Status: proposed first product slice.
 - Preserve exact image config and publish an ordinary local image consumable
   through `--pull=never` by current run, create, and build paths.
 - Emit structured conversion, transfer, reuse, and install accounting.
+
+The native-distribution slice is done when the two-worker acceptance above is
+green for an exact branch head and digest or architecture substitution fails
+before local-ref publication. This is the completion boundary for issue #545;
+it deliberately does not claim the later mediated OCI conversion service is
+implemented.
 
 Done means the same upstream multi-platform tag resolves to the pinned arm64 and
 amd64 source manifests from one upstream index generation, produces canonical

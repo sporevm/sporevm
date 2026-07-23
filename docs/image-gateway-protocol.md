@@ -247,6 +247,51 @@ unsupported kinds or artifact types,
 noncanonical media types or digests, alternate formatting, unsorted or
 duplicate descriptors, invalid UTF-8, and trailing input are rejected.
 
+## Immutable native image archive
+
+The first production transport for a final native image is a single-platform
+gzip-compressed USTAR archive with media type
+`application/vnd.sporevm.image.archive.v1+tar+gzip`. It carries the same
+canonical image manifest, config, rootfs index, and independently addressable
+objects as the gateway protocol; the archive adds no image or rootfs identity.
+CI artifact storage, object storage, or another delivery system transports the
+opaque archive bytes.
+
+Entries are regular files in this exact order:
+
+```text
+spore-image-manifest.json
+image-config.json
+rootfs-index.json
+objects/<64 lowercase BLAKE3 hexadecimal characters>
+```
+
+Object entries are the distinct nonzero rootfs objects sorted by digest.
+Headers use USTAR, mode `0444`, uid and gid zero, mtime zero, empty owner names,
+and two terminal zero blocks. Alternate entry order, duplicates, missing or
+extra entries, non-regular entries, noncanonical headers, bad checksums,
+truncation, and trailing decompressed bytes fail closed. Gzip and USTAR are
+rebuildable transport metadata; the lowercase SHA-256 digest of the complete
+compressed file is its immutable publication name.
+
+`spore image pack` resolves the requested local tag to its digest-pinned native
+image before writing anything, verifies the complete local CAS closure, and
+prints the archive SHA-256, gateway-manifest SHA-256, and native-image BLAKE3
+identities. It refuses to replace an existing output. `spore image unpack`
+requires the expected archive digest, target platform, and destination local
+tag. It verifies the complete archive digest before decompression, then verifies
+the selected platform, canonical manifest/config/index closure, native image
+identity, each object's index-derived length, and each object's BLAKE3 digest.
+Only after the complete closure is staged does it install through the existing
+CAS transaction and publish the local ref last.
+
+The initial archive path shares the eager-client bounds: at most 16 GiB logical
+rootfs size, 65,536 distinct nonzero objects, 4 GiB object payload, and 4 GiB
+compressed archive bytes. The unpacker uses private disk staging and never
+creates, captures, restores, or carries RAM, vCPU, device, session, or suspended
+machine state. `spore pack`, `push`, `pull`, and `unpack` remain the separate
+saved-machine bundle protocol.
+
 ## Experimental eager pull surface
 
 The first end-to-end proof uses an explicitly configured gateway origin and a

@@ -24,10 +24,13 @@ pub const max_eager_object_bytes: u64 = 4 * 1024 * 1024 * 1024;
 
 pub const usage =
     \\Usage:
+    \\  spore image pack local/name:tag --platform os/arch --out image.tar.gz
+    \\  spore image unpack image.tar.gz --archive-digest sha256:... --platform os/arch --ref local/name:tag
     \\  spore image pull SOURCE --gateway URL --repository NAME --ref local/name:tag [--platform os/arch]
     \\  spore image export-fixture SOURCE --repository NAME --metadata PATH --out DIR
     \\
     \\Options:
+    \\  --archive-digest DIGEST  Expected immutable SHA-256 archive identity
     \\  --gateway URL          Image gateway origin (HTTPS required)
     \\  --repository NAME     Gateway repository containing the source alias
     \\  --ref local/name:tag  Local mutable image ref to publish
@@ -448,6 +451,10 @@ fn validateEagerTransferBounds(logical_bytes: u64, object_count: u64, object_byt
     if (logical_bytes > max_eager_rootfs_logical_bytes or
         object_count > max_eager_object_count or
         object_bytes > max_eager_object_bytes) return error.GatewayImageTooLarge;
+}
+
+pub fn validateEagerTransferBoundsForArchive(logical_bytes: u64, object_count: u64, object_bytes: u64) !void {
+    return validateEagerTransferBounds(logical_bytes, object_count, object_bytes);
 }
 
 fn sourceKeyAlloc(allocator: std.mem.Allocator, source: []const u8) ![]u8 {

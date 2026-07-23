@@ -16,6 +16,7 @@ const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
 const image_gateway_pull = @import("image_gateway_pull.zig");
+const image_archive = @import("image_archive.zig");
 const lifecycle = @import("lifecycle.zig");
 const machine_output = @import("machine_output.zig");
 const local_paths = @import("local_paths.zig");
@@ -37,6 +38,10 @@ const system = @import("system.zig");
 
 pub const ImageGatewayPullOptions = image_gateway_pull.PullOptions;
 pub const ImageGatewayPullResult = image_gateway_pull.PullResult;
+pub const ImageArchivePackOptions = image_archive.PackOptions;
+pub const ImageArchivePackResult = image_archive.PackResult;
+pub const ImageArchiveUnpackOptions = image_archive.UnpackOptions;
+pub const ImageArchiveUnpackResult = image_archive.UnpackResult;
 
 /// Process context shared by product operations.
 ///
@@ -758,6 +763,32 @@ pub fn imageGatewayPull(
 
 pub fn deinitImageGatewayPullResult(allocator: std.mem.Allocator, result: ImageGatewayPullResult) void {
     image_gateway_pull.deinitPullResult(allocator, result);
+}
+
+/// Pack one complete local native image into an immutable transport archive.
+pub fn imageArchivePack(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ImageArchivePackOptions,
+) !ImageArchivePackResult {
+    return image_archive.pack(init, allocator, options);
+}
+
+pub fn deinitImageArchivePackResult(allocator: std.mem.Allocator, result: ImageArchivePackResult) void {
+    image_archive.deinitPackResult(allocator, result);
+}
+
+/// Verify and install one immutable native image archive into the local cache.
+pub fn imageArchiveUnpack(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ImageArchiveUnpackOptions,
+) !ImageArchiveUnpackResult {
+    return image_archive.unpack(init, allocator, options);
+}
+
+pub fn deinitImageArchiveUnpackResult(allocator: std.mem.Allocator, result: ImageArchiveUnpackResult) void {
+    image_archive.deinitUnpackResult(allocator, result);
 }
 
 /// Preload a cached rootfs into chunked CAS storage.
