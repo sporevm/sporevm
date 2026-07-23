@@ -4167,6 +4167,8 @@ test "lifecycle monitor spawn receives context environment" {
     defer spawn_arena_state.deinit();
     const spawn_arena = spawn_arena_state.allocator();
     const paths = try pathsFromRoot(spawn_arena, root, "env-probe");
+    releaseControlSocketPath(io, paths) catch {};
+    defer releaseControlSocketPath(io, paths) catch {};
 
     _ = try spawnMonitorExecutable(.{
         .minimal = undefined,
@@ -5871,8 +5873,8 @@ fn cliRuntimePathExit(command: []const u8, err: anyerror) noreturn {
                 std.debug.print("spore {s}: {s}\n", .{ command, detail });
             } else {
                 std.debug.print(
-                    "spore {s}: control socket path exceeds the platform limit; shorten the VM name or set {s} to a shorter path\n",
-                    .{ command, runtime_dir_env },
+                    "spore {s}: internal control socket path exceeds the platform limit\n",
+                    .{command},
                 );
             }
         },
@@ -6585,7 +6587,14 @@ test "lifecycle monitor stop distinguishes accepted socket close from pid exit" 
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
+    releaseControlSocketPath(io, paths) catch {};
+    Io.Dir.cwd().deleteFile(io, paths.control_socket_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
     try ensureVmDir(io, paths);
+    try claimControlSocketPath(io, paths);
+    defer releaseControlSocketPath(io, paths) catch {};
     const start = monotonicMs();
     try std.testing.expectEqual(
         MonitorStopResult.stopped,

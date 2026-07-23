@@ -513,8 +513,8 @@ const ExecServer = struct {
                 std.debug.print("monitor: {s}\n", .{detail});
             } else {
                 std.debug.print(
-                    "monitor: control socket path {s} is {d} bytes but the platform limit is {d}; shorten the VM name or set {s} to a shorter path\n",
-                    .{ socket_path, socket_path.len, lifecycle.max_control_socket_path_len, lifecycle.runtime_dir_env },
+                    "monitor: internal control socket path {s} is {d} bytes but the platform limit is {d}\n",
+                    .{ socket_path, socket_path.len, lifecycle.max_control_socket_path_len },
                 );
             }
             return err;
