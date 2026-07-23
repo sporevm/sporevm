@@ -33,6 +33,8 @@ the CLI alone exposes the experimental fresh profile.
 The public vocabulary is `save`, `attach`, and `restore` across Zig, C, and Go.
 JSONL run events keep their original `capture` event and `capture_path` fields
 and add `ownership` on capture plus `capture_ownership` on terminal exit.
+`ResourceType` distinguishes `.live_vm`, `.checkpoint`, `.image`, and
+`.bundle`. Additive `resource_type` fields use the same values in JSON results.
 
 ## Importing
 
@@ -94,6 +96,14 @@ Use the matching helper for owned results:
 `run`, `runManaged`, `runFromSpore`, and `attachSpore` return value results and
 do not need deinit.
 
+Live VM lifecycle results and list entries use `resource_type: "live_vm"`.
+Checkpoint inspection, fork, clone, unpack, pull, and removal use
+`resource_type: "checkpoint"`, while bundle inspection, pack, and push use
+`resource_type: "bundle"`. Image gateway and archive results use
+`resource_type: "image"`. Images contain application filesystem and OCI
+execution metadata; bundles and checkpoints contain no runnable image identity
+of their own.
+
 ## Local Spore Inspection
 
 Use `inspectSpore` to read metadata from a local `.spore` directory without
@@ -115,6 +125,14 @@ callers that should not infer it from chunks, devices, or sessions. Valid local
 spores report `true`. `SporeInspectResult.storage_mode` reports
 `memory-only`, `exact-rootfs`, `chunked-rootfs`, or the same rootfs mode with
 `-with-writable-disk`.
+
+`resource_type` is `checkpoint`. `can_run_from` reports whether the checkpoint
+can start a new process, while `can_attach` reports whether it records at least
+one session that can be selected for attach. `portability` is `host_local`,
+`portable`, or `batch_relative`; `ownership` retains the more specific
+`machine-local-pinned`, `portable-self-contained`, or `batch-relative`
+contract. Callers should use these fields instead of inferring operations or
+copy safety from directory contents.
 
 `SporeInspectResult.annotations` is an opaque key/value map copied out of the
 validated manifest. SporeVM does not interpret namespaces such as
@@ -234,14 +252,20 @@ Set `.generation_path` when a fork or fleet adapter has run-specific fan-out
 identity JSON to publish before the fresh command starts. Omitting it preserves
 the saved spore's normal generation resume behavior.
 
-Leave `.command` empty to attach to a saved session through the lower-level API
-compatibility path. The CLI spells this as `spore attach`. Set `.interactive =
-true` or `.tty = true` only when that saved session was started with
-interactive stdin or a PTY; unsupported input attach returns a usage error
-before restore instead of silently downgrading to output-only attach. If the
-manifest has exactly one non-default session, `runFromSpore` targets that handle
-for commandless attach; running a new command from a spore creates a new process
-session.
+`runFromSpore` requires a non-empty command and always creates a new process
+session. Use the distinct `attachSpore` operation to select a recorded session:
+
+```zig
+const result = try libspore.attachSpore(context, allocator, .{
+    .spore_dir = "base.spore",
+    .session_id = "default",
+    .interactive = true,
+});
+```
+
+Set `.interactive = true` or `.tty = true` only when that saved session
+supports stdin or a terminal. Unsupported input attach returns a usage error
+before restore instead of silently downgrading to output-only attach.
 
 `RunResult.memory_restore_source` and `memory_restore_reason` are populated for
 `runFromSpore` and `attachSpore`, so embedders can tell whether RAM came from

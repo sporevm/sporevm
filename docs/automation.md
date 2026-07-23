@@ -47,9 +47,9 @@ The bounded schema inventory is:
 | Operations | Result schemas |
 | --- | --- |
 | `version`, `host-info`, `inspect` | `spore.version.result.v1`, `spore.host-info.v2` or `.v3`, `spore.inspect.result.v1` |
-| artifact `fork`, `pack`, `unpack`, `push`, `inspect-bundle`, `pull` | `spore.fork.result.v1`, `spore.pack.result.v1`, `spore.unpack.result.v1`, `spore.push.result.v1`, `spore.bundle.inspect.v1`, `spore.pull.result.v1` |
-| `create`, `logs`, `save`, `restore`, named `rm`, named `fork`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v1`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v1`, `spore.copy.result.v1` |
-| `build`, rootfs operations, image gateway operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v1`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.pull.result.v1`, `spore.image.fixture.result.v1` |
+| checkpoint `fork`/`clone`, bundle `pack`/`push`/`inspect-bundle`, checkpoint `unpack`/`pull` | `spore.fork.result.v1`, `spore.clone.result.v1`, `spore.pack.result.v1`, `spore.unpack.result.v1`, `spore.push.result.v1`, `spore.bundle.inspect.v1`, `spore.pull.result.v1` |
+| `create`, `logs`, `save`, `restore`, `vm rm`, `vm fork`, `checkpoint rm`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v1`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v1`, `spore.copy.result.v1` |
+| `build`, rootfs operations, image gateway and archive operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v1`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.pull.result.v1`, `spore.image.fixture.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1` |
 | `system df`/`prune`, `cache gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v1`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
 
 Zig run and attach results use `spore.run.result.v1`. The bounded named-exec
@@ -60,6 +60,12 @@ Named create and `logs` share `spore.lifecycle.v1`. Its optional
 `initial_command` object first reports output disposition, destination, bound,
 and startup status, then the logs result adds process status, optional exit
 code, retained bytes, and per-stream truncation flags.
+
+Result schemas keep their existing names. Additive `resource_type` fields
+identify `live_vm`, `checkpoint`, `image`, or `bundle`, and checkpoint
+inspection also reports `can_attach`, `can_run_from`, `sessions` with
+per-session stream support, `portability`, and `ownership`. Existing consumers
+may ignore these fields under the v1 additive-field rule.
 
 ## Stable failures
 

@@ -1,6 +1,7 @@
 //! Product result contracts shared by libspore and CLI serializers.
 
 const std = @import("std");
+const resource = @import("resource.zig");
 
 pub const inspect_bundle_schema = "spore.bundle.inspect.v1";
 pub const pull_result_schema = "spore.pull.result.v1";
@@ -47,6 +48,7 @@ pub const BundleChildrenSummary = struct {
 pub const PullResult = struct {
     schema: []const u8 = pull_result_schema,
     schema_version: u32 = bundle_schema_version,
+    resource_type: resource.Type = .checkpoint,
     source: []const u8,
     bundle_dir: []const u8,
     out_dir: []const u8,
@@ -86,6 +88,7 @@ pub const RootfsBundleSummary = struct {
 pub const InspectBundleResult = struct {
     schema: []const u8 = inspect_bundle_schema,
     schema_version: u32 = bundle_schema_version,
+    resource_type: resource.Type = .bundle,
     source: []const u8,
     bundle_dir: []const u8,
     bundle_digest: DigestRef,

@@ -47,19 +47,19 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
                 "spore attach: spore has no saved session; run new commands with `spore run --from {s} ...`, or create one with `spore run --save <spore> --save-on TERM ...`; verify with `spore inspect {s}` and `Sessions: 1`\n",
                 .{ opts.spore_dir, opts.spore_dir },
             );
-            std.process.exit(2);
+            std.process.exit(api.classifyFailure(err).exit_code);
         }
         if (err == error.SavedSessionUnavailable) {
             std.debug.print("spore attach: saved session is not available: {s}\n", .{opts.session_id orelse "default"});
-            std.process.exit(2);
+            std.process.exit(api.classifyFailure(err).exit_code);
         }
         if (err == error.SavedSessionHasNoInteractiveStdin) {
             std.debug.print("spore attach: saved session has no interactive stdin: {s}\n", .{opts.session_id orelse "default"});
-            std.process.exit(2);
+            std.process.exit(api.classifyFailure(err).exit_code);
         }
         if (err == error.SavedSessionHasNoTerminal) {
             std.debug.print("spore attach: saved session has no terminal: {s}\n", .{opts.session_id orelse "default"});
-            std.process.exit(2);
+            std.process.exit(api.classifyFailure(err).exit_code);
         }
         return err;
     };

@@ -466,7 +466,7 @@ SPORE_RESUME_TIME_UNIX_NS=...
 ```
 
 For the first local fan-out contract, `SPORE_PARALLEL_JOB` is the child index
-within the local `spore fork --count N --out DIR` batch and
+within the local `spore checkpoint fork DIR --count N --out OUT_DIR` batch and
 `SPORE_PARALLEL_JOB_COUNT` is `N`. The generation JSON also retains
 `fork_index`, `fork_count`, `generation`, `parent_generation`, and resume-time
 fields; the fork fields currently match the parallel fields. Distributed

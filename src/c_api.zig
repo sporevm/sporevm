@@ -1754,6 +1754,10 @@ test "C ABI inspect spore JSON includes annotation values" {
     try std.testing.expectEqual(result_success, spore_inspect_spore_json(context, &options, &json));
     defer spore_free_string(context, json);
     const data = json.ptr.?[0..json.len];
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"resource_type\": \"checkpoint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"portability\": \"portable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"can_attach\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"can_run_from\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"vm_state_present\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"storage_mode\": \"memory-only\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"ownership\": \"portable-self-contained\"") != null);

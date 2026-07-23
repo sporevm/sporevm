@@ -1,10 +1,10 @@
 # Fan-Out
 
-`spore fork` mints local child spores, and `spore fanout` attaches those children
-with prefixed output:
+`spore checkpoint fork` mints local child checkpoints, and `spore fanout`
+attaches those children with prefixed output:
 
 ```bash
-spore fork warm.spore --count 5 --out children/
+spore checkpoint fork warm.spore --count 5 --out children/
 spore fanout children/
 ```
 
@@ -12,11 +12,12 @@ Children are named `000000` through zero-padded `N-1` and share the parent's
 chunk store. `spore fanout` is local orchestration over child spore directories;
 distributed offset/range partitioning is deferred.
 
-`spore fork` preserves the source spore's manifest version and vCPU count. A
+`spore checkpoint fork` preserves the source checkpoint's manifest version and
+vCPU count. A
 source saved with `--vcpus 4` mints children that also restore with 4 vCPUs;
 fork does not downshift an already-booted guest to a smaller CPU topology.
 
-For a running named VM, `spore fork --vm NAME --count N --name PATTERN` creates
+For a running named VM, `spore vm fork NAME --count N --name PATTERN` creates
 ready named children directly. Disk-backed sources use a queue-drained,
 single-epoch RAM/machine capture plus independent disk heads, so siblings
 inherit the same bytes and then diverge without a read-depth chain. Physical
@@ -34,7 +35,7 @@ original command stream:
 | --- | --- | --- | --- |
 | `spore save NAME --stop` | none | no | yes |
 | `spore run --save` | saved session | yes | yes |
-| `spore fork base.spore` | inherits parent | if parent has one | yes |
+| `spore checkpoint fork base.spore` | inherits parent | if parent has one | yes |
 | `spore unpack bundle --child N` | inherits bundled child | if child has one | yes |
 
 If the parent manifest declares bound services, fan-out supplies one fresh host
@@ -45,12 +46,12 @@ spore fanout children/ \
   --bind-service metadata=unix:/tmp/metadata.sock
 ```
 
-`spore fork` still only mints child spore directories; live host socket paths
-are not written into child manifests.
+`spore checkpoint fork` still only mints child checkpoint directories; live
+host socket paths are not written into child manifests.
 
-When the parent has a proof-validated local `ram.backing` file, `spore fork`
-keeps the proven parent fd open across the batch, hard-links that file into each
-child, and writes a child-local `ram.backing.proof`. Each child link is reopened
+When the parent has a proof-validated local `ram.backing` file, `spore
+checkpoint fork` keeps the proven parent fd open across the batch, hard-links
+that file into each child, and writes a child-local `ram.backing.proof`. Each child link is reopened
 without following symlinks and must match the proof-bound parent file identity
 before the proof is written. A missing or stale parent proof, an unavailable
 hard-link capability, or a conflicting child proof produces a chunk-only child;

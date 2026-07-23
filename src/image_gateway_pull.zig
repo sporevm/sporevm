@@ -13,6 +13,7 @@ const image = @import("image.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const resource = @import("resource.zig");
 const spore = @import("spore.zig");
 
 const Io = std.Io;
@@ -57,6 +58,7 @@ pub const default_platform = gateway.Platform{ .os = "linux", .arch = .arm64 };
 pub const PullResult = struct {
     schema: []const u8 = "spore.image.pull.result.v1",
     schema_version: u32 = 1,
+    resource_type: resource.Type = .image,
     resolved_image_ref: []const u8,
     image_digest: []const u8,
     objects_fetched: usize,
@@ -73,6 +75,7 @@ pub const ExportFixtureOptions = struct {
 pub const ExportFixtureResult = struct {
     schema: []const u8 = "spore.image.fixture.result.v1",
     schema_version: u32 = 1,
+    resource_type: resource.Type = .image,
     manifest_digest: []const u8,
     image_digest: []const u8,
     object_count: usize,
@@ -727,6 +730,7 @@ test "static fixture export produces a verified repository-bound closure" {
         .output_dir = tmp ++ "/gateway",
     });
     defer deinitExportFixtureResult(allocator, result);
+    try std.testing.expectEqual(resource.Type.image, result.resource_type);
     try std.testing.expectEqual(@as(usize, 1), result.object_count);
 
     const source_key = try sourceKeyAlloc(allocator, "docker.io/library/alpine:3.20");
@@ -757,6 +761,7 @@ test "static fixture export produces a verified repository-bound closure" {
         .allow_insecure_http = true,
     });
     defer deinitPullResult(allocator, pulled);
+    try std.testing.expectEqual(resource.Type.image, pulled.resource_type);
     try std.testing.expectEqualStrings(result.image_digest, pulled.image_digest);
     try std.testing.expectEqual(@as(usize, 1), pulled.objects_fetched);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, pull_cache, storage));

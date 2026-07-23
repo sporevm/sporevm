@@ -26,6 +26,7 @@ const platform = @import("platform.zig");
 const attach_mod = @import("attach.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const resource = @import("resource.zig");
 const saved_spore_fork = @import("saved_spore_fork.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
@@ -184,6 +185,8 @@ pub const RootfsImportTarOptions = rootfs_mod.ImportTarRequest;
 pub const RootfsImportTarResult = rootfs_mod.ImportTarResult;
 pub const RootfsPlatform = rootfs_mod.Platform;
 pub const Architecture = architecture.Architecture;
+pub const ResourceType = resource.Type;
+pub const Portability = resource.Portability;
 pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
 pub const RootfsStoragePolicy = rootfs_mod.RootfsStoragePolicy;
 pub const Disk = run_mod.Disk;
@@ -322,21 +325,17 @@ pub const ManagedRunOptions = struct {
     events: ?EventSink = null,
 };
 
-/// Run a command from a spore directory, or attach to one of its saved sessions.
+/// Run a new command from a checkpoint.
 ///
 /// This is the product API for `spore run --from`: it reads the manifest,
-/// restores machine/rootfs/disk policy from the spore, then executes a new
-/// guest command. Empty `command` attaches to a saved session for lower-level
-/// API compatibility; the CLI spells that path `spore attach`.
+/// restores machine/rootfs/disk policy from the checkpoint, then executes a new
+/// guest command. Use `attachSpore` to attach to a recorded session.
 pub const RunFromSporeOptions = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
     /// Guest command and arguments. The first element is the executable.
-    /// Leave empty to attach to a saved session.
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
-    /// Saved session to attach when command is empty.
-    attach_session_id: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
     vcpus: u32 = 1,
@@ -389,6 +388,7 @@ pub const ForkOptions = struct {
 pub const ForkResult = struct {
     schema: []const u8 = "spore.fork.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .checkpoint,
     parent: []const u8,
     out_dir: []const u8,
     count: usize,
@@ -416,6 +416,7 @@ pub const PackOptions = struct {
 pub const PackResult = struct {
     schema: []const u8 = "spore.pack.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .bundle,
     source: []const u8,
     out_dir: []const u8,
     bundle_digest: []const u8,
@@ -444,6 +445,7 @@ pub const UnpackOptions = struct {
 pub const UnpackResult = struct {
     schema: []const u8 = "spore.unpack.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .checkpoint,
     bundle: []const u8,
     out_dir: []const u8,
     bundle_digest: []const u8,
@@ -464,6 +466,10 @@ pub const CloneOptions = struct {
 };
 
 pub const CloneResult = struct {
+    schema: []const u8 = "spore.clone.result.v1",
+    schema_version: u32 = 1,
+    resource_type: ResourceType = .checkpoint,
+    portability: Portability = .portable,
     source: []const u8,
     out_dir: []const u8,
     ownership: []const u8 = saved_spore_ownership.portable_self_contained,
@@ -483,6 +489,7 @@ pub const PushOptions = struct {
 pub const PushResult = struct {
     schema: []const u8 = "spore.push.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .bundle,
     source: []const u8,
     destination: []const u8,
     store: []const u8 = "s3",
@@ -542,6 +549,10 @@ pub const SporeNetworkSummary = struct {
 pub const SporeInspectResult = struct {
     schema: []const u8 = "spore.inspect.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .checkpoint,
+    portability: Portability,
+    can_attach: bool,
+    can_run_from: bool,
     version: u32,
     vm_state_present: bool,
     storage_mode: []const u8,
@@ -1072,13 +1083,14 @@ pub fn runManaged(
     });
 }
 
-/// Restore machine inputs from an existing spore directory and execute a new
-/// guest command, or attach when the command is empty.
+/// Restore machine inputs from an existing checkpoint and execute a new guest
+/// command. Attach is a separate `attachSpore` operation.
 pub fn runFromSpore(
     context: Context,
     allocator: std.mem.Allocator,
     options: RunFromSporeOptions,
 ) !RunResult {
+    if (options.command.len == 0) return error.InvalidGuestCommand;
     const selected_backend = try backend_mod.requireProductRunner(options.backend);
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = .{},
@@ -1131,7 +1143,7 @@ pub fn runFromSpore(
         .resume_dir = options.spore_dir,
         .resume_generation = run_generation.resume_generation,
         .resume_sessions = sessions,
-        .attach_session_id = options.attach_session_id orelse spore.defaultAttachSessionId(sessions),
+        .attach_session_id = spore.default_session_id,
         .start_generation_params = run_generation.start_generation_params,
         .require_generation_ready = run_generation.start_generation_params != null,
         .command = options.command,
@@ -1711,12 +1723,16 @@ fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest:
     errdefer freeSessions(allocator, sessions);
     const network = try ownNetworkSummary(allocator, manifest.network);
     errdefer if (network) |owned_network| freeNetworkSummary(allocator, owned_network);
+    const ownership = try saved_spore_ownership.classify(allocator, spore_dir, manifest.disk);
 
     return .{
+        .portability = resource.portabilityForOwnership(ownership),
+        .can_attach = manifest.sessions.len != 0,
+        .can_run_from = true,
         .version = manifest.version,
         .vm_state_present = true,
         .storage_mode = inspectStorageMode(manifest),
-        .ownership = try saved_spore_ownership.classify(allocator, spore_dir, manifest.disk),
+        .ownership = ownership,
         .vcpu_count = vcpu_count,
         .platform = .{
             .arch = try allocator.dupe(u8, manifest.platform.arch),
@@ -1877,6 +1893,10 @@ test "inspect spore returns annotation values from saved manifest" {
 
     const inspected = try inspectSpore(allocator, dir);
     defer deinitSporeInspectResult(allocator, inspected);
+    try std.testing.expectEqual(ResourceType.checkpoint, inspected.resource_type);
+    try std.testing.expectEqual(Portability.portable, inspected.portability);
+    try std.testing.expect(inspected.can_attach);
+    try std.testing.expect(inspected.can_run_from);
     try std.testing.expect(inspected.vm_state_present);
     try std.testing.expectEqualStrings("exact-rootfs", inspected.storage_mode);
     try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, inspected.ownership);
@@ -1914,7 +1934,20 @@ test "inspect spore reports batch-relative offline fork children" {
 
     const inspected = try inspectSpore(allocator, child);
     defer deinitSporeInspectResult(allocator, inspected);
+    try std.testing.expectEqual(Portability.batch_relative, inspected.portability);
     try std.testing.expectEqualStrings(saved_spore_ownership.batch_relative, inspected.ownership);
+}
+
+test "run from checkpoint does not represent attach with an empty command" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.InvalidGuestCommand, runFromSpore(.{
+        .io = std.testing.io,
+        .environ_map = &env,
+    }, std.testing.allocator, .{
+        .spore_dir = "base.spore",
+        .command = &.{},
+    }));
 }
 
 test "run from generation state uses explicit params" {

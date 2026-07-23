@@ -281,7 +281,7 @@ spore create counter --image docker.io/library/alpine:3.20 \
 Fork it while that process is still running:
 
 ```bash
-spore fork --vm counter --count 2 --name child-%d
+spore vm fork counter --count 2 --name child-%d
 ```
 
 Both children keep running from the fork point:
@@ -352,10 +352,10 @@ the guest before the command starts.
 
 ## Fork and fan out
 
-Fork an existing spore:
+Fork an existing checkpoint:
 
 ```bash
-spore fork base.spore --count 100 --out forks
+spore checkpoint fork base.spore --count 100 --out forks
 ```
 
 Children are named `000000`, `000001`, and so on. They share verified content
@@ -411,8 +411,14 @@ spore exec bench-1 'echo hi'
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 spore restore bench-1.spore --name bench-2
 spore ps
-spore rm bench-2
+spore vm rm bench-2
 ```
+
+Use `spore checkpoint rm DIR` to delete saved state. It reports the checkpoint
+ownership class and whether removal released a machine-local backing pin.
+`spore vm rm NAME` stops the live monitor and deletes runtime state without
+touching checkpoints, images, or bundles. The older top-level `rm` and `fork`
+forms remain compatible throughout the 0.x release line.
 
 Create-time annotations and named lifecycle network policy can be passed as
 flags or through a JSON options file:

@@ -125,11 +125,11 @@ func TestRemoveSavedValidationAndResultContract(t *testing.T) {
 	if _, err := client.RemoveSaved(ctx, RemoveSavedOptions{SporeDir: "save.spore"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled RemoveSaved error = %v", err)
 	}
-	decoded, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"abc","pin_removed":true}`))
+	decoded, err := decodeRemovedSavedSpore([]byte(`{"schema":"spore.saved.remove.result.v1","schema_version":1,"resource_type":"checkpoint","action":"removed_spore","spore_dir":"save.spore","ownership":"machine-local-pinned","pin_id":"abc","pin_removed":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.PinID != "abc" || !decoded.PinRemoved {
+	if decoded.Schema != "spore.saved.remove.result.v1" || decoded.SchemaVersion != 1 || decoded.ResourceType != "checkpoint" || decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.Ownership != "machine-local-pinned" || decoded.PinID != "abc" || !decoded.PinRemoved {
 		t.Fatalf("unexpected removed save: %#v", decoded)
 	}
 	legacy, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"legacy"}`))
@@ -218,6 +218,9 @@ func TestInspectBundle(t *testing.T) {
 	if result.Schema != "spore.bundle.inspect.v1" {
 		t.Fatalf("schema = %q", result.Schema)
 	}
+	if result.ResourceType != "bundle" {
+		t.Fatalf("resource type = %q", result.ResourceType)
+	}
 	if !result.Indexed {
 		t.Fatal("expected indexed bundle")
 	}
@@ -246,6 +249,18 @@ func TestInspectSporeAnnotations(t *testing.T) {
 	}
 	if !result.VMStatePresent {
 		t.Fatal("expected VM state")
+	}
+	if result.Schema != "spore.inspect.result.v1" || result.SchemaVersion != 1 || result.VCPUCount != 1 {
+		t.Fatalf("inspection envelope = %#v", result)
+	}
+	if result.ResourceType != "checkpoint" || result.Portability != "portable" {
+		t.Fatalf("resource classification = %#v", result)
+	}
+	if result.CanAttach || !result.CanRunFrom {
+		t.Fatalf("capabilities = attach:%t run-from:%t", result.CanAttach, result.CanRunFrom)
+	}
+	if result.Ownership != "portable-self-contained" {
+		t.Fatalf("ownership = %q", result.Ownership)
 	}
 	if result.StorageMode != "memory-only" {
 		t.Fatalf("storage mode = %q", result.StorageMode)
@@ -496,6 +511,7 @@ func TestDecodeNamedLifecycleTiming(t *testing.T) {
 	result, err := decodeJSON[NamedLifecycleResult]([]byte(`{
 		"schema": "spore.lifecycle.v1",
 		"schema_version": 1,
+		"resource_type": "live_vm",
 		"action": "restored",
 		"name": "worker",
 		"state": "ready",
@@ -509,7 +525,7 @@ func TestDecodeNamedLifecycleTiming(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Timing == nil || result.Timing.WaitExecReadyMs != 17 || result.Timing.TotalMs != 24 {
+	if result.ResourceType != "live_vm" || result.Timing == nil || result.Timing.WaitExecReadyMs != 17 || result.Timing.TotalMs != 24 {
 		t.Fatalf("timing = %#v", result.Timing)
 	}
 }
