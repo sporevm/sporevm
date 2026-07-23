@@ -335,8 +335,17 @@ const (
 	ExecNamedStreamStdout ExecNamedStreamEventType = iota + 1
 	ExecNamedStreamStderr
 	ExecNamedStreamTerminal
-	ExecNamedStreamExit
+	ExecNamedStreamCompletion
 	ExecNamedStreamError
+)
+
+// TerminalOutcome classifies the final result of a streaming operation.
+type TerminalOutcome int
+
+const (
+	OutcomeCompleted TerminalOutcome = iota + 1
+	OutcomeFailed
+	OutcomeCanceled
 )
 
 // ExecNamedStreamEvent carries one streaming exec event.
@@ -344,6 +353,19 @@ type ExecNamedStreamEvent struct {
 	Type     ExecNamedStreamEventType
 	Bytes    []byte
 	ExitCode uint8
+	Outcome  TerminalOutcome
+	Failure  *StructuredFailure
+}
+
+// StructuredFailure is the stable spore.error.v1 failure body.
+type StructuredFailure struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Scope     string `json:"scope"`
+	Retry     string `json:"retry"`
+	Retryable bool   `json:"retryable"`
+	ExitCode  uint8  `json:"exit_code"`
+	Source    string `json:"source"`
 }
 
 // CopyNamedOptions selects one explicit host and guest path for named VM copy.
@@ -417,6 +439,12 @@ type NamedListEntry struct {
 	PID    *int64           `json:"pid"`
 	Memory *NamedListMemory `json:"memory"`
 	Stats  NamedListStats   `json:"stats"`
+}
+
+type NamedListResult struct {
+	Schema        string           `json:"schema"`
+	SchemaVersion uint32           `json:"schema_version"`
+	Entries       []NamedListEntry `json:"entries"`
 }
 
 type NamedListMemory struct {

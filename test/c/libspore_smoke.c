@@ -158,7 +158,8 @@ int main(void) {
   if (expect_success(spore_context_set_env(context, env_name, env_value)) != 0) return 1;
   SporeOwnedString named_json = {0};
   if (expect_success(spore_list_named_json(context, &named_json)) != 0) return 1;
-  if (named_json.ptr == 0 || strcmp(named_json.ptr, "[]\n") != 0) return 1;
+  if (named_json.ptr == 0 || strstr(named_json.ptr, "\"schema\": \"spore.lifecycle.list.result.v1\"") == 0) return 1;
+  if (strstr(named_json.ptr, "\"entries\": []") == 0) return 1;
   spore_free_string(context, named_json);
 #endif
 
