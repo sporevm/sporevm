@@ -194,6 +194,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         std.process.exit(2);
     };
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
+    try lifecycle.validateControlSocketOwner(init.io, paths);
     const paths_ms = lifecycle.monotonicMs();
     var existing_spec = lifecycle.readSpec(allocator, init.io, paths) catch |err| switch (err) {
         error.FileNotFound => null,

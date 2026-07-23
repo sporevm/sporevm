@@ -1787,8 +1787,8 @@ test "C ABI named lifecycle last error carries state and truthful log paths" {
     try std.testing.expectEqual(result_success, spore_context_set_env(context, borrowString("SPOREVM_RUNTIME_DIR"), borrowString(runtime)));
     const monitor_log_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "monitor.log" });
     defer allocator.free(monitor_log_path);
-    const control_socket_path = try std.fs.path.resolve(allocator, &.{ runtime, "vms", "bench-1", "control.sock" });
-    defer allocator.free(control_socket_path);
+    const paths = try spore_internal.lifecycle.pathsFromRoot(allocator, runtime, "bench-1");
+    defer paths.deinit(allocator);
 
     var argv = [_]SporeString{borrowString("/bin/true")};
     var options: SporeExecNamedOptions = undefined;
@@ -1806,7 +1806,7 @@ test "C ABI named lifecycle last error carries state and truthful log paths" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "state=absent") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, "console_log=none") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, monitor_log_path) != null);
-    try std.testing.expect(std.mem.indexOf(u8, detail, control_socket_path) != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, paths.control_socket_path) != null);
 }
 
 const inspect_spore_manifest_json =

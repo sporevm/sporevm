@@ -61,21 +61,8 @@ from named_restore_readiness import (
     verify_release_inputs,
 )
 
-CONTROL_SOCKET_PATH_LIMIT = 103
-
-
 def restore_name(iteration: int) -> str:
     return f"n{iteration}"
-
-
-def require_control_socket_path_budget(runtime_dir: pathlib.Path, iterations: int) -> pathlib.Path:
-    path = runtime_dir / "vms" / restore_name(iterations) / "control.sock"
-    size = len(os.fsencode(path))
-    if size > CONTROL_SOCKET_PATH_LIMIT:
-        raise BenchmarkError(
-            f"named restore control socket path is {size} bytes; portable limit is {CONTROL_SOCKET_PATH_LIMIT}: {path}"
-        )
-    return path
 
 
 def run_lane(
@@ -101,7 +88,6 @@ def run_lane(
     require_readiness_phases: bool = True,
     path_aliases: dict[str, str] | None = None,
 ) -> list[dict[str, object]]:
-    require_control_socket_path_budget(runtime_dir, iterations)
     runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     runtime_dir.chmod(0o700)
     spore_bin = debug_spore_wrapper(real_spore_bin, runtime_dir)
@@ -576,20 +562,6 @@ def self_test_manifest_vcpu_count() -> None:
             pass
         else:
             raise AssertionError(f"invalid manifest topology was accepted: {manifest!r}")
-
-
-def self_test_control_socket_path_budget() -> None:
-    for root in (pathlib.Path("/tmp"), pathlib.Path("/var/tmp/sporevm-named-restore-verity")):
-        runtime = root / "nr.XXXXXX" / "m" / "r" / "l1"
-        path = require_control_socket_path_budget(runtime, 5)
-        assert len(os.fsencode(path)) <= CONTROL_SOCKET_PATH_LIMIT
-    too_long = pathlib.Path("/tmp") / ("x" * CONTROL_SOCKET_PATH_LIMIT)
-    try:
-        require_control_socket_path_budget(too_long, 5)
-    except BenchmarkError:
-        pass
-    else:
-        raise AssertionError("oversized control socket path was accepted")
 
 
 def require_parent_proof(identity: dict[str, object], schema_version: int, label: str) -> None:
@@ -1206,7 +1178,6 @@ def main() -> int:
     if args.self_test:
         self_test()
         self_test_manifest_vcpu_count()
-        self_test_control_socket_path_budget()
         self_test_parent_proof_metrics()
         self_test_historical_readiness_validation()
         return 0

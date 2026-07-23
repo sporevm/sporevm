@@ -19,6 +19,10 @@ spore rm bench-2
 named surface is `create`, `exec`, `copy-in`, `copy-out`, `save`, `restore`,
 `fork --vm`, `ls`/`ps`, and `rm`.
 
+VM names are 1-128 ASCII bytes. The first byte must be alphanumeric; remaining
+bytes may also use `.`, `_`, and `-`. This public limit is identical on macOS
+and Linux and does not shrink when `SPOREVM_RUNTIME_DIR` is a long path.
+
 Linux/AMD64 KVM currently exposes an experimental fresh-execution subset:
 `create`, `exec`, and `rm` with the managed kernel, embedded minimal exec
 initrd, one vCPU, and explicit 512 MiB memory. Image and rootfs execution,
@@ -176,7 +180,6 @@ Live VM state is runtime state, not cache state:
 
 ```text
 $SPOREVM_RUNTIME_DIR/vms/<name>/
-  control.sock
   pid
   spec.json
   ready.json
@@ -186,6 +189,15 @@ $SPOREVM_RUNTIME_DIR/vms/<name>/
   console.log                 # only with --console-log
   monitor.log
 ```
+
+The private control socket lives at
+`/tmp/sporevm-control-<uid>/<digest>.sock`, where the fixed-size digest covers
+the resolved runtime root and full VM name. The adjacent `<digest>.owner`
+symlink points back to the readable `vms/<name>` registry directory. This keeps
+socket paths within host limits without truncating user names, leaves lookup
+and diagnostics inspectable, and makes a digest collision fail closed before a
+monitor starts. Lifecycle cleanup deletes both private socket entries only when
+they still belong to that registry entry.
 
 If `SPOREVM_RUNTIME_DIR` is unset, SporeVM uses the platform runtime directory
 or a private temp fallback. Runtime directories must be private to the current
