@@ -341,6 +341,20 @@ pub const Spec = struct {
     console_log_path: ?[]const u8 = null,
 };
 
+const LegacyMemoryPolicy = enum {
+    auto,
+    explicit,
+};
+
+const SpecMemoryProbe = struct {
+    memory: ?struct {
+        policy: ?LegacyMemoryPolicy = null,
+        bytes: ?u64 = null,
+        initial_bytes: ?u64 = null,
+        maximum_bytes: ?u64 = null,
+    } = null,
+};
+
 pub const ExecDefaults = spore.ExecDefaults;
 
 pub const DiskForkClaim = struct {
@@ -3076,13 +3090,38 @@ pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec)
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
     const data = try Io.Dir.cwd().readFileAlloc(io, paths.spec_path, allocator, .limited(max_metadata_bytes));
     defer allocator.free(data);
+    const legacy_memory = try legacyMemoryFromSpecJson(allocator, data);
     var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    if (legacy_memory) |memory| parsed.value.memory = memory;
     try validateSpec(parsed.value);
     return parsed;
+}
+
+fn legacyMemoryFromSpecJson(allocator: std.mem.Allocator, data: []const u8) !?memory_config.Config {
+    var probe = try std.json.parseFromSlice(SpecMemoryProbe, allocator, data, .{
+        .ignore_unknown_fields = true,
+    });
+    defer probe.deinit();
+    const value = probe.value.memory orelse return null;
+    const has_current = value.initial_bytes != null or value.maximum_bytes != null;
+    const has_legacy = value.policy != null or value.bytes != null;
+    if (has_current and has_legacy) return error.BadManifest;
+    if (!has_legacy) return null;
+    const policy = value.policy orelse return error.BadManifest;
+    const bytes = value.bytes orelse return error.BadManifest;
+    const config = switch (policy) {
+        .auto => memory_config.Config{
+            .initial_bytes = memory_config.default_bytes,
+            .maximum_bytes = bytes,
+        },
+        .explicit => memory_config.Config.fixed(bytes),
+    };
+    try config.validate();
+    return config;
 }
 
 fn validateSpec(spec: Spec) !void {
@@ -7007,6 +7046,31 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
 
     try writePid(allocator, io, paths, 1234);
     try std.testing.expectEqual(@as(i64, 1234), try readPid(allocator, io, paths));
+}
+
+test "legacy lifecycle memory policy migrates to explicit sizes" {
+    const allocator = std.testing.allocator;
+    const auto = (try legacyMemoryFromSpecJson(
+        allocator,
+        "{\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}}",
+    )).?;
+    try std.testing.expectEqual(memory_config.default_bytes, auto.initial_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), auto.maximum_bytes);
+
+    const fixed = (try legacyMemoryFromSpecJson(
+        allocator,
+        "{\"memory\":{\"policy\":\"explicit\",\"bytes\":2147483648}}",
+    )).?;
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), fixed.initial_bytes);
+    try std.testing.expectEqual(fixed.initial_bytes, fixed.maximum_bytes);
+
+    try std.testing.expectError(
+        error.BadManifest,
+        legacyMemoryFromSpecJson(
+            allocator,
+            "{\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184,\"initial_bytes\":536870912,\"maximum_bytes\":17179869184}}",
+        ),
+    );
 }
 
 test "durable lifecycle metadata drops transient disk fork claims" {

@@ -199,6 +199,9 @@ spore create bench-1 --options @create-options.json
 The file uses the same spellings as the CLI flags: `image`, `rootfs`, `kernel`,
 `initrd`, `pull`, `memory`, and `max_memory`. Omitting both memory fields
 creates a fixed 512 MiB VM; `max_memory` alone uses that initial default.
+Existing local registry entries are read explicitly: the former `explicit`
+policy becomes fixed at its stored byte size, while `auto` becomes 512 MiB
+initial memory with its stored byte size as the elastic ceiling.
 Unknown fields fail closed, `schema_version`
 must be `1`, and `--options` cannot be combined with individual create option
 flags. Bound services default `guest_host` to `NAME.spore.internal` when it is
