@@ -1580,6 +1580,7 @@ pub fn forkNamed(
     var source_pause_ms: ?u64 = null;
     var child_ready_ms: ?u64 = null;
     var started = std.array_list.Managed([]const u8).init(arena);
+    try started.ensureTotalCapacity(child_names.len);
 
     if (disk_backed) {
         const lease = try ensureDiskBaselineLease(arena, context, source_paths, &source_spec.value);
@@ -1613,16 +1614,17 @@ pub fn forkNamed(
             .environ_map = init.environ_map,
         });
         for (child_names, prepared.value.claims, 0..) |child_name, claim, index| {
-            try started.append(child_name);
             const spore_dir = try childSporeDir(arena, children_dir, index);
             startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, .{
                 .source_socket_path = ready.value.control_socket_path,
                 .batch_name = batch_name,
                 .prepared_claim = claim,
             }) catch |err| {
+                if (err != error.ControlSocketPathCollision) started.appendAssumeCapacity(child_name);
                 cleanupStartedChildren(init, arena, started.items);
                 return err;
             };
+            started.appendAssumeCapacity(child_name);
         }
         child_ready_ms = monotonicMs() -| children_start_ms;
     } else {
@@ -1638,12 +1640,13 @@ pub fn forkNamed(
             .environ_map = init.environ_map,
         });
         for (child_names, 0..) |child_name, index| {
-            try started.append(child_name);
             const spore_dir = try childSporeDir(arena, children_dir, index);
             startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, null) catch |err| {
+                if (err != error.ControlSocketPathCollision) started.appendAssumeCapacity(child_name);
                 cleanupStartedChildren(init, arena, started.items);
                 return err;
             };
+            started.appendAssumeCapacity(child_name);
         }
     }
 
