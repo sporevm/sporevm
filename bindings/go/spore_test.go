@@ -514,6 +514,41 @@ func TestDecodeNamedLifecycleTiming(t *testing.T) {
 	}
 }
 
+func TestDecodeNamedLifecycleInitialOutput(t *testing.T) {
+	result, err := decodeJSON[NamedLifecycleResult]([]byte(`{
+		"schema": "spore.lifecycle.v1",
+		"schema_version": 1,
+		"action": "logs",
+		"name": "worker",
+		"state": "ready",
+		"initial_command": {
+			"output_disposition": "retain",
+			"output_destination": "named_logs",
+			"output_limit_bytes_per_stream": 16381,
+			"startup_status": "started",
+			"process_status": "exited",
+			"exit_code": 7,
+			"stdout": [255, 65],
+			"stderr": "failed\n",
+			"stdout_truncated": true,
+			"stderr_truncated": false
+		}
+	}`), "named lifecycle result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := result.InitialCommand
+	if initial == nil || initial.ProcessStatus == nil || *initial.ProcessStatus != "exited" {
+		t.Fatalf("initial command = %#v", initial)
+	}
+	if initial.ExitCode == nil || *initial.ExitCode != 7 || initial.Stdout != string([]byte{255, 65}) || initial.Stderr != "failed\n" {
+		t.Fatalf("initial output = %#v", initial)
+	}
+	if !initial.StdoutTruncated {
+		t.Fatal("stdout truncation not decoded")
+	}
+}
+
 func TestDecodeExecNamedResult(t *testing.T) {
 	result, err := decodeJSON[ExecNamedResult]([]byte(`{
 		"exit_code": 7,

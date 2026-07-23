@@ -108,6 +108,16 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 expect_eq 'default|inherited|/workspace' "${default_context}" "detached image command defaults"
+"${spore_bin}" --json logs "${source_name}" | python3 -c '
+import json
+import sys
+
+initial = json.load(sys.stdin)["initial_command"]
+if initial["process_status"] != "exited" or initial["exit_code"] != 0:
+    raise SystemExit("successful initial command did not report exit 0")
+if initial["stdout"] != "default|inherited|/workspace" or initial["stderr"] != "":
+    raise SystemExit("successful initial command output was not retained")
+'
 
 "${spore_bin}" create "${override_name}" \
   --backend "${backend}" \
@@ -115,6 +125,7 @@ expect_eq 'default|inherited|/workspace' "${default_context}" "detached image co
   --pull never \
   --memory "${SPORE_SMOKE_MEMORY:-512mb}" \
   --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT:-60s}" \
+  --initial-output discard \
   -- /bin/sh -lc 'printf "%s|%s|%s" "$IMAGE_VALUE" "$CLEAR_ME" "$PWD" > detached-context'
 
 detached_context=""
@@ -126,6 +137,9 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 expect_eq 'default|inherited|/workspace' "${detached_context}" "detached create context"
+if "${spore_bin}" logs "${override_name}" >/dev/null 2>&1; then
+  die "discarded initial output was unexpectedly retrievable"
+fi
 
 if "${spore_bin}" create "${failed_name}" \
   --backend "${backend}" \

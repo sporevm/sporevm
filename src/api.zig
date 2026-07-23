@@ -210,6 +210,12 @@ pub const ImageCommitEvent = run_mod.ImageCommitEvent;
 pub const ExitEvent = run_mod.ExitEvent;
 pub const FailureEvent = run_mod.FailureEvent;
 pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
+pub const InitialOutputDisposition = lifecycle.InitialOutputDisposition;
+pub const InitialOutputDestination = lifecycle.InitialOutputDestination;
+pub const InitialCommandStartupStatus = lifecycle.InitialCommandStartupStatus;
+pub const InitialCommandProcessStatus = lifecycle.InitialCommandProcessStatus;
+pub const InitialCommandResult = lifecycle.InitialCommandResult;
+pub const InitialOutputNamedOptions = lifecycle.InitialOutputNamedOptions;
 pub const RestoreNamedOptions = lifecycle.RestoreNamedOptions;
 pub const ForkNamedOptions = lifecycle.ForkNamedOptions;
 pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
@@ -1234,6 +1240,15 @@ pub fn execNamed(
     options: ExecNamedOptions,
 ) !ExecNamedResult {
     return lifecycle.execNamed(context, allocator, options);
+}
+
+/// Retrieve the bounded stdout and stderr retained for a named VM's initial command.
+pub fn initialOutputNamed(
+    context: Context,
+    allocator: std.mem.Allocator,
+    options: InitialOutputNamedOptions,
+) !NamedLifecycleResult {
+    return lifecycle.initialOutputNamed(context, allocator, options);
 }
 
 /// Open a bidirectional streaming exec inside a ready named VM.

@@ -4077,6 +4077,7 @@ pub const ExecRequestContextOptions = struct {
     working_dir: ?[]const u8 = null,
     resume_time_unix_ns: u64 = 0,
     generation_params: ?[]const u8 = null,
+    retain_output: bool = false,
 };
 
 pub fn execRequestWithSessionContext(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: ExecRequestContextOptions) ![]const u8 {
@@ -4138,6 +4139,7 @@ pub fn detachedExecRequestWithSessionContext(allocator: std.mem.Allocator, argv:
         working_dir: []const u8,
         memory_pressure: bool = false,
         detached: bool = true,
+        retain_output: bool,
         closed_env: bool = true,
     }{
         .session_id = session_id,
@@ -4145,6 +4147,7 @@ pub fn detachedExecRequestWithSessionContext(allocator: std.mem.Allocator, argv:
         .argv = argv,
         .env = options.env,
         .working_dir = options.working_dir orelse "",
+        .retain_output = options.retain_output,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
@@ -4674,9 +4677,10 @@ test "run detached exec request asks guest to start without waiting" {
         .env = &.{"SPORE_CONTEXT=detached"},
         .working_dir = "/work",
         .resume_time_unix_ns = 1_700_000_000_000_000_000,
+        .retain_output = true,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[\"SPORE_CONTEXT=detached\"],\"working_dir\":\"/work\",\"memory_pressure\":false,\"detached\":true,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[\"SPORE_CONTEXT=detached\"],\"working_dir\":\"/work\",\"memory_pressure\":false,\"detached\":true,\"retain_output\":true,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {
