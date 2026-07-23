@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const aarch64_board = @import("src/aarch64/board.zig");
 const x86_64_board = @import("src/x86_64/board.zig");
+const spore_version = @import("src/version.zig").value;
 
 const macos_deployment_target = std.SemanticVersion{ .major = 13, .minor = 0, .patch = 0 };
 
@@ -21,7 +22,7 @@ pub fn build(b: *std.Build) void {
         .preferred_optimize_mode = .ReleaseSafe,
     });
     const macos_framework_path = macosFrameworkPath(b);
-    const libspore_version = std.SemanticVersion{ .major = 0, .minor = 15, .patch = 0 };
+    const libspore_version = std.SemanticVersion.parse(spore_version) catch unreachable;
 
     const libspore_mod = b.addModule("libspore", .{
         .root_source_file = b.path("src/libspore.zig"),
@@ -115,18 +116,18 @@ pub fn build(b: *std.Build) void {
     const install_libspore_static = b.addInstallArtifact(libspore_static, .{});
     const install_libspore_header = b.addInstallHeaderFile(b.path("include/spore.h"), "spore.h");
     const pc_files = b.addWriteFiles();
-    const libspore_pc = pc_files.add("libspore.pc",
-        \\prefix=${pcfiledir}/../..
-        \\libdir=${prefix}/lib
-        \\includedir=${prefix}/include
+    const libspore_pc = pc_files.add("libspore.pc", b.fmt(
+        \\prefix=${{pcfiledir}}/../..
+        \\libdir=${{prefix}}/lib
+        \\includedir=${{prefix}}/include
         \\
         \\Name: libspore
         \\Description: SporeVM C ABI
-        \\Version: 0.15.0
-        \\Libs: -L${libdir} -lspore
-        \\Cflags: -I${includedir}
+        \\Version: {s}
+        \\Libs: -L${{libdir}} -lspore
+        \\Cflags: -I${{includedir}}
         \\
-    );
+    , .{spore_version}));
     const install_libspore_pc = b.addInstallFileWithDir(libspore_pc, .lib, "pkgconfig/libspore.pc");
     b.getInstallStep().dependOn(&install_libspore_shared.step);
     b.getInstallStep().dependOn(&install_libspore_static.step);

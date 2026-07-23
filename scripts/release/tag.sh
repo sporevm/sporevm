@@ -29,8 +29,8 @@ require_source_version() {
     || die "zig-out/lib/pkgconfig/libspore.pc must be ${version}; run mise run check"
   [[ -x zig-out/bin/spore ]] \
     || die "zig-out/bin/spore is missing; run mise run check"
-  if ! zig-out/bin/spore version | grep -Fq "spore ${version} "; then
-    die "zig-out/bin/spore version must report ${version}; run mise run check"
+  if ! zig-out/bin/spore --version | grep -Fq "spore ${version} "; then
+    die "zig-out/bin/spore --version must report ${version}; run mise run check"
   fi
 }
 

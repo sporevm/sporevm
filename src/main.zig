@@ -19,6 +19,7 @@ var runtime_log_level: std.log.Level = .warn;
 
 const usage =
     \\Usage: spore [--debug] [--json] <command>
+    \\       spore --version
     \\
     \\Global options:
     \\  --debug             Show verbose VMM and restore logs
@@ -75,7 +76,6 @@ const usage =
     \\    cache               Inspect and collect local content-addressed caches
     \\    system              Inspect and prune local SporeVM system state
     \\    host-info           Print this host's platform facts
-    \\    version             Print the spore version
     \\    help                Show this help
     \\
 ;
@@ -149,6 +149,12 @@ pub fn main(init: std.process.Init) !void {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_file_writer: Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
+
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--version")) {
+        try writeVersion(stdout, builtin.mode);
+        try stdout.flush();
+        return;
+    }
 
     const parsed = parseGlobalArgs(args);
     if (parsed.debug) runtime_log_level = .debug;
@@ -241,7 +247,7 @@ fn runCommand(
             try stdout.writeAll("usage: spore version\n");
             return;
         }
-        try stdout.print("spore {s} ({t})\n", .{ spore_internal.version, builtin.mode });
+        try writeVersion(stdout, builtin.mode);
     } else if (std.mem.eql(u8, command, "host-info")) {
         if (wantsCommandHelp(command_args)) {
             try stdout.writeAll("usage: spore host-info\n");
@@ -522,6 +528,10 @@ fn wantsCommandHelp(args: []const []const u8) bool {
 fn isHelpFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or
         std.mem.eql(u8, arg, "--help");
+}
+
+fn writeVersion(writer: *Io.Writer, mode: std.builtin.OptimizeMode) !void {
+    try writer.print("spore {s} ({t})\n", .{ spore_internal.version, mode });
 }
 
 fn forkCommand(
@@ -1037,6 +1047,7 @@ fn writePullResult(writer: *Io.Writer, result: spore_api.PullResult) !void {
 
 test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "--debug") != null);
+    try std.testing.expect(std.mem.indexOf(u8, usage, "--version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "build") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "rootfs") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "run") != null);
@@ -1058,6 +1069,18 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "push") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pull") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
+}
+
+test "version output distinguishes development and release builds" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeVersion(&out.writer, .Debug);
+    try std.testing.expectEqualStrings("spore " ++ spore_internal.version ++ " (Debug)\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeVersion(&out.writer, .ReleaseSafe);
+    try std.testing.expectEqualStrings("spore " ++ spore_internal.version ++ " (ReleaseSafe)\n", out.written());
 }
 
 test "parse inspect bundle child range" {

@@ -100,6 +100,8 @@ build_target() {
   fi
   [[ -e "${shared_libs[0]}" ]] || die "missing built shared libspore library"
 
+  scripts/test/version.sh "${prefix}" ReleaseSafe
+
   mkdir -p "${staging}/bin"
   install -m 0755 "${binary}" "${staging}/bin/spore"
   install -m 0644 "${REPO_ROOT}/LICENSE" "${staging}/LICENSE"
