@@ -597,6 +597,30 @@ fn validIndexJson() []const u8 {
     ;
 }
 
+fn validV2IndexJson() []const u8 {
+    return
+    \\{
+    \\  "kind": "spore-disk-index-v2",
+    \\  "logical_size": 8192,
+    \\  "chunk_size": 4096,
+    \\  "hash_algorithm": "blake3",
+    \\  "object_namespace": "rootfs/blake3",
+    \\  "chunk_ranges": [
+    \\    {
+    \\      "start": 0,
+    \\      "digests": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    \\    }
+    \\  ],
+    \\  "zero_ranges": [
+    \\    {
+    \\      "start": 1,
+    \\      "count": 1
+    \\    }
+    \\  ]
+    \\}
+    ;
+}
+
 fn storageAndIndexJson(allocator: std.mem.Allocator) !struct {
     descriptor: Descriptor,
     bytes: []const u8,
@@ -621,6 +645,18 @@ test "disk index canonical encoding has stable bytes and digest" {
 
     try std.testing.expectEqualStrings(validIndexJson(), encoded.bytes);
     try std.testing.expectEqualStrings("blake3:84ed6c06aee56c98b84a1eeaa122dbb91642feeeca02675ef5765043ccad19ac", encoded.digest);
+}
+
+test "v2 disk index canonical encoding has stable bytes and digest" {
+    const allocator = std.testing.allocator;
+    const encoded = try encodeCanonicalAlloc(
+        allocator,
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{1}),
+    );
+    defer encoded.deinit(allocator);
+
+    try std.testing.expectEqualStrings(validV2IndexJson(), encoded.bytes);
+    try std.testing.expectEqualStrings("blake3:69fefbc2cd610a7d0d66ffe56978513273fbd38fb0ad905c1c9e40c04c86bcf0", encoded.digest);
 }
 
 test "manifest-bound disk index validates descriptor digest and canonical coverage" {
