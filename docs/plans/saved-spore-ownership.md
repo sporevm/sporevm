@@ -1,6 +1,6 @@
 # Saved Spore Ownership Safety
 
-Status: active
+Status: complete
 
 Last reviewed: 2026-07-23
 
@@ -18,9 +18,9 @@ manifest, and diskless batches use the same hidden-stage rename transaction.
 Legacy v1 pins stay readable and transportable but refuse destructive removal
 because their copy count cannot be established safely.
 
-The implementation slice is complete when inspect, save, removal, clone,
-pin-listing, and cache-GC output expose this contract; pack remains the transport
-encoding behind clone; and adversarial tests cover copy forms, duplicate links,
+The completed implementation exposes this contract through inspect, save,
+removal, clone, pin-listing, and cache-GC output. Pack remains the transport
+encoding behind clone, and adversarial tests cover copy forms, duplicate links,
 raw deletion, removal ordering, and batch-relative children. Resource aliases
 and broader lifecycle capability vocabulary remain in issues #546 and #553.
 
