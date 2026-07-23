@@ -12,6 +12,7 @@ const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
+const resource = @import("resource.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
@@ -23,6 +24,7 @@ const Io = std.Io;
 pub const Result = struct {
     schema: []const u8 = "spore.saved.remove.result.v1",
     schema_version: u32 = 1,
+    resource_type: resource.Type = .checkpoint,
     action: []const u8 = "removed_spore",
     spore_dir: []const u8,
     ownership: []const u8 = saved_spore_ownership.portable_self_contained,

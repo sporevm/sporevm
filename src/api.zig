@@ -388,6 +388,7 @@ pub const ForkOptions = struct {
 pub const ForkResult = struct {
     schema: []const u8 = "spore.fork.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .checkpoint,
     parent: []const u8,
     out_dir: []const u8,
     count: usize,
@@ -415,6 +416,7 @@ pub const PackOptions = struct {
 pub const PackResult = struct {
     schema: []const u8 = "spore.pack.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .bundle,
     source: []const u8,
     out_dir: []const u8,
     bundle_digest: []const u8,
@@ -443,6 +445,7 @@ pub const UnpackOptions = struct {
 pub const UnpackResult = struct {
     schema: []const u8 = "spore.unpack.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .checkpoint,
     bundle: []const u8,
     out_dir: []const u8,
     bundle_digest: []const u8,
@@ -463,6 +466,8 @@ pub const CloneOptions = struct {
 };
 
 pub const CloneResult = struct {
+    resource_type: ResourceType = .checkpoint,
+    portability: Portability = .portable,
     source: []const u8,
     out_dir: []const u8,
     ownership: []const u8 = saved_spore_ownership.portable_self_contained,
@@ -482,6 +487,7 @@ pub const PushOptions = struct {
 pub const PushResult = struct {
     schema: []const u8 = "spore.push.result.v1",
     schema_version: u32 = 1,
+    resource_type: ResourceType = .bundle,
     source: []const u8,
     destination: []const u8,
     store: []const u8 = "s3",

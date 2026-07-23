@@ -125,11 +125,11 @@ func TestRemoveSavedValidationAndResultContract(t *testing.T) {
 	if _, err := client.RemoveSaved(ctx, RemoveSavedOptions{SporeDir: "save.spore"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled RemoveSaved error = %v", err)
 	}
-	decoded, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"abc","pin_removed":true}`))
+	decoded, err := decodeRemovedSavedSpore([]byte(`{"resource_type":"checkpoint","action":"removed_spore","spore_dir":"save.spore","ownership":"machine-local-pinned","pin_id":"abc","pin_removed":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.PinID != "abc" || !decoded.PinRemoved {
+	if decoded.ResourceType != "checkpoint" || decoded.Action != "removed_spore" || decoded.SporeDir != "save.spore" || decoded.Ownership != "machine-local-pinned" || decoded.PinID != "abc" || !decoded.PinRemoved {
 		t.Fatalf("unexpected removed save: %#v", decoded)
 	}
 	legacy, err := decodeRemovedSavedSpore([]byte(`{"action":"removed_spore","spore_dir":"save.spore","pin_id":"legacy"}`))
@@ -508,6 +508,7 @@ func TestDecodeNamedLifecycleTiming(t *testing.T) {
 	result, err := decodeJSON[NamedLifecycleResult]([]byte(`{
 		"schema": "spore.lifecycle.v1",
 		"schema_version": 1,
+		"resource_type": "live_vm",
 		"action": "restored",
 		"name": "worker",
 		"state": "ready",
@@ -521,7 +522,7 @@ func TestDecodeNamedLifecycleTiming(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Timing == nil || result.Timing.WaitExecReadyMs != 17 || result.Timing.TotalMs != 24 {
+	if result.ResourceType != "live_vm" || result.Timing == nil || result.Timing.WaitExecReadyMs != 17 || result.Timing.TotalMs != 24 {
 		t.Fatalf("timing = %#v", result.Timing)
 	}
 }

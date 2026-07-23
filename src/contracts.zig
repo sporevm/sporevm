@@ -48,6 +48,7 @@ pub const BundleChildrenSummary = struct {
 pub const PullResult = struct {
     schema: []const u8 = pull_result_schema,
     schema_version: u32 = bundle_schema_version,
+    resource_type: resource.Type = .checkpoint,
     source: []const u8,
     bundle_dir: []const u8,
     out_dir: []const u8,

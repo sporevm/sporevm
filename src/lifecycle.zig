@@ -15,6 +15,7 @@ const memory_config = @import("memory.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
+const resource = @import("resource.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
@@ -195,8 +196,16 @@ const copy_out_usage =
 
 const rm_usage =
     \\Usage:
+    \\  spore vm rm NAME
+    \\  spore checkpoint rm DIR
     \\  spore rm NAME
     \\  spore rm --spore DIR
+    \\
+    \\`vm rm` stops the live VM monitor and deletes only its runtime state.
+    \\`checkpoint rm` deletes the checkpoint and releases its verified backing
+    \\authority according to the checkpoint's ownership class.
+    \\
+    \\The top-level forms remain compatible throughout the 0.x release line.
     \\
     \\Options:
     \\  -h, --help              Show this help
@@ -220,6 +229,8 @@ const save_usage =
 
 const fork_usage =
     \\Usage:
+    \\  spore checkpoint fork DIR --count N --out DIR
+    \\  spore vm fork NAME --count N --name PATTERN
     \\  spore fork <spore-dir> --count N --out DIR
     \\  spore fork --vm NAME --count N --name PATTERN
     \\
@@ -232,7 +243,8 @@ const fork_usage =
     \\  -h, --help            Show this help
     \\
     \\Notes:
-    \\  Live --vm fork supports one writable rootfs disk; networked VMs remain unsupported.
+    \\  Live VM fork supports one writable rootfs disk; networked VMs remain unsupported.
+    \\  The top-level forms remain compatible throughout the 0.x release line.
     \\
     \\Workflow:
     \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
@@ -388,6 +400,7 @@ pub const VmState = enum {
 };
 
 pub const ListEntry = struct {
+    resource_type: resource.Type = .live_vm,
     name: []const u8,
     state: []const u8,
     pid: ?i64 = null,
@@ -527,6 +540,7 @@ const RestoreOptions = struct {
 pub const NamedForkResult = struct {
     schema: []const u8 = "spore.lifecycle.fork.result.v1",
     schema_version: u32 = 1,
+    resource_type: resource.Type = .live_vm,
     source: []const u8,
     count: usize,
     children: []const []const u8,
@@ -663,6 +677,7 @@ pub const ListNamedOptions = struct {};
 pub const NamedLifecycleResult = struct {
     schema: []const u8 = lifecycle_schema,
     schema_version: u32 = lifecycle_schema_version,
+    resource_type: resource.Type = .live_vm,
     action: []const u8,
     name: []const u8,
     state: []const u8,
@@ -2448,12 +2463,24 @@ pub fn rmCli(
     const allocator = init.arena.allocator();
     if (args.len == 2 and std.mem.eql(u8, args[0], "--spore")) {
         const removed = removeSavedSpore(.{ .io = init.io, .environ_map = init.environ_map }, allocator, args[1]) catch |err| switch (err) {
+            error.FileNotFound => {
+                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: checkpoint not found: {s}; no ownership was changed", .{args[1]});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
+            },
+            error.InvalidSporeDir, error.BadManifest => {
+                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove invalid checkpoint: {s}; ownership remains unchanged", .{args[1]});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
+            },
+            error.SavedSporeInUse => {
+                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove checkpoint in use by a live VM: {s}; checkpoint ownership remains unchanged", .{args[1]});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
+            },
             error.LegacySharedPinRemovalRefused => {
-                const message = "spore rm: refusing to remove a legacy shared-pin spore because another raw copy may still depend on it; use `spore clone DIR --out PORTABLE` to make an independently owned copy, then remove the legacy pin only after accounting for every copy";
+                const message = "spore checkpoint rm: refusing to remove a legacy shared-pin checkpoint because another raw copy may still depend on its backing authority; use `spore clone DIR --out PORTABLE` to make an independently owned copy, then remove the legacy pin only after accounting for every copy";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
             },
             error.SavedSporeOwnershipConflict => {
-                const message = "spore rm: refusing to remove a machine-local spore whose ownership link is copied or duplicated; remove the raw duplicate, or use `spore clone DIR --out PORTABLE` for an independently owned copy";
+                const message = "spore checkpoint rm: refusing to remove a machine-local checkpoint whose ownership link is copied or duplicated; removal would invalidate shared backing authority, so remove the raw duplicate or use `spore clone DIR --out PORTABLE` for an independently owned copy";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
             },
             else => |e| return e,
@@ -2468,11 +2495,11 @@ pub fn rmCli(
     }, allocator, .{ .name = name }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir => exitLifecycleRuntimePathError(allocator, stderr, mode, "rm", err),
         error.NamedVmNotFound => {
-            const message = allocLifecycleMessage(allocator, "spore rm: VM not found: {s}", .{name});
+            const message = allocLifecycleMessage(allocator, "spore vm rm: live VM not found: {s}", .{name});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
         },
         error.MonitorShutdownTimedOut => {
-            const fallback = allocLifecycleMessage(allocator, "spore rm: timed out waiting for monitor cleanup: {s}", .{name});
+            const fallback = allocLifecycleMessage(allocator, "spore vm rm: timed out stopping live VM monitor before deleting runtime state: {s}", .{name});
             const message = allocLifecycleLastErrorMessage(allocator, "rm", fallback);
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "rm"), message);
         },
@@ -2498,9 +2525,11 @@ pub fn removeSavedSpore(context: Context, allocator: std.mem.Allocator, raw_dir:
 
 fn writeRemovedSavedSpore(writer: *Io.Writer, result: RemovedSavedSpore) !void {
     if (result.pin_removed) {
-        try writer.print("removed spore {s} ({s}; pin {s})\n", .{ result.spore_dir, result.ownership, result.pin_id });
+        try writer.print("removed checkpoint {s} ({s}); released exclusive backing pin {s}\n", .{ result.spore_dir, result.ownership, result.pin_id });
+    } else if (std.mem.eql(u8, result.ownership, saved_spore_ownership.batch_relative)) {
+        try writer.print("removed checkpoint {s} ({s}); shared batch backing remains owned by the batch\n", .{ result.spore_dir, result.ownership });
     } else {
-        try writer.print("removed spore {s} ({s}; no disk pin)\n", .{ result.spore_dir, result.ownership });
+        try writer.print("removed checkpoint {s} ({s}); checkpoint-owned files deleted, no global pin released\n", .{ result.spore_dir, result.ownership });
     }
     try writer.flush();
 }
@@ -4387,14 +4416,14 @@ fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, 
 }
 
 fn writeNamedForkResult(writer: *Io.Writer, result: NamedForkResult) !void {
-    try writer.writeAll("forked");
+    try writer.writeAll("forked live VM children:");
     for (result.children) |name| try writer.print(" {s}", .{name});
     try writer.writeByte('\n');
 }
 
 fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !void {
     if (std.mem.eql(u8, result.action, "created")) {
-        try writer.print("created vm {s}\n", .{result.name});
+        try writer.print("created live VM {s}\n", .{result.name});
         if (result.initial_command) |initial| {
             if (initial.output_destination == .named_logs) {
                 try writer.print(
@@ -4406,18 +4435,18 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
             }
         }
     } else if (std.mem.eql(u8, result.action, "restored")) {
-        try writer.print("restored vm {s}\n", .{result.name});
+        try writer.print("restored checkpoint as live VM {s}\n", .{result.name});
     } else if (std.mem.eql(u8, result.action, "saved")) {
-        try writer.print("saved {s} ({s}); vm {s} is still running\n", .{ result.spore_dir orelse result.name, result.ownership orelse saved_spore_ownership.portable_self_contained, result.name });
+        try writer.print("saved checkpoint {s} ({s}); live VM {s} is still running\n", .{ result.spore_dir orelse result.name, result.ownership orelse saved_spore_ownership.portable_self_contained, result.name });
     } else if (std.mem.eql(u8, result.action, "saved_stopped")) {
-        try writer.print("saved {s} ({s}) and stopped vm {s}\n", .{ result.spore_dir orelse result.name, result.ownership orelse saved_spore_ownership.portable_self_contained, result.name });
+        try writer.print("saved checkpoint {s} ({s}) and stopped live VM {s}\n", .{ result.spore_dir orelse result.name, result.ownership orelse saved_spore_ownership.portable_self_contained, result.name });
         if ((result.saved_sessions orelse 0) > 0) {
-            try writer.writeAll("spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n");
+            try writer.writeAll("checkpoint has a saved session; use `spore attach <checkpoint>` to reconnect, or `spore run --from <checkpoint> ...` to run new commands.\n");
         } else {
-            try writer.writeAll("spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n");
+            try writer.writeAll("checkpoint has no saved session; use `spore run --from <checkpoint> ...` to run new commands, or `spore run --save <checkpoint> --save-on TERM ...` if you want fanout to attach to the original command.\n");
         }
     } else if (std.mem.eql(u8, result.action, "removed")) {
-        try writer.print("removed vm {s}\n", .{result.name});
+        try writer.print("removed live VM {s}; monitor stopped and runtime state deleted, checkpoints, images, and bundles unchanged\n", .{result.name});
     } else {
         try writer.print("{s} vm {s}\n", .{ result.action, result.name });
     }
@@ -8036,7 +8065,7 @@ test "lifecycle human results render terse status lines" {
         .name = "counter",
         .state = "ready",
     });
-    try std.testing.expectEqualStrings("created vm counter\n", out.written());
+    try std.testing.expectEqualStrings("created live VM counter\n", out.written());
 
     out.clearRetainingCapacity();
     try writeNamedLifecycleResult(&out.writer, .{
@@ -8062,7 +8091,7 @@ test "lifecycle human results render terse status lines" {
         .state = "ready",
         .spore_dir = "counter.spore",
     });
-    try std.testing.expectEqualStrings("saved counter.spore (portable-self-contained); vm counter is still running\n", out.written());
+    try std.testing.expectEqualStrings("saved checkpoint counter.spore (portable-self-contained); live VM counter is still running\n", out.written());
 
     out.clearRetainingCapacity();
     try writeNamedLifecycleResult(&out.writer, .{
@@ -8072,8 +8101,8 @@ test "lifecycle human results render terse status lines" {
         .spore_dir = "counter.spore",
     });
     try std.testing.expectEqualStrings(
-        "saved counter.spore (portable-self-contained) and stopped vm counter\n" ++
-            "spore has no saved session; use `spore run --from <spore> ...` to run new commands, or `spore run --save <spore> --save-on TERM ...` if you want fanout to attach to the original command.\n",
+        "saved checkpoint counter.spore (portable-self-contained) and stopped live VM counter\n" ++
+            "checkpoint has no saved session; use `spore run --from <checkpoint> ...` to run new commands, or `spore run --save <checkpoint> --save-on TERM ...` if you want fanout to attach to the original command.\n",
         out.written(),
     );
 
@@ -8086,8 +8115,8 @@ test "lifecycle human results render terse status lines" {
         .saved_sessions = 1,
     });
     try std.testing.expectEqualStrings(
-        "saved counter.spore (portable-self-contained) and stopped vm counter\n" ++
-            "spore has a saved session; use `spore attach <spore>` to reconnect, or `spore run --from <spore> ...` to run new commands.\n",
+        "saved checkpoint counter.spore (portable-self-contained) and stopped live VM counter\n" ++
+            "checkpoint has a saved session; use `spore attach <checkpoint>` to reconnect, or `spore run --from <checkpoint> ...` to run new commands.\n",
         out.written(),
     );
 
@@ -8097,7 +8126,7 @@ test "lifecycle human results render terse status lines" {
         .count = 2,
         .children = &.{ "child-0", "child-1" },
     });
-    try std.testing.expectEqualStrings("forked child-0 child-1\n", out.written());
+    try std.testing.expectEqualStrings("forked live VM children: child-0 child-1\n", out.written());
 
     out.clearRetainingCapacity();
     try writeRemovedSavedSpore(&out.writer, .{
@@ -8105,7 +8134,7 @@ test "lifecycle human results render terse status lines" {
         .pin_id = "",
         .pin_removed = false,
     });
-    try std.testing.expectEqualStrings("removed spore diskless.spore (portable-self-contained; no disk pin)\n", out.written());
+    try std.testing.expectEqualStrings("removed checkpoint diskless.spore (portable-self-contained); checkpoint-owned files deleted, no global pin released\n", out.written());
 
     out.clearRetainingCapacity();
     try writeRemovedSavedSpore(&out.writer, .{
@@ -8114,7 +8143,7 @@ test "lifecycle human results render terse status lines" {
         .pin_id = "abc",
         .pin_removed = true,
     });
-    try std.testing.expectEqualStrings("removed spore disk.spore (machine-local-pinned; pin abc)\n", out.written());
+    try std.testing.expectEqualStrings("removed checkpoint disk.spore (machine-local-pinned); released exclusive backing pin abc\n", out.written());
 }
 
 test "saved-spore removal machine output distinguishes disk pin ownership" {
@@ -8131,6 +8160,7 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
         "{\n" ++
             "  \"schema\": \"spore.saved.remove.result.v1\",\n" ++
             "  \"schema_version\": 1,\n" ++
+            "  \"resource_type\": \"checkpoint\",\n" ++
             "  \"action\": \"removed_spore\",\n" ++
             "  \"spore_dir\": \"diskless.spore\",\n" ++
             "  \"ownership\": \"portable-self-contained\",\n" ++
@@ -8151,6 +8181,7 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
         "{\n" ++
             "  \"schema\": \"spore.saved.remove.result.v1\",\n" ++
             "  \"schema_version\": 1,\n" ++
+            "  \"resource_type\": \"checkpoint\",\n" ++
             "  \"action\": \"removed_spore\",\n" ++
             "  \"spore_dir\": \"disk.spore\",\n" ++
             "  \"ownership\": \"machine-local-pinned\",\n" ++
@@ -8183,6 +8214,7 @@ test "named restore machine result reports exec readiness timing" {
     var parsed = try std.json.parseFromSlice(NamedLifecycleResult, allocator, out.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("spore.lifecycle.v1", parsed.value.schema);
+    try std.testing.expectEqual(resource.Type.live_vm, parsed.value.resource_type);
     try std.testing.expectEqualStrings("restored", parsed.value.action);
     try std.testing.expectEqual(@as(u64, 17), parsed.value.timing.?.wait_exec_ready_ms);
     try std.testing.expectEqual(@as(u64, 24), parsed.value.timing.?.total_ms);
@@ -8228,6 +8260,7 @@ test "lifecycle list JSON exposes memory and nullable stats" {
     }, .{});
     defer allocator.free(json);
 
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"resource_type\":\"live_vm\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":{\"resident_bytes\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"dirty_chunks_pending\":null") != null);

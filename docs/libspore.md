@@ -33,6 +33,8 @@ the CLI alone exposes the experimental fresh profile.
 The public vocabulary is `save`, `attach`, and `restore` across Zig, C, and Go.
 JSONL run events keep their original `capture` event and `capture_path` fields
 and add `ownership` on capture plus `capture_ownership` on terminal exit.
+`ResourceType` distinguishes `.live_vm`, `.checkpoint`, `.image`, and
+`.bundle`. Additive `resource_type` fields use the same values in JSON results.
 
 ## Importing
 
@@ -93,6 +95,13 @@ Use the matching helper for owned results:
 
 `run`, `runManaged`, `runFromSpore`, and `attachSpore` return value results and
 do not need deinit.
+
+Live VM lifecycle results and list entries use `resource_type: "live_vm"`.
+Checkpoint inspection, fork, clone, unpack, pull, and removal use
+`resource_type: "checkpoint"`, while bundle inspection, pack, and push use
+`resource_type: "bundle"`. Images contain application filesystem and OCI
+execution metadata; bundles and checkpoints contain no runnable image identity
+of their own.
 
 ## Local Spore Inspection
 

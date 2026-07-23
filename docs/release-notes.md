@@ -111,5 +111,18 @@ completed, failed, or canceled completion record. Stable failures carry a
 code, resource scope, and three-way retry classification consistently across
 CLI, Zig, C, and Go adapters. See [Automation contract](automation.md).
 
+### Lifecycle resource vocabulary
+
+Inspection now reports checkpoint capabilities, session streams, portability,
+ownership, and an explicit resource type. `runFromSpore` always starts a new
+process and rejects an empty command; embedders use the separate `attachSpore`
+operation to reconnect to a saved session.
+
+The CLI adds `spore vm rm`, `spore vm fork`, `spore checkpoint rm`, and
+`spore checkpoint fork`. Removal output says whether it is deleting live
+runtime state or a checkpoint and explains the backing-ownership consequence.
+The older top-level `rm` and `fork` forms remain compatible throughout the 0.x
+release line.
+
 **Full changelog:**
 [v0.14.0...v0.15.0](https://github.com/sporevm/sporevm/compare/v0.14.0...v0.15.0)

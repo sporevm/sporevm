@@ -189,6 +189,7 @@ type PullOptions struct {
 type PullResult struct {
 	Schema          string                       `json:"schema"`
 	SchemaVersion   uint32                       `json:"schema_version"`
+	ResourceType    string                       `json:"resource_type"`
 	Source          string                       `json:"source"`
 	BundleDir       string                       `json:"bundle_dir"`
 	OutDir          string                       `json:"out_dir"`
@@ -420,16 +421,19 @@ type RemoveSavedOptions struct {
 
 // RemovedSavedSpore reports the removed save directory and whether a disk pin was removed.
 type RemovedSavedSpore struct {
-	Action     string `json:"action"`
-	SporeDir   string `json:"spore_dir"`
-	PinID      string `json:"pin_id"`
-	PinRemoved bool   `json:"pin_removed"`
+	ResourceType string `json:"resource_type"`
+	Action       string `json:"action"`
+	SporeDir     string `json:"spore_dir"`
+	Ownership    string `json:"ownership"`
+	PinID        string `json:"pin_id"`
+	PinRemoved   bool   `json:"pin_removed"`
 }
 
 // NamedLifecycleResult is the decoded spore.lifecycle.v1 contract.
 type NamedLifecycleResult struct {
 	Schema         string                `json:"schema"`
 	SchemaVersion  uint32                `json:"schema_version"`
+	ResourceType   string                `json:"resource_type"`
 	Action         string                `json:"action"`
 	Name           string                `json:"name"`
 	State          string                `json:"state"`
@@ -475,11 +479,12 @@ type ExecNamedResult struct {
 
 // NamedListEntry describes one VM returned by ListNamed.
 type NamedListEntry struct {
-	Name   string           `json:"name"`
-	State  string           `json:"state"`
-	PID    *int64           `json:"pid"`
-	Memory *NamedListMemory `json:"memory"`
-	Stats  NamedListStats   `json:"stats"`
+	ResourceType string           `json:"resource_type"`
+	Name         string           `json:"name"`
+	State        string           `json:"state"`
+	PID          *int64           `json:"pid"`
+	Memory       *NamedListMemory `json:"memory"`
+	Stats        NamedListStats   `json:"stats"`
 }
 
 type NamedListResult struct {

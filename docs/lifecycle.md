@@ -1,8 +1,20 @@
-# Named Lifecycle
+# Lifecycle And Resource Model
 
-Named lifecycle keeps a VM alive behind one local monitor process so callers can
-create a warmed guest, run repeated commands, save it as a spore, restore it
+SporeVM keeps four public resources distinct because they have different
+lifecycle and ownership rules:
+
+| Resource | Meaning | Primary operations |
+| --- | --- | --- |
+| Live VM | A running, named VM behind a host-local monitor | `create`, `exec`, `save`, `restore`, `spore vm fork`, `spore vm rm` |
+| Checkpoint (spore) | Saved machine and session state in a directory | `inspect`, `attach`, `run --from`, `spore checkpoint fork`, `spore checkpoint rm` |
+| Image | Application filesystem and OCI execution metadata, without machine state | `build`, `run --commit`, `image pull` |
+| Bundle | Portable transport encoding for checkpoints and fork batches | `pack`, `unpack`, `push`, `pull`, `inspect-bundle` |
+
+Named lifecycle keeps a live VM behind one local monitor process so callers can
+create a warmed guest, run repeated commands, save a checkpoint, restore it
 under a new name, and remove it without learning the monitor socket protocol.
+The `.spore` suffix and the word “spore” remain accepted names for checkpoint
+directories; public capability and result fields use `checkpoint`.
 
 ## User Contract
 
@@ -12,12 +24,17 @@ spore exec bench-1 'echo hi'
 spore save bench-1 --out bench-1.spore --stop
 spore restore bench-1.spore --name bench-2
 spore ps
-spore rm bench-2
+spore vm rm bench-2
 ```
 
 `spore run` remains the one-shot command. On ARM64 HVF/KVM hosts, the stable
 named surface is `create`, `exec`, `copy-in`, `copy-out`, `save`, `restore`,
-`fork --vm`, `ls`/`ps`, and `rm`.
+`vm fork`, `ls`/`ps`, and `vm rm`.
+
+The older `spore rm NAME`, `spore rm --spore DIR`, `spore fork DIR`, and
+`spore fork --vm NAME` forms remain compatible throughout the 0.x release
+line. New scripts should use the resource namespaces because they make the
+destructive target visible without interpreting a selector flag.
 
 VM names are 1-128 ASCII bytes. The first byte must be alphanumeric; remaining
 bytes may also use `.`, `_`, and `-`. This public limit is identical on macOS
@@ -316,7 +333,7 @@ manifest without dropping create-time annotations:
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
-Delete a saved spore with `spore rm --spore DIR`. Diskless saves
+Delete a checkpoint with `spore checkpoint rm DIR`. Diskless checkpoints
 have no pin, so removal validates the manifest, deletes the directory, and
 durably syncs its parent. Portable disk-backed spores from pack/unpack or pull
 carry their authoritative disk index locally and likewise have no host-private
@@ -355,11 +372,11 @@ running:
 ```bash
 spore create counter --image docker.io/library/alpine:3.20 \
   'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done'
-spore fork --vm counter --count 2 --name worker-%d
+spore vm fork counter --count 2 --name worker-%d
 spore exec worker-0 'cat /tick; sleep 1; cat /tick'
 ```
 
-`--name` is required with `--vm`. For `--count > 1`, it must contain exactly one
+`--name` is required for live VM fork. For `--count > 1`, it must contain exactly one
 `%d`-style integer placeholder. SporeVM validates every child name before
 pausing the source VM. A batch contains at most 32 children.
 
@@ -392,7 +409,7 @@ durable spores.
 Global JSON output exposes the phases separately:
 
 ```bash
-spore --json fork --vm counter --count 2 --name worker-%d
+spore --json vm fork counter --count 2 --name worker-%d
 ```
 
 The result includes `ram_capture_ms`, `disk_fork_ms`, `source_pause_ms`, and
@@ -413,7 +430,7 @@ Unknown monitor request types fail closed. `spore ls` reads monitor-published
 metadata such as `monitor-stats.json`; unavailable stats render as unknown
 instead of forcing an expensive VM memory scan.
 
-`spore create`, `spore restore --name`, and `spore fork --vm` report success
+`spore create`, `spore restore --name`, and `spore vm fork` report success
 only after the restored guest agent has answered a dedicated readiness request,
 the monitor has written `ready.json`, the recorded PID is alive, and the local
 `control.sock` answers a `hello` request with the same SporeVM version as the
