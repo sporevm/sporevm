@@ -117,7 +117,7 @@ func TestRemoveSavedValidationAndResultContract(t *testing.T) {
 	if !errors.As(err, &callErr) || callErr.Code == Success || callErr.Message == "" {
 		t.Fatalf("RemoveSaved error = %v", err)
 	}
-	if callErr.FailureCode != "usage.invalid_argument" || callErr.Scope != "usage" || callErr.Retry != "after_fix" || callErr.Retryable {
+	if callErr.FailureCode != "object.not_found" || callErr.Scope != "object" || callErr.Retry != "after_fix" || callErr.Retryable {
 		t.Fatalf("RemoveSaved structured error = %#v", callErr)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
