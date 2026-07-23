@@ -1,0 +1,151 @@
+{
+  "cases": [
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "base-readable-object",
+      "path": "/v1/repositories/team/base-images/manifests/sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-base",
+      "response": {
+        "bytes": 65536,
+        "digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "status": 200
+    },
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "cross-repository-denied",
+      "path": "/v1/repositories/team/other-images/manifests/sha256:b887a80189c8b9c46f77e645ab0631f705b80ef5daf09168597eb0d3e6fd5431/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-base",
+      "response": null,
+      "status": 404
+    },
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "global-object-route-absent",
+      "path": "/v1/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-base",
+      "response": null,
+      "status": 404
+    },
+    {
+      "authenticated": true,
+      "method": "HEAD",
+      "name": "head-route-absent",
+      "path": "/v1/repositories/team/base-images/manifests/sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-base",
+      "response": null,
+      "status": 404
+    },
+    {
+      "authenticated": false,
+      "method": "GET",
+      "name": "missing-authentication",
+      "path": "/v1/repositories/team/base-images/manifests/sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "",
+      "response": null,
+      "status": 401
+    },
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "missing-manifest-hidden",
+      "path": "/v1/repositories/team/base-images/manifests/sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-base",
+      "response": null,
+      "status": 404
+    },
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "missing-object-hidden",
+      "path": "/v1/repositories/team/base-images/manifests/sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda/objects/blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "principal": "reader-base",
+      "response": null,
+      "status": 404
+    },
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "missing-repository-hidden",
+      "path": "/v1/repositories/team/missing/manifests/sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-base",
+      "response": null,
+      "status": 404
+    },
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "other-readable-shared-object",
+      "path": "/v1/repositories/team/other-images/manifests/sha256:b887a80189c8b9c46f77e645ab0631f705b80ef5daf09168597eb0d3e6fd5431/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-other",
+      "response": {
+        "bytes": 65536,
+        "digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "status": 200
+    },
+    {
+      "authenticated": true,
+      "method": "GET",
+      "name": "unknown-principal-hidden",
+      "path": "/v1/repositories/team/base-images/manifests/sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda/objects/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "principal": "reader-unknown",
+      "response": null,
+      "status": 404
+    }
+  ],
+  "kind": "spore-image-gateway-object-authorization-conformance-v1",
+  "repositories": [
+    {
+      "manifests": [
+        {
+          "digest": "sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda",
+          "manifest_fixture": "test/image-gateway/image-manifest-arm64.json",
+          "objects": [
+            {
+              "bytes": 65536,
+              "digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "bytes": 1,
+              "digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          ],
+          "rootfs_index_digest": "blake3:e9dc19f238360c2cee5b0f24630e550affa8d6f219163b89ec4ff25a128cb12b",
+          "rootfs_index_fixture": "test/image-gateway/rootfs-index.json"
+        }
+      ],
+      "name": "team/base-images",
+      "readers": [
+        "reader-base"
+      ]
+    },
+    {
+      "manifests": [
+        {
+          "digest": "sha256:b887a80189c8b9c46f77e645ab0631f705b80ef5daf09168597eb0d3e6fd5431",
+          "manifest_fixture": "test/image-gateway/image-manifest-amd64.json",
+          "objects": [
+            {
+              "bytes": 65536,
+              "digest": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "bytes": 1,
+              "digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          ],
+          "rootfs_index_digest": "blake3:e9dc19f238360c2cee5b0f24630e550affa8d6f219163b89ec4ff25a128cb12b",
+          "rootfs_index_fixture": "test/image-gateway/rootfs-index.json"
+        }
+      ],
+      "name": "team/other-images",
+      "readers": [
+        "reader-other"
+      ]
+    }
+  ]
+}

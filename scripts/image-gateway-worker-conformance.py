@@ -4,20 +4,36 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import io
 import json
 import os
 import pathlib
 import platform
 import subprocess
 import sys
+import tarfile
 import tempfile
 from typing import Any
 
 
-SCHEMA = "spore-image-gateway-worker-conformance-v1"
+SCHEMA = "spore-image-gateway-worker-conformance-v2"
 TARGETS = ("amd64", "arm64")
 MAX_FIXTURE_FILE_BYTES = 64 * 1024 * 1024
+OCI_RUNTIME_CONFIG = {
+    "Cmd": ["-c", "exec ./tool"],
+    "Entrypoint": ["/bin/sh"],
+    "Env": ["PATH=/usr/bin:/bin", "SPORE_FIXTURE=1"],
+    "Labels": {"org.sporevm.fixture": "worker-conformance-v2"},
+    "StopSignal": "SIGTERM",
+    "User": "0:0",
+    "WorkingDir": "/opt/spore",
+}
+EXPECTED_RUNTIME_CONFIG = {
+    key: OCI_RUNTIME_CONFIG[key]
+    for key in ("Cmd", "Entrypoint", "Env", "User", "WorkingDir")
+}
 
 
 class ConformanceError(RuntimeError):
@@ -54,23 +70,126 @@ def write_blob(layout: pathlib.Path, data: bytes) -> dict[str, Any]:
     return {"digest": digest, "size": len(data)}
 
 
+def tar_layer(entries: list[dict[str, Any]]) -> bytes:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for entry in entries:
+            info = tarfile.TarInfo(entry["name"])
+            info.mode = entry.get("mode", 0o644)
+            info.uid = entry.get("uid", 0)
+            info.gid = entry.get("gid", 0)
+            info.uname = ""
+            info.gname = ""
+            info.mtime = 0
+            kind = entry["kind"]
+            if kind == "directory":
+                info.type = tarfile.DIRTYPE
+                info.size = 0
+                archive.addfile(info)
+            elif kind == "file":
+                data = entry["data"]
+                info.type = tarfile.REGTYPE
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+            elif kind == "hardlink":
+                info.type = tarfile.LNKTYPE
+                info.linkname = entry["target"]
+                info.size = 0
+                archive.addfile(info)
+            elif kind == "symlink":
+                info.type = tarfile.SYMTYPE
+                info.linkname = entry["target"]
+                info.size = 0
+                archive.addfile(info)
+            else:
+                raise ConformanceError(f"unsupported deterministic tar entry: {kind}")
+    return output.getvalue()
+
+
+def deterministic_gzip(data: bytes) -> bytes:
+    output = io.BytesIO()
+    with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0, compresslevel=9) as stream:
+        stream.write(data)
+    return output.getvalue()
+
+
 def build_oci_layout(layout: pathlib.Path) -> dict[str, Any]:
     layout.mkdir(parents=True)
     write_bytes(layout / "oci-layout", canonical_json({"imageLayoutVersion": "1.0.0"}))
 
-    layer = bytes(1024)
-    layer_descriptor = {
-        "mediaType": "application/vnd.oci.image.layer.v1.tar",
-        **write_blob(layout, layer),
-    }
+    base_layer = tar_layer(
+        [
+            {"kind": "directory", "mode": 0o755, "name": "opt"},
+            {"kind": "directory", "mode": 0o755, "name": "opt/spore"},
+            {"data": b"base layer\n", "kind": "file", "name": "opt/spore/base.txt"},
+            {
+                "data": b"#!/bin/sh\necho base\n",
+                "kind": "file",
+                "mode": 0o755,
+                "name": "opt/spore/tool",
+            },
+            {
+                "data": bytes(index % 251 for index in range(65_537)),
+                "gid": 1000,
+                "kind": "file",
+                "name": "opt/spore/non-aligned.bin",
+                "uid": 1000,
+            },
+            {
+                "kind": "hardlink",
+                "name": "opt/spore/non-aligned-copy.bin",
+                "target": "opt/spore/non-aligned.bin",
+            },
+            {
+                "kind": "symlink",
+                "name": "opt/spore/current",
+                "target": "tool",
+            },
+        ]
+    )
+    delta_layer = tar_layer(
+        [
+            {"data": b"", "kind": "file", "name": "opt/spore/.wh.base.txt"},
+            {
+                "data": b"#!/bin/sh\necho final\n",
+                "kind": "file",
+                "mode": 0o750,
+                "name": "opt/spore/tool",
+            },
+            {"data": b"final layer\n", "kind": "file", "name": "opt/spore/final.txt"},
+        ]
+    )
+    compressed_delta = deterministic_gzip(delta_layer)
+    layer_descriptors = [
+        {
+            "diff_id": sha256_digest(base_layer),
+            "kind": "base-ustar-v1",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            **write_blob(layout, base_layer),
+        },
+        {
+            "diff_id": sha256_digest(delta_layer),
+            "kind": "whiteout-gzip-v1",
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            **write_blob(layout, compressed_delta),
+        },
+    ]
+    oci_layer_descriptors = [
+        {"digest": layer["digest"], "mediaType": layer["mediaType"], "size": layer["size"]}
+        for layer in layer_descriptors
+    ]
     manifests: dict[str, str] = {}
     index_descriptors = []
     for arch in TARGETS:
         config = canonical_json(
             {
                 "architecture": arch,
+                "config": OCI_RUNTIME_CONFIG,
                 "os": "linux",
-                "rootfs": {"diff_ids": [layer_descriptor["digest"]], "type": "layers"},
+                "rootfs": {
+                    "diff_ids": [layer["diff_id"] for layer in layer_descriptors],
+                    "type": "layers",
+                },
             }
         )
         config_descriptor = {
@@ -80,7 +199,7 @@ def build_oci_layout(layout: pathlib.Path) -> dict[str, Any]:
         manifest = canonical_json(
             {
                 "config": config_descriptor,
-                "layers": [layer_descriptor],
+                "layers": oci_layer_descriptors,
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
                 "schemaVersion": 2,
             }
@@ -105,7 +224,16 @@ def build_oci_layout(layout: pathlib.Path) -> dict[str, Any]:
     write_bytes(layout / "index.json", index)
     return {
         "index_digest": sha256_digest(index),
-        "layer_digest": layer_descriptor["digest"],
+        "layers": [
+            {
+                "bytes": layer["size"],
+                "diff_id": layer["diff_id"],
+                "digest": layer["digest"],
+                "kind": layer["kind"],
+                "media_type": layer["mediaType"],
+            }
+            for layer in layer_descriptors
+        ],
         "manifests": manifests,
     }
 
@@ -196,6 +324,8 @@ def normalize_target(
         raise ConformanceError(f"gateway manifest selected the wrong platform for linux/{arch}")
     if config.get("os") != "linux" or config.get("architecture") != arch:
         raise ConformanceError(f"canonical config selected the wrong platform for linux/{arch}")
+    if config.get("config") != EXPECTED_RUNTIME_CONFIG:
+        raise ConformanceError("canonical config did not preserve the runtime metadata fixture")
 
     native_image_digest = require_digest(image.get("digest"), "blake3:", "native image digest")
     rootfs_index_digest = require_digest(rootfs.get("digest"), "blake3:", "rootfs index digest")
@@ -392,7 +522,7 @@ def produce(args: argparse.Namespace) -> None:
         "input": {
             "conversion_contract": conversion_contract,
             "index_digest": input_details["index_digest"],
-            "layer": {"bytes": 1024, "digest": input_details["layer_digest"], "kind": "empty-ustar-v1"},
+            "layers": input_details["layers"],
         },
         "schema": SCHEMA,
         "targets": target_results,
@@ -434,6 +564,13 @@ def self_test() -> None:
             pass
         else:
             raise ConformanceError("self-test accepted a rootfs chunk outside logical size")
+        first_layout = root / "first-layout"
+        second_layout = root / "second-layout"
+        first_details = build_oci_layout(first_layout)
+        second_details = build_oci_layout(second_layout)
+        if first_details != second_details:
+            raise ConformanceError("self-test produced different OCI layout metadata")
+        compare_directories(first_layout, second_layout)
     print("image-gateway worker conformance self-test ok")
 
 

@@ -74,7 +74,13 @@ and has transport name
 Fixture files carry one source-control newline which is excluded from the
 canonical bytes. The golden fixtures are normative for separators, indentation,
 field order, and LF line endings. Malformed fixtures live beside them under
-`malformed/`.
+`malformed/`: the unprefixed cases target the platform-index parser, while
+`attachment-*` cases target the record or list parser named by the filename.
+Together with the platform, image-manifest, config, rootfs-index, attachment,
+authorization, and worker-bundle goldens in `test/image-gateway/`, this directory
+is the versioned fixture exchange for another implementation. Consumers must
+accept the goldens byte-for-byte and reject every malformed case; fixture names
+are descriptive labels rather than protocol identifiers.
 
 ## Immutable image manifest
 
@@ -127,18 +133,25 @@ and
 
 ## Converter-worker conformance
 
-The minimal versioned fixture at
+The versioned fixture at
 [`test/image-gateway/worker-conformance/bundle.json`](../test/image-gateway/worker-conformance/bundle.json)
 demonstrates that converter host architecture does not enter native image
-identity for one empty, uncompressed layer. The fixture generator constructs
-one deterministic OCI index containing
-`linux/amd64` and `linux/arm64/v8` manifests over the same empty USTAR layer.
+identity for representative OCI filesystem content. The fixture generator
+constructs one deterministic OCI index containing `linux/amd64` and
+`linux/arm64/v8` manifests over one uncompressed USTAR layer and one gzip-
+compressed USTAR layer. The layers exercise directory and file modes, numeric
+ownership, a hard link, a symbolic link, an OCI whiteout, a later-layer file
+replacement, and a 65,537-byte file that crosses the native chunk boundary.
+The OCI config also carries command, entrypoint, environment, label, signal,
+user, and working-directory metadata, exercising the canonical projection that
+preserves Spore's supported runtime fields and excludes non-identity metadata.
 Each Linux worker converts both selected targets with the native ext4 writer and
 must reproduce the committed canonical config, rootfs index, gateway manifest,
 platform index, native image digest, and complete nonzero-object digest set.
 
-The bundle schema is `spore-image-gateway-worker-conformance-v1`. It records the
-input index, layer, and selected-manifest digests plus each output file's exact
+The bundle schema is `spore-image-gateway-worker-conformance-v2`. It records the
+input index, layers, compressed and uncompressed layer digests, and selected-
+manifest digests plus each output file's exact
 size and SHA-256 digest. Object bytes are not duplicated in source control; the
 bundle records every BLAKE3 object name, exact length, and SHA-256 transport
 digest, while the canonical rootfs index remains the authoritative logical
@@ -147,12 +160,12 @@ platform enters canonical image config. For one selected target, however, a
 `linux/arm64` converter worker and a `linux/amd64` converter worker must produce
 the same complete bundle bytes.
 
-The harness independently recomputes SHA-256 transport digests and exact sizes.
+The harness independently recomputes SHA-256 transport digests and exact sizes,
+checks the OCI diff IDs, and verifies the supported runtime-metadata projection.
 BLAKE3 object names, rootfs identity, and native image identity remain outputs
 of the SporeVM implementation under test; the byte comparison proves that those
 outputs agree across workers but is not an independent implementation of the
-identity algorithms. Richer compressed and multi-layer content fixtures remain
-follow-up conformance work.
+identity algorithms.
 
 Run the host-local check with:
 
@@ -285,3 +298,27 @@ existence `HEAD`, cross-repository mount, repository-wide missing-object query,
 or client-maintained attachment tag. Future reads remain bound to an authorized
 repository and immutable image-manifest closure. Physical CAS deduplication is
 an implementation detail and cannot become a caller-visible existence oracle.
+
+The single-object authorization contract is fixed by
+[`test/image-gateway/object-authorization.json`](../test/image-gateway/object-authorization.json).
+Missing authentication returns `401`. Once a principal is authenticated, a
+missing repository, denied repository, missing manifest, or object that is not
+reachable from that manifest all return the same empty `404` response. `HEAD`
+and repository-independent object routes also return `404`; they are not
+existence probes. A successful `GET` returns the exact index-derived object
+length and digest.
+
+The fixture grants two principals separate repositories whose canonical
+manifests reference the same two logical objects. Each principal can read the
+shared physical object only through its own repository and immutable manifest;
+using the other repository is indistinguishable from requesting missing state.
+The fixture is checked against the canonical manifest and rootfs-index vectors,
+so its logical closures cannot drift independently:
+
+```bash
+mise run test:image-gateway-authorization-conformance
+```
+
+This is a service-neutral conformance contract, not a SporeVM authorization
+implementation. Authentication, audit classification, and storage lookup stay
+owned by the separate gateway service in G1.

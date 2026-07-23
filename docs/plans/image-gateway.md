@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-22
+last_reviewed: 2026-07-23
 spec_refs:
   - docs/image-gateway-protocol.md
   - docs/filesystem.md
@@ -952,14 +952,14 @@ requested subject, record bytes, type, and exact artifact bytes. Golden,
 malformed, subject-binding, and fuzz coverage freeze the envelope; upload,
 relation mutation, authorization, retention, and policy remain deferred to G3.
 
-The minimal converter-worker equivalence fixture has landed. One deterministic
-multi-platform OCI layout containing an empty uncompressed layer is converted
-for both target platforms on Linux arm64 and Linux amd64 workers. Each run must
-reproduce the committed canonical config, rootfs index, gateway manifest,
-platform index, native image digest, and complete object summary. The versioned bundle under
-`test/image-gateway/worker-conformance/` is the shared fixture exchange surface;
-it adds no service or runtime behavior. Compressed, multi-layer, attribute-rich,
-and non-chunk-aligned content remain follow-up conformance fixtures.
+The converter-worker equivalence fixture now uses two deterministic layers,
+one uncompressed and one gzip-compressed, across both target platforms on Linux
+arm64 and Linux amd64 workers. It covers whiteout and overwrite behavior,
+links, modes, numeric ownership, runtime config, and non-chunk-aligned content.
+Each run must reproduce the committed canonical config, rootfs index, gateway
+manifest, platform index, native image digest, and complete object summary. The
+versioned bundle under `test/image-gateway/worker-conformance/` is the shared
+fixture exchange surface; it adds no service or runtime behavior.
 
 The transport benchmark harness has landed without adding a service or product
 protocol. It records fresh direct-OCI conversions and profile logs, exports the
@@ -987,19 +987,34 @@ rejects images above 16 GiB logical size, 65,536 distinct nonzero objects, or
 4 GiB of nonzero payload. These are client resource bounds for the eager proof,
 not native image-format limits. It has no authentication,
 conversion admission, server authorization, missing-object optimization,
-redirects, retries, or gateway provenance record. The rest of G0 remains open:
-production-shaped benchmark evidence and a transport choice, authorization and
-cross-repository conformance, and the separate gateway repository decision.
+redirects, retries, or gateway provenance record.
+
+Repository-bound authorization conformance now freezes the single-object data
+plane independently of an implementation. Two principals have disjoint
+repository grants over manifests that share physical object identities; only
+objects reachable from the authorized repository and immutable manifest can be
+read. Missing authentication returns `401`, while every authenticated missing,
+denied, or unreachable case returns the same empty `404`. This keeps physical
+deduplication from becoming cross-repository authority and preserves the
+manifest-bound object path needed by a future lazy-pull client.
+
+G0 also fixes repository ownership before service work begins. The service and
+worker implementations belong in the public `sporevm/image-gateway` repository,
+while deployment configuration and infrastructure remain in the private
+`sporevm/sporevm-ops` repository. This repository retains the protocol,
+canonical fixtures, client, and direct-OCI implementation so Spore continues to
+work without a gateway. The versioned conformance bundle is the boundary between
+the repositories; the service must consume it rather than importing SporeVM
+internals.
 
 ## Delivery Strategy
 
 ### G0 — Freeze the protocol and benchmark fixture
 
-Status: active prerequisite; native identity, platform-index, image-manifest,
-attachment-schema, converter-worker equivalence, and explicit eager-client proof
-slices landed. The transport harness, two-platform evidence, and G1 archive
-choice have landed; authorization, cross-repository conformance, and the
-separate gateway repository decision remain open.
+Status: complete prerequisite. Native identity, platform-index, image-manifest,
+attachment-schema, representative converter-worker equivalence, explicit
+eager-client proof, authorization, cross-repository conformance, transport
+evidence, the G1 archive choice, and repository ownership are frozen.
 
 - Write the durable gateway protocol and JSON/binary schemas with exact size,
   count, digest, and version bounds.
@@ -1024,14 +1039,14 @@ separate gateway repository decision remain open.
   native `spore build` image, including a multi-platform index, same-tag
   platform selection, malformed cases, and the concrete 64 MiB canonical-index
   bound.
-  The schema fixtures, closure verifier, versioned worker-equivalence bundle,
-  and two-worker CI matrix have landed; broader malformed fixture exchange
-  remains open.
+  The schema fixtures, malformed corpus, closure verifier, versioned worker-
+  equivalence bundle, and two-worker CI matrix have landed.
 - Run at least one selected target-manifest fixture through arm64 and amd64
   converter workers and require byte-identical config, index, and image digests;
   the worker architecture must not leak into native output. The committed
   two-target minimal fixture and Linux arm64/amd64 CI jobs now enforce this
-  invariant for the empty-layer case; richer content fixtures remain open.
+  invariant for compressed and uncompressed layers with representative
+  filesystem and runtime metadata.
 - Record a reproducible direct-OCI baseline for a small public image and the
   real `buildkite-sporevm` base on an empty client cache, pinned to the native
   writer and exact rootfs builder version. The two-platform small S3 baseline
@@ -1053,8 +1068,9 @@ separate gateway repository decision remain open.
   and end-to-end transfer economics. The harness schema covers these fields;
   service-side queue, conversion, and production backend evidence join in G1.
 - Decide the separate gateway repository before service implementation begins.
-  The shared fixture exchange mechanism is pinned by the versioned conformance
-  bundle and its exact output files.
+  Service and worker code belongs in public `sporevm/image-gateway`, deployment
+  remains in private `sporevm/sporevm-ops`, and the shared fixture exchange is
+  pinned by the versioned conformance bundle and its exact output files.
 
 Done means another implementation can produce or consume both platform fixtures
 without reading SporeVM's internal structs, the exact identity preimages are no
@@ -1383,8 +1399,10 @@ Status: deferred.
 
 These do not block G0 or the read-only G1 proof:
 
-- Which deployment identity provider and gateway repository naming scheme
-  should production use? G1 needs only an authenticated single-tenant namespace.
+- Which deployment identity provider and logical image-repository naming scheme
+  should production use? The service code repository is fixed as
+  `sporevm/image-gateway`; G1 needs only an authenticated single-tenant image
+  namespace.
 - Should a production gateway expose an OCI artifact adapter for generic
   registry storage? Revisit after G1 records object count, batch composition,
   storage requests, and cross-image reuse. Any adapter remains backend-private:
