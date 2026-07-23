@@ -3197,7 +3197,8 @@ test "RUN cache identity includes network mode and resources" {
     try std.testing.expect(!std.mem.eql(u8, spore_key, none_key));
 
     var resource_options = spore_options;
-    resource_options.memory.bytes += memory_config.page_alignment;
+    resource_options.memory.initial_bytes += memory_config.page_alignment;
+    resource_options.memory.maximum_bytes = resource_options.memory.initial_bytes;
     resource_options.vcpus = 2;
     resource_options.nofile = .{ .soft = 32_768, .hard = 65_536 };
     const resource_input = build_exec.cacheInputForStep(
@@ -3672,7 +3673,7 @@ test "fully cached build publishes final indexed image" {
             .env_digest = env_digest,
             .workdir = "/",
             .network_mode = .spore,
-            .memory_bytes = default_build_memory.bytes,
+            .memory_bytes = default_build_memory.initial_bytes,
             .vcpus = default_build_vcpus,
             .nofile_soft = default_build_nofile.soft,
             .nofile_hard = default_build_nofile.hard,

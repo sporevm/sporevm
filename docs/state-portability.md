@@ -1,9 +1,10 @@
 # Spore State Portability Contract
 
-**Status:** current implementation for manifest format v2, plus manifest-v3
-capture/restore for multi-vCPU state on KVM and same-backend HVF. This document
-records what SporeVM can capture, map, translate, and reject when restoring an
-aarch64 spore across the KVM and Hypervisor.framework backends.
+**Status:** current implementation for fixed-memory manifest formats v2/v3 and
+single-vCPU elastic format v4. Version 5 reserves the matching multi-vCPU
+elastic schema, but current elastic execution remains one-vCPU and writes v4.
+This document records what SporeVM can capture, map, translate, and reject when
+restoring an aarch64 spore across the KVM and Hypervisor.framework backends.
 
 The spore format describes bytes on disk. This document describes the portable
 meaning of those bytes: which guest-visible state is part of the contract, how
@@ -15,18 +16,18 @@ failed runs and keep backend-private state out of the spore contract.
 
 ## Scope
 
-Manifest-format-v2 portability is deliberately narrow:
+Portable state is deliberately narrow:
 
 - Guest ISA: aarch64 only.
 - vCPU topology: one vCPU.
 - Backends: Linux KVM and Apple Hypervisor.framework.
 - Device model: the frozen SporeVM board contract — virtio-mmio console,
-  optional blk, net, vsock, rng, and the generation MMIO device. Transient
-  grow-only virtio-mem for fresh managed auto runs is outside manifest v2;
-  capture/resume paths disable it rather than serializing hotplug state.
+  optional blk, net, vsock, rng, generation MMIO, and one grow-only virtio-mem
+  device for elastic versions 4/5.
 - Memory: portable restore is chunk-authoritative. Product same-host restore may
   use local proof-backed `ram.backing`, but that is acceleration metadata, not a
-  portability authority.
+  portability authority. Elastic manifests persist normalized initial,
+  maximum, requested, captured, and plugged-range state.
 - Disk: a captured `spore run --image` workload may reference one verified
   immutable ext4 rootfs artifact and, for image-created spores, manifest-bound
   chunked rootfs storage. It may also reference an optional sealed writable
@@ -54,7 +55,7 @@ these fields exactly unless this document says a field is translatable:
 | `arch` | must be `aarch64` | Guest RAM and registers are ISA-specific. |
 | `cpu_profile` | must match `sporevm-aarch64-v0` | Guest-visible feature IDs must match the saved execution environment. |
 | `device_model_version` | must match | Virtio layout, interrupt lines, and generation MMIO are board contract. |
-| `ram_base`, `ram_size` | must match | Guest physical addresses and page tables are already live. |
+| `ram_base`, `ram_size` | must match; `ram_size` is initial memory | Guest physical addresses and page tables are already live; elastic maximum and captured layout come from `memory_state`. |
 | `gic_dist_base`, `gic_redist_base` | must match | Linux has mapped the GIC MMIO windows. |
 | `counter_frequency_hz` | must match | Timer state is stored in this tick domain. |
 | device count/order | must match | Virtio transport state is positional and device IDs must line up. |
@@ -95,7 +96,7 @@ block identical-host fork/fan-out.
 | Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | product resume base; cache contract is verify-at-install, trust-at-open |
 | Writable root disk index | optional `chunk-index-disk-v0` over the effective immutable rootfs base | yes for local CAS store | verifies disk index and chunk objects | yes for local CAS store | verifies disk index and chunk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows, host socket material, or host port forwards | yes | fresh gateway | yes | fresh gateway | policy portable; flows and port forwards dropped; bound services fail closed unless restored |
-| Transient virtio-mem hotplug | not represented | fresh managed run only | n/a | fresh managed run only | n/a | outside manifest v2 |
+| Grow-only virtio-mem hotplug | v4/v5 normalized initial, maximum, requested, captured, and plugged block ranges | yes | yes | yes | yes | portable, one vCPU currently |
 | General writable disk contents | not represented | no | reject | no | reject | out of current format |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 | Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
@@ -180,12 +181,14 @@ escape hatch.
 
 ### Outside the spore
 
-These are intentionally not captured in manifest v2:
+These are intentionally not captured:
 
 - General disk contents and external host files. Rootfs-bound
   `chunk-index-disk-v0` indexes are captured as described above.
 - Network connections and host-side sockets.
-- Transient virtio-mem plug state and guest hotplug policy.
+- Host memory-pressure history and policy decisions after the captured
+  virtio-mem requested size; the resulting requested size and plugged layout
+  are captured in v4/v5.
 - Host paths, credentials, secrets, and runtime policy.
 - Kernel image identity and DTB identity, until the platform contract grows
   pinned kernel fields.

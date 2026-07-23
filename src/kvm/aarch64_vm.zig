@@ -167,9 +167,9 @@ const HotplugMapping = struct {
     vm_fd: std.c.fd_t,
     mapped_bytes: u64 = 0,
 
-    fn init(size: u64, guest_addr: u64, vm_fd: std.c.fd_t) !HotplugMapping {
+    fn init(bytes: []align(std.heap.page_size_min) u8, guest_addr: u64, vm_fd: std.c.fd_t) HotplugMapping {
         return .{
-            .bytes = (try mapAnonymousRam(size)).bytes,
+            .bytes = bytes,
             .guest_addr = guest_addr,
             .vm_fd = vm_fd,
         };
@@ -177,7 +177,6 @@ const HotplugMapping = struct {
 
     fn deinit(self: *HotplugMapping) void {
         self.unmapFromGuest() catch |err| std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
-        std.posix.munmap(self.bytes);
     }
 
     fn unmapFromGuest(self: *HotplugMapping) !void {
@@ -265,11 +264,17 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .start_ms = manifest_start,
             .manifest_ms = (try monotonicMs()) - manifest_start,
         };
+        const manifest_ram_size = if (resume_parsed) |parsed| parsed.value.platform.ram_size else resume_v1_parsed.?.value.platform.ram_size;
+        const manifest_memory_state = if (resume_parsed) |parsed| parsed.value.memory_state else resume_v1_parsed.?.value.memory_state;
+        const restored_memory = try spore.memoryConfig(manifest_ram_size, manifest_memory_state);
+        config.ram_size = restored_memory.initial_bytes;
+        config.virtio_mem_region_size = restored_memory.maximum_bytes - restored_memory.initial_bytes;
     }
     try topology.validateVcpuCount(config.vcpus);
     if (config.vcpus != 1 and (config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
+    if (config.dirty_tracking.enabled and config.virtio_mem_region_size != 0) return error.BadManifest;
 
     const kvm_fd = try kvm.openDevKvm();
     defer closeFd(kvm_fd);
@@ -293,8 +298,9 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
     var ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
+    const initial_ram_len: usize = @intCast(config.ram_size);
     var hotplug_mapping: ?HotplugMapping = if (config.virtio_mem_region_size > 0)
-        try HotplugMapping.init(config.virtio_mem_region_size, board.ram_base + config.ram_size, vm_fd)
+        HotplugMapping.init(@alignCast(ram_bytes[initial_ram_len..]), board.ram_base + config.ram_size, vm_fd)
     else
         null;
     defer if (hotplug_mapping) |*mapping| mapping.deinit();
@@ -401,6 +407,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             });
             try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &lazy_pager, &restore_stats);
             const state_start = try monotonicMs();
+            if (m.memory_state) |state| try mem_dev.restoreState(state);
             try applyTransports(transports, m.devices);
             try gen_dev.restore(allocator, config.resume_generation orelse m.generation);
             if (config.resume_generation == null) try spore.refreshResumeParams(allocator, &gen_dev);
@@ -412,6 +419,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             try checkKvmManifestV1(m, config, transports.len, host_counter_frequency_hz);
             try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &lazy_pager, &restore_stats);
             const state_start = try monotonicMs();
+            if (m.memory_state) |state| try mem_dev.restoreState(state);
             try applyTransports(transports, m.devices);
             try gen_dev.restore(allocator, config.resume_generation orelse m.generation);
             if (config.resume_generation == null) try spore.refreshResumeParams(allocator, &gen_dev);
@@ -422,7 +430,8 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             if (restore_stats) |*stats| stats.state_ms = (try monotonicMs()) - state_start;
         }
     } else {
-        const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(ram_bytes.len, board.ram_base, config.kernel, initrd.len) else null;
+        const boot_ram = ram_bytes[0..initial_ram_len];
+        const initrd_range = if (config.initrd) |initrd| try boot.planInitrd(boot_ram.len, board.ram_base, config.kernel, initrd.len) else null;
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = config.ram_size,
             .cpu_count = config.vcpus,
@@ -437,7 +446,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
         });
         defer allocator.free(dtb);
-        const layout = try boot.load(ram_bytes, board.ram_base, config.kernel, config.initrd, dtb);
+        const layout = try boot.load(boot_ram, board.ram_base, config.kernel, config.initrd, dtb);
         for (layout.populatedRanges(), 0..) |range, i| {
             boot_seed_ranges_buf[i] = .{ .start = range.start, .end = range.end };
         }
@@ -551,7 +560,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     }
     var exec_probe_done = false;
     var handled_memory_pressure_count: u32 = 0;
-    var requested_hotplug_size: u64 = 0;
+    var requested_hotplug_size: u64 = if (mem_transport_index != null) mem_dev.requested_size else 0;
     var pending_kvm_completion = false;
     var did_capture_request = false;
     while (true) {
@@ -593,7 +602,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                         null;
                     defer if (prepared_root) |*root| root.deinit();
                     const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    try takeSnapshot(allocator, request.dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, if (preparation) |*owned| owned.cacheLock() else null);
+                    try takeSnapshot(allocator, request.dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (mem_transport_index != null) &mem_dev else null, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, if (preparation) |*owned| owned.cacheLock() else null);
                     if (!request.continue_after) return .snapshotted;
                     const completed_dir = if (request.publish_dir) |publish_dir| blk: {
                         const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
@@ -619,6 +628,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                         &vsock_dev,
                         ram_bytes,
                         config,
+                        if (mem_transport_index != null) &mem_dev else null,
                         if (dirty_tracker) |*tracker| tracker else null,
                     ) catch |err| control.failDiskFork(err);
                 },
@@ -633,7 +643,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (mem_transport_index != null) &mem_dev else null, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continue_after_capture) {
@@ -670,7 +680,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     if (config.exec_probe_completes_run) {
                         if (config.snapshot_on_probe_complete) {
                             const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
+                            try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (mem_transport_index != null) &mem_dev else null, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -697,7 +707,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     pending_kvm_completion = false;
                 }
                 const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
+                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (mem_transport_index != null) &mem_dev else null, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 return .snapshotted;
             }
         }
@@ -1422,14 +1432,15 @@ fn ratePerSec(count: u64, elapsed_ms: u64) u64 {
 
 fn mapRam(allocator: std.mem.Allocator, config: Config, manifest_memory: ?spore.MemoryManifest) !RamMapping {
     _ = allocator;
+    const maximum_size = std.math.add(u64, config.ram_size, config.virtio_mem_region_size) catch return error.BadManifest;
     return switch (config.ram_restore) {
         .local_backing => |fd| blk: {
             const memory = manifest_memory orelse return error.BadManifest;
             const backing = memory.backing orelse return error.BadManifest;
-            try spore.validateMemoryBacking(backing, config.ram_size);
-            break :blk try mapFileBackedRamFd(fd, config.ram_size);
+            try spore.validateMemoryBacking(backing, maximum_size);
+            break :blk try mapFileBackedRamFd(fd, maximum_size);
         },
-        .fresh, .eager_chunks, .lazy_chunks => mapAnonymousRam(config.ram_size),
+        .fresh, .eager_chunks, .lazy_chunks => mapAnonymousRam(maximum_size),
     };
 }
 
@@ -1908,6 +1919,7 @@ fn captureSingleKvmDiskFork(
     vsock_dev: *const vsock.Vsock,
     ram_bytes: []const u8,
     config: Config,
+    memory_device: ?*const virtio_mem.Mem,
     dirty_tracker: ?*DirtyTracker,
 ) !void {
     const disk = config.disk_snapshot orelse return error.BadManifest;
@@ -1922,6 +1934,7 @@ fn captureSingleKvmDiskFork(
         vsock_dev,
         ram_bytes,
         config.ram_size,
+        memory_device,
         config.rootfs,
         null,
         disk,
@@ -1953,6 +1966,7 @@ fn takeSnapshot(
     vsock_dev: *const vsock.Vsock,
     ram_bytes: []const u8,
     ram_size: u64,
+    memory_device: ?*const virtio_mem.Mem,
     rootfs: ?spore.Rootfs,
     disk_snapshot: ?disk_layer.SnapshotState,
     quiescence_disk: ?disk_layer.SnapshotState,
@@ -2005,8 +2019,9 @@ fn takeSnapshot(
     else
         try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
     const memory_ms = (try monotonicMs()) - memory_start;
+    const memory_state = if (memory_device) |device| try device.captureState(arena, ram_size) else null;
     if (environ_map) |environ| {
-        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_size);
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_bytes.len);
     }
     var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
     defer if (owned_cache_lock) |*lock| lock.deinit();
@@ -2022,6 +2037,7 @@ fn takeSnapshot(
     const disk_ms = (try monotonicMs()) - disk_start;
     const manifest_start = try monotonicMs();
     const saved_manifest = spore.Manifest{
+        .version = if (memory_state != null) spore.format_version_elastic else spore.format_version,
         .platform = .{
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
@@ -2039,6 +2055,7 @@ fn takeSnapshot(
         .disk = disk_manifest,
         .network = network_manifest,
         .sessions = sessions,
+        .memory_state = memory_state,
         .memory = memory,
     };
     if (disk_manifest) |disk| {

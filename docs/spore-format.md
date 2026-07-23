@@ -312,9 +312,9 @@ reset or poweroff.
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
 
-- `version`: format version, currently 2 for this single-vCPU shape.
-  Consumers reject unknown versions and reject v0/v1 with a format-too-old
-  error.
+- `version`: format version 2 for the fixed-memory single-vCPU shape, or 4 for
+  the elastic-memory extension described below. Consumers reject unknown
+  versions and reject v0/v1 with a format-too-old error.
 - `annotations`: optional opaque string map for namespaced embedder metadata,
   such as `dev.buildkite.cleanroom.policy_hash`. Keys and values are UTF-8
   strings, values are not interpreted by SporeVM, and the serialized annotation
@@ -330,9 +330,8 @@ reset or poweroff.
   current Apple-M/Graviton common denominator; KVM enforces it by masking RNDR
   before guest boot. Device model version 4 includes the fixed virtio-mmio
   range plus the generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24
-  / INTID 56. Fresh managed auto-memory runs may attach a transient grow-only
-  virtio-mem device, but current capture/resume paths disable that transient
-  device and do not serialize virtio-mem state into manifest v2.
+  / INTID 56. Elastic manifests attach one grow-only virtio-mem device and
+  persist its normalized state; fixed manifests must not contain that device.
 - `machine`: normalized architectural state for one vCPU — `gprs` (x0–x30),
   `pc`, `cpsr`, `fpcr`, `fpsr`, `simd` (32 Q registers as u64 pairs),
   `sys_regs` (EL1 context registers by architectural name), `icc_regs`
@@ -467,6 +466,18 @@ representation.
   trust root and does not prove every RAM byte still matches the manifest's
   chunk refs. KVM and HVF map a validated fd `MAP_PRIVATE` to share clean parent
   pages across fork children while child writes fault into private CoW pages.
+- `memory_state`: present only in elastic manifest versions 4/5. It records
+  `initial_size`, `maximum_size`, total `requested_size`, total
+  `captured_size`, `block_size` (currently 2 MiB), and sorted
+  `plugged_ranges`. Each range has `start_block` and `block_count` relative to
+  the virtio-mem region immediately after initial RAM. Validation requires
+  maximum greater than initial, all sizes within the declared bounds, exact
+  2 MiB alignment, at most 8192 elastic blocks, canonical non-overlapping
+  ranges, and `captured_size == initial_size + plugged blocks`. The portable
+  memory index and optional backing cover `maximum_size`; `platform.ram_size`
+  remains the initial boot RAM size. Versions 2/3 omit this member and mean
+  fixed memory where initial, maximum, requested, captured, and memory-index
+  logical size all equal `platform.ram_size`.
 - `rootfs`: optional immutable rootfs artifact required by a captured
   read-only virtio-blk root device. `kind` is
   `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
@@ -545,7 +556,23 @@ v3 captures instead use `machine.gic.kind: "backend_private"` with `backend:
 "hvf"` and `format: "hv_gic_state_v0"`; other backends must reject that blob
 before mutating VM state.
 
-## Not Yet Captured By Manifest v2
+## Manifest Formats v4 and v5
+
+Versions 4 and 5 are the explicit elastic-memory variants of the v2
+single-vCPU and v3 multi-vCPU shapes, respectively. Their only added top-level
+member is normalized `memory_state`; they retain the matching machine and
+platform shape. Old readers reject the new versions cleanly instead of
+mistaking maximum memory for boot RAM or dropping virtio-mem state. Current
+product execution supports elastic memory only with one vCPU, so writers emit
+v4; v5 reserves the corresponding multi-vCPU schema and remains fail-closed at
+the runtime capability gate.
+
+Restore allocates the maximum-sized portable RAM image, maps initial RAM,
+recreates the virtio-mem transport, maps the captured requested prefix, restores
+the exact plugged ranges, and only then starts vCPUs. The manifest contains no
+raw KVM or Hypervisor.framework memory-region structure.
+
+## Not Yet Captured
 
 - General block-device state is still incomplete. The current writable disk
   contract is one rootfs-bound chunk index over verified rootfs CAS objects.
@@ -566,10 +593,9 @@ before mutating VM state.
 - Live network flows and host port forwards: manifest v2 persists requested
   network capability and policy only. Active TCP flows, learned DNS answers, and
   host loopback listeners are dropped across capture, resume, and fork.
-- Transient virtio-mem state: the first grow-only auto-memory prototype is a
-  fresh managed-run optimization. Manifest v2 records the fixed RAM image that
-  capture/resume can restore, not virtio-mem plug state, unplug state, or guest
-  hotplug policy.
+- Virtio-mem unplug and reclamation policy. Elastic versions persist the
+  grow-only requested size and exact plugged ranges, but unplug requests remain
+  unsupported.
 - Transient rootfs-growth block state: write-zeroes feature bit 14, its accepted
   feature latch, and in-progress growth requests are not a saved-machine
   contract. Both backends reject full-machine capture of the growth profile;

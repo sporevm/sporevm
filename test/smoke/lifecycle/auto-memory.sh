@@ -109,13 +109,14 @@ if run_capture "${create_stdout}" "${create_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" create "${vm_name}" \
     --backend "${backend}" \
-    --memory auto \
+    --memory 512mb \
+    --max-memory 16gb \
     --timeout "${SPORE_SMOKE_LIFECYCLE_AUTO_MEMORY_TIMEOUT_MS:-60000}ms" \
     --console-log "${console_log}"; then
   created=1
 else
   status=$?
-  require_success "${status}" "spore create --memory auto" "${create_stderr}"
+  require_success "${status}" "spore create --memory 512mb --max-memory 16gb" "${create_stderr}"
 fi
 create_ms="$(( $(now_ms) - create_start_ms ))"
 
@@ -167,8 +168,8 @@ def field(value):
     return "null" if value is None else str(value)
 
 for key, value in {
-    "memory_policy": memory.get("policy"),
-    "memory_bytes": memory.get("bytes"),
+    "initial_memory_bytes": memory.get("initial_bytes"),
+    "max_memory_bytes": memory.get("maximum_bytes"),
     "chunk_size": stats.get("chunk_size"),
     "chunks_total": stats.get("chunks_total"),
 }.items():
@@ -176,8 +177,8 @@ for key, value in {
         raise SystemExit(f"{key} missing from spore --json ls")
 
 print(
-    f"memory_policy={memory['policy']} "
-    f"memory_bytes={memory['bytes']} "
+    f"initial_memory_bytes={memory['initial_bytes']} "
+    f"max_memory_bytes={memory['maximum_bytes']} "
     f"resident_bytes={field(stats.get('resident_bytes'))} "
     f"chunk_size={stats['chunk_size']} "
     f"chunks_total={stats['chunks_total']} "
@@ -215,6 +216,7 @@ with open(manifest_path, "r", encoding="utf-8") as fh:
 
 ram_size = manifest["platform"]["ram_size"]
 memory = manifest["memory"]
+memory_state = manifest["memory_state"]
 chunks = memory["chunks"]
 zero_chunks = memory.get("zero_chunks") or []
 logical_size = memory["logical_size"]
@@ -248,6 +250,10 @@ backing_allocated = getattr(st, "st_blocks", 0) * 512
 
 print(
     f"manifest_ram_size={ram_size} "
+    f"manifest_initial_size={memory_state['initial_size']} "
+    f"manifest_maximum_size={memory_state['maximum_size']} "
+    f"manifest_requested_size={memory_state['requested_size']} "
+    f"manifest_captured_size={memory_state['captured_size']} "
     f"manifest_memory_logical_size={logical_size} "
     f"manifest_chunk_size={chunk_size} "
     f"manifest_chunks_total={chunks_total} "
@@ -267,19 +273,22 @@ fi
 eval "${ls_metrics}"
 eval "${manifest_metrics}"
 
-[[ "${memory_policy}" == "auto" ]] || die "memory policy was ${memory_policy}, expected auto"
-[[ "${memory_bytes}" == "17179869184" ]] || die "memory bytes was ${memory_bytes}, expected 17179869184"
-[[ "${manifest_ram_size}" == "17179869184" ]] || die "manifest ram size was ${manifest_ram_size}, expected 17179869184"
-[[ "${manifest_memory_logical_size}" == "${manifest_ram_size}" ]] || die "manifest memory logical size did not match platform RAM"
+[[ "${initial_memory_bytes}" == "536870912" ]] || die "initial memory bytes was ${initial_memory_bytes}, expected 536870912"
+[[ "${max_memory_bytes}" == "17179869184" ]] || die "max memory bytes was ${max_memory_bytes}, expected 17179869184"
+[[ "${manifest_ram_size}" == "${initial_memory_bytes}" ]] || die "manifest ram size did not match initial memory"
+[[ "${manifest_initial_size}" == "${initial_memory_bytes}" ]] || die "manifest initial size did not match lifecycle state"
+[[ "${manifest_maximum_size}" == "${max_memory_bytes}" ]] || die "manifest maximum size did not match lifecycle state"
+[[ "${manifest_memory_logical_size}" == "${manifest_maximum_size}" ]] || die "manifest memory logical size did not match maximum memory"
+[[ "${manifest_requested_size}" -ge "${manifest_captured_size}" && "${manifest_captured_size}" -ge "${manifest_initial_size}" ]] || die "manifest requested/captured sizes were inconsistent"
 [[ "${chunk_size}" == "2097152" && "${manifest_chunk_size}" == "2097152" ]] || die "unexpected memory chunk size"
 [[ "${chunks_total}" == "8192" && "${manifest_chunks_total}" == "8192" ]] || die "unexpected chunk count"
 if [[ "${resident_bytes}" != "null" ]]; then
-  [[ "${resident_bytes}" =~ ^[0-9]+$ && "${resident_bytes}" -gt 0 && "${resident_bytes}" -lt "${memory_bytes}" ]] || die "resident bytes did not distinguish host cost from configured RAM"
+  [[ "${resident_bytes}" =~ ^[0-9]+$ && "${resident_bytes}" -gt 0 && "${resident_bytes}" -lt "${max_memory_bytes}" ]] || die "resident bytes did not distinguish host cost from configured RAM"
 fi
 [[ "${manifest_chunks_nonzero}" =~ ^[0-9]+$ && "${manifest_chunks_nonzero}" -gt 0 && "${manifest_chunks_nonzero}" -lt "${manifest_chunks_total}" ]] || die "manifest chunks were not sparse"
 [[ "${manifest_zero_chunks}" =~ ^[0-9]+$ && "${manifest_zero_chunks}" -gt 0 && "$((manifest_zero_chunks + manifest_chunks_nonzero))" == "${manifest_chunks_total}" ]] || die "manifest zero chunks did not cover sparse memory"
 [[ "${backing_kind}" == "map-private-file-v0" ]] || die "unexpected backing kind: ${backing_kind}"
-[[ "${backing_size}" == "${manifest_ram_size}" && "${backing_logical_bytes}" == "${manifest_ram_size}" ]] || die "backing logical size did not match configured RAM"
+[[ "${backing_size}" == "${manifest_maximum_size}" && "${backing_logical_bytes}" == "${manifest_maximum_size}" ]] || die "backing logical size did not match maximum memory"
 [[ "${backing_allocated_bytes}" =~ ^[0-9]+$ && "${backing_allocated_bytes}" -gt 0 && "${backing_allocated_bytes}" -lt "${backing_logical_bytes}" ]] || die "backing allocation did not stay sparse"
 
 echo "smoke:lifecycle-auto-memory ok backend=${backend} create_ms=${create_ms} suspend_ms=${suspend_ms} ${ls_metrics} ${manifest_metrics}"

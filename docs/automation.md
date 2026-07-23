@@ -48,7 +48,7 @@ The bounded schema inventory is:
 | --- | --- |
 | `version`, `host-info`, `inspect` | `spore.version.result.v1`, `spore.host-info.v2` or `.v3`, `spore.inspect.result.v1` |
 | checkpoint `fork`/`clone`, bundle `pack`/`push`/`inspect-bundle`, checkpoint `unpack`/`pull` | `spore.fork.result.v1`, `spore.clone.result.v1`, `spore.pack.result.v1`, `spore.unpack.result.v1`, `spore.push.result.v1`, `spore.bundle.inspect.v1`, `spore.pull.result.v1` |
-| `create`, `logs`, `save`, `restore`, `vm rm`, `vm fork`, `checkpoint rm`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v1`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v1`, `spore.copy.result.v1` |
+| `create`, `logs`, `save`, `restore`, `vm rm`, `vm fork`, `checkpoint rm`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v1`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
 | `build`, rootfs operations, image gateway and archive operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v1`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.pull.result.v1`, `spore.image.fixture.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1` |
 | `system df`/`prune`, `cache gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v1`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
 
@@ -56,10 +56,22 @@ Zig run and attach results use `spore.run.result.v1`. The bounded named-exec
 compatibility collector used by Zig, C, and Go uses `spore.exec.result.v1`;
 streaming callers should use the completion contract instead.
 
+Run and attach completion records expose `memory_bytes` as initial
+guest-visible memory and `max_memory_bytes` as the ceiling; equal values mean
+fixed memory. Checkpoint inspection adds `initial_memory_bytes`,
+`max_memory_bytes`, `requested_memory_bytes`, `captured_memory_bytes`, and
+`plugged_memory_ranges`. Legacy fixed-memory manifests report the same value
+for all four sizes and an empty range list.
+
 Named create and `logs` share `spore.lifecycle.v1`. Its optional
 `initial_command` object first reports output disposition, destination, bound,
 and startup status, then the logs result adds process status, optional exit
 code, retained bytes, and per-stream truncation flags.
+
+Named `ls`/`ps` uses `spore.lifecycle.list.result.v2`; its `memory` object
+contains `initial_bytes` and `maximum_bytes`. Version 1 exposed the removed
+automatic-memory policy and is not compatible with the explicit two-size
+contract.
 
 Result schemas keep their existing names. Additive `resource_type` fields
 identify `live_vm`, `checkpoint`, `image`, or `bundle`, and checkpoint

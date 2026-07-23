@@ -13,7 +13,7 @@ const result_error: c_int = -3;
 
 const build_info_version_string: c_int = 1;
 const build_info_abi_version: c_int = 2;
-const c_abi_version: u32 = 19;
+const c_abi_version: u32 = 20;
 const reexec_contract_version: u32 = 1;
 const reexec_role_env = "SPORE_REEXEC_ROLE";
 const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
@@ -22,7 +22,7 @@ const inspect_spore_options_version: u32 = 1;
 const pull_options_version: u32 = 1;
 const system_df_options_version: u32 = 1;
 const system_prune_options_version: u32 = 1;
-const create_named_options_version: u32 = 6;
+const create_named_options_version: u32 = 7;
 const initial_output_named_options_version: u32 = 1;
 const restore_named_options_version: u32 = 1;
 const fork_named_options_version: u32 = 1;
@@ -157,6 +157,7 @@ const SporeCreateNamedOptions = extern struct {
     image_ref: SporeString,
     spore_executable: SporeString,
     memory_bytes: u64,
+    max_memory_bytes: u64,
     vcpus: u32,
     guest_port: u32,
     timeout_ms: u64,
@@ -378,6 +379,7 @@ pub export fn spore_create_named_options_init(options: ?*SporeCreateNamedOptions
         .image_ref = .{},
         .spore_executable = .{},
         .memory_bytes = 0,
+        .max_memory_bytes = 0,
         .vcpus = 1,
         .guest_port = 10700,
         .timeout_ms = 30_000,
@@ -812,7 +814,7 @@ pub export fn spore_create_named_json(
             .policy = network_policy,
             .bound_services = bound_services,
         },
-        .memory = memoryFromBytes(opts.memory_bytes) catch |err| return fail(ctx, err),
+        .memory = memoryFromBytes(opts.memory_bytes, opts.max_memory_bytes) catch |err| return fail(ctx, err),
         .vcpus = opts.vcpus,
         .guest_port = opts.guest_port,
         .timeout_ms = opts.timeout_ms,
@@ -1272,10 +1274,15 @@ fn parseBackend(raw: ?[]const u8) !libspore.Backend {
     return libspore.Backend.parse(value) orelse error.InvalidValue;
 }
 
-fn memoryFromBytes(bytes: u64) !libspore.MemoryConfig {
-    if (bytes == 0) return .{};
-    if (bytes % std.heap.page_size_min != 0) return error.InvalidValue;
-    return .{ .policy = .explicit, .bytes = bytes };
+fn memoryFromBytes(initial: u64, maximum: u64) !libspore.MemoryConfig {
+    var config = libspore.MemoryConfig{};
+    if (initial != 0) {
+        config.initial_bytes = initial;
+        config.maximum_bytes = initial;
+    }
+    if (maximum != 0) config.maximum_bytes = maximum;
+    config.validate() catch return error.InvalidValue;
+    return config;
 }
 
 fn parseNetworkPolicy(allocator: std.mem.Allocator, raw: ?[*]const SporeNetworkRule, len: usize) !libspore.NetworkPolicy {
@@ -1883,7 +1890,8 @@ test "C ABI can list named VMs from context runtime env" {
     defer spore_free_string(context, json);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json.ptr.?[0..json.len], .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("spore.lifecycle.list.result.v1", parsed.value.object.get("schema").?.string);
+    try std.testing.expectEqualStrings("spore.lifecycle.list.result.v2", parsed.value.object.get("schema").?.string);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("schema_version").?.integer);
     try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("entries").?.array.items.len);
 }
 

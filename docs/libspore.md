@@ -271,6 +271,16 @@ before restore instead of silently downgrading to output-only attach.
 `runFromSpore` and `attachSpore`, so embedders can tell whether RAM came from
 `local_backing` or verified `chunks` without parsing logs.
 
+Public memory configuration has two sizes. `MemoryConfig.initial_bytes` is the
+memory visible at boot and `maximum_bytes` is the grow-only ceiling. Equal
+values mean fixed memory; the zero/default configuration is fixed at 512 MiB.
+`RunResult.memory_bytes` retains its name but now unambiguously reports initial
+memory, with `max_memory_bytes` reporting the ceiling. `inspectSpore` also
+reports initial, maximum, requested, captured, and plugged-range state; legacy
+manifests return the same fixed size for all four values.
+Named list results use `spore.lifecycle.list.result.v2`, and
+`NamedListMemory` exposes `initial_bytes` and `maximum_bytes`.
+
 Use `fork` to mint an offline child batch from a saved spore. For pinned
 disk-backed parents, `ForkResult.pin_lock_wait_ms` reports time waiting for the
 global cache lock and `pin_publish_ms` reports only the lock-held pin and batch
@@ -672,9 +682,13 @@ named copy side-effect calls. ABI version 15 added saved-spore removal through
 `spore_remove_saved_json`; ABI version 16 added the architecture-discriminated
 `spore_host_info_json_v3` entry point; ABI version 17 added
 `SporeCreateNamedOptions.initial_argv`; ABI version 18 added structured last
-errors and terminal outcomes for streaming named exec; ABI version 19 adds
+errors and terminal outcomes for streaming named exec; ABI version 19 added
 `SporeCreateNamedOptions.initial_output` and
-`spore_initial_output_named_json`. Clients should compare the runtime
+`spore_initial_output_named_json`; ABI version 20 adds
+`SporeCreateNamedOptions.max_memory_bytes`, advances that options struct to
+version 7, and defines `memory_bytes` as initial memory. A zero initial value
+selects 512 MiB, and a zero maximum makes memory fixed at the initial value.
+Clients should compare the runtime
 build-info ABI with `SPORE_ABI_VERSION` before calling a newly added symbol.
 
 Release builds publish separate `libspore_Linux` and `libspore_Darwin`
@@ -1047,7 +1061,9 @@ variables through `SetEnv`, and named lifecycle `CreateNamed`,
 `InitialOutputNamed`, `ExecNamed`,
 `OpenExecNamedStream`, `CopyInNamed`, `CopyOutNamed`, `SaveNamed`,
 `RestoreNamed`, `RemoveNamed`, `RemoveSaved`, and `ListNamed`.
-`CreateNamedOptions` exposes `InitialArgv`, `InitialOutput`, and the create-time network policy
+`CreateNamedOptions` exposes `MemoryBytes` as initial memory and
+`MaxMemoryBytes` as its optional elastic ceiling, plus `InitialArgv`,
+`InitialOutput`, and the create-time network policy
 supported by the C ABI: `NetworkEnabled`, `AllowCIDRs`, `AllowHosts`, exact
 host/port `NetworkRules`, and `BoundServices` for host Unix sockets exposed to
 the guest. Passing CIDRs, hosts, exact rules, or bound services while
@@ -1069,7 +1085,7 @@ is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
 return JSON, and exposes named copy as error-returning side-effect methods. It
-requires an exact C ABI version 19 match. Go context cancellation is checked before
+requires an exact C ABI version 20 match. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

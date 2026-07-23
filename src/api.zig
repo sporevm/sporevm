@@ -564,6 +564,11 @@ pub const SporeInspectResult = struct {
     present_memory_chunk_count: usize,
     memory_backing_kind: ?[]const u8,
     memory_backing_size: ?u64,
+    initial_memory_bytes: u64,
+    max_memory_bytes: u64,
+    requested_memory_bytes: u64,
+    captured_memory_bytes: u64,
+    plugged_memory_ranges: []const spore.MemoryPluggedRange = &.{},
     gic_kind: []const u8,
     sessions: []Session = &.{},
     network: ?SporeNetworkSummary = null,
@@ -919,6 +924,7 @@ pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspe
     allocator.free(result.platform.arch);
     allocator.free(result.platform.cpu_profile);
     if (result.memory_backing_kind) |kind| allocator.free(kind);
+    allocator.free(result.plugged_memory_ranges);
     freeSessions(allocator, result.sessions);
     if (result.network) |network| freeNetworkSummary(allocator, network);
     allocator.free(result.annotation_keys);
@@ -1150,7 +1156,10 @@ pub fn runFromSpore(
         .guest_env = options.guest_env,
         .interactive = options.interactive,
         .tty = options.tty,
-        .memory = try memory_config.fromManifestBytes(if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size),
+        .memory = if (manifest) |parsed|
+            try spore.memoryConfig(parsed.value.platform.ram_size, parsed.value.memory_state)
+        else
+            try spore.memoryConfig(manifest_v1.?.value.platform.ram_size, manifest_v1.?.value.memory_state),
         .vcpus = manifest_vcpus,
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
@@ -1724,6 +1733,12 @@ fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest:
     const network = try ownNetworkSummary(allocator, manifest.network);
     errdefer if (network) |owned_network| freeNetworkSummary(allocator, owned_network);
     const ownership = try saved_spore_ownership.classify(allocator, spore_dir, manifest.disk);
+    const memory_state = manifest.memory_state;
+    const plugged_ranges = if (memory_state) |state|
+        try allocator.dupe(spore.MemoryPluggedRange, state.plugged_ranges)
+    else
+        try allocator.alloc(spore.MemoryPluggedRange, 0);
+    errdefer allocator.free(plugged_ranges);
 
     return .{
         .portability = resource.portabilityForOwnership(ownership),
@@ -1749,6 +1764,11 @@ fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest:
         .present_memory_chunk_count = present_chunks,
         .memory_backing_kind = if (manifest.memory.backing) |backing| try allocator.dupe(u8, backing.kind) else null,
         .memory_backing_size = if (manifest.memory.backing) |backing| backing.size else null,
+        .initial_memory_bytes = if (memory_state) |state| state.initial_size else manifest.platform.ram_size,
+        .max_memory_bytes = if (memory_state) |state| state.maximum_size else manifest.platform.ram_size,
+        .requested_memory_bytes = if (memory_state) |state| state.requested_size else manifest.platform.ram_size,
+        .captured_memory_bytes = if (memory_state) |state| state.captured_size else manifest.platform.ram_size,
+        .plugged_memory_ranges = plugged_ranges,
         .gic_kind = @tagName(manifest.machine.gic.kind),
         .sessions = sessions,
         .network = network,

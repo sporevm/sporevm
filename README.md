@@ -129,7 +129,7 @@ Run one command in a throwaway VM:
 spore run 'echo hi'
 ```
 
-The experimental Linux/AMD64 KVM profile requires its memory size explicitly:
+The experimental Linux/AMD64 KVM profile uses the same fixed 512 MiB default:
 
 ```bash
 spore run --memory 512mib 'echo hi'
@@ -434,7 +434,7 @@ for structured lifecycle state. See [docs/lifecycle.md](docs/lifecycle.md) for
 runtime layout, monitor jailing, named live fork, and limits.
 
 Linux/AMD64 KVM currently supports only fresh `create`, `exec`, and `rm` with
-one vCPU and explicit 512 MiB memory; the save, restore, and fork operations in
+one vCPU and fixed 512 MiB memory; the save, restore, and fork operations in
 the example above remain unavailable.
 
 ## Current scope
@@ -442,7 +442,7 @@ the example above remain unavailable.
 SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
 named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM has an
-experimental fresh-only development profile with one vCPU and explicit 512 MiB
+experimental fresh-only development profile with one vCPU and fixed 512 MiB
 memory; capture, resume, rootfs, networking, build, and standalone libspore
 execution remain gated.
 

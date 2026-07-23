@@ -107,8 +107,7 @@ const LoadedManifest = struct {
     }
 
     fn ramSize(self: LoadedManifest) u64 {
-        if (self.v0) |parsed| return parsed.value.platform.ram_size;
-        return self.v1.?.value.platform.ram_size;
+        return self.memory().logical_size;
     }
 
     fn rootfs(self: LoadedManifest) ?spore.Rootfs {

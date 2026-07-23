@@ -136,7 +136,8 @@ const create_usage =
     \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
     \\                          With --net, forward host loopback TCP to a guest port
     \\  --annotation KEY=VALUE  Add a create-time annotation to saved manifests
-    \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
+    \\  --memory SIZE           Initial guest memory (default: 512mb)
+    \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
@@ -340,6 +341,20 @@ pub const Spec = struct {
     console_log_path: ?[]const u8 = null,
 };
 
+const LegacyMemoryPolicy = enum {
+    auto,
+    explicit,
+};
+
+const SpecMemoryProbe = struct {
+    memory: ?struct {
+        policy: ?LegacyMemoryPolicy = null,
+        bytes: ?u64 = null,
+        initial_bytes: ?u64 = null,
+        maximum_bytes: ?u64 = null,
+    } = null,
+};
+
 pub const ExecDefaults = spore.ExecDefaults;
 
 pub const DiskForkClaim = struct {
@@ -409,8 +424,8 @@ pub const ListEntry = struct {
 };
 
 pub const ListMemory = struct {
-    policy: []const u8,
-    bytes: u64,
+    initial_bytes: u64,
+    maximum_bytes: u64,
 };
 
 pub const ListStats = struct {
@@ -469,6 +484,7 @@ const CreateOptionsFile = struct {
     image: ?[]const u8 = null,
     pull: ?[]const u8 = null,
     memory: ?[]const u8 = null,
+    max_memory: ?[]const u8 = null,
     vcpus: ?topology.VcpuCount = null,
     guest_port: ?u32 = null,
     timeout_ms: ?u64 = null,
@@ -698,8 +714,8 @@ pub const NamedLifecycleTiming = struct {
 };
 
 pub const NamedListResult = struct {
-    schema: []const u8 = "spore.lifecycle.list.result.v1",
-    schema_version: u32 = 1,
+    schema: []const u8 = "spore.lifecycle.list.result.v2",
+    schema_version: u32 = 2,
     entries: []const ListEntry,
 };
 
@@ -1011,6 +1027,11 @@ fn createNamedWithTiming(
         .command_name = "create",
         .record_artifact = spec.rootfs_path != null or spec.image_ref != null,
     });
+    if (spec.memory.isElastic()) {
+        const managed_kernel = spec.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
+        const managed_initrd = spec.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
+        if (!managed_kernel or !managed_initrd) return error.ElasticMemoryUnsupported;
+    }
     const initial_command: ?[]const []const u8 = if (options.image_ref != null)
         try run_mod.resolveImageRuntimeCommand(arena, rootfs.image_config, options.initial_command)
     else if (options.initial_command.len != 0)
@@ -1175,7 +1196,8 @@ pub fn restoreNamed(
     } else null;
     const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
     const manifest_exec_defaults = if (manifest) |parsed| parsed.value.exec_defaults else manifest_v1.?.value.exec_defaults;
-    const memory = memory_config.fromManifestBytes(ram_size) catch return error.InvalidMemorySize;
+    const memory_state = if (manifest) |parsed| parsed.value.memory_state else manifest_v1.?.value.memory_state;
+    const memory = spore.memoryConfig(ram_size, memory_state) catch return error.InvalidMemorySize;
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
 
     var lifecycle_spec = readSporeLifecycleSpec(arena, init.io, spore_dir) catch return error.InvalidLifecycleMetadata;
@@ -2006,7 +2028,7 @@ pub fn createCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         },
         error.X86ExplicitMemoryRequired, error.X86ExperimentalMemorySizeUnsupported => {
-            const message = "spore create: experimental x86-64 KVM requires explicit --memory 512mib; omitted and automatic memory are unavailable";
+            const message = "spore create: experimental x86-64 KVM supports only fixed 512 MiB memory";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },
         error.X86VcpuCountUnsupported, error.X86RootfsUnsupported, error.X86NetworkUnsupported, error.X86BuildUnsupported => {
@@ -2851,6 +2873,7 @@ fn emitNamedRestoreExit(event_writer: *run_mod.EventWriter, backend: run_mod.Bac
         .exit_code = 0,
         .vcpus = 1,
         .memory_bytes = 0,
+        .max_memory_bytes = 0,
     });
 }
 
@@ -3067,13 +3090,38 @@ pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec)
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
     const data = try Io.Dir.cwd().readFileAlloc(io, paths.spec_path, allocator, .limited(max_metadata_bytes));
     defer allocator.free(data);
+    const legacy_memory = try legacyMemoryFromSpecJson(allocator, data);
     var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
+    if (legacy_memory) |memory| parsed.value.memory = memory;
     try validateSpec(parsed.value);
     return parsed;
+}
+
+fn legacyMemoryFromSpecJson(allocator: std.mem.Allocator, data: []const u8) !?memory_config.Config {
+    var probe = try std.json.parseFromSlice(SpecMemoryProbe, allocator, data, .{
+        .ignore_unknown_fields = true,
+    });
+    defer probe.deinit();
+    const value = probe.value.memory orelse return null;
+    const has_current = value.initial_bytes != null or value.maximum_bytes != null;
+    const has_legacy = value.policy != null or value.bytes != null;
+    if (has_current and has_legacy) return error.BadManifest;
+    if (!has_legacy) return null;
+    const policy = value.policy orelse return error.BadManifest;
+    const bytes = value.bytes orelse return error.BadManifest;
+    const config = switch (policy) {
+        .auto => memory_config.Config{
+            .initial_bytes = memory_config.default_bytes,
+            .maximum_bytes = bytes,
+        },
+        .explicit => memory_config.Config.fixed(bytes),
+    };
+    try config.validate();
+    return config;
 }
 
 fn validateSpec(spec: Spec) !void {
@@ -3249,8 +3297,8 @@ fn readListMetadata(allocator: std.mem.Allocator, io: Io, paths: Paths) !ListMet
 
 fn listMemoryFromConfig(memory: memory_config.Config) ListMemory {
     return .{
-        .policy = @tagName(memory.policy),
-        .bytes = memory.bytes,
+        .initial_bytes = memory.initial_bytes,
+        .maximum_bytes = memory.maximum_bytes,
     };
 }
 
@@ -3258,7 +3306,7 @@ fn listStatsFromMemory(memory: ListMemory) ListStats {
     const chunk_size: u64 = spore.chunk_size;
     return .{
         .chunk_size = chunk_size,
-        .chunks_total = std.math.divCeil(u64, memory.bytes, chunk_size) catch unreachable,
+        .chunks_total = std.math.divCeil(u64, memory.maximum_bytes, chunk_size) catch unreachable,
     };
 }
 
@@ -3347,10 +3395,11 @@ fn readDarwinProcessResidentBytes(pid: i64) ?u64 {
 }
 
 fn writeMemoryValue(writer: *Io.Writer, memory: ListMemory) !void {
-    if (std.mem.eql(u8, memory.policy, "auto")) {
-        try writer.writeAll("auto/");
+    try writeBytesHuman(writer, memory.initial_bytes);
+    if (memory.maximum_bytes > memory.initial_bytes) {
+        try writer.writeAll("→");
+        try writeBytesHuman(writer, memory.maximum_bytes);
     }
-    try writeBytesHuman(writer, memory.bytes);
 }
 
 fn writeBytesHuman(writer: *Io.Writer, bytes: u64) !void {
@@ -3481,7 +3530,10 @@ fn applyCreateOptionsFileLifecycleCli(
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     };
     return parseCreateOptionsFile(allocator, parsed, data) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore create: invalid --options {s}: {s}", .{ raw_path, @errorName(err) });
+        const message = if (err == error.RemovedAuto)
+            allocLifecycleMessage(allocator, "spore create: --options memory \"auto\" was removed; use memory \"512mb\" with max_memory \"16gb\" for elastic memory", .{})
+        else
+            allocLifecycleMessage(allocator, "spore create: invalid --options {s}: {s}", .{ raw_path, @errorName(err) });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     };
 }
@@ -3517,6 +3569,10 @@ fn parseCreateOptionsFile(
     if (file.memory) |memory| {
         out.spec.memory = try memory_config.parse(memory);
     }
+    if (file.max_memory) |maximum| {
+        out.spec.memory.maximum_bytes = try memory_config.parseBytes(maximum);
+    }
+    try out.spec.memory.validate();
     if (file.vcpus) |vcpus| out.spec.vcpus = vcpus;
     if (file.guest_port) |port| out.spec.guest_port = port;
     if (file.timeout_ms) |timeout| out.spec.timeout_ms = timeout;
@@ -3559,6 +3615,7 @@ fn parseCreateArgs(
     var spec = Spec{ .name = "" };
     var options_path: ?[]const u8 = null;
     var field_flag_seen = false;
+    var max_memory_set = false;
     var image_pull_policy: run_mod.PullPolicy = .missing;
     var initial_output: InitialOutputDisposition = .retain;
     var network: run_mod.NetworkMode = .disabled;
@@ -3656,14 +3713,22 @@ fn parseCreateArgs(
         } else if (std.mem.eql(u8, args[i], "--memory")) {
             field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
-            spec.memory = memory_config.parse(raw) catch |err| {
-                const message = allocLifecycleMessage(
-                    allocator,
-                    "spore create: --memory must be auto or a positive page-aligned size like 512mb or 16gb ({s})",
-                    .{@errorName(err)},
-                );
+            spec.memory.initial_bytes = memory_config.parseBytes(raw) catch |err| {
+                const message = if (err == error.RemovedAuto)
+                    "spore create: --memory auto was removed; use --memory 512mb for fixed memory, or --memory 512mb --max-memory 16gb for elastic memory"
+                else
+                    allocLifecycleMessage(allocator, "spore create: --memory must be a positive page-aligned size like 512mb or 16gb ({s})", .{@errorName(err)});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
+            if (!max_memory_set) spec.memory.maximum_bytes = spec.memory.initial_bytes;
+        } else if (std.mem.eql(u8, args[i], "--max-memory")) {
+            field_flag_seen = true;
+            const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            spec.memory.maximum_bytes = memory_config.parseBytes(raw) catch |err| {
+                const message = allocLifecycleMessage(allocator, "spore create: --max-memory must be a positive page-aligned size like 512mb or 16gb ({s})", .{@errorName(err)});
+                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+            };
+            max_memory_set = true;
         } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
             const message = "spore create: --memory-mib has been replaced by --memory";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
@@ -3745,6 +3810,10 @@ fn parseCreateArgs(
         const message = "spore create: network flags require --net";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
+    spec.memory.validate() catch |err| {
+        const message = allocLifecycleMessage(allocator, "spore create: --max-memory must be greater than or equal to --memory ({s})", .{@errorName(err)});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
+    };
     return .{
         .spec = spec,
         .options_path = options_path,
@@ -4356,7 +4425,8 @@ fn startForkChildExecutable(
     const captured_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
     if (captured_disk != null) return error.UnsupportedNamedForkDisk;
     const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
-    const memory = try memory_config.fromManifestBytes(ram_size);
+    const memory_state = if (manifest) |parsed| parsed.value.memory_state else manifest_v1.?.value.memory_state;
+    const memory = try spore.memoryConfig(ram_size, memory_state);
     const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
     const fork_claim: ?DiskForkClaim = if (disk_claim) |claim| .{
         .source_socket_path = claim.source_socket_path,
@@ -4700,7 +4770,11 @@ fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]co
 
 fn appendMemoryArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), memory: memory_config.Config) !void {
     try argv.append("--memory");
-    try argv.append(try memory.cliValueAlloc(allocator));
+    try argv.append(try memory.initialCliValueAlloc(allocator));
+    if (try memory.maximumCliValueAlloc(allocator)) |maximum| {
+        try argv.append("--max-memory");
+        try argv.append(maximum);
+    }
 }
 
 fn resolveSpawnExecutable(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, exe: []const u8) ![]const u8 {
@@ -5128,7 +5202,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
         .preopens = .empty,
     }, allocator, .{
         .name = "bench-1",
-        .memory = .{ .policy = .explicit, .bytes = run_mod.x86_experimental_memory_bytes },
+        .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
     }));
 
     const detail = lastErrorMessage();
@@ -6943,7 +7017,7 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
             .env = &.{ "IMAGE_VALUE=default", "CLEAR_ME=inherited" },
             .working_dir = "/app",
         },
-        .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
+        .memory = memory_config.Config.fixed(512 * 1024 * 1024),
     });
     var spec = try readSpec(allocator, io, paths);
     defer spec.deinit();
@@ -6957,8 +7031,8 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqualStrings("IMAGE_VALUE=default", spec.value.exec_defaults.?.env[0]);
     try std.testing.expectEqualStrings("CLEAR_ME=inherited", spec.value.exec_defaults.?.env[1]);
     try std.testing.expectEqualStrings("/app", spec.value.exec_defaults.?.working_dir.?);
-    try std.testing.expectEqual(memory_config.Policy.explicit, spec.value.memory.policy);
-    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), spec.value.memory.bytes);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), spec.value.memory.initial_bytes);
+    try std.testing.expectEqual(spec.value.memory.initial_bytes, spec.value.memory.maximum_bytes);
 
     try writeReady(allocator, io, paths, .{
         .pid = 1234,
@@ -6972,6 +7046,31 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
 
     try writePid(allocator, io, paths, 1234);
     try std.testing.expectEqual(@as(i64, 1234), try readPid(allocator, io, paths));
+}
+
+test "legacy lifecycle memory policy migrates to explicit sizes" {
+    const allocator = std.testing.allocator;
+    const auto = (try legacyMemoryFromSpecJson(
+        allocator,
+        "{\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}}",
+    )).?;
+    try std.testing.expectEqual(memory_config.default_bytes, auto.initial_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), auto.maximum_bytes);
+
+    const fixed = (try legacyMemoryFromSpecJson(
+        allocator,
+        "{\"memory\":{\"policy\":\"explicit\",\"bytes\":2147483648}}",
+    )).?;
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), fixed.initial_bytes);
+    try std.testing.expectEqual(fixed.initial_bytes, fixed.maximum_bytes);
+
+    try std.testing.expectError(
+        error.BadManifest,
+        legacyMemoryFromSpecJson(
+            allocator,
+            "{\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184,\"initial_bytes\":536870912,\"maximum_bytes\":17179869184}}",
+        ),
+    );
 }
 
 test "durable lifecycle metadata drops transient disk fork claims" {
@@ -7091,18 +7190,22 @@ test "lifecycle monitor stop distinguishes accepted socket close from pid exit" 
     );
 }
 
-test "create parser accepts memory policy" {
+test "create parser separates initial and maximum memory" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
     const default_opts = try parseCreateArgs(&.{"bench-1"}, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(memory_config.Policy.auto, default_opts.spec.memory.policy);
-    try std.testing.expectEqual(memory_config.auto_bytes, default_opts.spec.memory.bytes);
+    try std.testing.expectEqual(memory_config.default_bytes, default_opts.spec.memory.initial_bytes);
+    try std.testing.expectEqual(memory_config.default_bytes, default_opts.spec.memory.maximum_bytes);
 
-    const explicit_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "16gb" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.spec.memory.policy);
-    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.spec.memory.bytes);
+    const fixed_opts = try parseCreateArgs(&.{ "bench-1", "--memory", "2gb" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), fixed_opts.spec.memory.initial_bytes);
+    try std.testing.expectEqual(fixed_opts.spec.memory.initial_bytes, fixed_opts.spec.memory.maximum_bytes);
+
+    const elastic_opts = try parseCreateArgs(&.{ "bench-1", "--max-memory", "16gb" }, allocator, &stderr.writer, .human);
+    try std.testing.expectEqual(memory_config.default_bytes, elastic_opts.spec.memory.initial_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), elastic_opts.spec.memory.maximum_bytes);
 }
 
 test "create parser accepts shell and exact commands" {
@@ -7367,8 +7470,8 @@ test "create options file maps to create options" {
     );
 
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.spec.image_ref.?);
-    try std.testing.expectEqual(memory_config.Policy.explicit, opts.spec.memory.policy);
-    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), opts.spec.memory.bytes);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), opts.spec.memory.initial_bytes);
+    try std.testing.expectEqual(opts.spec.memory.initial_bytes, opts.spec.memory.maximum_bytes);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.spec.vcpus);
     try std.testing.expectEqual(@as(u64, 120_000), opts.spec.timeout_ms);
     try std.testing.expectEqual(run_mod.NetworkMode.spore, opts.network);
@@ -7962,7 +8065,7 @@ test "lifecycle list entries sorts and classifies VM directories" {
     try writeSpec(allocator, io, stale, .{
         .name = "b-stale",
         .resume_dir = stale_spore_dir,
-        .memory = .{ .policy = .explicit, .bytes = 512 * 1024 * 1024 },
+        .memory = memory_config.Config.fixed(512 * 1024 * 1024),
     });
     try writeReady(allocator, io, stale, .{
         .pid = 9001,
@@ -7974,7 +8077,10 @@ test "lifecycle list entries sorts and classifies VM directories" {
     const ready = try pathsFromRoot(allocator, root, "a-ready");
     defer ready.deinit(allocator);
     const ready_pid = currentTestPid();
-    try writeSpec(allocator, io, ready, .{ .name = "a-ready" });
+    try writeSpec(allocator, io, ready, .{
+        .name = "a-ready",
+        .memory = .{ .initial_bytes = 512 * 1024 * 1024, .maximum_bytes = 16 * 1024 * 1024 * 1024 },
+    });
     try writeReady(allocator, io, ready, .{
         .pid = ready_pid,
         .control_socket_path = ready.control_socket_path,
@@ -7992,8 +8098,8 @@ test "lifecycle list entries sorts and classifies VM directories" {
     try std.testing.expectEqualStrings("a-ready", entries[0].name);
     try std.testing.expectEqualStrings("ready", entries[0].state);
     try std.testing.expectEqual(@as(?i64, ready_pid), entries[0].pid);
-    try std.testing.expectEqualStrings("auto", entries[0].memory.?.policy);
-    try std.testing.expectEqual(memory_config.auto_bytes, entries[0].memory.?.bytes);
+    try std.testing.expectEqual(memory_config.default_bytes, entries[0].memory.?.initial_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), entries[0].memory.?.maximum_bytes);
     if (readProcessResidentBytes(allocator, io, ready_pid) != null) {
         try std.testing.expect(entries[0].stats.resident_bytes != null);
     } else if (!(comptime builtin.os.tag == .linux or builtin.os.tag.isDarwin())) {
@@ -8001,14 +8107,14 @@ test "lifecycle list entries sorts and classifies VM directories" {
     }
     const chunk_size: u64 = spore.chunk_size;
     try std.testing.expectEqual(@as(?u64, chunk_size), entries[0].stats.chunk_size);
-    try std.testing.expectEqual(@as(?u64, memory_config.auto_bytes / chunk_size), entries[0].stats.chunks_total);
+    try std.testing.expectEqual(@as(?u64, (16 * 1024 * 1024 * 1024) / chunk_size), entries[0].stats.chunks_total);
     try std.testing.expectEqual(@as(?u64, 17), entries[0].stats.chunks_nonzero);
     try std.testing.expectEqual(@as(?u64, 2), entries[0].stats.dirty_chunks_pending);
     try std.testing.expectEqualStrings("b-stale", entries[1].name);
     try std.testing.expectEqualStrings("stale", entries[1].state);
     try std.testing.expectEqual(@as(?i64, 9001), entries[1].pid);
-    try std.testing.expectEqualStrings("explicit", entries[1].memory.?.policy);
-    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), entries[1].memory.?.bytes);
+    try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), entries[1].memory.?.initial_bytes);
+    try std.testing.expectEqual(entries[1].memory.?.initial_bytes, entries[1].memory.?.maximum_bytes);
     try std.testing.expectEqual(@as(?u64, 13), entries[1].stats.backing_logical_bytes);
     try std.testing.expect(entries[1].stats.backing_allocated_bytes != null);
     try std.testing.expectEqual(@as(?u64, 256), entries[1].stats.chunks_total);
@@ -8019,16 +8125,16 @@ test "lifecycle list entries render human table" {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    const stale_memory = listMemoryFromConfig(.{ .policy = .explicit, .bytes = 512 * 1024 * 1024 });
+    const stale_memory = listMemoryFromConfig(memory_config.Config.fixed(512 * 1024 * 1024));
     try writeListEntries(&out.writer, &.{
         .{
             .name = "a-ready",
             .state = "ready",
             .pid = 42,
-            .memory = listMemoryFromConfig(.{}),
+            .memory = listMemoryFromConfig(.{ .initial_bytes = 512 * 1024 * 1024, .maximum_bytes = 16 * 1024 * 1024 * 1024 }),
             .stats = .{
                 .resident_bytes = 184 * 1024 * 1024,
-                .backing_logical_bytes = memory_config.auto_bytes,
+                .backing_logical_bytes = 16 * 1024 * 1024 * 1024,
                 .backing_allocated_bytes = 34 * 1024 * 1024,
                 .chunks_total = 8192,
                 .chunks_nonzero = 17,
@@ -8045,7 +8151,7 @@ test "lifecycle list entries render human table" {
     });
     try std.testing.expectEqualStrings(
         "NAME\tSTATE\tPID\tMEMORY\tRESIDENT\tBACKING\tCHUNKS\tDIRTY\n" ++
-            "a-ready\tready\t42\tauto/16GiB\t184MiB\t34MiB/16GiB\t17/8192\t2\n" ++
+            "a-ready\tready\t42\t512MiB→16GiB\t184MiB\t34MiB/16GiB\t17/8192\t2\n" ++
             "b-stale\tstale\t-\t512MiB\t?\t?\t?/256\t?\n",
         out.written(),
     );
@@ -8261,7 +8367,7 @@ test "lifecycle list JSON exposes memory and nullable stats" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"resource_type\":\"live_vm\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"memory\":{\"initial_bytes\":536870912,\"maximum_bytes\":536870912}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":{\"resident_bytes\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"dirty_chunks_pending\":null") != null);
 }

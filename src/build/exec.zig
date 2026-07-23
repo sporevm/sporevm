@@ -28,7 +28,7 @@ const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v
 // Provisional build-VM default; make this a `spore build` option when larger
 // workloads such as `bundle install`-style RUN steps need more memory.
 const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;
-pub const default_build_memory = memory_config.Config{ .policy = .explicit, .bytes = build_vm_memory_bytes };
+pub const default_build_memory = memory_config.Config.fixed(build_vm_memory_bytes);
 pub const default_build_vcpus: topology.VcpuCount = 1;
 pub const max_build_nofile: u64 = 1_048_576;
 pub const default_build_nofile = NofileLimit{ .soft = 65_536, .hard = 65_536 };
@@ -65,7 +65,7 @@ pub const RunResources = struct {
     nofile: NofileLimit = default_build_nofile,
 
     pub fn validate(self: RunResources) !void {
-        _ = try memory_config.fromManifestBytes(self.memory.bytes);
+        try self.memory.validate();
         try topology.validateVcpuCount(self.vcpus);
         try self.nofile.validate();
     }
@@ -311,7 +311,7 @@ pub fn cacheInputForStep(
                 .env_digest = run.env_digest,
                 .workdir = run.workdir,
                 .network_mode = run.network_mode,
-                .memory_bytes = resources.memory.bytes,
+                .memory_bytes = resources.memory.initial_bytes,
                 .vcpus = resources.vcpus,
                 .nofile_soft = resources.nofile.soft,
                 .nofile_hard = resources.nofile.hard,
@@ -2851,7 +2851,7 @@ test "build nofile limit is bounded" {
 test "build RUN resources validate as one execution contract" {
     try (RunResources{}).validate();
     try std.testing.expectError(error.ZeroMemory, (RunResources{
-        .memory = .{ .policy = .explicit, .bytes = 0 },
+        .memory = .{ .initial_bytes = 0, .maximum_bytes = 0 },
     }).validate());
     try std.testing.expectError(error.UnsupportedVcpuCount, (RunResources{ .vcpus = 0 }).validate());
     try std.testing.expectError(error.InvalidBuildNofileLimit, (RunResources{

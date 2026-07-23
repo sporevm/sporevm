@@ -132,7 +132,6 @@ const approved_x86_kernel_sha256 = [_]u8{
 };
 const direct_image_platform = rootfs_mod.Platform{};
 const max_rootfs_metadata_bytes = 1024 * 1024;
-const auto_boot_memory_bytes: u64 = 512 * 1024 * 1024;
 pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
 
 pub const MemoryConfig = memory_config.Config;
@@ -179,8 +178,8 @@ fn validateFreshProductPolicyFor(zig_arch: std.Target.Cpu.Arch, selected_backend
     if (policy.rootfs) return error.X86RootfsUnsupported;
     if (policy.network) return error.X86NetworkUnsupported;
     if (policy.build) return error.X86BuildUnsupported;
-    if (policy.memory.policy != .explicit) return error.X86ExplicitMemoryRequired;
-    if (policy.memory.bytes != x86_experimental_memory_bytes) return error.X86ExperimentalMemorySizeUnsupported;
+    if (policy.memory.isElastic()) return error.X86ElasticMemoryUnsupported;
+    if (policy.memory.initial_bytes != x86_experimental_memory_bytes) return error.X86ExperimentalMemorySizeUnsupported;
     if (policy.vcpus != 1) return error.X86VcpuCountUnsupported;
 }
 
@@ -372,7 +371,10 @@ pub const Result = struct {
     probe_duration_ms: u64,
     exit_code: i32,
     vcpus: topology.VcpuCount,
+    /// Initial guest-visible memory.
     memory_bytes: u64,
+    /// Maximum guest-visible memory; equal to `memory_bytes` for fixed VMs.
+    max_memory_bytes: u64,
     saved: bool = false,
     committed: bool = false,
     save_path: ?[]const u8 = null,
@@ -460,6 +462,7 @@ pub const ExitEvent = struct {
     exit_code: i32,
     vcpus: topology.VcpuCount,
     memory_bytes: u64,
+    max_memory_bytes: u64,
     saved: bool = false,
     save_path: ?[]const u8 = null,
     save_ownership: ?[]const u8 = null,
@@ -675,6 +678,7 @@ fn exitEvent(command: []const u8, result: Result) ExitEvent {
         .exit_code = result.exit_code,
         .vcpus = result.vcpus,
         .memory_bytes = result.memory_bytes,
+        .max_memory_bytes = result.max_memory_bytes,
         .saved = result.saved,
         .save_path = result.save_path,
         .save_ownership = result.save_ownership,
@@ -887,6 +891,7 @@ pub const EventWriter = struct {
             exit_code: i32,
             vcpus: topology.VcpuCount,
             memory_bytes: u64,
+            max_memory_bytes: u64,
             captured: bool,
             capture_path: ?[]const u8,
             capture_ownership: ?[]const u8,
@@ -899,6 +904,7 @@ pub const EventWriter = struct {
             .exit_code = value.exit_code,
             .vcpus = value.vcpus,
             .memory_bytes = value.memory_bytes,
+            .max_memory_bytes = value.max_memory_bytes,
             .captured = value.saved,
             .capture_path = value.save_path,
             .capture_ownership = value.save_ownership,
@@ -1059,10 +1065,10 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
             @errorName(err),
         );
     }
-    if (err == error.X86ExplicitMemoryRequired or err == error.X86ExperimentalMemorySizeUnsupported) {
+    if (err == error.X86ElasticMemoryUnsupported or err == error.X86ExperimentalMemorySizeUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: experimental x86-64 KVM requires explicit --memory 512mib; omitted and automatic memory are unavailable",
+            "spore run: experimental x86-64 KVM requires fixed 512mib memory; --max-memory is unavailable",
             @errorName(err),
         );
     }
@@ -1182,7 +1188,7 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
 }
 
 pub fn isX86ProductPolicyError(err: anyerror) bool {
-    return err == error.X86ExplicitMemoryRequired or
+    return err == error.X86ElasticMemoryUnsupported or
         err == error.X86ExperimentalMemorySizeUnsupported or
         err == error.X86VcpuCountUnsupported or
         err == error.X86ResumeUnsupported or
@@ -1207,6 +1213,7 @@ pub const SharedOptions = struct {
     initrd_path: ?[]const u8 = null,
     memory: memory_config.Config = .{},
     memory_set: bool = false,
+    max_memory_set: bool = false,
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
@@ -1312,7 +1319,8 @@ pub const cli_usage =
     \\  --save DIR              Save a spore to DIR; defaults to --save-on EXIT
     \\  --save-on WHEN          Save trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-save   Keep running after a signal-triggered save
-    \\  --memory VALUE          Guest memory: auto, 512mb, 2gb, ... (default: auto = 16GiB)
+    \\  --memory SIZE           Initial guest memory (default: 512mb)
+    \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
     \\  --vcpus N               Guest vCPU count (1-8; save/restore backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
@@ -1392,15 +1400,15 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             commit_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--disk-size")) {
             const raw = takeValue(args, &i, args[i]);
-            const parsed = memory_config.parse(raw) catch |err| {
+            const bytes = memory_config.parseBytes(raw) catch |err| {
                 std.debug.print("spore run: invalid --disk-size {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
-            if (parsed.policy != .explicit or parsed.bytes % rootfs_cas.default_chunk_size != 0) {
+            if (bytes % rootfs_cas.default_chunk_size != 0) {
                 std.debug.print("spore run: --disk-size must be a positive 64KiB-aligned size like 20gb\n", .{});
                 std.process.exit(2);
             }
-            disk_size = parsed.bytes;
+            disk_size = bytes;
         } else if (std.mem.eql(u8, args[i], "--pull")) {
             const raw = takeValue(args, &i, args[i]);
             pull_policy = PullPolicy.parse(raw) orelse {
@@ -1573,8 +1581,8 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             std.debug.print("spore run: --from is mutually exclusive with --kernel and --initrd\n", .{});
             std.process.exit(2);
         }
-        if (shared.memory_set) {
-            std.debug.print("spore run: --from uses the spore manifest memory size; omit --memory\n", .{});
+        if (shared.memory_set or shared.max_memory_set) {
+            std.debug.print("spore run: --from uses the spore manifest memory sizes; omit --memory and --max-memory\n", .{});
             std.process.exit(2);
         }
     } else {
@@ -1613,6 +1621,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
         std.debug.print("spore run: --bind-service requires --net\n", .{});
         std.process.exit(2);
     }
+    memory_config.validateCliOrExit("spore run", shared.memory);
 
     return .{
         .backend = backend,
@@ -3356,12 +3365,10 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const network_manifest = try manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy);
 
     const resuming = opts.resume_dir != null;
-    const memory_plan = runMemoryPlan(opts.memory, .{
-        .fixed_ram = resuming or opts.save_path != null or opts.vcpus != 1,
-        .auto_hotplug_capable = opts.auto_memory_hotplug_capable,
-    });
+    if (opts.memory.isElastic() and ((!resuming and !opts.auto_memory_hotplug_capable) or opts.vcpus != 1)) return error.ElasticMemoryUnsupported;
+    const memory_plan = runMemoryPlan(opts.memory);
     const local_backing_start = monotonicMs();
-    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, memory_plan.boot_ram_size);
+    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.maximum_bytes);
     const local_backing_ms = monotonicMs() -| local_backing_start;
     defer ram_plan.deinit();
     if (resuming) std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
@@ -3511,7 +3518,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
                 .capture_request = capture_plan.request,
                 .continue_after_capture = capture_plan.continue_after_capture,
-                .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled and opts.vcpus == 1, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
+                .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled and opts.vcpus == 1 and !opts.memory.isElastic(), .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                 .network = network,
                 .environ_map = context.environ_map,
             });
@@ -3545,7 +3552,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                     .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
                     .capture_request = capture_plan.request,
                     .continue_after_capture = capture_plan.continue_after_capture,
-                    .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled, .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
+                    .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled and !opts.memory.isElastic(), .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
                     .network = network,
                     .environ_map = context.environ_map,
                 });
@@ -3646,25 +3653,10 @@ const RunMemoryPlan = struct {
     virtio_mem_region_size: u64,
 };
 
-const RunMemoryConstraints = struct {
-    fixed_ram: bool = false,
-    auto_hotplug_capable: bool = false,
-};
-
-fn runMemoryPlan(memory: memory_config.Config, constraints: RunMemoryConstraints) RunMemoryPlan {
-    if (!constraints.fixed_ram and
-        constraints.auto_hotplug_capable and
-        memory.policy == .auto and
-        memory.bytes > auto_boot_memory_bytes)
-    {
-        return .{
-            .boot_ram_size = auto_boot_memory_bytes,
-            .virtio_mem_region_size = memory.bytes - auto_boot_memory_bytes,
-        };
-    }
+fn runMemoryPlan(memory: memory_config.Config) RunMemoryPlan {
     return .{
-        .boot_ram_size = memory.bytes,
-        .virtio_mem_region_size = 0,
+        .boot_ram_size = memory.initial_bytes,
+        .virtio_mem_region_size = memory.maximum_bytes - memory.initial_bytes,
     };
 }
 
@@ -3791,7 +3783,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
         .network = opts.network != .disabled or opts.network_runtime != null,
         .build = opts.context_disk_path != null or opts.build_input_rootfs.len != 0 or opts.build_cache_disk_fd != null or opts.build_mode or opts.runtime_disk_head != null,
     });
-    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.bytes);
+    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.maximum_bytes);
     defer ram_plan.deinit();
     if (opts.resume_dir != null) std.log.info("named monitor memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     var gateway: net_gateway.Process = undefined;
@@ -3849,7 +3841,8 @@ fn executeMonitorWithOptionalRootfsCacheLock(
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
             break :blk try hvf.vm.run(allocator, .{
                 .kernel = artifacts.kernel,
-                .ram_size = opts.memory.bytes,
+                .ram_size = opts.memory.initial_bytes,
+                .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
                 .vcpus = opts.vcpus,
                 .cmdline = boot_args,
                 .initrd = artifacts.initrd,
@@ -3879,7 +3872,8 @@ fn executeMonitorWithOptionalRootfsCacheLock(
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
                 break :blk try kvm.vm.run(allocator, .{
                     .kernel = artifacts.kernel,
-                    .ram_size = opts.memory.bytes,
+                    .ram_size = opts.memory.initial_bytes,
+                    .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
                     .vcpus = opts.vcpus,
                     .cmdline = boot_args,
                     .initrd = artifacts.initrd,
@@ -3908,7 +3902,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
                 break :blk try x86_vm.run(allocator, .{
                     .kernel = artifacts.kernel,
-                    .ram_size = opts.memory.bytes,
+                    .ram_size = opts.memory.initial_bytes,
                     .vcpu_count = @intCast(opts.vcpus),
                     .cmdline = boot_args,
                     .initrd = artifacts.initrd,
@@ -4431,7 +4425,8 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = opts.vcpus,
-        .memory_bytes = opts.memory.bytes,
+        .memory_bytes = opts.memory.initial_bytes,
+        .max_memory_bytes = opts.memory.maximum_bytes,
         .saved = saved,
         .save_path = if (saved) opts.save_path else null,
         .save_ownership = if (saved) saveOwnership(opts) else null,
@@ -4458,7 +4453,8 @@ fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *con
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = exit_code,
         .vcpus = opts.vcpus,
-        .memory_bytes = opts.memory.bytes,
+        .memory_bytes = opts.memory.initial_bytes,
+        .max_memory_bytes = opts.memory.maximum_bytes,
         .saved = true,
         .save_path = opts.save_path,
         .save_ownership = saveOwnership(opts),
@@ -4477,7 +4473,8 @@ fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.H
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
         .vcpus = opts.vcpus,
-        .memory_bytes = opts.memory.bytes,
+        .memory_bytes = opts.memory.initial_bytes,
+        .max_memory_bytes = opts.memory.maximum_bytes,
         .saved = true,
         .save_path = opts.save_path,
         .save_ownership = saveOwnership(opts),
@@ -4631,8 +4628,12 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
     } else if (std.mem.eql(u8, name, "--initrd")) {
         shared.initrd_path = takeValue(args, i, name);
     } else if (std.mem.eql(u8, name, "--memory")) {
-        shared.memory = memory_config.parseCliOrExit("spore run", takeValue(args, i, name));
+        shared.memory.initial_bytes = memory_config.parseCliBytesOrExit("spore run", "--memory", takeValue(args, i, name));
+        if (!shared.max_memory_set) shared.memory.maximum_bytes = shared.memory.initial_bytes;
         shared.memory_set = true;
+    } else if (std.mem.eql(u8, name, "--max-memory")) {
+        shared.memory.maximum_bytes = memory_config.parseCliBytesOrExit("spore run", "--max-memory", takeValue(args, i, name));
+        shared.max_memory_set = true;
     } else if (std.mem.eql(u8, name, "--memory-mib")) {
         memory_config.rejectMemoryMiBFlag("spore run");
     } else if (std.mem.eql(u8, name, "--vcpus")) {
@@ -4939,7 +4940,8 @@ test "event writer emits JSONL lifecycle and output records" {
         .probe_duration_ms = 2,
         .exit_code = 7,
         .vcpus = 1,
-        .memory_bytes = memory_config.auto_bytes,
+        .memory_bytes = memory_config.default_bytes,
+        .max_memory_bytes = memory_config.default_bytes,
         .memory_restore_source = "local_backing",
         .memory_restore_reason = "proof_valid",
     };
@@ -5005,7 +5007,8 @@ test "event writer emits exactly one terminal failure" {
         .probe_duration_ms = 1,
         .exit_code = 0,
         .vcpus = 1,
-        .memory_bytes = memory_config.auto_bytes,
+        .memory_bytes = memory_config.default_bytes,
+        .max_memory_bytes = memory_config.default_bytes,
     });
 
     var lines = std.mem.splitScalar(u8, out.written(), '\n');
@@ -5151,7 +5154,8 @@ test "event writer emits capture events before exit" {
         .probe_duration_ms = 1,
         .exit_code = 0,
         .vcpus = 1,
-        .memory_bytes = memory_config.auto_bytes,
+        .memory_bytes = memory_config.default_bytes,
+        .max_memory_bytes = memory_config.default_bytes,
         .saved = true,
         .save_path = "out.spore",
         .save_ownership = saved_spore_ownership.portable_self_contained,
@@ -5435,13 +5439,13 @@ test "run cli guest command rejects unquoted shell words" {
     try std.testing.expectError(error.ShellCommandArgumentCountUnsupported, cliGuestCommand(std.testing.allocator, opts));
 }
 
-test "run cli parser allows default boot assets" {
+test "run cli parser defaults to fixed 512MiB" {
     const opts = try parseCliArgs(&.{ "--", "/bin/writeout" });
     try std.testing.expectEqual(Backend.auto, opts.backend);
     try std.testing.expect(opts.shared.kernel_path == null);
     try std.testing.expect(opts.shared.initrd_path == null);
-    try std.testing.expectEqual(memory_config.Policy.auto, opts.shared.memory.policy);
-    try std.testing.expectEqual(memory_config.auto_bytes, opts.shared.memory.bytes);
+    try std.testing.expectEqual(memory_config.default_bytes, opts.shared.memory.initial_bytes);
+    try std.testing.expectEqual(memory_config.default_bytes, opts.shared.memory.maximum_bytes);
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
@@ -5457,49 +5461,47 @@ test "backend auto resolves to a supported host backend" {
     }
 }
 
-test "run cli parser accepts memory policy" {
-    const auto_opts = try parseCliArgs(&.{ "--memory", "auto", "--", "/bin/true" });
-    try std.testing.expectEqual(memory_config.Policy.auto, auto_opts.shared.memory.policy);
-    try std.testing.expectEqual(memory_config.auto_bytes, auto_opts.shared.memory.bytes);
-    try std.testing.expect(auto_opts.shared.memory_set);
+test "run cli parser separates initial and maximum memory" {
+    const fixed = try parseCliArgs(&.{ "--memory", "2gb", "--", "/bin/true" });
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), fixed.shared.memory.initial_bytes);
+    try std.testing.expectEqual(fixed.shared.memory.initial_bytes, fixed.shared.memory.maximum_bytes);
 
-    const explicit_opts = try parseCliArgs(&.{ "--memory", "16gb", "--", "/bin/true" });
-    try std.testing.expectEqual(memory_config.Policy.explicit, explicit_opts.shared.memory.policy);
-    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), explicit_opts.shared.memory.bytes);
-    try std.testing.expect(explicit_opts.shared.memory_set);
+    const elastic = try parseCliArgs(&.{ "--memory", "512mb", "--max-memory", "16gb", "--", "/bin/true" });
+    try std.testing.expectEqual(memory_config.default_bytes, elastic.shared.memory.initial_bytes);
+    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), elastic.shared.memory.maximum_bytes);
+
+    const default_initial = try parseCliArgs(&.{ "--max-memory", "16gb", "--", "/bin/true" });
+    try std.testing.expectEqual(memory_config.default_bytes, default_initial.shared.memory.initial_bytes);
+    try std.testing.expectEqual(elastic.shared.memory.maximum_bytes, default_initial.shared.memory.maximum_bytes);
 }
 
-test "run memory plan selects virtio-mem only for capable fresh auto runs" {
-    const auto = memory_config.Config{};
-    const hotplug = runMemoryPlan(auto, .{ .auto_hotplug_capable = true });
-    try std.testing.expectEqual(auto_boot_memory_bytes, hotplug.boot_ram_size);
-    try std.testing.expectEqual(memory_config.auto_bytes - auto_boot_memory_bytes, hotplug.virtio_mem_region_size);
+test "run memory plan is fixed unless maximum exceeds initial" {
+    const fixed = memory_config.Config.fixed(2 * 1024 * 1024 * 1024);
+    const fixed_plan = runMemoryPlan(fixed);
+    try std.testing.expectEqual(fixed.initial_bytes, fixed_plan.boot_ram_size);
+    try std.testing.expectEqual(@as(u64, 0), fixed_plan.virtio_mem_region_size);
 
-    const custom_assets = runMemoryPlan(auto, .{});
-    try std.testing.expectEqual(memory_config.auto_bytes, custom_assets.boot_ram_size);
-    try std.testing.expectEqual(@as(u64, 0), custom_assets.virtio_mem_region_size);
-
-    const capture_or_resume = runMemoryPlan(auto, .{ .fixed_ram = true, .auto_hotplug_capable = true });
-    try std.testing.expectEqual(memory_config.auto_bytes, capture_or_resume.boot_ram_size);
-    try std.testing.expectEqual(@as(u64, 0), capture_or_resume.virtio_mem_region_size);
-
-    const explicit = memory_config.Config{ .policy = .explicit, .bytes = 1024 * 1024 * 1024 };
-    const explicit_plan = runMemoryPlan(explicit, .{ .auto_hotplug_capable = true });
-    try std.testing.expectEqual(explicit.bytes, explicit_plan.boot_ram_size);
-    try std.testing.expectEqual(@as(u64, 0), explicit_plan.virtio_mem_region_size);
+    const elastic = memory_config.Config{ .initial_bytes = memory_config.default_bytes, .maximum_bytes = 16 * 1024 * 1024 * 1024 };
+    const elastic_plan = runMemoryPlan(elastic);
+    try std.testing.expectEqual(elastic.initial_bytes, elastic_plan.boot_ram_size);
+    try std.testing.expectEqual(elastic.maximum_bytes - elastic.initial_bytes, elastic_plan.virtio_mem_region_size);
 }
 
-test "x86 fresh product policy is explicit and fail closed" {
+test "x86 fresh product policy is fixed and fail closed" {
     const accepted = FreshProductPolicy{
-        .memory = .{ .policy = .explicit, .bytes = x86_experimental_memory_bytes },
+        .memory = memory_config.Config.fixed(x86_experimental_memory_bytes),
         .vcpus = 1,
     };
     try validateFreshProductPolicyFor(.x86_64, .kvm, accepted);
     try validateFreshProductPolicyFor(.aarch64, .kvm, .{ .memory = .{}, .vcpus = 8, .resuming = true, .capture = true });
     try std.testing.expectError(error.UnsupportedBackend, validateFreshProductPolicyFor(.x86_64, .hvf, accepted));
-    try std.testing.expectError(error.X86ExplicitMemoryRequired, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = .{}, .vcpus = 1 }));
+    try validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = .{}, .vcpus = 1 });
     try std.testing.expectError(error.X86ExperimentalMemorySizeUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
-        .memory = .{ .policy = .explicit, .bytes = 1024 * 1024 * 1024 },
+        .memory = memory_config.Config.fixed(1024 * 1024 * 1024),
+        .vcpus = 1,
+    }));
+    try std.testing.expectError(error.X86ElasticMemoryUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
+        .memory = .{ .initial_bytes = 512 * 1024 * 1024, .maximum_bytes = 1024 * 1024 * 1024 },
         .vcpus = 1,
     }));
     try std.testing.expectError(error.X86VcpuCountUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
@@ -5933,7 +5935,8 @@ test "saved run result exits zero" {
         .probe_duration_ms = 1,
         .exit_code = 0,
         .vcpus = 1,
-        .memory_bytes = memory_config.auto_bytes,
+        .memory_bytes = memory_config.default_bytes,
+        .max_memory_bytes = memory_config.default_bytes,
         .saved = true,
         .save_path = "out.spore",
     };
@@ -5957,7 +5960,8 @@ test "saved run result preserves stored exit code" {
         .probe_duration_ms = 1,
         .exit_code = 7,
         .vcpus = 1,
-        .memory_bytes = memory_config.auto_bytes,
+        .memory_bytes = memory_config.default_bytes,
+        .max_memory_bytes = memory_config.default_bytes,
         .saved = true,
         .save_path = "out.spore",
     };

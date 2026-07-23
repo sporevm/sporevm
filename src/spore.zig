@@ -4,8 +4,8 @@
 //! fixed-size `chunks/<blake3-hex>` files with all-zero chunks elided; optional
 //! writable disks use verified chunk indexes and CAS objects. Machine state is
 //! normalized architectural aarch64 state — never raw
-//! hypervisor structures (see docs/spore-format.md). Formats v2 and v3 are the
-//! current manifest contracts; future versions should be deliberate migrations.
+//! hypervisor structures (see docs/spore-format.md). Formats v2/v3 are fixed
+//! memory and v4/v5 add normalized elastic-memory state.
 //!
 //! Manifests and chunks may come from untrusted storage: parsing is strict,
 //! chunk contents are verified against their ids before use, and restore
@@ -20,6 +20,7 @@ const disk_index = @import("disk_index.zig");
 const generation = @import("generation.zig");
 const gicv3 = @import("aarch64/gicv3.zig");
 const local_paths = @import("local_paths.zig");
+const memory_config = @import("memory.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
 const virtqueue = @import("virtio/queue.zig");
@@ -31,6 +32,8 @@ pub const format_version_legacy_v0: u32 = 0;
 pub const format_version_legacy_v1: u32 = 1;
 pub const format_version: u32 = 2;
 pub const format_version_v1: u32 = 3;
+pub const format_version_elastic: u32 = 4;
+pub const format_version_v1_elastic: u32 = 5;
 pub const max_manifest_bytes: usize = 64 * 1024 * 1024;
 pub const machine_schema_version_v1: u32 = 1;
 pub const chunk_size: usize = 2 * 1024 * 1024;
@@ -38,6 +41,7 @@ pub const ram_backing_kind = "map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
 pub const ram_backing_proof_path = "ram.backing.proof";
 pub const memory_object_namespace = "memory/blake3";
+pub const virtio_mem_device_id: u32 = 24;
 
 const local_backing_proof_version_v1: u32 = 1;
 const local_backing_proof_version_v2: u32 = 2;
@@ -429,6 +433,9 @@ pub const MemoryChunkRange = struct {
     end: usize,
 };
 
+pub const MemoryState = memory_config.CapturedState;
+pub const MemoryPluggedRange = memory_config.PluggedRange;
+
 pub const GenerationState = generation.State;
 pub const max_annotations_json_bytes = 64 * 1024;
 pub const Annotations = std.json.ArrayHashMap([]const u8);
@@ -445,6 +452,7 @@ pub const Manifest = struct {
     network: ?Network = null,
     sessions: []const Session = &.{},
     exec_defaults: ?ExecDefaults = null,
+    memory_state: ?MemoryState = null,
     memory: MemoryManifest,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
@@ -464,6 +472,7 @@ pub const ManifestV1 = struct {
     network: ?Network = null,
     sessions: []const Session = &.{},
     exec_defaults: ?ExecDefaults = null,
+    memory_state: ?MemoryState = null,
     memory: MemoryManifest,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
@@ -474,7 +483,7 @@ pub const ManifestV1 = struct {
 fn stringifyManifest(manifest: anytype, writer: anytype) !void {
     try writer.beginObject();
     inline for (std.meta.fields(@TypeOf(manifest))) |field| {
-        if (comptime std.mem.eql(u8, field.name, "exec_defaults")) {
+        if (comptime std.mem.eql(u8, field.name, "exec_defaults") or std.mem.eql(u8, field.name, "memory_state")) {
             if (@field(manifest, field.name)) |defaults| {
                 try writer.objectField(field.name);
                 try writer.write(defaults);
@@ -2010,9 +2019,15 @@ pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Man
 }
 
 pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
-    try validateAnnotations(manifest.annotations);
-    try validateSessions(manifest.sessions);
-    if (manifest.exec_defaults) |defaults| try validateExecDefaults(defaults);
+    if (manifest.memory_state != null) {
+        try validateManifest(manifest);
+    } else {
+        // Preserve the legacy writer behavior used by compatibility fixtures;
+        // current capture paths produce already-validated fixed manifests.
+        try validateAnnotations(manifest.annotations);
+        try validateSessions(manifest.sessions);
+        if (manifest.exec_defaults) |defaults| try validateExecDefaults(defaults);
+    }
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
@@ -2127,7 +2142,8 @@ fn forkV0(allocator: std.mem.Allocator, options: ForkOptions, parent: Manifest) 
     if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
 
     const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
-    const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size, 1);
+    const ram_size = parent.memory.logical_size;
+    const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, ram_size, 1);
     defer if (shared_backing) |backing| backing.deinit();
 
     const fork_batch_id = try randomHex(allocator, 16);
@@ -2138,7 +2154,7 @@ fn forkV0(allocator: std.mem.Allocator, options: ForkOptions, parent: Manifest) 
         try ensureNewDir(child_dir);
         try linkForkSharedStores(allocator, child_dir, shared);
         var child = parent;
-        try prepareForkChildBacking(allocator, child_dir, &child.memory, child.platform.ram_size, shared_backing, options.environ_map);
+        try prepareForkChildBacking(allocator, child_dir, &child.memory, ram_size, shared_backing, options.environ_map);
 
         const child_generation = parent.generation.generation + i + 1;
         const identity = try childIdentity(allocator, fork_batch_id, i);
@@ -2174,7 +2190,8 @@ fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1
 
     const child_gic = try forkGicStateV1(allocator, parent.machine.gic);
     const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
-    const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, parent.platform.ram_size, parent.platform.vcpu_count);
+    const ram_size = parent.memory.logical_size;
+    const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, ram_size, parent.platform.vcpu_count);
     defer if (shared_backing) |backing| backing.deinit();
     const fork_batch_id = try randomHex(allocator, 16);
 
@@ -2184,7 +2201,7 @@ fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1
         try ensureNewDir(child_dir);
         try linkForkSharedStores(allocator, child_dir, shared);
         var child = parent;
-        try prepareForkChildBacking(allocator, child_dir, &child.memory, child.platform.ram_size, shared_backing, options.environ_map);
+        try prepareForkChildBacking(allocator, child_dir, &child.memory, ram_size, shared_backing, options.environ_map);
 
         const child_generation = parent.generation.generation + i + 1;
         const identity = try childIdentity(allocator, fork_batch_id, i);
@@ -2626,7 +2643,7 @@ fn forkGicStateV1(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.
 }
 
 pub fn validateManifest(manifest: Manifest) Error!void {
-    try validateManifestVersion(manifest.version, format_version);
+    try validateManifestMemoryVersion(manifest.version, format_version, format_version_elastic, manifest.memory_state);
     try validateManifestCommon(
         manifest.annotations,
         manifest.platform.cpu_profile,
@@ -2638,13 +2655,14 @@ pub fn validateManifest(manifest: Manifest) Error!void {
         manifest.network,
         manifest.sessions,
         manifest.exec_defaults,
+        manifest.memory_state,
         manifest.memory,
     );
     gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
 }
 
 pub fn validateManifestV1(manifest: ManifestV1) Error!void {
-    try validateManifestVersion(manifest.version, format_version_v1);
+    try validateManifestMemoryVersion(manifest.version, format_version_v1, format_version_v1_elastic, manifest.memory_state);
     try validateManifestCommon(
         manifest.annotations,
         manifest.platform.cpu_profile,
@@ -2656,9 +2674,17 @@ pub fn validateManifestV1(manifest: ManifestV1) Error!void {
         manifest.network,
         manifest.sessions,
         manifest.exec_defaults,
+        manifest.memory_state,
         manifest.memory,
     );
     try validateMachineV1(manifest.platform, manifest.machine);
+}
+
+fn validateManifestMemoryVersion(actual: u32, fixed_version: u32, elastic_version: u32, memory_state: ?MemoryState) Error!void {
+    if (memory_state == null) return validateManifestVersion(actual, fixed_version);
+    if (actual == elastic_version) return;
+    if (actual < elastic_version) return error.FormatTooOld;
+    return error.BadManifest;
 }
 
 fn validateManifestVersion(actual: u32, expected: u32) Error!void {
@@ -2678,6 +2704,7 @@ fn validateManifestCommon(
     network: ?Network,
     sessions: []const Session,
     exec_defaults: ?ExecDefaults,
+    memory_state: ?MemoryState,
     memory: MemoryManifest,
 ) Error!void {
     try validateAnnotations(annotations);
@@ -2689,12 +2716,20 @@ fn validateManifestCommon(
     {
         return error.BadManifest;
     }
-    if (ram_size > std.math.maxInt(usize)) return error.BadManifest;
-    _ = try validateMemoryForRam(memory, @intCast(ram_size));
+    const memory_size = if (memory_state) |state| try validateMemoryState(state, ram_size) else ram_size;
+    if (memory_size > std.math.maxInt(usize)) return error.BadManifest;
+    _ = try validateMemoryForRam(memory, @intCast(memory_size));
     if (memory.backing) |backing| {
-        try validateMemoryBacking(backing, ram_size);
+        try validateMemoryBacking(backing, memory_size);
     }
     try validateTransportQueues(devices);
+    var virtio_mem_count: usize = 0;
+    for (devices) |device| {
+        if (device.device_id == virtio_mem_device_id) virtio_mem_count += 1;
+    }
+    if ((memory_state != null and virtio_mem_count != 1) or (memory_state == null and virtio_mem_count != 0)) {
+        return error.BadManifest;
+    }
     if (rootfs) |r| {
         try validateRootfs(r, devices);
     }
@@ -2704,6 +2739,39 @@ fn validateManifestCommon(
     if (network) |n| {
         try validateNetwork(n);
     }
+}
+
+pub fn memoryConfig(ram_size: u64, state: ?MemoryState) Error!memory_config.Config {
+    if (state) |elastic| {
+        _ = try validateMemoryState(elastic, ram_size);
+        return elastic.config();
+    }
+    return memory_config.fromManifestBytes(ram_size) catch return error.BadManifest;
+}
+
+fn validateMemoryState(state: MemoryState, ram_size: u64) Error!u64 {
+    if (state.initial_size != ram_size or state.maximum_size <= state.initial_size) return error.BadManifest;
+    state.config().validate() catch return error.BadManifest;
+    if (state.block_size != memory_config.elastic_block_size) return error.BadManifest;
+    if (state.requested_size < state.initial_size or state.requested_size > state.maximum_size) return error.BadManifest;
+    if (state.captured_size < state.initial_size or state.captured_size > state.requested_size) return error.BadManifest;
+    if ((state.requested_size - state.initial_size) % state.block_size != 0) return error.BadManifest;
+    if ((state.captured_size - state.initial_size) % state.block_size != 0) return error.BadManifest;
+
+    const region_blocks = (state.maximum_size - state.initial_size) / state.block_size;
+    const requested_blocks = (state.requested_size - state.initial_size) / state.block_size;
+    var next_block: u64 = 0;
+    var plugged_blocks: u64 = 0;
+    for (state.plugged_ranges) |range| {
+        if (range.block_count == 0 or range.start_block < next_block) return error.BadManifest;
+        const end = std.math.add(u64, range.start_block, range.block_count) catch return error.BadManifest;
+        if (end > region_blocks or end > requested_blocks) return error.BadManifest;
+        plugged_blocks = std.math.add(u64, plugged_blocks, range.block_count) catch return error.BadManifest;
+        next_block = end;
+    }
+    const plugged_bytes = std.math.mul(u64, plugged_blocks, state.block_size) catch return error.BadManifest;
+    if (state.captured_size != state.initial_size + plugged_bytes) return error.BadManifest;
+    return state.maximum_size;
 }
 
 pub fn validateExecDefaults(defaults: ExecDefaults) Error!void {
@@ -3713,6 +3781,33 @@ test "fuzz manifest v1 parsing" {
     try std.testing.fuzz({}, fuzzManifestV1Parse, .{});
 }
 
+fn fuzzElasticMemoryState(_: void, s: *std.testing.Smith) !void {
+    // Elastic memory state is attacker-controlled manifest input. Exercise
+    // range arithmetic independently so malformed block layouts cannot wrap,
+    // overlap, or escape the declared maximum.
+    var ranges: [16]MemoryPluggedRange = undefined;
+    const range_count = @as(usize, s.value(u8)) % (ranges.len + 1);
+    for (ranges[0..range_count]) |*range| {
+        range.* = .{
+            .start_block = s.value(u32),
+            .block_count = s.value(u32),
+        };
+    }
+    const state = MemoryState{
+        .initial_size = s.value(u64),
+        .maximum_size = s.value(u64),
+        .requested_size = s.value(u64),
+        .captured_size = s.value(u64),
+        .block_size = s.value(u64),
+        .plugged_ranges = ranges[0..range_count],
+    };
+    _ = validateMemoryState(state, s.value(u64)) catch return;
+}
+
+test "fuzz elastic memory state validation" {
+    try std.testing.fuzz({}, fuzzElasticMemoryState, .{});
+}
+
 fn fuzzMemoryManifest(_: void, s: *std.testing.Smith) !void {
     // Hostile memory manifests must fail closed, never read outside the
     // chunk store or write outside the target buffer.
@@ -3969,6 +4064,49 @@ test "manifest rejects oversized annotations" {
     try annotations.map.put(arena, "dev.buildkite.cleanroom.policy_hash", value);
     manifest.annotations = annotations;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+}
+
+test "elastic manifest round trips normalized memory state on a new version" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const initial_size = chunk_size;
+    const maximum_size = test_zero_memory_size;
+    var devices = [_]TransportState{testTransport(virtio_mem_device_id)};
+    const ranges = [_]MemoryPluggedRange{
+        .{ .start_block = 0, .block_count = 2 },
+        .{ .start_block = 4, .block_count = 1 },
+    };
+    var manifest = testForkManifest(testZeroMemoryManifest(maximum_size), initial_size, 3);
+    manifest.version = format_version_elastic;
+    manifest.devices = &devices;
+    manifest.memory_state = .{
+        .initial_size = initial_size,
+        .maximum_size = maximum_size,
+        .requested_size = maximum_size,
+        .captured_size = initial_size + 3 * memory_config.elastic_block_size,
+        .plugged_ranges = &ranges,
+    };
+
+    try saveManifest(arena, dir, manifest);
+    const parsed = try loadManifest(arena, dir);
+    defer parsed.deinit();
+    try std.testing.expectEqual(format_version_elastic, parsed.value.version);
+    try std.testing.expectEqual(initial_size, parsed.value.platform.ram_size);
+    try std.testing.expectEqual(maximum_size, parsed.value.memory.logical_size);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.memory_state.?.plugged_ranges.len);
+    try std.testing.expectEqual(maximum_size, (try memoryConfig(parsed.value.platform.ram_size, parsed.value.memory_state)).maximum_bytes);
+
+    var legacy = manifest;
+    legacy.version = format_version;
+    legacy.memory_state = null;
+    legacy.devices = &.{};
+    legacy.platform.ram_size = maximum_size;
+    try validateManifest(legacy);
+    try std.testing.expectEqual(maximum_size, (try memoryConfig(legacy.platform.ram_size, legacy.memory_state)).initial_bytes);
 }
 
 fn testTransport(device_id: u32) TransportState {

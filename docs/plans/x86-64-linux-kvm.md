@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-20
+last_reviewed: 2026-07-23
 spec_refs:
   - docs/spore-format.md
   - docs/state-portability.md
@@ -16,7 +16,6 @@ spec_refs:
   - src/kvm/common.zig
   - src/kvm/x86_64.zig
 related_plans:
-  - docs/plans/automatic-memory.md
   - docs/plans/multi-vcpu-nondestructive-save.md
   - docs/plans/spore-build.md
 ---
@@ -49,12 +48,12 @@ requires a matching architecture and compatible machine profile.
 | OCI/rootfs/network/image commit | Next: Slice 3b | Product gates remain closed |
 | Native build and standalone libspore | Pending: Slice 3c | Product gates remain closed |
 | Saved machine state and lifecycle parity | Pending: Slices 4–5 | No x86 manifest writer yet |
-| High/automatic memory and performance | Pending: Slice 6 | Product requires one vCPU and explicit 512 MiB |
+| High/elastic memory and performance | Pending: Slice 6 | Product requires fixed 512 MiB |
 | Packaging and supported release | Pending: Slice 7 | No x86 support claim yet |
 
 The current product path is experimental and fresh-only: Linux/x86-64 KVM, one
-vCPU, and explicit 512 MiB memory. OCI/rootfs, networking, build, libspore,
-capture, fork, automatic memory, and release paths remain fail closed.
+vCPU, and fixed 512 MiB memory. OCI/rootfs, networking, build, libspore,
+capture, fork, elastic memory, and release paths remain fail closed.
 
 ## Scope
 
@@ -62,12 +61,13 @@ Deliver the complete existing fresh, build, save, restore, fork, bundle, named
 lifecycle, networking, memory, CLI, and libspore contracts on x86-64 Linux/KVM.
 Use native `linux/amd64` workloads, normalized x86 machine state, one frozen
 virtio-mmio device model, and same-host-class portability. Preserve existing
-ARM behaviour and byte-compatible aarch64 v2/v3 manifests.
+ARM behaviour, byte-compatible fixed-memory aarch64 v2/v3 manifests, and the
+normalized elastic v4/v5 contract.
 
 This plan does not add x86 Hypervisor.framework, emulation, cross-ISA
 conversion, Windows support, PCI/ACPI/firmware boot, nested virtualization,
-cross-platform build emulation, arbitrary cross-vendor restore, persisted
-virtio-mem state, or a speculative hypervisor/run-loop framework.
+cross-platform build emulation, arbitrary cross-vendor restore, or a
+speculative hypervisor/run-loop framework.
 
 ## Product Contract
 
@@ -170,7 +170,7 @@ smokes pass on x86, with unchanged ARM build behaviour.
 ### Slice 4: Manifest v4 and fixed-memory capture
 
 Slice 4 uses one vCPU, one low RAM region, and one KVM slot. High RAM and
-automatic memory remain Slice 6 work.
+elastic memory remains Slice 6 work.
 
 #### Stage 4a: Specify and parse x86 manifest v4
 
@@ -251,7 +251,7 @@ sharing mutable generation or disk authority.
 **Done when:** x86 passes the same fixed-memory named lifecycle graph as ARM,
 including a running source beside restored or forked children.
 
-### Slice 6: Segmented memory, automatic memory, and performance
+### Slice 6: Segmented memory, elastic memory, and performance
 
 #### Stage 6a: Introduce and use bounded memory regions
 
@@ -271,16 +271,19 @@ including a running source beside restored or forked children.
 chunks, single-region v4 still restores, and ARM memory/snapshot regressions
 remain green.
 
-#### Stage 6b: Restore automatic memory
+#### Stage 6b: Add explicit elastic memory
 
 - Place transient x86 virtio-mem above fixed high RAM without colliding with
   board holes or device MMIO.
-- Keep transient state unsavable and normalize capture to fixed RAM, matching
-  the existing product contract.
-- Run sparse 16 GiB fresh and lifecycle accounting smokes.
+- Reuse the public initial/maximum contract: fixed 512 MiB by default and
+  grow-only virtio-mem only when maximum exceeds initial.
+- Persist normalized requested, captured, and plugged-range state in the x86
+  saved-state format without serializing KVM structs.
+- Run explicit `--memory 512mb --max-memory 16gb` fresh, capture, resume, and
+  lifecycle accounting smokes.
 
-**Done when:** omitted `--memory` exposes the documented sparse 16 GiB x86
-contract and saved state contains only fixed RAM.
+**Done when:** omitted memory flags remain fixed at 512 MiB, explicit elastic
+memory resumes the exact captured layout, and unsupported kernels fail closed.
 
 #### Stage 6c: Establish performance evidence
 
@@ -331,7 +334,7 @@ cumulative native gates:
 | OCI/rootfs/network/build | parser and conformance tests | workload and policy matrices |
 | Manifest and machine state | codec, bounds, fuzz, restore-order tests | process-boundary capture/restore |
 | Multi-vCPU lifecycle | topology and state tests | save/fork/named lifecycle matrix |
-| Segmented/automatic memory | region, boundary, dirty-map fuzz/tests | high-RAM, lazy/local, sparse 16 GiB |
+| Segmented/elastic memory | region, boundary, dirty-map fuzz/tests | high-RAM, lazy/local, explicit elastic range |
 | Packaging | archive, selector, installer tests | packaged CLI plus C/Go libspore |
 | Performance | benchmark parser/comparison tests | separate x86 baseline |
 
@@ -366,5 +369,5 @@ release notes only when packaged support is proven.
 
 All remaining slices and their native gates pass: the complete x86 product
 contract works, strict v4 preserves aarch64 v2/v3 compatibility, segmented and
-automatic memory do not regress ARM, and Slice 7 ships reproducible packages,
+elastic memory does not regress ARM, and Slice 7 ships reproducible packages,
 performance history, exact host reporting, and current durable docs.
