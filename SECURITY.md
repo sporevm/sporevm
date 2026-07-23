@@ -150,6 +150,13 @@ the aggregate. BuildKit result identity retains cache options only for a shared
 ID whose value equals the resolved destination; Spore matches that value-based
 rule without trying to recover whether the ID was written explicitly. Cache
 bytes are never rootfs CAS, manifest, secret, SSH, or credential input.
+The aggregate disk is one mutable cleanup unit rather than durable state rooted
+by build-step records. System prune and root-aware GC can unlink it only while
+holding the same coarse rootfs-cache `flock` as build execution and publication,
+so an active mount cannot race cleanup. The kernel releases both cache locks on
+process exit, including a crash. Lock pathnames may remain as inert files, but
+they carry no lease authority or retention lifetime; a later cleanup can always
+reclaim the disk, and a later build rejects or replaces an unclean disk.
 
 Default context bind mounts accept only one expanded literal relative source
 and one expanded target per declaration on ordinary shell-form RUN. Exec-form

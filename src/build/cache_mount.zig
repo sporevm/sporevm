@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const chunk_sealer = @import("../chunk_sealer.zig");
@@ -11,8 +12,8 @@ pub const max_target_bytes = 512;
 pub const max_id_bytes = 512;
 pub const default_disk_bytes: u64 = 4 << 30;
 const default_inode_count: u32 = 262_144;
-const store_rel = "build/cache-mounts-v1";
-const disk_name = "shared.ext4";
+pub const store_rel = "build/cache-mounts-v1";
+pub const disk_name = "shared.ext4";
 const cache_key_domain = "spore-build-cache-mount-key-v1";
 const mount_digest_domain = "spore-build-cache-mounts-v1";
 const ext4_magic: u16 = 0xef53;
@@ -38,6 +39,37 @@ pub const Mount = struct {
     key: []const u8,
     sharing: Sharing = .shared,
 };
+
+pub const DiskStats = struct {
+    path: []const u8,
+    logical_bytes: u64,
+    allocated_bytes: u64,
+    mtime_ns: i96,
+};
+
+pub fn diskPath(allocator: std.mem.Allocator, cache_root: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ cache_root, store_rel, disk_name });
+}
+
+pub fn diskStats(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !?DiskStats {
+    const path = try diskPath(allocator, cache_root);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return switch (std.c.errno(-1)) {
+        .NOENT => null,
+        else => error.CacheMountDiskOpenFailed,
+    };
+    defer _ = std.c.close(fd);
+    const stat = try (Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).stat(io);
+    if (stat.kind != .file) return error.CacheMountDiskInvalid;
+    return .{
+        .path = path,
+        .logical_bytes = stat.size,
+        .allocated_bytes = try std.math.mul(u64, try allocatedFileBlocks512(fd), 512),
+        .mtime_ns = stat.mtime.nanoseconds,
+    };
+}
 
 pub fn resolve(
     allocator: std.mem.Allocator,
@@ -199,6 +231,23 @@ pub const Store = struct {
         self.lock.deinit();
     }
 };
+
+fn allocatedFileBlocks512(fd: std.c.fd_t) !u64 {
+    return switch (builtin.os.tag) {
+        .linux => blk: {
+            var stat: std.os.linux.Statx = undefined;
+            const requested: std.os.linux.STATX = .{ .BLOCKS = true };
+            if (std.c.statx(fd, "", std.c.AT.EMPTY_PATH, requested, &stat) != 0 or !stat.mask.BLOCKS) return error.CacheMountDiskStatFailed;
+            break :blk stat.blocks;
+        },
+        .macos => blk: {
+            var stat: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &stat) != 0 or stat.blocks < 0) return error.CacheMountDiskStatFailed;
+            break :blk @intCast(stat.blocks);
+        },
+        else => @compileError("cache mount allocation accounting requires Linux statx or Darwin fstat"),
+    };
+}
 
 fn validDisk(io: Io, allocator: std.mem.Allocator, path: []const u8, image_size: u64) !bool {
     const path_z = try allocator.dupeZ(u8, path);

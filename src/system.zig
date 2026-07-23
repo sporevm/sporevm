@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
+const build_cache_mount = @import("build/cache_mount.zig");
 const build_step_cache = @import("build/step_cache.zig");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
@@ -56,9 +57,9 @@ const cache_usage =
     \\  spore cache unpin PIN_ID --force
     \\
     \\Options:
-    \\  --rootfs    Collect only the rootfs CAS cache (currently the only CAS scope)
+    \\  --rootfs    Collect the rootfs CAS and local build cache-mount storage
     \\  --dry-run   Report garbage without deleting it (default)
-    \\  --force     Delete unrooted CAS indexes and chunk objects
+    \\  --force     Delete unrooted CAS entries and build cache-mount storage
     \\  -h, --help  Show this help
     \\
     \\Pin safety:
@@ -72,6 +73,12 @@ pub const CacheStats = struct {
     bytes: u64 = 0,
 };
 
+pub const BuildCacheMountStats = struct {
+    count: usize = 0,
+    logical_bytes: u64 = 0,
+    allocated_bytes: u64 = 0,
+};
+
 pub const RootfsSystemSummary = struct {
     cache_root: []const u8,
     image_rootfs: CacheStats = .{},
@@ -83,6 +90,7 @@ pub const RootfsSystemSummary = struct {
     cas_complete_stamps: CacheStats = .{},
     ref_records: CacheStats = .{},
     temp_entries: CacheStats = .{},
+    build_cache_mounts: BuildCacheMountStats = .{},
     known_logical_bytes: u64 = 0,
     default_prunable_bytes: u64 = 0,
 };
@@ -92,6 +100,7 @@ const RootfsEntryKind = enum {
     digest_artifact,
     cas_index,
     cas_object,
+    build_cache_mount,
 
     fn label(self: RootfsEntryKind) []const u8 {
         return switch (self) {
@@ -99,6 +108,7 @@ const RootfsEntryKind = enum {
             .digest_artifact => "digest-artifact",
             .cas_index => "rootfs-cas-index",
             .cas_object => "rootfs-cas-object",
+            .build_cache_mount => "build-cache-mount",
         };
     }
 };
@@ -126,10 +136,14 @@ pub const RootfsPruneResult = struct {
     candidate_count: usize = 0,
     candidate_bytes: u64 = 0,
     candidate_reclaimable_bytes: u64 = 0,
+    cache_mount_candidate_count: usize = 0,
+    cache_mount_candidate_reclaimable_bytes: u64 = 0,
     default_selection: bool = false,
     deleted_count: usize = 0,
     deleted_bytes: u64 = 0,
     deleted_reclaimable_bytes: u64 = 0,
+    cache_mount_deleted_count: usize = 0,
+    cache_mount_deleted_reclaimable_bytes: u64 = 0,
     entries: []const RootfsPruneEntry = &.{},
     runtime_forks: ?RuntimeForkPruneResult = null,
 };
@@ -158,6 +172,10 @@ pub const RootfsGcResult = struct {
     candidate_bytes: u64 = 0,
     deleted_count: usize = 0,
     deleted_bytes: u64 = 0,
+    cache_mount_candidate_count: usize = 0,
+    cache_mount_candidate_bytes: u64 = 0,
+    cache_mount_deleted_count: usize = 0,
+    cache_mount_deleted_bytes: u64 = 0,
     entries: []const RootfsGcEntry = &.{},
 };
 
@@ -256,6 +274,7 @@ const PrunePlanEntry = struct {
     bytes: u64,
     metadata_bytes: u64 = 0,
     link_count: u64 = 1,
+    reclaimable_bytes: ?u64 = null,
     mtime_ns: i96,
     selected: bool = false,
 
@@ -264,6 +283,7 @@ const PrunePlanEntry = struct {
     }
 
     fn reclaimableBytes(self: PrunePlanEntry) u64 {
+        if (self.reclaimable_bytes) |bytes| return bytes;
         return (if (self.link_count <= 1) self.bytes else 0) + self.metadata_bytes;
     }
 };
@@ -855,9 +875,18 @@ fn summarizeRootfsCache(allocator: std.mem.Allocator, io: Io, cache_root: []cons
     summary.cas_indexes = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/indexes");
     summary.cas_objects = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/objects");
     summary.cas_complete_stamps = try treeStats(allocator, io, cache_root, "cas/rootfs/blake3/complete");
+    if (try build_cache_mount.diskStats(io, allocator, cache_root)) |stats| {
+        summary.build_cache_mounts = .{
+            .count = 1,
+            .logical_bytes = stats.logical_bytes,
+            .allocated_bytes = stats.allocated_bytes,
+        };
+        summary.default_prunable_bytes += stats.allocated_bytes;
+    }
     summary.known_logical_bytes = summary.image_rootfs.bytes + summary.image_metadata.bytes +
         summary.digest_artifacts.bytes + summary.cas_indexes.bytes + summary.cas_objects.bytes +
-        summary.cas_complete_stamps.bytes + summary.ref_records.bytes + summary.temp_entries.bytes;
+        summary.cas_complete_stamps.bytes + summary.ref_records.bytes + summary.temp_entries.bytes +
+        summary.build_cache_mounts.logical_bytes;
     return summary;
 }
 
@@ -917,6 +946,10 @@ fn pruneRootfsCache(
     var deleted_count: usize = 0;
     var deleted_bytes: u64 = 0;
     var deleted_reclaimable_bytes: u64 = 0;
+    var cache_mount_candidate_count: usize = 0;
+    var cache_mount_candidate_reclaimable_bytes: u64 = 0;
+    var cache_mount_deleted_count: usize = 0;
+    var cache_mount_deleted_reclaimable_bytes: u64 = 0;
 
     var selected_rootfs_object_digests = std.StringHashMap(void).init(allocator);
     defer deinitRootfsObjectDigestSet(allocator, &selected_rootfs_object_digests);
@@ -931,6 +964,10 @@ fn pruneRootfsCache(
         const reclaimable = entry.reclaimableBytes();
         candidate_bytes += logical;
         candidate_reclaimable_bytes += reclaimable;
+        if (entry.kind == .build_cache_mount) {
+            cache_mount_candidate_count += 1;
+            cache_mount_candidate_reclaimable_bytes += reclaimable;
+        }
         try result_entries.append(.{
             .kind = entry.kind.label(),
             .path = entry.path,
@@ -953,6 +990,10 @@ fn pruneRootfsCache(
             deleted_count += 1;
             deleted_bytes += logical;
             deleted_reclaimable_bytes += reclaimable;
+            if (entry.kind == .build_cache_mount) {
+                cache_mount_deleted_count += 1;
+                cache_mount_deleted_reclaimable_bytes += reclaimable;
+            }
         }
     }
 
@@ -969,10 +1010,14 @@ fn pruneRootfsCache(
         .candidate_count = entries.len,
         .candidate_bytes = candidate_bytes,
         .candidate_reclaimable_bytes = candidate_reclaimable_bytes,
+        .cache_mount_candidate_count = cache_mount_candidate_count,
+        .cache_mount_candidate_reclaimable_bytes = cache_mount_candidate_reclaimable_bytes,
         .default_selection = opts.default_selection,
         .deleted_count = deleted_count,
         .deleted_bytes = deleted_bytes,
         .deleted_reclaimable_bytes = deleted_reclaimable_bytes,
+        .cache_mount_deleted_count = cache_mount_deleted_count,
+        .cache_mount_deleted_reclaimable_bytes = cache_mount_deleted_reclaimable_bytes,
         .entries = entries,
     };
 }
@@ -1035,6 +1080,10 @@ fn gcRootfsCache(
     var candidate_bytes: u64 = 0;
     var deleted_count: usize = 0;
     var deleted_bytes: u64 = 0;
+    var cache_mount_candidate_count: usize = 0;
+    var cache_mount_candidate_bytes: u64 = 0;
+    var cache_mount_deleted_count: usize = 0;
+    var cache_mount_deleted_bytes: u64 = 0;
 
     try collectRootfsStorageRoots(
         allocator,
@@ -1082,6 +1131,24 @@ fn gcRootfsCache(
         }
     }
     if (comptime builtin.is_test) if (testing.gc_mutation_barrier) |barrier| barrier.pause(io);
+
+    if (try build_cache_mount.diskStats(io, allocator, options.cache_root)) |stats| {
+        cache_mount_candidate_count = 1;
+        cache_mount_candidate_bytes = stats.allocated_bytes;
+        candidate_bytes += stats.allocated_bytes;
+        try result_entries.append(.{
+            .kind = RootfsEntryKind.build_cache_mount.label(),
+            .path = stats.path,
+            .bytes = stats.allocated_bytes,
+        });
+        if (!options.dry_run) {
+            try Io.Dir.cwd().deleteFile(io, stats.path);
+            deleted_count += 1;
+            deleted_bytes += stats.allocated_bytes;
+            cache_mount_deleted_count = 1;
+            cache_mount_deleted_bytes = stats.allocated_bytes;
+        }
+    }
 
     try collectGcCasEntries(
         allocator,
@@ -1133,6 +1200,10 @@ fn gcRootfsCache(
         .candidate_bytes = candidate_bytes,
         .deleted_count = deleted_count,
         .deleted_bytes = deleted_bytes,
+        .cache_mount_candidate_count = cache_mount_candidate_count,
+        .cache_mount_candidate_bytes = cache_mount_candidate_bytes,
+        .cache_mount_deleted_count = cache_mount_deleted_count,
+        .cache_mount_deleted_bytes = cache_mount_deleted_bytes,
         .entries = entries,
     };
 }
@@ -1881,6 +1952,16 @@ fn collectPruneEntries(
         try collectCasArtifacts(allocator, io, cache_root, "cas/rootfs/blake3/objects", ".chunk", .cas_object, &entries);
     }
 
+    if (try build_cache_mount.diskStats(io, allocator, cache_root)) |stats| {
+        try entries.append(.{
+            .kind = .build_cache_mount,
+            .path = stats.path,
+            .bytes = stats.logical_bytes,
+            .reclaimable_bytes = stats.allocated_bytes,
+            .mtime_ns = stats.mtime_ns,
+        });
+    }
+
     return entries.toOwnedSlice();
 }
 
@@ -2095,6 +2176,11 @@ fn writeRootfsSummary(writer: *Io.Writer, summary: RootfsSystemSummary) !void {
     try writeStatsLine(writer, "Image metadata", summary.image_metadata);
     try writeStatsLine(writer, "Ref records", summary.ref_records);
     try writeStatsLine(writer, "Temporary entries", summary.temp_entries);
+    try writer.print("  Build cache mount disks: {d} entries, ", .{summary.build_cache_mounts.count});
+    try writeHumanBytes(writer, summary.build_cache_mounts.allocated_bytes);
+    try writer.writeAll(" allocated (");
+    try writeHumanBytes(writer, summary.build_cache_mounts.logical_bytes);
+    try writer.writeAll(" logical)\n");
     try writer.writeAll("  Known logical data: ");
     try writeHumanBytes(writer, summary.known_logical_bytes);
     try writer.writeAll(" (categories can overlap through hardlinks)\n\n");
@@ -2127,6 +2213,9 @@ fn writeRootfsPruneResult(writer: *Io.Writer, result: RootfsPruneResult) !void {
         try writer.writeAll("  Would reclaim: ");
         try writeHumanBytes(writer, result.candidate_reclaimable_bytes);
         try writer.writeByte('\n');
+        try writer.print("  Would reclaim build cache mounts: {d} entries, ", .{result.cache_mount_candidate_count});
+        try writeHumanBytes(writer, result.cache_mount_candidate_reclaimable_bytes);
+        try writer.writeByte('\n');
     } else {
         try writer.print("  Deleted: {d} entries\n", .{result.deleted_count});
         try writer.writeAll("  Removed from cache scope: ");
@@ -2134,6 +2223,9 @@ fn writeRootfsPruneResult(writer: *Io.Writer, result: RootfsPruneResult) !void {
         try writer.writeByte('\n');
         try writer.writeAll("  Reclaimed: ");
         try writeHumanBytes(writer, result.deleted_reclaimable_bytes);
+        try writer.writeByte('\n');
+        try writer.print("  Reclaimed build cache mounts: {d} entries, ", .{result.cache_mount_deleted_count});
+        try writeHumanBytes(writer, result.cache_mount_deleted_reclaimable_bytes);
         try writer.writeByte('\n');
     }
     try writer.writeAll("  Scope before: ");
@@ -2201,15 +2293,21 @@ fn writeRootfsGcResult(writer: *Io.Writer, result: RootfsGcResult) !void {
         try writer.writeAll("  Would reclaim: ");
         try writeHumanBytes(writer, result.candidate_bytes);
         try writer.writeByte('\n');
+        try writer.print("  Would reclaim build cache mounts: {d} entries, ", .{result.cache_mount_candidate_count});
+        try writeHumanBytes(writer, result.cache_mount_candidate_bytes);
+        try writer.writeByte('\n');
     } else {
         try writer.print("  Deleted: {d} entries\n", .{result.deleted_count});
         try writer.writeAll("  Reclaimed: ");
         try writeHumanBytes(writer, result.deleted_bytes);
         try writer.writeByte('\n');
+        try writer.print("  Reclaimed build cache mounts: {d} entries, ", .{result.cache_mount_deleted_count});
+        try writeHumanBytes(writer, result.cache_mount_deleted_bytes);
+        try writer.writeByte('\n');
     }
 
     if (result.entries.len == 0) {
-        try writer.writeAll("\nNo CAS garbage found.\n");
+        try writer.writeAll("\nNo cache garbage found.\n");
     } else {
         try writer.writeByte('\n');
         try writer.writeAll(if (result.dry_run) "Candidates\n" else "Deleted\n");
@@ -2417,6 +2515,130 @@ test "cache pins renders exact text and JSON health states" {
     try std.testing.expectEqual(saved_spore_pin.ListingState.index_valid, parsed.value[0].state);
     try std.testing.expectEqual(saved_spore_pin.ListingState.missing, parsed.value[1].state);
     try std.testing.expectEqual(saved_spore_pin.ListingState.corrupt, parsed.value[2].state);
+}
+
+fn createCacheMountFixture(io: Io, allocator: std.mem.Allocator, root: []const u8, logical_bytes: u64) !std.c.fd_t {
+    const dir = try std.fs.path.join(allocator, &.{ root, build_cache_mount.store_rel });
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const path = try build_cache_mount.diskPath(allocator, root);
+    const path_z = try allocator.dupeZ(u8, path);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
+    if (fd < 0) return error.CacheMountDiskOpenFailed;
+    errdefer _ = std.c.close(fd);
+    const block = [_]u8{0x5a} ** 4096;
+    if (std.c.pwrite(fd, &block, block.len, 0) != block.len or std.c.ftruncate(fd, @intCast(logical_bytes)) != 0) {
+        return error.CacheMountDiskSyncFailed;
+    }
+    return fd;
+}
+
+test "system accounts for and reclaims aggregate build cache mount storage" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const relative_root = "zig-cache/test-system-cache-mount-accounting";
+    defer Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    const root = try std.fs.path.resolve(allocator, &.{ try std.process.currentPathAlloc(io, allocator), relative_root });
+
+    const image_size: u64 = 64 << 20;
+    const fd = try createCacheMountFixture(io, allocator, root, image_size);
+    _ = std.c.close(fd);
+    const disk = (try build_cache_mount.diskStats(io, allocator, root)) orelse return error.CacheMountDiskInvalid;
+    try std.testing.expect(disk.allocated_bytes > 0);
+    try std.testing.expect(disk.allocated_bytes < disk.logical_bytes);
+
+    const summary = try df(allocator, io, .{ .cache_root = root });
+    defer deinitRootfsSystemSummary(allocator, summary);
+    try std.testing.expectEqual(@as(usize, 1), summary.build_cache_mounts.count);
+    try std.testing.expectEqual(image_size, summary.build_cache_mounts.logical_bytes);
+    try std.testing.expectEqual(disk.allocated_bytes, summary.build_cache_mounts.allocated_bytes);
+
+    const dry_prune = try prune(allocator, io, .{ .cache_root = root }, Io.Clock.real.now(io).nanoseconds);
+    defer deinitRootfsPruneResult(allocator, dry_prune);
+    try std.testing.expectEqual(@as(usize, 1), dry_prune.cache_mount_candidate_count);
+    try std.testing.expectEqual(disk.allocated_bytes, dry_prune.cache_mount_candidate_reclaimable_bytes);
+    try std.testing.expect((try build_cache_mount.diskStats(io, allocator, root)) != null);
+
+    const forced_prune = try prune(allocator, io, .{ .cache_root = root, .dry_run = false }, Io.Clock.real.now(io).nanoseconds);
+    defer deinitRootfsPruneResult(allocator, forced_prune);
+    try std.testing.expectEqual(@as(usize, 1), forced_prune.cache_mount_deleted_count);
+    try std.testing.expectEqual(disk.allocated_bytes, forced_prune.cache_mount_deleted_reclaimable_bytes);
+    try std.testing.expect((try build_cache_mount.diskStats(io, allocator, root)) == null);
+
+    const replacement_fd = try createCacheMountFixture(io, allocator, root, image_size);
+    _ = std.c.close(replacement_fd);
+    const replacement_disk = (try build_cache_mount.diskStats(io, allocator, root)) orelse return error.CacheMountDiskInvalid;
+    const forced_gc = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
+    defer deinitRootfsGcResult(allocator, forced_gc);
+    try std.testing.expectEqual(@as(usize, 1), forced_gc.cache_mount_deleted_count);
+    try std.testing.expectEqual(replacement_disk.allocated_bytes, forced_gc.cache_mount_deleted_bytes);
+    try std.testing.expect((try build_cache_mount.diskStats(io, allocator, root)) == null);
+}
+
+const TestCacheCleanup = enum { prune, gc };
+
+fn expectActiveBuildProtectsCacheMount(comptime operation: TestCacheCleanup) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const suffix = @tagName(operation);
+    const relative_root = try std.fmt.allocPrint(arena, "zig-cache/test-system-active-cache-mount-{s}", .{suffix});
+    defer Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    const root = try std.fs.path.resolve(arena, &.{ try std.process.currentPathAlloc(io, arena), relative_root });
+
+    var build_lock = try rootfs.lockRootfsCacheExclusive(io, arena, root);
+    const cache_fd = try createCacheMountFixture(io, arena, root, 64 << 20);
+
+    const CleanupContext = struct {
+        allocator: std.mem.Allocator,
+        io: Io,
+        cache_root: []const u8,
+        attempting: *Io.Semaphore,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.attempting.post(self.io);
+            switch (operation) {
+                .prune => {
+                    const result = prune(self.allocator, self.io, .{ .cache_root = self.cache_root, .dry_run = false }, Io.Clock.real.now(self.io).nanoseconds) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    deinitRootfsPruneResult(self.allocator, result);
+                },
+                .gc => {
+                    const result = gc(self.allocator, self.io, .{ .cache_root = self.cache_root, .dry_run = false }) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                    deinitRootfsGcResult(self.allocator, result);
+                },
+            }
+        }
+    };
+    var attempting = Io.Semaphore{};
+    var context = CleanupContext{ .allocator = allocator, .io = io, .cache_root = root, .attempting = &attempting };
+    const thread = try std.Thread.spawn(.{}, CleanupContext.run, .{&context});
+    attempting.waitUncancelable(io);
+
+    // Cleanup has started but cannot own the cache generation until the build
+    // closes its mounted disk and releases the process-bound flock.
+    try std.testing.expect((try build_cache_mount.diskStats(io, arena, root)) != null);
+    _ = std.c.close(cache_fd);
+    build_lock.deinit();
+    thread.join();
+    if (context.err) |err| return err;
+    try std.testing.expect((try build_cache_mount.diskStats(io, arena, root)) == null);
+}
+
+test "concurrent prune and gc wait for active build cache mounts" {
+    try expectActiveBuildProtectsCacheMount(.prune);
+    try expectActiveBuildProtectsCacheMount(.gc);
 }
 
 test "system summarizes rootfs cache and dry-run prunes oldest image entries" {

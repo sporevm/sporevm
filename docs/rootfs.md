@@ -319,9 +319,12 @@ command when scripts need stable field names and exact byte counts. Without
 `--older-than` or
 `--max-bytes`, prune selects all default-prunable rootfs entries: rebuildable or
 reimportable image-rootfs files that are not hardlinked to digest-addressed
-artifacts.
+artifacts, plus the host-local build cache-mount aggregate.
 
-`spore system df --rootfs` also reports rootfs CAS index and object bytes.
+`spore system df --rootfs` also reports rootfs CAS index and object bytes. Build
+cache mounts appear as one aggregate entry with separate logical capacity and
+allocated host bytes; prune and GC likewise report their reclaimed cache-mount
+bytes separately.
 `spore system prune --rootfs` does not delete digest-addressed artifacts or
 rootfs CAS files by default. The two are distinct data classes with distinct
 prune selectors:
@@ -342,6 +345,11 @@ prune selectors:
 runtime manifests, and process-owned lazy-runtime leases, then selects only
 unrooted CAS indexes and chunk objects. It is the preferred command when the
 goal is to clean chunk garbage without discarding reachable chunked storage.
+The mutable cache-mount aggregate is not a step-record or image root and is
+therefore collectable as a unit. A build holds the rootfs-cache `flock` from
+cache validation through final publication, so prune and GC wait until its
+mount disk is closed. Process exit releases that lock even after a crash; a
+leftover lock file has no lease lifetime and does not retain the disk.
 
 When `spore run --image ... --save SPORE` saves a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 materialization identity, size,

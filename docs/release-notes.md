@@ -56,5 +56,14 @@ reads, attachment publication, and policy evaluation remain future work.
 - Published archives remain `spore_Darwin_arm64`, `spore_Linux_arm64`, and
   their matching libspore archives.
 
+### Build cache maintenance
+
+`spore system df --rootfs` now includes the sparse build cache-mount aggregate
+with separate logical and allocated byte counts. Default system prune and
+root-aware cache GC can reclaim that aggregate, report its reclaimed storage
+separately, and serialize cleanup with active builds so a mounted cache disk is
+never unlinked. Builder crashes cannot leave a durable lease: the kernel drops
+the process-bound cache lock, and later cleanup or cache validation can recover.
+
 **Full changelog:**
 [v0.14.0...v0.15.0](https://github.com/sporevm/sporevm/compare/v0.14.0...v0.15.0)

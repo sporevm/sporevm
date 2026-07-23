@@ -72,8 +72,20 @@ it created before the rootfs freeze handshake. Failed RUN writes are retained,
 but cleanup failure blocks the checkpoint and step record. One RUN accepts at
 most eight mounts. A symlinked, non-regular, size-mismatched, bad-magic, or
 host-visible unclean aggregate disk is recreated before reuse; a guest mount
-rejection remains a build error. The current `spore rootfs df`, prune, and GC
-surfaces do not account for or remove this bounded host-local cache disk.
+rejection remains a build error.
+
+The aggregate disk is also the retention unit. Cache-mount directories are
+mutable accelerator state rather than children owned by immutable build-step
+records, so a completed build does not make the disk reachable. `spore system
+df --rootfs` reports one cache-mount entry with separate 4 GiB logical and
+host-allocated byte counts. Default prune and root-aware GC may reclaim the
+whole aggregate, and report its allocated bytes separately from rootfs/CAS
+reclamation. Both cleanup paths take the same coarse rootfs-cache `flock` held
+for the complete build publication epoch, so they cannot select or unlink the
+disk while a build has it open. The lock is process-bound and the kernel drops
+it when a builder exits, including a crash; the inert lock file may remain, but
+it is not a lease or retention root and cannot make the cache leak forever. An
+unclean disk left by a crash is still rejected or replaced on the next open.
 BuildKit v0.30.0 retains cache options in RUN result identity only when the
 effective ID value equals the resolved destination and sharing is `shared`;
 otherwise it clears ID and sharing. Spore matches that value-based quirk: an
@@ -393,8 +405,10 @@ spores.
 ## Cache Inspection And Pruning
 
 `spore system df --rootfs` reports image ext4 files, metadata, exact digest
-artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, and temporary
-entries. `spore cache gc --rootfs` performs a mark/sweep of rootfs CAS indexes
+artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, temporary
+entries, and the build cache-mount aggregate. Its cache-mount fields distinguish
+the sparse disk's logical capacity from allocated host bytes. `spore cache gc
+--rootfs` performs a mark/sweep of rootfs CAS indexes
 and objects from cache metadata, ref records, live runtime manifests, and
 process-owned lazy-runtime leases; it is dry-run by default and requires
 `--force` to delete candidates. Destructive prune consults the same runtime
@@ -404,8 +418,9 @@ stale build step records, removes them under the rootfs cache lock on `--force`
 before the CAS sweep, and preserves unknown future record kinds or schema
 versions conservatively.
 
-Default `spore system prune --rootfs` only selects rebuildable image rootfs
-entries. Flat digest artifacts are skipped unless `--include-digest-artifacts`
+Default `spore system prune --rootfs` selects rebuildable image rootfs entries
+and the unreferenced build cache-mount aggregate. Flat digest artifacts are
+skipped unless `--include-digest-artifacts`
 is passed with an age or size bound. Canonical rootfs CAS chunks are skipped
 unless `--include-rootfs-chunks` is passed.
 That shared namespace also holds writable-disk state: pruning it can break
