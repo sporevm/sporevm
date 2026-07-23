@@ -34,7 +34,11 @@ the underlying operation may have completed after the consumer lost the stream.
 Normal `run`, `attach`, `exec`, and `fanout` output remains raw unless
 `--events=jsonl` is selected. Fanout output events add a `child` field so
 callers can separate each child's stdout and stderr without parsing human
-prefixes. Build is bounded in global JSON mode: executor output is suppressed
+prefixes. They also carry a byte `offset` and `byte_count` within that child's
+stream. Fanout emits one `child_completion` for every child; a non-zero guest
+exit is a completed child result and contributes that status to the aggregate
+completion, while an abnormal child termination fails the aggregate stream.
+Build is bounded in global JSON mode: executor output is suppressed
 and the final `spore.build.result.v1` document is the only stdout value.
 
 The bounded schema inventory is:

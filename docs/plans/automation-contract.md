@@ -75,6 +75,11 @@ unrelated behavior changes are explicit non-goals.
   stable three-way classification.
 - Treat premature EOF as interruption, not cancellation or runtime failure,
   because the producer may still have completed the operation.
+- Treat each fanout child's guest exit as a completed child result, including a
+  non-zero exit, and project the first non-zero status onto the completed
+  aggregate. Only an abnormal child termination fails the aggregate operation.
+- Require an exact C ABI match in Go because an additive C struct change can be
+  unsafe even when a newer library still implements every older function.
 
 ## Key learnings from pressure-testing
 

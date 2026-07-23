@@ -1030,7 +1030,7 @@ is private to the current user, matching the named lifecycle registry rules.
 
 The Go binding decodes the same JSON contracts as the CLI and C ABI where calls
 return JSON, and exposes named copy as error-returning side-effect methods. It
-requires C ABI version 18 or newer. Go context cancellation is checked before
+requires an exact C ABI version 18 match. Go context cancellation is checked before
 entering C calls; long-running runtime cancellation is not exposed until the Zig
 product API and C ABI provide it.
 

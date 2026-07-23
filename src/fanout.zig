@@ -85,7 +85,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     defer cli_event_writer = null;
     const opts = try parseCliArgs(args);
     if (opts.event_mode == .jsonl) try events.emitStart(opts.backend);
-    execute(init, init.arena.allocator(), opts) catch |err| {
+    const exit_code = execute(init, init.arena.allocator(), opts, if (opts.event_mode == .jsonl) stdout else null) catch |err| {
         if (opts.event_mode == .jsonl) {
             const classified = run_mod.classifyFailure(err);
             try events.emitFailure(classified);
@@ -93,7 +93,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         }
         return err;
     };
-    if (opts.event_mode == .jsonl) try events.emitExecCompletion(0);
+    if (opts.event_mode == .jsonl) try events.emitExecCompletion(exit_code);
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 fn requestsJsonl(args: []const []const u8) bool {
@@ -170,7 +171,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     };
 }
 
-pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options) !void {
+pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, event_output: ?*Io.Writer) !u8 {
     const children = try listChildren(allocator, init.io, opts.children_dir);
     if (children.len == 0) {
         var buf: [2048]u8 = undefined;
@@ -185,11 +186,12 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     };
 
     var output_lock = OutputLock{};
+    var event_write_failed = std.atomic.Value(bool).init(false);
     var running = std.array_list.Managed(RunningChild).init(allocator);
     errdefer cleanupRunning(init.io, running.items);
 
     for (children) |child| {
-        const run = try startRunningChild(init, allocator, argv0, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, opts.event_mode, &output_lock);
+        const run = try startRunningChild(init, allocator, argv0, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, opts.event_mode, event_output, &output_lock, &event_write_failed);
         running.append(run) catch |err| {
             var single = [_]RunningChild{run};
             cleanupRunning(init.io, single[0..]);
@@ -211,19 +213,30 @@ pub fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Optio
     if (terminator_thread) |thread| thread.join();
 
     var failed = false;
+    var aggregate_exit_code: u8 = 0;
     for (running.items) |*run| {
         const term = run.child.wait(init.io) catch |err| {
             writeStderr("spore fanout: child {s} wait failed: {s}\n", .{ run.name, @errorName(err) });
+            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
             failed = true;
             continue;
         };
-        if (!termOk(term, opts.duration_ms != null)) {
+        if (termExitCode(term)) |exit_code| {
+            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .completed, exit_code, null);
+            if (exit_code != 0 and aggregate_exit_code == 0) aggregate_exit_code = exit_code;
+        } else if (termOk(term, opts.duration_ms != null)) {
+            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
+        } else {
             writeStderr("spore fanout: child {s} exited {s}\n", .{ run.name, termName(term) });
+            const classified = machine_output.fromZigError(error.FanoutChildFailed);
+            if (event_output) |output| writeChildCompletion(output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
             failed = true;
         }
     }
 
+    if (event_write_failed.load(.acquire)) return error.EventSinkFailed;
     if (failed) return error.FanoutChildFailed;
+    return aggregate_exit_code;
 }
 
 fn spawnAttach(
@@ -265,7 +278,9 @@ fn startRunningChild(
     bound_services: []const spore_net_policy.BoundServiceBinding,
     child: ChildSpec,
     event_mode: run_mod.EventMode,
+    event_output: ?*Io.Writer,
     output_lock: *OutputLock,
+    event_write_failed: *std.atomic.Value(bool),
 ) !RunningChild {
     var proc = try spawnAttach(init, allocator, argv0, backend, timeout_ms, bound_services, child.path);
     const stdout_fd = proc.stdout.?.handle;
@@ -273,14 +288,14 @@ fn startRunningChild(
     proc.stdout = null;
     proc.stderr = null;
 
-    const stdout_thread = std.Thread.spawn(.{}, streamThread, .{ stdout_fd, child.name, "stdout", event_mode, output_lock }) catch |err| {
+    const stdout_thread = std.Thread.spawn(.{}, streamThread, .{ stdout_fd, child.name, "stdout", event_mode, event_output, output_lock, event_write_failed }) catch |err| {
         proc.kill(init.io);
         _ = std.c.close(stdout_fd);
         _ = std.c.close(stderr_fd);
         return err;
     };
 
-    const stderr_thread = std.Thread.spawn(.{}, streamThread, .{ stderr_fd, child.name, "stderr", event_mode, output_lock }) catch |err| {
+    const stderr_thread = std.Thread.spawn(.{}, streamThread, .{ stderr_fd, child.name, "stderr", event_mode, event_output, output_lock, event_write_failed }) catch |err| {
         proc.kill(init.io);
         stdout_thread.join();
         _ = std.c.close(stderr_fd);
@@ -371,17 +386,22 @@ fn lessChildSpec(_: void, a: ChildSpec, b: ChildSpec) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_mode: run_mod.EventMode, output_lock: *OutputLock) void {
+fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_mode: run_mod.EventMode, event_output: ?*Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool)) void {
     defer _ = std.c.close(fd);
 
     var buf: [4096]u8 = undefined;
     var pending = std.array_list.Managed(u8).init(std.heap.page_allocator);
     defer pending.deinit();
+    var offset: u64 = 0;
     while (true) {
         const n = std.c.read(fd, &buf, buf.len);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n < 0 and event_mode == .jsonl) event_write_failed.store(true, .release);
+            break;
+        }
         if (event_mode == .jsonl) {
-            writeChildEvent(output_lock, name, stream, buf[0..@intCast(n)]);
+            writeChildEvent(event_output.?, output_lock, event_write_failed, name, stream, offset, buf[0..@intCast(n)]);
+            offset += @intCast(n);
             continue;
         }
         writePrefixed(output_lock, name, &pending, buf[0..@intCast(n)]) catch break;
@@ -391,18 +411,24 @@ fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_
     }
 }
 
-fn writeChildEvent(output_lock: *OutputLock, name: []const u8, stream: []const u8, bytes: []const u8) void {
+fn writeChildEvent(output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool), name: []const u8, stream: []const u8, offset: u64, bytes: []const u8) void {
     const allocator = std.heap.page_allocator;
-    const json = childEventJson(allocator, name, stream, bytes) catch return;
+    const json = childEventJson(allocator, name, stream, offset, bytes) catch {
+        event_write_failed.store(true, .release);
+        return;
+    };
     defer allocator.free(json);
 
     output_lock.lock();
-    fd_util.writeAllBestEffort(1, json);
-    fd_util.writeAllBestEffort(1, "\n");
-    output_lock.unlock();
+    defer output_lock.unlock();
+    output.writeAll(json) catch {
+        event_write_failed.store(true, .release);
+        return;
+    };
+    output.writeByte('\n') catch event_write_failed.store(true, .release);
 }
 
-fn childEventJson(allocator: std.mem.Allocator, name: []const u8, stream: []const u8, bytes: []const u8) ![]u8 {
+fn childEventJson(allocator: std.mem.Allocator, name: []const u8, stream: []const u8, offset: u64, bytes: []const u8) ![]u8 {
     const enc = std.base64.standard.Encoder;
     const data_base64 = try allocator.alloc(u8, enc.calcSize(bytes.len));
     defer allocator.free(data_base64);
@@ -414,8 +440,47 @@ fn childEventJson(allocator: std.mem.Allocator, name: []const u8, stream: []cons
         .command = "fanout",
         .backend = @as(?[]const u8, null),
         .child = name,
+        .offset = offset,
+        .byte_count = bytes.len,
         .data_base64 = data_base64,
     }, .{});
+}
+
+fn writeChildCompletion(output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool), name: []const u8, outcome: run_mod.TerminalOutcome, exit_code: u8, failure: ?machine_output.CliError) void {
+    const allocator = std.heap.page_allocator;
+    const json = childCompletionJson(allocator, name, outcome, exit_code, failure) catch {
+        event_write_failed.store(true, .release);
+        return;
+    };
+    defer allocator.free(json);
+    output_lock.lock();
+    defer output_lock.unlock();
+    output.writeAll(json) catch {
+        event_write_failed.store(true, .release);
+        return;
+    };
+    output.writeByte('\n') catch event_write_failed.store(true, .release);
+}
+
+fn childCompletionJson(allocator: std.mem.Allocator, name: []const u8, outcome: run_mod.TerminalOutcome, exit_code: u8, failure: ?machine_output.CliError) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .schema = machine_output.automation_event_schema,
+        .schema_version = machine_output.automation_event_schema_version,
+        .event = "child_completion",
+        .command = "fanout",
+        .backend = @as(?[]const u8, null),
+        .child = name,
+        .outcome = outcome,
+        .exit_code = exit_code,
+        .@"error" = if (failure) |classified| classified.envelope().@"error" else null,
+    }, .{});
+}
+
+fn termExitCode(term: std.process.Child.Term) ?u8 {
+    return switch (term) {
+        .exited => |code| code,
+        else => null,
+    };
 }
 
 fn writePrefixed(output_lock: *OutputLock, name: []const u8, pending: *std.array_list.Managed(u8), bytes: []const u8) !void {
@@ -578,7 +643,7 @@ test "fanout cli parser accepts shared automation event mode" {
 
 test "fanout child output uses the shared event envelope" {
     const allocator = std.testing.allocator;
-    const json = try childEventJson(allocator, "000007", "stderr", "boom\n");
+    const json = try childEventJson(allocator, "000007", "stderr", 4, "boom\n");
     defer allocator.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
@@ -586,7 +651,21 @@ test "fanout child output uses the shared event envelope" {
     try std.testing.expectEqualStrings("stderr", parsed.value.object.get("event").?.string);
     try std.testing.expectEqualStrings("fanout", parsed.value.object.get("command").?.string);
     try std.testing.expectEqualStrings("000007", parsed.value.object.get("child").?.string);
+    try std.testing.expectEqual(@as(i64, 4), parsed.value.object.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), parsed.value.object.get("byte_count").?.integer);
     try std.testing.expectEqualStrings("Ym9vbQo=", parsed.value.object.get("data_base64").?.string);
+}
+
+test "fanout child completion preserves a non-zero guest exit" {
+    const allocator = std.testing.allocator;
+    const json = try childCompletionJson(allocator, "000007", .completed, 23, null);
+    defer allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("child_completion", parsed.value.object.get("event").?.string);
+    try std.testing.expectEqualStrings("completed", parsed.value.object.get("outcome").?.string);
+    try std.testing.expectEqual(@as(i64, 23), parsed.value.object.get("exit_code").?.integer);
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("error").?);
 }
 
 test "fanout cli help accepts help after options" {

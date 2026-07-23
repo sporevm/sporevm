@@ -97,6 +97,7 @@ typedef struct SporeExecNamedStreamImpl *SporeExecNamedStream;
 #define SPORE_EXEC_NAMED_STREAM_TERMINAL 3
 #define SPORE_EXEC_NAMED_STREAM_COMPLETION 4
 #define SPORE_EXEC_NAMED_STREAM_EXIT SPORE_EXEC_NAMED_STREAM_COMPLETION
+/** Reserved legacy value; current streams terminate with COMPLETION. */
 #define SPORE_EXEC_NAMED_STREAM_ERROR 5
 
 #define SPORE_OUTCOME_COMPLETED 1
@@ -257,7 +258,9 @@ typedef struct SporeExecNamedStreamOptions {
 typedef struct SporeExecNamedStreamEvent {
   int type;
   SporeString bytes;
+  /** Guest exit status for COMPLETED, or the stable classified status otherwise. */
   uint8_t exit_code;
+  /** One of SPORE_OUTCOME_* for COMPLETION; zero for data events. */
   int outcome;
   /** Borrowed `spore.error.v1` JSON for failed or canceled completion. */
   SporeString error_json;

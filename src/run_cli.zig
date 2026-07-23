@@ -32,17 +32,16 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         }
         return err;
     };
-    try runParsedCli(init, arena, parsed, stdout);
+    try runParsedCli(init, arena, parsed, stdout, &event_writer);
 }
 
-fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer) !void {
+fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer, event_writer: *run_mod.EventWriter) !void {
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.command.len == 0) {
             failRunSetup("spore run: --from runs a new command from a spore; use `spore attach {s}` to connect to a saved session", .{spore_dir});
         }
     }
 
-    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
     var raw_output = RawOutputSink{};
     const events: ?api.EventSink = switch (parsed.event_mode) {
         .jsonl => event_writer.sink(),

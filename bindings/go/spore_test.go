@@ -26,8 +26,8 @@ func TestBuildInfo(t *testing.T) {
 	if info.Version == "" {
 		t.Fatal("empty version")
 	}
-	if info.ABIVersion < minABIVersion {
-		t.Fatalf("ABI version %d < %d", info.ABIVersion, minABIVersion)
+	if info.ABIVersion != minABIVersion {
+		t.Fatalf("ABI version %d != %d", info.ABIVersion, minABIVersion)
 	}
 }
 

@@ -1139,7 +1139,7 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     }
     if (err == error.NoSavedSession) {
         return machine_output.CliError.init(
-            .usage_invalid_argument,
+            .object_invalid,
             "spore run: spore has no saved session; pass a command after --from or use spore run --save to create a session spore",
             @errorName(err),
         );

@@ -864,11 +864,11 @@ pub export fn spore_exec_named_stream_open(
             .cols = if (opts.terminal_cols == 0) 80 else opts.terminal_cols,
         },
     }) catch |err| return fail(ctx, err);
-    errdefer {
+    const handle = ctx.allocator.create(SporeExecNamedStreamImpl) catch |err| {
         var cleanup = stream;
         cleanup.deinit();
-    }
-    const handle = ctx.allocator.create(SporeExecNamedStreamImpl) catch |err| return fail(ctx, err);
+        return fail(ctx, err);
+    };
     handle.* = .{ .stream = stream };
     out.* = handle;
     return result_success;
@@ -916,7 +916,7 @@ pub export fn spore_exec_named_stream_next(
                 .type = stream_event_completion,
                 .bytes = .{},
                 .exit_code = classified.exit_code,
-                .outcome = if (classified.code == .operation_canceled) outcome_canceled else outcome_failed,
+                .outcome = outcome_failed,
                 .error_json = borrowString(handle.completion_error_json),
             };
         },

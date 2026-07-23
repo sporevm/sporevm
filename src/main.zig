@@ -195,7 +195,10 @@ fn runCommand(
     mode: machine_output.Mode,
 ) !void {
     if (mode == .json and !supportsJson(command)) {
-        const message = allocMessage(arena, "spore --json does not support command: {s}", .{command});
+        const message = if (std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "exec") or std.mem.eql(u8, command, "fanout"))
+            allocMessage(arena, "spore --json {s} is not supported; use --events=jsonl for stream events", .{command})
+        else
+            allocMessage(arena, "spore --json does not support command: {s}", .{command});
         exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
     }
 
@@ -217,10 +220,6 @@ fn runCommand(
     } else if (std.mem.eql(u8, command, "run")) {
         try spore_internal.run_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "attach")) {
-        if (mode == .json) {
-            const message = "spore --json attach is not supported; use --events=jsonl for attach stream events";
-            exitWithCliError(arena, stderr, mode, machine_output.usageInvalidArgument(message, "attach"), message);
-        }
         try spore_internal.attach_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "create")) {
         try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
