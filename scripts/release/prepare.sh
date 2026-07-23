@@ -10,7 +10,7 @@ usage() {
   cat <<'USAGE'
 usage: scripts/release/prepare.sh vX.Y.Z
 
-Update source and package versions for the next SporeVM release.
+Update the authoritative SporeVM version for the next release.
 USAGE
 }
 

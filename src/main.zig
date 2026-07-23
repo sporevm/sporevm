@@ -25,7 +25,6 @@ const usage =
     \\  --debug             Show verbose VMM and restore logs
     \\  --json              Emit one JSON result for supported state and bundle commands
     \\                      Use --events=jsonl for run/attach stream events
-    \\  --version           Print the spore version
     \\
     \\Commands:
     \\  One-shot VMs:

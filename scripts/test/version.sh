@@ -31,7 +31,8 @@ fi
 [[ "$("${binary}" version)" == "${version_output}" ]] \
   || die "legacy version command disagrees with --version"
 
-"${binary}" --help | grep -Fq -- '--version' \
+help_output="$("${binary}" --help)"
+grep -Fq -- '--version' <<<"${help_output}" \
   || die "global help does not advertise --version"
 
 printf '[test-version] %s agrees with source and pkg-config metadata\n' "${version_output}"
