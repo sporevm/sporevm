@@ -5,23 +5,25 @@ usage() {
   echo "Usage: $0 <arm64|x86_64>" >&2
 }
 
+: "${AMP_SPOREVM_SSM_ROLE_ARN:=arn:aws:iam::907480720934:role/sporevm-amp-orb-ssm-dev}"
+: "${AMP_SPOREVM_SSM_AUDIENCE:=urn:sporevm:aws:ssm:buildkite-lab}"
+: "${AMP_SPOREVM_AWS_REGION:=ap-southeast-2}"
+: "${AMP_SPOREVM_SSM_ARM64_TARGET_NAME:=sporevm-k8s-dev-apse2-eks-spore-node}"
+: "${AMP_SPOREVM_SSM_X86_64_TARGET_NAME:=sporevm-dev-apse2-linux-x86-64}"
+
 target="${1:-}"
 case "$target" in
   arm64)
-    target_name="${AMP_SPOREVM_SSM_ARM64_TARGET_NAME:?AMP_SPOREVM_SSM_ARM64_TARGET_NAME is not set}"
+    target_name="$AMP_SPOREVM_SSM_ARM64_TARGET_NAME"
     ;;
   x86_64)
-    target_name="${AMP_SPOREVM_SSM_X86_64_TARGET_NAME:?AMP_SPOREVM_SSM_X86_64_TARGET_NAME is not set}"
+    target_name="$AMP_SPOREVM_SSM_X86_64_TARGET_NAME"
     ;;
   *)
     usage
     exit 2
     ;;
 esac
-
-: "${AMP_SPOREVM_SSM_ROLE_ARN:?AMP_SPOREVM_SSM_ROLE_ARN is not set}"
-: "${AMP_SPOREVM_SSM_AUDIENCE:?AMP_SPOREVM_SSM_AUDIENCE is not set}"
-: "${AMP_SPOREVM_AWS_REGION:?AMP_SPOREVM_AWS_REGION is not set}"
 
 for command in amp aws python3 session-manager-plugin; do
   if ! command -v "$command" >/dev/null 2>&1; then
