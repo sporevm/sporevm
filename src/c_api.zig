@@ -1703,6 +1703,7 @@ test "C ABI inspect spore JSON includes annotation values" {
     const data = json.ptr.?[0..json.len];
     try std.testing.expect(std.mem.indexOf(u8, data, "\"vm_state_present\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"storage_mode\": \"memory-only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"ownership\": \"portable-self-contained\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"annotations\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.workspace\": \"/workspaces/app\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"cleanroom.provenance\": \"sha256:abc123\"") != null);

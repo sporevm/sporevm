@@ -14,6 +14,7 @@ const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
+const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const spore = @import("spore.zig");
 const topology = @import("topology.zig");
 
@@ -24,6 +25,7 @@ pub const Result = struct {
     schema_version: u32 = 1,
     action: []const u8 = "removed_spore",
     spore_dir: []const u8,
+    ownership: []const u8 = saved_spore_ownership.portable_self_contained,
     /// Empty when the removed spore had no durable disk pin.
     pin_id: []const u8,
     pin_removed: bool = false,
@@ -48,11 +50,12 @@ pub fn remove(context: Context, allocator: std.mem.Allocator, raw_dir: []const u
     if (manifest == null) manifest_v1 = try spore.loadManifestV1(allocator, dir);
     const disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
     if (disk == null) {
+        const ownership = try saved_spore_ownership.classify(allocator, dir, disk);
         try rejectDisklessPinReference(context.io, allocator, dir);
         const id = try allocator.alloc(u8, 0);
         errdefer allocator.free(id);
         try deleteAndSyncParent(context.io, allocator, dir);
-        return .{ .spore_dir = dir, .pin_id = id };
+        return .{ .spore_dir = dir, .ownership = ownership, .pin_id = id };
     }
 
     const local_authority = try localAuthorityState(context.io, allocator, dir, disk.?);
@@ -63,6 +66,7 @@ pub fn remove(context: Context, allocator: std.mem.Allocator, raw_dir: []const u
     // the spore. It is safe to remove only while no live runtime owns that
     // directory as its lazy disk baseline.
     if (local_authority == .verified) {
+        const ownership = try saved_spore_ownership.classify(allocator, dir, disk);
         const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
         defer allocator.free(runtime_root);
         var lease_lock = try runtime_disk_lease.lockRegistry(context.io, allocator, runtime_root);
@@ -77,7 +81,7 @@ pub fn remove(context: Context, allocator: std.mem.Allocator, raw_dir: []const u
         const id = try allocator.alloc(u8, 0);
         errdefer allocator.free(id);
         try deleteAndSyncParent(context.io, allocator, dir);
-        return .{ .spore_dir = dir, .pin_id = id };
+        return .{ .spore_dir = dir, .ownership = ownership, .pin_id = id };
     }
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
@@ -87,11 +91,13 @@ pub fn remove(context: Context, allocator: std.mem.Allocator, raw_dir: []const u
     const registry = try saved_spore_pin.LockedRegistry.init(allocator, cache_root, &lock);
     var pin = try saved_spore_pin.loadForSporeLocked(context.io, allocator, registry, dir, disk.?);
     defer pin.deinit();
+    if (!saved_spore_pin.isExclusive(pin.value)) return error.LegacySharedPinRemovalRefused;
+    const ownership = try saved_spore_ownership.classify(allocator, dir, disk);
     const id = try allocator.dupe(u8, pin.value.id);
     errdefer allocator.free(id);
     try deleteAndSyncParent(context.io, allocator, dir);
     try saved_spore_pin.remove(context.io, allocator, registry, id);
-    return .{ .spore_dir = dir, .pin_id = id, .pin_removed = true };
+    return .{ .spore_dir = dir, .ownership = ownership, .pin_id = id, .pin_removed = true };
 }
 
 fn resolveExistingSporeDir(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
@@ -547,6 +553,7 @@ test "saved-spore removal preserves disk pin ordering across delete and sync fau
     try std.testing.expectError(error.IoFailed, remove(.{ .io = io, .environ_map = &env }, allocator, before_delete));
     _ = try Io.Dir.cwd().statFile(io, before_delete, .{ .follow_symlinks = false });
     var first_record = try saved_spore_pin.loadRecord(io, allocator, cache_root, first_id);
+    try std.testing.expectEqual(saved_spore_pin.OwnerState.exclusive, try saved_spore_pin.ownerState(arena, cache_root, first_id, first_record.value));
     first_record.deinit();
 
     const before_sync = try std.fs.path.join(arena, &.{ root, "disk-before-sync.spore" });
@@ -565,6 +572,7 @@ test "saved-spore removal preserves disk pin ordering across delete and sync fau
     try std.testing.expectError(error.IoFailed, remove(.{ .io = io, .environ_map = &env }, allocator, before_sync));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, before_sync, .{ .follow_symlinks = false }));
     var second_record = try saved_spore_pin.loadRecord(io, allocator, cache_root, second_id);
+    try std.testing.expectEqual(saved_spore_pin.OwnerState.orphaned, try saved_spore_pin.ownerState(arena, cache_root, second_id, second_record.value));
     second_record.deinit();
 
     testing.fault = .none;
@@ -573,4 +581,91 @@ test "saved-spore removal preserves disk pin ordering across delete and sync fau
     try std.testing.expect(removed.pin_removed);
     try std.testing.expectEqualStrings(first_id, removed.pin_id);
     try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, cache_root, first_id));
+}
+
+test "saved-spore removal refuses an ordinary copied pin reference" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const original = try std.fs.path.join(arena, &.{ root, "original.spore" });
+    const copied = try std.fs.path.join(arena, &.{ root, "copied.spore" });
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, original, 0x61, false);
+    var pin_id: []const u8 = undefined;
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, original, fixture.disk, fixture.manifest);
+        var pin = try saved_spore_pin.loadForSporeLocked(io, arena, registry, original, fixture.disk);
+        defer pin.deinit();
+        pin_id = try arena.dupe(u8, pin.value.id);
+    }
+    try Io.Dir.cwd().createDirPath(io, copied);
+    inline for (.{ "manifest.json", saved_spore_pin.reference_file }) |name| {
+        const source = try std.fs.path.join(arena, &.{ original, name });
+        const destination = try std.fs.path.join(arena, &.{ copied, name });
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, source, arena, .limited(saved_spore_pin.max_manifest_bytes + 1));
+        try chunk_sealer.writeFileAtomicDurable(arena, destination, bytes, 0o600);
+    }
+
+    try std.testing.expectError(error.SavedSporeOwnershipConflict, remove(.{ .io = io, .environ_map = &env }, allocator, copied));
+    _ = try Io.Dir.cwd().statFile(io, original, .{ .follow_symlinks = false });
+    _ = try Io.Dir.cwd().statFile(io, copied, .{ .follow_symlinks = false });
+    var record = try saved_spore_pin.loadRecord(io, allocator, cache_root, pin_id);
+    record.deinit();
+}
+
+test "saved-spore removal refuses legacy pins with unknowable duplicate references" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const saved = try std.fs.path.join(arena, &.{ root, "legacy.spore" });
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, saved, 0x62, false);
+    var pin_id: []const u8 = undefined;
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, saved, fixture.disk, fixture.manifest);
+        var current = try saved_spore_pin.loadForSporeLocked(io, arena, registry, saved, fixture.disk);
+        defer current.deinit();
+        pin_id = try arena.dupe(u8, current.value.id);
+        const record_path = try saved_spore_pin.recordPath(arena, cache_root, pin_id);
+        const legacy_record = try std.json.Stringify.valueAlloc(arena, saved_spore_pin.Record{
+            .schema = saved_spore_pin.legacy_schema,
+            .id = current.value.id,
+            .manifest_sha256 = current.value.manifest_sha256,
+            .storage = current.value.storage,
+        }, .{ .whitespace = .indent_2 });
+        try chunk_sealer.replaceFileAtomicDurable(arena, record_path, legacy_record, 0o600);
+        const ref_path = try std.fs.path.join(arena, &.{ saved, saved_spore_pin.reference_file });
+        const legacy_ref = try std.json.Stringify.valueAlloc(arena, saved_spore_pin.Reference{
+            .schema = saved_spore_pin.legacy_reference_schema,
+            .id = current.value.id,
+        }, .{ .whitespace = .indent_2 });
+        try chunk_sealer.replaceFileAtomicDurable(arena, ref_path, legacy_ref, 0o600);
+    }
+
+    try std.testing.expectError(error.LegacySharedPinRemovalRefused, remove(.{ .io = io, .environ_map = &env }, allocator, saved));
+    _ = try Io.Dir.cwd().statFile(io, saved, .{ .follow_symlinks = false });
+    var record = try saved_spore_pin.loadRecord(io, allocator, cache_root, pin_id);
+    record.deinit();
 }

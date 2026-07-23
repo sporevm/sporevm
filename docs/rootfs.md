@@ -122,11 +122,12 @@ spore run --from base.spore 'cat /var/tmp/example'
 
 The `--save` target must be a new path. SporeVM creates the output directory
 itself before writing memory, disk, and manifest files. Writable-disk bytes
-remain in the machine's rootfs CAS and are protected by an opaque durable pin
+remain in the machine's rootfs CAS and are protected by a durable pin
 recorded only in host-private lifecycle metadata. The save directory can be
-renamed or moved on the same host. A raw copy shares the original pin identity,
-so it has no independent removal lifetime; use `spore fork` for another
-machine-local lifecycle or pack/unpack for an independently portable copy.
+renamed or moved on the same host. Its cache-side ownership anchor makes raw
+copies fail closed instead of silently sharing deletion authority. Use `spore
+fork` for another machine-local lifecycle or `spore clone` for an independently
+portable copy.
 `spore pack` copies and verifies all required disk storage. The no-copy save fast
 path applies only after the machine-local parent already resides in the global
 CAS; the first save after portable/local-CAS restore performs a one-time

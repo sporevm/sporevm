@@ -12,12 +12,12 @@ implementation, is the product: two SporeVM builds on different hypervisors
 interoperate through this document.
 
 Durable cache pins are deliberately outside this format. Machine-local saves
-carry their opaque pin reference in host-private lifecycle metadata, and the
-cache owns the corresponding validated disk-index root. Neither pin ids nor
-host paths are serialized into `manifest.json` or portable bundles. Raw moves
-preserve the host-private reference, while raw copies share one pin identity;
-fork or pack/unpack is required for an independent lifecycle. The cache has no
-global save-reference registry.
+carry a host-private reference hard-linked to one cache-side ownership anchor,
+and the cache owns the corresponding validated disk-index root. Neither pin ids
+nor host paths are serialized into `manifest.json` or portable bundles. Raw
+moves preserve ownership, while raw copies are rejected because they cannot
+preserve the exclusive two-link identity. `spore clone` uses pack/unpack for an
+independent portable lifecycle. The cache has no global save-path registry.
 
 For the backend mapping rules, state classes, and current restore-direction
 matrix, see [Spore State Portability Contract](state-portability.md).

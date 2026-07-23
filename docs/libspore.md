@@ -32,7 +32,7 @@ the CLI alone exposes the experimental fresh profile.
 
 The public vocabulary is `save`, `attach`, and `restore` across Zig, C, and Go.
 JSONL run events keep their original `capture` event and `capture_path` fields
-for schema compatibility.
+and add `ownership` on capture plus `capture_ownership` on terminal exit.
 
 ## Importing
 
@@ -256,7 +256,11 @@ needed.
 Use `removeSavedSpore` to remove a saved-spore directory and unregister its
 durable disk pin when present. `RemovedSavedSpore.pin_removed` distinguishes
 machine-local pinned removal from diskless or portable local-CAS removal;
-`pin_id` is empty when no durable pin existed. The owned `spore_dir` and
+`ownership` is `machine-local-pinned`, `portable-self-contained`, or
+`batch-relative`, and `pin_id` is empty when no durable pin existed. New
+machine-local pins refuse copied or duplicate ownership references, while
+legacy shared pins refuse destructive removal. Use `cloneSpore` to make an
+independently owned portable copy through the pack/unpack encoding. The owned `spore_dir` and
 `pin_id` must be released with
 `deinitRemovedSavedSpore`. Portable removal returns `SavedSporeInUse` while a
 live restore still owns the directory as lazy disk authority.

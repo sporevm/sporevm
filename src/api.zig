@@ -24,6 +24,8 @@ const attach_mod = @import("attach.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const saved_spore_fork = @import("saved_spore_fork.zig");
+const saved_spore_ownership = @import("saved_spore_ownership.zig");
+const saved_spore_pin = @import("saved_spore_pin.zig");
 const run_mod = @import("run.zig");
 const gicv3 = @import("aarch64/gicv3.zig");
 const spore = @import("spore.zig");
@@ -441,6 +443,19 @@ pub const UnpackResult = struct {
     selected_child: ?[]const u8 = null,
 };
 
+/// Options for making an independently owned portable copy of one spore.
+pub const CloneOptions = struct {
+    spore_dir: []const u8,
+    out_dir: []const u8,
+    rootfs_cache: CacheRoot = .env,
+};
+
+pub const CloneResult = struct {
+    source: []const u8,
+    out_dir: []const u8,
+    ownership: []const u8 = saved_spore_ownership.portable_self_contained,
+};
+
 /// Options for pushing a bundle to a remote destination.
 pub const PushOptions = struct {
     bundle_dir: []const u8,
@@ -517,6 +532,7 @@ pub const SporeInspectResult = struct {
     version: u32,
     vm_state_present: bool,
     storage_mode: []const u8,
+    ownership: []const u8,
     vcpu_count: u32,
     platform: SporePlatformSummary,
     device_count: usize,
@@ -839,13 +855,13 @@ pub fn inspectSpore(
     // resume uses so inspect accepts everything resume can restore.
     if (spore.loadManifest(arena, spore_dir)) |manifest| {
         defer manifest.deinit();
-        return summarizeSpore(allocator, manifest.value, 1);
+        return summarizeSpore(allocator, spore_dir, manifest.value, 1);
     } else |err| {
         if (err != error.BadManifest) return err;
     }
     const manifest = try spore.loadManifestV1(arena, spore_dir);
     defer manifest.deinit();
-    return summarizeSpore(allocator, manifest.value, manifest.value.platform.vcpu_count);
+    return summarizeSpore(allocator, spore_dir, manifest.value, manifest.value.platform.vcpu_count);
 }
 
 /// Release memory owned by a `SporeInspectResult`.
@@ -1420,6 +1436,66 @@ pub fn deinitUnpackResult(allocator: std.mem.Allocator, result: UnpackResult) vo
     if (result.selected_child) |child| allocator.free(child);
 }
 
+/// Clone one spore through the existing pack/unpack transport encoding so the
+/// output owns all RAM and disk content it needs.
+pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: CloneOptions) !CloneResult {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var nonce: [8]u8 = undefined;
+    context.io.random(&nonce);
+    const bundle_dir = try std.fmt.allocPrint(arena, "{s}.clone-bundle-{x}", .{ options.out_dir, std.mem.readInt(u64, &nonce, .little) });
+    defer std.Io.Dir.cwd().deleteTree(context.io, bundle_dir) catch {};
+
+    _ = try pack(context, arena, .{
+        .spore_dir = options.spore_dir,
+        .out_dir = bundle_dir,
+        .rootfs_cache = options.rootfs_cache,
+    });
+    _ = try unpack(context, arena, .{
+        .bundle_dir = bundle_dir,
+        .out_dir = options.out_dir,
+        .rootfs_cache = options.rootfs_cache,
+    });
+    return .{ .source = options.spore_dir, .out_dir = options.out_dir };
+}
+
+test "clone spore makes a pinned save independently portable" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const source = try std.fs.path.join(arena, &.{ root, "source.spore" });
+    const output = try std.fs.path.join(arena, &.{ root, "portable.spore" });
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    try env.put(local_paths.runtime_dir_env, runtime_root);
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, source, 0x71, false);
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, source, fixture.disk, fixture.manifest);
+    }
+    const source_inspected = try inspectSpore(allocator, source);
+    defer deinitSporeInspectResult(allocator, source_inspected);
+    try std.testing.expectEqualStrings(saved_spore_ownership.machine_local_pinned, source_inspected.ownership);
+    const result = try cloneSpore(.{ .io = io, .environ_map = &env }, allocator, .{ .spore_dir = source, .out_dir = output });
+    try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, result.ownership);
+    const inspected = try inspectSpore(allocator, output);
+    defer deinitSporeInspectResult(allocator, inspected);
+    try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, inspected.ownership);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, try std.fs.path.join(arena, &.{ output, saved_spore_pin.reference_file }), .{ .follow_symlinks = false }));
+}
+
 /// Push a bundle to a remote destination.
 ///
 /// Owned strings in the result must be released with `deinitPushResult`.
@@ -1504,7 +1580,7 @@ pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
 
 /// Summarize either manifest version; the fields read here are shared
 /// between `spore.Manifest` and `spore.ManifestV1`.
-fn summarizeSpore(allocator: std.mem.Allocator, manifest: anytype, vcpu_count: u32) !SporeInspectResult {
+fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest: anytype, vcpu_count: u32) !SporeInspectResult {
     const present_chunks = manifest.memory.chunks.len;
 
     var annotations = spore.Annotations{};
@@ -1535,6 +1611,7 @@ fn summarizeSpore(allocator: std.mem.Allocator, manifest: anytype, vcpu_count: u
         .version = manifest.version,
         .vm_state_present = true,
         .storage_mode = inspectStorageMode(manifest),
+        .ownership = try saved_spore_ownership.classify(allocator, spore_dir, manifest.disk),
         .vcpu_count = vcpu_count,
         .platform = .{
             .arch = try allocator.dupe(u8, manifest.platform.arch),
@@ -1697,6 +1774,7 @@ test "inspect spore returns annotation values from saved manifest" {
     defer deinitSporeInspectResult(allocator, inspected);
     try std.testing.expect(inspected.vm_state_present);
     try std.testing.expectEqualStrings("exact-rootfs", inspected.storage_mode);
+    try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, inspected.ownership);
     try std.testing.expectEqualStrings("created", inspected.annotations.map.get("cleanroom.create").?);
     try std.testing.expectEqualStrings("warm", inspected.annotations.map.get("cleanroom.snapshot").?);
     try std.testing.expectEqual(@as(usize, 1), inspected.sessions.len);
@@ -1710,6 +1788,28 @@ test "inspect spore returns annotation values from saved manifest" {
     try std.testing.expectEqualStrings("cleanroom-gateway", network.bound_services[0].name);
     try std.testing.expectEqualStrings("gateway.cleanroom.internal", network.bound_services[0].guest_host);
     try std.testing.expectEqual(@as(u16, 8170), network.bound_services[0].guest_port);
+}
+
+test "inspect spore reports batch-relative offline fork children" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const batch = try std.fs.path.join(arena, &.{ root, "batch" });
+    const child = try std.fs.path.join(arena, &.{ batch, "000000" });
+    const shared = try std.fs.path.join(arena, &.{ batch, "shared-chunks" });
+    try std.Io.Dir.cwd().createDirPath(io, child);
+    try std.Io.Dir.cwd().createDirPath(io, shared);
+    try std.Io.Dir.cwd().symLink(io, "../shared-chunks", try std.fs.path.join(arena, &.{ child, "chunks" }), .{});
+    try spore.saveManifest(arena, child, manifest_test_support.manifest(.{}));
+
+    const inspected = try inspectSpore(allocator, child);
+    defer deinitSporeInspectResult(allocator, inspected);
+    try std.testing.expectEqualStrings(saved_spore_ownership.batch_relative, inspected.ownership);
 }
 
 test "run from generation state uses explicit params" {
