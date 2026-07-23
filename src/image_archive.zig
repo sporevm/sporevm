@@ -47,6 +47,7 @@ pub const PackResult = struct {
 pub const UnpackOptions = struct {
     archive_path: []const u8,
     archive_digest: []const u8,
+    expected_image_digest: []const u8,
     ref: []const u8,
     platform: gateway.Platform,
 };
@@ -131,13 +132,7 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
 
     const objects = try uniqueSortedObjects(allocator, storage, parsed_index.value.chunks);
     defer deinitObjects(allocator, objects);
-    var object_bytes: u64 = 0;
-    for (objects) |object| object_bytes = std.math.add(u64, object_bytes, object.size) catch return error.ImageArchiveTooLarge;
-    try @import("image_gateway_pull.zig").validateEagerTransferBoundsForArchive(
-        storage.logical_size,
-        objects.len,
-        object_bytes,
-    );
+    const object_bytes = try validateArchiveBounds(storage.logical_size, objects);
 
     const config_bytes = try image.canonicalConfigJson(allocator, metadata.value.config);
     defer allocator.free(config_bytes);
@@ -198,11 +193,9 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
 pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: UnpackOptions) !UnpackResult {
     try rootfs.validateLocalTagRef(options.ref);
     try gateway.validateDigest(options.archive_digest, "sha256:");
+    try gateway.validateDigest(options.expected_image_digest, "blake3:");
     const stat = try Io.Dir.cwd().statFile(init.io, options.archive_path, .{ .follow_symlinks = false });
     if (stat.kind != .file or stat.size == 0 or stat.size > max_archive_bytes) return error.ImageArchiveTooLarge;
-    const actual_archive_digest = try sha256FileDigestAlloc(allocator, init.io, options.archive_path);
-    defer allocator.free(actual_archive_digest);
-    if (!std.mem.eql(u8, actual_archive_digest, options.archive_digest)) return error.ImageArchiveDigestMismatch;
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     defer allocator.free(cache_root);
@@ -213,8 +206,17 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
     try Io.Dir.cwd().createDirPath(init.io, stage_dir);
     try chmodPath(allocator, stage_dir, 0o700);
 
-    var extracted = try extractArchive(init.io, allocator, options.archive_path, stage_dir, options.platform);
+    var extracted = try extractArchive(
+        init.io,
+        allocator,
+        options.archive_path,
+        options.archive_digest,
+        stage_dir,
+        options.platform,
+    );
     defer extracted.deinit(allocator);
+    if (!std.mem.eql(u8, extracted.verified.value.image.digest, options.expected_image_digest))
+        return error.ImageIdentityMismatch;
     const storage = gatewayStorageToSpore(extracted.verified.value.image.rootfs_storage);
 
     var cache_lock = try rootfs.lockRootfsCacheExclusive(init.io, allocator, cache_root);
@@ -239,7 +241,7 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
         .platform = .{ .os = options.platform.os, .arch = options.platform.arch },
         .config = extracted.config.value,
         .rootfs_storage = storage,
-        .expected_image_digest = extracted.verified.value.image.digest,
+        .expected_image_digest = options.expected_image_digest,
     });
     defer rootfs.deinitPublishIndexedImageResult(allocator, published);
 
@@ -279,13 +281,22 @@ const Extracted = struct {
     }
 };
 
-fn extractArchive(io: Io, allocator: std.mem.Allocator, archive_path: []const u8, stage_dir: []const u8, platform: gateway.Platform) !Extracted {
+fn extractArchive(
+    io: Io,
+    allocator: std.mem.Allocator,
+    archive_path: []const u8,
+    expected_archive_digest: []const u8,
+    stage_dir: []const u8,
+    platform: gateway.Platform,
+) !Extracted {
     var file = try Io.Dir.cwd().openFile(io, archive_path, .{});
     defer file.close(io);
     var file_buf: [64 * 1024]u8 = undefined;
     var file_reader: Io.File.Reader = .initStreaming(file, io, &file_buf);
+    var hash_buf: [64 * 1024]u8 = undefined;
+    var hashed = file_reader.interface.hashed(Sha256.init(.{}), &hash_buf);
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompress: std.compress.flate.Decompress = .init(&file_reader.interface, .gzip, &decompress_buf);
+    var decompress: std.compress.flate.Decompress = .init(&hashed.reader, .gzip, &decompress_buf);
 
     const manifest_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, manifest_entry, gateway_manifest.max_image_manifest_bytes);
     defer allocator.free(manifest_bytes);
@@ -325,15 +336,22 @@ fn extractArchive(io: Io, allocator: std.mem.Allocator, archive_path: []const u8
     defer parsed_index.deinit();
     const objects = try uniqueSortedObjects(allocator, storage, parsed_index.value.chunks);
     errdefer deinitObjects(allocator, objects);
+    _ = try validateArchiveBounds(storage.logical_size, objects);
 
     for (objects) |object| {
         const expected_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ object_prefix, object.digest["blake3:".len..] });
         defer allocator.free(expected_name);
         const staged_path = try std.fs.path.join(allocator, &.{ stage_dir, object.digest["blake3:".len..] });
         defer allocator.free(staged_path);
-        try readObjectEntry(io, allocator, &decompress.reader, expected_name, object, staged_path);
+        try readObjectEntry(io, &decompress.reader, expected_name, object, staged_path);
     }
     try readArchiveEnd(&decompress.reader);
+    _ = try hashed.reader.discardRemaining();
+    var archive_digest: [Sha256.digest_length]u8 = undefined;
+    hashed.hasher.final(&archive_digest);
+    const archive_hex = std.fmt.bytesToHex(archive_digest, .lower);
+    if (!std.mem.eql(u8, expected_archive_digest["sha256:".len..], &archive_hex))
+        return error.ImageArchiveDigestMismatch;
 
     return .{
         .manifest_digest = manifest_digest,
@@ -400,6 +418,18 @@ fn deinitObjects(allocator: std.mem.Allocator, objects: []ObjectDescriptor) void
     allocator.free(objects);
 }
 
+fn validateArchiveBounds(logical_bytes: u64, objects: []const ObjectDescriptor) !u64 {
+    var object_bytes: u64 = 0;
+    for (objects) |object|
+        object_bytes = std.math.add(u64, object_bytes, object.size) catch return error.ImageArchiveTooLarge;
+    try @import("image_gateway_pull.zig").validateEagerTransferBoundsForArchive(
+        logical_bytes,
+        objects.len,
+        object_bytes,
+    );
+    return object_bytes;
+}
+
 fn readNamedEntryAlloc(allocator: std.mem.Allocator, reader: *Io.Reader, expected_name: []const u8, max_bytes: usize) ![]u8 {
     var header: [512]u8 = undefined;
     if (!try readTarHeader(reader, &header) or isZeroBlock(&header)) return error.BadImageArchive;
@@ -413,7 +443,7 @@ fn readNamedEntryAlloc(allocator: std.mem.Allocator, reader: *Io.Reader, expecte
     return bytes;
 }
 
-fn readObjectEntry(io: Io, allocator: std.mem.Allocator, reader: *Io.Reader, expected_name: []const u8, object: ObjectDescriptor, path: []const u8) !void {
+fn readObjectEntry(io: Io, reader: *Io.Reader, expected_name: []const u8, object: ObjectDescriptor, path: []const u8) !void {
     var header: [512]u8 = undefined;
     if (!try readTarHeader(reader, &header) or isZeroBlock(&header)) return error.BadImageArchive;
     try verifyTarHeader(&header, expected_name, object.size);
@@ -438,7 +468,6 @@ fn readObjectEntry(io: Io, allocator: std.mem.Allocator, reader: *Io.Reader, exp
     const hex = std.fmt.bytesToHex(digest, .lower);
     if (!std.mem.eql(u8, object.digest["blake3:".len..], &hex)) return error.BadImageArchiveObject;
     try discardTarPadding(reader, object.size);
-    _ = allocator;
 }
 
 fn readArchiveEnd(reader: *Io.Reader) !void {
@@ -622,6 +651,13 @@ test "image archive tar header parser is fuzzed" {
     try std.testing.fuzz({}, fuzzTarHeader, .{});
 }
 
+test "native image archive import enforces eager transfer bounds" {
+    try std.testing.expectError(
+        error.GatewayImageTooLarge,
+        validateArchiveBounds(@import("image_gateway_pull.zig").max_eager_rootfs_logical_bytes + 1, &.{}),
+    );
+}
+
 test "native image archive round-trips into a clean cache and rejects substitution" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -724,6 +760,7 @@ test "native image archive round-trips into a clean cache and rejects substituti
     const unpacked = try unpack(init, allocator, .{
         .archive_path = archive_path,
         .archive_digest = pack_result.archive_digest,
+        .expected_image_digest = pack_result.image_digest,
         .ref = "local/archive:consumer",
         .platform = .{ .os = "linux", .arch = .arm64 },
     });
@@ -737,13 +774,27 @@ test "native image archive round-trips into a clean cache and rejects substituti
     try std.testing.expectError(error.ImageArchiveDigestMismatch, unpack(init, allocator, .{
         .archive_path = archive_path,
         .archive_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .expected_image_digest = pack_result.image_digest,
         .ref = "local/archive:rejected",
         .platform = .{ .os = "linux", .arch = .arm64 },
     }));
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, rejected_cache ++ "/refs", .{}));
+
+    const identity_rejected_cache = tmp ++ "/identity-rejected-cache";
+    try env.put(local_paths.rootfs_cache_env, identity_rejected_cache);
+    try std.testing.expectError(error.ImageIdentityMismatch, unpack(init, allocator, .{
+        .archive_path = archive_path,
+        .archive_digest = pack_result.archive_digest,
+        .expected_image_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .ref = "local/archive:wrong-identity",
+        .platform = .{ .os = "linux", .arch = .arm64 },
+    }));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, identity_rejected_cache ++ "/refs", .{}));
+
     try std.testing.expectError(error.BadProtocol, unpack(init, allocator, .{
         .archive_path = archive_path,
         .archive_digest = pack_result.archive_digest,
+        .expected_image_digest = pack_result.image_digest,
         .ref = "local/archive:wrong-arch",
         .platform = .{ .os = "linux", .arch = .amd64 },
     }));

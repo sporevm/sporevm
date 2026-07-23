@@ -12,6 +12,7 @@ receipt="${output}/receipt.env"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-image-publish.XXXXXX")"
 trap 'rm -rf "${scratch}"' EXIT
 mkdir -p "${output}"
+rm -f "${archive}" "${receipt}"
 
 export SPOREVM_ROOTFS_CACHE_DIR="${scratch}/rootfs-cache"
 export SPOREVM_RUNTIME_DIR="${scratch}/runtime"
@@ -36,6 +37,6 @@ if [[ ! "${archive_digest}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   exit 1
 fi
 
-printf 'ARCHIVE_DIGEST=%s\nIMAGE_DIGEST=%s\nPLATFORM=%s\n' \
-  "${archive_digest}" "${image_digest}" "linux/arm64" >"${receipt}"
+printf 'ARCHIVE_DIGEST=%s\nIMAGE_DIGEST=%s\nPLATFORM=%s\nPRODUCER_JOB_ID=%s\n' \
+  "${archive_digest}" "${image_digest}" "linux/arm64" "${BUILDKITE_JOB_ID}" >"${receipt}"
 echo "published native image archive ${archive_digest} for ${image_digest}"

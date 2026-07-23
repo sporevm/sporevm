@@ -6,21 +6,25 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
 
-output="zig-cache/native-image-distribution"
-archive="${output}/ci-final-image.tar.gz"
-receipt="${output}/receipt.env"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-image-consume.XXXXXX")"
 trap 'rm -rf "${scratch}"' EXIT
-mkdir -p "${output}"
+download="${scratch}/download"
+artifact_path="zig-cache/native-image-distribution"
+archive="${download}/${artifact_path}/ci-final-image.tar.gz"
+receipt="${download}/${artifact_path}/receipt.env"
+mkdir -p "${download}"
 
-buildkite-agent artifact download "${archive}" . --step native-image-archive-publish-linux-arm64
-buildkite-agent artifact download "${receipt}" . --step native-image-archive-publish-linux-arm64
+buildkite-agent artifact download "${artifact_path}/ci-final-image.tar.gz" "${download}" --step native-image-archive-publish-linux-arm64
+buildkite-agent artifact download "${artifact_path}/receipt.env" "${download}" --step native-image-archive-publish-linux-arm64
 ARCHIVE_DIGEST="$(awk -F= '$1 == "ARCHIVE_DIGEST" { print $2 }' "${receipt}")"
 IMAGE_DIGEST="$(awk -F= '$1 == "IMAGE_DIGEST" { print $2 }' "${receipt}")"
 PLATFORM="$(awk -F= '$1 == "PLATFORM" { print $2 }' "${receipt}")"
+PRODUCER_JOB_ID="$(awk -F= '$1 == "PRODUCER_JOB_ID" { print $2 }' "${receipt}")"
 if [[ ! "${ARCHIVE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
    [[ ! "${IMAGE_DIGEST}" =~ ^blake3:[0-9a-f]{64}$ ]] ||
-   [[ "${PLATFORM}" != "linux/arm64" ]]; then
+   [[ "${PLATFORM}" != "linux/arm64" ]] ||
+   [[ -z "${PRODUCER_JOB_ID}" ]] ||
+   [[ "${PRODUCER_JOB_ID}" == "${BUILDKITE_JOB_ID}" ]]; then
   echo "native image artifact receipt is invalid" >&2
   exit 1
 fi
@@ -32,6 +36,7 @@ mise run build:release
 unpack_output="$(zig-out/bin/spore image unpack \
   "${archive}" \
   --archive-digest "${ARCHIVE_DIGEST}" \
+  --expected-image-digest "${IMAGE_DIGEST}" \
   --platform "${PLATFORM}" \
   --ref local/ci-final-image:consumer)"
 printf '%s\n' "${unpack_output}"

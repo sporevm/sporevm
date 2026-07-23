@@ -983,12 +983,13 @@ framing to G2 unless production telemetry shows materially higher reuse.
 
 The first G1 product transport now implements that archive decision for final
 native images. `spore image pack` exports a complete local `spore build` or
-`spore run --commit` result as one immutable SHA-256-named gzip/USTAR object;
-`spore image unpack` requires that transport digest and an explicit platform,
+`spore run --commit` result as one immutable SHA-256-addressed gzip/USTAR object;
+`spore image unpack` requires that transport digest, the expected native image
+identity, and an explicit platform,
 re-verifies the canonical gateway manifest, config, rootfs index, native image
 identity, and every BLAKE3 object, then publishes an ordinary local ref last.
-The Buildkite acceptance pipeline builds and packs on one worker, crosses the
-artifact boundary, unpacks into a clean rootfs cache on another worker, checks
+The Buildkite acceptance pipeline builds and packs in one job, crosses the
+artifact boundary, unpacks into a clean rootfs cache in a dependent job, checks
 the exact native identity, and runs that image through `--pull=never`. This
 closes final native-image distribution without capturing suspended machine
 state, adding a gateway service framework, or distributing Dockerfile step
@@ -1102,9 +1103,10 @@ image artifact distribution.
 
 - Pack one complete local native image closure into the immutable compressed
   archive selected by G0, while keeping archive bytes outside native identity.
-- Require the archive SHA-256 and explicit platform on import, then verify and
-  install through the existing CAS and local-ref publication transaction.
-- Prove CI handoff on separate workers: build and publish the artifact on the
+- Require the archive SHA-256, expected native image BLAKE3, and explicit
+  platform on import, then verify and install through the existing CAS and
+  local-ref publication transaction.
+- Prove CI handoff in separate jobs: build and publish the artifact on the
   producer, download into an empty rootfs cache on the consumer, compare the
   native image identity, and run through `--pull=never` without saved state.
 - Keep artifact upload/download owned by the CI or object-store transport. The

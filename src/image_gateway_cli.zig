@@ -93,6 +93,7 @@ pub fn parsePackOptions(args: []const []const u8) !api.ImageArchivePackOptions {
 pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptions {
     var archive_path: ?[]const u8 = null;
     var archive_digest: ?[]const u8 = null;
+    var expected_image_digest: ?[]const u8 = null;
     var ref: ?[]const u8 = null;
     var platform: ?rootfs.Platform = null;
     var i: usize = 0;
@@ -102,6 +103,10 @@ pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptio
             i += 1;
             if (i >= args.len) return error.MissingImageArchiveDigest;
             archive_digest = args[i];
+        } else if (std.mem.eql(u8, arg, "--expected-image-digest")) {
+            i += 1;
+            if (i >= args.len) return error.MissingExpectedImageDigest;
+            expected_image_digest = args[i];
         } else if (std.mem.eql(u8, arg, "--ref")) {
             i += 1;
             if (i >= args.len) return error.MissingImageReference;
@@ -120,6 +125,7 @@ pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptio
     return .{
         .archive_path = archive_path orelse return error.MissingImageArchive,
         .archive_digest = archive_digest orelse return error.MissingImageArchiveDigest,
+        .expected_image_digest = expected_image_digest orelse return error.MissingExpectedImageDigest,
         .ref = ref orelse return error.MissingImageReference,
         .platform = .{ .os = selected.os, .arch = selected.arch },
     };
@@ -282,6 +288,8 @@ test "image archive options require immutable digest and explicit platform" {
         "app.spore-image.tar.gz",
         "--archive-digest",
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--expected-image-digest",
+        "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "--platform",
         "linux/amd64",
         "--ref",
@@ -290,6 +298,8 @@ test "image archive options require immutable digest and explicit platform" {
     try std.testing.expectEqual(.amd64, unpack.platform.arch);
     try std.testing.expectError(error.MissingImageArchiveDigest, parseUnpackOptions(&.{
         "app.spore-image.tar.gz",
+        "--expected-image-digest",
+        "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "--platform",
         "linux/amd64",
         "--ref",

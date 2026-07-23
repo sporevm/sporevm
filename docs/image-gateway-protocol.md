@@ -278,12 +278,14 @@ compressed file is its immutable publication name.
 image before writing anything, verifies the complete local CAS closure, and
 prints the archive SHA-256, gateway-manifest SHA-256, and native-image BLAKE3
 identities. It refuses to replace an existing output. `spore image unpack`
-requires the expected archive digest, target platform, and destination local
-tag. It verifies the complete archive digest before decompression, then verifies
-the selected platform, canonical manifest/config/index closure, native image
-identity, each object's index-derived length, and each object's BLAKE3 digest.
-Only after the complete closure is staged does it install through the existing
-CAS transaction and publish the local ref last.
+requires the expected archive digest, expected native image digest, target
+platform, and destination local tag. It hashes the same open file it parses,
+then verifies the selected platform, canonical manifest/config/index closure,
+native image identity, each object's index-derived length, and each object's
+BLAKE3 digest. An outer archive digest, expected native identity, or aggregate
+bound mismatch fails before cache publication. Only after the complete closure
+is staged does it install through the existing CAS transaction and publish the
+local ref last.
 
 The initial archive path shares the eager-client bounds: at most 16 GiB logical
 rootfs size, 65,536 distinct nonzero objects, 4 GiB object payload, and 4 GiB
