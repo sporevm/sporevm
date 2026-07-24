@@ -8,6 +8,8 @@
 - Zig toolchain is pinned in `mise.toml`. Build with `mise run build`, test
   with `mise run test`. Do not float the Zig version casually; upgrades are
   deliberate, one release at a time.
+- Amp Orbs can open a development shell on the managed Linux ARM64, Linux
+  x86_64, or macOS host with `.agents/ssm-sporevm arm64|x86_64|macos`.
 - SporeVM is an isolation boundary. Read `SECURITY.md` before changing
   virtqueue parsing, manifest/chunk decoding, or guest memory access. New
   parsers of attacker-influenced data require fuzz targets in the same change.

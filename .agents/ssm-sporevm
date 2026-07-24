@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: $0 <arm64|x86_64|macos>" >&2
+}
+
+: "${AMP_SPOREVM_SSM_ROLE_ARN:=arn:aws:iam::907480720934:role/sporevm-amp-orb-ssm-dev}"
+: "${AMP_SPOREVM_SSM_AUDIENCE:=urn:sporevm:aws:ssm:buildkite-lab}"
+: "${AMP_SPOREVM_AWS_REGION:=ap-southeast-2}"
+: "${AMP_SPOREVM_SSM_ARM64_TARGET_NAME:=sporevm-k8s-dev-apse2-eks-spore-node}"
+: "${AMP_SPOREVM_SSM_X86_64_TARGET_NAME:=sporevm-dev-apse2-linux-x86-64}"
+: "${AMP_SPOREVM_SSM_MACOS_TARGET_NAME:=sporevm-dev-apse2-mac-instance}"
+
+target="${1:-}"
+case "$target" in
+  arm64)
+    target_name="$AMP_SPOREVM_SSM_ARM64_TARGET_NAME"
+    ;;
+  x86_64)
+    target_name="$AMP_SPOREVM_SSM_X86_64_TARGET_NAME"
+    ;;
+  macos)
+    target_name="$AMP_SPOREVM_SSM_MACOS_TARGET_NAME"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+for command in amp python3 session-manager-plugin; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "Required command is not installed: $command" >&2
+    exit 1
+  fi
+done
+
+aws_command=(aws)
+if ! command -v aws >/dev/null 2>&1; then
+  if command -v mise >/dev/null 2>&1 && mise exec -- aws --version >/dev/null 2>&1; then
+    aws_command=(mise exec -- aws)
+  else
+    echo "Required command is not installed: aws" >&2
+    exit 1
+  fi
+fi
+
+token_file="$(mktemp)"
+trap 'rm -f "$token_file"' EXIT
+chmod 0600 "$token_file"
+
+amp orb id-token \
+  --audience "$AMP_SPOREVM_SSM_AUDIENCE" \
+  --ttl-seconds 900 \
+  >"$token_file"
+
+thread_id="$(
+  python3 - "$token_file" <<'PY'
+import base64
+import json
+import pathlib
+import sys
+
+token = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+payload = token.split(".")[1]
+payload += "=" * (-len(payload) % 4)
+claims = json.loads(base64.urlsafe_b64decode(payload))
+print(claims["thread_id"])
+PY
+)"
+
+export AWS_EC2_METADATA_DISABLED=true
+export AWS_PAGER=""
+export AWS_REGION="$AMP_SPOREVM_AWS_REGION"
+export AWS_ROLE_ARN="$AMP_SPOREVM_SSM_ROLE_ARN"
+export AWS_ROLE_SESSION_NAME="amp-${thread_id:0:60}"
+export AWS_WEB_IDENTITY_TOKEN_FILE="$token_file"
+
+instance_ids="$(
+  "${aws_command[@]}" ec2 describe-instances \
+    --filters \
+      "Name=tag:Name,Values=$target_name" \
+      "Name=tag:application,Values=sporevm" \
+      "Name=tag:env,Values=dev" \
+      "Name=instance-state-name,Values=running" \
+    --query "join(' ', Reservations[].Instances[].InstanceId)" \
+    --output text
+)"
+
+read -r -a instances <<<"$instance_ids"
+if [ "${#instances[@]}" -ne 1 ]; then
+  echo "Expected one running $target SporeVM development host, found ${#instances[@]}" >&2
+  exit 1
+fi
+
+"${aws_command[@]}" ssm start-session --target "${instances[0]}"

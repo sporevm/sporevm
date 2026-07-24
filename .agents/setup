@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Sandbox setup for SporeVM: install mise, then the pinned toolchain
-# (zig, gh, svu) from mise.toml.
+# (zig, gh, svu, AWS CLI) from mise.toml.
 set -euo pipefail
 
 # Native build tools required by the minimal exec initrd (Toybox) build.
 if command -v apt-get >/dev/null 2>&1; then
   sudo apt-get update -y || apt-get update -y || true
-  sudo apt-get install -y cpio make gcc xz-utils \
-    || apt-get install -y cpio make gcc xz-utils || true
+  sudo apt-get install -y ca-certificates cpio curl make gcc python3 xz-utils \
+    || apt-get install -y ca-certificates cpio curl make gcc python3 xz-utils || true
 fi
 
 if ! command -v mise >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/mise" ]; then
@@ -18,3 +18,36 @@ MISE="$(command -v mise || echo "$HOME/.local/bin/mise")"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 "$MISE" install
+
+# AWS CLI shells require the separate Session Manager websocket plugin. Pin the
+# package and verify it so Orb setup does not execute an unreviewed moving
+# artifact.
+if ! command -v session-manager-plugin >/dev/null 2>&1; then
+  session_manager_plugin_version='1.2.814.0'
+
+  case "$(uname -m)" in
+    x86_64)
+      session_manager_plugin_arch='ubuntu_64bit'
+      session_manager_plugin_sha256='67ddd12b963c28e44126f9732075caae333cc5f55e902623bd6a107ead2bcc56'
+      ;;
+    aarch64 | arm64)
+      session_manager_plugin_arch='ubuntu_arm64'
+      session_manager_plugin_sha256='dd714895b7e9b9945139301311778c175e556f75fda25250d36cff19c5eb0cdf'
+      ;;
+    *)
+      echo "Unsupported architecture for Session Manager plugin: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+
+  (
+    plugin_dir="$(mktemp -d)"
+    trap 'rm -rf "$plugin_dir"' EXIT
+    plugin_deb="$plugin_dir/session-manager-plugin.deb"
+    plugin_url="https://s3.amazonaws.com/session-manager-downloads/plugin/${session_manager_plugin_version}/${session_manager_plugin_arch}/session-manager-plugin.deb"
+
+    curl -fsSL "$plugin_url" -o "$plugin_deb"
+    echo "$session_manager_plugin_sha256  $plugin_deb" | sha256sum -c -
+    sudo dpkg -i "$plugin_deb" || dpkg -i "$plugin_deb"
+  )
+fi
