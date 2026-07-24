@@ -29,12 +29,22 @@ case "$target" in
     ;;
 esac
 
-for command in amp aws python3 session-manager-plugin; do
+for command in amp python3 session-manager-plugin; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "Required command is not installed: $command" >&2
     exit 1
   fi
 done
+
+aws_command=(aws)
+if ! command -v aws >/dev/null 2>&1; then
+  if command -v mise >/dev/null 2>&1 && mise exec -- aws --version >/dev/null 2>&1; then
+    aws_command=(mise exec -- aws)
+  else
+    echo "Required command is not installed: aws" >&2
+    exit 1
+  fi
+fi
 
 token_file="$(mktemp)"
 trap 'rm -f "$token_file"' EXIT
@@ -68,7 +78,7 @@ export AWS_ROLE_SESSION_NAME="amp-${thread_id:0:60}"
 export AWS_WEB_IDENTITY_TOKEN_FILE="$token_file"
 
 instance_ids="$(
-  aws ec2 describe-instances \
+  "${aws_command[@]}" ec2 describe-instances \
     --filters \
       "Name=tag:Name,Values=$target_name" \
       "Name=tag:application,Values=sporevm" \
@@ -84,4 +94,4 @@ if [ "${#instances[@]}" -ne 1 ]; then
   exit 1
 fi
 
-aws ssm start-session --target "${instances[0]}"
+"${aws_command[@]}" ssm start-session --target "${instances[0]}"
