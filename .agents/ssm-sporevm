@@ -84,7 +84,7 @@ instance_ids="$(
       "Name=tag:application,Values=sporevm" \
       "Name=tag:env,Values=dev" \
       "Name=instance-state-name,Values=running" \
-    --query 'Reservations[].Instances[].InstanceId' \
+    --query "join(' ', Reservations[].Instances[].InstanceId)" \
     --output text
 )"
 

@@ -10,6 +10,7 @@ bash scripts/benchmark/download-history.sh --self-test
 python3 scripts/benchmark/named-restore-readiness.py --self-test
 python3 scripts/benchmark/named-restore-readiness-test.py
 bash scripts/ci/named-restore-release-inputs-test.sh
+bash scripts/test/ssm-sporevm.sh
 python3 scripts/spore-build-conformance.py --self-test-schema
 python3 scripts/image-gateway-worker-conformance.py self-test
 python3 scripts/image-gateway-authorization-conformance.py --self-test
