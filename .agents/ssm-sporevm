@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <arm64|x86_64>" >&2
+  echo "Usage: $0 <arm64|x86_64|macos>" >&2
 }
 
 : "${AMP_SPOREVM_SSM_ROLE_ARN:=arn:aws:iam::907480720934:role/sporevm-amp-orb-ssm-dev}"
@@ -10,6 +10,7 @@ usage() {
 : "${AMP_SPOREVM_AWS_REGION:=ap-southeast-2}"
 : "${AMP_SPOREVM_SSM_ARM64_TARGET_NAME:=sporevm-k8s-dev-apse2-eks-spore-node}"
 : "${AMP_SPOREVM_SSM_X86_64_TARGET_NAME:=sporevm-dev-apse2-linux-x86-64}"
+: "${AMP_SPOREVM_SSM_MACOS_TARGET_NAME:=sporevm-dev-apse2-mac-instance}"
 
 target="${1:-}"
 case "$target" in
@@ -18,6 +19,9 @@ case "$target" in
     ;;
   x86_64)
     target_name="$AMP_SPOREVM_SSM_X86_64_TARGET_NAME"
+    ;;
+  macos)
+    target_name="$AMP_SPOREVM_SSM_MACOS_TARGET_NAME"
     ;;
   *)
     usage
