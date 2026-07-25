@@ -6,7 +6,7 @@ steps:
         key: "test-linux"
         command: "scripts/ci/run.sh scripts/ci/test.sh"
         plugins: &mise_plugins
-          - mise#a5845c5082d3a4fe36dd77ae74973dfc86fc91a2:
+          - mise#e53a95a05d51dd20b1bfcd98fb3f9fe13292812b:
               version: "2026.5.12"
         cache: &mise_cache
           paths:
