@@ -20,6 +20,22 @@ description = "Install optimized spore into ~/bin"
 run = "zig build test && scripts/test/contracts.sh"
 description = "Run unit tests and benchmark parser contract checks"
 
+[tasks."dev:qemu-kvm-build"]
+run = "scripts/dev/qemu-tcg-kvm.sh build"
+description = "Cross-build SporeVM for the macOS QEMU TCG KVM guest"
+
+[tasks."dev:qemu-kvm-start"]
+run = "scripts/dev/qemu-tcg-kvm.sh start"
+description = "Start the warm macOS QEMU TCG KVM development guest"
+
+[tasks."dev:qemu-kvm-smoke"]
+run = "scripts/dev/qemu-tcg-kvm.sh smoke"
+description = "Run SporeVM KVM and networking smokes in QEMU TCG"
+
+[tasks."dev:qemu-kvm-stop"]
+run = "scripts/dev/qemu-tcg-kvm.sh stop"
+description = "Stop the macOS QEMU TCG KVM development guest"
+
 [tasks."test:rootfs-slow"]
 run = "zig build rootfs-slow-test"
 description = "Run slow rootfs/ext4 conformance tests"

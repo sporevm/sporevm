@@ -67,6 +67,8 @@ hypervisors.
 - [docs/libspore.md](docs/libspore.md): Zig, C, and Go embedding surface.
 - [docs/automation.md](docs/automation.md): versioned CLI and library results,
   stream completion, and stable failure classification.
+- [docs/local-kvm-development.md](docs/local-kvm-development.md): local
+  Linux/KVM development inside QEMU TCG on Apple Silicon.
 
 ## Install
 
