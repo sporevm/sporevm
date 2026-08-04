@@ -3575,6 +3575,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                     .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                     .network = network,
                     .exec_probe = &stream,
+                    .exec_probe_completes_run = opts.commit == null,
                     .exec_control = exec_control,
                     .exec_probe_timeout_ms = opts.timeout_ms,
                 });
