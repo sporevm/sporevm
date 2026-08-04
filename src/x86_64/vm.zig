@@ -790,6 +790,15 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
             if (ctx.exec_probe_watchdog_until_control) ctx.exec_probe_done.store(true, .release);
             const disk_manifest = try takeRootfsSnapshot(ctx.allocator, request.dir, ctx.transports, ctx.disk_snapshot);
             try control.completeRootfsSnapshot(disk_manifest);
+            if (ctx.exec_probe_watchdog_until_control) {
+                switch (try x86ControlDecision(try control.poll(ctx.vsock_dev))) {
+                    .stop => {
+                        if (ctx.state.finishCause(.monitor_stopped)) ctx.wake_set.wakeAll();
+                        return true;
+                    },
+                    .keep_running, .rootfs_snapshot => return error.BadManifest,
+                }
+            }
         },
     }
     const transport = &ctx.transports[board.vsock_slot.index];
