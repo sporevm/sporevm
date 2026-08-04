@@ -3576,6 +3576,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                     .network = network,
                     .exec_probe = &stream,
                     .exec_probe_completes_run = opts.commit == null,
+                    .exec_probe_watchdog_until_control = opts.commit != null,
                     .exec_control = exec_control,
                     .exec_probe_timeout_ms = opts.timeout_ms,
                 });
