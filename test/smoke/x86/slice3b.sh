@@ -45,6 +45,19 @@ fi
   -- /bin/sh -lc 'test "$(uname -m)" = x86_64 && printf "x86 rootfs ok\n"'
 
 "${repo_root}/test/smoke/run/image-commit.sh"
+"${spore_bin}" run \
+  --backend kvm \
+  --memory 512mib \
+  --image docker.io/library/alpine:3.20 \
+  --disk-size 2gb \
+  --commit local/x86-slice3b:growth \
+  -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && test "$(df -k / | awk "NR == 2 { print \$2 }")" -gt 1500000 && echo x86-growth-ok >/x86-growth-marker'
+"${spore_bin}" run \
+  --backend kvm \
+  --memory 512mib \
+  --image local/x86-slice3b:growth \
+  --pull=never \
+  -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && grep -Fxq x86-growth-ok /x86-growth-marker'
 "${repo_root}/test/smoke/network/config.sh"
 "${repo_root}/test/smoke/network/dns.sh"
 "${repo_root}/test/smoke/network/http.sh"
