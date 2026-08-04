@@ -69,6 +69,10 @@ description = "Smoke product spore run streaming and exit status"
 run = "mise run build:release && zig build kvm-boot kvm-profile-probe kvm-profile-roundtrip x86-slice2a-smoke --release=safe && test/smoke/x86/slice3a.sh"
 description = "Run the native x86 frozen-board, fresh-product, and fail-closed Slice 3a matrix"
 
+[tasks."smoke:x86-slice3b"]
+run = "mise run build:release && zig build kvm-boot kvm-profile-probe kvm-profile-roundtrip x86-slice2a-smoke --release=safe && test/smoke/x86/slice3a.sh && test/smoke/x86/slice3b.sh"
+description = "Run the native x86 fresh-product, OCI/rootfs/commit, network-policy, and fail-closed Slice 3b matrix"
+
 [tasks."smoke:run-stdin"]
 run = "mise run build && test/smoke/run/stdin.sh"
 description = "Smoke product spore run interactive stdin forwarding"

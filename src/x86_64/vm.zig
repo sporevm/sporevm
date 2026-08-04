@@ -1,14 +1,17 @@
-//! Fresh-only x86-64 Linux/KVM virtual machine.
+//! Fresh-workload x86-64 Linux/KVM virtual machine.
 //!
-//! Slice 2a combines the frozen board and approved CPU profile with the shared
-//! device model. It deliberately excludes snapshots and persistent disk paths.
+//! The frozen board and approved CPU profile use the shared device, rootfs,
+//! network, and rootfs-only image snapshot contracts. Saved machine state and
+//! disk forks remain deliberately unavailable.
 
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const disk_layer = @import("../disk_layer.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const kvm = @import("../kvm/x86_64.zig");
+const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
 const mmio = @import("../virtio/mmio.zig");
 const virtio_queue = @import("../virtio/queue.zig");
@@ -42,6 +45,8 @@ pub const Config = struct {
     vcpu_count: u8 = default_vcpu_count,
     console_sink: *const fn ([]const u8) void,
     root_disk: ?virtio_blk.Backend = null,
+    root_blk_options: virtio_blk.Options = .{},
+    disk_snapshot: ?disk_layer.SnapshotState = null,
     context_disk: ?virtio_blk.Backend = null,
     build_disk: ?virtio_blk.Backend = null,
     cache_disk: ?virtio_blk.Backend = null,
@@ -301,6 +306,7 @@ const RunState = struct {
 };
 
 const ThreadContext = struct {
+    allocator: std.mem.Allocator,
     vm_fd: std.c.fd_t,
     vcpu: *Vcpu,
     state: *RunState,
@@ -311,6 +317,7 @@ const ThreadContext = struct {
     exec_probe: ?*virtio_vsock.HostStream,
     exec_probe_completes_run: bool,
     exec_control: ?virtio_vsock.Control,
+    disk_snapshot: ?disk_layer.SnapshotState,
     vsock_dev: *virtio_vsock.Vsock,
     network: virtio_net.Runtime,
     net_dev: *virtio_net.Net,
@@ -353,7 +360,6 @@ fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
 }
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
-    _ = allocator;
     try board.validateLayout(config.ram_size);
     try topology.validateVcpuCount(config.vcpu_count);
     if (config.exec_probe != null and config.exec_probe_timeout_ms == 0) return error.InvalidProbeTimeout;
@@ -472,7 +478,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     transports[board.console_slot.index] = .init(console_dev.device());
     for (disk_backends, board.disk_slots, 0..) |maybe_backend, slot, index| {
         if (maybe_backend) |backend| {
-            block_devs[index] = if (index == 0) .init(backend) else .initImmutableSource(backend);
+            block_devs[index] = if (index == 0) .initWithOptions(backend, config.root_blk_options) else .initImmutableSource(backend);
             transports[slot.index] = .init(block_devs[index].device());
         } else {
             transports[slot.index] = .init(empty_devs[index].device());
@@ -503,6 +509,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var started: usize = 0;
     while (started < initialized) : (started += 1) {
         contexts[started] = .{
+            .allocator = allocator,
             .vm_fd = vm_fd,
             .vcpu = &vcpus[started],
             .state = &state,
@@ -513,6 +520,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .exec_probe = config.exec_probe,
             .exec_probe_completes_run = config.exec_probe_completes_run,
             .exec_control = config.exec_control,
+            .disk_snapshot = config.disk_snapshot,
             .vsock_dev = &vsock_dev,
             .network = config.network,
             .net_dev = &net_dev,
@@ -736,8 +744,9 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
 }
 
 /// Polling is serialized with virtqueue MMIO because monitor control may
-/// attach or reset the active host stream. Slice 3a deliberately accepts only
-/// exec and stop actions; snapshot-family actions remain fail-closed.
+/// attach or reset the active host stream. Rootfs-only snapshots seal a
+/// quiescent writable image without capturing machine state; machine snapshot
+/// and disk-fork actions remain fail-closed.
 fn pollControlLocked(ctx: *ThreadContext) !bool {
     if (ctx.vcpu.index != 0) return false;
     const control = ctx.exec_control orelse return false;
@@ -746,6 +755,10 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
         .stop => {
             if (ctx.state.finishCause(.monitor_stopped)) ctx.wake_set.wakeAll();
             return true;
+        },
+        .rootfs_snapshot => |request| {
+            const disk_manifest = try takeRootfsSnapshot(ctx.allocator, request.dir, ctx.transports, ctx.disk_snapshot);
+            try control.completeRootfsSnapshot(disk_manifest);
         },
     }
     const transport = &ctx.transports[board.vsock_slot.index];
@@ -756,14 +769,68 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
     return false;
 }
 
-const X86ControlDecision = enum { keep_running, stop };
+const X86ControlDecision = union(enum) {
+    keep_running,
+    stop,
+    rootfs_snapshot: virtio_vsock.RootfsSnapshotAction,
+};
 
 fn x86ControlDecision(action: virtio_vsock.ControlAction) !X86ControlDecision {
     return switch (action) {
         .keep_running => .keep_running,
         .stop => .stop,
-        .snapshot, .rootfs_snapshot, .disk_fork => error.X86CaptureUnsupported,
+        .rootfs_snapshot => |request| .{ .rootfs_snapshot = request },
+        .snapshot, .disk_fork => error.X86CaptureUnsupported,
     };
+}
+
+fn takeRootfsSnapshot(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    transports: []mmio.Transport,
+    disk_snapshot: ?disk_layer.SnapshotState,
+) !?spore.Disk {
+    const disk_state = disk_snapshot orelse return error.BadManifest;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const devices = try captureTransports(arena, transports);
+    if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+        std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
+        return error.DeviceStatePending;
+    }
+    return try disk_state.finish(allocator, dir, true);
+}
+
+fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transport) ![]spore.TransportState {
+    const out = try allocator.alloc(spore.TransportState, transports.len);
+    for (transports, 0..) |*transport, index| {
+        const queues = try allocator.alloc(spore.QueueState, transport.dev.queue_count);
+        for (queues, 0..) |*state, queue_index| {
+            const queue = transport.queues[queue_index];
+            state.* = .{
+                .size = queue.size,
+                .ready = queue.ready,
+                .desc_addr = queue.desc_addr,
+                .avail_addr = queue.avail_addr,
+                .used_addr = queue.used_addr,
+                .last_avail = queue.last_avail,
+                .used_idx = queue.used_idx,
+            };
+        }
+        out[index] = .{
+            .device_id = transport.dev.device_id,
+            .status = transport.status,
+            .device_features_sel = transport.device_features_sel,
+            .driver_features_sel = transport.driver_features_sel,
+            .driver_features = transport.driver_features,
+            .queue_sel = transport.queue_sel,
+            .interrupt_status = transport.interrupt_status,
+            .queues = queues,
+        };
+    }
+    return out;
 }
 
 fn finishThread(ctx: *ThreadContext, err: anyerror) void {
@@ -1184,11 +1251,14 @@ test "terminal reservation blocks unclaimed finish and publication before comple
     }
 }
 
-test "x86 monitor control accepts only exec continuation and stop" {
+test "x86 monitor control accepts rootfs-only snapshots but rejects machine capture" {
     try std.testing.expectEqual(X86ControlDecision.keep_running, try x86ControlDecision(.keep_running));
     try std.testing.expectEqual(X86ControlDecision.stop, try x86ControlDecision(.stop));
     try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .snapshot = .{ .dir = "out.spore" } }));
-    try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .rootfs_snapshot = .{ .dir = "root" } }));
+    switch (try x86ControlDecision(.{ .rootfs_snapshot = .{ .dir = "root" } })) {
+        .rootfs_snapshot => |request| try std.testing.expectEqualStrings("root", request.dir),
+        .keep_running, .stop => return error.TestUnexpectedDecision,
+    }
     try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .disk_fork = .{ .dir = "fork", .count = 1 } }));
 }
 

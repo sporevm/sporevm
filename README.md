@@ -10,21 +10,22 @@
 [![Zig 0.16.0](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](mise.toml)
 
 SporeVM is a small virtual machine monitor for saving and forking Linux
-microVM state on ARM64. Linux x86-64/KVM also has an experimental
-fresh-execution profile.
+microVM state on ARM64. Linux x86-64/KVM also has an experimental fresh
+workload profile.
 
 | Host | Current support |
 | --- | --- |
 | macOS/ARM64 + HVF | Mature full lifecycle |
 | Linux/ARM64 + KVM | Mature full lifecycle |
-| Linux/AMD64 + KVM | Experimental fresh execution only |
+| Linux/AMD64 + KVM | Experimental fresh workloads; no saved state |
 
 The full lifecycle includes run, save, attach, restore, fork, rootfs,
 networking, and build workflows. The AMD64 profile is deliberately narrower:
 it uses the managed kernel and embedded minimal exec initrd with one vCPU and
-exactly 512 MiB of memory, and supports one-shot `run` plus fresh
-`create`/`exec`/`rm`. It does not support image or rootfs execution,
-networking, build, capture, save, restore, resume, fork, or fan-out.
+exactly 512 MiB of memory. Fresh one-shot and named workloads support native
+`linux/amd64` OCI images, explicit rootfs inputs, networking, and one-shot
+image commit. Build, capture, save, restore, resume, fork, and fan-out remain
+unavailable.
 
 A spore is sealed VM state with normalized machine state, device state,
 verified memory chunks, optional rootfs state, and a platform contract that
@@ -136,8 +137,8 @@ spore run --memory 512mib 'echo hi'
 ```
 
 That profile accepts only one vCPU and the managed kernel plus embedded minimal
-exec initrd. Image, rootfs, networking, build, and saved-state options fail
-closed.
+exec initrd. Native `linux/amd64` image and rootfs execution, networking, and
+one-shot image commit are available; build and saved-state options fail closed.
 
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
 initrd. The embedded initrd contains SporeVM helper binaries plus a small
@@ -433,9 +434,9 @@ to retrieve it after create returns. Machine callers can use global `--json`
 for structured lifecycle state. See [docs/lifecycle.md](docs/lifecycle.md) for
 runtime layout, monitor jailing, named live fork, and limits.
 
-Linux/AMD64 KVM currently supports only fresh `create`, `exec`, and `rm` with
-one vCPU and fixed 512 MiB memory; the save, restore, and fork operations in
-the example above remain unavailable.
+Linux/AMD64 KVM supports fresh `create`, `exec`, and `rm` with native images,
+rootfs inputs, and networking using one vCPU and fixed 512 MiB memory; the save,
+restore, and fork operations in the example above remain unavailable.
 
 ## Current scope
 
@@ -443,8 +444,8 @@ SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
 named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM has an
 experimental fresh-only development profile with one vCPU and fixed 512 MiB
-memory; capture, resume, rootfs, networking, build, and standalone libspore
-execution remain gated.
+memory; native OCI/rootfs execution, image commit, and networking are available,
+while capture, resume, build, and standalone libspore execution remain gated.
 
 Known limits: compatible host-class restore only, rootfs-bound writable disk
 state only, diskless named live fork, and no hardened public-cloud
