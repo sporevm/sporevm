@@ -1,6 +1,6 @@
 ---
 status: active
-last_reviewed: 2026-07-23
+last_reviewed: 2026-08-04
 spec_refs:
   - docs/spore-format.md
   - docs/state-portability.md
@@ -45,15 +45,16 @@ requires a matching architecture and compatible machine profile.
 | Shared and architecture-specific KVM UAPI | Complete | `src/kvm/common.zig`, `src/kvm/x86_64.zig` |
 | Architecture, host-info, artifacts, runner | Complete | `src/architecture.zig`, `src/platform.zig`, `src/x86_64/vm.zig`, `build.zig` |
 | Managed fresh product execution | Complete | `mise run smoke:x86-slice3a` on native x86 KVM |
-| OCI/rootfs/network/image commit | Next: Slice 3b | Product gates remain closed |
+| OCI/rootfs/network/image commit | Complete | `mise run smoke:x86-slice3b` on native x86 KVM |
 | Native build and standalone libspore | Pending: Slice 3c | Product gates remain closed |
 | Saved machine state and lifecycle parity | Pending: Slices 4–5 | No x86 manifest writer yet |
 | High/elastic memory and performance | Pending: Slice 6 | Product requires fixed 512 MiB |
 | Packaging and supported release | Pending: Slice 7 | No x86 support claim yet |
 
 The current product path is experimental and fresh-only: Linux/x86-64 KVM, one
-vCPU, and fixed 512 MiB memory. OCI/rootfs, networking, build, libspore,
-capture, fork, elastic memory, and release paths remain fail closed.
+vCPU, and fixed 512 MiB memory. Native OCI/rootfs execution, writable image
+commit, and networking are complete. Build, libspore, capture, fork, elastic
+memory, and release paths remain fail closed.
 
 ## Scope
 

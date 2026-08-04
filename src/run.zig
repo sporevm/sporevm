@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+const architecture = @import("architecture.zig");
 const attach_stream = @import("attach_stream.zig");
 const backend_mod = @import("backend.zig");
 const capture = @import("capture.zig");
@@ -130,9 +131,16 @@ const approved_x86_kernel_sha256 = [_]u8{
     0x45, 0xfa, 0x13, 0x2c, 0x8b, 0x48, 0xcf, 0x56,
     0x7f, 0x20, 0x00, 0x99, 0xb5, 0x5a, 0xbe, 0xe8,
 };
-const direct_image_platform = rootfs_mod.Platform{};
+const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
+    @compileError("SporeVM product execution requires an arm64 or amd64 host architecture");
 const max_rootfs_metadata_bytes = 1024 * 1024;
 pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
+
+fn directImagePlatformFor(zig_arch: std.Target.Cpu.Arch) !rootfs_mod.Platform {
+    return .{
+        .arch = architecture.fromTarget(zig_arch) orelse return error.UnsupportedArchitecture,
+    };
+}
 
 pub const MemoryConfig = memory_config.Config;
 pub const SaveTrigger = capture.Trigger;
@@ -162,7 +170,8 @@ pub const FreshProductPolicy = struct {
     build: bool = false,
 };
 
-/// Slice 3a exposes one deliberately narrow x86 product profile. Keep this
+/// The experimental x86 product profile remains fixed-memory, single-vCPU,
+/// fresh-only, and unavailable to the native builder. Keep this
 /// pure so API and lifecycle callers can reject unsupported work before
 /// downloads, rootfs resolution, gateway startup, or monitor state creation.
 pub fn validateFreshProductPolicy(selected_backend: Backend, policy: FreshProductPolicy) !void {
@@ -175,8 +184,6 @@ fn validateFreshProductPolicyFor(zig_arch: std.Target.Cpu.Arch, selected_backend
     if (selected_backend != .kvm) return error.UnsupportedBackend;
     if (policy.resuming) return error.X86ResumeUnsupported;
     if (policy.capture) return error.X86CaptureUnsupported;
-    if (policy.rootfs) return error.X86RootfsUnsupported;
-    if (policy.network) return error.X86NetworkUnsupported;
     if (policy.build) return error.X86BuildUnsupported;
     if (policy.memory.isElastic()) return error.X86ElasticMemoryUnsupported;
     if (policy.memory.initial_bytes != x86_experimental_memory_bytes) return error.X86ExperimentalMemorySizeUnsupported;
@@ -1075,14 +1082,14 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     if (err == error.X86ResumeUnsupported or err == error.X86CaptureUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: x86-64 KVM currently supports fresh execution only; resume, save, capture, fork, and image commit are unavailable",
+            "spore run: x86-64 KVM currently supports fresh execution only; resume, save, capture, and fork are unavailable",
             @errorName(err),
         );
     }
-    if (err == error.X86RootfsUnsupported or err == error.X86NetworkUnsupported or err == error.X86BuildUnsupported) {
+    if (err == error.X86BuildUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: x86-64 KVM rootfs, OCI, networking, and build integration have not landed yet",
+            "spore run: x86-64 KVM native build integration has not landed yet",
             @errorName(err),
         );
     }
@@ -1193,8 +1200,6 @@ pub fn isX86ProductPolicyError(err: anyerror) bool {
         err == error.X86VcpuCountUnsupported or
         err == error.X86ResumeUnsupported or
         err == error.X86CaptureUnsupported or
-        err == error.X86RootfsUnsupported or
-        err == error.X86NetworkUnsupported or
         err == error.X86BuildUnsupported;
 }
 
@@ -3159,6 +3164,7 @@ const CommitControl = struct {
     freeze_stream: vsock.HostStream = undefined,
     storage: ?spore.RootfsStorage = null,
     cache_lock: ?rootfs_mod.RootfsCacheLock = null,
+    wake: ?vsock.Wake = null,
 
     const Phase = enum {
         start_resize,
@@ -3209,6 +3215,7 @@ const CommitControl = struct {
                         const result = parseRootfsGrowResponse(self.resize_stdout.items) catch return error.RunCommitGuestResizeFailed;
                         if (result.device_bytes != self.rootfs_grow_target) return error.RunCommitGuestResizeFailed;
                         self.phase = .start_command;
+                        self.requestPoll();
                     },
                     .failed => {
                         dev.resetHostStream();
@@ -3232,6 +3239,7 @@ const CommitControl = struct {
                 self.phase = if (exit_code == 0) .start_freeze else .done;
                 // The backend detaches the completed exec probe later in this
                 // loop. Start the freeze stream on the following poll.
+                self.requestPoll();
                 return .keep_running;
             },
             .start_freeze => {
@@ -3253,6 +3261,7 @@ const CommitControl = struct {
                         if (exit_code != 0) return error.RunCommitGuestFreezeFailed;
                         self.cache_lock = try rootfs_mod.lockRootfsCacheExclusive(self.io, self.allocator, self.cache_root);
                         self.phase = .snapshot;
+                        self.requestPoll();
                     },
                     .failed => {
                         dev.resetHostStream();
@@ -3271,9 +3280,13 @@ const CommitControl = struct {
     }
 
     fn startStream(_: *CommitControl, dev: *vsock.Vsock, stream: *vsock.HostStream) !void {
-        try dev.attachHostStream(stream);
         stream.markStarted();
+        try dev.attachHostStream(stream);
         _ = try dev.flushHostStreamOutbound();
+    }
+
+    fn requestPoll(self: *CommitControl) void {
+        if (self.wake) |wake| wake.wake();
     }
 
     fn resizeOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
@@ -3294,6 +3307,7 @@ const CommitControl = struct {
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
         self.storage = storage;
         self.phase = .done;
+        self.requestPoll();
     }
 
     fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
@@ -3301,7 +3315,10 @@ const CommitControl = struct {
         return self.poll(dev);
     }
 
-    fn setWakeThunk(_: *anyopaque, _: vsock.Wake) void {}
+    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
+        const self: *CommitControl = @ptrCast(@alignCast(context));
+        self.wake = wake;
+    }
     fn completeSnapshotThunk(_: *anyopaque, _: []const u8) !void {}
 
     fn completeRootfsSnapshotThunk(context: *anyopaque, disk: ?spore.Disk) !void {
@@ -3347,7 +3364,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .memory = opts.memory,
         .vcpus = opts.vcpus,
         .resuming = opts.resume_dir != null,
-        .capture = opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save or opts.commit != null,
+        .capture = opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save,
         .rootfs = opts.rootfs_path != null or opts.rootfs != null or opts.disk != null or opts.rootfs_grow_target != 0,
         .network = opts.network != .disabled or opts.network_runtime != null,
         .build = opts.context_disk_path != null or opts.build_input_rootfs.len != 0 or opts.build_cache_disk_fd != null or opts.build_mode or opts.runtime_disk_head != null,
@@ -3566,8 +3583,13 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                     .initrd = initrd,
                     .console_sink = consoleSink,
                     .root_disk = runtime_disk.backend(),
+                    .root_blk_options = root_blk_options,
+                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                     .network = network,
                     .exec_probe = &stream,
+                    .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
+                    .exec_probe_completes_run = opts.commit == null,
+                    .exec_probe_watchdog_until_control = opts.commit != null,
                     .exec_control = exec_control,
                     .exec_probe_timeout_ms = opts.timeout_ms,
                 });
@@ -3908,6 +3930,8 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                     .initrd = artifacts.initrd,
                     .console_sink = consoleSink,
                     .root_disk = runtime_disk.backend(),
+                    .root_blk_options = root_blk_options,
+                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                     .network = network,
                     .exec_probe = startup_probe,
                     .exec_probe_completes_run = false,
@@ -5510,9 +5534,14 @@ test "x86 fresh product policy is fixed and fail closed" {
     }));
     try std.testing.expectError(error.X86ResumeUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .resuming = true }));
     try std.testing.expectError(error.X86CaptureUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .capture = true }));
-    try std.testing.expectError(error.X86RootfsUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .rootfs = true }));
-    try std.testing.expectError(error.X86NetworkUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .network = true }));
+    try validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .rootfs = true, .network = true });
     try std.testing.expectError(error.X86BuildUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .build = true }));
+}
+
+test "direct image product platform follows the native architecture" {
+    try std.testing.expectEqual(architecture.Architecture.arm64, (try directImagePlatformFor(.aarch64)).arch);
+    try std.testing.expectEqual(architecture.Architecture.amd64, (try directImagePlatformFor(.x86_64)).arch);
+    try std.testing.expectError(error.UnsupportedArchitecture, directImagePlatformFor(.wasm32));
 }
 
 test "run cli parser accepts rootfs path" {

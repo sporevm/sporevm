@@ -1,14 +1,17 @@
-//! Fresh-only x86-64 Linux/KVM virtual machine.
+//! Fresh-workload x86-64 Linux/KVM virtual machine.
 //!
-//! Slice 2a combines the frozen board and approved CPU profile with the shared
-//! device model. It deliberately excludes snapshots and persistent disk paths.
+//! The frozen board and approved CPU profile use the shared device, rootfs,
+//! network, and rootfs-only image snapshot contracts. Saved machine state and
+//! disk forks remain deliberately unavailable.
 
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const disk_layer = @import("../disk_layer.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const kvm = @import("../kvm/x86_64.zig");
+const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
 const mmio = @import("../virtio/mmio.zig");
 const virtio_queue = @import("../virtio/queue.zig");
@@ -42,12 +45,16 @@ pub const Config = struct {
     vcpu_count: u8 = default_vcpu_count,
     console_sink: *const fn ([]const u8) void,
     root_disk: ?virtio_blk.Backend = null,
+    root_blk_options: virtio_blk.Options = .{},
+    disk_snapshot: ?disk_layer.SnapshotState = null,
     context_disk: ?virtio_blk.Backend = null,
     build_disk: ?virtio_blk.Backend = null,
     cache_disk: ?virtio_blk.Backend = null,
     network: virtio_net.Runtime = .{},
     exec_probe: ?*virtio_vsock.HostStream = null,
+    exec_probe_start: virtio_vsock.HostStreamStart = .immediate,
     exec_probe_completes_run: bool = true,
+    exec_probe_watchdog_until_control: bool = false,
     exec_control: ?virtio_vsock.Control = null,
     exec_probe_timeout_ms: u64 = 30_000,
     generation_seed: ?GenerationSeed = null,
@@ -301,6 +308,7 @@ const RunState = struct {
 };
 
 const ThreadContext = struct {
+    allocator: std.mem.Allocator,
     vm_fd: std.c.fd_t,
     vcpu: *Vcpu,
     state: *RunState,
@@ -310,7 +318,13 @@ const ThreadContext = struct {
     gen_dev: *generation.Device,
     exec_probe: ?*virtio_vsock.HostStream,
     exec_probe_completes_run: bool,
+    exec_probe_done: *std.atomic.Value(bool),
+    exec_probe_completion_seen: *std.atomic.Value(bool),
+    exec_probe_deadline_ms: *std.atomic.Value(u64),
+    exec_probe_timeout_ms: u64,
+    exec_probe_watchdog_until_control: bool,
     exec_control: ?virtio_vsock.Control,
+    disk_snapshot: ?disk_layer.SnapshotState,
     vsock_dev: *virtio_vsock.Vsock,
     network: virtio_net.Runtime,
     net_dev: *virtio_net.Net,
@@ -336,14 +350,33 @@ const EmptyDevice = struct {
 const ProbeWatchdogContext = struct {
     state: *RunState,
     wake_set: *WakeSet,
+    probe: *virtio_vsock.HostStream,
+    done: *const std.atomic.Value(bool),
+    attachment_seen: *std.atomic.Value(bool),
+    active: *std.atomic.Value(bool),
+    deadline_ms: *std.atomic.Value(u64),
     timeout_ms: u64,
 };
 
 fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
-    const start = monotonicMs();
-    while (!ctx.state.stopped()) {
+    while (!ctx.state.stopped() and !ctx.done.load(.acquire)) {
+        if (!ctx.attachment_seen.load(.acquire) and ctx.probe.hasStarted()) {
+            if (!ctx.attachment_seen.swap(true, .acq_rel)) {
+                ctx.deadline_ms.store(monotonicMs() +| ctx.timeout_ms, .release);
+                ctx.active.store(true, .release);
+            }
+        }
+        if (!ctx.active.load(.acquire)) {
+            var delay = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = std.c.nanosleep(&delay, null);
+            continue;
+        }
+        const deadline_ms = ctx.deadline_ms.load(.acquire);
         const now = monotonicMs();
-        if (now >= start and now - start >= ctx.timeout_ms) {
+        if (now >= deadline_ms) {
+            if (ctx.done.load(.acquire)) return;
+            if (ctx.deadline_ms.load(.acquire) != deadline_ms) continue;
+            if (!ctx.attachment_seen.load(.acquire) and !ctx.probe.claimStartTimeout()) continue;
             if (ctx.state.finishError(error.ExecProbeTimeout)) ctx.wake_set.wakeAll();
             return;
         }
@@ -353,10 +386,10 @@ fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
 }
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
-    _ = allocator;
     try board.validateLayout(config.ram_size);
     try topology.validateVcpuCount(config.vcpu_count);
     if (config.exec_probe != null and config.exec_probe_timeout_ms == 0) return error.InvalidProbeTimeout;
+    if (config.exec_probe_start == .control and (config.exec_probe == null or config.exec_control == null)) return error.DeferredExecProbeRequiresControl;
 
     const kvm_fd = try kvm.openDevKvm();
     defer _ = std.c.close(kvm_fd);
@@ -472,7 +505,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     transports[board.console_slot.index] = .init(console_dev.device());
     for (disk_backends, board.disk_slots, 0..) |maybe_backend, slot, index| {
         if (maybe_backend) |backend| {
-            block_devs[index] = if (index == 0) .init(backend) else .initImmutableSource(backend);
+            block_devs[index] = if (index == 0) .initWithOptions(backend, config.root_blk_options) else .initImmutableSource(backend);
             transports[slot.index] = .init(block_devs[index].device());
         } else {
             transports[slot.index] = .init(empty_devs[index].device());
@@ -488,9 +521,19 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             try kvm.setIrq(vm_fd, board.generation_gsi, true);
         }
     }
-    if (config.exec_probe) |probe| try vsock_dev.attachHostStream(probe);
+    if (config.exec_probe_start == .immediate) {
+        if (config.exec_probe) |probe| {
+            try vsock_dev.attachHostStream(probe);
+            probe.markStarted();
+        }
+    }
 
     var state = RunState{};
+    var exec_probe_done = std.atomic.Value(bool).init(false);
+    var exec_probe_attachment_seen = std.atomic.Value(bool).init(config.exec_probe_start == .immediate);
+    var exec_probe_completion_seen = std.atomic.Value(bool).init(false);
+    var exec_probe_watchdog_active = std.atomic.Value(bool).init(config.exec_probe_start == .immediate or config.exec_probe_watchdog_until_control);
+    var exec_probe_deadline_ms = std.atomic.Value(u64).init(monotonicMs() +| config.exec_probe_timeout_ms);
     var wake_set = WakeSet{ .vcpus = vcpus[0..initialized] };
     config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetwork });
     defer config.network.clearWake();
@@ -503,6 +546,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var started: usize = 0;
     while (started < initialized) : (started += 1) {
         contexts[started] = .{
+            .allocator = allocator,
             .vm_fd = vm_fd,
             .vcpu = &vcpus[started],
             .state = &state,
@@ -512,7 +556,13 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .gen_dev = &gen_dev,
             .exec_probe = config.exec_probe,
             .exec_probe_completes_run = config.exec_probe_completes_run,
+            .exec_probe_done = &exec_probe_done,
+            .exec_probe_completion_seen = &exec_probe_completion_seen,
+            .exec_probe_deadline_ms = &exec_probe_deadline_ms,
+            .exec_probe_timeout_ms = config.exec_probe_timeout_ms,
+            .exec_probe_watchdog_until_control = config.exec_probe_watchdog_until_control,
             .exec_control = config.exec_control,
+            .disk_snapshot = config.disk_snapshot,
             .vsock_dev = &vsock_dev,
             .network = config.network,
             .net_dev = &net_dev,
@@ -524,18 +574,23 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         };
     }
 
-    var watchdog_context = ProbeWatchdogContext{
-        .state = &state,
-        .wake_set = &wake_set,
-        .timeout_ms = config.exec_probe_timeout_ms,
-    };
-    const watchdog = if (config.exec_probe != null and config.exec_probe_completes_run)
-        std.Thread.spawn(.{}, probeWatchdogMain, .{&watchdog_context}) catch |err| {
+    var watchdog_context: ProbeWatchdogContext = undefined;
+    const watchdog = if (config.exec_probe) |probe| blk: {
+        watchdog_context = .{
+            .state = &state,
+            .wake_set = &wake_set,
+            .probe = probe,
+            .done = &exec_probe_done,
+            .attachment_seen = &exec_probe_attachment_seen,
+            .active = &exec_probe_watchdog_active,
+            .deadline_ms = &exec_probe_deadline_ms,
+            .timeout_ms = config.exec_probe_timeout_ms,
+        };
+        break :blk std.Thread.spawn(.{}, probeWatchdogMain, .{&watchdog_context}) catch |err| {
             if (state.finishError(err)) wake_set.wakeAll();
             return err;
-        }
-    else
-        null;
+        };
+    } else null;
     defer if (watchdog) |thread| thread.join();
 
     // Joining is safe because the first terminal/error result wakes every
@@ -646,11 +701,22 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                 var probe_failed = false;
                 const owns_terminal = if (terminal) |result| ctx.state.reserveTerminal(result) else blk: {
                     if (ctx.exec_probe) |probe| switch (probe.state) {
-                        .complete => if (ctx.exec_probe_completes_run) {
-                            completes_run = true;
-                            break :blk ctx.state.reserveProbeComplete(ctx.vcpu.index);
+                        .complete => {
+                            if (ctx.exec_probe_completion_seen.swap(true, .acq_rel)) break :blk false;
+                            if (ctx.exec_probe_completes_run) {
+                                ctx.exec_probe_done.store(true, .release);
+                                completes_run = true;
+                                break :blk ctx.state.reserveProbeComplete(ctx.vcpu.index);
+                            }
+                            ctx.vsock_dev.resetHostStream();
+                            if (ctx.exec_probe_watchdog_until_control) {
+                                ctx.exec_probe_deadline_ms.store(monotonicMs() +| ctx.exec_probe_timeout_ms, .release);
+                            } else {
+                                ctx.exec_probe_done.store(true, .release);
+                            }
                         },
-                        .failed => if (ctx.exec_probe_completes_run) {
+                        .failed => {
+                            ctx.exec_probe_done.store(true, .release);
                             probe_failed = true;
                         },
                         .idle, .connecting, .connected => {},
@@ -736,16 +802,33 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
 }
 
 /// Polling is serialized with virtqueue MMIO because monitor control may
-/// attach or reset the active host stream. Slice 3a deliberately accepts only
-/// exec and stop actions; snapshot-family actions remain fail-closed.
+/// attach or reset the active host stream. Rootfs-only snapshots seal a
+/// quiescent writable image without capturing machine state; machine snapshot
+/// and disk-fork actions remain fail-closed.
 fn pollControlLocked(ctx: *ThreadContext) !bool {
     if (ctx.vcpu.index != 0) return false;
     const control = ctx.exec_control orelse return false;
-    switch (try x86ControlDecision(try control.poll(ctx.vsock_dev))) {
+    const decision = try x86ControlDecision(try control.poll(ctx.vsock_dev));
+    switch (decision) {
         .keep_running => {},
         .stop => {
+            if (ctx.exec_probe_watchdog_until_control) ctx.exec_probe_done.store(true, .release);
             if (ctx.state.finishCause(.monitor_stopped)) ctx.wake_set.wakeAll();
             return true;
+        },
+        .rootfs_snapshot => |request| {
+            if (ctx.exec_probe_watchdog_until_control) ctx.exec_probe_done.store(true, .release);
+            const disk_manifest = try takeRootfsSnapshot(ctx.allocator, request.dir, ctx.transports, ctx.disk_snapshot);
+            try control.completeRootfsSnapshot(disk_manifest);
+            if (ctx.exec_probe_watchdog_until_control) {
+                switch (try x86ControlDecision(try control.poll(ctx.vsock_dev))) {
+                    .stop => {
+                        if (ctx.state.finishCause(.monitor_stopped)) ctx.wake_set.wakeAll();
+                        return true;
+                    },
+                    .keep_running, .rootfs_snapshot => return error.BadManifest,
+                }
+            }
         },
     }
     const transport = &ctx.transports[board.vsock_slot.index];
@@ -756,14 +839,68 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
     return false;
 }
 
-const X86ControlDecision = enum { keep_running, stop };
+const X86ControlDecision = union(enum) {
+    keep_running,
+    stop,
+    rootfs_snapshot: virtio_vsock.RootfsSnapshotAction,
+};
 
 fn x86ControlDecision(action: virtio_vsock.ControlAction) !X86ControlDecision {
     return switch (action) {
         .keep_running => .keep_running,
         .stop => .stop,
-        .snapshot, .rootfs_snapshot, .disk_fork => error.X86CaptureUnsupported,
+        .rootfs_snapshot => |request| .{ .rootfs_snapshot = request },
+        .snapshot, .disk_fork => error.X86CaptureUnsupported,
     };
+}
+
+fn takeRootfsSnapshot(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    transports: []mmio.Transport,
+    disk_snapshot: ?disk_layer.SnapshotState,
+) !?spore.Disk {
+    const disk_state = disk_snapshot orelse return error.BadManifest;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const devices = try captureTransports(arena, transports);
+    if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+        std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
+        return error.DeviceStatePending;
+    }
+    return try disk_state.finish(allocator, dir, true);
+}
+
+fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transport) ![]spore.TransportState {
+    const out = try allocator.alloc(spore.TransportState, transports.len);
+    for (transports, 0..) |*transport, index| {
+        const queues = try allocator.alloc(spore.QueueState, transport.dev.queue_count);
+        for (queues, 0..) |*state, queue_index| {
+            const queue = transport.queues[queue_index];
+            state.* = .{
+                .size = queue.size,
+                .ready = queue.ready,
+                .desc_addr = queue.desc_addr,
+                .avail_addr = queue.avail_addr,
+                .used_addr = queue.used_addr,
+                .last_avail = queue.last_avail,
+                .used_idx = queue.used_idx,
+            };
+        }
+        out[index] = .{
+            .device_id = transport.dev.device_id,
+            .status = transport.status,
+            .device_features_sel = transport.device_features_sel,
+            .driver_features_sel = transport.driver_features_sel,
+            .driver_features = transport.driver_features,
+            .queue_sel = transport.queue_sel,
+            .interrupt_status = transport.interrupt_status,
+            .queues = queues,
+        };
+    }
+    return out;
 }
 
 fn finishThread(ctx: *ThreadContext, err: anyerror) void {
@@ -1184,11 +1321,14 @@ test "terminal reservation blocks unclaimed finish and publication before comple
     }
 }
 
-test "x86 monitor control accepts only exec continuation and stop" {
+test "x86 monitor control accepts rootfs-only snapshots but rejects machine capture" {
     try std.testing.expectEqual(X86ControlDecision.keep_running, try x86ControlDecision(.keep_running));
     try std.testing.expectEqual(X86ControlDecision.stop, try x86ControlDecision(.stop));
     try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .snapshot = .{ .dir = "out.spore" } }));
-    try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .rootfs_snapshot = .{ .dir = "root" } }));
+    switch (try x86ControlDecision(.{ .rootfs_snapshot = .{ .dir = "root" } })) {
+        .rootfs_snapshot => |request| try std.testing.expectEqualStrings("root", request.dir),
+        .keep_running, .stop => return error.TestUnexpectedDecision,
+    }
     try std.testing.expectError(error.X86CaptureUnsupported, x86ControlDecision(.{ .disk_fork = .{ .dir = "fork", .count = 1 } }));
 }
 
@@ -1224,9 +1364,19 @@ test "probe watchdog publishes a typed timeout" {
     var state = RunState{};
     var vcpus: [0]Vcpu = .{};
     var wake_set = WakeSet{ .vcpus = vcpus[0..] };
+    var probe = try virtio_vsock.HostStream.init(10700, "timeout");
+    var done = std.atomic.Value(bool).init(false);
+    var attachment_seen = std.atomic.Value(bool).init(true);
+    var active = std.atomic.Value(bool).init(true);
+    var deadline_ms = std.atomic.Value(u64).init(0);
     var context = ProbeWatchdogContext{
         .state = &state,
         .wake_set = &wake_set,
+        .probe = &probe,
+        .done = &done,
+        .attachment_seen = &attachment_seen,
+        .active = &active,
+        .deadline_ms = &deadline_ms,
         .timeout_ms = 0,
     };
     probeWatchdogMain(&context);
@@ -1235,6 +1385,58 @@ test "probe watchdog publishes a typed timeout" {
         .cause => return error.TestUnexpectedResult,
         .err => |err| try std.testing.expectEqual(error.ExecProbeTimeout, err),
     }
+}
+
+test "completed exec probe disarms watchdog without stopping commit control" {
+    var state = RunState{};
+    var vcpus: [0]Vcpu = .{};
+    var wake_set = WakeSet{ .vcpus = vcpus[0..] };
+    var probe = try virtio_vsock.HostStream.init(10700, "complete");
+    var done = std.atomic.Value(bool).init(true);
+    var attachment_seen = std.atomic.Value(bool).init(true);
+    var active = std.atomic.Value(bool).init(true);
+    var deadline_ms = std.atomic.Value(u64).init(0);
+    var context = ProbeWatchdogContext{
+        .state = &state,
+        .wake_set = &wake_set,
+        .probe = &probe,
+        .done = &done,
+        .attachment_seen = &attachment_seen,
+        .active = &active,
+        .deadline_ms = &deadline_ms,
+        .timeout_ms = 0,
+    };
+    probeWatchdogMain(&context);
+    try std.testing.expect(!state.stopped());
+    try std.testing.expect(state.publishedResult() == null);
+}
+
+test "deferred exec probe refreshes watchdog when command starts" {
+    var state = RunState{};
+    var vcpus: [0]Vcpu = .{};
+    var wake_set = WakeSet{ .vcpus = vcpus[0..] };
+    var probe = try virtio_vsock.HostStream.init(10700, "deferred");
+    probe.markStarted();
+    var done = std.atomic.Value(bool).init(false);
+    var attachment_seen = std.atomic.Value(bool).init(false);
+    var active = std.atomic.Value(bool).init(true);
+    var deadline_ms = std.atomic.Value(u64).init(0);
+    var context = ProbeWatchdogContext{
+        .state = &state,
+        .wake_set = &wake_set,
+        .probe = &probe,
+        .done = &done,
+        .attachment_seen = &attachment_seen,
+        .active = &active,
+        .deadline_ms = &deadline_ms,
+        .timeout_ms = 10_000,
+    };
+    const watchdog = try std.Thread.spawn(.{}, probeWatchdogMain, .{&context});
+    while (!attachment_seen.load(.acquire)) std.Thread.yield() catch {};
+    done.store(true, .release);
+    watchdog.join();
+    try std.testing.expect(deadline_ms.load(.acquire) > 0);
+    try std.testing.expect(!state.stopped());
 }
 
 test "fresh runner routes incompatible hosts through the canonical profile predicate" {

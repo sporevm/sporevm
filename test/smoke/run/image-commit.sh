@@ -17,13 +17,24 @@ infer_backend() {
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64) echo "hvf" ;;
     Linux-aarch64|Linux-arm64) echo "kvm" ;;
+    Linux-x86_64) echo "kvm" ;;
     *) die "cannot infer a supported backend; set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
   esac
 }
 
 backend="$(infer_backend)"
 image_ref="${SPORE_SMOKE_IMAGE:-docker.io/library/alpine:3.20}"
-smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
+if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]]; then
+  default_smoke_memory="512mib"
+  default_smoke_platform="linux/amd64"
+  x86_fresh_only=1
+else
+  default_smoke_memory="256mib"
+  default_smoke_platform="linux/arm64"
+  x86_fresh_only=0
+fi
+smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-${default_smoke_memory%mib}}mib}"
+smoke_platform="${SPORE_SMOKE_PLATFORM:-${default_smoke_platform}}"
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-run-image-commit.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
@@ -47,7 +58,7 @@ expect_rejected interactive -i --image "${image_ref}" --commit local/run-commit-
   --memory "${smoke_memory}" \
   --image "${image_ref}" \
   --commit local/run-commit-smoke:default-command
-"${spore_bin}" rootfs resolve local/run-commit-smoke:default-command >/dev/null
+"${spore_bin}" rootfs resolve local/run-commit-smoke:default-command --platform "${smoke_platform}" >/dev/null
 
 payload="${workdir}/payload.txt"
 printf 'copied-from-transient-injection\n' >"${payload}"
@@ -89,22 +100,24 @@ grep -Fq '"rootfs_index_digest":"blake3:' "${events}" || die "commit event omitt
   --pull=never \
   -- /bin/sh -lc 'grep -Fxq refreshed /refreshed.txt'
 
-"${spore_bin}" run \
-  --backend "${backend}" \
-  --memory "${smoke_memory}" \
-  --vcpus 2 \
-  --image local/run-commit-smoke:base \
-  --commit local/run-commit-smoke:multi-vcpu \
-  --pull=never \
-  -- /bin/sh -lc 'echo multi-vcpu >/multi-vcpu.txt'
-"${spore_bin}" run \
-  --backend "${backend}" \
-  --memory "${smoke_memory}" \
-  --image local/run-commit-smoke:multi-vcpu \
-  --pull=never \
-  -- /bin/sh -lc 'grep -Fxq multi-vcpu /multi-vcpu.txt'
+if (( ! x86_fresh_only )); then
+  "${spore_bin}" run \
+    --backend "${backend}" \
+    --memory "${smoke_memory}" \
+    --vcpus 2 \
+    --image local/run-commit-smoke:base \
+    --commit local/run-commit-smoke:multi-vcpu \
+    --pull=never \
+    -- /bin/sh -lc 'echo multi-vcpu >/multi-vcpu.txt'
+  "${spore_bin}" run \
+    --backend "${backend}" \
+    --memory "${smoke_memory}" \
+    --image local/run-commit-smoke:multi-vcpu \
+    --pull=never \
+    -- /bin/sh -lc 'grep -Fxq multi-vcpu /multi-vcpu.txt'
+fi
 
-before="$("${spore_bin}" rootfs resolve local/run-commit-smoke:base)"
+before="$("${spore_bin}" rootfs resolve local/run-commit-smoke:base --platform "${smoke_platform}")"
 if "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
@@ -114,8 +127,26 @@ if "${spore_bin}" run \
   -- /bin/sh -lc 'echo discarded >/failed.txt; exit 23'; then
   die "nonzero guest command unexpectedly succeeded"
 fi
-after="$("${spore_bin}" rootfs resolve local/run-commit-smoke:base)"
+after="$("${spore_bin}" rootfs resolve local/run-commit-smoke:base --platform "${smoke_platform}")"
 [[ "${before}" == "${after}" ]] || die "nonzero command changed the destination ref"
+
+if (( x86_fresh_only )); then
+  if "${spore_bin}" run \
+    --backend "${backend}" \
+    --memory "${smoke_memory}" \
+    --timeout 100ms \
+    --image local/run-commit-smoke:base \
+    --commit local/run-commit-smoke:timed-out \
+    --pull=never \
+    -- /bin/sh -lc 'sleep 5'; then
+    die "timed-out x86 commit command unexpectedly succeeded"
+  fi
+  if "${spore_bin}" rootfs resolve local/run-commit-smoke:timed-out --platform "${smoke_platform}" >/dev/null 2>&1; then
+    die "timed-out x86 commit published the destination ref"
+  fi
+  echo "smoke:run-image-commit ok backend=${backend} image=${image_ref} fresh-only=1"
+  exit 0
+fi
 
 warm_spore="${workdir}/warm.spore"
 children_dir="${workdir}/children"

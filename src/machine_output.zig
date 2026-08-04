@@ -258,8 +258,6 @@ pub fn fromZigError(err: anyerror) CliError {
         error.X86VcpuCountUnsupported,
         error.X86ResumeUnsupported,
         error.X86CaptureUnsupported,
-        error.X86RootfsUnsupported,
-        error.X86NetworkUnsupported,
         error.X86BuildUnsupported,
         => CliError.init(.usage_invalid_argument, ErrorCode.usage_invalid_argument.defaultMessage(), @errorName(err)),
         error.MissingGatewayUrl,

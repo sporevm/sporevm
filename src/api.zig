@@ -1009,7 +1009,7 @@ pub fn runManaged(
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
-        .capture = options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.commit_ref != null,
+        .capture = options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save,
         .rootfs = options.rootfs_path != null or options.image_ref != null or options.disk_size != null,
         .network = options.network != .disabled,
     });
