@@ -3164,6 +3164,7 @@ const CommitControl = struct {
     freeze_stream: vsock.HostStream = undefined,
     storage: ?spore.RootfsStorage = null,
     cache_lock: ?rootfs_mod.RootfsCacheLock = null,
+    wake: ?vsock.Wake = null,
 
     const Phase = enum {
         start_resize,
@@ -3214,6 +3215,7 @@ const CommitControl = struct {
                         const result = parseRootfsGrowResponse(self.resize_stdout.items) catch return error.RunCommitGuestResizeFailed;
                         if (result.device_bytes != self.rootfs_grow_target) return error.RunCommitGuestResizeFailed;
                         self.phase = .start_command;
+                        self.requestPoll();
                     },
                     .failed => {
                         dev.resetHostStream();
@@ -3237,6 +3239,7 @@ const CommitControl = struct {
                 self.phase = if (exit_code == 0) .start_freeze else .done;
                 // The backend detaches the completed exec probe later in this
                 // loop. Start the freeze stream on the following poll.
+                self.requestPoll();
                 return .keep_running;
             },
             .start_freeze => {
@@ -3258,6 +3261,7 @@ const CommitControl = struct {
                         if (exit_code != 0) return error.RunCommitGuestFreezeFailed;
                         self.cache_lock = try rootfs_mod.lockRootfsCacheExclusive(self.io, self.allocator, self.cache_root);
                         self.phase = .snapshot;
+                        self.requestPoll();
                     },
                     .failed => {
                         dev.resetHostStream();
@@ -3281,6 +3285,10 @@ const CommitControl = struct {
         _ = try dev.flushHostStreamOutbound();
     }
 
+    fn requestPoll(self: *CommitControl) void {
+        if (self.wake) |wake| wake.wake();
+    }
+
     fn resizeOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
         if (output != .stdout) return;
         const self: *CommitControl = @ptrCast(@alignCast(context.?));
@@ -3299,6 +3307,7 @@ const CommitControl = struct {
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
         self.storage = storage;
         self.phase = .done;
+        self.requestPoll();
     }
 
     fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
@@ -3306,7 +3315,10 @@ const CommitControl = struct {
         return self.poll(dev);
     }
 
-    fn setWakeThunk(_: *anyopaque, _: vsock.Wake) void {}
+    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
+        const self: *CommitControl = @ptrCast(@alignCast(context));
+        self.wake = wake;
+    }
     fn completeSnapshotThunk(_: *anyopaque, _: []const u8) !void {}
 
     fn completeRootfsSnapshotThunk(context: *anyopaque, disk: ?spore.Disk) !void {
@@ -3575,6 +3587,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                     .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                     .network = network,
                     .exec_probe = &stream,
+                    .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
                     .exec_probe_completes_run = opts.commit == null,
                     .exec_probe_watchdog_until_control = opts.commit != null,
                     .exec_control = exec_control,
