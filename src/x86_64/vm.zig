@@ -679,6 +679,7 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                                 completes_run = true;
                                 break :blk ctx.state.reserveProbeComplete(ctx.vcpu.index);
                             }
+                            ctx.vsock_dev.resetHostStream();
                             if (ctx.exec_probe_watchdog_until_control) {
                                 ctx.exec_probe_deadline_ms.store(monotonicMs() +| ctx.exec_probe_timeout_ms, .release);
                             } else {
