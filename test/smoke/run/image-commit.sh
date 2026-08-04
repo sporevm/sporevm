@@ -131,6 +131,19 @@ after="$("${spore_bin}" rootfs resolve local/run-commit-smoke:base --platform "$
 [[ "${before}" == "${after}" ]] || die "nonzero command changed the destination ref"
 
 if (( x86_fresh_only )); then
+  if "${spore_bin}" run \
+    --backend "${backend}" \
+    --memory "${smoke_memory}" \
+    --timeout 100ms \
+    --image local/run-commit-smoke:base \
+    --commit local/run-commit-smoke:timed-out \
+    --pull=never \
+    -- /bin/sh -lc 'sleep 5'; then
+    die "timed-out x86 commit command unexpectedly succeeded"
+  fi
+  if "${spore_bin}" rootfs resolve local/run-commit-smoke:timed-out --platform "${smoke_platform}" >/dev/null 2>&1; then
+    die "timed-out x86 commit published the destination ref"
+  fi
   echo "smoke:run-image-commit ok backend=${backend} image=${image_ref} fresh-only=1"
   exit 0
 fi

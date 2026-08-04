@@ -316,6 +316,7 @@ const ThreadContext = struct {
     gen_dev: *generation.Device,
     exec_probe: ?*virtio_vsock.HostStream,
     exec_probe_completes_run: bool,
+    exec_probe_done: *std.atomic.Value(bool),
     exec_control: ?virtio_vsock.Control,
     disk_snapshot: ?disk_layer.SnapshotState,
     vsock_dev: *virtio_vsock.Vsock,
@@ -343,14 +344,16 @@ const EmptyDevice = struct {
 const ProbeWatchdogContext = struct {
     state: *RunState,
     wake_set: *WakeSet,
+    done: *const std.atomic.Value(bool),
     timeout_ms: u64,
 };
 
 fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
     const start = monotonicMs();
-    while (!ctx.state.stopped()) {
+    while (!ctx.state.stopped() and !ctx.done.load(.acquire)) {
         const now = monotonicMs();
         if (now >= start and now - start >= ctx.timeout_ms) {
+            if (ctx.done.load(.acquire)) return;
             if (ctx.state.finishError(error.ExecProbeTimeout)) ctx.wake_set.wakeAll();
             return;
         }
@@ -497,6 +500,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     if (config.exec_probe) |probe| try vsock_dev.attachHostStream(probe);
 
     var state = RunState{};
+    var exec_probe_done = std.atomic.Value(bool).init(false);
     var wake_set = WakeSet{ .vcpus = vcpus[0..initialized] };
     config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetwork });
     defer config.network.clearWake();
@@ -519,6 +523,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .gen_dev = &gen_dev,
             .exec_probe = config.exec_probe,
             .exec_probe_completes_run = config.exec_probe_completes_run,
+            .exec_probe_done = &exec_probe_done,
             .exec_control = config.exec_control,
             .disk_snapshot = config.disk_snapshot,
             .vsock_dev = &vsock_dev,
@@ -535,9 +540,10 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var watchdog_context = ProbeWatchdogContext{
         .state = &state,
         .wake_set = &wake_set,
+        .done = &exec_probe_done,
         .timeout_ms = config.exec_probe_timeout_ms,
     };
-    const watchdog = if (config.exec_probe != null and config.exec_probe_completes_run)
+    const watchdog = if (config.exec_probe != null)
         std.Thread.spawn(.{}, probeWatchdogMain, .{&watchdog_context}) catch |err| {
             if (state.finishError(err)) wake_set.wakeAll();
             return err;
@@ -654,11 +660,15 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                 var probe_failed = false;
                 const owns_terminal = if (terminal) |result| ctx.state.reserveTerminal(result) else blk: {
                     if (ctx.exec_probe) |probe| switch (probe.state) {
-                        .complete => if (ctx.exec_probe_completes_run) {
-                            completes_run = true;
-                            break :blk ctx.state.reserveProbeComplete(ctx.vcpu.index);
+                        .complete => {
+                            ctx.exec_probe_done.store(true, .release);
+                            if (ctx.exec_probe_completes_run) {
+                                completes_run = true;
+                                break :blk ctx.state.reserveProbeComplete(ctx.vcpu.index);
+                            }
                         },
-                        .failed => if (ctx.exec_probe_completes_run) {
+                        .failed => {
+                            ctx.exec_probe_done.store(true, .release);
                             probe_failed = true;
                         },
                         .idle, .connecting, .connected => {},
@@ -1294,9 +1304,11 @@ test "probe watchdog publishes a typed timeout" {
     var state = RunState{};
     var vcpus: [0]Vcpu = .{};
     var wake_set = WakeSet{ .vcpus = vcpus[0..] };
+    var done = std.atomic.Value(bool).init(false);
     var context = ProbeWatchdogContext{
         .state = &state,
         .wake_set = &wake_set,
+        .done = &done,
         .timeout_ms = 0,
     };
     probeWatchdogMain(&context);
@@ -1305,6 +1317,22 @@ test "probe watchdog publishes a typed timeout" {
         .cause => return error.TestUnexpectedResult,
         .err => |err| try std.testing.expectEqual(error.ExecProbeTimeout, err),
     }
+}
+
+test "completed exec probe disarms watchdog without stopping commit control" {
+    var state = RunState{};
+    var vcpus: [0]Vcpu = .{};
+    var wake_set = WakeSet{ .vcpus = vcpus[0..] };
+    var done = std.atomic.Value(bool).init(true);
+    var context = ProbeWatchdogContext{
+        .state = &state,
+        .wake_set = &wake_set,
+        .done = &done,
+        .timeout_ms = 0,
+    };
+    probeWatchdogMain(&context);
+    try std.testing.expect(!state.stopped());
+    try std.testing.expect(state.publishedResult() == null);
 }
 
 test "fresh runner routes incompatible hosts through the canonical profile predicate" {
