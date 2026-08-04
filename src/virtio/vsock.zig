@@ -112,6 +112,12 @@ pub const HostStreamLifecycle = enum {
 
 pub const HostStreamLifecycleSink = *const fn (context: ?*anyopaque, event: HostStreamLifecycle) void;
 
+const HostStreamStartState = enum(u8) {
+    pending,
+    started,
+    timed_out,
+};
+
 pub const HostStreamProtocol = enum {
     legacy_text,
     spore_stream_v1,
@@ -130,6 +136,7 @@ pub const HostStream = struct {
     request_len: usize = 0,
     state: HostStreamState = .idle,
     started_at_ms: u64 = 0,
+    start_state: std.atomic.Value(HostStreamStartState) = .init(.pending),
     start_ms: ?u64 = null,
     attach_ms: ?u64 = null,
     connect_request_delivered_ms: ?u64 = null,
@@ -207,6 +214,15 @@ pub const HostStream = struct {
     pub fn markStarted(self: *HostStream) void {
         self.started_at_ms = monotonicMs();
         self.start_ms = self.elapsedMs();
+        _ = self.start_state.cmpxchgStrong(.pending, .started, .release, .monotonic);
+    }
+
+    pub fn hasStarted(self: *const HostStream) bool {
+        return self.start_state.load(.acquire) == .started;
+    }
+
+    pub fn claimStartTimeout(self: *HostStream) bool {
+        return self.start_state.cmpxchgStrong(.pending, .timed_out, .acq_rel, .acquire) == null;
     }
 
     pub fn setBackendRestoreMetrics(self: *HostStream, memory_ms: u64, state_ms: u64, pre_run_ms: u64) void {

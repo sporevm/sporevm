@@ -3280,8 +3280,8 @@ const CommitControl = struct {
     }
 
     fn startStream(_: *CommitControl, dev: *vsock.Vsock, stream: *vsock.HostStream) !void {
-        try dev.attachHostStream(stream);
         stream.markStarted();
+        try dev.attachHostStream(stream);
         _ = try dev.flushHostStreamOutbound();
     }
 
