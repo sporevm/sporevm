@@ -15,7 +15,7 @@ pub const usage =
     \\Options:
     \\  -t, --tag REF                  Local image ref to update, for example local/app:dev
     \\  -f, --file PATH                Dockerfile path, defaults to CONTEXT/Dockerfile
-    \\  --platform OS/ARCH             Target platform, currently linux/arm64
+    \\  --platform OS/ARCH             Native target: linux/arm64 or linux/amd64
     \\  --target STAGE                 Build and publish the named stage
     \\  --build-context NAME=oci-layout://PATH
     \\                                  Named OCI layout base available to FROM NAME
@@ -38,7 +38,7 @@ const ParsedOptions = struct {
     tag: ?[]const u8 = null,
     context_dir: ?[]const u8 = null,
     dockerfile_path: ?[]const u8 = null,
-    platform: rootfs_mod.Platform = .{},
+    platform: rootfs_mod.Platform = build_mod.default_build_platform,
     target: ?[]const u8 = null,
     build_contexts: std.array_list.Managed(build_mod.BuildContextArg),
     build_args: std.array_list.Managed(build_mod.BuildArg),
@@ -365,7 +365,7 @@ fn exitMachineError(allocator: std.mem.Allocator, stderr: *Io.Writer, classified
 fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diagnostic) !void {
     switch (err) {
         error.UnsupportedPlatform => {
-            try stderr.writeAll("spore build: runtime execution currently supports only linux/arm64\n");
+            try stderr.writeAll("spore build: runtime execution requires the native linux/arm64 or linux/amd64 platform\n");
         },
         error.DockerfileParseFailed, error.DockerfilePlanFailed => {
             if (diagnostic.dockerfile.message.len != 0) {

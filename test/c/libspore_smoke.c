@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -7,7 +9,82 @@ static int expect_success(SporeResult result) {
   return result == SPORE_SUCCESS ? 0 : 1;
 }
 
-int main(void) {
+static SporeString borrowed_string(const char *value) {
+  SporeString string = {value, strlen(value)};
+  return string;
+}
+
+static void print_last_error(SporeContext context, const char *operation) {
+  const SporeString error = spore_context_last_error(context);
+  fprintf(stderr, "libspore-c-smoke: %s failed: %.*s\n", operation,
+          (int)error.len, error.ptr == 0 ? "" : error.ptr);
+}
+
+static int fresh_run(const char *program, const char *name) {
+  SporeContext context = 0;
+  if (expect_success(spore_context_new(&context)) != 0 || context == 0) return 1;
+
+  SporeCreateNamedOptions create;
+  spore_create_named_options_init(&create);
+  create.name = borrowed_string(name);
+  create.backend = borrowed_string("kvm");
+  create.spore_executable = borrowed_string(program);
+  create.memory_bytes = UINT64_C(512) * UINT64_C(1024) * UINT64_C(1024);
+  create.vcpus = 1;
+  const SporeString initial_argv[] = {borrowed_string("/bin/true")};
+  create.initial_argv = initial_argv;
+  create.initial_argc = 1;
+
+  SporeOwnedString json = {0};
+  if (expect_success(spore_create_named_json(context, &create, &json)) != 0) {
+    print_last_error(context, "create");
+    spore_context_free(context);
+    return 1;
+  }
+  spore_free_string(context, json);
+
+  int result = 1;
+  SporeExecNamedOptions exec;
+  spore_exec_named_options_init(&exec);
+  exec.name = borrowed_string(name);
+  const SporeString exec_argv[] = {borrowed_string("/bin/writeout")};
+  exec.argv = exec_argv;
+  exec.argc = 1;
+  json = (SporeOwnedString){0};
+  if (expect_success(spore_exec_named_json(context, &exec, &json)) != 0) {
+    print_last_error(context, "exec");
+  } else if (json.ptr == 0 || strstr(json.ptr, "\"exit_code\": 0") == 0 ||
+             strstr(json.ptr, "spore stdout") == 0) {
+    fprintf(stderr, "libspore-c-smoke: exec result did not prove command completion\n");
+  } else {
+    result = 0;
+  }
+  spore_free_string(context, json);
+
+  SporeRemoveNamedOptions remove;
+  spore_remove_named_options_init(&remove);
+  remove.name = borrowed_string(name);
+  json = (SporeOwnedString){0};
+  if (expect_success(spore_remove_named_json(context, &remove, &json)) != 0) {
+    print_last_error(context, "remove");
+    result = 1;
+  }
+  spore_free_string(context, json);
+  spore_context_free(context);
+  return result;
+}
+
+int main(int argc, char **argv) {
+  if (getenv("SPORE_REEXEC_ROLE") != 0) {
+    int exit_code = 1;
+    if (spore_reexec_main(argc, (const char *const *)argv, &exit_code) != SPORE_SUCCESS) return 2;
+    return exit_code;
+  }
+  if (argc == 3 && strcmp(argv[1], "--fresh-run") == 0) {
+    return fresh_run(argv[0], argv[2]);
+  }
+  if (argc != 1) return 2;
+
   SporeString version = {0};
   if (expect_success(spore_build_info(SPORE_BUILD_INFO_VERSION_STRING, &version)) != 0) return 1;
   if (version.ptr == 0 || version.len == 0) return 1;

@@ -505,7 +505,11 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     transports[board.console_slot.index] = .init(console_dev.device());
     for (disk_backends, board.disk_slots, 0..) |maybe_backend, slot, index| {
         if (maybe_backend) |backend| {
-            block_devs[index] = if (index == 0) .initWithOptions(backend, config.root_blk_options) else .initImmutableSource(backend);
+            block_devs[index] = switch (index) {
+                0 => .initWithOptions(backend, config.root_blk_options),
+                3 => .init(backend),
+                else => .initImmutableSource(backend),
+            };
             transports[slot.index] = .init(block_devs[index].device());
         } else {
             transports[slot.index] = .init(empty_devs[index].device());

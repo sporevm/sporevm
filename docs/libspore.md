@@ -26,9 +26,10 @@ behavior or depend on CLI parsing.
 `arm64` on mature lifecycle hosts and `amd64` on experimental Linux/KVM
 fresh-execution hosts. Serialized spore machine state retains `aarch64` and
 `sporevm-aarch64-v0`; those are format and backend identifiers rather than
-product platform values. AMD64 host-info support does not imply standalone
-Zig, C, or Go execution support; those x86 execution paths remain gated while
-the CLI alone exposes the experimental fresh profile.
+product platform values. Standalone Zig, C, and Go consumers can use the AMD64
+fresh-run and fresh named `create`/`exec`/`remove` paths. Capture, save,
+restore, resume, fork, multi-vCPU, and elastic-memory APIs remain unavailable
+on AMD64.
 
 The public vocabulary is `save`, `attach`, and `restore` across Zig, C, and Go.
 JSONL run events keep their original `capture` event and `capture_path` fields
@@ -214,6 +215,11 @@ const result = try libspore.runManaged(init, allocator, .{
     .command = &.{ "/bin/true" },
 });
 ```
+
+On Linux/AMD64, fresh calls require KVM, one vCPU, and fixed 512 MiB memory.
+The source-tree `smoke:x86-slice3c` gate exercises standalone Zig, C, and Go
+consumers without a `spore` CLI on `PATH`; it does not enable any saved-state
+API.
 
 For image-backed calls, an empty `.command` uses OCI Entrypoint plus Cmd. A
 non-empty command replaces Cmd and follows Entrypoint. Set `.image_entrypoint`

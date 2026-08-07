@@ -2031,7 +2031,7 @@ pub fn createCli(
             const message = "spore create: experimental x86-64 KVM supports only fixed 512 MiB memory";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },
-        error.X86VcpuCountUnsupported, error.X86BuildUnsupported => {
+        error.X86VcpuCountUnsupported, error.X86DiskForkUnsupported => {
             const message = allocLifecycleMessage(allocator, "spore create: request is outside the fresh x86-64 KVM profile: {s}", .{@errorName(err)});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },

@@ -18,6 +18,7 @@ infer_backend() {
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64) echo "hvf" ;;
     Linux-aarch64|Linux-arm64) echo "kvm" ;;
+    Linux-x86_64) echo "kvm" ;;
     *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
   esac
 }
@@ -84,6 +85,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 run_embedder() {
+  local inherited=()
+  local name
+  for name in SPOREVM_KERNEL_CACHE_DIR SPOREVM_ROOTFS_CACHE_DIR SPOREVM_KERNEL_IMAGE SPOREVM_RUN_INITRD; do
+    if [[ -n "${!name:-}" ]]; then
+      inherited+=("${name}=${!name}")
+    fi
+  done
   env -i \
     HOME="${HOME:-/tmp}" \
     TMPDIR="${TMPDIR:-/tmp}" \
@@ -91,6 +99,7 @@ run_embedder() {
     SPOREVM_RUNTIME_DIR="${runtime_dir}" \
     DYLD_LIBRARY_PATH="${repo_root}/zig-out/lib" \
     LD_LIBRARY_PATH="${repo_root}/zig-out/lib" \
+    "${inherited[@]}" \
     "$@"
 }
 

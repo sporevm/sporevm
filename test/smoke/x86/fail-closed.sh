@@ -65,8 +65,10 @@ expect_failure restore "resume is unavailable" \
   "${run_env[@]}" "${spore_bin}" restore "${workdir}/missing.spore" --name restored-$$ --backend kvm
 expect_failure attach "X86ResumeUnsupported" \
   "${run_env[@]}" "${spore_bin}" attach "${workdir}/missing.spore"
-expect_failure build "X86BuildUnsupported" \
-  "${run_env[@]}" "${spore_bin}" build -t local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
+expect_failure build-vcpus "X86VcpuCountUnsupported" \
+  "${run_env[@]}" "${spore_bin}" build --platform linux/amd64 --vcpus 2 -t local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
+expect_failure build-memory "X86ExperimentalMemorySizeUnsupported" \
+  "${run_env[@]}" "${spore_bin}" build --platform linux/amd64 --memory 1gb -t local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
 [[ ! -e "${workdir}/saved.spore" ]] || die "rejected save created output"
 [[ ! -e "${kernel_cache}" ]] || die "rejected requests performed managed kernel work"
 

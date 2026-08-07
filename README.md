@@ -24,8 +24,9 @@ networking, and build workflows. The AMD64 profile is deliberately narrower:
 it uses the managed kernel and embedded minimal exec initrd with one vCPU and
 exactly 512 MiB of memory. Fresh one-shot and named workloads support native
 `linux/amd64` OCI images, explicit rootfs inputs, networking, and one-shot
-image commit. Build, capture, save, restore, resume, fork, and fan-out remain
-unavailable.
+image commit. Native `spore build` and standalone Zig, C, and Go libspore fresh
+execution are also available. Capture, save, restore, resume, fork, and fan-out
+remain unavailable.
 
 A spore is sealed VM state with normalized machine state, device state,
 verified memory chunks, optional rootfs state, and a platform contract that
@@ -96,7 +97,9 @@ the experimental Linux/AMD64 profile.
 
 `spore` is the CLI. `libspore` is the embedding surface for Zig, C, and Go
 callers. See [docs/libspore.md](docs/libspore.md) for import, ownership, C ABI,
-and Go binding details.
+and Go binding details. Experimental Linux/AMD64 callers may use fresh
+one-shot execution and fresh named `create`/`exec`/`rm`; saved-state and
+capture APIs remain unavailable.
 
 ## Build from source
 
@@ -138,7 +141,8 @@ spore run --memory 512mib 'echo hi'
 
 That profile accepts only one vCPU and the managed kernel plus embedded minimal
 exec initrd. Native `linux/amd64` image and rootfs execution, networking, and
-one-shot image commit are available; build and saved-state options fail closed.
+one-shot image commit are available. `spore build` selects `linux/amd64`
+natively; saved-state options fail closed.
 
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
 initrd. The embedded initrd contains SporeVM helper binaries plus a small
@@ -444,8 +448,9 @@ SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
 named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM has an
 experimental fresh-only development profile with one vCPU and fixed 512 MiB
-memory; native OCI/rootfs execution, image commit, and networking are available,
-while capture, resume, build, and standalone libspore execution remain gated.
+memory; native OCI/rootfs execution, image commit, networking, build, and
+standalone libspore fresh execution are available, while capture, saved-state
+restore/resume, disk fork, multi-vCPU, and elastic memory remain gated.
 
 Known limits: compatible host-class restore only, rootfs-bound writable disk
 state only, diskless named live fork, and no hardened public-cloud

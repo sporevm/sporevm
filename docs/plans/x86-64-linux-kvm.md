@@ -46,15 +46,16 @@ requires a matching architecture and compatible machine profile.
 | Architecture, host-info, artifacts, runner | Complete | `src/architecture.zig`, `src/platform.zig`, `src/x86_64/vm.zig`, `build.zig` |
 | Managed fresh product execution | Complete | `mise run smoke:x86-slice3a` on native x86 KVM |
 | OCI/rootfs/network/image commit | Complete | `mise run smoke:x86-slice3b` on native x86 KVM |
-| Native build and standalone libspore | Pending: Slice 3c | Product gates remain closed |
+| Native build and standalone libspore | Complete | `mise run smoke:x86-slice3c` on native x86 KVM |
 | Saved machine state and lifecycle parity | Pending: Slices 4–5 | No x86 manifest writer yet |
 | High/elastic memory and performance | Pending: Slice 6 | Product requires fixed 512 MiB |
 | Packaging and supported release | Pending: Slice 7 | No x86 support claim yet |
 
 The current product path is experimental and fresh-only: Linux/x86-64 KVM, one
 vCPU, and fixed 512 MiB memory. Native OCI/rootfs execution, writable image
-commit, and networking are complete. Build, libspore, capture, fork, elastic
-memory, and release paths remain fail closed.
+commit, networking, build, and standalone libspore fresh execution are
+complete. Capture, saved-state restore/resume, disk fork, elastic memory, and
+release paths remain fail closed.
 
 ## Scope
 
@@ -157,6 +158,11 @@ that lifecycle, and release requires the complete product contract.
 the network policy matrix pass natively without enabling capture.
 
 ### Slice 3c: Native build and libspore fresh run
+
+**Status: complete.** Native acceptance runs the `variable-expansion`
+Docker/Spore conformance case, including `TARGETARCH=amd64`, plus standalone
+Zig, C, and Go fresh-execution consumers without a `spore` CLI on `PATH`.
+Saved-state and capture APIs remain outside this slice.
 
 - Make `spore build` use the native platform, `TARGETARCH=amd64`, and
   architecture-scoped inputs, executor, caches, and OCI config; run the existing

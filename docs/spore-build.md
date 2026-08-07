@@ -7,7 +7,6 @@ pushable OCI image.
 ```bash
 spore build \
   -t local/app:dev \
-  --platform linux/arm64 \
   .
 
 spore run --image local/app:dev --pull=never -- /usr/local/bin/app
@@ -30,7 +29,7 @@ spore build [options] CONTEXT
 
   -t, --tag REF                  Local image ref to update
   -f, --file PATH                Dockerfile path
-  --platform linux/arm64         Target platform
+  --platform OS/ARCH             Native linux/arm64 or linux/amd64 platform
   --target STAGE                 Selected stage
   --build-context NAME=oci-layout://PATH
                                   Named OCI-layout base
@@ -45,11 +44,14 @@ spore build [options] CONTEXT
   --debugfs PATH                 debugfs helper for OCI imports
 ```
 
-The only target platform is `linux/arm64`. `--network spore` is the default;
-use `--network none` for builds whose `RUN` steps require no network. Timeout
-applies independently to each Dockerfile instruction. Memory, vCPU count, and
-`nofile` enter RUN cache identity because a command can observe them; timeout
-does not.
+The default and only executable target is the native platform: `linux/arm64`
+on ARM64 hosts and `linux/amd64` on AMD64 hosts. Cross-architecture builds fail
+before input resolution; SporeVM does not emulate another ISA. The AMD64 build
+profile uses one vCPU and fixed 512 MiB memory. `--network spore` is the
+default; use `--network none` for builds whose `RUN` steps require no network.
+Timeout applies independently to each Dockerfile instruction. Memory, vCPU
+count, and `nofile` enter RUN cache identity because a command can observe
+them; timeout does not.
 
 `--build-context` is repeatable and currently accepts only named OCI layouts.
 For example, `--build-context base=oci-layout:///tmp/base.oci` makes `FROM base`
@@ -65,7 +67,7 @@ every feature from that frontend version is implemented.
 
 | Instruction | Current support |
 | --- | --- |
-| `FROM` | Multi-stage `FROM ... AS`, `--platform=linux/arm64`, `scratch`, public registry images, local images, named OCI-layout contexts, and inheritance from an earlier stage. Only the selected target's reachable stage closure executes. |
+| `FROM` | Multi-stage `FROM ... AS`, the native `--platform=linux/arm64` or `--platform=linux/amd64`, `scratch`, public registry images, local images, named OCI-layout contexts, and inheritance from an earlier stage. Only the selected target's reachable stage closure executes. |
 | `ARG`, `ENV` | Global and stage arguments, repeated `--build-arg`, automatic platform arguments, and bounded `$NAME`, `${NAME}`, `${NAME:-word}`, `${NAME-word}`, `${NAME:+word}`, and `${NAME+word}` expansion. Unsupported modifiers fail closed. |
 | `WORKDIR` | Absolute and parent-relative paths with Docker-compatible resolution and builder expansion. |
 | `CMD`, `ENTRYPOINT` | Shell and JSON-array forms, including inheritance into later stages and publication in the final image config. |

@@ -11,13 +11,17 @@ const memory_config = @import("../memory.zig");
 const topology = @import("../topology.zig");
 const runtime_disk = @import("../runtime_disk.zig");
 const cache_mount = @import("cache_mount.zig");
-const board = @import("../aarch64/board.zig");
 const spore = @import("../spore.zig");
 const run_contract = @import("run_contract.zig");
 const step_cache = @import("step_cache.zig");
 const vsock = @import("../virtio/vsock.zig");
 
 const guest_port: u32 = 10700;
+const max_virtio_devices = switch (builtin.cpu.arch) {
+    .aarch64 => @import("../aarch64/board.zig").max_virtio_devices,
+    .x86_64 => @import("../x86_64/board.zig").max_virtio_devices,
+    else => 0,
+};
 pub const default_step_timeout_ms: u64 = 30 * 60 * 1000;
 const max_captured_output = 64 * 1024;
 const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
@@ -25,9 +29,9 @@ const p0_idle_probe_env = "SPOREVM_ROOTFS_GROWTH_P0_IDLE_MS";
 const max_p0_idle_probe_ms: u64 = 10_000;
 const build_producer_domain = "sporevm-build-producer-v2";
 const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v2;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
-// Provisional build-VM default; make this a `spore build` option when larger
-// workloads such as `bundle install`-style RUN steps need more memory.
-const build_vm_memory_bytes: u64 = 2 * 1024 * 1024 * 1024;
+// The x86 product profile is intentionally fixed at 512 MiB. AArch64 keeps
+// the established 2 GiB default for larger RUN steps.
+const build_vm_memory_bytes: u64 = if (builtin.cpu.arch == .x86_64) 512 * 1024 * 1024 else 2 * 1024 * 1024 * 1024;
 pub const default_build_memory = memory_config.Config.fixed(build_vm_memory_bytes);
 pub const default_build_vcpus: topology.VcpuCount = 1;
 pub const max_build_nofile: u64 = 1_048_576;
@@ -42,7 +46,7 @@ pub const max_guest_working_dir_len = 255;
 pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
 pub const max_context_bind_mounts = 8;
-pub const max_build_input_disks = 2;
+pub const max_build_input_disks: usize = if (builtin.cpu.arch == .x86_64) 1 else 2;
 const enospc_patterns = [_][]const u8{
     "SPORE_BUILD_ENOSPC",
     "No space left on device",
@@ -558,7 +562,7 @@ fn collectCacheMounts(allocator: std.mem.Allocator, steps: []const Step) ![]cons
 
 pub fn buildDeviceEnvelopeFits(has_context: bool, build_input_count: usize, has_cache: bool) bool {
     const fixed_devices: usize = 5; // console, rootfs, net, vsock, rng
-    return fixed_devices + @intFromBool(has_context) + build_input_count + @intFromBool(has_cache) <= board.max_virtio_devices;
+    return fixed_devices + @intFromBool(has_context) + build_input_count + @intFromBool(has_cache) <= max_virtio_devices;
 }
 
 test "cache mounts preserve the frozen build device envelope" {
