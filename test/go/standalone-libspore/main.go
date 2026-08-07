@@ -34,7 +34,12 @@ func run(ctx context.Context) error {
 		return err
 	}
 	defer client.Close()
-	for _, name := range []string{"HOME", "TMPDIR", "PATH", "SPOREVM_RUNTIME_DIR", "DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"} {
+	for _, name := range []string{
+		"HOME", "TMPDIR", "PATH", "SPOREVM_RUNTIME_DIR",
+		"SPOREVM_KERNEL_CACHE_DIR", "SPOREVM_ROOTFS_CACHE_DIR",
+		"SPOREVM_KERNEL_IMAGE", "SPOREVM_RUN_INITRD",
+		"DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH",
+	} {
 		if value := os.Getenv(name); value != "" {
 			if err := client.SetEnv(ctx, name, value); err != nil {
 				return fmt.Errorf("set %s: %w", name, err)

@@ -105,7 +105,11 @@ run_embedder() {
 }
 
 timeout_ms="${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}"
-memory_mib="${SPORE_SMOKE_MEMORY_MIB:-256}"
+default_memory_mib=256
+if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]]; then
+  default_memory_mib=512
+fi
+memory_mib="${SPORE_SMOKE_MEMORY_MIB:-${default_memory_mib}}"
 
 run_embedder "${embedder}" \
   -name "${plain_name}" \
