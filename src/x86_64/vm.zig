@@ -504,20 +504,21 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var disk_writable: [4]bool = @splat(false);
     disk_backends[0] = config.root_disk;
     disk_writable[0] = true;
-    var disk_count: usize = 1;
+    var next_input_slot: usize = 1;
     if (config.context_disk) |backend| {
-        disk_backends[disk_count] = backend;
-        disk_count += 1;
+        disk_backends[next_input_slot] = backend;
+        next_input_slot += 1;
     }
     for (config.build_input_disks) |backend| {
-        if (disk_count == disk_backends.len) return error.TooManyVirtioDevices;
-        disk_backends[disk_count] = backend;
-        disk_count += 1;
+        if (next_input_slot == disk_backends.len or
+            (next_input_slot == disk_backends.len - 1 and config.cache_disk != null)) return error.TooManyVirtioDevices;
+        disk_backends[next_input_slot] = backend;
+        next_input_slot += 1;
     }
     if (config.cache_disk) |backend| {
-        if (disk_count == disk_backends.len) return error.TooManyVirtioDevices;
-        disk_backends[disk_count] = backend;
-        disk_writable[disk_count] = config.cache_disk_writable;
+        const cache_slot = disk_backends.len - 1;
+        disk_backends[cache_slot] = backend;
+        disk_writable[cache_slot] = config.cache_disk_writable;
     }
     var vsock_dev = virtio_vsock.Vsock.init(.{});
     var rng_dev = virtio_rng.Rng{};
