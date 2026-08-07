@@ -65,9 +65,14 @@ expect_failure restore "resume is unavailable" \
   "${run_env[@]}" "${spore_bin}" restore "${workdir}/missing.spore" --name restored-$$ --backend kvm
 expect_failure attach "X86ResumeUnsupported" \
   "${run_env[@]}" "${spore_bin}" attach "${workdir}/missing.spore"
-expect_failure build "X86BuildUnsupported" \
-  "${run_env[@]}" "${spore_bin}" build -t local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
+expect_failure checkpoint-fork "X86ForkUnsupported" \
+  "${run_env[@]}" "${spore_bin}" checkpoint fork "${workdir}/missing.spore" --count 1 --out "${workdir}/children"
+expect_failure build-vcpus "X86VcpuCountUnsupported" \
+  "${run_env[@]}" "${spore_bin}" build --platform linux/amd64 --vcpus 2 -t local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
+expect_failure build-memory "X86ExperimentalMemorySizeUnsupported" \
+  "${run_env[@]}" "${spore_bin}" build --platform linux/amd64 --memory 1gb -t local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
 [[ ! -e "${workdir}/saved.spore" ]] || die "rejected save created output"
+[[ ! -e "${workdir}/children" ]] || die "rejected checkpoint fork created output"
 [[ ! -e "${kernel_cache}" ]] || die "rejected requests performed managed kernel work"
 
 managed_dir="${kernel_cache}/sporevm-kernels/${release}"
@@ -80,6 +85,11 @@ if [[ -n "${seed_dir}" ]]; then
 fi
 "${run_env[@]}" "${spore_bin}" create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 >/dev/null
 created=1
+expect_failure named-copy-in "X86NamedCopyUnsupported" \
+  "${run_env[@]}" "${spore_bin}" copy-in "${vm_name}" "${workdir}/missing-host-input" /tmp/input
+expect_failure named-copy-out "X86NamedCopyUnsupported" \
+  "${run_env[@]}" "${spore_bin}" copy-out "${vm_name}" /tmp/output "${workdir}/host-output"
+[[ ! -e "${workdir}/host-output" ]] || die "rejected named copy-out created output"
 expect_failure named-save "capture is unavailable" \
   "${run_env[@]}" "${spore_bin}" save "${vm_name}" --out "${workdir}/named.spore"
 "${run_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/true

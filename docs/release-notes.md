@@ -8,12 +8,15 @@ Linux/AMD64 KVM fresh workloads now use native `linux/amd64` OCI selection,
 explicit rootfs inputs, the shared writable rootfs and image-commit path, and
 the shared network policy graph. Native acceptance covers rootfs execution and
 mutation, image commit, DNS, HTTP, hard-floor deny policy, bound services, and
-host-to-guest forwarding.
+host-to-guest forwarding. Native `spore build` now selects `linux/amd64`,
+including automatic `TARGETARCH=amd64` build arguments, and standalone Zig, C,
+and Go libspore consumers can execute fresh workloads through the same product
+path.
 
 The profile remains experimental, source-built, fixed at one vCPU and 512 MiB,
-and fresh-only. Build, standalone libspore execution, capture, save, restore,
-resume, fork, and fan-out remain fail closed; no AMD64 saved-state format or
-release archive is introduced.
+and fresh-only. Capture, save, restore, resume, disk fork, fan-out, multi-vCPU,
+and elastic memory remain fail closed; no AMD64 saved-state format or release
+archive is introduced.
 
 ### Explicit initial and maximum memory
 

@@ -277,6 +277,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_c_smoke = b.addRunArtifact(c_smoke);
 
+    const standalone_zig_mod = b.createModule(.{
+        .root_source_file = b.path("test/standalone-libspore-zig.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "libspore", .module = libspore_mod },
+        },
+    });
+    if (target_is_hvf) linkHypervisor(standalone_zig_mod, macos_framework_path);
+    const standalone_zig = b.addExecutable(.{
+        .name = "libspore-zig-fresh-smoke",
+        .root_module = standalone_zig_mod,
+    });
+    const install_standalone_zig = b.addInstallArtifact(standalone_zig, .{});
+    const install_standalone_c = b.addInstallArtifact(c_smoke, .{});
+    const consumer_smokes = b.step("libspore-consumer-smokes", "Build standalone libspore Zig and C consumers");
+    consumer_smokes.dependOn(&install_standalone_zig.step);
+    consumer_smokes.dependOn(&install_standalone_c.step);
+
     const x86_64_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/x86_64_tests.zig"),

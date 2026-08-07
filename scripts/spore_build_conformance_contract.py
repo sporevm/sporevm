@@ -7,11 +7,21 @@ import difflib
 import enum
 import json
 import pathlib
+import platform as host_platform
 import shlex
 from typing import Any
 
 
-PLATFORM = "linux/arm64"
+def native_platform(machine: str) -> str:
+    normalized = machine.strip().lower()
+    if normalized in ("aarch64", "arm64"):
+        return "linux/arm64"
+    if normalized in ("x86_64", "amd64"):
+        return "linux/amd64"
+    raise ValueError(f"unsupported native build architecture: {machine!r}")
+
+
+PLATFORM = native_platform(host_platform.machine())
 BUILDKIT_IMAGE = (
     "moby/buildkit@sha256:"
     "0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f"
@@ -28,6 +38,23 @@ class HarnessError(RuntimeError):
 
 class CaseError(HarnessError):
     pass
+
+
+def self_test_native_platform() -> None:
+    if native_platform("aarch64") != "linux/arm64":
+        raise HarnessError("self-test: aarch64 native platform mismatch")
+    if native_platform("arm64") != "linux/arm64":
+        raise HarnessError("self-test: arm64 native platform mismatch")
+    if native_platform("x86_64") != "linux/amd64":
+        raise HarnessError("self-test: x86_64 native platform mismatch")
+    if native_platform("AMD64") != "linux/amd64":
+        raise HarnessError("self-test: amd64 native platform mismatch")
+    try:
+        native_platform("riscv64")
+    except ValueError:
+        pass
+    else:
+        raise HarnessError("self-test: unsupported native platform was accepted")
 
 
 class Outcome(str, enum.Enum):

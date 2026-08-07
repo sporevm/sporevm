@@ -57,6 +57,9 @@ pub const default_build_memory = build_exec.default_build_memory;
 pub const default_build_vcpus = build_exec.default_build_vcpus;
 pub const default_step_timeout_ms = build_exec.default_step_timeout_ms;
 pub const default_build_nofile = build_exec.default_build_nofile;
+pub const default_build_platform = rootfs_mod.Platform{
+    .arch = architecture.fromTarget(builtin.cpu.arch) orelse .arm64,
+};
 pub const max_build_nofile = build_exec.max_build_nofile;
 pub const max_run_command_len = build_exec.max_run_command_len;
 pub const max_guest_envc = build_exec.max_guest_envc;
@@ -67,7 +70,7 @@ pub const Options = struct {
     tag: []const u8,
     context_dir: []const u8,
     dockerfile_path: []const u8,
-    platform: rootfs_mod.Platform = .{},
+    platform: rootfs_mod.Platform = default_build_platform,
     target: ?[]const u8 = null,
     build_contexts: []const BuildContextArg = &.{},
     build_args: []const BuildArg = &.{},
@@ -194,16 +197,16 @@ const automatic_build_capacity_bytes: u64 = 16 * 1024 * 1024 * 1024;
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Result {
     const backend = try backend_mod.requireProductRunner(.auto);
     try run_mod.validateFreshProductPolicy(backend, .{
-        .memory = .{},
-        .vcpus = 1,
-        .build = true,
+        .memory = options.memory,
+        .vcpus = options.vcpus,
     });
 
     var local_diagnostic: Diagnostic = .{};
     const diagnostic = options.diagnostic orelse &local_diagnostic;
     diagnostic.* = .{};
 
-    if (architecture.selectBackend(options.platform.arch) != .aarch64) return error.UnsupportedPlatform;
+    const native_arch = architecture.fromTarget(builtin.cpu.arch) orelse return error.UnsupportedPlatform;
+    if (!std.mem.eql(u8, options.platform.os, "linux") or options.platform.arch != native_arch) return error.UnsupportedPlatform;
 
     const dockerfile_bytes = Io.Dir.cwd().readFileAlloc(init.io, options.dockerfile_path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => {
@@ -507,7 +510,6 @@ test "build requires a product runner before reading inputs" {
     run_mod.validateFreshProductPolicy(backend, .{
         .memory = .{},
         .vcpus = 1,
-        .build = true,
     }) catch |expected_err| {
         const allocator = std.testing.allocator;
         var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2050,7 +2052,7 @@ test "automatic platform args derive from the selected platform and accept overr
     }, document.global_args, &diagnostic);
     try std.testing.expectEqualStrings("linux", lookupArg("TARGETOS", args.items).?);
     try std.testing.expectEqualStrings("override", lookupArg("TARGETARCH", args.items).?);
-    try std.testing.expectEqualStrings("linux/arm64", lookupArg("TARGETPLATFORM", args.items).?);
+    try std.testing.expectEqualStrings(if (builtin.cpu.arch == .x86_64) "linux/amd64" else "linux/arm64", lookupArg("TARGETPLATFORM", args.items).?);
     try std.testing.expectEqualStrings("ci", lookupArg("TARGETSTAGE", args.items).?);
     try std.testing.expectEqualStrings("linux-override-ci", lookupArg("ARTIFACT", args.items).?);
 }
@@ -2154,7 +2156,13 @@ test "remote ADD resolves inherited ARG and automatic platform values at instruc
         0,
         4,
     );
-    try std.testing.expectEqualStrings("https://example.com/1.2.3/tool-linux-arm64", input.resolved_url);
+    try std.testing.expectEqualStrings(
+        if (builtin.cpu.arch == .x86_64)
+            "https://example.com/1.2.3/tool-linux-amd64"
+        else
+            "https://example.com/1.2.3/tool-linux-arm64",
+        input.resolved_url,
+    );
     try std.testing.expectEqualStrings("/opt/$VERSION/tool", input.resolved_dest);
     try std.testing.expectEqual(@as(u32, 0o644), input.mode);
 }
@@ -3898,7 +3906,7 @@ test "unsupported reachable platform fails before context or base resolution" {
     try std.testing.expectEqualStrings("spore build FROM --platform must match linux/arm64", diagnostic.dockerfile.message);
 }
 
-test "amd64 product platform fails at the unavailable backend before input IO" {
+test "cross-architecture product platform fails before input IO" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -3907,11 +3915,12 @@ test "amd64 product platform fails at the unavailable backend before input IO" {
     defer env.deinit();
     const init = testInit(allocator, io, &arena_state, &env);
 
+    const cross_arch: architecture.Architecture = if (builtin.cpu.arch == .x86_64) .arm64 else .amd64;
     try std.testing.expectError(error.UnsupportedPlatform, build(init, arena_state.allocator(), .{
-        .tag = "local/app:amd64",
+        .tag = "local/app:cross-architecture",
         .context_dir = "missing-context",
         .dockerfile_path = "missing-Dockerfile",
-        .platform = .{ .arch = .amd64 },
+        .platform = .{ .arch = cross_arch },
     }));
 }
 

@@ -43,8 +43,9 @@ and Linux and does not shrink when `SPOREVM_RUNTIME_DIR` is a long path.
 Linux/AMD64 KVM currently exposes an experimental fresh-execution subset:
 `create`, `exec`, and `rm` with the managed kernel, embedded minimal exec
 initrd, one vCPU, and fixed 512 MiB memory. Fresh named workloads may use native
-`linux/amd64` images, explicit rootfs inputs, and networking. Build, copy, save,
-restore, resume, and fork are unavailable on that profile.
+`linux/amd64` images, explicit rootfs inputs, and networking. Standalone
+libspore consumers may use the same fresh create/exec/remove path. Named copy,
+save, restore, resume, and fork are unavailable on that profile.
 
 One-shot `spore run --image SOURCE --commit local/name:tag -- COMMAND` publishes
 successful disk preparation as an image; it does not create or name a live VM.

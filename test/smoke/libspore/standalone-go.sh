@@ -18,6 +18,7 @@ infer_backend() {
   case "$(uname -s)-$(uname -m)" in
     Darwin-arm64) echo "hvf" ;;
     Linux-aarch64|Linux-arm64) echo "kvm" ;;
+    Linux-x86_64) echo "kvm" ;;
     *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
   esac
 }
@@ -71,8 +72,11 @@ embedder="${workdir}/standalone-libspore"
 (
   cd "${workdir}"
   env \
-    PKG_CONFIG_PATH="${repo_root}/zig-out/lib/pkgconfig" \
     CGO_ENABLED=1 \
+    CGO_CFLAGS="-I${repo_root}/zig-out/include ${CGO_CFLAGS:-}" \
+    CGO_LDFLAGS="-L${repo_root}/zig-out/lib -lspore ${CGO_LDFLAGS:-}" \
+    CC="${CC:-zig cc}" \
+    PKG_CONFIG="${PKG_CONFIG:-/usr/bin/true}" \
     go build -o "${embedder}" .
 )
 
@@ -84,6 +88,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 run_embedder() {
+  local inherited=()
+  local name
+  for name in SPOREVM_KERNEL_CACHE_DIR SPOREVM_ROOTFS_CACHE_DIR SPOREVM_KERNEL_IMAGE SPOREVM_RUN_INITRD; do
+    if [[ -n "${!name:-}" ]]; then
+      inherited+=("${name}=${!name}")
+    fi
+  done
   env -i \
     HOME="${HOME:-/tmp}" \
     TMPDIR="${TMPDIR:-/tmp}" \
@@ -91,11 +102,16 @@ run_embedder() {
     SPOREVM_RUNTIME_DIR="${runtime_dir}" \
     DYLD_LIBRARY_PATH="${repo_root}/zig-out/lib" \
     LD_LIBRARY_PATH="${repo_root}/zig-out/lib" \
+    "${inherited[@]}" \
     "$@"
 }
 
 timeout_ms="${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}"
-memory_mib="${SPORE_SMOKE_MEMORY_MIB:-256}"
+default_memory_mib=256
+if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]]; then
+  default_memory_mib=512
+fi
+memory_mib="${SPORE_SMOKE_MEMORY_MIB:-${default_memory_mib}}"
 
 run_embedder "${embedder}" \
   -name "${plain_name}" \

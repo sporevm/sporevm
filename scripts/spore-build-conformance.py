@@ -45,6 +45,7 @@ from spore_build_conformance_contract import (
     parse_jsonl,
     parse_spore_build,
     select_cases,
+    self_test_native_platform,
     self_test_schema,
     self_test_sharding,
     shard_cases,
@@ -113,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preflight-only",
         action="store_true",
-        help="validate Docker, Buildx, linux/arm64, Spore, and a native hypervisor, then exit",
+        help="validate Docker, Buildx, the native Linux platform, Spore, and a native hypervisor, then exit",
     )
     parser.add_argument(
         "--work-dir",
@@ -849,6 +850,7 @@ def main() -> int:
             self_test_schema(all_cases)
             self_test_sharding(all_cases)
             self_test_managed_builder_name()
+            self_test_native_platform()
             print(
                 "spore-build-conformance schema, sharding, and builder-cache self-tests ok"
             )

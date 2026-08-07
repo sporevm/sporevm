@@ -167,13 +167,13 @@ pub const FreshProductPolicy = struct {
     capture: bool = false,
     rootfs: bool = false,
     network: bool = false,
-    build: bool = false,
+    disk_fork: bool = false,
 };
 
 /// The experimental x86 product profile remains fixed-memory, single-vCPU,
-/// fresh-only, and unavailable to the native builder. Keep this
-/// pure so API and lifecycle callers can reject unsupported work before
-/// downloads, rootfs resolution, gateway startup, or monitor state creation.
+/// and fresh-only. Keep this pure so API and lifecycle callers can reject
+/// unsupported work before downloads, rootfs resolution, gateway startup, or
+/// monitor state creation.
 pub fn validateFreshProductPolicy(selected_backend: Backend, policy: FreshProductPolicy) !void {
     if (comptime builtin.os.tag != .linux) return;
     return validateFreshProductPolicyFor(builtin.cpu.arch, selected_backend, policy);
@@ -184,7 +184,7 @@ fn validateFreshProductPolicyFor(zig_arch: std.Target.Cpu.Arch, selected_backend
     if (selected_backend != .kvm) return error.UnsupportedBackend;
     if (policy.resuming) return error.X86ResumeUnsupported;
     if (policy.capture) return error.X86CaptureUnsupported;
-    if (policy.build) return error.X86BuildUnsupported;
+    if (policy.disk_fork) return error.X86DiskForkUnsupported;
     if (policy.memory.isElastic()) return error.X86ElasticMemoryUnsupported;
     if (policy.memory.initial_bytes != x86_experimental_memory_bytes) return error.X86ExperimentalMemorySizeUnsupported;
     if (policy.vcpus != 1) return error.X86VcpuCountUnsupported;
@@ -1086,10 +1086,10 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
             @errorName(err),
         );
     }
-    if (err == error.X86BuildUnsupported) {
+    if (err == error.X86DiskForkUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: x86-64 KVM native build integration has not landed yet",
+            "spore run: x86-64 KVM disk fork is unavailable",
             @errorName(err),
         );
     }
@@ -1200,7 +1200,7 @@ pub fn isX86ProductPolicyError(err: anyerror) bool {
         err == error.X86VcpuCountUnsupported or
         err == error.X86ResumeUnsupported or
         err == error.X86CaptureUnsupported or
-        err == error.X86BuildUnsupported;
+        err == error.X86DiskForkUnsupported;
 }
 
 pub const MonitorExit = enum {
@@ -3367,7 +3367,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .capture = opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save,
         .rootfs = opts.rootfs_path != null or opts.rootfs != null or opts.disk != null or opts.rootfs_grow_target != 0,
         .network = opts.network != .disabled or opts.network_runtime != null,
-        .build = opts.context_disk_path != null or opts.build_input_rootfs.len != 0 or opts.build_cache_disk_fd != null or opts.build_mode or opts.runtime_disk_head != null,
+        .disk_fork = opts.runtime_disk_head != null,
     });
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
@@ -3803,7 +3803,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
         .resuming = opts.resume_dir != null or opts.resume_generation != null or opts.resume_sessions.len != 0,
         .rootfs = opts.rootfs_path != null or opts.rootfs != null or opts.disk != null or opts.rootfs_grow_target != 0,
         .network = opts.network != .disabled or opts.network_runtime != null,
-        .build = opts.context_disk_path != null or opts.build_input_rootfs.len != 0 or opts.build_cache_disk_fd != null or opts.build_mode or opts.runtime_disk_head != null,
+        .disk_fork = opts.runtime_disk_head != null,
     });
     var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.maximum_bytes);
     defer ram_plan.deinit();
@@ -3931,6 +3931,10 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                     .console_sink = consoleSink,
                     .root_disk = runtime_disk.backend(),
                     .root_blk_options = root_blk_options,
+                    .context_disk = if (context_disk_fd) |fd| .{ .file = fd } else null,
+                    .build_input_disks = build_input_backends,
+                    .cache_disk = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
+                    .cache_disk_writable = opts.build_cache_disk_fd != null,
                     .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                     .network = network,
                     .exec_probe = startup_probe,
@@ -5535,7 +5539,7 @@ test "x86 fresh product policy is fixed and fail closed" {
     try std.testing.expectError(error.X86ResumeUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .resuming = true }));
     try std.testing.expectError(error.X86CaptureUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .capture = true }));
     try validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .rootfs = true, .network = true });
-    try std.testing.expectError(error.X86BuildUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .build = true }));
+    try std.testing.expectError(error.X86DiskForkUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .disk_fork = true }));
 }
 
 test "direct image product platform follows the native architecture" {
