@@ -74,6 +74,7 @@ embedder="${workdir}/standalone-libspore"
   env \
     PKG_CONFIG_PATH="${repo_root}/zig-out/lib/pkgconfig" \
     CGO_ENABLED=1 \
+    CC="${CC:-zig cc}" \
     go build -o "${embedder}" .
 )
 

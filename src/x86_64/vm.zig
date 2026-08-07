@@ -50,6 +50,7 @@ pub const Config = struct {
     context_disk: ?virtio_blk.Backend = null,
     build_disk: ?virtio_blk.Backend = null,
     cache_disk: ?virtio_blk.Backend = null,
+    cache_disk_writable: bool = false,
     network: virtio_net.Runtime = .{},
     exec_probe: ?*virtio_vsock.HostStream = null,
     exec_probe_start: virtio_vsock.HostStreamStart = .immediate,
@@ -507,7 +508,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         if (maybe_backend) |backend| {
             block_devs[index] = switch (index) {
                 0 => .initWithOptions(backend, config.root_blk_options),
-                3 => .init(backend),
+                3 => if (config.cache_disk_writable) .init(backend) else .initImmutableSource(backend),
                 else => .initImmutableSource(backend),
             };
             transports[slot.index] = .init(block_devs[index].device());

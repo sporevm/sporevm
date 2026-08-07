@@ -3935,6 +3935,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                     .context_disk = if (context_disk_fd) |fd| .{ .file = fd } else null,
                     .build_disk = if (build_input_backends.len == 1) build_input_backends[0] else null,
                     .cache_disk = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
+                    .cache_disk_writable = opts.build_cache_disk_fd != null,
                     .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
                     .network = network,
                     .exec_probe = startup_probe,

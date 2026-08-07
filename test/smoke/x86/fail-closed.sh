@@ -85,6 +85,11 @@ if [[ -n "${seed_dir}" ]]; then
 fi
 "${run_env[@]}" "${spore_bin}" create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 >/dev/null
 created=1
+expect_failure named-copy-in "X86NamedCopyUnsupported" \
+  "${run_env[@]}" "${spore_bin}" copy-in "${vm_name}" "${workdir}/missing-host-input" /tmp/input
+expect_failure named-copy-out "X86NamedCopyUnsupported" \
+  "${run_env[@]}" "${spore_bin}" copy-out "${vm_name}" /tmp/output "${workdir}/host-output"
+[[ ! -e "${workdir}/host-output" ]] || die "rejected named copy-out created output"
 expect_failure named-save "capture is unavailable" \
   "${run_env[@]}" "${spore_bin}" save "${vm_name}" --out "${workdir}/named.spore"
 "${run_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/true

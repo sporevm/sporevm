@@ -755,7 +755,7 @@ test "build CLI reports a recognized platform with no runtime backend" {
     defer stderr.deinit();
     try writeBuildError(&stderr.writer, error.UnsupportedPlatform, .{});
     try std.testing.expectEqualStrings(
-        "spore build: runtime execution currently supports only linux/arm64\n",
+        "spore build: runtime execution requires the native linux/arm64 or linux/amd64 platform\n",
         stderr.written(),
     );
 }

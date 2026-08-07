@@ -1356,12 +1356,19 @@ pub fn openExecNamedStream(
     return openExecNamedStreamAt(context, arena, ready.value.control_socket_path, options);
 }
 
+fn rejectX86NamedCopy() !void {
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+        return error.X86NamedCopyUnsupported;
+    }
+}
+
 pub fn copyInNamed(
     context: Context,
     allocator: std.mem.Allocator,
     options: CopyNamedOptions,
 ) !void {
     clearLastError();
+    try rejectX86NamedCopy();
     var archive = try createCopyArchive(allocator, context.io, options.host_path);
     defer archive.deinit(context.io);
 
@@ -1382,6 +1389,7 @@ pub fn copyOutNamed(
     options: CopyNamedOptions,
 ) !void {
     clearLastError();
+    try rejectX86NamedCopy();
     var archive = try createEmptyCopyArchive(allocator, context.io);
     defer archive.deinit(context.io);
 
@@ -1400,6 +1408,21 @@ pub fn copyOutNamed(
 
     if (exit_code != 0) return error.GuestCopyFailed;
     try extractCopyArchive(allocator, context.io, archive.path, options.host_path);
+}
+
+test "x86 named copy APIs remain fail closed before host IO" {
+    if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    const context = Context{ .io = std.testing.io, .environ_map = &environ };
+    const options = CopyNamedOptions{
+        .name = "x86-copy-rejected",
+        .host_path = "missing-host-path",
+        .guest_path = "/tmp/rejected",
+    };
+    try std.testing.expectError(error.X86NamedCopyUnsupported, copyInNamed(context, std.testing.allocator, options));
+    try std.testing.expectError(error.X86NamedCopyUnsupported, copyOutNamed(context, std.testing.allocator, options));
 }
 
 const ExecNamedStreamingResult = struct {
@@ -1445,6 +1468,7 @@ fn copyNamedStreaming(
     fds: CopyStreamFds,
 ) !u8 {
     clearLastError();
+    try rejectX86NamedCopy();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2314,6 +2338,7 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     if (args.len != 3) exitLifecycleCliError(allocator, stderr, mode, machine_output.usageMissingArgument(copy_in_usage, "copy-in"), copy_in_usage);
     validateNameLifecycleCli(allocator, stderr, mode, "copy-in", args[0]);
     const parsed = CopyNamedOptions{ .name = args[0], .host_path = args[1], .guest_path = args[2] };
+    try rejectX86NamedCopy();
 
     var archive = createCopyArchive(allocator, init.io, parsed.host_path) catch |err| {
         if (mode == .json) return err;
@@ -2387,6 +2412,7 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
     if (args.len != 3) exitLifecycleCliError(allocator, stderr, mode, machine_output.usageMissingArgument(copy_out_usage, "copy-out"), copy_out_usage);
     validateNameLifecycleCli(allocator, stderr, mode, "copy-out", args[0]);
     const parsed = CopyNamedOptions{ .name = args[0], .guest_path = args[1], .host_path = args[2] };
+    try rejectX86NamedCopy();
 
     var archive = createEmptyCopyArchive(allocator, init.io) catch |err| {
         if (mode == .json) return err;
