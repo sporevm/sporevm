@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
         .console_sink = consoleSink,
         .root_disk = .{ .memory = disk_memory[0] },
         .context_disk = .{ .memory = disk_memory[1] },
-        .build_disk = .{ .memory = disk_memory[2] },
+        .build_input_disks = &.{.{ .memory = disk_memory[2] }},
         .cache_disk = .{ .memory = disk_memory[3] },
     });
     switch (result) {

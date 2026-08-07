@@ -3922,7 +3922,6 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                 });
             }
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-                if (build_input_backends.len > 1) return error.TooManyBuildInputDisks;
                 break :blk try x86_vm.run(allocator, .{
                     .kernel = artifacts.kernel,
                     .ram_size = opts.memory.initial_bytes,
@@ -3933,7 +3932,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
                     .root_disk = runtime_disk.backend(),
                     .root_blk_options = root_blk_options,
                     .context_disk = if (context_disk_fd) |fd| .{ .file = fd } else null,
-                    .build_disk = if (build_input_backends.len == 1) build_input_backends[0] else null,
+                    .build_input_disks = build_input_backends,
                     .cache_disk = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
                     .cache_disk_writable = opts.build_cache_disk_fd != null,
                     .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),

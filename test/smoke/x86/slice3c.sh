@@ -41,10 +41,19 @@ build_context="${workdir}/build-context"
 mkdir -p "${build_context}"
 printf 'native context payload\n' >"${build_context}/payload.txt"
 cat >"${build_context}/Dockerfile" <<'EOF'
-FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20
+FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20 AS native
 ARG TARGETARCH
 COPY payload.txt /slice3c-context
 RUN --mount=type=cache,target=/cache,id=slice3c-$TARGETARCH test "$TARGETARCH" = amd64 && grep -Fxq 'native context payload' /slice3c-context && printf '%s\n' "$TARGETARCH" >/slice3c-arch
+
+FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20 AS second
+RUN printf '%s\n' second >/slice3c-second
+
+FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20
+COPY --from=native /slice3c-context /slice3c-context
+COPY --from=native /slice3c-arch /slice3c-arch
+COPY --from=second /slice3c-second /slice3c-second
+RUN test "$(cat /slice3c-arch)" = amd64 && grep -Fxq 'native context payload' /slice3c-context && grep -Fxq second /slice3c-second
 CMD ["/bin/true"]
 EOF
 

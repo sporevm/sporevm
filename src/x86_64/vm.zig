@@ -48,7 +48,7 @@ pub const Config = struct {
     root_blk_options: virtio_blk.Options = .{},
     disk_snapshot: ?disk_layer.SnapshotState = null,
     context_disk: ?virtio_blk.Backend = null,
-    build_disk: ?virtio_blk.Backend = null,
+    build_input_disks: []const virtio_blk.Backend = &.{},
     cache_disk: ?virtio_blk.Backend = null,
     cache_disk_writable: bool = false,
     network: virtio_net.Runtime = .{},
@@ -499,18 +499,38 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var console_dev = virtio_console.Console{ .sink = config.console_sink };
     var block_devs: [4]virtio_blk.Blk = undefined;
     var empty_devs: [4]EmptyDevice = @splat(.{});
-    const disk_backends = [_]?virtio_blk.Backend{ config.root_disk, config.context_disk, config.build_disk, config.cache_disk };
+    if (config.build_input_disks.len > 2) return error.TooManyBuildInputDisks;
+    var disk_backends: [4]?virtio_blk.Backend = @splat(null);
+    var disk_writable: [4]bool = @splat(false);
+    disk_backends[0] = config.root_disk;
+    disk_writable[0] = true;
+    var disk_count: usize = 1;
+    if (config.context_disk) |backend| {
+        disk_backends[disk_count] = backend;
+        disk_count += 1;
+    }
+    for (config.build_input_disks) |backend| {
+        if (disk_count == disk_backends.len) return error.TooManyVirtioDevices;
+        disk_backends[disk_count] = backend;
+        disk_count += 1;
+    }
+    if (config.cache_disk) |backend| {
+        if (disk_count == disk_backends.len) return error.TooManyVirtioDevices;
+        disk_backends[disk_count] = backend;
+        disk_writable[disk_count] = config.cache_disk_writable;
+    }
     var vsock_dev = virtio_vsock.Vsock.init(.{});
     var rng_dev = virtio_rng.Rng{};
     var transports: [board.max_virtio_devices]mmio.Transport = undefined;
     transports[board.console_slot.index] = .init(console_dev.device());
     for (disk_backends, board.disk_slots, 0..) |maybe_backend, slot, index| {
         if (maybe_backend) |backend| {
-            block_devs[index] = switch (index) {
-                0 => .initWithOptions(backend, config.root_blk_options),
-                3 => if (config.cache_disk_writable) .init(backend) else .initImmutableSource(backend),
-                else => .initImmutableSource(backend),
-            };
+            block_devs[index] = if (index == 0)
+                .initWithOptions(backend, config.root_blk_options)
+            else if (disk_writable[index])
+                .init(backend)
+            else
+                .initImmutableSource(backend);
             transports[slot.index] = .init(block_devs[index].device());
         } else {
             transports[slot.index] = .init(empty_devs[index].device());
