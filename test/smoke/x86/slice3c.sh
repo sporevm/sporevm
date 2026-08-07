@@ -35,9 +35,28 @@ if [[ -n "${seed_dir}" ]]; then
   done
 fi
 
-python3 "${repo_root}/scripts/spore-build-conformance.py" \
-  --spore-bin "${spore_bin}" \
-  --case variable-expansion
+python3 "${repo_root}/scripts/spore-build-conformance.py" --self-test-schema
+
+build_context="${workdir}/build-context"
+mkdir -p "${build_context}"
+printf 'native context payload\n' >"${build_context}/payload.txt"
+cat >"${build_context}/Dockerfile" <<'EOF'
+FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20
+ARG TARGETARCH
+COPY payload.txt /slice3c-context
+RUN --mount=type=cache,target=/cache,id=slice3c-$TARGETARCH test "$TARGETARCH" = amd64 && grep -Fxq 'native context payload' /slice3c-context && printf '%s\n' "$TARGETARCH" >/slice3c-arch
+CMD ["/bin/true"]
+EOF
+
+build_tag="local/x86-slice3c:conformance"
+"${spore_bin}" build --network none --tag "${build_tag}" "${build_context}" \
+  >"${workdir}/build-first.log"
+"${spore_bin}" build --network none --tag "${build_tag}" "${build_context}" \
+  >"${workdir}/build-warm.log"
+grep -Fq 'executed_steps=0 boot_count=0' "${workdir}/build-warm.log" || \
+  die "warm native build did not reuse the complete Dockerfile cache"
+"${spore_bin}" run --backend kvm --memory 512mib --image "${build_tag}" --pull=never -- \
+  /bin/sh -lc 'test "$(cat /slice3c-arch)" = amd64 && grep -Fxq "native context payload" /slice3c-context'
 
 run_path="/usr/bin:/bin:/usr/sbin:/sbin"
 if env -i PATH="${run_path}" /bin/sh -c 'command -v spore >/dev/null 2>&1'; then

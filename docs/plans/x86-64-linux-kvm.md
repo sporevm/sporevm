@@ -159,10 +159,11 @@ the network policy matrix pass natively without enabling capture.
 
 ### Slice 3c: Native build and libspore fresh run
 
-**Status: complete.** Native acceptance runs the `variable-expansion`
-Docker/Spore conformance case, including `TARGETARCH=amd64`, plus standalone
-Zig, C, and Go fresh-execution consumers without a `spore` CLI on `PATH`.
-Saved-state and capture APIs remain outside this slice.
+**Status: complete.** Native acceptance runs a cold and warm Dockerfile
+contract covering `TARGETPLATFORM`, `TARGETARCH=amd64`, context and cache disks,
+then executes the built image. It also runs standalone Zig, C, and Go
+fresh-execution consumers without a `spore` CLI on `PATH`. Saved-state and
+capture APIs remain outside this slice.
 
 - Make `spore build` use the native platform, `TARGETARCH=amd64`, and
   architecture-scoped inputs, executor, caches, and OCI config; run the existing
