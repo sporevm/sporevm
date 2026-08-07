@@ -1357,12 +1357,19 @@ pub fn deinitNamedList(allocator: std.mem.Allocator, entries: []NamedListEntry) 
 /// Fork a parent spore into multiple child spores.
 ///
 /// Owned strings in the result must be released with `deinitForkResult`.
+fn rejectX86SavedStateFork() !void {
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+        return error.X86ForkUnsupported;
+    }
+}
+
 pub fn fork(
     context: Context,
     allocator: std.mem.Allocator,
     options: ForkOptions,
 ) !ForkResult {
     if (options.count == 0) return error.BadForkCount;
+    try rejectX86SavedStateFork();
     const result = try saved_spore_fork.execute(context, allocator, .{
         .parent_dir = options.parent_dir,
         .out_dir = options.out_dir,
@@ -1411,6 +1418,15 @@ test "fork validates count and returns owned child paths" {
         .out_dir = children,
         .count = 0,
     }));
+
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+        try std.testing.expectError(error.X86ForkUnsupported, fork(context, allocator, .{
+            .parent_dir = parent,
+            .out_dir = children,
+            .count = 2,
+        }));
+        return;
+    }
 
     try std.Io.Dir.cwd().createDirPath(io, parent);
     try spore.saveManifest(arena, parent, manifest_test_support.manifest(.{}));
