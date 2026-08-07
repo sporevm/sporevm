@@ -20,9 +20,28 @@ static void print_last_error(SporeContext context, const char *operation) {
           (int)error.len, error.ptr == 0 ? "" : error.ptr);
 }
 
+static int copy_process_env(SporeContext context, const char *name) {
+  const char *value = getenv(name);
+  if (value == 0) return 0;
+  return expect_success(spore_context_set_env(context, borrowed_string(name),
+                                              borrowed_string(value)));
+}
+
 static int fresh_run(const char *program, const char *name) {
   SporeContext context = 0;
   if (expect_success(spore_context_new(&context)) != 0 || context == 0) return 1;
+  const char *env_names[] = {
+      "HOME", "TMPDIR", "PATH", "SPOREVM_RUNTIME_DIR",
+      "SPOREVM_KERNEL_CACHE_DIR", "SPOREVM_ROOTFS_CACHE_DIR",
+      "SPOREVM_KERNEL_IMAGE", "SPOREVM_RUN_INITRD",
+  };
+  for (size_t index = 0; index < sizeof(env_names) / sizeof(env_names[0]); index++) {
+    if (copy_process_env(context, env_names[index]) != 0) {
+      print_last_error(context, "set environment");
+      spore_context_free(context);
+      return 1;
+    }
+  }
 
   SporeCreateNamedOptions create;
   spore_create_named_options_init(&create);
