@@ -64,8 +64,16 @@ also diagnose and reclaim a two-link reference left in an unpublished save or
 batch stage after a crash. Failed ordinary publication preserves the staged
 manifest outside loadable authority for manual recovery. Legacy v1 pins remain
 readable and packable but refuse destructive removal because duplicate
-references cannot be proven absent. Portable unpack, pull, and clone materialize a
-descriptor-bound local CAS inside the saved-spore directory. Destructive
+references cannot be proven absent. Supported machine-local removal writes a
+bounded, host-private, versioned removal journal before deleting the save. The
+journal is keyed by canonical path, names only the already validated exclusive
+pin, and is fuzzed under the same fail-closed local-record assumptions. It lets
+an absent-path retry finish pin release only for that exact prior operation;
+arbitrary absent paths and malformed journals remain errors. A save recreated
+at the same path must pass normal manifest and ownership validation before its
+operation completes any pending prior pin release and replaces the idempotency
+record. Portable unpack, pull, and clone materialize a descriptor-bound local
+CAS inside the saved-spore directory. Destructive
 removal classifies that authority only after verifying the canonical index and
 every referenced object against their BLAKE3 digests; a simultaneous
 host-private pin reference fails closed. Foreground and named restore publish

@@ -352,7 +352,16 @@ and ambiguous directories containing both local CAS and a host-private pin
 reference, fail closed without deleting either authority.
 Machine-local disk-backed removal keeps the cache lock while it validates the
 exclusive ownership link, deletes the visible save, syncs the parent, and
-unregisters the pin. If `rm -rf` bypasses the command, `spore cache pins`
+unregisters the pin. Before deleting, it durably records the canonical path and
+exclusive pin identity in a machine-local removal journal. Retrying that exact
+supported removal after the directory disappears finishes pin release, or
+returns the completed result; an unrelated absent path still fails with
+`FileNotFound`, and a save recreated at the path must pass normal ownership and
+authority validation rather than consuming the old result. If the path is
+reused while the prior operation is still pending, removal finishes releasing
+the old pin before recording authority for the new save. Completed records are
+retained to preserve idempotence and are replaced only by a newly validated save
+at the same canonical path. If `rm -rf` bypasses the command, `spore cache pins`
 reports the remaining one-link anchor as `orphaned`, and `spore cache gc
 --force` reclaims the pin and newly unrooted CAS content. Legacy v1 pins have no
 such proof, so removal refuses them; clone first, then use expert-only `spore

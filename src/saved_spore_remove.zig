@@ -39,7 +39,10 @@ pub fn deinit(allocator: std.mem.Allocator, result: Result) void {
 }
 
 pub fn remove(context: Context, allocator: std.mem.Allocator, raw_dir: []const u8) !Result {
-    const dir = try resolveExistingSporeDir(allocator, context.io, raw_dir);
+    const dir = resolveExistingSporeDir(allocator, context.io, raw_dir) catch |err| switch (err) {
+        error.FileNotFound => return resumeRemoval(context, allocator, raw_dir),
+        else => |e| return e,
+    };
     errdefer allocator.free(dir);
     try validateManifestPath(context.io, allocator, dir);
     var manifest = spore.loadManifest(allocator, dir) catch |err| switch (err) {
@@ -97,9 +100,165 @@ pub fn remove(context: Context, allocator: std.mem.Allocator, raw_dir: []const u
     const ownership = try saved_spore_ownership.classify(allocator, dir, disk);
     const id = try allocator.dupe(u8, pin.value.id);
     errdefer allocator.free(id);
+    try beginRemoval(context.io, allocator, registry, dir, id);
     try deleteAndSyncParent(context.io, allocator, dir);
+    if (comptime builtin.is_test) if (testing.fault == .after_delete) return error.IoFailed;
     try saved_spore_pin.remove(context.io, allocator, registry, id);
+    if (comptime builtin.is_test) if (testing.fault == .after_pin_release) return error.IoFailed;
+    try writeRemovalRecord(allocator, cache_root, .{
+        .spore_dir = dir,
+        .pin_id = id,
+        .state = .completed,
+    });
     return .{ .spore_dir = dir, .ownership = ownership, .pin_id = id, .pin_removed = true };
+}
+
+const removal_schema = "spore.saved-remove.v1";
+const removal_dir_name = "saved-removals";
+const max_removal_record_bytes = 16 * 1024;
+const RemovalState = enum { pending, completed };
+const RemovalRecord = struct {
+    schema: []const u8 = removal_schema,
+    spore_dir: []const u8,
+    pin_id: []const u8,
+    state: RemovalState,
+
+    fn validate(self: RemovalRecord, expected_dir: []const u8) !void {
+        if (!std.mem.eql(u8, self.schema, removal_schema) or
+            !std.mem.eql(u8, self.spore_dir, expected_dir) or
+            !std.fs.path.isAbsolute(self.spore_dir) or
+            !saved_spore_pin.validId(self.pin_id)) return error.BadManifest;
+    }
+};
+
+fn normalizedRemovalPath(allocator: std.mem.Allocator, io: Io, raw_dir: []const u8) ![]const u8 {
+    const path = try std.fs.path.resolve(allocator, &.{raw_dir});
+    defer allocator.free(path);
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidSporeDir;
+    const name = std.fs.path.basename(path);
+    if (name.len == 0) return error.InvalidSporeDir;
+    var real_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const real_len = try Io.Dir.cwd().realPathFile(io, parent, &real_buf);
+    return std.fs.path.join(allocator, &.{ real_buf[0..real_len], name });
+}
+
+fn removalRecordPath(allocator: std.mem.Allocator, cache_root: []const u8, dir: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(dir, &digest, .{});
+    const name = try std.fmt.allocPrint(allocator, "{x}.json", .{digest});
+    defer allocator.free(name);
+    return std.fs.path.join(allocator, &.{ cache_root, removal_dir_name, name });
+}
+
+fn writeRemovalRecord(allocator: std.mem.Allocator, cache_root: []const u8, record: RemovalRecord) !void {
+    const path = try removalRecordPath(allocator, cache_root, record.spore_dir);
+    defer allocator.free(path);
+    const bytes = try std.json.Stringify.valueAlloc(allocator, record, .{ .whitespace = .indent_2 });
+    defer allocator.free(bytes);
+    try chunk_sealer.replaceFileAtomicDurable(allocator, path, bytes, 0o600);
+}
+
+fn loadRemovalRecord(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, dir: []const u8) !std.json.Parsed(RemovalRecord) {
+    const path = try removalRecordPath(allocator, cache_root, dir);
+    defer allocator.free(path);
+    const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
+    if (stat.kind != .file) return error.BadManifest;
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_removal_record_bytes));
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(RemovalRecord, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadManifest;
+    errdefer parsed.deinit();
+    try parsed.value.validate(dir);
+    return parsed;
+}
+
+fn beginRemoval(io: Io, allocator: std.mem.Allocator, registry: saved_spore_pin.LockedRegistry, dir: []const u8, pin_id: []const u8) !void {
+    var prior = loadRemovalRecord(io, allocator, registry.cache_root, dir) catch |err| switch (err) {
+        error.FileNotFound => {
+            try writeRemovalRecord(allocator, registry.cache_root, .{
+                .spore_dir = dir,
+                .pin_id = pin_id,
+                .state = .pending,
+            });
+            return;
+        },
+        else => |e| return e,
+    };
+    defer prior.deinit();
+    if (prior.value.state == .pending and !std.mem.eql(u8, prior.value.pin_id, pin_id)) {
+        // A new save may reuse the path after the old operation deleted its
+        // directory. Complete that operation before replacing its authority.
+        saved_spore_pin.remove(io, allocator, registry, prior.value.pin_id) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        try writeRemovalRecord(allocator, registry.cache_root, .{
+            .spore_dir = dir,
+            .pin_id = prior.value.pin_id,
+            .state = .completed,
+        });
+    }
+    try writeRemovalRecord(allocator, registry.cache_root, .{
+        .spore_dir = dir,
+        .pin_id = pin_id,
+        .state = .pending,
+    });
+}
+
+fn resumeRemoval(context: Context, allocator: std.mem.Allocator, raw_dir: []const u8) !Result {
+    const dir = try normalizedRemovalPath(allocator, context.io, raw_dir);
+    errdefer allocator.free(dir);
+    const cache_root = local_paths.rootfsCacheRootPath(allocator, context.environ_map) catch |err| switch (err) {
+        error.MissingHome => return error.FileNotFound,
+        else => |e| return e,
+    };
+    defer allocator.free(cache_root);
+    // Do not create or lock a cache merely because an arbitrary path is absent.
+    const record_path = try removalRecordPath(allocator, cache_root, dir);
+    defer allocator.free(record_path);
+    _ = Io.Dir.cwd().statFile(context.io, record_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => |e| return e,
+    };
+    var lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
+    defer lock.deinit();
+    const registry = try saved_spore_pin.LockedRegistry.init(allocator, cache_root, &lock);
+    // The path may have been recreated after the initial absent-path check.
+    // Supported pinned publication holds this same cache lock, so refusing the
+    // race prevents an old journal from authorizing a newly published save.
+    if (Io.Dir.cwd().statFile(context.io, dir, .{ .follow_symlinks = false })) |_| {
+        return error.PathAlreadyExists;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    }
+    var record = try loadRemovalRecord(context.io, allocator, cache_root, dir);
+    defer record.deinit();
+    if (record.value.state == .pending) {
+        // A prior attempt may have deleted the directory but failed while
+        // syncing its parent. Re-establish the original durability boundary
+        // before releasing the durable pin.
+        try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(dir) orelse ".");
+        saved_spore_pin.remove(context.io, allocator, registry, record.value.pin_id) catch |err| switch (err) {
+            // A prior attempt may have durably removed the pin but failed before
+            // publishing completion. The path-bound journal is the authority.
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        if (comptime builtin.is_test) if (testing.fault == .after_pin_release) return error.IoFailed;
+        try writeRemovalRecord(allocator, cache_root, .{
+            .spore_dir = dir,
+            .pin_id = record.value.pin_id,
+            .state = .completed,
+        });
+    }
+    const id = try allocator.dupe(u8, record.value.pin_id);
+    errdefer allocator.free(id);
+    return .{
+        .spore_dir = dir,
+        .ownership = saved_spore_ownership.machine_local_pinned,
+        .pin_id = id,
+        .pin_removed = true,
+    };
 }
 
 fn resolveExistingSporeDir(allocator: std.mem.Allocator, io: Io, raw: []const u8) ![]const u8 {
@@ -178,7 +337,7 @@ fn pinReferencePresent(io: Io, allocator: std.mem.Allocator, dir: []const u8) !b
     return true;
 }
 
-const RemoveFault = enum { none, before_delete, before_parent_sync };
+const RemoveFault = enum { none, before_delete, before_parent_sync, after_delete, after_pin_release };
 const testing = if (builtin.is_test) struct {
     var fault: RemoveFault = .none;
 } else struct {};
@@ -583,6 +742,184 @@ test "saved-spore removal preserves disk pin ordering across delete and sync fau
     try std.testing.expect(removed.pin_removed);
     try std.testing.expectEqualStrings(first_id, removed.pin_id);
     try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, cache_root, first_id));
+}
+
+test "saved-spore pinned removal journal is crash retryable and path safe" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const saved = try std.fs.path.join(arena, &.{ root, "retry.spore" });
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    defer testing.fault = .none;
+
+    const first = try manifest_test_support.diskFixture(arena, io, cache_root, saved, 0x71, false);
+    var first_id: []const u8 = undefined;
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, saved, first.disk, first.manifest);
+        var pin = try saved_spore_pin.loadForSporeLocked(io, arena, registry, saved, first.disk);
+        defer pin.deinit();
+        first_id = try arena.dupe(u8, pin.value.id);
+    }
+
+    // Crash after visible deletion: retry releases the still-durable pin.
+    testing.fault = .after_delete;
+    try std.testing.expectError(error.IoFailed, remove(.{ .io = io, .environ_map = &env }, allocator, saved));
+    var retained = try saved_spore_pin.loadRecord(io, allocator, cache_root, first_id);
+    retained.deinit();
+    testing.fault = .none;
+    const resumed = try remove(.{ .io = io, .environ_map = &env }, allocator, saved);
+    defer deinit(allocator, resumed);
+    try std.testing.expect(resumed.pin_removed);
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, cache_root, first_id));
+
+    // A completed operation remains idempotent, but arbitrary absence does not.
+    const completed = try remove(.{ .io = io, .environ_map = &env }, allocator, saved);
+    defer deinit(allocator, completed);
+    try std.testing.expectEqualStrings(first_id, completed.pin_id);
+    const absent = try std.fs.path.join(arena, &.{ root, "never-saved.spore" });
+    try std.testing.expectError(error.FileNotFound, remove(.{ .io = io, .environ_map = &env }, allocator, absent));
+
+    // Reuse is validated as a new save and replaces, rather than consumes, the
+    // completed record. A crash after unpin then resumes from pending state.
+    const second = try manifest_test_support.diskFixture(arena, io, cache_root, saved, 0x72, false);
+    var second_id: []const u8 = undefined;
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, saved, second.disk, second.manifest);
+        var pin = try saved_spore_pin.loadForSporeLocked(io, arena, registry, saved, second.disk);
+        defer pin.deinit();
+        second_id = try arena.dupe(u8, pin.value.id);
+    }
+    testing.fault = .after_pin_release;
+    try std.testing.expectError(error.IoFailed, remove(.{ .io = io, .environ_map = &env }, allocator, saved));
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, cache_root, second_id));
+    testing.fault = .none;
+    const second_resumed = try remove(.{ .io = io, .environ_map = &env }, allocator, saved);
+    defer deinit(allocator, second_resumed);
+    try std.testing.expectEqualStrings(second_id, second_resumed.pin_id);
+
+    // If the path is reused while an older operation is still pending, the
+    // old pin is released before the journal transitions to the new pin.
+    const third = try manifest_test_support.diskFixture(arena, io, cache_root, saved, 0x73, false);
+    var third_id: []const u8 = undefined;
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, saved, third.disk, third.manifest);
+        var pin = try saved_spore_pin.loadForSporeLocked(io, arena, registry, saved, third.disk);
+        defer pin.deinit();
+        third_id = try arena.dupe(u8, pin.value.id);
+    }
+    testing.fault = .after_delete;
+    try std.testing.expectError(error.IoFailed, remove(.{ .io = io, .environ_map = &env }, allocator, saved));
+    var third_retained = try saved_spore_pin.loadRecord(io, allocator, cache_root, third_id);
+    third_retained.deinit();
+
+    const fourth = try manifest_test_support.diskFixture(arena, io, cache_root, saved, 0x74, false);
+    var fourth_id: []const u8 = undefined;
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, saved, fourth.disk, fourth.manifest);
+        var pin = try saved_spore_pin.loadForSporeLocked(io, arena, registry, saved, fourth.disk);
+        defer pin.deinit();
+        fourth_id = try arena.dupe(u8, pin.value.id);
+    }
+    testing.fault = .none;
+    const fourth_removed = try remove(.{ .io = io, .environ_map = &env }, allocator, saved);
+    defer deinit(allocator, fourth_removed);
+    try std.testing.expectEqualStrings(fourth_id, fourth_removed.pin_id);
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, cache_root, third_id));
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, cache_root, fourth_id));
+
+    // Existing malformed journal state fails closed once the save is absent.
+    const journal = try removalRecordPath(arena, cache_root, saved);
+    try chunk_sealer.replaceFileAtomicDurable(arena, journal, "{}", 0o600);
+    try std.testing.expectError(error.BadManifest, remove(.{ .io = io, .environ_map = &env }, allocator, saved));
+}
+
+test "saved-spore removal retry canonicalizes a symlinked parent" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const first_parent = try std.fs.path.join(arena, &.{ root, "first" });
+    const second_parent = try std.fs.path.join(arena, &.{ root, "second" });
+    const alias = try std.fs.path.join(arena, &.{ root, "alias" });
+    try Io.Dir.cwd().createDirPath(io, first_parent);
+    try Io.Dir.cwd().createDirPath(io, second_parent);
+    try Io.Dir.cwd().symLink(io, first_parent, alias, .{});
+    const saved = try std.fs.path.join(arena, &.{ alias, "retry.spore" });
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    defer testing.fault = .none;
+
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, saved, 0x73, false);
+    var pin_id: []const u8 = undefined;
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
+        try saved_spore_pin.publishManifest(io, arena, registry, saved, fixture.disk, fixture.manifest);
+        var pin = try saved_spore_pin.loadForSporeLocked(io, arena, registry, saved, fixture.disk);
+        defer pin.deinit();
+        pin_id = try arena.dupe(u8, pin.value.id);
+    }
+    testing.fault = .after_delete;
+    try std.testing.expectError(error.IoFailed, remove(.{ .io = io, .environ_map = &env }, allocator, saved));
+    testing.fault = .none;
+
+    try Io.Dir.cwd().deleteFile(io, alias);
+    try Io.Dir.cwd().symLink(io, second_parent, alias, .{});
+    try std.testing.expectError(error.FileNotFound, remove(.{ .io = io, .environ_map = &env }, allocator, saved));
+    var retained = try saved_spore_pin.loadRecord(io, allocator, cache_root, pin_id);
+    retained.deinit();
+
+    try Io.Dir.cwd().deleteFile(io, alias);
+    try Io.Dir.cwd().symLink(io, first_parent, alias, .{});
+    const resumed = try remove(.{ .io = io, .environ_map = &env }, allocator, saved);
+    defer deinit(allocator, resumed);
+    try std.testing.expectEqualStrings(pin_id, resumed.pin_id);
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, allocator, cache_root, pin_id));
+}
+
+test "fuzz saved-spore removal journal parser" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const FuzzContext = struct {
+        fn testOne(_: @This(), smith: *std.testing.Smith) anyerror!void {
+            var buf: [4096]u8 = undefined;
+            const input = buf[0..smith.slice(&buf)];
+            const allocator = std.testing.allocator;
+            if (std.json.parseFromSlice(RemovalRecord, allocator, input, .{ .allocate = .alloc_always, .ignore_unknown_fields = false })) |parsed_value| {
+                var parsed = parsed_value;
+                defer parsed.deinit();
+                _ = parsed.value.validate("/tmp/fuzz.spore") catch {};
+            } else |_| {}
+        }
+    };
+    try std.testing.fuzz(FuzzContext{}, FuzzContext.testOne, .{});
 }
 
 test "saved-spore removal refuses an ordinary copied pin reference" {
