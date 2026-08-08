@@ -299,7 +299,9 @@ machine-local pinned removal from diskless or portable local-CAS removal;
 `ownership` is `machine-local-pinned`, `portable-self-contained`, or
 `batch-relative`, and `pin_id` is empty when no durable pin existed. New
 machine-local pins refuse copied or duplicate ownership references, while
-legacy shared pins refuse destructive removal. Use `cloneSpore` to make an
+legacy shared pins refuse destructive removal. Machine-local pinned removal is
+durably retryable with the same canonical save path after its directory has
+disappeared; arbitrary absent paths remain `FileNotFound`. Use `cloneSpore` to make an
 independently owned portable copy through the pack/unpack encoding. The owned `spore_dir` and
 `pin_id` must be released with
 `deinitRemovedSavedSpore`. Portable removal returns `SavedSporeInUse` while a
