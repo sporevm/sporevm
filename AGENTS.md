@@ -21,3 +21,7 @@
   shared.
 - Real-hardware smoke scripts live in `scripts/` and must run identically in
   CI and by hand.
+- For local Linux/KVM development on Apple Silicon, use
+  `docs/local-kvm-development.md` and `scripts/dev/qemu-tcg-kvm.sh`. This
+  emulated path speeds up iteration but does not replace native KVM or
+  Hypervisor.framework validation.
