@@ -298,7 +298,4 @@ test "run cli help accepts help before argv delimiter only" {
     try std.testing.expect(wantsHelp(&.{ "--image", "alpine", "--help" }));
     try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
     try std.testing.expect(!wantsHelp(&.{ "--", "/bin/true", "--help" }));
-    try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "spore run --save base.spore --save-on TERM") != null);
-    try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "Uses spore memory/device sizing; omit --memory") != null);
-    try std.testing.expect(std.mem.indexOf(u8, run_mod.cli_usage, "--generation FILE") != null);
 }

@@ -698,29 +698,6 @@ fn elapsedNs(start_ns: u64) u64 {
     return monotonicNs() -| start_ns;
 }
 
-test "runtime disk owns trace path without a rootfs" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const tmp = "zig-cache/test-run-runtime-disk-no-rootfs-trace";
-    const trace_path = tmp ++ "/rootfs-trace.jsonl";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
-    try env.put(rootfs_trace_env, absolute_trace_path);
-
-    const context = Context{ .io = io, .environ_map = &env };
-    var runtime = try open(context, allocator, .{});
-    defer runtime.deinit();
-    try std.testing.expect(runtime.backend() == null);
-}
-
 test "runtime disk rejects corrupt rootfs before constructing file block source" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

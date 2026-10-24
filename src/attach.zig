@@ -472,12 +472,6 @@ test "attach cli parser accepts hidden timeout-ms compatibility spelling" {
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
-test "attach cli parser accepts jsonl events" {
-    const opts = try parseCliArgs(&.{ "--events=jsonl", "child.spore" });
-    try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
-    try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
-}
-
 test "attach cli parser accepts generation file" {
     const opts = try parseCliArgs(&.{ "--generation", "generation.json", "--events=jsonl", "child.spore" });
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);

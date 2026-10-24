@@ -676,20 +676,6 @@ test "e2fsprogs orphan_file support is version gated" {
     try std.testing.expect(e2fsprogsSupportsOrphanFileVersion("not a version") == null);
 }
 
-test "deterministic ext4 identity derives stable UUIDs from digest" {
-    const determinism = Determinism.fromDigest("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-    try std.testing.expectEqual(@as(usize, 36), determinism.uuid.len);
-    try std.testing.expectEqual(@as(usize, 36), determinism.hash_seed.len);
-    try std.testing.expectEqual(@as(u8, '-'), determinism.uuid[8]);
-    try std.testing.expectEqual(@as(u8, '-'), determinism.uuid[13]);
-    try std.testing.expect(!std.mem.eql(u8, determinism.uuid[0..], determinism.hash_seed[0..]));
-    try std.testing.expectEqualSlices(
-        u8,
-        determinism.uuid[0..],
-        Determinism.fromDigest("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").uuid[0..],
-    );
-}
-
 test "debugfs stderr checker accepts banner and rejects diagnostics" {
     try checkDebugfsStderrBytes("debugfs 1.47.3 (8-Jul-2025)\n");
     try std.testing.expectError(

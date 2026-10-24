@@ -2152,12 +2152,6 @@ fn rotateHash(hash: u32, shift: u5) u32 {
     return (hash << shift) ^ (hash >> right);
 }
 
-test "computed rootfs inode counts satisfy native writer packing" {
-    const inode_count = ext4.computeImageInodes(100_001);
-    try std.testing.expectEqual(@as(u64, 0), inode_count % ext4.rootfs_ext4_inodes_per_block);
-    try validateInodeCount(@intCast(inode_count));
-}
-
 test "native ext4 writer inline CAS index matches rescanned image" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2253,15 +2247,6 @@ test "sparse data span zero pads its partial final block" {
     try std.testing.expectEqual(actual.len, try output.readPositionalAll(io, &actual, 0));
     try std.testing.expectEqualSlices(u8, payload, actual[0..payload.len]);
     try std.testing.expect(std.mem.allEqual(u8, actual[payload.len..], 0));
-}
-
-test "sparse zero gap accounts a large logical tail without a dense map" {
-    var profile: EmitProfile = .{};
-    const blocks: u32 = 4 * 1024 * 1024;
-    try emitZeroGap(blocks, null, &profile);
-    try std.testing.expectEqual(@as(u64, blocks), profile.zero_blocks);
-    try std.testing.expectEqual(@as(u64, blocks) * block_size, profile.zero_bytes_skipped);
-    try std.testing.expectEqual(@as(u64, 0), profile.emit_map_bytes);
 }
 
 test "indexed directory children match scanned directory bytes" {

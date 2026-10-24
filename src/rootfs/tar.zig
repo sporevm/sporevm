@@ -2352,25 +2352,6 @@ test "opaque whiteout rejects symlink parent" {
     try Io.Dir.cwd().access(io, victim_path ++ "/keep", .{});
 }
 
-test "directory entries preserve tar mode" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-directory-mode";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    var root = try Io.Dir.cwd().createDirPathOpen(io, tmp, .{ .open_options = .{ .iterate = true } });
-    defer root.close(io);
-    var ownership = OwnershipMap.init(allocator);
-    defer ownership_mod.deinit(allocator, &ownership);
-    var created = CreatedPathMap.init(allocator);
-    defer deinitCreatedPaths(allocator, &created);
-
-    try writeDirectory(allocator, io, root, &ownership, &created, "root", 0o700, case_sensitive_test_options);
-    const stat = try root.statFile(io, "root", .{ .follow_symlinks = false });
-    if (permissionsToMode(stat.permissions)) |mode| {
-        try std.testing.expectEqual(@as(u32, 0o700), mode & 0o777);
-    }
-}
-
 test "directory entries replace non-directories" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

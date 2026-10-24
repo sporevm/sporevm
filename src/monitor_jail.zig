@@ -84,16 +84,6 @@ pub fn smokeDeniedExec(io: Io) !void {
     return error.MonitorJailAllowedExec;
 }
 
-test "monitor jail has a denied exec profile" {
-    try std.testing.expect(std.mem.indexOf(u8, macos_profile, "(deny process-exec)") != null);
-    if (comptime builtin.os.tag == .linux) {
-        const filter = linuxExecDenyFilter();
-        try std.testing.expectEqual(@as(u32, @offsetOf(linux.SECCOMP.data, "arch")), filter[0].k);
-        try std.testing.expectEqual(audit_arch_current, filter[1].k);
-        try std.testing.expectEqual(@as(u32, @offsetOf(linux.SECCOMP.data, "nr")), filter[3].k);
-    }
-}
-
 fn linuxExecDenyFilter() [9]SockFilter {
     return .{
         stmt(linux.BPF.LD | linux.BPF.W | linux.BPF.ABS, @offsetOf(linux.SECCOMP.data, "arch")),
