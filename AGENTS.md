@@ -33,3 +33,18 @@
   contracts, not incidental internal structure.
 - Distinguish temporary development scaffolding from checks worth maintaining.
 - Never delete or weaken a failing test just to make the suite pass.
+
+## Amp orbs
+
+- `.agents/setup` prepares a fresh orb: system packages, the `mise`-pinned
+  tools for this checkout and for every sibling checkout under
+  `../repos/<name>`, and a warm Debug build. Keep it idempotent and under two
+  minutes on a warm snapshot.
+- Sibling checkouts (`zmoltcp`, `kernels`, `examples`, `k8s`) are independent
+  Git repositories. Run Git, builds, and tests from the repository that owns a
+  change, and keep cross-repository changes as separate branches and commits.
+- Orbs have no `/dev/kvm` or Hypervisor.framework. Expect test steps that need
+  a hypervisor (`libspore-c-smoke`, tests that reach `requireProductRunner`,
+  all `test/smoke/`) to fail or skip there. When `ssm-sporevm` is on `PATH`,
+  `ssm-sporevm arm64|x86_64|macos` opens a shell on a managed host with real
+  hardware for those.
