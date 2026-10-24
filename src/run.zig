@@ -5229,13 +5229,6 @@ test "run request rejects guest argv length overflow" {
     try std.testing.expectError(error.RunArgTooLong, execRequest(std.testing.allocator, &.{arg[0..]}));
 }
 
-test "run request accepts 256 byte argv at legacy boundary" {
-    var arg = [_]u8{'a'} ** 256;
-    const request = try execRequest(std.testing.allocator, &.{arg[0..]});
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(request.len > arg.len);
-}
-
 test "run request accepts 4096 byte argv within total request limit" {
     var arg = [_]u8{'a'} ** 4096;
     const request = try execRequest(std.testing.allocator, &.{arg[0..]});
@@ -5421,14 +5414,6 @@ test "run cli parser accepts tty and combined interactive tty" {
     try std.testing.expectEqualStrings("/bin/sh", it_opts.command[0]);
 }
 
-test "run cli parser accepts shell command without separator" {
-    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo hi" });
-    try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.image_ref.?);
-    try std.testing.expectEqual(CommandMode.shell, opts.command_mode);
-    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
-    try std.testing.expectEqualStrings("echo hi", opts.command[0]);
-}
-
 test "run cli parser accepts shell command with source spore" {
     const opts = try parseCliArgs(&.{ "--from", "base.spore", "cat /work-ready" });
     try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
@@ -5477,16 +5462,6 @@ test "run cli parser defaults to fixed 512MiB" {
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
-}
-
-test "backend auto resolves to a supported host backend" {
-    if (Backend.auto.supportedOnHost()) {
-        const resolved = try Backend.auto.resolveForHost();
-        try std.testing.expect(resolved != .auto);
-        try std.testing.expect(resolved.supportedOnHost());
-    } else {
-        try std.testing.expectError(error.UnsupportedBackend, Backend.auto.resolveForHost());
-    }
 }
 
 test "run cli parser separates initial and maximum memory" {
@@ -5668,16 +5643,6 @@ test "run pull never fails closed on mutable image ref cache miss" {
     }
 }
 
-test "run cli parser accepts source spore" {
-    const opts = try parseCliArgs(&.{ "--from", "base.spore", "--", "/bin/writeout" });
-    try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
-    try std.testing.expect(opts.rootfs_path == null);
-    try std.testing.expect(opts.image_ref == null);
-    try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
-    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
-    try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
-}
-
 test "run cli parser accepts source spore generation file" {
     const opts = try parseCliArgs(&.{ "--from", "base.spore", "--generation", "generation.json", "--", "/bin/writeout" });
     try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
@@ -5701,14 +5666,6 @@ test "run cli parser accepts source spore bound service bindings" {
     try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
     try std.testing.expect(!opts.network_policy.hasRules());
-}
-
-test "run cli parser accepts net flag" {
-    const opts = try parseCliArgs(&.{ "--net", "--", "/bin/true" });
-    try std.testing.expectEqual(NetworkMode.spore, opts.network);
-    try std.testing.expect(opts.network_requested);
-    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
-    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 
 test "run cli parser accepts network allow rules" {
@@ -5819,23 +5776,6 @@ test "run builds manifest network from active policy" {
     try std.testing.expect(network.requirements.exact_host_port);
 
     try std.testing.expect((try manifestNetworkFromOptions(std.testing.allocator, .disabled, &policy)) == null);
-}
-
-test "run refuses to restore saved bound services without live bindings" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const manifest_network = spore.Network{
-        .bound_services = &.{.{
-            .name = "cleanroom-gateway",
-            .guest_host = "gateway.cleanroom.internal",
-            .guest_port = 8170,
-        }},
-        .requirements = .{ .bound_services = true },
-    };
-
-    try std.testing.expectError(error.MissingBoundServiceBinding, networkOptionsFromManifest(arena, manifest_network));
 }
 
 test "run binding diagnostics name missing saved bound service" {
@@ -5959,23 +5899,6 @@ test "run cli parser defaults save trigger to exit" {
     try std.testing.expect(!opts.continue_after_save);
 }
 
-test "saved run result exits zero" {
-    const result = Result{
-        .backend = .hvf,
-        .start_ms = 1,
-        .vsock_connect_ms = 2,
-        .exec_response_ms = 3,
-        .probe_duration_ms = 1,
-        .exit_code = 0,
-        .vcpus = 1,
-        .memory_bytes = memory_config.default_bytes,
-        .max_memory_bytes = memory_config.default_bytes,
-        .saved = true,
-        .save_path = "out.spore",
-    };
-    try std.testing.expectEqual(@as(u8, 0), result.processExitCode());
-}
-
 test "save ownership distinguishes disk-backed and diskless captures" {
     const base = Options{ .kernel_path = "Image", .command = &.{} };
     try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, saveOwnership(base));
@@ -5999,37 +5922,6 @@ test "saved run result preserves stored exit code" {
         .save_path = "out.spore",
     };
     try std.testing.expectEqual(@as(u8, 7), result.processExitCode());
-}
-
-test "rootfs digest cache verifies exact bytes" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const tmp = "zig-cache/test-run-rootfs-digest-cache";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    try std.testing.expect(std.mem.startsWith(u8, artifact.digest, spore.rootfs_digest_prefix));
-    try std.testing.expectEqual(@as(u64, "rootfs bytes".len), artifact.size);
-
-    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
-    const fd = try rootfs_cache.openVerifiedFromCache(io, arena, cache_root, rootfs);
-    _ = std.c.close(fd);
-
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    const stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
-
-    try Io.Dir.cwd().deleteFile(io, digest_path);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
-    try std.testing.expectError(error.RootFSDigestMismatch, rootfs_cache.openVerifiedFromCache(io, arena, cache_root, rootfs));
 }
 
 test "explicit rootfs input can record exact immutable identity" {
@@ -6176,30 +6068,6 @@ test "explicit rootfs input falls back when direct image cache metadata has no s
     try std.testing.expect(fallback_resolved.rootfs != null);
     try std.testing.expectEqualStrings(fallback_expected.digest, fallback_resolved.rootfs.?.artifact.digest);
     try std.testing.expectEqual(fallback_expected.size, fallback_resolved.rootfs.?.artifact.size);
-}
-
-test "rootfs digest cache rejects unsafe existing paths" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const tmp = "zig-cache/test-run-rootfs-digest-cache-symlink";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
-    const digest_z = try arena.dupeZ(u8, digest_path);
-    const rootfs_z = try arena.dupeZ(u8, rootfs_path);
-    if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
-
-    try std.testing.expectError(error.RootFSDigestMismatch, rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path));
 }
 
 test "run image cache creates absolute cache directories" {

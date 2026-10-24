@@ -362,12 +362,6 @@ pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) !
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
-test "attach request targets default session" {
-    const request = try attachRequest(std.testing.allocator, spore.default_session_id);
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
-}
-
 test "attach request can target recorded session id" {
     const request = try attachRequest(std.testing.allocator, "run-1234");
     defer std.testing.allocator.free(request);

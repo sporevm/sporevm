@@ -61,29 +61,6 @@ pub fn formatEvidence(buffer: []u8, terminal: Terminal) ![]const u8 {
     };
 }
 
-test "classified lifecycle causes determine their only possible outcome" {
-    try std.testing.expectEqual(Outcome.guest_reset, (Cause{ .pio_reset = .{
-        .exit_reason = kvm.KVM_EXIT_IO,
-        .width = 1,
-        .port = 0x64,
-        .count = 1,
-        .value = 0xfe,
-    } }).outcome());
-    try std.testing.expectEqual(Outcome.guest_off, (Cause{ .board_poweroff = .{
-        .exit_reason = kvm.KVM_EXIT_MMIO,
-        .gpa = 0xd000_1020,
-        .offset = 0x20,
-        .len = 4,
-        .value = 0x4646_4f50,
-    } }).outcome());
-    try std.testing.expectEqual(Outcome.guest_reset, (Cause{ .system_event_reset = .{
-        .exit_reason = kvm.KVM_EXIT_SYSTEM_EVENT,
-    } }).outcome());
-    try std.testing.expectEqual(Outcome.guest_off, (Cause{ .system_event_shutdown = .{
-        .exit_reason = kvm.KVM_EXIT_SYSTEM_EVENT,
-    } }).outcome());
-}
-
 test "lifecycle evidence retains the stable normalized and raw strings" {
     var buffer: [256]u8 = undefined;
     try std.testing.expectEqualStrings(

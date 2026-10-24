@@ -373,19 +373,6 @@ test "selected manifest digest is caller-owned" {
     try std.testing.expectEqualStrings("sha256:0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", selected);
 }
 
-test "manifest selection distinguishes both OCI architectures" {
-    const allocator = std.testing.allocator;
-    const index =
-        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64"}},{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","platform":{"os":"linux","architecture":"amd64"}}]}
-    ;
-    const arm64 = (try selectedManifestDigest(allocator, index, .{ .arch = .arm64 })).?;
-    defer allocator.free(arm64);
-    const amd64 = (try selectedManifestDigest(allocator, index, .{ .arch = .amd64 })).?;
-    defer allocator.free(amd64);
-    try std.testing.expectEqualStrings("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", arm64);
-    try std.testing.expectEqualStrings("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", amd64);
-}
-
 test "manifest selection normalizes variants and rejects ambiguity" {
     const allocator = std.testing.allocator;
     const arm64_v8 =

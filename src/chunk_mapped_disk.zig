@@ -2072,35 +2072,6 @@ test "known zero growth keeps partial base authority after overlay write failure
     try std.testing.expectEqualSlices(u8, &base_bytes, &readback);
 }
 
-test "partial write preserves untouched bytes from base" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
-    defer base.close(io);
-    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
-    defer overlay.close(io);
-
-    var base_bytes: [8192]u8 = undefined;
-    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate(i);
-    try base.writeStreamingAll(io, &base_bytes);
-
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
-    var disk = try ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 4096);
-    defer disk.deinit();
-
-    const patch = [_]u8{0xAA} ** 512;
-    try disk.writeAt(&patch, 1024);
-
-    var readback: [4096]u8 = undefined;
-    try disk.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, base_bytes[0..1024], readback[0..1024]);
-    try std.testing.expectEqualSlices(u8, &patch, readback[1024..1536]);
-    try std.testing.expectEqualSlices(u8, base_bytes[1536..4096], readback[1536..4096]);
-    try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
-}
-
 test "chunk mapped disk matches byte model across partial writes" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

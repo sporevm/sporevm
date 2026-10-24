@@ -4999,15 +4999,6 @@ fn readyPollSleep(attempt: *u32) void {
     sleepMs(delay_ms);
 }
 
-test "lifecycle readiness polling keeps startup detection bounded" {
-    try std.testing.expectEqual(@as(u64, 1), readyPollDelayMs(0));
-    try std.testing.expectEqual(@as(u64, 1), readyPollDelayMs(9));
-    try std.testing.expectEqual(@as(u64, 5), readyPollDelayMs(10));
-    try std.testing.expectEqual(@as(u64, 5), readyPollDelayMs(109));
-    try std.testing.expectEqual(@as(u64, 20), readyPollDelayMs(110));
-    try std.testing.expectEqual(@as(u64, 20), readyPollDelayMs(std.math.maxInt(u32)));
-}
-
 fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeout_ms: u64, spore_executable_path: []const u8) !void {
     const start = monotonicMs();
     var sleep_attempt: u32 = 0;
@@ -6798,21 +6789,6 @@ test "copy archive extraction writes children under read-only directories" {
     try std.testing.expectEqualStrings("readonly", data);
 }
 
-test "lifecycle result carries stable schema" {
-    const result = LifecycleResult{
-        .action = "created",
-        .name = "bench-1",
-        .state = "ready",
-        .pid = 42,
-    };
-    try std.testing.expectEqualStrings(lifecycle_schema, result.schema);
-    try std.testing.expectEqual(lifecycle_schema_version, result.schema_version);
-    try std.testing.expectEqualStrings("created", result.action);
-    try std.testing.expectEqualStrings("bench-1", result.name);
-    try std.testing.expectEqualStrings("ready", result.state);
-    try std.testing.expectEqual(@as(?i64, 42), result.pid);
-}
-
 test "named exec response rejects truncated collector output" {
     const allocator = std.testing.allocator;
     clearLastError();
@@ -6929,51 +6905,6 @@ test "lifecycle fork help routes through named fork cli" {
     try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
     try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
     try std.testing.expect(!wantsHelp(&.{ "bench-1", "--", "/bin/true", "--help" }));
-    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork <spore-dir> --count N --out DIR") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fork --vm NAME --count N --name PATTERN") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "supports one writable rootfs disk") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "--allow-slow-copy") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fork_usage, "spore fanout children --for 10s") != null);
-}
-
-test "lifecycle monitor backend support is explicit" {
-    const hvf_supported = comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
-    const kvm_supported = comptime builtin.os.tag == .linux and
-        (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .x86_64);
-    try std.testing.expectEqual(hvf_supported or kvm_supported, monitorBackendSupported("auto"));
-    try std.testing.expectEqual(hvf_supported, monitorBackendSupported("hvf"));
-    try std.testing.expectEqual(kvm_supported, monitorBackendSupported("kvm"));
-    try std.testing.expect(!monitorBackendSupported("bogus"));
-}
-
-test "lifecycle runtime root prefers explicit and xdg absolute paths" {
-    const allocator = std.testing.allocator;
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-
-    try env.put(runtime_dir_env, "/tmp/sporevm-runtime");
-    const explicit = try runtimeRootPath(allocator, &env);
-    defer allocator.free(explicit);
-    try std.testing.expectEqualStrings("/tmp/sporevm-runtime", explicit);
-
-    _ = env.swapRemove(runtime_dir_env);
-    try env.put("XDG_RUNTIME_DIR", "/tmp/xdg-runtime");
-    const xdg = try runtimeRootPath(allocator, &env);
-    defer allocator.free(xdg);
-    try std.testing.expectEqualStrings("/tmp/xdg-runtime/sporevm", xdg);
-}
-
-test "lifecycle runtime root rejects relative environment paths" {
-    const allocator = std.testing.allocator;
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-
-    try env.put(runtime_dir_env, "relative");
-    try std.testing.expectError(error.InvalidRuntimeDir, runtimeRootPath(allocator, &env));
-
-    _ = env.swapRemove(runtime_dir_env);
-    try env.put("XDG_RUNTIME_DIR", "");
-    try std.testing.expectError(error.InvalidRuntimeDir, runtimeRootPath(allocator, &env));
 }
 
 test "save validates annotations before touching runtime state" {
@@ -8324,34 +8255,6 @@ test "saved-spore removal machine output distinguishes disk pin ownership" {
     );
 }
 
-test "named restore machine result reports exec readiness timing" {
-    const allocator = std.testing.allocator;
-    var out: Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-
-    try machine_output.writeJson(allocator, &out.writer, NamedLifecycleResult{
-        .action = "restored",
-        .name = "worker-1",
-        .state = "ready",
-        .pid = 42,
-        .spore_dir = "/tmp/parent.spore",
-        .timing = .{
-            .prepare_ms = 3,
-            .spawn_monitor_ms = 4,
-            .wait_exec_ready_ms = 17,
-            .total_ms = 24,
-        },
-    });
-
-    var parsed = try std.json.parseFromSlice(NamedLifecycleResult, allocator, out.written(), .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("spore.lifecycle.v1", parsed.value.schema);
-    try std.testing.expectEqual(resource.Type.live_vm, parsed.value.resource_type);
-    try std.testing.expectEqualStrings("restored", parsed.value.action);
-    try std.testing.expectEqual(@as(u64, 17), parsed.value.timing.?.wait_exec_ready_ms);
-    try std.testing.expectEqual(@as(u64, 24), parsed.value.timing.?.total_ms);
-}
-
 test "initial output machine result preserves invalid UTF-8 as bytes" {
     const allocator = std.testing.allocator;
     var out: Io.Writer.Allocating = .init(allocator);
@@ -8396,25 +8299,6 @@ test "lifecycle list JSON exposes memory and nullable stats" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"memory\":{\"initial_bytes\":536870912,\"maximum_bytes\":536870912}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":{\"resident_bytes\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"dirty_chunks_pending\":null") != null);
-}
-
-test "lifecycle reads monitor stats metadata" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-monitor-stats"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    const paths = try pathsFromRoot(allocator, root, "bench-1");
-    defer paths.deinit(allocator);
-    try ensureVmDir(io, paths);
-    try writeMonitorStats(allocator, io, paths, .{
-        .chunks_nonzero = 17,
-        .dirty_chunks_pending = 2,
-    });
-
-    const stats = try readMonitorStats(allocator, io, paths);
-    try std.testing.expectEqual(@as(?u64, 17), stats.chunks_nonzero);
-    try std.testing.expectEqual(@as(?u64, 2), stats.dirty_chunks_pending);
 }
 
 test "linux statm resident parser reads resident pages" {

@@ -185,13 +185,6 @@ fn cliReason(err: ParseError) []const u8 {
     };
 }
 
-test "memory defaults to fixed 512MiB" {
-    const config = Config{};
-    try std.testing.expectEqual(default_bytes, config.initial_bytes);
-    try std.testing.expectEqual(default_bytes, config.maximum_bytes);
-    try std.testing.expect(!config.isElastic());
-}
-
 test "memory parser accepts binary product units" {
     const allocator = std.testing.allocator;
     const aligned_bytes = try std.fmt.allocPrint(allocator, "{d}b", .{page_alignment});

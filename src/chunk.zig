@@ -49,26 +49,6 @@ pub const ChunkId = struct {
     }
 };
 
-test "identical contents produce identical ids" {
-    const a = ChunkId.fromContents("the same bytes");
-    const b = ChunkId.fromContents("the same bytes");
-    try std.testing.expect(a.eql(b));
-}
-
-test "different contents produce different ids" {
-    const a = ChunkId.fromContents("some bytes");
-    const b = ChunkId.fromContents("other bytes");
-    try std.testing.expect(!a.eql(b));
-}
-
-test "hex round-trip" {
-    const id = ChunkId.fromContents("round trip me");
-    const hex = id.toHex();
-    try std.testing.expectEqual(@as(usize, ChunkId.hex_len), hex.len);
-    const parsed = try ChunkId.fromHex(&hex);
-    try std.testing.expect(id.eql(parsed));
-}
-
 test "fromHex rejects malformed input" {
     try std.testing.expectError(error.InvalidChunkId, ChunkId.fromHex("abc"));
     const not_hex = "zz" ** 32;

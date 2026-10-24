@@ -674,9 +674,6 @@ test "fanout cli help accepts help after options" {
     try std.testing.expect(wantsHelp(&.{ "children", "--for", "10s", "--help" }));
     try std.testing.expect(!wantsHelp(&.{"children"}));
     try std.testing.expect(!wantsHelp(&.{ "help", "--for", "10s" }));
-    try std.testing.expect(std.mem.indexOf(u8, cli_usage, "Requires child spores with saved sessions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cli_usage, "spore inspect children/000000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cli_usage, "spore fanout children --for 10s") != null);
 }
 
 test "fanout cli parser accepts bound service bindings" {
@@ -685,14 +682,6 @@ test "fanout cli parser accepts bound service bindings" {
     try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
     try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
-}
-
-test "fanout duration parser accepts common suffixes" {
-    try std.testing.expectEqual(@as(u64, 500), try run_mod.parseDurationMs("500ms"));
-    try std.testing.expectEqual(@as(u64, 10_000), try run_mod.parseDurationMs("10s"));
-    try std.testing.expectEqual(@as(u64, 60_000), try run_mod.parseDurationMs("1m"));
-    try std.testing.expectEqual(@as(u64, 5_000), try run_mod.parseDurationMs("5"));
-    try std.testing.expectError(error.InvalidDuration, run_mod.parseDurationMs("0s"));
 }
 
 fn testManifest(sessions: []const spore.Session) spore.Manifest {

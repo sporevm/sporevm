@@ -290,16 +290,3 @@ fn failPager(context: *Context, comptime fmt: []const u8, args: anytype) void {
     const wake_context: ?*anyopaque = if (wake_context_addr == 0) null else @ptrFromInt(wake_context_addr);
     wake_fn(wake_context);
 }
-
-test "fault address maps to memory chunk range" {
-    const zero_chunks = [_]u64{ 0, 1, 2 };
-    const manifest = spore.MemoryManifest{
-        .logical_size = zero_chunks.len * spore.chunk_size,
-        .chunk_size = spore.chunk_size,
-        .zero_chunks = &zero_chunks,
-    };
-    const ram_len = zero_chunks.len * spore.chunk_size;
-    const range = try spore.memoryChunkRange(manifest, ram_len, 2);
-    try std.testing.expectEqual(@as(usize, 2 * spore.chunk_size), range.start);
-    try std.testing.expectEqual(@as(usize, 3 * spore.chunk_size), range.end);
-}

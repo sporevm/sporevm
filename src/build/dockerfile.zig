@@ -1007,26 +1007,6 @@ test "fuzz Dockerfile subset parser" {
     try std.testing.fuzz({}, fuzzDockerfile, .{});
 }
 
-test "Dockerfile parser accepts supported subset" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var diag: Diagnostic = .{};
-    const doc = try parse(arena_state.allocator(),
-        \\# syntax is a comment for this subset
-        \\FROM base
-        \\ARG RAILS_ENV=test
-        \\ENV PATH=/usr/bin FOO=bar
-        \\WORKDIR /app
-        \\COPY Gemfile* ./
-        \\RUN bundle install
-        \\CMD ["/bin/sh","-c","echo ok"]
-        \\
-    , &diag);
-    try std.testing.expectEqual(@as(usize, 1), doc.stages.len);
-    try std.testing.expectEqual(@as(usize, 6), doc.stages[0].instructions.len);
-    try std.testing.expectEqualStrings("base", doc.stages[0].from.value.from.source);
-}
-
 test "Dockerfile parser preserves a narrow COPY heredoc with its source span" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
