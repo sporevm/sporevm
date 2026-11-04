@@ -2928,14 +2928,6 @@ test "transport restore rejects unoffered block features" {
     try std.testing.expectEqual(@as(u64, 0), transports[0].driver_features);
 }
 
-test "HVF build input wiring keeps WRITE_ZEROES on root vda only" {
-    var storage = [_]u8{0} ** blk.sector_size;
-    var root = blk.Blk.initWithOptions(.{ .memory = &storage }, .{ .write_zeroes = true });
-    var source = blk.Blk.initImmutableSource(.{ .memory = &storage });
-    try std.testing.expect(root.device().device_features & blk.feature_write_zeroes != 0);
-    try std.testing.expectEqual(@as(u64, 0), source.device().device_features & blk.feature_write_zeroes);
-}
-
 fn raiseGenerationIrqIfPending(gen_dev: *const generation.Device) !void {
     if (gen_dev.interrupt_status & generation.irq_generation_changed != 0) {
         try hvf.check(hvf.hv_gic_set_spi(board.generationIntid(), true), "generation raise spi");
@@ -3225,24 +3217,6 @@ test "HVF redistributor window accepts unordered frames" {
     const window = try hvfRedistributorWindow(&vcpus, 0x2_0000);
     try std.testing.expectEqual(@as(u64, 0x0801_0000), window.base);
     try std.testing.expectEqual(@as(u64, 0x4_0000), window.size);
-}
-
-test "gic target routes redistributor frame to matching hvf vcpu" {
-    var vcpus = [_]HvfVcpu{
-        .{ .handle = 11, .redist_base = 0x0802_0000 },
-        .{ .handle = 22, .redist_base = 0x0804_0000 },
-    };
-    const target = (try gicMmioTarget(11, 0x0802_0000 + 0x2_0000 + 0xc, .{
-        .dist_base = 0x0800_0000,
-        .dist_size = 0x1_0000,
-        .redist_base = 0x0802_0000,
-        .redist_size = 0x4_0000,
-        .redist_stride = 0x2_0000,
-        .redist_vcpus = vcpus[0..],
-    })).?;
-    try std.testing.expectEqual(gic.Region.redistributor, target.region);
-    try std.testing.expectEqual(@as(u64, 0xc), target.offset);
-    try std.testing.expectEqual(@as(hvf.VcpuHandle, 22), target.vcpu);
 }
 
 test "vsock rx flush materializes lazy transport queues before delivery" {

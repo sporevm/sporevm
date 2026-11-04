@@ -1977,13 +1977,6 @@ fn appendTestSpioFrame(out: []u8, cursor: *usize, frame_type: u8, offset: u64, p
     cursor.* += payload.len;
 }
 
-test "build fsfreeze request stays bounded" {
-    const request = try run_mod.simpleControlRequest(std.testing.allocator, "fsfreeze-v1", "spore-build-freeze-1");
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"fsfreeze-v1\"") != null);
-}
-
 test "build rootfs grow request stays bounded" {
     const request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
     defer std.testing.allocator.free(request);

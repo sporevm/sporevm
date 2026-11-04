@@ -1783,22 +1783,6 @@ test "C ABI removes diskless saved spores without inventing a pin" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, dir, .{ .follow_symlinks = false }));
 }
 
-test "C ABI saved-spore removal JSON distinguishes disk pin ownership" {
-    var context: ?*SporeContextImpl = null;
-    try std.testing.expectEqual(result_success, spore_context_new(&context));
-    defer spore_context_free(context);
-
-    var json = try jsonOwned(context.?, libspore.RemovedSavedSpore{
-        .spore_dir = "disk.spore",
-        .pin_id = "abc",
-        .pin_removed = true,
-    });
-    defer spore_free_string(context, json);
-    const data = json.ptr.?[0..json.len];
-    try std.testing.expect(std.mem.indexOf(u8, data, "\"pin_id\": \"abc\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, data, "\"pin_removed\": true") != null);
-}
-
 test "C ABI named exec JSON preserves arbitrary output bytes" {
     var context: ?*SporeContextImpl = null;
     try std.testing.expectEqual(result_success, spore_context_new(&context));

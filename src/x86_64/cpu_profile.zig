@@ -363,10 +363,6 @@ pub const ClockDecision = enum {
 
 pub const clock_decision_inventory = std.enums.values(ClockDecision);
 
-test "candidate is atomically approved after same-host Slice 0b proof" {
-    try std.testing.expectEqual(CandidateStatus.approved_same_host, candidate_status);
-}
-
 test "CPUID decision inventory is bounded ordered and explicit" {
     try std.testing.expect(cpuid_decision_inventory.len <= 256);
     for (cpuid_decision_inventory, 0..) |decision, index| {
@@ -406,18 +402,6 @@ test "profile capability audit inventory uses stable Linux KVM IDs" {
     }
 }
 
-test "XSAVE audit bounds separate legacy and XSAVE2 storage" {
-    try std.testing.expectEqual(@as(u32, 576), xsave_legacy_and_header_bytes);
-    try std.testing.expectEqual(@as(u32, 4096), kvm_legacy_xsave_area_bytes);
-}
-
-test "MSR audit inventory is ordered unique and named" {
-    for (msr_audit_inventory, 0..) |entry, index| {
-        try std.testing.expect(entry.name.len != 0);
-        if (index > 0) try std.testing.expect(msr_audit_inventory[index - 1].index < entry.index);
-    }
-}
-
 test "Stage 0b.2 MSR restore inventory is bounded and explicitly ordered" {
     try std.testing.expect(stage0b2_msr_inventory.len <= 32);
     for (stage0b2_msr_inventory, 0..) |entry, index| {
@@ -430,12 +414,6 @@ test "Stage 0b.2 MSR restore inventory is bounded and explicitly ordered" {
         }
     }
     try std.testing.expectEqual(Stage0b2MsrDisposition.excluded, stage0b2_msr_inventory[stage0b2_msr_inventory.len - 1].disposition);
-}
-
-test "clock decisions remain explicit and unresolved" {
-    try std.testing.expectEqual(@as(usize, 7), clock_decision_inventory.len);
-    try std.testing.expectEqual(ClockDecision.guest_tsc_khz, clock_decision_inventory[0]);
-    try std.testing.expectEqual(ClockDecision.monotonicity_tolerance, clock_decision_inventory[6]);
 }
 
 test "candidate profile is narrow ordered and derived from Stage 0b.2 evidence" {

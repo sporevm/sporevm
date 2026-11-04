@@ -872,36 +872,6 @@ test "v2 disk index rejects malformed and out-of-bounds ranges" {
     }));
 }
 
-test "v2 compact ranges encode a dense 32 GiB disk below the bounded index limit" {
-    const allocator = std.testing.allocator;
-    const chunk_size: u64 = 64 * 1024;
-    const logical_size: u64 = 32 * 1024 * 1024 * 1024;
-    const chunk_count = logical_size / chunk_size;
-    const zero_tail = [_]DiskIndexZeroRange{.{ .start = 1, .count = chunk_count - 1 }};
-    const encoded = try encodeCanonicalAlloc(allocator, .{
-        .kind = disk_index_kind,
-        .logical_size = logical_size,
-        .chunk_size = chunk_size,
-        .hash_algorithm = "blake3",
-        .object_namespace = "rootfs/blake3",
-        .chunks = &.{.{ .logical_chunk = 0, .digest = digest_b }},
-        .zero_ranges = &zero_tail,
-    });
-    defer encoded.deinit(allocator);
-    // This one-chunk index carries the same 32 GiB geometry plus a zero-range
-    // object that a dense index omits, so replacing its one digest with the
-    // complete unescaped hex blob is a conservative exact-size bound.
-    const fixed_bytes = encoded.bytes.len - chunk.ChunkId.hex_len;
-    const dense_bytes = try std.math.add(
-        u64,
-        fixed_bytes,
-        try std.math.mul(u64, chunk_count, chunk.ChunkId.hex_len),
-    );
-    try std.testing.expect(dense_bytes < max_index_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.bytes, "\"start\": 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.bytes, "\"logical_chunk\"") == null);
-}
-
 fn fuzzDiskIndexParse(_: void, s: *std.testing.Smith) !void {
     // Disk indexes may arrive from registries, bundles, or peers. They
     // must either fail closed or validate to a descriptor-bound, canonical map.

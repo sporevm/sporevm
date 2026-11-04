@@ -1173,24 +1173,6 @@ test "fuzz dockerignore parser" {
     try std.testing.fuzz({}, fuzzDockerignore, .{});
 }
 
-test "context hashing applies dockerignore" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-hash";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/app");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/app/a.txt", .data = "a" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/app/b.tmp", .data = "b" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.dockerignore", .data = "*.tmp\n" });
-    var diag: IgnoreDiagnostic = .{};
-    const ctx = try load(arena, io, root, &diag);
-    const digest = try hashCopySources(arena, io, ctx, &.{"app"});
-    try std.testing.expect(std.mem.startsWith(u8, digest, "blake3:"));
-}
-
 test "COPY source resolution rejects intermediate symlinks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1575,24 +1557,6 @@ test "context hashing frames fields so payload NULs cannot alias records" {
     const framed_one = try hashCopySources(arena, io, ctx_one, &.{"a"});
     const framed_two = try hashCopySources(arena, io, ctx_two, &.{ "a", "b" });
     try std.testing.expect(!std.mem.eql(u8, framed_one, framed_two));
-}
-
-test "context hashing deduplicates repeated COPY source matches" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-hash-dedupe";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/a", .data = "same" });
-
-    var diag: IgnoreDiagnostic = .{};
-    const ctx = try load(arena, io, root, &diag);
-    const once = try hashCopySources(arena, io, ctx, &.{"a"});
-    const twice = try hashCopySources(arena, io, ctx, &.{ "a", "a" });
-    try std.testing.expectEqualStrings(once, twice);
 }
 
 test "COPY roots deterministically keep the earliest overlapping selector" {

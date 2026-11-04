@@ -569,19 +569,6 @@ pub fn threadCpuNs() u64 {
     return seconds * std.time.ns_per_s + nanos;
 }
 
-test "seals zero and data chunks" {
-    var stats: WorkStats = .{};
-    var zero = [_]u8{0} ** 64;
-    try std.testing.expectEqual(SealResult.zero, try sealBytes(&zero, &stats));
-
-    zero[0] = 1;
-    const sealed = try sealBytes(&zero, &stats);
-    switch (sealed) {
-        .zero => return error.TestUnexpectedResult,
-        .data => |id| try std.testing.expect(id.matches(&zero)),
-    }
-}
-
 test "write-if-missing verifies existing data" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

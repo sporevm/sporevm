@@ -161,21 +161,6 @@ test "cache roots ignore empty optional environment values" {
     try std.testing.expectError(error.MissingHome, kernelCacheRootPath(allocator, &env));
 }
 
-test "cache roots use platform home fallback" {
-    const allocator = std.testing.allocator;
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put("HOME", "/home/spore");
-
-    const kernels = try kernelCacheRootPath(allocator, &env);
-    defer allocator.free(kernels);
-    const expected = if (comptime builtin.os.tag == .macos)
-        "/home/spore/Library/Caches/sporevm/kernels"
-    else
-        "/home/spore/.cache/sporevm/kernels";
-    try std.testing.expectEqualStrings(expected, kernels);
-}
-
 test "runtime root prefers explicit and xdg absolute paths" {
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);

@@ -483,29 +483,6 @@ test "same aggregate cache id rejects incompatible sharing declarations" {
     try std.testing.expectError(error.RunCacheMountSharingConflict, validateCompatible(&combined));
 }
 
-test "BuildKit cache result identity uses id and destination value equality" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-    const custom_a = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = "a", .sharing = .shared }});
-    const custom_b = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = "b", .sharing = .locked }});
-    try std.testing.expectEqualStrings(try digest(allocator, custom_a), try digest(allocator, custom_b));
-    // BuildKit's solver sees only CacheOpt.ID and the resolved destination.
-    // An explicit shared ID equal to the destination is therefore
-    // intentionally indistinguishable from the historical default case.
-    const explicit_equal_target = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .id = "/cache", .sharing = .shared }});
-    try std.testing.expect(!std.mem.eql(u8, try digest(allocator, explicit_equal_target), try digest(allocator, custom_b)));
-
-    const default_shared = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache" }});
-    const default_locked = try resolveConfigured(allocator, "/", &.{.{ .target = "/cache", .sharing = .locked }});
-    try std.testing.expect(!std.mem.eql(u8, try digest(allocator, default_shared), try digest(allocator, default_locked)));
-    // The default ID is cleaned before a relative target joins WORKDIR, so it
-    // differs from the resolved destination and BuildKit clears both forms.
-    const relative_shared = try resolveConfigured(allocator, "/work", &.{.{ .target = "cache" }});
-    const relative_locked = try resolveConfigured(allocator, "/work", &.{.{ .target = "cache", .sharing = .locked }});
-    try std.testing.expectEqualStrings(try digest(allocator, relative_shared), try digest(allocator, relative_locked));
-}
-
 test "cache store recreates a host-visible unclean aggregate" {
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

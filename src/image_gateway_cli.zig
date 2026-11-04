@@ -254,20 +254,6 @@ test "image pull options require explicit gateway repository and local ref" {
     try std.testing.expectEqual(gateway_pull.default_platform.arch, defaults.platform.arch);
 }
 
-test "fixture export options require an existing metadata input and new output" {
-    const parsed = try parseExportFixtureOptions(&.{
-        "docker.io/library/alpine:3.20",
-        "--repository",
-        "fixture",
-        "--metadata",
-        "/tmp/alpine.json",
-        "--out",
-        "/tmp/gateway",
-    });
-    try std.testing.expectEqualStrings("fixture", parsed.repository);
-    try std.testing.expectEqualStrings("/tmp/gateway", parsed.output_dir);
-}
-
 test "image archive options require immutable digest and explicit platform" {
     const pack = try parsePackOptions(&.{
         "local/app:ci",

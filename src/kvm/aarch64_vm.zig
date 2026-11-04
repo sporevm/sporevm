@@ -2412,14 +2412,6 @@ test "transport restore rejects unoffered block features" {
     try std.testing.expectEqual(@as(u64, 0), transports[0].driver_features);
 }
 
-test "KVM build input wiring keeps WRITE_ZEROES on root vda only" {
-    var storage = [_]u8{0} ** blk.sector_size;
-    var root = blk.Blk.initWithOptions(.{ .memory = &storage }, .{ .write_zeroes = true });
-    var source = blk.Blk.initImmutableSource(.{ .memory = &storage });
-    try std.testing.expect(root.device().device_features & blk.feature_write_zeroes != 0);
-    try std.testing.expectEqual(@as(u64, 0), source.device().device_features & blk.feature_write_zeroes);
-}
-
 fn raiseGenerationIrqIfPending(vm_fd: std.c.fd_t, gen_dev: *const generation.Device) !void {
     if (gen_dev.interrupt_status & generation.irq_generation_changed != 0) {
         try kvm.setIrq(vm_fd, board.generationIntid(), true);

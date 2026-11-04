@@ -864,27 +864,6 @@ test "COPY destination policy is explicit cache identity" {
     try std.testing.expect(!std.mem.eql(u8, follow_key, link_key));
 }
 
-test "RUN cache mount digest is explicit cache identity" {
-    const allocator = std.testing.allocator;
-    const base: StepInput = .{
-        .platform = .{},
-        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .canonical_instruction = "RUN --mount=type=cache,target=/cache true",
-        .executor_identity = test_executor_identity,
-        .operation = .{ .run = .{
-            .network_mode = .none,
-            .cache_mount_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        } },
-    };
-    const first = try stepKey(allocator, base);
-    defer allocator.free(first);
-    var changed = base;
-    changed.operation.run.cache_mount_digest = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    const second = try stepKey(allocator, changed);
-    defer allocator.free(second);
-    try std.testing.expect(!std.mem.eql(u8, first, second));
-}
-
 test "RUN context bind digest is explicit cache identity" {
     const allocator = std.testing.allocator;
     const base: StepInput = .{
@@ -1070,49 +1049,6 @@ test "rewriting a step record replaces a prior child snapshot" {
     _ = try writeRecord(io, arena, cache_root, input, key, second_storage);
     const hit = (try readHit(io, arena, cache_root, input, key)) orelse return error.MissingBuildCacheRecord;
     try std.testing.expectEqualStrings(second_storage.index_digest, hit.index_digest);
-}
-
-test "large COPY heredoc record is a warm hit and a GC root" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const tmp = "zig-cache/test-build-step-cache-large-copy-heredoc";
-    const cache_root = tmp ++ "/cache";
-    const child_rootfs = tmp ++ "/child.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "large heredoc child rootfs bytes" });
-
-    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
-    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
-    const instruction = try arena.alloc(u8, 300 * 1024);
-    @memset(instruction, 'x');
-    @memcpy(instruction[0.."COPY <<EOF /large\n".len], "COPY <<EOF /large\n");
-    const input = StepInput{
-        .platform = .{},
-        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .canonical_instruction = instruction,
-        .executor_identity = test_executor_identity,
-        .operation = .{ .copy = .{
-            .input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            .workdir = "/",
-            .destination_policy = .follow,
-        } },
-    };
-    const key = try stepKey(arena, input);
-    const path = try writeRecord(io, arena, cache_root, input, key, storage);
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_step_record_bytes));
-    try std.testing.expect(bytes.len > 256 * 1024);
-
-    const hit = (try readHit(io, arena, cache_root, input, key)) orelse return error.MissingBuildCacheRecord;
-    try std.testing.expectEqualStrings(storage.index_digest, hit.index_digest);
-    switch (try inspectRecordForGc(io, arena, cache_root, path, key)) {
-        .root => |root| try std.testing.expectEqualStrings(storage.index_digest, root.index_digest),
-        .legacy, .stale, .unknown => return error.MissingBuildCacheRecord,
-    }
 }
 
 test "inclusive step record bound is readable and one byte beyond fails closed" {

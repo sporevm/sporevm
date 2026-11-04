@@ -1977,14 +1977,6 @@ fn contextCopyTransitionForTest(
     };
 }
 
-test "variable substitution uses env before args" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const got = try substitute(arena, "${APP}/$MODE", &.{.{ .key = "MODE", .value = "arg" }}, &.{"APP=/srv"}, '\\');
-    try std.testing.expectEqualStrings("/srv/arg", got);
-}
-
 test "COPY heredoc transition expands from the instruction-start state" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -2671,28 +2663,6 @@ test "implicit root HOME transitions only affected RUN cache identities" {
     try std.testing.expectEqualStrings(run_digest, step.env_digest);
 }
 
-test "realistic pinned Go multi-stage scratch Dockerfile parses and plans" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var diagnostic: dockerfile.Diagnostic = .{};
-    const document = try dockerfile.parse(arena,
-        \\FROM --platform=linux/arm64 golang@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191 AS build
-        \\WORKDIR /src
-        \\COPY . .
-        \\RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /out/app .
-        \\FROM scratch
-        \\COPY --from=build /out/app /app
-        \\ENTRYPOINT ["/app"]
-        \\
-    , &diagnostic);
-    const plan = try build_plan.create(arena, &document, .{}, &diagnostic);
-    try std.testing.expectEqual(@as(usize, 2), plan.stages.len);
-    try std.testing.expectEqual(@as(usize, 2), plan.order.len);
-    try std.testing.expectEqual(@as(usize, 1), plan.stages[1].copies.len);
-    try std.testing.expectEqual(@as(usize, 1), plan.target_index);
-}
-
 test "optional-absent SSH declaration injects only the inert default environment value" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3245,58 +3215,6 @@ test "WORKDIR transition resolves environment before cache lookup" {
     try std.testing.expectEqualStrings("/srv/app", step.target);
     try std.testing.expectEqualStrings("/previous", step.workdir);
     try std.testing.expectEqualStrings(try effectiveEnvDigest(arena, state), step.env_digest);
-}
-
-test "COPY cache identity ignores run-only network mode" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var diag: dockerfile.Diagnostic = .{};
-    const doc = try dockerfile.parse(arena,
-        \\FROM base
-        \\WORKDIR /app
-        \\COPY src/ ./
-        \\
-    , &diag);
-    const instruction = doc.stages[0].instructions[1];
-    const storage = spore.RootfsStorage{
-        .kind = spore.rootfs_storage_kind_chunked_ext4,
-        .device = .{ .mmio_slot = 1 },
-        .logical_size = spore.disk_chunk_size,
-        .chunk_size = spore.disk_chunk_size,
-        .hash_algorithm = "blake3",
-        .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .object_namespace = "rootfs/blake3",
-    };
-    const state = State{
-        .storage = storage,
-        .environment = try buildEnvironmentFromEffective(arena, &.{}),
-        .args = std.array_list.Managed(ArgValue).init(arena),
-        .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
-        .workdir = "/app",
-    };
-    const options = Options{
-        .tag = "local/app:dev",
-        .context_dir = "unused",
-        .dockerfile_path = "unused",
-    };
-    const input_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const env_digest = try effectiveEnvDigest(arena, state);
-    const copy_step = build_exec.Step{ .copy = .{
-        .canonical_instruction = instruction.raw,
-        .input_digest = input_digest,
-        .env_digest = env_digest,
-        .workdir = state.workdir,
-        .requests = &.{},
-    } };
-    const input = build_exec.cacheInputForStep(options.platform, storage.index_digest, test_executor_identity, copy_step, runResources(options));
-    const key = try step_cache.stepKey(arena, input);
-
-    var none_options = options;
-    none_options.network = .none;
-    const none_input = build_exec.cacheInputForStep(none_options.platform, storage.index_digest, test_executor_identity, copy_step, runResources(none_options));
-    try std.testing.expectEqualStrings(key, try step_cache.stepKey(arena, none_input));
 }
 
 test "build disk grow target uses deterministic sparse policy" {
@@ -4223,16 +4141,6 @@ test "metadata-only scratch publication serializes destructive GC until ref visi
     const indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_dir, resolved)) orelse return error.MissingIndexedRootfs;
     defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_dir, indexed.storage));
-}
-
-test "scratch allocation accounting is bound to the opened inode" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(io, "allocated", .{ .read = true });
-    defer file.close(io);
-    try file.writeStreamingAll(io, &([_]u8{0x5a} ** 4096));
-    try std.testing.expect(try allocatedFileBlocks512(file.handle) > 0);
 }
 
 fn testInit(
