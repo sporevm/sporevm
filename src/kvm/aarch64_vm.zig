@@ -194,7 +194,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         try vmm.restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = try monotonicMs();
         if (m.memory_state) |state| try mem_dev.restoreState(state);
-        try vmm.applyTransports(transports, m.devices);
+        try vmm.applyTransports(transports, m.devices, ram);
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, gen_dev);
         switch (m.machine) {

@@ -264,7 +264,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         try vmm.restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = monotonicMs();
         if (m.memory_state) |state| try mem_dev.restoreState(state);
-        try vmm.applyTransports(transports, m.devices);
+        try vmm.applyTransports(transports, m.devices, ram);
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, gen_dev);
         try snapshot.applyMachine(allocator, vcpu, machine);
@@ -1082,7 +1082,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         if (machine.gic.kind != .backend_private) return error.PlatformMismatch;
         try vmm.restoreMemory(allocator, restore, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
         const state_start = monotonicMs();
-        try vmm.applyTransports(options.transports, manifest.devices);
+        try vmm.applyTransports(options.transports, manifest.devices, options.ram);
         try options.gen_dev.restore(allocator, restore.generation orelse manifest.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, options.gen_dev);
         try snapshot.applyGicState(allocator, vcpus[0].handle, machine.gic);
