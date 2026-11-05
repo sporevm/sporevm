@@ -472,9 +472,12 @@ mise run smoke core
 save, fork, the named lifecycle, copy, the monitor jail, and networking. CI
 runs it on every commit on Linux ARM64 (KVM) and macOS (HVF). `mise run smoke
 full` adds the other aarch64 scripts in `test/smoke/`. The suite prints one
-line per script and keeps each script's log under `zig-cache/smoke/`. Each
-script also runs on its own against `zig-out/bin/spore` (or `SPORE_BIN`), for
-example `test/smoke/run/tty.sh`.
+line per script and keeps each script's log under `zig-cache/smoke/`. `mise run
+smoke` also takes one script path without `.sh`, such as `mise run smoke
+run/tty`; on Linux x86-64 KVM hosts, `mise run smoke x86/run` and `mise run
+smoke x86/build` run the x86-64 smokes. Each script also runs on its own
+against `zig-out/bin/spore` (or `SPORE_BIN`), for example
+`test/smoke/run/tty.sh`.
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
 Release notes and release-gate summaries live on
