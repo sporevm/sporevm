@@ -2215,7 +2215,7 @@ static int parse_json_optional_i64(const char **cursor, int *present, int64_t *o
   return 0;
 }
 
-static int parse_exec_argv_value_mode(const char **cursor, struct run_request *out, int allow_empty) {
+static int parse_exec_argv_value(const char **cursor, struct run_request *out) {
   const char *p = *cursor;
   if (*p != '[') return -1;
   p++;
@@ -2225,7 +2225,6 @@ static int parse_exec_argv_value_mode(const char **cursor, struct run_request *o
   size_t decoded_len = 0;
   p = skip_ws(p);
   if (*p == ']') {
-    if (!allow_empty) return -1;
     out->argv[0] = NULL;
     *cursor = p + 1;
     return 0;
@@ -2319,12 +2318,11 @@ static int build_cache_targets_overlap(const char *a, const char *b) {
   return 0;
 }
 
-static int parse_build_cache_mounts_value(const char **cursor, struct run_request *out, int allow_empty) {
+static int parse_build_cache_mounts_value(const char **cursor, struct run_request *out) {
   const char *p = *cursor;
   if (*p != '[') return -1;
   p = skip_ws(p + 1);
   if (*p == ']') {
-    if (!allow_empty) return -1;
     out->build_cache_mount_count = 0;
     *cursor = p + 1;
     return 0;
@@ -2418,7 +2416,11 @@ static int parse_build_context_binds_value(const char **cursor, struct run_reque
   const char *p = *cursor;
   if (*p != '[') return -1;
   p = skip_ws(p + 1);
-  if (*p == ']') return -1;
+  if (*p == ']') {
+    out->build_context_bind_count = 0;
+    *cursor = p + 1;
+    return 0;
+  }
   size_t count = 0;
   for (;;) {
     if (count >= MAX_BUILD_CONTEXT_BINDS || *p != '{') return -1;
@@ -2480,8 +2482,10 @@ static int parse_build_context_binds_value(const char **cursor, struct run_reque
   return 0;
 }
 
-static int parse_build_run_request(const char *req, size_t req_len, struct run_request *out,
-                                   const char *expected_type, int version) {
+// Shell form streams command_len bytes after the request and sends an empty
+// argv; exec form sends argv with command_len 0. Context binds are shell-only,
+// matching the host planner.
+static int parse_build_run_request(const char *req, size_t req_len, struct run_request *out) {
   if (req_len == 0 || req[req_len - 1] != '\n') return -1;
   enum {
     SEEN_TYPE = 1u << 0,
@@ -2501,9 +2505,8 @@ static int parse_build_run_request(const char *req, size_t req_len, struct run_r
     SEEN_COMMAND_LEN = 1u << 14,
     SEEN_CACHE_MOUNTS = 1u << 15,
     SEEN_CONTEXT_BINDS = 1u << 16,
-    SEEN_COMMON = (1u << 14) - 1,
+    SEEN_ALL = (1u << 17) - 1,
   };
-  if (version != 2 && version != 3 && version != 4) return -1;
 
   const char *p = skip_ws(req);
   if (*p != '{') return -1;
@@ -2525,7 +2528,7 @@ static int parse_build_run_request(const char *req, size_t req_len, struct run_r
     if (strcmp(key, "type") == 0) {
       bit = SEEN_TYPE;
       char type[32];
-      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, expected_type) != 0) return -1;
+      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-run-v4") != 0) return -1;
     } else if (strcmp(key, "session_id") == 0) {
       bit = SEEN_SESSION_ID;
       if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
@@ -2534,11 +2537,11 @@ static int parse_build_run_request(const char *req, size_t req_len, struct run_r
       if (parse_json_u64(&p, &out->resume_time_unix_ns) != 0) return -1;
     } else if (strcmp(key, "command_len") == 0) {
       bit = SEEN_COMMAND_LEN;
-      if ((version != 3 && version != 4) || parse_json_u64(&p, &out->build_command_len) != 0 ||
+      if (parse_json_u64(&p, &out->build_command_len) != 0 ||
           out->build_command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
     } else if (strcmp(key, "argv") == 0) {
       bit = SEEN_ARGV;
-      if (parse_exec_argv_value_mode(&p, out, version >= 3) != 0) return -1;
+      if (parse_exec_argv_value(&p, out) != 0) return -1;
     } else if (strcmp(key, "env") == 0) {
       bit = SEEN_ENV;
       if (parse_exec_env_value(&p, out) != 0) return -1;
@@ -2547,10 +2550,10 @@ static int parse_build_run_request(const char *req, size_t req_len, struct run_r
       if (parse_json_string(&p, out->working_dir, sizeof(out->working_dir)) != 0 || out->working_dir[0] != '/') return -1;
     } else if (strcmp(key, "cache_mounts") == 0) {
       bit = SEEN_CACHE_MOUNTS;
-      if ((version != 3 && version != 4) || parse_build_cache_mounts_value(&p, out, version == 4) != 0) return -1;
+      if (parse_build_cache_mounts_value(&p, out) != 0) return -1;
     } else if (strcmp(key, "context_binds") == 0) {
       bit = SEEN_CONTEXT_BINDS;
-      if (version != 4 || parse_build_context_binds_value(&p, out) != 0) return -1;
+      if (parse_build_context_binds_value(&p, out) != 0) return -1;
     } else if (strcmp(key, "stdio") == 0) {
       bit = SEEN_STDIO;
       char stdio[8];
@@ -2597,41 +2600,23 @@ static int parse_build_run_request(const char *req, size_t req_len, struct run_r
     p = skip_ws(p + 1);
     if (*p == '}') return -1;
   }
-  unsigned int required = SEEN_COMMON;
-  if (version == 3) required |= SEEN_COMMAND_LEN | SEEN_CACHE_MOUNTS;
-  if (version == 4) required |= SEEN_COMMAND_LEN | SEEN_CACHE_MOUNTS | SEEN_CONTEXT_BINDS;
-  if (seen != required || *skip_ws(p) != '\0') return -1;
+  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
   if (out->nofile_soft == 0 || out->nofile_soft > out->nofile_hard || out->nofile_hard > MAX_BUILD_NOFILE) return -1;
-  if (version == 3 && !((out->build_command_len > 0 && out->argv[0] == NULL) ||
-                        (out->build_command_len == 0 && out->argv[0] != NULL))) return -1;
-  if (version == 4 && !(out->build_command_len > 0 && out->argv[0] == NULL)) return -1;
-  if (version == 4) {
-    for (size_t i = 0; i < out->build_context_bind_count; i++) {
-      for (size_t j = 0; j < out->build_cache_mount_count; j++) {
-        if (build_cache_targets_overlap(out->build_context_binds[i].target,
-                                        out->build_cache_mounts[j].target)) return -1;
-      }
+  out->build_exec_form = out->argv[0] != NULL;
+  if (out->build_exec_form && (out->build_command_len != 0 || out->build_context_bind_count != 0)) return -1;
+  if (!out->build_exec_form && out->build_command_len == 0) return -1;
+  for (size_t i = 0; i < out->build_context_bind_count; i++) {
+    for (size_t j = 0; j < out->build_cache_mount_count; j++) {
+      if (build_cache_targets_overlap(out->build_context_binds[i].target,
+                                      out->build_cache_mounts[j].target)) return -1;
     }
   }
   out->kind = REQUEST_BUILD_RUN;
   out->protocol_v1 = 1;
-  out->build_exec_form = version == 2 || out->argv[0] != NULL;
   return 0;
 }
 
-static int parse_build_run_v2_request(const char *req, size_t req_len, struct run_request *out) {
-  return parse_build_run_request(req, req_len, out, "spore-build-run-v2", 2);
-}
-
-static int parse_build_run_v3_request(const char *req, size_t req_len, struct run_request *out) {
-  return parse_build_run_request(req, req_len, out, "spore-build-run-v3", 3);
-}
-
-static int parse_build_run_v4_request(const char *req, size_t req_len, struct run_request *out) {
-  return parse_build_run_request(req, req_len, out, "spore-build-run-v4", 4);
-}
-
-static int parse_build_copy_request(const char *req, size_t req_len, struct run_request *out, const char *expected_type, int require_destination_policy) {
+static int parse_build_copy_request(const char *req, size_t req_len, struct run_request *out) {
   if (req_len == 0 || req[req_len - 1] != '\n') return -1;
   enum {
     SEEN_TYPE = 1u << 0,
@@ -2645,8 +2630,7 @@ static int parse_build_copy_request(const char *req, size_t req_len, struct run_
     SEEN_INPUT_INDEX = 1u << 8,
     SEEN_MTIME = 1u << 9,
     SEEN_DESTINATION_POLICY = 1u << 10,
-    SEEN_V4_ALL = (1u << 10) - 1,
-    SEEN_V5_ALL = (1u << 11) - 1,
+    SEEN_ALL = (1u << 11) - 1,
   };
 
   const char *p = skip_ws(req);
@@ -2669,7 +2653,7 @@ static int parse_build_copy_request(const char *req, size_t req_len, struct run_
     if (strcmp(key, "type") == 0) {
       bit = SEEN_TYPE;
       char type[32];
-      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, expected_type) != 0) return -1;
+      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-copy-v5") != 0) return -1;
     } else if (strcmp(key, "session_id") == 0) {
       bit = SEEN_SESSION_ID;
       if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
@@ -2708,11 +2692,12 @@ static int parse_build_copy_request(const char *req, size_t req_len, struct run_
       bit = SEEN_MTIME;
       if (parse_json_optional_i64(&p, &out->copy_mtime_present, &out->copy_mtime_unix_seconds) != 0) return -1;
     } else if (strcmp(key, "destination_policy") == 0) {
-      if (!require_destination_policy) return -1;
       bit = SEEN_DESTINATION_POLICY;
       char destination_policy[16];
-      if (parse_json_string(&p, destination_policy, sizeof(destination_policy)) != 0 || strcmp(destination_policy, "link") != 0) return -1;
-      out->copy_destination_policy = COPY_DESTINATION_LINK;
+      if (parse_json_string(&p, destination_policy, sizeof(destination_policy)) != 0) return -1;
+      if (strcmp(destination_policy, "follow") == 0) out->copy_destination_policy = COPY_DESTINATION_FOLLOW;
+      else if (strcmp(destination_policy, "link") == 0) out->copy_destination_policy = COPY_DESTINATION_LINK;
+      else return -1;
     } else {
       return -1;
     }
@@ -2728,14 +2713,13 @@ static int parse_build_copy_request(const char *req, size_t req_len, struct run_
     p = skip_ws(p + 1);
     if (*p == '}') return -1;
   }
-  unsigned int required = require_destination_policy ? SEEN_V5_ALL : SEEN_V4_ALL;
-  if (seen != required || *skip_ws(p) != '\0') return -1;
+  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
   if (out->copy_source_disk == COPY_SOURCE_CONTEXT) {
     if (out->copy_source_kind == COPY_KIND_AUTO || out->copy_entry_count == 0 || out->copy_input_index != 0) return -1;
   } else if (out->copy_source_kind != COPY_KIND_AUTO || out->copy_entry_count != 0) {
     return -1;
   }
-  if (require_destination_policy && out->copy_source_disk != COPY_SOURCE_BUILD_INPUT) return -1;
+  if (out->copy_destination_policy == COPY_DESTINATION_LINK && out->copy_source_disk != COPY_SOURCE_BUILD_INPUT) return -1;
   out->kind = REQUEST_BUILD_COPY;
   out->protocol_v1 = 1;
   return 0;
@@ -2821,20 +2805,11 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
   char type[32];
   int type_rc = parse_top_level_request_type(req, type, sizeof(type));
   if (type_rc < 0) return -1;
-  if (type_rc > 0 && strcmp(type, "spore-build-run-v2") == 0) {
-    return parse_build_run_v2_request(req, req_len, out);
-  }
-  if (type_rc > 0 && strcmp(type, "spore-build-run-v3") == 0) {
-    return parse_build_run_v3_request(req, req_len, out);
-  }
   if (type_rc > 0 && strcmp(type, "spore-build-run-v4") == 0) {
-    return parse_build_run_v4_request(req, req_len, out);
-  }
-  if (type_rc > 0 && strcmp(type, "spore-build-copy-v4") == 0) {
-    return parse_build_copy_request(req, req_len, out, "spore-build-copy-v4", 0);
+    return parse_build_run_request(req, req_len, out);
   }
   if (type_rc > 0 && strcmp(type, "spore-build-copy-v5") == 0) {
-    return parse_build_copy_request(req, req_len, out, "spore-build-copy-v5", 1);
+    return parse_build_copy_request(req, req_len, out);
   }
   if (type_rc > 0) {
     if (strcmp(type, "ready") == 0) {
@@ -2857,13 +2832,6 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     } else if (strcmp(type, "copy-out-v1") == 0) {
       out->kind = REQUEST_COPY_OUT;
       out->protocol_v1 = 1;
-    } else if (strcmp(type, "spore-build-run-v1") == 0) {
-      out->kind = REQUEST_BUILD_RUN;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "spore-build-copy-v2") == 0 || strcmp(type, "spore-build-copy-v3") == 0) {
-      out->kind = REQUEST_BUILD_COPY;
-      out->protocol_v1 = 1;
-      out->copy_source_disk = COPY_SOURCE_CONTEXT;
     } else if (strcmp(type, "spore-build-workdir-v1") == 0) {
       out->kind = REQUEST_BUILD_WORKDIR;
       out->protocol_v1 = 1;
@@ -2914,73 +2882,9 @@ static int parse_request(const char *req, size_t req_len, struct run_request *ou
     int path_rc = parse_string_field(req, "path", out->copy_path, sizeof(out->copy_path));
     if (path_rc <= 0) return -1;
   }
-  if (out->kind == REQUEST_BUILD_RUN) {
-    uint64_t command_len = 0;
-    int command_len_rc = parse_u64_field(req, "command_len", &command_len);
-    if (command_len_rc <= 0 || command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
-    out->build_command_len = command_len;
-    if (find_field_value(req, "argv") != NULL) return -1;
-    if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
-    int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
-    if (working_dir_rc < 0) return -1;
-    if (working_dir_rc == 0) out->working_dir[0] = '\0';
-    int nofile_soft_rc = parse_u64_field(req, "nofile_soft", &out->nofile_soft);
-    int nofile_hard_rc = parse_u64_field(req, "nofile_hard", &out->nofile_hard);
-    if (nofile_soft_rc <= 0 || nofile_hard_rc <= 0 ||
-        out->nofile_soft == 0 || out->nofile_soft > out->nofile_hard ||
-        out->nofile_hard > MAX_BUILD_NOFILE) return -1;
-  }
   if (out->kind == REQUEST_BUILD_WORKDIR) {
     int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
     if (working_dir_rc <= 0 || out->working_dir[0] != '/') return -1;
-  }
-  if (out->kind == REQUEST_BUILD_COPY) {
-    int source_rc = parse_string_field(req, "source", out->copy_source, sizeof(out->copy_source));
-    if (source_rc <= 0) return -1;
-    int dest_rc = parse_string_field(req, "dest", out->copy_dest, sizeof(out->copy_dest));
-    if (dest_rc <= 0) return -1;
-    char source_kind[16];
-    int kind_rc = parse_string_field(req, "source_kind", source_kind, sizeof(source_kind));
-    if (kind_rc <= 0) return -1;
-    if (strcmp(source_kind, "directory") == 0) {
-      out->copy_source_kind = COPY_KIND_DIR;
-    } else if (strcmp(source_kind, "file") == 0) {
-      out->copy_source_kind = COPY_KIND_FILE;
-    } else if (strcmp(source_kind, "sym_link") == 0) {
-      out->copy_source_kind = COPY_KIND_SYMLINK;
-    } else if (strcmp(source_kind, "auto") == 0) {
-      out->copy_source_kind = COPY_KIND_AUTO;
-    } else {
-      return -1;
-    }
-    int dest_is_dir = 0;
-    int dest_dir_rc = parse_bool_field(req, "dest_is_dir", &dest_is_dir);
-    if (dest_dir_rc < 0) return -1;
-    if (dest_dir_rc > 0) out->copy_dest_is_dir = dest_is_dir;
-    uint64_t entry_count = 0;
-    int count_rc = parse_u64_field(req, "entry_count", &entry_count);
-    if (count_rc <= 0 || entry_count > MAX_BUILD_CONTEXT_COPY_ENTRIES) return -1;
-    out->copy_entry_count = entry_count;
-    char source_disk[24];
-    int source_disk_rc = parse_string_field(req, "source_disk", source_disk, sizeof(source_disk));
-    if (source_disk_rc > 0) {
-      if (strcmp(source_disk, "context") == 0) {
-        out->copy_source_disk = COPY_SOURCE_CONTEXT;
-      } else if (strcmp(source_disk, "build_input") == 0) {
-        out->copy_source_disk = COPY_SOURCE_BUILD_INPUT;
-      } else {
-        return -1;
-      }
-    } else if (source_disk_rc < 0) {
-      return -1;
-    }
-    int input_index_rc = parse_u64_field(req, "input_index", &out->copy_input_index);
-    if (input_index_rc < 0 || out->copy_input_index >= MAX_BUILD_INPUT_DISKS) return -1;
-    if (out->copy_source_disk == COPY_SOURCE_CONTEXT) {
-      if (out->copy_source_kind == COPY_KIND_AUTO || out->copy_entry_count == 0 || out->copy_input_index != 0) return -1;
-    } else {
-      if (out->copy_source_kind != COPY_KIND_AUTO || out->copy_entry_count != 0 || input_index_rc <= 0) return -1;
-    }
   }
   if (out->protocol_v1 && (out->kind == REQUEST_START || out->kind == REQUEST_ATTACH)) {
     char stdio[16];
@@ -5883,6 +5787,41 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   int rc = read_build_command_from_spio(&client, parsed.build_command_len, command, sizeof(command), error, sizeof(error));
   close(pipe_fds[0]);
   return rc == 0 ? SPORE_AGENT_FUZZ_RUN_COMPLETE : SPORE_AGENT_FUZZ_RUN_REQUEST;
+}
+
+// The largest value each request bound accepts, for the host parity test.
+struct spore_agent_request_limits {
+  uint64_t request_bytes;
+  uint64_t argc;
+  uint64_t exec_args_bytes;
+  uint64_t shell_command_bytes;
+  uint64_t envc;
+  uint64_t env_bytes;
+  uint64_t working_dir_bytes;
+  uint64_t cache_mounts;
+  uint64_t context_binds;
+  uint64_t copy_path_bytes;
+  uint64_t copy_entries;
+  uint64_t build_input_disks;
+  uint64_t nofile;
+};
+
+__attribute__((visibility("hidden"))) void spore_agent_test_request_limits(struct spore_agent_request_limits *out) {
+  // read_line and parse_json_string keep one byte of each buffer for the NUL.
+  out->request_bytes = MAX_REQUEST - 1;
+  out->argc = MAX_ARGC;
+  out->exec_args_bytes = MAX_BUILD_EXEC_ARGS_BYTES;
+  out->shell_command_bytes = MAX_BUILD_RUN_COMMAND_LEN;
+  out->envc = MAX_ENVC;
+  out->env_bytes = MAX_ENV_LEN - 1;
+  out->working_dir_bytes = MAX_WORKDIR_LEN - 1;
+  out->cache_mounts = MAX_BUILD_CACHE_MOUNTS;
+  out->context_binds = MAX_BUILD_CONTEXT_BINDS;
+  // Also bounds cache-mount targets and context-bind paths.
+  out->copy_path_bytes = MAX_COPY_PATH_LEN;
+  out->copy_entries = MAX_BUILD_CONTEXT_COPY_ENTRIES;
+  out->build_input_disks = MAX_BUILD_INPUT_DISKS;
+  out->nofile = MAX_BUILD_NOFILE;
 }
 
 // Starts `/bin/sh -c captured_script` as a captured session, the state of a

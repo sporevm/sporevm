@@ -36,13 +36,13 @@ pub const default_build_memory = memory_config.Config.fixed(build_vm_memory_byte
 pub const default_build_vcpus: topology.VcpuCount = 1;
 pub const max_build_nofile: u64 = 1_048_576;
 pub const default_build_nofile = NofileLimit{ .soft = 65_536, .hard = 65_536 };
-const max_guest_request_len = 8191;
+const max_guest_request_len = run_mod.max_guest_request_len;
 pub const max_run_command_len = run_contract.max_shell_command_bytes;
 pub const max_run_exec_args = run_contract.max_exec_args;
 pub const max_run_exec_args_bytes = run_contract.max_exec_args_bytes;
-pub const max_guest_envc = 64;
-pub const max_guest_env_len = 255;
-pub const max_guest_working_dir_len = 255;
+pub const max_guest_envc = run_mod.max_guest_envc;
+pub const max_guest_env_len = run_mod.max_guest_env_len;
+pub const max_guest_working_dir_len = run_mod.max_guest_working_dir_len;
 pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
 pub const max_context_bind_mounts = 8;
@@ -1160,180 +1160,63 @@ fn runRequestJson(
     if (cache_mounts.len > cache_mount.max_mounts_per_run) return error.TooManyRunCacheMounts;
     if (context_bind_mounts.len > max_context_bind_mounts) return error.TooManyRunContextBindMounts;
     for (context_bind_mounts) |mount| try validateContextBindMount(mount);
-    if (context_bind_mounts.len != 0) switch (command) {
-        .shell => {},
-        .exec => return error.RunContextBindCommandUnsupported,
-    };
-    if (cache_mounts.len != 0 or context_bind_mounts.len != 0) {
-        const shell = switch (command) {
-            .shell => |value| value,
-            .exec => "",
-        };
-        const argv = switch (command) {
-            .shell => &.{},
-            .exec => |value| value,
-        };
-        if (shell.len > max_run_command_len) return error.RunCommandTooLong;
-        if (argv.len != 0) {
-            if (run_contract.execArgvViolation(argv)) |violation| switch (violation) {
+    // Shell form streams its command after the request; exec form sends argv.
+    var shell: []const u8 = "";
+    var argv: []const []const u8 = &.{};
+    switch (command) {
+        .shell => |value| {
+            if (value.len > max_run_command_len) return error.RunCommandTooLong;
+            shell = value;
+        },
+        .exec => |value| {
+            if (context_bind_mounts.len != 0) return error.RunContextBindCommandUnsupported;
+            if (run_contract.execArgvViolation(value)) |violation| switch (violation) {
                 .empty, .too_many_args => return error.RunArgCountUnsupported,
                 .empty_executable, .nul => return error.RunArgUnsupported,
                 .decoded_too_large => return error.RunRequestTooLarge,
             };
-        }
-        const PayloadMount = struct { target: []const u8, key: []const u8 };
-        const payload_mounts = try allocator.alloc(PayloadMount, cache_mounts.len);
-        defer allocator.free(payload_mounts);
-        for (cache_mounts, 0..) |mount, index| payload_mounts[index] = .{ .target = mount.target, .key = mount.key };
-        const PayloadBind = struct { source: []const u8, target: []const u8 };
-        const payload_binds = try allocator.alloc(PayloadBind, context_bind_mounts.len);
-        defer allocator.free(payload_binds);
-        for (context_bind_mounts, 0..) |mount, index| payload_binds[index] = .{ .source = mount.transport_source, .target = mount.target };
-        const Common = struct {
-            session_id: []const u8,
-            resume_time_unix_ns: u64,
-            command_len: usize,
-            argv: []const []const u8,
-            env: []const []const u8,
-            working_dir: []const u8,
-            nofile_soft: u64,
-            nofile_hard: u64,
-        };
-        const common = Common{
-            .session_id = session_id,
-            .resume_time_unix_ns = now,
-            .command_len = shell.len,
-            .argv = argv,
-            .env = env,
-            .working_dir = workdir,
-            .nofile_soft = nofile.soft,
-            .nofile_hard = nofile.hard,
-        };
-        if (context_bind_mounts.len == 0) {
-            const payload = struct {
-                type: []const u8 = "spore-build-run-v3",
-                session_id: []const u8,
-                resume_time_unix_ns: u64,
-                command_len: usize,
-                argv: []const []const u8,
-                env: []const []const u8,
-                working_dir: []const u8,
-                cache_mounts: []const PayloadMount,
-                stdio: []const u8 = "pipe",
-                term: []const u8 = "xterm",
-                terminal_rows: u16 = 24,
-                terminal_cols: u16 = 80,
-                memory_pressure: bool = false,
-                nofile_soft: u64,
-                nofile_hard: u64,
-                closed_env: bool = true,
-            }{
-                .session_id = common.session_id,
-                .resume_time_unix_ns = common.resume_time_unix_ns,
-                .command_len = common.command_len,
-                .argv = common.argv,
-                .env = common.env,
-                .working_dir = common.working_dir,
-                .cache_mounts = payload_mounts,
-                .nofile_soft = common.nofile_soft,
-                .nofile_hard = common.nofile_hard,
-            };
-            return std.json.Stringify.valueAlloc(allocator, payload, .{});
-        }
-        const payload = struct {
-            type: []const u8 = "spore-build-run-v4",
-            session_id: []const u8,
-            resume_time_unix_ns: u64,
-            command_len: usize,
-            argv: []const []const u8,
-            env: []const []const u8,
-            working_dir: []const u8,
-            cache_mounts: []const PayloadMount,
-            context_binds: []const PayloadBind,
-            stdio: []const u8 = "pipe",
-            term: []const u8 = "xterm",
-            terminal_rows: u16 = 24,
-            terminal_cols: u16 = 80,
-            memory_pressure: bool = false,
-            nofile_soft: u64,
-            nofile_hard: u64,
-            closed_env: bool = true,
-        }{
-            .session_id = common.session_id,
-            .resume_time_unix_ns = common.resume_time_unix_ns,
-            .command_len = common.command_len,
-            .argv = common.argv,
-            .env = common.env,
-            .working_dir = common.working_dir,
-            .cache_mounts = payload_mounts,
-            .context_binds = payload_binds,
-            .nofile_soft = common.nofile_soft,
-            .nofile_hard = common.nofile_hard,
-        };
-        return std.json.Stringify.valueAlloc(allocator, payload, .{});
+            argv = value;
+        },
     }
-    return switch (command) {
-        .shell => |shell| blk: {
-            if (shell.len > max_run_command_len) return error.RunCommandTooLong;
-            const payload = struct {
-                type: []const u8 = "spore-build-run-v1",
-                session_id: []const u8,
-                resume_time_unix_ns: u64,
-                command_len: usize,
-                env: []const []const u8,
-                working_dir: []const u8,
-                stdio: []const u8 = "pipe",
-                term: []const u8 = "xterm",
-                terminal_rows: u16 = 24,
-                terminal_cols: u16 = 80,
-                memory_pressure: bool = false,
-                nofile_soft: u64,
-                nofile_hard: u64,
-                closed_env: bool = true,
-            }{
-                .session_id = session_id,
-                .resume_time_unix_ns = now,
-                .command_len = shell.len,
-                .env = env,
-                .working_dir = workdir,
-                .nofile_soft = nofile.soft,
-                .nofile_hard = nofile.hard,
-            };
-            break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
-        },
-        .exec => |argv| blk: {
-            if (run_contract.execArgvViolation(argv)) |violation| switch (violation) {
-                .empty, .too_many_args => return error.RunArgCountUnsupported,
-                .empty_executable, .nul => return error.RunArgUnsupported,
-                .decoded_too_large => return error.RunRequestTooLarge,
-            };
-            const payload = struct {
-                type: []const u8 = "spore-build-run-v2",
-                session_id: []const u8,
-                resume_time_unix_ns: u64,
-                argv: []const []const u8,
-                env: []const []const u8,
-                working_dir: []const u8,
-                stdio: []const u8 = "pipe",
-                term: []const u8 = "xterm",
-                terminal_rows: u16 = 24,
-                terminal_cols: u16 = 80,
-                memory_pressure: bool = false,
-                nofile_soft: u64,
-                nofile_hard: u64,
-                closed_env: bool = true,
-            }{
-                .session_id = session_id,
-                .resume_time_unix_ns = now,
-                .argv = argv,
-                .env = env,
-                .working_dir = workdir,
-                .nofile_soft = nofile.soft,
-                .nofile_hard = nofile.hard,
-            };
-            break :blk try std.json.Stringify.valueAlloc(allocator, payload, .{});
-        },
+    const PayloadMount = struct { target: []const u8, key: []const u8 };
+    const payload_mounts = try allocator.alloc(PayloadMount, cache_mounts.len);
+    defer allocator.free(payload_mounts);
+    for (cache_mounts, 0..) |mount, index| payload_mounts[index] = .{ .target = mount.target, .key = mount.key };
+    const PayloadBind = struct { source: []const u8, target: []const u8 };
+    const payload_binds = try allocator.alloc(PayloadBind, context_bind_mounts.len);
+    defer allocator.free(payload_binds);
+    for (context_bind_mounts, 0..) |mount, index| payload_binds[index] = .{ .source = mount.transport_source, .target = mount.target };
+    const payload = struct {
+        type: []const u8 = "spore-build-run-v4",
+        session_id: []const u8,
+        resume_time_unix_ns: u64,
+        command_len: usize,
+        argv: []const []const u8,
+        env: []const []const u8,
+        working_dir: []const u8,
+        cache_mounts: []const PayloadMount,
+        context_binds: []const PayloadBind,
+        stdio: []const u8 = "pipe",
+        term: []const u8 = "xterm",
+        terminal_rows: u16 = 24,
+        terminal_cols: u16 = 80,
+        memory_pressure: bool = false,
+        nofile_soft: u64,
+        nofile_hard: u64,
+        closed_env: bool = true,
+    }{
+        .session_id = session_id,
+        .resume_time_unix_ns = now,
+        .command_len = shell.len,
+        .argv = argv,
+        .env = env,
+        .working_dir = workdir,
+        .cache_mounts = payload_mounts,
+        .context_binds = payload_binds,
+        .nofile_soft = nofile.soft,
+        .nofile_hard = nofile.hard,
     };
+    return std.json.Stringify.valueAlloc(allocator, payload, .{});
 }
 
 fn validateContextBindMount(mount: ContextBindMount) !void {
@@ -1369,7 +1252,7 @@ fn contextBindPathsOverlap(a: []const u8, b: []const u8) bool {
 fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: CopyRequest) ![]const u8 {
     try validateCopyRequest(request);
     const payload = struct {
-        type: []const u8 = "spore-build-copy-v4",
+        type: []const u8 = "spore-build-copy-v5",
         session_id: []const u8,
         source: []const u8,
         dest: []const u8,
@@ -1379,6 +1262,7 @@ fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: Co
         source_disk: []const u8,
         input_index: usize,
         mtime_unix_seconds: ?i64,
+        destination_policy: []const u8,
     }{
         .session_id = session_id,
         .source = request.source,
@@ -1389,36 +1273,9 @@ fn copyRequest(allocator: std.mem.Allocator, session_id: []const u8, request: Co
         .source_disk = @tagName(request.source_disk),
         .input_index = request.input_index,
         .mtime_unix_seconds = request.mtime_unix_seconds,
+        .destination_policy = @tagName(request.destination_policy),
     };
-    const json = switch (request.destination_policy) {
-        .follow => try std.json.Stringify.valueAlloc(allocator, payload, .{}),
-        .link => blk: {
-            const LinkPayload = struct {
-                type: []const u8 = "spore-build-copy-v5",
-                session_id: []const u8,
-                source: []const u8,
-                dest: []const u8,
-                source_kind: []const u8,
-                dest_is_dir: bool,
-                entry_count: usize,
-                source_disk: []const u8,
-                input_index: usize,
-                mtime_unix_seconds: ?i64,
-                destination_policy: []const u8 = "link",
-            };
-            break :blk try std.json.Stringify.valueAlloc(allocator, LinkPayload{
-                .session_id = session_id,
-                .source = request.source,
-                .dest = request.dest,
-                .source_kind = @tagName(request.source_kind),
-                .dest_is_dir = request.dest_is_dir,
-                .entry_count = request.entry_count,
-                .source_disk = @tagName(request.source_disk),
-                .input_index = request.input_index,
-                .mtime_unix_seconds = request.mtime_unix_seconds,
-            }, .{});
-        },
-    };
+    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
     return std.fmt.allocPrint(allocator, "{s}\n", .{json});
@@ -1546,6 +1403,22 @@ extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_block
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
 extern fn spore_agent_fuzz_build_resolv_target(target: [*]const u8, target_len: usize, logical: [*]u8, logical_cap: usize) c_int;
 extern fn spore_agent_test_bounded_readlink(target: [*]const u8, target_len: usize) c_int;
+const GuestRequestLimits = extern struct {
+    request_bytes: u64,
+    argc: u64,
+    exec_args_bytes: u64,
+    shell_command_bytes: u64,
+    envc: u64,
+    env_bytes: u64,
+    working_dir_bytes: u64,
+    cache_mounts: u64,
+    context_binds: u64,
+    copy_path_bytes: u64,
+    copy_entries: u64,
+    build_input_disks: u64,
+    nofile: u64,
+};
+extern fn spore_agent_test_request_limits(out: *GuestRequestLimits) void;
 extern fn spore_agent_test_exec_beside_running_session(captured_script: [*:0]const u8, request: [*]const u8, request_len: usize, input: [*]const u8, input_len: usize, response: [*]u8, response_cap: usize, captured_stdout: *u64) isize;
 extern fn spore_build_copy_test_confined_source_parent(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
 extern fn spore_build_copy_test_confined_mtime(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize, unix_seconds: i64) c_int;
@@ -1596,7 +1469,7 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
         }
 
         if (mode == 2) {
-            const request = "{\"type\":\"spore-build-run-v1\",\"command_len\":65537}\n";
+            const request = over_limit_shell_request;
             _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
             return;
         }
@@ -1642,6 +1515,27 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
         if (mode != 3) appendTestSpioFrame(&stream, &stream_len, 2, command.len, "");
         _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..stream_len].ptr, stream_len);
     }
+}
+
+test "host request limits match the guest agent" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    var guest: GuestRequestLimits = undefined;
+    spore_agent_test_request_limits(&guest);
+    try std.testing.expectEqual(@as(u64, run_mod.max_guest_request_len), guest.request_bytes);
+    try std.testing.expectEqual(@as(u64, max_run_exec_args), guest.argc);
+    try std.testing.expectEqual(@as(u64, run_mod.max_guest_argc), guest.argc);
+    try std.testing.expectEqual(@as(u64, max_run_exec_args_bytes), guest.exec_args_bytes);
+    try std.testing.expectEqual(@as(u64, max_run_command_len), guest.shell_command_bytes);
+    try std.testing.expectEqual(@as(u64, max_guest_envc), guest.envc);
+    try std.testing.expectEqual(@as(u64, max_guest_env_len), guest.env_bytes);
+    try std.testing.expectEqual(@as(u64, max_guest_working_dir_len), guest.working_dir_bytes);
+    try std.testing.expectEqual(@as(u64, cache_mount.max_mounts_per_run), guest.cache_mounts);
+    try std.testing.expectEqual(@as(u64, max_context_bind_mounts), guest.context_binds);
+    try std.testing.expectEqual(@as(u64, max_copy_entry_path_len), guest.copy_path_bytes);
+    try std.testing.expectEqual(@as(u64, cache_mount.max_target_bytes), guest.copy_path_bytes);
+    try std.testing.expectEqual(@as(u64, max_copy_entries), guest.copy_entries);
+    try std.testing.expectEqual(@as(u64, max_build_input_disks), guest.build_input_disks);
+    try std.testing.expectEqual(max_build_nofile, guest.nofile);
 }
 
 test "build agent fd budget covers every bounded hardlink authority" {
@@ -2225,7 +2119,8 @@ test "build copy request names context disk source" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
     defer parsed.deinit();
     const object = parsed.value.object;
-    try std.testing.expectEqualStrings("spore-build-copy-v4", object.get("type").?.string);
+    try std.testing.expectEqualStrings("spore-build-copy-v5", object.get("type").?.string);
+    try std.testing.expectEqualStrings("follow", object.get("destination_policy").?.string);
     try std.testing.expectEqualStrings("src", object.get("source").?.string);
     try std.testing.expectEqualStrings("/work", object.get("dest").?.string);
     try std.testing.expectEqualStrings("directory", object.get("source_kind").?.string);
@@ -2263,21 +2158,21 @@ test "build copy request accepts the root destination" {
     try std.testing.expectEqualStrings("/", parsed.value.object.get("dest").?.string);
 }
 
-test "build copy v4 guest parser rejects incomplete or ambiguous framing" {
+test "build copy guest parser rejects incomplete or ambiguous framing" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
-    const valid = "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null}\n";
+    const valid = "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"follow\"}\n";
     try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(valid.ptr, valid.len, valid[0..0].ptr, 0));
 
     const invalid = [_][]const u8{
         valid[0 .. valid.len - 1],
         valid[0 .. valid.len - 2] ++ ",}\n",
         valid[0 .. valid.len - 2] ++ " trailing\n",
-        "{\"type\":\"spore-build-copy-v4\",\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null}\n",
-        "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"extra\":true}\n",
-        "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0}\n",
-        "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":9223372036854775808}\n",
-        "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":-9223372036854775809}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"follow\"}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"follow\",\"extra\":true}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"destination_policy\":\"follow\"}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":9223372036854775808,\"destination_policy\":\"follow\"}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":-9223372036854775809,\"destination_policy\":\"follow\"}\n",
     };
     for (invalid) |request| {
         try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
@@ -2331,20 +2226,22 @@ test "build copy link request uses the strict v5 build-input contract" {
     }));
 }
 
-test "build copy v5 guest parser rejects incomplete or ambiguous link policy" {
+test "build copy guest parser requires one known destination policy" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
-    const valid = "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\"}\n";
-    try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(valid.ptr, valid.len, valid[0..0].ptr, 0));
+    const link = "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\"}\n";
+    const follow = "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"follow\"}\n";
+    for ([_][]const u8{ link, follow }) |request| {
+        try std.testing.expectEqual(guest_agent_fuzz_copy_request, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
+    }
 
     const invalid = [_][]const u8{
-        valid[0 .. valid.len - 1],
-        valid[0 .. valid.len - 2] ++ " trailing\n",
+        link[0 .. link.len - 1],
+        link[0 .. link.len - 2] ++ " trailing\n",
         "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null}\n",
-        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"follow\"}\n",
+        "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"merge\"}\n",
         "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"auto\",\"dest_is_dir\":false,\"entry_count\":0,\"source_disk\":\"build_input\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\",\"destination_policy\":\"link\"}\n",
         "{\"type\":\"spore-build-copy-v5\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\"}\n",
-        "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null,\"destination_policy\":\"link\"}\n",
     };
     for (invalid) |request| {
         try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
@@ -2405,25 +2302,31 @@ test "build copy request accepts exact path bound" {
     }));
 }
 
-test "build run request uses spore stream v1 start" {
+test "build shell-form RUN request streams its command" {
     const request = try runRequest(std.testing.allocator, "spore-build-1", .{ .shell = "echo ok" }, &.{"PATH=/usr/bin"}, "/work", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":7,\"argv\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"cache_mounts\":[],\"context_binds\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"nofile_soft\":65536") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"nofile_hard\":65536") != null);
 }
 
+const over_limit_shell_request = "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":65537,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
+
 fn rawExecRequestForTest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
     const payload = struct {
-        type: []const u8 = "spore-build-run-v2",
+        type: []const u8 = "spore-build-run-v4",
         session_id: []const u8 = "spore-build-test",
         resume_time_unix_ns: u64 = 1,
+        command_len: usize = 0,
         argv: []const []const u8,
         env: []const []const u8 = &.{},
         working_dir: []const u8 = "/",
+        cache_mounts: []const []const u8 = &.{},
+        context_binds: []const []const u8 = &.{},
         stdio: []const u8 = "pipe",
         term: []const u8 = "xterm",
         terminal_rows: u16 = 24,
@@ -2449,9 +2352,8 @@ test "build exec-form RUN request carries exact bounded argv" {
         std.testing.io,
     );
     defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v2\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"argv\":[\"printf\",\"%s|%s\",\"two words\",\"\",\"$VALUE\",\"control\\u0001\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "command_len") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":0,\"argv\":[\"printf\",\"%s|%s\",\"two words\",\"\",\"$VALUE\",\"control\\u0001\"]") != null);
     if (comptime guest_agent_fuzz_supported) {
         try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
     }
@@ -2484,7 +2386,7 @@ test "build exec-form RUN request carries exact bounded argv" {
     try std.testing.expectError(error.RunRequestTooLarge, validateRunRequest(std.testing.allocator, .{ .exec = &.{ "printf", escaped_controls } }, &.{"PATH=/usr/bin"}, "/", default_build_nofile));
 }
 
-test "cache-mounted RUN uses strict v3 request" {
+test "cache-mounted RUN request carries an exact mount list" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2501,21 +2403,20 @@ test "cache-mounted RUN uses strict v3 request" {
         std.testing.io,
     );
     defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-build-run-v4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"target\":\"/var/cache/apt\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"target\":\"/work/relative\"") != null);
     if (comptime guest_agent_fuzz_supported) {
         try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
-        const reused_key = "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/one\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"target\":\"/two\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
+        const reused_key = "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/one\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"target\":\"/two\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
         try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(reused_key.ptr, reused_key.len, reused_key[0..0].ptr, 0));
         const malformed = [_][]const u8{
             request[0 .. request.len - 1],
-            "{\"type\":\"spore-build-run-v3\"}\n",
-            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache/../escape\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache\",\"key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-            "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"target\":\"/cache/nested\",\"key\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\"}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache/../escape\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache\",\"key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/cache\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},{\"target\":\"/cache/nested\",\"key\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
         };
         for (malformed) |raw| {
             try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(raw.ptr, raw.len, raw[0..0].ptr, 0));
@@ -2523,7 +2424,7 @@ test "cache-mounted RUN uses strict v3 request" {
     }
 }
 
-test "context-bind RUN uses strict v4 request" {
+test "context-bind RUN request carries exact shell-form binds" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2573,7 +2474,6 @@ test "context-bind RUN uses strict v4 request" {
     if (comptime guest_agent_fuzz_supported) {
         try std.testing.expectEqual(guest_agent_fuzz_run_request, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0));
         const malformed = [_][]const u8{
-            "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
             "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[{\"source\":\"../x\",\"target\":\"/x\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
             "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[{\"source\":\"x\",\"target\":\"/proc/x\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
             "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":1,\"argv\":[],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[{\"source\":\"x\",\"target\":\"/run/buildkit/ssh_agent.0\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
@@ -2897,33 +2797,45 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     appendTestSpioFrame(&stream, &stream_len, 1, 0, "abc");
     try std.testing.expectEqual(guest_agent_fuzz_run_request, spore_agent_fuzz_build_request(run_request.ptr, run_request.len, stream[0..stream_len].ptr, stream_len));
 
-    const over_limit = "{\"type\":\"spore-build-run-v1\",\"command_len\":65537}\n";
-    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(over_limit.ptr, over_limit.len, stream[0..0].ptr, 0));
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(over_limit_shell_request.ptr, over_limit_shell_request.len, stream[0..0].ptr, 0));
 
     const empty_exec = try rawExecRequestForTest(std.testing.allocator, &.{});
     defer std.testing.allocator.free(empty_exec);
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(empty_exec.ptr, empty_exec.len, stream[0..0].ptr, 0));
 
-    const reordered_exec = "{\"closed_env\":true,\"nofile_hard\":1,\"nofile_soft\":1,\"memory_pressure\":false,\"terminal_cols\":80,\"terminal_rows\":24,\"term\":\"xterm\",\"stdio\":\"pipe\",\"working_dir\":\"/\",\"env\":[],\"argv\":[\"true\"],\"resume_time_unix_ns\":1,\"session_id\":\"s\",\"type\":\"spore-build-run-v2\"}\n";
+    const reordered_exec = "{\"closed_env\":true,\"nofile_hard\":1,\"nofile_soft\":1,\"memory_pressure\":false,\"terminal_cols\":80,\"terminal_rows\":24,\"term\":\"xterm\",\"stdio\":\"pipe\",\"context_binds\":[],\"cache_mounts\":[],\"working_dir\":\"/\",\"env\":[],\"argv\":[\"true\"],\"command_len\":0,\"resume_time_unix_ns\":1,\"session_id\":\"s\",\"type\":\"spore-build-run-v4\"}\n";
     try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(reordered_exec.ptr, reordered_exec.len, stream[0..0].ptr, 0));
 
     const malformed_exec_requests = [_][]const u8{
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\",],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true} trailing\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"argv\":[\"false\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-        "{\"type\":\"spore-build-run-v2\",\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true,\"unknown\":0}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"line\nbreak\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"tty\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
-        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":01,\"nofile_hard\":1,\"closed_env\":true}\n",
-        "{\"type\":\"start\",\"type\":\"spore-build-run-v2\",\"argv\":[\"/bin/true\"]}\n",
-        "{\"type\":\"spore-build-run-v2\",\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"command\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\",],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true} trailing\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"argv\":[\"false\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v4\",\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true,\"unknown\":0}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"line\nbreak\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"tty\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":01,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"start\",\"type\":\"spore-build-run-v4\",\"argv\":[\"/bin/true\"]}\n",
+        "{\"type\":\"spore-build-run-v4\",\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n",
+        "{\"type\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":4,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
     };
     for (malformed_exec_requests) |malformed| {
         try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(malformed.ptr, malformed.len, stream[0..0].ptr, 0));
+    }
+
+    const removed_versions = [_][]const u8{
+        "{\"type\":\"spore-build-run-v1\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":3,\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-run-v3\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[{\"target\":\"/one\",\"key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n",
+        "{\"type\":\"spore-build-copy-v2\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"entry_count\":1}\n",
+        "{\"type\":\"spore-build-copy-v3\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\"}\n",
+        "{\"type\":\"spore-build-copy-v4\",\"session_id\":\"s\",\"source\":\"input\",\"dest\":\"/output\",\"source_kind\":\"file\",\"dest_is_dir\":false,\"entry_count\":1,\"source_disk\":\"context\",\"input_index\":0,\"mtime_unix_seconds\":null}\n",
+    };
+    for (removed_versions) |removed| {
+        try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(removed.ptr, removed.len, stream[0..0].ptr, 0));
     }
 
     const missing_newline = reordered_exec[0 .. reordered_exec.len - 1];
@@ -2935,7 +2847,7 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     @memset(exactly_full[missing_newline.len..], ' ');
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(exactly_full.ptr, exactly_full.len, stream[0..0].ptr, 0));
 
-    const escaped_type_key = "{\"\\u0074ype\":\"spore-build-run-v2\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
+    const escaped_type_key = "{\"\\u0074ype\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
     try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(escaped_type_key.ptr, escaped_type_key.len, stream[0..0].ptr, 0));
 
     const ordinary_start = "{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n";
