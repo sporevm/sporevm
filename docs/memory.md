@@ -72,10 +72,10 @@ memory:
     size: <maximum_memory_size>
 ```
 
-Legacy fixed-memory manifests have no `memory_state`; their platform
-`ram_size`, memory logical size, requested size, and captured guest-visible size
-are all the same. Elastic captures use manifest version 4 (single vCPU) or 5
-(multi-vCPU schema) and add backend-neutral `memory_state` containing:
+Fixed-memory manifests have no `memory_state`; their platform `ram_size`,
+memory logical size, requested size, and captured guest-visible size are all
+the same. Elastic captures, which are single-vCPU only, add backend-neutral
+`memory_state` containing:
 
 - `initial_size` and `maximum_size`, including initial RAM;
 - `requested_size`, the guest-visible target requested from virtio-mem at capture;
@@ -87,8 +87,7 @@ are all the same. Elastic captures use manifest version 4 (single vCPU) or 5
 Resume allocates the declared maximum, maps only initial RAM plus the captured
 requested prefix, recreates the virtio-mem device, and restores its exact
 plugged bitmap before vCPUs run. Raw KVM or Hypervisor.framework structures
-never enter the manifest. Older readers reject versions 4/5; current readers
-continue to interpret versions 2/3 as fixed memory.
+never enter the manifest.
 
 The backing file is never portable restore authority. Product restore maps it
 only when `ram.backing.proof` validates against the canonical memory index

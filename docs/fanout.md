@@ -12,9 +12,8 @@ Children are named `000000` through zero-padded `N-1` and share the parent's
 chunk store. `spore fanout` is local orchestration over child spore directories;
 distributed offset/range partitioning is deferred.
 
-`spore checkpoint fork` preserves the source checkpoint's manifest version and
-vCPU count. A
-source saved with `--vcpus 4` mints children that also restore with 4 vCPUs;
+`spore checkpoint fork` preserves the source checkpoint's vCPU count. A source
+saved with `--vcpus 4` mints children that also restore with 4 vCPUs;
 fork does not downshift an already-booted guest to a smaller CPU topology.
 
 For a running named VM, `spore vm fork NAME --count N --name PATTERN` creates
