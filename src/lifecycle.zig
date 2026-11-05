@@ -3101,14 +3101,21 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
 
 pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec) !void {
     try validateSpec(spec);
-    try ensureVmDir(io, paths);
     const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
+    // readSpecFile must read back every spec written here, and readFileAlloc
+    // fails once its limit is reached.
+    if (json.len >= max_metadata_bytes) return error.SpecTooLarge;
+    try ensureVmDir(io, paths);
     try chunk_sealer.replaceFileAtomicDurable(allocator, paths.spec_path, json, 0o600);
 }
 
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
-    const data = try Io.Dir.cwd().readFileAlloc(io, paths.spec_path, allocator, .limited(max_metadata_bytes));
+    return readSpecFile(allocator, io, paths.spec_path);
+}
+
+pub fn readSpecFile(allocator: std.mem.Allocator, io: Io, spec_path: []const u8) !std.json.Parsed(Spec) {
+    const data = try Io.Dir.cwd().readFileAlloc(io, spec_path, allocator, .limited(max_metadata_bytes));
     defer allocator.free(data);
     const legacy_memory = try legacyMemoryFromSpecJson(allocator, data);
     var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
@@ -6954,6 +6961,36 @@ test "lifecycle paths are rooted under vms by name" {
     try std.testing.expect(std.mem.endsWith(u8, paths.control_socket_owner_path, control_socket_owner_suffix));
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/console.log", paths.console_log_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor.log", paths.monitor_log_path);
+}
+
+test "lifecycle refuses to write a spec it cannot read back" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "large");
+    defer paths.deinit(allocator);
+
+    // Size `kernel_path` so the spec lands exactly on the reader's limit.
+    try writeSpec(allocator, io, paths, .{ .name = "large", .kernel_path = "" });
+    const base_len = (try Io.Dir.cwd().statFile(io, paths.spec_path, .{})).size;
+    try Io.Dir.cwd().deleteFile(io, paths.spec_path);
+    const kernel_path = try allocator.alloc(u8, max_metadata_bytes - base_len);
+    defer allocator.free(kernel_path);
+    @memset(kernel_path, 'k');
+
+    try std.testing.expectError(error.SpecTooLarge, writeSpec(allocator, io, paths, .{ .name = "large", .kernel_path = kernel_path }));
+    try std.testing.expectError(error.FileNotFound, readSpec(allocator, io, paths));
+
+    try writeSpec(allocator, io, paths, .{ .name = "large", .kernel_path = kernel_path[1..] });
+    try std.testing.expectEqual(max_metadata_bytes - 1, (try Io.Dir.cwd().statFile(io, paths.spec_path, .{})).size);
+    var spec = try readSpec(allocator, io, paths);
+    defer spec.deinit();
+    try std.testing.expectEqual(kernel_path.len - 1, spec.value.kernel_path.?.len);
 }
 
 test "lifecycle metadata helpers round trip spec ready and pid" {

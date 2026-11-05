@@ -9,6 +9,7 @@ const build_step_cache = @import("build/step_cache.zig");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
+const lifecycle = @import("lifecycle.zig");
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
@@ -20,7 +21,6 @@ const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
 const test_barrier = @import("test_barrier.zig");
 const default_prune_max_bytes = 0;
-const max_runtime_spec_bytes = 64 * 1024;
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const max_root_record_bytes = 1024 * 1024;
 
@@ -309,11 +309,6 @@ const RuntimeForkPlanEntry = struct {
     bytes: u64,
     mtime_ns: i96,
     selected: bool = false,
-};
-
-const RuntimeVmSpecRef = struct {
-    resume_dir: ?[]const u8 = null,
-    disk_baseline_lease: ?runtime_disk_lease.Lease = null,
 };
 
 const RootfsStorageRoot = struct {
@@ -1644,19 +1639,9 @@ fn collectStorageRootsFromRuntimeLeases(
     var it = vms_dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        const spec_path = try std.fs.path.join(allocator, &.{ vms_dir_path, entry.name, "spec.json" });
-        const data = Io.Dir.cwd().readFileAlloc(io, spec_path, allocator, .limited(max_runtime_spec_bytes)) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            error.StreamTooLong => return error.BadManifest,
-            else => |e| return e,
-        };
-        defer allocator.free(data);
-        var parsed = std.json.parseFromSlice(RuntimeVmSpecRef, allocator, data, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        }) catch return error.BadManifest;
-        defer parsed.deinit();
-        const lease = parsed.value.disk_baseline_lease orelse continue;
+        var spec = try readRuntimeVmSpec(allocator, io, vms_dir_path, entry.name) orelse continue;
+        defer spec.deinit();
+        const lease = spec.value.disk_baseline_lease orelse continue;
         try addStorageRootFromRuntimeLease(allocator, io, cache_root, lease, storage_roots);
     }
 }
@@ -1702,19 +1687,9 @@ fn collectRuntimeLeaseProtectedPaths(
     var it = vms_dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        const spec_path = try std.fs.path.join(allocator, &.{ vms_dir_path, entry.name, "spec.json" });
-        const data = Io.Dir.cwd().readFileAlloc(io, spec_path, allocator, .limited(max_runtime_spec_bytes)) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            error.StreamTooLong => return error.BadManifest,
-            else => |e| return e,
-        };
-        defer allocator.free(data);
-        var parsed = std.json.parseFromSlice(RuntimeVmSpecRef, allocator, data, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        }) catch return error.BadManifest;
-        defer parsed.deinit();
-        const lease = parsed.value.disk_baseline_lease orelse continue;
+        var spec = try readRuntimeVmSpec(allocator, io, vms_dir_path, entry.name) orelse continue;
+        defer spec.deinit();
+        const lease = spec.value.disk_baseline_lease orelse continue;
         try addProtectedPathsFromRuntimeLease(allocator, io, cache_root, lease, protected_paths);
     }
 }
@@ -2021,22 +1996,25 @@ fn collectRuntimeForkRefs(allocator: std.mem.Allocator, io: Io, runtime_root: []
     var it = vms_dir.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        const spec_path = try std.fs.path.join(allocator, &.{ vms_dir_path, entry.name, "spec.json" });
-        const data = Io.Dir.cwd().readFileAlloc(io, spec_path, allocator, .limited(max_runtime_spec_bytes)) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => |e| return e,
-        };
-        defer allocator.free(data);
-        var parsed = std.json.parseFromSlice(RuntimeVmSpecRef, allocator, data, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        }) catch return error.BadManifest;
-        defer parsed.deinit();
-        const resume_dir = parsed.value.resume_dir orelse continue;
+        var spec = try readRuntimeVmSpec(allocator, io, vms_dir_path, entry.name) orelse continue;
+        defer spec.deinit();
+        const resume_dir = spec.value.resume_dir orelse continue;
         try refs.append(try std.fs.path.resolve(allocator, &.{resume_dir}));
     }
 
     return refs.toOwnedSlice();
+}
+
+/// Reads a named VM spec with the lifecycle reader. Null means the VM has no
+/// spec; a spec lifecycle cannot read fails closed.
+fn readRuntimeVmSpec(allocator: std.mem.Allocator, io: Io, vms_dir_path: []const u8, name: []const u8) !?std.json.Parsed(lifecycle.Spec) {
+    const spec_path = try std.fs.path.join(allocator, &.{ vms_dir_path, name, "spec.json" });
+    defer allocator.free(spec_path);
+    return lifecycle.readSpecFile(allocator, io, spec_path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
 }
 
 fn pathReferenced(path: []const u8, refs: []const []const u8) bool {
@@ -2989,7 +2967,7 @@ test "system prunes only unreferenced runtime fork batches" {
     try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ root, "vms", "worker" }));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ live_child, "manifest.json" }), .data = "live" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, "forks", "dead", "manifest.json" }), .data = "dead" });
-    const spec = try std.fmt.allocPrint(allocator, "{{\"resume_dir\":\"{s}\"}}", .{live_child});
+    const spec = try std.fmt.allocPrint(allocator, "{{\"name\":\"worker\",\"resume_dir\":\"{s}\"}}", .{live_child});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, "vms", "worker", "spec.json" }), .data = spec });
 
     const opts = PrunePlanOptions{
@@ -3225,7 +3203,8 @@ test "runtime disk lease protects its cache baseline from prune and gc" {
         .sub_path = try std.fs.path.join(allocator, &.{ resume_dir, "manifest.json" }),
         .data = manifest_json,
     });
-    const spec_json = try std.json.Stringify.valueAlloc(allocator, RuntimeVmSpecRef{
+    const spec_json = try std.json.Stringify.valueAlloc(allocator, lifecycle.Spec{
+        .name = "child",
         .resume_dir = resume_dir,
         .disk_baseline_lease = .{
             .store = .rootfs_cache,
@@ -3269,6 +3248,51 @@ test "runtime disk lease protects its cache baseline from prune and gc" {
     try std.testing.expect(try fileExists(io, rooted_object_path));
     try std.testing.expect(!try fileExists(io, gc_orphan_index_path));
     try std.testing.expect(!try fileExists(io, gc_orphan_object_path));
+}
+
+test "system prune and gc read named VM specs larger than 64 KiB" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "cache" });
+    const runtime_root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    const leased = try writeGcStorageFixture(allocator, io, root, null, 0x64);
+    // The largest annotation set create accepts pushes spec.json past 64 KiB.
+    const key = "dev.sporevm.test";
+    const value = try allocator.alloc(u8, spore.max_annotations_json_bytes - key.len - 7);
+    @memset(value, 'a');
+    var annotations = spore.Annotations{};
+    try annotations.map.put(allocator, key, value);
+    const paths = try lifecycle.pathsFromRoot(allocator, runtime_root, "large");
+    try lifecycle.writeSpec(allocator, io, paths, .{
+        .name = "large",
+        .annotations = annotations,
+        .disk_baseline_lease = .{
+            .store = .rootfs_cache,
+            .root = root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = leased.storage.index_digest,
+            .rootfs_storage = leased.storage,
+        },
+    });
+    try std.testing.expect((try Io.Dir.cwd().statFile(io, paths.spec_path, .{})).size > 64 * 1024);
+
+    _ = try prune(allocator, io, .{
+        .cache_root = root,
+        .runtime_root = runtime_root,
+        .dry_run = false,
+        .include_rootfs_chunks = true,
+        .max_bytes = 0,
+    }, std.time.ns_per_s);
+    _ = try gc(allocator, io, .{ .cache_root = root, .runtime_root = runtime_root, .dry_run = false });
+    try std.testing.expect(try fileExists(io, try rootfs_cas.manifestIndexPath(allocator, root, leased.storage.index_digest)));
+    try std.testing.expect(try fileExists(io, try rootfs_cas.manifestObjectPath(allocator, root, leased.object_digest)));
 }
 
 test "lazy runtime survives destructive prune and gc before its first cas read" {
