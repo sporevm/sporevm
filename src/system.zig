@@ -1793,7 +1793,12 @@ fn collectStorageRootFromRefPath(
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return error.BadManifest;
-    const cache_key = parsed.value.rootfs_cache_key orelse return error.BadManifest;
+    const cache_key = parsed.value.rootfs_cache_key orelse {
+        // A local ref names `<cache_root>/<key>.json` metadata, which the
+        // metadata scan already roots, so it adds no root of its own.
+        rootfs.validateLocalRefRecord(allocator, data) catch return error.BadManifest;
+        return;
+    };
     if (!isLowerHexDigest(cache_key)) return error.BadManifest;
     const metadata_name = try std.fmt.allocPrint(allocator, "{s}.json", .{cache_key});
     const metadata_path = try std.fs.path.join(allocator, &.{ cache_root, metadata_name });
@@ -3150,6 +3155,49 @@ test "system cache gc preserves rooted disk index objects and deletes CAS orphan
     try std.testing.expect(!try fileExists(io, orphan_object_path));
     try std.testing.expect(!try fileExists(io, orphan_stamp_path));
     try std.testing.expect(!try fileExists(io, stray_object_path));
+}
+
+test "system cache gc keeps local image ref storage and collects unreferenced CAS" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+
+    const referenced = try writeGcStorageFixture(allocator, io, root, null, 0x71);
+    const orphan = try writeGcStorageFixture(allocator, io, root, null, 0x72);
+    try rootfs_cas.markStorageComplete(io, allocator, root, referenced.storage.index_digest);
+    var published: rootfs.PublishIndexedImageResult = undefined;
+    {
+        var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
+        defer cache_lock.deinit();
+        published = try rootfs.publishIndexedImageWithCacheLockHeld(io, allocator, root, .{
+            .ref = "local/app:dev",
+            .rootfs_storage = referenced.storage,
+        });
+    }
+    const referenced_index_path = try rootfs_cas.manifestIndexPath(allocator, root, referenced.storage.index_digest);
+    const referenced_object_path = try rootfs_cas.manifestObjectPath(allocator, root, referenced.object_digest);
+    const orphan_index_path = try rootfs_cas.manifestIndexPath(allocator, root, orphan.storage.index_digest);
+    const orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest);
+
+    const result = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 0), result.unparseable_ref_count);
+    try std.testing.expect(try fileExists(io, referenced_index_path));
+    try std.testing.expect(try fileExists(io, referenced_object_path));
+    try std.testing.expect(!try fileExists(io, orphan_index_path));
+    try std.testing.expect(!try fileExists(io, orphan_object_path));
+
+    // Pruning the image metadata leaves the local ref naming nothing, so its
+    // storage becomes collectable.
+    try Io.Dir.cwd().deleteFile(io, published.metadata_path);
+    const after_prune = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 0), after_prune.unparseable_ref_count);
+    try std.testing.expect(try fileExists(io, published.local_ref_path));
+    try std.testing.expect(!try fileExists(io, referenced_index_path));
+    try std.testing.expect(!try fileExists(io, referenced_object_path));
 }
 
 test "runtime disk lease protects its cache baseline from prune and gc" {
