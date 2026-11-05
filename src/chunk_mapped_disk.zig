@@ -50,24 +50,13 @@ const Source = enum(u8) {
     cas,
 };
 
-const DigestEntry = struct {
-    logical_chunk: u64,
-    id: chunk.ChunkId,
-};
+const DigestEntry = disk_index.DiskIndexChunk;
 
 const DigestIndex = struct {
     entries: []DigestEntry = &.{},
 
     fn fromDiskIndex(allocator: std.mem.Allocator, index: disk_index.DiskIndex) Error!DigestIndex {
-        const entries = try allocator.alloc(DigestEntry, index.chunks.len);
-        errdefer if (entries.len != 0) allocator.free(entries);
-        for (index.chunks, 0..) |entry, i| {
-            entries[i] = .{
-                .logical_chunk = entry.logical_chunk,
-                .id = try chunkIdFromDigest(entry.digest),
-            };
-        }
-        return .{ .entries = entries };
+        return .{ .entries = try allocator.dupe(DigestEntry, index.chunks) };
     }
 
     fn clone(self: DigestIndex, allocator: std.mem.Allocator) Error!DigestIndex {
@@ -457,8 +446,8 @@ pub const ChunkMappedDisk = struct {
             .zero, .zero_dirty => @memset(buf, 0),
             .cas => {
                 const id = self.digest_index.get(@intCast(chunk_index)) orelse return error.BadManifest;
-                var digest_buf: ManifestDigest = undefined;
-                const data = try self.readCasObject(manifestDigest(id, &digest_buf), buf.len, null);
+                const digest = id.toDigest();
+                const data = try self.readCasObject(&digest, buf.len, null);
                 defer self.allocator.free(data);
                 @memcpy(buf, data);
             },
@@ -988,10 +977,7 @@ pub const ChunkMappedDisk = struct {
         if (self.isPoisoned()) return error.Poisoned;
         if (self.remote != null) return error.RemoteBackedSnapshot;
         var chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
-        errdefer {
-            for (chunks.items) |entry| self.allocator.free(entry.digest);
-            chunks.deinit(self.allocator);
-        }
+        errdefer chunks.deinit(self.allocator);
         var zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
         defer zero_ranges.deinit(self.allocator);
 
@@ -1057,15 +1043,14 @@ pub const ChunkMappedDisk = struct {
                 if (parent_id) |id| {
                     const object_len = try self.chunkLen(chunk_index);
                     parent_stats.referenced_bytes +|= object_len;
-                    var digest_buf: ManifestDigest = undefined;
-                    const digest = manifestDigest(id, &digest_buf);
-                    try appendChunkEntry(self.allocator, &chunks, chunk_index, digest);
+                    const digest = id.toDigest();
+                    try chunks.append(self.allocator, .{ .logical_chunk = logical_chunk, .id = id });
                     parent_chunks_reused += 1;
                     if (!std.mem.eql(u8, self.parent_root.?, dir)) {
                         const entry = try published_parent_objects.getOrPut(id);
                         if (!entry.found_existing) {
                             const publish_start_ns = try monotonicNs();
-                            const outcome = try self.publishParentObject(self.parent_root.?, dir, digest, object_len);
+                            const outcome = try self.publishParentObject(self.parent_root.?, dir, &digest, object_len);
                             parent_stats.record(outcome, object_len, elapsedSince(publish_start_ns));
                             if (outcome == .linked) linked_parent_object = true;
                         }
@@ -1082,8 +1067,7 @@ pub const ChunkMappedDisk = struct {
                 switch (batch.results[parallel_result_cursor]) {
                     .zero => try disk_index.appendZeroChunk(self.allocator, &zero_ranges, @intCast(chunk_index)),
                     .data => |id| {
-                        var digest_buf: ManifestDigest = undefined;
-                        try appendChunkEntry(self.allocator, &chunks, chunk_index, manifestDigest(id, &digest_buf));
+                        try chunks.append(self.allocator, .{ .logical_chunk = logical_chunk, .id = id });
                         sealed_data_objects = true;
                     },
                 }
@@ -1107,10 +1091,7 @@ pub const ChunkMappedDisk = struct {
         }
 
         const chunk_slice = try chunks.toOwnedSlice(self.allocator);
-        defer {
-            for (chunk_slice) |entry| self.allocator.free(entry.digest);
-            self.allocator.free(chunk_slice);
-        }
+        defer self.allocator.free(chunk_slice);
 
         const index = disk_index.DiskIndex{
             .kind = disk_index.disk_index_kind,
@@ -1266,16 +1247,10 @@ pub const ChunkMappedDisk = struct {
                 return false;
             },
             .data => |id| {
-                const hex = id.toHex();
-                const digest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
-                errdefer self.allocator.free(digest);
-                const object_path = try rootfs_cas.manifestObjectPath(self.allocator, dir, digest);
+                const object_path = try rootfs_cas.objectPath(self.allocator, dir, id);
                 defer self.allocator.free(object_path);
                 _ = try chunk_sealer.writePathAllIfMissingTimedForBatch(self.allocator, object_path, data, work_stats);
-                try chunks.append(self.allocator, .{
-                    .logical_chunk = @intCast(chunk_index),
-                    .digest = digest,
-                });
+                try chunks.append(self.allocator, .{ .logical_chunk = @intCast(chunk_index), .id = id });
                 return true;
             },
         }
@@ -1386,10 +1361,9 @@ pub const ChunkMappedDisk = struct {
             self.recordLazyCasFault(false, 0, fault_start_ns, write_ns, object_stats);
         };
         const id = self.digest_index.get(@intCast(chunk_index)) orelse return error.BadManifest;
-        var digest_buf: ManifestDigest = undefined;
-        const digest = manifestDigest(id, &digest_buf);
+        const digest = id.toDigest();
         const len = try self.chunkLen(chunk_index);
-        const data = try self.readCasObject(digest, len, if (trace_enabled) &object_stats else null);
+        const data = try self.readCasObject(&digest, len, if (trace_enabled) &object_stats else null);
         defer self.allocator.free(data);
         const offset = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;
         const write_start_ns = if (trace_enabled) monotonicNs() catch 0 else 0;
@@ -1625,40 +1599,12 @@ fn sealSnapshotChunkWorker(context: *SnapshotSealContext, item_index: usize, wor
     context.results[item_index] = switch (sealed) {
         .zero => .zero,
         .data => |id| result: {
-            var digest_buf: ManifestDigest = undefined;
-            const object_path = try rootfs_cas.manifestObjectPath(std.heap.page_allocator, context.dir, manifestDigest(id, &digest_buf));
+            const object_path = try rootfs_cas.objectPath(std.heap.page_allocator, context.dir, id);
             defer std.heap.page_allocator.free(object_path);
             _ = try chunk_sealer.writePathAllIfMissingTimedForBatch(std.heap.page_allocator, object_path, data, work_stats);
             break :result .{ .data = id };
         },
     };
-}
-
-const ManifestDigest = [spore.rootfs_digest_prefix.len + chunk.ChunkId.hex_len]u8;
-
-fn chunkIdFromDigest(digest: []const u8) Error!chunk.ChunkId {
-    return chunk.ChunkId.fromHex(try spore.diskDigestHex(digest)) catch return error.BadManifest;
-}
-
-fn manifestDigest(id: chunk.ChunkId, buf: *ManifestDigest) []const u8 {
-    @memcpy(buf[0..spore.rootfs_digest_prefix.len], spore.rootfs_digest_prefix);
-    const hex = id.toHex();
-    @memcpy(buf[spore.rootfs_digest_prefix.len..], &hex);
-    return buf;
-}
-
-fn appendChunkEntry(
-    allocator: std.mem.Allocator,
-    chunks: *std.ArrayList(disk_index.DiskIndexChunk),
-    chunk_index: usize,
-    digest: []const u8,
-) Error!void {
-    const cloned_digest = try allocator.dupe(u8, digest);
-    errdefer allocator.free(cloned_digest);
-    try chunks.append(allocator, .{
-        .logical_chunk = @intCast(chunk_index),
-        .digest = cloned_digest,
-    });
 }
 
 fn computeChunkCount(size: u64, chunk_size: u64) Error!u64 {
@@ -1797,16 +1743,15 @@ fn freeTestDisk(allocator: std.mem.Allocator, disk: spore.Disk) void {
     allocator.free(disk.object_namespace);
 }
 
-fn digestForChunk(index: disk_index.DiskIndex, logical_chunk: u64) Error![]const u8 {
+fn idForChunk(index: disk_index.DiskIndex, logical_chunk: u64) Error!chunk.ChunkId {
     for (index.chunks) |entry| {
-        if (entry.logical_chunk == logical_chunk) return entry.digest;
+        if (entry.logical_chunk == logical_chunk) return entry.id;
     }
     return error.BadManifest;
 }
 
-fn expectChunkDigest(index: disk_index.DiskIndex, logical_chunk: u64, digest: []const u8) !void {
-    const actual = try digestForChunk(index, logical_chunk);
-    try std.testing.expectEqualStrings(digest, actual);
+fn expectChunkId(index: disk_index.DiskIndex, logical_chunk: u64, id: chunk.ChunkId) !void {
+    try std.testing.expect(id.eql(try idForChunk(index, logical_chunk)));
 }
 
 fn expectZeroChunk(index: disk_index.DiskIndex, logical_chunk: u64) !void {
@@ -1828,8 +1773,6 @@ test "sparse raw digest index reduces dense lazy runtime ownership" {
     };
     const cache_root = "x" ** 81;
     const id = chunk.ChunkId.fromContents("runtime digest ownership fixture");
-    var digest_buf: ManifestDigest = undefined;
-    const digest = manifestDigest(id, &digest_buf);
 
     for (cases, 0..) |case, case_index| {
         var name_buf: [32]u8 = undefined;
@@ -1842,7 +1785,7 @@ test "sparse raw digest index reduces dense lazy runtime ownership" {
         const chunks = try allocator.alloc(disk_index.DiskIndexChunk, case.nonzero_chunks);
         defer allocator.free(chunks);
         for (chunks, 0..) |*entry, logical_chunk| {
-            entry.* = .{ .logical_chunk = @intCast(logical_chunk), .digest = digest };
+            entry.* = .{ .logical_chunk = @intCast(logical_chunk), .id = id };
         }
         const zero_ranges = [_]disk_index.DiskIndexZeroRange{.{ .start = case.nonzero_chunks, .count = case.source_count - case.nonzero_chunks }};
         const index = disk_index.DiskIndex{
@@ -1866,7 +1809,7 @@ test "sparse raw digest index reduces dense lazy runtime ownership" {
         try std.testing.expectEqual(@as(usize, @intCast(indexStatePayloadBytes(case.source_count, cache_root, index))), live_bytes);
         try std.testing.expectEqual(@as(usize, 3) + @as(usize, @intFromBool(case.nonzero_chunks != 0)), live_allocations);
         if (case_index == 0) {
-            const legacy_bytes = case.source_count * @sizeOf(Source) + case.source_count * @sizeOf(?[]const u8) * 2 + cache_root.len * 2 + case.nonzero_chunks * @sizeOf(ManifestDigest) * 2;
+            const legacy_bytes = case.source_count * @sizeOf(Source) + case.source_count * @sizeOf(?[]const u8) * 2 + cache_root.len * 2 + case.nonzero_chunks * @sizeOf(chunk.ChunkId.Digest) * 2;
             const legacy_allocations = 5 + case.nonzero_chunks * 2;
             try std.testing.expectEqual(@as(usize, 3_704_220), legacy_bytes);
             try std.testing.expectEqual(@as(usize, 791_898), live_bytes);
@@ -2050,8 +1993,8 @@ test "known zero growth rejects a corrupt partial CAS tail before mutation" {
         .index_digest = preload.index_digest,
     });
     defer index.deinit();
-    const tail_digest = try digestForChunk(index.value, 1);
-    const object_path = try rootfs_cas.manifestObjectPath(arena, parent_cache, tail_digest);
+    const tail_id = try idForChunk(index.value, 1);
+    const object_path = try rootfs_cas.objectPath(arena, parent_cache, tail_id);
     try std.Io.Dir.cwd().deleteFile(io, object_path);
     const corrupt_tail = [_]u8{0xa5} ** (old_size - chunk_size);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = object_path, .data = &corrupt_tail });
@@ -2070,7 +2013,6 @@ test "known zero growth rejects a corrupt partial CAS tail before mutation" {
     try std.testing.expectEqual(@as(u64, old_size), disk.capacityBytes());
     try std.testing.expectEqual(@as(usize, 2), disk.chunkCount());
     try std.testing.expectEqual(Source.cas, disk.sources[1]);
-    const tail_id = try chunkIdFromDigest(tail_digest);
     try std.testing.expect(tail_id.eql(disk.digest_index.get(1) orelse return error.TestExpectedEqual));
     try std.testing.expectEqual(@as(u64, old_size), disk.parent_logical_size);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
@@ -2248,11 +2190,11 @@ test "zero range clears a full lazy CAS chunk without fetching and rejects a cor
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
 
-    const digest_a = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const digest_b = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const digest_a_id = chunk.ChunkId{ .bytes = @splat(0xaa) };
+    const digest_b_id = chunk.ChunkId{ .bytes = @splat(0xbb) };
     const chunks = [_]disk_index.DiskIndexChunk{
-        .{ .logical_chunk = 0, .digest = digest_a },
-        .{ .logical_chunk = 1, .digest = digest_b },
+        .{ .logical_chunk = 0, .id = digest_a_id },
+        .{ .logical_chunk = 1, .id = digest_b_id },
     };
     const index = disk_index.DiskIndex{
         .kind = disk_index.disk_index_kind,
@@ -2267,8 +2209,6 @@ test "zero range clears a full lazy CAS chunk without fetching and rejects a cor
     var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, total_size, chunk_size);
     defer disk.deinit();
     try disk.attachCasIndex("/missing-cache", index);
-    const digest_a_id = try chunkIdFromDigest(digest_a);
-    const digest_b_id = try chunkIdFromDigest(digest_b);
 
     // A complete chunk does not need its old payload to establish zeroes.
     try disk.zeroRange(0, chunk_size);
@@ -2441,8 +2381,8 @@ test "known zero growth rolls back every fallible allocation" {
             var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, chunk_size, chunk_size);
             defer disk.deinit();
 
-            const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-            const chunks = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = digest }};
+            const parent_id = chunk.ChunkId{ .bytes = @splat(0xaa) };
+            const chunks = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .id = parent_id }};
             const index = disk_index.DiskIndex{
                 .kind = disk_index.disk_index_kind,
                 .logical_size = chunk_size,
@@ -2452,7 +2392,6 @@ test "known zero growth rolls back every fallible allocation" {
                 .chunks = &chunks,
             };
             try disk.attachParentIndex("/parent-cache", index);
-            const parent_id = try chunkIdFromDigest(digest);
 
             disk.growKnownZero(2 * chunk_size) catch |err| {
                 if (err != error.OutOfMemory) return err;
@@ -2535,7 +2474,7 @@ test "snapshot writes disk index and chunk objects" {
     try std.testing.expectEqual(@as(usize, 0), parsed.value.zero_ranges.len);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
 
-    const object_path = try rootfs_cas.manifestObjectPath(allocator, spore_dir, parsed.value.chunks[0].digest);
+    const object_path = try rootfs_cas.objectPath(allocator, spore_dir, parsed.value.chunks[0].id);
     defer allocator.free(object_path);
     try std.Io.Dir.cwd().access(io, object_path, .{ .read = true });
 }
@@ -2783,7 +2722,7 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     defer snapshot_index.deinit();
     try std.testing.expectEqual(snapshot_index.value.chunks.len, fork_b.disk.digest_index.entries.len);
     try expectZeroChunk(snapshot_index.value, 1);
-    try expectChunkDigest(snapshot_index.value, 2, try digestForChunk(parent_index.value, 2));
+    try expectChunkId(snapshot_index.value, 2, try idForChunk(parent_index.value, 2));
     try std.testing.expectEqual(@as(usize, 0), fork_b.disk.dirtyChunkCount());
     try std.testing.expectEqual(Source.overlay_clean, fork_b.disk.sources[6]);
     var promoted_after_snapshot: [64]u8 = undefined;
@@ -2817,7 +2756,8 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     for (second_full_index.value.chunks) |entry| {
         const offset: usize = @intCast(entry.logical_chunk * spore.disk_chunk_size);
         const expected = model[offset..@min(offset + chunk_size, model.len)];
-        const object = try rootfs_cas.readVerifiedManifestObject(allocator, snapshot_dir, entry.digest, expected.len);
+        const digest = entry.id.toDigest();
+        const object = try rootfs_cas.readVerifiedManifestObject(allocator, snapshot_dir, &digest, expected.len);
         defer allocator.free(object);
         try std.testing.expectEqualSlices(u8, expected, object);
     }
@@ -2885,7 +2825,7 @@ test "cas index attach rejects incomplete coverage" {
 
     const chunks = [_]disk_index.DiskIndexChunk{.{
         .logical_chunk = 0,
-        .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .id = .{ .bytes = @splat(0xaa) },
     }};
     const incomplete = disk_index.DiskIndex{
         .kind = disk_index.disk_index_kind,

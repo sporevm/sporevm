@@ -1168,7 +1168,7 @@ fn gcRootfsCache(
                 else => return error.BadManifest,
             };
             for (parsed.value.chunks) |chunk_entry| {
-                try rooted_objects.put(chunk_entry.digest, {});
+                try rooted_objects.put(try allocator.dupe(u8, &chunk_entry.id.toDigest()), {});
             }
         }
     }
@@ -1439,7 +1439,7 @@ fn collectPinnedProtectedPaths(allocator: std.mem.Allocator, io: Io, cache_root:
         defer allocator.free(bytes);
         var parsed = try disk_index.parseDiskIndex(allocator, bytes, try spore.diskIndexDescriptorForStorage(storage));
         defer parsed.deinit();
-        for (parsed.value.chunks) |chunk_entry| try protected.put(try rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest), {});
+        for (parsed.value.chunks) |chunk_entry| try protected.put(try rootfs_cas.objectPath(allocator, cache_root, chunk_entry.id), {});
     }
     return false;
 }
@@ -1670,7 +1670,7 @@ fn addProtectedPathsFromRuntimeLease(
             var index = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
             defer index.deinit();
             for (index.value.chunks) |chunk_entry| {
-                try protected_paths.put(try rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest), {});
+                try protected_paths.put(try rootfs_cas.objectPath(allocator, cache_root, chunk_entry.id), {});
             }
         },
     }
@@ -2955,11 +2955,11 @@ test "system prune removes complete stamp once for multiple referenced rootfs ob
     const chunks = [_]disk_index.DiskIndexChunk{
         .{
             .logical_chunk = 0,
-            .digest = first_digest,
+            .id = try chunk.ChunkId.fromDigest(first_digest),
         },
         .{
             .logical_chunk = 1,
-            .digest = second_digest,
+            .id = try chunk.ChunkId.fromDigest(second_digest),
         },
     };
     const index = disk_index.DiskIndex{
@@ -3902,7 +3902,7 @@ fn writeGcStorageFixture(
     const object_digest = try writeGcObjectFixture(allocator, io, cache_root, seed);
     const chunks = [_]disk_index.DiskIndexChunk{.{
         .logical_chunk = 0,
-        .digest = object_digest,
+        .id = try chunk.ChunkId.fromDigest(object_digest),
     }};
     const index = disk_index.DiskIndex{
         .kind = disk_index.disk_index_kind,

@@ -433,7 +433,6 @@ const InlineRootfsCas = struct {
     fn deinit(self: *InlineRootfsCas) void {
         self.stopSealWorkers();
         self.freeQueuedSealTasks();
-        for (self.manifest_chunks.items) |entry| self.allocator.free(entry.digest);
         self.manifest_chunks.deinit(self.allocator);
         self.manifest_zero_ranges.deinit(self.allocator);
         self.allocator.free(self.seal_worker_stats);
@@ -691,15 +690,7 @@ const InlineRootfsCas = struct {
         for (self.seal_results[0..expected_chunks], 0..) |maybe_result, logical_chunk| {
             const result = maybe_result orelse continue;
             nonzero_results += 1;
-            const hex = result.id.toHex();
-            const digest = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
-            self.manifest_chunks.append(self.allocator, .{
-                .logical_chunk = @intCast(logical_chunk),
-                .digest = digest,
-            }) catch |err| {
-                self.allocator.free(digest);
-                return err;
-            };
+            try self.manifest_chunks.append(self.allocator, .{ .logical_chunk = @intCast(logical_chunk), .id = result.id });
             if (result.published) {
                 self.objects_written += 1;
                 self.object_bytes_written += result.bytes_len;

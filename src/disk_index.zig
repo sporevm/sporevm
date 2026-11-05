@@ -22,7 +22,7 @@ pub const Error = error{
 
 pub const DiskIndexChunk = struct {
     logical_chunk: u64,
-    digest: []const u8,
+    id: chunk.ChunkId,
 };
 
 pub const DiskIndexZeroRange = struct {
@@ -58,26 +58,16 @@ pub const DiskIndexV2 = struct {
     zero_ranges: []const DiskIndexZeroRange = &.{},
 };
 
-/// Per-chunk digest refs expanded from packed chunk ranges.
-pub const DecodedChunks = struct {
-    chunks: []DiskIndexChunk,
-    digest_refs: []u8,
-
-    pub fn deinit(self: DecodedChunks, allocator: std.mem.Allocator) void {
-        if (self.chunks.len != 0) allocator.free(self.chunks);
-        if (self.digest_refs.len != 0) allocator.free(self.digest_refs);
-    }
-};
-
+/// A decoded index that owns every slice in `value`.
 pub const ParsedDiskIndex = struct {
     allocator: std.mem.Allocator,
     value: DiskIndex,
-    parsed: std.json.Parsed(DiskIndexV2),
-    decoded: DecodedChunks,
 
     pub fn deinit(self: ParsedDiskIndex) void {
-        self.decoded.deinit(self.allocator);
-        self.parsed.deinit();
+        self.allocator.free(self.value.hash_algorithm);
+        self.allocator.free(self.value.object_namespace);
+        self.allocator.free(self.value.chunks);
+        self.allocator.free(self.value.zero_ranges);
     }
 };
 
@@ -119,9 +109,7 @@ pub fn parseDiskIndex(
     const result = try parseV2(allocator, bytes);
     errdefer result.deinit();
     try validateDiskIndex(result.value, descriptor);
-    const canonical_bytes = try stringifyBoundedAlloc(allocator, result.parsed.value);
-    defer allocator.free(canonical_bytes);
-    if (!std.mem.eql(u8, bytes, canonical_bytes)) return error.BadManifest;
+    try expectCanonical(bytes, result.value);
     return result;
 }
 
@@ -151,35 +139,38 @@ pub fn parseSelfDescribedDiskIndex(allocator: std.mem.Allocator, bytes: []const 
 }
 
 fn parseV2(allocator: std.mem.Allocator, bytes: []const u8) Error!ParsedDiskIndex {
-    const parsed = std.json.parseFromSlice(DiskIndexV2, allocator, bytes, .{
-        .allocate = .alloc_always,
+    // Strings stay slices of `bytes`, so the packed digests are never copied;
+    // only the decoded chunk ids outlive this function.
+    const encoded = std.json.parseFromSlice(DiskIndexV2, allocator, bytes, .{
+        .allocate = .alloc_if_needed,
         .duplicate_field_behavior = .@"error",
         .ignore_unknown_fields = false,
     }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.BadManifest,
     };
-    errdefer parsed.deinit();
-    const decoded = try decodeChunkRanges(allocator, parsed.value);
-    return .{
-        .allocator = allocator,
-        .value = .{
-            .kind = parsed.value.kind,
-            .logical_size = parsed.value.logical_size,
-            .chunk_size = parsed.value.chunk_size,
-            .hash_algorithm = parsed.value.hash_algorithm,
-            .object_namespace = parsed.value.object_namespace,
-            .chunks = decoded.chunks,
-            .zero_ranges = parsed.value.zero_ranges,
-        },
-        .parsed = parsed,
-        .decoded = decoded,
-    };
+    defer encoded.deinit();
+
+    const chunks = try decodeChunkRanges(allocator, encoded.value);
+    errdefer allocator.free(chunks);
+    const zero_ranges = try allocator.dupe(DiskIndexZeroRange, encoded.value.zero_ranges);
+    errdefer allocator.free(zero_ranges);
+    const hash_algorithm = try allocator.dupe(u8, encoded.value.hash_algorithm);
+    errdefer allocator.free(hash_algorithm);
+    return .{ .allocator = allocator, .value = .{
+        .kind = disk_index_kind,
+        .logical_size = encoded.value.logical_size,
+        .chunk_size = encoded.value.chunk_size,
+        .hash_algorithm = hash_algorithm,
+        .object_namespace = try allocator.dupe(u8, encoded.value.object_namespace),
+        .chunks = chunks,
+        .zero_ranges = zero_ranges,
+    } };
 }
 
-/// Validates the encoded ranges and expands packed digests into one
-/// `blake3:<hex>` ref per nonzero chunk.
-pub fn decodeChunkRanges(allocator: std.mem.Allocator, index: DiskIndexV2) Error!DecodedChunks {
+/// Validates the encoded ranges and expands the packed digests into one
+/// chunk id per nonzero chunk.
+pub fn decodeChunkRanges(allocator: std.mem.Allocator, index: DiskIndexV2) Error![]DiskIndexChunk {
     try validateV2Shape(index);
 
     var nonzero_count: u64 = 0;
@@ -187,28 +178,21 @@ pub fn decodeChunkRanges(allocator: std.mem.Allocator, index: DiskIndexV2) Error
         nonzero_count = std.math.add(u64, nonzero_count, range.digests.len / chunk.ChunkId.hex_len) catch return error.BadManifest;
     }
     const chunk_len = std.math.cast(usize, nonzero_count) orelse return error.BadManifest;
-    const digest_ref_bytes = std.math.mul(usize, chunk_len, digest_prefix.len + chunk.ChunkId.hex_len) catch return error.BadManifest;
     const chunks = try allocator.alloc(DiskIndexChunk, chunk_len);
-    errdefer if (chunks.len != 0) allocator.free(chunks);
-    const digest_refs = try allocator.alloc(u8, digest_ref_bytes);
-    errdefer if (digest_refs.len != 0) allocator.free(digest_refs);
+    errdefer allocator.free(chunks);
 
     var entry_index: usize = 0;
     for (index.chunk_ranges) |range| {
         const count = range.digests.len / chunk.ChunkId.hex_len;
         for (0..count) |offset| {
-            const ref_start = entry_index * (digest_prefix.len + chunk.ChunkId.hex_len);
-            const digest_ref = digest_refs[ref_start..][0 .. digest_prefix.len + chunk.ChunkId.hex_len];
-            @memcpy(digest_ref[0..digest_prefix.len], digest_prefix);
-            @memcpy(digest_ref[digest_prefix.len..], range.digests[offset * chunk.ChunkId.hex_len ..][0..chunk.ChunkId.hex_len]);
             chunks[entry_index] = .{
                 .logical_chunk = std.math.add(u64, range.start, offset) catch return error.BadManifest,
-                .digest = digest_ref,
+                .id = chunk.ChunkId.fromHex(range.digests[offset * chunk.ChunkId.hex_len ..][0..chunk.ChunkId.hex_len]) catch return error.BadManifest,
             };
             entry_index += 1;
         }
     }
-    return .{ .chunks = chunks, .digest_refs = digest_refs };
+    return chunks;
 }
 
 pub fn validateDiskIndex(index: DiskIndex, descriptor: Descriptor) Error!void {
@@ -238,7 +222,6 @@ fn validateIndexShape(index: DiskIndex) Error!void {
         if (previous_chunk) |previous| {
             if (entry.logical_chunk <= previous) return error.BadManifest;
         }
-        try validateDigestRef(entry.digest);
         previous_chunk = entry.logical_chunk;
     }
 
@@ -340,31 +323,14 @@ pub fn appendZeroChunk(allocator: std.mem.Allocator, ranges: *std.ArrayList(Disk
     try ranges.append(allocator, .{ .start = logical_chunk, .count = 1 });
 }
 
-fn validateDigestRef(digest: []const u8) Error!void {
-    if (!std.mem.startsWith(u8, digest, digest_prefix)) return error.BadManifest;
-    const hex = digest[digest_prefix.len..];
-    if (hex.len != chunk.ChunkId.hex_len) return error.BadManifest;
-    for (hex) |byte| {
-        if (isLowerHex(byte)) continue;
-        return error.BadManifest;
-    }
-    _ = chunk.ChunkId.fromHex(hex) catch return error.BadManifest;
-}
-
 fn isLowerHex(byte: u8) bool {
     return (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
 }
 
-fn digestHex(digest: []const u8) Error![]const u8 {
-    try validateDigestRef(digest);
-    return digest[digest_prefix.len..];
-}
-
 fn validateIndexDigest(bytes: []const u8, digest: []const u8) Error!void {
-    const expected_hex = try digestHex(digest);
-    const id = chunk.ChunkId.fromContents(bytes);
-    const actual_hex = id.toHex();
-    if (!std.mem.eql(u8, expected_hex, actual_hex[0..])) return error.BadManifest;
+    if (!std.mem.startsWith(u8, digest, digest_prefix)) return error.BadManifest;
+    const actual_hex = chunk.ChunkId.fromContents(bytes).toHex();
+    if (!std.mem.eql(u8, digest[digest_prefix.len..], &actual_hex)) return error.BadManifest;
 }
 
 pub const EncodedIndex = struct {
@@ -397,21 +363,66 @@ fn canonicalBytesAlloc(allocator: std.mem.Allocator, index: DiskIndex) Error![]u
 
 fn stringifyCanonicalAlloc(allocator: std.mem.Allocator, index: DiskIndex) Error![]u8 {
     try checkKind(index.kind);
-    const Encoder = struct {
-        index: DiskIndex,
-
-        pub fn jsonStringify(self: @This(), jws: *std.json.Stringify) std.json.Stringify.Error!void {
-            try jws.beginObject();
-            try writeFields(jws, self.index);
-            try jws.endObject();
-        }
-    };
     return stringifyBoundedAlloc(allocator, Encoder{ .index = index });
 }
 
+const Encoder = struct {
+    index: DiskIndex,
+
+    pub fn jsonStringify(self: Encoder, jws: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jws.beginObject();
+        try writeFields(jws, self.index);
+        try jws.endObject();
+    }
+};
+
+const json_options: std.json.Stringify.Options = .{
+    .whitespace = .indent_2,
+    .emit_null_optional_fields = false,
+};
+
+/// Fails unless encoding `index` reproduces `bytes` exactly. The encoding is
+/// compared as it is written, so it is never held in memory.
+fn expectCanonical(bytes: []const u8, index: DiskIndex) Error!void {
+    var buffer: [4096]u8 = undefined;
+    var matcher: MatchingWriter = .{ .expected = bytes, .writer = .{
+        .buffer = &buffer,
+        .vtable = &.{ .drain = MatchingWriter.drain },
+    } };
+    std.json.Stringify.value(Encoder{ .index = index }, json_options, &matcher.writer) catch return error.BadManifest;
+    matcher.writer.flush() catch return error.BadManifest;
+    if (matcher.matched != bytes.len) return error.BadManifest;
+}
+
+/// A writer that fails as soon as its output stops matching `expected`.
+const MatchingWriter = struct {
+    expected: []const u8,
+    matched: usize = 0,
+    writer: std.Io.Writer,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *MatchingWriter = @alignCast(@fieldParentPtr("writer", w));
+        try self.match(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            try self.match(slice);
+            n += slice.len;
+        }
+        for (0..splat) |_| try self.match(data[data.len - 1]);
+        return n + splat * data[data.len - 1].len;
+    }
+
+    fn match(self: *MatchingWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        const rest = self.expected[self.matched..];
+        if (bytes.len > rest.len or !std.mem.eql(u8, bytes, rest[0..bytes.len])) return error.WriteFailed;
+        self.matched += bytes.len;
+    }
+};
+
 /// Writes the encoded index fields into an open JSON object, packing each run
 /// of contiguous nonzero chunks into one `chunk_ranges` entry. Memory
-/// manifests embed these fields. A malformed digest ref fails the write.
+/// manifests embed these fields.
 pub fn writeFields(jws: *std.json.Stringify, index: DiskIndex) std.json.Stringify.Error!void {
     try jws.objectField("kind");
     try jws.write(index.kind);
@@ -438,7 +449,8 @@ pub fn writeFields(jws: *std.json.Stringify, index: DiskIndex) std.json.Stringif
         try jws.beginWriteRaw();
         try jws.writer.writeByte('"');
         for (index.chunks[start_index..end_index]) |entry| {
-            try jws.writer.writeAll(digestHex(entry.digest) catch return error.WriteFailed);
+            const hex = entry.id.toHex();
+            try jws.writer.writeAll(&hex);
         }
         try jws.writer.writeByte('"');
         jws.endWriteRaw();
@@ -451,10 +463,7 @@ pub fn writeFields(jws: *std.json.Stringify, index: DiskIndex) std.json.Stringif
 }
 
 fn stringifyBoundedAlloc(allocator: std.mem.Allocator, value: anytype) Error![]u8 {
-    const bytes = std.json.Stringify.valueAlloc(allocator, value, .{
-        .whitespace = .indent_2,
-        .emit_null_optional_fields = false,
-    }) catch return error.OutOfMemory;
+    const bytes = std.json.Stringify.valueAlloc(allocator, value, json_options) catch return error.OutOfMemory;
     errdefer allocator.free(bytes);
     if (bytes.len == 0 or bytes.len > max_index_bytes) return error.BadManifest;
     return bytes;
@@ -467,8 +476,8 @@ fn digestBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) Error![]u8 
 }
 
 const digest_a = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const digest_b = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const digest_c = "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const id_b: chunk.ChunkId = .{ .bytes = @splat(0xbb) };
+const id_c: chunk.ChunkId = .{ .bytes = @splat(0xcc) };
 
 fn testDescriptor(index_digest: []const u8) Descriptor {
     return .{
@@ -525,7 +534,7 @@ fn storageAndIndexJson(allocator: std.mem.Allocator) !struct {
 } {
     const encoded = try encodeCanonicalAlloc(
         allocator,
-        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_1),
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_1),
     );
     return .{
         .descriptor = testDescriptor(encoded.digest),
@@ -537,12 +546,34 @@ test "v2 disk index canonical encoding has stable bytes and digest" {
     const allocator = std.testing.allocator;
     const encoded = try encodeCanonicalAlloc(
         allocator,
-        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_1),
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_1),
     );
     defer encoded.deinit(allocator);
 
     try std.testing.expectEqualStrings(validV2IndexJson(), encoded.bytes);
     try std.testing.expectEqualStrings("blake3:69fefbc2cd610a7d0d66ffe56978513273fbd38fb0ad905c1c9e40c04c86bcf0", encoded.digest);
+}
+
+test "disk index fixtures decode and re-encode to the same bytes" {
+    const allocator = std.testing.allocator;
+    const fixtures = [_][]const u8{
+        "test/image/rootfs-index.json",
+        "test/image/worker-conformance/targets/linux-amd64/rootfs-index.json",
+        "test/image/worker-conformance/targets/linux-arm64/rootfs-index.json",
+    };
+    for (fixtures) |path| {
+        const file = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(max_index_bytes));
+        defer allocator.free(file);
+        const bytes = std.mem.trimEnd(u8, file, "\n");
+        const parsed = try parseSelfDescribedDiskIndex(allocator, bytes);
+        defer parsed.deinit();
+        const encoded = try encodeCanonicalAlloc(allocator, parsed.value);
+        defer encoded.deinit(allocator);
+        try std.testing.expectEqualStrings(bytes, encoded.bytes);
+        const expected_digest = try digestBytesAlloc(allocator, bytes);
+        defer allocator.free(expected_digest);
+        try std.testing.expectEqualStrings(expected_digest, encoded.digest);
+    }
 }
 
 test "manifest-bound disk index validates descriptor digest and canonical coverage" {
@@ -556,6 +587,7 @@ test "manifest-bound disk index validates descriptor digest and canonical covera
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
     try std.testing.expectEqual(@as(u64, 0), parsed.value.chunks[0].logical_chunk);
+    try std.testing.expect(parsed.value.chunks[0].id.eql(id_b));
     try std.testing.expectEqual(@as(usize, 1), parsed.value.zero_ranges.len);
     try std.testing.expectEqual(DiskIndexZeroRange{ .start = 1, .count = 1 }, parsed.value.zero_ranges[0]);
 }
@@ -594,7 +626,7 @@ test "disk index reports retired kinds as too old" {
         try std.testing.expectError(error.FormatTooOld, parseSelfDescribedDiskIndex(arena, bytes));
     }
 
-    const v1_index = testIndex("spore-disk-index-v1", &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_1);
+    const v1_index = testIndex("spore-disk-index-v1", &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_1);
     try std.testing.expectError(error.FormatTooOld, validateDiskIndex(v1_index, testDescriptor(digest_a)));
     try std.testing.expectError(error.FormatTooOld, encodeCanonicalAlloc(arena, v1_index));
 }
@@ -631,15 +663,15 @@ test "manifest-bound disk index rejects digest and descriptor mismatches" {
     try std.testing.expectError(error.BadManifest, parseDiskIndex(arena, missing_kind, testDescriptor(missing_kind_digest)));
 
     const descriptor = testDescriptor(digest_a);
-    var wrong_kind = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_1);
+    var wrong_kind = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_1);
     wrong_kind.kind = "unknown-rootfs-index-v0";
     try std.testing.expectError(error.BadManifest, validateDiskIndex(wrong_kind, descriptor));
 
-    var wrong_index_algorithm = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_1);
+    var wrong_index_algorithm = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_1);
     wrong_index_algorithm.hash_algorithm = "sha256";
     try std.testing.expectError(error.BadManifest, validateDiskIndex(wrong_index_algorithm, descriptor));
 
-    var wrong_index_namespace = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_1);
+    var wrong_index_namespace = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_1);
     wrong_index_namespace.object_namespace = "../rootfs";
     try std.testing.expectError(error.BadManifest, validateDiskIndex(wrong_index_namespace, descriptor));
 }
@@ -648,8 +680,8 @@ test "manifest-bound disk index rejects non-canonical chunk tables" {
     try std.testing.expectError(error.BadManifest, validateDiskIndex(testIndex(
         disk_index_kind,
         &.{
-            .{ .logical_chunk = 0, .digest = digest_b },
-            .{ .logical_chunk = 0, .digest = digest_c },
+            .{ .logical_chunk = 0, .id = id_b },
+            .{ .logical_chunk = 0, .id = id_c },
         },
         &.{},
     ), testDescriptor(digest_a)));
@@ -657,29 +689,24 @@ test "manifest-bound disk index rejects non-canonical chunk tables" {
     try std.testing.expectError(error.BadManifest, validateDiskIndex(testIndex(
         disk_index_kind,
         &.{
-            .{ .logical_chunk = 1, .digest = digest_b },
-            .{ .logical_chunk = 0, .digest = digest_c },
+            .{ .logical_chunk = 1, .id = id_b },
+            .{ .logical_chunk = 0, .id = id_c },
         },
         &.{},
     ), testDescriptor(digest_a)));
 
     try std.testing.expectError(error.BadManifest, validateDiskIndex(
-        testIndex(disk_index_kind, &.{.{ .logical_chunk = 2, .digest = digest_b }}, &zero_chunk_0),
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 2, .id = id_b }}, &zero_chunk_0),
         testDescriptor(digest_a),
     ));
 
     try std.testing.expectError(error.BadManifest, validateDiskIndex(
-        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_0),
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_0),
         testDescriptor(digest_a),
     ));
 
     try std.testing.expectError(error.BadManifest, validateDiskIndex(
-        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = "sha256:bbbb" }}, &zero_chunk_1),
-        testDescriptor(digest_a),
-    ));
-
-    try std.testing.expectError(error.BadManifest, validateDiskIndex(
-        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{}),
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &.{}),
         testDescriptor(digest_a),
     ));
 }
@@ -707,7 +734,7 @@ test "v2 disk index rejects malformed and out-of-bounds ranges" {
     const descriptor = testDescriptor(digest_a);
     const one_zero = [_]DiskIndexZeroRange{.{ .start = 1, .count = 1 }};
 
-    var index = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &.{});
+    var index = testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &.{});
     index.zero_ranges = &one_zero;
     try validateDiskIndex(index, descriptor);
 
@@ -742,7 +769,7 @@ test "v2 disk index rejects malformed and out-of-bounds ranges" {
         .chunk_size = 4096,
         .hash_algorithm = "blake3",
         .object_namespace = "rootfs/blake3",
-        .chunk_ranges = &.{.{ .start = std.math.maxInt(u64), .digests = digest_b[digest_prefix.len..] }},
+        .chunk_ranges = &.{.{ .start = std.math.maxInt(u64), .digests = &id_b.toHex() }},
         .zero_ranges = &one_zero,
     }));
 }
@@ -775,7 +802,7 @@ fn fuzzV2DiskIndexParse(_: void, s: *std.testing.Smith) !void {
     const allocator = std.testing.allocator;
     const encoded = try encodeCanonicalAlloc(
         allocator,
-        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .digest = digest_b }}, &zero_chunk_1),
+        testIndex(disk_index_kind, &.{.{ .logical_chunk = 0, .id = id_b }}, &zero_chunk_1),
     );
     defer encoded.deinit(allocator);
     const mutation_count = s.valueRangeAtMost(u8, 0, 4);

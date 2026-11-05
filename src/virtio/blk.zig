@@ -1383,7 +1383,7 @@ fn expectLazyFaultInFailureViaVirtio(kind: LazyFaultKind) !void {
         .missing => 1,
         .corrupt_same_size => 2,
     };
-    const bad_object_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[bad_chunk].digest);
+    const bad_object_path = try rootfs_cas.objectPath(arena, cache_root, parsed.value.chunks[bad_chunk].id);
 
     var base = try disk_layer.createTempOverlay(arena);
     defer base.deinit();

@@ -223,10 +223,7 @@ fn preloadFd(
     const chunk_count: usize = @intCast(chunk_count_u64);
     var manifest_chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
     try manifest_chunks.ensureTotalCapacity(allocator, chunk_count);
-    defer {
-        for (manifest_chunks.items) |entry| allocator.free(entry.digest);
-        manifest_chunks.deinit(allocator);
-    }
+    defer manifest_chunks.deinit(allocator);
     var manifest_zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
     defer manifest_zero_ranges.deinit(allocator);
 
@@ -265,12 +262,7 @@ fn preloadFd(
             continue;
         }
         const id = chunk.ChunkId.fromContents(data);
-        const hex = id.toHex();
-        const digest_ref = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, hex[0..] });
-        try manifest_chunks.append(allocator, .{
-            .logical_chunk = @intCast(i),
-            .digest = digest_ref,
-        });
+        try manifest_chunks.append(allocator, .{ .logical_chunk = @intCast(i), .id = id });
         const object_path = try objectPathZForDir(allocator, object_dir_path, id);
         defer allocator.free(object_path);
         const object_check_start_ms = monotonicMs();
@@ -392,7 +384,7 @@ pub fn storageContentComplete(
     defer parsed.deinit();
 
     for (parsed.value.chunks) |entry| {
-        const path = try manifestObjectPath(allocator, cache_root, entry.digest);
+        const path = try objectPath(allocator, cache_root, entry.id);
         defer allocator.free(path);
         if (!try rootfs_cache.regularFileNoSymlink(io, path)) return false;
         const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -516,7 +508,7 @@ pub fn removeStorageCompleteStampsReferencingObjects(
         };
         defer parsed.deinit();
         for (parsed.value.chunks) |chunk_entry| {
-            if (object_digests.contains(chunk_entry.digest)) {
+            if (object_digests.contains(&chunk_entry.id.toDigest())) {
                 try removeStorageCompleteStamp(io, allocator, cache_root, index_digest);
                 break;
             }
@@ -654,7 +646,10 @@ pub fn manifestIndexPath(allocator: std.mem.Allocator, cache_root: []const u8, i
 
 pub fn manifestObjectPath(allocator: std.mem.Allocator, cache_root: []const u8, object_digest: []const u8) ![]const u8 {
     const hex = try rootfsDigestHex(object_digest);
-    const id = chunk.ChunkId.fromHex(hex) catch return error.BadManifest;
+    return objectPath(allocator, cache_root, chunk.ChunkId.fromHex(hex) catch return error.BadManifest);
+}
+
+pub fn objectPath(allocator: std.mem.Allocator, cache_root: []const u8, id: chunk.ChunkId) ![]const u8 {
     const dir = try objectDir(allocator, cache_root);
     defer allocator.free(dir);
     return objectPathForDir(allocator, dir, id);
@@ -752,11 +747,7 @@ fn loadManifestIndex(
     var ids = try allocator.alloc(?chunk.ChunkId, @intCast(expected_chunks));
     errdefer allocator.free(ids);
     @memset(ids, null);
-    for (parsed.value.chunks) |entry| {
-        const hex = try spore.diskDigestHex(entry.digest);
-        const logical_chunk: usize = @intCast(entry.logical_chunk);
-        ids[logical_chunk] = chunk.ChunkId.fromHex(hex) catch return error.BadManifest;
-    }
+    for (parsed.value.chunks) |entry| ids[@intCast(entry.logical_chunk)] = entry.id;
     parsed.deinit();
     return .{
         .chunk_ids = ids,

@@ -36,6 +36,24 @@ pub const ChunkId = struct {
         return std.fmt.bytesToHex(self.bytes, .lower);
     }
 
+    /// How manifests and indexes write a chunk digest.
+    pub const digest_prefix = "blake3:";
+    pub const Digest = [digest_prefix.len + hex_len]u8;
+
+    /// The `blake3:<lowercase hex>` digest form.
+    pub fn toDigest(self: ChunkId) Digest {
+        var digest: Digest = undefined;
+        digest[0..digest_prefix.len].* = digest_prefix.*;
+        digest[digest_prefix.len..].* = self.toHex();
+        return digest;
+    }
+
+    /// Parse the `blake3:<hex>` digest form.
+    pub fn fromDigest(digest: []const u8) error{InvalidChunkId}!ChunkId {
+        if (!std.mem.startsWith(u8, digest, digest_prefix)) return error.InvalidChunkId;
+        return fromHex(digest[digest_prefix.len..]);
+    }
+
     /// Parse a lowercase or uppercase hex id, as found in manifests.
     pub fn fromHex(hex: []const u8) error{InvalidChunkId}!ChunkId {
         if (hex.len != hex_len) return error.InvalidChunkId;

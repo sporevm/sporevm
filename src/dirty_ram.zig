@@ -292,7 +292,7 @@ pub const Sealer = struct {
             if (maybe_ref) |ref| {
                 chunks.append(.{
                     .logical_chunk = @intCast(i),
-                    .digest = try spore.memoryDigestFromHex(self.allocator, ref),
+                    .id = chunk.ChunkId.fromHex(ref) catch return error.BadManifest,
                 }) catch return error.OutOfMemory;
             } else {
                 try disk_index.appendZeroChunk(self.allocator, &zero_ranges, @intCast(i));
@@ -624,7 +624,7 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
     const backing = try readFileAllForTest(arena, backing_path, ram.len);
     try std.testing.expectEqualSlices(u8, ram, backing);
 
-    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, try spore.memoryChunkDigestHex(manifest.chunks[0].digest) });
+    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, &manifest.chunks[0].id.toHex() });
     try std.testing.expectEqual(@as(c_int, 0), std.c.access(chunk_path, 0));
 }
 

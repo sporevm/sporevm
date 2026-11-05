@@ -82,7 +82,7 @@ pub fn diskFixture(
     const object_hex = object_id.toHex();
     const object_digest = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, object_hex[0..] });
     const chunks = try allocator.alloc(disk_index.DiskIndexChunk, 1);
-    chunks[0] = .{ .logical_chunk = 0, .digest = object_digest };
+    chunks[0] = .{ .logical_chunk = 0, .id = object_id };
     const encoded = try disk_index.encodeCanonicalAlloc(allocator, .{
         .kind = disk_index.disk_index_kind,
         .logical_size = object_bytes.len,
