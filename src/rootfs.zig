@@ -2172,6 +2172,15 @@ pub fn localRefCachePath(
     return std.fs.path.join(allocator, &.{ cache_root, "refs", "local", file_name });
 }
 
+/// Rejects anything that is not a well-formed local ref record.
+pub fn validateLocalRefRecord(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    var parsed = try std.json.parseFromSlice(LocalRefMetadata, allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (!std.mem.eql(u8, value.kind, local_ref_cache_kind)) return error.LocalRefCacheMismatch;
+    if (!try localResolvedRefMatchesDigest(allocator, value.ref, value.resolved_image_ref, value.image_manifest_digest)) return error.LocalRefCacheMismatch;
+}
+
 pub fn rootfsCacheKeyAlloc(allocator: std.mem.Allocator, resolved: ResolvedImage) ![]u8 {
     var h = Sha256.init(.{});
     h.update(builder_version);

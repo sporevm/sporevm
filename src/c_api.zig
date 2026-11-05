@@ -807,7 +807,7 @@ pub export fn spore_create_named_json(
             .enabled = opts.network_enabled != 0,
             .allow_cidrs = allow_cidrs,
             .allow_hosts = allow_hosts,
-            .policy = network_policy,
+            .policy = if (opts.network_rule_count != 0) network_policy else null,
             .bound_services = bound_services,
         },
         .memory = memoryFromBytes(opts.memory_bytes, opts.max_memory_bytes) catch |err| return fail(ctx, err),
