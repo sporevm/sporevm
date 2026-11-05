@@ -1,7 +1,6 @@
 {
   "input": {
     "conversion_contract": {
-      "ext4_writer": "native",
       "rootfs_builder": "sporevm-rootfs-v6"
     },
     "index_digest": "sha256:d94fc2c3d8c589122604a5b99a7215d7c8c0dac7576d900952af1623d4b918d5",
@@ -22,7 +21,7 @@
       }
     ]
   },
-  "schema": "spore-image-worker-conformance-v3",
+  "schema": "spore-image-worker-conformance-v4",
   "targets": [
     {
       "files": {

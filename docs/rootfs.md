@@ -208,18 +208,25 @@ layer. Prepare stable dependencies or Docker data into an image, put frequently
 changing code above it with `spore build FROM local/...`, then capture one warm
 spore and use `spore fork` plus `spore run --from` for children.
 
-The rootfs cache key includes the resolved digest-pinned image ref, target
-platform, and rootfs builder version. Mutable tag inputs also get a small local
-ref record, so a warm `spore run --image docker.io/library/alpine:3.20` or
-`spore create --image docker.io/library/alpine:3.20` can go straight to the
-previously validated rootfs instead of re-resolving the tag on every invocation.
-`--pull=missing|always|never` controls whether mutable refs may use that local
-record, force registry refresh, or fail without one. If the ref record or
-referenced rootfs is missing or mismatched, SporeVM falls back to the registry
-path and updates the record after the rootfs cache is valid. Saved image runs
-also require manifest-bound chunked rootfs storage. New builds write it
-immediately; older flat-only cache entries miss and are rebuilt or reimported
-so the saved manifest can record portable rootfs identity.
+Pulled, imported, and built images live in a host-local catalog in the rootfs
+cache, each identified by its native BLAKE3 image identity over the rootfs
+index and canonical config. A pull or import also records which OCI manifest,
+index, or tar digest the current rootfs builder converted into that image, so a
+digest-pinned ref converts once and then resolves without the registry. Names
+such as `local/app:dev` or `docker.io/library/alpine:3.20` are per-platform ref
+records pointing at an image, so a warm `spore run --image
+docker.io/library/alpine:3.20` or `spore create --image
+docker.io/library/alpine:3.20` goes straight to the previously converted image
+instead of re-resolving the tag on every invocation.
+`--pull=missing|always|never` controls whether mutable refs may use that
+record, force registry refresh, or fail without one. If the record or the
+image's storage is missing, SporeVM falls back to the registry and repoints the
+name once the image is published. A new rootfs builder version converts
+digest-pinned sources again, and `--pull=missing` resolves a registry tag again
+when its image came from an older builder; local names keep pointing at their
+images. Images always carry chunked storage, which saved image runs record in
+the spore manifest. Caches written by earlier SporeVM versions are not read;
+pull, import, or build those images again.
 
 When a chunked rootfs has its index and objects but no usable flat
 materialization, `spore run` can start from the index directly. The runtime
@@ -251,10 +258,9 @@ spore run --image local/sporevm-app:dev 'echo hi'
 tar like buildx writes. It verifies all `blobs/sha256/*` files against their
 filename digest, selects the requested platform from `index.json`, rejects
 unsupported manifest/config/layer media types, applies the verified layer tars,
-and writes the deterministic ext4 output under the resolved image cache key.
-The import also writes chunked `rootfs.storage` for portable saved spores and
-bundles. Flat-only imported metadata is no longer a valid cache hit; reimport
-the image or tar to record the rootfs storage index identity.
+and publishes the deterministic ext4 output as a local image with chunked
+`rootfs.storage` for portable saved spores and bundles. Importing a layout the
+current builder already converted only repoints the name.
 
 For local BuildKit workflows that do not need OCI metadata, export the final
 root filesystem as an uncompressed tar and import that directly:
@@ -270,18 +276,18 @@ spore rootfs import-tar /tmp/sporevm-app-rootfs.tar \
   --platform linux/arm64
 ```
 
-`import-tar` records the tar SHA256 as the digest-pinned local identity and then
+`import-tar` records the tar SHA256 as the image's source digest and then
 uses the same deterministic ext4, digest-cache, and `rootfs.storage` path as
 `import-oci`. It accepts the BuildKit rootfs tar shape and fails closed on
 unsupported PAX xattrs. It does not record OCI `Env`, `WorkingDir`,
 `Entrypoint`, `Cmd`, or `User`, so callers must pass a guest command explicitly.
 
 Local refs use the `local/<name>:<tag>` form and are host-local mutable pointers
-only. The imported rootfs metadata records a digest-pinned local resolved
-identity, `local/<name>@sha256:<manifest-or-tar>`. Saved image-created spores record
-the rootfs storage index identity and size plus manifest-attached
-`rootfs.storage`. `spore run --image local/...` resolves from the
-local ref cache and does not fall back to a network registry.
+only. A local ref resolves to `local/<name>@blake3:<image>`; an imported image
+is also named by `local/<name>@sha256:<manifest-or-tar>`. Saved image-created
+spores record the rootfs storage index identity and size plus manifest-attached
+`rootfs.storage`. `spore run --image local/...` resolves from the local catalog
+and does not fall back to a network registry.
 
 Set `SPOREVM_ROOTFS_CACHE_DIR` to choose the cache directory; otherwise SporeVM
 uses the platform cache directory. Cache setup messages are shown only with
@@ -354,9 +360,11 @@ prune selectors:
   `spore cache gc --rootfs` command to preserve reachable state.
 
 `spore cache gc --rootfs` is stricter than prune. It roots descriptor-selected
-versioned disk indexes from cache metadata, image ref records, live
+versioned disk indexes from local image records, live
 runtime manifests, and process-owned lazy-runtime leases, then selects only
-unrooted CAS indexes and chunk objects. It is the preferred command when the
+unrooted CAS indexes and chunk objects. Names and derivations are not roots: an
+image pruned by `spore system prune` leaves its names pointing at nothing, and
+GC collects its storage. An image record GC cannot parse keeps every CAS entry. It is the preferred command when the
 goal is to clean chunk garbage without discarding reachable chunked storage.
 The mutable cache-mount aggregate is not a step-record or image root and is
 therefore collectable as a unit. A build holds the rootfs-cache `flock` from
@@ -528,9 +536,7 @@ repeated builds of the same resolved image produce identical bytes. This
 journal-less native profile is inside the automatic-growth support envelope.
 
 The native writer is the only rootfs writer and needs no e2fsprogs. It uses
-builder version `sporevm-rootfs-v6`; older rootfs cache entries are rebuilt
-once. Rootfs metadata records `"ext4_writer": "native"`, and cache entries
-written by the removed e2fsprogs writer are rebuilt instead of reused.
+builder version `sporevm-rootfs-v6`.
 
 The writer maps file data with ext4 block maps rather than extents: direct,
 single, double, and triple indirect blocks. Without the `huge_file` feature,

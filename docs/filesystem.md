@@ -8,24 +8,31 @@ authority.
 
 ## Rootfs Production
 
-`spore rootfs build` materializes an OCI image into a deterministic ext4 image,
-installs that image into the digest cache, and writes chunked rootfs CAS storage
-by default:
+Pulling, importing, or building an image materializes a deterministic ext4
+image, writes chunked rootfs CAS storage, and publishes the result in the local
+image catalog:
 
 ```text
 $SPOREVM_ROOTFS_CACHE_DIR/
-  <image-cache-key>.ext4
-  <image-cache-key>.json              # includes rootfs_storage
+  images/<image>.json                 # platform, config, rootfs_storage, source
+  images/<image>.ext4                 # flat ext4 of an image converted from OCI layers
+  images/derivations/<key>.json       # OCI source digest -> image, per builder and platform
+  refs/<key>.json                     # image name -> image, per platform
   by-digest/blake3/<rootfs>.ext4      # exact fd-backed compatibility path
   cas/rootfs/blake3/indexes/<id>.json # spore-disk-index-v2
   cas/rootfs/blake3/objects/<id>.chunk
 ```
 
+`<image>` is the native BLAKE3 image identity over the rootfs index and
+canonical config. Every record is replaced atomically and fsynced with its
+directory. Only image records root CAS storage; names and derivations may
+dangle after prune, and then miss. Records from earlier cache layouts are not
+read; pull, import, or build the image again.
+
 `spore run --image ... --save` is the writable-rootfs product path. It
-records the immutable ext4 artifact, records `rootfs.storage` from the metadata
-sidecar for image-created spores, and captures rootfs writes as a sealed disk
-index over that base. Older image cache entries miss under the flag-day cache
-identity and are rebuilt from the source image rather than migrated. `spore
+records the immutable ext4 artifact, records `rootfs.storage` from the image
+record for image-created spores, and captures rootfs writes as a sealed disk
+index over that base. `spore
 rootfs cas-preload --attach-spore` remains a repair/debug path for existing
 exact-rootfs spores; it is not the normal producer path.
 
@@ -235,8 +242,8 @@ unchanged.
 `spore run --image ... --commit local/name:tag` uses the same writable head but
 publishes its sealed root disk as a new indexed local image after a successful
 guest command. The transaction holds the rootfs cache lock from snapshot
-sealing through the completeness stamp, metadata write, and atomic local-ref
-replacement, so concurrent rootfs collection cannot remove an unpublished CAS
+sealing through the completeness stamp, image record write, and atomic
+local-ref replacement, so concurrent rootfs collection cannot remove an unpublished CAS
 object. Failed commands and failed snapshots do not update the ref.
 With `--disk-size`, SporeVM first resolves the source image config and requires
 a complete, descriptor-bound rootfs index, then validates the requested
@@ -408,12 +415,12 @@ spores.
 
 ## Cache Inspection And Pruning
 
-`spore system df --rootfs` reports image ext4 files, metadata, exact digest
-artifacts, rootfs CAS indexes, rootfs CAS objects, ref records, temporary
+`spore system df --rootfs` reports image ext4 files, image records, exact digest
+artifacts, rootfs CAS indexes, rootfs CAS objects, ref and derivation records, temporary
 entries, and build cache-mount storage. Its cache-mount fields distinguish
 sparse logical capacity from allocated host bytes. `spore cache gc
 --rootfs` performs a mark/sweep of rootfs CAS indexes
-and objects from cache metadata, ref records, live runtime manifests, and
+and objects from image records, live runtime manifests, and
 process-owned lazy-runtime leases; it is dry-run by default and requires
 `--force` to delete candidates. Destructive prune consults the same runtime
 leases before selecting explicit CAS entries.

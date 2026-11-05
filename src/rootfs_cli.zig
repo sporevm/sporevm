@@ -146,9 +146,8 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     });
     if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print(
-        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
+        "metadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
         .{
-            result.rootfs_path,
             result.metadata_path,
             parsed.ref,
             result.resolved_image_ref,
@@ -172,9 +171,8 @@ fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     });
     if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print(
-        "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
+        "metadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
         .{
-            result.rootfs_path,
             result.metadata_path,
             parsed.ref,
             result.resolved_image_ref,

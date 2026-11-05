@@ -16,6 +16,7 @@ const step_cache = @import("build/step_cache.zig");
 const backend_mod = @import("backend.zig");
 const disk_index = @import("disk_index.zig");
 const image = @import("image.zig");
+const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -196,12 +197,6 @@ const StageInputs = struct {
 
 const ArgValue = step_cache.ArgInput;
 
-const CachedMetadata = struct {
-    config: rootfs_mod.ImageConfig = .{},
-    rootfs_storage: ?spore.RootfsStorage = null,
-    rootfs_size: u64 = 0,
-};
-
 const automatic_build_capacity_bytes: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Result {
@@ -380,11 +375,11 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     // Keep the exclusive cache lock through local-ref publication so every
     // PREPARE/step root and its destination ref become reachable in one GC
     // exclusion window.
-    const publish = try rootfs_mod.publishIndexedImageLocked(init.io, allocator, cache_root, build_cache_lock, .{
-        .ref = options.tag,
+    const publish = try local_image.publish(init.io, allocator, cache_root, build_cache_lock, .{
         .platform = options.platform,
         .config = final_plan.config,
-        .rootfs_storage = final_storage,
+        .storage = final_storage,
+        .name = options.tag,
     });
     if (any_exec_step) {
         std.log.info(
@@ -393,10 +388,10 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         );
     }
     return .{
-        .resolved_image_ref = publish.resolved_image_ref,
-        .index_digest = publish.rootfs_storage.index_digest,
-        .metadata_path = publish.metadata_path,
-        .local_ref_path = publish.local_ref_path,
+        .resolved_image_ref = publish.resolved_ref,
+        .index_digest = final_storage.index_digest,
+        .metadata_path = publish.record_path,
+        .local_ref_path = publish.ref_path.?,
         .cache_hit = any_exec_step and diagnostic.executor.executed_steps == 0,
     };
 }
@@ -1120,8 +1115,8 @@ fn resolveBase(init: std.process.Init, allocator: std.mem.Allocator, options: Op
             .platform = options.platform,
             .rootfs_storage = .chunked,
         });
-        const metadata = try readCachedMetadata(allocator, init.io, imported.metadata_path);
-        return .{ .cache_root = cache_root, .storage = imported.rootfs_storage, .config = metadata.config };
+        const local = (try local_image.readRecord(init.io, allocator, cache_root, imported.image_manifest_digest)) orelse return error.RootFSDigestCacheMiss;
+        return .{ .cache_root = cache_root, .storage = local.storage, .config = local.config };
     }
     const image_ref = try normalizeBuildImageRef(allocator, source);
     const resolved = try run_mod.resolveRootfsInputDetailed(init, allocator, .{
@@ -1765,34 +1760,6 @@ fn removeArg(args: *std.array_list.Managed(ArgValue), key: []const u8) void {
             return;
         }
     }
-}
-
-fn readCachedMetadata(allocator: std.mem.Allocator, io: Io, path: []const u8) !CachedMetadata {
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-    var parsed = try std.json.parseFromSlice(CachedMetadata, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
-    defer parsed.deinit();
-    const value = parsed.value;
-    return .{
-        .config = try cloneImageConfig(allocator, value.config),
-        .rootfs_storage = if (value.rootfs_storage) |storage| try spore.cloneRootfsStorage(allocator, storage) else null,
-        .rootfs_size = value.rootfs_size,
-    };
-}
-
-fn cloneImageConfig(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig) !rootfs_mod.ImageConfig {
-    const runtime = config.config;
-    return .{
-        .architecture = config.architecture,
-        .os = if (config.os) |os| try allocator.dupe(u8, os) else null,
-        .config = if (runtime) |rt| .{
-            .Env = if (rt.Env) |entries| try cloneStringList(allocator, entries) else null,
-            .Entrypoint = if (rt.Entrypoint) |entries| try cloneStringList(allocator, entries) else null,
-            .Cmd = if (rt.Cmd) |entries| try cloneStringList(allocator, entries) else null,
-            .WorkingDir = if (rt.WorkingDir) |dir| try allocator.dupe(u8, dir) else null,
-            .User = if (rt.User) |user| try allocator.dupe(u8, user) else null,
-            .OnBuild = if (rt.OnBuild) |entries| try cloneStringList(allocator, entries) else null,
-        } else null,
-    };
 }
 
 fn findBuildContext(contexts: []const BuildContextArg, name: []const u8) ?BuildContextArg {
@@ -3418,10 +3385,10 @@ test "fully cached build publishes final indexed image" {
 
     const base_preload = try rootfs_cas.preloadPath(io, arena, cache_root, base_rootfs, rootfs_cas.default_chunk_size);
     const base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, base_preload);
-    _ = try rootfs_mod.publishIndexedImage(init, arena, .{
-        .ref = "local/base:dev",
+    _ = try local_image.lockAndPublish(io, arena, cache_root, .{
         .platform = .{},
-        .rootfs_storage = base_storage,
+        .storage = base_storage,
+        .name = "local/base:dev",
     });
 
     const producer = try build_exec.resolveProducer(init, arena);
@@ -3493,17 +3460,12 @@ test "fully cached build publishes final indexed image" {
     try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.boot_count);
     try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.executed_steps);
     try std.testing.expectEqualStrings(prepared_storage.index_digest, result.index_digest);
-    const resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, "local/app:dev", .{});
-    try std.testing.expect(!std.mem.eql(u8, prepared_storage.index_digest, resolved.manifest_digest));
-    const indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved)) orelse return error.MissingIndexedRootfs;
-    defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed);
-    try std.testing.expectEqualStrings(prepared_storage.index_digest, indexed.storage.index_digest);
+    const local = (try local_image.find(io, arena, cache_root, "local/app:dev", .{})) orelse return error.MissingLocalImage;
+    try std.testing.expect(!std.mem.eql(u8, prepared_storage.index_digest, local.identity));
+    try std.testing.expectEqualStrings(prepared_storage.index_digest, local.storage.index_digest);
 
-    const resolved_direct = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, result.resolved_image_ref, .{});
-    try std.testing.expectEqualStrings(resolved.manifest_digest, resolved_direct.manifest_digest);
-    const indexed_direct = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, resolved_direct)) orelse return error.MissingIndexedRootfs;
-    defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed_direct);
-    try std.testing.expectEqualStrings(prepared_storage.index_digest, indexed_direct.storage.index_digest);
+    const direct = (try local_image.find(io, arena, cache_root, result.resolved_image_ref, .{})) orelse return error.MissingLocalImage;
+    try std.testing.expectEqualStrings(local.identity, direct.identity);
 }
 
 test "metadata-only builds with different CMD publish distinct image identities" {
@@ -3549,10 +3511,10 @@ test "metadata-only builds with different CMD publish distinct image identities"
 
     const base_preload = try rootfs_cas.preloadPath(io, arena, cache_root, base_rootfs, rootfs_cas.default_chunk_size);
     const base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, base_preload);
-    _ = try rootfs_mod.publishIndexedImage(init, arena, .{
-        .ref = "local/base:dev",
+    _ = try local_image.lockAndPublish(io, arena, cache_root, .{
         .platform = .{},
-        .rootfs_storage = base_storage,
+        .storage = base_storage,
+        .name = "local/base:dev",
     });
 
     var diagnostic: Diagnostic = .{};
@@ -3577,19 +3539,12 @@ test "metadata-only builds with different CMD publish distinct image identities"
     try std.testing.expect(!false_result.cache_hit);
     try std.testing.expect(!std.mem.eql(u8, true_result.resolved_image_ref, false_result.resolved_image_ref));
 
-    const true_resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, true_result.resolved_image_ref, .{});
-    const false_resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_root, false_result.resolved_image_ref, .{});
-    const true_indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, true_resolved)) orelse return error.MissingIndexedRootfs;
-    defer rootfs_mod.deinitCachedIndexedRootfs(arena, true_indexed);
-    const false_indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_root, false_resolved)) orelse return error.MissingIndexedRootfs;
-    defer rootfs_mod.deinitCachedIndexedRootfs(arena, false_indexed);
-    try std.testing.expectEqualStrings(base_storage.index_digest, true_indexed.storage.index_digest);
-    try std.testing.expectEqualStrings(base_storage.index_digest, false_indexed.storage.index_digest);
-
-    const true_metadata = try readCachedMetadata(arena, io, true_result.metadata_path);
-    const false_metadata = try readCachedMetadata(arena, io, false_result.metadata_path);
-    try std.testing.expectEqualStrings("/bin/true", true_metadata.config.config.?.Cmd.?[0]);
-    try std.testing.expectEqualStrings("/bin/false", false_metadata.config.config.?.Cmd.?[0]);
+    const true_local = (try local_image.find(io, arena, cache_root, true_result.resolved_image_ref, .{})) orelse return error.MissingLocalImage;
+    const false_local = (try local_image.find(io, arena, cache_root, false_result.resolved_image_ref, .{})) orelse return error.MissingLocalImage;
+    try std.testing.expectEqualStrings(base_storage.index_digest, true_local.storage.index_digest);
+    try std.testing.expectEqualStrings(base_storage.index_digest, false_local.storage.index_digest);
+    try std.testing.expectEqualStrings("/bin/true", true_local.config.config.?.Cmd.?[0]);
+    try std.testing.expectEqualStrings("/bin/false", false_local.config.config.?.Cmd.?[0]);
 }
 
 test "multi-stage target inherits config and prunes unreachable bases" {
@@ -3636,11 +3591,11 @@ test "multi-stage target inherits config and prunes unreachable bases" {
     const cache_root = try local_paths.rootfsCacheRootPath(arena, &env);
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, base_rootfs, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
-    _ = try rootfs_mod.publishIndexedImage(init, arena, .{
-        .ref = "local/base:dev",
+    _ = try local_image.lockAndPublish(io, arena, cache_root, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux", .config = .{ .WorkingDir = "/build" } },
-        .rootfs_storage = storage,
+        .storage = storage,
+        .name = "local/base:dev",
     });
 
     var diagnostic: Diagnostic = .{};
@@ -3652,8 +3607,8 @@ test "multi-stage target inherits config and prunes unreachable bases" {
         .diagnostic = &diagnostic,
     });
     try std.testing.expectEqualStrings(storage.index_digest, result.index_digest);
-    const metadata = try readCachedMetadata(arena, io, result.metadata_path);
-    const config = metadata.config.config.?;
+    const local = (try local_image.find(io, arena, cache_root, "local/app:runtime", .{})) orelse return error.MissingLocalImage;
+    const config = local.config.config.?;
     try std.testing.expectEqualStrings(default_linux_path, config.Env.?[0]);
     try std.testing.expectEqualStrings("SNAPSHOT=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", config.Env.?[1]);
     try std.testing.expectEqualStrings("BUILD=yes", config.Env.?[2]);
@@ -3752,10 +3707,10 @@ test "a stage with three distinct COPY inputs fails before boot with the third i
         const bytes = try std.fmt.allocPrint(arena, "distinct rootfs {d}", .{index});
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = bytes });
         const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
-        _ = try rootfs_mod.publishIndexedImage(init, arena, .{
-            .ref = ref,
+        _ = try local_image.lockAndPublish(io, arena, cache_root, .{
             .platform = .{},
-            .rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
+            .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
+            .name = ref,
         });
     }
 
@@ -3794,10 +3749,10 @@ test "literal COPY --from source restrictions fail before boot" {
     const init = testInit(allocator, io, &arena_state, &env);
     const cache_root = try local_paths.rootfsCacheRootPath(arena, &env);
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, source_rootfs, rootfs_cas.default_chunk_size);
-    _ = try rootfs_mod.publishIndexedImage(init, arena, .{
-        .ref = "local/source:dev",
+    _ = try local_image.lockAndPublish(io, arena, cache_root, .{
         .platform = .{},
-        .rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
+        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
+        .name = "local/source:dev",
     });
 
     const cases = [_]struct { source: []const u8, expected: anyerror }{
@@ -3913,10 +3868,10 @@ test "scratch stage publishes an empty native rootfs without guest execution" {
     try std.testing.expect(diagnostic.scratch.first_temp_allocated_bytes <= 36 * 1024 * 1024);
     try std.testing.expect(diagnostic.scratch.first_object_bytes_written <= 896 * 1024);
     try std.testing.expectEqual(@as(u64, 129), diagnostic.scratch.first_nonzero_chunks);
-    const metadata = try readCachedMetadata(arena, io, result.metadata_path);
-    try std.testing.expectEqualStrings("/app", metadata.config.config.?.Entrypoint.?[0]);
-    try std.testing.expect(metadata.rootfs_storage != null);
-    const storage = metadata.rootfs_storage.?;
+    const local = (try local_image.find(io, arena, cache_dir, "local/app:scratch", .{})) orelse return error.MissingLocalImage;
+    try std.testing.expectEqualStrings(result.metadata_path, try local_image.recordPath(arena, cache_dir, local.identity));
+    try std.testing.expectEqualStrings("/app", local.config.config.?.Entrypoint.?[0]);
+    const storage = local.storage;
     try std.testing.expectEqual(automatic_build_capacity_bytes, storage.logical_size);
     const index_path = try rootfs_cas.manifestIndexPath(arena, cache_dir, storage.index_digest);
     const index_bytes = try Io.Dir.cwd().readFileAlloc(io, index_path, arena, .limited(disk_index.max_index_bytes));
@@ -4054,11 +4009,9 @@ test "metadata-only scratch publication serializes destructive GC until ref visi
     if (gc_context.err) |err| return err;
 
     const result = build_thread_context.result orelse return error.BadManifest;
-    const resolved = try rootfs_mod.resolveLocalCachedRef(io, arena, cache_dir, "local/app:scratch-gc", .{});
-    try std.testing.expectEqualStrings(result.resolved_image_ref, resolved.ref);
-    const indexed = (try rootfs_mod.cachedImageIndexedRootfs(io, arena, cache_dir, resolved)) orelse return error.MissingIndexedRootfs;
-    defer rootfs_mod.deinitCachedIndexedRootfs(arena, indexed);
-    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_dir, indexed.storage));
+    const local = (try local_image.find(io, arena, cache_dir, "local/app:scratch-gc", .{})) orelse return error.MissingLocalImage;
+    try std.testing.expectEqualStrings(result.resolved_image_ref, try local_image.resolvedRefAlloc(arena, "local/app:scratch-gc", local.identity, local.oci));
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_dir, local.storage));
 }
 
 fn testInit(

@@ -477,8 +477,6 @@ fn ownRootfsStorageDigestFields(allocator: std.mem.Allocator, storage: spore.Roo
 }
 
 fn ownRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOciResult) !RootfsImportOciResult {
-    const rootfs_path = try allocator.dupe(u8, result.rootfs_path);
-    errdefer allocator.free(rootfs_path);
     const metadata_path = try allocator.dupe(u8, result.metadata_path);
     errdefer allocator.free(metadata_path);
     const local_ref_path = try allocator.dupe(u8, result.local_ref_path);
@@ -489,7 +487,6 @@ fn ownRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOc
     errdefer allocator.free(image_manifest_digest);
     const rootfs_storage = try ownRootfsStorageDigestFields(allocator, result.rootfs_storage);
     return .{
-        .rootfs_path = rootfs_path,
         .metadata_path = metadata_path,
         .local_ref_path = local_ref_path,
         .resolved_image_ref = resolved_image_ref,

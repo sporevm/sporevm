@@ -6,7 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 authoritative_cache_state() {
   local cache_root="$1"
   {
-    for rel in refs/local build/steps cas/rootfs/blake3/indexes cas/rootfs/blake3/objects cas/rootfs/blake3/complete; do
+    for rel in refs build/steps cas/rootfs/blake3/indexes cas/rootfs/blake3/objects cas/rootfs/blake3/complete; do
       if [[ -d "${cache_root}/${rel}" ]]; then
         find "${cache_root}/${rel}" -type f -print
       fi

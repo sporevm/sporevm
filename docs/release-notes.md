@@ -12,7 +12,8 @@ running and removes it. `cache gc` deletes step records from every older
 builder version (`sporevm-build-v0` to `v8`) instead of keeping them as roots.
 GC treated v0 to v5 records as unknown and kept every CAS entry, so on a cache
 that holds them the first GC now runs a real sweep. JSON output advances to
-`spore.cache.gc.result.v2` without `legacy_step_record_count`.
+`spore.cache.gc.result.v2` without `legacy_step_record_count` or
+`unparseable_ref_count`.
 
 `spore-disk-index-v2` is the only disk-index encoding, and the manifest memory
 index now uses it too, so manifest bytes change. Older disk indexes fail as too
@@ -35,6 +36,17 @@ rootfs builds no longer fail on files larger than 4 GiB. The e2fsprogs writer
 `spore build` and `spore rootfs`, and the macOS case-sensitive sparse-image
 staging volume are removed. Rootfs cache entries written by the e2fsprogs
 writer are rebuilt with the native writer.
+
+### One local image catalog
+
+Pulled, imported, built, committed, and unpacked images share one catalog
+keyed by native BLAKE3 image identity, with durable record writes. Bumping the
+rootfs builder no longer orphans local refs. Older flat cache entries
+(`<cache>/<key>.ext4` and `<key>.json`, `refs/local/`) are no longer read;
+delete the rootfs cache directory to reclaim their space.
+`spore.rootfs.import.result.v2` drops `rootfs_path` and reports the image
+identity as `image_manifest_digest`. `spore run --rootfs` no longer trusts
+files in the rootfs cache without hashing them.
 
 ### Embedding libraries removed
 

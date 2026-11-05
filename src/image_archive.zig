@@ -12,6 +12,7 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
 const image = @import("image.zig");
 const image_manifest = @import("image_manifest.zig");
+const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
 const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
@@ -68,13 +69,6 @@ pub const UnpackResult = struct {
     object_count: usize,
 };
 
-const CachedMetadata = struct {
-    image_manifest_digest: []const u8,
-    platform: rootfs.Platform,
-    config: image.Config,
-    rootfs_storage: spore.RootfsStorage,
-};
-
 const ObjectDescriptor = struct {
     digest: []const u8,
     size: usize,
@@ -88,38 +82,16 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
     defer allocator.free(cache_root);
     var cache_lock = try rootfs.lockRootfsCacheExclusive(init.io, allocator, cache_root);
     defer cache_lock.deinit();
-    const resolved = try rootfs.resolveLocalCachedRef(init.io, allocator, cache_root, options.source, options.platform);
-    defer {
-        allocator.free(resolved.ref);
-        allocator.free(resolved.manifest_digest);
-    }
-    const cached = (try rootfs.cachedImageIndexedRootfs(init.io, allocator, cache_root, resolved)) orelse
+    var catalog_arena = std.heap.ArenaAllocator.init(allocator);
+    defer catalog_arena.deinit();
+    const catalog_allocator = catalog_arena.allocator();
+    const identity = (try local_image.lookup(init.io, catalog_allocator, cache_root, options.source, options.platform)) orelse
+        return error.FileNotFound;
+    const local = (try local_image.readRecord(init.io, catalog_allocator, cache_root, identity)) orelse return error.FileNotFound;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, catalog_allocator, cache_root, local.storage))
         return error.LocalImageStorageUnavailable;
-    defer rootfs.deinitCachedIndexedRootfs(allocator, cached);
 
-    const metadata_bytes = try Io.Dir.cwd().readFileAlloc(
-        init.io,
-        cached.metadata_path,
-        allocator,
-        .limited(1024 * 1024),
-    );
-    defer allocator.free(metadata_bytes);
-    var metadata = try std.json.parseFromSlice(CachedMetadata, allocator, metadata_bytes, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-        .duplicate_field_behavior = .@"error",
-    });
-    defer metadata.deinit();
-    if (!std.mem.eql(u8, metadata.value.image_manifest_digest, resolved.manifest_digest) or
-        !std.mem.eql(u8, metadata.value.platform.os, options.platform.os) or
-        metadata.value.platform.arch != options.platform.arch or
-        metadata.value.config.architecture == null or
-        metadata.value.config.architecture.? != options.platform.arch or
-        metadata.value.config.os == null or
-        !std.mem.eql(u8, metadata.value.config.os.?, options.platform.os)) return error.ImageIdentityMismatch;
-
-    const storage = metadata.value.rootfs_storage;
-    try spore.validateRootfsStorageDescriptor(storage);
+    const storage = local.storage;
     const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);
     const index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(allocator, index_path, storage);
@@ -137,19 +109,14 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
     defer deinitObjects(allocator, objects);
     const object_bytes = try validateArchiveBounds(storage.logical_size, objects);
 
-    const config_bytes = try image.canonicalConfigJson(allocator, metadata.value.config);
+    const config_bytes = try image.canonicalConfigJson(allocator, local.config);
     defer allocator.free(config_bytes);
     const config_transport = try image_manifest.transportDigestAlloc(allocator, config_bytes);
     defer allocator.free(config_transport);
     const config_digest = try image.configDigestAlloc(allocator, config_bytes);
     defer allocator.free(config_digest);
-    const image_digest = try image.imageDigestAlloc(allocator, storage.index_digest, config_bytes);
+    const image_digest = try allocator.dupe(u8, local.identity);
     errdefer allocator.free(image_digest);
-    // Tags from `spore rootfs import-oci` or `import-tar` resolve to SHA-256
-    // local digests bound by the metadata check above, so they are packed
-    // under their recomputed native identity.
-    if (std.mem.startsWith(u8, resolved.manifest_digest, "blake3:") and
-        !std.mem.eql(u8, image_digest, resolved.manifest_digest)) return error.ImageIdentityMismatch;
 
     const manifest_value = image_manifest.ImageManifest{
         .kind = image_manifest.image_manifest_kind,
@@ -243,19 +210,19 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
     _ = try rootfs_cas.installStorageIndexPathRepairingInvalid(allocator, init.io, index_path, extracted.index_bytes, storage);
     if (!try rootfs_cas.storageContentComplete(init.io, allocator, cache_root, storage)) return error.IncompleteImageArchive;
     try rootfs_cas.markStorageComplete(init.io, allocator, cache_root, storage.index_digest);
-    const published = try rootfs.publishIndexedImageLocked(init.io, allocator, cache_root, &cache_lock, .{
-        .ref = options.ref,
+    const published = try local_image.publish(init.io, allocator, cache_root, &cache_lock, .{
         .platform = options.platform,
         .config = extracted.config.value,
-        .rootfs_storage = storage,
-        .expected_image_digest = options.expected_image_digest,
+        .storage = storage,
+        .name = options.ref,
+        .expected_identity = options.expected_image_digest,
     });
-    defer rootfs.deinitPublishIndexedImageResult(allocator, published);
+    defer published.deinit(allocator);
 
     return .{
-        .resolved_image_ref = try allocator.dupe(u8, published.resolved_image_ref),
+        .resolved_image_ref = try allocator.dupe(u8, published.resolved_ref),
         .manifest_digest = try allocator.dupe(u8, extracted.manifest_digest),
-        .image_digest = try allocator.dupe(u8, published.image_manifest_digest),
+        .image_digest = try allocator.dupe(u8, published.identity),
         .object_count = extracted.objects.len,
     };
 }
@@ -629,7 +596,7 @@ test "native image archive import enforces aggregate bounds" {
     try std.testing.expectError(error.ImageArchiveTooLarge, validateArchiveBounds(1, many));
 }
 
-test "image pack recomputes identity only for SHA-256 local refs" {
+test "image pack rejects an image record that does not match its identity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -679,33 +646,22 @@ test "image pack recomputes identity only for SHA-256 local refs" {
     const object_path = try rootfs_cas.manifestObjectPath(allocator, cache, object_digest);
     _ = try rootfs_cas.installChunkPath(allocator, io, object_path, object_bytes, object_digest, object_bytes.len);
     try rootfs_cas.markStorageComplete(io, allocator, cache, storage.index_digest);
-    const published = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = "local/archive:native",
+    const published = try local_image.lockAndPublish(io, allocator, cache, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = storage,
+        .storage = storage,
+        .name = "local/archive:native",
     });
     const arm64 = rootfs.Platform{ .os = "linux", .arch = .arm64 };
     const native = try pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/native.tar.gz", .platform = arm64 });
-    const metadata = try Io.Dir.cwd().readFileAlloc(io, published.metadata_path, allocator, .limited(1024 * 1024));
+    try std.testing.expectEqualStrings(published.identity, native.image_digest);
 
-    // An import-oci or import-tar tag names the same metadata under a SHA-256
-    // local digest; it packs to the identical native archive.
-    const local_digest = "sha256:" ++ "c" ** 64;
-    const imported = rootfs.ResolvedImage{ .ref = "local/archive@" ++ local_digest, .manifest_digest = local_digest, .platform = arm64 };
-    const imported_metadata = try std.mem.replaceOwned(u8, allocator, metadata, published.image_manifest_digest, local_digest);
-    const imported_metadata_path = try rootfs.cachedImageRootfsMetadataPath(allocator, cache, imported);
-    try chunk_sealer.replaceFileAtomicDurable(allocator, imported_metadata_path, imported_metadata, 0o644);
-    _ = try rootfs.writeLocalRefCache(io, allocator, cache, "local/archive:imported", imported);
-    const imported_result = try pack(init, allocator, .{ .source = "local/archive:imported", .output_path = tmp ++ "/imported.tar.gz", .platform = arm64 });
-    try std.testing.expectEqualStrings(native.archive_digest, imported_result.archive_digest);
-    try std.testing.expectEqualStrings(published.image_manifest_digest, imported_result.image_digest);
-
-    // A native BLAKE3 ref whose metadata no longer recomputes to that identity
-    // is rejected.
-    const tampered = try std.mem.replaceOwned(u8, allocator, metadata, "\"architecture\": \"arm64\"", "\"architecture\": \"arm64\", \"config\": {\"WorkingDir\": \"/tampered\"}");
-    try chunk_sealer.replaceFileAtomicDurable(allocator, published.metadata_path, tampered, 0o644);
-    try std.testing.expectError(error.ImageIdentityMismatch, pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/tampered.tar.gz", .platform = arm64 }));
+    const record = try Io.Dir.cwd().readFileAlloc(io, published.record_path, allocator, .limited(1024 * 1024));
+    const tampered = try std.mem.replaceOwned(u8, allocator, record, "\"architecture\": \"arm64\"", "\"architecture\": \"arm64\", \"config\": {\"WorkingDir\": \"/tampered\"}");
+    try std.testing.expect(!std.mem.eql(u8, record, tampered));
+    try chunk_sealer.replaceFileAtomicDurable(allocator, published.record_path, tampered, 0o644);
+    try std.testing.expectError(error.BadManifest, pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/tampered.tar.gz", .platform = arm64 }));
+    try std.testing.expectError(error.FileNotFound, pack(init, allocator, .{ .source = "local/archive:missing", .output_path = tmp ++ "/missing.tar.gz", .platform = arm64 }));
 }
 
 test "native image archive round-trips into a clean cache and rejects substitution" {
@@ -763,13 +719,13 @@ test "native image archive round-trips into a clean cache and rejects substituti
     defer allocator.free(installed_object);
     _ = try rootfs_cas.installChunkPath(allocator, io, installed_object, object_bytes, object_digest, object_bytes.len);
     try rootfs_cas.markStorageComplete(io, allocator, producer_cache, storage.index_digest);
-    const published = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = "local/archive:producer",
+    const published = try local_image.lockAndPublish(io, allocator, producer_cache, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = storage,
+        .storage = storage,
+        .name = "local/archive:producer",
     });
-    defer rootfs.deinitPublishIndexedImageResult(allocator, published);
+    defer published.deinit(allocator);
 
     const archive_path = tmp ++ "/image.tar.gz";
     const pack_result = try pack(init, allocator, .{
@@ -779,7 +735,7 @@ test "native image archive round-trips into a clean cache and rejects substituti
     });
     defer deinitPackResult(allocator, pack_result);
     try std.testing.expectEqual(resource.Type.image, pack_result.resource_type);
-    try std.testing.expectEqualStrings(published.image_manifest_digest, pack_result.image_digest);
+    try std.testing.expectEqualStrings(published.identity, pack_result.image_digest);
     try std.testing.expectEqual(@as(usize, 1), pack_result.object_count);
     try std.testing.expectError(error.ImageArchiveOutputExists, pack(init, allocator, .{
         .source = "local/archive:producer",
