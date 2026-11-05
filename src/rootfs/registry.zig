@@ -13,65 +13,104 @@ pub const FetchManifestResult = struct {
     content_digest: ?[]u8 = null,
 };
 
+/// Names a host that serves docker.io content in place of Docker Hub
+/// (`host` or `host:port`, HTTPS only), like Docker's `registry-mirrors`.
+pub const docker_hub_mirror_env = "SPOREVM_DOCKER_HUB_MIRROR";
+
+/// Registry state shared by the requests of one image pull.
+pub const Session = struct {
+    client: *std.http.Client,
+    bearer_token: ?[]const u8 = null,
+    /// Serves docker.io manifests and blobs until it lacks a manifest; the
+    /// rest of the pull then uses Docker Hub.
+    docker_hub_mirror: ?[]const u8 = null,
+
+    pub fn init(client: *std.http.Client, environ: *const std.process.Environ.Map) !Session {
+        const mirror = environ.get(docker_hub_mirror_env) orelse "";
+        if (mirror.len == 0) return .{ .client = client };
+        oci.validateRegistry(mirror) catch return error.BadDockerHubMirror;
+        return .{ .client = client, .docker_hub_mirror = mirror };
+    }
+};
+
+const manifest_accept =
+    "application/vnd.oci.image.index.v1+json, " ++
+    "application/vnd.docker.distribution.manifest.list.v2+json, " ++
+    "application/vnd.oci.image.manifest.v1+json, " ++
+    "application/vnd.docker.distribution.manifest.v2+json";
+
 pub fn fetchManifest(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *Session,
     image_ref: oci.ImageRef,
     digest: []const u8,
 ) ![]u8 {
-    const url = try image_ref.manifestUrl(allocator, digest);
-    const accept =
-        "application/vnd.oci.image.index.v1+json, " ++
-        "application/vnd.docker.distribution.manifest.list.v2+json, " ++
-        "application/vnd.oci.image.manifest.v1+json, " ++
-        "application/vnd.docker.distribution.manifest.v2+json";
-    return fetchBytes(allocator, client, bearer_token, url, accept, max_registry_manifest_bytes);
+    const result = try fetchManifestFrom(allocator, session, image_ref.registry, image_ref.repository, digest);
+    if (result.content_digest) |content_digest| allocator.free(content_digest);
+    return result.bytes;
 }
 
 pub fn fetchManifestByTag(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *Session,
     image_tag: oci.ImageTag,
 ) !FetchManifestResult {
-    const url = try image_tag.manifestUrl(allocator);
-    const accept =
-        "application/vnd.oci.image.index.v1+json, " ++
-        "application/vnd.docker.distribution.manifest.list.v2+json, " ++
-        "application/vnd.oci.image.manifest.v1+json, " ++
-        "application/vnd.docker.distribution.manifest.v2+json";
-    return fetchBytesWithContentDigest(allocator, client, bearer_token, url, accept, max_registry_manifest_bytes);
+    return fetchManifestFrom(allocator, session, image_tag.registry, image_tag.repository, image_tag.tag);
+}
+
+fn fetchManifestFrom(
+    allocator: std.mem.Allocator,
+    session: *Session,
+    registry_name: []const u8,
+    repository: []const u8,
+    reference: []const u8,
+) !FetchManifestResult {
+    while (true) {
+        const mirror = if (oci.isDockerHub(registry_name)) session.docker_hub_mirror else null;
+        const url = try oci.manifestUrl(allocator, registry_name, repository, reference, mirror);
+        std.log.debug("registry: fetching manifest {s}", .{url});
+        if (fetchBytesWithContentDigest(allocator, session.client, &session.bearer_token, url, manifest_accept, max_registry_manifest_bytes)) |result| {
+            return result;
+        } else |err| switch (err) {
+            // Uncached repositories make mirror.gcr.io answer 404 or, when its
+            // own upstream quota is spent, 429.
+            error.RegistryNotFound, error.RegistryRateLimited => if (mirror == null) return err,
+            else => return err,
+        }
+        std.log.debug("registry: {s} cannot serve {s}/{s} manifest {s}; using Docker Hub for this pull", .{ mirror.?, registry_name, repository, reference });
+        session.docker_hub_mirror = null;
+        session.bearer_token = null;
+    }
 }
 
 pub fn fetchBlobBytes(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *Session,
     image_ref: oci.ImageRef,
     digest: []const u8,
     expected_size: ?u64,
 ) ![]u8 {
-    const url = try image_ref.blobUrl(allocator, digest);
+    const url = try oci.blobUrl(allocator, image_ref.registry, image_ref.repository, digest, session.docker_hub_mirror);
     if (expected_size) |size| {
         if (size > max_registry_config_bytes) return error.RegistryBodyTooLarge;
-        return fetchBytes(allocator, client, bearer_token, url, "application/octet-stream", size);
+        return fetchBytes(allocator, session.client, &session.bearer_token, url, "application/octet-stream", size);
     }
-    return fetchBytes(allocator, client, bearer_token, url, "application/octet-stream", max_registry_config_bytes);
+    return fetchBytes(allocator, session.client, &session.bearer_token, url, "application/octet-stream", max_registry_config_bytes);
 }
 
 pub fn fetchBlobToFile(
     allocator: std.mem.Allocator,
     io: Io,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *Session,
     image_ref: oci.ImageRef,
     digest: []const u8,
     expected_size: ?u64,
     max_size: u64,
     path: []const u8,
 ) !void {
-    const url = try image_ref.blobUrl(allocator, digest);
+    const client = session.client;
+    const bearer_token = &session.bearer_token;
+    const url = try oci.blobUrl(allocator, image_ref.registry, image_ref.repository, digest, session.docker_hub_mirror);
     const body_limit = if (expected_size) |size| limit: {
         if (size > max_size) return error.RegistryBodyTooLarge;
         break :limit size;
@@ -107,9 +146,17 @@ pub fn fetchBlobToFile(
             continue;
         }
 
-        if (result.status != .ok) return error.RegistryHTTPStatus;
+        if (result.status != .ok) return httpStatusError(result.status);
         return;
     }
+}
+
+fn httpStatusError(status: std.http.Status) error{ RegistryNotFound, RegistryRateLimited, RegistryHTTPStatus } {
+    return switch (status) {
+        .not_found => error.RegistryNotFound,
+        .too_many_requests => error.RegistryRateLimited,
+        else => error.RegistryHTTPStatus,
+    };
 }
 
 fn fetchBytes(
@@ -166,7 +213,7 @@ fn fetchBytesWithContentDigest(
             continue;
         }
 
-        if (result.status != .ok) return error.RegistryHTTPStatus;
+        if (result.status != .ok) return httpStatusError(result.status);
         const bytes = try writer.toOwnedSlice();
         const content_digest = result.content_digest;
         result.content_digest = null;

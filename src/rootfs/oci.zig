@@ -34,14 +34,6 @@ pub const ImageRef = struct {
         const parsed = try parseImageName(name);
         return .{ .registry = parsed.registry, .repository = parsed.repository, .digest = digest };
     }
-
-    pub fn manifestUrl(self: ImageRef, allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
-        return manifestUrlFor(allocator, self.registry, self.repository, digest);
-    }
-
-    pub fn blobUrl(self: ImageRef, allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
-        return blobUrlFor(allocator, self.registry, self.repository, digest);
-    }
 };
 
 pub const ImageTag = struct {
@@ -59,10 +51,6 @@ pub const ImageTag = struct {
         const tag = raw[tag_colon + 1 ..];
         validateTag(tag) catch return error.BadImageReference;
         return .{ .registry = parsed.registry, .repository = parsed.repository, .tag = tag };
-    }
-
-    pub fn manifestUrl(self: ImageTag, allocator: std.mem.Allocator) ![]u8 {
-        return manifestUrlFor(allocator, self.registry, self.repository, self.tag);
     }
 
     pub fn digestRef(self: ImageTag, allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
@@ -86,17 +74,23 @@ fn parseImageName(name: []const u8) !ImageName {
     return .{ .registry = registry, .repository = repository };
 }
 
-fn manifestUrlFor(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, reference: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/manifests/{s}", .{ registryApiHost(registry), repository, reference });
+/// Registry API URL for a manifest. `docker_hub_mirror` replaces Docker Hub
+/// for docker.io references only; the reference itself is unchanged.
+pub fn manifestUrl(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, reference: []const u8, docker_hub_mirror: ?[]const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/manifests/{s}", .{ registryApiHost(registry, docker_hub_mirror), repository, reference });
 }
 
-fn blobUrlFor(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, digest: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/blobs/{s}", .{ registryApiHost(registry), repository, digest });
+pub fn blobUrl(allocator: std.mem.Allocator, registry: []const u8, repository: []const u8, digest: []const u8, docker_hub_mirror: ?[]const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "https://{s}/v2/{s}/blobs/{s}", .{ registryApiHost(registry, docker_hub_mirror), repository, digest });
 }
 
-fn registryApiHost(registry: []const u8) []const u8 {
-    if (std.ascii.eqlIgnoreCase(registry, "docker.io")) return "registry-1.docker.io";
-    return registry;
+pub fn isDockerHub(registry: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(registry, "docker.io");
+}
+
+fn registryApiHost(registry: []const u8, docker_hub_mirror: ?[]const u8) []const u8 {
+    if (!isDockerHub(registry)) return registry;
+    return docker_hub_mirror orelse "registry-1.docker.io";
 }
 
 pub const Descriptor = struct {
@@ -250,7 +244,7 @@ pub fn isSha256Digest(digest: []const u8) bool {
     return true;
 }
 
-fn validateRegistry(registry: []const u8) !void {
+pub fn validateRegistry(registry: []const u8) !void {
     for (registry) |c| {
         if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == ':')) return error.BadImageReference;
     }
@@ -301,7 +295,7 @@ test "tag ref parsing supports registry ports and validates docker tags" {
     try std.testing.expectEqualStrings("team/repo", parsed.repository);
     try std.testing.expectEqualStrings("v1.2_3", parsed.tag);
 
-    const url = try parsed.manifestUrl(std.testing.allocator);
+    const url = try manifestUrl(std.testing.allocator, parsed.registry, parsed.repository, parsed.tag, null);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://registry.example:5000/v2/team/repo/manifests/v1.2_3", url);
 
@@ -310,21 +304,37 @@ test "tag ref parsing supports registry ports and validates docker tags" {
     try std.testing.expectError(error.BadImageReference, ImageTag.parse("registry.example/team/repo:bad+tag"));
 }
 
-test "docker.io references fetch from Docker Hub registry API" {
-    const tag = try ImageTag.parse("docker.io/library/alpine:3.20");
-    const tag_url = try tag.manifestUrl(std.testing.allocator);
-    defer std.testing.allocator.free(tag_url);
-    try std.testing.expectEqualStrings("https://registry-1.docker.io/v2/library/alpine/manifests/3.20", tag_url);
+test "docker.io references fetch from Docker Hub or its mirror" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const hub = try ImageRef.parse("docker.io/library/alpine@" ++ digest);
+    const ghcr = try ImageTag.parse("ghcr.io/buildkite/base:1");
 
-    const image_ref = try ImageRef.parse("docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-    const manifest_url = try image_ref.manifestUrl(
-        std.testing.allocator,
-        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    );
-    defer std.testing.allocator.free(manifest_url);
     try std.testing.expectEqualStrings(
-        "https://registry-1.docker.io/v2/library/alpine/manifests/sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        manifest_url,
+        "https://registry-1.docker.io/v2/library/alpine/manifests/3.20",
+        try manifestUrl(a, hub.registry, hub.repository, "3.20", null),
+    );
+    try std.testing.expectEqualStrings(
+        "https://registry-1.docker.io/v2/library/alpine/blobs/" ++ digest,
+        try blobUrl(a, hub.registry, hub.repository, digest, null),
+    );
+    try std.testing.expectEqualStrings(
+        "https://mirror.gcr.io/v2/library/alpine/manifests/" ++ digest,
+        try manifestUrl(a, hub.registry, hub.repository, hub.digest, "mirror.gcr.io"),
+    );
+    try std.testing.expectEqualStrings(
+        "https://mirror.example:5000/v2/library/alpine/blobs/" ++ digest,
+        try blobUrl(a, hub.registry, hub.repository, digest, "mirror.example:5000"),
+    );
+    try std.testing.expectEqualStrings(
+        "https://ghcr.io/v2/buildkite/base/manifests/1",
+        try manifestUrl(a, ghcr.registry, ghcr.repository, ghcr.tag, "mirror.gcr.io"),
+    );
+    try std.testing.expectEqualStrings(
+        "https://ghcr.io/v2/buildkite/base/blobs/" ++ digest,
+        try blobUrl(a, ghcr.registry, ghcr.repository, digest, "mirror.gcr.io"),
     );
 }
 

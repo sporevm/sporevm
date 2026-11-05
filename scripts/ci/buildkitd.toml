@@ -3,3 +3,6 @@
   reservedSpace = "2GB"
   maxUsedSpace = "4GB"
   minFreeSpace = "20GB"
+
+[registry."docker.io"]
+  mirrors = ["mirror.gcr.io"]

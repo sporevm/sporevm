@@ -850,9 +850,9 @@ fn resolveTaggedImageRef(init: std.process.Init, allocator: std.mem.Allocator, o
 
     var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
     defer client.deinit();
-    var bearer_token: ?[]const u8 = null;
+    var session = try registry.Session.init(&client, init.environ_map);
 
-    const fetched = try registry.fetchManifestByTag(allocator, &client, &bearer_token, image_tag);
+    const fetched = try registry.fetchManifestByTag(allocator, &session, image_tag);
     const tag_digest = try manifestContentDigest(allocator, fetched.bytes, fetched.content_digest);
     const image_ref = ImageRef{
         .registry = image_tag.registry,
@@ -861,8 +861,7 @@ fn resolveTaggedImageRef(init: std.process.Init, allocator: std.mem.Allocator, o
     };
     const selected_manifest_digest = try resolveManifestDigest(
         allocator,
-        &client,
-        &bearer_token,
+        &session,
         image_ref,
         opts.platform,
         tag_digest,
@@ -870,26 +869,25 @@ fn resolveTaggedImageRef(init: std.process.Init, allocator: std.mem.Allocator, o
     );
     const selected_manifest_bytes = try selectedManifestBytes(
         allocator,
-        &client,
-        &bearer_token,
+        &session,
         image_ref,
         selected_manifest_digest,
         fetched.bytes,
     );
-    try validateManifestConfigPlatform(allocator, &client, &bearer_token, image_ref, selected_manifest_bytes, opts.platform);
+    try validateManifestConfigPlatform(allocator, &session, image_ref, selected_manifest_bytes, opts.platform);
     return image_tag.digestRef(allocator, selected_manifest_digest);
 }
 
 pub fn resolveImageRef(init: std.process.Init, allocator: std.mem.Allocator, raw_ref: []const u8, platform: Platform) !ResolvedImage {
     var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
     defer client.deinit();
-    var bearer_token: ?[]const u8 = null;
+    var session = try registry.Session.init(&client, init.environ_map);
 
-    const image_source = try fetchBuildImageSource(allocator, &client, &bearer_token, raw_ref);
+    const image_source = try fetchBuildImageSource(allocator, &session, raw_ref);
     const image_ref = image_source.ref;
-    const manifest_digest = try resolveManifestDigest(allocator, &client, &bearer_token, image_ref, platform, image_ref.digest, image_source.manifest_bytes);
-    const selected_manifest_bytes = try selectedManifestBytes(allocator, &client, &bearer_token, image_ref, manifest_digest, image_source.manifest_bytes);
-    try validateManifestConfigPlatform(allocator, &client, &bearer_token, image_ref, selected_manifest_bytes, platform);
+    const manifest_digest = try resolveManifestDigest(allocator, &session, image_ref, platform, image_ref.digest, image_source.manifest_bytes);
+    const selected_manifest_bytes = try selectedManifestBytes(allocator, &session, image_ref, manifest_digest, image_source.manifest_bytes);
+    try validateManifestConfigPlatform(allocator, &session, image_ref, selected_manifest_bytes, platform);
 
     return .{
         .ref = try digestImageRef(allocator, image_ref, manifest_digest),
@@ -920,12 +918,11 @@ fn manifestContentDigest(allocator: std.mem.Allocator, manifest_bytes: []const u
 
 fn fetchBuildImageSource(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *registry.Session,
     raw_ref: []const u8,
 ) !BuildImageSource {
     if (ImageRef.parse(raw_ref)) |image_ref| {
-        const manifest_bytes = try registry.fetchManifest(allocator, client, bearer_token, image_ref, image_ref.digest);
+        const manifest_bytes = try registry.fetchManifest(allocator, session, image_ref, image_ref.digest);
         try oci.verifyDigestBytes(image_ref.digest, manifest_bytes);
         return .{ .ref = image_ref, .manifest_bytes = manifest_bytes };
     } else |err| switch (err) {
@@ -934,7 +931,7 @@ fn fetchBuildImageSource(
     }
 
     const image_tag = try ImageTag.parse(raw_ref);
-    const fetched = try registry.fetchManifestByTag(allocator, client, bearer_token, image_tag);
+    const fetched = try registry.fetchManifestByTag(allocator, session, image_tag);
     const tag_digest = try manifestContentDigest(allocator, fetched.bytes, fetched.content_digest);
     return .{
         .ref = .{
@@ -953,8 +950,7 @@ fn digestImageRef(allocator: std.mem.Allocator, image_ref: ImageRef, digest: []c
 
 fn selectedManifestBytes(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *registry.Session,
     image_ref: ImageRef,
     digest: []const u8,
     initial_manifest_bytes: []const u8,
@@ -962,15 +958,14 @@ fn selectedManifestBytes(
     const bytes = if (std.mem.eql(u8, digest, image_ref.digest))
         initial_manifest_bytes
     else
-        try registry.fetchManifest(allocator, client, bearer_token, image_ref, digest);
+        try registry.fetchManifest(allocator, session, image_ref, digest);
     try oci.verifyDigestBytes(digest, bytes);
     return bytes;
 }
 
 fn validateManifestConfigPlatform(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *registry.Session,
     image_ref: ImageRef,
     manifest_bytes: []const u8,
     platform: Platform,
@@ -981,7 +976,7 @@ fn validateManifestConfigPlatform(
 
     if (manifest.schemaVersion != 2) return error.UnsupportedManifestSchema;
     if (!oci.isSha256Digest(manifest.config.digest)) return error.UnsupportedDigest;
-    const config_bytes = try registry.fetchBlobBytes(allocator, client, bearer_token, image_ref, manifest.config.digest, manifest.config.size);
+    const config_bytes = try registry.fetchBlobBytes(allocator, session, image_ref, manifest.config.digest, manifest.config.size);
     try oci.verifyDigestBytes(manifest.config.digest, config_bytes);
     var config_parsed = try std.json.parseFromSlice(ImageConfig, allocator, config_bytes, .{ .ignore_unknown_fields = true });
     defer config_parsed.deinit();
@@ -1427,7 +1422,7 @@ const MaterializeOptions = struct {
 fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
     var client: std.http.Client = .{ .allocator = allocator, .io = init.io };
     defer client.deinit();
-    var bearer_token: ?[]const u8 = null;
+    var session = try registry.Session.init(&client, init.environ_map);
 
     const temp_dir_root = opts.temp_dir_root orelse ".zig-cache";
     try Io.Dir.cwd().createDirPath(init.io, temp_dir_root);
@@ -1448,12 +1443,12 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     try Io.Dir.cwd().createDirPath(init.io, layers_dir);
 
     const resolve_start = profile.start();
-    const image_source = try fetchBuildImageSource(allocator, &client, &bearer_token, opts.ref);
+    const image_source = try fetchBuildImageSource(allocator, &session, opts.ref);
     const image_ref = image_source.ref;
     const manifest_bytes = image_source.manifest_bytes;
-    const manifest_digest = try resolveManifestDigest(allocator, &client, &bearer_token, image_ref, opts.platform, image_ref.digest, manifest_bytes);
+    const manifest_digest = try resolveManifestDigest(allocator, &session, image_ref, opts.platform, image_ref.digest, manifest_bytes);
     const resolved_image_ref = try digestImageRef(allocator, image_ref, manifest_digest);
-    const selected_manifest_bytes = try selectedManifestBytes(allocator, &client, &bearer_token, image_ref, manifest_digest, manifest_bytes);
+    const selected_manifest_bytes = try selectedManifestBytes(allocator, &session, image_ref, manifest_digest, manifest_bytes);
     profile.phase("oci_resolve_fetch", resolve_start);
 
     var manifest_parsed = try std.json.parseFromSlice(ImageManifest, allocator, selected_manifest_bytes, .{ .ignore_unknown_fields = true });
@@ -1465,7 +1460,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
 
     const config_start = profile.start();
     if (!oci.isSha256Digest(manifest.config.digest)) return error.UnsupportedDigest;
-    const config_bytes = try registry.fetchBlobBytes(allocator, &client, &bearer_token, image_ref, manifest.config.digest, manifest.config.size);
+    const config_bytes = try registry.fetchBlobBytes(allocator, &session, image_ref, manifest.config.digest, manifest.config.size);
     try oci.verifyDigestBytes(manifest.config.digest, config_bytes);
     var config_parsed = try std.json.parseFromSlice(ImageConfig, allocator, config_bytes, .{ .ignore_unknown_fields = true });
     defer config_parsed.deinit();
@@ -1477,7 +1472,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     for (manifest.layers, 0..) |layer, i| {
         if (!oci.isSupportedLayerMediaType(layer.mediaType)) return error.UnsupportedLayerMediaType;
         const layer_path = try layerBlobPath(allocator, layers_dir, layer.digest);
-        try registry.fetchBlobToFile(allocator, init.io, &client, &bearer_token, image_ref, layer.digest, layer.size, tar.max_content_bytes, layer_path);
+        try registry.fetchBlobToFile(allocator, init.io, &session, image_ref, layer.digest, layer.size, tar.max_content_bytes, layer_path);
         try oci.verifyDigestFile(init.io, layer.digest, layer_path);
         layer_files[i] = .{ .media_type = layer.mediaType, .digest = layer.digest, .path = layer_path };
     }
@@ -1926,15 +1921,14 @@ fn monotonicMs() u64 {
 
 fn resolveManifestDigest(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    bearer_token: *?[]const u8,
+    session: *registry.Session,
     image_ref: ImageRef,
     platform: Platform,
     digest: []const u8,
     manifest_bytes: []const u8,
 ) ![]const u8 {
     const selected = try oci.selectedManifestDigest(allocator, manifest_bytes, platform) orelse return digest;
-    const bytes = try registry.fetchManifest(allocator, client, bearer_token, image_ref, selected);
+    const bytes = try registry.fetchManifest(allocator, session, image_ref, selected);
     try oci.verifyDigestBytes(selected, bytes);
     return selected;
 }
