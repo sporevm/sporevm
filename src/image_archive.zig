@@ -243,7 +243,7 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
     _ = try rootfs_cas.installStorageIndexPathRepairingInvalid(allocator, init.io, index_path, extracted.index_bytes, storage);
     if (!try rootfs_cas.storageContentComplete(init.io, allocator, cache_root, storage)) return error.IncompleteImageArchive;
     try rootfs_cas.markStorageComplete(init.io, allocator, cache_root, storage.index_digest);
-    const published = try rootfs.publishIndexedImageWithCacheLockHeld(init.io, allocator, cache_root, .{
+    const published = try rootfs.publishIndexedImageLocked(init.io, allocator, cache_root, &cache_lock, .{
         .ref = options.ref,
         .platform = options.platform,
         .config = extracted.config.value,

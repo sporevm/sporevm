@@ -19,6 +19,7 @@ const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 const tar = @import("rootfs/tar.zig");
+const test_barrier = @import("test_barrier.zig");
 
 const Io = std.Io;
 
@@ -31,6 +32,12 @@ const ext4_writer_name = "native";
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
+
+pub const testing = if (builtin.is_test) struct {
+    /// Pauses an image materialization after fetch and merge, before it takes
+    /// the cache lock to emit and publish.
+    pub var publish_lock_barrier: ?*test_barrier.Barrier = null;
+} else struct {};
 
 pub const usage =
     \\Usage: spore rootfs <command>
@@ -152,8 +159,15 @@ const BuildOptions = struct {
     platform: Platform = .{},
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: ?[]const u8 = null,
-    cache_owned_output: bool = false,
-    rootfs_cache_lock_held: bool = false,
+    publish: ?CachePublish = null,
+};
+
+/// Final cache paths for a materialized rootfs and its metadata. The metadata
+/// roots the image's CAS storage for GC, so both are renamed into place in the
+/// same cache-lock epoch that wrote the storage.
+const CachePublish = struct {
+    rootfs_path: []const u8,
+    metadata_path: []const u8,
 };
 
 pub const ResolvedImage = struct {
@@ -853,27 +867,18 @@ pub fn importOciLayout(init: std.process.Init, allocator: std.mem.Allocator, req
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    const result = blk: {
-        var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
-        defer cache_lock.deinit();
-
-        const build_result = try buildRootFSFromLayout(init, allocator, .{
-            .requested_ref = request.ref,
-            .resolved_image_ref = resolved_image_ref,
-            .manifest_digest = source.manifest_digest,
-            .source = source,
-            .output = temp_rootfs_path,
-            .metadata = temp_metadata_path,
-            .platform = request.platform,
-            .metadata_rootfs_path = rootfs_path,
-            .temp_dir_root = temp_dir_root,
-            .cache_owned_output = true,
-            .rootfs_cache_lock_held = true,
-        });
-        try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
-        try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
-        break :blk build_result;
-    };
+    const result = try buildRootFSFromLayout(init, allocator, .{
+        .requested_ref = request.ref,
+        .resolved_image_ref = resolved_image_ref,
+        .manifest_digest = source.manifest_digest,
+        .source = source,
+        .output = temp_rootfs_path,
+        .metadata = temp_metadata_path,
+        .platform = request.platform,
+        .metadata_rootfs_path = rootfs_path,
+        .temp_dir_root = temp_dir_root,
+        .publish = .{ .rootfs_path = rootfs_path, .metadata_path = metadata_path },
+    });
     const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
 
     return .{
@@ -929,27 +934,18 @@ pub fn importTar(init: std.process.Init, allocator: std.mem.Allocator, request: 
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    const result = blk: {
-        var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
-        defer cache_lock.deinit();
-
-        const build_result = try buildRootFSFromTar(init, allocator, .{
-            .requested_ref = request.ref,
-            .resolved_image_ref = resolved_image_ref,
-            .manifest_digest = input_digest,
-            .input = request.input,
-            .output = temp_rootfs_path,
-            .metadata = temp_metadata_path,
-            .platform = request.platform,
-            .metadata_rootfs_path = rootfs_path,
-            .temp_dir_root = temp_dir_root,
-            .cache_owned_output = true,
-            .rootfs_cache_lock_held = true,
-        });
-        try Io.Dir.renameAbsolute(temp_rootfs_path, rootfs_path, init.io);
-        try Io.Dir.renameAbsolute(temp_metadata_path, metadata_path, init.io);
-        break :blk build_result;
-    };
+    const result = try buildRootFSFromTar(init, allocator, .{
+        .requested_ref = request.ref,
+        .resolved_image_ref = resolved_image_ref,
+        .manifest_digest = input_digest,
+        .input = request.input,
+        .output = temp_rootfs_path,
+        .metadata = temp_metadata_path,
+        .platform = request.platform,
+        .metadata_rootfs_path = rootfs_path,
+        .temp_dir_root = temp_dir_root,
+        .publish = .{ .rootfs_path = rootfs_path, .metadata_path = metadata_path },
+    });
     const local_ref_path = try writeLocalRefCache(init.io, allocator, cache_root, request.ref, resolved);
 
     return .{
@@ -968,18 +964,20 @@ pub fn publishIndexedImage(init: std.process.Init, allocator: std.mem.Allocator,
     try ensureDirPath(init.io, cache_root);
     var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
     defer cache_lock.deinit();
-    return publishIndexedImageWithCacheLockHeld(init.io, allocator, cache_root, request);
+    return publishIndexedImageLocked(init.io, allocator, cache_root, &cache_lock, request);
 }
 
-/// Publish an indexed image while the caller holds the exclusive rootfs cache
-/// lock. This lets run/build transactions protect newly sealed CAS objects from
-/// pruning until the local ref has been updated.
-pub fn publishIndexedImageWithCacheLockHeld(
+/// Publish an indexed image in the caller's cache-lock epoch. This lets
+/// run/build transactions protect newly sealed CAS objects from GC until the
+/// local ref has been updated.
+pub fn publishIndexedImageLocked(
     io: Io,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
+    cache_lock: *const RootfsCacheLock,
     request: PublishIndexedImageRequest,
 ) !PublishIndexedImageResult {
+    if (!try cache_lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockNotHeld;
     _ = try parseLocalTagRef(request.ref);
     try spore.validateRootfsStorageDescriptor(request.rootfs_storage);
     try spore.validateRootfsDeviceShape(request.rootfs_storage.device);
@@ -1032,7 +1030,7 @@ pub fn publishIndexedImageWithCacheLockHeld(
 
     const result_storage = try cloneRootfsStorageDigestFields(allocator, request.rootfs_storage);
     errdefer deinitStorageDigestFields(allocator, result_storage);
-    const local_ref_path = try writeLocalRefCacheAnyDigestWithCacheLockHeld(io, allocator, cache_root, request.ref, resolved);
+    const local_ref_path = try writeLocalRefLocked(io, allocator, cache_root, cache_lock, request.ref, resolved);
     return .{
         .metadata_path = metadata_path,
         .local_ref_path = local_ref_path,
@@ -1166,8 +1164,7 @@ const LayoutBuildOptions = struct {
     platform: Platform = .{},
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
-    cache_owned_output: bool = false,
-    rootfs_cache_lock_held: bool = false,
+    publish: ?CachePublish = null,
 };
 
 const TarBuildOptions = struct {
@@ -1180,8 +1177,7 @@ const TarBuildOptions = struct {
     platform: Platform = .{},
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir_root: []const u8,
-    cache_owned_output: bool = false,
-    rootfs_cache_lock_held: bool = false,
+    publish: ?CachePublish = null,
 };
 
 const MaterializeLayer = struct {
@@ -1203,8 +1199,7 @@ const MaterializeOptions = struct {
     metadata_rootfs_path: ?[]const u8 = null,
     temp_dir: []const u8,
     profile: RootfsBuildProfile,
-    cache_owned_output: bool = false,
-    rootfs_cache_lock_held: bool = false,
+    publish: ?CachePublish = null,
 };
 
 fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: BuildOptions) !BuildResult {
@@ -1275,8 +1270,7 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = temp_dir,
         .profile = profile,
-        .cache_owned_output = opts.cache_owned_output,
-        .rootfs_cache_lock_held = opts.rootfs_cache_lock_held,
+        .publish = opts.publish,
     });
     const cleanup_start = profile.start();
     Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
@@ -1327,8 +1321,7 @@ fn buildRootFSFromLayout(init: std.process.Init, allocator: std.mem.Allocator, o
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = temp_dir,
         .profile = profile,
-        .cache_owned_output = opts.cache_owned_output,
-        .rootfs_cache_lock_held = opts.rootfs_cache_lock_held,
+        .publish = opts.publish,
     });
     const cleanup_start = profile.start();
     Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
@@ -1370,8 +1363,7 @@ fn buildRootFSFromTar(init: std.process.Init, allocator: std.mem.Allocator, opts
         .metadata_rootfs_path = opts.metadata_rootfs_path,
         .temp_dir = temp_dir,
         .profile = profile,
-        .cache_owned_output = opts.cache_owned_output,
-        .rootfs_cache_lock_held = opts.rootfs_cache_lock_held,
+        .publish = opts.publish,
     });
     const cleanup_start = profile.start();
     Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
@@ -1386,16 +1378,22 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
     const deterministic_ext4 = ext4.Determinism.fromDigest(opts.manifest_digest);
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     defer allocator.free(cache_root);
-    var maybe_cache_lock: ?RootfsCacheLock = null;
-    defer if (maybe_cache_lock) |*lock| lock.deinit();
-    const preload_result = try materializeRootFSNative(init, allocator, opts, layer_meta, deterministic_ext4, cache_root, &maybe_cache_lock);
+    var tree = try mergeLayers(init, allocator, opts, layer_meta);
+    defer tree.deinit(allocator);
+
+    // Fetching and merging touched only the private temp dir, which GC and
+    // prune never read, so they run without the cache lock. Emit writes CAS
+    // objects (or skips ones already present) that nothing roots until the
+    // metadata below is published, so emit and publication share one lock
+    // epoch: GC cannot collect storage the new metadata is about to root.
+    if (comptime builtin.is_test) if (testing.publish_lock_barrier) |barrier| barrier.pause(init.io);
+    var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
+    defer cache_lock.deinit();
+    const preload_result = try emitMergedTree(init, allocator, opts, &tree, deterministic_ext4, cache_root, &cache_lock);
     const stat = try Io.Dir.cwd().statFile(init.io, opts.output, .{});
-    if (maybe_cache_lock == null and !opts.rootfs_cache_lock_held) {
-        maybe_cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
-    }
 
     const rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
-    if (trustedDigestHardlinkEligible(opts.cache_owned_output, opts.output, cache_root)) {
+    if (trustedDigestHardlinkEligible(opts.publish != null, opts.output, cache_root)) {
         const cache_start = opts.profile.start();
         _ = try rootfs_cache.installTrustedMaterializationByHardlink(
             init.io,
@@ -1433,34 +1431,29 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
         .emit_null_optional_fields = false,
     });
     try ext4.writeFileAtPath(init.io, opts.metadata, metadata_json);
+    if (opts.publish) |publish| {
+        try renameCachePath(init.io, opts.output, publish.rootfs_path);
+        try renameCachePath(init.io, opts.metadata, publish.metadata_path);
+    }
     opts.profile.phase("metadata_write", metadata_start);
 
     return .{ .rootfs_storage = rootfs_storage };
 }
 
-fn materializeRootFSNative(
+fn mergeLayers(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     opts: MaterializeOptions,
     layer_meta: []oci.LayerMetadata,
-    deterministic_ext4: ext4.Determinism,
-    cache_root: []const u8,
-    cache_lock: *?RootfsCacheLock,
-) !rootfs_cas.PreloadResult {
-    const native_layers = try allocator.alloc(tar.LayerInput, opts.layers.len);
-    defer allocator.free(native_layers);
-
+) !tar.MergedTree {
     const merge_start = opts.profile.start();
-    for (opts.layers, 0..) |layer, i| {
-        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
-        layer_meta[i] = .{ .media_type = layer.media_type, .digest = layer.digest };
-        native_layers[i] = .{ .media_type = layer.media_type, .path = layer.path, .spill_dir = opts.temp_dir };
-    }
     var tree = tar.MergedTree.init(allocator);
     errdefer tree.deinit(allocator);
-    for (native_layers, 0..) |layer, layer_index| {
+    for (opts.layers, 0..) |layer, layer_index| {
+        if (!oci.isSupportedLayerMediaType(layer.media_type)) return error.UnsupportedLayerMediaType;
+        layer_meta[layer_index] = .{ .media_type = layer.media_type, .digest = layer.digest };
         const layer_start = opts.profile.start();
-        try tar.applyLayerToMergedTree(allocator, init.io, &tree, layer);
+        try tar.applyLayerToMergedTree(allocator, init.io, &tree, .{ .media_type = layer.media_type, .path = layer.path, .spill_dir = opts.temp_dir });
         const content_size = tree.contentSize();
         if (content_size > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
         if (opts.profile.enabled) {
@@ -1468,7 +1461,6 @@ fn materializeRootFSNative(
             opts.profile.layerPhase(layer_index, layer_start, stat.size, tree.entryCount(), content_size);
         }
     }
-    defer tree.deinit(allocator);
     opts.profile.phase("tree_merge", merge_start);
 
     const required_dirs_start = opts.profile.start();
@@ -1479,7 +1471,19 @@ fn materializeRootFSNative(
     try ensureRequiredMergedDir(allocator, &tree, "tmp", 0o1777);
     try ensureMergedResolverPlaceholder(allocator, &tree);
     opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
+    return tree;
+}
 
+fn emitMergedTree(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    opts: MaterializeOptions,
+    tree: *tar.MergedTree,
+    deterministic_ext4: ext4.Determinism,
+    cache_root: []const u8,
+    cache_lock: *const RootfsCacheLock,
+) !rootfs_cas.PreloadResult {
+    if (!try cache_lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockNotHeld;
     const scan_start = opts.profile.start();
     const content_size = tree.contentSize();
     if (content_size > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
@@ -1488,10 +1492,7 @@ fn materializeRootFSNative(
     opts.profile.phase("ext4_size_scan", scan_start);
 
     const native_start = opts.profile.start();
-    if (cache_lock.* == null and !opts.rootfs_cache_lock_held) {
-        cache_lock.* = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
-    }
-    const emit_result = try ext4_writer.emitFromMergedTree(allocator, init.io, &tree, opts.output, .{
+    const emit_result = try ext4_writer.emitFromMergedTree(allocator, init.io, tree, opts.output, .{
         .image_size = image_size,
         .inode_count = @intCast(inode_count),
         .determinism = deterministic_ext4,
@@ -1713,16 +1714,18 @@ fn writeLocalRefCacheAnyDigest(
 ) ![]const u8 {
     var cache_lock = try lockRootfsCacheExclusive(io, allocator, cache_root);
     defer cache_lock.deinit();
-    return writeLocalRefCacheAnyDigestWithCacheLockHeld(io, allocator, cache_root, raw_ref, resolved);
+    return writeLocalRefLocked(io, allocator, cache_root, &cache_lock, raw_ref, resolved);
 }
 
-fn writeLocalRefCacheAnyDigestWithCacheLockHeld(
+fn writeLocalRefLocked(
     io: Io,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
+    cache_lock: *const RootfsCacheLock,
     raw_ref: []const u8,
     resolved: ResolvedImage,
 ) ![]const u8 {
+    if (!try cache_lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockNotHeld;
     _ = try parseLocalTagRef(raw_ref);
     if (!try localResolvedRefMatchesDigest(allocator, raw_ref, resolved.ref, resolved.manifest_digest)) return error.LocalRefCacheMismatch;
 
@@ -2097,9 +2100,6 @@ pub fn buildCachedImageRootfs(
     defer Io.Dir.cwd().deleteFile(init.io, temp_rootfs_path) catch {};
     defer Io.Dir.cwd().deleteFile(init.io, temp_metadata_path) catch {};
 
-    var cache_lock = try lockRootfsCacheExclusive(init.io, allocator, cache_root);
-    defer cache_lock.deinit();
-
     std.log.debug("spore rootfs: building cached rootfs for {s}", .{resolved.ref});
     _ = try buildRootFS(init, allocator, .{
         .ref = resolved.ref,
@@ -2108,12 +2108,8 @@ pub fn buildCachedImageRootfs(
         .platform = resolved.platform,
         .metadata_rootfs_path = rootfs_path,
         .temp_dir_root = temp_dir_root,
-        .cache_owned_output = true,
-        .rootfs_cache_lock_held = true,
+        .publish = .{ .rootfs_path = rootfs_path, .metadata_path = metadata_path },
     });
-    try renameCachePath(init.io, temp_rootfs_path, rootfs_path);
-    try renameCachePath(init.io, temp_metadata_path, metadata_path);
-
     std.log.debug("spore rootfs: cached rootfs {s}", .{rootfs_path});
     return rootfs_path;
 }

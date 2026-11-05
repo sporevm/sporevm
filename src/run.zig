@@ -3619,8 +3619,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         if (result.exit_code == 0) {
             const control = if (commit_control) |*value| value else return error.RunCommitDidNotComplete;
             const storage = control.storage orelse return error.RunCommitDidNotComplete;
-            if (control.cache_lock == null) return error.RunCommitDidNotComplete;
-            const published = try rootfs_mod.publishIndexedImageWithCacheLockHeld(context.io, allocator, control.cache_root, .{
+            const cache_lock = if (control.cache_lock) |*lock| lock else return error.RunCommitDidNotComplete;
+            const published = try rootfs_mod.publishIndexedImageLocked(context.io, allocator, control.cache_root, cache_lock, .{
                 .ref = commit.ref,
                 .platform = commit.platform,
                 .config = commit.config,
