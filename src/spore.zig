@@ -46,7 +46,6 @@ pub const Error = error{
     FormatTooOld,
     BadChunk,
     BadForkCount,
-    UnsupportedVcpuCount,
     AlreadyExists,
     PlatformMismatch,
     IoFailed,
@@ -1753,7 +1752,6 @@ pub fn parseManifest(allocator: std.mem.Allocator, bytes: []const u8) Error!std.
     };
     errdefer parsed.deinit();
     validateManifest(parsed.value) catch |err| return switch (err) {
-        error.FormatTooOld => error.FormatTooOld,
         error.OutOfMemory => error.OutOfMemory,
         else => error.BadManifest,
     };
@@ -1794,7 +1792,7 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
     }
     const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
     const ram_size = parent.memory.logical_size;
-    const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, ram_size, parent.platform.vcpu_count);
+    const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, ram_size);
     defer if (shared_backing) |backing| backing.deinit();
     const fork_batch_id = try randomHex(allocator, 16);
 
@@ -1999,11 +1997,9 @@ fn provenForkBacking(
     parent_dir: []const u8,
     memory: MemoryManifest,
     ram_size: u64,
-    vcpu_count: topology.VcpuCount,
 ) Error!?ProvenForkBacking {
     const backing = memory.backing orelse return null;
     const environ = maybe_environ orelse return null;
-    try topology.validateVcpuCount(vcpu_count);
     const opened = try openProvenLocalMemoryBackingDetailed(allocator, environ, parent_dir, memory, ram_size);
     if (opened.plan.source != .local_backing) return null;
     const fd = opened.plan.fd orelse return error.IoFailed;
@@ -4148,7 +4144,7 @@ test "fork propagates unexpected child proof write I/O and cleans the backing li
     const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
     try writeLocalMemoryBackingProof(arena, &env, parent_dir, memory, ram.len);
     var child = testForkManifest(memory, ram.len, 12);
-    const shared_backing = (try provenForkBacking(arena, &env, parent_dir, memory, ram.len, 1)) orelse return error.TestUnexpectedResult;
+    const shared_backing = (try provenForkBacking(arena, &env, parent_dir, memory, ram.len)) orelse return error.TestUnexpectedResult;
     defer shared_backing.deinit();
 
     try std.testing.expectError(
@@ -4177,7 +4173,7 @@ test "fork backing link rejects a path swap after proof validation" {
     @memset(ram, 0x41);
     const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
     try writeLocalMemoryBackingProof(arena, &env, parent_dir, memory, ram.len);
-    const source = (try provenForkBacking(arena, &env, parent_dir, memory, ram.len, 1)) orelse return error.TestUnexpectedResult;
+    const source = (try provenForkBacking(arena, &env, parent_dir, memory, ram.len)) orelse return error.TestUnexpectedResult;
     defer source.deinit();
 
     if (std.c.unlink(source.source_path.ptr) != 0) return error.IoFailed;
@@ -4225,7 +4221,7 @@ test "fork backing hardlink falls back across filesystems" {
     @memset(ram, 0x5C);
     const memory = try saveMemoryWithBacking(arena, parent_dir, ram);
     try writeLocalMemoryBackingProof(arena, &env, parent_dir, memory, ram.len);
-    const source = (try provenForkBacking(arena, &env, parent_dir, memory, ram.len, 1)) orelse return error.TestUnexpectedResult;
+    const source = (try provenForkBacking(arena, &env, parent_dir, memory, ram.len)) orelse return error.TestUnexpectedResult;
     defer source.deinit();
 
     if (try testLinuxPathDevice(source.source_path) == try testLinuxPathDevice(child_dir)) return error.SkipZigTest;
