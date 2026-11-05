@@ -395,7 +395,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     // Keep the exclusive cache lock through local-ref publication so every
     // PREPARE/step root and its destination ref become reachable in one GC
     // exclusion window.
-    const publish = try rootfs_mod.publishIndexedImageWithCacheLockHeld(init.io, allocator, cache_root, .{
+    const publish = try rootfs_mod.publishIndexedImageLocked(init.io, allocator, cache_root, build_cache_lock, .{
         .ref = options.tag,
         .platform = options.platform,
         .config = final_artifact.config,

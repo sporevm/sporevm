@@ -3151,7 +3151,7 @@ test "system cache gc keeps local image ref storage and collects unreferenced CA
     {
         var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
         defer cache_lock.deinit();
-        published = try rootfs.publishIndexedImageWithCacheLockHeld(io, allocator, root, .{
+        published = try rootfs.publishIndexedImageLocked(io, allocator, root, &cache_lock, .{
             .ref = "local/app:dev",
             .rootfs_storage = referenced.storage,
         });
@@ -3176,6 +3176,84 @@ test "system cache gc keeps local image ref storage and collects unreferenced CA
     try std.testing.expect(try fileExists(io, published.local_ref_path));
     try std.testing.expect(!try fileExists(io, referenced_index_path));
     try std.testing.expect(!try fileExists(io, referenced_object_path));
+}
+
+test "image import fetches without the cache lock and GC cannot collect what it publishes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "cache" });
+    const layer_path = try std.fs.path.join(allocator, &.{ tmp_root, "rootfs.tar" });
+    var layer: Io.Writer.Allocating = .init(allocator);
+    var layer_writer = std.tar.Writer{ .underlying_writer = &layer.writer };
+    try layer_writer.writeFileBytes("etc/hello", "hello\n", .{ .mode = 0o644 });
+    try layer_writer.finishPedantically();
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_path, .data = layer.written() });
+    var env = std.process.Environ.Map.init(allocator);
+    try env.put(local_paths.rootfs_cache_env, root);
+
+    const Import = struct {
+        env: *std.process.Environ.Map,
+        input: []const u8,
+        barrier: *test_barrier.Barrier,
+        arena: std.heap.ArenaAllocator = .init(std.testing.allocator),
+        result: anyerror!rootfs.ImportTarResult = error.ImportDidNotFinish,
+
+        fn run(self: *@This()) void {
+            self.result = rootfs.importTar(.{
+                .minimal = undefined,
+                .arena = &self.arena,
+                .gpa = std.testing.allocator,
+                .io = std.testing.io,
+                .environ_map = self.env,
+                .preopens = .empty,
+            }, self.arena.allocator(), .{ .input = self.input, .ref = "local/fetch:dev" });
+            // Unblock the test if the import failed before reaching the barrier.
+            if (self.result) |_| {} else |_| self.barrier.reached.post(std.testing.io);
+        }
+    };
+
+    // Publish the image once, then drop its metadata: its CAS storage is now
+    // unrooted, exactly what a re-import would find and dedupe against.
+    var barrier = test_barrier.Barrier{};
+    var first = Import{ .env = &env, .input = layer_path, .barrier = &barrier };
+    defer first.arena.deinit();
+    first.run();
+    const first_result = try first.result;
+    try Io.Dir.cwd().deleteFile(io, first_result.metadata_path);
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, root, first_result.rootfs_storage.index_digest);
+
+    var second = Import{ .env = &env, .input = layer_path, .barrier = &barrier };
+    defer second.arena.deinit();
+    rootfs.testing.publish_lock_barrier = &barrier;
+    defer rootfs.testing.publish_lock_barrier = null;
+    var import_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, Import.run, .{&second}),
+        .barriers = &.{&barrier},
+    };
+    defer import_thread.deinit();
+    barrier.waitReached(io);
+
+    // The import has fetched and merged its layers. Other cache users are not
+    // blocked behind it, and a GC in this window collects the unrooted
+    // storage the import is about to emit and publish again.
+    var cache_lock = try rootfs.tryLockRootfsCacheExclusive(io, allocator, root);
+    cache_lock.deinit();
+    _ = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expect(!try fileExists(io, index_path));
+
+    barrier.release(io);
+    import_thread.join();
+    const second_result = try second.result;
+    try std.testing.expectEqualStrings(first_result.rootfs_storage.index_digest, second_result.rootfs_storage.index_digest);
+    _ = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, root, second_result.rootfs_storage));
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, root, second_result.rootfs_storage));
 }
 
 test "runtime disk lease protects its cache baseline from prune and gc" {
