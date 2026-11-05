@@ -17,12 +17,12 @@ Kinds:
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     kernel release tag (run/sporevm default: v0.7.1;
-                              other kinds: v0.6.3)
-  SPOREVM_KERNEL_VERSION     Linux version (run/sporevm default: 6.1.191;
-                              other kinds: 6.1.155)
+  SPOREVM_KERNEL_RELEASE     kernel release tag (run/sporevm default:
+                              src/managed_kernel.env; other kinds: v0.6.3)
+  SPOREVM_KERNEL_VERSION     Linux version (run/sporevm default:
+                              src/managed_kernel.env; other kinds: 6.1.155)
   SPOREVM_KERNEL_REPOSITORY  GitHub repo override
-                              default: sporevm/kernels for run/sporevm,
+                              default: src/managed_kernel.env for run/sporevm,
                               buildkite/cleanroom-kernels for initrd/rootfs
   SPOREVM_KERNEL_CACHE_DIR   cache directory override
 EOF
@@ -32,6 +32,9 @@ die() {
   echo "error: $*" >&2
   exit 1
 }
+
+# shellcheck source=src/managed_kernel.env
+source "$(dirname "${BASH_SOURCE[0]}")/../../src/managed_kernel.env"
 
 abs_path() {
   local path="$1"
@@ -158,7 +161,7 @@ verify_kernel() {
   actual="$(sha256_file "${image}")"
   [[ "${actual}" == "${expected}" ]] || return 1
   if [[ "${kernel_arch}" == "x86_64" && "$(basename "${image}")" == sporevm-x86_64-* ]]; then
-    [[ "${actual}" == "13ca22ff42b795c33365c89fad3e7d5bbf0a972cdaedc7f70f2f78270ee7bb82" ]] || {
+    [[ "${actual}" == "${managed_kernel_x86_64_sha256}" ]] || {
       echo "error: managed x86 kernel does not match the approved candidate digest" >&2
       return 1
     }
@@ -218,9 +221,9 @@ default_release="v0.6.3"
 
 case "${kind}" in
   run | sporevm)
-    repo="${repo:-sporevm/kernels}"
-    linux_version="${SPOREVM_KERNEL_VERSION:-6.1.191}"
-    default_release="v0.7.1"
+    repo="${repo:-${managed_kernel_repository}}"
+    linux_version="${SPOREVM_KERNEL_VERSION:-${managed_kernel_linux_version}}"
+    default_release="${managed_kernel_release}"
     if [[ "${kernel_arch}" == "x86_64" ]]; then
       asset="sporevm-x86_64-linux-${linux_version}-bzImage"
     else

@@ -5,8 +5,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
 board_smoke_bin="${SPOREVM_X86_BOARD_SMOKE_BIN:-${repo_root}/zig-out/bin/x86-board-smoke}"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
-release="${SPOREVM_KERNEL_RELEASE:-v0.7.1}"
-asset="sporevm-x86_64-linux-6.1.191-bzImage"
+# shellcheck source=src/managed_kernel.env
+source "${repo_root}/src/managed_kernel.env"
+release="${SPOREVM_KERNEL_RELEASE:-${managed_kernel_release}}"
+asset="sporevm-x86_64-linux-${managed_kernel_linux_version}-bzImage"
 
 die() {
   echo "error: $*" >&2
@@ -46,7 +48,7 @@ mkdir -p "${SPOREVM_RUNTIME_DIR}"
 chmod 0700 "${SPOREVM_RUNTIME_DIR}"
 
 if [[ -n "${seed_dir}" ]]; then
-  managed_dir="${SPOREVM_KERNEL_CACHE_DIR}/sporevm-kernels/${release}"
+  managed_dir="${SPOREVM_KERNEL_CACHE_DIR}/${managed_kernel_repository//\//-}/${release}"
   mkdir -p "${managed_dir}"
   for suffix in "" .config .sha256; do
     [[ -f "${seed_dir}/${asset}${suffix}" ]] || die "missing managed seed asset: ${seed_dir}/${asset}${suffix}"

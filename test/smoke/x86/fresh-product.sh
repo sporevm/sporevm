@@ -4,8 +4,10 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
-release="${SPOREVM_KERNEL_RELEASE:-v0.7.1}"
-asset="sporevm-x86_64-linux-6.1.191-bzImage"
+# shellcheck source=src/managed_kernel.env
+source "${repo_root}/src/managed_kernel.env"
+release="${SPOREVM_KERNEL_RELEASE:-${managed_kernel_release}}"
+asset="sporevm-x86_64-linux-${managed_kernel_linux_version}-bzImage"
 
 die() {
   echo "error: $*" >&2
@@ -38,7 +40,7 @@ trap cleanup EXIT
 mkdir -p "${runtime_dir}"
 chmod 0700 "${runtime_dir}"
 if [[ -n "${seed_dir}" ]]; then
-  managed_dir="${kernel_cache}/sporevm-kernels/${release}"
+  managed_dir="${kernel_cache}/${managed_kernel_repository//\//-}/${release}"
   mkdir -p "${managed_dir}"
   for suffix in "" .config .sha256; do
     cp "${seed_dir}/${asset}${suffix}" "${managed_dir}/${asset}${suffix}"
