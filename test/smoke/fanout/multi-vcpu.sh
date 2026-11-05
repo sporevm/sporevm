@@ -50,6 +50,8 @@ expect_named_online_cpus() {
   expect_online_cpus "${stdout}"
 }
 
+# The metrics are info logs, so NAME must have been created with
+# `spore --debug create` for its monitor to write them.
 save_named_with_metrics() {
   local name="$1"
   local out_dir="$2"
@@ -109,7 +111,7 @@ run_disk_point_in_time_case() {
   local restored_name="${source_name}-restored"
   local saved_dir="${workdir}/${kind}.spore"
 
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${source_name}" \
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --debug create "${source_name}" \
     --backend "${backend}" \
     --vcpus "${vcpus}" \
     --memory "${memory}" \
@@ -180,17 +182,6 @@ create_timeout_ms="${SPORE_SMOKE_CREATE_TIMEOUT_MS:-120000}"
 online_cpu_command=(/bin/sh -c 'printf "spore cpus-online "; cat /sys/devices/system/cpu/online')
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-multi-vcpu"
 smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-mvcpu"
-if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
-  exact_spore_bin="$(cd "$(dirname "${spore_bin}")" && pwd -P)/$(basename "${spore_bin}")"
-  debug_spore_bin="${workdir}/spore-debug"
-  {
-    printf '#!/usr/bin/env bash\n'
-    printf 'exact_spore=%q\n' "${exact_spore_bin}"
-    printf 'exec -a "$0" "$exact_spore" --debug "$@"\n'
-  } >"${debug_spore_bin}"
-  chmod 700 "${debug_spore_bin}"
-  spore_bin="${debug_spore_bin}"
-fi
 vm_name="mvcpus-${backend}"
 forked_name="${vm_name}-forked"
 resumed_name="${vm_name}-resumed"
@@ -391,7 +382,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   # conflating it with rootfs publication work.
   auto_name="${vm_name}-auto"
   auto_dir="${workdir}/auto.spore"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${auto_name}" \
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --debug create "${auto_name}" \
     --backend "${backend}" \
     --vcpus "${vcpus}" \
     --timeout "${create_timeout_ms}ms" \

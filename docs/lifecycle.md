@@ -253,7 +253,9 @@ monitor log, vsock state, optional network gateway, and a local newline-delimite
 JSON control socket. `ready.json`, list output, and lifecycle results report a
 console path only when the monitor actually opened one. Restore never reuses a
 saved lifecycle console path as host authority; a future explicit restore option
-would need to select a new path.
+would need to select a new path. `spore --debug` on `create`, `restore`, or
+`fork` starts the monitor with `--debug`, so `monitor.log` includes its info
+and debug logs, such as save timing metrics.
 
 ## Session Handles
 
