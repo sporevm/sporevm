@@ -7,7 +7,6 @@ spec_refs:
   - docs/memory.md
   - docs/lifecycle.md
   - docs/rootfs.md
-  - docs/libspore.md
   - SECURITY.md
   - src/architecture.zig
   - src/x86_64/board.zig
@@ -46,21 +45,21 @@ requires a matching architecture and compatible machine profile.
 | Architecture, host-info, artifacts, runner | Complete | `src/architecture.zig`, `src/platform.zig`, `src/x86_64/vm.zig`, `build.zig` |
 | Managed fresh product execution | Complete | `mise run smoke:x86-slice3a` on native x86 KVM |
 | OCI/rootfs/network/image commit | Complete | `mise run smoke:x86-slice3b` on native x86 KVM |
-| Native build and standalone libspore | Complete | `mise run smoke:x86-slice3c` on native x86 KVM |
+| Native build | Complete | `mise run smoke:x86-slice3c` on native x86 KVM |
 | Saved machine state and lifecycle parity | Pending: Slices 4–5 | No x86 manifest writer yet |
 | High/elastic memory and performance | Pending: Slice 6 | Product requires fixed 512 MiB |
 | Packaging and supported release | Pending: Slice 7 | No x86 support claim yet |
 
 The current product path is experimental and fresh-only: Linux/x86-64 KVM, one
 vCPU, and fixed 512 MiB memory. Native OCI/rootfs execution, writable image
-commit, networking, build, and standalone libspore fresh execution are
-complete. Capture, saved-state restore/resume, disk fork, elastic memory, and
-release paths remain fail closed.
+commit, networking, and build are complete. Capture, saved-state
+restore/resume, disk fork, elastic memory, and release paths remain fail
+closed.
 
 ## Scope
 
 Deliver the complete existing fresh, build, save, restore, fork, bundle, named
-lifecycle, networking, memory, CLI, and libspore contracts on x86-64 Linux/KVM.
+lifecycle, networking, memory, and CLI contracts on x86-64 Linux/KVM.
 Use native `linux/amd64` workloads, normalized x86 machine state, one frozen
 virtio-mmio device model, and same-host-class portability. Preserve existing
 ARM behaviour, byte-compatible fixed-memory aarch64 v2/v3 manifests, and the
@@ -157,23 +156,19 @@ that lifecycle, and release requires the complete product contract.
 **Done when:** fresh amd64 image execution, rootfs mutation, image commit, and
 the network policy matrix pass natively without enabling capture.
 
-### Slice 3c: Native build and libspore fresh run
+### Slice 3c: Native build
 
 **Status: complete.** Native acceptance runs a cold and warm Dockerfile
 contract covering `TARGETPLATFORM`, `TARGETARCH=amd64`, context and cache disks,
-then executes the built image. It also runs standalone Zig, C, and Go
-fresh-execution consumers without a `spore` CLI on `PATH`. Saved-state and
-capture APIs remain outside this slice.
+then executes the built image. Saved state and capture remain outside this
+slice.
 
 - Make `spore build` use the native platform, `TARGETARCH=amd64`, and
   architecture-scoped inputs, executor, caches, and OCI config; run the existing
   conformance suite without emulation.
-- Route standalone libspore fresh-run APIs through the reviewed x86 product
-  path while capture APIs remain explicitly unavailable.
-- Cross-check Zig, C, and Go architecture surfaces needed by Slice 7.
 
-**Done when:** Dockerfile builds and standalone development libspore fresh-run
-smokes pass on x86, with unchanged ARM build behaviour.
+**Done when:** Dockerfile builds pass on x86, with unchanged ARM build
+behaviour.
 
 ### Slice 4: Manifest v4 and fixed-memory capture
 
@@ -212,7 +207,7 @@ pre-restore vCPU execution or backwards guest time.
 - Enable `run --save`, `run --from`, inspect, pack, unpack, push, and pull for
   x86 while preserving OCI/rootfs, network, annotation, generation, and
   session state.
-- Route CLI/libspore through one compatibility boundary and prove bundle
+- Route the CLI through one compatibility boundary and prove bundle
   transfer/restore on a compatible destination.
 
 **Done when:** a captured x86 spore survives public bundle round trips on the
@@ -306,12 +301,11 @@ ordinary x86 memory contract is ready to advertise.
 ### Slice 7: Package and release
 
 - Build a fixture release and run supported mise/ubi selectors before freezing
-  CLI and libspore asset names. Preserve the existing ARM libspore compatibility
-  asset until supported clients can select unambiguous architecture names.
+  CLI asset names.
 - Add native x86 Buildkite unit, smoke, packaged-smoke, and benchmark steps on
   the repository-owned queue.
-- Publish x86 CLI/libspore archives with complete checksum, selector,
-  installer, release dependency, and standalone C/Go smoke coverage.
+- Publish x86 CLI archives with complete checksum, selector, installer, and
+  release dependency coverage.
 - Repeat the CPU/clock profile and packaged correctness proof on a replacement
   or second machine of the same declared host class.
 - Require exact-head ARM64 KVM, ARM64 HVF, and x86-64 KVM proofs before the
@@ -343,7 +337,7 @@ cumulative native gates:
 | Manifest and machine state | codec, bounds, fuzz, restore-order tests | process-boundary capture/restore |
 | Multi-vCPU lifecycle | topology and state tests | save/fork/named lifecycle matrix |
 | Segmented/elastic memory | region, boundary, dirty-map fuzz/tests | high-RAM, lazy/local, explicit elastic range |
-| Packaging | archive, selector, installer tests | packaged CLI plus C/Go libspore |
+| Packaging | archive, selector, installer tests | packaged CLI |
 | Performance | benchmark parser/comparison tests | separate x86 baseline |
 
 Native evidence uses the exact candidate commit and managed artifacts.
@@ -363,13 +357,12 @@ host-info, artifact identity, capability output, checksums, and smoke logs.
 ## Documentation Work
 
 Update each durable owner in the slice that changes it: format and portability
-in Slice 4, lifecycle in Slices 4–5, memory in Slice 6, rootfs/libspore with
+in Slice 4, lifecycle in Slices 4–5, memory in Slice 6, rootfs with
 Slices 3b–3c, and security alongside every new boundary. Update README and
 release notes only when packaged support is proven.
 
 ## Deferred Decisions
 
-- Libspore archive names wait for the Slice 7 mise/ubi fixture.
 - Broader host compatibility waits for a new named profile and proof.
 - A common machine/run abstraction waits for two concrete consumers.
 

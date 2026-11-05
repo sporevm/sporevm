@@ -45,10 +45,6 @@ spore run --net --allow-host example.com -- /bin/wget -qO- https://example.com
 spore run --net --allow-cidr 93.184.216.34/32 -- /bin/wget -qO- http://93.184.216.34/
 ```
 
-The libspore policy API is stricter: `NetworkPolicy{ .default = .deny }` uses
-exact host plus port rules and exposes capability facts through
-`networkCapabilities()`.
-
 ## Bound Services
 
 One-shot runs can expose declared host Unix sockets to the guest:
@@ -68,8 +64,7 @@ socket as guest-controlled.
 
 Saved manifests record bound-service requirements by name, guest host, and
 guest port, but never durable host socket paths. Restore fails closed unless a
-caller supplies fresh live bindings for each declared service through libspore
-or the CLI:
+caller supplies fresh live bindings for each declared service:
 
 ```bash
 spore attach net-enabled.spore \

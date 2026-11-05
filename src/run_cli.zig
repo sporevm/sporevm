@@ -52,7 +52,7 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
     defer run_mod.closeConsoleLog();
 
     const full_args = try init.minimal.args.toSlice(arena);
-    const spore_executable = full_args[0];
+    const spore_executable = try std.process.executablePathAlloc(init.io, arena);
     const result = runParsed(init, arena, parsed, events, spore_executable, runtimeDebugEnabled(full_args)) catch |err| {
         if (parsed.event_mode == .jsonl) {
             const classified = api.classifyFailure(err);

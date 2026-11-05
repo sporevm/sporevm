@@ -20,8 +20,6 @@ trap 'rm -rf "${workdir}"' EXIT
 export SPOREVM_KERNEL_CACHE_DIR="${workdir}/kernel-cache"
 export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
-export SPORE_BACKEND=kvm
-export SPORE_SMOKE_MEMORY_MIB=512
 mkdir -p "${SPOREVM_RUNTIME_DIR}"
 chmod 0700 "${SPOREVM_RUNTIME_DIR}"
 
@@ -67,23 +65,6 @@ grep -Fq 'executed_steps=0 boot_count=0' "${workdir}/build-warm.log" || \
 "${spore_bin}" run --backend kvm --memory 512mib --image "${build_tag}" --pull=never -- \
   /bin/sh -lc 'test "$(cat /slice3c-arch)" = amd64 && grep -Fxq "native context payload" /slice3c-context'
 
-run_path="/usr/bin:/bin:/usr/sbin:/sbin"
-if env -i PATH="${run_path}" /bin/sh -c 'command -v spore >/dev/null 2>&1'; then
-  die "test PATH unexpectedly resolves spore"
-fi
-
-consumer_env=(env -i
-  HOME="${HOME:-/tmp}"
-  TMPDIR="${TMPDIR:-/tmp}"
-  PATH="${run_path}"
-  SPOREVM_KERNEL_CACHE_DIR="${SPOREVM_KERNEL_CACHE_DIR}"
-  SPOREVM_ROOTFS_CACHE_DIR="${SPOREVM_ROOTFS_CACHE_DIR}"
-  SPOREVM_RUNTIME_DIR="${SPOREVM_RUNTIME_DIR}")
-
-"${consumer_env[@]}" "${repo_root}/zig-out/bin/libspore-zig-fresh-smoke"
-"${consumer_env[@]}" "${repo_root}/zig-out/bin/libspore-c-smoke" \
-  --fresh-run "c-standalone-kvm-$$"
-"${repo_root}/test/smoke/libspore/standalone-go.sh"
 "${repo_root}/test/smoke/x86/fail-closed.sh"
 
 if find "${SPOREVM_RUNTIME_DIR}" -mindepth 2 -print -quit | grep -q .; then

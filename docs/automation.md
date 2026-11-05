@@ -1,7 +1,7 @@
 # Automation contract
 
-SporeVM has one versioning and terminal-outcome contract across the CLI, Zig
-API, C ABI, and Go binding. Human output remains intentionally unstable.
+The CLI's `--json` results and `--events=jsonl` streams are SporeVM's only
+programmatic interface. Human output remains intentionally unstable.
 
 ## CLI surfaces
 
@@ -51,10 +51,6 @@ The bounded schema inventory is:
 | `create`, `logs`, `save`, `restore`, `vm rm`, `vm fork`, `checkpoint rm`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v1`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
 | `build`, rootfs operations, image gateway and archive operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v1`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.pull.result.v1`, `spore.image.fixture.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1` |
 | `system df`/`prune`, `cache gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v1`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
-
-Zig run and attach results use `spore.run.result.v1`. The bounded named-exec
-compatibility collector used by Zig, C, and Go uses `spore.exec.result.v1`;
-streaming callers should use the completion contract instead.
 
 Run and attach completion records expose `memory_bytes` as initial
 guest-visible memory and `max_memory_bytes` as the ceiling; equal values mean
@@ -121,16 +117,6 @@ The stable v1 codes are:
 | `runtime.execution_failed` | `runtime` | `unknown` |
 | `operation.canceled` | `operation` | `unknown` |
 | `stream.interrupted` | `stream` | `unknown` |
-
-## Library alignment
-
-Zig exposes `ClassifiedFailure`, `TerminalOutcome`, and typed run events. C ABI
-failures retain the existing result code and expose the matching borrowed
-`spore.error.v1` document through `spore_context_last_error_json`. Go decodes
-that document into `CallError` fields. Streaming named exec uses one completion
-event with a terminal outcome in C and Go; a transport failure returned by
-`Next` is classified as `stream.interrupted` instead of masquerading as a guest
-result.
 
 ## Compatibility
 

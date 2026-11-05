@@ -43,9 +43,8 @@ and Linux and does not shrink when `SPOREVM_RUNTIME_DIR` is a long path.
 Linux/AMD64 KVM currently exposes an experimental fresh-execution subset:
 `create`, `exec`, and `rm` with the managed kernel, embedded minimal exec
 initrd, one vCPU, and fixed 512 MiB memory. Fresh named workloads may use native
-`linux/amd64` images, explicit rootfs inputs, and networking. Standalone
-libspore consumers may use the same fresh create/exec/remove path. Named copy,
-save, restore, resume, and fork are unavailable on that profile.
+`linux/amd64` images, explicit rootfs inputs, and networking. Named copy, save,
+restore, resume, and fork are unavailable on that profile.
 
 One-shot `spore run --image SOURCE --commit local/name:tag -- COMMAND` publishes
 successful disk preparation as an image; it does not create or name a live VM.
@@ -143,8 +142,7 @@ the calculation does not compare unsynchronised host and guest clocks.
 Telemetry that is absent or malformed is emitted as `null` and never changes
 the guest result. The output path's parent must already exist.
 
-Named create exposes the same create-time annotation and networking options as
-the lifecycle library:
+Named create accepts create-time annotations and networking options:
 
 ```bash
 spore create bench-1 \
@@ -453,15 +451,14 @@ instead of forcing an expensive VM memory scan.
 only after the restored guest agent has answered a dedicated readiness request,
 the monitor has written `ready.json`, the recorded PID is alive, and the local
 `control.sock` answers a `hello` request with the same SporeVM version as the
-linked library. This means a successful named restore is immediately ready for
+calling `spore`. This means a successful named restore is immediately ready for
 `spore exec`; callers do not need to poll with a no-op command. For disk-backed
 fork children, the baseline and one-shot `SCM_RIGHTS` overlay claim are validated
 and adopted before that guest readiness probe succeeds. The monitor argv and
 control protocol are a private
-same-version contract, so matching is exact: a libspore `1.5.0` caller cannot
-use a `spore` executable reporting `1.3.0`, even if PATH resolves that older
-binary. Version mismatch is a startup error that names both versions and the
-resolved executable path.
+same-version contract, so matching is exact: a `spore` `1.5.0` caller cannot
+use a monitor reporting `1.3.0`. Version mismatch is a startup error that names
+both versions and the resolved executable path.
 
 Named lifecycle failures include the last known lifecycle state, recorded PID
 when present, the configured console path when one exists, `monitor.log`, and
@@ -493,31 +490,23 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
   `spore run --from <spore-dir> <command>` starts a new command from saved VM
   state. `--generation FILE` is accepted only with `--from`. `spore run -t
   --from <spore-dir> <command>` is not implemented yet.
-- Every attached `spore exec` uses the streaming monitor request. Embedders use
-  `openExecNamedStream` for the same separate stdout/stderr, optional stdin,
-  terminal, resize, exit, and monitor-error surface. The monitor uses fail-fast
-  backpressure: a disconnected consumer or local socket that cannot accept a
-  complete frame within the 25 ms send deadline aborts that exec so it cannot
-  block the VM control loop indefinitely.
+- Every attached `spore exec` uses the streaming monitor request with separate
+  stdout/stderr, optional stdin, terminal, resize, exit, and monitor-error
+  frames. The monitor uses fail-fast backpressure: a disconnected consumer or
+  local socket that cannot accept a complete frame within the 25 ms send
+  deadline aborts that exec so it cannot block the VM control loop
+  indefinitely.
 - `spore exec --events=jsonl` uses the same `spore.automation.event.v1`
   envelope as run, attach, restore, and fanout. It emits base64 output records
   followed by exactly one completed, failed, or canceled completion; EOF before
   completion is `stream.interrupted`.
-- `ExecNamedStream.timing` becomes available when the timing event preceding
-  the exit frame is consumed. The bounded `ExecNamedResult` carries the same
-  optional timing structure.
-- The bounded `execNamed` compatibility collector returns owned byte slices to
-  Zig. Its C JSON result keeps valid UTF-8 stdout and stderr as strings and
-  represents invalid UTF-8 streams as integer byte arrays; the Go binding
-  accepts both forms without changing the bytes.
 - Initial create output uses the existing `spore.lifecycle.v1` result. Create
   populates `initial_command` with its disposition, optional destination,
   per-stream limit, and startup status; `logs` returns the same nested object
   with process status, optional exit code, bytes, and truncation flags.
 - `spore copy-in` and `spore copy-out` transfer explicit regular files or
   directory trees. Symlinks, special files, overwrite, and workspace sync are
-  intentionally outside this primitive. Embedders use the matching
-  `copyInNamed`/`copyOutNamed` libspore API.
+  intentionally outside this primitive.
 - `spore attach` connects to saved sessions in spores. Attaching to an
   already-running named VM remains outside the public CLI surface.
 - Named live fork accepts at most 32 children and one writable rootfs disk.

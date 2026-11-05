@@ -1,7 +1,6 @@
 [tools]
 aws-cli = "2.36.7"
 gh = "2.89.0"
-go = "1.26.3"
 svu = "3.4.1"
 zig = "0.16.0"
 
@@ -41,10 +40,6 @@ description = "Verify repository-bound gateway object authorization fixtures"
 run = "scripts/benchmark/image-gateway-transport-test.py"
 description = "Verify image-gateway archive and missing-object benchmark accounting"
 
-[tasks.docs]
-run = "zig build docs"
-description = "Generate libspore API documentation"
-
 [tasks.check]
 run = "mise run test && mise run build && scripts/test/version.sh zig-out && git diff --check"
 description = "Run unit tests, build, and diff hygiene"
@@ -75,8 +70,8 @@ run = "mise run build:release && zig build kvm-boot kvm-profile-probe kvm-profil
 description = "Run the native x86 fresh-product, OCI/rootfs/commit, network-policy, and fail-closed Slice 3b matrix"
 
 [tasks."smoke:x86-slice3c"]
-run = "mise run build:release && zig build libspore-consumer-smokes --release=safe && bash test/smoke/x86/slice3c.sh"
-description = "Run native x86 build conformance and standalone Zig, C, and Go libspore fresh execution"
+run = "mise run build:release && bash test/smoke/x86/slice3c.sh"
+description = "Run native x86 build conformance and fail-closed checks"
 
 [tasks."smoke:run-stdin"]
 run = "mise run build && test/smoke/run/stdin.sh"
@@ -161,10 +156,6 @@ description = "Smoke the monitor jail denied-operation path"
 [tasks."smoke:monitor-failure-modes"]
 run = "mise run build && test/smoke/monitor/failure-modes.sh"
 description = "Smoke monitor signal, guest OOM, and killed-monitor cleanup behavior"
-
-[tasks."smoke:libspore-standalone-go"]
-run = "mise run build && test/smoke/libspore/standalone-go.sh"
-description = "Smoke Go libspore named lifecycle without spore on PATH"
 
 [tasks."smoke:run-net-config"]
 run = "mise run build && test/smoke/network/config.sh"

@@ -19,9 +19,6 @@ const max_network_events = 128;
 const max_stderr_line_len = 512;
 const netd_event_prefix = "spore-net-event ";
 const netd_json_event_prefix = "{\"event\":\"network_";
-const reexec_role_env = "SPORE_REEXEC_ROLE";
-const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
-const reexec_contract_value = "1";
 
 pub const StartError = error{
     NetdSpawnFailed,
@@ -129,12 +126,8 @@ pub const Process = struct {
             argv.append("--forward") catch return error.OutOfMemory;
             argv.append(value) catch return error.OutOfMemory;
         }
-        var child_env = reexecEnvMap(allocator, "netd") catch return error.OutOfMemory;
-        defer child_env.deinit();
-
         const child = std.process.spawn(io, .{
             .argv = argv.items,
-            .environ_map = &child_env,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
@@ -577,26 +570,7 @@ fn ignoreSigpipe() void {
     std.posix.sigaction(.PIPE, &action, null);
 }
 
-fn reexecEnvMap(allocator: std.mem.Allocator, role: []const u8) std.mem.Allocator.Error!std.process.Environ.Map {
-    var env = std.process.Environ.createMap(.{ .block = currentEnvironBlock() }, allocator) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Unexpected => unreachable,
-    };
-    errdefer env.deinit();
-    try env.put(reexec_role_env, role);
-    try env.put(reexec_contract_env, reexec_contract_value);
-    return env;
-}
-
-fn currentEnvironBlock() std.process.Environ.Block {
-    if (comptime builtin.os.tag == .windows) return .global;
-
-    var count: usize = 0;
-    while (std.c.environ[count] != null) : (count += 1) {}
-    return .{ .slice = std.c.environ[0..count :null] };
-}
-
-test "spore-net gateway spawn marks reexec role" {
+test "spore-net gateway spawns netd with policy arguments" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -612,7 +586,7 @@ test "spore-net gateway spawn marks reexec role" {
     defer allocator.free(out_path);
     const script = try std.fmt.allocPrint(
         allocator,
-        "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' \"$SPORE_REEXEC_ROLE\" \"$SPORE_REEXEC_CONTRACT\" \"$1\" \"$2\" \"$3\" \"$4\" > {s}\nprintf 'ready\\n' >&2\ncat >/dev/null\n",
+        "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n%s\\n' \"$1\" \"$2\" \"$3\" \"$4\" > {s}\nprintf 'ready\\n' >&2\ncat >/dev/null\n",
         .{out_path},
     );
     defer allocator.free(script);
@@ -625,7 +599,7 @@ test "spore-net gateway spawn marks reexec role" {
 
     const observed = try Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(4096));
     defer allocator.free(observed);
-    try std.testing.expectEqualStrings("netd\n1\nnetd\n--stdio\n--default-action\ndeny\n", observed);
+    try std.testing.expectEqualStrings("netd\n--stdio\n--default-action\ndeny\n", observed);
 }
 
 test "spore-net gateway buffers multiple rx frames" {

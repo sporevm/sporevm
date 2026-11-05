@@ -55,24 +55,18 @@ resolve_macos_sdkroot() {
 
 build_target() {
   local target_key="$1"
-  local zig_target asset_dir archive_name lib_asset_dir lib_archive_name prefix staging lib_staging binary
-  local -a shared_libs
+  local zig_target asset_dir archive_name prefix staging binary
 
-  # ponytail: lib archives are arm64-only today; omit arch so old mise picks the CLI archive.
   case "${target_key}" in
     linux-arm64)
       zig_target="aarch64-linux-musl"
       asset_dir="spore_Linux_arm64"
       archive_name="${asset_dir}.tar.gz"
-      lib_asset_dir="libspore_Linux"
-      lib_archive_name="${lib_asset_dir}.tar.gz"
       ;;
     darwin-arm64)
       zig_target="aarch64-macos.13.0"
       asset_dir="spore_Darwin_arm64"
       archive_name="${asset_dir}.tar.gz"
-      lib_asset_dir="libspore_Darwin"
-      lib_archive_name="${lib_asset_dir}.tar.gz"
       resolve_macos_sdkroot
       require_command codesign
       ;;
@@ -83,22 +77,12 @@ build_target() {
 
   prefix="${WORK_DIR}/${target_key}/prefix"
   staging="${WORK_DIR}/${asset_dir}"
-  lib_staging="${WORK_DIR}/${lib_asset_dir}"
   binary="${prefix}/bin/spore"
 
   echo "--- :zig: Build ${target_key}"
   zig build -Dtarget="${zig_target}" --release=safe --prefix "${prefix}"
 
   [[ -x "${binary}" ]] || die "missing built binary: ${binary}"
-  [[ -f "${prefix}/include/spore.h" ]] || die "missing built header: ${prefix}/include/spore.h"
-  [[ -f "${prefix}/lib/libspore.a" ]] || die "missing built static library: ${prefix}/lib/libspore.a"
-  [[ -f "${prefix}/lib/pkgconfig/libspore.pc" ]] || die "missing pkg-config file: ${prefix}/lib/pkgconfig/libspore.pc"
-  if [[ "${target_key}" == "darwin-arm64" ]]; then
-    shared_libs=("${prefix}"/lib/libspore*.dylib)
-  else
-    shared_libs=("${prefix}"/lib/libspore.so*)
-  fi
-  [[ -e "${shared_libs[0]}" ]] || die "missing built shared libspore library"
 
   scripts/test/version.sh "${prefix}" ReleaseSafe
 
@@ -110,7 +94,6 @@ build_target() {
   file "${staging}/bin/spore"
   if [[ "${target_key}" == "darwin-arm64" ]]; then
     codesign -dv --verbose=2 "${staging}/bin/spore" >/dev/null
-    codesign -dv --verbose=2 "${shared_libs[0]}" >/dev/null
   fi
 
   echo "--- :package: Archive ${archive_name}"
@@ -120,26 +103,6 @@ build_target() {
     tar -czf "${OUTPUT_DIR}/${archive_name}" "${asset_dir}"
   )
   ARCHIVE_NAMES+=("${archive_name}")
-
-  mkdir -p "${lib_staging}/docs"
-  install -m 0644 "${REPO_ROOT}/LICENSE" "${lib_staging}/LICENSE"
-  install -m 0644 "${REPO_ROOT}/README.md" "${lib_staging}/README.md"
-  install -m 0644 "${REPO_ROOT}/docs/libspore.md" "${lib_staging}/docs/libspore.md"
-  (
-    cd "${prefix}"
-    tar -cf - include/spore.h lib/libspore* lib/pkgconfig/libspore.pc
-  ) | (
-    cd "${lib_staging}"
-    tar -xf -
-  )
-
-  echo "--- :package: Archive ${lib_archive_name}"
-  rm -f "${OUTPUT_DIR}/${lib_archive_name}"
-  (
-    cd "${WORK_DIR}"
-    tar -czf "${OUTPUT_DIR}/${lib_archive_name}" "${lib_asset_dir}"
-  )
-  ARCHIVE_NAMES+=("${lib_archive_name}")
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -197,10 +160,6 @@ require_command zig
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 rm -f \
-  "${OUTPUT_DIR}/libspore_Darwin.tar.gz" \
-  "${OUTPUT_DIR}/libspore_Darwin_arm64.tar.gz" \
-  "${OUTPUT_DIR}/libspore_Linux.tar.gz" \
-  "${OUTPUT_DIR}/libspore_Linux_arm64.tar.gz" \
   "${OUTPUT_DIR}/spore_Darwin_arm64.tar.gz" \
   "${OUTPUT_DIR}/spore_Linux_arm64.tar.gz" \
   "${OUTPUT_DIR}/checksums.txt"
@@ -221,11 +180,6 @@ done
 
 for archive_name in "${ARCHIVE_NAMES[@]}"; do
   [[ -f "${OUTPUT_DIR}/${archive_name}" ]] || die "missing release archive: ${archive_name}"
-  case "${archive_name}" in
-    libspore_*_arm64.tar.gz)
-      die "libspore release archives must omit arch to keep old mise on CLI assets: ${archive_name}"
-      ;;
-  esac
 done
 
 echo "--- :fingerprint: Write checksums"

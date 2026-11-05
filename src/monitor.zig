@@ -13,7 +13,6 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const Io = std.Io;
 const net = std.Io.net;
 
-const generation = @import("generation.zig");
 const lifecycle = @import("lifecycle.zig");
 const backend_mod = @import("backend.zig");
 const memory_config = @import("memory.zig");
@@ -149,12 +148,6 @@ fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: lifecycle.D
 }
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    const allocator = init.arena.allocator();
-    const full_args = try init.minimal.args.toSlice(allocator);
-    try runRole(init, args, stdout, full_args[0]);
-}
-
-pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, spore_executable: []const u8) !void {
     const start_ms = lifecycle.monotonicMs();
     if (wantsHelp(args)) {
         try stdout.writeAll(monitor_usage);
@@ -163,6 +156,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     }
 
     const allocator = init.arena.allocator();
+    const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
     if (monitor_jail.wantsSmoke(init.environ_map)) {
         try monitor_jail.applyForMonitor(init.environ_map);
         try monitor_jail.smokeDeniedExec(init.io);
@@ -234,11 +228,6 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     const spec_disk_baseline_lease = if (existing_spec) |spec| spec.value.disk_baseline_lease else null;
     const spec_disk_fork_claim = if (existing_spec) |spec| spec.value.disk_fork_claim else null;
     const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
-    const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
-        var gen_dev = generation.Device{};
-        try gen_dev.restore(allocator, state);
-        break :blk try allocator.dupe(u8, gen_dev.paramsPayload());
-    } else null;
     const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
     const spec_exec_defaults = if (existing_spec) |spec| spec.value.exec_defaults orelse lifecycle.ExecDefaults{} else lifecycle.ExecDefaults{};
     const spec_sessions = if (existing_spec) |spec|
@@ -303,7 +292,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     });
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
+    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_exec_defaults);
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
     if (spec_disk_baseline_lease) |lease| {
@@ -450,7 +439,6 @@ const ExecServer = struct {
     guest_port: u32,
     timeout_ms: u64,
     server: net.Server,
-    generation_params: ?[]const u8,
     exec_defaults: lifecycle.ExecDefaults,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -503,7 +491,7 @@ const ExecServer = struct {
     disk_baseline_active: ?runtime_disk_lease.Active = null,
     snapshot_publication_wait: snapshot_publication.Wait = .{},
 
-    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
         // sun_path holds only 104; enforce the real platform limit before
         // listen so an oversized path fails with a clear log line instead
@@ -539,7 +527,6 @@ const ExecServer = struct {
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
-            .generation_params = generation_params,
             .exec_defaults = exec_defaults,
             .disk_claims = runtime_disk_claim.Registry.init(allocator),
             .session_nonce = session_nonce,
@@ -861,19 +848,6 @@ const ExecServer = struct {
         const ns = Io.Clock.real.now(self.io).nanoseconds;
         if (ns <= 0) return 0;
         return @intCast(ns);
-    }
-
-    fn execRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
-        var id_buf: [64]u8 = undefined;
-        const session_id = try self.nextSessionId(&id_buf);
-        var merged_env: [run.max_guest_envc][]const u8 = undefined;
-        const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
-        return run.execRequestWithSessionContext(self.allocator, argv, session_id, .{
-            .env = exec_context.env,
-            .working_dir = exec_context.working_dir,
-            .resume_time_unix_ns = self.wallClockUnixNs(),
-            .generation_params = self.generation_params,
-        });
     }
 
     fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, interactive: bool, tty: bool, terminal_name: []const u8, terminal_size: spore_stream.Resize) ![]const u8 {
@@ -1887,8 +1861,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeAll(server.io, stream, response);
         return false;
     }
-    const detached = std.mem.eql(u8, parsed.value.type, "start");
-    if (!detached and !std.mem.eql(u8, parsed.value.type, "exec")) {
+    if (!std.mem.eql(u8, parsed.value.type, "start")) {
         try writeControlError(server.io, stream, "unknown control request");
         return false;
     }
@@ -1896,16 +1869,10 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlError(server.io, stream, "command request missing argv");
         return false;
     };
-    const request = if (detached)
-        server.detachedExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
-            try writeControlError(server.io, stream, guestCommandErrorMessage(err));
-            return false;
-        }
-    else
-        server.execRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir) catch |err| {
-            try writeControlError(server.io, stream, guestCommandErrorMessage(err));
-            return false;
-        };
+    const request = server.detachedExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
+        try writeControlError(server.io, stream, guestCommandErrorMessage(err));
+        return false;
+    };
     defer server.allocator.free(request);
     const response = server.submitExec(request) catch {
         try writeControlError(server.io, stream, "monitor busy");
