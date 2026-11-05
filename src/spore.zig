@@ -4,8 +4,7 @@
 //! fixed-size `chunks/<blake3-hex>` files with all-zero chunks elided; optional
 //! writable disks use verified chunk indexes and CAS objects. Machine state is
 //! normalized architectural aarch64 state — never raw
-//! hypervisor structures (see docs/spore-format.md). Formats v2/v3 are fixed
-//! memory and v4/v5 add normalized elastic-memory state.
+//! hypervisor structures (see docs/spore-format.md).
 //!
 //! Manifests and chunks may come from untrusted storage: parsing is strict,
 //! chunk contents are verified against their ids before use, and restore
@@ -27,14 +26,8 @@ const virtqueue = @import("virtio/queue.zig");
 const Blake3 = std.crypto.hash.Blake3;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
-pub const format_version_legacy_v0: u32 = 0;
-pub const format_version_legacy_v1: u32 = 1;
-pub const format_version: u32 = 2;
-pub const format_version_v1: u32 = 3;
-pub const format_version_elastic: u32 = 4;
-pub const format_version_v1_elastic: u32 = 5;
+pub const format_version: u32 = 6;
 pub const max_manifest_bytes: usize = 64 * 1024 * 1024;
-pub const machine_schema_version_v1: u32 = 1;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "map-private-file-v0";
 pub const ram_backing_path = "ram.backing";
@@ -64,26 +57,15 @@ pub const Platform = struct {
     arch: []const u8 = "aarch64",
     cpu_profile: []const u8,
     device_model_version: u32,
-    ram_base: u64,
-    ram_size: u64,
-    gic_dist_base: u64,
-    gic_redist_base: u64,
-    /// Architected counter frequency in Hz. `machine.vtimer` values are in
-    /// this tick domain; restore requires an exact match until cross-frequency
-    /// timer virtualization has a real design.
-    counter_frequency_hz: u64,
-};
-
-pub const PlatformV1 = struct {
-    arch: []const u8 = "aarch64",
-    cpu_profile: []const u8,
-    device_model_version: u32,
     vcpu_count: topology.VcpuCount,
     ram_base: u64,
     ram_size: u64,
     gic_dist_base: u64,
     gic_redist_base: u64,
     gic_redist_stride: u64,
+    /// Architected counter frequency in Hz. vtimer values are in this tick
+    /// domain; restore requires an exact match until cross-frequency timer
+    /// virtualization has a real design.
     counter_frequency_hz: u64,
 };
 
@@ -154,13 +136,18 @@ pub const VcpuState = struct {
     vtimer: VtimerState,
 };
 
-pub const MachineStateV1 = struct {
-    schema_version: u32 = machine_schema_version_v1,
+pub const MachineStateMulti = struct {
     vcpus: []VcpuState,
     /// Interrupt controller state. Portable producers use the multi-vCPU GICv3
     /// shape; same-backend temporary producers must tag private blobs so other
     /// backends fail closed.
     gic: gicv3.State,
+};
+
+/// One vCPU uses `single`; two or more use `multi`.
+pub const Machine = union(enum) {
+    single: MachineState,
+    multi: MachineStateMulti,
 };
 
 pub const MemoryBacking = struct {
@@ -387,8 +374,6 @@ pub const Disk = struct {
     chunk_size: u64 = 64 * 1024,
     hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
     object_namespace: []const u8 = rootfs_storage_object_namespace,
-    /// Must be empty for chunk-index manifests.
-    layers: []const []const u8 = &.{},
 };
 
 pub const network_kind_spore = "spore-net-v0";
@@ -476,7 +461,7 @@ pub const Manifest = struct {
     version: u32 = format_version,
     annotations: Annotations = .{},
     platform: Platform,
-    machine: MachineState,
+    machine: Machine,
     devices: []TransportState,
     generation: GenerationState,
     rootfs: ?Rootfs = null,
@@ -484,49 +469,26 @@ pub const Manifest = struct {
     network: ?Network = null,
     sessions: []const Session = &.{},
     exec_defaults: ?ExecDefaults = null,
+    /// Present only for elastic memory, which requires one vCPU.
     memory_state: ?MemoryState = null,
     memory: MemoryManifest,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try stringifyManifest(self, writer);
-    }
-};
-
-pub const ManifestV1 = struct {
-    version: u32 = format_version_v1,
-    annotations: Annotations = .{},
-    platform: PlatformV1,
-    machine: MachineStateV1,
-    devices: []TransportState,
-    generation: GenerationState,
-    rootfs: ?Rootfs = null,
-    disk: ?Disk = null,
-    network: ?Network = null,
-    sessions: []const Session = &.{},
-    exec_defaults: ?ExecDefaults = null,
-    memory_state: ?MemoryState = null,
-    memory: MemoryManifest,
-
-    pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try stringifyManifest(self, writer);
-    }
-};
-
-fn stringifyManifest(manifest: anytype, writer: anytype) !void {
-    try writer.beginObject();
-    inline for (std.meta.fields(@TypeOf(manifest))) |field| {
-        if (comptime std.mem.eql(u8, field.name, "exec_defaults") or std.mem.eql(u8, field.name, "memory_state")) {
-            if (@field(manifest, field.name)) |defaults| {
+        try writer.beginObject();
+        inline for (std.meta.fields(Manifest)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "exec_defaults") or std.mem.eql(u8, field.name, "memory_state")) {
+                if (@field(self, field.name)) |value| {
+                    try writer.objectField(field.name);
+                    try writer.write(value);
+                }
+            } else {
                 try writer.objectField(field.name);
-                try writer.write(defaults);
+                try writer.write(@field(self, field.name));
             }
-        } else {
-            try writer.objectField(field.name);
-            try writer.write(@field(manifest, field.name));
         }
+        try writer.endObject();
     }
-    try writer.endObject();
-}
+};
 
 // --- file helpers (libc-based; std.Io migration is a later cleanup) ---------
 
@@ -1474,7 +1436,6 @@ pub fn validateDisk(disk: Disk, maybe_rootfs: ?Rootfs, devices: []const Transpor
         if (disk.chunk_size != disk_chunk_size) return error.BadManifest;
         if (!std.mem.eql(u8, disk.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
         if (!std.mem.eql(u8, disk.object_namespace, rootfs_storage_object_namespace)) return error.BadManifest;
-        if (disk.layers.len != 0) return error.BadManifest;
     } else {
         return error.BadManifest;
     }
@@ -1742,30 +1703,7 @@ pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Man
 }
 
 pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
-    if (manifest.memory_state != null) {
-        try validateManifest(manifest);
-    } else {
-        // Preserve the legacy writer behavior used by compatibility fixtures;
-        // current capture paths produce already-validated fixed manifests.
-        try validateAnnotations(manifest.annotations);
-        try validateSessions(manifest.sessions);
-        if (manifest.exec_defaults) |defaults| try validateExecDefaults(defaults);
-    }
-    const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
-    defer allocator.free(json);
-    const path_z = try pathZ(allocator, "{s}", .{path});
-    defer allocator.free(path_z);
-    try writeFileAll(path_z, json);
-}
-
-pub fn saveManifestV1(allocator: std.mem.Allocator, dir: []const u8, manifest: ManifestV1) Error!void {
-    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
-    defer allocator.free(path);
-    try saveManifestV1Path(allocator, path, manifest);
-}
-
-pub fn saveManifestV1Path(allocator: std.mem.Allocator, path: []const u8, manifest: ManifestV1) Error!void {
-    try validateManifestV1(manifest);
+    try validateManifest(manifest);
     const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
@@ -1784,8 +1722,25 @@ pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!st
     defer allocator.free(path_z);
     const bytes = try readFileAll(allocator, path_z, max_manifest_bytes);
     defer allocator.free(bytes);
+    return parseManifest(allocator, bytes);
+}
+
+/// Parses and validates manifest bytes. The version is checked before the
+/// shape, so manifests from older formats fail as FormatTooOld.
+pub fn parseManifest(allocator: std.mem.Allocator, bytes: []const u8) Error!std.json.Parsed(Manifest) {
+    const VersionProbe = struct { version: u32 };
+    const probe = std.json.parseFromSlice(VersionProbe, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadManifest,
+    };
+    const version = probe.value.version;
+    probe.deinit();
+    try validateManifestVersion(version);
+
     const parsed = std.json.parseFromSlice(Manifest, allocator, bytes, .{
-        // The byte buffer is freed before the parse result is used.
+        // Callers may free the byte buffer before using the parse result.
         .allocate = .alloc_always,
     }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -1793,33 +1748,6 @@ pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!st
     };
     errdefer parsed.deinit();
     validateManifest(parsed.value) catch |err| return switch (err) {
-        error.FormatTooOld => error.FormatTooOld,
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.BadManifest,
-    };
-    return parsed;
-}
-
-pub fn loadManifestV1(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(ManifestV1) {
-    const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
-    defer allocator.free(path);
-    return loadManifestV1Path(allocator, path);
-}
-
-pub fn loadManifestV1Path(allocator: std.mem.Allocator, path: []const u8) Error!std.json.Parsed(ManifestV1) {
-    const path_z = try pathZ(allocator, "{s}", .{path});
-    defer allocator.free(path_z);
-    const bytes = try readFileAll(allocator, path_z, max_manifest_bytes);
-    defer allocator.free(bytes);
-    const parsed = std.json.parseFromSlice(ManifestV1, allocator, bytes, .{
-        // The byte buffer is freed before the parse result is used.
-        .allocate = .alloc_always,
-    }) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.BadManifest,
-    };
-    errdefer parsed.deinit();
-    validateManifestV1(parsed.value) catch |err| return switch (err) {
         error.FormatTooOld => error.FormatTooOld,
         error.OutOfMemory => error.OutOfMemory,
         else => error.BadManifest,
@@ -1849,69 +1777,16 @@ pub const ForkResult = struct {
 pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult {
     if (options.count == 0) return error.BadForkCount;
 
-    const parsed = loadManifest(allocator, options.parent_dir) catch |err| switch (err) {
-        error.BadManifest => {
-            const parsed_v1 = loadManifestV1(allocator, options.parent_dir) catch return error.BadManifest;
-            defer parsed_v1.deinit();
-            return forkV1(allocator, options, parsed_v1.value);
-        },
-        else => |e| return e,
-    };
+    const parsed = try loadManifest(allocator, options.parent_dir);
     defer parsed.deinit();
-    return forkV0(allocator, options, parsed.value);
-}
-
-fn forkV0(allocator: std.mem.Allocator, options: ForkOptions, parent: Manifest) Error!ForkResult {
+    const parent = parsed.value;
     if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
 
-    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
-    const ram_size = parent.memory.logical_size;
-    const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, ram_size, 1);
-    defer if (shared_backing) |backing| backing.deinit();
-
-    const fork_batch_id = try randomHex(allocator, 16);
-
-    var i: usize = 0;
-    while (i < options.count) : (i += 1) {
-        const child_dir = try pathZ(allocator, "{s}/{d:0>6}", .{ options.out_dir, i });
-        try ensureNewDir(child_dir);
-        try linkForkSharedStores(allocator, child_dir, shared);
-        var child = parent;
-        try prepareForkChildBacking(allocator, child_dir, &child.memory, ram_size, shared_backing, options.environ_map);
-
-        const child_generation = parent.generation.generation + i + 1;
-        const identity = try childIdentity(allocator, fork_batch_id, i);
-        const params_b64 = try forkParamsB64(allocator, .{
-            .schema_version = 0,
-            .parent_generation = parent.generation.generation,
-            .generation = child_generation,
-            .fork_index = i,
-            .fork_count = options.count,
-            .parallel_index = i,
-            .parallel_count = options.count,
-            .fork_batch_id = fork_batch_id,
-            .vm_id = identity.vm_id,
-            .hostname = identity.hostname,
-            .mac_seed = identity.mac_seed,
-            .mac_address = identity.mac_address,
-        });
-        defer allocator.free(params_b64);
-        child.generation = .{
-            .generation = child_generation,
-            .interrupt_status = generation.irq_generation_changed,
-            .params_b64 = params_b64,
-        };
-        child.machine.gic = try forkGicState(allocator, parent.machine.gic);
-        try saveManifest(allocator, child_dir, child);
+    var child_machine = parent.machine;
+    switch (child_machine) {
+        .single => |*machine| machine.gic = try forkGicState(allocator, machine.gic),
+        .multi => |*machine| machine.gic = try forkGicState(allocator, machine.gic),
     }
-
-    return forkResult(allocator, options, parent.generation.generation);
-}
-
-fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1) Error!ForkResult {
-    if (parent.generation.generation > std.math.maxInt(u64) - options.count) return error.BadForkCount;
-
-    const child_gic = try forkGicStateV1(allocator, parent.machine.gic);
     const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
     const ram_size = parent.memory.logical_size;
     const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, ram_size, parent.platform.vcpu_count);
@@ -1948,8 +1823,8 @@ fn forkV1(allocator: std.mem.Allocator, options: ForkOptions, parent: ManifestV1
             .interrupt_status = generation.irq_generation_changed,
             .params_b64 = params_b64,
         };
-        child.machine.gic = child_gic;
-        try saveManifestV1(allocator, child_dir, child);
+        child.machine = child_machine;
+        try saveManifest(allocator, child_dir, child);
     }
 
     return forkResult(allocator, options, parent.generation.generation);
@@ -2294,174 +2169,86 @@ fn macString(allocator: std.mem.Allocator, mac: [6]u8) Error![]const u8 {
     }) catch return error.OutOfMemory;
 }
 
+/// Marks the generation interrupt line asserted so forked children observe
+/// their new generation on first entry. Backend-private blobs pass through.
 fn forkGicState(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.State {
-    if (state.kind != .gicv3) return state;
-
-    const gic = state.gicv3 orelse return error.BadManifest;
-    var has_generation_line = false;
-    for (gic.line_levels) |line| {
-        if (line.intid == board.generationIntid()) {
-            has_generation_line = true;
-            break;
-        }
-    }
-
-    const next_len = gic.line_levels.len + @intFromBool(!has_generation_line);
-    const line_levels = allocator.alloc(gicv3.LineLevel, next_len) catch return error.OutOfMemory;
-    for (gic.line_levels, 0..) |line, i| {
-        line_levels[i] = if (line.intid == board.generationIntid()) .{
-            .intid = line.intid,
-            .asserted = true,
-        } else line;
-    }
-    if (!has_generation_line) {
-        line_levels[gic.line_levels.len] = .{ .intid = board.generationIntid(), .asserted = true };
-    }
-
-    return .{
-        .kind = .gicv3,
-        .gicv3 = .{
-            .schema_version = gic.schema_version,
-            .dist_regs = gic.dist_regs,
-            .redist_regs = gic.redist_regs,
-            .line_levels = line_levels,
+    switch (state.kind) {
+        .backend_private => return state,
+        .gicv3 => {
+            const gic = state.gicv3 orelse return error.BadManifest;
+            var next = gic;
+            next.line_levels = try assertGenerationLine(gicv3.LineLevel, allocator, gic.line_levels);
+            return .{ .kind = .gicv3, .gicv3 = next };
         },
-    };
+        .gicv3_multi => {
+            const gic = state.gicv3_multi orelse return error.BadManifest;
+            var next = gic;
+            next.line_levels = try assertGenerationLine(gicv3.MultiLineLevel, allocator, gic.line_levels);
+            return .{ .kind = .gicv3_multi, .gicv3_multi = next };
+        },
+    }
 }
 
-fn forkGicStateV1(allocator: std.mem.Allocator, state: gicv3.State) Error!gicv3.State {
-    if (state.kind == .backend_private) return state;
-    if (state.kind != .gicv3_multi) return error.UnsupportedVcpuCount;
-
-    const gic = state.gicv3_multi orelse return error.BadManifest;
+fn assertGenerationLine(comptime Line: type, allocator: std.mem.Allocator, lines: []const Line) Error![]Line {
     var has_generation_line = false;
-    for (gic.line_levels) |line| {
+    for (lines) |line| {
         if (line.intid == board.generationIntid()) {
             has_generation_line = true;
             break;
         }
     }
 
-    const next_len = gic.line_levels.len + @intFromBool(!has_generation_line);
-    const line_levels = allocator.alloc(gicv3.MultiLineLevel, next_len) catch return error.OutOfMemory;
-    for (gic.line_levels, 0..) |line, i| {
-        line_levels[i] = if (line.intid == board.generationIntid()) .{
-            .intid = line.intid,
-            .asserted = true,
-        } else line;
+    const next = allocator.alloc(Line, lines.len + @intFromBool(!has_generation_line)) catch return error.OutOfMemory;
+    for (lines, 0..) |line, i| {
+        next[i] = line;
+        if (line.intid == board.generationIntid()) next[i].asserted = true;
     }
     if (!has_generation_line) {
-        line_levels[gic.line_levels.len] = .{ .intid = board.generationIntid(), .asserted = true };
+        next[lines.len] = .{ .intid = board.generationIntid(), .asserted = true };
     }
-
-    return .{
-        .kind = .gicv3_multi,
-        .gicv3_multi = .{
-            .schema_version = gic.schema_version,
-            .dist_regs = gic.dist_regs,
-            .redistributors = gic.redistributors,
-            .line_levels = line_levels,
-        },
-    };
+    return next;
 }
 
 pub fn validateManifest(manifest: Manifest) Error!void {
-    try validateManifestMemoryVersion(manifest.version, format_version, format_version_elastic, manifest.memory_state);
-    try validateManifestCommon(
-        manifest.annotations,
-        manifest.platform.cpu_profile,
-        manifest.platform.counter_frequency_hz,
-        manifest.platform.ram_size,
-        manifest.devices,
-        manifest.rootfs,
-        manifest.disk,
-        manifest.network,
-        manifest.sessions,
-        manifest.exec_defaults,
-        manifest.memory_state,
-        manifest.memory,
-    );
-    gicv3.validate(manifest.machine.gic) catch return error.BadManifest;
-}
-
-pub fn validateManifestV1(manifest: ManifestV1) Error!void {
-    try validateManifestMemoryVersion(manifest.version, format_version_v1, format_version_v1_elastic, manifest.memory_state);
-    try validateManifestCommon(
-        manifest.annotations,
-        manifest.platform.cpu_profile,
-        manifest.platform.counter_frequency_hz,
-        manifest.platform.ram_size,
-        manifest.devices,
-        manifest.rootfs,
-        manifest.disk,
-        manifest.network,
-        manifest.sessions,
-        manifest.exec_defaults,
-        manifest.memory_state,
-        manifest.memory,
-    );
-    try validateMachineV1(manifest.platform, manifest.machine);
-}
-
-fn validateManifestMemoryVersion(actual: u32, fixed_version: u32, elastic_version: u32, memory_state: ?MemoryState) Error!void {
-    if (memory_state == null) return validateManifestVersion(actual, fixed_version);
-    if (actual == elastic_version) return;
-    if (actual < elastic_version) return error.FormatTooOld;
-    return error.BadManifest;
-}
-
-fn validateManifestVersion(actual: u32, expected: u32) Error!void {
-    if (actual == expected) return;
-    if (actual < expected) return error.FormatTooOld;
-    return error.BadManifest;
-}
-
-fn validateManifestCommon(
-    annotations: Annotations,
-    cpu_profile: []const u8,
-    counter_frequency_hz: u64,
-    ram_size: u64,
-    devices: []const TransportState,
-    rootfs: ?Rootfs,
-    disk: ?Disk,
-    network: ?Network,
-    sessions: []const Session,
-    exec_defaults: ?ExecDefaults,
-    memory_state: ?MemoryState,
-    memory: MemoryManifest,
-) Error!void {
-    try validateAnnotations(annotations);
-    try validateSessions(sessions);
-    if (exec_defaults) |defaults| try validateExecDefaults(defaults);
-    if (cpu_profile.len == 0) return error.BadManifest;
-    if (counter_frequency_hz == 0 or
-        counter_frequency_hz > std.math.maxInt(u32))
+    try validateManifestVersion(manifest.version);
+    try validateAnnotations(manifest.annotations);
+    try validateSessions(manifest.sessions);
+    if (manifest.exec_defaults) |defaults| try validateExecDefaults(defaults);
+    if (manifest.platform.cpu_profile.len == 0) return error.BadManifest;
+    if (manifest.platform.counter_frequency_hz == 0 or
+        manifest.platform.counter_frequency_hz > std.math.maxInt(u32))
     {
         return error.BadManifest;
     }
-    const memory_size = if (memory_state) |state| try validateMemoryState(state, ram_size) else ram_size;
+    const memory_size = if (manifest.memory_state) |state| try validateMemoryState(state, manifest.platform.ram_size) else manifest.platform.ram_size;
     if (memory_size > std.math.maxInt(usize)) return error.BadManifest;
-    _ = try validateMemoryForRam(memory, @intCast(memory_size));
-    if (memory.backing) |backing| {
+    _ = try validateMemoryForRam(manifest.memory, @intCast(memory_size));
+    if (manifest.memory.backing) |backing| {
         try validateMemoryBacking(backing, memory_size);
     }
-    try validateTransportQueues(devices);
+    try validateTransportQueues(manifest.devices);
     var virtio_mem_count: usize = 0;
-    for (devices) |device| {
+    for (manifest.devices) |device| {
         if (device.device_id == virtio_mem_device_id) virtio_mem_count += 1;
     }
-    if ((memory_state != null and virtio_mem_count != 1) or (memory_state == null and virtio_mem_count != 0)) {
-        return error.BadManifest;
+    if (virtio_mem_count != @intFromBool(manifest.memory_state != null)) return error.BadManifest;
+    if (manifest.rootfs) |r| {
+        try validateRootfs(r, manifest.devices);
     }
-    if (rootfs) |r| {
-        try validateRootfs(r, devices);
+    if (manifest.disk) |d| {
+        try validateDisk(d, manifest.rootfs, manifest.devices);
     }
-    if (disk) |d| {
-        try validateDisk(d, rootfs, devices);
-    }
-    if (network) |n| {
+    if (manifest.network) |n| {
         try validateNetwork(n);
     }
+    try validateMachine(manifest.platform, manifest.machine);
+    // Elastic memory restore supports one vCPU.
+    if (manifest.memory_state != null and manifest.machine != .single) return error.BadManifest;
+}
+
+fn validateManifestVersion(version: u32) Error!void {
+    if (version < format_version) return error.FormatTooOld;
+    if (version > format_version) return error.BadManifest;
 }
 
 pub fn memoryConfig(ram_size: u64, state: ?MemoryState) Error!memory_config.Config {
@@ -2576,11 +2363,22 @@ fn validateSessionId(id: []const u8) Error!void {
     }
 }
 
-fn validateMachineV1(platform: PlatformV1, machine: MachineStateV1) Error!void {
-    if (machine.schema_version != machine_schema_version_v1) return error.BadManifest;
+fn validateMachine(platform: Platform, machine: Machine) Error!void {
     topology.validateVcpuCount(platform.vcpu_count) catch return error.BadManifest;
     if (platform.gic_redist_stride == 0) return error.BadManifest;
     _ = board.redistributorRegionSize(platform.gic_redist_stride, platform.vcpu_count) catch return error.BadManifest;
+    switch (machine) {
+        .single => |single| {
+            if (platform.vcpu_count != 1) return error.BadManifest;
+            if (single.gic.kind == .gicv3_multi) return error.BadManifest;
+            gicv3.validate(single.gic) catch return error.BadManifest;
+        },
+        .multi => |multi| try validateMachineMulti(platform, multi),
+    }
+}
+
+fn validateMachineMulti(platform: Platform, machine: MachineStateMulti) Error!void {
+    if (platform.vcpu_count < 2) return error.BadManifest;
     if (machine.vcpus.len != platform.vcpu_count) return error.BadManifest;
     gicv3.validate(machine.gic) catch return error.BadManifest;
     const gic = switch (machine.gic.kind) {
@@ -3267,35 +3065,16 @@ test "corrupted chunk fails closed" {
 
 fn fuzzManifestParse(_: void, s: *std.testing.Smith) !void {
     // Manifests come from untrusted storage: parsing must never crash and
-    // must either fail or produce a structurally valid manifest.
+    // must either fail or produce a structurally valid manifest, including the
+    // per-vCPU and per-redistributor arrays of multi-vCPU machine state.
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);
-    const parsed = std.json.parseFromSlice(Manifest, std.testing.allocator, buf[0..len], .{
-        .allocate = .alloc_always,
-    }) catch return;
+    const parsed = parseManifest(std.testing.allocator, buf[0..len]) catch return;
     defer parsed.deinit();
-    validateManifest(parsed.value) catch return;
 }
 
 test "fuzz manifest parsing" {
     try std.testing.fuzz({}, fuzzManifestParse, .{});
-}
-
-fn fuzzManifestV1Parse(_: void, s: *std.testing.Smith) !void {
-    // The multi-vCPU manifest adds per-vCPU and per-redistributor arrays at the
-    // same trust boundary as the single-vCPU manifest; parse plus validation
-    // must fail closed.
-    var buf: [4096]u8 = undefined;
-    const len = s.slice(&buf);
-    const parsed = std.json.parseFromSlice(ManifestV1, std.testing.allocator, buf[0..len], .{
-        .allocate = .alloc_always,
-    }) catch return;
-    defer parsed.deinit();
-    validateManifestV1(parsed.value) catch return;
-}
-
-test "fuzz manifest v1 parsing" {
-    try std.testing.fuzz({}, fuzzManifestV1Parse, .{});
 }
 
 fn fuzzElasticMemoryState(_: void, s: *std.testing.Smith) !void {
@@ -3398,13 +3177,15 @@ test "manifest json round-trip" {
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0xffff_ffc0_0000_0000,
             .cpsr = 0x3c5,
@@ -3422,7 +3203,7 @@ test "manifest json round-trip" {
                     .line_levels = &.{.{ .intid = 16, .asserted = false }},
                 },
             },
-        },
+        } },
         .devices = &devices,
         .generation = .{
             .generation = 7,
@@ -3447,10 +3228,13 @@ test "manifest json round-trip" {
     try std.testing.expectEqualStrings("sporevm-aarch64-v0", parsed.value.platform.cpu_profile);
     try std.testing.expectEqual(@as(u64, 0x8000_0000), parsed.value.platform.ram_base);
     try std.testing.expectEqual(@as(u64, 24_000_000), parsed.value.platform.counter_frequency_hz);
-    try std.testing.expectEqual(@as(u64, 123), parsed.value.machine.vtimer.cntvct);
-    try std.testing.expectEqualStrings("sctlr_el1", parsed.value.machine.sys_regs[0].name);
-    try std.testing.expectEqual(gicv3.StateKind.gicv3, parsed.value.machine.gic.kind);
-    try std.testing.expectEqual(@as(u32, gicv3.distRouterOffset(32)), parsed.value.machine.gic.gicv3.?.dist_regs[0].offset);
+    try std.testing.expectEqual(@as(topology.VcpuCount, 1), parsed.value.platform.vcpu_count);
+    try std.testing.expectEqual(@as(u64, 0x2_0000), parsed.value.platform.gic_redist_stride);
+    const machine = parsed.value.machine.single;
+    try std.testing.expectEqual(@as(u64, 123), machine.vtimer.cntvct);
+    try std.testing.expectEqualStrings("sctlr_el1", machine.sys_regs[0].name);
+    try std.testing.expectEqual(gicv3.StateKind.gicv3, machine.gic.kind);
+    try std.testing.expectEqual(@as(u32, gicv3.distRouterOffset(32)), machine.gic.gicv3.?.dist_regs[0].offset);
     try std.testing.expectEqual(@as(u16, 64), parsed.value.devices[0].queues[0].size);
     try std.testing.expectEqual(@as(u64, 7), parsed.value.generation.generation);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.sessions.len);
@@ -3546,29 +3330,96 @@ test "manifest with a v1 memory index is rejected" {
     try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
 }
 
-test "manifest loaders preserve format-too-old errors" {
+test "manifests from older formats fail as too old" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const single_dir = try testDir(arena);
-    var single = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
-    single.version = format_version_legacy_v0;
-    try saveManifest(arena, single_dir, single);
-    try std.testing.expectError(error.FormatTooOld, loadManifest(arena, single_dir));
+    const dir = try testDir(arena);
+    const path = try pathZ(arena, "{s}/manifest.json", .{dir});
+    try saveManifest(arena, dir, testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3));
+    const current = try std.json.parseFromSliceLeaky(std.json.Value, arena, try readFileAll(arena, path, max_manifest_bytes), .{});
 
-    const multi_dir = try testDir(arena);
-    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    const redists = [_]gicv3.RedistributorState{
-        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
-        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
+    // Version 2 stored single-vCPU machine state unwrapped and had no
+    // vcpu_count or redistributor stride; versions 3 and 5 wrapped vCPUs in a
+    // schema-versioned object. Each older version fails before its shape is
+    // parsed.
+    var single = try cloneJsonValue(arena, current);
+    const single_platform = &single.object.getPtr("platform").?.object;
+    _ = single_platform.orderedRemove("vcpu_count");
+    _ = single_platform.orderedRemove("gic_redist_stride");
+    try single.object.put(arena, "machine", current.object.get("machine").?.object.get("single").?);
+    for ([_]i64{ 0, 1, 2, 4 }) |version| {
+        try single.object.put(arena, "version", .{ .integer = version });
+        try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, single, .{}));
+        try std.testing.expectError(error.FormatTooOld, loadManifest(arena, dir));
+    }
+    var multi = try cloneJsonValue(arena, current);
+    var multi_machine: std.json.ObjectMap = .empty;
+    try multi_machine.put(arena, "schema_version", .{ .integer = 1 });
+    try multi_machine.put(arena, "vcpus", .{ .array = .init(arena) });
+    try multi.object.put(arena, "machine", .{ .object = multi_machine });
+    for ([_]i64{ 3, 5 }) |version| {
+        try multi.object.put(arena, "version", .{ .integer = version });
+        try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, multi, .{}));
+        try std.testing.expectError(error.FormatTooOld, loadManifest(arena, dir));
+    }
+
+    // Unknown newer versions and manifests without a version are malformed.
+    var future = try cloneJsonValue(arena, current);
+    try future.object.put(arena, "version", .{ .integer = format_version + 1 });
+    try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, future, .{}));
+    try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
+    _ = future.object.orderedRemove("version");
+    try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, future, .{}));
+    try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
+}
+
+test "manifest machine state is one tagged union" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const path = try pathZ(arena, "{s}/manifest.json", .{dir});
+    try saveManifest(arena, dir, testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3));
+    const json = try readFileAll(arena, path, max_manifest_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 6,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"machine\": {\n    \"single\": {\n      \"gprs\"") != null);
+
+    const malformed = [_][]const u8{
+        // Two tags, an unknown tag, a duplicate field, and the removed
+        // multi-vCPU schema_version field are all rejected.
+        try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"multi\": {}, \"single\": {"),
+        try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"single_v2\": {"),
+        try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"single\": {\"pc\": 0, "),
+        try std.mem.replaceOwned(u8, arena, json, "\"vcpu_count\": 1,", "\"vcpu_count\": 1, \"vcpu_count\": 1,"),
+        try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"single\": {\"schema_version\": 1, "),
     };
-    var multi = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
-    multi.version = format_version_legacy_v1;
-    const multi_json = std.json.Stringify.valueAlloc(arena, multi, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
-    try writeFileAll(try pathZ(arena, "{s}/manifest.json", .{multi_dir}), multi_json);
-    try std.testing.expectError(error.FormatTooOld, loadManifestV1(arena, multi_dir));
+    for (malformed) |bytes| {
+        try std.testing.expect(!std.mem.eql(u8, bytes, json));
+        try std.testing.expectError(error.BadManifest, parseManifest(arena, bytes));
+    }
+}
+
+test "manifest save validates the whole manifest" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
+    manifest.platform.counter_frequency_hz = 0;
+    try std.testing.expectError(error.BadManifest, saveManifest(arena, dir, manifest));
+    try std.testing.expectError(error.IoFailed, loadManifest(arena, dir));
+}
+
+fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    const bytes = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    return std.json.parseFromSliceLeaky(std.json.Value, allocator, bytes, .{});
 }
 
 test "session attach validation rejects unavailable input streams" {
@@ -3591,7 +3442,7 @@ test "single non-default session becomes the attach handle" {
     try std.testing.expectEqualStrings("run-1234", defaultAttachSessionId(&sessions));
 }
 
-test "manifest v1 validates and round-trips multi-vCPU topology" {
+test "manifest validates and round-trips multi-vCPU topology" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3604,21 +3455,21 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
         .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &redist_regs },
         .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &redist_regs },
     };
-    const manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
+    const manifest = testManifestMulti(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists);
 
-    try validateManifestV1(manifest);
-    try saveManifestV1(arena, dir, manifest);
-    try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
-    const parsed = try loadManifestV1(arena, dir);
+    try validateManifest(manifest);
+    try saveManifest(arena, dir, manifest);
+    const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, format_version_v1), parsed.value.version);
+    try std.testing.expectEqual(format_version, parsed.value.version);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), parsed.value.platform.vcpu_count);
     try std.testing.expectEqual(@as(u64, 0x2_0000), parsed.value.platform.gic_redist_stride);
-    try std.testing.expectEqual(@as(aarch64_topology.Mpidr, 0x8000_0001), parsed.value.machine.vcpus[1].mpidr);
-    try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, parsed.value.machine.gic.kind);
+    const machine = parsed.value.machine.multi;
+    try std.testing.expectEqual(@as(aarch64_topology.Mpidr, 0x8000_0001), machine.vcpus[1].mpidr);
+    try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, machine.gic.kind);
 
     var private_manifest = manifest;
-    private_manifest.machine.gic = .{
+    private_manifest.machine.multi.gic = .{
         .kind = .backend_private,
         .backend_private = .{
             .backend = .hvf,
@@ -3626,33 +3477,45 @@ test "manifest v1 validates and round-trips multi-vCPU topology" {
             .data_b64 = "AA==",
         },
     };
-    try validateManifestV1(private_manifest);
+    try validateManifest(private_manifest);
 }
 
-test "manifest v1 rejects invalid vCPU topology" {
+test "manifest rejects invalid vCPU topology" {
     var redists = [_]gicv3.RedistributorState{
         .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
         .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
 
     var count_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    var manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &count_vcpus, &redists);
+    var manifest = testManifestMulti(testZeroMemoryManifest(1 << 29), 1 << 29, &count_vcpus, &redists);
     manifest.platform.vcpu_count = 3;
-    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 
     var duplicate_index_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &duplicate_index_vcpus, &redists);
-    manifest.machine.vcpus[1].index = 0;
-    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+    manifest = testManifestMulti(testZeroMemoryManifest(1 << 29), 1 << 29, &duplicate_index_vcpus, &redists);
+    manifest.machine.multi.vcpus[1].index = 0;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 
     var duplicate_mpidr_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &duplicate_mpidr_vcpus, &redists);
-    manifest.machine.vcpus[1].mpidr = manifest.machine.vcpus[0].mpidr;
-    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+    manifest = testManifestMulti(testZeroMemoryManifest(1 << 29), 1 << 29, &duplicate_mpidr_vcpus, &redists);
+    manifest.machine.multi.vcpus[1].mpidr = manifest.machine.multi.vcpus[0].mpidr;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 
     var missing_redist_vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
-    manifest = testManifestV1(testZeroMemoryManifest(1 << 29), 1 << 29, &missing_redist_vcpus, redists[0..1]);
-    try std.testing.expectError(error.BadManifest, validateManifestV1(manifest));
+    manifest = testManifestMulti(testZeroMemoryManifest(1 << 29), 1 << 29, &missing_redist_vcpus, redists[0..1]);
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+
+    var one_vcpu = [_]VcpuState{testVcpuState(0)};
+    manifest = testManifestMulti(testZeroMemoryManifest(1 << 29), 1 << 29, &one_vcpu, redists[0..1]);
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+
+    var single = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
+    try validateManifest(single);
+    single.platform.vcpu_count = 2;
+    try std.testing.expectError(error.BadManifest, validateManifest(single));
+    single.platform.vcpu_count = 1;
+    single.platform.gic_redist_stride = 0;
+    try std.testing.expectError(error.BadManifest, validateManifest(single));
 }
 
 test "manifest rejects oversized annotations" {
@@ -3670,7 +3533,7 @@ test "manifest rejects oversized annotations" {
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }
 
-test "elastic manifest round trips normalized memory state on a new version" {
+test "elastic manifest round trips normalized memory state" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3685,7 +3548,6 @@ test "elastic manifest round trips normalized memory state on a new version" {
         .{ .start_block = 4, .block_count = 1 },
     };
     var manifest = testForkManifest(testZeroMemoryManifest(maximum_size), initial_size, 3);
-    manifest.version = format_version_elastic;
     manifest.devices = &devices;
     manifest.memory_state = .{
         .initial_size = initial_size,
@@ -3698,19 +3560,32 @@ test "elastic manifest round trips normalized memory state on a new version" {
     try saveManifest(arena, dir, manifest);
     const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
-    try std.testing.expectEqual(format_version_elastic, parsed.value.version);
     try std.testing.expectEqual(initial_size, parsed.value.platform.ram_size);
     try std.testing.expectEqual(maximum_size, parsed.value.memory.logical_size);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.memory_state.?.plugged_ranges.len);
     try std.testing.expectEqual(maximum_size, (try memoryConfig(parsed.value.platform.ram_size, parsed.value.memory_state)).maximum_bytes);
 
-    var legacy = manifest;
-    legacy.version = format_version;
-    legacy.memory_state = null;
-    legacy.devices = &.{};
-    legacy.platform.ram_size = maximum_size;
-    try validateManifest(legacy);
-    try std.testing.expectEqual(maximum_size, (try memoryConfig(legacy.platform.ram_size, legacy.memory_state)).initial_bytes);
+    var fixed = manifest;
+    fixed.memory_state = null;
+    fixed.devices = &.{};
+    fixed.platform.ram_size = maximum_size;
+    try validateManifest(fixed);
+    try std.testing.expectEqual(maximum_size, (try memoryConfig(fixed.platform.ram_size, fixed.memory_state)).initial_bytes);
+
+    // Elastic memory restore supports one vCPU.
+    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    const redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
+    };
+    var multi = testManifestMulti(manifest.memory, initial_size, &vcpus, &redists);
+    multi.devices = manifest.devices;
+    multi.memory_state = manifest.memory_state;
+    try std.testing.expectError(error.BadManifest, validateManifest(multi));
+    multi.devices = &.{};
+    multi.memory_state = null;
+    multi.platform.ram_size = maximum_size;
+    try validateManifest(multi);
 }
 
 fn testTransport(device_id: u32) TransportState {
@@ -3813,7 +3688,7 @@ fn testVcpuState(index: topology.VcpuIndex) VcpuState {
     };
 }
 
-fn testManifestV1(memory: MemoryManifest, ram_size: u64, vcpus: []VcpuState, redists: []const gicv3.RedistributorState) ManifestV1 {
+fn testManifestMulti(memory: MemoryManifest, ram_size: u64, vcpus: []VcpuState, redists: []const gicv3.RedistributorState) Manifest {
     return .{
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
@@ -3826,7 +3701,7 @@ fn testManifestV1(memory: MemoryManifest, ram_size: u64, vcpus: []VcpuState, red
             .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .multi = .{
             .vcpus = vcpus,
             .gic = .{
                 .kind = .gicv3_multi,
@@ -3836,7 +3711,7 @@ fn testManifestV1(memory: MemoryManifest, ram_size: u64, vcpus: []VcpuState, red
                     .line_levels = &.{},
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
         .memory = memory,
@@ -3943,9 +3818,6 @@ test "manifest disk validates rootfs-bound chunk index disk" {
     manifest.disk.?.size = 8192;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.disk.?.size = 4096;
-    manifest.disk.?.layers = &.{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"};
-    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
-    manifest.disk.?.layers = &.{};
     manifest.disk.?.kind = "cow-block-v0";
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }
@@ -4003,13 +3875,15 @@ fn testForkManifest(memory: MemoryManifest, ram_size: u64, initial_generation: u
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = ram_size,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -4027,7 +3901,7 @@ fn testForkManifest(memory: MemoryManifest, ram_size: u64, initial_generation: u
                     .line_levels = &test_fork_line_levels,
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = initial_generation, .interrupt_status = 0, .params_b64 = "" },
         .memory = memory,
@@ -4090,12 +3964,11 @@ test "fork mints child manifests with shared chunks and pending generation" {
     try std.testing.expectEqualStrings("IMAGE_VALUE=default", first.value.exec_defaults.?.env[0]);
     try std.testing.expectEqualStrings("/workspace", first.value.exec_defaults.?.working_dir.?);
     try std.testing.expect(first.value.generation.params_b64.len > 0);
-    try std.testing.expect(first.value.machine.gic.gicv3.?.line_levels[0].asserted);
+    try std.testing.expect(first.value.machine.single.gic.gicv3.?.line_levels[0].asserted);
     try std.testing.expect(first.value.rootfs != null);
     try std.testing.expectEqualStrings(parent_manifest.rootfs.?.artifact.digest, first.value.rootfs.?.artifact.digest);
     try std.testing.expect(first.value.disk != null);
     try std.testing.expectEqualStrings(parent_manifest.disk.?.base, first.value.disk.?.base);
-    try std.testing.expectEqual(@as(usize, 0), first.value.disk.?.layers.len);
     try std.testing.expect(first.value.network != null);
     try std.testing.expectEqualStrings(network_kind_spore, first.value.network.?.kind);
     try std.testing.expectEqualStrings(parent_manifest.network.?.allow_cidrs[0], first.value.network.?.allow_cidrs[0]);
@@ -4369,7 +4242,7 @@ test "fork rejects empty count" {
     }));
 }
 
-test "fork mints manifest v1 child manifests with shared chunks and pending generation" {
+test "fork mints multi-vCPU child manifests with shared chunks and pending generation" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4392,7 +4265,7 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
         .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
         .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
-    var parent_manifest = testManifestV1(memory, ram.len, &vcpus, &redists);
+    var parent_manifest = testManifestMulti(memory, ram.len, &vcpus, &redists);
     var devices = [_]TransportState{
         testTransport(3),
         testTransport(rootfs_virtio_blk_device_id),
@@ -4402,7 +4275,7 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     parent_manifest.disk = testDisk(1);
     parent_manifest.generation = .{ .generation = 51, .interrupt_status = 0, .params_b64 = "" };
     try std.Io.Dir.cwd().createDirPath(std.testing.io, try pathZ(arena, "{s}/cas", .{parent_dir}));
-    try saveManifestV1(arena, parent_dir, parent_manifest);
+    try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{
         .parent_dir = parent_dir,
@@ -4416,16 +4289,14 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     try std.testing.expectEqual(@as(u64, 53), result.last_generation);
 
     const first_child_dir = try pathZ(arena, "{s}/000000", .{out_dir});
-    try std.testing.expectError(error.BadManifest, loadManifest(arena, first_child_dir));
-    const first = try loadManifestV1(arena, first_child_dir);
+    const first = try loadManifest(arena, first_child_dir);
     defer first.deinit();
-    try std.testing.expectEqual(@as(u32, format_version_v1), first.value.version);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), first.value.platform.vcpu_count);
     try std.testing.expectEqual(@as(u64, 52), first.value.generation.generation);
     try std.testing.expectEqual(@as(u32, generation.irq_generation_changed), first.value.generation.interrupt_status);
     try std.testing.expect(first.value.generation.params_b64.len > 0);
-    try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, first.value.machine.gic.kind);
-    const first_gic = first.value.machine.gic.gicv3_multi.?;
+    try std.testing.expectEqual(gicv3.StateKind.gicv3_multi, first.value.machine.multi.gic.kind);
+    const first_gic = first.value.machine.multi.gic.gicv3_multi.?;
     try std.testing.expectEqual(@as(usize, 1), first_gic.line_levels.len);
     try std.testing.expectEqual(board.generationIntid(), first_gic.line_levels[0].intid);
     try std.testing.expect(first_gic.line_levels[0].asserted);
@@ -4465,12 +4336,12 @@ test "fork mints manifest v1 child manifests with shared chunks and pending gene
     try std.testing.expectEqual((try fstatLocalFile(parent_backing_fd)).inode, (try fstatLocalFile(child_backing_fd)).inode);
 
     const second_child_dir = try pathZ(arena, "{s}/000001", .{out_dir});
-    const second = try loadManifestV1(arena, second_child_dir);
+    const second = try loadManifest(arena, second_child_dir);
     defer second.deinit();
     try std.testing.expectEqual(@as(u64, 53), second.value.generation.generation);
 }
 
-test "fork preserves backend-private manifest v1 gic state" {
+test "fork preserves backend-private multi-vCPU gic state" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -4488,8 +4359,8 @@ test "fork preserves backend-private manifest v1 gic state" {
         .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
         .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
-    var manifest = testManifestV1(memory, ram.len, &vcpus, &redists);
-    manifest.machine.gic = .{
+    var manifest = testManifestMulti(memory, ram.len, &vcpus, &redists);
+    manifest.machine.multi.gic = .{
         .kind = .backend_private,
         .backend_private = .{
             .backend = .hvf,
@@ -4497,8 +4368,8 @@ test "fork preserves backend-private manifest v1 gic state" {
             .data_b64 = "AA==",
         },
     };
-    const backend_gic = manifest.machine.gic.backend_private.?;
-    try saveManifestV1(arena, parent_dir, manifest);
+    const backend_gic = manifest.machine.multi.gic.backend_private.?;
+    try saveManifest(arena, parent_dir, manifest);
 
     const result = try fork(arena, .{
         .parent_dir = parent_dir,
@@ -4508,10 +4379,10 @@ test "fork preserves backend-private manifest v1 gic state" {
     try std.testing.expectEqual(@as(usize, 1), result.count);
 
     const child_dir = try pathZ(arena, "{s}/000000", .{out_dir});
-    const child = try loadManifestV1(arena, child_dir);
+    const child = try loadManifest(arena, child_dir);
     defer child.deinit();
-    try std.testing.expectEqual(gicv3.StateKind.backend_private, child.value.machine.gic.kind);
-    const child_gic = child.value.machine.gic.backend_private.?;
+    try std.testing.expectEqual(gicv3.StateKind.backend_private, child.value.machine.multi.gic.kind);
+    const child_gic = child.value.machine.multi.gic.backend_private.?;
     try std.testing.expectEqual(backend_gic.backend, child_gic.backend);
     try std.testing.expectEqualStrings(backend_gic.format, child_gic.format);
     try std.testing.expectEqualStrings(backend_gic.data_b64, child_gic.data_b64);
@@ -4529,13 +4400,15 @@ test "backend-private GIC state json round-trip" {
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -4553,7 +4426,7 @@ test "backend-private GIC state json round-trip" {
                     .data_b64 = "AAAA",
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .memory = testZeroMemoryManifest(1 << 29),
@@ -4561,9 +4434,9 @@ test "backend-private GIC state json round-trip" {
     try saveManifest(arena, dir, manifest);
     const parsed = try loadManifest(arena, dir);
     defer parsed.deinit();
-    try std.testing.expectEqual(gicv3.StateKind.backend_private, parsed.value.machine.gic.kind);
-    try std.testing.expectEqual(gicv3.BackendKind.hvf, parsed.value.machine.gic.backend_private.?.backend);
-    try std.testing.expectEqualStrings(gicv3.hvf_backend_private_format, parsed.value.machine.gic.backend_private.?.format);
+    try std.testing.expectEqual(gicv3.StateKind.backend_private, parsed.value.machine.single.gic.kind);
+    try std.testing.expectEqual(gicv3.BackendKind.hvf, parsed.value.machine.single.gic.backend_private.?.backend);
+    try std.testing.expectEqualStrings(gicv3.hvf_backend_private_format, parsed.value.machine.single.gic.backend_private.?.format);
 }
 
 test "manifest rejects invalid counter frequency" {
@@ -4571,13 +4444,15 @@ test "manifest rejects invalid counter frequency" {
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = 1 << 29,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 0,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -4595,7 +4470,7 @@ test "manifest rejects invalid counter frequency" {
                     .data_b64 = "AAAA",
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .memory = testZeroMemoryManifest(1 << 29),
