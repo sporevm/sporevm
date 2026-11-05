@@ -70,10 +70,14 @@ const embedded_run_initrd_sha256 = blk: {
         @compileError("generated minimal initrd SHA-256 is not canonical hex");
     break :blk digest;
 };
-const managed_kernel_pins = @embedFile("managed_kernel.env");
-const default_kernel_repository = managedKernelPin("managed_kernel_repository");
-const default_kernel_release = managedKernelPin("managed_kernel_release");
-const default_kernel_version = managedKernelPin("managed_kernel_linux_version");
+const managed_kernel = parseManagedKernelPins(@embedFile("managed_kernel.env"));
+// Some pins are only used on one architecture; check the file on every target.
+comptime {
+    _ = managed_kernel;
+}
+const default_kernel_repository = managed_kernel.repository;
+const default_kernel_release = managed_kernel.release;
+const default_kernel_version = managed_kernel.linux_version;
 pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
 const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
 const force_write_zeroes_backend_failure_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_BACKEND_FAILURE_EXPERIMENT";
@@ -131,22 +135,64 @@ const managed_x86_kernel_forbidden_config_symbols = [_][]const u8{
     "CONFIG_MOUSE_PS2",
     "CONFIG_SERIO_I8042",
 };
-const approved_x86_kernel_sha256 = blk: {
-    var digest: [Sha256.digest_length]u8 = undefined;
-    const hex = managedKernelPin("managed_kernel_x86_64_sha256");
-    if (hex.len != 2 * digest.len) @compileError("managed_kernel_x86_64_sha256 is not a SHA-256 digest");
-    _ = std.fmt.hexToBytes(&digest, hex) catch
-        @compileError("managed_kernel_x86_64_sha256 is not canonical hex");
-    break :blk digest;
+const approved_x86_kernel_sha256 = managed_kernel.x86_64_sha256;
+
+const ManagedKernelPins = struct {
+    repository: []const u8,
+    release: []const u8,
+    linux_version: []const u8,
+    x86_64_sha256: [Sha256.digest_length]u8,
 };
 
-fn managedKernelPin(comptime key: []const u8) []const u8 {
+/// Shell scripts `source` the same file, so accept only comments and
+/// unquoted, unrepeated `key=value` lines that both readers see alike.
+fn parseManagedKernelPins(comptime text: []const u8) ManagedKernelPins {
     comptime {
-        var lines = std.mem.tokenizeScalar(u8, managed_kernel_pins, '\n');
+        @setEvalBranchQuota(10_000);
+        const keys = [_][]const u8{
+            "managed_kernel_repository",
+            "managed_kernel_release",
+            "managed_kernel_linux_version",
+            "managed_kernel_x86_64_sha256",
+        };
+        var values: [keys.len]?[]const u8 = .{null} ** keys.len;
+        var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, key ++ "=")) return line[key.len + 1 ..];
+            if (line.len == 0 or line[0] == '#') continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse
+                @compileError("src/managed_kernel.env: expected key=value: " ++ line);
+            const index = for (keys, 0..) |key, i| {
+                if (std.mem.eql(u8, line[0..eq], key)) break i;
+            } else @compileError("src/managed_kernel.env: unknown key: " ++ line);
+            if (values[index] != null) @compileError("src/managed_kernel.env repeats " ++ keys[index]);
+            const value = line[eq + 1 ..];
+            if (value.len == 0) @compileError("src/managed_kernel.env: empty value: " ++ line);
+            for (value) |c| {
+                if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "._/-", c) == null) {
+                    @compileError("src/managed_kernel.env: value must match [0-9A-Za-z._/-]+: " ++ line);
+                }
+            }
+            values[index] = value;
         }
-        @compileError("src/managed_kernel.env is missing " ++ key);
+        for (keys, values) |key, value| {
+            if (value == null) @compileError("src/managed_kernel.env is missing " ++ key);
+        }
+
+        const hex = values[3].?;
+        var digest: [Sha256.digest_length]u8 = undefined;
+        if (hex.len != 2 * digest.len) @compileError("managed_kernel_x86_64_sha256 is not a SHA-256 digest");
+        for (hex) |c| {
+            if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) {
+                @compileError("managed_kernel_x86_64_sha256 must be lowercase hex");
+            }
+        }
+        _ = std.fmt.hexToBytes(&digest, hex) catch unreachable;
+        return .{
+            .repository = values[0].?,
+            .release = values[1].?,
+            .linux_version = values[2].?,
+            .x86_64_sha256 = digest,
+        };
     }
 }
 
