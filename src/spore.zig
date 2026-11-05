@@ -802,8 +802,7 @@ fn memoryIndexIdentity(allocator: std.mem.Allocator, memory: MemoryManifest, exp
     if (expected_size > std.math.maxInt(usize)) return error.BadManifest;
     _ = try validateMemoryForRam(memory, @intCast(expected_size));
     const encoded_index = disk_index.encodeCanonicalAlloc(allocator, memoryIndex(memory)) catch |err| return switch (err) {
-        error.BadManifest => error.BadManifest,
-        error.FormatTooOld => error.FormatTooOld,
+        error.BadManifest, error.FormatTooOld => error.BadManifest,
         error.OutOfMemory => error.OutOfMemory,
     };
     allocator.free(encoded_index.bytes);
@@ -1645,15 +1644,12 @@ pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: Memor
 }
 
 pub fn validateMemoryForRam(manifest: MemoryManifest, ram_len: usize) Error!MemoryPlan {
-    disk_index.checkKind(manifest.kind) catch |err| return switch (err) {
-        error.FormatTooOld => error.FormatTooOld,
-        else => error.BadManifest,
-    };
     const expected_size: u64 = @intCast(ram_len);
-    disk_index.validateDiskIndex(memoryIndex(manifest), memoryIndexDescriptor(manifest, expected_size)) catch |err| switch (err) {
-        error.BadManifest => return error.BadManifest,
-        error.FormatTooOld => return error.FormatTooOld,
-        error.OutOfMemory => return error.OutOfMemory,
+    // The manifest version gate rejects old manifests as too old, so a retired
+    // memory index kind inside a current manifest is just malformed.
+    disk_index.validateDiskIndex(memoryIndex(manifest), memoryIndexDescriptor(manifest, expected_size)) catch |err| return switch (err) {
+        error.BadManifest, error.FormatTooOld => error.BadManifest,
+        error.OutOfMemory => error.OutOfMemory,
     };
     if (manifest.chunk_size != chunk_size) return error.BadManifest;
     const chunk_count = try diskClusterCount(expected_size, manifest.chunk_size);
@@ -3032,7 +3028,7 @@ test "memory manifest validation rejects non-canonical chunks" {
 
     var retired_kind = mm;
     retired_kind.kind = "spore-disk-index-v1";
-    try std.testing.expectError(error.FormatTooOld, validateMemoryForRam(retired_kind, ram.len));
+    try std.testing.expectError(error.BadManifest, validateMemoryForRam(retired_kind, ram.len));
 
     var malformed_refs = try arena.dupe(MemoryChunk, mm.chunks);
     malformed_refs[0].digest = "not-a-blake3-id";
