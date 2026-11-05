@@ -18,8 +18,6 @@ const build_usage =
     \\  --output <path>        Rootfs ext4 output path
     \\  --metadata <path>      Metadata sidecar path (default: <output>.json)
     \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
-    \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
-    \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
     \\
 ;
@@ -33,8 +31,6 @@ const import_oci_usage =
     \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked (default: chunked)
-    \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
-    \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
     \\
 ;
@@ -48,8 +44,6 @@ const import_tar_usage =
     \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked (default: chunked)
-    \\  --mkfs <path>          external writer mkfs.ext4 binary (auto-detect)
-    \\  --debugfs <path>       external writer debugfs binary (auto-detect)
     \\  -h, --help             Show this help
     \\
 ;
@@ -121,14 +115,12 @@ fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, m
     }
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseBuildOptions(arena, args, stdout);
-    const result = api.rootfsBuild(init, arena, .{
+    const result = try api.rootfsBuild(init, arena, .{
         .ref = parsed.ref,
         .output = parsed.output,
         .metadata = parsed.metadata,
         .platform = parsed.platform,
-        .mkfs = parsed.mkfs,
-        .debugfs = parsed.debugfs,
-    }) catch |err| return rootfsBuildError(err);
+    });
     if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_identity: {s}\nrootfs_storage: {s}\n", .{
         parsed.output,
@@ -146,14 +138,12 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     }
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseImportOciOptions(args, stdout);
-    const result = api.rootfsImportOci(init, arena, .{
+    const result = try api.rootfsImportOci(init, arena, .{
         .input = parsed.input,
         .ref = parsed.ref,
         .platform = parsed.platform,
         .rootfs_storage = parsed.rootfs_storage,
-        .mkfs = parsed.mkfs,
-        .debugfs = parsed.debugfs,
-    }) catch |err| return rootfsBuildError(err);
+    });
     if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print(
         "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
@@ -174,14 +164,12 @@ fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     }
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseImportTarOptions(args, stdout);
-    const result = api.rootfsImportTar(init, arena, .{
+    const result = try api.rootfsImportTar(init, arena, .{
         .input = parsed.input,
         .ref = parsed.ref,
         .platform = parsed.platform,
         .rootfs_storage = parsed.rootfs_storage,
-        .mkfs = parsed.mkfs,
-        .debugfs = parsed.debugfs,
-    }) catch |err| return rootfsBuildError(err);
+    });
     if (mode == .json) return machine_output.writeJson(arena, stdout, result);
     try stdout.print(
         "rootfs: {s}\nmetadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
@@ -193,16 +181,6 @@ fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
             result.rootfs_storage.index_digest,
         },
     );
-}
-
-fn rootfsBuildError(err: anyerror) anyerror {
-    if (err == error.UnsupportedExt4FileSize) {
-        std.debug.print(
-            "rootfs: native ext4 writer does not support files larger than 4 GiB yet; set SPOREVM_EXT4_WRITER=external to use the e2fsprogs writer\n",
-            .{},
-        );
-    }
-    return err;
 }
 
 fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {

@@ -40,8 +40,6 @@ spore build [options] CONTEXT
   --vcpus COUNT                  Build VM vCPUs, from 1 through 8
   --timeout DURATION             Per-instruction timeout
   --ulimit nofile=SOFT[:HARD]    RUN open-file limit
-  --mkfs PATH                    mkfs helper for OCI imports
-  --debugfs PATH                 debugfs helper for OCI imports
 ```
 
 The default and only executable target is the native platform: `linux/arm64`

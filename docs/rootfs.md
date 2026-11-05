@@ -90,9 +90,8 @@ same VM with the digest-bound boot artifacts. Managed-default cache hits do not
 read the kernel or initrd bodies; an executor miss verifies and boots the same
 once-opened kernel bytes.
 
-The v1 growth contract covers SporeVM's journal-less native ext4 profile and
-journal-less layouts produced by SporeVM's e2fsprogs writer, or equivalent
-layouts that the pinned guest kernel can online-grow. Before writable mount,
+The v1 growth contract covers SporeVM's journal-less native ext4 profile, or
+equivalent journal-less layouts that the pinned guest kernel can online-grow. Before writable mount,
 the initrd rejects `has_journal`, recovery and journal-device flags, filesystem
 error or orphan state, a nonzero legacy orphan head, and the orphan-file
 pending-cleanup flag. A frozen journal-less checkpoint is still accepted when
@@ -293,11 +292,10 @@ Set `SPOREVM_DOCKER_HUB_MIRROR` to an HTTPS `host[:port]` such as `mirror.gcr.io
 to pull `docker.io` images through that mirror; refs and digests still name
 `docker.io`, and a pull falls back to Docker Hub when the mirror lacks its manifest.
 
-OCI layers may contain distinct paths that differ only by case. On hosts with
-case-insensitive filesystems, such as the default macOS APFS configuration,
-SporeVM uses managed case-sensitive staging for rootfs materialization rather
-than corrupting those paths. `SPOREVM_ROOTFS_CACHE_DIR` still overrides the
-final ext4/json cache location.
+OCI layers may contain distinct paths that differ only by case. SporeVM merges
+layers in memory and writes ext4 directly, so those paths stay distinct on
+case-insensitive host filesystems such as the default macOS APFS
+configuration.
 
 Inspect local rootfs cache usage with:
 
@@ -530,22 +528,14 @@ Unix epoch, and omits the ext4 journal and metadata checksum features so
 repeated builds of the same resolved image produce identical bytes. This
 journal-less native profile is inside the automatic-growth support envelope.
 
-Set `SPOREVM_EXT4_WRITER=external` to use the legacy e2fsprogs writer. SporeVM
-also disables its journal (and orphan-file feature when supported), keeping
-SporeVM-produced external layouts inside the pre-mount growth envelope when
-their remaining features and geometry are accepted by the pinned kernel.
-`mkfs.ext4` and `debugfs` are auto-detected from `PATH`, common Linux locations,
-and Homebrew's `e2fsprogs` prefix. Use `--mkfs` and `--debugfs` to override the
-detected binaries for that external fallback.
+The native writer is the only rootfs writer and needs no e2fsprogs. It uses
+builder version `sporevm-rootfs-v6`; older rootfs cache entries are rebuilt
+once. Rootfs metadata records `"ext4_writer": "native"`, and cache entries
+written by the removed e2fsprogs writer are rebuilt instead of reused.
 
-The current native default uses builder version `sporevm-rootfs-v6`; older
-rootfs cache entries are rebuilt once. Rootfs metadata records the selected
-writer, so switching `SPOREVM_EXT4_WRITER` forces a rebuild of the v6 cache
-entry instead of silently reusing an artifact produced by the other writer.
-
-The first native writer profile uses block maps without extents or
-triple-indirect blocks, so a single regular file larger than about 4 GiB fails
-closed with `UnsupportedExt4FileSize`. Set `SPOREVM_EXT4_WRITER=external` for
-images that need such files until native extents or triple-indirect support
-lands. The native profile also omits `dir_index`, so lookup in unusually large
-directories remains linear.
+The writer maps file data with ext4 block maps rather than extents: direct,
+single, double, and triple indirect blocks. Without the `huge_file` feature,
+the inode's 32-bit sector count limits one regular file to just under 2 TiB,
+and larger files fail closed with `UnsupportedExt4FileSize`; the 32 GiB rootfs
+content limit applies first to OCI and tar imports. The profile also omits
+`dir_index`, so lookup in unusually large directories remains linear.
