@@ -252,6 +252,8 @@ pub const Gateway = struct {
     next_forward_local_port: u16 = first_forward_local_port,
     stats: Stats = .{},
     emit_events: bool = false,
+    /// Set by `offer` when policy denies the SYN being processed.
+    syn_denied: bool = false,
 
     pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime, port_forwards: []const spore_net_policy.PortForwardConfig) !void {
         self.device = Device.init();
@@ -263,6 +265,7 @@ pub const Gateway = struct {
         self.next_forward_local_port = first_forward_local_port;
         self.stats = .{};
         self.emit_events = false;
+        self.syn_denied = false;
         for (&self.flows, 0..) |*flow, i| {
             flow.init();
             self.sock_ptrs[i] = &flow.sock;
@@ -303,8 +306,15 @@ pub const Gateway = struct {
     pub fn receiveFrame(self: *Gateway, frame: []const u8, now: Instant) bool {
         if (!isGuestTcpFrame(frame)) return false;
         self.current_now = now;
+        self.syn_denied = false;
         self.device.enqueueRx(frame);
         self.pollStack(now);
+        if (self.syn_denied) {
+            var reset_buf: [spore_net.max_frame_len]u8 = undefined;
+            if (buildSynReset(frame, &reset_buf)) |reset| {
+                if (!self.output.push(reset)) self.stats.output_drops += 1;
+            }
+        }
         return true;
     }
 
@@ -427,6 +437,7 @@ pub const Gateway = struct {
     fn offer(self: *Gateway, request: ForwardRequest) ?*TcpSock {
         const target = self.targetForRequest(request) orelse {
             self.stats.denied += 1;
+            self.syn_denied = true;
             return null;
         };
 
@@ -802,14 +813,54 @@ fn isGuestTcpFrame(frame: []const u8) bool {
     return true;
 }
 
+/// Builds the RST|ACK answering a denied guest SYN (RFC 9293 3.10.7.1), so
+/// the guest connection fails at once instead of retrying the SYN until it
+/// times out. Only called for frames the stack accepted as a valid SYN.
+fn buildSynReset(syn_frame: []const u8, out: *[spore_net.max_frame_len]u8) ?[]const u8 {
+    const eth = ethernet.parse(syn_frame) catch return null;
+    const ip_data = ethernet.payload(syn_frame) catch return null;
+    const ip_repr = ipv4.parse(ip_data) catch return null;
+    const segment = ipv4.payloadSlice(ip_data) catch return null;
+    const syn = tcp_socket.TcpRepr.fromWireBytes(segment) orelse return null;
+    const reset = tcp_socket.rstReply(syn).toWireRepr();
+    const tcp_len = tcp_wire.emit(reset, out[ethernet.HEADER_LEN + ipv4.HEADER_LEN ..]) catch return null;
+    _ = ethernet.emit(.{
+        .dst_addr = eth.src_addr,
+        .src_addr = spore_net.gateway_mac,
+        .ethertype = .ipv4,
+    }, out[0..ethernet.HEADER_LEN]) catch return null;
+    _ = ipv4.emit(.{
+        .version = 4,
+        .ihl = 5,
+        .dscp_ecn = 0,
+        .total_length = @intCast(ipv4.HEADER_LEN + tcp_len),
+        .identification = 0,
+        .dont_fragment = true,
+        .more_fragments = false,
+        .fragment_offset = 0,
+        .ttl = 64,
+        .protocol = .tcp,
+        .checksum = 0,
+        .src_addr = ip_repr.dst_addr,
+        .dst_addr = ip_repr.src_addr,
+    }, out[ethernet.HEADER_LEN..][0..ipv4.HEADER_LEN]) catch return null;
+    const tcp = out[ethernet.HEADER_LEN + ipv4.HEADER_LEN ..][0..tcp_len];
+    std.mem.writeInt(u16, tcp[16..18], tcp_wire.computeChecksum(ip_repr.dst_addr, ip_repr.src_addr, tcp), .big);
+    return out[0 .. ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_len];
+}
+
 fn minInstant(current: ?Instant, candidate: Instant) Instant {
     if (current) |value| return if (candidate.lessThan(value)) candidate else value;
     return candidate;
 }
 
 fn buildTcpSynFrame(dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_frame_len]u8) []const u8 {
+    return buildTcpSynFrameFrom(49152, dst_addr, dst_port, out);
+}
+
+fn buildTcpSynFrameFrom(src_port: u16, dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_frame_len]u8) []const u8 {
     const tcp_len = tcp_wire.emit(.{
-        .src_port = 49152,
+        .src_port = src_port,
         .dst_port = dst_port,
         .seq_number = 1000,
         .ack_number = 0,
@@ -848,6 +899,25 @@ fn buildTcpSynFrame(dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_
     tcp[17] = @truncate(tcp_checksum & 0xFF);
 
     return out[0 .. ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_len];
+}
+
+fn expectSynReset(frame: []const u8, dst_addr: ipv4.Address, dst_port: u16) !void {
+    const eth = try ethernet.parse(frame);
+    try std.testing.expectEqualSlices(u8, &spore_net.guest_mac, &eth.dst_addr);
+    try std.testing.expectEqualSlices(u8, &spore_net.gateway_mac, &eth.src_addr);
+    const ip_data = try ethernet.payload(frame);
+    try std.testing.expect(ipv4.verifyChecksum(ip_data[0..ipv4.HEADER_LEN]));
+    const ip_repr = try ipv4.parse(ip_data);
+    try std.testing.expectEqualSlices(u8, &dst_addr, &ip_repr.src_addr);
+    try std.testing.expectEqualSlices(u8, &spore_net.guest_ipv4, &ip_repr.dst_addr);
+    const segment = try ipv4.payloadSlice(ip_data);
+    try std.testing.expect(tcp_wire.verifyChecksum(ip_repr.src_addr, ip_repr.dst_addr, segment));
+    const reset = try tcp_wire.parse(segment);
+    try std.testing.expect(reset.flags.rst and reset.flags.ack and !reset.flags.syn);
+    try std.testing.expectEqual(dst_port, reset.src_port);
+    try std.testing.expectEqual(@as(u16, 49152), reset.dst_port);
+    // buildTcpSynFrame sends seq 1000; the SYN consumes one sequence number.
+    try std.testing.expectEqual(@as(u32, 1001), reset.ack_number);
 }
 
 const GuestSockets = struct { tcp4_sockets: []*TcpSock };
@@ -955,10 +1025,50 @@ test "spore-netd TCP denies blocked SYN before host socket open" {
         const now = Instant.fromMillis(@intCast(i));
         try std.testing.expect(gateway.receiveFrame(frame, now));
         gateway.service(now);
+        try expectSynReset(gateway.dequeueFrame() orelse return error.TestUnexpectedResult, addr, 80);
+        try std.testing.expectEqual(@as(?[]const u8, null), gateway.dequeueFrame());
     }
 
     try std.testing.expectEqual(blocked.len, gateway.stats.denied);
     try std.testing.expectEqual(@as(usize, 0), gateway.stats.connect_attempts);
+}
+
+test "spore-netd TCP resets a guest connection to a denied destination" {
+    var config = spore_net_policy.Config{};
+    try config.addNetworkPolicy(.{});
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+
+    try guest.sock.connect(.{ 93, 184, 216, 34 }, 443, spore_net.guest_ipv4, 49152);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.denied);
+    try std.testing.expectEqual(tcp_socket.State.closed, guest.sock.getState());
+}
+
+test "spore-netd TCP drops a SYN without a reset when the flow table is full" {
+    var config = spore_net_policy.Config{};
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-missing-full-table.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+
+    // Each SYN takes a flow slot; without a service pass none is reaped.
+    var frame_buf: [spore_net.max_frame_len]u8 = undefined;
+    var port: u16 = 0;
+    while (port < max_flows) : (port += 1) {
+        try std.testing.expect(gateway.receiveFrame(buildTcpSynFrameFrom(49152 + port, spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
+    }
+    while (gateway.dequeueFrame()) |_| {}
+
+    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrameFrom(49152 + max_flows, spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.flow_limit_drops);
+    try std.testing.expectEqual(@as(usize, 0), gateway.stats.denied);
     try std.testing.expectEqual(@as(?[]const u8, null), gateway.dequeueFrame());
 }
 
