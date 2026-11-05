@@ -100,17 +100,12 @@ authoritative memory/index/backing metadata, allocation failure, unexpected
 host I/O, corrupt chunks, and backend/platform/topology errors remain restore
 errors; fallback does not hide failures outside the optional acceleration hint.
 
-On Linux, proof creation measures an existing fs-verity digest before attempting
-any permission change. A new owned read-only backing is made owner-writable only
-around the enable-and-measure ioctl, then restored to its exact original mode
-and checked for the same device, inode, owner, and size before the proof is
-published. Enabling verity may update mtime, so schema v2 binds the proof to the
-post-enable mtime and digest and re-stats that exact identity before publication;
-existing-verity and schema-v1 paths require the original mtime. Errors attempt
-the same restoration and publish no proof. A crash
-inside this bounded window may leave an owner-writable unproved backing, but it
-cannot make that file authoritative: chunks remain the restore authority and a
-missing proof selects the verified-chunk path.
+The proof is an HMAC keyed by a per-user key in the runtime root. It binds the
+backing's device, inode, owner, size, and mtime, and proof creation re-stats
+the opened backing before publishing so a file changed in between gets no
+proof. Anyone who can rewrite the backing can also read the key, so the proof is
+host-local provenance, not byte integrity. Proofs from other schemas, including
+the removed fs-verity schema v2, fall back to chunks.
 
 ## Local CoW
 
@@ -161,9 +156,6 @@ and single-vCPU HVF capture retain the dirty-tracking fast path.
   monitor-published nonzero and pending dirty chunk counters. Fields
   remain nullable when no cheap runtime source exists.
 - Resume from chunks is portable; local backing is same-host acceleration only.
-- On Linux filesystems with fs-verity support, schema v2 local backing proofs
-  sign the kernel verity digest and restore re-measures the opened fd before
-  mapping. Other filesystems keep the v1 local-provenance proof path.
 - Virtio-mem is grow-only. Unplug and reclamation remain unsupported.
 
 ## Validation
