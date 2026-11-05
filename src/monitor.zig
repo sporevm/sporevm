@@ -1076,8 +1076,7 @@ const ExecServer = struct {
             defer self.mutex.unlock(self.io);
             if (self.state != .active_exec or !self.active_streaming_exec or !self.active_stream_valid) return error.ControlStreamClosed;
         }
-        var stop = std.atomic.Value(bool).init(false);
-        if (!try self.active_stream.enqueueResizeBlocking(resize, &stop)) return error.ControlStreamClosed;
+        if (!self.active_stream.enqueueResize(resize)) return error.ControlStreamClosed;
         if (self.wake) |wake| wake.wake();
     }
 

@@ -169,8 +169,7 @@ pub const RunStdinControl = struct {
             const count = self.resize_count.load(.acquire);
             if (count != self.resize_seen) {
                 self.resize_seen = count;
-                const resize = terminalSizeOrDefault(self.resize_fd);
-                _ = try self.stream.enqueueResizeBlocking(resize, &self.stop);
+                _ = self.stream.enqueueResize(terminalSizeOrDefault(self.resize_fd));
             }
         }
         _ = try dev.flushHostStreamOutbound();

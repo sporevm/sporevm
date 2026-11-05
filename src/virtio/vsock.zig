@@ -182,6 +182,9 @@ pub const HostStream = struct {
     outbound_head: usize = 0,
     outbound_count: usize = 0,
     outbound_frames: [max_outbound_frames]OutboundFrame = undefined,
+    /// Latest terminal size waiting for an outbound slot; guarded by
+    /// `outbound_lock` and only set while the ring is full.
+    pending_resize: ?spore_stream.Resize = null,
     output_sink: ?HostStreamOutputSink = null,
     output_sink_context: ?*anyopaque = null,
     lifecycle_sink: ?HostStreamLifecycleSink = null,
@@ -616,16 +619,32 @@ pub const HostStream = struct {
         return self.enqueueOutboundBlocking(frame, stop);
     }
 
-    pub fn enqueueResizeBlocking(self: *HostStream, resize: spore_stream.Resize, stop: *const std.atomic.Value(bool)) !bool {
-        var payload: [4]u8 = undefined;
-        spore_stream.writeResizePayload(&payload, resize);
-        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
-        const frame = try spore_stream.writeFrame(&frame_buf, .{
+    /// Queues a terminal resize without waiting for ring space. Callers may
+    /// hold the VMM device lock, which every path that drains the ring also
+    /// takes, so this must never block. Resize is idempotent: while the ring
+    /// is full only the latest size is kept, and it takes the next free slot.
+    pub fn enqueueResize(self: *HostStream, resize: spore_stream.Resize) bool {
+        if (self.state == .complete or self.state == .failed) return false;
+        self.outbound_lock.lock();
+        defer self.outbound_lock.unlock();
+        self.pending_resize = resize;
+        self.queuePendingResizeLocked();
+        return true;
+    }
+
+    fn queuePendingResizeLocked(self: *HostStream) void {
+        const resize = self.pending_resize orelse return;
+        if (self.outbound_count >= self.outbound_frames.len) return;
+        const frame = &self.outbound_frames[(self.outbound_head + self.outbound_count) % self.outbound_frames.len];
+        spore_stream.writeHeader(frame.data[0..spore_stream.header_len], .{
             .frame_type = .resize,
             .stream_id = .terminal,
-            .offset = 0,
-        }, &payload);
-        return self.enqueueOutboundBlocking(frame, stop);
+            .payload_len = 4,
+        });
+        spore_stream.writeResizePayload(frame.data[spore_stream.header_len..][0..4], resize);
+        frame.len = spore_stream.header_len + 4;
+        self.outbound_count += 1;
+        self.pending_resize = null;
     }
 
     fn enqueueOutboundBlocking(self: *HostStream, frame: []const u8, stop: *const std.atomic.Value(bool)) !bool {
@@ -669,6 +688,7 @@ pub const HostStream = struct {
         frame.len = 0;
         self.outbound_head = (self.outbound_head + 1) % self.outbound_frames.len;
         self.outbound_count -= 1;
+        self.queuePendingResizeLocked();
         return out[0..len];
     }
 
@@ -1479,7 +1499,7 @@ test "host stream queues terminal v1 frames and resize" {
     var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
     var stop = std.atomic.Value(bool).init(false);
     try std.testing.expect(try stream.enqueueTerminalDataBlocking("ab", &stop));
-    try std.testing.expect(try stream.enqueueResizeBlocking(.{ .rows = 40, .cols = 120 }, &stop));
+    try std.testing.expect(stream.enqueueResize(.{ .rows = 40, .cols = 120 }));
     try std.testing.expect(try stream.enqueueTerminalCloseBlocking(&stop));
 
     var payload_buf: [max_payload]u8 = undefined;
@@ -1507,6 +1527,34 @@ test "host stream queues terminal v1 frames and resize" {
     try std.testing.expectEqual(spore_stream.FrameType.close, close_header.frame_type);
     try std.testing.expectEqual(spore_stream.StreamId.terminal, close_header.stream_id);
     try std.testing.expectEqual(@as(u64, 2), close_header.offset);
+    try std.testing.expect(stream.dequeueOutboundWithin(&payload_buf, max_payload) == null);
+}
+
+test "host stream resize does not wait for a full outbound ring and sends the latest size" {
+    var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+    for (0..max_outbound_frames) |_| {
+        try std.testing.expectEqual(@as(usize, 1), try stream.enqueueStdinDataNonblocking("x"));
+    }
+    // Resizes are queued under the VMM device lock, which every ring drainer
+    // also needs, so a full ring must coalesce instead of waiting.
+    try std.testing.expect(stream.enqueueResize(.{ .rows = 30, .cols = 100 }));
+    try std.testing.expect(stream.enqueueResize(.{ .rows = 40, .cols = 120 }));
+
+    var payload_buf: [max_payload]u8 = undefined;
+    var header_buf: [spore_stream.header_len]u8 = undefined;
+    for (0..max_outbound_frames) |_| {
+        const frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
+        @memcpy(&header_buf, frame[0..spore_stream.header_len]);
+        try std.testing.expectEqual(spore_stream.FrameType.data, (try spore_stream.readHeader(&header_buf)).frame_type);
+    }
+    const resize_frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
+    @memcpy(&header_buf, resize_frame[0..spore_stream.header_len]);
+    const resize_header = try spore_stream.readHeader(&header_buf);
+    try std.testing.expectEqual(spore_stream.FrameType.resize, resize_header.frame_type);
+    try std.testing.expectEqual(spore_stream.StreamId.terminal, resize_header.stream_id);
+    const resize = try spore_stream.readResizePayload(resize_frame[spore_stream.header_len..]);
+    try std.testing.expectEqual(@as(u16, 40), resize.rows);
+    try std.testing.expectEqual(@as(u16, 120), resize.cols);
     try std.testing.expect(stream.dequeueOutboundWithin(&payload_buf, max_payload) == null);
 }
 
