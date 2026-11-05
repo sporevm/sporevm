@@ -315,14 +315,13 @@ reset or poweroff.
 - `version`: format version 2 for the fixed-memory single-vCPU shape, or 4 for
   the elastic-memory extension described below. Consumers reject unknown
   versions and reject v0/v1 with a format-too-old error.
-- `annotations`: optional opaque string map for namespaced embedder metadata,
+- `annotations`: optional opaque string map for namespaced caller metadata,
   such as `dev.buildkite.cleanroom.policy_hash`. Keys and values are UTF-8
   strings, values are not interpreted by SporeVM, and the serialized annotation
   object is capped at 64 KiB. Restore ignores annotations it does not know.
-  `libspore.inspectSpore`, `spore_inspect_spore_json`, and the Go
-  `InspectSpore` binding return these key/value pairs from local `.spore`
-  artifacts after the same manifest validation, so embedders can recover
-  opaque metadata without sidecar files.
+  `spore --json inspect` returns these key/value pairs from local `.spore`
+  artifacts after the same manifest validation, so callers can recover opaque
+  metadata without sidecar files.
 - `platform`: contract the restoring host must satisfy exactly — `arch`
   (aarch64), `cpu_profile`, `device_model_version`, `ram_base`, `ram_size`,
   `gic_dist_base`, `gic_redist_base`, and `counter_frequency_hz`. Restore
@@ -515,8 +514,7 @@ representation.
   live gateway state, TCP flows, DNS response caches, host socket paths,
   host port forwards, credential material, or helper process state. Resume and
   `spore run --from` must attach a fresh gateway that satisfies the recorded
-  `requirements` and policy or fail closed. `libspore.inspectSpore`,
-  `spore_inspect_spore_json`, and the Go `InspectSpore` binding expose the
+  `requirements` and policy or fail closed. `spore --json inspect` exposes the
   network kind, requirements, and bound-service requirements so callers can
   preflight restore-time bindings without parsing `manifest.json` directly.
 

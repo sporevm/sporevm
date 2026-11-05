@@ -24,9 +24,8 @@ networking, and build workflows. The AMD64 profile is deliberately narrower:
 it uses the managed kernel and embedded minimal exec initrd with one vCPU and
 exactly 512 MiB of memory. Fresh one-shot and named workloads support native
 `linux/amd64` OCI images, explicit rootfs inputs, networking, and one-shot
-image commit. Native `spore build` and standalone Zig, C, and Go libspore fresh
-execution are also available. Capture, save, restore, resume, fork, and fan-out
-remain unavailable.
+image commit. Native `spore build` is also available. Capture, save, restore,
+resume, fork, and fan-out remain unavailable.
 
 A spore is sealed VM state with normalized machine state, device state,
 verified memory chunks, optional rootfs state, and a platform contract that
@@ -66,9 +65,9 @@ hypervisors.
 - [docs/fanout.md](docs/fanout.md): fork identity and fan-out behavior.
 - [docs/networking.md](docs/networking.md): SporeVM-managed networking.
 - [docs/lifecycle.md](docs/lifecycle.md): named VM lifecycle.
-- [docs/libspore.md](docs/libspore.md): Zig, C, and Go embedding surface.
-- [docs/automation.md](docs/automation.md): versioned CLI and library results,
-  stream completion, and stable failure classification.
+- [docs/automation.md](docs/automation.md): versioned `--json` results, stream
+  completion, and stable failure classification for programs that drive
+  `spore`.
 
 ## Install
 
@@ -92,14 +91,6 @@ Use `spore_Linux_arm64` on Linux. Add `$asset/bin` to `PATH`, or move the
 extracted directory wherever you keep standalone tools.
 Published release archives currently target ARM64; build from source to use
 the experimental Linux/AMD64 profile.
-
-## Use as a library
-
-`spore` is the CLI. `libspore` is the embedding surface for Zig, C, and Go
-callers. See [docs/libspore.md](docs/libspore.md) for import, ownership, C ABI,
-and Go binding details. Experimental Linux/AMD64 callers may use fresh
-one-shot execution and fresh named `create`/`exec`/`rm`; saved-state and
-capture APIs remain unavailable.
 
 ## Build from source
 
@@ -448,9 +439,9 @@ SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
 named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM has an
 experimental fresh-only development profile with one vCPU and fixed 512 MiB
-memory; native OCI/rootfs execution, image commit, networking, build, and
-standalone libspore fresh execution are available, while capture, saved-state
-restore/resume, disk fork, multi-vCPU, and elastic memory remain gated.
+memory; native OCI/rootfs execution, image commit, networking, and build are
+available, while capture, saved-state restore/resume, disk fork, multi-vCPU,
+and elastic memory remain gated.
 
 Known limits: compatible host-class restore only, rootfs-bound writable disk
 state only, diskless named live fork, and no hardened public-cloud
@@ -508,11 +499,10 @@ SPOREVM_RELEASE_VERSION=vX.Y.Z mise run release
 ```
 
 `release:prepare` updates the authoritative version in `src/version.zig`; the
-CLI, libspore shared library, and pkg-config metadata all derive from it.
-`mise run release` runs local checks, verifies the built CLI and pkg-config
-metadata match the target version, and pushes the tag. The Buildkite tag build
-creates Linux ARM64 and macOS ARM64 CLI archives plus matching `libspore`
-archives, writes `checksums.txt`, and publishes the GitHub release. Use
+CLI derives its version from it. `mise run release` runs local checks, verifies
+the built CLI matches the target version, and pushes the tag. The Buildkite tag
+build creates Linux ARM64 and macOS ARM64 CLI archives, writes
+`checksums.txt`, and publishes the GitHub release. Use
 `mise run release:snapshot` to build release archives locally without
 publishing.
 

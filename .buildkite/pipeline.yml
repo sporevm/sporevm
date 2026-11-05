@@ -42,7 +42,7 @@ steps:
         agents:
           queue: sporevm-linux-amd64
 
-      - label: ":hammer_and_wrench: x86-64 Slice 3c build + libspore (Linux AMD64)"
+      - label: ":hammer_and_wrench: x86-64 Slice 3c build (Linux AMD64)"
         key: "x86-slice3c-linux-amd64"
         command: "scripts/ci/run.sh mise run smoke:x86-slice3c"
         timeout_in_minutes: 30
@@ -168,7 +168,6 @@ steps:
         command: "scripts/ci/run.sh scripts/release/build-assets.sh --target linux-arm64 --output dist"
         artifact_paths:
           - "dist/spore_Linux_arm64.tar.gz"
-          - "dist/libspore_Linux.tar.gz"
         plugins: *mise_plugins
         cache: *mise_cache
         agents: *linux_agents
@@ -179,7 +178,6 @@ steps:
         command: "scripts/ci/run.sh scripts/release/build-assets.sh --target darwin-arm64 --output dist"
         artifact_paths:
           - "dist/spore_Darwin_arm64.tar.gz"
-          - "dist/libspore_Darwin.tar.gz"
         plugins: *mise_plugins
         cache: *mise_cache
         concurrency: 1

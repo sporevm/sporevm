@@ -1,8 +1,4 @@
-//! Product API boundary used by the CLI and embedding layers.
-//!
-//! Import this module through `libspore`. Backend, device, storage, monitor, and
-//! CLI modules stay internal; this file owns the product operations and result
-//! contracts callers should build against.
+//! Product operations and result contracts used by the CLI.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -17,8 +13,6 @@ const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
 const image_gateway_pull = @import("image_gateway_pull.zig");
 const image_archive = @import("image_archive.zig");
-const lifecycle = @import("lifecycle.zig");
-const machine_output = @import("machine_output.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const memory_config = @import("memory.zig");
@@ -35,7 +29,6 @@ const gicv3 = @import("aarch64/gicv3.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
-const system = @import("system.zig");
 
 pub const ImageGatewayPullOptions = image_gateway_pull.PullOptions;
 pub const ImageGatewayPullResult = image_gateway_pull.PullResult;
@@ -44,10 +37,7 @@ pub const ImageArchivePackResult = image_archive.PackResult;
 pub const ImageArchiveUnpackOptions = image_archive.UnpackOptions;
 pub const ImageArchiveUnpackResult = image_archive.UnpackResult;
 
-/// Process context shared by product operations.
-///
-/// `Context` carries process IO and environment access without requiring
-/// embedders to construct CLI argument vectors.
+/// Process IO and environment access shared by product operations.
 pub const Context = context_mod.Context;
 
 /// Cache root selection for operations that materialize or read cached bytes.
@@ -62,8 +52,7 @@ pub const CacheRoot = union(enum) {
 
 /// ARM host capability and cache summary returned by `hostInfo`.
 ///
-/// The result owns `backends` and any resolved cache-root paths. Release it with
-/// `deinitHostInfo` using the same allocator passed to `hostInfo`. This v2
+/// The result owns `backends` and any resolved cache-root paths. This v2
 /// compatibility surface returns `error.UnsupportedArchitecture` on x86-64;
 /// use `HostInfoV3` and `hostInfoV3` for either supported architecture.
 pub const HostInfo = struct {
@@ -111,10 +100,6 @@ pub const PathFact = struct {
 /// surface is valid on both aarch64 and x86-64 and never represents
 /// not-applicable architecture fields with sentinel zeroes.
 pub const HostInfoV3 = platform.HostInfoV3;
-pub const PlatformFactsV3 = platform.PlatformFactsV3;
-pub const Aarch64PlatformFacts = platform.Aarch64PlatformFacts;
-pub const X86PlatformFacts = platform.X86PlatformFacts;
-pub const KvmCapabilityFact = platform.KvmCapabilityFact;
 
 /// Rootfs storage policy used when packing a spore into a bundle.
 pub const RootfsBundlePolicy = enum {
@@ -140,17 +125,8 @@ pub const InspectBundleOptions = struct {
     child_range: ?ChildRange = null,
 };
 
-pub const DigestRef = contracts.DigestRef;
-pub const CacheState = contracts.CacheState;
-pub const ChunkMaterializationSummary = contracts.ChunkMaterializationSummary;
-pub const RootfsMaterializationSummary = contracts.RootfsMaterializationSummary;
-pub const RemoteBundleCache = contracts.RemoteBundleCache;
-pub const BundleChildrenSummary = contracts.BundleChildrenSummary;
 pub const PullResult = contracts.PullResult;
 pub const BundleChildSummary = contracts.BundleChildSummary;
-pub const BundleSelectionSummary = contracts.BundleSelectionSummary;
-pub const ChunkpackSummary = contracts.ChunkpackSummary;
-pub const RootfsBundleSummary = contracts.RootfsBundleSummary;
 pub const InspectBundleResult = contracts.InspectBundleResult;
 
 pub const Backend = run_mod.Backend;
@@ -159,22 +135,14 @@ pub const SaveTrigger = run_mod.SaveTrigger;
 pub const ImagePullPolicy = run_mod.PullPolicy;
 pub const NetworkMode = run_mod.NetworkMode;
 pub const NetworkConfig = run_mod.NetworkPolicy;
-pub const NetworkCapabilities = spore_net_policy.NetworkCapabilities;
-pub const NetworkDefault = spore_net_policy.NetworkDefault;
 pub const NetworkPolicy = spore_net_policy.NetworkPolicy;
-pub const NetworkRule = spore_net_policy.NetworkRule;
-pub const BoundService = spore_net_policy.BoundService;
 pub const BoundServiceBinding = spore_net_policy.BoundServiceBinding;
 pub const BoundServiceBindingDiagnostic = spore_net_policy.BoundServiceBindingDiagnostic;
-pub const BoundServiceTarget = spore_net_policy.BoundServiceTarget;
-pub const PortForwardConfig = spore_net_policy.PortForwardConfig;
 pub const Rootfs = run_mod.Rootfs;
 pub const Annotations = spore.Annotations;
-pub const validateAnnotations = spore.validateAnnotations;
 pub const NetworkRequirements = spore.NetworkRequirements;
 pub const NetworkBoundServiceRequirement = spore.NetworkBoundServiceRequirement;
 pub const Session = spore.Session;
-pub const SessionStreams = spore.SessionStreams;
 pub const RootfsBuildOptions = rootfs_mod.BuildRequest;
 pub const RootfsBuildResult = rootfs_mod.BuildResult;
 pub const RootfsCasPreloadOptions = rootfs_mod.CasPreloadRequest;
@@ -183,104 +151,16 @@ pub const RootfsImportOciOptions = rootfs_mod.ImportOciRequest;
 pub const RootfsImportOciResult = rootfs_mod.ImportOciResult;
 pub const RootfsImportTarOptions = rootfs_mod.ImportTarRequest;
 pub const RootfsImportTarResult = rootfs_mod.ImportTarResult;
-pub const RootfsPlatform = rootfs_mod.Platform;
 pub const Architecture = architecture.Architecture;
 pub const ResourceType = resource.Type;
 pub const Portability = resource.Portability;
 pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
-pub const RootfsStoragePolicy = rootfs_mod.RootfsStoragePolicy;
-pub const Disk = run_mod.Disk;
 pub const InjectedFile = run_mod.InjectedFile;
 pub const RunResult = run_mod.Result;
 pub const AttachResult = run_mod.Result;
 pub const RunEvent = run_mod.RunEvent;
 pub const EventSink = run_mod.EventSink;
 pub const ClassifiedFailure = run_mod.ClassifiedFailure;
-pub const FailureCode = run_mod.FailureCode;
-pub const FailureScope = run_mod.FailureScope;
-pub const RetryClass = run_mod.RetryClass;
-pub const TerminalOutcome = run_mod.TerminalOutcome;
-pub const error_schema = machine_output.error_schema;
-pub const error_schema_version = machine_output.error_schema_version;
-pub const automation_event_schema = machine_output.automation_event_schema;
-pub const automation_event_schema_version = machine_output.automation_event_schema_version;
-pub const Timings = run_mod.Timings;
-pub const StartEvent = run_mod.StartEvent;
-pub const ReadyEvent = run_mod.ReadyEvent;
-pub const OutputEvent = run_mod.OutputEvent;
-pub const SaveEvent = run_mod.SaveEvent;
-pub const ImageCommitEvent = run_mod.ImageCommitEvent;
-pub const ExitEvent = run_mod.ExitEvent;
-pub const FailureEvent = run_mod.FailureEvent;
-pub const CreateNamedOptions = lifecycle.CreateNamedOptions;
-pub const InitialOutputDisposition = lifecycle.InitialOutputDisposition;
-pub const InitialOutputDestination = lifecycle.InitialOutputDestination;
-pub const InitialCommandStartupStatus = lifecycle.InitialCommandStartupStatus;
-pub const InitialCommandProcessStatus = lifecycle.InitialCommandProcessStatus;
-pub const InitialCommandResult = lifecycle.InitialCommandResult;
-pub const InitialOutputNamedOptions = lifecycle.InitialOutputNamedOptions;
-pub const RestoreNamedOptions = lifecycle.RestoreNamedOptions;
-pub const ForkNamedOptions = lifecycle.ForkNamedOptions;
-pub const ExecNamedOptions = lifecycle.ExecNamedOptions;
-pub const ExecNamedStreamOptions = lifecycle.ExecNamedStreamOptions;
-pub const ExecNamedStream = lifecycle.ExecNamedStream;
-pub const ExecNamedStreamEvent = lifecycle.ExecNamedStreamEvent;
-pub const TerminalSize = lifecycle.TerminalSize;
-pub const CopyNamedOptions = lifecycle.CopyNamedOptions;
-pub const NamedNetworkOptions = lifecycle.NamedNetworkOptions;
-pub const SaveNamedOptions = lifecycle.SaveNamedOptions;
-pub const RemoveNamedOptions = lifecycle.RemoveNamedOptions;
-pub const RemovedSavedSpore = lifecycle.RemovedSavedSpore;
-pub const ListNamedOptions = lifecycle.ListNamedOptions;
-pub const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
-pub const NamedListResult = lifecycle.NamedListResult;
-pub const NamedExecTiming = lifecycle.NamedExecTiming;
-pub const ExecNamedResult = lifecycle.ExecNamedResult;
-pub const NamedForkResult = lifecycle.NamedForkResult;
-pub const NamedListEntry = lifecycle.ListEntry;
-pub const NamedListMemory = lifecycle.ListMemory;
-pub const NamedListStats = lifecycle.ListStats;
-pub const CacheStats = system.CacheStats;
-pub const RootfsSystemSummary = system.RootfsSystemSummary;
-pub const RootfsPruneEntry = system.RootfsPruneEntry;
-pub const RootfsPruneResult = system.RootfsPruneResult;
-pub const RuntimeForkPruneEntry = system.RuntimeForkPruneEntry;
-pub const RuntimeForkPruneResult = system.RuntimeForkPruneResult;
-
-/// Low-level VM run options.
-///
-/// Use this when the caller already has an explicit kernel and rootfs/disk
-/// inputs. For CLI-like image/rootfs setup, use `runManaged`.
-pub const RunOptions = struct {
-    backend: Backend = .auto,
-    kernel_path: []const u8,
-    initrd_path: ?[]const u8 = null,
-    rootfs_path: ?[]const u8 = null,
-    rootfs: ?Rootfs = null,
-    disk: ?Disk = null,
-    /// Guest command and arguments. The first element is the executable.
-    command: []const []const u8,
-    guest_env: []const []const u8 = &.{},
-    guest_working_dir: ?[]const u8 = null,
-    /// Ephemeral files made available under /run/sporevm/injected for this fresh run.
-    injected_files: []const InjectedFile = &.{},
-    interactive: bool = false,
-    tty: bool = false,
-    memory: MemoryConfig = .{},
-    vcpus: u32 = 1,
-    guest_port: u32 = 10700,
-    timeout_ms: u64 = 30_000,
-    save_path: ?[]const u8 = null,
-    save_trigger: SaveTrigger = .exit,
-    continue_after_save: bool = false,
-    annotations: Annotations = .{},
-    network: NetworkMode = .disabled,
-    network_policy: NetworkConfig = .{},
-    spore_executable: []const u8 = "spore",
-    debug: bool = false,
-    /// Optional synchronous event sink. Output byte slices are callback-scoped.
-    events: ?EventSink = null,
-};
 
 /// CLI-like fresh run options.
 ///
@@ -411,8 +291,6 @@ pub const PackOptions = struct {
 };
 
 /// Result returned by `pack`.
-///
-/// `bundle_digest` is owned and must be released with `deinitPackResult`.
 pub const PackResult = struct {
     schema: []const u8 = "spore.pack.result.v1",
     schema_version: u32 = 1,
@@ -439,9 +317,6 @@ pub const UnpackOptions = struct {
 };
 
 /// Result returned by `unpack`.
-///
-/// `bundle_digest` and `selected_child`, when present, are owned and must be
-/// released with `deinitUnpackResult`.
 pub const UnpackResult = struct {
     schema: []const u8 = "spore.unpack.result.v1",
     schema_version: u32 = 1,
@@ -484,8 +359,6 @@ pub const PushOptions = struct {
 };
 
 /// Result returned by `push`.
-///
-/// `bundle_digest` is owned and must be released with `deinitPushResult`.
 pub const PushResult = struct {
     schema: []const u8 = "spore.push.result.v1",
     schema_version: u32 = 1,
@@ -508,21 +381,6 @@ pub const PullOptions = struct {
     allow_metadata_only_rootfs: bool = false,
     aws_region: ?[]const u8 = null,
     aws_executable: []const u8 = "aws",
-};
-
-/// Options for rootfs cache inspection.
-pub const SystemDfOptions = struct {
-    rootfs_cache: CacheRoot = .env,
-};
-
-/// Options for local rootfs and runtime cleanup.
-pub const SystemPruneOptions = struct {
-    rootfs_cache: CacheRoot = .env,
-    dry_run: bool = true,
-    include_digest_artifacts: bool = false,
-    older_than_seconds: ?u64 = null,
-    max_bytes: ?u64 = null,
-    rootfs_only: bool = false,
 };
 
 /// Platform summary returned by `inspectSpore`.
@@ -578,8 +436,8 @@ pub const SporeInspectResult = struct {
 
 /// Return ARM-shaped v2 host facts, backend availability, and cache roots.
 ///
-/// The caller owns returned slices and optional paths. Call `deinitHostInfo`
-/// with the same allocator when done. This compatibility function returns
+/// The caller owns returned slices and optional paths. This compatibility
+/// function returns
 /// `error.UnsupportedArchitecture` on x86-64; use `hostInfoV3` for either
 /// supported architecture.
 pub fn hostInfo(
@@ -632,71 +490,7 @@ pub fn hostInfoV3(
     return platform.hostInfoV3(allocator, context.environ_map);
 }
 
-/// Release memory owned by a `HostInfo` result.
-pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
-    allocator.free(info.backends);
-    freePathFact(allocator, info.cache_roots.kernels);
-    freePathFact(allocator, info.cache_roots.rootfs);
-    freePathFact(allocator, info.cache_roots.bundles);
-    freePathFact(allocator, info.cache_roots.runtime);
-}
-
-pub fn deinitHostInfoV3(allocator: std.mem.Allocator, info: HostInfoV3) void {
-    platform.deinitHostInfoV3(allocator, info);
-}
-
-/// Summarize the local rootfs cache.
-///
-/// The returned cache root is owned by the caller. Release it with
-/// `deinitRootfsSystemSummary`.
-pub fn systemDf(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: SystemDfOptions,
-) !RootfsSystemSummary {
-    const rootfs_cache = try resolveRequiredCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
-    defer rootfs_cache.deinit(allocator);
-    return system.df(allocator, context.io, .{ .cache_root = rootfs_cache.path.? });
-}
-
-/// Release memory owned by a `RootfsSystemSummary`.
-pub fn deinitRootfsSystemSummary(allocator: std.mem.Allocator, summary: RootfsSystemSummary) void {
-    system.deinitRootfsSystemSummary(allocator, summary);
-}
-
-/// Prune the local rootfs cache and, when age-based cleanup is requested,
-/// unreferenced runtime fork batches.
-///
-/// The result owns cache roots and entry paths. Release it with
-/// `deinitRootfsPruneResult`.
-pub fn systemPrune(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: SystemPruneOptions,
-) !RootfsPruneResult {
-    const rootfs_cache = try resolveRequiredCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
-    defer rootfs_cache.deinit(allocator);
-
-    const runtime_root = if (!options.rootfs_only and options.older_than_seconds != null)
-        local_paths.runtimeRootPath(allocator, context.environ_map) catch null
-    else
-        null;
-    defer if (runtime_root) |root| allocator.free(root);
-
-    return system.prune(allocator, context.io, .{
-        .cache_root = rootfs_cache.path.?,
-        .runtime_root = runtime_root,
-        .dry_run = options.dry_run,
-        .include_digest_artifacts = options.include_digest_artifacts,
-        .older_than_seconds = options.older_than_seconds,
-        .max_bytes = options.max_bytes,
-        .rootfs_only = options.rootfs_only,
-    }, std.Io.Clock.real.now(context.io).nanoseconds);
-}
-
 /// Build an ext4 rootfs from an OCI image reference.
-///
-/// Release owned result fields with `deinitRootfsBuildResult`.
 pub fn rootfsBuild(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -710,14 +504,7 @@ pub fn rootfsBuild(
     };
 }
 
-/// Release memory owned by a `RootfsBuildResult`.
-pub fn deinitRootfsBuildResult(allocator: std.mem.Allocator, result: RootfsBuildResult) void {
-    rootfs_mod.deinitBuildResult(allocator, result);
-}
-
 /// Import an OCI layout into the local rootfs cache under a local ref.
-///
-/// Release owned result fields with `deinitRootfsImportOciResult`.
 pub fn rootfsImportOci(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -729,14 +516,7 @@ pub fn rootfsImportOci(
     return ownRootfsImportOciResult(allocator, result);
 }
 
-/// Release memory owned by a `RootfsImportOciResult`.
-pub fn deinitRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOciResult) void {
-    rootfs_mod.deinitImportOciResult(allocator, result);
-}
-
 /// Import an uncompressed rootfs tar into the local rootfs cache under a local ref.
-///
-/// Release owned result fields with `deinitRootfsImportTarResult`.
 pub fn rootfsImportTar(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -748,15 +528,7 @@ pub fn rootfsImportTar(
     return ownRootfsImportOciResult(allocator, result);
 }
 
-/// Release memory owned by a `RootfsImportTarResult`.
-pub fn deinitRootfsImportTarResult(allocator: std.mem.Allocator, result: RootfsImportTarResult) void {
-    rootfs_mod.deinitImportTarResult(allocator, result);
-}
-
 /// Resolve an image tag or local ref to the digest-pinned ref used by SporeVM.
-///
-/// The returned string is owned by the caller. Release it with
-/// `deinitRootfsResolveResult`.
 pub fn rootfsResolve(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -766,11 +538,6 @@ pub fn rootfsResolve(
     defer arena_state.deinit();
     const resolved = try rootfs_mod.resolveReference(init, arena_state.allocator(), options);
     return allocator.dupe(u8, resolved);
-}
-
-/// Release memory owned by a `rootfsResolve` result.
-pub fn deinitRootfsResolveResult(allocator: std.mem.Allocator, resolved_ref: []const u8) void {
-    rootfs_mod.deinitResolvedReference(allocator, resolved_ref);
 }
 
 /// Pull and verify one platform image from an explicitly configured image
@@ -783,10 +550,6 @@ pub fn imageGatewayPull(
     return image_gateway_pull.pull(init, allocator, options);
 }
 
-pub fn deinitImageGatewayPullResult(allocator: std.mem.Allocator, result: ImageGatewayPullResult) void {
-    image_gateway_pull.deinitPullResult(allocator, result);
-}
-
 /// Pack one complete local native image into an immutable transport archive.
 pub fn imageArchivePack(
     init: std.process.Init,
@@ -794,10 +557,6 @@ pub fn imageArchivePack(
     options: ImageArchivePackOptions,
 ) !ImageArchivePackResult {
     return image_archive.pack(init, allocator, options);
-}
-
-pub fn deinitImageArchivePackResult(allocator: std.mem.Allocator, result: ImageArchivePackResult) void {
-    image_archive.deinitPackResult(allocator, result);
 }
 
 /// Verify and install one immutable native image archive into the local cache.
@@ -809,13 +568,7 @@ pub fn imageArchiveUnpack(
     return image_archive.unpack(init, allocator, options);
 }
 
-pub fn deinitImageArchiveUnpackResult(allocator: std.mem.Allocator, result: ImageArchiveUnpackResult) void {
-    image_archive.deinitUnpackResult(allocator, result);
-}
-
 /// Preload a cached rootfs into chunked CAS storage.
-///
-/// Release owned result fields with `deinitRootfsCasPreloadResult`.
 pub fn rootfsCasPreload(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -825,11 +578,6 @@ pub fn rootfsCasPreload(
     defer arena_state.deinit();
     const result = try rootfs_mod.casPreload(init, arena_state.allocator(), options);
     return ownRootfsCasPreloadResult(allocator, result);
-}
-
-/// Release memory owned by a `RootfsCasPreloadResult`.
-pub fn deinitRootfsCasPreloadResult(allocator: std.mem.Allocator, result: RootfsCasPreloadResult) void {
-    rootfs_mod.deinitCasPreloadResult(allocator, result);
 }
 
 fn ownRootfsStorageDigestFields(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
@@ -889,11 +637,6 @@ fn ownRootfsCasPreloadResult(allocator: std.mem.Allocator, result: RootfsCasPrel
     };
 }
 
-/// Release memory owned by a `RootfsPruneResult`.
-pub fn deinitRootfsPruneResult(allocator: std.mem.Allocator, result: RootfsPruneResult) void {
-    system.deinitRootfsPruneResult(allocator, result);
-}
-
 /// Inspect a spore manifest without resuming or mutating it.
 ///
 /// Owned strings in the result must be released with
@@ -938,54 +681,9 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
     return run_mod.classifyFailure(err);
 }
 
-/// Return libspore's enforceable network capability facts.
-pub fn networkCapabilities() NetworkCapabilities {
-    return spore_net_policy.capabilities();
-}
-
-/// Boot a VM with explicit kernel/rootfs inputs and execute a guest command.
-///
-/// This call does not stream guest output to process stdout/stderr. Use
-/// `RunOptions.events` to observe lifecycle and output events.
-pub fn run(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: RunOptions,
-) !RunResult {
-    _ = try backend_mod.requireProductRunner(options.backend, .probe());
-    return run_mod.execute(context, allocator, .{
-        .backend = options.backend,
-        .kernel_path = options.kernel_path,
-        .initrd_path = options.initrd_path,
-        .rootfs_path = options.rootfs_path,
-        .rootfs = options.rootfs,
-        .disk = options.disk,
-        .command = options.command,
-        .guest_env = options.guest_env,
-        .guest_working_dir = options.guest_working_dir,
-        .injected_files = options.injected_files,
-        .interactive = options.interactive,
-        .tty = options.tty,
-        .memory = options.memory,
-        .vcpus = options.vcpus,
-        .guest_port = options.guest_port,
-        .timeout_ms = options.timeout_ms,
-        .stream_output = false,
-        .save_path = options.save_path,
-        .save_trigger = options.save_trigger,
-        .continue_after_save = options.continue_after_save,
-        .annotations = options.annotations,
-        .network = options.network,
-        .network_policy = options.network_policy,
-        .spore_executable = options.spore_executable,
-        .debug = options.debug,
-        .events = options.events,
-    });
-}
-
 /// Resolve managed kernel/initrd/rootfs inputs, boot a VM, and execute a command.
 ///
-/// This is the library form of the high-level `spore run` setup path.
+/// This is the high-level `spore run` setup path.
 pub fn runManaged(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -1227,134 +925,6 @@ pub fn attachSpore(
     });
 }
 
-/// Create a long-lived named VM without exposing the private monitor socket.
-pub fn createNamed(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: CreateNamedOptions,
-) !NamedLifecycleResult {
-    return lifecycle.createNamed(init, allocator, .probe(), options);
-}
-
-/// Restore a spore as a long-lived named VM.
-pub fn restoreNamed(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: RestoreNamedOptions,
-) !NamedLifecycleResult {
-    return lifecycle.restoreNamed(init, allocator, options);
-}
-
-/// Fork a ready named VM into ready children. One writable rootfs disk is
-/// supported; networked sources remain unsupported.
-pub fn forkNamed(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: ForkNamedOptions,
-) !NamedForkResult {
-    return lifecycle.forkNamed(init, allocator, options);
-}
-
-/// Execute a command inside a ready named VM.
-pub fn execNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: ExecNamedOptions,
-) !ExecNamedResult {
-    return lifecycle.execNamed(context, allocator, options);
-}
-
-/// Retrieve the bounded stdout and stderr retained for a named VM's initial command.
-pub fn initialOutputNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: InitialOutputNamedOptions,
-) !NamedLifecycleResult {
-    return lifecycle.initialOutputNamed(context, allocator, options);
-}
-
-/// Open a bidirectional streaming exec inside a ready named VM.
-pub fn openExecNamedStream(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: ExecNamedStreamOptions,
-) !ExecNamedStream {
-    return lifecycle.openExecNamedStream(context, allocator, options);
-}
-
-pub const clearLastLifecycleError = lifecycle.clearLastError;
-pub const lastLifecycleErrorMessage = lifecycle.lastErrorMessage;
-
-/// Copy an explicit host file or directory into a ready named VM.
-pub fn copyInNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: CopyNamedOptions,
-) !void {
-    return lifecycle.copyInNamed(context, allocator, options);
-}
-
-/// Copy an explicit guest file or directory out of a ready named VM.
-pub fn copyOutNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: CopyNamedOptions,
-) !void {
-    return lifecycle.copyOutNamed(context, allocator, options);
-}
-
-/// Save a named VM into a spore. Set `stop` to remove the live registry entry.
-pub fn saveNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: SaveNamedOptions,
-) !NamedLifecycleResult {
-    return lifecycle.saveNamed(context, allocator, options);
-}
-
-/// Remove a named VM registry entry, stopping the monitor when it is ready.
-pub fn removeNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: RemoveNamedOptions,
-) !NamedLifecycleResult {
-    return lifecycle.removeNamed(context, allocator, options);
-}
-
-/// Remove a saved spore and release its verified pinned or portable disk authority.
-pub fn removeSavedSpore(context: Context, allocator: std.mem.Allocator, spore_dir: []const u8) !RemovedSavedSpore {
-    return lifecycle.removeSavedSpore(context, allocator, spore_dir);
-}
-
-pub fn deinitRemovedSavedSpore(allocator: std.mem.Allocator, result: RemovedSavedSpore) void {
-    lifecycle.deinitRemovedSavedSpore(allocator, result);
-}
-
-/// List named VMs in the process runtime root.
-pub fn listNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: ListNamedOptions,
-) ![]NamedListEntry {
-    return lifecycle.listNamed(context, allocator, options);
-}
-
-pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycleResult) void {
-    lifecycle.deinitNamedLifecycleResult(allocator, result);
-}
-
-pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
-    lifecycle.deinitExecNamedResult(allocator, result);
-}
-
-pub fn deinitNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) void {
-    lifecycle.deinitNamedForkResult(allocator, result);
-}
-
-pub fn deinitNamedList(allocator: std.mem.Allocator, entries: []NamedListEntry) void {
-    lifecycle.freeListEntries(allocator, entries);
-}
-
 /// Fork a parent spore into multiple child spores.
 ///
 /// Owned strings in the result must be released with `deinitForkResult`.
@@ -1443,8 +1013,6 @@ test "fork validates count and returns owned child paths" {
 }
 
 /// Pack a spore directory into a portable bundle.
-///
-/// Owned strings in the result must be released with `deinitPackResult`.
 pub fn pack(
     context: Context,
     allocator: std.mem.Allocator,
@@ -1478,14 +1046,7 @@ pub fn pack(
     };
 }
 
-/// Release memory owned by a `PackResult`.
-pub fn deinitPackResult(allocator: std.mem.Allocator, result: PackResult) void {
-    allocator.free(result.bundle_digest);
-}
-
 /// Unpack a bundle into a spore directory.
-///
-/// Owned strings in the result must be released with `deinitUnpackResult`.
 pub fn unpack(
     context: Context,
     allocator: std.mem.Allocator,
@@ -1514,12 +1075,6 @@ pub fn unpack(
         .child_count = result.child_count,
         .selected_child = result.selected_child,
     };
-}
-
-/// Release memory owned by an `UnpackResult`.
-pub fn deinitUnpackResult(allocator: std.mem.Allocator, result: UnpackResult) void {
-    allocator.free(result.bundle_digest);
-    if (result.selected_child) |child| allocator.free(child);
 }
 
 /// Clone one spore through the existing pack/unpack transport encoding so the
@@ -1640,8 +1195,6 @@ test "clone spore makes a pinned save independently portable" {
 }
 
 /// Push a bundle to a remote destination.
-///
-/// Owned strings in the result must be released with `deinitPushResult`.
 pub fn push(
     context: Context,
     allocator: std.mem.Allocator,
@@ -1664,15 +1217,7 @@ pub fn push(
     };
 }
 
-/// Release memory owned by a `PushResult`.
-pub fn deinitPushResult(allocator: std.mem.Allocator, result: PushResult) void {
-    allocator.free(result.bundle_digest);
-}
-
 /// Inspect bundle metadata without materializing a child spore.
-///
-/// Owned strings and child summaries must be released with
-/// `deinitInspectBundleResult`.
 pub fn inspectBundle(
     allocator: std.mem.Allocator,
     options: InspectBundleOptions,
@@ -1684,15 +1229,7 @@ pub fn inspectBundle(
     });
 }
 
-/// Release memory owned by an `InspectBundleResult`.
-pub fn deinitInspectBundleResult(allocator: std.mem.Allocator, result: InspectBundleResult) void {
-    contracts.deinitInspectBundleResult(allocator, result);
-}
-
 /// Pull a bundle into a local spore directory.
-///
-/// The returned contract is owned by the caller and must be released with
-/// `deinitPullResult`.
 pub fn pull(
     context: Context,
     allocator: std.mem.Allocator,
@@ -1714,11 +1251,6 @@ pub fn pull(
         .aws_region = options.aws_region,
         .aws_executable = options.aws_executable,
     });
-}
-
-/// Release memory owned by a `PullResult`.
-pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
-    contracts.deinitPullResult(allocator, result);
 }
 
 /// Summarize either manifest version; the fields read here are shared
@@ -2099,10 +1631,6 @@ fn pathFact(fact: platform.PathFact) PathFact {
     };
 }
 
-fn freePathFact(allocator: std.mem.Allocator, fact: PathFact) void {
-    if (fact.path) |path| allocator.free(path);
-}
-
 const CacheKind = enum {
     rootfs,
     bundle,
@@ -2129,22 +1657,6 @@ fn resolveCacheRoot(
         .env => switch (kind) {
             .rootfs => if (local_paths.rootfsCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
             .bundle => if (local_paths.bundleCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
-        },
-    };
-}
-
-fn resolveRequiredCacheRoot(
-    requested: CacheRoot,
-    allocator: std.mem.Allocator,
-    environ_map: *const std.process.Environ.Map,
-    kind: CacheKind,
-) !ResolvedCacheRoot {
-    return switch (requested) {
-        .none => error.CacheUnavailable,
-        .path => |path| .{ .path = path },
-        .env => switch (kind) {
-            .rootfs => .{ .path = try local_paths.rootfsCacheRootPath(allocator, environ_map), .owned = true },
-            .bundle => .{ .path = try local_paths.bundleCacheRootPath(allocator, environ_map), .owned = true },
         },
     };
 }

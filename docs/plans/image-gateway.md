@@ -735,8 +735,8 @@ network policy. Help text must distinguish top-level saved-machine `spore pull`,
 the new image-scoped `spore image pull`, and the lower-level rootfs commands.
 
 The first transparent surface should be one shared rootfs resolution option
-used by `run`, `create`, `build`, and libspore rather than four independent CLI
-implementations. C and Go bindings follow only after the Zig contract settles.
+used by `run`, `create`, and `build` rather than three independent CLI
+implementations.
 
 The configured gateway origin is a separate pinned trust decision from OCI
 source egress. HTTPS remains mandatory, but a deployment may explicitly allow
@@ -1166,7 +1166,7 @@ that backend can boot images.
 
 Status: proposed follow-up.
 
-- Add one gateway-aware rootfs resolution seam used by CLI and libspore.
+- Add one gateway-aware rootfs resolution seam used by the CLI.
 - Implement explicit `gateway-required` and `gateway-then-direct-public`
   fallback policies plus current `missing|always|never` semantics.
 - Let `spore run --image`, named create, and reachable external `FROM` or

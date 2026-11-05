@@ -54,8 +54,6 @@ const ParsedOptions = struct {
 
 pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     const allocator = init.arena.allocator();
-    const full_args = try init.minimal.args.toSlice(allocator);
-    const spore_executable = full_args[0];
     if (wantsHelp(args)) {
         try stdout.writeAll(usage);
         return;
@@ -85,6 +83,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         std.process.exit(2);
     };
     const dockerfile_path = parsed.dockerfile_path orelse try std.fs.path.join(allocator, &.{ context_dir, "Dockerfile" });
+    const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
 
     var diagnostic: build_mod.Diagnostic = .{};
     const result = build_mod.build(init, allocator, .{

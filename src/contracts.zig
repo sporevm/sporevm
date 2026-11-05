@@ -1,4 +1,4 @@
-//! Product result contracts shared by libspore and CLI serializers.
+//! Product result contracts shared by CLI serializers.
 
 const std = @import("std");
 const resource = @import("resource.zig");
@@ -110,15 +110,6 @@ pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
     allocator.free(result.bundle_dir);
     allocator.free(result.bundle_digest.hex);
     if (result.children.selected_child) |child| allocator.free(child);
-}
-
-pub fn deinitInspectBundleResult(allocator: std.mem.Allocator, result: InspectBundleResult) void {
-    allocator.free(result.bundle_dir);
-    allocator.free(result.bundle_digest.hex);
-    allocator.free(result.parent_manifest);
-    allocator.free(result.chunkpack_index);
-    deinitBundleChildSummaries(allocator, result.children);
-    deinitBundleSelectionSummary(allocator, result.selection);
 }
 
 pub fn deinitBundleSelectionSummary(allocator: std.mem.Allocator, selection: BundleSelectionSummary) void {

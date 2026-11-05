@@ -25,8 +25,6 @@ require_source_version() {
   source="$(source_version)"
   [[ "${source}" == "${version}" ]] \
     || die "src/version.zig version must be ${version} before tagging v${version}"
-  grep -Fq "Version: ${version}" zig-out/lib/pkgconfig/libspore.pc \
-    || die "zig-out/lib/pkgconfig/libspore.pc must be ${version}; run mise run check"
   [[ -x zig-out/bin/spore ]] \
     || die "zig-out/bin/spore is missing; run mise run check"
   if ! zig-out/bin/spore --version | grep -Fq "spore ${version} "; then

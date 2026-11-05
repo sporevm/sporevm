@@ -39,9 +39,6 @@ pub const runtime_dir_env = local_paths.runtime_dir_env;
 pub const max_name_len = 128;
 pub const monitor_hello_schema = "spore.monitor.hello.v1";
 pub const monitor_helper_contract: u32 = 1;
-const reexec_role_env = "SPORE_REEXEC_ROLE";
-const reexec_contract_env = "SPORE_REEXEC_CONTRACT";
-const reexec_contract_value = "1";
 
 const max_metadata_bytes = 128 * 1024;
 const max_control_response = 128 * 1024;
@@ -747,8 +744,8 @@ pub const ExecNamedResult = struct {
     timing: ?NamedExecTiming = null,
 };
 
-/// `execNamed` is a compatibility collector and rejects output beyond this
-/// per-stream limit. Use `openExecNamedStream` for streamed command output.
+/// Per-stream limit for output the monitor retains for `start` and
+/// `initial-output`. Use `openExecNamedStream` for streamed command output.
 pub const exec_named_capture_limit = 16 * 1024;
 pub const initial_output_protocol_header_len = 3;
 pub const initial_output_limit_bytes_per_stream: u32 = exec_named_capture_limit - initial_output_protocol_header_len;
@@ -961,19 +958,6 @@ fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
     return .{ .mode = .spore, .policy = config };
 }
 
-pub fn createNamed(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    host: backend_mod.Host,
-    options: CreateNamedOptions,
-) !NamedLifecycleResult {
-    const start_ms = monotonicMs();
-    return createNamedWithTiming(init, allocator, host, options, .{
-        .start_ms = start_ms,
-        .parsed_ms = start_ms,
-    });
-}
-
 const CreateTimingAnchors = struct {
     start_ms: u64,
     parsed_ms: u64,
@@ -1053,9 +1037,9 @@ fn createNamedWithTiming(
     if (spec.rootfs != null or spec.exec_defaults != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
-    const spore_executable_path = try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
+    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
     const monitor_spawned_ms = monotonicMs();
-    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, spore_executable_path);
+    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
     writeCreateTiming(arena, init.io, paths, .{
         .parse_ms = timing.parsed_ms - timing.start_ms,
@@ -1247,9 +1231,9 @@ pub fn restoreNamed(
 
     const prepared_ms = monotonicMs();
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
-    const spore_executable_path = try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
+    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
     const monitor_spawned_ms = monotonicMs();
-    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, spore_executable_path);
+    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
 
     var ready = try readReady(arena, init.io, paths);
@@ -1317,29 +1301,6 @@ fn leaseForSavedDisk(io: Io, allocator: std.mem.Allocator, environ: *const std.p
     }
 }
 
-pub fn execNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: ExecNamedOptions,
-) !ExecNamedResult {
-    clearLastError();
-    if (options.command.len == 0) return error.InvalidGuestCommand;
-    if (options.interactive or options.tty) return error.UnsupportedInteractiveExec;
-    if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
-
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
-    if (state != .ready) return namedVmNotReady(arena, context.io, paths, "exec", options.name, state);
-    var ready = try readReady(arena, context.io, paths);
-    defer ready.deinit();
-    const response = try sendExecRequest(arena, context.io, ready.value.control_socket_path, options.command, options.guest_env, options.guest_working_dir);
-    return parseExecNamedResponse(allocator, arena, response);
-}
-
 pub fn openExecNamedStream(
     context: Context,
     allocator: std.mem.Allocator,
@@ -1364,69 +1325,6 @@ fn rejectX86NamedCopy() !void {
     if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
         return error.X86NamedCopyUnsupported;
     }
-}
-
-pub fn copyInNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: CopyNamedOptions,
-) !void {
-    clearLastError();
-    try rejectX86NamedCopy();
-    var archive = try createCopyArchive(allocator, context.io, options.host_path);
-    defer archive.deinit(context.io);
-
-    const source_fd = try openHostFileRead(allocator, context.io, archive.path);
-    defer _ = std.c.close(source_fd);
-
-    const exit_code = try copyNamedStreaming(context, allocator, options, "copy-in-v1", .{
-        .input_fd = source_fd,
-        .stdout_fd = -1,
-        .stderr_fd = -1,
-    });
-    if (exit_code != 0) return error.GuestCopyFailed;
-}
-
-pub fn copyOutNamed(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: CopyNamedOptions,
-) !void {
-    clearLastError();
-    try rejectX86NamedCopy();
-    var archive = try createEmptyCopyArchive(allocator, context.io);
-    defer archive.deinit(context.io);
-
-    const archive_fd = try openHostFileCreate(allocator, archive.path);
-    var archive_fd_open = true;
-    defer {
-        if (archive_fd_open) _ = std.c.close(archive_fd);
-    }
-
-    const exit_code = try copyNamedStreaming(context, allocator, options, "copy-out-v1", .{
-        .stdout_fd = archive_fd,
-        .stderr_fd = -1,
-    });
-    _ = std.c.close(archive_fd);
-    archive_fd_open = false;
-
-    if (exit_code != 0) return error.GuestCopyFailed;
-    try extractCopyArchive(allocator, context.io, archive.path, options.host_path);
-}
-
-test "x86 named copy APIs remain fail closed before host IO" {
-    if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return error.SkipZigTest;
-
-    var environ = std.process.Environ.Map.init(std.testing.allocator);
-    defer environ.deinit();
-    const context = Context{ .io = std.testing.io, .environ_map = &environ };
-    const options = CopyNamedOptions{
-        .name = "x86-copy-rejected",
-        .host_path = "missing-host-path",
-        .guest_path = "/tmp/rejected",
-    };
-    try std.testing.expectError(error.X86NamedCopyUnsupported, copyInNamed(context, std.testing.allocator, options));
-    try std.testing.expectError(error.X86NamedCopyUnsupported, copyOutNamed(context, std.testing.allocator, options));
 }
 
 const ExecNamedStreamingResult = struct {
@@ -2010,7 +1908,7 @@ pub fn createCli(
             },
             else => |e| return e,
         };
-    const full_args = try init.minimal.args.toSlice(allocator);
+    const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
     const result = createNamedWithTiming(init, allocator, .probe(), .{
         .name = spec.name,
         .backend = run_mod.Backend.parse(spec.backend) orelse unreachable,
@@ -2027,7 +1925,7 @@ pub fn createCli(
         .timeout_ms = spec.timeout_ms,
         .console_log_path = spec.console_log_path,
         .initial_output = parsed.initial_output,
-        .spore_executable = full_args[0],
+        .spore_executable = spore_executable,
         .annotations = spec.annotations,
     }, .{
         .start_ms = start_ms,
@@ -2069,7 +1967,7 @@ pub fn createCli(
             const message = "spore create: required rootfs object was not found";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "create"), message);
         },
-        error.MonitorReadyTimeout, error.SporeExecutableVersionUnavailable => {
+        error.MonitorReadyTimeout => {
             const message = allocLifecycleLastErrorMessage(allocator, "create", "spore create: timed out waiting for monitor readiness");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
         },
@@ -2679,13 +2577,13 @@ pub fn forkCli(
 
     const allocator = init.arena.allocator();
     const parsed = parseForkArgs(args, allocator, stderr, mode);
-    const full_args = try init.minimal.args.toSlice(allocator);
+    const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
     const result = forkNamed(init, allocator, .{
         .source_name = parsed.source_name,
         .count = parsed.count,
         .name_pattern = parsed.name_pattern,
         .allow_slow_copy = parsed.allow_slow_copy,
-        .spore_executable = full_args[0],
+        .spore_executable = spore_executable,
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong, error.ControlSocketPathCollision => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
         error.InvalidForkNamePattern => {
@@ -2741,7 +2639,7 @@ pub fn forkCli(
             const message = "spore fork: the source disk baseline is no longer complete in its bound store";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "fork"), message);
         },
-        error.MonitorReadyTimeout, error.MonitorVersionMismatch, error.SporeExecutableVersionUnavailable => {
+        error.MonitorReadyTimeout, error.MonitorVersionMismatch => {
             const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: timed out waiting for monitor readiness");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "fork"), message);
         },
@@ -2780,14 +2678,14 @@ pub fn restoreCli(
     restore_cli_event_writer = if (requestsJsonl(args)) &event_writer else null;
     defer restore_cli_event_writer = null;
     const parsed = parseRestoreArgs(args, allocator, stderr, mode);
-    const full_args = try init.minimal.args.toSlice(allocator);
+    const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
     if (parsed.event_mode == .jsonl) try event_writer.emitStart(parsed.backend orelse .auto);
     const result = restoreNamed(init, allocator, .{
         .spore_dir = parsed.spore_dir,
         .name = parsed.name,
         .backend = parsed.backend,
         .generation_path = parsed.generation_path,
-        .spore_executable = full_args[0],
+        .spore_executable = spore_executable,
         .bound_services = parsed.bound_services.slice(),
     }) catch |err| {
         emitRestoreFailureEvent(&event_writer, parsed.event_mode, err);
@@ -2866,7 +2764,7 @@ pub fn restoreCli(
                 const message = allocLifecycleLastErrorMessage(allocator, "restore", fallback);
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
-            error.MonitorReadyTimeout, error.MonitorVersionMismatch, error.SporeExecutableVersionUnavailable => {
+            error.MonitorReadyTimeout, error.MonitorVersionMismatch => {
                 const message = allocLifecycleLastErrorMessage(allocator, "restore", "spore restore: timed out waiting for monitor readiness");
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "restore"), message);
             },
@@ -4506,8 +4404,8 @@ fn startForkChildExecutable(
     };
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, allocator, child_name);
     try writeSpec(allocator, init.io, paths, spec);
-    const spore_executable_path = try spawnMonitorExecutable(init, allocator, paths, spec, spore_executable, null);
-    try waitForReadyResult(allocator, init.io, paths, spec.timeout_ms, spore_executable_path);
+    try spawnMonitorExecutable(init, allocator, paths, spec, spore_executable, null);
+    try waitForReadyResult(allocator, init.io, paths, spec.timeout_ms, spore_executable);
 }
 
 fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, names: []const []const u8) void {
@@ -4590,41 +4488,17 @@ fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !v
     }
 }
 
-fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, spec: Spec, exe: []const u8, network_policy: ?*const run_mod.NetworkPolicy) ![]const u8 {
+/// Starts `exe monitor ...`. CLI callers pass the running executable's path so
+/// the monitor is always this exact build.
+fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, spec: Spec, exe: []const u8, network_policy: ?*const run_mod.NetworkPolicy) !void {
     try validateControlSocketPath(paths.control_socket_path);
     try ensureVmDir(init.io, paths);
-    const resolved_exe = try resolveSpawnExecutable(allocator, init.io, init.environ_map, exe);
-    errdefer allocator.free(resolved_exe);
-    // Skip the pre-spawn version probe when re-exec'ing the current process:
-    // self-exec cannot skew, and running an embedder binary with a bare
-    // "version" argv (without the re-exec environment) would invoke the
-    // embedder's own CLI.
-    if (!isSelfExecutable(init.io, allocator, resolved_exe)) {
-        const executable_version = querySporeExecutableVersion(init, allocator, resolved_exe) catch {
-            setStartupError(allocator, init.io, paths, spec.name, resolved_exe, "could not read spore executable version");
-            return error.SporeExecutableVersionUnavailable;
-        };
-        defer allocator.free(executable_version);
-        if (!std.mem.eql(u8, executable_version, version.value)) {
-            const reason = try std.fmt.allocPrint(allocator, "libspore {s} cannot use spore executable {s} at {s}", .{ version.value, executable_version, resolved_exe });
-            defer allocator.free(reason);
-            setStartupError(
-                allocator,
-                init.io,
-                paths,
-                spec.name,
-                resolved_exe,
-                reason,
-            );
-            return error.MonitorVersionMismatch;
-        }
-    }
 
     var monitor_log = try createFileAtPath(init.io, paths.monitor_log_path);
     defer monitor_log.close(init.io);
 
     var argv = std.array_list.Managed([]const u8).init(allocator);
-    try argv.append(resolved_exe);
+    try argv.append(exe);
     try argv.append("monitor");
     try argv.append(spec.name);
     try argv.append("--backend");
@@ -4668,19 +4542,15 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
     errdefer {
         if (release_socket_claim) releaseControlSocketPath(init.io, paths) catch {};
     }
-    var child_env = try init.environ_map.clone(allocator);
-    try child_env.put(reexec_role_env, "monitor");
-    try child_env.put(reexec_contract_env, reexec_contract_value);
     _ = try std.process.spawn(init.io, .{
         .argv = argv.items,
-        .environ_map = &child_env,
+        .environ_map = init.environ_map,
         .stdin = .ignore,
         .stdout = .{ .file = monitor_log },
         .stderr = .{ .file = monitor_log },
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
     release_socket_claim = false;
-    return resolved_exe;
 }
 
 test "lifecycle monitor spawn receives context environment" {
@@ -4697,15 +4567,9 @@ test "lifecycle monitor spawn receives context environment" {
     defer allocator.free(script_path);
     const out_path = try std.fs.path.resolve(allocator, &.{ root, "home.txt" });
     defer allocator.free(out_path);
-    const script = try std.fmt.allocPrint(
-        allocator,
-        "#!/bin/sh\nif [ \"$1\" = version ]; then printf 'spore {s} (test)\\n'; exit 0; fi\nprintf '%s\\n%s\\n%s\\n' \"$HOME\" \"$SPORE_REEXEC_ROLE\" \"$SPORE_REEXEC_CONTRACT\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
-        .{version.value},
-    );
-    defer allocator.free(script);
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = script_path,
-        .data = script,
+        .data = "#!/bin/sh\nprintf '%s\\n' \"$HOME\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
     });
     try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
 
@@ -4721,7 +4585,7 @@ test "lifecycle monitor spawn receives context environment" {
     releaseControlSocketPath(io, paths) catch {};
     defer releaseControlSocketPath(io, paths) catch {};
 
-    _ = try spawnMonitorExecutable(.{
+    try spawnMonitorExecutable(.{
         .minimal = undefined,
         .arena = undefined,
         .gpa = allocator,
@@ -4747,7 +4611,7 @@ test "lifecycle monitor spawn receives context environment" {
         break;
     }
     try std.testing.expect(observed != null);
-    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\nmonitor\n1\n", observed.?);
+    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\n", observed.?);
 }
 
 fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {
@@ -4819,104 +4683,6 @@ fn appendMemoryArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([
         try argv.append("--max-memory");
         try argv.append(maximum);
     }
-}
-
-fn resolveSpawnExecutable(allocator: std.mem.Allocator, io: Io, environ: *const std.process.Environ.Map, exe: []const u8) ![]const u8 {
-    if (exe.len == 0) return error.InvalidSporeExecutable;
-    if (Io.Dir.path.isAbsolute(exe) or std.mem.indexOfScalar(u8, exe, std.fs.path.sep) != null) {
-        return std.fs.path.resolve(allocator, &.{exe});
-    }
-    const path = environ.get("PATH") orelse return allocator.dupe(u8, exe);
-    var parts = std.mem.splitScalar(u8, path, std.fs.path.delimiter);
-    while (parts.next()) |part| {
-        const dir = if (part.len == 0) "." else part;
-        const candidate = try std.fs.path.resolve(allocator, &.{ dir, exe });
-        const stat = Io.Dir.cwd().statFile(io, candidate, .{ .follow_symlinks = true }) catch |err| switch (err) {
-            error.FileNotFound => {
-                allocator.free(candidate);
-                continue;
-            },
-            else => {
-                allocator.free(candidate);
-                return err;
-            },
-        };
-        if (stat.kind == Io.File.Kind.file) return candidate;
-        allocator.free(candidate);
-    }
-    return allocator.dupe(u8, exe);
-}
-
-fn isSelfExecutable(io: Io, allocator: std.mem.Allocator, resolved_exe: []const u8) bool {
-    const self_path = std.process.executablePathAlloc(io, allocator) catch return false;
-    defer allocator.free(self_path);
-    if (std.mem.eql(u8, self_path, resolved_exe)) return true;
-    // resolveSpawnExecutable is lexical, so compare through symlinks too:
-    // an embedder may hand us its own path via a symlink.
-    const real_exe = Io.Dir.cwd().realPathFileAlloc(io, resolved_exe, allocator) catch return false;
-    defer allocator.free(real_exe);
-    return std.mem.eql(u8, self_path, real_exe);
-}
-
-fn querySporeExecutableVersion(init: std.process.Init, allocator: std.mem.Allocator, exe: []const u8) ![]const u8 {
-    var child = try std.process.spawn(init.io, .{
-        .argv = &.{ exe, "version" },
-        .environ_map = init.environ_map,
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    });
-    defer child.kill(init.io);
-    const stdout_fd = child.stdout.?.handle;
-    child.stdout = null;
-    defer _ = std.c.close(stdout_fd);
-
-    var output = std.array_list.Managed(u8).init(allocator);
-    defer output.deinit();
-    var buf: [256]u8 = undefined;
-    while (output.items.len < 1024) {
-        const n = std.c.read(stdout_fd, &buf, buf.len);
-        if (n < 0) {
-            switch (std.c.errno(n)) {
-                .INTR => continue,
-                else => return error.SporeExecutableVersionUnavailable,
-            }
-        }
-        if (n == 0) break;
-        try output.appendSlice(buf[0..@intCast(n)]);
-    }
-    const term = try child.wait(init.io);
-    const ok = switch (term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (!ok) return error.SporeExecutableVersionUnavailable;
-    return parseSporeVersionOutput(allocator, output.items);
-}
-
-fn parseSporeVersionOutput(allocator: std.mem.Allocator, output: []const u8) ![]const u8 {
-    const trimmed = std.mem.trim(u8, output, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "spore ")) return error.SporeExecutableVersionUnavailable;
-    var rest = trimmed["spore ".len..];
-    const end = std.mem.indexOfAny(u8, rest, " \t\r\n") orelse rest.len;
-    rest = rest[0..end];
-    if (rest.len == 0) return error.SporeExecutableVersionUnavailable;
-    return allocator.dupe(u8, rest);
-}
-
-test "lifecycle parses spore executable version output" {
-    const allocator = std.testing.allocator;
-
-    const plain = try parseSporeVersionOutput(allocator, "spore 1.5.0\n");
-    defer allocator.free(plain);
-    try std.testing.expectEqualStrings("1.5.0", plain);
-
-    const decorated = try parseSporeVersionOutput(allocator, "spore 1.5.0 (test build)\n");
-    defer allocator.free(decorated);
-    try std.testing.expectEqualStrings("1.5.0", decorated);
-
-    try std.testing.expectError(error.SporeExecutableVersionUnavailable, parseSporeVersionOutput(allocator, "spore\n"));
-    try std.testing.expectError(error.SporeExecutableVersionUnavailable, parseSporeVersionOutput(allocator, "other 1.5.0\n"));
 }
 
 const FakeHelloServer = struct {
@@ -5160,7 +4926,7 @@ test "lifecycle readiness fails on monitor version mismatch" {
 
     clearLastError();
     try std.testing.expectError(error.MonitorVersionMismatch, waitForReadyResult(allocator, io, paths, 1_000, "/tmp/spore-1.3.0"));
-    const expected = try std.fmt.allocPrint(allocator, "libspore {s} cannot use spore executable 1.3.0 at /tmp/spore-1.3.0", .{version.value});
+    const expected = try std.fmt.allocPrint(allocator, "spore {s} cannot use spore executable 1.3.0 at /tmp/spore-1.3.0", .{version.value});
     defer allocator.free(expected);
     const detail = lastErrorMessage();
     try std.testing.expect(std.mem.indexOf(u8, detail, expected) != null);
@@ -5189,7 +4955,7 @@ test "lifecycle named not ready diagnostics include state pid and logs" {
     try env.put(runtime_dir_env, root);
 
     clearLastError();
-    try std.testing.expectError(error.NamedVmNotReady, execNamed(.{
+    try std.testing.expectError(error.NamedVmNotReady, openExecNamedStream(.{
         .io = io,
         .environ_map = &env,
     }, allocator, .{
@@ -5228,7 +4994,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     try env.put(runtime_dir_env, root);
 
     clearLastError();
-    try std.testing.expectError(error.NamedVmExists, createNamed(.{
+    try std.testing.expectError(error.NamedVmExists, createNamedWithTiming(.{
         .minimal = undefined,
         .arena = undefined,
         .gpa = allocator,
@@ -5238,7 +5004,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     }, allocator, .{}, .{
         .name = "bench-1",
         .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
-    }));
+    }, .{ .start_ms = 0, .parsed_ms = 0 }));
 
     const detail = lastErrorMessage();
     try std.testing.expect(std.mem.indexOf(u8, detail, "state=stale") != null);
@@ -5246,18 +5012,6 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "console_log=none") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.monitor_log_path) != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.control_socket_path) != null);
-}
-
-fn sendExecRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8) ![]const u8 {
-    const payload = struct {
-        type: []const u8 = "exec",
-        argv: []const []const u8,
-        env: []const []const u8,
-        working_dir: ?[]const u8,
-    }{ .argv = argv, .env = env, .working_dir = working_dir };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    return sendControlJson(allocator, io, socket_path, json);
 }
 
 fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !ExecNamedStream {
@@ -5476,8 +5230,7 @@ fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const
     const address = try controlSocketAddress(socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
     defer stream.close(io);
-    // libspore can enter here on a fixed-size cgo system stack, while callers
-    // commonly use arenas that cannot reclaim scratch beneath the response.
+    // Callers commonly use arenas that cannot reclaim scratch beneath the response.
     const read_buffer = try std.heap.page_allocator.alloc(u8, max_control_response);
     defer std.heap.page_allocator.free(read_buffer);
     writeAll(io, stream, json) catch return error.MonitorUnavailable;
@@ -5520,9 +5273,9 @@ fn validateMonitorHello(allocator: std.mem.Allocator, response: []const u8, spor
 fn monitorHelloMismatch(hello: MonitorHelloResponse, spore_executable_path: ?[]const u8) error{MonitorVersionMismatch} {
     const reported = hello.spore_version orelse "unknown";
     if (spore_executable_path) |path| {
-        setLastError("libspore {s} cannot use spore executable {s} at {s}", .{ version.value, reported, path });
+        setLastError("spore {s} cannot use spore executable {s} at {s}", .{ version.value, reported, path });
     } else {
-        setLastError("libspore {s} cannot use monitor helper reporting version {s}", .{ version.value, reported });
+        setLastError("spore {s} cannot use monitor helper reporting version {s}", .{ version.value, reported });
     }
     return error.MonitorVersionMismatch;
 }

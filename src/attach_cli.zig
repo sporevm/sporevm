@@ -32,7 +32,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .session_id = opts.session_id,
         .generation_path = opts.generation_path,
         .timeout_ms = opts.timeout_ms,
-        .spore_executable = full_args[0],
+        .spore_executable = try std.process.executablePathAlloc(init.io, arena),
         .debug = runtimeDebugEnabled(full_args),
         .interactive = opts.interactive,
         .tty = opts.tty,

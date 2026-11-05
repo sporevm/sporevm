@@ -73,51 +73,23 @@ verify_cli_archive() {
   done
 }
 
-verify_libspore_archive() {
-  local asset_path="$1"
-  local root_dir="$2"
-  local entry listing
-
-  listing="$(tar -tzf "${asset_path}")"
-  for entry in \
-    "${root_dir}/include/spore.h" \
-    "${root_dir}/lib/libspore.a" \
-    "${root_dir}/lib/pkgconfig/libspore.pc" \
-    "${root_dir}/LICENSE" \
-    "${root_dir}/README.md" \
-    "${root_dir}/docs/libspore.md"; do
-    grep -Fxq "${entry}" <<<"${listing}" \
-      || die "missing ${entry} in ${asset_path}"
-  done
-
-  grep -Eq "^${root_dir}/lib/libspore\\.(so|[0-9].*\\.dylib)" <<<"${listing}" \
-    || die "missing shared libspore library in ${asset_path}"
-}
-
 download_release_archive() {
   local asset_name="$1"
   local step_key="$2"
-  local asset_kind="$3"
   local asset_path="${ASSET_DIR}/${asset_name}"
   local root_dir="${asset_name%.tar.gz}"
 
   buildkite-agent artifact download "dist/${asset_name}" "${REPO_ROOT}" --step "${step_key}"
   [[ -f "${asset_path}" ]] || die "missing downloaded release asset: ${asset_path}"
-  case "${asset_kind}" in
-    cli) verify_cli_archive "${asset_path}" "${root_dir}" ;;
-    libspore) verify_libspore_archive "${asset_path}" "${root_dir}" ;;
-    *) die "unknown release asset kind: ${asset_kind}" ;;
-  esac
+  verify_cli_archive "${asset_path}" "${root_dir}"
 }
 
 download_release_archives() {
   rm -rf "${ASSET_DIR}"
   mkdir -p "${ASSET_DIR}"
 
-  download_release_archive "spore_Darwin_arm64.tar.gz" "release-darwin-arm64" cli
-  download_release_archive "libspore_Darwin.tar.gz" "release-darwin-arm64" libspore
-  download_release_archive "spore_Linux_arm64.tar.gz" "release-linux-arm64" cli
-  download_release_archive "libspore_Linux.tar.gz" "release-linux-arm64" libspore
+  download_release_archive "spore_Darwin_arm64.tar.gz" "release-darwin-arm64"
+  download_release_archive "spore_Linux_arm64.tar.gz" "release-linux-arm64"
 }
 
 write_checksums() {
@@ -164,8 +136,6 @@ GITHUB_REPOSITORY_NAME="${SPOREVM_GITHUB_REPOSITORY:-sporevm/sporevm}"
 EXPECTED_ASSETS=(
   spore_Darwin_arm64.tar.gz
   spore_Linux_arm64.tar.gz
-  libspore_Darwin.tar.gz
-  libspore_Linux.tar.gz
 )
 
 require_command buildkite-agent

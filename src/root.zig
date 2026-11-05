@@ -3,7 +3,7 @@
 //! A spore is sealed VM state: a manifest of memory chunks, guest machine
 //! state, and storage identity or data. This module
 //! exposes backend, device, storage, daemon, and CLI implementation modules for
-//! in-repo tools. Product callers should import `libspore`, not this module.
+//! the CLI and in-repo tools.
 
 pub const api = @import("api.zig");
 pub const architecture = @import("architecture.zig");

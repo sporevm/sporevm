@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Embedding libraries removed
+
+The C ABI (`spore.h` and the `libspore` archives), the Go binding, and the Zig
+`libspore` module are removed; the CLI's `--json` output is the only interface.
+
 ### Experimental AMD64 fresh workloads
 
 Linux/AMD64 KVM fresh workloads now use native `linux/amd64` OCI selection,
@@ -9,9 +14,7 @@ explicit rootfs inputs, the shared writable rootfs and image-commit path, and
 the shared network policy graph. Native acceptance covers rootfs execution and
 mutation, image commit, DNS, HTTP, hard-floor deny policy, bound services, and
 host-to-guest forwarding. Native `spore build` now selects `linux/amd64`,
-including automatic `TARGETARCH=amd64` build arguments, and standalone Zig, C,
-and Go libspore consumers can execute fresh workloads through the same product
-path.
+including automatic `TARGETARCH=amd64` build arguments.
 
 The profile remains experimental, source-built, fixed at one vCPU and 512 MiB,
 and fresh-only. Capture, save, restore, resume, disk fork, fan-out, multi-vCPU,
@@ -26,14 +29,12 @@ larger grow-only virtio-mem ceiling. `--max-memory` may be used alone with the
 512 MiB initial default. The former `--memory auto` policy has been removed;
 use `--memory 512mb --max-memory 16gb` to preserve its intended elastic range.
 
-The Zig, C, and Go APIs use the same two-size contract. Existing
-`memory_bytes`/`MemoryBytes` fields now unambiguously mean initial memory, and
-the additive maximum field enables elasticity. The C ABI advances to 20 and
-`SporeCreateNamedOptions` advances to version 7. Named list output advances to
-`spore.lifecycle.list.result.v2`, where memory contains `initial_bytes` and
-`maximum_bytes`. Existing named-VM registry entries migrate the old `explicit`
-policy to fixed memory and the old `auto` policy to 512 MiB initial memory with
-its stored ceiling.
+JSON results use the same two-size contract. Existing `memory_bytes` fields now
+unambiguously mean initial memory, and the additive maximum field enables
+elasticity. Named list output advances to `spore.lifecycle.list.result.v2`,
+where memory contains `initial_bytes` and `maximum_bytes`. Existing named-VM
+registry entries migrate the old `explicit` policy to fixed memory and the old
+`auto` policy to 512 MiB initial memory with its stored ceiling.
 
 Elastic captures use manifest v4 and persist backend-neutral initial, maximum,
 requested, captured, and exact plugged-block state. Current readers retain v2

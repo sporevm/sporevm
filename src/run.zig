@@ -4098,18 +4098,8 @@ pub const ExecRequestContextOptions = struct {
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
     resume_time_unix_ns: u64 = 0,
-    generation_params: ?[]const u8 = null,
     retain_output: bool = false,
 };
-
-pub fn execRequestWithSessionContext(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: ExecRequestContextOptions) ![]const u8 {
-    return execRequestWithSessionOptions(allocator, argv, session_id, .{
-        .env = options.env,
-        .working_dir = options.working_dir,
-        .resume_time_unix_ns = options.resume_time_unix_ns,
-        .generation_params = options.generation_params,
-    });
-}
 
 pub fn execRequestWithSessionGenerationParams(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64, generation_params: []const u8) ![]const u8 {
     return execRequestWithSessionOptions(allocator, argv, session_id, .{
