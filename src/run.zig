@@ -662,7 +662,7 @@ fn portForwardEvent(command: []const u8, backend: ?Backend, service: spore_net_p
         .backend = backend,
         .kind = .bound_unix_service,
         .name = service.name,
-        .guest_host = if (service.guest_host.len == 0) null else service.guest_host,
+        .guest_host = service.guest_host,
         .guest_port = service.guest_port,
         .target = "unix",
     };
@@ -1353,7 +1353,7 @@ fn renamedRunFlagHint(arg: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn parseCliArgs(args: []const []const u8) !CliOptions {
+pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !CliOptions {
     var backend: Backend = .auto;
     var shared = SharedOptions{};
     var from_spore_dir: ?[]const u8 = null;
@@ -1596,7 +1596,7 @@ pub fn parseCliArgs(args: []const []const u8) !CliOptions {
             std.process.exit(2);
         }
         for (bind_service_args.slice()) |raw| {
-            network_policy.addBindService(raw) catch |err| {
+            network_policy.addBindService(allocator, raw) catch |err| {
                 std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
@@ -5308,7 +5308,7 @@ test "run from carries writable disk manifests into runtime options" {
 }
 
 test "run cli parser accepts command after separator" {
-    const opts = try parseCliArgs(&.{ "--backend", "hvf", "--kernel", "Image", "--initrd", "root.cpio", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--backend", "hvf", "--kernel", "Image", "--initrd", "root.cpio", "--", "/bin/true" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
     try std.testing.expectEqualStrings("Image", opts.shared.kernel_path.?);
     try std.testing.expectEqualStrings("root.cpio", opts.shared.initrd_path.?);
@@ -5318,12 +5318,12 @@ test "run cli parser accepts command after separator" {
 }
 
 test "run cli parser accepts flexible timeout duration" {
-    const opts = try parseCliArgs(&.{ "--timeout", "120s", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--timeout", "120s", "--", "/bin/true" });
     try std.testing.expectEqual(@as(u64, 120_000), opts.shared.timeout_ms);
 }
 
 test "run cli parser accepts hidden timeout-ms compatibility spelling" {
-    const opts = try parseCliArgs(&.{ "--timeout-ms", "120000", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--timeout-ms", "120000", "--", "/bin/true" });
     try std.testing.expectEqual(@as(u64, 120_000), opts.shared.timeout_ms);
 }
 
@@ -5336,14 +5336,14 @@ test "run duration parser accepts common suffixes" {
 }
 
 test "run cli parser accepts injected files" {
-    const opts = try parseCliArgs(&.{ "--inject", "config=host-config.json", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--inject", "config=host-config.json", "--", "/bin/true" });
     try std.testing.expectEqual(@as(usize, 1), opts.injected_file_sources.len);
     try std.testing.expectEqualStrings("config", opts.injected_file_sources.items[0].id);
     try std.testing.expectEqualStrings("host-config.json", opts.injected_file_sources.items[0].path);
 }
 
 test "run cli parser accepts repeatable env specs" {
-    const opts = try parseCliArgs(&.{ "--env", "SPORE_TEST_ENV=ok", "--env", "HOST_ENV", "--", "/usr/bin/env" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--env", "SPORE_TEST_ENV=ok", "--env", "HOST_ENV", "--", "/usr/bin/env" });
     try std.testing.expectEqual(@as(usize, 2), opts.guest_env_specs.len);
     try std.testing.expectEqualStrings("SPORE_TEST_ENV=ok", opts.guest_env_specs.items[0].literal);
     try std.testing.expectEqualStrings("HOST_ENV", opts.guest_env_specs.items[1].copy);
@@ -5366,7 +5366,7 @@ test "injected file ids reject paths" {
 }
 
 test "run cli parser accepts interactive stdin" {
-    const opts = try parseCliArgs(&.{ "-i", "--image", "docker.io/library/alpine:3.20", "--", "/bin/cat" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "-i", "--image", "docker.io/library/alpine:3.20", "--", "/bin/cat" });
     try std.testing.expect(opts.interactive);
     try std.testing.expect(!opts.tty);
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
@@ -5375,13 +5375,13 @@ test "run cli parser accepts interactive stdin" {
 }
 
 test "run cli parser accepts tty and combined interactive tty" {
-    const tty_opts = try parseCliArgs(&.{ "-t", "--image", "docker.io/library/alpine:3.20", "--", "/bin/sh" });
+    const tty_opts = try parseCliArgs(std.testing.allocator, &.{ "-t", "--image", "docker.io/library/alpine:3.20", "--", "/bin/sh" });
     try std.testing.expect(!tty_opts.interactive);
     try std.testing.expect(tty_opts.tty);
     try std.testing.expectEqual(CommandMode.argv, tty_opts.command_mode);
     try std.testing.expectEqualStrings("/bin/sh", tty_opts.command[0]);
 
-    const it_opts = try parseCliArgs(&.{ "-it", "--image", "docker.io/library/alpine:3.20", "--", "/bin/sh" });
+    const it_opts = try parseCliArgs(std.testing.allocator, &.{ "-it", "--image", "docker.io/library/alpine:3.20", "--", "/bin/sh" });
     try std.testing.expect(it_opts.interactive);
     try std.testing.expect(it_opts.tty);
     try std.testing.expectEqual(CommandMode.argv, it_opts.command_mode);
@@ -5389,7 +5389,7 @@ test "run cli parser accepts tty and combined interactive tty" {
 }
 
 test "run cli parser accepts shell command with source spore" {
-    const opts = try parseCliArgs(&.{ "--from", "base.spore", "cat /work-ready" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "base.spore", "cat /work-ready" });
     try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
     try std.testing.expectEqual(CommandMode.shell, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
@@ -5397,14 +5397,14 @@ test "run cli parser accepts shell command with source spore" {
 }
 
 test "run cli parser accepts commandless source spore" {
-    const opts = try parseCliArgs(&.{ "--from", "live.spore" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "live.spore" });
     try std.testing.expectEqualStrings("live.spore", opts.from_spore_dir.?);
     try std.testing.expectEqual(CommandMode.shell, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 0), opts.command.len);
 }
 
 test "run cli guest command wraps shell command" {
-    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo hi" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "echo hi" });
     const argv = try cliGuestCommand(std.testing.allocator, opts);
     defer std.testing.allocator.free(argv);
     try std.testing.expectEqual(@as(usize, 3), argv.len);
@@ -5414,7 +5414,7 @@ test "run cli guest command wraps shell command" {
 }
 
 test "run cli guest command keeps exact argv" {
-    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "--", "/bin/echo", "hi" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "--", "/bin/echo", "hi" });
     const argv = try cliGuestCommand(std.testing.allocator, opts);
     try std.testing.expectEqual(@as(usize, 2), argv.len);
     try std.testing.expectEqualStrings("/bin/echo", argv[0]);
@@ -5422,12 +5422,12 @@ test "run cli guest command keeps exact argv" {
 }
 
 test "run cli guest command rejects unquoted shell words" {
-    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "echo", "hi" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "echo", "hi" });
     try std.testing.expectError(error.ShellCommandArgumentCountUnsupported, cliGuestCommand(std.testing.allocator, opts));
 }
 
 test "run cli parser defaults to fixed 512MiB" {
-    const opts = try parseCliArgs(&.{ "--", "/bin/writeout" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--", "/bin/writeout" });
     try std.testing.expectEqual(Backend.auto, opts.backend);
     try std.testing.expect(opts.shared.kernel_path == null);
     try std.testing.expect(opts.shared.initrd_path == null);
@@ -5439,15 +5439,15 @@ test "run cli parser defaults to fixed 512MiB" {
 }
 
 test "run cli parser separates initial and maximum memory" {
-    const fixed = try parseCliArgs(&.{ "--memory", "2gb", "--", "/bin/true" });
+    const fixed = try parseCliArgs(std.testing.allocator, &.{ "--memory", "2gb", "--", "/bin/true" });
     try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), fixed.shared.memory.initial_bytes);
     try std.testing.expectEqual(fixed.shared.memory.initial_bytes, fixed.shared.memory.maximum_bytes);
 
-    const elastic = try parseCliArgs(&.{ "--memory", "512mb", "--max-memory", "16gb", "--", "/bin/true" });
+    const elastic = try parseCliArgs(std.testing.allocator, &.{ "--memory", "512mb", "--max-memory", "16gb", "--", "/bin/true" });
     try std.testing.expectEqual(memory_config.default_bytes, elastic.shared.memory.initial_bytes);
     try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), elastic.shared.memory.maximum_bytes);
 
-    const default_initial = try parseCliArgs(&.{ "--max-memory", "16gb", "--", "/bin/true" });
+    const default_initial = try parseCliArgs(std.testing.allocator, &.{ "--max-memory", "16gb", "--", "/bin/true" });
     try std.testing.expectEqual(memory_config.default_bytes, default_initial.shared.memory.initial_bytes);
     try std.testing.expectEqual(elastic.shared.memory.maximum_bytes, default_initial.shared.memory.maximum_bytes);
 }
@@ -5498,7 +5498,7 @@ test "direct image product platform follows the native architecture" {
 }
 
 test "run cli parser accepts rootfs path" {
-    const opts = try parseCliArgs(&.{ "--rootfs", "rootfs.ext4", "--", "/bin/echo", "hi" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--rootfs", "rootfs.ext4", "--", "/bin/echo", "hi" });
     try std.testing.expectEqualStrings("rootfs.ext4", opts.rootfs_path.?);
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
@@ -5506,7 +5506,7 @@ test "run cli parser accepts rootfs path" {
 }
 
 test "run cli parser accepts image ref" {
-    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "--", "/bin/echo", "hi" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "--", "/bin/echo", "hi" });
     try std.testing.expect(opts.rootfs_path == null);
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.image_ref.?);
     try std.testing.expectEqual(PullPolicy.missing, opts.pull_policy);
@@ -5517,18 +5517,18 @@ test "run cli parser accepts image ref" {
 }
 
 test "run cli parser accepts image entrypoint override" {
-    const opts = try parseCliArgs(&.{ "--image", "local/example:dev", "--entrypoint", "/scanner", "--", "/runtime" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "local/example:dev", "--entrypoint", "/scanner", "--", "/runtime" });
     try std.testing.expectEqualStrings("/scanner", opts.image_entrypoint.?);
     try std.testing.expectEqualSlices([]const u8, &.{"/runtime"}, opts.command);
 }
 
 test "run cli parser permits omitted command only for images" {
-    const opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20" });
     try std.testing.expectEqual(@as(usize, 0), opts.command.len);
 }
 
 test "run cli parser accepts image commit" {
-    const opts = try parseCliArgs(&.{
+    const opts = try parseCliArgs(std.testing.allocator, &.{
         "--image",
         "docker.io/library/alpine:3.20",
         "--commit",
@@ -5545,7 +5545,7 @@ test "run cli parser accepts image commit" {
 }
 
 test "run cli parser accepts commit disk size" {
-    const opts = try parseCliArgs(&.{
+    const opts = try parseCliArgs(std.testing.allocator, &.{
         "--image",
         "docker.io/library/alpine:3.20",
         "--commit",
@@ -5565,10 +5565,10 @@ test "run disk size is absolute and cannot shrink" {
 }
 
 test "run cli parser accepts image pull policy" {
-    const equals_opts = try parseCliArgs(&.{ "--pull=always", "--image", "docker.io/library/alpine:3.20", "--", "/bin/true" });
+    const equals_opts = try parseCliArgs(std.testing.allocator, &.{ "--pull=always", "--image", "docker.io/library/alpine:3.20", "--", "/bin/true" });
     try std.testing.expectEqual(PullPolicy.always, equals_opts.pull_policy);
 
-    const value_opts = try parseCliArgs(&.{ "--image", "docker.io/library/alpine:3.20", "--pull", "never", "--", "/bin/true" });
+    const value_opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "--pull", "never", "--", "/bin/true" });
     try std.testing.expectEqual(PullPolicy.never, value_opts.pull_policy);
 }
 
@@ -5618,18 +5618,18 @@ test "run pull never fails closed on mutable image ref cache miss" {
 }
 
 test "run cli parser accepts source spore generation file" {
-    const opts = try parseCliArgs(&.{ "--from", "base.spore", "--generation", "generation.json", "--", "/bin/writeout" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "base.spore", "--generation", "generation.json", "--", "/bin/writeout" });
     try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
 
-    const equals_opts = try parseCliArgs(&.{ "--from", "base.spore", "--generation=generation.json", "--", "/bin/writeout" });
+    const equals_opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "base.spore", "--generation=generation.json", "--", "/bin/writeout" });
     try std.testing.expectEqualStrings("generation.json", equals_opts.generation_path.?);
 }
 
 test "run cli parser accepts source spore bound service bindings" {
-    const opts = try parseCliArgs(&.{
+    const opts = try parseCliArgs(std.testing.allocator, &.{
         "--from",
         "base.spore",
         "--bind-service",
@@ -5643,7 +5643,7 @@ test "run cli parser accepts source spore bound service bindings" {
 }
 
 test "run cli parser accepts network allow rules" {
-    const opts = try parseCliArgs(&.{
+    const opts = try parseCliArgs(std.testing.allocator, &.{
         "--net",
         "--allow-cidr",
         "93.184.216.34/32",
@@ -5662,7 +5662,9 @@ test "run cli parser accepts network allow rules" {
 }
 
 test "run cli parser accepts network bind services" {
-    const opts = try parseCliArgs(&.{
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const opts = try parseCliArgs(arena.allocator(), &.{
         "--net",
         "--bind-service",
         "metadata=unix:/tmp/metadata.sock",
@@ -5675,6 +5677,7 @@ test "run cli parser accepts network bind services" {
     try std.testing.expect(opts.network_requested);
     try std.testing.expectEqual(@as(usize, 2), opts.network_policy.bound_service_count);
     try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", opts.network_policy.bound_services[0].guest_host);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
     try std.testing.expectEqualStrings("cache", opts.network_policy.bound_services[1].name);
     try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.bound_services[1].guest_port);
@@ -5682,7 +5685,7 @@ test "run cli parser accepts network bind services" {
 }
 
 test "run cli parser accepts network port forwards" {
-    const opts = try parseCliArgs(&.{
+    const opts = try parseCliArgs(std.testing.allocator, &.{
         "--net",
         "--forward",
         "127.0.0.1:8080:80",
@@ -5846,7 +5849,7 @@ test "removed capture flags map to save rename hints" {
 }
 
 test "run cli parser accepts save flags" {
-    const opts = try parseCliArgs(&.{ "--save", "out.spore", "--save-on", "USR1", "--continue-after-save", "--", "/bin/sleeper" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--save", "out.spore", "--save-on", "USR1", "--continue-after-save", "--", "/bin/sleeper" });
     try std.testing.expectEqualStrings("out.spore", opts.save_path.?);
     try std.testing.expectEqual(capture.Signal.USR1, opts.save_trigger.signalValue().?);
     try std.testing.expect(opts.continue_after_save);
@@ -5855,19 +5858,19 @@ test "run cli parser accepts save flags" {
 }
 
 test "run cli parser accepts bounded vcpu count" {
-    const opts = try parseCliArgs(&.{ "--vcpus", "2", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--vcpus", "2", "--", "/bin/true" });
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.shared.vcpus);
 }
 
 test "run cli parser accepts jsonl events" {
-    const opts = try parseCliArgs(&.{ "--events=jsonl", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--events=jsonl", "--", "/bin/true" });
     try std.testing.expectEqual(EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 
 test "run cli parser defaults save trigger to exit" {
-    const opts = try parseCliArgs(&.{ "--save", "out.spore", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--save", "out.spore", "--", "/bin/true" });
     try std.testing.expectEqualStrings("out.spore", opts.save_path.?);
     try std.testing.expect(opts.save_trigger.isExit());
     try std.testing.expect(!opts.continue_after_save);

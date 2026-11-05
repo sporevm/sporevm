@@ -3408,13 +3408,9 @@ fn createBoundServicesFromConfig(
     if (cli_services.len == 0) return &.{};
     const services = try allocator.alloc(spore_net_policy.BoundService, cli_services.len);
     for (cli_services, services) |service, *out| {
-        const guest_host = if (service.guest_host.len != 0)
-            service.guest_host
-        else
-            try std.fmt.allocPrint(allocator, "{s}.spore.internal", .{service.name});
         out.* = .{
             .name = service.name,
-            .guest_host = guest_host,
+            .guest_host = service.guest_host,
             .guest_port = service.guest_port,
             .target = .{ .unix = service.unix_path },
         };
@@ -3633,7 +3629,7 @@ fn parseCreateArgs(
         } else if (std.mem.eql(u8, args[i], "--bind-service")) {
             field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
-            network_policy.addBindService(raw) catch |err| {
+            network_policy.addBindService(allocator, raw) catch |err| {
                 const message = allocLifecycleMessage(allocator, "spore create: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
@@ -7169,7 +7165,9 @@ test "create parser accepts network allow policy" {
 }
 
 test "create parser accepts annotations exact host ports and bound services" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
@@ -7191,6 +7189,7 @@ test "create parser accepts annotations exact host ports and bound services" {
     try std.testing.expectEqual(@as(u16, 443), opts.network_policy.exact_rules[0].ports[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.bound_service_count);
     try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", opts.network_policy.bound_services[0].guest_host);
     try std.testing.expectEqual(@as(u16, 8170), opts.network_policy.bound_services[0].guest_port);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
 }

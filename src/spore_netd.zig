@@ -44,7 +44,7 @@ const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
 const netd_usage =
     \\Usage:
-    \\  spore netd --stdio [--default-action deny] [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bind-service NAME[:PORT]=unix:/path.sock] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]
+    \\  spore netd --stdio [--default-action deny] [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]
     \\
     \\Internal helper for SporeVM-managed networking.
     \\
@@ -193,12 +193,6 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
             const raw = takeValue(args, &i, args[i]);
             opts.policy.addAllowHost(raw) catch |err| {
                 std.debug.print("spore netd: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--bind-service")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.policy.addBindService(raw) catch |err| {
-                std.debug.print("spore netd: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "--allow-host-port")) {
@@ -785,7 +779,7 @@ test "spore-netd resolves bound services to the gateway" {
     const frame = testDnsFrame(query, &frame_buf);
     var forwarder = TestDnsForwarder{ .fail = true };
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
     var out: [max_frame_len]u8 = undefined;
@@ -808,7 +802,7 @@ test "spore-netd returns empty NOERROR for bound service AAAA queries" {
     const frame = testDnsFrame(query, &frame_buf);
     var forwarder = TestDnsForwarder{ .fail = true };
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
     var out: [max_frame_len]u8 = undefined;
@@ -835,7 +829,7 @@ test "spore-netd forwards ordinary DNS when a bound service exists" {
     const frame = testDnsFrame(query, &frame_buf);
     var forwarder = TestDnsForwarder{ .response = response };
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
     var out: [max_frame_len]u8 = undefined;
@@ -1080,7 +1074,7 @@ fn fuzzFrameStreamAndArp(_: void, s: *std.testing.Smith) !void {
     var out: [max_frame_len]u8 = undefined;
     var forwarder = TestDnsForwarder{ .fail = true };
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/metadata.sock");
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
     _ = arpReply(bytes[0..len], &out);

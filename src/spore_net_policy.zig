@@ -145,7 +145,6 @@ pub const ExactRuleConfig = struct {
 };
 
 pub const BoundServiceConfig = struct {
-    declaration: []const u8 = "",
     name: []const u8 = "",
     guest_host: []const u8 = "",
     guest_port: u16 = 0,
@@ -184,7 +183,10 @@ pub const Config = struct {
         self.allow_host_count += 1;
     }
 
-    pub fn addBindService(self: *Config, raw: []const u8) ParseError!void {
+    /// Adds a CLI `NAME[:PORT]=unix:/path.sock` binding, exposed to the guest
+    /// as `NAME.spore.internal:PORT`. The guest host is allocated so the
+    /// config always carries the host a saved manifest records.
+    pub fn addBindService(self: *Config, allocator: std.mem.Allocator, raw: []const u8) (ParseError || std.mem.Allocator.Error)!void {
         const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidBoundService;
         if (std.mem.indexOfScalar(u8, raw[eq + 1 ..], '=') != null) return error.InvalidBoundService;
         const name_port = raw[0..eq];
@@ -201,20 +203,9 @@ pub const Config = struct {
         const unix_prefix = "unix:";
         if (!std.mem.startsWith(u8, target, unix_prefix)) return error.UnsupportedBoundServiceTarget;
         const path = target[unix_prefix.len..];
-        try validateUnixSocketPath(path);
-
-        if (self.bound_service_count >= max_bound_services) return error.TooManyBoundServices;
-        for (self.boundServiceSlice()) |existing| {
-            if (std.mem.eql(u8, existing.name, name)) return error.DuplicateBoundService;
-            if (existing.guest_port == guest_port) return error.DuplicateBoundService;
-        }
-        self.bound_services[self.bound_service_count] = .{
-            .declaration = raw,
-            .name = name,
-            .guest_port = guest_port,
-            .unix_path = path,
-        };
-        self.bound_service_count += 1;
+        const guest_host = try std.fmt.allocPrint(allocator, "{s}.spore.internal", .{name});
+        errdefer allocator.free(guest_host);
+        try self.addBoundUnixService(name, guest_host, guest_port, path);
     }
 
     pub fn addNetworkPolicy(self: *Config, policy: NetworkPolicy) ParseError!void {
@@ -257,8 +248,8 @@ pub const Config = struct {
         if (self.bound_service_count >= max_bound_services) return error.TooManyBoundServices;
         for (self.boundServiceSlice()) |existing| {
             if (std.mem.eql(u8, existing.name, name)) return error.DuplicateBoundService;
-            if (existing.guest_host.len != 0 and std.mem.eql(u8, existing.guest_host, guest_host)) return error.DuplicateBoundService;
-            if (existing.guest_port != 0 and existing.guest_port == guest_port) return error.DuplicateBoundService;
+            if (std.mem.eql(u8, existing.guest_host, guest_host)) return error.DuplicateBoundService;
+            if (existing.guest_port == guest_port) return error.DuplicateBoundService;
         }
         self.bound_services[self.bound_service_count] = .{
             .name = name,
@@ -508,7 +499,7 @@ pub const Runtime = struct {
         }
         for (config.boundServiceSlice()) |service| {
             try validateServiceName(service.name);
-            if (service.guest_host.len != 0) try validateHost(service.guest_host);
+            try validateHost(service.guest_host);
             runtime.bound_services[runtime.bound_service_count] = service;
             runtime.bound_service_count += 1;
         }
@@ -628,13 +619,7 @@ pub const Runtime = struct {
 
     pub fn boundServiceForDnsQuery(self: *const Runtime, packet: []const u8, name_offset: usize) ?*const BoundServiceConfig {
         for (self.bound_services[0..self.bound_service_count]) |*service| {
-            if (service.guest_host.len != 0) {
-                if (dnsNameMatchesHost(packet, name_offset, service.guest_host)) return service;
-            } else {
-                var host_buf: [max_bound_service_name_len + ".spore.internal".len]u8 = undefined;
-                const host = std.fmt.bufPrint(&host_buf, "{s}.spore.internal", .{service.name}) catch unreachable;
-                if (dnsNameMatchesHost(packet, name_offset, host)) return service;
-            }
+            if (dnsNameMatchesHost(packet, name_offset, service.guest_host)) return service;
         }
         return null;
     }
@@ -1272,18 +1257,20 @@ test "spore-net policy DNS rebinding answers cannot override hard floor" {
 }
 
 test "spore-net policy parses bound unix service declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     var config = Config{};
-    try config.addBindService("metadata=unix:/tmp/metadata.sock");
-    try config.addBindService("cache:8080=unix:/tmp/cache.sock");
+    try config.addBindService(arena.allocator(), "metadata=unix:/tmp/metadata.sock");
+    try config.addBindService(arena.allocator(), "cache:8080=unix:/tmp/cache.sock");
 
     try std.testing.expect(config.hasBoundServices());
     try std.testing.expectEqual(@as(usize, 2), config.bound_service_count);
-    try std.testing.expectEqualStrings("metadata=unix:/tmp/metadata.sock", config.bound_services[0].declaration);
     try std.testing.expectEqualStrings("metadata", config.bound_services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", config.bound_services[0].guest_host);
     try std.testing.expectEqual(@as(u16, 80), config.bound_services[0].guest_port);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", config.bound_services[0].unix_path);
-    try std.testing.expectEqualStrings("cache:8080=unix:/tmp/cache.sock", config.bound_services[1].declaration);
     try std.testing.expectEqualStrings("cache", config.bound_services[1].name);
+    try std.testing.expectEqualStrings("cache.spore.internal", config.bound_services[1].guest_host);
     try std.testing.expectEqual(@as(u16, 8080), config.bound_services[1].guest_port);
     try std.testing.expectEqualStrings("/tmp/cache.sock", config.bound_services[1].unix_path);
 
@@ -1308,12 +1295,27 @@ test "spore-net policy parses bound unix service bindings" {
 }
 
 test "spore-net policy rejects invalid bound service declarations" {
+    const allocator = std.testing.allocator;
     var config = Config{};
-    try std.testing.expectError(error.InvalidBoundService, config.addBindService("metadata"));
-    try std.testing.expectError(error.InvalidBoundServiceName, config.addBindService("MetaData=unix:/tmp/metadata.sock"));
-    try std.testing.expectError(error.InvalidPort, config.addBindService("metadata:0=unix:/tmp/metadata.sock"));
-    try std.testing.expectError(error.UnsupportedBoundServiceTarget, config.addBindService("metadata=tcp:127.0.0.1:8080"));
-    try std.testing.expectError(error.InvalidBoundServiceTarget, config.addBindService("metadata=unix:relative.sock"));
+    try std.testing.expectError(error.InvalidBoundService, config.addBindService(allocator, "metadata"));
+    try std.testing.expectError(error.InvalidBoundServiceName, config.addBindService(allocator, "MetaData=unix:/tmp/metadata.sock"));
+    try std.testing.expectError(error.InvalidPort, config.addBindService(allocator, "metadata:0=unix:/tmp/metadata.sock"));
+    try std.testing.expectError(error.UnsupportedBoundServiceTarget, config.addBindService(allocator, "metadata=tcp:127.0.0.1:8080"));
+    try std.testing.expectError(error.InvalidBoundServiceTarget, config.addBindService(allocator, "metadata=unix:relative.sock"));
+}
+
+test "spore-net CLI bound services produce a valid saved manifest network" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var config = Config{};
+    try config.addBindService(arena.allocator(), "metadata:8080=unix:/tmp/metadata.sock");
+
+    const network = try manifestNetworkFromConfig(arena.allocator(), &config);
+    try spore.validateNetwork(network);
+    try std.testing.expectEqual(@as(usize, 1), network.bound_services.len);
+    try std.testing.expectEqualStrings("metadata", network.bound_services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", network.bound_services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8080), network.bound_services[0].guest_port);
 }
 
 test "spore-net policy exposes first-slice capability facts" {

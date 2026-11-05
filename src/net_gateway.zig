@@ -109,17 +109,12 @@ pub const Process = struct {
             }
         }
         for (policy.boundServiceSlice()) |service| {
-            if (service.declaration.len != 0) {
-                argv.append("--bind-service") catch return error.OutOfMemory;
-                argv.append(service.declaration) catch return error.OutOfMemory;
-            } else {
-                const port = std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}) catch return error.OutOfMemory;
-                argv.append("--bound-unix-service") catch return error.OutOfMemory;
-                argv.append(service.name) catch return error.OutOfMemory;
-                argv.append(service.guest_host) catch return error.OutOfMemory;
-                argv.append(port) catch return error.OutOfMemory;
-                argv.append(service.unix_path) catch return error.OutOfMemory;
-            }
+            const port = std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}) catch return error.OutOfMemory;
+            argv.append("--bound-unix-service") catch return error.OutOfMemory;
+            argv.append(service.name) catch return error.OutOfMemory;
+            argv.append(service.guest_host) catch return error.OutOfMemory;
+            argv.append(port) catch return error.OutOfMemory;
+            argv.append(service.unix_path) catch return error.OutOfMemory;
         }
         for (policy.portForwardSlice()) |forward| {
             const value = std.fmt.allocPrint(allocator, "127.0.0.1:{d}:{d}", .{ forward.host_port, forward.guest_port }) catch return error.OutOfMemory;

@@ -441,8 +441,7 @@ pub const Gateway = struct {
                 break :blk openHostSocket(request.local.addr, request.local.port);
             },
             .bound_unix => |bound| blk: {
-                const host: ?[]const u8 = if (bound.guest_host.len == 0) null else bound.guest_host;
-                emitNetworkDecision("allow", host, request.local.addr, request.local.port, bound.name);
+                emitNetworkDecision("allow", bound.guest_host, request.local.addr, request.local.port, bound.name);
                 break :blk openUnixSocket(bound.unix_path);
             },
         };
@@ -900,7 +899,7 @@ test "spore-netd TCP denies blocked SYN before host socket open" {
 
 test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial" {
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/sporevm-netd-missing-bound-service.sock");
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-missing-bound-service.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
@@ -925,11 +924,14 @@ test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial"
 }
 
 test "spore-netd TCP routes two bound services independently and rejects duplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/metadata.sock");
-    try std.testing.expectError(error.DuplicateBoundService, config.addBindService("metadata:8080=unix:/tmp/metadata-2.sock"));
-    try std.testing.expectError(error.DuplicateBoundService, config.addBindService("cache=unix:/tmp/cache.sock"));
-    try config.addBindService("cache:8080=unix:/tmp/cache.sock");
+    try config.addBindService(allocator, "metadata=unix:/tmp/metadata.sock");
+    try std.testing.expectError(error.DuplicateBoundService, config.addBindService(allocator, "metadata:8080=unix:/tmp/metadata-2.sock"));
+    try std.testing.expectError(error.DuplicateBoundService, config.addBindService(allocator, "cache=unix:/tmp/cache.sock"));
+    try config.addBindService(allocator, "cache:8080=unix:/tmp/cache.sock");
 
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
@@ -1006,10 +1008,13 @@ test "spore-netd TCP applies poll results only to the flow that was polled" {
 
     var first_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var second_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     var config = spore_net_policy.Config{};
-    try config.addBindService(try std.fmt.bufPrint(&first_buf, "first=unix:{s}", .{path_z}));
-    try config.addBindService(try std.fmt.bufPrint(&second_buf, "second:8080=unix:{s}", .{path_z}));
-    try config.addBindService("missing:81=unix:/tmp/sporevm-netd-missing-poll-service.sock");
+    try config.addBindService(allocator, try std.fmt.bufPrint(&first_buf, "first=unix:{s}", .{path_z}));
+    try config.addBindService(allocator, try std.fmt.bufPrint(&second_buf, "second:8080=unix:{s}", .{path_z}));
+    try config.addBindService(allocator, "missing:81=unix:/tmp/sporevm-netd-missing-poll-service.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
