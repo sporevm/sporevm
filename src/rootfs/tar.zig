@@ -236,13 +236,16 @@ pub const RecordIterator = struct {
         if (isZeroBlock(&header)) return null;
         try verifyTarHeader(&header);
         const size = try tarSize(&header);
-        self.setPayloadSize(size);
+        try self.setPayloadSize(size);
         return .{ .header = header, .size = size, .payload_offset = self.offset };
     }
 
     /// Replaces the current record's payload size, as a pax `size` record
-    /// does. Call it before reading any of the payload.
-    pub fn setPayloadSize(self: *RecordIterator, size: u64) void {
+    /// does. Call it before reading any of the payload. Sizes above
+    /// `max_content_bytes` fail, so skipping a payload cannot overflow the
+    /// reader's position.
+    pub fn setPayloadSize(self: *RecordIterator, size: u64) !void {
+        if (size > max_content_bytes) return error.RootFSArchiveTooLarge;
         self.payload_left = size;
         self.padding_left = @intCast((512 - size % 512) % 512);
     }
@@ -369,7 +372,7 @@ fn applyTarRecordsToMergedTree(
             try record.name(allocator);
         defer if (owns_name) allocator.free(raw_name);
         const payload_size = pax.size orelse record.size;
-        records.setPayloadSize(payload_size);
+        try records.setPayloadSize(payload_size);
         defer {
             if (long_name) |p| {
                 allocator.free(p);
@@ -1747,6 +1750,38 @@ test "global pax extraction fields and xattrs fail closed" {
     try std.testing.expectError(error.UnsupportedTarXattr, applyTestLayer(allocator, &tmp, &tree, "xattr.tar", &xattr_block));
 }
 
+/// A pax `size` near 2^64 for a directory entry, whose payload the parser
+/// skips instead of reading.
+fn hugePaxSizeLayer() [1536]u8 {
+    var layer = [_]u8{0} ** 1536;
+    const record = "29 size=18446744073709551615\n";
+    makeTarHeader(layer[0..512], "pax", 'x', record.len);
+    @memcpy(layer[512 .. 512 + record.len], record);
+    makeTarHeader(layer[1024..1536], "dir", '5', 0);
+    return layer;
+}
+
+test "tar payload sizes past the content limit fail closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+
+    const pax_layer = hugePaxSizeLayer();
+    try std.testing.expectError(error.RootFSArchiveTooLarge, applyTestLayer(allocator, &tmp, &tree, "pax.tar", &pax_layer));
+
+    // The same size as a base-256 header field.
+    var header = [_]u8{0} ** 512;
+    makeTarHeader(&header, "dir", '5', 0);
+    header[124..136].* = .{ 0x80, 0, 0, 0 } ++ .{0xff} ** 8;
+    @memset(header[148..156], ' ');
+    var sum: u64 = 0;
+    for (header) |b| sum += b;
+    writeTarOctal(header[148..156], sum);
+    try std.testing.expectError(error.RootFSArchiveTooLarge, applyTestLayer(allocator, &tmp, &tree, "header.tar", &header));
+}
+
 test "pax size overrides ustar file size" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1873,5 +1908,10 @@ fn fuzzTarLayer(_: void, s: *std.testing.Smith) !void {
 }
 
 test "fuzz OCI tar layer parsing" {
-    try std.testing.fuzz({}, fuzzTarLayer, .{});
+    // Smith reads a little-endian u32 length before the slice bytes.
+    const layer = hugePaxSizeLayer();
+    var seed: [4 + layer.len]u8 = undefined;
+    std.mem.writeInt(u32, seed[0..4], layer.len, .little);
+    @memcpy(seed[4..], &layer);
+    try std.testing.fuzz({}, fuzzTarLayer, .{ .corpus = &.{&seed} });
 }
