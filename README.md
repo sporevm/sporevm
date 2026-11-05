@@ -409,8 +409,8 @@ spore ps
 spore vm rm bench-2
 ```
 
-Use `spore checkpoint rm DIR` to delete saved state. It reports the checkpoint
-ownership class and whether removal released a machine-local backing pin.
+Use `spore checkpoint rm DIR` to delete saved state; `spore cache gc --force`
+then reclaims storage nothing else references.
 `spore vm rm NAME` stops the live monitor and deletes runtime state without
 touching checkpoints, images, or bundles. The older top-level `rm` and `fork`
 forms remain compatible throughout the 0.x release line.

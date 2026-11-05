@@ -200,8 +200,9 @@ const rm_usage =
     \\  spore rm --spore DIR
     \\
     \\`vm rm` stops the live VM monitor and deletes only its runtime state.
-    \\`checkpoint rm` deletes the checkpoint and releases its verified backing
-    \\authority according to the checkpoint's ownership class.
+    \\`checkpoint rm` deletes the checkpoint directory unless a foreground or
+    \\named restore holds a lazy-disk lease on it. `spore cache gc --force` then
+    \\reclaims storage nothing else references.
     \\
     \\The top-level forms remain compatible throughout the 0.x release line.
     \\
@@ -2404,25 +2405,22 @@ pub fn rmCli(
     }
     const allocator = init.arena.allocator();
     if (args.len == 2 and std.mem.eql(u8, args[0], "--spore")) {
+        // An empty path resolves to the working directory.
+        if (args[1].len == 0) {
+            const message = "spore checkpoint rm: DIR must not be empty";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "rm"), message);
+        }
         const removed = removeSavedSpore(.{ .io = init.io, .environ_map = init.environ_map }, allocator, args[1]) catch |err| switch (err) {
             error.FileNotFound => {
-                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: checkpoint not found: {s}; no ownership was changed", .{args[1]});
+                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: checkpoint not found: {s}", .{args[1]});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
             },
             error.InvalidSporeDir, error.BadManifest => {
-                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove invalid checkpoint: {s}; ownership remains unchanged", .{args[1]});
+                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove {s}: not a checkpoint (no readable spore manifest.json)", .{args[1]});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
             },
             error.SavedSporeInUse => {
-                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove checkpoint in use by a live VM: {s}; checkpoint ownership remains unchanged", .{args[1]});
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
-            },
-            error.LegacySharedPinRemovalRefused => {
-                const message = "spore checkpoint rm: refusing to remove a legacy shared-pin checkpoint because another raw copy may still depend on its backing authority; use `spore clone DIR --out PORTABLE` to make an independently owned copy, then remove the legacy pin only after accounting for every copy";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
-            },
-            error.SavedSporeOwnershipConflict => {
-                const message = "spore checkpoint rm: refusing to remove a machine-local checkpoint whose ownership link is copied or duplicated; removal would invalidate shared backing authority, so remove the raw duplicate or use `spore clone DIR --out PORTABLE` for an independently owned copy";
+                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove checkpoint in use by a live VM: {s}", .{args[1]});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
             },
             else => |e| return e,
@@ -2466,13 +2464,7 @@ pub fn removeSavedSpore(context: Context, allocator: std.mem.Allocator, raw_dir:
 }
 
 fn writeRemovedSavedSpore(writer: *Io.Writer, result: RemovedSavedSpore) !void {
-    if (result.pin_removed) {
-        try writer.print("removed checkpoint {s} ({s}); released exclusive backing pin {s}\n", .{ result.spore_dir, result.ownership, result.pin_id });
-    } else if (std.mem.eql(u8, result.ownership, saved_spore_ownership.batch_relative)) {
-        try writer.print("removed checkpoint {s} ({s}); shared batch backing remains owned by the batch\n", .{ result.spore_dir, result.ownership });
-    } else {
-        try writer.print("removed checkpoint {s} ({s}); checkpoint-owned files deleted, no global pin released\n", .{ result.spore_dir, result.ownership });
-    }
+    try writer.print("removed checkpoint {s}; run `spore cache gc --force` to reclaim storage nothing else references\n", .{result.spore_dir});
     try writer.flush();
 }
 
@@ -8019,64 +8011,23 @@ test "lifecycle human results render terse status lines" {
     try std.testing.expectEqualStrings("forked live VM children: child-0 child-1\n", out.written());
 
     out.clearRetainingCapacity();
-    try writeRemovedSavedSpore(&out.writer, .{
-        .spore_dir = "diskless.spore",
-        .pin_id = "",
-        .pin_removed = false,
-    });
-    try std.testing.expectEqualStrings("removed checkpoint diskless.spore (portable-self-contained); checkpoint-owned files deleted, no global pin released\n", out.written());
-
-    out.clearRetainingCapacity();
-    try writeRemovedSavedSpore(&out.writer, .{
-        .spore_dir = "disk.spore",
-        .ownership = saved_spore_ownership.machine_local_pinned,
-        .pin_id = "abc",
-        .pin_removed = true,
-    });
-    try std.testing.expectEqualStrings("removed checkpoint disk.spore (machine-local-pinned); released exclusive backing pin abc\n", out.written());
+    try writeRemovedSavedSpore(&out.writer, .{ .spore_dir = "disk.spore" });
+    try std.testing.expectEqualStrings("removed checkpoint disk.spore; run `spore cache gc --force` to reclaim storage nothing else references\n", out.written());
 }
 
-test "saved-spore removal machine output distinguishes disk pin ownership" {
+test "saved-spore removal machine output names only the removed directory" {
     const allocator = std.testing.allocator;
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try machine_output.writeJson(allocator, &out.writer, RemovedSavedSpore{
-        .spore_dir = "diskless.spore",
-        .pin_id = "",
-        .pin_removed = false,
-    });
+    try machine_output.writeJson(allocator, &out.writer, RemovedSavedSpore{ .spore_dir = "disk.spore" });
     try std.testing.expectEqualStrings(
         "{\n" ++
-            "  \"schema\": \"spore.saved.remove.result.v1\",\n" ++
-            "  \"schema_version\": 1,\n" ++
+            "  \"schema\": \"spore.saved.remove.result.v2\",\n" ++
+            "  \"schema_version\": 2,\n" ++
             "  \"resource_type\": \"checkpoint\",\n" ++
             "  \"action\": \"removed_spore\",\n" ++
-            "  \"spore_dir\": \"diskless.spore\",\n" ++
-            "  \"ownership\": \"portable-self-contained\",\n" ++
-            "  \"pin_id\": \"\",\n" ++
-            "  \"pin_removed\": false\n" ++
-            "}\n",
-        out.written(),
-    );
-
-    out.clearRetainingCapacity();
-    try machine_output.writeJson(allocator, &out.writer, RemovedSavedSpore{
-        .spore_dir = "disk.spore",
-        .ownership = saved_spore_ownership.machine_local_pinned,
-        .pin_id = "abc",
-        .pin_removed = true,
-    });
-    try std.testing.expectEqualStrings(
-        "{\n" ++
-            "  \"schema\": \"spore.saved.remove.result.v1\",\n" ++
-            "  \"schema_version\": 1,\n" ++
-            "  \"resource_type\": \"checkpoint\",\n" ++
-            "  \"action\": \"removed_spore\",\n" ++
-            "  \"spore_dir\": \"disk.spore\",\n" ++
-            "  \"ownership\": \"machine-local-pinned\",\n" ++
-            "  \"pin_id\": \"abc\",\n" ++
-            "  \"pin_removed\": true\n" ++
+            "  \"spore_dir\": \"disk.spore\"\n" ++
             "}\n",
         out.written(),
     );

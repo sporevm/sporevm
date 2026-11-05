@@ -608,7 +608,7 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
     return record;
 }
 
-pub fn isExclusive(record: Record) bool {
+fn isExclusive(record: Record) bool {
     return std.mem.eql(u8, record.schema, schema);
 }
 

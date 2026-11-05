@@ -56,7 +56,7 @@ const usage =
     \\    rm NAME             Remove a named VM
     \\
     \\  Checkpoints:
-    \\    checkpoint rm DIR   Remove a checkpoint and its backing authority
+    \\    checkpoint rm DIR   Remove a checkpoint directory
     \\    checkpoint fork DIR --count N --out DIR
     \\                        Fork a checkpoint into checkpoint children
     \\    inspect <spore-dir> Print a spore manifest summary
@@ -173,8 +173,8 @@ const checkpoint_usage =
     \\  spore checkpoint fork DIR --count N --out DIR
     \\
     \\A checkpoint (also called a spore) is saved machine state. Removing it
-    \\deletes the checkpoint and releases backing authority according to its
-    \\reported ownership class.
+    \\deletes the checkpoint directory; `spore cache gc --force` then reclaims
+    \\storage nothing else references.
     \\
 ;
 

@@ -16,6 +16,15 @@ writer are rebuilt with the native writer.
 The C ABI (`spore.h` and the `libspore` archives), the Go binding, and the Zig
 `libspore` module are removed; the CLI's `--json` output is the only interface.
 
+### Checkpoint removal leaves pin release to GC
+
+`spore checkpoint rm DIR` now deletes a checkpoint whose manifest parses,
+refusing while a foreground or named restore holds a lazy-disk lease on it. It
+no longer verifies disk objects, so checkpoints with corrupt storage can be
+removed. `spore cache gc --force` releases the pin and storage. The removal
+journal is gone, and JSON output advances to `spore.saved.remove.result.v2`
+without `ownership`, `pin_id`, or `pin_removed`.
+
 ### Experimental AMD64 fresh workloads
 
 Linux/AMD64 KVM fresh workloads now use native `linux/amd64` OCI selection,
