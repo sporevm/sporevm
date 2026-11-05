@@ -739,7 +739,6 @@ pub const ExecNamedResult = struct {
     exit_code: u8,
     stdout: []u8,
     stderr: []u8,
-    network_events_jsonl: []u8 = &.{},
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
     timing: ?NamedExecTiming = null,
@@ -1853,7 +1852,6 @@ pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLif
 pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
     allocator.free(result.stdout);
     allocator.free(result.stderr);
-    allocator.free(result.network_events_jsonl);
 }
 
 pub fn deinitNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) void {
@@ -3408,13 +3406,9 @@ fn createBoundServicesFromConfig(
     if (cli_services.len == 0) return &.{};
     const services = try allocator.alloc(spore_net_policy.BoundService, cli_services.len);
     for (cli_services, services) |service, *out| {
-        const guest_host = if (service.guest_host.len != 0)
-            service.guest_host
-        else
-            try std.fmt.allocPrint(allocator, "{s}.spore.internal", .{service.name});
         out.* = .{
             .name = service.name,
-            .guest_host = guest_host,
+            .guest_host = service.guest_host,
             .guest_port = service.guest_port,
             .target = .{ .unix = service.unix_path },
         };
@@ -3633,7 +3627,7 @@ fn parseCreateArgs(
         } else if (std.mem.eql(u8, args[i], "--bind-service")) {
             field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
-            network_policy.addBindService(raw) catch |err| {
+            network_policy.addBindService(allocator, raw) catch |err| {
                 const message = allocLifecycleMessage(allocator, "spore create: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
@@ -4515,10 +4509,10 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
         try argv.append("--resume");
         try argv.append(path);
     }
-    if (network_policy) |policy| {
-        if (spec.network != null) try appendMonitorNetworkPolicyArgs(allocator, &argv, policy);
-    } else if (spec.network) |network| {
-        try appendMonitorNetworkManifestArgs(allocator, &argv, network);
+    if (spec.network) |network| {
+        const policy = try monitorNetworkPolicy(allocator, network, network_policy);
+        try argv.append("--net-policy");
+        try argv.append(try spore_net_policy.encodeArgAlloc(allocator, &policy));
     }
     try appendMemoryArg(allocator, &argv, spec.memory);
     try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
@@ -4606,61 +4600,12 @@ test "lifecycle monitor spawn receives context environment" {
     try std.testing.expectEqualStrings("/tmp/sporevm-context-home\n", observed.?);
 }
 
-fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {
-    try argv.append("--net");
-    if (policy.default_deny) {
-        try argv.append("--default-action");
-        try argv.append(spore.network_default_deny);
-    }
-    for (policy.allowCidrSlice()) |cidr| {
-        try argv.append("--allow-cidr");
-        try argv.append(cidr);
-    }
-    for (policy.allowHostSlice()) |host| {
-        try argv.append("--allow-host");
-        try argv.append(host);
-    }
-    for (policy.exactRuleSlice()) |rule| {
-        for (rule.portSlice()) |port| {
-            try argv.append("--allow-host-port");
-            try argv.append(try std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }));
-        }
-    }
-    for (policy.boundServiceSlice()) |service| {
-        try argv.append("--bound-unix-service");
-        try argv.append(service.name);
-        try argv.append(service.guest_host);
-        try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}));
-        try argv.append(service.unix_path);
-    }
-    for (policy.portForwardSlice()) |forward| {
-        try argv.append("--forward");
-        try argv.append(try std.fmt.allocPrint(allocator, "127.0.0.1:{d}:{d}", .{ forward.host_port, forward.guest_port }));
-    }
-}
-
-fn appendMonitorNetworkManifestArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), network: spore.Network) !void {
+/// The policy a monitor enforces: the caller's live policy when it has one,
+/// otherwise the policy recorded with the VM.
+fn monitorNetworkPolicy(allocator: std.mem.Allocator, network: spore.Network, live: ?*const run_mod.NetworkPolicy) !run_mod.NetworkPolicy {
+    if (live) |policy| return policy.*;
     if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
-    try argv.append("--net");
-    if (network.default_action) |action| {
-        if (!std.mem.eql(u8, action, spore.network_default_deny)) return error.InvalidNetworkPolicy;
-        try argv.append("--default-action");
-        try argv.append(action);
-    }
-    for (network.allow_cidrs) |cidr| {
-        try argv.append("--allow-cidr");
-        try argv.append(cidr);
-    }
-    for (network.allow_hosts) |host| {
-        try argv.append("--allow-host");
-        try argv.append(host);
-    }
-    for (network.allow_host_ports) |rule| {
-        for (rule.ports) |port| {
-            try argv.append("--allow-host-port");
-            try argv.append(try std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }));
-        }
-    }
+    return spore_net_policy.configFromManifestNetwork(allocator, network);
 }
 
 fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), flag: []const u8, value: anytype) !void {
@@ -5466,7 +5411,6 @@ const ControlResponse = struct {
     exit_code: ?i32 = null,
     stdout_b64: ?[]const u8 = null,
     stderr_b64: ?[]const u8 = null,
-    network_events_jsonl_b64: ?[]const u8 = null,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
     out_dir: ?[]const u8 = null,
@@ -5508,16 +5452,10 @@ fn parseExecNamedResponse(
     errdefer allocator.free(stdout);
     const stderr = try decodeControlOutput(allocator, parsed.value.stderr_b64 orelse return error.BadMonitorResponse);
     errdefer allocator.free(stderr);
-    const network_events_jsonl = if (parsed.value.network_events_jsonl_b64) |encoded|
-        try decodeControlOutput(allocator, encoded)
-    else
-        try allocator.dupe(u8, "");
-    errdefer allocator.free(network_events_jsonl);
     return .{
         .exit_code = @intCast(exit_code),
         .stdout = stdout,
         .stderr = stderr,
-        .network_events_jsonl = network_events_jsonl,
         .stdout_truncated = parsed.value.stdout_truncated,
         .stderr_truncated = parsed.value.stderr_truncated,
         .timing = parsed.value.timing,
@@ -6557,7 +6495,7 @@ test "named exec response rejects truncated collector output" {
     clearLastError();
     defer clearLastError();
     const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":true}
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","stdout_truncated":false,"stderr_truncated":true}
     ;
     try std.testing.expectError(error.ExecOutputTruncated, parseExecNamedResponse(allocator, allocator, response));
     try std.testing.expectEqualStrings(
@@ -6569,7 +6507,7 @@ test "named exec response rejects truncated collector output" {
 test "named exec response decodes complete bounded output" {
     const allocator = std.testing.allocator;
     const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":false,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","stdout_truncated":false,"stderr_truncated":false,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
     ;
     const result = try parseExecNamedResponse(allocator, allocator, response);
     defer deinitExecNamedResult(allocator, result);
@@ -6577,7 +6515,6 @@ test "named exec response decodes complete bounded output" {
     try std.testing.expectEqual(@as(u8, 7), result.exit_code);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 'A' }, result.stdout);
     try std.testing.expectEqualSlices(u8, &.{ 0xfe, 'B' }, result.stderr);
-    try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
     try std.testing.expectEqual(@as(?u64, 2), result.timing.?.dispatch_ms);
     try std.testing.expectEqual(@as(?u64, 7_000), result.timing.?.guest_user_cpu_us);
     try std.testing.expectEqual(@as(u64, 13), result.timing.?.total_ms);
@@ -7169,7 +7106,9 @@ test "create parser accepts network allow policy" {
 }
 
 test "create parser accepts annotations exact host ports and bound services" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
@@ -7191,6 +7130,7 @@ test "create parser accepts annotations exact host ports and bound services" {
     try std.testing.expectEqual(@as(u16, 443), opts.network_policy.exact_rules[0].ports[0]);
     try std.testing.expectEqual(@as(usize, 1), opts.network_policy.bound_service_count);
     try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", opts.network_policy.bound_services[0].guest_host);
     try std.testing.expectEqual(@as(u16, 8170), opts.network_policy.bound_services[0].guest_port);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
 }
@@ -7351,31 +7291,17 @@ test "create cli keeps plain --net unrestricted and exact rules deny by default"
     try std.testing.expectEqualStrings("github.com", exact_config.policy.exact_rules[0].host);
 }
 
-test "lifecycle monitor policy args preserve default deny" {
-    var argv = std.array_list.Managed([]const u8).init(std.testing.allocator);
-    defer argv.deinit();
-    const policy = run_mod.NetworkPolicy{ .default_deny = true };
+test "lifecycle monitor policy from a recorded network keeps default deny" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    try appendMonitorNetworkPolicyArgs(std.testing.allocator, &argv, &policy);
-
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("--net", argv.items[0]);
-    try std.testing.expectEqualStrings("--default-action", argv.items[1]);
-    try std.testing.expectEqualStrings(spore.network_default_deny, argv.items[2]);
-}
-
-test "lifecycle monitor manifest args preserve default action" {
-    var argv = std.array_list.Managed([]const u8).init(std.testing.allocator);
-    defer argv.deinit();
-
-    try appendMonitorNetworkManifestArgs(std.testing.allocator, &argv, .{
-        .default_action = spore.network_default_deny,
-    });
-
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("--net", argv.items[0]);
-    try std.testing.expectEqualStrings("--default-action", argv.items[1]);
-    try std.testing.expectEqualStrings(spore.network_default_deny, argv.items[2]);
+    const policy = try monitorNetworkPolicy(arena, .{ .default_action = spore.network_default_deny }, null);
+    try std.testing.expect(policy.default_deny);
+    try std.testing.expect(!policy.hasBoundServices());
+    try std.testing.expectError(error.UnsupportedBoundServiceRestore, monitorNetworkPolicy(arena, .{
+        .bound_services = &.{.{ .name = "metadata", .guest_host = "metadata.spore.internal", .guest_port = 80 }},
+    }, null));
 }
 
 test "new output dirs resolve to absolute paths" {

@@ -24,7 +24,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
     if (requestsJsonl(args)) setup_event_writer = &event_writer;
     defer setup_event_writer = null;
-    const parsed = run_mod.parseCliArgs(args) catch |err| {
+    const parsed = run_mod.parseCliArgs(arena, args) catch |err| {
         if (setup_event_writer) |events| {
             const classified = api.classifyFailure(err);
             events.emitFailure(classified) catch {};
@@ -176,9 +176,6 @@ fn runParsed(
 
     if (parsed.save_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
         failRunSetup("spore run: --rootfs with --save is not portable yet; use --image so save can record immutable rootfs identity", .{});
-    }
-    if (parsed.save_path != null and parsed.network_policy.hasBoundServices()) {
-        failRunSetup("spore run: --bind-service with --save needs manifest support first", .{});
     }
 
     const command: []const []const u8 = if (parsed.command.len == 0)

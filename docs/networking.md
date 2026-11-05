@@ -29,7 +29,8 @@ networking tools.
 
 The hard floor always blocks host loopback, link-local metadata addresses,
 private/control-plane ranges, unspecified/broadcast addresses, and the internal
-gateway range. DNS answers cannot override that floor.
+gateway range. DNS answers cannot override that floor. A denied TCP connection
+is reset, so the guest's connect fails at once instead of timing out.
 
 With plain `--net`, public IPv4 TCP egress is allowed after the hard floor.
 Adding `--allow-cidr` or `--allow-host` restricts public egress to those CIDRs

@@ -5,7 +5,6 @@
 //! bridge between guest TCP payloads and nonblocking host `connect()` sockets.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const zmoltcp = @import("zmoltcp");
 
 const spore_net = @import("spore_net.zig");
@@ -57,15 +56,18 @@ pub const Stats = struct {
     output_drops: usize = 0,
 };
 
-const HostState = enum {
-    none,
+const FlowState = enum {
+    free,
     connecting,
     connected,
+    /// The host socket failed to open or connect; aborted on next service.
     failed,
+    /// The host socket is closed; the slot is reaped once the guest socket is.
+    closed,
 };
 
 const RequestTarget = union(enum) {
-    tcp: ?[]const u8,
+    tcp,
     bound_unix: *const spore_net_policy.BoundServiceConfig,
 };
 
@@ -112,9 +114,8 @@ const ByteBuffer = struct {
 };
 
 const Flow = struct {
-    in_use: bool = false,
     fd: std.c.fd_t = -1,
-    state: HostState = .none,
+    state: FlowState = .free,
     request: ForwardRequest = undefined,
     sock: TcpSock = undefined,
     rx_storage: [tcp_rx_buffer_len]u8 = undefined,
@@ -147,8 +148,7 @@ const Flow = struct {
 
     fn start(self: *Flow, request: ForwardRequest, now: Instant) void {
         self.closeFd();
-        self.in_use = true;
-        self.state = .none;
+        self.state = .failed;
         self.request = request;
         self.to_host.reset();
         self.to_guest.reset();
@@ -163,7 +163,6 @@ const Flow = struct {
 
     fn startPortForward(self: *Flow, host_fd: std.c.fd_t, guest_port: u16, local_port: u16, now: Instant) bool {
         self.closeFd();
-        self.in_use = true;
         self.state = .connected;
         self.fd = host_fd;
         self.to_host.reset();
@@ -177,7 +176,7 @@ const Flow = struct {
         self.initSocket();
         self.sock.connect(spore_net.guest_ipv4, guest_port, spore_net.gateway_ipv4, local_port) catch {
             self.closeFd();
-            self.in_use = false;
+            self.state = .free;
             return false;
         };
         return true;
@@ -253,6 +252,8 @@ pub const Gateway = struct {
     next_forward_local_port: u16 = first_forward_local_port,
     stats: Stats = .{},
     emit_events: bool = false,
+    /// Set by `offer` when policy denies the SYN being processed.
+    syn_denied: bool = false,
 
     pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime, port_forwards: []const spore_net_policy.PortForwardConfig) !void {
         self.device = Device.init();
@@ -264,6 +265,7 @@ pub const Gateway = struct {
         self.next_forward_local_port = first_forward_local_port;
         self.stats = .{};
         self.emit_events = false;
+        self.syn_denied = false;
         for (&self.flows, 0..) |*flow, i| {
             flow.init();
             self.sock_ptrs[i] = &flow.sock;
@@ -304,8 +306,15 @@ pub const Gateway = struct {
     pub fn receiveFrame(self: *Gateway, frame: []const u8, now: Instant) bool {
         if (!isGuestTcpFrame(frame)) return false;
         self.current_now = now;
+        self.syn_denied = false;
         self.device.enqueueRx(frame);
         self.pollStack(now);
+        if (self.syn_denied) {
+            var reset_buf: [spore_net.max_frame_len]u8 = undefined;
+            if (buildSynReset(frame, &reset_buf)) |reset| {
+                if (!self.output.push(reset)) self.stats.output_drops += 1;
+            }
+        }
         return true;
     }
 
@@ -333,11 +342,14 @@ pub const Gateway = struct {
         }
         for (&self.flows) |*flow| {
             flow.poll_index = null;
-            if (!flow.in_use or flow.fd < 0) continue;
+            if (flow.fd < 0) continue;
             var events: i16 = 0;
             if (flow.state == .connecting or flow.to_host.len > 0) events |= std.c.POLL.OUT;
             if (flow.state == .connected and !flow.host_eof and flow.to_guest.freeLen() > 0) events |= std.c.POLL.IN;
-            if (events == 0) events = std.c.POLL.IN;
+            // Nothing to write and no room for host bytes (or host EOF): a
+            // readable socket would wake every poll until the guest catches
+            // up, so leave it out until there is something to do.
+            if (events == 0) continue;
             if (count >= fds.len) break;
             fds[count] = .{ .fd = flow.fd, .events = events, .revents = 0 };
             flow.poll_index = count;
@@ -370,7 +382,7 @@ pub const Gateway = struct {
         var next: ?Instant = null;
         if (self.stack.pollAt()) |at| next = minInstant(next, at);
         for (&self.flows) |*flow| {
-            if (!flow.in_use) continue;
+            if (flow.state == .free) continue;
             next = minInstant(next, flow.idle_deadline);
             if (flow.state == .connecting) next = minInstant(next, flow.connect_deadline);
         }
@@ -425,6 +437,7 @@ pub const Gateway = struct {
     fn offer(self: *Gateway, request: ForwardRequest) ?*TcpSock {
         const target = self.targetForRequest(request) orelse {
             self.stats.denied += 1;
+            self.syn_denied = true;
             return null;
         };
 
@@ -436,15 +449,8 @@ pub const Gateway = struct {
 
         self.stats.connect_attempts += 1;
         const open_result = switch (target) {
-            .tcp => |host| blk: {
-                emitNetworkDecision("allow", host, request.local.addr, request.local.port, "policy");
-                break :blk openHostSocket(request.local.addr, request.local.port);
-            },
-            .bound_unix => |bound| blk: {
-                const host: ?[]const u8 = if (bound.guest_host.len == 0) null else bound.guest_host;
-                emitNetworkDecision("allow", host, request.local.addr, request.local.port, bound.name);
-                break :blk openUnixSocket(bound.unix_path);
-            },
+            .tcp => openHostSocket(request.local.addr, request.local.port),
+            .bound_unix => |bound| openUnixSocket(bound.unix_path),
         };
         switch (open_result) {
             .connected => |fd| {
@@ -472,10 +478,11 @@ pub const Gateway = struct {
             if (self.policy.boundServiceForPort(request.local.port)) |bound| return .{ .bound_unix = bound };
         }
         const decision = self.policy.decideIpv4Port(request.local.addr, request.local.port);
-        const host = self.policy.hostForIpv4Port(request.local.addr, request.local.port);
-        if (decision == .allow) return .{ .tcp = host };
-        if (self.emit_events) emitDeniedEgressEvent(request.local.addr, request.local.port, decision);
-        emitNetworkDecision("deny", host, request.local.addr, request.local.port, decision.name());
+        if (decision == .allow) return .tcp;
+        if (self.emit_events) {
+            var line: [max_denied_event_len]u8 = undefined;
+            std.debug.print("{s}\n", .{deniedEventLine(&line, request.local.addr, request.local.port, decision)});
+        }
         std.log.debug(
             "spore-netd denied egress reason={s} dst={d}.{d}.{d}.{d}:{d}",
             .{
@@ -492,13 +499,13 @@ pub const Gateway = struct {
 
     fn freeFlow(self: *Gateway) ?*Flow {
         for (&self.flows) |*flow| {
-            if (!flow.in_use) return flow;
+            if (flow.state == .free) return flow;
         }
         return null;
     }
 
     fn serviceFlow(self: *Gateway, flow: *Flow, now: Instant) void {
-        if (!flow.in_use) return;
+        if (flow.state == .free) return;
         if (now.greaterThanOrEqual(flow.idle_deadline)) {
             self.abortFlow(flow);
             return;
@@ -537,6 +544,7 @@ pub const Gateway = struct {
         }
         if (flow.sock.getState() == .closed and flow.to_host.len == 0) {
             flow.closeFd();
+            flow.state = .closed;
             flow.host_eof = true;
             return;
         }
@@ -551,9 +559,13 @@ pub const Gateway = struct {
             flow.host_write_shutdown = true;
         }
         if (flow.host_eof and flow.to_guest.len == 0) {
-            flow.closeFd();
-            flow.state = .none;
+            // The host has finished sending, so FIN the guest, but keep the
+            // host socket until the guest's remaining bytes have reached it.
             flow.sock.close();
+            if (flow.host_write_shutdown) {
+                flow.closeFd();
+                flow.state = .closed;
+            }
         }
     }
 
@@ -625,7 +637,7 @@ pub const Gateway = struct {
 
     fn abortFlow(_: *Gateway, flow: *Flow) void {
         flow.closeFd();
-        flow.state = .none;
+        flow.state = .closed;
         flow.host_eof = true;
         flow.to_host.reset();
         flow.to_guest.reset();
@@ -633,7 +645,7 @@ pub const Gateway = struct {
     }
 
     fn reapFlow(_: *Gateway, flow: *Flow) void {
-        if (!flow.in_use) return;
+        if (flow.state == .free) return;
         if (flow.fd >= 0) return;
         if (flow.sock.getState() != .closed) return;
         if (flow.sock.localEndpoint() != null) return;
@@ -649,19 +661,23 @@ pub const Gateway = struct {
     }
 };
 
-fn emitNetworkDecision(action: []const u8, host: ?[]const u8, addr: ipv4.Address, port: u16, reason: []const u8) void {
-    if (builtin.is_test) return;
-    if (host) |value| {
-        std.debug.print(
-            "{{\"event\":\"network_decision\",\"action\":\"{s}\",\"host\":\"{s}\",\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"reason_code\":\"{s}\"}}\n",
-            .{ action, value, addr[0], addr[1], addr[2], addr[3], port, reason },
-        );
-    } else {
-        std.debug.print(
-            "{{\"event\":\"network_decision\",\"action\":\"{s}\",\"host\":null,\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"reason_code\":\"{s}\"}}\n",
-            .{ action, addr[0], addr[1], addr[2], addr[3], port, reason },
-        );
-    }
+/// The `spore-netd` stderr line for a denied guest connection. The parent
+/// parses it back with this type into a run `network` event.
+pub const DeniedEvent = struct {
+    event: []const u8 = "egress_denied",
+    ip: []const u8,
+    port: u16,
+    reason: []const u8,
+};
+
+pub const max_denied_event_len = 128;
+
+pub fn deniedEventLine(out: *[max_denied_event_len]u8, addr: ipv4.Address, port: u16, decision: spore_net_policy.Decision) []const u8 {
+    var ip_buf: [15]u8 = undefined;
+    const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }) catch unreachable;
+    var writer = std.Io.Writer.fixed(out);
+    std.json.Stringify.value(DeniedEvent{ .ip = ip, .port = port, .reason = decision.name() }, .{}, &writer) catch unreachable;
+    return writer.buffered();
 }
 
 const OpenResult = union(enum) {
@@ -784,13 +800,6 @@ pub fn isBlockedDestination(addr: ipv4.Address) bool {
     return false;
 }
 
-fn emitDeniedEgressEvent(addr: ipv4.Address, port: u16, reason: spore_net_policy.Decision) void {
-    std.debug.print(
-        "spore-net-event egress_denied {d}.{d}.{d}.{d} {d} {s}\n",
-        .{ addr[0], addr[1], addr[2], addr[3], port, reason.name() },
-    );
-}
-
 fn isGuestTcpFrame(frame: []const u8) bool {
     if (frame.len < ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_wire.HEADER_LEN) return false;
     const eth = ethernet.parse(frame) catch return false;
@@ -804,14 +813,54 @@ fn isGuestTcpFrame(frame: []const u8) bool {
     return true;
 }
 
+/// Builds the RST|ACK answering a denied guest SYN (RFC 9293 3.10.7.1), so
+/// the guest connection fails at once instead of retrying the SYN until it
+/// times out. Only called for frames the stack accepted as a valid SYN.
+fn buildSynReset(syn_frame: []const u8, out: *[spore_net.max_frame_len]u8) ?[]const u8 {
+    const eth = ethernet.parse(syn_frame) catch return null;
+    const ip_data = ethernet.payload(syn_frame) catch return null;
+    const ip_repr = ipv4.parse(ip_data) catch return null;
+    const segment = ipv4.payloadSlice(ip_data) catch return null;
+    const syn = tcp_socket.TcpRepr.fromWireBytes(segment) orelse return null;
+    const reset = tcp_socket.rstReply(syn).toWireRepr();
+    const tcp_len = tcp_wire.emit(reset, out[ethernet.HEADER_LEN + ipv4.HEADER_LEN ..]) catch return null;
+    _ = ethernet.emit(.{
+        .dst_addr = eth.src_addr,
+        .src_addr = spore_net.gateway_mac,
+        .ethertype = .ipv4,
+    }, out[0..ethernet.HEADER_LEN]) catch return null;
+    _ = ipv4.emit(.{
+        .version = 4,
+        .ihl = 5,
+        .dscp_ecn = 0,
+        .total_length = @intCast(ipv4.HEADER_LEN + tcp_len),
+        .identification = 0,
+        .dont_fragment = true,
+        .more_fragments = false,
+        .fragment_offset = 0,
+        .ttl = 64,
+        .protocol = .tcp,
+        .checksum = 0,
+        .src_addr = ip_repr.dst_addr,
+        .dst_addr = ip_repr.src_addr,
+    }, out[ethernet.HEADER_LEN..][0..ipv4.HEADER_LEN]) catch return null;
+    const tcp = out[ethernet.HEADER_LEN + ipv4.HEADER_LEN ..][0..tcp_len];
+    std.mem.writeInt(u16, tcp[16..18], tcp_wire.computeChecksum(ip_repr.dst_addr, ip_repr.src_addr, tcp), .big);
+    return out[0 .. ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_len];
+}
+
 fn minInstant(current: ?Instant, candidate: Instant) Instant {
     if (current) |value| return if (candidate.lessThan(value)) candidate else value;
     return candidate;
 }
 
 fn buildTcpSynFrame(dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_frame_len]u8) []const u8 {
+    return buildTcpSynFrameFrom(49152, dst_addr, dst_port, out);
+}
+
+fn buildTcpSynFrameFrom(src_port: u16, dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_frame_len]u8) []const u8 {
     const tcp_len = tcp_wire.emit(.{
-        .src_port = 49152,
+        .src_port = src_port,
         .dst_port = dst_port,
         .seq_number = 1000,
         .ack_number = 0,
@@ -850,6 +899,91 @@ fn buildTcpSynFrame(dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_
     tcp[17] = @truncate(tcp_checksum & 0xFF);
 
     return out[0 .. ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_len];
+}
+
+fn expectSynReset(frame: []const u8, dst_addr: ipv4.Address, dst_port: u16) !void {
+    const eth = try ethernet.parse(frame);
+    try std.testing.expectEqualSlices(u8, &spore_net.guest_mac, &eth.dst_addr);
+    try std.testing.expectEqualSlices(u8, &spore_net.gateway_mac, &eth.src_addr);
+    const ip_data = try ethernet.payload(frame);
+    try std.testing.expect(ipv4.verifyChecksum(ip_data[0..ipv4.HEADER_LEN]));
+    const ip_repr = try ipv4.parse(ip_data);
+    try std.testing.expectEqualSlices(u8, &dst_addr, &ip_repr.src_addr);
+    try std.testing.expectEqualSlices(u8, &spore_net.guest_ipv4, &ip_repr.dst_addr);
+    const segment = try ipv4.payloadSlice(ip_data);
+    try std.testing.expect(tcp_wire.verifyChecksum(ip_repr.src_addr, ip_repr.dst_addr, segment));
+    const reset = try tcp_wire.parse(segment);
+    try std.testing.expect(reset.flags.rst and reset.flags.ack and !reset.flags.syn);
+    try std.testing.expectEqual(dst_port, reset.src_port);
+    try std.testing.expectEqual(@as(u16, 49152), reset.dst_port);
+    // buildTcpSynFrame sends seq 1000; the SYN consumes one sequence number.
+    try std.testing.expectEqual(@as(u32, 1001), reset.ack_number);
+}
+
+const GuestSockets = struct { tcp4_sockets: []*TcpSock };
+const GuestStack = stack_mod.Stack(Device, GuestSockets);
+
+/// A guest-side zmoltcp stack wired to a `Gateway` through its frame
+/// interface, for tests that need a real guest TCP peer.
+const TestGuest = struct {
+    device: Device,
+    sock: TcpSock,
+    sock_ptrs: [1]*TcpSock,
+    stack: GuestStack,
+    rx_storage: [tcp_rx_buffer_len]u8,
+    tx_storage: [tcp_tx_buffer_len]u8,
+
+    fn init(self: *TestGuest, now: Instant) void {
+        self.device = Device.init();
+        self.sock = TcpSock.init(&self.rx_storage, &self.tx_storage);
+        self.sock.ack_delay = null;
+        self.sock_ptrs = .{&self.sock};
+        self.stack = GuestStack.init(spore_net.guest_mac, .{ .tcp4_sockets = &self.sock_ptrs });
+        self.stack.iface.v4.addIpAddr(.{ .address = spore_net.guest_ipv4, .prefix_len = 30 });
+        _ = self.stack.iface.v4.routes.add(zmoltcp.iface.Route.newDefaultGateway(spore_net.gateway_ipv4));
+        self.stack.iface.neighbor_cache.fill(spore_net.gateway_ipv4, spore_net.gateway_mac, now);
+    }
+
+    /// Moves frames between the guest and the gateway until both are idle.
+    fn exchange(self: *TestGuest, gateway: *Gateway, now: Instant) void {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            _ = self.stack.poll(now, &self.device);
+            var moved = false;
+            while (self.device.dequeueTx()) |frame| {
+                _ = gateway.receiveFrame(frame, now);
+                moved = true;
+            }
+            gateway.service(now);
+            while (gateway.dequeueFrame()) |frame| {
+                self.device.enqueueRx(frame);
+                moved = true;
+            }
+            if (!moved) return;
+        }
+    }
+};
+
+/// One iteration of the netd host side: poll host sockets, then service.
+fn pollHost(gateway: *Gateway, now: Instant) !void {
+    var fds: [max_port_forwards + max_flows]std.posix.pollfd = undefined;
+    const count = gateway.fillPollFds(&fds);
+    _ = try std.posix.poll(fds[0..count], 1_000);
+    gateway.servicePoll(fds[0..count]);
+    gateway.service(now);
+}
+
+fn listenUnix(path: [:0]const u8) !std.c.fd_t {
+    _ = std.c.unlink(path.ptr);
+    const listener = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (listener < 0) return error.TestUnexpectedResult;
+    errdefer _ = std.c.close(listener);
+    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
+    sockaddr.family = std.c.AF.UNIX;
+    @memcpy(sockaddr.path[0..path.len], path);
+    if (std.c.bind(listener, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un)) != 0) return error.TestUnexpectedResult;
+    if (std.c.listen(listener, 4) != 0) return error.TestUnexpectedResult;
+    return listener;
 }
 
 fn testForwardRequest(dst_addr: ipv4.Address, dst_port: u16) ForwardRequest {
@@ -891,16 +1025,56 @@ test "spore-netd TCP denies blocked SYN before host socket open" {
         const now = Instant.fromMillis(@intCast(i));
         try std.testing.expect(gateway.receiveFrame(frame, now));
         gateway.service(now);
+        try expectSynReset(gateway.dequeueFrame() orelse return error.TestUnexpectedResult, addr, 80);
+        try std.testing.expectEqual(@as(?[]const u8, null), gateway.dequeueFrame());
     }
 
     try std.testing.expectEqual(blocked.len, gateway.stats.denied);
     try std.testing.expectEqual(@as(usize, 0), gateway.stats.connect_attempts);
+}
+
+test "spore-netd TCP resets a guest connection to a denied destination" {
+    var config = spore_net_policy.Config{};
+    try config.addNetworkPolicy(.{});
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+
+    try guest.sock.connect(.{ 93, 184, 216, 34 }, 443, spore_net.guest_ipv4, 49152);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.denied);
+    try std.testing.expectEqual(tcp_socket.State.closed, guest.sock.getState());
+}
+
+test "spore-netd TCP drops a SYN without a reset when the flow table is full" {
+    var config = spore_net_policy.Config{};
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-missing-full-table.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+
+    // Each SYN takes a flow slot; without a service pass none is reaped.
+    var frame_buf: [spore_net.max_frame_len]u8 = undefined;
+    var port: u16 = 0;
+    while (port < max_flows) : (port += 1) {
+        try std.testing.expect(gateway.receiveFrame(buildTcpSynFrameFrom(49152 + port, spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
+    }
+    while (gateway.dequeueFrame()) |_| {}
+
+    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrameFrom(49152 + max_flows, spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
+    try std.testing.expectEqual(@as(usize, 1), gateway.stats.flow_limit_drops);
+    try std.testing.expectEqual(@as(usize, 0), gateway.stats.denied);
     try std.testing.expectEqual(@as(?[]const u8, null), gateway.dequeueFrame());
 }
 
 test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial" {
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/sporevm-netd-missing-bound-service.sock");
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-missing-bound-service.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
@@ -925,11 +1099,14 @@ test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial"
 }
 
 test "spore-netd TCP routes two bound services independently and rejects duplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     var config = spore_net_policy.Config{};
-    try config.addBindService("metadata=unix:/tmp/metadata.sock");
-    try std.testing.expectError(error.DuplicateBoundService, config.addBindService("metadata:8080=unix:/tmp/metadata-2.sock"));
-    try std.testing.expectError(error.DuplicateBoundService, config.addBindService("cache=unix:/tmp/cache.sock"));
-    try config.addBindService("cache:8080=unix:/tmp/cache.sock");
+    try config.addBindService(allocator, "metadata=unix:/tmp/metadata.sock");
+    try std.testing.expectError(error.DuplicateBoundService, config.addBindService(allocator, "metadata:8080=unix:/tmp/metadata-2.sock"));
+    try std.testing.expectError(error.DuplicateBoundService, config.addBindService(allocator, "cache=unix:/tmp/cache.sock"));
+    try config.addBindService(allocator, "cache:8080=unix:/tmp/cache.sock");
 
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
@@ -991,40 +1168,33 @@ test "spore-netd TCP opens bound Unix stream sockets" {
 
 test "spore-netd TCP applies poll results only to the flow that was polled" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-poll-test-{d}.sock", .{std.c.getpid()});
-    _ = std.c.unlink(path_z.ptr);
-    defer _ = std.c.unlink(path_z.ptr);
-
-    const listener = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    try std.testing.expect(listener >= 0);
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-poll-test-{d}.sock", .{std.c.getpid()});
+    const listener = try listenUnix(path);
     defer _ = std.c.close(listener);
-    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
-    sockaddr.family = std.c.AF.UNIX;
-    @memcpy(sockaddr.path[0..path_z.len], path_z);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.bind(listener, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un)));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.listen(listener, 4));
+    defer _ = std.c.unlink(path.ptr);
 
-    var first_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    var second_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
     var config = spore_net_policy.Config{};
-    try config.addBindService(try std.fmt.bufPrint(&first_buf, "first=unix:{s}", .{path_z}));
-    try config.addBindService(try std.fmt.bufPrint(&second_buf, "second:8080=unix:{s}", .{path_z}));
-    try config.addBindService("missing:81=unix:/tmp/sporevm-netd-missing-poll-service.sock");
+    try config.addBoundUnixService("first", "first.spore.internal", 80, path);
+    try config.addBoundUnixService("second", "second.spore.internal", 8080, path);
+    try config.addBoundUnixService("missing", "missing.spore.internal", 81, "/tmp/sporevm-netd-missing-poll-service.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
     defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
 
-    // A failed flow takes the first slot and is reaped, leaving the open
-    // flow in a later slot with a free slot before it.
+    // A failed flow takes the first slot and is reaped, leaving the guest's
+    // connection in a later slot with a free slot before it.
     var frame_buf: [spore_net.max_frame_len]u8 = undefined;
     try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 81, &frame_buf), Instant.fromMillis(1)));
-    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
-    gateway.service(Instant.fromMillis(1));
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49153);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+    try std.testing.expectEqual(tcp_socket.State.established, guest.sock.getState());
     const host_peer = std.c.accept(listener, null, null);
     try std.testing.expect(host_peer >= 0);
     defer _ = std.c.close(host_peer);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(host_peer, std.c.SHUT.WR));
+    try std.testing.expectEqual(@as(isize, 1), std.c.send(host_peer, "x", 1, 0));
 
     var fds: [max_port_forwards + max_flows]std.posix.pollfd = undefined;
     const count = gateway.fillPollFds(&fds);
@@ -1034,11 +1204,107 @@ test "spore-netd TCP applies poll results only to the flow that was polled" {
     // a new flow in the free slot ahead of the polled one.
     try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 8080, &frame_buf), Instant.fromMillis(2)));
     gateway.servicePoll(fds[0..count]);
-    gateway.service(Instant.fromMillis(2));
+    guest.exchange(&gateway, Instant.fromMillis(2));
 
-    // The polled flow saw its host EOF and closed its host socket.
+    // The polled flow read the host byte and relayed it to the guest.
     var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 0), std.c.recv(host_peer, &byte, byte.len, std.c.MSG.DONTWAIT));
+    try std.testing.expectEqual(@as(usize, 1), try guest.sock.recvSlice(&byte));
+    try std.testing.expectEqualStrings("x", &byte);
+}
+
+test "spore-netd TCP delivers guest bytes sent after host EOF" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-eof-test-{d}.sock", .{std.c.getpid()});
+    const listener = try listenUnix(path);
+    defer _ = std.c.close(listener);
+    defer _ = std.c.unlink(path.ptr);
+
+    var config = spore_net_policy.Config{};
+    try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49153);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+    try std.testing.expectEqual(tcp_socket.State.established, guest.sock.getState());
+    const host_peer = std.c.accept(listener, null, null);
+    try std.testing.expect(host_peer >= 0);
+    defer _ = std.c.close(host_peer);
+
+    // The host half-closes before the guest has sent anything; the guest
+    // sees the FIN but can still send.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(host_peer, std.c.SHUT.WR));
+    try pollHost(&gateway, Instant.fromMillis(2));
+    guest.exchange(&gateway, Instant.fromMillis(2));
+    try std.testing.expectEqual(tcp_socket.State.close_wait, guest.sock.getState());
+
+    try std.testing.expectEqual(@as(usize, 4), try guest.sock.sendSlice("ping"));
+    guest.exchange(&gateway, Instant.fromMillis(3));
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 4), std.c.recv(host_peer, &buf, buf.len, std.c.MSG.DONTWAIT));
+    try std.testing.expectEqualStrings("ping", buf[0..4]);
+
+    // Once the guest closes too, the gateway closes the host socket.
+    guest.sock.close();
+    guest.exchange(&gateway, Instant.fromMillis(4));
+    try std.testing.expectEqual(@as(isize, 0), std.c.recv(host_peer, &buf, buf.len, std.c.MSG.DONTWAIT));
+}
+
+test "spore-netd TCP stops polling a host socket while the guest cannot take more" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-backpressure-test-{d}.sock", .{std.c.getpid()});
+    const listener = try listenUnix(path);
+    defer _ = std.c.close(listener);
+    defer _ = std.c.unlink(path.ptr);
+
+    var config = spore_net_policy.Config{};
+    try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49153);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+    try std.testing.expectEqual(tcp_socket.State.established, guest.sock.getState());
+    const host_peer = std.c.accept(listener, null, null);
+    try std.testing.expect(host_peer >= 0);
+    defer _ = std.c.close(host_peer);
+
+    // The host keeps writing while the guest reads nothing, until the guest
+    // window and every gateway buffer are full and the host fd leaves the
+    // poll set even though it still has bytes to read.
+    try std.testing.expect(setNonBlocking(host_peer));
+    var chunk: [4096]u8 = undefined;
+    @memset(&chunk, 'x');
+    var written: usize = 0;
+    var fds: [max_port_forwards + max_flows]std.posix.pollfd = undefined;
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        while (written < 1024 * 1024) {
+            const n = std.c.send(host_peer, &chunk, chunk.len, 0);
+            if (n <= 0) break;
+            written += @intCast(n);
+        }
+        const count = gateway.fillPollFds(&fds);
+        if (count == 0) break;
+        _ = try std.posix.poll(fds[0..count], 1_000);
+        gateway.servicePoll(fds[0..count]);
+        guest.exchange(&gateway, Instant.fromMillis(2));
+    }
+    try std.testing.expect(rounds < 64);
+
+    // Once the guest reads, the gateway forwards what it has buffered.
+    var drained: [tcp_rx_buffer_len]u8 = undefined;
+    try std.testing.expect(try guest.sock.recvSlice(&drained) > 0);
+    guest.exchange(&gateway, Instant.fromMillis(3));
+    try std.testing.expect(try guest.sock.recvSlice(&drained) > 0);
 }
 
 test "spore-netd TCP enforces exact learned host ports" {
@@ -1071,6 +1337,95 @@ test "spore-netd TCP routes configured bound service ports to Unix sockets" {
         .tcp => return error.TestUnexpectedResult,
     }
     try std.testing.expect(gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8171)) == null);
+}
+
+/// Builds checksum-correct guest TCP frames from fuzz input, so the stack
+/// does not drop them before they reach the gateway's policy and flows.
+/// Each frame takes a 21-byte header (flags, destination selector and
+/// address, ports, sequence and acknowledgment numbers, window, payload
+/// length) followed by its payload.
+fn fuzzGatewayReceiveFrame(_: void, s: *std.testing.Smith) !void {
+    var config = spore_net_policy.Config{};
+    try config.addNetworkPolicy(.{});
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-fuzz-missing.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+
+    var input: [4096]u8 = undefined;
+    const len = @min(s.slice(&input), input.len);
+    const header_len = 21;
+    var offset: usize = 0;
+    var now_ms: i64 = 0;
+    while (offset + header_len <= len) {
+        const header = input[offset..][0..header_len];
+        offset += header_len;
+        const payload_len = @min(header[20], len - offset);
+        const payload = input[offset..][0..payload_len];
+        offset += payload_len;
+
+        const dst_addr: ipv4.Address = if ((header[1] & 1) != 0) spore_net.gateway_ipv4 else header[2..6].*;
+        var frame_buf: [spore_net.max_frame_len]u8 = undefined;
+        const tcp_start = ethernet.HEADER_LEN + ipv4.HEADER_LEN;
+        const tcp_header_len = tcp_wire.emit(.{
+            .src_port = std.mem.readInt(u16, header[8..10], .big),
+            .dst_port = std.mem.readInt(u16, header[6..8], .big),
+            .seq_number = std.mem.readInt(u32, header[10..14], .big),
+            .ack_number = std.mem.readInt(u32, header[14..18], .big),
+            .data_offset = 5,
+            .flags = .{
+                .fin = (header[0] & 0x01) != 0,
+                .syn = (header[0] & 0x02) != 0,
+                .rst = (header[0] & 0x04) != 0,
+                .psh = (header[0] & 0x08) != 0,
+                .ack = (header[0] & 0x10) != 0,
+                .urg = (header[0] & 0x20) != 0,
+            },
+            .window_size = std.mem.readInt(u16, header[18..20], .big),
+            .checksum = 0,
+            .urgent_pointer = 0,
+        }, frame_buf[tcp_start..]) catch unreachable;
+        @memcpy(frame_buf[tcp_start + tcp_header_len ..][0..payload.len], payload);
+        const tcp_len = tcp_header_len + payload.len;
+        _ = ethernet.emit(.{
+            .dst_addr = spore_net.gateway_mac,
+            .src_addr = spore_net.guest_mac,
+            .ethertype = .ipv4,
+        }, frame_buf[0..ethernet.HEADER_LEN]) catch unreachable;
+        _ = ipv4.emit(.{
+            .version = 4,
+            .ihl = 5,
+            .dscp_ecn = 0,
+            .total_length = @intCast(ipv4.HEADER_LEN + tcp_len),
+            .identification = 0,
+            .dont_fragment = true,
+            .more_fragments = false,
+            .fragment_offset = 0,
+            .ttl = 64,
+            .protocol = .tcp,
+            .checksum = 0,
+            .src_addr = spore_net.guest_ipv4,
+            .dst_addr = dst_addr,
+        }, frame_buf[ethernet.HEADER_LEN..][0..ipv4.HEADER_LEN]) catch unreachable;
+        const tcp = frame_buf[tcp_start..][0..tcp_len];
+        std.mem.writeInt(u16, tcp[16..18], tcp_wire.computeChecksum(spore_net.guest_ipv4, dst_addr, tcp), .big);
+
+        const now = Instant.fromMillis(now_ms);
+        _ = gateway.receiveFrame(frame_buf[0 .. tcp_start + tcp_len], now);
+        gateway.service(now);
+        while (gateway.dequeueFrame()) |_| {}
+        now_ms += 50;
+    }
+}
+
+test "fuzz spore-netd TCP gateway guest frames" {
+    // A SYN to the bound service, its ACK with data, then a denied SYN.
+    try std.testing.fuzz({}, fuzzGatewayReceiveFrame, .{ .corpus = &.{
+        "\x02\x01\x00\x00\x00\x00\x00\x50\xc0\x00\x00\x00\x03\xe8\x00\x00\x00\x00\x04\x00\x00" ++
+            "\x18\x01\x00\x00\x00\x00\x00\x50\xc0\x00\x00\x00\x03\xe9\x00\x00\x00\x01\x04\x00\x04ping" ++
+            "\x02\x00\x5d\xb8\xd8\x22\x01\xbb\xc0\x01\x00\x00\x07\xd0\x00\x00\x00\x00\x04\x00\x00",
+    } });
 }
 
 fn fuzzGuestTcpFrameClassifier(_: void, s: *std.testing.Smith) !void {

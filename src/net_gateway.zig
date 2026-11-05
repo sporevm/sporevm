@@ -10,15 +10,13 @@ const Io = std.Io;
 const spore_net = @import("spore_net.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd = @import("spore_netd.zig");
-const spore = @import("spore.zig");
+const spore_netd_tcp = @import("spore_netd_tcp.zig");
 const virtio_net = @import("virtio/net.zig");
 
 const ready_timeout_ms = 1_000;
 const max_rx_pending = 16;
 const max_network_events = 128;
 const max_stderr_line_len = 512;
-const netd_event_prefix = "spore-net-event ";
-const netd_json_event_prefix = "{\"event\":\"network_";
 
 pub const StartError = error{
     NetdSpawnFailed,
@@ -67,11 +65,6 @@ pub const Process = struct {
     network_event_head: usize = 0,
     network_event_count: usize = 0,
     network_events: [max_network_events]NetworkEvent = undefined,
-    event_lock: SpinLock = .{},
-    event_head: usize = 0,
-    event_count: usize = 0,
-    event_lens: [max_network_events]usize = [_]usize{0} ** max_network_events,
-    event_bufs: [max_network_events][max_stderr_line_len]u8 = undefined,
 
     pub fn start(
         self: *Process,
@@ -89,43 +82,10 @@ pub const Process = struct {
         if (debug) argv.append("--debug") catch return error.OutOfMemory;
         argv.append("netd") catch return error.OutOfMemory;
         argv.append("--stdio") catch return error.OutOfMemory;
-        if (policy.default_deny) {
-            argv.append("--default-action") catch return error.OutOfMemory;
-            argv.append(spore.network_default_deny) catch return error.OutOfMemory;
-        }
-        for (policy.allowCidrSlice()) |cidr| {
-            argv.append("--allow-cidr") catch return error.OutOfMemory;
-            argv.append(cidr) catch return error.OutOfMemory;
-        }
-        for (policy.allowHostSlice()) |host| {
-            argv.append("--allow-host") catch return error.OutOfMemory;
-            argv.append(host) catch return error.OutOfMemory;
-        }
-        for (policy.exactRuleSlice()) |rule| {
-            for (rule.portSlice()) |port| {
-                const host_port = std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }) catch return error.OutOfMemory;
-                argv.append("--allow-host-port") catch return error.OutOfMemory;
-                argv.append(host_port) catch return error.OutOfMemory;
-            }
-        }
-        for (policy.boundServiceSlice()) |service| {
-            if (service.declaration.len != 0) {
-                argv.append("--bind-service") catch return error.OutOfMemory;
-                argv.append(service.declaration) catch return error.OutOfMemory;
-            } else {
-                const port = std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}) catch return error.OutOfMemory;
-                argv.append("--bound-unix-service") catch return error.OutOfMemory;
-                argv.append(service.name) catch return error.OutOfMemory;
-                argv.append(service.guest_host) catch return error.OutOfMemory;
-                argv.append(port) catch return error.OutOfMemory;
-                argv.append(service.unix_path) catch return error.OutOfMemory;
-            }
-        }
-        for (policy.portForwardSlice()) |forward| {
-            const value = std.fmt.allocPrint(allocator, "127.0.0.1:{d}:{d}", .{ forward.host_port, forward.guest_port }) catch return error.OutOfMemory;
-            argv.append("--forward") catch return error.OutOfMemory;
-            argv.append(value) catch return error.OutOfMemory;
-        }
+        argv.append("--policy") catch return error.OutOfMemory;
+        const policy_arg = spore_net_policy.encodeArgAlloc(allocator, &policy) catch return error.OutOfMemory;
+        defer allocator.free(policy_arg);
+        argv.append(policy_arg) catch return error.OutOfMemory;
         const child = std.process.spawn(io, .{
             .argv = argv.items,
             .stdin = .pipe,
@@ -216,41 +176,6 @@ pub const Process = struct {
         self.network_event_head = (self.network_event_head + 1) % max_network_events;
         self.network_event_count -= 1;
         return event;
-    }
-
-    pub fn clearEvents(self: *Process) void {
-        self.event_lock.lock();
-        defer self.event_lock.unlock();
-        self.event_head = 0;
-        self.event_count = 0;
-        @memset(&self.event_lens, 0);
-    }
-
-    pub fn drainEventJsonl(self: *Process, allocator: std.mem.Allocator) ![]u8 {
-        self.event_lock.lock();
-        defer self.event_lock.unlock();
-
-        var total: usize = 0;
-        var i: usize = 0;
-        while (i < self.event_count) : (i += 1) {
-            const idx = (self.event_head + i) % max_network_events;
-            total += self.event_lens[idx] + 1;
-        }
-        const out = try allocator.alloc(u8, total);
-        var pos: usize = 0;
-        i = 0;
-        while (i < self.event_count) : (i += 1) {
-            const idx = (self.event_head + i) % max_network_events;
-            const len = self.event_lens[idx];
-            @memcpy(out[pos..][0..len], self.event_bufs[idx][0..len]);
-            pos += len;
-            out[pos] = '\n';
-            pos += 1;
-        }
-        self.event_head = 0;
-        self.event_count = 0;
-        @memset(&self.event_lens, 0);
-        return out;
     }
 
     fn backend(self: *Process) virtio_net.Backend {
@@ -370,24 +295,6 @@ pub const Process = struct {
         self.network_event_count += 1;
         return true;
     }
-
-    fn enqueueJsonEventLine(self: *Process, line: []const u8) void {
-        if (!std.mem.startsWith(u8, line, netd_json_event_prefix)) return;
-        self.event_lock.lock();
-        defer self.event_lock.unlock();
-        const idx = if (self.event_count < max_network_events) blk: {
-            const tail = (self.event_head + self.event_count) % max_network_events;
-            self.event_count += 1;
-            break :blk tail;
-        } else blk: {
-            const tail = self.event_head;
-            self.event_head = (self.event_head + 1) % max_network_events;
-            break :blk tail;
-        };
-        const len = @min(line.len, max_stderr_line_len);
-        @memcpy(self.event_bufs[idx][0..len], line[0..len]);
-        self.event_lens[idx] = len;
-    }
 };
 
 const SpinLock = struct {
@@ -503,10 +410,6 @@ fn drainStderr(self: *Process) void {
 }
 
 fn handleStderrLine(self: *Process, line: []const u8) void {
-    if (std.mem.startsWith(u8, line, netd_json_event_prefix)) {
-        self.enqueueJsonEventLine(line);
-        return;
-    }
     if (parseNetworkEventLine(line)) |event| {
         if (!self.enqueueNetworkEvent(event)) {
             std.log.debug("spore-net gateway dropped network event: queue full", .{});
@@ -517,28 +420,23 @@ fn handleStderrLine(self: *Process, line: []const u8) void {
 }
 
 fn parseNetworkEventLine(line: []const u8) ?NetworkEvent {
-    if (!std.mem.startsWith(u8, line, netd_event_prefix)) return null;
-    var fields = std.mem.splitScalar(u8, line[netd_event_prefix.len..], ' ');
-    const kind_raw = fields.next() orelse return null;
-    const ip_raw = fields.next() orelse return null;
-    const port_raw = fields.next() orelse return null;
-    const reason_raw = fields.next() orelse return null;
-    if (fields.next() != null) return null;
-
-    const kind: NetworkEventKind = if (std.mem.eql(u8, kind_raw, "egress_denied")) .egress_denied else return null;
-    const destination_ip = spore_net.parseIpv4(ip_raw) orelse return null;
-    const destination_port = std.fmt.parseUnsigned(u16, port_raw, 10) catch return null;
-    const reason: spore_net_policy.Decision = if (std.mem.eql(u8, reason_raw, spore_net_policy.Decision.deny_hard_floor.name()))
+    if (!std.mem.startsWith(u8, line, "{")) return null;
+    var buf: [max_stderr_line_len]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const event = std.json.parseFromSliceLeaky(spore_netd_tcp.DeniedEvent, fba.allocator(), line, .{}) catch return null;
+    if (!std.mem.eql(u8, event.event, "egress_denied")) return null;
+    const destination_ip = spore_net.parseIpv4(event.ip) orelse return null;
+    const reason: spore_net_policy.Decision = if (std.mem.eql(u8, event.reason, spore_net_policy.Decision.deny_hard_floor.name()))
         .deny_hard_floor
-    else if (std.mem.eql(u8, reason_raw, spore_net_policy.Decision.deny_not_allowed.name()))
+    else if (std.mem.eql(u8, event.reason, spore_net_policy.Decision.deny_not_allowed.name()))
         .deny_not_allowed
     else
         return null;
 
     return .{
-        .kind = kind,
+        .kind = .egress_denied,
         .destination_ip = destination_ip,
-        .destination_port = destination_port,
+        .destination_port = event.port,
         .reason = reason,
     };
 }
@@ -599,7 +497,14 @@ test "spore-net gateway spawns netd with policy arguments" {
 
     const observed = try Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(4096));
     defer allocator.free(observed);
-    try std.testing.expectEqualStrings("netd\n--stdio\n--default-action\ndeny\n", observed);
+    var lines = std.mem.splitScalar(u8, observed, '\n');
+    try std.testing.expectEqualStrings("netd", lines.next().?);
+    try std.testing.expectEqualStrings("--stdio", lines.next().?);
+    try std.testing.expectEqualStrings("--policy", lines.next().?);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const policy = try spore_net_policy.parseArg(arena.allocator(), lines.next().?);
+    try std.testing.expectEqualDeep(spore_net_policy.Config{ .default_deny = true }, policy);
 }
 
 test "spore-net gateway buffers multiple rx frames" {
@@ -625,21 +530,18 @@ test "spore-net gateway drops rx frames only after queue capacity" {
     try std.testing.expect(!process.enqueueRxFrame("overflow"));
 }
 
-test "spore-net gateway parses denied egress events from netd stderr" {
-    const event = parseNetworkEventLine("spore-net-event egress_denied 169.254.169.254 80 hard-floor") orelse return error.TestUnexpectedResult;
+test "spore-net gateway queues denied egress events from netd stderr" {
+    var process = Process{};
+    var line: [spore_netd_tcp.max_denied_event_len]u8 = undefined;
+    handleStderrLine(&process, spore_netd_tcp.deniedEventLine(&line, .{ 169, 254, 169, 254 }, 80, .deny_hard_floor));
+    handleStderrLine(&process, "debug noise");
+    handleStderrLine(&process, "{\"event\":\"egress_denied\",\"ip\":\"169.254.169.254\",\"port\":80,\"reason\":\"allow\"}");
+    handleStderrLine(&process, "{\"event\":\"egress_denied\",\"ip\":\"169.254.169.254\",\"port\":80,\"reason\":\"hard-floor\",\"extra\":1}");
+
+    const event = process.popNetworkEvent() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(NetworkEventKind.egress_denied, event.kind);
     try std.testing.expectEqualSlices(u8, &.{ 169, 254, 169, 254 }, &event.destination_ip);
     try std.testing.expectEqual(@as(u16, 80), event.destination_port);
     try std.testing.expectEqual(spore_net_policy.Decision.deny_hard_floor, event.reason);
-    try std.testing.expect(parseNetworkEventLine("spore-net-event egress_denied 169.254.169.254 80 allow") == null);
-    try std.testing.expect(parseNetworkEventLine("debug noise") == null);
-}
-
-test "spore-net gateway buffers network event lines from stderr" {
-    var process = Process{};
-    handleStderrLine(&process, "{\"event\":\"network_decision\",\"action\":\"deny\"}");
-    handleStderrLine(&process, "ignored");
-    const events = try process.drainEventJsonl(std.testing.allocator);
-    defer std.testing.allocator.free(events);
-    try std.testing.expectEqualStrings("{\"event\":\"network_decision\",\"action\":\"deny\"}\n", events);
+    try std.testing.expect(process.popNetworkEvent() == null);
 }
