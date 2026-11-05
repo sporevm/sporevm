@@ -386,4 +386,4 @@ if [[ "${workload}" == "package" || "${workload}" == "all" ]]; then
   run_workload "package-install" "${package_image}" 0 "${package_command}" "${package_verify}" "${package_read}"
 fi
 
-echo "benchmark:writable-rootfs ok output=${output}"
+echo "writable-rootfs.sh ok output=${output}"

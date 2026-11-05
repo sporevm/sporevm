@@ -133,32 +133,6 @@ steps:
   - group: ":microscope: Opt-in validation"
     key: "opt-in-validation"
     steps:
-      - label: ":stopwatch: Named restore readiness (Linux ARM64)"
-        key: "named-restore-readiness-linux-arm64"
-        if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
-        env:
-          SPOREVM_NAMED_RESTORE_SCRATCH_ROOT: "/var/tmp/sporevm-named-restore-verity"
-        command: "scripts/ci/run.sh scripts/ci/buildkite-named-restore-readiness.sh"
-        artifact_paths:
-          - "zig-cache/named-restore-readiness/*.jsonl"
-          - "zig-cache/named-restore-readiness/*.json"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        agents: *linux_agents
-
-      - label: ":stopwatch: Named restore readiness (macOS ARM64)"
-        key: "named-restore-readiness-macos-arm64"
-        if: build.env("SPOREVM_RUN_NAMED_RESTORE_BENCHMARK") == "1"
-        command: "scripts/ci/run.sh scripts/ci/buildkite-named-restore-readiness.sh"
-        artifact_paths:
-          - "zig-cache/named-restore-readiness/*.jsonl"
-          - "zig-cache/named-restore-readiness/*.json"
-        plugins: *mise_plugins
-        cache: *mise_cache
-        concurrency: 1
-        concurrency_group: "sporevm-benchmarks/macos"
-        agents: *mac_agents
-
       - label: ":ext4: Slow rootfs tests (Linux ARM64)"
         key: "rootfs-slow-test-linux"
         if: build.env("SPOREVM_RUN_ROOTFS_SLOW_TESTS") == "1"

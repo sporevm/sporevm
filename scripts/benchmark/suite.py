@@ -69,7 +69,6 @@ BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
 GUEST_TIMING_RE = re.compile(r"vsock host stream guest timing: timing (?P<fields>.+)")
 KVM_PROBE_COMPLETION_RE = re.compile(r"kvm probe completion timing: (?P<fields>.+)")
 ROOTFS_PROFILE_RE = re.compile(r"spore rootfs profile: phase=(?P<phase>\S+) ms=(?P<ms>\d+)(?P<tail>.*)")
-HISTORY_RESET_RE = re.compile(r"(?im)^\s*spore-benchmark-reset:\s*(?P<targets>[^\n]+)")
 
 PHASE_METRIC_FIELDS = (
     "rootfs_open_verified_ms",
@@ -627,23 +626,6 @@ def load_benchmark_expectations(root: Path) -> dict[str, object]:
     return value
 
 
-def benchmark_history_reset() -> dict[str, object] | None:
-    raw = os.environ.get("SPOREVM_BENCHMARK_RESET", "").strip()
-    source = "SPOREVM_BENCHMARK_RESET"
-    if not raw:
-        message = os.environ.get("BUILDKITE_MESSAGE", "")
-        match = HISTORY_RESET_RE.search(message)
-        if match:
-            raw = match.group("targets").strip()
-            source = "BUILDKITE_MESSAGE"
-    if not raw:
-        return None
-    targets = [part.strip() for part in re.split(r"[, ]+", raw) if part.strip()]
-    if not targets:
-        targets = ["all"]
-    return {"source": source, "raw": raw, "targets": targets}
-
-
 def default_host_id() -> str:
     for key in ("SPOREVM_BENCHMARK_HOST_ID", "BUILDKITE_AGENT_NAME"):
         value = os.environ.get(key, "").strip()
@@ -712,7 +694,6 @@ class BenchmarkRunner:
         self.env["SPOREVM_BUNDLE_CACHE_DIR"] = str(self.bundle_cache_dir)
         self.effective_image = args.image
         self.expectations = load_benchmark_expectations(self.root)
-        self.history_reset = benchmark_history_reset()
 
     def setup(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -720,8 +701,6 @@ class BenchmarkRunner:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.rootfs_cache_dir.mkdir(parents=True, exist_ok=True)
         self.bundle_cache_dir.mkdir(parents=True, exist_ok=True)
-        if self.args.build:
-            self.build()
         if not self.spore_bin.is_file() or not os.access(self.spore_bin, os.X_OK):
             die(f"spore binary not executable: {self.spore_bin}")
         if self.needs_image_setup():
@@ -732,14 +711,6 @@ class BenchmarkRunner:
 
     def needs_image_setup(self) -> bool:
         return any(benchmark in IMAGE_SETUP_BENCHMARKS for benchmark in self.args.benchmarks)
-
-    def build(self) -> None:
-        cmd = ["mise", "run", "build"] if shutil.which("mise") else ["zig", "build"]
-        stdout = self.log_dir / "build.stdout"
-        stderr = self.log_dir / "build.stderr"
-        rc, elapsed_ms, error = run_command(cmd, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=600)
-        if rc != 0:
-            die(f"build failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
 
     def resolve_image(self) -> None:
         if is_pinned_image_ref(self.args.image):
@@ -850,7 +821,6 @@ class BenchmarkRunner:
             "rootfs_cache_dir": str(self.rootfs_cache_dir),
             "bundle_cache_dir": str(self.bundle_cache_dir),
             "benchmark_expectations": self.expectations,
-            "benchmark_history_reset": self.history_reset,
         }
 
     def spore_version(self) -> str | None:
@@ -1981,9 +1951,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--writable-rootfs-memory-mib", type=int, default=1024)
     parser.add_argument("--no-prewarm-rootfs", dest="prewarm_rootfs", action="store_false")
     parser.add_argument("--prewarm-memory", default="512mb")
-    parser.add_argument("--no-build", dest="build", action="store_false")
     parser.add_argument("--self-test", action="store_true")
-    parser.set_defaults(build=True, prewarm_rootfs=True)
+    parser.set_defaults(prewarm_rootfs=True)
     args = parser.parse_args(argv)
     if args.self_test:
         return args

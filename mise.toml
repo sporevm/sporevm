@@ -222,17 +222,9 @@ description = "Smoke disk-backed named live fork, divergence, leases, and nested
 run = "mise run build && test/smoke/rootfs/writable.sh"
 description = "Smoke writable rootfs disk layer save and run-from replay"
 
-[tasks."benchmark:writable-rootfs"]
-run = "mise run build:release && scripts/benchmark/writable-rootfs.sh --iterations 1"
-description = "Benchmark writable rootfs COW, sealed append, and replay paths"
-
 [tasks."benchmark:disk-fork"]
 run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast -lc --test-filter 'disk fork benchmark'"
 description = "Benchmark native disk-head cloning, 32-child preparation, and generation-32 reads"
-
-[tasks."benchmark:pgbench-snapshot"]
-run = "mise run build:release && scripts/benchmark/pgbench-snapshot.py --no-build"
-description = "Benchmark repeated named saves under pgbench write load and verify restored databases"
 
 [tasks."smoke:local-pull"]
 run = "mise run build && test/smoke/fanout/local-pull.sh"
@@ -242,38 +234,6 @@ description = "Smoke local file:// pull materialization and restored rootfs fan-
 run = "mise run build && test/smoke/run/basic.sh && test/smoke/run/capture.sh"
 description = "Run product smoke tests"
 
-[tasks."benchmark:smoke"]
-run = "mise run build:release && scripts/benchmark/suite.py --profile smoke --no-build"
-description = "Run a quick benchmark-suite smoke profile"
-
-[tasks."benchmark:ci"]
-run = "mise run build:release && scripts/benchmark/suite.py --profile ci --no-build"
-description = "Run the short CI benchmark profile and write comparable JSON output"
-
-[tasks."benchmark:comparison"]
-run = "mise run build:release && scripts/benchmark/suite.py --profile comparison --no-build"
-description = "Run the heavier all-dimension comparison benchmark profile"
-
-[tasks."benchmark:nightly"]
-run = "mise run build:release && scripts/benchmark/suite.py --profile nightly --no-build"
-description = "Run the scheduled benchmark guardrail profile"
-
-[tasks."benchmark:full"]
-run = "mise run build:release && scripts/benchmark/suite.py --profile full --no-build"
-description = "Run the full benchmark suite"
-
-[tasks."benchmark:compare"]
-run = "scripts/benchmark/compare.py"
-description = "Compare two benchmark summary JSON files"
-
-[tasks."benchmark:detect-regressions"]
-run = "scripts/benchmark/detect_regressions.py"
-description = "Detect benchmark regressions against trailing history"
-
-[tasks."benchmark:rootfs-writers"]
-run = "mise run build && scripts/benchmark/rootfs-writers.py --no-build"
-description = "Compare native and external rootfs writer phase timings"
-
-[tasks."benchmark:export"]
-run = "scripts/benchmark/export-site-data.py zig-cache/sporevm-benchmarks/latest-summary.json"
-description = "Export latest benchmark summary as static trend data"
+[tasks.benchmark]
+run = "mise run build:release && scripts/benchmark/suite.py"
+description = "Run the benchmark suite against a ReleaseSafe build"
