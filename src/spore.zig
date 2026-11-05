@@ -1724,7 +1724,10 @@ pub fn loadManifestPath(allocator: std.mem.Allocator, path: []const u8) Error!st
 /// Parses and validates manifest bytes. The version is checked before the
 /// shape, so manifests from older formats fail as FormatTooOld.
 pub fn parseManifest(allocator: std.mem.Allocator, bytes: []const u8) Error!std.json.Parsed(Manifest) {
-    const VersionProbe = struct { version: u32 };
+    // Every manifest version has had these objects. Requiring them keeps
+    // another program's manifest.json with a small `version` from passing as
+    // an old spore.
+    const VersionProbe = struct { version: u32, platform: struct {}, machine: struct {}, memory: struct {} };
     const probe = std.json.parseFromSlice(VersionProbe, allocator, bytes, .{
         .ignore_unknown_fields = true,
     }) catch |err| return switch (err) {
@@ -3369,6 +3372,11 @@ test "manifests from older formats fail as too old" {
     try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
     _ = future.object.orderedRemove("version");
     try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, future, .{}));
+    try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
+
+    // Other programs write manifest.json too, and std.json reads the string
+    // "1.0" as the integer 1. Without spore members it is not an old spore.
+    try writeFileAll(path, "{\"manifest_version\":3,\"name\":\"ext\",\"version\":\"1.0\"}");
     try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
 }
 

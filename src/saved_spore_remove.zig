@@ -226,7 +226,7 @@ test "saved-spore removal refuses directories that are not spores and live saved
     // Browser extensions, PWAs, and many other projects have a manifest.json.
     const extension = try host.path("extension");
     try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(host.arena, &.{ extension, ".git" }));
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(host.arena, &.{ extension, "manifest.json" }), .data = "{\"manifest_version\":3,\"name\":\"ext\"}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(host.arena, &.{ extension, "manifest.json" }), .data = "{\"manifest_version\":3,\"name\":\"ext\",\"version\":\"1.0\"}" });
     try std.testing.expectError(error.BadManifest, host.rm(extension));
     // A save whose manifest no longer parses is indistinguishable from any
     // other directory; users delete it with `rm -rf` and let GC reclaim it.
