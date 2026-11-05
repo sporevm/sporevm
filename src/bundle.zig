@@ -2772,12 +2772,12 @@ fn httpContentLength(head: []const u8) Error!?u64 {
 }
 
 fn resolveHttpFetchTarget(io: Io, uri: std.Uri) Error!Io.net.IpAddress {
-    return fetch_policy.resolveUriAddress(io, uri, .{}) catch |err| switch (err) {
+    return (fetch_policy.resolveUriAddresses(io, uri, .{}) catch |err| switch (err) {
         error.UnsupportedRemoteFetchScheme,
         error.UnsafeRemoteFetchTarget,
         => return error.BadManifest,
         else => return error.IoFailed,
-    };
+    }).items[0];
 }
 
 fn validateHttpFetchTarget(io: Io, uri: std.Uri) Error!void {

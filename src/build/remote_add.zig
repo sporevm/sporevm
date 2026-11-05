@@ -244,22 +244,16 @@ pub fn fetch(
     var redirects: u8 = 0;
     while (true) {
         const uri = try validateUrl(current_url);
-        const target = try fetch_policy.resolveUriAddress(io, uri, .{ .require_https = true });
-        const connection = try fetch_policy.connectResolvedUri(client, uri, target);
-        var req = client.request(.GET, uri, .{
+        const addresses = try fetch_policy.resolveUriAddresses(io, uri, .{ .require_https = true });
+        var req: std.http.Client.Request = undefined;
+        var header_buffer: [16 * 1024]u8 = undefined;
+        var response = try fetch_policy.getHead(client, uri, addresses.slice(), .{
             .headers = .{ .accept_encoding = .{ .override = "identity" } },
             .extra_headers = &.{std.http.Header{ .name = "accept", .value = "application/octet-stream" }},
             .redirect_behavior = .unhandled,
             .keep_alive = false,
-            .connection = connection,
-        }) catch |err| {
-            client.connection_pool.release(connection, client.io);
-            return err;
-        };
+        }, &req, &header_buffer);
         defer req.deinit();
-        try req.sendBodiless();
-        var header_buffer: [16 * 1024]u8 = undefined;
-        var response = try req.receiveHead(&header_buffer);
 
         if (response.head.status.class() == .redirect) {
             redirects += 1;
