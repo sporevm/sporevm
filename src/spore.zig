@@ -1699,12 +1699,18 @@ pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Man
 }
 
 pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
-    try validateManifest(manifest);
-    const json = std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch return error.OutOfMemory;
+    const json = try encodeManifestAlloc(allocator, manifest);
     defer allocator.free(json);
     const path_z = try pathZ(allocator, "{s}", .{path});
     defer allocator.free(path_z);
     try writeFileAll(path_z, json);
+}
+
+/// Validates and encodes manifest bytes for every writer, including those
+/// that publish them through a pin.
+pub fn encodeManifestAlloc(allocator: std.mem.Allocator, manifest: Manifest) Error![]u8 {
+    try validateManifest(manifest);
+    return std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 }) catch error.OutOfMemory;
 }
 
 pub fn loadManifest(allocator: std.mem.Allocator, dir: []const u8) Error!std.json.Parsed(Manifest) {

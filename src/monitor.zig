@@ -1183,7 +1183,7 @@ const ExecServer = struct {
         manifest.value.annotations = lifecycle_spec.value.annotations;
         manifest.value.exec_defaults = lifecycle_spec.value.exec_defaults;
         if (manifest.value.disk) |disk| {
-            const bytes = try std.json.Stringify.valueAlloc(self.allocator, manifest.value, .{ .whitespace = .indent_2 });
+            const bytes = try spore.encodeManifestAlloc(self.allocator, manifest.value);
             defer self.allocator.free(bytes);
             const authorization_started = runtime_disk_fork_capture.monotonicNs();
             try saved_spore_pin.replaceAuthorizedManifest(self.io, self.allocator, registry, work_dir, disk, bytes);

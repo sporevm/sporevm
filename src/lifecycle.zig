@@ -1557,7 +1557,7 @@ fn saveStopNamed(
         }
         manifest.value.exec_defaults = suspend_spec.exec_defaults;
         if (manifest.value.disk) |disk| {
-            const bytes = try std.json.Stringify.valueAlloc(arena, manifest.value, .{ .whitespace = .indent_2 });
+            const bytes = try spore.encodeManifestAlloc(arena, manifest.value);
             const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
             var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
             defer cache_lock.deinit();
