@@ -25,8 +25,6 @@ const max_virtio_devices = switch (builtin.cpu.arch) {
 pub const default_step_timeout_ms: u64 = 30 * 60 * 1000;
 const max_captured_output = 64 * 1024;
 const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
-const p0_idle_probe_env = "SPOREVM_ROOTFS_GROWTH_P0_IDLE_MS";
-const max_p0_idle_probe_ms: u64 = 10_000;
 const build_producer_domain = "sporevm-build-producer-v2";
 const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v2;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
 // The x86 product profile is intentionally fixed at 512 MiB. AArch64 keeps
@@ -368,8 +366,6 @@ const Phase = enum {
     snapshot,
     start_thaw,
     active_thaw,
-    p0_idle_start,
-    p0_idle_wait,
     done,
     failed,
 };
@@ -465,7 +461,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
         null;
     defer if (cache_store) |*store| store.deinit();
 
-    var control = try BuildControl.init(init.io, allocator, options, try p0IdleProbeMs(init.environ_map));
+    var control = try BuildControl.init(init.io, allocator, options);
     defer control.deinit();
 
     const rootfs = try rootfsFromStorage(allocator, options.base_storage);
@@ -638,10 +634,6 @@ const BuildControl = struct {
     resize_stdout: std.array_list.Managed(u8),
     resize_stdout_overflow: bool = false,
     enospc_detector: EnospcDetector = .{},
-    p0_idle_probe_ms: u64 = 0,
-    p0_idle_deadline_ns: u64 = 0,
-    p0_idle_baseline: vsock.ControlStats = .{},
-    latest_stats: vsock.ControlStats = .{},
     executed_steps: usize = 0,
     failed_instruction: ?[]const u8 = null,
     failed_instruction_line: usize = 0,
@@ -655,7 +647,7 @@ const BuildControl = struct {
     preparation_publish_ms: ?u64 = null,
     instruction_timing: InstructionTiming = .{},
 
-    fn init(io: Io, allocator: std.mem.Allocator, options: Options, p0_idle_probe_ms: u64) !BuildControl {
+    fn init(io: Io, allocator: std.mem.Allocator, options: Options) !BuildControl {
         return .{
             .io = io,
             .allocator = allocator,
@@ -675,7 +667,6 @@ const BuildControl = struct {
             .active_step_key = if (options.preparation) |preparation| preparation.step_key else "",
             .capture = std.array_list.Managed(u8).init(allocator),
             .resize_stdout = std.array_list.Managed(u8).init(allocator),
-            .p0_idle_probe_ms = p0_idle_probe_ms,
             .snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
         };
     }
@@ -723,19 +714,6 @@ const BuildControl = struct {
                 return .keep_running;
             },
             .active_thaw => return try self.pollActiveStream(dev),
-            .p0_idle_start => {
-                self.p0_idle_baseline = self.latest_stats;
-                self.p0_idle_deadline_ns = std.math.add(u64, try monotonicNs(), self.p0_idle_probe_ms * std.time.ns_per_ms) catch return error.ClockFailed;
-                self.phase = .p0_idle_wait;
-                return .keep_running;
-            },
-            .p0_idle_wait => {
-                if (try monotonicNs() < self.p0_idle_deadline_ns) return .keep_running;
-                try validateIdleBlockStats(self.p0_idle_baseline, self.latest_stats);
-                std.log.info("rootfs growth P0 idle: ms={d} write_zeroes_delta=0 out_delta=0", .{self.p0_idle_probe_ms});
-                self.phase = .start_freeze;
-                return .keep_running;
-            },
             .done, .failed => return .stop,
         }
     }
@@ -877,7 +855,7 @@ const BuildControl = struct {
                 const result = parseRootfsGrowResponse(self.resize_stdout.items) catch return error.BuildGuestResizeResponseInvalid;
                 if (result.device_bytes != self.rootfs_grow_target) return error.BuildGuestResizeGeometryMismatch;
                 self.capture.clearRetainingCapacity();
-                self.phase = if (self.p0_idle_probe_ms == 0) .start_freeze else .p0_idle_start;
+                self.phase = .start_freeze;
             },
             .run, .copy, .workdir => {
                 if (exit_code != 0) {
@@ -999,9 +977,7 @@ const BuildControl = struct {
 
     fn completeSnapshot(_: *BuildControl, _: []const u8) !void {}
 
-    fn reportStats(self: *BuildControl, stats: vsock.ControlStats) void {
-        self.latest_stats = stats;
-    }
+    fn reportStats(_: *BuildControl, _: vsock.ControlStats) void {}
 
     fn appendOutput(self: *BuildControl, bytes: []const u8) void {
         self.enospc_detector.observe(bytes);
@@ -1089,39 +1065,6 @@ fn preparationMetricsLine(buf: []u8, publish_ms: u64, resume_ms: u64, target_mib
 
 fn parseRootfsGrowResponse(bytes: []const u8) !run_mod.RootfsGrowResult {
     return run_mod.parseRootfsGrowResponse(bytes);
-}
-
-fn parseP0IdleProbeMs(value: ?[]const u8) !u64 {
-    const raw = value orelse return 0;
-    if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return 0;
-    const parsed = std.fmt.parseUnsigned(u64, raw, 10) catch return error.BadP0IdleProbe;
-    if (parsed > max_p0_idle_probe_ms) return error.BadP0IdleProbe;
-    return parsed;
-}
-
-fn p0IdleProbeMs(environ: *const std.process.Environ.Map) !u64 {
-    if (!run_mod.rootfsGrowthExperimentsEnabled(environ)) return 0;
-    return parseP0IdleProbeMs(environ.get(p0_idle_probe_env));
-}
-
-fn validateIdleBlockStats(before: vsock.ControlStats, after: vsock.ControlStats) !void {
-    const before_write_zeroes_requests = before.write_zeroes_requests orelse return error.MissingP0BlockStats;
-    const before_write_zeroes_bytes = before.write_zeroes_bytes orelse return error.MissingP0BlockStats;
-    const before_write_zeroes_errors = before.write_zeroes_errors orelse return error.MissingP0BlockStats;
-    const before_write_zeroes_backend_failures = before.write_zeroes_backend_failures orelse return error.MissingP0BlockStats;
-    const before_write_zeroes_unsupported = before.write_zeroes_unsupported orelse return error.MissingP0BlockStats;
-    const before_out_requests = before.out_requests orelse return error.MissingP0BlockStats;
-    const before_out_bytes = before.out_bytes orelse return error.MissingP0BlockStats;
-    if ((after.write_zeroes_requests orelse return error.MissingP0BlockStats) != before_write_zeroes_requests or
-        (after.write_zeroes_bytes orelse return error.MissingP0BlockStats) != before_write_zeroes_bytes or
-        (after.write_zeroes_errors orelse return error.MissingP0BlockStats) != before_write_zeroes_errors or
-        (after.write_zeroes_backend_failures orelse return error.MissingP0BlockStats) != before_write_zeroes_backend_failures or
-        (after.write_zeroes_unsupported orelse return error.MissingP0BlockStats) != before_write_zeroes_unsupported or
-        (after.out_requests orelse return error.MissingP0BlockStats) != before_out_requests or
-        (after.out_bytes orelse return error.MissingP0BlockStats) != before_out_bytes)
-    {
-        return error.RootfsBackgroundWritesDetected;
-    }
 }
 
 fn monotonicNs() !u64 {
@@ -2182,34 +2125,6 @@ test "fuzz guest ext4 geometry parser" {
 
 test "fuzz guest ext4 growth source preflight" {
     try std.testing.fuzz({}, fuzzGuestExt4GrowthSource, .{});
-}
-
-test "P0 idle probe is bounded and rejects background block writes" {
-    try std.testing.expectEqual(@as(u64, 0), try parseP0IdleProbeMs(null));
-    try std.testing.expectEqual(@as(u64, 6000), try parseP0IdleProbeMs("6000"));
-    try std.testing.expectError(error.BadP0IdleProbe, parseP0IdleProbeMs("10001"));
-
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put(p0_idle_probe_env, "6000");
-    try std.testing.expectEqual(@as(u64, 0), try p0IdleProbeMs(&env));
-    try env.put(run_mod.rootfs_growth_experiments_env, "1");
-    try std.testing.expectEqual(@as(u64, 6000), try p0IdleProbeMs(&env));
-
-    const baseline = vsock.ControlStats{
-        .write_zeroes_requests = 3,
-        .write_zeroes_bytes = 4096,
-        .write_zeroes_errors = 0,
-        .write_zeroes_backend_failures = 0,
-        .write_zeroes_unsupported = 0,
-        .out_requests = 7,
-        .out_bytes = 8192,
-    };
-    try validateIdleBlockStats(baseline, baseline);
-    var changed = baseline;
-    changed.out_requests.? += 1;
-    try std.testing.expectError(error.RootfsBackgroundWritesDetected, validateIdleBlockStats(baseline, changed));
-    try std.testing.expectError(error.MissingP0BlockStats, validateIdleBlockStats(.{}, baseline));
 }
 
 test "checkpoint controls use step-specific vsock identities" {
