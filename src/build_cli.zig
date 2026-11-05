@@ -386,9 +386,6 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
                 try stderr.writeAll("spore build: unsupported .dockerignore pattern\n");
             }
         },
-        error.CacheMissRequiresBuildExecutor => {
-            try stderr.writeAll("spore build: cache miss requires an executor path that is not implemented yet\n");
-        },
         error.BuildRunFailed => {
             if (diagnostic.executor.instruction) |instruction| {
                 if (diagnostic.executor.instruction_line != 0) {
@@ -554,18 +551,6 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         },
         error.RunContextBindCommandUnsupported => {
             try stderr.print("spore build: Dockerfile line {d}: RUN context bind mounts require ordinary shell form\n", .{diagnostic.instruction_line});
-        },
-        error.UnsupportedBuildFrom => {
-            try stderr.writeAll("spore build: FROM image reference is not supported\n");
-        },
-        error.UnsupportedMultiStageDockerfile => {
-            try stderr.writeAll("spore build: the planned multi-stage operation is not supported\n");
-        },
-        error.MissingDockerfileFrom => {
-            try stderr.writeAll("spore build: Dockerfile must start from a supported FROM instruction\n");
-        },
-        error.UnsetBuildArg => {
-            try stderr.writeAll("spore build: variable substitution referenced an unset ARG or ENV value\n");
         },
         error.CopySourceEscapesContext => {
             try stderr.writeAll("spore build: COPY source escapes the build context\n");

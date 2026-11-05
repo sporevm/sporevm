@@ -624,7 +624,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             continue;
         }
         if (config.exec_control) |control| {
-            control.reportStats(monitorStats(if (dirty_tracker) |*tracker| tracker else null, config.root_blk_options.stats));
+            control.reportStats(monitorStats(if (dirty_tracker) |*tracker| tracker else null));
             switch (try control.poll(&vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
@@ -1321,7 +1321,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             continue;
         }
         if (options.config.exec_control) |control| {
-            control.reportStats(monitorStats(null, options.config.root_blk_options.stats));
+            control.reportStats(monitorStats(null));
             device_lock.lock();
             const action = control.poll(options.vsock_dev) catch |err| {
                 device_lock.unlock();
@@ -2301,29 +2301,13 @@ const DirtyTracker = struct {
     }
 };
 
-fn monitorStats(tracker: ?*DirtyTracker, root_blk_stats: ?*const blk.Stats) vsock.ControlStats {
+fn monitorStats(tracker: ?*DirtyTracker) vsock.ControlStats {
     var result = vsock.ControlStats{};
     if (tracker) |active| {
         result.chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount());
         result.dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending());
     }
-    if (root_blk_stats) |stats| mergeRootBlkStats(&result, stats.snapshot());
     return result;
-}
-
-fn mergeRootBlkStats(result: *vsock.ControlStats, snapshot_stats: blk.Stats.Snapshot) void {
-    result.accepted_features = snapshot_stats.accepted_features;
-    result.write_zeroes_requests = snapshot_stats.write_zeroes_requests;
-    result.write_zeroes_bytes = snapshot_stats.write_zeroes_bytes;
-    result.write_zeroes_unmap_requests = snapshot_stats.write_zeroes_unmap_requests;
-    result.write_zeroes_ok = snapshot_stats.write_zeroes_ok;
-    result.write_zeroes_errors = snapshot_stats.write_zeroes_errors;
-    result.write_zeroes_backend_failures = snapshot_stats.write_zeroes_backend_failures;
-    result.write_zeroes_unsupported = snapshot_stats.write_zeroes_unsupported;
-    result.out_requests = snapshot_stats.out_requests;
-    result.out_bytes = snapshot_stats.out_bytes;
-    result.out_all_zero_requests = snapshot_stats.out_all_zero_requests;
-    result.out_all_zero_bytes = snapshot_stats.out_all_zero_bytes;
 }
 
 fn logNamedSnapshotPublication(metrics: vsock.SnapshotPublishMetrics, pause_started_ns: u64) void {
@@ -2339,32 +2323,6 @@ fn logNamedSnapshotPublication(metrics: vsock.SnapshotPublishMetrics, pause_star
             vsock.SnapshotPublishMetrics.nsToMs(source_pause_ns),
         },
     );
-}
-
-test "monitor stats merge root block telemetry without replacing dirty RAM stats" {
-    var result = vsock.ControlStats{ .chunks_nonzero = 91, .dirty_chunks_pending = 92 };
-    mergeRootBlkStats(&result, .{
-        .accepted_features = 1,
-        .write_zeroes_requests = 2,
-        .write_zeroes_bytes = 3,
-        .write_zeroes_unmap_requests = 4,
-        .write_zeroes_ok = 5,
-        .write_zeroes_errors = 6,
-        .write_zeroes_backend_failures = 7,
-        .write_zeroes_unsupported = 8,
-        .out_requests = 9,
-        .out_bytes = 10,
-        .out_all_zero_requests = 11,
-        .out_all_zero_bytes = 12,
-    });
-
-    try std.testing.expectEqual(@as(?u64, 91), result.chunks_nonzero);
-    try std.testing.expectEqual(@as(?u64, 92), result.dirty_chunks_pending);
-    try std.testing.expectEqual(@as(?u64, 1), result.accepted_features);
-    try std.testing.expectEqual(@as(?u64, 5), result.write_zeroes_ok);
-    try std.testing.expectEqual(@as(?u64, 7), result.write_zeroes_backend_failures);
-    try std.testing.expectEqual(@as(?u64, 10), result.out_bytes);
-    try std.testing.expectEqual(@as(?u64, 12), result.out_all_zero_bytes);
 }
 
 fn materializeAllTransportQueues(pager: *lazy_ram.Pager, transports: []mmio.Transport) !void {
