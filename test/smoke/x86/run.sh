@@ -27,7 +27,7 @@ if [[ -n "${seed_dir}" ]]; then
   [[ -f "${kernel_path}" ]] || die "missing managed seed asset: ${kernel_path}"
 else
   kernel_path="$(env SPOREVM_KERNEL_ARCH=x86_64 SPOREVM_KERNEL_CACHE_DIR="${workdir}/board-kernel-cache" \
-    "${repo_root}/scripts/kernel/ensure-managed-kernel.sh" run)"
+    "${repo_root}/scripts/kernel/ensure-managed-kernel.sh")"
 fi
 
 # The frozen-board smoke proves generation acknowledgement, root block

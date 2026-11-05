@@ -4,26 +4,17 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage:
-  scripts/kernel/ensure-managed-kernel.sh run|sporevm|initrd|rootfs
+  scripts/kernel/ensure-managed-kernel.sh
 
-Resolve, download, cache, and verify the managed native Linux kernel from
-GitHub releases. Prints the absolute Image or bzImage path on stdout.
-
-Kinds:
-  run      SporeVM kernel with initrd, virtio-blk, ext4, and Docker runtime support
-  sporevm  Alias for run
-  initrd   cleanroom minimal initrd-profile kernel
-  rootfs   cleanroom minimal rootfs-profile kernel
+Resolve, download, cache, and verify the managed SporeVM kernel for this host
+from GitHub releases. Defaults come from src/managed_kernel.env. Prints the
+absolute Image or bzImage path on stdout.
 
 Environment:
   SPOREVM_KERNEL_IMAGE       explicit local Image path; skips download
-  SPOREVM_KERNEL_RELEASE     kernel release tag (run/sporevm default:
-                              src/managed_kernel.env; other kinds: v0.6.3)
-  SPOREVM_KERNEL_VERSION     Linux version (run/sporevm default:
-                              src/managed_kernel.env; other kinds: 6.1.155)
+  SPOREVM_KERNEL_RELEASE     kernel release tag override
+  SPOREVM_KERNEL_VERSION     Linux version override
   SPOREVM_KERNEL_REPOSITORY  GitHub repo override
-                              default: src/managed_kernel.env for run/sporevm,
-                              buildkite/cleanroom-kernels for initrd/rootfs
   SPOREVM_KERNEL_CACHE_DIR   cache directory override
 EOF
 }
@@ -152,7 +143,7 @@ verify_run_kernel_config() {
 verify_kernel() {
   local image="$1"
   local sha_file="$2"
-  local config_file="${3:-}"
+  local config_file="$3"
   [[ -f "${image}" && -f "${sha_file}" ]] || return 1
 
   local expected actual
@@ -160,15 +151,11 @@ verify_kernel() {
   [[ -n "${expected}" ]] || return 1
   actual="$(sha256_file "${image}")"
   [[ "${actual}" == "${expected}" ]] || return 1
-  if [[ "${kernel_arch}" == "x86_64" && "$(basename "${image}")" == sporevm-x86_64-* ]]; then
-    [[ "${actual}" == "${managed_kernel_x86_64_sha256}" ]] || {
-      echo "error: managed x86 kernel does not match the approved candidate digest" >&2
-      return 1
-    }
+  if [[ "${kernel_arch}" == "x86_64" && "${actual}" != "${managed_kernel_x86_64_sha256}" ]]; then
+    echo "error: managed x86 kernel does not match the approved candidate digest" >&2
+    return 1
   fi
-  if [[ -n "${config_file}" ]]; then
-    verify_run_kernel_config "${config_file}" || return 1
-  fi
+  verify_run_kernel_config "${config_file}"
 }
 
 download_asset() {
@@ -176,16 +163,11 @@ download_asset() {
   local release="$2"
   local asset="$3"
   local tmp_dir="$4"
-  local require_config="$5"
 
   if command -v gh >/dev/null 2>&1; then
-    local patterns=(--pattern "${asset}" --pattern "${asset}.sha256")
-    if [[ "${require_config}" == "1" ]]; then
-      patterns+=(--pattern "${asset}.config")
-    fi
     if GH_PROMPT_DISABLED=1 gh release download "${release}" \
       --repo "${repo}" \
-      "${patterns[@]}" \
+      --pattern "${asset}" --pattern "${asset}.sha256" --pattern "${asset}.config" \
       --dir "${tmp_dir}" \
       --clobber >/dev/null 2>&1; then
       return 0
@@ -194,20 +176,23 @@ download_asset() {
 
   command -v curl >/dev/null 2>&1 || return 1
   local base_url="https://github.com/${repo}/releases/download/${release}"
-  curl -fsSL --retry 3 "${base_url}/${asset}" -o "${tmp_dir}/${asset}"
-  curl -fsSL --retry 3 "${base_url}/${asset}.sha256" -o "${tmp_dir}/${asset}.sha256"
-  if [[ "${require_config}" == "1" ]]; then
-    curl -fsSL --retry 3 "${base_url}/${asset}.config" -o "${tmp_dir}/${asset}.config"
-  fi
+  local suffix
+  for suffix in "" .sha256 .config; do
+    curl -fsSL --retry 3 "${base_url}/${asset}${suffix}" -o "${tmp_dir}/${asset}${suffix}"
+  done
 }
 
-kind="${1:-}"
-if [[ -z "${kind}" || "${kind}" == "-h" || "${kind}" == "--help" ]]; then
-  usage
-  [[ -z "${kind}" ]] && exit 2 || exit 0
-fi
-shift
-[[ $# -eq 0 ]] || die "unexpected argument: $1"
+case "${1:-}" in
+  "") ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
 
 if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   [[ -f "${SPOREVM_KERNEL_IMAGE}" ]] || die "SPOREVM_KERNEL_IMAGE not found: ${SPOREVM_KERNEL_IMAGE}"
@@ -215,56 +200,24 @@ if [[ -n "${SPOREVM_KERNEL_IMAGE:-}" ]]; then
   exit 0
 fi
 
-linux_version="${SPOREVM_KERNEL_VERSION:-6.1.155}"
-repo="${SPOREVM_KERNEL_REPOSITORY:-}"
-default_release="v0.6.3"
-
-case "${kind}" in
-  run | sporevm)
-    repo="${repo:-${managed_kernel_repository}}"
-    linux_version="${SPOREVM_KERNEL_VERSION:-${managed_kernel_linux_version}}"
-    default_release="${managed_kernel_release}"
-    if [[ "${kernel_arch}" == "x86_64" ]]; then
-      asset="sporevm-x86_64-linux-${linux_version}-bzImage"
-    else
-      asset="sporevm-arm64-linux-${linux_version}-Image"
-    fi
-    ;;
-  initrd)
-    repo="${repo:-buildkite/cleanroom-kernels}"
-    asset="cleanroom-darwin-vz-minimal-initrd-arm64-linux-${linux_version}-Image"
-    ;;
-  rootfs)
-    repo="${repo:-buildkite/cleanroom-kernels}"
-    asset="cleanroom-darwin-vz-minimal-rootfs-arm64-linux-${linux_version}-Image"
-    ;;
-  *)
-    die "kernel kind must be run, sporevm, initrd, or rootfs"
-    ;;
-esac
-release="${SPOREVM_KERNEL_RELEASE:-${default_release}}"
-
-repo_cache="${repo//\//-}"
-dest_dir="$(cache_root)/${repo_cache}/${release}"
-dest="${dest_dir}/${asset}"
-sha_dest="${dest}.sha256"
-config_dest=""
-require_config=0
-if [[ "${kind}" == "run" || "${kind}" == "sporevm" ]]; then
-  config_dest="${dest}.config"
-  require_config=1
+repo="${SPOREVM_KERNEL_REPOSITORY:-${managed_kernel_repository}}"
+release="${SPOREVM_KERNEL_RELEASE:-${managed_kernel_release}}"
+linux_version="${SPOREVM_KERNEL_VERSION:-${managed_kernel_linux_version}}"
+if [[ "${kernel_arch}" == "x86_64" ]]; then
+  asset="sporevm-x86_64-linux-${linux_version}-bzImage"
+else
+  asset="sporevm-arm64-linux-${linux_version}-Image"
 fi
 
-if verify_kernel "${dest}" "${sha_dest}" "${config_dest}"; then
+dest_dir="$(cache_root)/${repo//\//-}/${release}"
+dest="${dest_dir}/${asset}"
+
+if verify_kernel "${dest}" "${dest}.sha256" "${dest}.config"; then
   abs_path "${dest}"
   exit 0
 fi
 
-if [[ -n "${config_dest}" ]]; then
-  rm -f "${dest}" "${sha_dest}" "${config_dest}"
-else
-  rm -f "${dest}" "${sha_dest}"
-fi
+rm -f "${dest}" "${dest}.sha256" "${dest}.config"
 mkdir -p "${dest_dir}"
 tmp_dir="$(mktemp -d "${dest_dir}/download.XXXXXX")"
 cleanup() {
@@ -273,16 +226,12 @@ cleanup() {
 trap cleanup EXIT
 
 echo "downloading managed kernel ${repo}@${release}:${asset}" >&2
-download_asset "${repo}" "${release}" "${asset}" "${tmp_dir}" "${require_config}" || die "failed to download ${asset} from ${repo}@${release}"
-verify_kernel "${tmp_dir}/${asset}" "${tmp_dir}/${asset}.sha256" "${config_dest:+${tmp_dir}/${asset}.config}" || die "verification failed for ${asset}"
+download_asset "${repo}" "${release}" "${asset}" "${tmp_dir}" || die "failed to download ${asset} from ${repo}@${release}"
+verify_kernel "${tmp_dir}/${asset}" "${tmp_dir}/${asset}.sha256" "${tmp_dir}/${asset}.config" || die "verification failed for ${asset}"
 
-mv "${tmp_dir}/${asset}" "${dest}"
-mv "${tmp_dir}/${asset}.sha256" "${sha_dest}"
-if [[ -n "${config_dest}" ]]; then
-  mv "${tmp_dir}/${asset}.config" "${config_dest}"
-  chmod 0444 "${dest}" "${sha_dest}" "${config_dest}" || true
-else
-  chmod 0444 "${dest}" "${sha_dest}" || true
-fi
+for suffix in "" .sha256 .config; do
+  mv "${tmp_dir}/${asset}${suffix}" "${dest}${suffix}"
+done
+chmod 0444 "${dest}" "${dest}.sha256" "${dest}.config" || true
 
 abs_path "${dest}"
