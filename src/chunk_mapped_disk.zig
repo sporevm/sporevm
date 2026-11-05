@@ -59,10 +59,6 @@ const DigestIndex = struct {
         return .{ .entries = try allocator.dupe(DigestEntry, index.chunks) };
     }
 
-    fn clone(self: DigestIndex, allocator: std.mem.Allocator) Error!DigestIndex {
-        return .{ .entries = try allocator.dupe(DigestEntry, self.entries) };
-    }
-
     fn deinit(self: *DigestIndex, allocator: std.mem.Allocator) void {
         if (self.entries.len != 0) allocator.free(self.entries);
         self.* = .{};
@@ -109,11 +105,6 @@ fn sourceIsDirty(source: Source) bool {
 }
 
 pub const ForkCloneMethod = runtime_disk_fork.CloneMethod;
-
-pub const ForkOptions = struct {
-    force_copy: bool = false,
-    quiesced: bool = false,
-};
 
 pub const ExportForkOptions = struct {
     allow_copy: bool = false,
@@ -187,20 +178,6 @@ const LazyCasTraceStats = struct {
 const LazyCasTrace = struct {
     fd: std.c.fd_t,
     stats: LazyCasTraceStats,
-};
-
-pub const ForkedDisk = struct {
-    disk: ChunkMappedDisk,
-    clone_method: ForkCloneMethod,
-
-    pub fn deinit(self: *ForkedDisk) void {
-        if (self.disk.overlay_fd) |fd| {
-            _ = std.c.close(fd);
-            self.disk.overlay_fd = null;
-        }
-        self.disk.deinit();
-        self.* = undefined;
-    }
 };
 
 pub const PreparedSnapshotRoot = struct {
@@ -372,19 +349,10 @@ pub const ChunkMappedDisk = struct {
         if (self.lazy_cas_trace) |*trace| trace.stats.runtime_open_ns = elapsed_ns;
     }
 
-    pub fn grow(self: *ChunkMappedDisk, new_size: u64) Error!void {
-        return self.growWithSource(new_size, .zero_dirty);
-    }
-
     /// Extends a private sparse disk with bytes whose zero value is already
-    /// authoritative from the storage layer. Unlike `grow`, a later snapshot
-    /// may reuse the appended coverage without reading or sealing it.
+    /// authoritative from the storage layer, so a later snapshot may reuse
+    /// the appended coverage without reading or sealing it.
     pub fn growKnownZero(self: *ChunkMappedDisk, new_size: u64) Error!void {
-        return self.growWithSource(new_size, .zero);
-    }
-
-    fn growWithSource(self: *ChunkMappedDisk, new_size: u64, appended_source: Source) Error!void {
-        std.debug.assert(appended_source == .zero or appended_source == .zero_dirty);
         const overlay_fd = self.overlay_fd orelse return error.ReadOnly;
         if (new_size < self.size) return error.BadDiskSize;
         if (new_size == self.size) return;
@@ -395,7 +363,7 @@ pub const ChunkMappedDisk = struct {
         const old_chunk_count = self.sources.len;
         const new_sources = try self.allocator.alloc(Source, @intCast(new_chunk_count));
         @memcpy(new_sources[0..old_chunk_count], self.sources);
-        @memset(new_sources[old_chunk_count..], appended_source);
+        @memset(new_sources[old_chunk_count..], .zero);
         errdefer self.allocator.free(new_sources);
 
         // A partial final chunk changes identity when its logical length grows:
@@ -410,10 +378,7 @@ pub const ChunkMappedDisk = struct {
             const tail_index = old_chunk_count - 1;
             const old_source = self.sources[tail_index];
             if (self.chunkKnownZero(tail_index)) {
-                new_sources[tail_index] = if (appended_source == .zero_dirty or old_source == .zero_dirty)
-                    .zero_dirty
-                else
-                    .zero;
+                new_sources[tail_index] = if (old_source == .zero_dirty) .zero_dirty else .zero;
             } else {
                 const tail_len = std.math.cast(usize, old_tail_len) orelse return error.BadClusterSize;
                 const tail = try self.allocator.alloc(u8, tail_len);
@@ -684,47 +649,6 @@ pub const ChunkMappedDisk = struct {
                 return error.FlushFailed;
             }
         }
-    }
-
-    /// Forks the mutable disk head. The caller must have paused the VM and
-    /// proven there are no in-flight virtio-blk requests before cloning the
-    /// source map and overlay fd; this primitive does not drain device queues.
-    pub fn fork(self: *ChunkMappedDisk, options: ForkOptions) Error!ForkedDisk {
-        std.debug.assert(options.quiesced);
-        if (self.isPoisoned()) return error.Poisoned;
-        const parent_fd = self.overlay_fd orelse return error.ReadOnly;
-        const child_sources = try self.allocator.dupe(Source, self.sources);
-        errdefer self.allocator.free(child_sources);
-        const child_index = try self.cloneIndexState();
-        errdefer child_index.deinit(self.allocator);
-        const child_overlay_dir = try self.allocator.dupe(u8, self.overlay_dir orelse return error.ReadOnly);
-        errdefer self.allocator.free(child_overlay_dir);
-        const child_pending_identity = if (self.pending_snapshot_identity) |identity| try self.allocator.dupe(u8, identity) else null;
-        errdefer if (child_pending_identity) |identity| self.allocator.free(identity);
-        const child_committed_identity = if (self.committed_snapshot_identity) |identity| try self.allocator.dupe(u8, identity) else null;
-        errdefer if (child_committed_identity) |identity| self.allocator.free(identity);
-
-        const cloned = try self.cloneOverlay(parent_fd, .{ .allow_copy = true, .force_copy = options.force_copy });
-        errdefer _ = std.c.close(cloned.fd);
-        return .{
-            .disk = .{
-                .allocator = self.allocator,
-                .base = self.base,
-                .overlay_fd = cloned.fd,
-                .overlay_dir = child_overlay_dir,
-                .size = self.size,
-                .chunk_size = self.chunk_size,
-                .sources = child_sources,
-                .cas_root = child_index.cas_root,
-                .digest_index = child_index.digest_index,
-                .parent_root = child_index.parent_root,
-                .parent_logical_size = child_index.parent_logical_size,
-                .pending_snapshot_identity = child_pending_identity,
-                .committed_snapshot_identity = child_committed_identity,
-                .snapshot_published = self.snapshot_published,
-            },
-            .clone_method = cloned.method,
-        };
     }
 
     /// Exports the process-independent portion of a live disk head. The
@@ -1455,19 +1379,6 @@ pub const ChunkMappedDisk = struct {
         self.parent_logical_size = 0;
     }
 
-    fn cloneIndexState(self: ChunkMappedDisk) Error!IndexClone {
-        const cas_root = if (self.cas_root) |root| try self.allocator.dupe(u8, root) else null;
-        errdefer if (cas_root) |root| self.allocator.free(root);
-        const parent_root = if (self.parent_root) |root| try self.allocator.dupe(u8, root) else null;
-        errdefer if (parent_root) |root| self.allocator.free(root);
-        return .{
-            .cas_root = cas_root,
-            .parent_root = parent_root,
-            .digest_index = try self.digest_index.clone(self.allocator),
-            .parent_logical_size = self.parent_logical_size,
-        };
-    }
-
     fn copyOverlayChunks(self: *ChunkMappedDisk, parent_fd: std.c.fd_t, child_fd: std.c.fd_t) Error!u64 {
         const overlay_size = std.math.cast(std.c.off_t, self.size) orelse return error.BadDiskSize;
         if (std.c.ftruncate(child_fd, overlay_size) != 0) return error.ResizeFailed;
@@ -1526,20 +1437,6 @@ const Span = struct {
     chunk_index: usize,
     chunk_offset: usize,
     len: usize,
-};
-
-const IndexClone = struct {
-    cas_root: ?[]const u8 = null,
-    parent_root: ?[]const u8 = null,
-    digest_index: DigestIndex = .{},
-    parent_logical_size: u64 = 0,
-
-    fn deinit(self: IndexClone, allocator: std.mem.Allocator) void {
-        if (self.cas_root) |root| allocator.free(root);
-        if (self.parent_root) |root| allocator.free(root);
-        var digest_index = self.digest_index;
-        digest_index.deinit(allocator);
-    }
 };
 
 const ParentClone = struct {
@@ -2222,7 +2119,7 @@ test "zero range clears a full lazy CAS chunk without fetching and rejects a cor
     try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
 }
 
-test "zero marking and growth advance dirty state" {
+test "zero marking advances dirty state" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -2242,18 +2139,16 @@ test "zero marking and growth advance dirty state" {
     defer overlay.close(io);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
-    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, chunk_size, chunk_size);
+    var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, chunk_size * 2, chunk_size);
     defer disk.deinit();
 
     const baseline = try disk.snapshotIndex(spore_dir, .{ .mmio_slot = 1 }, true);
     defer freeTestDisk(allocator, baseline);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
-    const baseline_id = disk.digest_index.get(0) orelse return error.TestExpectedEqual;
 
-    try disk.grow(chunk_size * 2);
-    try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
-    try std.testing.expect(baseline_id.eql(disk.digest_index.get(0) orelse return error.TestExpectedEqual));
     try disk.markZeroChunk(0);
+    try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
+    try disk.markZeroChunk(1);
     try std.testing.expectEqual(@as(usize, 2), disk.dirtyChunkCount());
     var zero_stats: SnapshotStats = .{};
     const grown = try disk.snapshotIndexWithStats(spore_dir, .{ .mmio_slot = 1 }, true, &zero_stats);
@@ -2663,25 +2558,19 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     try disk.writeAt(&patch_b, 5 * spore.disk_chunk_size + 41);
     @memcpy(model[5 * chunk_size + 41 ..][0..patch_b.len], &patch_b);
 
-    var fork_a = try disk.fork(.{ .force_copy = true, .quiesced = true });
-    defer fork_a.deinit();
-    try std.testing.expectEqual(disk.digest_index.entries.len, fork_a.disk.digest_index.entries.len);
-    try std.testing.expect(disk.digest_index.entries.ptr != fork_a.disk.digest_index.entries.ptr);
     const patch_c = [_]u8{0x5E} ** 211;
-    try fork_a.disk.writeAt(&patch_c, 73);
+    try disk.writeAt(&patch_c, 73);
     @memcpy(model[73..][0..patch_c.len], &patch_c);
 
-    var fork_b = try fork_a.disk.fork(.{ .force_copy = true, .quiesced = true });
-    defer fork_b.deinit();
     @memset(replacement, 0x6F);
-    try fork_b.disk.writeAt(replacement, 6 * spore.disk_chunk_size);
+    try disk.writeAt(replacement, 6 * spore.disk_chunk_size);
     @memcpy(model[6 * chunk_size ..][0..chunk_size], replacement);
 
-    const dirty_count = fork_b.disk.dirtyChunkCount();
-    try std.testing.expect(dirty_count < fork_b.disk.chunkCount());
+    const dirty_count = disk.dirtyChunkCount();
+    try std.testing.expect(dirty_count < disk.chunkCount());
 
     var snapshot_stats: SnapshotStats = .{};
-    const snapshot_disk = try fork_b.disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &snapshot_stats);
+    const snapshot_disk = try disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &snapshot_stats);
     defer freeTestDisk(allocator, snapshot_disk);
     try std.testing.expect(!snapshot_stats.full_scan);
     try std.testing.expectEqual(dirty_count, snapshot_stats.sealed_candidate_chunks);
@@ -2720,28 +2609,28 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     });
     const snapshot_index = try disk_index.parseDiskIndex(arena, snapshot_index_bytes, try spore.diskIndexDescriptorForStorage(snapshot_storage));
     defer snapshot_index.deinit();
-    try std.testing.expectEqual(snapshot_index.value.chunks.len, fork_b.disk.digest_index.entries.len);
+    try std.testing.expectEqual(snapshot_index.value.chunks.len, disk.digest_index.entries.len);
     try expectZeroChunk(snapshot_index.value, 1);
     try expectChunkId(snapshot_index.value, 2, try idForChunk(parent_index.value, 2));
-    try std.testing.expectEqual(@as(usize, 0), fork_b.disk.dirtyChunkCount());
-    try std.testing.expectEqual(Source.overlay_clean, fork_b.disk.sources[6]);
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
+    try std.testing.expectEqual(Source.overlay_clean, disk.sources[6]);
     var promoted_after_snapshot: [64]u8 = undefined;
     const promoted_offset = 6 * chunk_size + 123;
-    try fork_b.disk.readAt(&promoted_after_snapshot, @intCast(promoted_offset));
+    try disk.readAt(&promoted_after_snapshot, @intCast(promoted_offset));
     try std.testing.expectEqualSlices(u8, model[promoted_offset..][0..promoted_after_snapshot.len], &promoted_after_snapshot);
 
     const patch_d = [_]u8{0x71} ** 31;
-    try fork_b.disk.writeAt(&patch_d, 7 * spore.disk_chunk_size + 9);
+    try disk.writeAt(&patch_d, 7 * spore.disk_chunk_size + 9);
     @memcpy(model[7 * chunk_size + 9 ..][0..patch_d.len], &patch_d);
-    try std.testing.expectEqual(@as(usize, 1), fork_b.disk.dirtyChunkCount());
+    try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
 
     var second_stats: SnapshotStats = .{};
-    const second_snapshot_disk = try fork_b.disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &second_stats);
+    const second_snapshot_disk = try disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &second_stats);
     defer freeTestDisk(allocator, second_snapshot_disk);
     try std.testing.expect(!second_stats.full_scan);
     try std.testing.expectEqual(@as(usize, 1), second_stats.sealed_candidate_chunks);
     try std.testing.expectEqual(@as(u64, 1), second_stats.work.sealed_chunks);
-    try std.testing.expectEqual(@as(usize, 0), fork_b.disk.dirtyChunkCount());
+    try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = model });
     const second_full_preload = try rootfs_cas.preloadPath(io, arena, full_cache, full_path, spore.disk_chunk_size);
@@ -2788,7 +2677,7 @@ test "read only disk rejects writes" {
     try std.testing.expectEqualSlices(u8, &base_bytes, &readback);
 }
 
-test "read only disk rejects fork" {
+test "read only disk rejects fork head export" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2803,7 +2692,10 @@ test "read only disk rejects fork" {
     var disk = try ChunkMappedDisk.initReadOnly(std.testing.allocator, base_source, base_bytes.len, 512);
     defer disk.deinit();
 
-    try std.testing.expectError(error.ReadOnly, disk.fork(.{ .quiesced = true }));
+    try std.testing.expectError(error.ReadOnly, disk.exportForkHead(.{
+        .kind = .rootfs,
+        .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }, .{ .quiesced = true }));
 }
 
 test "cas index attach rejects incomplete coverage" {
@@ -2840,59 +2732,6 @@ test "cas index attach rejects incomplete coverage" {
     var readback: [1024]u8 = undefined;
     try disk.readAt(&readback, 0);
     try std.testing.expectEqualSlices(u8, &base_bytes, &readback);
-}
-
-test "forced-copy fork isolates parent and child overlays" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
-    defer base.close(io);
-    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
-    defer overlay.close(io);
-
-    var base_bytes: [1536]u8 = undefined;
-    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
-    var parent_model = base_bytes;
-    var child_model = base_bytes;
-    try base.writeStreamingAll(io, &base_bytes);
-
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
-    var disk = try ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
-    defer disk.deinit();
-
-    const first_parent_patch = [_]u8{0xA1} ** 48;
-    try disk.writeAt(&first_parent_patch, 480);
-    @memcpy(parent_model[480..][0..first_parent_patch.len], &first_parent_patch);
-    @memcpy(child_model[480..][0..first_parent_patch.len], &first_parent_patch);
-
-    var child = try disk.fork(.{ .force_copy = true, .quiesced = true });
-    defer child.deinit();
-
-    try std.testing.expectEqual(ForkCloneMethod.copy, child.clone_method);
-    try std.testing.expectEqual(disk.chunkCount(), child.disk.chunkCount());
-    try std.testing.expectEqual(disk.dirtyChunkCount(), child.disk.dirtyChunkCount());
-
-    var readback: [1536]u8 = undefined;
-    try child.disk.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, &child_model, &readback);
-
-    const second_parent_patch = [_]u8{0xB2} ** 32;
-    try disk.writeAt(&second_parent_patch, 32);
-    @memcpy(parent_model[32..][0..second_parent_patch.len], &second_parent_patch);
-
-    try child.disk.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, &child_model, &readback);
-
-    const child_patch = [_]u8{0xC3} ** 40;
-    try child.disk.writeAt(&child_patch, 512 + 24);
-    @memcpy(child_model[512 + 24 ..][0..child_patch.len], &child_patch);
-
-    try disk.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, &parent_model, &readback);
-    try child.disk.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, &child_model, &readback);
 }
 
 test "portable fork head round trips overlay and zero overrides" {
@@ -3036,11 +2875,6 @@ test "post-snapshot fast fork uses sealed baseline without native overlay clone"
     var prepared_root = try parent.prepareSnapshotRoot("unused-published-save");
     defer prepared_root.deinit();
     try parent.commitSnapshotRoot("snapshot-staging-root", &prepared_root, .shared_no_rebind);
-
-    var in_process_child = try parent.fork(.{ .force_copy = true, .quiesced = true });
-    defer in_process_child.deinit();
-    try std.testing.expect(in_process_child.disk.pending_snapshot_identity == null);
-    try std.testing.expectEqualStrings(snapshot.base, in_process_child.disk.committed_snapshot_identity.?);
 
     var head = try parent.exportForkHead(.{
         .kind = .rootfs,
@@ -3278,158 +3112,8 @@ test "8GiB native disk fork benchmark" {
     try std.testing.expect(batch_elapsed_ns < std.time.ns_per_s);
 }
 
-fn benchmarkRandomReads(disk: *ChunkMappedDisk, offsets: []const u64, buffer: []u8) !u64 {
-    const start_ns = try monotonicNs();
-    for (offsets) |offset| try disk.readAt(buffer, offset);
-    return (try monotonicNs()) - start_ns;
-}
-
-fn lessU64(_: void, lhs: u64, rhs: u64) bool {
-    return lhs < rhs;
-}
-
-fn p95(samples: []u64) u64 {
-    std.mem.sort(u64, samples, {}, lessU64);
-    return samples[(samples.len * 95 + 99) / 100 - 1];
-}
-
-test "32-generation disk fork benchmark keeps warm random reads flat" {
-    if (std.c.getenv("SPOREVM_DISK_FORK_BENCHMARK") == null) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const overlay_dir = benchmarkOverlayDir();
-    const disk_size: u64 = 64 * 1024 * 1024;
-    const logical_size: std.c.off_t = @intCast(disk_size);
-    const base_fd = try createTempOverlayFd(allocator, overlay_dir);
-    defer _ = std.c.close(base_fd);
-    if (std.c.ftruncate(base_fd, logical_size) != 0) return error.ResizeFailed;
-    const overlay_fd = try createTempOverlayFd(allocator, overlay_dir);
-    defer _ = std.c.close(overlay_fd);
-    if (std.c.ftruncate(overlay_fd, logical_size) != 0) return error.ResizeFailed;
-
-    const base_source = block_source.FileBlockSource.init(base_fd, disk_size);
-    var generation_zero = try ChunkMappedDisk.initWritableAt(allocator, base_source, overlay_fd, overlay_dir, disk_size, spore.disk_chunk_size);
-    defer generation_zero.deinit();
-    const fill = try allocator.alloc(u8, 1024 * 1024);
-    defer allocator.free(fill);
-    @memset(fill, 0xA5);
-    var fill_offset: u64 = 0;
-    while (fill_offset < disk_size) : (fill_offset += fill.len) {
-        try generation_zero.writeAt(fill, fill_offset);
-    }
-
-    var generations: [32]ForkedDisk = undefined;
-    var initialized: usize = 0;
-    defer {
-        var i = initialized;
-        while (i > 0) {
-            i -= 1;
-            generations[i].deinit();
-        }
-    }
-    var current = &generation_zero;
-    while (initialized < generations.len) : (initialized += 1) {
-        generations[initialized] = try current.fork(.{ .quiesced = true });
-        current = &generations[initialized].disk;
-    }
-
-    const offsets = try allocator.alloc(u64, 32768);
-    defer allocator.free(offsets);
-    var random: u64 = 0x9e3779b97f4a7c15;
-    for (offsets) |*offset| {
-        random = random *% 6364136223846793005 +% 1442695040888963407;
-        offset.* = (random % (disk_size / 4096)) * 4096;
-    }
-    var read_buffer: [4096]u8 = undefined;
-    _ = try benchmarkRandomReads(&generation_zero, offsets, &read_buffer);
-    _ = try benchmarkRandomReads(current, offsets, &read_buffer);
-
-    var generation_zero_samples: [21]u64 = undefined;
-    var generation_32_samples: [21]u64 = undefined;
-    for (0..generation_zero_samples.len) |i| {
-        if (i % 2 == 0) {
-            generation_zero_samples[i] = try benchmarkRandomReads(&generation_zero, offsets, &read_buffer);
-            generation_32_samples[i] = try benchmarkRandomReads(current, offsets, &read_buffer);
-        } else {
-            generation_32_samples[i] = try benchmarkRandomReads(current, offsets, &read_buffer);
-            generation_zero_samples[i] = try benchmarkRandomReads(&generation_zero, offsets, &read_buffer);
-        }
-    }
-    const generation_zero_p95 = p95(&generation_zero_samples);
-    const generation_32_p95 = p95(&generation_32_samples);
-    std.debug.print(
-        "disk-fork-benchmark random_reads=32768 generation=0 p95_ms={d:.3} generation=32 p95_ms={d:.3} ratio={d:.3}\n",
-        .{
-            @as(f64, @floatFromInt(generation_zero_p95)) / std.time.ns_per_ms,
-            @as(f64, @floatFromInt(generation_32_p95)) / std.time.ns_per_ms,
-            @as(f64, @floatFromInt(generation_32_p95)) / @as(f64, @floatFromInt(generation_zero_p95)),
-        },
-    );
-    try std.testing.expect(generation_32_p95 <= generation_zero_p95 + generation_zero_p95 / 10);
-}
-
 fn benchmarkOverlayDir() []const u8 {
     const raw = std.c.getenv("TMPDIR") orelse return runtime_overlay_dir;
     const dir = std.mem.span(raw);
     return if (dir.len == 0) runtime_overlay_dir else dir;
-}
-
-test "sequential forks keep a flat chunk map" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
-    defer base.close(io);
-    var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
-    defer overlay.close(io);
-
-    var base_bytes: [2048]u8 = undefined;
-    for (&base_bytes, 0..) |*byte, i| byte.* = @truncate((i * 29) + 11);
-    var parent_model = base_bytes;
-    var final_model = base_bytes;
-    try base.writeStreamingAll(io, &base_bytes);
-
-    const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
-    var disk = try ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
-    defer disk.deinit();
-
-    const parent_patch = [_]u8{0xD4} ** 64;
-    try disk.writeAt(&parent_patch, 700);
-    @memcpy(parent_model[700..][0..parent_patch.len], &parent_patch);
-    @memcpy(final_model[700..][0..parent_patch.len], &parent_patch);
-
-    var forks: [32]ForkedDisk = undefined;
-    var initialized: usize = 0;
-    defer {
-        var i = initialized;
-        while (i > 0) {
-            i -= 1;
-            forks[i].deinit();
-        }
-    }
-
-    var current: *ChunkMappedDisk = &disk;
-    while (initialized < forks.len) {
-        forks[initialized] = try current.fork(.{ .force_copy = true, .quiesced = true });
-        initialized += 1;
-        const forked = &forks[initialized - 1];
-        try std.testing.expectEqual(ForkCloneMethod.copy, forked.clone_method);
-        try std.testing.expectEqual(disk.chunkCount(), forked.disk.chunkCount());
-        try std.testing.expectEqual(@as(usize, 1), forked.disk.dirtyChunkCount());
-        current = &forked.disk;
-    }
-
-    var readback: [2048]u8 = undefined;
-    try current.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, &final_model, &readback);
-
-    const final_patch = [_]u8{0xE5} ** 96;
-    try current.writeAt(&final_patch, 1200);
-    @memcpy(final_model[1200..][0..final_patch.len], &final_patch);
-
-    try current.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, &final_model, &readback);
-    try disk.readAt(&readback, 0);
-    try std.testing.expectEqualSlices(u8, &parent_model, &readback);
 }

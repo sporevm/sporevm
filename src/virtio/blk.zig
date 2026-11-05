@@ -1133,7 +1133,16 @@ test "validated write zeroes backend failure poisons the mutable head" {
         error.Poisoned,
         disk.snapshotIndex("unused-poisoned-snapshot", .{ .mmio_slot = 1 }, true),
     );
-    try std.testing.expectError(error.Poisoned, disk.fork(.{ .quiesced = true }));
+    try std.testing.expectError(
+        error.Poisoned,
+        disk.exportForkHead(
+            .{
+                .kind = .rootfs,
+                .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+            .{ .quiesced = true },
+        ),
+    );
 }
 
 test "validated ordinary write failure poisons a partially mutated head" {
@@ -1186,7 +1195,6 @@ test "validated ordinary write failure poisons a partially mutated head" {
         error.Poisoned,
         disk.snapshotIndex("unused-out-poisoned-snapshot", .{ .mmio_slot = 1 }, true),
     );
-    try std.testing.expectError(error.Poisoned, disk.fork(.{ .quiesced = true }));
     try std.testing.expectError(
         error.Poisoned,
         disk.exportForkHead(
