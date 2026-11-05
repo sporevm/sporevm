@@ -28,17 +28,9 @@ description = "Run slow rootfs/ext4 conformance tests"
 run = "mise run build && scripts/spore-build-conformance.py --spore-bin zig-out/bin/spore"
 description = "Compare the landed spore build subset with BuildKit on small fixtures"
 
-[tasks."test:image-gateway-worker-conformance"]
-run = "mise run build:release && scripts/image-gateway-worker-conformance.py check --spore-bin zig-out/bin/spore --expected test/image-gateway/worker-conformance"
-description = "Verify native gateway conversion output against the cross-worker fixture"
-
-[tasks."test:image-gateway-authorization-conformance"]
-run = "python3 scripts/image-gateway-authorization-conformance.py test/image-gateway/object-authorization.json"
-description = "Verify repository-bound gateway object authorization fixtures"
-
-[tasks."test:image-gateway-transport-benchmark"]
-run = "scripts/benchmark/image-gateway-transport-test.py"
-description = "Verify image-gateway archive and missing-object benchmark accounting"
+[tasks."test:image-worker-conformance"]
+run = "mise run build:release && scripts/image-worker-conformance.py check --spore-bin zig-out/bin/spore --expected test/image/worker-conformance"
+description = "Verify native image conversion output against the cross-worker fixture"
 
 [tasks.check]
 run = "mise run test && mise run build && scripts/test/version.sh zig-out && git diff --check"

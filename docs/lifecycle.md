@@ -7,7 +7,7 @@ lifecycle and ownership rules:
 | --- | --- | --- |
 | Live VM | A running, named VM behind a host-local monitor | `create`, `exec`, `save`, `restore`, `spore vm fork`, `spore vm rm` |
 | Checkpoint (spore) | Saved machine and session state in a directory | `inspect`, `attach`, `run --from`, `spore checkpoint fork`, `spore checkpoint rm` |
-| Image | Application filesystem and OCI execution metadata, without machine state | `build`, `run --commit`, `image pull` |
+| Image | Application filesystem and OCI execution metadata, without machine state | `build`, `run --commit`, `image unpack` |
 | Bundle | Portable transport encoding for checkpoints and fork batches | `pack`, `unpack`, `push`, `pull`, `inspect-bundle` |
 
 Named lifecycle keeps a live VM behind one local monitor process so callers can

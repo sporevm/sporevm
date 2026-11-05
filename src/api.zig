@@ -11,7 +11,6 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
-const image_gateway_pull = @import("image_gateway_pull.zig");
 const image_archive = @import("image_archive.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
@@ -30,8 +29,6 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
 
-pub const ImageGatewayPullOptions = image_gateway_pull.PullOptions;
-pub const ImageGatewayPullResult = image_gateway_pull.PullResult;
 pub const ImageArchivePackOptions = image_archive.PackOptions;
 pub const ImageArchivePackResult = image_archive.PackResult;
 pub const ImageArchiveUnpackOptions = image_archive.UnpackOptions;
@@ -538,16 +535,6 @@ pub fn rootfsResolve(
     defer arena_state.deinit();
     const resolved = try rootfs_mod.resolveReference(init, arena_state.allocator(), options);
     return allocator.dupe(u8, resolved);
-}
-
-/// Pull and verify one platform image from an explicitly configured image
-/// gateway, then publish it into the ordinary local image cache.
-pub fn imageGatewayPull(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: ImageGatewayPullOptions,
-) !ImageGatewayPullResult {
-    return image_gateway_pull.pull(init, allocator, options);
 }
 
 /// Pack one complete local native image into an immutable transport archive.

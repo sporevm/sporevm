@@ -50,7 +50,15 @@ canonical native image closure and every BLAKE3 rootfs object, and publishes an
 ordinary local ref only after
 the complete image is installed. The archive carries no suspended machine
 state; existing top-level bundle `pack`, `push`, `pull`, and `unpack` commands
-remain reserved for saved spores.
+remain reserved for saved spores. `spore image pack` also accepts tags from
+`spore rootfs import-oci` or `import-tar` (SHA-256 local digests).
+`spore --json image pack` and
+`spore --json image unpack` now print their documented result documents
+instead of text.
+
+### Image gateway pull removed
+
+`spore image pull` (experimental since v0.15) is removed.
 
 ## v0.17.1
 

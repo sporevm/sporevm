@@ -1,11 +1,11 @@
-# buildkite-sporevm benchmark context
+# buildkite-sporevm image context
 
 This is the build context from local `buildkite-sporevm` commit
 `ad8967125968098b917090e49b6410dd5a6b19c5`, adapted to use a named OCI layout
-as its `base` build context for the image-gateway transport benchmark. The benchmark adds
-the generated dependency-image archives and DynamoDB Local distribution before
+as its `base` build context. The build script adds the generated
+dependency-image archives and DynamoDB Local distribution before
 building it; their immutable inputs and checksums live in
-`scripts/ci/image-gateway-buildkite-workload-benchmark.sh`.
+`scripts/build-buildkite-sporevm-image.sh`.
 
 The adapted files committed here have these SHA-256 digests:
 

@@ -6,7 +6,4 @@ cd "${repo_root}"
 
 python3 scripts/benchmark/parse-save-metrics.py --self-test
 python3 scripts/spore-build-conformance.py --self-test-schema
-python3 scripts/image-gateway-worker-conformance.py self-test
-python3 scripts/image-gateway-authorization-conformance.py --self-test
-python3 scripts/image-gateway-authorization-conformance.py test/image-gateway/object-authorization.json
-python3 scripts/benchmark/image-gateway-transport-test.py
+python3 scripts/image-worker-conformance.py self-test

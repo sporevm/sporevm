@@ -1,21 +1,20 @@
-//! Bounded, canonical image-manifest protocol and closure verification.
+//! Bounded, canonical native image manifest and closure verification.
 //!
 //! The manifest describes one platform-specific native image. This module is
 //! deliberately data-only: callers provide the manifest, config, and disk
-//! index bytes, so direct OCI imports and a future gateway share verification
-//! without acquiring network, cache, filesystem, or runtime dependencies.
+//! index bytes, so image transports share verification without acquiring
+//! network, cache, filesystem, or runtime dependencies.
 
 const std = @import("std");
 const disk_index = @import("disk_index.zig");
 const image = @import("image.zig");
-const gateway = @import("image_gateway.zig");
+const oci = @import("rootfs/oci.zig");
+const spore = @import("spore.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const image_manifest_kind = "spore-image-gateway-manifest-v1";
-pub const oci_source_kind = "oci-image";
 pub const max_image_manifest_bytes: usize = 64 * 1024;
 pub const max_config_blob_bytes: usize = 64 * 1024 * 1024;
-pub const max_reference_bytes: usize = 4096;
-pub const max_contract_value_bytes: usize = 256;
 
 pub const rootfs_device_kind = "virtio-mmio";
 pub const rootfs_device_role = "rootfs";
@@ -26,49 +25,22 @@ pub const rootfs_chunk_size: u64 = 64 * 1024;
 pub const rootfs_hash_algorithm = "blake3";
 pub const rootfs_object_namespace = "rootfs/blake3";
 
+pub const Error = error{
+    BadProtocol,
+    OutOfMemory,
+};
+
 pub const ConfigBlobDescriptor = struct {
     transport_digest: []const u8,
     config_digest: []const u8,
     bytes: u64,
 };
 
-pub const RootfsDevice = struct {
-    kind: []const u8,
-    role: []const u8,
-    virtio_device_id: u32,
-    mmio_slot: u32,
-};
-
-pub const RootfsStorage = struct {
-    kind: []const u8,
-    device: RootfsDevice,
-    logical_size: u64,
-    chunk_size: u64,
-    hash_algorithm: []const u8,
-    index_digest: []const u8,
-    base_identity: []const u8,
-    object_namespace: []const u8,
-};
-
-pub const GatewayImage = struct {
+pub const ManifestImage = struct {
     digest: []const u8,
-    platform: gateway.Platform,
+    platform: oci.Platform,
     config_blob: ConfigBlobDescriptor,
-    rootfs_storage: RootfsStorage,
-};
-
-pub const ConversionContract = struct {
-    rootfs_builder: []const u8,
-    ext4_writer: []const u8,
-};
-
-pub const OciSource = struct {
-    kind: []const u8,
-    requested_ref: []const u8,
-    resolved_ref: []const u8,
-    source_index_digest: []const u8,
-    selected_manifest_digest: []const u8,
-    conversion_contract: ConversionContract,
+    rootfs_storage: spore.RootfsStorage,
 };
 
 pub const RootfsIndexDescriptor = struct {
@@ -80,8 +52,7 @@ pub const RootfsIndexDescriptor = struct {
 
 pub const ImageManifest = struct {
     kind: []const u8,
-    image: GatewayImage,
-    source: ?OciSource = null,
+    image: ManifestImage,
     rootfs_index: RootfsIndexDescriptor,
 };
 
@@ -101,7 +72,7 @@ pub const EncodedImageManifest = struct {
 pub fn parseImageManifest(
     allocator: std.mem.Allocator,
     bytes: []const u8,
-) gateway.Error!std.json.Parsed(ImageManifest) {
+) Error!std.json.Parsed(ImageManifest) {
     if (bytes.len == 0 or bytes.len > max_image_manifest_bytes) return error.BadProtocol;
     const parsed = std.json.parseFromSlice(ImageManifest, allocator, bytes, .{
         .allocate = .alloc_always,
@@ -122,23 +93,23 @@ pub fn parseImageManifest(
 pub fn encodeImageManifestAlloc(
     allocator: std.mem.Allocator,
     manifest: ImageManifest,
-) gateway.Error!EncodedImageManifest {
+) Error!EncodedImageManifest {
     const bytes = try canonicalImageManifestAlloc(allocator, manifest);
     errdefer allocator.free(bytes);
     return .{
         .bytes = bytes,
-        .transport_digest = try gateway.transportDigestAlloc(allocator, bytes),
+        .transport_digest = try transportDigestAlloc(allocator, bytes),
     };
 }
 
-pub fn validateImageManifest(manifest: ImageManifest) gateway.Error!void {
+pub fn validateImageManifest(manifest: ImageManifest) Error!void {
     if (!std.mem.eql(u8, manifest.kind, image_manifest_kind)) return error.BadProtocol;
     if (!std.mem.eql(u8, manifest.image.platform.os, "linux")) return error.BadProtocol;
-    try gateway.validateDigest(manifest.image.digest, "blake3:");
+    try validateDigest(manifest.image.digest, "blake3:");
 
     const config = manifest.image.config_blob;
-    try gateway.validateDigest(config.transport_digest, "sha256:");
-    try gateway.validateDigest(config.config_digest, "blake3:");
+    try validateDigest(config.transport_digest, "sha256:");
+    try validateDigest(config.config_digest, "blake3:");
     if (config.bytes == 0 or config.bytes > max_config_blob_bytes) return error.BadProtocol;
 
     const storage = manifest.image.rootfs_storage;
@@ -151,48 +122,42 @@ pub fn validateImageManifest(manifest: ImageManifest) gateway.Error!void {
         storage.chunk_size != rootfs_chunk_size or
         !std.mem.eql(u8, storage.hash_algorithm, rootfs_hash_algorithm) or
         !std.mem.eql(u8, storage.object_namespace, rootfs_object_namespace)) return error.BadProtocol;
-    try gateway.validateDigest(storage.index_digest, "blake3:");
+    try validateDigest(storage.index_digest, "blake3:");
     if (!std.mem.eql(u8, storage.base_identity, storage.index_digest)) return error.BadProtocol;
 
     const index = manifest.rootfs_index;
-    try gateway.validateDigest(index.digest, "blake3:");
+    try validateDigest(index.digest, "blake3:");
     if (!std.mem.eql(u8, index.digest, storage.index_digest) or
         index.bytes == 0 or index.bytes > disk_index.max_index_bytes or
         index.object_bytes > storage.logical_size) return error.BadProtocol;
     const chunk_count = std.math.divCeil(u64, storage.logical_size, storage.chunk_size) catch return error.BadProtocol;
     if (index.object_count > chunk_count) return error.BadProtocol;
-
-    if (manifest.source) |source| try validateOciSource(source);
 }
 
-/// Verify all bytes selected by a platform-index descriptor and return the
-/// owned parsed manifest. Success proves transport digests, canonical native
-/// config, disk-index integrity and summary, platform, and native image identity.
-pub fn verifySelectedImageManifest(
+/// Verify the manifest named by `expected_manifest_digest` and its complete
+/// closure, and return the owned parsed manifest. Success proves transport
+/// digests, platform, canonical native config, disk-index integrity and
+/// summary, and native image identity.
+pub fn verifyImageManifest(
     allocator: std.mem.Allocator,
-    selected: gateway.ManifestDescriptor,
-    expected_source_index_digest: ?[]const u8,
+    expected_manifest_digest: []const u8,
+    platform: oci.Platform,
     manifest_bytes: []const u8,
     canonical_config_bytes: []const u8,
     rootfs_index_bytes: []const u8,
-) gateway.Error!std.json.Parsed(ImageManifest) {
+) Error!std.json.Parsed(ImageManifest) {
     var parsed = try parseImageManifest(allocator, manifest_bytes);
     errdefer parsed.deinit();
     const manifest = parsed.value;
 
-    const manifest_digest = try gateway.transportDigestAlloc(allocator, manifest_bytes);
+    const manifest_digest = try transportDigestAlloc(allocator, manifest_bytes);
     defer allocator.free(manifest_digest);
-    if (!std.mem.eql(u8, manifest_digest, selected.manifest_digest) or
-        !selected.platform.eql(manifest.image.platform) or
-        !std.mem.eql(u8, selected.image_digest, manifest.image.digest)) return error.BadProtocol;
-    if (expected_source_index_digest) |expected| {
-        try gateway.validateDigest(expected, "sha256:");
-        const source = manifest.source orelse return error.BadProtocol;
-        if (!std.mem.eql(u8, expected, source.source_index_digest)) return error.BadProtocol;
-    } else if (manifest.source != null) return error.BadProtocol;
+    if (!std.mem.eql(u8, manifest_digest, expected_manifest_digest) or
+        !std.mem.eql(u8, platform.os, manifest.image.platform.os) or
+        platform.arch != manifest.image.platform.arch) return error.BadProtocol;
 
     if (canonical_config_bytes.len != manifest.image.config_blob.bytes) return error.BadProtocol;
-    const config_transport = try gateway.transportDigestAlloc(allocator, canonical_config_bytes);
+    const config_transport = try transportDigestAlloc(allocator, canonical_config_bytes);
     defer allocator.free(config_transport);
     if (!std.mem.eql(u8, config_transport, manifest.image.config_blob.transport_digest)) return error.BadProtocol;
 
@@ -225,7 +190,7 @@ pub fn verifySelectedImageManifest(
     return parsed;
 }
 
-fn canonicalImageManifestAlloc(allocator: std.mem.Allocator, manifest: ImageManifest) gateway.Error![]u8 {
+fn canonicalImageManifestAlloc(allocator: std.mem.Allocator, manifest: ImageManifest) Error![]u8 {
     try validateImageManifest(manifest);
     const bytes = std.json.Stringify.valueAlloc(allocator, manifest, .{
         .whitespace = .indent_2,
@@ -248,6 +213,24 @@ pub fn parseCanonicalConfig(allocator: std.mem.Allocator, bytes: []const u8) !st
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, bytes, canonical)) return error.BadProtocol;
     return parsed;
+}
+
+pub fn validateDigest(digest: []const u8, prefix: []const u8) Error!void {
+    if (!std.mem.startsWith(u8, digest, prefix)) return error.BadProtocol;
+    const hex = digest[prefix.len..];
+    if (hex.len != 64) return error.BadProtocol;
+    for (hex) |byte| {
+        if ((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f')) continue;
+        return error.BadProtocol;
+    }
+}
+
+/// Name exact canonical bytes by their lowercase SHA-256 transport digest.
+pub fn transportDigestAlloc(allocator: std.mem.Allocator, bytes: []const u8) Error![]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex}) catch return error.OutOfMemory;
 }
 
 const ObjectSummary = struct {
@@ -274,36 +257,7 @@ fn objectSummary(allocator: std.mem.Allocator, index: disk_index.DiskIndex) !Obj
     return .{ .count = @intCast(seen.count()), .bytes = total };
 }
 
-fn validateOciSource(source: OciSource) gateway.Error!void {
-    if (!std.mem.eql(u8, source.kind, oci_source_kind)) return error.BadProtocol;
-    try validateBoundedValue(source.requested_ref, max_reference_bytes);
-    try validateBoundedValue(source.resolved_ref, max_reference_bytes);
-    try gateway.validateDigest(source.source_index_digest, "sha256:");
-    try gateway.validateDigest(source.selected_manifest_digest, "sha256:");
-    const at = std.mem.lastIndexOfScalar(u8, source.resolved_ref, '@') orelse return error.BadProtocol;
-    if (at == 0 or !std.mem.eql(u8, source.resolved_ref[at + 1 ..], source.selected_manifest_digest)) return error.BadProtocol;
-    try validateContractValue(source.conversion_contract.rootfs_builder);
-    try validateContractValue(source.conversion_contract.ext4_writer);
-}
-
-fn validateBoundedValue(value: []const u8, max: usize) gateway.Error!void {
-    if (value.len == 0 or value.len > max) return error.BadProtocol;
-    for (value) |byte| {
-        if (byte < 0x21 or byte > 0x7e) return error.BadProtocol;
-    }
-}
-
-fn validateContractValue(value: []const u8) gateway.Error!void {
-    if (value.len == 0 or value.len > max_contract_value_bytes) return error.BadProtocol;
-    for (value) |byte| {
-        if ((byte >= 'a' and byte <= 'z') or
-            (byte >= '0' and byte <= '9') or
-            byte == '.' or byte == '_' or byte == '-') continue;
-        return error.BadProtocol;
-    }
-}
-
-fn mapProtocolError(err: anyerror) gateway.Error {
+fn mapProtocolError(err: anyerror) Error {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.BadProtocol;
 }
 
@@ -315,147 +269,108 @@ fn canonicalFixtureBytes(bytes: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, bytes, "\n")) bytes[0 .. bytes.len - 1] else bytes;
 }
 
+const arm64_manifest_digest = "sha256:b657390a5d37e2f098694027575d44fee3e235d64d6ffa630c995d9be54a01ca";
+
 fn verifyFixture(
     allocator: std.mem.Allocator,
     manifest_path: []const u8,
     config_path: []const u8,
-    platform: gateway.Platform,
+    platform: oci.Platform,
     manifest_digest: []const u8,
     image_digest: []const u8,
-    expected_source_index_digest: ?[]const u8,
 ) !void {
     const manifest_storage = try readFixtureAlloc(allocator, manifest_path, max_image_manifest_bytes);
     defer allocator.free(manifest_storage);
     const config_storage = try readFixtureAlloc(allocator, config_path, max_config_blob_bytes);
     defer allocator.free(config_storage);
-    const index_storage = try readFixtureAlloc(allocator, "test/image-gateway/rootfs-index.json", disk_index.max_index_bytes);
+    const index_storage = try readFixtureAlloc(allocator, "test/image/rootfs-index.json", disk_index.max_index_bytes);
     defer allocator.free(index_storage);
     const manifest_bytes = canonicalFixtureBytes(manifest_storage);
     const config_bytes = canonicalFixtureBytes(config_storage);
     const index_bytes = canonicalFixtureBytes(index_storage);
 
-    var parsed = try verifySelectedImageManifest(allocator, .{
-        .platform = platform,
-        .manifest_digest = manifest_digest,
-        .image_digest = image_digest,
-    }, expected_source_index_digest, manifest_bytes, config_bytes, index_bytes);
+    var parsed = try verifyImageManifest(allocator, manifest_digest, platform, manifest_bytes, config_bytes, index_bytes);
     defer parsed.deinit();
+    try std.testing.expectEqualStrings(image_digest, parsed.value.image.digest);
     const encoded = try encodeImageManifestAlloc(allocator, parsed.value);
     defer encoded.deinit(allocator);
     try std.testing.expectEqualStrings(manifest_bytes, encoded.bytes);
     try std.testing.expectEqualStrings(manifest_digest, encoded.transport_digest);
 }
 
-test "arm64 and amd64 OCI image-manifest fixtures verify complete closure" {
+test "arm64 and amd64 image-manifest fixtures verify complete closure" {
     const allocator = std.testing.allocator;
     try verifyFixture(
         allocator,
-        "test/image-gateway/image-manifest-arm64.json",
-        "test/image-gateway/config-arm64.json",
+        "test/image/image-manifest-arm64.json",
+        "test/image/config-arm64.json",
         .{ .os = "linux", .arch = .arm64 },
-        "sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda",
+        arm64_manifest_digest,
         "blake3:792e35d2abe3a9155e79ae1e57bdedffaefe9be673852eda44e87297e8ddbcca",
-        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     );
     try verifyFixture(
         allocator,
-        "test/image-gateway/image-manifest-amd64.json",
-        "test/image-gateway/config-amd64.json",
+        "test/image/image-manifest-amd64.json",
+        "test/image/config-amd64.json",
         .{ .os = "linux", .arch = .amd64 },
-        "sha256:b887a80189c8b9c46f77e645ab0631f705b80ef5daf09168597eb0d3e6fd5431",
+        "sha256:5204bf7ae314b9ec88c9650b445d505d5e044a577794cafd7ba927a3377f6727",
         "blake3:8817e359af38ba3e65881b4ccd3c68e387ffbfe0eb59cc1c79146657d7b2fe4c",
-        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    );
-}
-
-test "native image-manifest fixture omits OCI provenance without changing image identity" {
-    const allocator = std.testing.allocator;
-    try verifyFixture(
-        allocator,
-        "test/image-gateway/image-manifest-native.json",
-        "test/image-gateway/config-arm64.json",
-        .{ .os = "linux", .arch = .arm64 },
-        "sha256:b657390a5d37e2f098694027575d44fee3e235d64d6ffa630c995d9be54a01ca",
-        "blake3:792e35d2abe3a9155e79ae1e57bdedffaefe9be673852eda44e87297e8ddbcca",
-        null,
     );
 }
 
 test "image-manifest verification rejects broken closure" {
     const allocator = std.testing.allocator;
-    const manifest_storage = try readFixtureAlloc(allocator, "test/image-gateway/image-manifest-arm64.json", max_image_manifest_bytes);
+    const manifest_storage = try readFixtureAlloc(allocator, "test/image/image-manifest-arm64.json", max_image_manifest_bytes);
     defer allocator.free(manifest_storage);
-    const config_storage = try readFixtureAlloc(allocator, "test/image-gateway/config-arm64.json", max_config_blob_bytes);
+    const config_storage = try readFixtureAlloc(allocator, "test/image/config-arm64.json", max_config_blob_bytes);
     defer allocator.free(config_storage);
-    const index_storage = try readFixtureAlloc(allocator, "test/image-gateway/rootfs-index.json", disk_index.max_index_bytes);
+    const index_storage = try readFixtureAlloc(allocator, "test/image/rootfs-index.json", disk_index.max_index_bytes);
     defer allocator.free(index_storage);
     const manifest_bytes = canonicalFixtureBytes(manifest_storage);
     const config_bytes = canonicalFixtureBytes(config_storage);
     const index_bytes = canonicalFixtureBytes(index_storage);
-    const selected = gateway.ManifestDescriptor{
-        .platform = .{ .os = "linux", .arch = .arm64 },
-        .manifest_digest = "sha256:229c1e468922537a038b629378ab49b0e7354d10cb5a217d783b221f9fb44eda",
-        .image_digest = "blake3:792e35d2abe3a9155e79ae1e57bdedffaefe9be673852eda44e87297e8ddbcca",
-    };
+    const arm64 = oci.Platform{ .os = "linux", .arch = .arm64 };
 
-    var wrong_descriptor = selected;
-    wrong_descriptor.manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const source_index_digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, wrong_descriptor, source_index_digest, manifest_bytes, config_bytes, index_bytes));
-    wrong_descriptor = selected;
-    wrong_descriptor.platform.arch = .amd64;
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, wrong_descriptor, source_index_digest, manifest_bytes, config_bytes, index_bytes));
-    wrong_descriptor = selected;
-    wrong_descriptor.image_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, wrong_descriptor, source_index_digest, manifest_bytes, config_bytes, index_bytes));
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, selected, null, manifest_bytes, config_bytes, index_bytes));
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, selected, "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", manifest_bytes, config_bytes, index_bytes));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(allocator, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", arm64, manifest_bytes, config_bytes, index_bytes));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(allocator, arm64_manifest_digest, .{ .os = "linux", .arch = .amd64 }, manifest_bytes, config_bytes, index_bytes));
 
     const bad_config = try allocator.dupe(u8, config_bytes);
     defer allocator.free(bad_config);
     bad_config[17] = 'x';
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, selected, source_index_digest, manifest_bytes, bad_config, index_bytes));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(allocator, arm64_manifest_digest, arm64, manifest_bytes, bad_config, index_bytes));
 
     const bad_index = try allocator.dupe(u8, index_bytes);
     defer allocator.free(bad_index);
     bad_index[bad_index.len - 3] = '1';
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, selected, source_index_digest, manifest_bytes, config_bytes, bad_index));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(allocator, arm64_manifest_digest, arm64, manifest_bytes, config_bytes, bad_index));
 
     var parsed = try parseImageManifest(allocator, manifest_bytes);
     defer parsed.deinit();
     parsed.value.rootfs_index.object_bytes -= 1;
     const inconsistent = try encodeImageManifestAlloc(allocator, parsed.value);
     defer inconsistent.deinit(allocator);
-    const inconsistent_selected = gateway.ManifestDescriptor{
-        .platform = selected.platform,
-        .manifest_digest = inconsistent.transport_digest,
-        .image_digest = selected.image_digest,
-    };
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, inconsistent_selected, source_index_digest, inconsistent.bytes, config_bytes, index_bytes));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(allocator, inconsistent.transport_digest, arm64, inconsistent.bytes, config_bytes, index_bytes));
 
     parsed.value.rootfs_index.object_bytes += 1;
     parsed.value.rootfs_index.object_count -= 1;
     const wrong_count = try encodeImageManifestAlloc(allocator, parsed.value);
     defer wrong_count.deinit(allocator);
-    wrong_descriptor = selected;
-    wrong_descriptor.manifest_digest = wrong_count.transport_digest;
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, wrong_descriptor, source_index_digest, wrong_count.bytes, config_bytes, index_bytes));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(allocator, wrong_count.transport_digest, arm64, wrong_count.bytes, config_bytes, index_bytes));
 
     parsed.value.rootfs_index.object_count += 1;
     parsed.value.rootfs_index.bytes += 1;
     const wrong_index_bytes = try encodeImageManifestAlloc(allocator, parsed.value);
     defer wrong_index_bytes.deinit(allocator);
-    wrong_descriptor.manifest_digest = wrong_index_bytes.transport_digest;
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, wrong_descriptor, source_index_digest, wrong_index_bytes.bytes, config_bytes, index_bytes));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(allocator, wrong_index_bytes.transport_digest, arm64, wrong_index_bytes.bytes, config_bytes, index_bytes));
 }
 
 test "image-manifest verification rejects config and manifest architecture confusion" {
     const allocator = std.testing.allocator;
-    const manifest_storage = try readFixtureAlloc(allocator, "test/image-gateway/image-manifest-amd64.json", max_image_manifest_bytes);
+    const manifest_storage = try readFixtureAlloc(allocator, "test/image/image-manifest-amd64.json", max_image_manifest_bytes);
     defer allocator.free(manifest_storage);
-    const config_storage = try readFixtureAlloc(allocator, "test/image-gateway/config-amd64.json", max_config_blob_bytes);
+    const config_storage = try readFixtureAlloc(allocator, "test/image/config-amd64.json", max_config_blob_bytes);
     defer allocator.free(config_storage);
-    const index_storage = try readFixtureAlloc(allocator, "test/image-gateway/rootfs-index.json", disk_index.max_index_bytes);
+    const index_storage = try readFixtureAlloc(allocator, "test/image/rootfs-index.json", disk_index.max_index_bytes);
     defer allocator.free(index_storage);
     const config_bytes = canonicalFixtureBytes(config_storage);
     const index_bytes = canonicalFixtureBytes(index_storage);
@@ -465,11 +380,14 @@ test "image-manifest verification rejects config and manifest architecture confu
     parsed.value.image.platform.arch = .arm64;
     const confused = try encodeImageManifestAlloc(allocator, parsed.value);
     defer confused.deinit(allocator);
-    try std.testing.expectError(error.BadProtocol, verifySelectedImageManifest(allocator, .{
-        .platform = .{ .os = "linux", .arch = .arm64 },
-        .manifest_digest = confused.transport_digest,
-        .image_digest = parsed.value.image.digest,
-    }, "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", confused.bytes, config_bytes, index_bytes));
+    try std.testing.expectError(error.BadProtocol, verifyImageManifest(
+        allocator,
+        confused.transport_digest,
+        .{ .os = "linux", .arch = .arm64 },
+        confused.bytes,
+        config_bytes,
+        index_bytes,
+    ));
 }
 
 test "rootfs object summary counts unique immutable objects" {
@@ -495,7 +413,7 @@ test "rootfs object summary counts unique immutable objects" {
 
 test "image-manifest parser and schema bounds fail closed" {
     const allocator = std.testing.allocator;
-    const manifest_storage = try readFixtureAlloc(allocator, "test/image-gateway/image-manifest-arm64.json", max_image_manifest_bytes);
+    const manifest_storage = try readFixtureAlloc(allocator, "test/image/image-manifest-arm64.json", max_image_manifest_bytes);
     defer allocator.free(manifest_storage);
     const manifest_bytes = canonicalFixtureBytes(manifest_storage);
     const trailing = try std.mem.concat(allocator, u8, &.{ manifest_bytes, "\n" });
@@ -530,8 +448,8 @@ test "image-manifest parser and schema bounds fail closed" {
 
     const invalid_utf8 = try allocator.dupe(u8, manifest_bytes);
     defer allocator.free(invalid_utf8);
-    const requested_ref = std.mem.indexOf(u8, invalid_utf8, "registry.example") orelse unreachable;
-    invalid_utf8[requested_ref] = 0xff;
+    const storage_kind = std.mem.indexOf(u8, invalid_utf8, "chunked-ext4") orelse unreachable;
+    invalid_utf8[storage_kind] = 0xff;
     try std.testing.expectError(error.BadProtocol, parseImageManifest(allocator, invalid_utf8));
 
     const oversized = try allocator.alloc(u8, max_image_manifest_bytes + 1);
@@ -544,24 +462,14 @@ test "image-manifest parser and schema bounds fail closed" {
     parsed.value.image.rootfs_storage.device.mmio_slot = 2;
     try std.testing.expectError(error.BadProtocol, validateImageManifest(parsed.value));
     parsed.value.image.rootfs_storage.device.mmio_slot = rootfs_mmio_slot;
-    parsed.value.source.?.resolved_ref = "registry.example/spore/demo:latest";
-    try std.testing.expectError(error.BadProtocol, validateImageManifest(parsed.value));
-    parsed.value.source.?.resolved_ref = "registry.example/spore/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     parsed.value.image.rootfs_storage.base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try std.testing.expectError(error.BadProtocol, validateImageManifest(parsed.value));
     parsed.value.image.rootfs_storage.base_identity = parsed.value.image.rootfs_storage.index_digest;
     parsed.value.rootfs_index.digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try std.testing.expectError(error.BadProtocol, validateImageManifest(parsed.value));
-    parsed.value.rootfs_index.digest = parsed.value.image.rootfs_storage.index_digest;
-    parsed.value.source.?.requested_ref = "registry.example/spore/demo:latest\nforged";
-    try std.testing.expectError(error.BadProtocol, validateImageManifest(parsed.value));
-    parsed.value.source.?.requested_ref = "registry.example/spore/demo:latest";
-    parsed.value.source.?.conversion_contract.ext4_writer = "Native";
-    try std.testing.expectError(error.BadProtocol, validateImageManifest(parsed.value));
 }
 
-test "gateway rootfs wire constants match the native storage contract" {
-    const spore = @import("spore.zig");
+test "image-manifest rootfs wire constants match the native storage contract" {
     try std.testing.expectEqualStrings(spore.rootfs_device_kind_virtio_mmio, rootfs_device_kind);
     try std.testing.expectEqualStrings(spore.rootfs_device_role, rootfs_device_role);
     try std.testing.expectEqual(spore.rootfs_virtio_blk_device_id, rootfs_device_id);
@@ -578,7 +486,7 @@ fn fuzzImageManifestParse(_: void, smith: *std.testing.Smith) !void {
     parsed.deinit();
 }
 
-test "fuzz gateway image-manifest parser" {
+test "fuzz image-manifest parser" {
     try std.testing.fuzz({}, fuzzImageManifestParse, .{});
 }
 
@@ -589,6 +497,6 @@ fn fuzzCanonicalConfigParse(_: void, smith: *std.testing.Smith) !void {
     parsed.deinit();
 }
 
-test "fuzz gateway canonical-config parser" {
+test "fuzz canonical image-config parser" {
     try std.testing.fuzz({}, fuzzCanonicalConfigParse, .{});
 }
