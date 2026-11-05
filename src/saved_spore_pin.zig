@@ -995,7 +995,7 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
     const save = try std.fs.path.join(allocator, &.{ root, "staged.spore" });
     defer allocator.free(save);
     try Io.Dir.cwd().createDirPath(io, save);
-    const zero_chunks = [_]u64{0};
+    const zero_ranges = [_]disk_index.DiskIndexZeroRange{.{ .start = 0, .count = 1 }};
     const index = disk_index.DiskIndex{
         .kind = disk_index.disk_index_kind,
         .logical_size = spore.disk_chunk_size,
@@ -1003,7 +1003,7 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
         .chunks = &.{},
-        .zero_chunks = &zero_chunks,
+        .zero_ranges = &zero_ranges,
     };
     const encoded = try disk_index.encodeCanonicalAlloc(allocator, index);
     defer allocator.free(encoded.bytes);

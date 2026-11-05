@@ -44,26 +44,28 @@ the requested amount is satisfied.
 
 ## Manifest Authority
 
-`manifest.memory` records fixed-size BLAKE3-addressed chunks as the same sparse
-index shape used for disk data. `chunks` contains sorted nonzero entries with
-`logical_chunk` and `digest`; `zero_chunks` lists sorted all-zero logical chunk
-numbers. RAM uses 2MiB chunks and the `memory/blake3` namespace. Every nonzero
-chunk loaded from disk, a bundle, a cache, S3, or HTTP(S) is verified against
-its digest before guest use.
+`manifest.memory` records fixed-size BLAKE3-addressed chunks in the
+`spore-disk-index-v2` encoding used for disk data. Each `chunk_ranges` entry
+packs the digests of a run of contiguous nonzero chunks; `zero_ranges` counts
+runs of all-zero chunks. RAM uses 2MiB chunks and the `memory/blake3`
+namespace. Every nonzero chunk loaded from disk, a bundle, a cache, S3, or
+HTTP(S) is verified against its digest before guest use.
 
 `manifest.memory.backing` may name a local `ram.backing` file:
 
 ```text
 memory:
-  kind: spore-disk-index-v1
+  kind: spore-disk-index-v2
   logical_size: <maximum_memory_size>
   chunk_size: 2097152
   hash_algorithm: blake3
   object_namespace: memory/blake3
-  chunks:
-    - logical_chunk: 0
-      digest: blake3:...
-  zero_chunks: [1, 2, ...]
+  chunk_ranges:
+    - start: 0
+      digests: <64 hex characters per chunk>
+  zero_ranges:
+    - start: 1
+      count: <zero chunks>
   backing:
     kind: map-private-file-v0
     path: ram.backing
@@ -91,7 +93,7 @@ continue to interpret versions 2/3 as fixed memory.
 The backing file is never portable restore authority. Product restore maps it
 only when `ram.backing.proof` validates against the canonical memory index
 identity, opened file identity, backing metadata, and host-local runtime key.
-That fingerprint uses the same canonical `spore-disk-index-v1` byte encoding as
+That fingerprint uses the same canonical `spore-disk-index-v2` byte encoding as
 disk and rootfs indexes. The fixed backing and proof paths are inspected without
 following symlinks and must name regular files. Missing, symlinked, non-regular,
 or size-mismatched optional paths, and stale, malformed, foreign-key, or

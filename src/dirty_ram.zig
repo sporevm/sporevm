@@ -7,6 +7,7 @@
 const std = @import("std");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
+const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
 
 pub const Stats = struct {
@@ -284,8 +285,8 @@ pub const Sealer = struct {
 
         var chunks = std.array_list.Managed(spore.MemoryChunk).init(self.allocator);
         errdefer chunks.deinit();
-        var zero_chunks = std.array_list.Managed(u64).init(self.allocator);
-        errdefer zero_chunks.deinit();
+        var zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
+        errdefer zero_ranges.deinit(self.allocator);
 
         for (self.refs, 0..) |maybe_ref, i| {
             if (maybe_ref) |ref| {
@@ -294,20 +295,20 @@ pub const Sealer = struct {
                     .digest = try spore.memoryDigestFromHex(self.allocator, ref),
                 }) catch return error.OutOfMemory;
             } else {
-                zero_chunks.append(@intCast(i)) catch return error.OutOfMemory;
+                try disk_index.appendZeroChunk(self.allocator, &zero_ranges, @intCast(i));
             }
         }
 
         const chunk_slice = chunks.toOwnedSlice() catch return error.OutOfMemory;
         errdefer self.allocator.free(chunk_slice);
-        const zero_slice = zero_chunks.toOwnedSlice() catch return error.OutOfMemory;
+        const zero_slice = try zero_ranges.toOwnedSlice(self.allocator);
         errdefer self.allocator.free(zero_slice);
 
         return .{
             .logical_size = @intCast(self.ram.len),
             .chunk_size = spore.chunk_size,
             .chunks = chunk_slice,
-            .zero_chunks = zero_slice,
+            .zero_ranges = zero_slice,
             .backing = .{ .path = spore.ram_backing_path, .size = self.ram.len },
         };
     }

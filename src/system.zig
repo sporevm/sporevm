@@ -1168,7 +1168,12 @@ fn gcRootfsCache(
                 else => |e| return e,
             };
             const descriptor = spore.diskIndexDescriptorForStorage(storage) catch return error.BadManifest;
-            const parsed = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch return error.BadManifest;
+            const parsed = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch |err| switch (err) {
+                // No reader exists for an index this old. Keep the file its
+                // record names so later runs can read it, but root no objects.
+                error.FormatTooOld => continue,
+                else => return error.BadManifest,
+            };
             for (parsed.value.chunks) |chunk_entry| {
                 try rooted_objects.put(chunk_entry.digest, {});
             }
@@ -3247,6 +3252,65 @@ test "image import fetches without the cache lock and GC cannot collect what it 
     _ = try gc(allocator, io, .{ .cache_root = root, .dry_run = false });
     try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, root, second_result.rootfs_storage));
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, root, second_result.rootfs_storage));
+}
+
+test "system cache gc keeps an index that predates v2 but reclaims its objects" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+
+    const current = try writeGcStorageFixture(allocator, io, root, "current.json", 0x71);
+    const old_object_digest = try writeGcObjectFixture(allocator, io, root, 0x72);
+    // Canonical bytes of the removed v1 encoding.
+    const old_index = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "kind": "spore-disk-index-v1",
+        \\  "logical_size": 512,
+        \\  "chunk_size": {d},
+        \\  "hash_algorithm": "blake3",
+        \\  "object_namespace": "rootfs/blake3",
+        \\  "chunks": [
+        \\    {{
+        \\      "logical_chunk": 0,
+        \\      "digest": "{s}"
+        \\    }}
+        \\  ],
+        \\  "zero_chunks": []
+        \\}}
+    , .{ spore.disk_chunk_size, old_object_digest });
+    const old_index_hex = chunk.ChunkId.fromContents(old_index).toHex();
+    const old_index_digest = try std.fmt.allocPrint(allocator, "{s}{s}", .{ spore.rootfs_digest_prefix, old_index_hex[0..] });
+    const old_index_path = try rootfs_cas.manifestIndexPath(allocator, root, old_index_digest);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = old_index_path, .data = old_index });
+    var old_storage = current.storage;
+    old_storage.index_digest = old_index_digest;
+    old_storage.base_identity = old_index_digest;
+    const old_storage_json = try std.json.Stringify.valueAlloc(allocator, old_storage, .{});
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ root, "old.json" }),
+        .data = try std.fmt.allocPrint(allocator, "{{\"rootfs_size\":512,\"rootfs_storage\":{s}}}", .{old_storage_json}),
+    });
+    const old_object_path = try rootfs_cas.manifestObjectPath(allocator, root, old_object_digest);
+    const current_index_path = try rootfs_cas.manifestIndexPath(allocator, root, current.storage.index_digest);
+    const current_object_path = try rootfs_cas.manifestObjectPath(allocator, root, current.object_digest);
+
+    const dry_run = try gcRootfsCache(allocator, io, .{ .cache_root = root });
+    try std.testing.expectEqual(@as(usize, 2), dry_run.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 1), dry_run.rooted_objects);
+    try std.testing.expectEqual(@as(usize, 1), dry_run.candidate_count);
+
+    // The metadata still names the old index, so later runs must succeed too.
+    for (0..2) |_| {
+        _ = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+        try std.testing.expect(try fileExists(io, old_index_path));
+        try std.testing.expect(!try fileExists(io, old_object_path));
+        try std.testing.expect(try fileExists(io, current_index_path));
+        try std.testing.expect(try fileExists(io, current_object_path));
+    }
 }
 
 test "runtime disk lease protects its cache baseline from prune and gc" {

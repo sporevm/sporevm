@@ -269,7 +269,7 @@ fn canonicalFixtureBytes(bytes: []const u8) []const u8 {
     return if (std.mem.endsWith(u8, bytes, "\n")) bytes[0 .. bytes.len - 1] else bytes;
 }
 
-const arm64_manifest_digest = "sha256:b657390a5d37e2f098694027575d44fee3e235d64d6ffa630c995d9be54a01ca";
+const arm64_manifest_digest = "sha256:fcc3dbd055d0d00d5100b1c53ba25c01e6ff3df509ec3442f9f3da891abb6a59";
 
 fn verifyFixture(
     allocator: std.mem.Allocator,
@@ -306,15 +306,15 @@ test "arm64 and amd64 image-manifest fixtures verify complete closure" {
         "test/image/config-arm64.json",
         .{ .os = "linux", .arch = .arm64 },
         arm64_manifest_digest,
-        "blake3:792e35d2abe3a9155e79ae1e57bdedffaefe9be673852eda44e87297e8ddbcca",
+        "blake3:8782c5de42ca08004f92c43c8127375380f90d55ec499fb10d6bb8a8b15d25aa",
     );
     try verifyFixture(
         allocator,
         "test/image/image-manifest-amd64.json",
         "test/image/config-amd64.json",
         .{ .os = "linux", .arch = .amd64 },
-        "sha256:5204bf7ae314b9ec88c9650b445d505d5e044a577794cafd7ba927a3377f6727",
-        "blake3:8817e359af38ba3e65881b4ccd3c68e387ffbfe0eb59cc1c79146657d7b2fe4c",
+        "sha256:3701f224c51477fb6e7a620fd74be5cdfc039afcd6a7ba583cff79c6c6d1a74c",
+        "blake3:042e47fb84ff6adbfa270a96c4f091ba6d9f5f38d28548ef01de2ddae7bd504f",
     );
 }
 
@@ -442,8 +442,8 @@ test "image-manifest parser and schema bounds fail closed" {
 
     const uppercase = try allocator.dupe(u8, manifest_bytes);
     defer allocator.free(uppercase);
-    const digest_offset = std.mem.indexOf(u8, uppercase, "792e35d2") orelse unreachable;
-    uppercase[digest_offset + 3] = 'E';
+    const digest_offset = std.mem.indexOf(u8, uppercase, "8782c5de") orelse unreachable;
+    uppercase[digest_offset + 4] = 'C';
     try std.testing.expectError(error.BadProtocol, parseImageManifest(allocator, uppercase));
 
     const invalid_utf8 = try allocator.dupe(u8, manifest_bytes);

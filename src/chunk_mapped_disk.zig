@@ -950,8 +950,8 @@ pub const ChunkMappedDisk = struct {
             for (chunks.items) |entry| self.allocator.free(entry.digest);
             chunks.deinit(self.allocator);
         }
-        var zero_chunks: std.ArrayList(u64) = .empty;
-        errdefer zero_chunks.deinit(self.allocator);
+        var zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
+        defer zero_ranges.deinit(self.allocator);
 
         const object_dir = try objectDir(self.allocator, dir);
         defer self.allocator.free(object_dir);
@@ -1000,12 +1000,12 @@ pub const ChunkMappedDisk = struct {
             const parent_id = parent_digest_cursor.next(logical_chunk);
             switch (self.sources[chunk_index]) {
                 .zero => {
-                    try zero_chunks.append(self.allocator, @intCast(chunk_index));
+                    try disk_index.appendZeroChunk(self.allocator, &zero_ranges, @intCast(chunk_index));
                     clean_zero_chunks_reused += 1;
                     continue;
                 },
                 .zero_dirty => {
-                    try zero_chunks.append(self.allocator, @intCast(chunk_index));
+                    try disk_index.appendZeroChunk(self.allocator, &zero_ranges, @intCast(chunk_index));
                     dirty_zero_chunks_recorded += 1;
                     continue;
                 },
@@ -1029,7 +1029,7 @@ pub const ChunkMappedDisk = struct {
                         }
                     }
                 } else {
-                    try zero_chunks.append(self.allocator, @intCast(chunk_index));
+                    try disk_index.appendZeroChunk(self.allocator, &zero_ranges, @intCast(chunk_index));
                     clean_zero_chunks_reused += 1;
                 }
                 continue;
@@ -1038,7 +1038,7 @@ pub const ChunkMappedDisk = struct {
             if (parallel_batch) |batch| {
                 if (parallel_result_cursor >= batch.results.len or batch.indices[parallel_result_cursor] != chunk_index) return error.BadManifest;
                 switch (batch.results[parallel_result_cursor]) {
-                    .zero => try zero_chunks.append(self.allocator, @intCast(chunk_index)),
+                    .zero => try disk_index.appendZeroChunk(self.allocator, &zero_ranges, @intCast(chunk_index)),
                     .data => |id| {
                         var digest_buf: ManifestDigest = undefined;
                         try appendChunkEntry(self.allocator, &chunks, chunk_index, manifestDigest(id, &digest_buf));
@@ -1047,7 +1047,7 @@ pub const ChunkMappedDisk = struct {
                 }
                 parallel_result_cursor += 1;
             } else {
-                sealed_data_objects = try self.sealSnapshotChunk(dir, chunk_index, serial_buf, &chunks, &zero_chunks, &work_stats) or sealed_data_objects;
+                sealed_data_objects = try self.sealSnapshotChunk(dir, chunk_index, serial_buf, &chunks, &zero_ranges, &work_stats) or sealed_data_objects;
             }
         }
         if (parallel_batch) |batch| {
@@ -1069,8 +1069,6 @@ pub const ChunkMappedDisk = struct {
             for (chunk_slice) |entry| self.allocator.free(entry.digest);
             self.allocator.free(chunk_slice);
         }
-        const zero_slice = try zero_chunks.toOwnedSlice(self.allocator);
-        defer self.allocator.free(zero_slice);
 
         const index = disk_index.DiskIndex{
             .kind = disk_index.disk_index_kind,
@@ -1079,7 +1077,7 @@ pub const ChunkMappedDisk = struct {
             .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
             .object_namespace = spore.rootfs_storage_object_namespace,
             .chunks = chunk_slice,
-            .zero_chunks = zero_slice,
+            .zero_ranges = zero_ranges.items,
         };
         const index_encode_start_ns = try monotonicNs();
         const encoded_index = try disk_index.encodeCanonicalAlloc(self.allocator, index);
@@ -1213,7 +1211,7 @@ pub const ChunkMappedDisk = struct {
         chunk_index: usize,
         buf: []u8,
         chunks: *std.ArrayList(disk_index.DiskIndexChunk),
-        zero_chunks: *std.ArrayList(u64),
+        zero_ranges: *std.ArrayList(disk_index.DiskIndexZeroRange),
         work_stats: *chunk_sealer.WorkStats,
     ) Error!bool {
         const len = try self.chunkLen(chunk_index);
@@ -1223,7 +1221,7 @@ pub const ChunkMappedDisk = struct {
         work_stats.sealed_chunks += 1;
         switch (sealed) {
             .zero => {
-                try zero_chunks.append(self.allocator, @intCast(chunk_index));
+                try disk_index.appendZeroChunk(self.allocator, zero_ranges, @intCast(chunk_index));
                 return false;
             },
             .data => |id| {
@@ -1803,9 +1801,7 @@ test "sparse raw digest index reduces dense lazy runtime ownership" {
         for (chunks, 0..) |*entry, logical_chunk| {
             entry.* = .{ .logical_chunk = @intCast(logical_chunk), .digest = digest };
         }
-        const zero_chunks = try allocator.alloc(u64, case.source_count - case.nonzero_chunks);
-        defer allocator.free(zero_chunks);
-        for (zero_chunks, 0..) |*logical_chunk, i| logical_chunk.* = @intCast(case.nonzero_chunks + i);
+        const zero_ranges = [_]disk_index.DiskIndexZeroRange{.{ .start = case.nonzero_chunks, .count = case.source_count - case.nonzero_chunks }};
         const index = disk_index.DiskIndex{
             .kind = disk_index.disk_index_kind,
             .logical_size = logical_size,
@@ -1813,7 +1809,7 @@ test "sparse raw digest index reduces dense lazy runtime ownership" {
             .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
             .object_namespace = spore.rootfs_storage_object_namespace,
             .chunks = chunks,
-            .zero_chunks = zero_chunks,
+            .zero_ranges = &zero_ranges,
         };
 
         var measured = std.testing.FailingAllocator.init(allocator, .{});
@@ -2222,7 +2218,6 @@ test "zero range clears a full lazy CAS chunk without fetching and rejects a cor
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
         .chunks = &chunks,
-        .zero_chunks = &.{},
     };
 
     const base_source = block_source.FileBlockSource.init(base.handle, total_size);
@@ -2412,7 +2407,6 @@ test "known zero growth rolls back every fallible allocation" {
                 .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
                 .object_namespace = spore.rootfs_storage_object_namespace,
                 .chunks = &chunks,
-                .zero_chunks = &.{},
             };
             try disk.attachParentIndex("/parent-cache", index);
             const parent_id = try chunkIdFromDigest(digest);
@@ -2496,7 +2490,7 @@ test "snapshot writes disk index and chunk objects" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
     try std.testing.expectEqual(@as(u64, 0), parsed.value.chunks[0].logical_chunk);
-    try std.testing.expectEqual(@as(usize, 0), parsed.value.zero_chunks.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.zero_ranges.len);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
 
     const object_path = try rootfs_cas.manifestObjectPath(allocator, spore_dir, parsed.value.chunks[0].digest);
@@ -2858,7 +2852,6 @@ test "cas index attach rejects incomplete coverage" {
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
         .chunks = &chunks,
-        .zero_chunks = &.{},
     };
     try std.testing.expectError(error.BadManifest, disk.attachCasIndex("/missing-cache", incomplete));
 

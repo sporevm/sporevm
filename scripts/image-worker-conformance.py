@@ -303,13 +303,7 @@ def expected_chunk_size(index: dict[str, Any], logical_chunk: int) -> int:
 
 
 def disk_index_chunks(index: dict[str, Any]) -> list[dict[str, Any]]:
-    kind = index.get("kind")
-    if kind == "spore-disk-index-v1":
-        chunks = index.get("chunks")
-        if not isinstance(chunks, list):
-            raise ConformanceError("rootfs v1 index is missing chunks")
-        return chunks
-    if kind != "spore-disk-index-v2":
+    if index.get("kind") != "spore-disk-index-v2":
         raise ConformanceError("rootfs index has an unsupported kind")
     ranges = index.get("chunk_ranges")
     if not isinstance(ranges, list):

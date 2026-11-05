@@ -3427,15 +3427,14 @@ test "fully cached build publishes final indexed image" {
     const producer = try build_exec.resolveProducer(init, arena);
     const prepared_size = try buildDiskGrowTarget(base_storage);
     const prepared_chunk_count: usize = @intCast(prepared_size / rootfs_cas.default_chunk_size);
-    const zero_chunks = try arena.alloc(u64, prepared_chunk_count);
-    for (zero_chunks, 0..) |*logical_chunk, i| logical_chunk.* = @intCast(i);
+    const zero_ranges = [_]disk_index.DiskIndexZeroRange{.{ .start = 0, .count = prepared_chunk_count }};
     const encoded_prepared = try disk_index.encodeCanonicalAlloc(arena, .{
         .kind = disk_index.disk_index_kind,
         .logical_size = prepared_size,
         .chunk_size = rootfs_cas.default_chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
-        .zero_chunks = zero_chunks,
+        .zero_ranges = &zero_ranges,
     });
     const prepared_index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, encoded_prepared.digest);
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(prepared_index_path) orelse return error.BadManifest);

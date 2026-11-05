@@ -148,26 +148,24 @@ with open(manifest_path, "r", encoding="utf-8") as fh:
 ram_size = manifest["platform"]["ram_size"]
 memory = manifest["memory"]
 memory_state = manifest["memory_state"]
-chunks = memory["chunks"]
-zero_chunks = memory.get("zero_chunks") or []
+if memory["kind"] != "spore-disk-index-v2":
+    raise SystemExit(f"unexpected memory index kind {memory['kind']}")
+chunks = []
+for chunk_range in memory["chunk_ranges"]:
+    digests = chunk_range["digests"]
+    if len(digests) == 0 or len(digests) % 64 != 0:
+        raise SystemExit("memory chunk range has malformed digests")
+    chunks.extend(range(chunk_range["start"], chunk_range["start"] + len(digests) // 64))
+zero_chunks = []
+for zero_range in memory["zero_ranges"]:
+    zero_chunks.extend(range(zero_range["start"], zero_range["start"] + zero_range["count"]))
 logical_size = memory["logical_size"]
 chunk_size = memory["chunk_size"]
 expected_chunks = (logical_size + chunk_size - 1) // chunk_size
 covered_chunks = set()
-for chunk in chunks:
-    logical_chunk = chunk.get("logical_chunk")
-    if not isinstance(logical_chunk, int):
-        raise SystemExit("memory chunk entry missing logical_chunk")
+for logical_chunk in chunks + zero_chunks:
     if logical_chunk < 0 or logical_chunk >= expected_chunks:
         raise SystemExit(f"memory chunk {logical_chunk} out of range")
-    if logical_chunk in covered_chunks:
-        raise SystemExit(f"memory chunk {logical_chunk} covered more than once")
-    covered_chunks.add(logical_chunk)
-for logical_chunk in zero_chunks:
-    if not isinstance(logical_chunk, int):
-        raise SystemExit("zero chunk entry is not an integer")
-    if logical_chunk < 0 or logical_chunk >= expected_chunks:
-        raise SystemExit(f"zero chunk {logical_chunk} out of range")
     if logical_chunk in covered_chunks:
         raise SystemExit(f"memory chunk {logical_chunk} covered more than once")
     covered_chunks.add(logical_chunk)

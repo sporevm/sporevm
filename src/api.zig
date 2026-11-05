@@ -1485,7 +1485,7 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
         },
         .devices = &.{},
         .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
-        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
+        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
     try spore.saveManifestV1(arena, dir, manifest);
 
