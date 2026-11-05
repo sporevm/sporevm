@@ -1,3 +1,8 @@
+env:
+  # Docker Hub allows 100 anonymous manifest requests per hour per IP, and the
+  # agents share egress IPs. Pull docker.io images through Google's mirror.
+  SPOREVM_DOCKER_HUB_MIRROR: "mirror.gcr.io"
+
 steps:
   - group: ":test_tube: Tests"
     key: "tests"
