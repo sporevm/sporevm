@@ -1896,17 +1896,7 @@ fn updateHashWithDiskFilesForManifestPath(
         try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
     );
     defer parsed_manifest.deinit();
-    try updateHashWithDiskFilesForManifest(allocator, h, bundle_dir, parsed_manifest.disk(), seen);
-}
-
-fn updateHashWithDiskFilesForManifest(
-    allocator: std.mem.Allocator,
-    h: *Sha256,
-    bundle_dir: []const u8,
-    disk_opt: ?spore.Disk,
-    seen: *std.StringHashMap(void),
-) Error!void {
-    const disk = disk_opt orelse return;
+    const disk = parsed_manifest.disk() orelse return;
     const storage = try diskStorageDescriptor(disk);
     const index_rel = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
     if (try markBundleFileSeen(seen, index_rel)) {
