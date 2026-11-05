@@ -121,35 +121,24 @@ metadata's `rootfs_storage` descriptor remains keyed by the raw rootfs index
 digest used to boot the VM. `rootfs_storage` is the local rootfs metadata
 field; portable spore manifests continue to use `rootfs.storage`.
 
-A local single-spore bundle is the first distribution form:
-
-```text
-<bundle>/
-├── manifest.json           # portable manifest; local RAM backing stripped
-├── chunkpack.index.json    # blake3 chunk id -> pack/offset/length/sha256
-├── chunkpacks/000000.pack  # uncompressed logical chunks concatenated
-├── rootfs/blake3/<hex>.ext4
-                            # optional exact immutable rootfs artifact
-├── rootfs/blake3/indexes/<hex>.json
-└── rootfs/blake3/objects/<hex>.chunk
-                            # optional writable disk/rootfs chunk CAS
-```
-
-An indexed distribution bundle can carry a parent manifest and many child
-manifests without duplicating shared memory chunks:
+A bundle is the distribution form. `bundle.json` names a parent manifest and
+zero or more child manifests, which share memory chunks without duplicating
+them; `spore pack` without `--children` writes a bundle with no children:
 
 ```text
 <bundle>/
 ├── bundle.json
 ├── manifests/
-│   ├── parent.json
+│   ├── parent.json         # portable manifest; local RAM backing stripped
 │   └── children/000042.json
-├── chunkpack.index.json
-├── chunkpacks/000000.pack
+├── chunkpack.index.json    # blake3 chunk id -> pack/offset/length/sha256
+├── chunkpacks/000000.pack  # uncompressed logical chunks concatenated
 ├── rootfs.index.json       # optional rootfs identity -> artifact policy
 ├── rootfs/blake3/<hex>.ext4
+                            # optional exact immutable rootfs artifact
 ├── rootfs/blake3/indexes/<hex>.json
 └── rootfs/blake3/objects/<hex>.chunk
+                            # optional writable disk/rootfs chunk CAS
 ```
 
 Bundles are an implementation format for distribution, not a new machine-state
@@ -162,20 +151,20 @@ chunkpack metadata, pack blobs, rootfs metadata, included rootfs artifacts,
 chunked rootfs/disk indexes and objects. It is
 not a replacement for per-chunk, per-rootfs, or per-disk-object verification.
 
-If `manifest.json` records an immutable rootfs artifact, `spore pack` includes
+If a bundled manifest records an immutable rootfs artifact, `spore pack` includes
 the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` from a trusted local
 digest-cache entry, then verifies the bundled copy by BLAKE3 and size.
 `spore unpack` requires that bundled artifact, verifies it against the manifest,
 then installs it into the local rootfs materialization cache before writing the unpacked
-manifest. Indexed bundles record that artifact in `rootfs.index.json` with an
-explicit `exact-bytes` policy by default. `spore pack --children ...
+manifest. Bundles record that artifact in `rootfs.index.json` with an
+explicit `exact-bytes` policy by default. `spore pack
 --rootfs=metadata-only` records the same digest and size with `metadata-only`
 policy and omits the ext4 file; materialized unpack and pull accept that policy
 only with `--allow-metadata-only-rootfs` and a trusted shape-compatible hit in
 the selected rootfs materialization cache.
 
-If `manifest.json` records `rootfs.storage.kind:
-"chunked-ext4-rootfs-v0"`, indexed bundles carry the exact
+If a bundled manifest records `rootfs.storage.kind:
+"chunked-ext4-rootfs-v0"`, the bundle carries the exact
 versioned disk-index bytes named by `rootfs.storage.index_digest` under
 `rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero rootfs chunk
 object under `rootfs/blake3/objects/<hex>.chunk`. Unpack and pull verify the
@@ -194,14 +183,14 @@ writing the manifest, failing closed on missing or digest-mismatched
 index/object bytes.
 
 `spore pull file:///path/to/bundle --child 42 --out child.spore` is the first
-pull materialization policy. It accepts local indexed bundles, canonicalizes the
+pull materialization policy. It accepts local bundles, canonicalizes the
 child id to the six-digit child manifest id, verifies the selected chunks through
 the bundle index, and writes a normal spore directory. When
 `SPOREVM_BUNDLE_CACHE_DIR` is set, or the platform cache root is available, pull
 installs verified memory chunks into a node-local BLAKE3 chunk cache and hard
 links them into the output spore where the filesystem allows it.
 
-`spore push /path/to/bundle s3://bucket/prefix/` publishes an indexed bundle to
+`spore push /path/to/bundle s3://bucket/prefix/` publishes a bundle to
 S3 by uploading only the canonical files named by the validated bundle metadata.
 `spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out
 child.spore` downloads that exact object set into the node-local bundle cache,
@@ -602,7 +591,7 @@ raw KVM or Hypervisor.framework memory-region structure.
 - Chunkpack bundles are portable only after local RAM backing metadata has been
   stripped. `spore unpack` reconstitutes normal `chunks/<blake3>` files and
   fails closed when a pack segment's SHA256 or logical BLAKE3 id mismatches.
-- Indexed bundles validate `bundle.json` child ids and relative manifest paths
+- Bundles validate `bundle.json` child ids and relative manifest paths
   before selecting a parent or child manifest. `spore unpack --child 000042`
   writes a normal spore directory for the selected child.
 - Local `spore pull file://... --child 42` and remote digest-pinned

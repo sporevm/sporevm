@@ -400,7 +400,7 @@ Spores with a `chunk-index-disk-v0` writable disk include that disk index under
 resumable spore.
 
 If a spore manifest has manifest-attached chunked rootfs storage under
-`rootfs.storage`, indexed bundles carry the descriptor-bound
+`rootfs.storage`, bundles carry the descriptor-bound
 versioned disk index under `rootfs/blake3/indexes/<hex>.json` and the
 referenced nonzero rootfs chunk objects under
 `rootfs/blake3/objects/<hex>.chunk`. `spore unpack` and `spore pull` verify the
@@ -413,8 +413,8 @@ rootfs child.
 for repairing or upgrading an existing exact-rootfs spore. It is no longer the
 normal image-build or image-capture path.
 
-Indexed bundles also support an explicit prepared-cache mode:
-`spore pack SPORE --children CHILDREN --rootfs=metadata-only --out BUNDLE`
+Bundles also support an explicit prepared-cache mode:
+`spore pack SPORE [--children CHILDREN] --rootfs=metadata-only --out BUNDLE`
 records the immutable rootfs identity and size without embedding the ext4 bytes.
 `spore unpack` and `spore pull` reject those bundles by default. Passing
 `--allow-metadata-only-rootfs` makes materialization require that the selected
@@ -424,7 +424,7 @@ trust-at-open cache contract, so it still fails before writing a resumable
 spore if the cache entry is missing, symlinked, non-regular, or size-mismatched.
 
 `spore pull file:///path/to/bundle --child 42 --out child.spore` does the same
-rootfs installation for indexed local bundles while materializing one selected
+rootfs installation for local bundles while materializing one selected
 child. Digest-pinned remote pulls, such as `spore pull
 s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
 `spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42

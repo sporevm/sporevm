@@ -92,7 +92,6 @@ pub const InspectBundleResult = struct {
     source: []const u8,
     bundle_dir: []const u8,
     bundle_digest: DigestRef,
-    indexed: bool,
     parent_manifest: []const u8,
     chunkpack_index: []const u8,
     chunkpack: ChunkpackSummary,

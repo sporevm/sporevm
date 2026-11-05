@@ -71,7 +71,7 @@ const usage =
     \\    unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
     \\                        Unpack a local spore bundle into a spore dir
     \\    push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
-    \\                        Push an indexed bundle to an object store
+    \\                        Push a bundle to an object store
     \\    inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
     \\                        Inspect bundle metadata without materializing it
     \\    pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
@@ -1205,7 +1205,6 @@ fn writeInspectBundleResult(writer: *Io.Writer, result: spore_api.InspectBundleR
     try writer.print("  Source: {s}\n", .{result.source});
     try writer.print("  Bundle: {s}\n", .{result.bundle_dir});
     try writer.print("  Bundle digest: {s}:{s}\n", .{ result.bundle_digest.algorithm, result.bundle_digest.hex });
-    try writer.print("  Indexed: {}\n", .{result.indexed});
     try writer.print("  Chunks: {d} chunks across {d} packs, {d} bytes\n", .{ result.chunkpack.chunk_count, result.chunkpack.pack_count, result.chunkpack.payload_bytes });
     try writer.print("  Children: {d}\n", .{result.child_count});
     if (result.selection.selected_count > 0) {
@@ -1294,7 +1293,6 @@ test "inspect bundle output lists selected child ids" {
         .source = "bundle",
         .bundle_dir = "/tmp/bundle",
         .bundle_digest = .{ .hex = "abc" },
-        .indexed = true,
         .parent_manifest = "manifests/parent.json",
         .chunkpack_index = "chunkpack.index.json",
         .chunkpack = .{ .chunk_count = 1, .pack_count = 1, .payload_bytes = 4096 },

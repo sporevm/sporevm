@@ -25,6 +25,16 @@ removed. `spore cache gc --force` releases the pin and storage. The removal
 journal is gone, and JSON output advances to `spore.saved.remove.result.v2`
 without `ownership`, `pin_id`, or `pin_removed`.
 
+### Bundles are always indexed
+
+`spore pack` without `--children` now always writes `bundle.json` with no
+children. Memory-only spores and spores with an exact-bytes rootfs but no
+`rootfs.storage` used to get a flat bundle, so their layout and `bundle_digest`
+change. Spores with chunked rootfs storage and `--rootfs=metadata-only` packs
+were already indexed and are byte-identical. Flat bundles from earlier versions
+fail with `FormatTooOld` and must be re-packed. `spore inspect-bundle` no longer
+reports `indexed`.
+
 ### Experimental AMD64 fresh workloads
 
 Linux/AMD64 KVM fresh workloads now use native `linux/amd64` OCI selection,
