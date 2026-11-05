@@ -4,6 +4,7 @@
 //! completion and runtime stats back.
 
 const std = @import("std");
+const image_store = @import("../image_store.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const snapshot_publication = @import("../snapshot_publication.zig");
 const spore = @import("../spore.zig");
@@ -58,7 +59,7 @@ pub const Control = struct {
     completeRootfsSnapshotFn: *const fn (context: *anyopaque, disk: ?spore.Disk) anyerror!void,
     completeDiskForkFn: ?*const fn (context: *anyopaque, batch: *runtime_disk_fork_capture.Batch) anyerror!void = null,
     failDiskForkFn: ?*const fn (context: *anyopaque, err: anyerror) void = null,
-    refuseSnapshotsFn: ?*const fn (context: *anyopaque) void = null,
+    attachImageStoreFn: ?*const fn (context: *anyopaque, fetcher: *image_store.Fetcher) void = null,
     reportStatsFn: *const fn (context: *anyopaque, stats: ControlStats) void,
 
     pub fn poll(self: Control, dev: *vsock.Vsock) !ControlAction {
@@ -100,12 +101,13 @@ pub const Control = struct {
         fail(self.context, err);
     }
 
-    /// The run's root disk reads missing objects from an image store, and no
-    /// snapshot can capture it. The controller refuses snapshot requests
-    /// rather than pausing the guest for one that fails and ends the run.
-    pub fn refuseSnapshots(self: Control) void {
-        const refuse = self.refuseSnapshotsFn orelse return;
-        refuse(self.context);
+    /// The run's root disk reads missing objects through `fetcher`. Before a
+    /// snapshot request pauses the guest, the controller fetches the rest, so
+    /// a store failure fails the request instead of the paused capture, which
+    /// would end the run.
+    pub fn attachImageStore(self: Control, fetcher: *image_store.Fetcher) void {
+        const attach = self.attachImageStoreFn orelse return;
+        attach(self.context, fetcher);
     }
 
     pub fn reportStats(self: Control, stats: ControlStats) void {

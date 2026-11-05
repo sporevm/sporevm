@@ -30,6 +30,7 @@ const local_paths = @import("local_paths.zig");
 const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const spore = @import("spore.zig");
 
 const digest_prefix = image.digest_prefix;
 const digest_len = digest_prefix.len + chunk.ChunkId.hex_len;
@@ -385,7 +386,7 @@ pub const GetError = error{
 
 /// Reads files from one store. Requests are bounded by size and time; an
 /// HTTP(S) request runs on an `Io` worker that is canceled at its deadline.
-/// Not thread-safe; `Fetcher` serializes callers.
+/// Thread-safe: concurrent requests share the connection pool.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -495,8 +496,13 @@ pub const Client = struct {
     fn httpGet(self: *Client, allocator: std.mem.Allocator, url: []const u8, limit: Limit) ![]u8 {
         const uri = try std.Uri.parse(url);
         // Certificate validity is checked against `now`, which init set when
-        // it loaded the CA bundle; a long run must not keep that time.
-        if (self.base.scheme == .https) self.http.now = Io.Clock.real.now(self.io);
+        // it loaded the CA bundle; a long run must not keep that time. The
+        // HTTP client updates `now` under this lock too.
+        if (self.base.scheme == .https) {
+            self.http.ca_bundle_lock.lockUncancelable(self.io);
+            defer self.http.ca_bundle_lock.unlock(self.io);
+            self.http.now = Io.Clock.real.now(self.io);
+        }
         var request = try self.http.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
             .headers = .{ .accept_encoding = .omit },
@@ -566,81 +572,224 @@ pub const FetchStats = struct {
     install_errors: u64 = 0,
 };
 
-/// Fetches rootfs objects missing from the local CAS during a guest fault and
-/// installs them there. Installs skip the rootfs cache lock: the runtime
-/// lease, taken with the cache lock held after the index was installed,
-/// already roots every object the index names.
+/// Store reads at once while `Fetcher.fetchAll` fills the cache.
+pub const fill_concurrency = 16;
+
+/// Fetches the rootfs objects of one leased storage that are missing from the
+/// local CAS and installs them there. Installs skip the rootfs cache lock: the
+/// runtime lease, taken with the cache lock held after the index was
+/// installed, already roots every object the index names.
+///
+/// Thread-safe. Reference-counted, because a named monitor's control handler
+/// thread can still be filling the cache when the run loop closes the disk.
 pub const Fetcher = struct {
     allocator: std.mem.Allocator,
     io: Io,
+    /// Owns `cache_root` and `storage`.
+    arena: std.heap.ArenaAllocator,
     cache_root: []const u8,
+    storage: spore.RootfsStorage,
     client: Client,
-    /// Serializes use of `client` and `stats`.
+    refs: std.atomic.Value(u32) = .init(1),
+    /// Guards `stats`.
     mutex: Io.Mutex = .init,
     stats: FetchStats = .{},
+    /// Serializes `fetchAll`.
+    fill_mutex: Io.Mutex = .init,
+    /// Every object of `storage` is local.
+    complete: std.atomic.Value(bool) = .init(false),
+    /// A guest read could not fetch its object, which poisoned the disk.
+    read_failed: std.atomic.Value(bool) = .init(false),
+    /// `fetchAll` stops and fails; set when the VM is stopping.
+    canceled: std.atomic.Value(bool) = .init(false),
 
     /// `allocator` must be thread-safe: faults run on vCPU threads and
     /// requests on `Io` workers.
-    pub fn create(allocator: std.mem.Allocator, io: Io, cache_root: []const u8, origin: []const u8) !*Fetcher {
+    pub fn create(allocator: std.mem.Allocator, io: Io, cache_root: []const u8, origin: []const u8, storage: spore.RootfsStorage) !*Fetcher {
         const self = try allocator.create(Fetcher);
         errdefer allocator.destroy(self);
-        const owned_root = try allocator.dupe(u8, cache_root);
-        errdefer allocator.free(owned_root);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned_root = try arena.allocator().dupe(u8, cache_root);
+        const owned_storage = try spore.cloneRootfsStorage(arena.allocator(), storage);
         self.* = .{
             .allocator = allocator,
             .io = io,
+            .arena = arena,
             .cache_root = owned_root,
+            .storage = owned_storage,
             .client = try Client.init(allocator, io, origin),
         };
         return self;
     }
 
-    pub fn destroy(self: *Fetcher) void {
+    pub fn retain(self: *Fetcher) *Fetcher {
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    pub fn release(self: *Fetcher) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const stats = self.stats;
         std.log.debug("image store {s}: fetched {d} objects, {d} bytes in {d} ms; {d} errors, {d} install errors", .{
             self.client.base.url, stats.fetches, stats.bytes, stats.fetch_ns / std.time.ns_per_ms, stats.errors, stats.install_errors,
         });
         self.client.deinit();
-        self.allocator.free(self.cache_root);
+        self.arena.deinit();
         self.allocator.destroy(self);
     }
 
-    /// Fill `buf` with the object `digest` names, whose length is `buf.len`,
-    /// verified against its BLAKE3 digest. The caller has found it missing
-    /// locally; disk reads hold the VMM device lock, so a second fault on the
-    /// same object finds it installed. A failed local install is counted, not
-    /// returned: the bytes are already verified.
-    pub fn fetchObject(self: *Fetcher, digest: []const u8, buf: []u8) (GetError || error{BadChunk})!void {
+    pub fn currentStats(self: *Fetcher) FetchStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        return self.stats;
+    }
+
+    /// Fill `buf` with the object `digest` names for a guest read, verified
+    /// against its BLAKE3 digest; its length is `buf.len`. The caller has found
+    /// it missing locally. A failed local install is counted, not returned:
+    /// the bytes are already verified.
+    pub fn fetchObject(self: *Fetcher, digest: []const u8, buf: []u8) (GetError || error{BadChunk})!void {
+        const bytes = self.fetchVerified(digest, buf.len) catch |err| {
+            self.read_failed.store(true, .release);
+            return err;
+        };
+        defer self.allocator.free(bytes);
+        @memcpy(buf, bytes);
+        self.install(digest, bytes) catch {};
+    }
+
+    /// Make `fetchAll` stop at its next object and fail, so a VM that is
+    /// stopping need not wait for a whole image to download.
+    pub fn cancel(self: *Fetcher) void {
+        self.canceled.store(true, .release);
+    }
+
+    /// Whether a guest read could not fetch its object. The disk is then
+    /// poisoned, and no snapshot can capture it.
+    pub fn readFailed(self: *Fetcher) bool {
+        return self.read_failed.load(.acquire);
+    }
+
+    /// Fetch every object of the storage that is missing locally, so that a
+    /// snapshot can name them all, with up to `fill_concurrency` reads at
+    /// once. On failure the objects fetched so far stay installed and the
+    /// disk keeps serving reads; a later call fetches the rest.
+    pub fn fetchAll(self: *Fetcher) !void {
+        if (self.canceled.load(.acquire)) return error.ImageStoreFetchCanceled;
+        if (self.complete.load(.acquire)) return;
+        self.fill_mutex.lockUncancelable(self.io);
+        defer self.fill_mutex.unlock(self.io);
+        if (self.complete.load(.acquire)) return;
+        const start_ns = monotonicNs();
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        const missing = try self.missingObjects(arena_state.allocator());
+        var fill = Fill{ .fetcher = self, .objects = missing };
+        var group: Io.Group = .init;
+        // This thread is one of the workers.
+        for (1..@min(fill_concurrency, missing.len)) |_| {
+            group.concurrent(self.io, Fill.run, .{&fill}) catch break;
+        }
+        Fill.run(&fill) catch {};
+        group.await(self.io) catch {};
+        if (fill.err) |err| return err;
+        self.complete.store(true, .release);
+        std.log.info("image store {s}: fetched the root disk's {d} missing objects in {d} ms", .{ self.client.base.url, missing.len, (monotonicNs() -| start_ns) / std.time.ns_per_ms });
+    }
+
+    const Object = struct {
+        digest: []const u8,
+        len: usize,
+    };
+
+    const Fill = struct {
+        fetcher: *Fetcher,
+        objects: []const Object,
+        next: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        /// The first failure; guarded by `fetcher.mutex`.
+        err: ?anyerror = null,
+
+        fn run(fill: *Fill) Io.Cancelable!void {
+            while (!fill.failed.load(.acquire)) {
+                if (fill.fetcher.canceled.load(.acquire)) return fill.fail(error.ImageStoreFetchCanceled);
+                const i = fill.next.fetchAdd(1, .monotonic);
+                if (i >= fill.objects.len) return;
+                const object = fill.objects[i];
+                const bytes = fill.fetcher.fetchVerified(object.digest, object.len) catch |err| return fill.fail(err);
+                defer fill.fetcher.allocator.free(bytes);
+                fill.fetcher.install(object.digest, bytes) catch |err| return fill.fail(err);
+            }
+        }
+
+        fn fail(fill: *Fill, err: anyerror) void {
+            fill.fetcher.mutex.lockUncancelable(fill.fetcher.io);
+            defer fill.fetcher.mutex.unlock(fill.fetcher.io);
+            if (fill.err == null) fill.err = err;
+            fill.failed.store(true, .release);
+        }
+    };
+
+    /// The distinct objects of the storage's index that are not in the local
+    /// CAS at their indexed length.
+    fn missingObjects(self: *Fetcher, arena: std.mem.Allocator) ![]const Object {
+        const index_path = try rootfs_cas.manifestIndexPath(arena, self.cache_root, self.storage.index_digest);
+        const bytes = try rootfs_cas.readVerifiedStorageIndexPath(arena, index_path, self.storage);
+        const parsed = try disk_index.parseDiskIndex(arena, bytes, try spore.diskIndexDescriptorForStorage(self.storage));
+        var seen = std.AutoHashMap(chunk.ChunkId, void).init(arena);
+        var missing: std.ArrayList(Object) = .empty;
+        for (parsed.value.chunks) |entry| {
+            if ((try seen.getOrPut(entry.id)).found_existing) continue;
+            const len = try rootfs_cas.storageChunkLen(self.storage, entry.logical_chunk);
+            const digest = try arena.dupe(u8, &entry.id.toDigest());
+            const path = try rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, digest);
+            defer self.allocator.free(path);
+            const stat = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => |e| return e,
+            };
+            if (stat) |value| if (value.kind == .file and value.size == len) continue;
+            try missing.append(arena, .{ .digest = digest, .len = len });
+        }
+        return missing.items;
+    }
+
+    fn fetchVerified(self: *Fetcher, digest: []const u8, len: usize) (GetError || error{BadChunk})![]u8 {
         const start_ns = monotonicNs();
         const id = chunk.ChunkId.fromHex(digest[digest_prefix.len..]) catch return error.BadChunk;
         const path = try objectPathAlloc(self.allocator, digest);
         defer self.allocator.free(path);
-        const bytes = self.client.get(self.allocator, path, .{ .max = buf.len, .exact = true }, object_budget) catch |err| {
-            self.stats.errors += 1;
+        const bytes = self.client.get(self.allocator, path, .{ .max = len, .exact = true }, object_budget) catch |err| {
+            self.record(.{ .errors = 1 });
             std.log.debug("image store {s}: fetching {s} failed: {s}", .{ self.client.base.url, digest, @errorName(err) });
             return err;
         };
-        defer self.allocator.free(bytes);
+        errdefer self.allocator.free(bytes);
         if (!id.matches(bytes)) {
-            self.stats.errors += 1;
+            self.record(.{ .errors = 1 });
             std.log.debug("image store {s}: object {s} failed verification", .{ self.client.base.url, digest });
             return error.BadChunk;
         }
-        @memcpy(buf, bytes);
-        self.stats.fetches += 1;
-        self.stats.bytes += bytes.len;
-        self.stats.fetch_ns += monotonicNs() -| start_ns;
+        self.record(.{ .fetches = 1, .bytes = bytes.len, .fetch_ns = monotonicNs() -| start_ns });
+        return bytes;
+    }
 
-        const installed_path = rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, digest) catch {
-            self.stats.install_errors += 1;
-            return;
-        };
-        defer self.allocator.free(installed_path);
-        _ = rootfs_cas.installChunkPath(self.allocator, self.io, installed_path, bytes, digest, bytes.len) catch {
-            self.stats.install_errors += 1;
-        };
+    fn install(self: *Fetcher, digest: []const u8, bytes: []const u8) !void {
+        errdefer self.record(.{ .install_errors = 1 });
+        const path = try rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, digest);
+        defer self.allocator.free(path);
+        _ = try rootfs_cas.installChunkPath(self.allocator, self.io, path, bytes, digest, bytes.len);
+    }
+
+    fn record(self: *Fetcher, delta: FetchStats) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.stats.fetches += delta.fetches;
+        self.stats.bytes += delta.bytes;
+        self.stats.fetch_ns += delta.fetch_ns;
+        self.stats.errors += delta.errors;
+        self.stats.install_errors += delta.install_errors;
     }
 };
 
@@ -909,10 +1058,11 @@ test "a store image resolves into an empty cache with only its metadata" {
     try std.testing.expectError(error.ImageStoreNotFound, resolve(io, allocator, missing_cache, try std.fmt.allocPrint(allocator, "{s}/2", .{store}), platform));
 }
 
-/// Serves files from `root` over HTTP/1.1 on loopback, one connection at a
-/// time. `failures` answers that many requests with 500 first; `hang` holds
-/// every request open until `deinit`.
-const TestServer = struct {
+/// Test support: serves files from `root` over HTTP/1.1 on loopback, one
+/// connection at a time. `failures` answers that many requests with 500
+/// first; `hang` holds every request open until `deinit`; `delay_ms` delays
+/// every answer, reading the file after the delay.
+pub const TestServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
     root: []const u8,
@@ -922,8 +1072,9 @@ const TestServer = struct {
     failures: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
     hang: std.atomic.Value(bool) = .init(false),
+    delay_ms: std.atomic.Value(u32) = .init(0),
 
-    fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
+    pub fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
         var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
         self.* = .{
             .allocator = allocator,
@@ -935,7 +1086,7 @@ const TestServer = struct {
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
     }
 
-    fn stop(self: *TestServer) void {
+    pub fn stop(self: *TestServer) void {
         self.closed.store(true, .release);
         if (self.server.socket.address.connect(self.io, .{ .mode = .stream })) |stream| {
             stream.close(self.io);
@@ -944,7 +1095,7 @@ const TestServer = struct {
         self.server.deinit(self.io);
     }
 
-    fn url(self: *TestServer, allocator: std.mem.Allocator) ![]u8 {
+    pub fn url(self: *TestServer, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
     }
 
@@ -966,6 +1117,7 @@ const TestServer = struct {
         defer self.allocator.free(file_path);
         while (std.mem.trimEnd(u8, try reader.interface.takeDelimiterExclusive('\n'), "\r").len != 0) {}
         _ = self.requests.fetchAdd(1, .monotonic);
+        std.Io.sleep(self.io, .fromMilliseconds(self.delay_ms.load(.monotonic)), .awake) catch {};
         if (self.hang.load(.acquire)) {
             while (!self.closed.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
             return;

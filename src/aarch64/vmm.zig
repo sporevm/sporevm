@@ -872,6 +872,10 @@ pub fn writeSnapshot(
     const generation_start = clock.nowMs();
     const gen_state = try source.gen_dev.capture(arena);
     const generation_ms = clock.nowMs() - generation_start;
+    // Fetch a store image's missing objects before sealing the disk, so a
+    // failed download leaves nothing written and does not hold the cache
+    // lock. A disk fork keeps the layer live, so it fetches nothing.
+    if (target.disk == .finish) if (config.disk_snapshot) |disk_state| try disk_state.fetchFromStore();
     const memory_start = clock.nowMs();
     const memory = if (dirty_tracker) |tracker|
         try tracker.finish()
@@ -2414,4 +2418,69 @@ test "threaded control delivery kicks every vCPU once per delivered batch" {
 
     try std.testing.expect(try threaded.pollControl(control) == .keep_running);
     for (&vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 1), vcpu.kicks.load(.monotonic));
+}
+
+test "a snapshot fetches a store image's missing objects first, and a disk fork fetches none" {
+    const image_store = @import("../image_store.zig");
+    const runtime_disk = @import("../runtime_disk.zig");
+    var fixture: image_store.TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const cache = try fixture.path("consumer-cache");
+    try fixture.env.put(local_paths.rootfs_cache_env, cache);
+    const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
+    const local = try image_store.resolve(io, allocator, cache, ref, .{});
+    var storage = local.storage;
+    storage.device = .{ .mmio_slot = 1 };
+    var runtime = try runtime_disk.open(.{ .io = io, .environ_map = &fixture.env }, std.testing.allocator, .{ .rootfs = .{
+        .device = storage.device,
+        .artifact = .{ .digest = storage.index_digest, .size = storage.logical_size, .format = spore.rootfs_artifact_format_ext4 },
+        .storage = storage,
+        .source = .{ .requested_ref = ref, .resolved_image_ref = ref, .image_manifest_digest = local.identity, .platform = "linux/arm64", .builder_version = rootfs_mod.builder_version },
+    } });
+    defer runtime.deinit();
+    const fetcher = runtime.fetcher.?;
+
+    // The store lost every object, so fetching the image must fail.
+    try std.Io.Dir.cwd().deleteTree(io, try std.fs.path.join(allocator, &.{ store, "objects" }));
+    var storages: [2][blk.sector_size]u8 = undefined;
+    var blocks = [_]blk.Blk{ blk.Blk.initWithOptions(.{ .memory = &storages[0] }, .{}), blk.Blk.initWithOptions(.{ .memory = &storages[1] }, .{}) };
+    var transports = [_]mmio.Transport{ mmio.Transport.init(blocks[0].device()), mmio.Transport.init(blocks[1].device()) };
+    const gen_dev = generation.Device{};
+    const vsock_dev = vsock.Vsock.init(.{ .guest_cid = vsock.default_guest_cid });
+    const ram = try allocator.alloc(u8, spore.chunk_size);
+    @memset(ram, 0);
+    var config = testBoot(.{});
+    config.disk_snapshot = runtime.snapshot();
+    const source = SnapshotSource{ .config = &config, .transports = &transports, .gen_dev = &gen_dev, .vsock_dev = &vsock_dev, .ram_bytes = ram, .ram_size = ram.len };
+    var vm = TestVm{};
+    var vcpus = [_]TestVcpu{.{ .live = testVcpuState(0, .{ .cntvct = 1, .cntv_ctl = 0, .cntv_cval = 0 }) }};
+    const NoTracker = struct {
+        const metrics_mode = "full-scan";
+        fn finish(_: *@This()) !spore.MemoryManifest {
+            unreachable;
+        }
+        fn logSnapshotMetrics(_: *@This(), _: SnapshotMetrics) void {}
+    };
+
+    // A disk fork leaves the layer live and reads from the store later, so
+    // it fetches nothing and goes on to write memory. (Its manifest then
+    // needs the host counter frequency, which only an arm64 host has.)
+    const fork_dir = try fixture.path("fork");
+    writeSnapshot(std.testing.allocator, "test", &vm, @as([]TestVcpu, &vcpus), @as(?*NoTracker, null), source, .{ .dir = fork_dir, .disk = .quiesce_only }) catch |err| {
+        try std.testing.expect(err != error.ImageStoreIncomplete);
+    };
+    try std.Io.Dir.cwd().access(io, try std.fs.path.join(allocator, &.{ fork_dir, "chunks" }), .{});
+    try std.testing.expectEqual(@as(u64, 0), fetcher.stats.fetches);
+    try std.testing.expectEqual(@as(u64, 0), fetcher.stats.errors);
+
+    // A snapshot fetches first and fails before it writes anything.
+    const save_dir = try fixture.path("save");
+    try std.testing.expectError(error.ImageStoreIncomplete, writeSnapshot(std.testing.allocator, "test", &vm, @as([]TestVcpu, &vcpus), @as(?*NoTracker, null), source, .{ .dir = save_dir }));
+    try std.testing.expect(fetcher.stats.errors != 0);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, save_dir, .{}));
 }

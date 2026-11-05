@@ -92,7 +92,7 @@ pub const RuntimeDisk = struct {
 
     pub fn deinit(self: *RuntimeDisk) void {
         if (self.chunk_mapped) |*disk| disk.deinit();
-        if (self.fetcher) |fetcher| fetcher.destroy();
+        if (self.fetcher) |fetcher| fetcher.release();
         if (self.overlay) |*overlay| overlay.deinit();
         if (self.rootfs_fd) |fd| _ = std.c.close(fd);
         if (self.trace_fd) |fd| _ = std.c.close(fd);
@@ -219,7 +219,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             if (origin) |store| {
                 // Faults run on vCPU threads and fetches on Io workers, so the
                 // fetcher needs a thread-safe allocator.
-                runtime.fetcher = try image_store.Fetcher.create(std.heap.c_allocator, context.io, cache_root, store);
+                runtime.fetcher = try image_store.Fetcher.create(std.heap.c_allocator, context.io, cache_root, store, storage);
                 runtime.chunk_mapped.?.attachRemote(runtime.fetcher.?);
             }
             // The sparse fd and verified parent index make every appended byte

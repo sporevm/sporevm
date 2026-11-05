@@ -36,9 +36,8 @@ pub const Error = error{
     FlushFailed,
     Poisoned,
     FastForkUnavailable,
-    /// Objects the disk names may exist only in its image store, so a
-    /// snapshot would claim storage this host does not have.
-    RemoteBackedSnapshot,
+    /// The image store did not supply every object a snapshot would name.
+    ImageStoreIncomplete,
 } || chunk_sealer.Error || rootfs_cas.SourceError || runtime_disk_fork.Error || spore.Error || block_source.Error || std.mem.Allocator.Error;
 
 const Source = enum(u8) {
@@ -836,6 +835,16 @@ pub const ChunkMappedDisk = struct {
 
     /// Fetches CAS objects missing from `cas_root` through `fetcher`, which
     /// must outlive the disk. A failed fetch poisons the disk.
+    /// Fetches every object of the index that is only in the image store, so
+    /// a snapshot can claim them. A failure leaves the head as it was.
+    pub fn fetchFromStore(self: *ChunkMappedDisk) Error!void {
+        const remote = self.remote orelse return;
+        remote.fetchAll() catch |err| {
+            std.log.warn("snapshot: the image store could not supply every object of the root disk: {s}", .{@errorName(err)});
+            return error.ImageStoreIncomplete;
+        };
+    }
+
     pub fn attachRemote(self: *ChunkMappedDisk, fetcher: *image_store.Fetcher) void {
         self.remote = fetcher;
     }
@@ -926,7 +935,8 @@ pub const ChunkMappedDisk = struct {
     ) Error!spore.Disk {
         std.debug.assert(quiesced);
         if (self.isPoisoned()) return error.Poisoned;
-        if (self.remote != null) return error.RemoteBackedSnapshot;
+        // The VMM fetches first; this only backs it up.
+        try self.fetchFromStore();
         var chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
         errdefer chunks.deinit(self.allocator);
         var zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
@@ -1381,7 +1391,7 @@ pub const ChunkMappedDisk = struct {
         for (self.sources) |source| {
             if (source == .cas) remaining +|= 1;
         }
-        const remote: image_store.FetchStats = if (self.remote) |fetcher| fetcher.stats else .{};
+        const remote: image_store.FetchStats = if (self.remote) |fetcher| fetcher.currentStats() else .{};
         var line_buf: [1536]u8 = undefined;
         const line = std.fmt.bufPrint(
             &line_buf,

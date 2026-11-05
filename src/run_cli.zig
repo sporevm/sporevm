@@ -70,7 +70,7 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
             writeStderr("\n");
             std.process.exit(classified.exit_code);
         }
-        if (err == error.ImageCommandMissing or err == error.UnsupportedImageUser or err == error.RunArgCountUnsupported or err == error.RunArgTooLong or err == error.RunProgramEmpty or err == error.RemoteImageNotSnapshotable) {
+        if (err == error.ImageCommandMissing or err == error.UnsupportedImageUser or err == error.RunArgCountUnsupported or err == error.RunArgTooLong or err == error.RunProgramEmpty or err == error.ImageStoreIncomplete) {
             const classified = api.classifyFailure(err);
             writeStderr(classified.message);
             writeStderr("\n");
