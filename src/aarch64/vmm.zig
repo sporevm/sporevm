@@ -30,6 +30,42 @@ const vsock_stream = @import("../virtio/vsock_stream.zig");
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
+/// A guest access to an emulated device register.
+pub const Mmio = struct {
+    addr: u64,
+    size_log2: u2,
+    /// The value written, or null for a read.
+    write: ?u64,
+};
+
+/// Why a backend's `Vcpu.run` returned to its run loop.
+pub const Exit = union(enum) {
+    /// A device register access. The loop emulates it, then calls
+    /// `completeMmio` with the value a read returns.
+    mmio: Mmio,
+    /// A host-side wake interrupted the guest.
+    kicked,
+    /// The guest is waiting for an interrupt.
+    wfi,
+    /// The guest powered off or asked for a reset.
+    shutdown: Shutdown,
+    /// The backend handled the exit itself; the loop runs its host-side
+    /// checks before entering the guest again.
+    handled,
+
+    pub const Shutdown = enum {
+        off,
+        reset,
+
+        pub fn cause(self: Shutdown) ExitCause {
+            return switch (self) {
+                .off => .guest_off,
+                .reset => .guest_reset,
+            };
+        }
+    };
+};
+
 pub const max_build_input_disks = 2;
 
 pub const Config = struct {
