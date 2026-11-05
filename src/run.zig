@@ -43,6 +43,8 @@ const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
 const vmm = @import("aarch64/vmm.zig");
 const vsock = @import("virtio/vsock.zig");
+const vsock_control = @import("virtio/vsock_control.zig");
+const vsock_stream = @import("virtio/vsock_stream.zig");
 
 const max_file_size = 256 * 1024 * 1024;
 const max_kernel_asset_size = 256 * 1024 * 1024;
@@ -563,7 +565,7 @@ pub const EventEmitter = struct {
         if (self.sink) |sink| try sink.emit(.{ .ready = .{ .command = self.command, .backend = self.backend } });
     }
 
-    pub fn emitOutput(self: *EventEmitter, output: vsock.HostStreamOutput, bytes: []const u8) !void {
+    pub fn emitOutput(self: *EventEmitter, output: vsock_stream.HostStreamOutput, bytes: []const u8) !void {
         if (bytes.len == 0) return;
         try self.emitReady();
         const offset = switch (output) {
@@ -625,7 +627,7 @@ pub const EventEmitter = struct {
         };
     }
 
-    pub fn emitOutputBestEffort(self: *EventEmitter, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    pub fn emitOutputBestEffort(self: *EventEmitter, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         self.emitOutput(output, bytes) catch {
             self.write_failed = true;
         };
@@ -943,7 +945,7 @@ pub const EventWriter = struct {
         try self.write(event);
     }
 
-    pub fn emitOutput(self: *EventWriter, output: vsock.HostStreamOutput, bytes: []const u8) !void {
+    pub fn emitOutput(self: *EventWriter, output: vsock_stream.HostStreamOutput, bytes: []const u8) !void {
         if (bytes.len == 0) return;
         try self.emitReady();
         const offset = switch (output) {
@@ -1037,7 +1039,7 @@ pub const EventWriter = struct {
         };
     }
 
-    pub fn emitOutputBestEffort(self: *EventWriter, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    pub fn emitOutputBestEffort(self: *EventWriter, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         self.emitOutput(output, bytes) catch {
             self.write_failed = true;
         };
@@ -3135,19 +3137,19 @@ fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
 const CommitControl = struct {
     io: Io,
     allocator: std.mem.Allocator,
-    command_stream: *vsock.HostStream,
+    command_stream: *vsock_stream.HostStream,
     guest_port: u32,
     timeout_ms: u64,
     cache_root: []const u8,
     rootfs_grow_target: u64,
     phase: Phase,
-    resize_stream: vsock.HostStream = undefined,
+    resize_stream: vsock_stream.HostStream = undefined,
     resize_stdout: std.array_list.Managed(u8),
     resize_stdout_overflow: bool = false,
-    freeze_stream: vsock.HostStream = undefined,
+    freeze_stream: vsock_stream.HostStream = undefined,
     storage: ?spore.RootfsStorage = null,
     cache_lock: ?rootfs_mod.RootfsCacheLock = null,
-    wake: ?vsock.Wake = null,
+    wake: ?vsock_control.Wake = null,
 
     const Phase = enum {
         start_resize,
@@ -3165,7 +3167,7 @@ const CommitControl = struct {
         if (self.cache_lock) |*lock| lock.deinit();
     }
 
-    fn control(self: *CommitControl) vsock.Control {
+    fn control(self: *CommitControl) vsock_control.Control {
         return .{
             .context = self,
             .pollFn = pollThunk,
@@ -3176,12 +3178,12 @@ const CommitControl = struct {
         };
     }
 
-    fn poll(self: *CommitControl, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn poll(self: *CommitControl, dev: *vsock.Vsock) !vsock_control.ControlAction {
         switch (self.phase) {
             .start_resize => {
                 const request = try simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-run-commit-resize");
-                self.resize_stream = try vsock.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
-                self.resize_stream.host_port = vsock.HostStream.deriveHostPort(request);
+                self.resize_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
+                self.resize_stream.host_port = vsock_stream.HostStream.deriveHostPort(request);
                 self.resize_stream.setOutputSink(self, resizeOutputSink);
                 try self.startStream(dev, &self.resize_stream);
                 self.phase = .active_resize;
@@ -3227,8 +3229,8 @@ const CommitControl = struct {
             },
             .start_freeze => {
                 const request = try simpleControlRequest(self.allocator, "fsfreeze-v1", "spore-run-commit-freeze");
-                self.freeze_stream = try vsock.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
-                self.freeze_stream.host_port = vsock.HostStream.deriveHostPort(request);
+                self.freeze_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
+                self.freeze_stream.host_port = vsock_stream.HostStream.deriveHostPort(request);
                 try dev.attachHostStream(&self.freeze_stream);
                 self.freeze_stream.markStarted();
                 _ = try dev.flushHostStreamOutbound();
@@ -3262,7 +3264,7 @@ const CommitControl = struct {
         }
     }
 
-    fn startStream(_: *CommitControl, dev: *vsock.Vsock, stream: *vsock.HostStream) !void {
+    fn startStream(_: *CommitControl, dev: *vsock.Vsock, stream: *vsock_stream.HostStream) !void {
         stream.markStarted();
         try dev.attachHostStream(stream);
         _ = try dev.flushHostStreamOutbound();
@@ -3272,7 +3274,7 @@ const CommitControl = struct {
         if (self.wake) |wake| wake.wake();
     }
 
-    fn resizeOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn resizeOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         if (output != .stdout) return;
         const self: *CommitControl = @ptrCast(@alignCast(context.?));
         const remaining = max_rootfs_grow_response -| self.resize_stdout.items.len;
@@ -3293,12 +3295,12 @@ const CommitControl = struct {
         self.requestPoll();
     }
 
-    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock_control.ControlAction {
         const self: *CommitControl = @ptrCast(@alignCast(context));
         return self.poll(dev);
     }
 
-    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
+    fn setWakeThunk(context: *anyopaque, wake: vsock_control.Wake) void {
         const self: *CommitControl = @ptrCast(@alignCast(context));
         self.wake = wake;
     }
@@ -3309,7 +3311,7 @@ const CommitControl = struct {
         try self.completeRootfsSnapshot(disk);
     }
 
-    fn reportStatsThunk(_: *anyopaque, _: vsock.ControlStats) void {}
+    fn reportStatsThunk(_: *anyopaque, _: vsock_control.ControlStats) void {}
 };
 
 pub fn simpleControlRequest(allocator: std.mem.Allocator, request_type: []const u8, session_id: []const u8) ![]const u8 {
@@ -3406,9 +3408,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const boot_args = if (resuming) "" else try productBootArgs(allocator, base_boot_args);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
-    var stream = try vsock.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
+    var stream = try vsock_stream.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
     const request_ms = monotonicMs() -| request_start;
-    if (resuming) stream.host_port = vsock.HostStream.deriveHostPort(request.bytes);
+    if (resuming) stream.host_port = vsock_stream.HostStream.deriveHostPort(request.bytes);
     if (opts.events != null) {
         stream.setLifecycleSink(&events, runEventLifecycleSink);
         stream.setOutputSink(&events, runEventOutputSink);
@@ -3702,7 +3704,7 @@ pub fn loadMonitorBootArtifacts(
     };
 }
 
-pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control, startup_probe: ?*vsock.HostStream) !MonitorResult {
+pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock_control.Control, startup_probe: ?*vsock_stream.HostStream) !MonitorResult {
     _ = try opts.backend.resolveForHost();
     const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
     return executeMonitorWithBootArtifacts(context, allocator, opts, artifacts, control, startup_probe);
@@ -3712,8 +3714,8 @@ pub fn executeMonitorWithRootfsCacheLock(
     context: Context,
     allocator: std.mem.Allocator,
     opts: Options,
-    control: vsock.Control,
-    startup_probe: ?*vsock.HostStream,
+    control: vsock_control.Control,
+    startup_probe: ?*vsock_stream.HostStream,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !MonitorResult {
     _ = try opts.backend.resolveForHost();
@@ -3726,8 +3728,8 @@ pub fn executeMonitorWithBootArtifacts(
     allocator: std.mem.Allocator,
     opts: Options,
     artifacts: MonitorBootArtifacts,
-    control: vsock.Control,
-    startup_probe: ?*vsock.HostStream,
+    control: vsock_control.Control,
+    startup_probe: ?*vsock_stream.HostStream,
 ) !MonitorResult {
     return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, null);
 }
@@ -3737,8 +3739,8 @@ pub fn executeMonitorWithBootArtifactsAndRootfsCacheLock(
     allocator: std.mem.Allocator,
     opts: Options,
     artifacts: MonitorBootArtifacts,
-    control: vsock.Control,
-    startup_probe: ?*vsock.HostStream,
+    control: vsock_control.Control,
+    startup_probe: ?*vsock_stream.HostStream,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !MonitorResult {
     return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
@@ -3749,8 +3751,8 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     allocator: std.mem.Allocator,
     opts: Options,
     artifacts: MonitorBootArtifacts,
-    control: vsock.Control,
-    startup_probe: ?*vsock.HostStream,
+    control: vsock_control.Control,
+    startup_probe: ?*vsock_stream.HostStream,
     rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !MonitorResult {
     try topology.validateVcpuCount(opts.vcpus);
@@ -3904,7 +3906,7 @@ fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !s
 
 pub var console_fd: std.c.fd_t = -1;
 
-fn runOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+fn runOutputSink(_: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
     const fd: std.c.fd_t = switch (output) {
         .stdout => 1,
         .stderr => 2,
@@ -3913,12 +3915,12 @@ fn runOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const 
     fd_util.writeAllBestEffort(fd, bytes);
 }
 
-fn runEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+fn runEventOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
     const events: *EventEmitter = @ptrCast(@alignCast(context.?));
     events.emitOutputBestEffort(output, bytes);
 }
 
-fn runEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
+fn runEventLifecycleSink(context: ?*anyopaque, event: vsock_stream.HostStreamLifecycle) void {
     const events: *EventEmitter = @ptrCast(@alignCast(context.?));
     switch (event) {
         .ready => events.emitReadyBestEffort(),
@@ -4357,7 +4359,7 @@ fn productBootArgs(allocator: std.mem.Allocator, base: []const u8) ![]const u8 {
     return base;
 }
 
-fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostStream, saved: bool) !Result {
+fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream, saved: bool) !Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -4389,15 +4391,15 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock.HostSt
     };
 }
 
-fn resultFromSignalCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) Result {
+fn resultFromSignalCapture(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream) Result {
     return resultFromSignalCaptureExitCode(backend, opts, stream, 0);
 }
 
-fn resultFromAbortedSignalCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) Result {
+fn resultFromAbortedSignalCapture(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream) Result {
     return resultFromSignalCaptureExitCode(backend, opts, stream, 130);
 }
 
-fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *const vsock.HostStream, exit_code: u8) Result {
+fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream, exit_code: u8) Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -4417,7 +4419,7 @@ fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *con
     };
 }
 
-fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock.HostStream) !Result {
+fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream) !Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
