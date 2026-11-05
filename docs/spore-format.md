@@ -577,9 +577,7 @@ raw KVM or Hypervisor.framework memory-region structure.
 
 - General block-device state is still incomplete. The current writable disk
   contract is one rootfs-bound chunk index over verified rootfs CAS objects.
-- Access traces: the KVM and HVF lazy-restore harnesses can write local
-  first-touch traces for measurement, but manifest v2 does not persist access
-  traces or prefetch hints.
+- Access traces and prefetch hints for lazy restore.
 - Multi-vCPU machine state in manifest v2. Manifest v3 carries this state for
   KVM capture/restore and same-HVF capture/restore.
 - Kernel identity in the platform contract (pinned-build enforcement).

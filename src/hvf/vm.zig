@@ -43,11 +43,7 @@ pub const Config = struct {
     cmdline: []const u8 = "console=hvc0",
     initrd: ?[]const u8 = null,
     console_sink: *const fn ([]const u8) void,
-    /// Host fd backing /dev/vda, if any. Immutable rootfs callers pass a
-    /// read-only fd; guest write requests fail through the block device.
-    disk_fd: ?std.c.fd_t = null,
-    /// Full block backend for writable or layered rootfs runs. Takes
-    /// precedence over disk_fd.
+    /// Block backend for /dev/vda, if any.
     disk_backend: ?blk.Backend = null,
     /// Ephemeral feature profile for the root disk. The default remains the
     /// portable, resumable virtio-blk surface.
@@ -68,9 +64,6 @@ pub const Config = struct {
     network_manifest: ?spore.Network = null,
     annotations: spore.Annotations = .{},
     sessions: []const spore.Session = &.{},
-    /// Poll fd 0 (set non-blocking by the caller) for console input on
-    /// guest idle exits.
-    poll_stdin: bool = false,
     /// Resume from a spore directory instead of booting the kernel.
     resume_dir: ?[]const u8 = null,
     /// Optional pre-refreshed generation state for product resume attach.
@@ -84,9 +77,6 @@ pub const Config = struct {
     environ_map: ?*const std.process.Environ.Map = null,
     /// Optional fd that receives one line per lazily materialized chunk.
     lazy_ram_trace_fd: ?std.c.fd_t = null,
-    /// Take a spore snapshot after this many milliseconds of run time and
-    /// stop. Requires snapshot_dir.
-    snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
     /// Snapshot and stop when the exec probe has observed command completion.
     snapshot_on_probe_complete: bool = false,
@@ -104,7 +94,6 @@ pub const Config = struct {
     exec_probe_timeout_ms: u64 = 30_000,
     exec_probe_start: vsock.HostStreamStart = .immediate,
     exec_probe_completes_run: bool = true,
-    exec_probe_failure_fatal: bool = true,
     /// Optional virtio-net frame backend. The default remains closed.
     network: net.Runtime = .{},
     /// Optional monitor control hook for attaching host streams after boot.
@@ -112,7 +101,7 @@ pub const Config = struct {
 };
 
 fn hasFreshCaptureTrigger(config: Config) bool {
-    return config.snapshot_after_ms != null or config.snapshot_on_probe_complete or config.capture_request != null;
+    return config.snapshot_on_probe_complete or config.capture_request != null;
 }
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
@@ -378,8 +367,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var transports_buf: [board.max_virtio_devices]mmio.Transport = undefined;
     transports_buf[0] = mmio.Transport.init(con.device());
     var transport_count: usize = 1;
-    const disk_backend: ?blk.Backend = if (config.disk_backend) |backend| backend else if (config.disk_fd) |fd| .{ .file = fd } else null;
-    if (disk_backend) |backend| {
+    if (config.disk_backend) |backend| {
         blk_dev = blk.Blk.initWithOptions(backend, config.root_blk_options);
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
@@ -557,8 +545,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         boot_ms = monotonicMs() - boot_start;
     }
 
-    const counter_start = snapshot.hostCounter();
-    const counter_freq = snapshot.hostCounterFreq();
     const start_ms = monotonicMs();
     emitRestoreMetrics(config, &restore_stats, start_ms);
     var attach_probe_ms: u64 = 0;
@@ -704,11 +690,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         }
         if (config.exec_probe) |probe| {
             if (!exec_probe_done) {
-                if (probe.state == .failed) {
-                    if (config.exec_probe_failure_fatal) return error.VsockProbeFailed;
-                    vsock_dev.host_stream = null;
-                    exec_probe_done = true;
-                }
+                if (probe.state == .failed) return error.VsockProbeFailed;
                 if (probe.state == .complete) {
                     if (config.exec_probe_completes_run) {
                         if (config.snapshot_on_probe_complete) {
@@ -726,24 +708,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > config.exec_probe_timeout_ms) {
-                    if (config.exec_probe_failure_fatal) return error.VsockProbeTimedOut;
-                    vsock_dev.host_stream = null;
-                    exec_probe_done = true;
-                }
-            }
-        }
-        if (config.snapshot_after_ms) |after_ms| {
-            const elapsed_ms = (snapshot.hostCounter() - counter_start) * 1000 / counter_freq;
-            if (elapsed_ms >= after_ms) {
-                const dir = config.snapshot_dir orelse return error.HvCallFailed;
-                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
-                    .dist_base = dist_base,
-                    .redist_base = vcpu_redist_base,
-                    .ram_size = config.ram_size,
-                    .memory_device = if (mem_transport_index != null) &mem_dev else null,
-                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
-                return .snapshotted;
+                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
             }
         }
         if (config.resume_dir != null and config.exec_probe != null and !logged_first_vcpu_entry) {
@@ -808,12 +773,8 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     },
                     ec_wfx => {
                         // WFI/WFE: nothing better to do single-threaded yet;
-                        // poll input, yield briefly, let the vtimer wake us.
+                        // yield briefly, let the vtimer wake us.
                         try advancePc(vcpu);
-                        if (config.poll_stdin) {
-                            if (lazy_pager) |*pager| try materializeTransportQueues(pager, &transports[0]);
-                            try drainStdin(&con, &transports[0], ram);
-                        }
                         var ts = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_us };
                         _ = std.c.nanosleep(&ts, null);
                     },
@@ -842,10 +803,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 // With hv_gic the timer PPI is delivered by the GIC; unmask
                 // so subsequent timer exits can fire.
                 try hvf.check(hvf.hv_vcpu_set_vtimer_mask(vcpu, false), "vtimer unmask");
-                if (config.poll_stdin) {
-                    if (lazy_pager) |*pager| try materializeTransportQueues(pager, &transports[0]);
-                    try drainStdin(&con, &transports[0], ram);
-                }
             },
             .canceled => {
                 if (config.capture_request) |request_capture| {
@@ -1458,11 +1415,8 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         if (options.config.exec_probe) |probe| {
             if (!exec_probe_done) {
                 if (probe.state == .failed) {
-                    if (options.config.exec_probe_failure_fatal) {
-                        state.finish(.{ .err = error.VsockProbeFailed });
-                        continue;
-                    }
-                    exec_probe_done = true;
+                    state.finish(.{ .err = error.VsockProbeFailed });
+                    continue;
                 }
                 if (probe.state == .complete) {
                     std.log.debug("hvf multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
@@ -1476,11 +1430,8 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     exec_probe_done = true;
                 }
                 if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
-                    if (options.config.exec_probe_failure_fatal) {
-                        state.finish(.{ .err = error.VsockProbeTimedOut });
-                        continue;
-                    }
-                    exec_probe_done = true;
+                    state.finish(.{ .err = error.VsockProbeTimedOut });
+                    continue;
                 }
             }
         }
@@ -1491,11 +1442,6 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             }
             if (request_capture.isRequested()) {
                 return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null, request_capture);
-            }
-        }
-        if (options.config.snapshot_after_ms) |after_ms| {
-            if (monotonicMs() -| start_ms >= after_ms) {
-                return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), null, null);
             }
         }
         sleepMs(1);
@@ -2940,20 +2886,6 @@ fn flushNetworkRxHvf(
     if (net_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(transport_index)), true), "raise net spi");
-    }
-}
-
-/// Drain pending bytes from non-blocking stdin into the console rx queue.
-fn drainStdin(con: *console.Console, t: *mmio.Transport, ram: guestmem.GuestRam) !void {
-    var buf: [256]u8 = undefined;
-    while (true) {
-        const n = std.c.read(0, &buf, buf.len);
-        if (n <= 0) return;
-        const fed = con.feed(t, ram, buf[0..@intCast(n)]);
-        if (fed > 0) {
-            try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(0), true), "console rx spi");
-        }
-        if (n < buf.len) return;
     }
 }
 

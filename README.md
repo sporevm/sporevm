@@ -462,8 +462,7 @@ above.
 - `src/`: SporeVM implementation, including backend-specific and shared device
   model code.
 - `guest/`: source for guest initrd assets embedded by the build.
-- `test/`: unit smoke fixtures, product smoke tests, and remote hardware
-  validation harnesses.
+- `test/`: unit smoke fixtures and product smoke tests.
 - `scripts/`: CI, release, benchmark, kernel asset, and internal helper
   automation.
 

@@ -21,23 +21,9 @@ pub const Region = enum { distributor, redistributor };
 
 pub const StrictAccessError = error{UnsupportedGicRegister};
 
-/// Strict snapshot/probe read path. Unlike `mmioRead`, unsupported offsets are
-/// errors because callers are trying to prove whether a portable state mapping
-/// is complete.
-pub fn readRegStrict(region: Region, vcpu: hvf.VcpuHandle, spec: gicv3.RegSpec) StrictAccessError!gicv3.MmioReg {
-    var value: u64 = 0;
-    const ret = switch (region) {
-        .distributor => hv_gic_get_distributor_reg(@intCast(spec.offset & 0xffff), &value),
-        .redistributor => hv_gic_get_redistributor_reg(vcpu, spec.offset, &value),
-    };
-    if (ret != hvf.success) return error.UnsupportedGicRegister;
-    if (spec.width_bits == 32) value &= 0xffff_ffff;
-    return .{ .offset = spec.offset, .width_bits = spec.width_bits, .value = value };
-}
-
-/// Strict snapshot/probe write path. This is not used by guest MMIO emulation;
-/// it exists so future portable restore code can fail closed on unsupported
-/// HVF GIC offsets instead of silently dropping state.
+/// Strict write path for portable GIC restore. Unlike `mmioWrite`, an offset
+/// HVF does not support is an error, so restore can fail closed instead of
+/// silently dropping state.
 pub fn writeRegStrict(region: Region, vcpu: hvf.VcpuHandle, reg: gicv3.MmioReg) StrictAccessError!void {
     const ret = switch (region) {
         .distributor => hv_gic_set_distributor_reg(@intCast(reg.offset & 0xffff), reg.value),

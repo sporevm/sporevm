@@ -104,7 +104,6 @@ pub const VcpuExit = extern struct {
 // Exception classes we care about during bring-up.
 pub const ec_hvc: u6 = 0x16;
 pub const ec_smc: u6 = 0x17;
-pub const ec_brk: u6 = 0x3c;
 pub const ec_instruction_abort: u6 = 0x20;
 pub const ec_data_abort: u6 = 0x24;
 
@@ -118,7 +117,6 @@ pub extern "c" fn hv_vcpu_destroy(vcpu: VcpuHandle) ReturnCode;
 pub extern "c" fn hv_vcpu_run(vcpu: VcpuHandle) ReturnCode;
 pub extern "c" fn hv_vcpu_get_reg(vcpu: VcpuHandle, reg: Reg, value: *u64) ReturnCode;
 pub extern "c" fn hv_vcpu_set_reg(vcpu: VcpuHandle, reg: Reg, value: u64) ReturnCode;
-pub extern "c" fn hv_vcpu_set_trap_debug_exceptions(vcpu: VcpuHandle, value: bool) ReturnCode;
 pub extern "c" fn hv_vcpu_set_vtimer_mask(vcpu: VcpuHandle, vtimer_is_masked: bool) ReturnCode;
 pub extern "c" fn hv_vcpu_get_sys_reg(vcpu: VcpuHandle, reg: SysReg, value: *u64) ReturnCode;
 pub extern "c" fn hv_vcpu_set_sys_reg(vcpu: VcpuHandle, reg: SysReg, value: u64) ReturnCode;
@@ -204,7 +202,6 @@ pub extern "c" fn hv_gic_get_distributor_size(size: *usize) ReturnCode;
 pub extern "c" fn hv_gic_get_distributor_base_alignment(alignment: *usize) ReturnCode;
 pub extern "c" fn hv_gic_get_redistributor_region_size(size: *usize) ReturnCode;
 pub extern "c" fn hv_gic_get_redistributor_base_alignment(alignment: *usize) ReturnCode;
-pub extern "c" fn hv_gic_get_spi_interrupt_range(intid_base: *u32, intid_count: *u32) ReturnCode;
 pub extern "c" fn hv_gic_get_redistributor_size(size: *usize) ReturnCode;
 pub extern "c" fn hv_gic_get_redistributor_base(vcpu: VcpuHandle, base: *Ipa) ReturnCode;
 

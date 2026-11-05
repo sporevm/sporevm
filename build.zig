@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
     const target_arch = target.result.cpu.arch;
     const target_is_hvf = target_os == .macos and target_arch == .aarch64;
     const target_is_kvm = target_os == .linux and target_arch == .aarch64;
-    const target_is_kvm_boot = target_os == .linux and (target_arch == .aarch64 or target_arch == .x86_64);
+    const target_is_x86_kvm = target_os == .linux and target_arch == .x86_64;
     const host_is_hvf = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
     const host_is_kvm = builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
     const optimize = b.standardOptimizeOption(.{
@@ -431,83 +431,14 @@ pub fn build(b: *std.Build) void {
         build_inode_enospc_smoke_step.dependOn(&run_inode_enospc_cli_smoke.step);
     }
 
-    // Hypervisor.framework smoke test: host-only, needs entitlement signing.
-    // Run with `zig build hvf-smoke` on an Apple Silicon Mac.
-    if (target_is_hvf and host_is_hvf) {
-        const smoke_mod = b.createModule(.{
-            .root_source_file = b.path("src/hvf_smoke.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "spore_internal", .module = internal_mod },
-            },
-        });
-        linkHypervisor(smoke_mod, macos_framework_path);
-
-        const smoke = b.addExecutable(.{
-            .name = "hvf-smoke",
-            .root_module = smoke_mod,
-        });
-        const install_smoke = b.addInstallArtifact(smoke, .{});
-
-        const sign = b.addSystemCommand(&.{
-            "codesign",                          "--sign", "-", "--force", "--entitlements", "spore.entitlements",
-            b.getInstallPath(.bin, "hvf-smoke"),
-        });
-        sign.step.dependOn(&install_smoke.step);
-
-        const run_smoke = b.addSystemCommand(&.{b.getInstallPath(.bin, "hvf-smoke")});
-        run_smoke.step.dependOn(&sign.step);
-
-        const smoke_step = b.step("hvf-smoke", "Run the Hypervisor.framework smoke test (signs the binary)");
-        smoke_step.dependOn(&run_smoke.step);
-
-        const run_gic_probe = b.addSystemCommand(&.{ b.getInstallPath(.bin, "hvf-smoke"), "--gic-probe" });
-        run_gic_probe.step.dependOn(&sign.step);
-
-        const gic_probe_step = b.step("hvf-gic-probe", "Probe Hypervisor.framework GICv3 portable-state support");
-        gic_probe_step.dependOn(&run_gic_probe.step);
-
-        // Kernel boot harness: builds and signs, does not run (needs a kernel).
-        const boot_mod = b.createModule(.{
-            .root_source_file = b.path("src/hvf_boot.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "spore_internal", .module = internal_mod },
-            },
-        });
-        linkHypervisor(boot_mod, macos_framework_path);
-
-        const boot_exe = b.addExecutable(.{
-            .name = "hvf-boot",
-            .root_module = boot_mod,
-        });
-        const install_boot = b.addInstallArtifact(boot_exe, .{});
-
-        const sign_boot = b.addSystemCommand(&.{
-            "codesign",                         "--sign", "-", "--force", "--entitlements", "spore.entitlements",
-            b.getInstallPath(.bin, "hvf-boot"),
-        });
-        sign_boot.step.dependOn(&install_boot.step);
-
-        const boot_step = b.step("hvf-boot", "Build and sign the HVF kernel boot harness");
-        boot_step.dependOn(&sign_boot.step);
-    }
-
-    // Linux KVM boot harness: host-only, needs /dev/kvm on the target architecture.
-    if (target_is_kvm_boot) {
+    // x86-64 Linux KVM harnesses: host-only, need /dev/kvm.
+    if (target_is_x86_kvm) {
         const kvm_boot_mod = b.createModule(.{
-            .root_source_file = b.path(if (target_arch == .x86_64) "src/x86_64_kvm_boot.zig" else "src/kvm_boot.zig"),
+            .root_source_file = b.path("src/x86_64_kvm_boot.zig"),
             .target = target,
             .optimize = optimize,
             .strip = optimize != .Debug,
             .link_libc = true,
-            .imports = if (target_arch == .x86_64) &.{} else &.{
-                .{ .name = "spore_internal", .module = internal_mod },
-            },
         });
 
         const kvm_boot_exe = b.addExecutable(.{

@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const boot_harness = @import("../boot_harness.zig");
 const fd_util = @import("../fd.zig");
 const board = @import("board.zig");
 const vm = @import("vm.zig");
@@ -10,11 +9,17 @@ const vm = @import("vm.zig");
 const max_boot_file = 256 * 1024 * 1024;
 const probe_disk_size = 1024 * 1024;
 
+const Options = struct {
+    kernel_path: []const u8,
+    cmdline: ?[]const u8 = null,
+    mem_mib: u64 = 512,
+    initrd_path: ?[]const u8 = null,
+};
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    const options = boot_harness.parseArgs(args) catch usageExit();
-    validateOptions(options) catch usageExit();
+    const options = parseArgs(args) catch usageExit();
 
     const kernel = try std.Io.Dir.cwd().readFileAlloc(init.io, options.kernel_path, arena, .limited(max_boot_file));
     const initrd_file = if (options.initrd_path) |path|
@@ -76,17 +81,23 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn validateOptions(options: boot_harness.Options) !void {
-    if (options.disk_path != null or
-        options.snapshot_after_ms != null or
-        options.spore_dir != null or
-        options.resume_dir != null or
-        options.lazy_ram or
-        options.lazy_ram_trace_path != null or
-        options.dirty_track)
-    {
-        return error.UnsupportedStageOption;
+fn parseArgs(args: []const []const u8) !Options {
+    if (args.len < 2) return error.BadUsage;
+    var options = Options{ .kernel_path = args[1] };
+    var i: usize = 2;
+    while (i + 1 < args.len) : (i += 2) {
+        if (std.mem.eql(u8, args[i], "--cmdline")) {
+            options.cmdline = args[i + 1];
+        } else if (std.mem.eql(u8, args[i], "--mem-mib")) {
+            options.mem_mib = try std.fmt.parseInt(u64, args[i + 1], 10);
+        } else if (std.mem.eql(u8, args[i], "--initrd")) {
+            options.initrd_path = args[i + 1];
+        } else {
+            return error.BadUsage;
+        }
     }
+    if (i != args.len) return error.BadUsage;
+    return options;
 }
 
 fn consoleSink(bytes: []const u8) void {

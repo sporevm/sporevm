@@ -11,7 +11,6 @@ pub const backend = @import("backend.zig");
 pub const board = @import("aarch64/board.zig");
 pub const block_source = @import("block_source.zig");
 pub const boot = @import("aarch64/boot.zig");
-pub const boot_harness = @import("boot_harness.zig");
 pub const build = @import("build.zig");
 pub const build_exec = @import("build/exec.zig");
 pub const build_cli = @import("build_cli.zig");

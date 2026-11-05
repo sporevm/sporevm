@@ -280,11 +280,8 @@ Current evidence:
   `mise run smoke:counter-fanout`, and `mise run smoke:rootfs-fanout`.
 - Local writable rootfs persistence, fork divergence, and local
   bundle-carried disk index replay are covered by `mise run smoke:writable-rootfs`.
-- Same-class KVM writable-rootfs bundle materialization previously passed with
-  `test/remote/bundle.sh --writable-rootfs` on two `a1.metal` hosts
-  in run `writable-rootfs-20260619T212758Z`. The repo keeps
-  `test/remote/bundle.sh` for host-level remote diagnostics; release validation
-  should target the deployed Kubernetes stack when that harness exists.
+- Same-class KVM writable-rootfs bundle materialization previously passed on
+  two `a1.metal` hosts in run `writable-rootfs-20260619T212758Z`.
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
   `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
   reject it before running guest code.
