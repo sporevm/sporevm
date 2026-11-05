@@ -30,14 +30,27 @@ pub const Trigger = union(enum) {
     }
 };
 
-pub const Plan = struct {
-    snapshot_dir: ?[]const u8 = null,
-    snapshot_on_probe_complete: bool = false,
-    request: ?*Request = null,
-    signal: ?Signal = null,
-    continue_after_capture: bool = false,
-    /// Fresh captures track dirty RAM and seal the dirty set at capture time.
+/// What the VMM captures, where, and when.
+pub const Capture = struct {
+    dir: []const u8,
+    trigger: When,
+    /// Track dirty RAM from boot and seal only the dirty set at capture time.
     dirty_tracking: bool = false,
+
+    pub const When = union(enum) {
+        /// Capture when the probe command completes, then stop.
+        probe_complete,
+        /// Capture when the host request fires.
+        request: struct { req: *Request, then: Then },
+    };
+
+    pub const Then = enum { stop, keep_running };
+};
+
+pub const Plan = struct {
+    capture: ?Capture = null,
+    /// Signal that fires the capture request; null for exit captures.
+    signal: ?Signal = null,
 
     pub const ProductRunOptions = struct {
         capture_path: ?[]const u8 = null,
@@ -48,16 +61,22 @@ pub const Plan = struct {
     };
 
     pub fn productRun(options: ProductRunOptions) Plan {
-        const has_capture = options.capture_path != null;
-        const signal = if (has_capture) options.trigger.signalValue() else null;
-
-        return .{
-            .snapshot_dir = options.capture_path,
-            .snapshot_on_probe_complete = has_capture and options.trigger.isExit(),
-            .request = if (signal != null) options.request else null,
-            .signal = signal,
-            .continue_after_capture = signal != null and options.continue_after_capture,
-            .dirty_tracking = has_capture and options.resume_dir == null,
+        const dir = options.capture_path orelse return .{};
+        // Fresh captures track dirty RAM and seal the dirty set at capture time.
+        const dirty_tracking = options.resume_dir == null;
+        return switch (options.trigger) {
+            .exit => .{ .capture = .{ .dir = dir, .trigger = .probe_complete, .dirty_tracking = dirty_tracking } },
+            .signal => |signal| .{
+                .capture = .{
+                    .dir = dir,
+                    .trigger = .{ .request = .{
+                        .req = options.request,
+                        .then = if (options.continue_after_capture) .keep_running else .stop,
+                    } },
+                    .dirty_tracking = dirty_tracking,
+                },
+                .signal = signal,
+            },
         };
     }
 
@@ -66,7 +85,8 @@ pub const Plan = struct {
     }
 
     pub fn isExitCapture(self: Plan) bool {
-        return self.snapshot_dir != null and self.snapshot_on_probe_complete;
+        const value = self.capture orelse return false;
+        return value.trigger == .probe_complete;
     }
 };
 
@@ -275,12 +295,12 @@ test "product run capture plan enables dirty tracking for fresh captures" {
         .continue_after_capture = true,
     });
 
-    try std.testing.expectEqualStrings("base.spore", plan.snapshot_dir.?);
-    try std.testing.expect(!plan.snapshot_on_probe_complete);
+    const value = plan.capture.?;
+    try std.testing.expectEqualStrings("base.spore", value.dir);
+    try std.testing.expectEqual(&request_value, value.trigger.request.req);
+    try std.testing.expectEqual(Capture.Then.keep_running, value.trigger.request.then);
+    try std.testing.expect(value.dirty_tracking);
     try std.testing.expectEqual(Signal.USR1, plan.signal.?);
-    try std.testing.expectEqual(&request_value, plan.request.?);
-    try std.testing.expect(plan.continue_after_capture);
-    try std.testing.expect(plan.dirty_tracking);
     try std.testing.expect(plan.isSignalCapture());
     try std.testing.expect(!plan.isExitCapture());
 }
@@ -292,16 +312,25 @@ test "product run capture plan keeps resume captures on full snapshot path" {
         .trigger = .exit,
         .resume_dir = "parent.spore",
         .request = &request_value,
+        .continue_after_capture = true,
     });
 
-    try std.testing.expectEqualStrings("resume.spore", plan.snapshot_dir.?);
-    try std.testing.expect(plan.snapshot_on_probe_complete);
-    try std.testing.expect(plan.request == null);
+    const value = plan.capture.?;
+    try std.testing.expectEqualStrings("resume.spore", value.dir);
+    try std.testing.expect(value.trigger == .probe_complete);
+    try std.testing.expect(!value.dirty_tracking);
     try std.testing.expect(plan.signal == null);
-    try std.testing.expect(!plan.continue_after_capture);
-    try std.testing.expect(!plan.dirty_tracking);
     try std.testing.expect(!plan.isSignalCapture());
     try std.testing.expect(plan.isExitCapture());
+}
+
+test "product run without a capture path plans no capture" {
+    var request_value = Request{};
+    const plan = Plan.productRun(.{ .trigger = .{ .signal = Signal.USR1 }, .request = &request_value });
+    try std.testing.expect(plan.capture == null);
+    try std.testing.expect(plan.signal == null);
+    try std.testing.expect(!plan.isSignalCapture());
+    try std.testing.expect(!plan.isExitCapture());
 }
 
 var test_wake_count: u32 = 0;
