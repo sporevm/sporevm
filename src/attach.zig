@@ -19,6 +19,7 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const virtio_net = @import("virtio/net.zig");
+const vmm = @import("aarch64/vmm.zig");
 const vsock = @import("virtio/vsock.zig");
 
 pub const Backend = run_mod.Backend;
@@ -241,43 +242,28 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     var ram_plan = try ram_restore.Plan.fromMemory(allocator, context.environ_map, opts.spore_dir, memory, memory_config.maximum_bytes, vcpu_count);
     defer ram_plan.deinit();
     std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
+    const vm_config: vmm.Config = .{
+        .start = .{ .restore = .{
+            .dir = opts.spore_dir,
+            .ram = ram_plan.strategy,
+            .generation = attach.generation_state,
+        } },
+        .vcpus = vcpu_count,
+        .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
+        .disk_backend = runtime_disk_state.backend(),
+        .probe = if (identity_probe) |stream| .{ .stream = stream, .timeout_ms = opts.timeout_ms } else null,
+        .network = network,
+        .exec_control = exec_control,
+    };
     const cause = switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try hvf.vm.run(allocator, .{
-                .kernel = "",
-                .ram_size = ram_size,
-                .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
-                .disk_backend = runtime_disk_state.backend(),
-                .resume_dir = opts.spore_dir,
-                .resume_generation = attach.generation_state,
-                .vcpus = vcpu_count,
-                .ram_restore = ram_plan.strategy,
-                .network = network,
-                .exec_probe = identity_probe,
-                .exec_control = exec_control,
-                .exec_probe_timeout_ms = opts.timeout_ms,
-                .exec_probe_completes_run = true,
-            });
+            break :blk try hvf.vm.run(allocator, vm_config);
         },
         .kvm => blk: {
             if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try kvm.vm.run(allocator, .{
-                .kernel = "",
-                .ram_size = ram_size,
-                .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
-                .disk_backend = runtime_disk_state.backend(),
-                .resume_dir = opts.spore_dir,
-                .resume_generation = attach.generation_state,
-                .vcpus = vcpu_count,
-                .ram_restore = ram_plan.strategy,
-                .network = network,
-                .exec_probe = identity_probe,
-                .exec_control = exec_control,
-                .exec_probe_timeout_ms = opts.timeout_ms,
-                .exec_probe_completes_run = true,
-            });
+            break :blk try kvm.vm.run(allocator, vm_config);
         },
     };
 

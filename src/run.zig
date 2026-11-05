@@ -41,6 +41,7 @@ const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
 const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
+const vmm = @import("aarch64/vmm.zig");
 const vsock = @import("virtio/vsock.zig");
 
 const max_file_size = 256 * 1024 * 1024;
@@ -3453,12 +3454,12 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .request = &capture_request,
         .continue_after_capture = opts.continue_after_save,
     });
-    if (capture_plan.snapshot_dir) |snapshot_dir| {
-        try spore.createSnapshotRoot(allocator, snapshot_dir);
+    if (capture_plan.capture) |vm_capture| {
+        try spore.createSnapshotRoot(allocator, vm_capture.dir);
         if (hasRootfs(opts)) {
             const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
             defer allocator.free(cache_root);
-            try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, snapshot_dir);
+            try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, vm_capture.dir);
         }
     }
     var saved_session_buf: [1]spore.Session = undefined;
@@ -3469,7 +3470,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         break :blk saved_session_buf[0..1];
     };
     if (capture_plan.signal) |signal| {
-        signal_registration = capture.SignalRegistration.install(signal, capture_plan.request.?);
+        signal_registration = capture.SignalRegistration.install(signal, &capture_request);
     }
     std.log.debug(
         "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} disk_ms={d} request_ms={d} ram_mib={d} virtio_mem_mib={d}",
@@ -3485,76 +3486,53 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         },
     );
 
+    var vm_capture = capture_plan.capture;
+    // HVF tracks dirty RAM with one vCPU only, and neither backend tracks it
+    // with elastic memory.
+    if (vm_capture) |*value| value.dirty_tracking = value.dirty_tracking and !opts.memory.isElastic() and (backend == .kvm or opts.vcpus == 1);
+    const vm_config: vmm.Config = .{
+        .start = if (opts.resume_dir) |dir| .{ .restore = .{
+            .dir = dir,
+            .ram = ram_plan.strategy,
+            .generation = opts.resume_generation,
+        } } else .{ .boot = .{
+            .kernel = kernel,
+            .cmdline = boot_args,
+            .initrd = initrd,
+            .ram_size = memory_plan.boot_ram_size,
+            .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
+        } },
+        .vcpus = opts.vcpus,
+        .console_sink = consoleSink,
+        .disk_backend = runtime_disk.backend(),
+        .root_blk_options = root_blk_options,
+        .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
+        .rootfs = opts.rootfs,
+        .network_manifest = network_manifest,
+        .annotations = opts.annotations,
+        .sessions = saved_sessions,
+        .environ_map = context.environ_map,
+        .probe = .{
+            .stream = &stream,
+            .timeout_ms = opts.timeout_ms,
+            .start = if (opts.rootfs_grow_target != 0) .control else .immediate,
+            .on_complete = if (opts.commit == null) .stop else .detach,
+        },
+        .capture = vm_capture,
+        .network = network,
+        .exec_control = exec_control,
+    };
+
     const backend_run_start = monotonicMs();
     const cause = (switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk hvf.vm.run(allocator, .{
-                .kernel = kernel,
-                .ram_size = memory_plan.boot_ram_size,
-                .vcpus = opts.vcpus,
-                .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
-                .cmdline = boot_args,
-                .initrd = initrd,
-                .console_sink = consoleSink,
-                .disk_backend = runtime_disk.backend(),
-                .root_blk_options = root_blk_options,
-                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                .rootfs = opts.rootfs,
-                .network_manifest = network_manifest,
-                .annotations = opts.annotations,
-                .sessions = saved_sessions,
-                .resume_dir = opts.resume_dir,
-                .resume_generation = opts.resume_generation,
-                .ram_restore = ram_plan.strategy,
-                .exec_probe = &stream,
-                .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
-                .exec_probe_completes_run = opts.commit == null,
-                .exec_control = exec_control,
-                .exec_probe_timeout_ms = opts.timeout_ms,
-                .snapshot_dir = capture_plan.snapshot_dir,
-                .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
-                .capture_request = capture_plan.request,
-                .continue_after_capture = capture_plan.continue_after_capture,
-                .dirty_tracking = capture_plan.dirty_tracking and opts.vcpus == 1 and !opts.memory.isElastic(),
-                .network = network,
-                .environ_map = context.environ_map,
-            });
+            break :blk hvf.vm.run(allocator, vm_config);
         },
         .kvm => blk: {
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
-                break :blk kvm.vm.run(allocator, .{
-                    .kernel = kernel,
-                    .ram_size = memory_plan.boot_ram_size,
-                    .vcpus = opts.vcpus,
-                    .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
-                    .cmdline = boot_args,
-                    .initrd = initrd,
-                    .console_sink = consoleSink,
-                    .disk_backend = runtime_disk.backend(),
-                    .root_blk_options = root_blk_options,
-                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                    .rootfs = opts.rootfs,
-                    .network_manifest = network_manifest,
-                    .annotations = opts.annotations,
-                    .sessions = saved_sessions,
-                    .resume_dir = opts.resume_dir,
-                    .resume_generation = opts.resume_generation,
-                    .ram_restore = ram_plan.strategy,
-                    .exec_probe = &stream,
-                    .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
-                    .exec_probe_completes_run = opts.commit == null,
-                    .exec_control = exec_control,
-                    .exec_probe_timeout_ms = opts.timeout_ms,
-                    .snapshot_dir = capture_plan.snapshot_dir,
-                    .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
-                    .capture_request = capture_plan.request,
-                    .continue_after_capture = capture_plan.continue_after_capture,
-                    .dirty_tracking = capture_plan.dirty_tracking and !opts.memory.isElastic(),
-                    .network = network,
-                    .environ_map = context.environ_map,
-                });
+                break :blk kvm.vm.run(allocator, vm_config);
             }
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
                 break :blk x86_vm.run(allocator, .{
@@ -3839,69 +3817,45 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
     defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
 
+    const vm_config: vmm.Config = .{
+        .start = if (opts.resume_dir) |dir| .{ .restore = .{
+            .dir = dir,
+            .ram = ram_plan.strategy,
+            .generation = opts.resume_generation,
+        } } else .{ .boot = .{
+            .kernel = artifacts.kernel,
+            .cmdline = boot_args,
+            .initrd = artifacts.initrd,
+            .ram_size = opts.memory.initial_bytes,
+            .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
+        } },
+        .vcpus = opts.vcpus,
+        .console_sink = consoleSink,
+        .disk_backend = runtime_disk.backend(),
+        .root_blk_options = root_blk_options,
+        .context_disk_fd = context_disk_fd,
+        .build_input_disk_backends = build_input_backends,
+        .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
+        .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
+        .rootfs = opts.rootfs,
+        .network_manifest = network_manifest,
+        .annotations = opts.annotations,
+        .sessions = opts.resume_sessions,
+        .environ_map = context.environ_map,
+        .probe = if (startup_probe) |stream| .{ .stream = stream, .timeout_ms = opts.timeout_ms, .on_complete = .detach } else null,
+        .network = network,
+        .exec_control = control,
+    };
+
     const cause = switch (backend) {
         .auto => unreachable,
         .hvf => blk: {
             if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try hvf.vm.run(allocator, .{
-                .kernel = artifacts.kernel,
-                .ram_size = opts.memory.initial_bytes,
-                .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
-                .vcpus = opts.vcpus,
-                .cmdline = boot_args,
-                .initrd = artifacts.initrd,
-                .console_sink = consoleSink,
-                .disk_backend = runtime_disk.backend(),
-                .root_blk_options = root_blk_options,
-                .context_disk_fd = context_disk_fd,
-                .build_input_disk_backends = build_input_backends,
-                .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
-                .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                .rootfs = opts.rootfs,
-                .network_manifest = network_manifest,
-                .annotations = opts.annotations,
-                .sessions = opts.resume_sessions,
-                .resume_dir = opts.resume_dir,
-                .resume_generation = opts.resume_generation,
-                .ram_restore = ram_plan.strategy,
-                .exec_probe = startup_probe,
-                .exec_probe_timeout_ms = opts.timeout_ms,
-                .exec_probe_completes_run = false,
-                .exec_control = control,
-                .network = network,
-                .environ_map = context.environ_map,
-            });
+            break :blk try hvf.vm.run(allocator, vm_config);
         },
         .kvm => blk: {
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
-                break :blk try kvm.vm.run(allocator, .{
-                    .kernel = artifacts.kernel,
-                    .ram_size = opts.memory.initial_bytes,
-                    .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
-                    .vcpus = opts.vcpus,
-                    .cmdline = boot_args,
-                    .initrd = artifacts.initrd,
-                    .console_sink = consoleSink,
-                    .disk_backend = runtime_disk.backend(),
-                    .root_blk_options = root_blk_options,
-                    .context_disk_fd = context_disk_fd,
-                    .build_input_disk_backends = build_input_backends,
-                    .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
-                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                    .rootfs = opts.rootfs,
-                    .network_manifest = network_manifest,
-                    .annotations = opts.annotations,
-                    .sessions = opts.resume_sessions,
-                    .resume_dir = opts.resume_dir,
-                    .resume_generation = opts.resume_generation,
-                    .ram_restore = ram_plan.strategy,
-                    .exec_probe = startup_probe,
-                    .exec_probe_timeout_ms = opts.timeout_ms,
-                    .exec_probe_completes_run = false,
-                    .exec_control = control,
-                    .network = network,
-                    .environ_map = context.environ_map,
-                });
+                break :blk try kvm.vm.run(allocator, vm_config);
             }
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
                 break :blk try x86_vm.run(allocator, .{
