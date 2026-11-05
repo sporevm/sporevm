@@ -96,10 +96,6 @@ pub const Config = struct {
     exec_control: ?vsock.Control = null,
 };
 
-fn hasFreshCaptureTrigger(config: Config) bool {
-    return config.snapshot_on_probe_complete or config.capture_request != null;
-}
-
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
 const KvmPostRunAction = enum { dispatch_exit, handle_async_wake };
@@ -273,7 +269,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
 
     const map_ram_start = try monotonicMs();
     const resume_memory: ?spore.MemoryManifest = if (resume_parsed) |parsed| parsed.value.memory else if (resume_v1_parsed) |parsed| parsed.value.memory else null;
-    const ram_mapping = try mapRam(allocator, config, resume_memory);
+    const ram_mapping = try mapRam(config, resume_memory);
     if (restore_stats) |*stats| stats.map_ram_ms = (try monotonicMs()) - map_ram_start;
     defer ram_mapping.deinit();
     const ram_bytes = ram_mapping.bytes;
@@ -372,8 +368,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     const vcpu_fd = primary_vcpu.fd;
     try initGic(gic_dev.fd);
 
-    if (config.resume_dir) |spore_dir| {
-        _ = spore_dir;
+    if (config.resume_dir != null) {
         const host_counter_frequency_hz = snapshot.hostCounterFreq();
         if (resume_v1_parsed == null) {
             const m = resume_parsed.?.value;
@@ -658,17 +653,14 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         switch (kvmPostRunAction(run_result, run_bytes[kvm.RunLayout.immediate_exit] != 0)) {
             .dispatch_exit => {},
             .handle_async_wake => {
-                const stopped_for_wake = run_bytes[kvm.RunLayout.immediate_exit] != 0;
-                _ = consumeCaptureWake(config.capture_request, run_bytes);
+                clearImmediateExit(run_bytes);
                 if (config.capture_request) |request_capture| {
                     if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
                 }
                 if (config.network.failed()) continue;
                 if (config.network.consumeWake()) {
                     try flushNetworkRxKvm(vm_fd, &net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
-                    continue;
                 }
-                if (stopped_for_wake and config.exec_control != null) continue;
                 continue;
             },
         }
@@ -1183,7 +1175,7 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
         pending_kvm_completion = false;
         const post_run_action = kvmPostRunAction(run_result, ctx.vcpu.run_bytes[kvm.RunLayout.immediate_exit] != 0);
         if (post_run_action == .handle_async_wake) {
-            _ = consumeCaptureWake(null, ctx.vcpu.run_bytes);
+            clearImmediateExit(ctx.vcpu.run_bytes);
             if (ctx.state.snapshotRequested()) {
                 if (!completePendingKvmExitBeforeSnapshot(ctx, &pending_kvm_completion)) return;
                 ctx.vcpu.snapshot_paused.store(true, .release);
@@ -1291,13 +1283,10 @@ fn flushNetworkRxKvm(
     }
 }
 
-fn consumeCaptureWake(capture_request: ?*capture.Request, run_bytes: []u8) bool {
-    if (run_bytes[kvm.RunLayout.immediate_exit] == 0) return false;
+/// A wake sets `immediate_exit` so the next KVM_RUN returns at once; clear it
+/// once the wake has been seen so the following entry runs the guest.
+fn clearImmediateExit(run_bytes: []u8) void {
     run_bytes[kvm.RunLayout.immediate_exit] = 0;
-    if (capture_request) |request_capture| {
-        return request_capture.isRequested() or request_capture.isAbortRequested();
-    }
-    return false;
 }
 
 fn monotonicMs() !u64 {
@@ -1346,8 +1335,7 @@ fn ratePerSec(count: u64, elapsed_ms: u64) u64 {
     return count * std.time.ms_per_s / elapsed_ms;
 }
 
-fn mapRam(allocator: std.mem.Allocator, config: Config, manifest_memory: ?spore.MemoryManifest) !RamMapping {
-    _ = allocator;
+fn mapRam(config: Config, manifest_memory: ?spore.MemoryManifest) !RamMapping {
     const maximum_size = std.math.add(u64, config.ram_size, config.virtio_mem_region_size) catch return error.BadManifest;
     return switch (config.ram_restore) {
         .local_backing => |fd| blk: {
@@ -2005,9 +1993,10 @@ fn takeSnapshotV1(
     const snapshot_total_ms = (try monotonicMs()) - total_start;
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
     std.log.info(
-        "kvm snapshot metrics: version=1 vcpus={d} ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_total_ms={d}",
+        "kvm snapshot metrics: version=1 vcpus={d} mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_total_ms={d}",
         .{
             vcpus.len,
+            if (dirty_tracker != null) "dirty-log" else "full-scan",
             ram_size / 1024 / 1024,
             memory_plan.chunk_count,
             memory_plan.nonzero_chunk_count,
