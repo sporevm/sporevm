@@ -1116,7 +1116,6 @@ pub const ChunkMappedDisk = struct {
             .chunk_size = self.chunk_size,
             .hash_algorithm = hash_algorithm,
             .object_namespace = object_namespace,
-            .layers = &.{},
         };
         if (stats_out) |out| {
             out.* = .{
@@ -2470,7 +2469,6 @@ test "snapshot writes disk index and chunk objects" {
 
     try std.testing.expectEqualStrings(spore.disk_kind_chunk_index, manifest_disk.kind);
     try std.testing.expectEqual(@as(u64, spore.disk_chunk_size), manifest_disk.chunk_size);
-    try std.testing.expectEqual(@as(usize, 0), manifest_disk.layers.len);
 
     const index_path = try rootfs_cas.manifestIndexPath(allocator, spore_dir, manifest_disk.base);
     defer allocator.free(index_path);

@@ -3,11 +3,12 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-expect_manifest_v3() {
+expect_multi_vcpu_manifest() {
   local dir="$1"
   [[ -f "${dir}/manifest.json" ]] || die "missing manifest: ${dir}/manifest.json"
-  [[ "$(json_field "${dir}/manifest.json" version)" == "3" ]] || die "manifest is not v3: ${dir}/manifest.json"
+  [[ "$(json_field "${dir}/manifest.json" version)" == "6" ]] || die "manifest is not v6: ${dir}/manifest.json"
   [[ "$(json_field "${dir}/manifest.json" platform.vcpu_count)" == "${vcpus}" ]] || die "manifest vcpu_count mismatch: ${dir}/manifest.json"
+  [[ -n "$(json_field "${dir}/manifest.json" machine.multi.gic.kind)" ]] || die "manifest has no multi-vCPU machine state: ${dir}/manifest.json"
 }
 
 expect_nproc_equals() {
@@ -124,7 +125,7 @@ run_disk_point_in_time_case() {
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- \
     /bin/sh -lc 'printf captured > /var/sporevm-save-point; sync'
   save_named_with_metrics "${source_name}" "${saved_dir}" "${kind}"
-  expect_manifest_v3 "${saved_dir}"
+  expect_multi_vcpu_manifest "${saved_dir}"
   [[ "$(json_field "${saved_dir}/manifest.json" disk.kind)" == "chunk-index-disk-v0" ]] || \
     die "${kind} save did not record a writable disk index"
 
@@ -235,9 +236,9 @@ if ! "${spore_bin}" run \
   cat "${workdir}/from-base.stderr" >&2 || true
   die "multi-vCPU run --save base failed"
 fi
-expect_manifest_v3 "${from_base_dir}"
+expect_multi_vcpu_manifest "${from_base_dir}"
 
-fork_dir="${workdir}/v3-children"
+fork_dir="${workdir}/multi-children"
 fork_child_stdout="${workdir}/fork-child.stdout"
 fork_child_stderr="${workdir}/fork-child.stderr"
 if ! "${spore_bin}" fork "${from_base_dir}" --count 2 --out "${fork_dir}" \
@@ -246,8 +247,8 @@ if ! "${spore_bin}" fork "${from_base_dir}" --count 2 --out "${fork_dir}" \
   cat "${workdir}/fork.stderr" >&2 || true
   die "multi-vCPU fork failed"
 fi
-expect_manifest_v3 "${fork_dir}/000000"
-expect_manifest_v3 "${fork_dir}/000001"
+expect_multi_vcpu_manifest "${fork_dir}/000000"
+expect_multi_vcpu_manifest "${fork_dir}/000001"
 
 if ! "${spore_bin}" run \
   --backend "${backend}" \
@@ -308,7 +309,7 @@ if [[ "${capture_status}" != "0" ]]; then
   cat "${capture_stderr}" >&2 || true
   die "multi-vCPU signal capture did not finish cleanly"
 fi
-expect_manifest_v3 "${capture_dir}"
+expect_multi_vcpu_manifest "${capture_dir}"
 
 resume_stdout="${workdir}/resume.stdout"
 resume_stderr="${workdir}/resume.stderr"
@@ -350,7 +351,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/named-live-save.stderr" >&2 || true
     die "multi-vCPU named non-destructive save failed"
   fi
-  expect_manifest_v3 "${concurrent_dir}"
+  expect_multi_vcpu_manifest "${concurrent_dir}"
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/named-live-ls.stdout" 2>"${workdir}/named-live-ls.stderr"; then
     cat "${workdir}/named-live-ls.stdout" >&2 || true
     cat "${workdir}/named-live-ls.stderr" >&2 || true
@@ -410,7 +411,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   # Non-destructive multi-vCPU save of an active workload: prove the source VM
   # stays registered and keeps ticking after save, then remove the source and
   # verify the point-in-time spore restores and preserves the captured workload
-  # state. `expect_manifest_v3` above verifies the saved vCPU topology; the first
+  # state. `expect_multi_vcpu_manifest` above verifies the saved vCPU topology; the first
   # post-restore exec may run under the restored file-stdio affinity gate.
   live_name="${vm_name}-live"
   live_restored_name="${vm_name}-live-restored"
@@ -427,7 +428,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/live-save.stderr" >&2 || true
     die "multi-vCPU non-destructive save failed"
   fi
-  expect_manifest_v3 "${live_dir}"
+  expect_multi_vcpu_manifest "${live_dir}"
   # The source VM must still be registered as ready after a non-destructive save.
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/live-ls.stdout" 2>"${workdir}/live-ls.stderr"; then
     cat "${workdir}/live-ls.stdout" >&2 || true
@@ -456,9 +457,8 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     cat "${workdir}/suspend.stderr" >&2 || true
     die "multi-vCPU named save --stop failed"
   fi
-  expect_manifest_v3 "${named_dir}"
-  # Multi-vCPU stopped saves write v3 manifests; inspect must accept everything
-  # restore accepts.
+  expect_multi_vcpu_manifest "${named_dir}"
+  # Inspect must accept everything restore accepts.
   if ! "${spore_bin}" --json inspect "${named_dir}" >"${workdir}/inspect.json" 2>"${workdir}/inspect.stderr"; then
     cat "${workdir}/inspect.json" >&2 || true
     cat "${workdir}/inspect.stderr" >&2 || true

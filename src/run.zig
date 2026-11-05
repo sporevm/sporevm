@@ -1825,35 +1825,17 @@ pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: Network
 }
 
 pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
-    return resumeRootfsForRunParts(allocator, manifest.devices, manifest.rootfs);
-}
-
-pub fn resumeRootfsForRunV1(allocator: std.mem.Allocator, manifest: spore.ManifestV1) !?spore.Rootfs {
-    return resumeRootfsForRunParts(allocator, manifest.devices, manifest.rootfs);
-}
-
-fn resumeRootfsForRunParts(allocator: std.mem.Allocator, devices: []const spore.TransportState, rootfs_opt: ?spore.Rootfs) !?spore.Rootfs {
-    const disk_count = spore.countBlockDevices(devices);
+    const disk_count = spore.countBlockDevices(manifest.devices);
     if (disk_count == 0) return null;
     if (disk_count != 1) return error.UnsupportedRootfsDeviceCount;
-    const rootfs = rootfs_opt orelse return error.MissingRootfsArtifact;
-    try spore.validateRootfs(rootfs, devices);
+    const rootfs = manifest.rootfs orelse return error.MissingRootfsArtifact;
+    try spore.validateRootfs(rootfs, manifest.devices);
     return try cloneRootfs(allocator, rootfs);
 }
 
 pub fn resumeDiskForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Disk {
-    return resumeDiskForRunParts(allocator, manifest.disk);
-}
-
-pub fn resumeDiskForRunV1(allocator: std.mem.Allocator, manifest: spore.ManifestV1) !?spore.Disk {
-    return resumeDiskForRunParts(allocator, manifest.disk);
-}
-
-fn resumeDiskForRunParts(allocator: std.mem.Allocator, disk_opt: ?spore.Disk) !?spore.Disk {
-    if (disk_opt) |disk| {
-        return try disk_layer.cloneDisk(allocator, disk);
-    }
-    return null;
+    const disk = manifest.disk orelse return null;
+    return try disk_layer.cloneDisk(allocator, disk);
 }
 
 fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs {
@@ -5210,13 +5192,15 @@ fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
         .platform = .{
             .cpu_profile = "test",
             .device_model_version = 1,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = 4096,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -5234,7 +5218,7 @@ fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
                     .line_levels = &.{},
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .disk = if (with_disk) .{
@@ -5256,7 +5240,6 @@ test "run from carries writable disk manifests into runtime options" {
         std.testing.allocator.free(disk.base);
         std.testing.allocator.free(disk.hash_algorithm);
         std.testing.allocator.free(disk.object_namespace);
-        std.testing.allocator.free(disk.layers);
     }
     try std.testing.expectEqualStrings("blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", disk.base);
 }

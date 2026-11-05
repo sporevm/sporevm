@@ -218,7 +218,7 @@ pub fn remove(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, id
 }
 
 pub fn storageForDisk(disk: spore.Disk) !spore.RootfsStorage {
-    if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index) or disk.layers.len != 0) return error.BadManifest;
+    if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.BadManifest;
     const storage = spore.RootfsStorage{
         .kind = spore.rootfs_storage_kind_chunked_ext4,
         .device = disk.device,
@@ -263,7 +263,7 @@ pub fn ensureOwnershipLinkCompatible(allocator: std.mem.Allocator, cache_root: [
 /// Publish the host-private pin/reference before making manifest.json visible.
 /// The caller holds the rootfs cache lock and has already made the CAS root
 /// durable. Failure may leave a safe orphan pin, never an unrooted manifest.
-pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk, manifest: anytype) !void {
+pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk, manifest: spore.Manifest) !void {
     const stage = try std.fs.path.join(allocator, &.{ spore_dir, ".sporevm-pin-stage" });
     defer allocator.free(stage);
     try createDirectoryExclusive(allocator, stage);
@@ -278,11 +278,7 @@ pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedReg
     // From this point a failed publication leaves recovery material in the
     // stage directory. The preflight above cleans its empty stage on refusal.
     cleanup_stage = false;
-    switch (@TypeOf(manifest)) {
-        spore.Manifest => try spore.saveManifest(allocator, stage, manifest),
-        spore.ManifestV1 => try spore.saveManifestV1(allocator, stage, manifest),
-        else => @compileError("unsupported saved-spore manifest type"),
-    }
+    try spore.saveManifest(allocator, stage, manifest);
     const staged_manifest = try std.fs.path.join(allocator, &.{ stage, "manifest.json" });
     defer allocator.free(staged_manifest);
     const manifest_bytes = try Io.Dir.cwd().readFileAlloc(io, staged_manifest, allocator, .limited(max_manifest_bytes + 1));
@@ -1023,7 +1019,6 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
         .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
-        .layers = &.{},
     };
     var lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache);
     defer lock.deinit();

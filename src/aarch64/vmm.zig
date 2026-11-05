@@ -140,20 +140,12 @@ pub const Prepared = struct {
     vcpus: topology.VcpuCount,
     ram_size: u64,
     virtio_mem_region_size: u64,
-    manifest: Manifest = .none,
-
-    pub const Manifest = union(enum) {
-        none,
-        v0: std.json.Parsed(spore.Manifest),
-        v1: std.json.Parsed(spore.ManifestV1),
-    };
+    /// Loaded on restore.
+    manifest: ?std.json.Parsed(spore.Manifest) = null,
 
     pub fn deinit(self: *Prepared) void {
-        switch (self.manifest) {
-            .none => {},
-            inline else => |*parsed| parsed.deinit(),
-        }
-        self.manifest = .none;
+        if (self.manifest) |parsed| parsed.deinit();
+        self.manifest = null;
     }
 
     pub fn restoring(self: Prepared) bool {
@@ -169,10 +161,8 @@ pub const Prepared = struct {
     }
 
     pub fn memory(self: Prepared) ?spore.MemoryManifest {
-        return switch (self.manifest) {
-            .none => null,
-            inline else => |parsed| parsed.value.memory,
-        };
+        const parsed = self.manifest orelse return null;
+        return parsed.value.memory;
     }
 };
 
@@ -226,24 +216,13 @@ fn loadRestore(allocator: std.mem.Allocator, config: Config, restore: Start.Rest
     if (restore.ram == .fresh) return error.BadManifest;
     var prepared: Prepared = .{ .config = config, .vcpus = config.vcpus, .ram_size = 0, .virtio_mem_region_size = 0 };
     errdefer prepared.deinit();
+    prepared.manifest = try spore.loadManifest(allocator, restore.dir);
+    const manifest = prepared.manifest.?.value;
+    // One requested vCPU means "whatever the spore saved".
     if (config.vcpus == 1) {
-        if (spore.loadManifest(allocator, restore.dir)) |parsed| {
-            prepared.manifest = .{ .v0 = parsed };
-        } else |err| switch (err) {
-            error.BadManifest => {
-                prepared.manifest = .{ .v1 = try spore.loadManifestV1(allocator, restore.dir) };
-                prepared.vcpus = prepared.manifest.v1.value.platform.vcpu_count;
-            },
-            else => |e| return e,
-        }
-    } else {
-        prepared.manifest = .{ .v1 = try spore.loadManifestV1(allocator, restore.dir) };
-        if (prepared.manifest.v1.value.platform.vcpu_count != config.vcpus) return error.PlatformMismatch;
-    }
-    const restored_memory = switch (prepared.manifest) {
-        .none => unreachable,
-        inline else => |parsed| try spore.memoryConfig(parsed.value.platform.ram_size, parsed.value.memory_state),
-    };
+        prepared.vcpus = manifest.platform.vcpu_count;
+    } else if (manifest.platform.vcpu_count != config.vcpus) return error.PlatformMismatch;
+    const restored_memory = try spore.memoryConfig(manifest.platform.ram_size, manifest.memory_state);
     prepared.ram_size = restored_memory.initial_bytes;
     prepared.virtio_mem_region_size = restored_memory.maximum_bytes - restored_memory.initial_bytes;
     return prepared;

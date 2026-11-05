@@ -541,17 +541,9 @@ pub fn inspectSpore(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Multi-vCPU spores carry a v1 manifest; try the same version fallback
-    // resume uses so inspect accepts everything resume can restore.
-    if (spore.loadManifest(arena, spore_dir)) |manifest| {
-        defer manifest.deinit();
-        return summarizeSpore(allocator, spore_dir, manifest.value, 1);
-    } else |err| {
-        if (err != error.BadManifest) return err;
-    }
-    const manifest = try spore.loadManifestV1(arena, spore_dir);
+    const manifest = try spore.loadManifest(arena, spore_dir);
     defer manifest.deinit();
-    return summarizeSpore(allocator, spore_dir, manifest.value, manifest.value.platform.vcpu_count);
+    return summarizeSpore(allocator, spore_dir, manifest.value);
 }
 
 /// Release memory owned by a `SporeInspectResult`.
@@ -699,28 +691,14 @@ pub fn runFromSpore(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var manifest = spore.loadManifest(arena, options.spore_dir) catch |err| switch (err) {
-        error.BadManifest => null,
-        else => |e| return e,
-    };
-    defer if (manifest) |*parsed| parsed.deinit();
-    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
-    defer if (manifest_v1) |*parsed| parsed.deinit();
-    if (manifest == null) manifest_v1 = try spore.loadManifestV1(arena, options.spore_dir);
+    const parsed = try spore.loadManifest(arena, options.spore_dir);
+    defer parsed.deinit();
+    const manifest = parsed.value;
 
-    const rootfs = if (manifest) |parsed|
-        try run_mod.resumeRootfsForRun(arena, parsed.value)
-    else
-        try run_mod.resumeRootfsForRunV1(arena, manifest_v1.?.value);
-    const disk = if (manifest) |parsed|
-        try run_mod.resumeDiskForRun(arena, parsed.value)
-    else
-        try run_mod.resumeDiskForRunV1(arena, manifest_v1.?.value);
-    const network_options = try run_mod.networkOptionsFromManifestWithBindingDiagnostic(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services, options.bound_service_diagnostic);
-    const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else options.vcpus;
-    if (manifest_v1 != null and options.vcpus != 1 and options.vcpus != manifest_vcpus) return error.PlatformMismatch;
-    const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
-    const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
+    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest);
+    const disk = try run_mod.resumeDiskForRun(arena, manifest);
+    const network_options = try run_mod.networkOptionsFromManifestWithBindingDiagnostic(arena, manifest.network, options.bound_services, options.bound_service_diagnostic);
+    if (options.vcpus != 1 and options.vcpus != manifest.platform.vcpu_count) return error.PlatformMismatch;
     const explicit_generation_params = if (options.generation_path) |path|
         attach_mod.loadGenerationParams(context.io, arena, path) catch |err| switch (err) {
             error.BadGenerationPayload, error.StreamTooLong => return err,
@@ -728,7 +706,7 @@ pub fn runFromSpore(
         }
     else
         null;
-    const run_generation = try prepareRunFromGenerationState(arena, manifest_generation, explicit_generation_params);
+    const run_generation = try prepareRunFromGenerationState(arena, manifest.generation, explicit_generation_params);
 
     return run_mod.execute(context, arena, .{
         .backend = options.backend,
@@ -739,7 +717,7 @@ pub fn runFromSpore(
         .disk = disk,
         .resume_dir = options.spore_dir,
         .resume_generation = run_generation.resume_generation,
-        .resume_sessions = sessions,
+        .resume_sessions = manifest.sessions,
         .attach_session_id = spore.default_session_id,
         .start_generation_params = run_generation.start_generation_params,
         .require_generation_ready = run_generation.start_generation_params != null,
@@ -747,18 +725,15 @@ pub fn runFromSpore(
         .guest_env = options.guest_env,
         .interactive = options.interactive,
         .tty = options.tty,
-        .memory = if (manifest) |parsed|
-            try spore.memoryConfig(parsed.value.platform.ram_size, parsed.value.memory_state)
-        else
-            try spore.memoryConfig(manifest_v1.?.value.platform.ram_size, manifest_v1.?.value.memory_state),
-        .vcpus = manifest_vcpus,
+        .memory = try spore.memoryConfig(manifest.platform.ram_size, manifest.memory_state),
+        .vcpus = manifest.platform.vcpu_count,
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
         .stream_output = false,
         .save_path = options.save_path,
         .save_trigger = options.save_trigger,
         .continue_after_save = options.continue_after_save,
-        .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
+        .annotations = manifest.annotations,
         .network = network_options.network,
         .network_policy = network_options.policy,
         .spore_executable = options.spore_executable,
@@ -1145,9 +1120,7 @@ pub fn pull(
     });
 }
 
-/// Summarize either manifest version; the fields read here are shared
-/// between `spore.Manifest` and `spore.ManifestV1`.
-fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest: anytype, vcpu_count: u32) !SporeInspectResult {
+fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest: spore.Manifest) !SporeInspectResult {
     const present_chunks = manifest.memory.chunks.len;
 
     var annotations = spore.Annotations{};
@@ -1189,7 +1162,7 @@ fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest:
         .vm_state_present = true,
         .storage_mode = inspectStorageMode(manifest),
         .ownership = ownership,
-        .vcpu_count = vcpu_count,
+        .vcpu_count = manifest.platform.vcpu_count,
         .platform = .{
             .arch = try allocator.dupe(u8, manifest.platform.arch),
             .cpu_profile = try allocator.dupe(u8, manifest.platform.cpu_profile),
@@ -1210,7 +1183,9 @@ fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest:
         .requested_memory_bytes = if (memory_state) |state| state.requested_size else manifest.platform.ram_size,
         .captured_memory_bytes = if (memory_state) |state| state.captured_size else manifest.platform.ram_size,
         .plugged_memory_ranges = plugged_ranges,
-        .gic_kind = @tagName(manifest.machine.gic.kind),
+        .gic_kind = switch (manifest.machine) {
+            inline else => |machine| @tagName(machine.gic.kind),
+        },
         .sessions = sessions,
         .network = network,
         .annotations = annotations,
@@ -1218,7 +1193,7 @@ fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest:
     };
 }
 
-fn inspectStorageMode(manifest: anytype) []const u8 {
+fn inspectStorageMode(manifest: spore.Manifest) []const u8 {
     const rootfs = manifest.rootfs orelse return "memory-only";
     const writable_disk = manifest.disk != null;
     if (rootfs.storage != null) return if (writable_disk) "chunked-rootfs-with-writable-disk" else "chunked-rootfs";
@@ -1443,7 +1418,7 @@ test "run from generation state omits empty generation when params are absent" {
     try std.testing.expect(prepared.start_generation_params == null);
 }
 
-test "inspect spore summarizes multi-vcpu v1 manifests" {
+test "inspect spore summarizes multi-vcpu manifests" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1459,7 +1434,7 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
         .{ .mpidr = vcpus[0].mpidr, .regs = &.{} },
         .{ .mpidr = vcpus[1].mpidr, .regs = &.{} },
     };
-    const manifest = spore.ManifestV1{
+    const manifest = spore.Manifest{
         .annotations = annotations,
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
@@ -1472,7 +1447,7 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
             .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .multi = .{
             .vcpus = &vcpus,
             .gic = .{
                 .kind = .gicv3_multi,
@@ -1482,16 +1457,16 @@ test "inspect spore summarizes multi-vcpu v1 manifests" {
                     .line_levels = &.{},
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
         .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
-    try spore.saveManifestV1(arena, dir, manifest);
+    try spore.saveManifest(arena, dir, manifest);
 
     const inspected = try inspectSpore(allocator, dir);
     defer deinitSporeInspectResult(allocator, inspected);
-    try std.testing.expectEqual(@as(u32, spore.format_version_v1), inspected.version);
+    try std.testing.expectEqual(spore.format_version, inspected.version);
     try std.testing.expect(inspected.vm_state_present);
     try std.testing.expectEqualStrings("memory-only", inspected.storage_mode);
     try std.testing.expectEqual(@as(u32, 2), inspected.vcpu_count);

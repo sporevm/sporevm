@@ -35,32 +35,6 @@ pub const Result = struct {
     pin_lock_wait_ms: ?u64 = null,
 };
 
-const LoadedManifest = union(enum) {
-    current: std.json.Parsed(spore.Manifest),
-    v1: std.json.Parsed(spore.ManifestV1),
-
-    fn load(allocator: std.mem.Allocator, spore_dir: []const u8) !LoadedManifest {
-        const current = spore.loadManifest(allocator, spore_dir) catch |err| switch (err) {
-            error.BadManifest => return .{ .v1 = try spore.loadManifestV1(allocator, spore_dir) },
-            else => |e| return e,
-        };
-        return .{ .current = current };
-    }
-
-    fn disk(self: LoadedManifest) ?spore.Disk {
-        return switch (self) {
-            .current => |parsed| parsed.value.disk,
-            .v1 => |parsed| parsed.value.disk,
-        };
-    }
-
-    fn deinit(self: *LoadedManifest) void {
-        switch (self.*) {
-            inline else => |*parsed| parsed.deinit(),
-        }
-    }
-};
-
 const CrashBoundary = enum { none, before_batch_rename, batch_rename, parent_sync };
 
 const TestFault = struct {
@@ -116,9 +90,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var parent_manifest = try LoadedManifest.load(arena, options.parent_dir);
+    const parent_manifest = try spore.loadManifest(arena, options.parent_dir);
     defer parent_manifest.deinit();
-    const disk = parent_manifest.disk();
+    const disk = parent_manifest.value.disk;
     var disk_root: ?[]const u8 = null;
     var parent_pin_id: ?[]const u8 = null;
     var validated_storage: ?spore.RootfsStorage = null;
@@ -174,9 +148,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
             defer allocator.free(bytes);
             if (bytes.len > saved_spore_pin.max_manifest_bytes) return error.StreamTooLong;
             try chunk_sealer.replaceFileAtomicDurable(arena, manifest_path, bytes, 0o644);
-            var child_manifest = try LoadedManifest.load(arena, child);
+            const child_manifest = try spore.loadManifest(arena, child);
             defer child_manifest.deinit();
-            const child_disk = child_manifest.disk() orelse return error.BadManifest;
+            const child_disk = child_manifest.value.disk orelse return error.BadManifest;
             prepared_pins.?[index] = try saved_spore_pin.prepareValidatedReference(
                 context.io,
                 arena,
@@ -351,7 +325,6 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
         .chunk_size = storage.chunk_size,
         .hash_algorithm = storage.hash_algorithm,
         .object_namespace = storage.object_namespace,
-        .layers = &.{},
     };
     var manifest = manifest_test_support.manifest(.{});
     manifest.platform.ram_size = ram.len;

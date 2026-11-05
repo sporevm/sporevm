@@ -3,7 +3,7 @@
 //! Boots the pinned kernel with the SporeVM board (GICv3 via hv_gic,
 //! virtio-mmio console/blk/net/vsock/rng, generation MMIO), handles MMIO data
 //! aborts, PSCI over HVC, vtimer exits, WFI, and HVF snapshot/resume.
-//! Multi-vCPU capture/resume uses manifest v3 with same-HVF private GIC state.
+//! Multi-vCPU capture/resume uses `machine.multi` with same-HVF private GIC state.
 
 const std = @import("std");
 const aarch64_topology = @import("../aarch64/topology.zig");
@@ -189,10 +189,10 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
 
     const default_dist_base: u64 = std.mem.alignForward(u64, 0x0800_0000, dist_align);
     const default_redist_base: u64 = std.mem.alignForward(u64, default_dist_base + dist_size, redist_align);
-    const dist_base: u64, const redist_base: u64 = switch (prepared.manifest) {
-        .none => .{ default_dist_base, default_redist_base },
-        inline else => |parsed| .{ parsed.value.platform.gic_dist_base, parsed.value.platform.gic_redist_base },
-    };
+    const dist_base: u64, const redist_base: u64 = if (prepared.manifest) |parsed|
+        .{ parsed.value.platform.gic_dist_base, parsed.value.platform.gic_redist_base }
+    else
+        .{ default_dist_base, default_redist_base };
     if (dist_base % dist_align != 0 or redist_base % redist_align != 0) return error.PlatformMismatch;
 
     const gic_config = hvf.hv_gic_config_create();
@@ -352,17 +352,21 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const vcpu_ms = monotonicMs() - vcpu_start;
 
     var boot_ms: u64 = 0;
-    if (prepared.restoring()) {
+    if (prepared.manifest) |parsed| {
         const restore = config.start.restore;
-        if (prepared.manifest == .v1) return error.UnsupportedVcpuCount;
         // Restore: memory, device, GIC, and vCPU state from the spore.
-        const m = prepared.manifest.v0.value;
-        const host_counter_frequency_hz = snapshot.hostCounterFreq();
+        const m = parsed.value;
+        const machine = switch (m.machine) {
+            .single => |single| single,
+            .multi => return error.UnsupportedVcpuCount,
+        };
         try platform_contract.checkManifest(m, .{
+            .vcpu_count = 1,
             .ram_size = prepared.ram_size,
             .gic_dist_base = dist_base,
             .gic_redist_base = vcpu_redist_base,
-            .counter_frequency_hz = host_counter_frequency_hz,
+            .gic_redist_stride = redist_stride,
+            .counter_frequency_hz = snapshot.hostCounterFreq(),
             .device_count = transports.len,
         });
         try restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
@@ -371,7 +375,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         try applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, &gen_dev);
-        try snapshot.applyMachine(allocator, vcpu, m.machine);
+        try snapshot.applyMachine(allocator, vcpu, machine);
         try raiseGenerationIrqIfPending(&gen_dev);
         if (restore_stats) |*stats| stats.state_ms = monotonicMs() - state_start;
     } else {
@@ -501,6 +505,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                     try takeSnapshot(allocator, request.dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
+                        .redist_stride = @intCast(redist_stride),
                         .ram_size = prepared.ram_size,
                         .memory_device = if (mem_transport_index != null) &mem_dev else null,
                     }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, if (preparation) |*owned| owned.cacheLock() else null);
@@ -530,6 +535,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                         .{
                             .dist_base = dist_base,
                             .redist_base = vcpu_redist_base,
+                            .redist_stride = @intCast(redist_stride),
                             .ram_size = prepared.ram_size,
                             .memory_device = if (mem_transport_index != null) &mem_dev else null,
                         },
@@ -546,6 +552,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 try takeSnapshot(allocator, config.capture.?.dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
+                    .redist_stride = @intCast(redist_stride),
                     .ram_size = prepared.ram_size,
                     .memory_device = if (mem_transport_index != null) &mem_dev else null,
                 }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
@@ -568,6 +575,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                             try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
+                                .redist_stride = @intCast(redist_stride),
                                 .ram_size = prepared.ram_size,
                                 .memory_device = if (mem_transport_index != null) &mem_dev else null,
                             }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
@@ -1058,18 +1066,32 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     );
 
     var boot_ms: u64 = 0;
-    if (options.prepared.restoring()) {
+    if (options.prepared.manifest) |parsed| {
         const restore = config.start.restore;
-        const manifest = &options.prepared.manifest.v1.value;
+        const manifest = &parsed.value;
         const restore_start = monotonicMs();
-        try checkHvfManifestV1(manifest.*, options.prepared, options.transports.len, snapshot.hostCounterFreq(), options.dist_base, redist_window.base, @intCast(redist_stride));
+        const machine = switch (manifest.machine) {
+            .multi => |multi| multi,
+            .single => return error.PlatformMismatch,
+        };
+        try platform_contract.checkManifest(manifest.*, .{
+            .vcpu_count = options.prepared.vcpus,
+            .ram_size = options.prepared.ram_size,
+            .gic_dist_base = options.dist_base,
+            .gic_redist_base = redist_window.base,
+            .gic_redist_stride = @intCast(redist_stride),
+            .counter_frequency_hz = snapshot.hostCounterFreq(),
+            .device_count = options.transports.len,
+        });
+        // HVF restores only its own private GIC blob.
+        if (machine.gic.kind != .backend_private) return error.PlatformMismatch;
         try restoreMemory(allocator, restore, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
         const state_start = monotonicMs();
         try applyTransports(options.transports, manifest.devices);
         try options.gen_dev.restore(allocator, restore.generation orelse manifest.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, options.gen_dev);
-        try snapshot.applyGicState(allocator, vcpus[0].handle, manifest.machine.gic);
-        try applyHvfVcpuStates(vcpus, manifest.machine);
+        try snapshot.applyGicState(allocator, vcpus[0].handle, machine.gic);
+        try applyHvfVcpuStates(vcpus, machine);
         for (vcpus) |*vcpu| vcpu.setRunning();
         try raiseGenerationIrqIfPending(options.gen_dev);
         if (options.restore_stats.*) |*stats| stats.state_ms = monotonicMs() - state_start;
@@ -1187,7 +1209,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                             null;
                         defer if (prepared_root) |*root| root.deinit();
                         var source_pause_started_ns: u64 = 0;
-                        takeSnapshotV1(
+                        takeSnapshotMulti(
                             allocator,
                             request.dir,
                             vcpus,
@@ -1236,7 +1258,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), request.dir, null);
                 },
                 .rootfs_snapshot => |request| {
-                    const disk_manifest = takeRootfsSnapshotV1(
+                    const disk_manifest = takeRootfsSnapshotMulti(
                         allocator,
                         request.dir,
                         vcpus,
@@ -1327,7 +1349,7 @@ fn snapshotMultiHvfAndStop(
     snapshot_dir: []const u8,
     request_capture: ?*capture.Request,
 ) !ExitCause {
-    takeSnapshotV1(
+    takeSnapshotMulti(
         allocator,
         snapshot_dir,
         vcpus,
@@ -1416,7 +1438,7 @@ fn captureHvfVcpuStates(allocator: std.mem.Allocator, vcpus: []HvfVcpu) ![]spore
     return states;
 }
 
-fn applyHvfVcpuStates(vcpus: []HvfVcpu, machine: spore.MachineStateV1) !void {
+fn applyHvfVcpuStates(vcpus: []HvfVcpu, machine: spore.MachineStateMulti) !void {
     if (machine.vcpus.len != vcpus.len) return error.PlatformMismatch;
     const timer_plan = try planHvfVtimerRestore(machine.vcpus, snapshot.hostCounter());
     for (machine.vcpus, 0..) |vcpu_state, i| {
@@ -1788,22 +1810,6 @@ fn restoreMemory(
     }
 }
 
-fn checkHvfManifestV1(manifest: spore.ManifestV1, prepared: *const vmm.Prepared, device_count: usize, host_counter_frequency_hz: u64, dist_base: u64, redist_base: u64, redist_stride: u64) !void {
-    if (manifest.version != spore.format_version_v1) return error.PlatformMismatch;
-    if (!std.mem.eql(u8, manifest.platform.arch, platform_contract.machine_arch)) return error.PlatformMismatch;
-    if (!std.mem.eql(u8, manifest.platform.cpu_profile, board.cpu_profile)) return error.PlatformMismatch;
-    if (manifest.platform.device_model_version != board.device_model_version) return error.PlatformMismatch;
-    if (manifest.platform.vcpu_count != prepared.vcpus) return error.PlatformMismatch;
-    if (manifest.platform.ram_base != board.ram_base) return error.PlatformMismatch;
-    if (manifest.platform.ram_size != prepared.ram_size) return error.PlatformMismatch;
-    if (manifest.platform.gic_dist_base != dist_base) return error.PlatformMismatch;
-    if (manifest.platform.gic_redist_base != redist_base) return error.PlatformMismatch;
-    if (manifest.platform.gic_redist_stride != redist_stride) return error.PlatformMismatch;
-    if (manifest.platform.counter_frequency_hz != host_counter_frequency_hz) return error.PlatformMismatch;
-    if (manifest.devices.len != device_count) return error.PlatformMismatch;
-    if (manifest.machine.gic.kind != .backend_private) return error.PlatformMismatch;
-}
-
 fn mapAnonymousRam(size: u64) !RamMapping {
     const bytes = try std.posix.mmap(
         null,
@@ -2043,7 +2049,7 @@ fn logNamedSnapshotPublication(metrics: vsock.SnapshotPublishMetrics, pause_star
 const SnapshotPlatform = struct {
     dist_base: u64,
     redist_base: u64,
-    redist_stride: u64 = 0,
+    redist_stride: u64,
     ram_size: u64,
     memory_device: ?*const virtio_mem.Mem = null,
 };
@@ -2190,17 +2196,18 @@ fn takeSnapshot(
     const disk_ms = monotonicMs() - disk_start;
     const manifest_start = monotonicMs();
     const saved_manifest = spore.Manifest{
-        .version = if (memory_state != null) spore.format_version_elastic else spore.format_version,
         .platform = .{
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
+            .vcpu_count = 1,
             .ram_base = board.ram_base,
             .ram_size = platform.ram_size,
             .gic_dist_base = platform.dist_base,
             .gic_redist_base = platform.redist_base,
+            .gic_redist_stride = platform.redist_stride,
             .counter_frequency_hz = snapshot.hostCounterFreq(),
         },
-        .machine = machine,
+        .machine = .{ .single = machine },
         .devices = devices,
         .generation = gen_state,
         .annotations = annotations,
@@ -2295,7 +2302,7 @@ fn takeSnapshot(
     std.log.info("spore written to {s}", .{dir});
 }
 
-fn takeRootfsSnapshotV1(
+fn takeRootfsSnapshotMulti(
     allocator: std.mem.Allocator,
     dir: []const u8,
     vcpus: []HvfVcpu,
@@ -2308,7 +2315,7 @@ fn takeRootfsSnapshotV1(
     return try takeRootfsSnapshot(allocator, dir, transports, disk_snapshot);
 }
 
-fn takeSnapshotV1(
+fn takeSnapshotMulti(
     allocator: std.mem.Allocator,
     dir: []const u8,
     vcpus: []HvfVcpu,
@@ -2346,7 +2353,7 @@ fn takeSnapshotV1(
     const total_start = monotonicMs();
     const machine_start = total_start;
     const vcpu_states = try captureHvfVcpuStates(arena, vcpus);
-    const machine = try snapshot.captureMachineV1(arena, vcpu_states);
+    const machine = try snapshot.captureMachineMulti(arena, vcpu_states);
     const machine_ms = monotonicMs() - machine_start;
     const devices_start = monotonicMs();
     const devices = try captureTransports(arena, transports);
@@ -2386,7 +2393,7 @@ fn takeSnapshotV1(
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
     const disk_ms = monotonicMs() - disk_start;
     const manifest_start = monotonicMs();
-    const saved_manifest = spore.ManifestV1{
+    const saved_manifest = spore.Manifest{
         .platform = .{
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
@@ -2398,7 +2405,7 @@ fn takeSnapshotV1(
             .gic_redist_stride = platform.redist_stride,
             .counter_frequency_hz = snapshot.hostCounterFreq(),
         },
-        .machine = machine,
+        .machine = .{ .multi = machine },
         .devices = devices,
         .generation = gen_state,
         .annotations = annotations,
@@ -2412,8 +2419,8 @@ fn takeSnapshotV1(
         if (environ_map != null) {
             const registry = try saved_spore_pin.LockedRegistry.init(arena, disk_root, rootfs_cache_lock orelse &owned_cache_lock.?);
             try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
-        } else try spore.saveManifestV1(arena, dir, saved_manifest);
-    } else try spore.saveManifestV1(arena, dir, saved_manifest);
+        } else try spore.saveManifest(arena, dir, saved_manifest);
+    } else try spore.saveManifest(arena, dir, saved_manifest);
     const manifest_ms = monotonicMs() - manifest_start;
     const snapshot_total_ms = monotonicMs() - total_start;
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
@@ -2450,7 +2457,7 @@ fn captureMultiHvfDiskFork(
     const disk = options.disk_snapshot orelse return error.BadManifest;
     const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
     defer state.clearSnapshot();
-    try takeSnapshotV1(
+    try takeSnapshotMulti(
         allocator,
         request.dir,
         vcpus,

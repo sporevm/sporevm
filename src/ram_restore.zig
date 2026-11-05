@@ -42,15 +42,7 @@ pub const Plan = struct {
         ram_size: u64,
     ) !Plan {
         const dir = resume_dir orelse return .{};
-        var parsed = spore.loadManifest(allocator, dir) catch |err| switch (err) {
-            error.BadManifest => null,
-            else => |e| return e,
-        };
-        if (parsed) |*manifest| {
-            defer manifest.deinit();
-            return fromMemory(allocator, environ, dir, manifest.value.memory, ram_size, 1);
-        }
-        var manifest = try spore.loadManifestV1(allocator, dir);
+        const manifest = try spore.loadManifest(allocator, dir);
         defer manifest.deinit();
         return fromMemory(allocator, environ, dir, manifest.value.memory, ram_size, manifest.value.platform.vcpu_count);
     }

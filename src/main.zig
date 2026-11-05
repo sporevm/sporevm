@@ -695,14 +695,6 @@ fn forkCommand(
         .out_dir = out_dir.?,
         .count = count.?,
     }) catch |err| switch (err) {
-        error.UnsupportedVcpuCount => {
-            const inspected = spore_api.inspectSpore(allocator, parent_dir.?) catch return err;
-            const vcpu_count = inspected.vcpu_count;
-            spore_api.deinitSporeInspectResult(allocator, inspected);
-            const body = machine_output.forkUnsupportedVcpuBody(allocator, vcpu_count);
-            const message = allocMessage(allocator, "spore {s}: {s}", .{ command_label, body });
-            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command_label), message);
-        },
         error.CrossDeviceOwnershipLink => {
             const message = allocMessage(allocator, "spore {s}: machine-local pinned children must share a filesystem with the rootfs cache; use `spore clone` for a portable child on another filesystem", .{command_label});
             exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command_label), message);
