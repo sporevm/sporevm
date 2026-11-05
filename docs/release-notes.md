@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Format reset
+
+Old local formats have no readers. `spore host-info` reports only
+`spore.host-info.v3`, including on arm64. A named VM whose spec still has the
+removed memory `policy` is stale; `spore vm rm` stops its monitor if it is still
+running and removes it. `cache gc` deletes step records from every older
+builder version (`sporevm-build-v0` to `v8`) instead of keeping them as roots.
+GC treated v0 to v5 records as unknown and kept every CAS entry, so on a cache
+that holds them the first GC now runs a real sweep. JSON output advances to
+`spore.cache.gc.result.v2` without `legacy_step_record_count`.
+
 ### One ext4 writer
 
 The native ext4 writer now maps files through triple-indirect blocks, so image
@@ -60,9 +71,7 @@ use `--memory 512mb --max-memory 16gb` to preserve its intended elastic range.
 JSON results use the same two-size contract. Existing `memory_bytes` fields now
 unambiguously mean initial memory, and the additive maximum field enables
 elasticity. Named list output advances to `spore.lifecycle.list.result.v2`,
-where memory contains `initial_bytes` and `maximum_bytes`. Existing named-VM
-registry entries migrate the old `explicit` policy to fixed memory and the old
-`auto` policy to 512 MiB initial memory with its stored ceiling.
+where memory contains `initial_bytes` and `maximum_bytes`.
 
 Elastic captures use manifest v4 and persist backend-neutral initial, maximum,
 requested, captured, and exact plugged-block state. Current readers retain v2

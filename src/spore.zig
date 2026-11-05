@@ -322,7 +322,6 @@ pub const Rootfs = struct {
     source: ?RootfsSource = null,
 };
 
-pub const disk_kind_cow_block = "cow-block-v0";
 pub const disk_kind_chunk_index = "chunk-index-disk-v0";
 pub const disk_digest_prefix = rootfs_digest_prefix;
 
@@ -1423,8 +1422,6 @@ pub fn validateDisk(disk: Disk, maybe_rootfs: ?Rootfs, devices: []const Transpor
         if (!std.mem.eql(u8, disk.hash_algorithm, rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;
         if (!std.mem.eql(u8, disk.object_namespace, rootfs_storage_object_namespace)) return error.BadManifest;
         if (disk.layers.len != 0) return error.BadManifest;
-    } else if (std.mem.eql(u8, disk.kind, disk_kind_cow_block)) {
-        return error.FormatTooOld;
     } else {
         return error.BadManifest;
     }
@@ -1494,9 +1491,9 @@ pub fn rootfsQueuesQuiescent(rootfs: Rootfs, devices: []const TransportState) Er
     return true;
 }
 
-pub fn diskQueuesQuiescent(disk: Disk, devices: []const TransportState) Error!bool {
-    try validateRootfsDevice(disk.device, devices);
-    const device = devices[disk.device.mmio_slot];
+pub fn diskQueuesQuiescent(disk_device: RootfsDevice, devices: []const TransportState) Error!bool {
+    try validateRootfsDevice(disk_device, devices);
+    const device = devices[disk_device.mmio_slot];
     for (device.queues) |queue| {
         if (queue.ready and queue.last_avail != queue.used_idx) return false;
     }
@@ -3793,7 +3790,7 @@ test "manifest disk validates rootfs-bound chunk index disk" {
     const disk = parsed.value.disk orelse return error.BadManifest;
     try std.testing.expectEqualStrings(disk_kind_chunk_index, disk.kind);
     try std.testing.expectEqual(@as(u64, 4096), disk.size);
-    try std.testing.expect(try diskQueuesQuiescent(disk, parsed.value.devices));
+    try std.testing.expect(try diskQueuesQuiescent(disk.device, parsed.value.devices));
 
     manifest.rootfs = null;
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
@@ -3810,8 +3807,8 @@ test "manifest disk validates rootfs-bound chunk index disk" {
     manifest.disk.?.layers = &.{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"};
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
     manifest.disk.?.layers = &.{};
-    manifest.disk.?.kind = disk_kind_cow_block;
-    try std.testing.expectError(error.FormatTooOld, validateManifest(manifest));
+    manifest.disk.?.kind = "cow-block-v0";
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }
 
 test "manifest disk binds to chunked rootfs storage identity" {

@@ -7,8 +7,9 @@ const spore = @import("../spore.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 
-pub const builder_version = "sporevm-build-v9";
-const legacy_builder_versions = [_][]const u8{ "sporevm-build-v8", "sporevm-build-v7", "sporevm-build-v6" };
+const builder_version_prefix = "sporevm-build-v";
+const builder_version_number: u32 = 9;
+pub const builder_version = std.fmt.comptimePrint("{s}{d}", .{ builder_version_prefix, builder_version_number });
 const record_kind = "sporevm-build-step-v1";
 const stale_record_kind_v2 = "sporevm-build-step-v2";
 // A record can contain an accepted 1 MiB Dockerfile instruction. Six bytes per
@@ -29,14 +30,8 @@ const RecordEnvelope = struct {
 
 const DecodedRecord = union(enum) {
     current: Current,
-    legacy: Parsed,
     stale,
     unknown,
-
-    const Parsed = struct {
-        json: std.json.Parsed(StepRecord),
-        storage: spore.RootfsStorage,
-    };
 
     const Current = struct {
         json: std.json.Parsed(StepRecord),
@@ -47,7 +42,6 @@ const DecodedRecord = union(enum) {
     fn deinit(self: *DecodedRecord) void {
         switch (self.*) {
             .current => |*record| record.json.deinit(),
-            .legacy => |*record| record.json.deinit(),
             .stale, .unknown => {},
         }
     }
@@ -55,7 +49,6 @@ const DecodedRecord = union(enum) {
 
 pub const GcRecordInspection = union(enum) {
     root: spore.RootfsStorage,
-    legacy: spore.RootfsStorage,
     stale,
     unknown,
 };
@@ -446,7 +439,7 @@ pub fn readHit(
     defer decoded.deinit();
     const current = switch (decoded) {
         .current => |record| record,
-        .legacy, .stale, .unknown => return null,
+        .stale, .unknown => return null,
     };
     if (!stepInputEql(current.input, input)) return null;
     if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, current.storage)) return null;
@@ -468,26 +461,20 @@ pub fn inspectRecordForGc(
     defer allocator.free(bytes);
     var decoded = try decodeRecord(allocator, bytes, expected_key);
     defer decoded.deinit();
-    const InspectionKind = enum { root, legacy };
-    const storage, const inspection: InspectionKind = switch (decoded) {
+    const storage = switch (decoded) {
         .current => |record| blk: {
             if (!currentRecordRetainedByGc(record.input)) return .stale;
-            break :blk .{ record.storage, .root };
+            break :blk record.storage;
         },
-        .legacy => |record| .{ record.storage, .legacy },
         .stale => return .stale,
         .unknown => return .unknown,
     };
     // Complete stamps are invalidated before normal CAS deletion, so retain the
-    // O(1) fast path when possible and scan every object only to repair legacy
-    // or interrupted publication.
+    // O(1) fast path when possible and scan every object only to repair
+    // interrupted publication.
     if (!try rootfs_cas.storageMarkedComplete(io, allocator, cache_root, storage) and
         !try rootfs_cas.storageContentComplete(io, allocator, cache_root, storage)) return .stale;
-    const cloned = try spore.cloneRootfsStorage(allocator, storage);
-    return switch (inspection) {
-        .root => .{ .root = cloned },
-        .legacy => .{ .legacy = cloned },
-    };
+    return .{ .root = try spore.cloneRootfsStorage(allocator, storage) };
 }
 
 fn readRecordAlloc(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -512,14 +499,10 @@ fn decodeRecord(allocator: std.mem.Allocator, bytes: []const u8, expected_key: [
         parsed.deinit();
         return .stale;
     };
-    for (legacy_builder_versions) |legacy_builder_version| {
-        if (std.mem.eql(u8, parsed.value.builder_version, legacy_builder_version)) {
-            return .{ .legacy = .{ .json = parsed, .storage = storage } };
-        }
-    }
     if (!std.mem.eql(u8, parsed.value.builder_version, builder_version)) {
+        const older = olderBuilderVersion(parsed.value.builder_version);
         parsed.deinit();
-        return .unknown;
+        return if (older) .stale else .unknown;
     }
     const input = currentRecordInput(parsed.value) catch |err| {
         parsed.deinit();
@@ -542,6 +525,15 @@ fn decodeRecord(allocator: std.mem.Allocator, bytes: []const u8, expected_key: [
         return .stale;
     };
     return .{ .current = .{ .json = parsed, .input = input, .storage = storage } };
+}
+
+/// Records from an older builder can never hit and are pruned. A newer or
+/// unrecognized builder version may belong to a newer binary sharing the
+/// cache, so it stays unknown and keeps GC conservative.
+fn olderBuilderVersion(version: []const u8) bool {
+    if (!std.mem.startsWith(u8, version, builder_version_prefix)) return false;
+    const number = std.fmt.parseInt(u32, version[builder_version_prefix.len..], 10) catch return false;
+    return number < builder_version_number;
 }
 
 fn stepInputEql(a: StepInput, b: StepInput) bool {
@@ -1100,7 +1092,7 @@ test "inclusive step record bound is readable and one byte beyond fails closed" 
     try std.testing.expectEqualStrings(storage.index_digest, hit.index_digest);
     switch (try inspectRecordForGc(io, arena, cache_root, exact_path, exact_key)) {
         .root => |root| try std.testing.expectEqualStrings(storage.index_digest, root.index_digest),
-        .legacy, .stale, .unknown => return error.MissingBuildCacheRecord,
+        .stale, .unknown => return error.MissingBuildCacheRecord,
     }
 
     const oversized_instruction = try arena.alloc(u8, exact_instruction.len + 1);
@@ -1123,7 +1115,7 @@ test "inclusive step record bound is readable and one byte beyond fails closed" 
     try std.testing.expect((try readHit(io, arena, cache_root, exact_input, exact_key)) == null);
     switch (try inspectRecordForGc(io, arena, cache_root, exact_path, exact_key)) {
         .unknown => {},
-        .root, .legacy, .stale => return error.OversizedBuildCacheRecordAccepted,
+        .root, .stale => return error.OversizedBuildCacheRecordAccepted,
     }
 }
 
@@ -1165,7 +1157,7 @@ test "prepare record round trips typed identity and exact target" {
     try std.testing.expectEqualStrings(storage.index_digest, hit.index_digest);
     switch (try inspectRecordForGc(io, arena, cache_root, path, key)) {
         .root => |root| try std.testing.expectEqualStrings(storage.index_digest, root.index_digest),
-        .legacy, .stale, .unknown => return error.MissingBuildCacheRecord,
+        .stale, .unknown => return error.MissingBuildCacheRecord,
     }
 
     try std.testing.expectError(error.BuildCacheKeyMismatch, readHit(
@@ -1223,7 +1215,7 @@ test "prepare record rejects target mismatch and missing completeness stamp" {
     try std.testing.expect((try readHit(io, arena, cache_root, input, key)) == null);
     switch (try inspectRecordForGc(io, arena, cache_root, path, key)) {
         .stale => {},
-        .root, .legacy, .unknown => return error.MalformedBuildRecordAccepted,
+        .root, .unknown => return error.MalformedBuildRecordAccepted,
     }
 
     _ = try writeRecord(io, arena, cache_root, input, key, storage);
@@ -1284,48 +1276,50 @@ test "pre-capability COPY record misses after executor identity changes" {
     try std.testing.expect((try readHit(io, arena, cache_root, new_input, new_key)) != null);
 }
 
-test "gc inspection retains complete legacy records" {
+test "gc inspection prunes older builder records and keeps newer ones unknown" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-legacy-gc";
+    const tmp = "zig-cache/test-build-step-cache-old-builder-gc";
     const cache_root = tmp ++ "/cache";
     const child_rootfs = tmp ++ "/child.ext4";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "legacy child rootfs bytes" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "old child rootfs bytes" });
 
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
-    const keys = [_][]const u8{
-        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    const cases = [_]struct { version: []const u8, stale: bool }{
+        .{ .version = "sporevm-build-v6", .stale = true },
+        .{ .version = "sporevm-build-v7", .stale = true },
+        .{ .version = "sporevm-build-v8", .stale = true },
+        .{ .version = "sporevm-build-v10", .stale = false },
+        .{ .version = "other-builder-v1", .stale = false },
     };
-    for (legacy_builder_versions, keys) |legacy_version, legacy_key| {
-        const path = try recordPath(arena, cache_root, legacy_key);
-        const parent = std.fs.path.dirname(path) orelse return error.BadManifest;
-        try Io.Dir.cwd().createDirPath(io, parent);
-        const legacy_json = try std.json.Stringify.valueAlloc(arena, .{
+    for (cases, 0..) |case, i| {
+        const key = try std.fmt.allocPrint(arena, "{x:0>64}", .{i + 0xc0});
+        const path = try recordPath(arena, cache_root, key);
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path) orelse return error.BadManifest);
+        const json = try std.json.Stringify.valueAlloc(arena, .{
             .kind = record_kind,
-            .builder_version = legacy_version,
+            .builder_version = case.version,
             .platform = rootfs_mod.Platform{},
-            .step_key = legacy_key,
+            .step_key = key,
             .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             .child_index_digest = storage.index_digest,
             .rootfs_storage = storage,
             .instruction_kind = "RUN",
             .instruction = "RUN true",
-            .disk_grow_target = @as(u64, 9 * 1024 * 1024 * 1024),
         }, .{});
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = legacy_json });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
 
-        switch (try inspectRecordForGc(io, arena, cache_root, path, legacy_key)) {
-            .legacy => |legacy_storage| try std.testing.expectEqualStrings(storage.index_digest, legacy_storage.index_digest),
-            .root, .stale, .unknown => return error.MissingBuildCacheRecord,
+        switch (try inspectRecordForGc(io, arena, cache_root, path, key)) {
+            .stale => try std.testing.expect(case.stale),
+            .unknown => try std.testing.expect(!case.stale),
+            .root => return error.OldBuilderRecordRetained,
         }
     }
 }

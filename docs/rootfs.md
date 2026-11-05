@@ -318,11 +318,10 @@ spore cache gc --rootfs --force
 spore --json cache gc --rootfs
 ```
 
-Rootfs cache GC treats current `spore build` step records as roots. Valid
-complete builder-v8, builder-v7, and builder-v6 records cannot hit builder-v9 keys, but
-remain retained roots for their child storage. Malformed or incomplete known records and
+Rootfs cache GC treats current `spore build` step records as roots. Records
+from older builder versions, malformed or incomplete known records, and
 semantically stale current records are pruneable. Unknown future step-record
-kinds or schema versions are retained and make the CAS sweep conservative.
+kinds or builder versions are retained and make the CAS sweep conservative.
 
 These commands render human summaries by default. Put global `--json` before the
 command when scripts need stable field names and exact byte counts. Without

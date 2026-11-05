@@ -1,10 +1,4 @@
-//! Runtime writable disk snapshot glue.
-//!
-//! The legacy disk-layer parser and layered COW backend have been removed from
-//! the runtime path. This module keeps the small shared pieces still used while
-//! rootfs-backed runs use the chunk-mapped backend. The old disk kind appears
-//! only as an internal clean exact-rootfs sentinel and is never accepted from a
-//! persisted manifest.
+//! Runtime writable disk snapshot glue for the chunk-mapped rootfs backend.
 
 const std = @import("std");
 const block_source = @import("block_source.zig");
@@ -113,19 +107,26 @@ fn formatDiskSnapshotMetrics(buf: []u8, metrics: SnapshotMetrics) std.fmt.BufPri
     );
 }
 
+/// The immutable baseline under a writable rootfs head and the virtio-mmio
+/// device that exposes it.
+pub const Base = struct {
+    baseline: runtime_disk_fork.Baseline,
+    device: spore.RootfsDevice,
+};
+
 pub const SnapshotState = struct {
-    base: spore.Disk,
+    base: Base,
     active: ActiveHead,
     metrics: ?*SnapshotMetrics = null,
 
     /// Finish a writable disk snapshot after the VMM has paused the guest and
     /// verified the matching virtio-blk queues have no pending requests.
+    /// A clean head over an exact rootfs baseline needs no disk state, so it
+    /// returns null until the head publishes its first index.
     pub fn finish(self: SnapshotState, _: std.mem.Allocator, dir: []const u8, quiesced: bool) Error!?spore.Disk {
         std.debug.assert(quiesced);
         try self.active.ensurePublishable();
-        if (self.active.dirtyClusterCount() == 0) {
-            if (std.mem.eql(u8, self.base.kind, spore.disk_kind_cow_block) and !self.active.hasPublishedSnapshot()) return null;
-        }
+        if (self.active.dirtyClusterCount() == 0 and self.base.baseline.kind == .rootfs and !self.active.hasPublishedSnapshot()) return null;
         const start_ns = try monotonicNs();
         const dirty_chunks = self.active.dirtyClusterCount();
         var stats: chunk_mapped_disk.SnapshotStats = .{};
@@ -191,15 +192,9 @@ pub const SnapshotState = struct {
     }
 };
 
-pub fn forkBaseline(base: spore.Disk) Error!runtime_disk_fork.Baseline {
-    const kind: runtime_disk_fork.BaselineKind = if (std.mem.eql(u8, base.kind, spore.disk_kind_chunk_index))
-        .disk_index
-    else if (std.mem.eql(u8, base.kind, spore.disk_kind_cow_block))
-        .rootfs
-    else
-        return error.BadManifest;
-    try spore.validateDiskDigest(base.base);
-    return .{ .kind = kind, .identity = base.base };
+pub fn forkBaseline(base: Base) Error!runtime_disk_fork.Baseline {
+    try spore.validateDiskDigest(base.baseline.identity);
+    return base.baseline;
 }
 
 fn monotonicNs() Error!u64 {
@@ -260,16 +255,6 @@ pub fn createTempOverlayAt(allocator: std.mem.Allocator, dir: []const u8) Error!
     return .{ .fd = fd };
 }
 
-pub fn diskFromRootfs(rootfs: spore.Rootfs) spore.Disk {
-    return .{
-        .kind = spore.disk_kind_cow_block,
-        .device = rootfs.device,
-        .size = spore.effectiveRootfsLogicalSize(rootfs),
-        .base = spore.effectiveRootfsBaseIdentity(rootfs),
-        .layers = &.{},
-    };
-}
-
 pub fn cloneDisk(allocator: std.mem.Allocator, disk: spore.Disk) Error!spore.Disk {
     const kind = try allocator.dupe(u8, disk.kind);
     errdefer allocator.free(kind);
@@ -308,7 +293,7 @@ pub fn cloneDisk(allocator: std.mem.Allocator, disk: spore.Disk) Error!spore.Dis
     };
 }
 
-test "snapshot returns null for a clean exact-rootfs sentinel disk" {
+test "snapshot returns null for a clean exact-rootfs baseline" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -325,11 +310,9 @@ test "snapshot returns null for a clean exact-rootfs sentinel disk" {
     var disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, bytes.len, 512);
     defer disk.deinit();
 
-    const base_disk = spore.Disk{
-        .kind = spore.disk_kind_cow_block,
+    const base_disk = Base{
+        .baseline = .{ .kind = .rootfs, .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
         .device = .{ .mmio_slot = 1 },
-        .size = bytes.len,
-        .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     };
     const snapshot = try (SnapshotState{
         .base = base_disk,
@@ -368,11 +351,8 @@ test "clean chunk-index save publishes its index" {
     const stale_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const saved = (try (SnapshotState{
         .base = .{
-            .kind = spore.disk_kind_chunk_index,
+            .baseline = .{ .kind = .disk_index, .identity = stale_identity },
             .device = .{ .mmio_slot = 1 },
-            .size = bytes.len,
-            .base = stale_identity,
-            .chunk_size = 512,
         },
         .active = .{ .chunk_mapped = &disk },
     }).finish(arena, out_dir, true)) orelse return error.BadManifest;
@@ -409,10 +389,8 @@ test "clean save after dirty cow snapshot keeps current identity" {
     try disk.writeAt(&patch, 101);
     const state = SnapshotState{
         .base = .{
-            .kind = spore.disk_kind_cow_block,
+            .baseline = .{ .kind = .rootfs, .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
             .device = .{ .mmio_slot = 1 },
-            .size = bytes.len,
-            .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         },
         .active = .{ .chunk_mapped = &disk },
     };

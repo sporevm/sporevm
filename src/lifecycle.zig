@@ -339,20 +339,6 @@ pub const Spec = struct {
     console_log_path: ?[]const u8 = null,
 };
 
-const LegacyMemoryPolicy = enum {
-    auto,
-    explicit,
-};
-
-const SpecMemoryProbe = struct {
-    memory: ?struct {
-        policy: ?LegacyMemoryPolicy = null,
-        bytes: ?u64 = null,
-        initial_bytes: ?u64 = null,
-        maximum_bytes: ?u64 = null,
-    } = null,
-};
-
 pub const ExecDefaults = spore.ExecDefaults;
 
 pub const DiskForkClaim = struct {
@@ -1819,8 +1805,22 @@ fn removeNamedAtPaths(context: Context, allocator: std.mem.Allocator, paths: Pat
             try stopReadyMonitor(allocator, context.io, paths, ready.value);
             try deleteVmState(context.io, paths);
         },
-        .incomplete, .stale => {
+        .incomplete => {
             removed_pid = readPid(allocator, context.io, paths) catch null;
+            try deleteVmState(context.io, paths);
+        },
+        .stale => {
+            removed_pid = readPid(allocator, context.io, paths) catch null;
+            // An unreadable spec, such as one from an older binary, is stale
+            // even while its monitor still runs. Stop that monitor first so it
+            // is not left running with no state to find it by.
+            if (readReady(allocator, context.io, paths)) |parsed| {
+                var ready = parsed;
+                defer ready.deinit();
+                if (removed_pid) |pid| {
+                    if (pid == ready.value.pid and pidAlive(pid)) try stopReadyMonitor(allocator, context.io, paths, ready.value);
+                }
+            } else |_| {}
             try deleteVmState(context.io, paths);
         },
     }
@@ -3007,38 +3007,14 @@ pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Pa
 pub fn readSpecFile(allocator: std.mem.Allocator, io: Io, spec_path: []const u8) !std.json.Parsed(Spec) {
     const data = try Io.Dir.cwd().readFileAlloc(io, spec_path, allocator, .limited(max_metadata_bytes));
     defer allocator.free(data);
-    const legacy_memory = try legacyMemoryFromSpecJson(allocator, data);
+    // An unknown field means an older spec shape, such as the removed memory
+    // `policy`/`bytes` pair, and fails closed instead of silently defaulting.
     var parsed = try std.json.parseFromSlice(Spec, allocator, data, .{
         .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
     });
     errdefer parsed.deinit();
-    if (legacy_memory) |memory| parsed.value.memory = memory;
     try validateSpec(parsed.value);
     return parsed;
-}
-
-fn legacyMemoryFromSpecJson(allocator: std.mem.Allocator, data: []const u8) !?memory_config.Config {
-    var probe = try std.json.parseFromSlice(SpecMemoryProbe, allocator, data, .{
-        .ignore_unknown_fields = true,
-    });
-    defer probe.deinit();
-    const value = probe.value.memory orelse return null;
-    const has_current = value.initial_bytes != null or value.maximum_bytes != null;
-    const has_legacy = value.policy != null or value.bytes != null;
-    if (has_current and has_legacy) return error.BadManifest;
-    if (!has_legacy) return null;
-    const policy = value.policy orelse return error.BadManifest;
-    const bytes = value.bytes orelse return error.BadManifest;
-    const config = switch (policy) {
-        .auto => memory_config.Config{
-            .initial_bytes = memory_config.default_bytes,
-            .maximum_bytes = bytes,
-        },
-        .explicit => memory_config.Config.fixed(bytes),
-    };
-    try config.validate();
-    return config;
 }
 
 fn validateSpec(spec: Spec) !void {
@@ -6735,29 +6711,61 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqual(@as(i64, 1234), try readPid(allocator, io, paths));
 }
 
-test "legacy lifecycle memory policy migrates to explicit sizes" {
+test "lifecycle specs with the removed memory policy are stale and removable" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const auto = (try legacyMemoryFromSpecJson(
-        allocator,
-        "{\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}}",
-    )).?;
-    try std.testing.expectEqual(memory_config.default_bytes, auto.initial_bytes);
-    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024 * 1024), auto.maximum_bytes);
+    const io = std.testing.io;
+    const root = try std.fs.path.resolve(allocator, &.{"/tmp/sporevm-test-lifecycle-old-memory-policy"});
+    defer allocator.free(root);
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const paths = try pathsFromRoot(allocator, root, "old-1");
+    defer paths.deinit(allocator);
 
-    const fixed = (try legacyMemoryFromSpecJson(
-        allocator,
-        "{\"memory\":{\"policy\":\"explicit\",\"bytes\":2147483648}}",
-    )).?;
-    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), fixed.initial_bytes);
-    try std.testing.expectEqual(fixed.initial_bytes, fixed.maximum_bytes);
+    try writeSpec(allocator, io, paths, .{ .name = "old-1" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = paths.spec_path,
+        .data = "{\"name\":\"old-1\",\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}}",
+    });
+    try std.testing.expectError(error.UnknownField, readSpec(allocator, io, paths));
 
-    try std.testing.expectError(
-        error.BadManifest,
-        legacyMemoryFromSpecJson(
-            allocator,
-            "{\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184,\"initial_bytes\":536870912,\"maximum_bytes\":17179869184}}",
-        ),
-    );
+    // The monitor that wrote this spec may still be running. A sleeper in its
+    // own process group stands in for it; a thread reaps it once it exits.
+    const Reaper = struct {
+        fn run(child: *std.process.Child, child_io: Io, term: *?std.process.Child.Term) void {
+            term.* = child.wait(child_io) catch null;
+        }
+    };
+    var monitor = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .pgid = 0 });
+    const monitor_pid: i64 = monitor.id.?;
+    var monitor_term: ?std.process.Child.Term = null;
+    const reaper = std.Thread.spawn(.{}, Reaper.run, .{ &monitor, io, &monitor_term }) catch |err| {
+        monitor.kill(io);
+        return err;
+    };
+    var reaped = false;
+    defer if (!reaped) {
+        signalMonitorProcessGroup(monitor_pid, .KILL);
+        reaper.join();
+    };
+    try writeReady(allocator, io, paths, .{
+        .pid = monitor_pid,
+        .control_socket_path = paths.control_socket_path,
+        .console_log_path = paths.console_log_path,
+    });
+    try writePid(allocator, io, paths, monitor_pid);
+    try std.testing.expectEqual(VmState.stale, try classifyVmState(allocator, io, paths, pidAlive));
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, root);
+    const removed = try removeNamed(.{ .io = io, .environ_map = &env }, allocator, .{ .name = "old-1" });
+    defer deinitNamedLifecycleResult(allocator, removed);
+    try std.testing.expectEqual(monitor_pid, removed.pid.?);
+    try std.testing.expect(!pidAlive(monitor_pid));
+    reaper.join();
+    reaped = true;
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, monitor_term.?);
+    try std.testing.expectEqual(VmState.absent, try classifyVmState(allocator, io, paths, alwaysAlive));
 }
 
 test "durable lifecycle metadata drops transient disk fork claims" {

@@ -112,11 +112,8 @@ test "batch owns every cloned head until registration moves it" {
     try disk.writeAt(&patch, 8);
     var batch = try prepare(allocator, .{
         .base = .{
-            .kind = spore.disk_kind_cow_block,
+            .baseline = .{ .kind = .rootfs, .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
             .device = .{ .mmio_slot = 1 },
-            .size = spore.disk_chunk_size,
-            .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            .chunk_size = spore.disk_chunk_size,
         },
         .active = .{ .chunk_mapped = &disk },
     }, 2, .{ .allow_copy = true, .force_copy = true });

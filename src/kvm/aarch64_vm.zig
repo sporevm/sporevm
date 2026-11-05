@@ -1550,7 +1550,7 @@ fn takeRootfsSnapshot(
     const arena = arena_state.allocator();
 
     const devices = try captureTransports(arena, transports);
-    if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+    if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
         std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
         return error.DeviceStatePending;
     }
@@ -1645,7 +1645,7 @@ fn takeSnapshot(
     const devices_ms = (try monotonicMs()) - devices_start;
     var disk_quiesced = false;
     if (disk_snapshot orelse quiescence_disk) |disk_state| {
-        if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+        if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
             std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
             return error.DeviceStatePending;
         }
@@ -1830,7 +1830,7 @@ fn takeSnapshotV1(
     const devices_ms = (try monotonicMs()) - devices_start;
     var disk_quiesced = false;
     if (disk_snapshot orelse quiescence_disk) |disk_state| {
-        if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+        if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
             std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
             return error.DeviceStatePending;
         }

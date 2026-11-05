@@ -12,33 +12,10 @@ const x86_cpu_profile = @import("x86_64/cpu_profile.zig");
 const x86_kvm = @import("kvm/x86_64.zig");
 
 pub const machine_arch = "aarch64";
-pub const host_info_schema = "spore.host-info.v2";
-pub const host_info_schema_version: u32 = 2;
-pub const host_info_v3_schema = "spore.host-info.v3";
-pub const host_info_v3_schema_version: u32 = 3;
+pub const host_info_schema = "spore.host-info.v3";
+pub const host_info_schema_version: u32 = 3;
 pub const default_gic_dist_base: u64 = 0x0800_0000;
 pub const default_gic_redist_base: u64 = 0x0802_0000;
-
-pub const HostInfo = struct {
-    schema: []const u8 = host_info_schema,
-    schema_version: u32 = host_info_schema_version,
-    host_class: []const u8,
-    platform: PlatformFacts,
-    backends: [2]BackendAvailability,
-    cache_roots: CacheRoots,
-};
-
-pub const PlatformFacts = struct {
-    os: []const u8,
-    arch: architecture.Architecture,
-    cpu_profile: []const u8,
-    device_model_version: u32,
-    ram_base: u64,
-    gic_dist_base: u64,
-    gic_redist_base: u64,
-    counter_frequency_source: []const u8,
-    counter_frequency_hz: u64,
-};
 
 pub const BackendAvailability = struct {
     name: []const u8,
@@ -63,17 +40,17 @@ pub const PathFact = struct {
 /// Architecture-discriminated host facts. The union tag is intentionally part
 /// of the JSON shape, so an ARM consumer never has to interpret zero-valued x86
 /// fields (or vice versa) as "not applicable".
-pub const HostInfoV3 = struct {
-    schema: []const u8 = host_info_v3_schema,
-    schema_version: u32 = host_info_v3_schema_version,
+pub const HostInfo = struct {
+    schema: []const u8 = host_info_schema,
+    schema_version: u32 = host_info_schema_version,
     host_class: []const u8,
     architecture: []const u8,
-    platform: PlatformFactsV3,
+    platform: PlatformFacts,
     backends: [2]BackendAvailability,
     cache_roots: CacheRoots,
 };
 
-pub const PlatformFactsV3 = union(enum) {
+pub const PlatformFacts = union(enum) {
     arm64: Aarch64PlatformFacts,
     amd64: X86PlatformFacts,
 };
@@ -151,10 +128,10 @@ pub const KvmCapabilityFact = struct {
     satisfied: bool,
 };
 
-/// Pure input to the v3 renderer. Offline tools and tests can render either
-/// architecture without executing an architecture-specific instruction or
-/// opening `/dev/kvm`.
-pub const HostInfoV3Snapshot = struct {
+/// Pure input to the host-info renderer. Offline tools and tests can render
+/// either architecture without executing an architecture-specific instruction
+/// or opening `/dev/kvm`.
+pub const HostInfoSnapshot = struct {
     os: []const u8,
     architecture: architecture.Architecture,
     host_class: []const u8,
@@ -175,63 +152,22 @@ pub const Expected = struct {
     device_count: usize,
 };
 
+/// Return the versioned host-info contract on either supported architecture.
+/// Architecture-specific probing is confined to snapshot construction; JSON
+/// rendering and fixture inspection use `hostInfoFromSnapshot` directly.
 pub fn hostInfo(
     allocator: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
 ) !HostInfo {
-    if (!supportsHostInfoV2(builtin.cpu.arch)) return error.UnsupportedArchitecture;
-    const kernels = try cacheRootFact(allocator, environ, .kernels);
-    errdefer freePathFact(allocator, kernels);
-    const rootfs = try cacheRootFact(allocator, environ, .rootfs);
-    errdefer freePathFact(allocator, rootfs);
-    const bundles = try cacheRootFact(allocator, environ, .bundles);
-    errdefer freePathFact(allocator, bundles);
-    const runtime = try runtimeRootFact(allocator, environ);
-    errdefer freePathFact(allocator, runtime);
-
-    return .{
-        .host_class = hostClass(),
-        .platform = .{
-            .os = @tagName(builtin.os.tag),
-            .arch = architecture.fromTarget(builtin.cpu.arch) orelse return error.UnsupportedHost,
-            .cpu_profile = board.cpu_profile,
-            .device_model_version = board.device_model_version,
-            .ram_base = board.ram_base,
-            .gic_dist_base = default_gic_dist_base,
-            .gic_redist_base = default_gic_redist_base,
-            .counter_frequency_source = "cntfrq_el0",
-            .counter_frequency_hz = try hostCounterFrequencyHz(),
-        },
-        .backends = .{ hvfAvailability(), kvmAvailability() },
-        .cache_roots = .{
-            .kernels = kernels,
-            .rootfs = rootfs,
-            .bundles = bundles,
-            .runtime = runtime,
-        },
-    };
+    const snapshot = try currentHostInfoSnapshot();
+    return hostInfoFromSnapshot(allocator, environ, snapshot);
 }
 
-pub fn supportsHostInfoV2(zig_arch: std.Target.Cpu.Arch) bool {
-    return zig_arch == .aarch64;
-}
-
-/// Return the versioned host-info contract on either supported architecture.
-/// Architecture-specific probing is confined to snapshot construction; JSON
-/// rendering and fixture inspection use `hostInfoV3FromSnapshot` directly.
-pub fn hostInfoV3(
+pub fn hostInfoFromSnapshot(
     allocator: std.mem.Allocator,
     environ: *const std.process.Environ.Map,
-) !HostInfoV3 {
-    const snapshot = try currentHostInfoV3Snapshot();
-    return hostInfoV3FromSnapshot(allocator, environ, snapshot);
-}
-
-pub fn hostInfoV3FromSnapshot(
-    allocator: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-    snapshot: HostInfoV3Snapshot,
-) !HostInfoV3 {
+    snapshot: HostInfoSnapshot,
+) !HostInfo {
     const kernels = try cacheRootFact(allocator, environ, .kernels);
     errdefer freePathFact(allocator, kernels);
     const rootfs = try cacheRootFact(allocator, environ, .rootfs);
@@ -244,7 +180,7 @@ pub fn hostInfoV3FromSnapshot(
     return .{
         .host_class = snapshot.host_class,
         .architecture = @tagName(snapshot.architecture),
-        .platform = platformFactsV3(snapshot),
+        .platform = platformFacts(snapshot),
         .backends = snapshot.backends,
         .cache_roots = .{
             .kernels = kernels,
@@ -255,7 +191,7 @@ pub fn hostInfoV3FromSnapshot(
     };
 }
 
-fn platformFactsV3(snapshot: HostInfoV3Snapshot) PlatformFactsV3 {
+fn platformFacts(snapshot: HostInfoSnapshot) PlatformFacts {
     return switch (snapshot.architecture) {
         .arm64 => .{ .arm64 = .{
             .os = snapshot.os,
@@ -275,14 +211,14 @@ fn platformFactsV3(snapshot: HostInfoV3Snapshot) PlatformFactsV3 {
     };
 }
 
-pub fn deinitHostInfoV3(allocator: std.mem.Allocator, info: HostInfoV3) void {
+pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     freePathFact(allocator, info.cache_roots.kernels);
     freePathFact(allocator, info.cache_roots.rootfs);
     freePathFact(allocator, info.cache_roots.bundles);
     freePathFact(allocator, info.cache_roots.runtime);
 }
 
-fn currentHostInfoV3Snapshot() !HostInfoV3Snapshot {
+fn currentHostInfoSnapshot() !HostInfoSnapshot {
     if (comptime builtin.cpu.arch == .aarch64) {
         return .{
             .os = @tagName(builtin.os.tag),
@@ -360,13 +296,6 @@ fn unavailableReasonName(reason: backend_mod.UnavailableReason) []const u8 {
         .incompatible_cpu_profile => "cpu_profile_incompatible",
         .kvm_probe_failed => "kvm_probe_failed",
     };
-}
-
-pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
-    freePathFact(allocator, info.cache_roots.kernels);
-    freePathFact(allocator, info.cache_roots.rootfs);
-    freePathFact(allocator, info.cache_roots.bundles);
-    freePathFact(allocator, info.cache_roots.runtime);
 }
 
 fn freePathFact(allocator: std.mem.Allocator, fact: PathFact) void {
@@ -549,7 +478,8 @@ test "host info exposes schema and cache roots" {
 
     try std.testing.expectEqualStrings(host_info_schema, info.schema);
     try std.testing.expectEqual(host_info_schema_version, info.schema_version);
-    try std.testing.expectEqual(architecture.Architecture.arm64, info.platform.arch);
+    try std.testing.expectEqualStrings("arm64", info.architecture);
+    try std.testing.expect(info.platform == .arm64);
     try std.testing.expect(std.mem.indexOf(u8, info.host_class, "aarch64") == null);
     try std.testing.expect(std.mem.indexOf(u8, info.host_class, "arm64") != null);
     try std.testing.expect(info.backends.len >= 2);
@@ -559,7 +489,7 @@ test "host info exposes schema and cache roots" {
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/sporevm", info.cache_roots.runtime.path.?);
 }
 
-test "v3 offline renderer discriminates ARM and x86 without host probing" {
+test "host info offline renderer discriminates ARM and x86 without host probing" {
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -571,15 +501,15 @@ test "v3 offline renderer discriminates ARM and x86 without host probing" {
     const unavailable_kvm = unsupportedBackend("kvm");
     const available_kvm = BackendAvailability{ .name = "kvm", .supported = true, .available = true, .reason = "available" };
 
-    const arm = try hostInfoV3FromSnapshot(allocator, &env, .{
+    const arm = try hostInfoFromSnapshot(allocator, &env, .{
         .os = "macos",
         .architecture = .arm64,
         .host_class = "macos-arm64-hvf",
         .aarch64_counter_frequency_hz = 24_000_000,
         .backends = .{ available_hvf, unavailable_kvm },
     });
-    defer deinitHostInfoV3(allocator, arm);
-    try std.testing.expectEqualStrings(host_info_v3_schema, arm.schema);
+    defer deinitHostInfo(allocator, arm);
+    try std.testing.expectEqualStrings(host_info_schema, arm.schema);
     try std.testing.expectEqualStrings("arm64", arm.architecture);
     try std.testing.expectEqual(@as(u64, 24_000_000), arm.platform.arm64.counter.frequency_hz);
 
@@ -588,14 +518,14 @@ test "v3 offline renderer discriminates ARM and x86 without host probing" {
         capability.value = @max(capability.minimum, capability.required_bits);
         capability.satisfied = true;
     }
-    const x86 = try hostInfoV3FromSnapshot(allocator, &env, .{
+    const x86 = try hostInfoFromSnapshot(allocator, &env, .{
         .os = "linux",
         .architecture = .amd64,
         .host_class = "linux-amd64-kvm",
         .x86_kvm_capabilities = capabilities,
         .backends = .{ unavailable_hvf, available_kvm },
     });
-    defer deinitHostInfoV3(allocator, x86);
+    defer deinitHostInfo(allocator, x86);
     try std.testing.expectEqualStrings("amd64", x86.architecture);
     try std.testing.expectEqualStrings(x86_board.board_profile, x86.platform.amd64.board_profile);
     try std.testing.expectEqualStrings(x86_cpu_profile.profile_name, x86.platform.amd64.cpu_profile);
@@ -623,45 +553,4 @@ test "v3 offline renderer discriminates ARM and x86 without host probing" {
             "\"cache_roots\":{\"kernels\":{\"path\":\"/tmp/sporevm-cache/sporevm/kernels\",\"resolved\":true,\"source\":\"environment\"},\"rootfs\":{\"path\":\"/tmp/sporevm-cache/sporevm/rootfs\",\"resolved\":true,\"source\":\"environment\"},\"bundles\":{\"path\":\"/tmp/sporevm-cache/sporevm/bundles\",\"resolved\":true,\"source\":\"environment\"},\"runtime\":{\"path\":\"/tmp/sporevm-runtime/sporevm\",\"resolved\":true,\"source\":\"environment\"}}}",
         x86_json,
     );
-}
-
-test "v2 schema remains the OCI-named ARM-shaped contract" {
-    try std.testing.expectEqualStrings("spore.host-info.v2", host_info_schema);
-    try std.testing.expectEqual(@as(u32, 2), host_info_schema_version);
-    const info = HostInfo{
-        .host_class = "linux-arm64-kvm",
-        .platform = .{
-            .os = "linux",
-            .arch = .arm64,
-            .cpu_profile = "sporevm-aarch64-v0",
-            .device_model_version = 4,
-            .ram_base = 0x8000_0000,
-            .gic_dist_base = default_gic_dist_base,
-            .gic_redist_base = default_gic_redist_base,
-            .counter_frequency_source = "cntfrq_el0",
-            .counter_frequency_hz = 24_000_000,
-        },
-        .backends = .{
-            .{ .name = "hvf", .supported = false, .available = false, .reason = "unsupported_os_or_arch" },
-            .{ .name = "kvm", .supported = true, .available = true, .reason = "available" },
-        },
-        .cache_roots = .{
-            .kernels = .{ .path = null, .resolved = false, .source = "missing_home" },
-            .rootfs = .{ .path = null, .resolved = false, .source = "missing_home" },
-            .bundles = .{ .path = null, .resolved = false, .source = "missing_home" },
-            .runtime = .{ .path = null, .resolved = false, .source = "invalid_runtime_dir" },
-        },
-    };
-    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, info, .{});
-    defer std.testing.allocator.free(json);
-    try std.testing.expectEqualStrings(
-        "{\"schema\":\"spore.host-info.v2\",\"schema_version\":2,\"host_class\":\"linux-arm64-kvm\",\"platform\":{\"os\":\"linux\",\"arch\":\"arm64\",\"cpu_profile\":\"sporevm-aarch64-v0\",\"device_model_version\":4,\"ram_base\":2147483648,\"gic_dist_base\":134217728,\"gic_redist_base\":134348800,\"counter_frequency_source\":\"cntfrq_el0\",\"counter_frequency_hz\":24000000},\"backends\":[{\"name\":\"hvf\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"},{\"name\":\"kvm\",\"supported\":true,\"available\":true,\"reason\":\"available\"}],\"cache_roots\":{\"kernels\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"rootfs\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"bundles\":{\"path\":null,\"resolved\":false,\"source\":\"missing_home\"},\"runtime\":{\"path\":null,\"resolved\":false,\"source\":\"invalid_runtime_dir\"}}}",
-        json,
-    );
-}
-
-test "v2 host info is explicitly ARM only" {
-    try std.testing.expect(supportsHostInfoV2(.aarch64));
-    try std.testing.expect(!supportsHostInfoV2(.x86_64));
-    try std.testing.expect(!supportsHostInfoV2(.riscv64));
 }

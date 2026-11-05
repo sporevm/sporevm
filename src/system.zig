@@ -162,8 +162,8 @@ pub const RootfsGcEntry = struct {
 };
 
 pub const RootfsGcResult = struct {
-    schema: []const u8 = "spore.cache.gc.result.v1",
-    schema_version: u32 = 1,
+    schema: []const u8 = "spore.cache.gc.result.v2",
+    schema_version: u32 = 2,
     cache_root: []const u8,
     dry_run: bool,
     rooted_indexes: usize = 0,
@@ -173,7 +173,6 @@ pub const RootfsGcResult = struct {
     unparseable_step_record_count: usize = 0,
     unparseable_pin_count: usize = 0,
     pin_index_validation_count: usize = 0,
-    legacy_step_record_count: usize = 0,
     stale_step_record_count: usize = 0,
     step_record_candidate_count: usize = 0,
     step_record_deleted_count: usize = 0,
@@ -189,7 +188,6 @@ pub const RootfsGcResult = struct {
 };
 
 const GcStepRecordStats = struct {
-    legacy_count: usize = 0,
     stale_count: usize = 0,
     candidate_count: usize = 0,
     candidate_bytes: u64 = 0,
@@ -1242,7 +1240,6 @@ fn gcRootfsCache(
         .unparseable_step_record_count = conservative_roots.step_record_count,
         .unparseable_pin_count = conservative_roots.pin_count,
         .pin_index_validation_count = conservative_roots.pin_index_validation_count,
-        .legacy_step_record_count = step_record_plan.stats.legacy_count,
         .stale_step_record_count = step_record_plan.stats.stale_count,
         .step_record_candidate_count = step_record_plan.stats.candidate_count,
         .step_record_deleted_count = step_record_plan.stats.deleted_count,
@@ -1512,10 +1509,6 @@ fn collectStorageRootsFromBuildStepRecords(
         const expected_key = entry.name[0 .. entry.name.len - ".json".len];
         switch (try build_step_cache.inspectRecordForGc(io, allocator, cache_root, path, expected_key)) {
             .root => |storage| try addStorageRoot(storage_roots, storage),
-            .legacy => |storage| {
-                plan.stats.legacy_count += 1;
-                try addStorageRoot(storage_roots, storage);
-            },
             .stale => {
                 plan.stats.stale_count += 1;
                 try planGcStepRecordCandidate(
@@ -3603,21 +3596,6 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
         .data = "{\"kind\":\"future-rootfs-ref-v99\"}",
     });
     try Io.Dir.cwd().createDirPath(io, root ++ "/build/steps");
-    const legacy_key = "legacy";
-    const legacy_path = root ++ "/build/steps/legacy.json";
-    const legacy_json = try std.json.Stringify.valueAlloc(allocator, .{
-        .kind = "sporevm-build-step-v1",
-        .builder_version = "sporevm-build-v6",
-        .platform = rootfs.Platform{},
-        .step_key = legacy_key,
-        .parent_index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .child_index_digest = orphan.storage.index_digest,
-        .rootfs_storage = orphan.storage,
-        .instruction_kind = "RUN",
-        .instruction = "RUN true",
-        .network_mode = build_step_cache.NetworkMode.none,
-    }, .{});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = legacy_path, .data = legacy_json });
     const stale_step_path = root ++ "/build/steps/stale.json";
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = stale_step_path,
@@ -3643,7 +3621,6 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
     try std.testing.expectEqual(@as(usize, 1), forced.unparseable_pin_count);
     try std.testing.expectEqual(@as(usize, 1), forced.candidate_count);
     try std.testing.expectEqual(@as(usize, 1), forced.deleted_count);
-    try std.testing.expectEqual(@as(usize, 1), forced.legacy_step_record_count);
     try std.testing.expectEqual(@as(usize, 1), forced.stale_step_record_count);
     try std.testing.expect(try fileExists(io, orphan_index_path));
     try std.testing.expect(try fileExists(io, orphan_object_path));
@@ -3655,12 +3632,12 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "1 unrecognized saved-spore pin records found; retained all rootfs CAS entries.") != null);
 }
 
-test "system cache gc preserves complete storage rooted only by a v6 record" {
+test "system cache gc deletes v6 step records and storage only they rooted" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-v6-root";
+    const root = "zig-cache/test-system-cache-gc-v6-record";
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
     Io.Dir.cwd().deleteTree(io, root) catch {};
     try Io.Dir.cwd().createDirPath(io, root);
@@ -3683,7 +3660,7 @@ test "system cache gc preserves complete storage rooted only by a v6 record" {
     const key = try build_step_cache.stepKey(allocator, input);
     const path = try build_step_cache.recordPath(allocator, root, key);
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path) orelse return error.BadManifest);
-    const legacy_json = try std.json.Stringify.valueAlloc(allocator, .{
+    const v6_json = try std.json.Stringify.valueAlloc(allocator, .{
         .kind = "sporevm-build-step-v1",
         .builder_version = "sporevm-build-v6",
         .platform = rootfs.Platform{},
@@ -3695,17 +3672,25 @@ test "system cache gc preserves complete storage rooted only by a v6 record" {
         .instruction = "RUN true",
         .network_mode = build_step_cache.NetworkMode.none,
     }, .{});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = legacy_json });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = v6_json });
 
     try std.testing.expect((try build_step_cache.readHit(io, allocator, root, input, key)) == null);
     const index_path = try rootfs_cas.manifestIndexPath(allocator, root, rooted.storage.index_digest);
     const object_path = try rootfs_cas.manifestObjectPath(allocator, root, rooted.object_digest);
-    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
-    try std.testing.expectEqual(@as(usize, 1), forced.legacy_step_record_count);
-    try std.testing.expectEqual(@as(usize, 0), forced.step_record_deleted_count);
+
+    const planned = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = true });
+    try std.testing.expectEqual(@as(usize, 0), planned.unparseable_step_record_count);
+    try std.testing.expectEqual(@as(usize, 1), planned.stale_step_record_count);
+    try std.testing.expectEqual(@as(usize, 1), planned.step_record_candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), planned.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 3), planned.candidate_count);
     try std.testing.expect(try fileExists(io, path));
-    try std.testing.expect(try fileExists(io, index_path));
-    try std.testing.expect(try fileExists(io, object_path));
+
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 1), forced.step_record_deleted_count);
+    try std.testing.expect(!try fileExists(io, path));
+    try std.testing.expect(!try fileExists(io, index_path));
+    try std.testing.expect(!try fileExists(io, object_path));
 }
 
 test "system cache mutation lock rejects a concurrent holder" {
