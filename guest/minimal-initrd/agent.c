@@ -4718,6 +4718,33 @@ static void drain_session_terminal(struct session *session) {
   }
 }
 
+// Adds the session's stdout and stderr pipes to a poll set, as roles
+// stdout_role and stdout_role + 1. pump_session_output handles their events.
+static void add_session_output_fds(const struct session *session, struct pollfd *fds, int *roles, nfds_t *nfds, int stdout_role) {
+  if (session->stdout_open && !session->file_stdio) {
+    fds[*nfds].fd = session->stdout_fd;
+    fds[*nfds].events = POLLIN | POLLHUP | POLLERR;
+    if (session->tty && session->terminal_pending_len != 0) fds[*nfds].events |= POLLOUT;
+    fds[*nfds].revents = 0;
+    roles[(*nfds)++] = stdout_role;
+  }
+  if (session->stderr_open && !session->file_stdio) {
+    fds[*nfds].fd = session->stderr_fd;
+    fds[*nfds].events = POLLIN | POLLHUP | POLLERR;
+    fds[*nfds].revents = 0;
+    roles[(*nfds)++] = stdout_role + 1;
+  }
+}
+
+static void pump_session_output(struct session *session, struct client *client, int is_stdout, short revents) {
+  if (is_stdout && session->tty) {
+    if (revents & POLLOUT) drain_session_terminal(session);
+    if (revents & (POLLIN | POLLHUP | POLLERR)) pump_session_terminal(session, client);
+  } else {
+    pump_session_stream(session, client, is_stdout);
+  }
+}
+
 static void close_session_stdin(struct session *session) {
   if (session->stdin_fd >= 0) {
     close(session->stdin_fd);
@@ -4980,8 +5007,15 @@ static void maybe_send_memory_pressure(struct session *session, struct client *c
   }
 }
 
-static void run_transient_exec(struct client *client, const struct run_request *request, int use_rootfs) {
-  if (request->protocol_v1 || request->stdin_enabled || request->tty || request->interactive || request->memory_pressure) {
+// Runs an exec beside a captured session that is still running, such as a
+// named VM restored from a live capture. Named exec sends start-v1 with pipe
+// stdin, so forward its stdin frames; terminals and memory pressure need the
+// primary session slot. Until the exec finishes, the agent keeps draining the
+// captured session's output into its replay buffer, as the main loop does
+// with no client attached, so the captured workload never blocks on a full
+// pipe. Other execs and copies to the VM wait for this one to finish.
+static void run_transient_exec(struct session *session, struct client *client, const struct run_request *request, int use_rootfs) {
+  if (request->tty || request->memory_pressure) {
     (void)send_client_error_exit(client, 2, "spore run: session already started\n");
     close_client(client);
     return;
@@ -4991,6 +5025,7 @@ static void run_transient_exec(struct client *client, const struct run_request *
   const struct session_start_options options = {
     .use_rootfs = use_rootfs,
     .exec_lookup = EXEC_LOOKUP_PATH,
+    .stdin_enabled = request->stdin_enabled,
     .terminal_rows = request->terminal_rows,
     .terminal_cols = request->terminal_cols,
   };
@@ -5001,9 +5036,14 @@ static void run_transient_exec(struct client *client, const struct run_request *
     return;
   }
 
+  // The agent has one client slot and this exec holds it, so the captured
+  // session's output goes only to its replay buffer and the console.
+  struct client no_client;
+  memset(&no_client, 0, sizeof(no_client));
+  no_client.fd = -1;
   while (client->fd >= 0 && (!transient.exited || transient.stdout_open || transient.stderr_open)) {
-    struct pollfd fds[3];
-    int roles[3];
+    struct pollfd fds[6];
+    int roles[6];
     nfds_t nfds = 0;
     if (transient.stdout_open) {
       fds[nfds].fd = transient.stdout_fd;
@@ -5018,20 +5058,32 @@ static void run_transient_exec(struct client *client, const struct run_request *
       roles[nfds++] = 2;
     }
     fds[nfds].fd = client->fd;
-    fds[nfds].events = POLLHUP | POLLERR;
+    fds[nfds].events = POLLHUP | POLLERR | (client->protocol_v1 ? POLLIN : 0);
     fds[nfds].revents = 0;
     roles[nfds++] = 3;
+    if (transient.stdin_open && transient.stdin_pending_len != 0) {
+      fds[nfds].fd = transient.stdin_fd;
+      fds[nfds].events = POLLOUT | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 4;
+    }
+    add_session_output_fds(session, fds, roles, &nfds, 5);
 
     int pr = poll(fds, nfds, 100);
     if (pr > 0) {
       for (nfds_t i = 0; i < nfds; i++) {
         if (fds[i].revents == 0) continue;
-        if (roles[i] == 1) {
+        if (roles[i] == 5 || roles[i] == 6) {
+          pump_session_output(session, &no_client, roles[i] == 5, fds[i].revents);
+        } else if (roles[i] == 1) {
           pump_session_stream(&transient, client, 1);
         } else if (roles[i] == 2) {
           pump_session_stream(&transient, client, 0);
-        } else if (roles[i] == 3 && (fds[i].revents & (POLLHUP | POLLERR))) {
-          close_client(client);
+        } else if (roles[i] == 3) {
+          if (fds[i].revents & POLLIN) pump_client_v1(&transient, client);
+          if (fds[i].revents & (POLLHUP | POLLERR)) close_client(client);
+        } else if (roles[i] == 4) {
+          drain_session_stdin(&transient);
         }
       }
     }
@@ -5694,7 +5746,7 @@ static void accept_request(int listener, struct session *session, struct client 
         return;
       }
       if (!session_finished(session)) {
-        run_transient_exec(client, &request, use_rootfs);
+        run_transient_exec(session, client, &request, use_rootfs);
         return;
       }
       // ponytail: completed-base resumes lose pipe wakeups under ReleaseSafe; keep the file fallback resumed-only.
@@ -5782,6 +5834,9 @@ static void accept_request(int listener, struct session *session, struct client 
 }
 
 #ifdef SPORE_AGENT_REQUEST_FUZZ
+#include <stddef.h>
+#include <sys/un.h>
+
 enum spore_agent_fuzz_result {
   SPORE_AGENT_FUZZ_INVALID = 0,
   SPORE_AGENT_FUZZ_RUN_REQUEST = 1,
@@ -5828,6 +5883,84 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   int rc = read_build_command_from_spio(&client, parsed.build_command_len, command, sizeof(command), error, sizeof(error));
   close(pipe_fds[0]);
   return rc == 0 ? SPORE_AGENT_FUZZ_RUN_COMPLETE : SPORE_AGENT_FUZZ_RUN_REQUEST;
+}
+
+// Starts `/bin/sh -c captured_script` as a captured session, the state of a
+// named VM restored from a live capture, then sends request_bytes and
+// input_bytes as a second client while it runs. Copies the frames the agent
+// answers with into response and returns their length, or -1 when the harness
+// itself fails. *captured_stdout gets how many bytes of the captured
+// session's stdout the agent had read when the second client finished.
+__attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_running_session(
+    const char *captured_script,
+    const unsigned char *request_bytes, size_t request_len,
+    const unsigned char *input_bytes, size_t input_len,
+    unsigned char *response, size_t response_cap, uint64_t *captured_stdout) {
+  static struct session session;
+  static struct detached_children detached;
+  *captured_stdout = 0;
+  char *captured_argv[] = { "/bin/sh", "-c", (char *)captured_script, NULL };
+  char *empty_envp[] = { NULL };
+  const struct session_start_options captured_options = {
+    .exec_lookup = EXEC_LOOKUP_PATH,
+    .stdin_enabled = 1,
+  };
+  if (start_session(&session, "captured", captured_argv, empty_envp, "", &captured_options) != 0) return -1;
+
+  struct client client;
+  memset(&client, 0, sizeof(client));
+  client.fd = -1;
+  memset(&detached, 0, sizeof(detached));
+  detached.retained_pid = -1;
+  detached.retained_stdout_fd = -1;
+  detached.retained_stderr_fd = -1;
+  struct generation_monitor generation = { .base = NULL, .last_generation = UINT64_MAX, .unavailable = 1 };
+  ssize_t total = -1;
+  int peer = -1;
+  int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  int name_len = snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1, "spore-agent-test-%d", (int)getpid());
+  socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + (size_t)name_len);
+  if (listener < 0 || bind(listener, (struct sockaddr *)&addr, addr_len) != 0 || listen(listener, 1) != 0) goto done;
+  peer = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (peer < 0 || connect(peer, (struct sockaddr *)&addr, addr_len) != 0) goto done;
+  if (write_all(peer, request_bytes, request_len) != 0 || write_all(peer, input_bytes, input_len) != 0) goto done;
+
+  // The agent mirrors session output to its console; keep it off the test
+  // runner's stdout, which may carry the build protocol.
+  int saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
+  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+  if (saved_stdout < 0 || null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0) {
+    if (saved_stdout >= 0) close(saved_stdout);
+    if (null_fd >= 0) close(null_fd);
+    goto done;
+  }
+  accept_request(listener, &session, &client, &detached, &generation, "/run/sporevm", 0, 0, 0, 1, "", 0, 1, "", 0, 1, "", 0, 1, "");
+  close_client(&client);
+  *captured_stdout = session.stdout_offset;
+  (void)dup2(saved_stdout, STDOUT_FILENO);
+  close(saved_stdout);
+  close(null_fd);
+
+  total = 0;
+  while ((size_t)total < response_cap) {
+    ssize_t n = read(peer, response + total, response_cap - (size_t)total);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) break;
+    total += n;
+  }
+
+done:
+  if (peer >= 0) close(peer);
+  if (listener >= 0) close(listener);
+  // The captured script may still be running or blocked on a full pipe. A
+  // child it started dies on EPIPE once reset_session closes the pipes.
+  (void)kill(session.pid, SIGKILL);
+  wait_child_blocking(session.pid);
+  reset_session(&session);
+  return total;
 }
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_exec_arg_equals(
@@ -6083,19 +6216,7 @@ int main(void) {
       fds[nfds].revents = 0;
       roles[nfds++] = 1;
     }
-    if (session.stdout_open && !session.file_stdio) {
-      fds[nfds].fd = session.stdout_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      if (session.tty && session.terminal_pending_len != 0) fds[nfds].events |= POLLOUT;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 2;
-    }
-    if (session.stderr_open && !session.file_stdio) {
-      fds[nfds].fd = session.stderr_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 3;
-    }
+    add_session_output_fds(&session, fds, roles, &nfds, 2);
     fds[nfds].fd = sigchld_pipe[0];
     fds[nfds].events = POLLIN;
     fds[nfds].revents = 0;
@@ -6140,15 +6261,8 @@ int main(void) {
           if (fds[i].revents & (POLLHUP | POLLERR)) {
             close_client(&client);
           }
-        } else if (roles[i] == 2) {
-          if (session.tty) {
-            if (fds[i].revents & POLLOUT) drain_session_terminal(&session);
-            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) pump_session_terminal(&session, &client);
-          } else {
-            pump_session_stream(&session, &client, 1);
-          }
-        } else if (roles[i] == 3) {
-          pump_session_stream(&session, &client, 0);
+        } else if (roles[i] == 2 || roles[i] == 3) {
+          pump_session_output(&session, &client, roles[i] == 2, fds[i].revents);
         } else if (roles[i] == 4) {
           drain_sigchld_wakeup();
           reap_detached_children(&detached);
