@@ -192,6 +192,81 @@ pub fn ensureMergedFile(
     try putMergedFile(allocator, tree, &created, rel, .{ .memory = copied }, mode, owner, &.{});
 }
 
+/// Walks the header records of a tar stream. Every tar reader goes through
+/// it, so record framing, header checksums, numeric fields, and payload
+/// padding are parsed in one place. The caller may read the current payload;
+/// `next` skips whatever is left of it.
+pub const RecordIterator = struct {
+    reader: *Io.Reader,
+    /// Stream offset of the next byte `reader` returns.
+    offset: u64 = 0,
+    payload_left: u64 = 0,
+    padding_left: usize = 0,
+
+    pub const Record = struct {
+        header: [512]u8,
+        /// Payload size from the header.
+        size: u64,
+        /// Stream offset of the first payload byte.
+        payload_offset: u64,
+
+        pub fn kind(record: *const Record) u8 {
+            return record.header[156];
+        }
+
+        pub fn name(record: *const Record, allocator: std.mem.Allocator) ![]u8 {
+            return tarFullName(allocator, &record.header);
+        }
+    };
+
+    /// Returns null at the end of the stream or at the first zero block.
+    pub fn next(self: *RecordIterator) !?Record {
+        try self.reader.discardAll64(self.payload_left);
+        self.offset += self.payload_left;
+        self.payload_left = 0;
+        // The stream may end straight after the last payload.
+        self.offset += try self.reader.discardShort(self.padding_left);
+        self.padding_left = 0;
+
+        var header: [512]u8 = undefined;
+        const n = try self.reader.readSliceShort(&header);
+        if (n == 0) return null;
+        if (n != header.len) return error.TruncatedTarHeader;
+        self.offset += header.len;
+        if (isZeroBlock(&header)) return null;
+        try verifyTarHeader(&header);
+        const size = try tarSize(&header);
+        try self.setPayloadSize(size);
+        return .{ .header = header, .size = size, .payload_offset = self.offset };
+    }
+
+    /// Replaces the current record's payload size, as a pax `size` record
+    /// does. Call it before reading any of the payload. Sizes above
+    /// `max_content_bytes` fail, so skipping a payload cannot overflow the
+    /// reader's position.
+    pub fn setPayloadSize(self: *RecordIterator, size: u64) !void {
+        if (size > max_content_bytes) return error.RootFSArchiveTooLarge;
+        self.payload_left = size;
+        self.padding_left = @intCast((512 - size % 512) % 512);
+    }
+
+    pub fn readPayloadAlloc(self: *RecordIterator, allocator: std.mem.Allocator, max_bytes: u64) ![]u8 {
+        if (self.payload_left > max_bytes) return error.TarHeaderTooLarge;
+        const bytes = try allocator.alloc(u8, @intCast(self.payload_left));
+        errdefer allocator.free(bytes);
+        try self.reader.readSliceAll(bytes);
+        self.offset += bytes.len;
+        self.payload_left = 0;
+        return bytes;
+    }
+
+    pub fn streamPayload(self: *RecordIterator, writer: *Io.Writer) !void {
+        try self.reader.streamExact64(writer, self.payload_left);
+        self.offset += self.payload_left;
+        self.payload_left = 0;
+    }
+};
+
 const LayerLimits = struct {
     payload_bytes: u64 = 0,
     entries: u64 = 0,
@@ -225,7 +300,22 @@ fn applySeekableTarLayerToMergedTree(
 ) !void {
     var file = try Io.Dir.cwd().openFile(io, layer_path, .{});
     defer file.close(io);
+    // Positional reads skip regular file payloads without reading them; the
+    // tree keeps them as slices of the layer file.
+    var buffer: [4096]u8 = undefined;
+    var reader: Io.File.Reader = .init(file, io, &buffer);
+    applyTarRecordsToMergedTree(allocator, tree, layer_path, &reader.interface) catch |err| switch (err) {
+        error.ReadFailed => return reader.err orelse err,
+        else => |e| return e,
+    };
+}
 
+fn applyTarRecordsToMergedTree(
+    allocator: std.mem.Allocator,
+    tree: *MergedTree,
+    layer_path: []const u8,
+    reader: *Io.Reader,
+) !void {
     var limits: LayerLimits = .{};
     var long_name: ?[]u8 = null;
     var long_link: ?[]u8 = null;
@@ -240,59 +330,50 @@ fn applySeekableTarLayerToMergedTree(
         deinitCreatedPaths(allocator, &created);
     }
 
-    var offset: u64 = 0;
-    while (true) {
-        var header: [512]u8 = undefined;
-        if (!try readTarHeaderAt(file, io, &header, offset)) break;
-        offset += header.len;
-        if (isZeroBlock(&header)) break;
-        try verifyTarHeader(&header);
-        const size = try tarSize(&header);
-        const kind = header[156];
-        const payload_offset = offset;
+    var records: RecordIterator = .{ .reader = reader };
+    while (try records.next()) |record| {
+        const kind = record.kind();
 
         if (kind == 'L') {
-            try accountTarMetadataRecord(&limits, size);
+            try accountTarMetadataRecord(&limits, record.size);
             if (long_name) |p| allocator.free(p);
-            long_name = try readTarStringAt(allocator, file, io, payload_offset, size);
-            offset = try tarPayloadEnd(payload_offset, size);
+            long_name = try readTarString(allocator, &records);
             continue;
         }
         if (kind == 'K') {
-            try accountTarMetadataRecord(&limits, size);
+            try accountTarMetadataRecord(&limits, record.size);
             if (long_link) |p| allocator.free(p);
-            long_link = try readTarStringAt(allocator, file, io, payload_offset, size);
-            offset = try tarPayloadEnd(payload_offset, size);
+            long_link = try readTarString(allocator, &records);
             continue;
         }
         if (kind == 'x') {
-            try accountTarMetadataRecord(&limits, size);
+            try accountTarMetadataRecord(&limits, record.size);
             pax.clear(allocator);
-            try readPaxHeaderAt(allocator, file, io, payload_offset, size, &pax);
-            offset = try tarPayloadEnd(payload_offset, size);
+            try readPaxHeader(allocator, &records, &pax);
             continue;
         }
         if (kind == 'g') {
-            try accountTarMetadataRecord(&limits, size);
-            try readPaxHeaderAt(allocator, file, io, payload_offset, size, &global_pax);
+            try accountTarMetadataRecord(&limits, record.size);
+            try readPaxHeader(allocator, &records, &global_pax);
             try validateGlobalPax(global_pax);
-            offset = try tarPayloadEnd(payload_offset, size);
             continue;
         }
 
         try accountTarEntry(&limits);
 
+        // The deferred reset below clears pax.path and long_name first, so
+        // decide ownership of raw_name now.
+        const owns_name = pax.path == null and long_name == null;
         const raw_name = if (pax.path) |p|
             p
         else if (long_name) |p|
             p
         else
-            try tarFullName(allocator, &header);
-        defer if (pax.path == null and long_name == null) allocator.free(raw_name);
-        const payload_size = pax.size orelse size;
-        const next_offset = try tarPayloadEnd(payload_offset, payload_size);
+            try record.name(allocator);
+        defer if (owns_name) allocator.free(raw_name);
+        const payload_size = pax.size orelse record.size;
+        try records.setPayloadSize(payload_size);
         defer {
-            offset = next_offset;
             if (long_name) |p| {
                 allocator.free(p);
                 long_name = null;
@@ -312,7 +393,7 @@ fn applySeekableTarLayerToMergedTree(
             else => |e| return e,
         };
         defer allocator.free(rel);
-        const entry_ownership = try tarOwnership(&header, pax, global_pax);
+        const entry_ownership = try tarOwnership(&record.header, pax, global_pax);
 
         if (std.mem.startsWith(u8, baseName(rel), ".wh.") and pax.xattrs.items.len != 0) {
             return error.UnsupportedTarXattr;
@@ -325,22 +406,22 @@ fn applySeekableTarLayerToMergedTree(
             0, '0' => {
                 try addContentBytes(&limits, payload_size);
                 try addXattrBytes(&limits, pax.xattrs.items);
-                const source = try fileSourceFromLayer(allocator, layer_path, payload_offset, payload_size);
+                const source = try fileSourceFromLayer(allocator, layer_path, record.payload_offset, payload_size);
                 errdefer source.deinit(allocator);
-                try putMergedFile(allocator, tree, &created, rel, source, try tarMode(&header), entry_ownership, pax.xattrs.items);
+                try putMergedFile(allocator, tree, &created, rel, source, try tarMode(&record.header), entry_ownership, pax.xattrs.items);
             },
             '5' => {
                 if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
-                try putMergedDirectory(allocator, tree, &created, rel, try tarMode(&header), entry_ownership);
+                try putMergedDirectory(allocator, tree, &created, rel, try tarMode(&record.header), entry_ownership);
             },
             '2' => {
                 if (pax.xattrs.items.len != 0) return error.UnsupportedTarXattr;
-                const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
+                const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&record.header);
                 try putMergedSymlink(allocator, tree, &created, rel, raw_link, entry_ownership);
             },
             '1' => {
                 try addXattrBytes(&limits, pax.xattrs.items);
-                const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&header);
+                const raw_link = if (pax.linkpath) |p| p else if (long_link) |p| p else tarLinkName(&record.header);
                 try putMergedHardlink(allocator, tree, &created, rel, raw_link, entry_ownership, pax.xattrs.items);
             },
             else => {
@@ -729,56 +810,16 @@ fn readFileSourceAlloc(allocator: std.mem.Allocator, io: Io, source: FileSource)
     }
 }
 
-fn readTarHeaderAt(file: Io.File, io: Io, header: *[512]u8, offset: u64) !bool {
-    const n = try file.readPositionalAll(io, header, offset);
-    if (n == 0) return false;
-    if (n != header.len) return error.TruncatedTarHeader;
-    return true;
-}
-
-fn readFilePayloadAllocAt(
-    allocator: std.mem.Allocator,
-    file: Io.File,
-    io: Io,
-    offset: u64,
-    size: u64,
-) ![]u8 {
-    if (size > max_pax_header_bytes) return error.TarHeaderTooLarge;
-    const bytes = try allocator.alloc(u8, @intCast(size));
-    errdefer allocator.free(bytes);
-    const n = try file.readPositionalAll(io, bytes, offset);
-    if (n != bytes.len) return error.UnexpectedEndOfStream;
-    return bytes;
-}
-
-fn readTarStringAt(
-    allocator: std.mem.Allocator,
-    file: Io.File,
-    io: Io,
-    offset: u64,
-    size: u64,
-) ![]u8 {
-    const bytes = try readFilePayloadAllocAt(allocator, file, io, offset, size);
+fn readTarString(allocator: std.mem.Allocator, records: *RecordIterator) ![]u8 {
+    const bytes = try records.readPayloadAlloc(allocator, max_pax_header_bytes);
     defer allocator.free(bytes);
     return allocator.dupe(u8, trimTrailingNul(bytes));
 }
 
-fn readPaxHeaderAt(
-    allocator: std.mem.Allocator,
-    file: Io.File,
-    io: Io,
-    offset: u64,
-    size: u64,
-    out: *PendingPax,
-) !void {
-    const bytes = try readFilePayloadAllocAt(allocator, file, io, offset, size);
+fn readPaxHeader(allocator: std.mem.Allocator, records: *RecordIterator, out: *PendingPax) !void {
+    const bytes = try records.readPayloadAlloc(allocator, max_pax_header_bytes);
     defer allocator.free(bytes);
     try parsePaxHeaderBytes(allocator, bytes, out);
-}
-
-fn tarPayloadEnd(payload_offset: u64, size: u64) !u64 {
-    const padding = (512 - (size % 512)) % 512;
-    return std.math.add(u64, try std.math.add(u64, payload_offset, size), padding);
 }
 
 fn accountTarEntry(limits: *LayerLimits) !void {
@@ -1658,6 +1699,18 @@ test "truncated tar headers fail closed" {
     try std.testing.expectError(error.TruncatedTarHeader, applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block));
 }
 
+test "truncated tar payloads fail closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    var block = [_]u8{0} ** 612;
+    makeTarHeader(block[0..512], "file", '0', 1000);
+
+    try std.testing.expectError(error.EndOfStream, applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block));
+}
+
 test "global pax uid gid defaults apply to following entries" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1697,6 +1750,38 @@ test "global pax extraction fields and xattrs fail closed" {
     try std.testing.expectError(error.UnsupportedTarXattr, applyTestLayer(allocator, &tmp, &tree, "xattr.tar", &xattr_block));
 }
 
+/// A pax `size` near 2^64 for a directory entry, whose payload the parser
+/// skips instead of reading.
+fn hugePaxSizeLayer() [1536]u8 {
+    var layer = [_]u8{0} ** 1536;
+    const record = "29 size=18446744073709551615\n";
+    makeTarHeader(layer[0..512], "pax", 'x', record.len);
+    @memcpy(layer[512 .. 512 + record.len], record);
+    makeTarHeader(layer[1024..1536], "dir", '5', 0);
+    return layer;
+}
+
+test "tar payload sizes past the content limit fail closed" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+
+    const pax_layer = hugePaxSizeLayer();
+    try std.testing.expectError(error.RootFSArchiveTooLarge, applyTestLayer(allocator, &tmp, &tree, "pax.tar", &pax_layer));
+
+    // The same size as a base-256 header field.
+    var header = [_]u8{0} ** 512;
+    makeTarHeader(&header, "dir", '5', 0);
+    header[124..136].* = .{ 0x80, 0, 0, 0 } ++ .{0xff} ** 8;
+    @memset(header[148..156], ' ');
+    var sum: u64 = 0;
+    for (header) |b| sum += b;
+    writeTarOctal(header[148..156], sum);
+    try std.testing.expectError(error.RootFSArchiveTooLarge, applyTestLayer(allocator, &tmp, &tree, "header.tar", &header));
+}
+
 test "pax size overrides ustar file size" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1712,6 +1797,30 @@ test "pax size overrides ustar file size" {
 
     try applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block);
     try expectMergedFileData(allocator, &tree, "file", "hello");
+}
+
+test "pax paths and GNU long names name the next entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    var block = [_]u8{0} ** 4096;
+    const pax_record = "17 path=pax-name\n";
+    makeTarHeader(block[0..512], "pax", 'x', pax_record.len);
+    @memcpy(block[512 .. 512 + pax_record.len], pax_record);
+    makeTarHeader(block[1024..1536], "ignored", '0', 1);
+    block[1536] = 'p';
+    const long_name = "gnu-name\x00";
+    makeTarHeader(block[2048..2560], "././@LongLink", 'L', long_name.len);
+    @memcpy(block[2560 .. 2560 + long_name.len], long_name);
+    makeTarHeader(block[3072..3584], "ignored", '0', 1);
+    block[3584] = 'g';
+
+    try applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block);
+    try expectMergedFileData(allocator, &tree, "pax-name", "p");
+    try expectMergedFileData(allocator, &tree, "gnu-name", "g");
+    try std.testing.expect(tree.entries.get("ignored") == null);
 }
 
 test "root tar entries are ignored only for directories" {
@@ -1788,14 +1897,21 @@ fn fuzzTarLayer(_: void, s: *std.testing.Smith) !void {
     var buf: [8192]u8 = undefined;
     const len = s.slice(&buf);
 
+    // The checking allocator, not an arena, so leaks and double frees on
+    // error paths fail the run.
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var tree = MergedTree.init(arena_state.allocator());
-    applyTestLayer(arena_state.allocator(), &tmp, &tree, "layer.tar", buf[0..len]) catch return;
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    applyTestLayer(allocator, &tmp, &tree, "layer.tar", buf[0..len]) catch return;
 }
 
 test "fuzz OCI tar layer parsing" {
-    try std.testing.fuzz({}, fuzzTarLayer, .{});
+    // Smith reads a little-endian u32 length before the slice bytes.
+    const layer = hugePaxSizeLayer();
+    var seed: [4 + layer.len]u8 = undefined;
+    std.mem.writeInt(u32, seed[0..4], layer.len, .little);
+    @memcpy(seed[4..], &layer);
+    try std.testing.fuzz({}, fuzzTarLayer, .{ .corpus = &.{&seed} });
 }
