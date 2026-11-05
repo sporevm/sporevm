@@ -259,8 +259,8 @@ per-agent cache on the host's fast scratch disk.
 Capacity and publication changes additionally run:
 
 ```bash
-mise run smoke:build-rootfs-capacity
-mise run smoke:build-publication
+test/smoke/rootfs/build-capacity.sh
+test/smoke/rootfs/build-publication.sh
 ```
 
 The C5 real-workload gate runs on Linux ARM64/KVM with the frozen workload and

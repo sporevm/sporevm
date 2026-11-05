@@ -451,7 +451,7 @@ Validate OCI rootfs capture, fork, and parallel `spore run --from` execution
 with the opt-in Ruby fan-out smoke:
 
 ```bash
-mise run smoke:rootfs-fanout
+test/smoke/fanout/rootfs.sh
 ```
 
 Forked rootfs workloads should not read the generation MMIO page directly. The

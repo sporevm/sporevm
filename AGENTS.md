@@ -19,8 +19,8 @@
 - Hypervisor-specific code lives behind the hypervisor interface; device
   model, DTB generation, and manifest code must stay backend-neutral and
   shared.
-- Real-hardware smoke scripts live in `scripts/` and must run identically in
-  CI and by hand.
+- Real-hardware smoke scripts live in `test/smoke/` and must run identically
+  in CI and by hand. `mise run smoke core` is the per-commit gate.
 
 ## Tests
 

@@ -33,6 +33,27 @@ steps:
         agents: &mac_agents
           queue: sporevm-mac
 
+      - label: ":fire: Smoke core (Linux ARM64 KVM)"
+        key: "smoke-core-linux-arm64"
+        command: "scripts/ci/run.sh mise run smoke core"
+        artifact_paths: &smoke_artifacts
+          - "zig-cache/smoke/**/*"
+        timeout_in_minutes: 20
+        plugins: *mise_plugins
+        cache: *mise_cache
+        agents: *linux_agents
+
+      - label: ":fire: Smoke core (macOS ARM64 HVF)"
+        key: "smoke-core-macos"
+        command: "scripts/ci/run.sh mise run smoke core"
+        artifact_paths: *smoke_artifacts
+        timeout_in_minutes: 20
+        plugins: *mise_plugins
+        cache: *mise_cache
+        concurrency: 1
+        concurrency_group: "sporevm-benchmarks/macos"
+        agents: *mac_agents
+
       - label: ":computer: x86-64 Slice 3b (Linux AMD64)"
         key: "x86-slice3b-linux-amd64"
         command: "scripts/ci/run.sh mise run smoke:x86-slice3b"
@@ -191,6 +212,8 @@ steps:
     depends_on:
       - "test-linux"
       - "test-macos"
+      - "smoke-core-linux-arm64"
+      - "smoke-core-macos"
       - "release-linux-arm64"
       - "release-darwin-arm64"
     if: build.tag != null

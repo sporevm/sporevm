@@ -357,7 +357,7 @@ resize leave the logical map and digest authority unchanged.
   fork. Monitor processes deny child process
   execution through an embedded macOS sandbox profile or Linux seccomp filter
   after optional startup helpers are spawned, covered by
-  `mise run smoke:monitor-jail`. Startup fails closed unless the guest agent
+  `test/smoke/monitor/jail.sh`. Startup fails closed unless the guest agent
   completes its readiness request and the local control socket answers the
   same-version monitor handshake. Disk-backed named spores preserve
   immutable-rootfs identity and sealed writable disk indexes; image-created VMs

@@ -105,9 +105,8 @@ mise run install
 `mise run check` runs unit tests, the product build, and diff hygiene.
 `mise run install` builds an optimized `spore` and installs it into `~/bin`,
 with runtime assets under `~/share/sporevm`.
-`mise run smoke` builds once, then runs the default product run, signal-save,
-and attach smokes. Focused smoke commands are listed under
-[Validation](#validation).
+`mise run smoke core` boots real VMs on Apple Silicon or Linux ARM64 with KVM;
+see [Validation](#validation).
 
 For local iteration:
 
@@ -463,24 +462,16 @@ Most local changes should start here:
 
 ```bash
 mise run check
-mise run smoke
+mise run smoke core
 ```
 
-Useful focused checks:
-
-```bash
-mise run smoke:run
-mise run smoke:run-stdin
-mise run smoke:run-tty
-mise run smoke:run-attach
-mise run smoke:run-capture  # signal-save workflow
-mise run smoke:lifecycle-tty
-mise run smoke:rootfs-fanout
-mise run smoke:writable-rootfs
-mise run smoke:run-net-dns
-mise run smoke:monitor-jail
-mise run smoke:monitor-failure-modes
-```
+`mise run smoke core` builds `spore`, then boots real VMs through run, signal
+save, fork, the named lifecycle, copy, the monitor jail, and networking. CI
+runs it on every commit on Linux ARM64 (KVM) and macOS (HVF). `mise run smoke
+full` adds the other aarch64 scripts in `test/smoke/`. The suite prints one
+line per script and keeps each script's log under `zig-cache/smoke/`. Each
+script also runs on its own against `zig-out/bin/spore` (or `SPORE_BIN`), for
+example `test/smoke/run/tty.sh`.
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
 Release notes and release-gate summaries live on

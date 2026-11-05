@@ -172,6 +172,6 @@ Useful focused checks:
 ```bash
 test/smoke/run/auto-memory.sh
 test/smoke/lifecycle/auto-memory.sh
-mise run smoke:counter-fanout
+test/smoke/fanout/counter.sh
 test/smoke/run/capture.sh
 ```
