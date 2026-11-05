@@ -61,8 +61,8 @@ pub const LocalImage = struct {
     config: image.Config,
     storage: spore.RootfsStorage,
     oci: ?OciProvenance = null,
-    /// Image store that holds every object `storage` names. When set, objects
-    /// may be missing locally; the index is always local.
+    /// Image store that holds every object `storage` names, recorded only
+    /// while some objects are missing locally. The index is always local.
     origin: ?[]const u8 = null,
 };
 
@@ -92,8 +92,10 @@ pub const PublishRequest = struct {
     /// `platform`, also recorded as a derivation so the index digest
     /// resolves without the registry.
     selected_from: ?[]const u8 = null,
+    /// Store to fetch missing objects from. Ignored when storage is complete
+    /// locally; required when it is not.
     origin: ?[]const u8 = null,
-    /// Materialized ext4 renamed into the catalog as `images/<hex>.ext4`.
+    /// Materialized ext4 hard-linked into the catalog as `images/<hex>.ext4`.
     flat_path: ?[]const u8 = null,
     /// Name pointed at the image after everything else is published.
     name: ?[]const u8 = null,
@@ -158,10 +160,18 @@ pub fn find(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, ref: [
     return local;
 }
 
-/// Load a usable image: its record exists and its storage is complete
-/// locally, or it has an origin to fetch missing objects from. Returns null
-/// otherwise. Allocates into `allocator`; use an arena.
+/// Load an image whose record exists and whose storage is complete locally.
+/// Returns null otherwise. Allocates into `allocator`; use an arena.
 pub fn load(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, identity: []const u8) !?LocalImage {
+    const local = (try readRecord(io, allocator, cache_root, identity)) orelse return null;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, local.storage)) return null;
+    return local;
+}
+
+/// Like `load`, but also returns an image with objects missing locally when
+/// its record names an `origin` to fetch them from. Only for callers that
+/// attach that origin to the disk they open.
+pub fn loadAllowingOrigin(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, identity: []const u8) !?LocalImage {
     const local = (try readRecord(io, allocator, cache_root, identity)) orelse return null;
     if (local.origin == null and !try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, local.storage)) return null;
     return local;
@@ -205,8 +215,7 @@ pub fn publish(
     try spore.validateRootfsStorageDescriptor(request.storage);
     try spore.validateRootfsDeviceShape(request.storage.device);
     if (!std.mem.eql(u8, request.storage.index_digest, request.storage.base_identity)) return error.BadManifest;
-    // Only a registry pull may name an image outside `local/`.
-    if (request.name) |name| if (request.oci == null and !rootfs.isLocalImageRef(name)) return error.LocalRefMustUseLocalRegistry;
+    if (request.name) |name| try validateName(name, request.oci);
     var config = request.config;
     if (config.architecture) |arch| {
         if (arch != request.platform.arch) return error.UnsupportedPlatform;
@@ -214,13 +223,18 @@ pub fn publish(
     if (config.os) |os| {
         if (!std.mem.eql(u8, os, request.platform.os)) return error.UnsupportedPlatform;
     } else config.os = request.platform.os;
-    if (request.origin) |origin| {
+    // A complete local copy is authoritative: the record names an origin only
+    // while objects are missing, so publishing with or without one never
+    // changes a complete image.
+    const origin = if (try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, request.storage)) null else origin: {
+        const origin = request.origin orelse return error.RootFSDigestCacheMiss;
         if (origin.len == 0) return error.BadManifest;
         // GC and a later fetch both need the index to know the objects.
         const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, request.storage.index_digest);
         defer allocator.free(index_path);
         allocator.free(try rootfs_cas.readVerifiedStorageIndexPath(allocator, index_path, request.storage));
-    } else if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, cache_root, request.storage)) return error.RootFSDigestCacheMiss;
+        break :origin origin;
+    };
 
     const identity = try identityAlloc(allocator, request.storage.index_digest, config);
     errdefer allocator.free(identity);
@@ -231,22 +245,29 @@ pub fn publish(
     errdefer allocator.free(resolved_ref);
 
     if (request.flat_path) |flat_path| {
+        // Share the digest-addressed inode, so prune sees the flat file as
+        // linked and keeps the record.
         const path = try flatPath(allocator, cache_root, identity);
         defer allocator.free(path);
         try chunk_sealer.ensureDirPath(allocator, std.fs.path.dirname(path).?);
-        try Io.Dir.rename(Io.Dir.cwd(), flat_path, Io.Dir.cwd(), path, io);
+        Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        try Io.Dir.hardLink(Io.Dir.cwd(), flat_path, Io.Dir.cwd(), path, io, .{});
         try chunk_sealer.fsyncParentDirPath(allocator, path);
     }
     const record_path = try recordPath(allocator, cache_root, identity);
     errdefer allocator.free(record_path);
-    try writeJsonDurable(allocator, record_path, LocalImage{
+    const local = LocalImage{
         .identity = identity,
         .platform = request.platform,
         .config = config,
         .storage = request.storage,
         .oci = request.oci,
-        .origin = request.origin,
-    });
+        .origin = origin,
+    };
+    try writeJsonDurable(allocator, record_path, local);
     if (request.oci) |provenance| {
         try derive(allocator, cache_root, provenance.manifest_digest, request.platform, provenance.builder_version, identity);
         if (request.selected_from) |index_digest| {
@@ -255,7 +276,7 @@ pub fn publish(
             }
         }
     }
-    const ref_path = if (request.name) |name| try tag(allocator, cache_root, cache_lock, name, request.platform, identity) else null;
+    const ref_path = if (request.name) |name| try tag(allocator, cache_root, cache_lock, name, local) else null;
     return .{ .identity = identity, .resolved_ref = resolved_ref, .record_path = record_path, .ref_path = ref_path };
 }
 
@@ -277,22 +298,31 @@ pub fn lockAndPublish(io: Io, allocator: std.mem.Allocator, cache_root: []const 
     return publish(io, allocator, cache_root, &cache_lock, request);
 }
 
-/// Point `name` on `platform` at `identity`. Returns the ref record path.
+/// Point `name` on the image's platform at `local`. Returns the ref record
+/// path.
 pub fn tag(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     cache_lock: *const rootfs.RootfsCacheLock,
     name: []const u8,
-    platform: Platform,
-    identity: []const u8,
+    local: LocalImage,
 ) ![]const u8 {
     if (!try cache_lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockNotHeld;
-    _ = try oci.ImageTag.parse(name);
-    try validateIdentity(identity);
-    const path = try refPath(allocator, cache_root, name, platform);
+    try validateName(name, local.oci);
+    try validateIdentity(local.identity);
+    const path = try refPath(allocator, cache_root, name, local.platform);
     errdefer allocator.free(path);
-    try writeJsonDurable(allocator, path, RefRecord{ .name = name, .platform = platform, .image = identity });
+    try writeJsonDurable(allocator, path, RefRecord{ .name = name, .platform = local.platform, .image = local.identity });
     return path;
+}
+
+/// A name outside `local/` may only point at an image pulled from a registry,
+/// never at a build, commit, unpack or import.
+fn validateName(name: []const u8, provenance: ?OciProvenance) !void {
+    _ = try oci.ImageTag.parse(name);
+    if (rootfs.isLocalImageRef(name)) return;
+    const source = provenance orelse return error.LocalRefMustUseLocalRegistry;
+    if (rootfs.isLocalImageRef(source.ref)) return error.LocalRefMustUseLocalRegistry;
 }
 
 /// The digest-pinned reference a run records for `requested`: local names
@@ -465,38 +495,47 @@ test "local image names resolve through refs, identities and derivations across 
     try std.testing.expectEqualStrings(old.identity, (try find(io, allocator, cache.root, "registry.example.test/app:old", arm64)).?.identity);
     try std.testing.expectEqual(null, try lookup(io, allocator, cache.root, "registry.example.test/app@" ++ old_manifest, arm64));
 
+    // Registry names only point at registry pulls.
     try std.testing.expectError(error.LocalRefMustUseLocalRegistry, lockAndPublish(io, allocator, cache.root, .{
         .platform = arm64,
         .storage = try cache.storage(4),
-        .name = "registry.example.test/app:native",
+        .oci = .{ .ref = "local/app@" ++ manifest, .manifest_digest = manifest, .builder_version = rootfs.builder_version },
+        .name = "registry.example.test/app:imported",
     }));
+    var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, cache.root);
+    defer cache_lock.deinit();
+    const native_image = (try load(io, allocator, cache.root, native.identity)).?;
+    try std.testing.expectError(error.LocalRefMustUseLocalRegistry, tag(allocator, cache.root, &cache_lock, "registry.example.test/app:native", native_image));
 }
 
-test "local image load needs complete storage unless an origin can supply it" {
+test "only the origin-aware load returns an image with objects missing locally" {
     const io = std.testing.io;
     var cache = try TestCache.init();
     defer cache.deinit();
     const allocator = cache.arena.allocator();
+    const store = "https://images.example.test/store";
 
+    // A complete local copy is authoritative and records no origin.
     const storage = try cache.storage(5);
-    const published = try lockAndPublish(io, allocator, cache.root, .{ .platform = .{}, .storage = storage, .name = "local/app:dev" });
-    try std.testing.expect(try load(io, allocator, cache.root, published.identity) != null);
+    const published = try lockAndPublish(io, allocator, cache.root, .{ .platform = .{}, .storage = storage, .origin = store, .name = "local/app:dev" });
+    try std.testing.expectEqual(null, (try load(io, allocator, cache.root, published.identity)).?.origin);
 
     const objects = try std.fs.path.join(allocator, &.{ cache.root, "cas", "rootfs", "blake3", "objects" });
     try Io.Dir.cwd().deleteTree(io, objects);
     try rootfs_cas.removeStorageCompleteStamp(io, allocator, cache.root, storage.index_digest);
     try std.testing.expectEqual(null, try load(io, allocator, cache.root, published.identity));
-    try std.testing.expectEqual(null, try find(io, allocator, cache.root, "local/app:dev", .{}));
+    try std.testing.expectEqual(null, try loadAllowingOrigin(io, allocator, cache.root, published.identity));
     try std.testing.expectError(error.RootFSDigestCacheMiss, lockAndPublish(io, allocator, cache.root, .{ .platform = .{}, .storage = storage }));
 
-    const remote = try lockAndPublish(io, allocator, cache.root, .{ .platform = .{}, .storage = storage, .origin = "https://images.example.test/store" });
+    const remote = try lockAndPublish(io, allocator, cache.root, .{ .platform = .{}, .storage = storage, .origin = store });
     try std.testing.expectEqualStrings(published.identity, remote.identity);
-    const loaded = (try load(io, allocator, cache.root, remote.identity)).?;
-    try std.testing.expectEqualStrings("https://images.example.test/store", loaded.origin.?);
+    try std.testing.expectEqual(null, try load(io, allocator, cache.root, remote.identity));
+    try std.testing.expectEqual(null, try find(io, allocator, cache.root, "local/app:dev", .{}));
+    try std.testing.expectEqualStrings(store, (try loadAllowingOrigin(io, allocator, cache.root, remote.identity)).?.origin.?);
 
     const record = try Io.Dir.cwd().readFileAlloc(io, remote.record_path, allocator, .limited(max_record_bytes));
     const tampered = try std.mem.replaceOwned(u8, allocator, record, "\"os\": \"linux\"", "\"os\": \"freebsd\"");
     try std.testing.expect(!std.mem.eql(u8, record, tampered));
     try chunk_sealer.replaceFileAtomicDurable(allocator, remote.record_path, tampered, 0o644);
-    try std.testing.expectError(error.BadManifest, load(io, allocator, cache.root, remote.identity));
+    try std.testing.expectError(error.BadManifest, loadAllowingOrigin(io, allocator, cache.root, remote.identity));
 }

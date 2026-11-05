@@ -3255,6 +3255,45 @@ test "system cache gc keeps an index that predates v2 but reclaims its objects" 
     }
 }
 
+test "converting an image again keeps its flat file linked so prune keeps the image" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "cache" });
+    const layer_path = try std.fs.path.join(allocator, &.{ tmp_root, "rootfs.tar" });
+    var layer: Io.Writer.Allocating = .init(allocator);
+    var layer_writer = std.tar.Writer{ .underlying_writer = &layer.writer };
+    try layer_writer.writeFileBytes("etc/hello", "hello\n", .{ .mode = 0o644 });
+    try layer_writer.finishPedantically();
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_path, .data = layer.written() });
+    var env = std.process.Environ.Map.init(allocator);
+    try env.put(local_paths.rootfs_cache_env, root);
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &arena_state,
+        .gpa = std.testing.allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    // Without its record, the import converts again and finds the
+    // digest-addressed flat file from the first conversion already present,
+    // as after a builder change that leaves the bytes unchanged.
+    const request = rootfs.ImportTarRequest{ .input = layer_path, .ref = "local/flat:dev" };
+    const first = try rootfs.importTar(init, allocator, request);
+    try Io.Dir.cwd().deleteFile(io, first.metadata_path);
+    const second = try rootfs.importTar(init, allocator, request);
+    try std.testing.expectEqualStrings(first.image_manifest_digest, second.image_manifest_digest);
+
+    _ = try prune(allocator, io, .{ .cache_root = root, .dry_run = false }, std.time.ns_per_s);
+    try std.testing.expect(try local_image.load(io, allocator, root, second.image_manifest_digest) != null);
+}
+
 test "runtime disk lease protects its cache baseline from prune and gc" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

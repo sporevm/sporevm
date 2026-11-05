@@ -41,11 +41,12 @@ writer are rebuilt with the native writer.
 
 Pulled, imported, built, committed, and unpacked images share one catalog
 keyed by native BLAKE3 image identity, with durable record writes. Bumping the
-rootfs builder no longer orphans local refs. Caches from earlier versions are
-not read; pull, import, or build images again. `spore.rootfs.import.result.v2`
-drops `rootfs_path` and reports the image identity as `image_manifest_digest`.
-`spore run --rootfs` no longer trusts files in the rootfs cache without hashing
-them.
+rootfs builder no longer orphans local refs. Older flat cache entries
+(`<cache>/<key>.ext4` and `<key>.json`, `refs/local/`) are no longer read;
+delete the rootfs cache directory to reclaim their space.
+`spore.rootfs.import.result.v2` drops `rootfs_path` and reports the image
+identity as `image_manifest_digest`. `spore run --rootfs` no longer trusts
+files in the rootfs cache without hashing them.
 
 ### Embedding libraries removed
 

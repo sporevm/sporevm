@@ -222,10 +222,11 @@ instead of re-resolving the tag on every invocation.
 record, force registry refresh, or fail without one. If the record or the
 image's storage is missing, SporeVM falls back to the registry and repoints the
 name once the image is published. A new rootfs builder version converts
-digest-pinned sources again but leaves existing names pointing at their images.
-Images always carry chunked storage, which saved image runs record in the
-spore manifest. Caches written by earlier SporeVM versions are not read; pull,
-import, or build those images again.
+digest-pinned sources again, and `--pull=missing` resolves a registry tag again
+when its image came from an older builder; local names keep pointing at their
+images. Images always carry chunked storage, which saved image runs record in
+the spore manifest. Caches written by earlier SporeVM versions are not read;
+pull, import, or build those images again.
 
 When a chunked rootfs has its index and objects but no usable flat
 materialization, `spore run` can start from the index directly. The runtime
@@ -535,9 +536,7 @@ repeated builds of the same resolved image produce identical bytes. This
 journal-less native profile is inside the automatic-growth support envelope.
 
 The native writer is the only rootfs writer and needs no e2fsprogs. It uses
-builder version `sporevm-rootfs-v6`; older rootfs cache entries are rebuilt
-once. Rootfs metadata records `"ext4_writer": "native"`, and cache entries
-written by the removed e2fsprogs writer are rebuilt instead of reused.
+builder version `sporevm-rootfs-v6`.
 
 The writer maps file data with ext4 block maps rather than extents: direct,
 single, double, and triple indirect blocks. Without the `huge_file` feature,

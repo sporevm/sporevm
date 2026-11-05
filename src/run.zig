@@ -2047,7 +2047,8 @@ fn resolveImageRootfs(
         ) };
     };
     // Local names and digests are immutable or never pulled; a registry tag
-    // follows its ref record unless --pull=always asks the registry again.
+    // follows its ref record unless --pull=always asks the registry again,
+    // or --pull=missing finds a conversion by an older rootfs builder.
     if (local_ref or digest_pinned != null or pull_policy != .always) {
         const found = local_image.find(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
             return .{ .failure = rootfsInputFailure(
@@ -2058,7 +2059,11 @@ fn resolveImageRootfs(
                 .{ command_name, image_ref, @errorName(err) },
             ) };
         };
-        if (found) |local| return .{ .resolved = try imageRootfsInput(allocator, image_ref, local) };
+        if (found) |local| {
+            const stale = !local_ref and digest_pinned == null and pull_policy == .missing and
+                if (local.oci) |source| !std.mem.eql(u8, source.builder_version, rootfs_mod.builder_version) else false;
+            if (!stale) return .{ .resolved = try imageRootfsInput(allocator, image_ref, local) };
+        }
     }
     if (local_ref) return .{ .failure = rootfsInputFailure(
         allocator,
@@ -2110,7 +2115,7 @@ fn pulledImage(
         if (name) |tag| {
             var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
             defer cache_lock.deinit();
-            _ = try local_image.tag(allocator, cache_root, &cache_lock, tag, resolved.platform, local.identity);
+            _ = try local_image.tag(allocator, cache_root, &cache_lock, tag, local);
         }
         return local;
     }
@@ -5239,6 +5244,72 @@ test "run pull never fails closed on mutable image ref cache miss" {
             try std.testing.expectEqual(machine_output.ErrorCode.object_not_found, failure.code);
             try std.testing.expect(std.mem.indexOf(u8, failure.message, "--pull=never") != null);
         },
+    }
+}
+
+test "run --pull=missing converts a registry tag again after a rootfs builder change" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-run-image-builder-change";
+    const cache_root = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    const rootfs_path = tmp ++ "/rootfs.ext4";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
+
+    // The loopback registry fails every registry request before connecting.
+    const manifest = "sha256:" ++ "a" ** 64;
+    for ([_]struct { name: []const u8, builder: []const u8, workdir: []const u8 }{
+        .{ .name = "127.0.0.1:1/app:old", .builder = "sporevm-rootfs-previous", .workdir = "/old" },
+        .{ .name = "127.0.0.1:1/app:current", .builder = rootfs_mod.builder_version, .workdir = "/current" },
+    }) |published| {
+        _ = try local_image.lockAndPublish(io, arena, cache_root, .{
+            .platform = direct_image_platform,
+            .config = .{ .config = .{ .WorkingDir = published.workdir } },
+            .storage = storage,
+            .oci = .{ .ref = "127.0.0.1:1/app@" ++ manifest, .manifest_digest = manifest, .builder_version = published.builder },
+            .name = published.name,
+        });
+    }
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+    const Case = struct { ref: []const u8, pull: PullPolicy, workdir: ?[]const u8 };
+    for ([_]Case{
+        .{ .ref = "127.0.0.1:1/app:current", .pull = .missing, .workdir = "/current" },
+        .{ .ref = "127.0.0.1:1/app:old", .pull = .never, .workdir = "/old" },
+        .{ .ref = "127.0.0.1:1/app:old", .pull = .missing, .workdir = null },
+    }) |case| {
+        const result = try resolveRootfsInputDetailedResult(init, arena, .{
+            .rootfs_path = null,
+            .image_ref = case.ref,
+            .pull_policy = case.pull,
+            .command_name = "run",
+        });
+        switch (result) {
+            .resolved => |input| try std.testing.expectEqualStrings(case.workdir orelse return error.ExpectedRegistryResolve, input.guest_working_dir.?),
+            .failure => |failure| {
+                if (case.workdir != null) return error.ExpectedLocalImage;
+                try std.testing.expect(std.mem.indexOf(u8, failure.message, "image resolve failed") != null);
+            },
+        }
     }
 }
 

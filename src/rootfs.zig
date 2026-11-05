@@ -875,7 +875,7 @@ fn importedImage(
     const local = (try local_image.find(io, allocator, cache_root, source_ref, platform)) orelse return null;
     var cache_lock = try lockRootfsCacheExclusive(io, allocator, cache_root);
     defer cache_lock.deinit();
-    const ref_path = try local_image.tag(allocator, cache_root, &cache_lock, name, platform, local.identity);
+    const ref_path = try local_image.tag(allocator, cache_root, &cache_lock, name, local);
     std.log.debug("spore rootfs: using imported image {s} for {s}", .{ local.identity, name });
     return .{
         .metadata_path = try local_image.recordPath(allocator, cache_root, local.identity),
@@ -1221,7 +1221,12 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
             return .{ .rootfs_storage = rootfs_storage };
         },
         .catalog => |catalog| {
-            _ = try rootfs_cache.installTrustedMaterializationByHardlink(init.io, allocator, cache_root, output, rootfs_storage.index_digest, stat.size);
+            // An existing digest-addressed file wins over this output; the
+            // catalog links whichever file the digest path names.
+            const flat_path = if (try rootfs_cache.installTrustedMaterializationByHardlink(init.io, allocator, cache_root, output, rootfs_storage.index_digest, stat.size)) |_|
+                try rootfs_cache.digestPath(allocator, cache_root, rootfs_storage.index_digest)
+            else
+                output;
             const published = try local_image.publish(init.io, allocator, cache_root, &cache_lock, .{
                 .platform = opts.platform,
                 .config = opts.config,
@@ -1232,7 +1237,7 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
                     .builder_version = builder_version,
                 },
                 .selected_from = opts.selected_from,
-                .flat_path = output,
+                .flat_path = flat_path,
                 .name = catalog.name,
             });
             return .{ .rootfs_storage = rootfs_storage, .published = published };
