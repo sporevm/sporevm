@@ -22,6 +22,7 @@ const x86_vm = if (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
     @import("x86_64/vm.zig")
 else
     struct {};
+const image_store = @import("image_store.zig");
 const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
@@ -136,7 +137,7 @@ const approved_x86_kernel_sha256 = [_]u8{
     0xbf, 0x0a, 0x97, 0x2c, 0xda, 0xed, 0xc7, 0xf7,
     0x0f, 0x2f, 0x78, 0x27, 0x0e, 0xe7, 0xbb, 0x82,
 };
-const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
+pub const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
     @compileError("SporeVM product execution requires an arm64 or amd64 host architecture");
 pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
 
@@ -1097,6 +1098,13 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
             @errorName(err),
         );
     }
+    if (err == error.RemoteImageNotSnapshotable) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: --save and --commit are refused for images run from a store",
+            @errorName(err),
+        );
+    }
     if (err == error.InvalidRunCommitOptions or err == error.RunCommitImageConfigUnavailable or err == error.RunCommitRootfsNotSnapshotable) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
@@ -1870,6 +1878,9 @@ pub const ResolvedRootfsInput = struct {
     image_config: ?rootfs_mod.ImageConfig = null,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
+    /// The rootfs reads missing objects from the image's store, so it cannot
+    /// be saved or committed.
+    remote: bool = false,
 };
 
 /// Resolve OCI process metadata for a fresh image-backed invocation. The
@@ -2035,6 +2046,21 @@ fn resolveImageRootfs(
     };
     try ensureDirPath(init.io, cache_root);
 
+    if (image_store.isStoreRef(image_ref)) {
+        const local = image_store.resolve(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
+            return .{ .failure = rootfsInputFailure(
+                allocator,
+                machine_output.fromZigError(err).code,
+                command_name,
+                "spore {s}: image store fetch failed for {s}: {s}",
+                .{ command_name, image_ref, @errorName(err) },
+            ) };
+        };
+        var input = try imageRootfsInput(allocator, image_ref, local);
+        input.remote = local.origin != null and !try rootfs_cas.storageMarkedComplete(init.io, allocator, cache_root, local.storage);
+        return .{ .resolved = input };
+    }
+
     const local_ref = rootfs_mod.isLocalImageRef(image_ref);
     const digest_pinned = if (local_ref) null else try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform);
     if (!local_ref and digest_pinned == null) rootfs_mod.validateTaggedImageRef(image_ref) catch |err| {
@@ -2158,8 +2184,12 @@ fn imageRootfsInput(allocator: std.mem.Allocator, requested_ref: []const u8, loc
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
     var storage = local.storage;
     storage.device = rootfs_device;
-    const resolved_ref = try local_image.resolvedRefAlloc(allocator, requested_ref, local.identity, local.oci);
-    const at = std.mem.lastIndexOfScalar(u8, resolved_ref, '@').?;
+    const resolved_ref = if (image_store.isStoreRef(requested_ref))
+        try image_store.resolvedRefAlloc(allocator, requested_ref, local.identity)
+    else
+        try local_image.resolvedRefAlloc(allocator, requested_ref, local.identity, local.oci);
+    // `repo@digest`, or `<store>/blake3:<hex>` for a store image.
+    const digest_start = std.mem.lastIndexOfAny(u8, resolved_ref, "@/").? + 1;
     const runtime = local.config.config;
     const working_dir = if (runtime) |config| config.WorkingDir else null;
     return .{
@@ -2176,7 +2206,7 @@ fn imageRootfsInput(allocator: std.mem.Allocator, requested_ref: []const u8, loc
                 // A local tag is mutable, so saves record what it resolved to.
                 .requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved_ref else requested_ref,
                 .resolved_image_ref = resolved_ref,
-                .image_manifest_digest = resolved_ref[at + 1 ..],
+                .image_manifest_digest = resolved_ref[digest_start..],
                 .platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ local.platform.os, local.platform.arch.name() }),
                 .builder_version = if (local.oci) |source| source.builder_version else rootfs_mod.builder_version,
             },
@@ -3504,6 +3534,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     });
     defer runtime_disk.deinit();
     if (opts.runtime_disk_head) |head| try runtime_disk.adoptForkHead(head);
+    if (runtime_disk.fetcher != null) control.refuseSnapshots();
     const context_disk_fd = if (opts.context_disk_path) |path| try openReadOnlyDiskFd(context.io, allocator, path) else null;
     defer if (context_disk_fd) |fd| {
         _ = std.c.close(fd);
@@ -4495,6 +4526,97 @@ test "local image supplies run env, working directory and rootfs identity" {
         .rootfs = input.rootfs,
         .command = &.{"/bin/true"},
     }));
+}
+
+fn resolveStoreRefForTest(init: std.process.Init, allocator: std.mem.Allocator, options: RootfsInputOptions) !ResolvedRootfsInput {
+    return switch (try resolveRootfsInputDetailedResult(init, allocator, options)) {
+        .resolved => |resolved| resolved,
+        .failure => |failure| {
+            std.debug.print("store ref failed: {s}\n", .{failure.message});
+            return error.ExpectedStoreImage;
+        },
+    };
+}
+
+test "a store image runs lazily from an empty cache and fails closed without its objects" {
+    var fixture: image_store.TestImage = undefined;
+    try fixture.init(direct_image_platform);
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    try fixture.env.put(local_paths.rootfs_cache_env, try fixture.path("consumer-cache"));
+    const consumer = fixture.env.get(local_paths.rootfs_cache_env).?;
+    const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
+
+    const resolved = try resolveStoreRefForTest(fixture.processInit(), allocator, .{
+        .rootfs_path = null,
+        .image_ref = ref,
+        .command_name = "run",
+        .record_artifact = true,
+    });
+    try std.testing.expectEqualStrings(fixture.identity, resolved.rootfs.?.source.?.image_manifest_digest);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ store, fixture.identity }), resolved.rootfs.?.source.?.resolved_image_ref);
+    try std.testing.expect(resolved.remote);
+
+    const context = Context{ .io = io, .environ_map = &fixture.env };
+    var runtime = try runtime_disk_mod.open(context, std.testing.allocator, .{ .rootfs = resolved.rootfs });
+    {
+        defer runtime.deinit();
+        const disk = &runtime.chunk_mapped.?;
+        const readback = try allocator.alloc(u8, fixture.rootfs_bytes.len);
+        try disk.readAt(readback, 0);
+        try std.testing.expectEqualSlices(u8, fixture.rootfs_bytes, readback);
+        try std.testing.expectEqual(@as(u64, 3), runtime.fetcher.?.stats.fetches);
+        try std.testing.expectEqual(@as(u64, 0), runtime.fetcher.?.stats.install_errors);
+        try std.testing.expectError(error.RemoteBackedSnapshot, disk.snapshotIndex(try fixture.path("snapshot"), .{ .mmio_slot = 1 }, true));
+    }
+    // Every object is local now, so the next run fetches nothing.
+    try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, consumer, resolved.rootfs.?.storage.?));
+    var warm = try runtime_disk_mod.open(context, std.testing.allocator, .{ .rootfs = resolved.rootfs });
+    {
+        defer warm.deinit();
+        const readback = try allocator.alloc(u8, fixture.rootfs_bytes.len);
+        try warm.chunk_mapped.?.readAt(readback, 0);
+        try std.testing.expectEqualSlices(u8, fixture.rootfs_bytes, readback);
+        try std.testing.expectEqual(@as(u64, 0), warm.fetcher.?.stats.fetches);
+    }
+
+    // A store object with other bytes, or none, fails the read and poisons
+    // the head; nothing reaches the local CAS.
+    for ([_]bool{ true, false }) |corrupt| {
+        const cache = try fixture.path(if (corrupt) "corrupt-cache" else "missing-cache");
+        try fixture.env.put(local_paths.rootfs_cache_env, cache);
+        const cold = try resolveStoreRefForTest(fixture.processInit(), allocator, .{
+            .rootfs_path = null,
+            .image_ref = ref,
+            .command_name = "run",
+        });
+        for (try fixture.listStore(store)) |file| {
+            if (!std.mem.startsWith(u8, file, "objects/")) continue;
+            const object_path = try std.fs.path.join(allocator, &.{ store, file });
+            if (corrupt) {
+                const bytes = try std.Io.Dir.cwd().readFileAlloc(io, object_path, allocator, .limited(rootfs_cas.default_chunk_size + 1));
+                bytes[0] ^= 1;
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = object_path, .data = bytes });
+            } else {
+                try std.Io.Dir.cwd().deleteFile(io, object_path);
+            }
+        }
+        var failing = try runtime_disk_mod.open(context, std.testing.allocator, .{ .rootfs = cold.rootfs });
+        defer failing.deinit();
+        var block: [512]u8 = undefined;
+        try std.testing.expectError(if (corrupt) error.BadChunk else error.MissingChunk, failing.chunk_mapped.?.readAt(&block, 0));
+        try std.testing.expect(failing.chunk_mapped.?.isPoisoned());
+        try std.testing.expectEqual(@as(u64, 1), failing.fetcher.?.stats.errors);
+        // A poisoned disk does not ask the store again for another object.
+        try std.testing.expectError(error.Poisoned, failing.chunk_mapped.?.readAt(&block, 2 * rootfs_cas.default_chunk_size));
+        try std.testing.expectEqual(@as(u64, 1), failing.fetcher.?.stats.errors);
+        try std.testing.expect(!try rootfs_cas.storageContentComplete(io, allocator, cache, cold.rootfs.?.storage.?));
+        const objects_dir = try std.fs.path.join(allocator, &.{ cache, "cas", "rootfs", "blake3", "objects" });
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, objects_dir, .{}));
+    }
 }
 
 test "image runtime command composes entrypoint defaults and caller override" {

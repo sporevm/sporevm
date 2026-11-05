@@ -1478,7 +1478,10 @@ fn saveContinueNamed(
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
     const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, temp_dir, out_dir);
-    if (!try snapshotResponseOk(arena, response)) return error.MonitorRequestFailed;
+    if (!try snapshotResponseOk(arena, response)) {
+        if (try snapshotRefused(arena, response)) return error.RemoteImageNotSnapshotable;
+        return error.MonitorRequestFailed;
+    }
     cleanup_temp = false;
     return ownedNamedLifecycleResult(allocator, .{
         .action = "saved",
@@ -1546,7 +1549,10 @@ fn saveStopNamed(
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
     const response = try sendSuspendRequest(arena, context.io, ready.value.control_socket_path, out_dir);
-    if (try suspendResponseFailureMessage(arena, response) != null) return error.MonitorRequestFailed;
+    if (try suspendResponseFailureMessage(arena, response) != null) {
+        if (try snapshotRefused(arena, response)) return error.RemoteImageNotSnapshotable;
+        return error.MonitorRequestFailed;
+    }
 
     var cleanup_after_suspend = true;
     defer if (cleanup_after_suspend) {
@@ -2496,6 +2502,10 @@ pub fn saveCli(
         error.MissingRootfsIdentity => {
             const message = "spore save: disk-backed lifecycle save requires recorded immutable rootfs identity";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "save"), message);
+        },
+        error.RemoteImageNotSnapshotable => {
+            const message = allocLifecycleMessage(allocator, "spore save: VM {s} runs an image from a store, and saving it is not supported; the VM keeps running", .{parsed.name});
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.MonitorVersionMismatch, error.MonitorShutdownTimedOut => {
             const fallback = switch (err) {
@@ -5411,6 +5421,21 @@ fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const
     return try allocator.dupe(u8, message);
 }
 
+/// The monitor's answer to a save of a VM whose root disk reads objects from
+/// an image store. It refuses before pausing the guest, so the VM keeps
+/// running.
+pub const snapshot_refused_store_rootfs = "the root disk reads objects from an image store and cannot be saved";
+
+fn snapshotRefused(allocator: std.mem.Allocator, response: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.type, "error") and
+        std.mem.eql(u8, parsed.value.message orelse "", snapshot_refused_store_rootfs);
+}
+
 fn snapshotResponseOk(allocator: std.mem.Allocator, response: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
         .allocate = .alloc_always,
@@ -7987,4 +8012,13 @@ fn currentTestPid() i64 {
 
 fn aliveOnlyCurrentProcess(pid: i64) bool {
     return pid == currentTestPid();
+}
+
+test "save recognizes the monitor's refusal of a store-backed root disk" {
+    const allocator = std.testing.allocator;
+    const refused = try std.json.Stringify.valueAlloc(allocator, .{ .type = "error", .message = snapshot_refused_store_rootfs }, .{});
+    defer allocator.free(refused);
+    try std.testing.expect(try snapshotRefused(allocator, refused));
+    try std.testing.expect(!try snapshotRefused(allocator, "{\"type\":\"error\",\"message\":\"monitor busy\"}"));
+    try std.testing.expect(!try snapshotRefused(allocator, "{\"type\":\"snapshotted\",\"out_dir\":\"/tmp/a\"}"));
 }

@@ -69,7 +69,7 @@ pub const UnpackResult = struct {
     object_count: usize,
 };
 
-const ObjectDescriptor = struct {
+pub const ObjectDescriptor = struct {
     digest: []const u8,
     size: usize,
 };
@@ -82,20 +82,81 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
     defer allocator.free(cache_root);
     var cache_lock = try rootfs.lockRootfsCacheExclusive(init.io, allocator, cache_root);
     defer cache_lock.deinit();
-    var catalog_arena = std.heap.ArenaAllocator.init(allocator);
-    defer catalog_arena.deinit();
-    const catalog_allocator = catalog_arena.allocator();
-    const identity = (try local_image.lookup(init.io, catalog_allocator, cache_root, options.source, options.platform)) orelse
+    var closure = try loadLocalClosure(init.io, allocator, cache_root, options.source, options.platform);
+    defer closure.deinit(allocator);
+    _ = try validateArchiveBounds(closure.storage.logical_size, closure.objects);
+
+    const temp_path = try temporarySiblingPath(allocator, init.io, options.output_path);
+    defer allocator.free(temp_path);
+    defer Io.Dir.cwd().deleteFile(init.io, temp_path) catch {};
+    try writeArchive(init.io, allocator, temp_path, cache_root, closure.manifest.bytes, closure.config_bytes, closure.index_bytes, closure.objects);
+    const archive_digest = try sha256FileDigestAlloc(allocator, init.io, temp_path);
+    errdefer allocator.free(archive_digest);
+    const archive_stat = try Io.Dir.cwd().statFile(init.io, temp_path, .{ .follow_symlinks = false });
+    if (archive_stat.kind != .file or archive_stat.size > max_archive_bytes) return error.ImageArchiveTooLarge;
+    Io.Dir.hardLink(Io.Dir.cwd(), temp_path, Io.Dir.cwd(), options.output_path, init.io, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.ImageArchiveOutputExists,
+        else => |e| return e,
+    };
+    errdefer Io.Dir.cwd().deleteFile(init.io, options.output_path) catch {};
+    try chunk_sealer.fsyncParentDirPath(allocator, options.output_path);
+
+    const manifest_digest = try allocator.dupe(u8, closure.manifest.transport_digest);
+    errdefer allocator.free(manifest_digest);
+    return .{
+        .archive_digest = archive_digest,
+        .manifest_digest = manifest_digest,
+        .image_digest = try allocator.dupe(u8, closure.image_digest),
+        .object_count = closure.objects.len,
+        .archive_bytes = archive_stat.size,
+    };
+}
+
+/// One complete local image as `pack` and `image push` publish it: canonical
+/// manifest, config and rootfs index, and its distinct objects sorted by
+/// digest. Objects stay in the local CAS; read them with
+/// `rootfs_cas.readVerifiedManifestObject`.
+pub const LocalClosure = struct {
+    image_digest: []const u8,
+    storage: spore.RootfsStorage,
+    manifest: image_manifest.EncodedImageManifest,
+    config_bytes: []const u8,
+    index_bytes: []const u8,
+    objects: []ObjectDescriptor,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *LocalClosure, allocator: std.mem.Allocator) void {
+        self.manifest.deinit(allocator);
+        allocator.free(self.config_bytes);
+        allocator.free(self.index_bytes);
+        deinitObjects(allocator, self.objects);
+        self.arena.deinit();
+    }
+};
+
+/// Load the local image `source` names on `platform` with complete local
+/// storage. The caller holds the rootfs cache lock while it reads objects.
+pub fn loadLocalClosure(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    source: []const u8,
+    platform: rootfs.Platform,
+) !LocalClosure {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const catalog_allocator = arena.allocator();
+    const identity = (try local_image.lookup(io, catalog_allocator, cache_root, source, platform)) orelse
         return error.FileNotFound;
-    const local = (try local_image.readRecord(init.io, catalog_allocator, cache_root, identity)) orelse return error.FileNotFound;
-    if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, catalog_allocator, cache_root, local.storage))
+    const local = (try local_image.readRecord(io, catalog_allocator, cache_root, identity)) orelse return error.FileNotFound;
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, catalog_allocator, cache_root, local.storage))
         return error.LocalImageStorageUnavailable;
 
     const storage = local.storage;
     const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);
     const index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(allocator, index_path, storage);
-    defer allocator.free(index_bytes);
+    errdefer allocator.free(index_bytes);
     var parsed_index = try disk_index.parseDiskIndex(allocator, index_bytes, .{
         .logical_size = storage.logical_size,
         .chunk_size = storage.chunk_size,
@@ -106,23 +167,20 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
     defer parsed_index.deinit();
 
     const objects = try uniqueSortedObjects(allocator, storage, parsed_index.value.chunks);
-    defer deinitObjects(allocator, objects);
-    const object_bytes = try validateArchiveBounds(storage.logical_size, objects);
+    errdefer deinitObjects(allocator, objects);
+    var object_bytes: u64 = 0;
+    for (objects) |object| object_bytes = std.math.add(u64, object_bytes, object.size) catch return error.BadManifest;
 
     const config_bytes = try image.canonicalConfigJson(allocator, local.config);
-    defer allocator.free(config_bytes);
-    const config_transport = try image_manifest.transportDigestAlloc(allocator, config_bytes);
-    defer allocator.free(config_transport);
-    const config_digest = try image.configDigestAlloc(allocator, config_bytes);
-    defer allocator.free(config_digest);
-    const image_digest = try allocator.dupe(u8, local.identity);
-    errdefer allocator.free(image_digest);
+    errdefer allocator.free(config_bytes);
+    const config_transport = try image_manifest.transportDigestAlloc(catalog_allocator, config_bytes);
+    const config_digest = try image.configDigestAlloc(catalog_allocator, config_bytes);
 
-    const manifest_value = image_manifest.ImageManifest{
+    const manifest = try image_manifest.encodeImageManifestAlloc(allocator, .{
         .kind = image_manifest.image_manifest_kind,
         .image = .{
-            .digest = image_digest,
-            .platform = options.platform,
+            .digest = local.identity,
+            .platform = platform,
             .config_blob = .{
                 .transport_digest = config_transport,
                 .config_digest = config_digest,
@@ -136,31 +194,15 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
             .object_count = objects.len,
             .object_bytes = object_bytes,
         },
-    };
-    const encoded_manifest = try image_manifest.encodeImageManifestAlloc(allocator, manifest_value);
-    defer encoded_manifest.deinit(allocator);
-
-    const temp_path = try temporarySiblingPath(allocator, init.io, options.output_path);
-    defer allocator.free(temp_path);
-    defer Io.Dir.cwd().deleteFile(init.io, temp_path) catch {};
-    try writeArchive(init.io, allocator, temp_path, cache_root, encoded_manifest.bytes, config_bytes, index_bytes, objects);
-    const archive_digest = try sha256FileDigestAlloc(allocator, init.io, temp_path);
-    errdefer allocator.free(archive_digest);
-    const archive_stat = try Io.Dir.cwd().statFile(init.io, temp_path, .{ .follow_symlinks = false });
-    if (archive_stat.kind != .file or archive_stat.size > max_archive_bytes) return error.ImageArchiveTooLarge;
-    Io.Dir.hardLink(Io.Dir.cwd(), temp_path, Io.Dir.cwd(), options.output_path, init.io, .{}) catch |err| switch (err) {
-        error.PathAlreadyExists => return error.ImageArchiveOutputExists,
-        else => |e| return e,
-    };
-    errdefer Io.Dir.cwd().deleteFile(init.io, options.output_path) catch {};
-    try chunk_sealer.fsyncParentDirPath(allocator, options.output_path);
-
+    });
     return .{
-        .archive_digest = archive_digest,
-        .manifest_digest = try allocator.dupe(u8, encoded_manifest.transport_digest),
-        .image_digest = image_digest,
-        .object_count = objects.len,
-        .archive_bytes = archive_stat.size,
+        .image_digest = local.identity,
+        .storage = storage,
+        .manifest = manifest,
+        .config_bytes = config_bytes,
+        .index_bytes = index_bytes,
+        .objects = objects,
+        .arena = arena,
     };
 }
 

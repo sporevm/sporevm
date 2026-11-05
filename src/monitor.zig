@@ -488,6 +488,9 @@ const ExecServer = struct {
     startup: ?StartupMetadata = null,
     disk_baseline_active: ?runtime_disk_lease.Active = null,
     snapshot_publication_wait: snapshot_publication.Wait = .{},
+    /// Set once the root disk is open when it reads objects from an image
+    /// store: no snapshot can capture it, so save requests are refused.
+    snapshots_refused: bool = false,
 
     fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
@@ -591,8 +594,15 @@ const ExecServer = struct {
             .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
             .completeDiskForkFn = completeDiskForkThunk,
             .failDiskForkFn = failDiskForkThunk,
+            .refuseSnapshotsFn = refuseSnapshotsThunk,
             .reportStatsFn = reportStatsThunk,
         };
+    }
+
+    fn refuseSnapshots(self: *ExecServer) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.snapshots_refused = true;
     }
 
     fn setWake(self: *ExecServer, wake: vsock_control.Wake) void {
@@ -1056,6 +1066,8 @@ const ExecServer = struct {
         if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        // Refuse before the guest pauses: a failed capture ends the VM.
+        if (self.snapshots_refused) return error.RemoteImageNotSnapshotable;
         while (self.state == .done) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
@@ -1079,6 +1091,7 @@ const ExecServer = struct {
         }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (self.snapshots_refused) return error.RemoteImageNotSnapshotable;
         while (self.state == .done) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
@@ -1459,6 +1472,11 @@ const ExecServer = struct {
         self.failDiskFork(err);
     }
 
+    fn refuseSnapshotsThunk(context: *anyopaque) void {
+        const self: *ExecServer = @ptrCast(@alignCast(context));
+        self.refuseSnapshots();
+    }
+
     fn reportStatsThunk(context: *anyopaque, stats: vsock_control.ControlStats) void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         self.reportStats(stats);
@@ -1738,8 +1756,8 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             try writeControlError(server.io, stream, "suspend request missing out_dir");
             return false;
         };
-        const response = server.submitSuspend(out_dir) catch {
-            try writeControlError(server.io, stream, "monitor busy");
+        const response = server.submitSuspend(out_dir) catch |err| {
+            try writeControlError(server.io, stream, snapshotSubmitErrorMessage(err));
             return false;
         };
         try writeAll(server.io, stream, response);
@@ -1759,8 +1777,8 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             try writeControlError(server.io, stream, "snapshot request must set continue=true");
             return false;
         }
-        const response = server.submitSnapshot(out_dir, parsed.value.publish_dir) catch {
-            try writeControlError(server.io, stream, "monitor busy");
+        const response = server.submitSnapshot(out_dir, parsed.value.publish_dir) catch |err| {
+            try writeControlError(server.io, stream, snapshotSubmitErrorMessage(err));
             return false;
         };
         try writeAll(server.io, stream, response);
@@ -2047,6 +2065,10 @@ fn writeControlHello(io: Io, stream: net.Stream) !void {
     const json = try std.json.Stringify.valueAlloc(fixed.allocator(), payload, .{});
     try writeAll(io, stream, json);
     try writeAll(io, stream, "\n");
+}
+
+fn snapshotSubmitErrorMessage(err: anyerror) []const u8 {
+    return if (err == error.RemoteImageNotSnapshotable) lifecycle.snapshot_refused_store_rootfs else "monitor busy";
 }
 
 fn writeControlError(io: Io, stream: net.Stream, message: []const u8) !void {
@@ -2906,4 +2928,24 @@ test "named exec timing partitions monitor and guest phases" {
     try std.testing.expectEqual(@as(?u64, 13), timing.output_result_delivery_ms);
     try std.testing.expectEqual(@as(u64, 10), timing.teardown_ms);
     try std.testing.expectEqual(@as(u64, 100), timing.total_ms);
+}
+
+test "a monitor whose root disk reads from an image store refuses saves before pausing" {
+    var server: ExecServer = undefined;
+    server.allocator = std.testing.allocator;
+    server.io = std.testing.io;
+    server.mutex = .init;
+    server.cond = .init;
+    server.state = .idle;
+    server.wake = null;
+    server.snapshots_refused = false;
+
+    // The run loop reports the disk it opened through the control interface.
+    server.control().refuseSnapshots();
+    try std.testing.expectError(error.RemoteImageNotSnapshotable, server.submitSuspend("/tmp/save.spore"));
+    try std.testing.expectError(error.RemoteImageNotSnapshotable, server.submitSnapshot("/tmp/save.tmp", "/tmp/save.spore"));
+    // Nothing reaches the run loop, so the guest never pauses.
+    try std.testing.expectEqual(RequestState.idle, server.state);
+    try std.testing.expectEqualStrings(lifecycle.snapshot_refused_store_rootfs, snapshotSubmitErrorMessage(error.RemoteImageNotSnapshotable));
+    try std.testing.expectEqualStrings("monitor busy", snapshotSubmitErrorMessage(error.ControlBusy));
 }

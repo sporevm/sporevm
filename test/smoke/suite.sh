@@ -11,7 +11,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # The per-commit gate: one-shot run, signal save, fork, named lifecycle, copy,
-# the monitor jail, and networking.
+# the monitor jail, networking, and lazy runs from an image store.
 core=(
   run/basic.sh
   run/capture.sh
@@ -21,6 +21,7 @@ core=(
   monitor/jail.sh
   network/deny.sh
   network/forward.sh
+  rootfs/remote-lazy.sh
 )
 
 full=(

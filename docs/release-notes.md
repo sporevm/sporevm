@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Lazy images from a store
+
+`spore image push local/app:1 /srv/images/app` writes a static image store
+that any file server can publish, and `spore run --image
+https://images.example/app` (or `create`) boots it with only the image's
+manifest, config and index local, fetching each rootfs object the guest reads
+on first use. `--save`, `--commit` and `spore save` are refused for images run
+from a store. See `docs/image-format.md`.
+
 ### Format reset
 
 Old local formats have no readers. `spore host-info` reports only
