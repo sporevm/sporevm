@@ -50,9 +50,7 @@ use `--memory 512mb --max-memory 16gb` to preserve its intended elastic range.
 JSON results use the same two-size contract. Existing `memory_bytes` fields now
 unambiguously mean initial memory, and the additive maximum field enables
 elasticity. Named list output advances to `spore.lifecycle.list.result.v2`,
-where memory contains `initial_bytes` and `maximum_bytes`. Existing named-VM
-registry entries migrate the old `explicit` policy to fixed memory and the old
-`auto` policy to 512 MiB initial memory with its stored ceiling.
+where memory contains `initial_bytes` and `maximum_bytes`.
 
 Elastic captures use manifest v4 and persist backend-neutral initial, maximum,
 requested, captured, and exact plugged-block state. Current readers retain v2
