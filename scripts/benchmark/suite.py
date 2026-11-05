@@ -701,8 +701,6 @@ class BenchmarkRunner:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.rootfs_cache_dir.mkdir(parents=True, exist_ok=True)
         self.bundle_cache_dir.mkdir(parents=True, exist_ok=True)
-        if self.args.build:
-            self.build()
         if not self.spore_bin.is_file() or not os.access(self.spore_bin, os.X_OK):
             die(f"spore binary not executable: {self.spore_bin}")
         if self.needs_image_setup():
@@ -713,14 +711,6 @@ class BenchmarkRunner:
 
     def needs_image_setup(self) -> bool:
         return any(benchmark in IMAGE_SETUP_BENCHMARKS for benchmark in self.args.benchmarks)
-
-    def build(self) -> None:
-        cmd = ["mise", "run", "build"] if shutil.which("mise") else ["zig", "build"]
-        stdout = self.log_dir / "build.stdout"
-        stderr = self.log_dir / "build.stderr"
-        rc, elapsed_ms, error = run_command(cmd, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=600)
-        if rc != 0:
-            die(f"build failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
 
     def resolve_image(self) -> None:
         if is_pinned_image_ref(self.args.image):
@@ -1961,9 +1951,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--writable-rootfs-memory-mib", type=int, default=1024)
     parser.add_argument("--no-prewarm-rootfs", dest="prewarm_rootfs", action="store_false")
     parser.add_argument("--prewarm-memory", default="512mb")
-    parser.add_argument("--no-build", dest="build", action="store_false")
     parser.add_argument("--self-test", action="store_true")
-    parser.set_defaults(build=True, prewarm_rootfs=True)
+    parser.set_defaults(prewarm_rootfs=True)
     args = parser.parse_args(argv)
     if args.self_test:
         return args

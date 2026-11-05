@@ -5,7 +5,6 @@ spec_refs:
   - docs/spore-build.md
   - docs/filesystem.md
   - docs/rootfs.md
-  - docs/benchmarks.md
   - docs/spore-format.md
   - SECURITY.md
   - src/build.zig

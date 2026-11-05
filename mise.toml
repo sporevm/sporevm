@@ -235,5 +235,5 @@ run = "mise run build && test/smoke/run/basic.sh && test/smoke/run/capture.sh"
 description = "Run product smoke tests"
 
 [tasks.benchmark]
-run = "mise run build:release && scripts/benchmark/suite.py --no-build"
+run = "mise run build:release && scripts/benchmark/suite.py"
 description = "Run the benchmark suite against a ReleaseSafe build"
