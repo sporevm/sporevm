@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage: scripts/kernel/make-minimal-exec-initrd.sh --arch aarch64|x86_64 \
-       --generation-base GPA --toybox-source DIR <out.cpio>
+       --generation-base GPA --toybox-source DIR [--depfile PATH] <out.cpio>
 
 Build a tiny architecture-specific Linux initrd for the SporeVM minimal
 boot/run path. The generation GPA is supplied by build.zig from the selected
@@ -22,12 +22,15 @@ Environment:
 
 The newc mtime is pinned to zero so build-system environment changes cannot
 change an embedded artifact without changing an explicit build input.
+--depfile writes a Makefile-style list of the guest sources the archive was
+built from, so build.zig can cache it without repeating that list.
 EOF
 }
 
 toybox_source=""
 target_arch=""
 generation_base=""
+depfile=""
 out=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -63,6 +66,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --generation-base=*)
       generation_base="${1#--generation-base=}"
+      shift
+      ;;
+    --depfile)
+      [[ $# -ge 2 ]] || { echo "error: --depfile requires a value" >&2; exit 2; }
+      depfile="${2:-}"
+      shift 2
+      ;;
+    --depfile=*)
+      depfile="${1#--depfile=}"
       shift
       ;;
     -*)
@@ -161,16 +173,17 @@ trap 'rm -rf "${workdir}"' EXIT
 mkdir -p "${workdir}/root/bin" "${workdir}/root/dev" "${workdir}/root/proc" "${workdir}/root/run" "${workdir}/root/tmp" "${workdir}/root/usr/bin"
 
 source_dir="${REPO_ROOT}/guest/minimal-initrd"
-sources=(agent true false writeout sleeper finite counter nproc gencheck rngcheck blkcheck netcheck nslookup wget httpd flockcheck cgroupcheck toybox-sh)
-for src in "${sources[@]}"; do
-  if [[ ! -f "${source_dir}/${src}.c" ]]; then
-    echo "error: missing minimal initrd source: ${source_dir}/${src}.c" >&2
-    exit 1
-  fi
+# The guest source list. Each NAME.c becomes /bin/NAME, except agent.c, which
+# links agent_sources into /init, and toybox-sh.c, which becomes /bin/sh.
+programs=(agent true false writeout sleeper finite counter nproc gencheck rngcheck blkcheck netcheck nslookup wget httpd flockcheck cgroupcheck toybox-sh)
+agent_sources=("${source_dir}/build_copy.c" "${source_dir}/build_run_sandbox.c")
+inputs=("${agent_sources[@]}" "${source_dir}/build_copy.h" "${source_dir}/build_run_sandbox.h" "${source_dir}/toybox.config")
+for program in "${programs[@]}"; do
+  inputs+=("${source_dir}/${program}.c")
 done
-for src in build_copy.c build_copy.h build_run_sandbox.c build_run_sandbox.h; do
-  if [[ ! -f "${source_dir}/${src}" ]]; then
-    echo "error: missing minimal initrd source: ${source_dir}/${src}" >&2
+for input in "${inputs[@]}"; do
+  if [[ ! -f "${input}" ]]; then
+    echo "error: missing minimal initrd source: ${input}" >&2
     exit 1
   fi
 done
@@ -334,29 +347,14 @@ build_toybox() {
   chmod 0755 "${dst}"
 }
 
-compile_static agent "${workdir}/root/init" \
-  "${source_dir}/build_copy.c" \
-  "${source_dir}/build_run_sandbox.c"
-compile_static true "${workdir}/root/bin/true"
-compile_static false "${workdir}/root/bin/false"
-compile_static writeout "${workdir}/root/bin/writeout"
-compile_static sleeper "${workdir}/root/bin/sleeper"
-compile_static finite "${workdir}/root/bin/finite"
-compile_static counter "${workdir}/root/bin/counter"
-compile_static nproc "${workdir}/root/bin/nproc"
-compile_static gencheck "${workdir}/root/bin/gencheck"
-compile_static rngcheck "${workdir}/root/bin/rngcheck"
-compile_static blkcheck "${workdir}/root/bin/blkcheck"
-compile_static netcheck "${workdir}/root/bin/netcheck"
-compile_static nslookup "${workdir}/root/bin/nslookup"
-compile_static wget "${workdir}/root/bin/wget"
-compile_static httpd "${workdir}/root/bin/httpd"
-compile_static flockcheck "${workdir}/root/bin/flockcheck"
-compile_static cgroupcheck "${workdir}/root/bin/cgroupcheck"
-compile_static toybox-sh "${workdir}/root/bin/sh"
+for program in "${programs[@]}"; do
+  case "${program}" in
+    agent) compile_static agent "${workdir}/root/init" "${agent_sources[@]}" ;;
+    toybox-sh) compile_static toybox-sh "${workdir}/root/bin/sh" ;;
+    *) compile_static "${program}" "${workdir}/root/bin/${program}" ;;
+  esac
+done
 build_toybox "${toybox_source}" "${workdir}/root/bin/toybox"
-chmod 0755 "${workdir}/root/init" "${workdir}/root/bin/true" "${workdir}/root/bin/false" "${workdir}/root/bin/writeout" "${workdir}/root/bin/sleeper" "${workdir}/root/bin/finite" "${workdir}/root/bin/counter" "${workdir}/root/bin/nproc" "${workdir}/root/bin/gencheck" "${workdir}/root/bin/rngcheck" "${workdir}/root/bin/blkcheck" "${workdir}/root/bin/netcheck" "${workdir}/root/bin/nslookup" "${workdir}/root/bin/wget" "${workdir}/root/bin/httpd" "${workdir}/root/bin/flockcheck" "${workdir}/root/bin/cgroupcheck" "${workdir}/root/bin/sh" "${workdir}/root/bin/toybox"
-chmod 1777 "${workdir}/root/tmp"
 
 python3 - "${workdir}/root" "${target_arch}" <<'PY'
 import pathlib
@@ -446,4 +444,7 @@ with temporary.open("wb") as stream:
 os.replace(temporary, output)
 PY
 
+if [[ -n "${depfile}" ]]; then
+  printf '%s: %s\n' "${out}" "${inputs[*]}" >"${depfile}"
+fi
 echo "wrote ${out}"

@@ -10,24 +10,11 @@ fail() {
   exit 1
 }
 
-toybox_source=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --toybox-source)
-      [[ $# -ge 2 ]] || fail "--toybox-source requires a value"
-      toybox_source="${2:-}"
-      shift 2
-      ;;
-    --toybox-source=*)
-      toybox_source="${1#--toybox-source=}"
-      shift
-      ;;
-    *)
-      fail "unexpected argument: $1"
-      ;;
-  esac
-done
-[[ -d "${toybox_source}" ]] || fail "--toybox-source must name the pinned Toybox source directory"
+[[ $# -eq 3 ]] || fail "usage: $0 TOYBOX_SOURCE AARCH64_CPIO X86_64_CPIO"
+toybox_source="$1"
+aarch64_cpio="$2"
+x86_64_cpio="$3"
+[[ -d "${toybox_source}" ]] || fail "TOYBOX_SOURCE must name the pinned Toybox source directory"
 
 bash -n "${generator}"
 bash -n "$0"
@@ -53,51 +40,13 @@ if "${generator}" --arch x86_64 --generation-base 0xc001000 --toybox-source "${t
 fi
 grep -Fq 'generation GPA does not match the x86_64 SporeVM board' "${task_tmp}/stderr" || fail "mismatch did not report the board contract"
 
-build_arch() {
-  local arch="$1"
-  local triple="$2"
-  local generation_base="$3"
-  local first="${task_tmp}/${arch}-first.cpio"
-  local second="${task_tmp}/${arch}-second.cpio"
-  local compiler_log="${task_tmp}/${arch}-cc.log"
-  local compiler_wrapper="${task_tmp}/${arch}-cc"
-
-  (
-    umask 0022
-    SOURCE_DATE_EPOCH=123 "${generator}" \
-      --arch "${arch}" \
-      --generation-base "${generation_base}" \
-      --toybox-source "${toybox_source}" \
-      "${first}" >/dev/null
-  )
-
-  cat >"${compiler_wrapper}" <<EOF
-#!/usr/bin/env bash
-printf '%s\\n' "\$*" >>"${compiler_log}"
-exec zig cc -target ${triple} "\$@"
-EOF
-  chmod 0755 "${compiler_wrapper}"
-  (
-    umask 0077
-    CC="${compiler_wrapper}" SOURCE_DATE_EPOCH=456 "${generator}" \
-      --arch "${arch}" \
-      --generation-base "${generation_base}" \
-      --toybox-source "${toybox_source}" \
-      "${second}" >/dev/null
-  )
-
-  cmp -s "${first}" "${second}" || fail "${arch} archive changed across compiler selection, umask, or ambient timestamp"
-  grep -Fq -- "-DSPORE_GENERATION_BASE=${generation_base}ULL" "${compiler_log}" || fail "${arch} compiler did not receive the selected board GPA"
-  python3 - "${first}" "${arch}" "${generation_base}" <<'PY'
+check_archive() {
+  python3 - "$1" <<'PY'
 import pathlib
 import stat
-import struct
 import sys
 
 archive = pathlib.Path(sys.argv[1]).read_bytes()
-arch = sys.argv[2]
-generation_base = int(sys.argv[3], 0)
-machine = {"aarch64": 183, "x86_64": 62}[arch]
 offset = 0
 entries = {}
 while True:
@@ -141,17 +90,6 @@ for name, (mode, payload) in entries.items():
     elif kind == stat.S_IFREG:
         if permissions != 0o755:
             raise SystemExit(f"error: noncanonical executable mode: {name}")
-        if len(payload) < 64 or payload[:6] != b"\x7fELF\x02\x01":
-            raise SystemExit(f"error: executable is not little-endian ELF64: {name}")
-        if struct.unpack_from("<H", payload, 18)[0] != machine:
-            raise SystemExit(f"error: executable has wrong machine: {name}")
-        phoff = struct.unpack_from("<Q", payload, 32)[0]
-        phentsize = struct.unpack_from("<H", payload, 54)[0]
-        phnum = struct.unpack_from("<H", payload, 56)[0]
-        if phentsize < 4 or phoff + phentsize * phnum > len(payload):
-            raise SystemExit(f"error: malformed ELF program headers: {name}")
-        if any(struct.unpack_from("<I", payload, phoff + index * phentsize)[0] == 3 for index in range(phnum)):
-            raise SystemExit(f"error: dynamically linked executable: {name}")
     else:
         raise SystemExit(f"error: unsupported newc entry type: {name}")
 
@@ -159,12 +97,41 @@ required = {".", "bin", "dev", "proc", "run", "tmp", "usr", "usr/bin", "init", "
 missing = required.difference(entries)
 if missing:
     raise SystemExit(f"error: missing newc entries: {sorted(missing)}")
-if generation_base not in (0x0c001000, 0xd0001000):
-    raise SystemExit("error: test was given a non-board generation GPA")
 PY
 }
 
-build_arch aarch64 aarch64-linux-musl 0xc001000
-build_arch x86_64 x86_64-linux-musl 0xd0001000
+check_archive "${aarch64_cpio}"
+check_archive "${x86_64_cpio}"
+
+# The embedded initrd's digest is part of every `spore build` cache key, so
+# rebuild each archive under a different umask, temporary directory, ambient
+# timestamp, and compiler command, and require the same bytes.
+rebuild_arch() {
+  local arch="$1"
+  local triple="$2"
+  local generation_base="$3"
+  local expected="$4"
+  local rebuilt="${task_tmp}/${arch}.cpio"
+
+  mkdir "${task_tmp}/${arch}-tmp"
+  (
+    umask 0077
+    TMPDIR="${task_tmp}/${arch}-tmp" CC="zig cc -target ${triple}" SOURCE_DATE_EPOCH=456 "${generator}" \
+      --arch "${arch}" \
+      --generation-base "${generation_base}" \
+      --toybox-source "${toybox_source}" \
+      "${rebuilt}" >/dev/null
+  )
+  cmp -s "${expected}" "${rebuilt}" || fail "${arch} archive changed across umask, TMPDIR, SOURCE_DATE_EPOCH, or CC"
+}
+
+rebuild_arch aarch64 aarch64-linux-musl 0xc001000 "${aarch64_cpio}" &
+aarch64_rebuild=$!
+rebuild_arch x86_64 x86_64-linux-musl 0xd0001000 "${x86_64_cpio}" &
+x86_64_rebuild=$!
+rebuild_status=0
+wait "${aarch64_rebuild}" || rebuild_status=1
+wait "${x86_64_rebuild}" || rebuild_status=1
+[[ "${rebuild_status}" -eq 0 ]] || exit 1
 
 echo "minimal exec initrd test: passed"

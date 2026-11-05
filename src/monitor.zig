@@ -172,7 +172,7 @@ pub fn runRole(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
 
     const opts = try parseMonitorArgs(args);
     const parsed_ms = lifecycle.monotonicMs();
-    const selected_backend = backend_mod.requireProductRunner(opts.backend) catch |err| {
+    const selected_backend = backend_mod.requireProductRunner(opts.backend, .probe()) catch |err| {
         std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };

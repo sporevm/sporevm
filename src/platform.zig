@@ -340,7 +340,7 @@ fn unsupportedBackend(name: []const u8) BackendAvailability {
 
 fn x86KvmAvailability(capabilities: [x86_cpu_profile.required_capabilities.len]KvmCapabilityFact) BackendAvailability {
     _ = capabilities;
-    const availability = backend_mod.availability(.kvm);
+    const availability = backend_mod.availability(.kvm, .probe());
     return switch (availability) {
         .available => .{ .name = "kvm", .supported = true, .available = true, .reason = "available" },
         .unavailable => |result| .{

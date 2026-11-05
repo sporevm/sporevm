@@ -964,10 +964,11 @@ fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
 pub fn createNamed(
     init: std.process.Init,
     allocator: std.mem.Allocator,
+    host: backend_mod.Host,
     options: CreateNamedOptions,
 ) !NamedLifecycleResult {
     const start_ms = monotonicMs();
-    return createNamedWithTiming(init, allocator, options, .{
+    return createNamedWithTiming(init, allocator, host, options, .{
         .start_ms = start_ms,
         .parsed_ms = start_ms,
     });
@@ -981,12 +982,13 @@ const CreateTimingAnchors = struct {
 fn createNamedWithTiming(
     init: std.process.Init,
     allocator: std.mem.Allocator,
+    host: backend_mod.Host,
     options: CreateNamedOptions,
     timing: CreateTimingAnchors,
 ) !NamedLifecycleResult {
     clearLastError();
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
-    const selected_backend = try backend_mod.requireProductRunner(options.backend);
+    const selected_backend = try backend_mod.requireProductRunner(options.backend, host);
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -1140,7 +1142,7 @@ pub fn restoreNamed(
     const start_ms = monotonicMs();
     clearLastError();
     const requested_backend = options.backend orelse run_mod.Backend.auto;
-    const selected_backend = try backend_mod.requireProductRunner(requested_backend);
+    const selected_backend = try requested_backend.resolveForHost();
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = .{},
         .vcpus = 1,
@@ -1638,7 +1640,7 @@ pub fn saveNamed(
 
 fn rejectX86NamedPersistence(spec: Spec) !void {
     const requested = run_mod.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
-    const selected = try backend_mod.requireProductRunner(requested);
+    const selected = try requested.resolveForHost();
     try run_mod.validateFreshProductPolicy(selected, .{
         .memory = spec.memory,
         .vcpus = spec.vcpus,
@@ -2009,7 +2011,7 @@ pub fn createCli(
             else => |e| return e,
         };
     const full_args = try init.minimal.args.toSlice(allocator);
-    const result = createNamedWithTiming(init, allocator, .{
+    const result = createNamedWithTiming(init, allocator, .probe(), .{
         .name = spec.name,
         .backend = run_mod.Backend.parse(spec.backend) orelse unreachable,
         .kernel_path = spec.kernel_path,
@@ -5233,7 +5235,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
         .io = io,
         .environ_map = &env,
         .preopens = .empty,
-    }, allocator, .{
+    }, allocator, .{}, .{
         .name = "bench-1",
         .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
     }));

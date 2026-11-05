@@ -106,6 +106,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         .debugfs = parsed.debugfs,
         .output = if (mode == .json) null else stdout,
         .diagnostic = &diagnostic,
+        .host = .probe(),
     }) catch |err| {
         if (mode == .json) exitMachineError(allocator, stderr, machine_output.fromZigError(err));
         try writeBuildError(stderr, err, diagnostic);

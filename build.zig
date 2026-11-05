@@ -34,42 +34,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
-    const toybox_dep = b.dependency("toybox", .{});
-    const guest_arch = guestArchitecture(target_arch) orelse
-        std.debug.panic("unsupported embedded guest architecture: {s}", .{@tagName(target_arch)});
+    const toybox = b.dependency("toybox", .{}).path("");
+    const aarch64_initrd = addMinimalExecInitrd(b, toybox, .aarch64);
+    const x86_64_initrd = addMinimalExecInitrd(b, toybox, .x86_64);
+    const minimal_exec_initrd_module = switch (target_arch) {
+        .aarch64 => aarch64_initrd.module,
+        .x86_64 => x86_64_initrd.module,
+        else => std.debug.panic("unsupported embedded guest architecture: {s}", .{@tagName(target_arch)}),
+    };
     const guest_generation_base = generationBase(target_arch) orelse unreachable;
-    const minimal_exec_assets = b.addSystemCommand(&.{
-        "bash",
-        "-c",
-        \\set -euo pipefail
-        \\scripts/kernel/make-minimal-exec-initrd.sh --arch "$4" --generation-base "$5" --toybox-source "$3" "$1"
-        \\if command -v sha256sum >/dev/null 2>&1; then
-        \\  initrd_sha256="$(sha256sum "$1" | awk '{print $1}')"
-        \\else
-        \\  initrd_sha256="$(shasum -a 256 "$1" | awk '{print $1}')"
-        \\fi
-        \\printf '%s\n' \
-        \\  'pub const minimal_exec_initrd = @embedFile("minimal-exec-initrd.cpio");' \
-        \\  "pub const minimal_exec_initrd_sha256_hex = \"${initrd_sha256}\";" \
-        \\  >"$2"
-        ,
-        "sporevm-initrd-assets",
-    });
-    _ = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.cpio");
-    const minimal_exec_initrd_module = minimal_exec_assets.addOutputFileArg("minimal-exec-initrd.zig");
-    minimal_exec_assets.addDirectoryArg(toybox_dep.path(""));
-    minimal_exec_assets.addArg(guest_arch);
-    minimal_exec_assets.addArg(b.fmt("0x{x}", .{guest_generation_base}));
-    minimal_exec_assets.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
-    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
-    const minimal_exec_sources = [_][]const u8{ "agent", "true", "false", "writeout", "sleeper", "finite", "counter", "nproc", "gencheck", "rngcheck", "blkcheck", "netcheck", "nslookup", "wget", "httpd", "flockcheck", "cgroupcheck", "toybox-sh" };
-    for (minimal_exec_sources) |src| {
-        minimal_exec_assets.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
-    }
-    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_copy.c"));
-    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_copy.h"));
-    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.c"));
-    minimal_exec_assets.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.h"));
     libspore_mod.addAnonymousImport("run_assets", .{
         .root_source_file = minimal_exec_initrd_module,
     });
@@ -315,20 +288,18 @@ pub fn build(b: *std.Build) void {
     run_x86_64_tests.step.dependOn(&run_c_smoke.step);
 
     const test_step = b.step("test", "Run unit tests");
-    const minimal_exec_initrd_tests = b.addSystemCommand(&.{
-        "bash", "scripts/kernel/test-minimal-exec-initrd.sh", "--toybox-source",
-    });
-    minimal_exec_initrd_tests.addDirectoryArg(toybox_dep.path(""));
+    const minimal_exec_initrd_tests = b.addSystemCommand(&.{"bash"});
+    minimal_exec_initrd_tests.addFileArg(b.path("scripts/kernel/test-minimal-exec-initrd.sh"));
+    minimal_exec_initrd_tests.addDirectoryArg(toybox);
+    minimal_exec_initrd_tests.addFileArg(aarch64_initrd.cpio);
+    minimal_exec_initrd_tests.addFileArg(x86_64_initrd.cpio);
+    // Files the check reads besides its arguments.
     minimal_exec_initrd_tests.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
-    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/toybox.config"));
-    for (minimal_exec_sources) |src| {
-        minimal_exec_initrd_tests.addFileInput(b.path(b.fmt("guest/minimal-initrd/{s}.c", .{src})));
-    }
-    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_copy.c"));
-    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_copy.h"));
-    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.c"));
-    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/build_run_sandbox.h"));
-    const minimal_exec_initrd_test_step = b.step("minimal-exec-initrd-test", "Build and validate deterministic embedded initrds for every guest architecture");
+    minimal_exec_initrd_tests.addFileInput(b.path("build.zig"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/agent.c"));
+    // An output makes the check cacheable instead of rerunning every build.
+    _ = minimal_exec_initrd_tests.captureStdOut(.{});
+    const minimal_exec_initrd_test_step = b.step("minimal-exec-initrd-test", "Build every guest architecture's embedded initrd and check that it rebuilds byte-identically");
     minimal_exec_initrd_test_step.dependOn(&minimal_exec_initrd_tests.step);
     test_step.dependOn(minimal_exec_initrd_test_step);
     test_step.dependOn(&run_libspore_tests.step);
@@ -601,11 +572,41 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-fn guestArchitecture(arch: std.Target.Cpu.Arch) ?[]const u8 {
-    return switch (arch) {
-        .aarch64 => "aarch64",
-        .x86_64 => "x86_64",
-        else => null,
+const MinimalExecInitrd = struct {
+    cpio: std.Build.LazyPath,
+    module: std.Build.LazyPath,
+};
+
+/// Build the embedded guest initrd for one architecture. The generator owns
+/// the guest source list and reports it in a depfile, so the cached result is
+/// rebuilt only when a guest source, the generator, or Toybox changes.
+fn addMinimalExecInitrd(b: *std.Build, toybox: std.Build.LazyPath, arch: std.Target.Cpu.Arch) MinimalExecInitrd {
+    const run = b.addSystemCommand(&.{
+        "bash",
+        "-c",
+        \\set -euo pipefail
+        \\"$1" --arch "$2" --generation-base "$3" --toybox-source "$4" --depfile "$5" "$6"
+        \\if command -v sha256sum >/dev/null 2>&1; then
+        \\  initrd_sha256="$(sha256sum "$6" | awk '{print $1}')"
+        \\else
+        \\  initrd_sha256="$(shasum -a 256 "$6" | awk '{print $1}')"
+        \\fi
+        \\printf '%s\n' \
+        \\  'pub const minimal_exec_initrd = @embedFile("minimal-exec-initrd.cpio");' \
+        \\  "pub const minimal_exec_initrd_sha256_hex = \"${initrd_sha256}\";" \
+        \\  >"$7"
+        ,
+        "sporevm-initrd-assets",
+    });
+    run.setName(b.fmt("minimal exec initrd {s}", .{@tagName(arch)}));
+    run.addFileArg(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
+    run.addArg(@tagName(arch));
+    run.addArg(b.fmt("0x{x}", .{generationBase(arch).?}));
+    run.addDirectoryArg(toybox);
+    _ = run.addDepFileOutputArg("minimal-exec-initrd.d");
+    return .{
+        .cpio = run.addOutputFileArg("minimal-exec-initrd.cpio"),
+        .module = run.addOutputFileArg("minimal-exec-initrd.zig"),
     };
 }
 
