@@ -14,8 +14,10 @@ that holds them the first GC now runs a real sweep. JSON output advances to
 `spore.cache.gc.result.v2` without `legacy_step_record_count`.
 
 `spore-disk-index-v2` is the only disk-index encoding, and the manifest memory
-index now uses it too, so manifest bytes change. Older disk indexes and
-memory indexes fail as too old, and `cache gc` reclaims old disk indexes.
+index now uses it too, so manifest bytes change. Older disk indexes fail as too
+old, and manifests with an older memory index are rejected. `cache gc` keeps an
+old disk index that an image or record still names but reclaims the objects
+only it referenced.
 
 ### One ext4 writer
 

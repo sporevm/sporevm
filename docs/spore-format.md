@@ -395,8 +395,9 @@ reset or poweroff.
 
 Every disk-index identity is the BLAKE3 digest of one exact canonical JSON
 encoding, `spore-disk-index-v2`. Indexes of earlier kinds
-(`spore-disk-index-v1`, `rootfs-block-index-v0`) fail as too old, and
-`cache gc` reclaims them with the objects only they referenced.
+(`spore-disk-index-v1`, `rootfs-block-index-v0`) fail as too old. `cache gc`
+keeps such an index while a record names it but reclaims the objects only it
+referenced.
 
 Top-level fields appear in this order: `kind`, `logical_size`, `chunk_size`,
 `hash_algorithm`, `object_namespace`, `chunk_ranges`, then `zero_ranges`.
@@ -432,9 +433,9 @@ representation.
   `chunk_ranges`, and `zero_ranges`, followed by the optional `backing`. RAM
   keeps the 2MiB memory chunk size; disk indexes use 64KiB chunks. Each packed
   digest names a portable `chunks/<hex>` file, and validation requires every
-  logical chunk to be covered exactly once by either range list. A memory
-  index of an earlier kind fails as too old. `backing` is optional local
-  acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
+  logical chunk to be covered exactly once by either range list. A manifest
+  whose memory index has an earlier shape is rejected. `backing` is optional
+  local acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks remain the
   portable verified source of truth; imported and cold spores materialize from
   chunks instead. Product restore paths (`spore attach`, `spore run --from`, and

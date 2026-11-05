@@ -208,20 +208,11 @@ pub const MemoryManifest = struct {
         try jws.endObject();
     }
 
+    /// Parses the encoded fields straight from the token stream so hostile
+    /// input fails at the first unexpected token. Memory indexes of earlier
+    /// kinds have different fields and fail like any other malformed object.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!MemoryManifest {
-        const value = try std.json.Value.jsonParse(allocator, source, options);
-        return jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError!MemoryManifest {
-        // A retired index kind keeps only its kind, so validation reports
-        // FormatTooOld instead of a shape mismatch.
-        if (source == .object) if (source.object.get("kind")) |kind| if (kind == .string) {
-            disk_index.checkKind(kind.string) catch |err| if (err == error.FormatTooOld) {
-                return .{ .kind = kind.string, .logical_size = 0, .chunk_size = 0 };
-            };
-        };
-        const encoded = try std.json.innerParseFromValue(Encoded, allocator, source, options);
+        const encoded = try std.json.innerParse(Encoded, allocator, source, options);
         const decoded = disk_index.decodeChunkRanges(allocator, .{
             .kind = encoded.kind,
             .logical_size = encoded.logical_size,
@@ -3334,25 +3325,42 @@ test "fuzz elastic memory state validation" {
     try std.testing.fuzz({}, fuzzElasticMemoryState, .{});
 }
 
-fn fuzzMemoryManifest(_: void, s: *std.testing.Smith) !void {
-    // Hostile memory manifests must fail closed, never read outside the
-    // chunk store or write outside the target buffer.
-    var ram: [4096]u8 = undefined;
-    var ref_buf: [128]u8 = undefined;
-    const ref_len = s.slice(&ref_buf);
-    var refs = [_]MemoryChunk{.{ .logical_chunk = s.value(u64), .digest = ref_buf[0..ref_len] }};
-    const zero_ranges = [_]disk_index.DiskIndexZeroRange{.{ .start = 0, .count = 3 }};
-    const mm = MemoryManifest{
-        .logical_size = s.value(u64),
-        .chunk_size = s.value(u64),
-        .chunks = &refs,
-        .zero_ranges = &zero_ranges,
+fn fuzzMemoryManifestParse(_: void, s: *std.testing.Smith) !void {
+    // Memory indexes arrive in manifests from bundles and peers. Start near
+    // a valid object so mutations reach range decoding and validation
+    // instead of stopping at the JSON tokenizer.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ram_len = 6 * chunk_size;
+    const seed = MemoryManifest{
+        .logical_size = ram_len,
+        .chunk_size = chunk_size,
+        .chunks = &.{
+            .{ .logical_chunk = 0, .digest = "blake3:" ++ "a" ** 64 },
+            .{ .logical_chunk = 1, .digest = "blake3:" ++ "b" ** 64 },
+            .{ .logical_chunk = 4, .digest = "blake3:" ++ "c" ** 64 },
+        },
+        .zero_ranges = &.{ .{ .start = 2, .count = 2 }, .{ .start = 5, .count = 1 } },
+        .backing = .{ .path = ram_backing_path, .size = ram_len },
     };
-    _ = loadMemory(std.testing.allocator, "/nonexistent-spore", mm, &ram) catch return;
+    const bytes = try std.json.Stringify.valueAlloc(arena, seed, .{ .whitespace = .indent_2 });
+    const mutation_count = s.valueRangeAtMost(u8, 0, 4);
+    for (0..mutation_count) |_| bytes[s.index(bytes.len)] = s.value(u8);
+    const input = bytes[0..s.valueRangeAtMost(u32, 1, @intCast(bytes.len))];
+
+    const parsed = std.json.parseFromSliceLeaky(MemoryManifest, arena, input, .{}) catch return;
+    const plan = validateMemoryForRam(parsed, ram_len) catch return;
+    var zero_chunks: usize = 0;
+    for (parsed.zero_ranges) |range| zero_chunks += @intCast(range.count);
+    try std.testing.expectEqual(plan.chunk_count, parsed.chunks.len + zero_chunks);
+    const encoded = try std.json.Stringify.valueAlloc(arena, parsed, .{ .whitespace = .indent_2 });
+    const reparsed = try std.json.parseFromSliceLeaky(MemoryManifest, arena, encoded, .{});
+    try std.testing.expectEqualStrings(encoded, try std.json.Stringify.valueAlloc(arena, reparsed, .{ .whitespace = .indent_2 }));
 }
 
-test "fuzz memory manifest handling" {
-    try std.testing.fuzz({}, fuzzMemoryManifest, .{});
+test "fuzz memory manifest decoder" {
+    try std.testing.fuzz({}, fuzzMemoryManifestParse, .{});
 }
 
 test "manifest json round-trip" {
@@ -3514,7 +3522,7 @@ test "manifest memory index uses the canonical disk-index encoding" {
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(MemoryManifest, arena, split, .{}));
 }
 
-test "manifest with a retired memory index kind fails as too old" {
+test "manifest with a v1 memory index is rejected" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3535,7 +3543,7 @@ test "manifest with a retired memory index kind fails as too old" {
     for (0..(1 << 29) / chunk_size) |i| try zero_chunks.append(.{ .integer = @intCast(i) });
     try memory.put(arena, "zero_chunks", .{ .array = zero_chunks });
     try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, root, .{ .whitespace = .indent_2 }));
-    try std.testing.expectError(error.FormatTooOld, loadManifest(arena, dir));
+    try std.testing.expectError(error.BadManifest, loadManifest(arena, dir));
 }
 
 test "manifest loaders preserve format-too-old errors" {

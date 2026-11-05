@@ -1161,6 +1161,7 @@ fn gcRootfsCache(
         var storage_it = storage_roots.iterator();
         while (storage_it.next()) |entry| {
             const storage = entry.value_ptr.*;
+            try rooted_indexes.put(storage.index_digest, {});
             const index_path = try rootfs_cas.manifestIndexPath(allocator, options.cache_root, storage.index_digest);
             const bytes = Io.Dir.cwd().readFileAlloc(io, index_path, allocator, .limited(disk_index.max_index_bytes)) catch |err| switch (err) {
                 error.FileNotFound, error.StreamTooLong => return error.BadManifest,
@@ -1168,12 +1169,11 @@ fn gcRootfsCache(
             };
             const descriptor = spore.diskIndexDescriptorForStorage(storage) catch return error.BadManifest;
             const parsed = disk_index.parseDiskIndex(allocator, bytes, descriptor) catch |err| switch (err) {
-                // No reader exists for an index this old, so it roots nothing
-                // and GC reclaims it with the objects only it referenced.
+                // No reader exists for an index this old. Keep the file its
+                // record names so later runs can read it, but root no objects.
                 error.FormatTooOld => continue,
                 else => return error.BadManifest,
             };
-            try rooted_indexes.put(storage.index_digest, {});
             for (parsed.value.chunks) |chunk_entry| {
                 try rooted_objects.put(chunk_entry.digest, {});
             }
@@ -3254,7 +3254,7 @@ test "image import fetches without the cache lock and GC cannot collect what it 
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, root, second_result.rootfs_storage));
 }
 
-test "system cache gc reclaims storage whose index predates v2" {
+test "system cache gc keeps an index that predates v2 but reclaims its objects" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
@@ -3299,14 +3299,18 @@ test "system cache gc reclaims storage whose index predates v2" {
     const current_object_path = try rootfs_cas.manifestObjectPath(allocator, root, current.object_digest);
 
     const dry_run = try gcRootfsCache(allocator, io, .{ .cache_root = root });
-    try std.testing.expectEqual(@as(usize, 1), dry_run.rooted_indexes);
-    try std.testing.expectEqual(@as(usize, 2), dry_run.candidate_count);
+    try std.testing.expectEqual(@as(usize, 2), dry_run.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 1), dry_run.rooted_objects);
+    try std.testing.expectEqual(@as(usize, 1), dry_run.candidate_count);
 
-    _ = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
-    try std.testing.expect(!try fileExists(io, old_index_path));
-    try std.testing.expect(!try fileExists(io, old_object_path));
-    try std.testing.expect(try fileExists(io, current_index_path));
-    try std.testing.expect(try fileExists(io, current_object_path));
+    // The metadata still names the old index, so later runs must succeed too.
+    for (0..2) |_| {
+        _ = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+        try std.testing.expect(try fileExists(io, old_index_path));
+        try std.testing.expect(!try fileExists(io, old_object_path));
+        try std.testing.expect(try fileExists(io, current_index_path));
+        try std.testing.expect(try fileExists(io, current_object_path));
+    }
 }
 
 test "runtime disk lease protects its cache baseline from prune and gc" {
