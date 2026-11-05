@@ -2,11 +2,12 @@
 
 const std = @import("std");
 
+const run = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_stream = @import("spore_stream.zig");
 const vsock = @import("virtio/vsock.zig");
 
-const max_guest_request_len = 8191;
+const max_guest_request_len = run.max_guest_request_len;
 
 pub const RunStdinControl = struct {
     stream: *vsock.HostStream,

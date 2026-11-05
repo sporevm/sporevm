@@ -166,7 +166,7 @@ become reusable authority.
 The public HTTPS single-file form also accepts `--chmod=<octal>`. The operand
 uses the same instruction-start expansion rules as other builder-owned fields,
 must resolve to `0` through `07777`, and enters both the immutable context-disk
-source inode and the ADD input digest. The unchanged strict COPY v4 request
+source inode and the ADD input digest. The unchanged strict COPY request
 then applies that inode through the existing confined guest copy path, so mode
 and `Last-Modified` mtime remain independent. Empty, symbolic, malformed,
 duplicate, and out-of-range modes fail before an ADD request is sent.
@@ -175,7 +175,7 @@ A single unquoted `COPY <<NAME destination` heredoc becomes one immutable
 root-owned `0644` regular file in that same context-disk pipeline. Its bounded
 body expands from the instruction-start ARG/ENV snapshot without consuming
 literal quote bytes, then the builder hashes the exact resolved bytes and the
-delimiter-derived source name before cache lookup. The existing strict COPY v4
+delimiter-derived source name before cache lookup. The existing strict COPY
 request applies the file, so a trailing-slash destination uses `NAME` as the
 basename and ordinary COPY owns destination conflicts and checkpoint cleanup.
 The canonical heredoc source, resolved destination, workdir, environment
@@ -183,7 +183,7 @@ state, parent, and executor identity complete the step key. Quoted or
 tab-chomping delimiters, multiple or mixed heredoc sources, COPY flags on the
 form remain fail-closed.
 
-Context `COPY --parents` uses the same immutable capture and strict COPY v4
+Context `COPY --parents` uses the same immutable capture and strict COPY
 apply path. The host maps each selected file, directory, or glob root to its
 ordered cleaned root-relative destination below the resolved `WORKDIR` target,
 then binds that mapping and the captured bytes and modes into COPY identity.

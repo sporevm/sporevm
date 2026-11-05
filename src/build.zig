@@ -1174,7 +1174,7 @@ fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, i
             .environment = .{ .config = config_env, .effective = env },
             .args = args,
             .arg_overrides = arg_overrides,
-            .workdir = if (runtime.WorkingDir) |dir| if (dir.len == 0) "/" else try allocator.dupe(u8, dir) else "/",
+            .workdir = try baseWorkdir(allocator, runtime.WorkingDir orelse ""),
             .entrypoint = if (runtime.Entrypoint) |entrypoint| try cloneStringList(allocator, entrypoint) else null,
             .cmd = if (runtime.Cmd) |cmd| try cloneStringList(allocator, cmd) else null,
             .user = if (runtime.User) |user| try allocator.dupe(u8, user) else null,
@@ -1656,6 +1656,15 @@ fn resolveCmd(allocator: std.mem.Allocator, cmd: dockerfile.Cmd) ![]const []cons
 
 fn resolveWorkdir(allocator: std.mem.Allocator, current: []const u8, next: []const u8) ![]const u8 {
     return std.fs.path.resolvePosix(allocator, &.{ current, next });
+}
+
+/// BuildKit v0.30.0 applies a base image's WorkingDir as a WORKDIR relative
+/// to itself (system.NormalizeWorkdir), so a relative "app" becomes
+/// "/app/app". Absolute values are kept as-is.
+fn baseWorkdir(allocator: std.mem.Allocator, dir: []const u8) ![]const u8 {
+    if (dir.len == 0) return "/";
+    if (std.fs.path.isAbsolutePosix(dir)) return allocator.dupe(u8, dir);
+    return resolveWorkdir(allocator, try resolveWorkdir(allocator, "/", dir), dir);
 }
 
 fn substituteStateList(allocator: std.mem.Allocator, raw: []const []const u8, state: State, escape: u8) ![]const []const u8 {
@@ -2918,6 +2927,23 @@ test "RUN executor preserves exact argv and effective ENV ARG state" {
     changed.canonical_instruction = "RUN [\"printf\",\"%s|%s\",\"two words\",\"changed\"]";
     const changed_key = try step_cache.stepKey(arena, build_exec.cacheInputForStep(.{}, testStorage().index_digest, test_executor_identity, .{ .run = changed }, .{}));
     try std.testing.expect(!std.mem.eql(u8, original_key, changed_key));
+}
+
+test "relative base image WorkingDir resolves like BuildKit" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { base: []const u8, workdir: []const u8 }{
+        .{ .base = "app", .workdir = "/app/app" },
+        .{ .base = "./srv/app/", .workdir = "/srv/app/srv/app" },
+        .{ .base = "..", .workdir = "/" },
+        .{ .base = "/srv/", .workdir = "/srv/" },
+        .{ .base = "", .workdir = "/" },
+    };
+    for (cases) |case| {
+        const state = try stateFromBase(arena, .{ .config = .{ .WorkingDir = case.base } }, &.{});
+        try std.testing.expectEqualStrings(case.workdir, state.workdir);
+    }
 }
 
 test "stage config inheritance preserves entrypoint cmd user env and workdir" {
