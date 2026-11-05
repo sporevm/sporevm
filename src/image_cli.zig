@@ -170,6 +170,7 @@ test "image archive options require immutable digest and explicit platform" {
 test "json image pack and unpack print their documented result documents" {
     const chunk = @import("chunk.zig");
     const disk_index = @import("disk_index.zig");
+    const local_image = @import("local_image.zig");
     const local_paths = @import("local_paths.zig");
     const rootfs_cas = @import("rootfs_cas.zig");
     const spore = @import("spore.zig");
@@ -223,11 +224,11 @@ test "json image pack and unpack print their documented result documents" {
     const object_path = try rootfs_cas.manifestObjectPath(allocator, producer_cache, object_digest);
     _ = try rootfs_cas.installChunkPath(allocator, io, object_path, object_bytes, object_digest, object_bytes.len);
     try rootfs_cas.markStorageComplete(io, allocator, producer_cache, storage.index_digest);
-    _ = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = "local/cli-json:producer",
+    _ = try local_image.lockAndPublish(io, allocator, producer_cache, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = storage,
+        .storage = storage,
+        .name = "local/cli-json:producer",
     });
 
     var pack_out: Io.Writer.Allocating = .init(allocator);

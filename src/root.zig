@@ -34,6 +34,7 @@ pub const image_archive = @import("image_archive.zig");
 pub const image_cli = @import("image_cli.zig");
 pub const image_manifest = @import("image_manifest.zig");
 pub const lifecycle = @import("lifecycle.zig");
+pub const local_image = @import("local_image.zig");
 pub const local_paths = @import("local_paths.zig");
 pub const memory = @import("memory.zig");
 pub const machine_output = @import("machine_output.zig");
@@ -114,6 +115,7 @@ test {
     testing.refAllDecls(image_cli);
     testing.refAllDecls(image_manifest);
     testing.refAllDecls(lifecycle);
+    testing.refAllDecls(local_image);
     testing.refAllDecls(local_paths);
     testing.refAllDecls(memory);
     testing.refAllDecls(machine_output);

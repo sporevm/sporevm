@@ -22,6 +22,7 @@ const x86_vm = if (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
     @import("x86_64/vm.zig")
 else
     struct {};
+const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
@@ -137,7 +138,6 @@ const approved_x86_kernel_sha256 = [_]u8{
 };
 const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
     @compileError("SporeVM product execution requires an arm64 or amd64 host architecture");
-const max_rootfs_metadata_bytes = 1024 * 1024;
 pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
 
 fn directImagePlatformFor(zig_arch: std.Target.Cpu.Arch) !rootfs_mod.Platform {
@@ -364,13 +364,6 @@ pub const PullPolicy = enum {
         return null;
     }
 };
-
-fn useMutableImageRefCache(policy: PullPolicy) bool {
-    return switch (policy) {
-        .missing, .never => true,
-        .always => false,
-    };
-}
 
 pub const Result = struct {
     schema: []const u8 = "spore.run.result.v1",
@@ -1956,7 +1949,7 @@ pub fn resolveRootfsInputDetailedResult(
     const resolved = if (options.rootfs_path) |path|
         try resolvePathRootfs(init, allocator, path, options.command_name, options.record_artifact)
     else if (options.image_ref) |ref|
-        try resolveImageRootfs(init, allocator, ref, options.command_name, options.pull_policy, options.record_artifact)
+        try resolveImageRootfs(init, allocator, ref, options.command_name, options.pull_policy)
     else
         RootfsInputResolution{ .resolved = .{ .path = null } };
     switch (resolved) {
@@ -2020,68 +2013,7 @@ fn resolvePathRootfsArtifact(
     cache_root: []const u8,
     rootfs_path: []const u8,
 ) !spore.RootfsArtifactRef {
-    if (try trustedExplicitCachedRootfsArtifact(io, allocator, cache_root, rootfs_path)) |artifact| return artifact;
     return rootfs_cache.cacheByDigestPathCopy(io, allocator, cache_root, rootfs_path);
-}
-
-fn trustedExplicitCachedRootfsArtifact(
-    io: Io,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    rootfs_path: []const u8,
-) !?spore.RootfsArtifactRef {
-    const cache_key = directImageCacheRootfsKey(cache_root, rootfs_path) orelse return null;
-    const metadata_file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{cache_key});
-    defer allocator.free(metadata_file_name);
-    const metadata_path = try std.fs.path.join(allocator, &.{ cache_root, metadata_file_name });
-    defer allocator.free(metadata_path);
-
-    const artifact = (try rootfs_mod.cachedImageRootfsArtifact(io, allocator, metadata_path, rootfs_path)) orelse return null;
-    errdefer allocator.free(artifact.digest);
-
-    const trusted_rootfs = spore.Rootfs{
-        .device = .{ .mmio_slot = 1 },
-        .artifact = artifact,
-    };
-    const fd = rootfs_cache.openTrustedFromCache(io, allocator, cache_root, trusted_rootfs) catch |err| switch (err) {
-        error.RootFSDigestCacheMiss => {
-            allocator.free(artifact.digest);
-            return null;
-        },
-        else => |e| return e,
-    };
-    _ = std.c.close(fd);
-    return artifact;
-}
-
-fn directImageCacheRootfsKey(cache_root: []const u8, rootfs_path: []const u8) ?[]const u8 {
-    if (!Io.Dir.path.isAbsolute(rootfs_path)) return null;
-
-    const file_name = directCacheChildName(cache_root, rootfs_path) orelse return null;
-    if (!std.mem.endsWith(u8, file_name, ".ext4")) return null;
-    const cache_key = file_name[0 .. file_name.len - ".ext4".len];
-    if (cache_key.len != Sha256.digest_length * 2) return null;
-    for (cache_key) |c| {
-        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return null;
-    }
-    return cache_key;
-}
-
-fn directCacheChildName(cache_root: []const u8, path: []const u8) ?[]const u8 {
-    if (cache_root.len == 0) return null;
-    if (std.mem.eql(u8, cache_root, std.fs.path.sep_str)) {
-        if (path.len <= cache_root.len) return null;
-        const file_name = path[cache_root.len..];
-        if (std.mem.indexOfScalar(u8, file_name, std.fs.path.sep) != null) return null;
-        return file_name;
-    }
-
-    if (!std.mem.startsWith(u8, path, cache_root)) return null;
-    if (path.len <= cache_root.len + 1) return null;
-    if (path[cache_root.len] != std.fs.path.sep) return null;
-    const file_name = path[cache_root.len + 1 ..];
-    if (std.mem.indexOfScalar(u8, file_name, std.fs.path.sep) != null) return null;
-    return file_name;
 }
 
 fn resolveImageRootfs(
@@ -2090,7 +2022,6 @@ fn resolveImageRootfs(
     image_ref: []const u8,
     command_name: []const u8,
     pull_policy: PullPolicy,
-    record_artifact: bool,
 ) !RootfsInputResolution {
     const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
         error.MissingHome => return .{ .failure = rootfsInputFailure(
@@ -2104,91 +2035,47 @@ fn resolveImageRootfs(
     };
     try ensureDirPath(init.io, cache_root);
 
-    if (rootfs_mod.isLocalImageRef(image_ref)) {
-        const resolved = rootfs_mod.resolveLocalCachedRef(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                .object_not_found,
-                command_name,
-                "spore {s}: local image ref not imported for {s}: {s}",
-                .{ command_name, image_ref, @errorName(err) },
-            ) };
-        };
-        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved) catch |err| {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                .cache_integrity_failed,
-                command_name,
-                "spore {s}: cached rootfs metadata check failed: {s}",
-                .{ command_name, @errorName(err) },
-            ) };
-        }) |path| {
-            return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, true);
-        }
-        if (try resolvedIndexedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, command_name)) |indexed| {
-            return indexed;
-        }
+    const local_ref = rootfs_mod.isLocalImageRef(image_ref);
+    const digest_pinned = if (local_ref) null else try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform);
+    if (!local_ref and digest_pinned == null) rootfs_mod.validateTaggedImageRef(image_ref) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
-            .object_not_found,
+            .usage_invalid_argument,
             command_name,
-            "spore {s}: local image rootfs cache miss for {s}; import an OCI layout with 'spore rootfs import-oci <layout> --ref local/name:tag'",
-            .{ command_name, image_ref },
+            "spore {s}: image resolve failed for {s}: {s}",
+            .{ command_name, image_ref, @errorName(err) },
         ) };
-    }
-
-    const digest_pinned = try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform);
-
-    if (digest_pinned) |resolved| {
-        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved) catch |err| {
+    };
+    // Local names and digests are immutable or never pulled; a registry tag
+    // follows its ref record unless --pull=always asks the registry again.
+    if (local_ref or digest_pinned != null or pull_policy != .always) {
+        const found = local_image.find(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
             return .{ .failure = rootfsInputFailure(
                 allocator,
                 .cache_integrity_failed,
                 command_name,
-                "spore {s}: cached rootfs metadata check failed: {s}",
-                .{ command_name, @errorName(err) },
-            ) };
-        }) |path| {
-            return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, true);
-        }
-        if (try resolvedIndexedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, command_name)) |indexed| {
-            return indexed;
-        }
-    } else {
-        rootfs_mod.validateTaggedImageRef(image_ref) catch |err| {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                .usage_invalid_argument,
-                command_name,
-                "spore {s}: image resolve failed for {s}: {s}",
+                "spore {s}: local image check failed for {s}: {s}",
                 .{ command_name, image_ref, @errorName(err) },
             ) };
         };
-        if (useMutableImageRefCache(pull_policy)) {
-            if (rootfs_mod.cachedImageRefRootfsPath(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
-                return .{ .failure = rootfsInputFailure(
-                    allocator,
-                    .cache_integrity_failed,
-                    command_name,
-                    "spore {s}: cached image ref check failed: {s}",
-                    .{ command_name, @errorName(err) },
-                ) };
-            }) |hit| {
-                return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, hit.resolved, hit.path, command_name, record_artifact, true);
-            }
-        }
-        if (pull_policy == .never) {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                .object_not_found,
-                command_name,
-                "spore {s}: image ref cache miss for {s} with --pull=never",
-                .{ command_name, image_ref },
-            ) };
-        }
+        if (found) |local| return .{ .resolved = try imageRootfsInput(allocator, image_ref, local) };
     }
+    if (local_ref) return .{ .failure = rootfsInputFailure(
+        allocator,
+        .object_not_found,
+        command_name,
+        "spore {s}: local image not found: {s}; build, import or unpack it first",
+        .{ command_name, image_ref },
+    ) };
+    if (digest_pinned == null and pull_policy == .never) return .{ .failure = rootfsInputFailure(
+        allocator,
+        .object_not_found,
+        command_name,
+        "spore {s}: image ref cache miss for {s} with --pull=never",
+        .{ command_name, image_ref },
+    ) };
 
-    const resolved = rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
+    const resolved = digest_pinned orelse rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
             machine_output.fromZigError(err).code,
@@ -2197,30 +2084,8 @@ fn resolveImageRootfs(
             .{ command_name, image_ref, @errorName(err) },
         ) };
     };
-    if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            .cache_integrity_failed,
-            command_name,
-            "spore {s}: cached rootfs metadata check failed: {s}",
-            .{ command_name, @errorName(err) },
-        ) };
-    }) |path| {
-        if (digest_pinned == null) rootfs_mod.writeImageRefCacheRecord(init.io, allocator, cache_root, image_ref, resolved) catch |err| {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                machine_output.fromZigError(err).code,
-                command_name,
-                "spore {s}: image ref cache update failed: {s}",
-                .{ command_name, @errorName(err) },
-            ) };
-        };
-        return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, true);
-    }
-    if (try resolvedIndexedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, command_name)) |indexed| {
-        return indexed;
-    }
-    const path = rootfs_mod.buildCachedImageRootfs(init, allocator, cache_root, resolved) catch |err| {
+    const name = if (digest_pinned == null) image_ref else null;
+    const local = pulledImage(init, allocator, cache_root, resolved, name) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
             machine_output.fromZigError(err).code,
@@ -2229,61 +2094,28 @@ fn resolveImageRootfs(
             .{ command_name, resolved.ref, @errorName(err) },
         ) };
     };
-    if (digest_pinned == null) rootfs_mod.writeImageRefCacheRecord(init.io, allocator, cache_root, image_ref, resolved) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            machine_output.fromZigError(err).code,
-            command_name,
-            "spore {s}: image ref cache update failed: {s}",
-            .{ command_name, @errorName(err) },
-        ) };
-    };
-    return try resolvedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, path, command_name, record_artifact, false);
+    return .{ .resolved = try imageRootfsInput(allocator, image_ref, local) };
 }
 
-fn resolvedImageRootfsInputResult(
+/// The image the current builder converted from `resolved`, pulling it if
+/// this host has none. Points `name` at it.
+fn pulledImage(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
-    requested_ref: []const u8,
     resolved: rootfs_mod.ResolvedImage,
-    rootfs_path: []const u8,
-    command_name: []const u8,
-    record_artifact: bool,
-    storage_prevalidated: bool,
-) !RootfsInputResolution {
-    const input = resolvedImageRootfsInput(init, allocator, cache_root, requested_ref, resolved, rootfs_path, record_artifact, storage_prevalidated) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            machine_output.fromZigError(err).code,
-            command_name,
-            "spore {s}: image rootfs setup failed for {s}: {s}",
-            .{ command_name, requested_ref, @errorName(err) },
-        ) };
-    };
-    return .{ .resolved = input };
-}
-
-fn resolvedIndexedImageRootfsInputResult(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    requested_ref: []const u8,
-    resolved: rootfs_mod.ResolvedImage,
-    command_name: []const u8,
-) !?RootfsInputResolution {
-    var indexed = (try rootfs_mod.cachedImageIndexedRootfs(init.io, allocator, cache_root, resolved)) orelse return null;
-    const input = indexedImageRootfsInput(init, allocator, requested_ref, resolved, &indexed) catch |err| {
-        rootfs_mod.deinitCachedIndexedRootfs(allocator, indexed);
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            machine_output.fromZigError(err).code,
-            command_name,
-            "spore {s}: indexed image rootfs setup failed for {s}: {s}",
-            .{ command_name, requested_ref, @errorName(err) },
-        ) };
-    };
-    return .{ .resolved = input };
+    name: ?[]const u8,
+) !local_image.LocalImage {
+    if (try local_image.find(init.io, allocator, cache_root, resolved.ref, resolved.platform)) |local| {
+        if (name) |tag| {
+            var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
+            defer cache_lock.deinit();
+            _ = try local_image.tag(allocator, cache_root, &cache_lock, tag, resolved.platform, local.identity);
+        }
+        return local;
+    }
+    const published = try rootfs_mod.pullImage(init, allocator, cache_root, resolved, name);
+    return (try local_image.load(init.io, allocator, cache_root, published.identity)) orelse error.RootFSDigestCacheMiss;
 }
 
 fn rootfsInputFailure(
@@ -2317,147 +2149,37 @@ fn rootfsInputError(code: machine_output.ErrorCode) anyerror {
     };
 }
 
-fn indexedImageRootfsInput(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    requested_ref: []const u8,
-    resolved: rootfs_mod.ResolvedImage,
-    indexed: *rootfs_mod.CachedIndexedRootfs,
-) !ResolvedRootfsInput {
-    const run_config = try readCachedImageRunConfig(init.io, allocator, indexed.metadata_path);
-
+fn imageRootfsInput(allocator: std.mem.Allocator, requested_ref: []const u8, local: local_image.LocalImage) !ResolvedRootfsInput {
     const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
-    indexed.storage.device = rootfs_device;
-    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch.name() });
-    const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
-    allocator.free(indexed.metadata_path);
-    indexed.metadata_path = &.{};
+    var storage = local.storage;
+    storage.device = rootfs_device;
+    const resolved_ref = try local_image.resolvedRefAlloc(allocator, requested_ref, local.identity, local.oci);
+    const at = std.mem.lastIndexOfScalar(u8, resolved_ref, '@').?;
+    const runtime = local.config.config;
+    const working_dir = if (runtime) |config| config.WorkingDir else null;
     return .{
         .path = null,
         .rootfs = .{
             .device = rootfs_device,
-            .artifact = indexed.artifact,
-            .storage = indexed.storage,
-            .source = .{
-                .requested_ref = manifest_requested_ref,
-                .resolved_image_ref = resolved.ref,
-                .image_manifest_digest = resolved.manifest_digest,
-                .platform = platform,
-                .builder_version = rootfs_mod.builder_version,
+            .artifact = .{
+                .digest = storage.index_digest,
+                .size = storage.logical_size,
+                .format = spore.rootfs_artifact_format_ext4,
             },
-        },
-        .guest_env = run_config.env,
-        .guest_working_dir = run_config.working_dir,
-        .image_config = run_config.image_config,
-    };
-}
-
-fn resolvedImageRootfsInput(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    requested_ref: []const u8,
-    resolved: rootfs_mod.ResolvedImage,
-    rootfs_path: []const u8,
-    record_artifact: bool,
-    storage_prevalidated: bool,
-) !ResolvedRootfsInput {
-    const metadata_path = try rootfs_mod.cachedImageRootfsMetadataPath(allocator, cache_root, resolved);
-    const run_config = try readCachedImageRunConfig(init.io, allocator, metadata_path);
-    if (!record_artifact) return .{
-        .path = rootfs_path,
-        .guest_env = run_config.env,
-        .guest_working_dir = run_config.working_dir,
-        .image_config = run_config.image_config,
-    };
-    const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
-    const artifact = (try rootfs_mod.cachedImageRootfsArtifact(init.io, allocator, metadata_path, rootfs_path)) orelse return error.BadManifest;
-    errdefer allocator.free(artifact.digest);
-    var storage = (try rootfs_mod.readCachedRootfsStorage(init.io, allocator, metadata_path, artifact)) orelse return error.BadManifest;
-    errdefer rootfs_mod.deinitRootfsStorageDescriptor(allocator, storage);
-    storage.device = rootfs_device;
-    if (!storage_prevalidated and !try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, cache_root, storage)) return error.RootFSDigestCacheMiss;
-    const platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ resolved.platform.os, resolved.platform.arch.name() });
-    const manifest_requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved.ref else requested_ref;
-    return .{
-        .path = rootfs_path,
-        .rootfs = .{
-            .device = rootfs_device,
-            .artifact = artifact,
             .storage = storage,
             .source = .{
-                .requested_ref = manifest_requested_ref,
-                .resolved_image_ref = resolved.ref,
-                .image_manifest_digest = resolved.manifest_digest,
-                .platform = platform,
-                .builder_version = rootfs_mod.builder_version,
+                // A local tag is mutable, so saves record what it resolved to.
+                .requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved_ref else requested_ref,
+                .resolved_image_ref = resolved_ref,
+                .image_manifest_digest = resolved_ref[at + 1 ..],
+                .platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ local.platform.os, local.platform.arch.name() }),
+                .builder_version = if (local.oci) |source| source.builder_version else rootfs_mod.builder_version,
             },
         },
-        .guest_env = run_config.env,
-        .guest_working_dir = run_config.working_dir,
-        .image_config = run_config.image_config,
+        .guest_env = if (runtime) |config| config.Env orelse &.{} else &.{},
+        .guest_working_dir = if (working_dir) |dir| if (dir.len == 0) null else dir else null,
+        .image_config = local.config,
     };
-}
-
-const ImageRunConfig = struct {
-    env: []const []const u8 = &.{},
-    working_dir: ?[]const u8 = null,
-    image_config: ?rootfs_mod.ImageConfig = null,
-};
-
-const CachedImageRunMetadata = struct {
-    config: ?rootfs_mod.ImageConfig = null,
-};
-
-fn readCachedImageRunConfig(io: Io, allocator: std.mem.Allocator, metadata_path: []const u8) !ImageRunConfig {
-    const metadata = Io.Dir.cwd().readFileAlloc(io, metadata_path, allocator, .limited(max_rootfs_metadata_bytes)) catch |err| switch (err) {
-        error.FileNotFound, error.StreamTooLong => return .{},
-        else => |e| return e,
-    };
-    defer allocator.free(metadata);
-    var parsed = std.json.parseFromSlice(CachedImageRunMetadata, allocator, metadata, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    }) catch return .{};
-    defer parsed.deinit();
-
-    const source_config = parsed.value.config orelse return .{};
-    const image_config = try cloneImageConfig(allocator, source_config);
-    const runtime = image_config.config orelse return .{ .image_config = image_config };
-    return .{
-        .env = runtime.Env orelse &.{},
-        .working_dir = if (runtime.WorkingDir) |dir| if (dir.len == 0) null else dir else null,
-        .image_config = image_config,
-    };
-}
-
-fn cloneImageConfig(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig) !rootfs_mod.ImageConfig {
-    return .{
-        .architecture = config.architecture,
-        .os = if (config.os) |value| try allocator.dupe(u8, value) else null,
-        .config = if (config.config) |runtime| .{
-            .Env = if (runtime.Env) |entries| try cloneStringListMutable(allocator, entries) else null,
-            .Entrypoint = if (runtime.Entrypoint) |entries| try cloneStringListMutable(allocator, entries) else null,
-            .Cmd = if (runtime.Cmd) |entries| try cloneStringListMutable(allocator, entries) else null,
-            .WorkingDir = if (runtime.WorkingDir) |value| try allocator.dupe(u8, value) else null,
-            .User = if (runtime.User) |value| try allocator.dupe(u8, value) else null,
-        } else null,
-    };
-}
-
-fn cloneStringListMutable(allocator: std.mem.Allocator, entries: []const []const u8) ![][]const u8 {
-    const cloned = try allocator.alloc([]const u8, entries.len);
-    for (entries, 0..) |entry, i| cloned[i] = try allocator.dupe(u8, entry);
-    return cloned;
-}
-
-fn cloneStringList(allocator: std.mem.Allocator, entries: []const []const u8) ![]const []const u8 {
-    if (entries.len == 0) return &.{};
-    const cloned = try allocator.alloc([]const u8, entries.len);
-    for (entries, 0..) |entry, i| {
-        cloned[i] = try allocator.dupe(u8, entry);
-    }
-    return cloned;
 }
 
 fn ensureDirPath(io: Io, path: []const u8) !void {
@@ -3583,18 +3305,18 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             const control = if (commit_control) |*value| value else return error.RunCommitDidNotComplete;
             const storage = control.storage orelse return error.RunCommitDidNotComplete;
             const cache_lock = if (control.cache_lock) |*lock| lock else return error.RunCommitDidNotComplete;
-            const published = try rootfs_mod.publishIndexedImageLocked(context.io, allocator, control.cache_root, cache_lock, .{
-                .ref = commit.ref,
+            const published = try local_image.publish(context.io, allocator, control.cache_root, cache_lock, .{
                 .platform = commit.platform,
                 .config = commit.config,
-                .rootfs_storage = storage,
+                .storage = storage,
+                .name = commit.ref,
             });
             events.emitImageCommitBestEffort(.{
                 .command = "run",
                 .backend = backend,
                 .ref = commit.ref,
-                .resolved_image_ref = published.resolved_image_ref,
-                .rootfs_index_digest = published.rootfs_storage.index_digest,
+                .resolved_image_ref = published.resolved_ref,
+                .rootfs_index_digest = storage.index_digest,
             });
             result.committed = true;
         }
@@ -4697,7 +4419,7 @@ test "cli env overrides image env by key" {
     try std.testing.expectEqualStrings("CLEAR_ME=", cleared[1]);
 }
 
-test "image rootfs metadata supplies run env and working directory" {
+test "local image supplies run env, working directory and rootfs identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -4709,33 +4431,23 @@ test "image rootfs metadata supplies run env and working directory" {
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, cache_root);
 
-    const resolved = rootfs_mod.ResolvedImage{
-        .ref = "local/buildkite-spore@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .manifest_digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .platform = .{},
-    };
-    const metadata_path = try rootfs_mod.cachedImageRootfsMetadataPath(arena, cache_root, resolved);
-    try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = metadata_path,
-        .data =
-        \\{
-        \\  "config": {
-        \\    "architecture": "arm64",
-        \\    "os": "linux",
-        \\    "config": {
-        \\      "Env": ["GEM_HOME=/usr/local/bundle", "BUNDLE_APP_CONFIG=/usr/local/bundle"],
-        \\      "Entrypoint": ["/usr/bin/env"],
-        \\      "Cmd": ["bundle", "exec"],
-        \\      "WorkingDir": "/app",
-        \\      "User": "1000:1000"
-        \\    }
-        \\  }
-        \\}
-        ,
+    const rootfs_path = tmp ++ "/rootfs.ext4";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
+    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
+    var image_env = [_][]const u8{ "GEM_HOME=/usr/local/bundle", "BUNDLE_APP_CONFIG=/usr/local/bundle" };
+    var entrypoint = [_][]const u8{"/usr/bin/env"};
+    var cmd = [_][]const u8{ "bundle", "exec" };
+    const published = try local_image.lockAndPublish(io, arena, cache_root, .{
+        .platform = direct_image_platform,
+        .config = .{ .config = .{ .Env = &image_env, .Entrypoint = &entrypoint, .Cmd = &cmd, .WorkingDir = "/app", .User = "1000:1000" } },
+        .storage = storage,
+        .name = "local/buildkite-spore:ci",
     });
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
     var process_arena = std.heap.ArenaAllocator.init(allocator);
     defer process_arena.deinit();
     const init = std.process.Init{
@@ -4747,56 +4459,35 @@ test "image rootfs metadata supplies run env and working directory" {
         .preopens = .empty,
     };
 
-    const rootfs_path = tmp ++ "/rootfs.ext4";
-    const input = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, false, false);
+    const result = try resolveRootfsInputDetailedResult(init, arena, .{
+        .rootfs_path = null,
+        .image_ref = "local/buildkite-spore:ci",
+        .command_name = "run",
+        .record_artifact = true,
+    });
+    const input = switch (result) {
+        .resolved => |resolved| resolved,
+        .failure => return error.ExpectedLocalImage,
+    };
     try std.testing.expectEqual(@as(usize, 2), input.guest_env.len);
     try std.testing.expectEqualStrings("GEM_HOME=/usr/local/bundle", input.guest_env[0]);
     try std.testing.expectEqualStrings("BUNDLE_APP_CONFIG=/usr/local/bundle", input.guest_env[1]);
     try std.testing.expectEqualStrings("/app", input.guest_working_dir.?);
-    try std.testing.expectEqual(.arm64, input.image_config.?.architecture.?);
-    try std.testing.expectEqualStrings("linux", input.image_config.?.os.?);
+    try std.testing.expectEqual(direct_image_platform.arch, input.image_config.?.architecture.?);
     try std.testing.expectEqualStrings("/usr/bin/env", input.image_config.?.config.?.Entrypoint.?[0]);
-    try std.testing.expectEqualStrings("bundle", input.image_config.?.config.?.Cmd.?[0]);
     try std.testing.expectEqualStrings("1000:1000", input.image_config.?.config.?.User.?);
 
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
-    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
-    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
-    _ = try rootfs_cache.installTrustedMaterializationByHardlink(io, arena, cache_root, rootfs_path, storage.index_digest, storage.logical_size);
-    const storage_json = try std.json.Stringify.valueAlloc(arena, storage, .{});
-    const rootfs_metadata = try std.fmt.allocPrint(arena,
-        \\{{
-        \\  "rootfs_path": "{s}",
-        \\  "rootfs_size": {d},
-        \\  "rootfs_storage": {s},
-        \\  "config": {{
-        \\    "architecture": "arm64",
-        \\    "os": "linux",
-        \\    "config": {{
-        \\      "Env": ["GEM_HOME=/usr/local/bundle", "BUNDLE_APP_CONFIG=/usr/local/bundle"],
-        \\      "WorkingDir": "/app"
-        \\    }}
-        \\  }}
-        \\}}
-    , .{ rootfs_path, storage.logical_size, storage_json });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = rootfs_metadata });
-    const captured = try resolvedImageRootfsInput(init, arena, cache_root, "local/buildkite-spore:ci", resolved, rootfs_path, true, false);
-    try std.testing.expect(captured.rootfs != null);
-    try std.testing.expect(captured.rootfs.?.storage != null);
-    try std.testing.expectEqualStrings(resolved.ref, captured.rootfs.?.source.?.requested_ref);
-    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, captured.rootfs.?.storage.?));
-
-    const updated_metadata = try Io.Dir.cwd().readFileAlloc(io, metadata_path, arena, .limited(1024 * 1024));
-    try std.testing.expect(std.mem.indexOf(u8, updated_metadata, "\"rootfs_storage\"") != null);
-
-    const digest_path = try rootfs_cache.digestPath(arena, cache_root, captured.rootfs.?.artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, digest_path);
-    try std.testing.expect(!try rootfs_cache.regularFileNoSymlink(io, digest_path));
-    try std.testing.expect(try rootfs_cas.storageComplete(io, arena, cache_root, captured.rootfs.?.storage.?));
+    // A save records what the mutable local tag resolved to.
+    const rootfs = input.rootfs.?;
+    try std.testing.expectEqualStrings(published.resolved_ref, rootfs.source.?.requested_ref);
+    try std.testing.expectEqualStrings(published.resolved_ref, rootfs.source.?.resolved_image_ref);
+    try std.testing.expectEqualStrings(published.identity, rootfs.source.?.image_manifest_digest);
+    try std.testing.expectEqualStrings(storage.index_digest, rootfs.artifact.digest);
+    try std.testing.expectEqualStrings(storage.index_digest, rootfs.storage.?.index_digest);
     try std.testing.expect(rootfsWritable(.{
         .kernel_path = "",
-        .rootfs_path = captured.path,
-        .rootfs = captured.rootfs,
+        .rootfs_path = input.path,
+        .rootfs = input.rootfs,
         .command = &.{"/bin/true"},
     }));
 }
@@ -5512,12 +5203,6 @@ test "run cli parser accepts image pull policy" {
     try std.testing.expectEqual(PullPolicy.never, value_opts.pull_policy);
 }
 
-test "run pull policy routes mutable image ref cache lookups" {
-    try std.testing.expect(useMutableImageRefCache(.missing));
-    try std.testing.expect(!useMutableImageRefCache(.always));
-    try std.testing.expect(useMutableImageRefCache(.never));
-}
-
 test "run pull never fails closed on mutable image ref cache miss" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -5892,99 +5577,6 @@ test "explicit rootfs input can record exact immutable identity" {
     try Io.Dir.cwd().access(io, digest_path, .{ .read = true });
     const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
-}
-
-test "direct image cache rootfs key requires exact cache child shape" {
-    const cache_root = "/tmp/cache";
-    const cache_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    try std.testing.expectEqualStrings(cache_key, directImageCacheRootfsKey(cache_root, "/tmp/cache/" ++ cache_key ++ ".ext4").?);
-    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache-other/" ++ cache_key ++ ".ext4") == null);
-    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache/by-digest/" ++ cache_key ++ ".ext4") == null);
-    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache/0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef.ext4") == null);
-    try std.testing.expect(directImageCacheRootfsKey(cache_root, "/tmp/cache/" ++ cache_key ++ ".raw") == null);
-    try std.testing.expect(directImageCacheRootfsKey(cache_root, "tmp/cache/" ++ cache_key ++ ".ext4") == null);
-}
-
-test "explicit rootfs input falls back when direct image cache metadata has no storage" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const tmp = "zig-cache/test-run-explicit-rootfs-cache-fast-path";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, cache_root);
-    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
-
-    const cache_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_cache_root, cache_key });
-    const metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ absolute_cache_root, cache_key });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, absolute_cache_root, rootfs_path);
-    const metadata = .{
-        .rootfs_path = rootfs_path,
-        .rootfs_size = artifact.size,
-    };
-    const metadata_json = try std.json.Stringify.valueAlloc(arena, metadata, .{});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = metadata_path, .data = metadata_json });
-
-    const result = try resolveRootfsInputDetailedResult(init, arena, .{
-        .rootfs_path = rootfs_path,
-        .image_ref = null,
-        .command_name = "create",
-        .record_artifact = true,
-    });
-    const resolved = switch (result) {
-        .resolved => |resolved| resolved,
-        .failure => return error.ExpectedRootfsRecord,
-    };
-    try std.testing.expectEqualStrings(rootfs_path, resolved.path.?);
-    try std.testing.expect(resolved.rootfs != null);
-    try std.testing.expectEqualStrings(artifact.digest, resolved.rootfs.?.artifact.digest);
-    try std.testing.expectEqual(artifact.size, resolved.rootfs.?.artifact.size);
-
-    const fallback_cache_key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
-    const fallback_rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_cache_root, fallback_cache_key });
-    const fallback_metadata_path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ absolute_cache_root, fallback_cache_key });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = fallback_rootfs_path, .data = "fallback rootfs bytes" });
-    const fallback_metadata = .{
-        .rootfs_path = fallback_rootfs_path,
-        .rootfs_size = @as(u64, "fallback rootfs bytes".len),
-    };
-    const fallback_metadata_json = try std.json.Stringify.valueAlloc(arena, fallback_metadata, .{});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = fallback_metadata_path, .data = fallback_metadata_json });
-    const fallback_expected = try rootfs_cache.hashPath(io, arena, fallback_rootfs_path);
-
-    const fallback_result = try resolveRootfsInputDetailedResult(init, arena, .{
-        .rootfs_path = fallback_rootfs_path,
-        .image_ref = null,
-        .command_name = "create",
-        .record_artifact = true,
-    });
-    const fallback_resolved = switch (fallback_result) {
-        .resolved => |value| value,
-        .failure => return error.ExpectedRootfsRecord,
-    };
-    try std.testing.expect(fallback_resolved.rootfs != null);
-    try std.testing.expectEqualStrings(fallback_expected.digest, fallback_resolved.rootfs.?.artifact.digest);
-    try std.testing.expectEqual(fallback_expected.size, fallback_resolved.rootfs.?.artifact.size);
 }
 
 test "run image cache creates absolute cache directories" {

@@ -124,7 +124,7 @@ packs each into an image archive, and must reproduce the committed canonical
 config, rootfs index, image manifest, native image digest, and complete
 nonzero-object digest set.
 
-The bundle schema is `spore-image-worker-conformance-v3`. It records the
+The bundle schema is `spore-image-worker-conformance-v4`. It records the
 input index, layers, compressed and uncompressed layer digests, and
 selected-manifest digests plus each output file's exact size and SHA-256
 digest. Object bytes are not duplicated in source control; the bundle records

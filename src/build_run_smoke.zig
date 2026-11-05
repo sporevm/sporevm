@@ -10,8 +10,8 @@ const build_mod = spore_internal.build;
 const disk_index = spore_internal.disk_index;
 const ext4 = spore_internal.rootfs_ext4;
 const ext4_writer = spore_internal.rootfs.ext4_writer;
+const local_image = spore_internal.local_image;
 const local_paths = spore_internal.local_paths;
-const rootfs = spore_internal.rootfs;
 const rootfs_cas = spore_internal.rootfs_cas;
 const spore = spore_internal.spore;
 
@@ -114,11 +114,11 @@ pub fn main(init: std.process.Init) !void {
         break :blk try rootfs_cas.preloadPath(io, allocator, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
     } else emitted.preload_result orelse return error.BadManifest;
     const base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
-    _ = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = "local/build-smoke-base:dev",
+    _ = try local_image.lockAndPublish(io, allocator, cache_root, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = base_storage,
+        .storage = base_storage,
+        .name = "local/build-smoke-base:dev",
     });
 
     switch (mode) {
@@ -139,11 +139,11 @@ pub fn main(init: std.process.Init) !void {
     const second_preload = second_emitted.preload_result orelse return error.BadManifest;
     const second_base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, second_preload);
     if (std.mem.eql(u8, base_storage.index_digest, second_base_storage.index_digest)) return error.ExpectedDistinctMultiStageBases;
-    _ = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = "local/build-smoke-base-two:dev",
+    _ = try local_image.lockAndPublish(io, allocator, cache_root, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = second_base_storage,
+        .storage = second_base_storage,
+        .name = "local/build-smoke-base-two:dev",
     });
     const third_emitted = try ext4_writer.emit(allocator, io, third_rootfs_path, &entries, .{
         .image_size = 16 << 20,
@@ -156,11 +156,11 @@ pub fn main(init: std.process.Init) !void {
     const third_preload = third_emitted.preload_result orelse return error.BadManifest;
     const third_base_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, third_preload);
     if (std.mem.eql(u8, second_base_storage.index_digest, third_base_storage.index_digest)) return error.ExpectedDistinctMultiStageBases;
-    _ = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = "local/build-smoke-base-three:dev",
+    _ = try local_image.lockAndPublish(io, allocator, cache_root, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = third_base_storage,
+        .storage = third_base_storage,
+        .name = "local/build-smoke-base-three:dev",
     });
 
     try writeDockerfile(io, dockerfile_path, "step2");
@@ -618,15 +618,15 @@ fn runLaterStageFailureRetrySmoke(
     base_storage: spore.RootfsStorage,
 ) !void {
     const destination = "local/build-smoke-later-failure:dev";
-    _ = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = destination,
+    const seeded = try local_image.lockAndPublish(io, allocator, cache_root, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = base_storage,
+        .storage = base_storage,
+        .name = destination,
     });
-    const destination_ref_path = try rootfs.localRefCachePath(allocator, cache_root, destination, .{});
+    const destination_ref_path = seeded.ref_path.?;
     const ref_before = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
-    const resolved_before = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
+    const resolved_before = (try local_image.lookup(io, allocator, cache_root, destination, .{})) orelse return error.MissingLocalImage;
 
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = dockerfile_path,
@@ -663,12 +663,8 @@ fn runLaterStageFailureRetrySmoke(
     }
     const ref_after_failure = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
     if (!std.mem.eql(u8, ref_before, ref_after_failure)) return error.LaterStageFailureChangedDestinationRef;
-    const resolved_after_failure = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
-    if (!std.mem.eql(u8, resolved_before.ref, resolved_after_failure.ref) or
-        !std.mem.eql(u8, resolved_before.manifest_digest, resolved_after_failure.manifest_digest))
-    {
-        return error.LaterStageFailureChangedDestinationIdentity;
-    }
+    const resolved_after_failure = (try local_image.lookup(io, allocator, cache_root, destination, .{})) orelse return error.MissingLocalImage;
+    if (!std.mem.eql(u8, resolved_before, resolved_after_failure)) return error.LaterStageFailureChangedDestinationIdentity;
     var prefix_before_retry = try findStepRecord(io, allocator, cache_root, "RUN transaction-prefix");
     defer prefix_before_retry.deinit();
     if (try stepRecordsContain(io, allocator, cache_root, "RUN transaction-fail")) return error.LaterStageFailurePublishedRecord;
@@ -901,11 +897,11 @@ fn runShelllessResizeSmoke(
         .cas_seal_workers = 1,
     });
     const preload = emitted.preload_result orelse return error.BadManifest;
-    _ = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = "local/build-smoke-shellless-base:dev",
+    _ = try local_image.lockAndPublish(io, allocator, cache_root, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
+        .storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload),
+        .name = "local/build-smoke-shellless-base:dev",
     });
 
     const payload_path = try std.fs.path.joinZ(allocator, &.{ context_dir, "shellless.bin" });
@@ -1159,9 +1155,9 @@ fn writeLargeRunDockerfile(io: Io, dockerfile_path: []const u8) !void {
 }
 
 const PublicationState = struct {
-    root_metadata_files: usize,
-    root_metadata_digest: [Blake3.digest_length]u8,
-    local_refs: usize,
+    image_records: usize,
+    image_records_digest: [Blake3.digest_length]u8,
+    refs: usize,
     step_records: usize,
     indexes: usize,
     complete_stamps: usize,
@@ -1213,15 +1209,15 @@ fn runEnospcSmoke(
     if (prepare_diagnostic.executor.resize_count != 1) return error.ExpectedOnePreparationResize;
 
     // Seed the destination so failure can prove byte-for-byte ref stability.
-    _ = try rootfs.publishIndexedImage(init, allocator, .{
-        .ref = destination,
+    const seeded = try local_image.lockAndPublish(io, allocator, cache_root, .{
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
-        .rootfs_storage = base_storage,
+        .storage = base_storage,
+        .name = destination,
     });
-    const destination_ref_path = try rootfs.localRefCachePath(allocator, cache_root, destination, .{});
+    const destination_ref_path = seeded.ref_path.?;
     const ref_before = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
-    const resolved_before = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
+    const resolved_before = (try local_image.lookup(io, allocator, cache_root, destination, .{})) orelse return error.MissingLocalImage;
     const publication_before = try publicationState(io, allocator, cache_root);
 
     try writeSingleRunDockerfile(io, dockerfile_path, command);
@@ -1259,9 +1255,8 @@ fn runEnospcSmoke(
 
     const ref_after = try Io.Dir.cwd().readFileAlloc(io, destination_ref_path, allocator, .limited(64 * 1024));
     if (!std.mem.eql(u8, ref_before, ref_after)) return error.EnospcBuildChangedDestinationRef;
-    const resolved_after = try rootfs.resolveLocalCachedRef(io, allocator, cache_root, destination, .{});
-    if (!std.mem.eql(u8, resolved_before.ref, resolved_after.ref) or
-        !std.mem.eql(u8, resolved_before.manifest_digest, resolved_after.manifest_digest)) return error.EnospcBuildChangedDestinationIdentity;
+    const resolved_after = (try local_image.lookup(io, allocator, cache_root, destination, .{})) orelse return error.MissingLocalImage;
+    if (!std.mem.eql(u8, resolved_before, resolved_after)) return error.EnospcBuildChangedDestinationIdentity;
 
     const publication_after = try publicationState(io, allocator, cache_root);
     if (!std.meta.eql(publication_before, publication_after)) {
@@ -1274,8 +1269,8 @@ fn runEnospcSmoke(
     if (try stepRecordsContain(io, allocator, cache_root, command)) return error.EnospcBuildPublishedStepRecord;
 
     std.debug.print(
-        "spore-build-{s}-smoke ok: exit=28 executed_steps=1 resize_count=0 ref={s}\n",
-        .{ @tagName(mode), resolved_after.ref },
+        "spore-build-{s}-smoke ok: exit=28 executed_steps=1 resize_count=0 image={s}\n",
+        .{ @tagName(mode), resolved_after },
     );
 }
 
@@ -1294,11 +1289,11 @@ fn writeSingleRunFromDockerfile(io: Io, path: []const u8, from: []const u8, comm
 }
 
 fn publicationState(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !PublicationState {
-    const root_metadata = try rootMetadataState(io, allocator, cache_root);
+    const image_records = try imageRecordState(io, allocator, try std.fs.path.join(allocator, &.{ cache_root, local_image.images_dir }));
     return .{
-        .root_metadata_files = root_metadata.files,
-        .root_metadata_digest = root_metadata.digest,
-        .local_refs = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "refs", "local" })),
+        .image_records = image_records.files,
+        .image_records_digest = image_records.digest,
+        .refs = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, local_image.refs_dir })),
         .step_records = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "build", "steps" })),
         .indexes = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "cas", "rootfs", "blake3", "indexes" })),
         .complete_stamps = try countFiles(io, try std.fs.path.join(allocator, &.{ cache_root, "cas", "rootfs", "blake3", "complete" })),
@@ -1306,13 +1301,13 @@ fn publicationState(io: Io, allocator: std.mem.Allocator, cache_root: []const u8
     };
 }
 
-const RootMetadataState = struct {
+const ImageRecordState = struct {
     files: usize,
     digest: [Blake3.digest_length]u8,
 };
 
-fn rootMetadataState(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !RootMetadataState {
-    var dir = try Io.Dir.cwd().openDir(io, cache_root, .{ .iterate = true, .follow_symlinks = false });
+fn imageRecordState(io: Io, allocator: std.mem.Allocator, images_path: []const u8) !ImageRecordState {
+    var dir = try Io.Dir.cwd().openDir(io, images_path, .{ .iterate = true, .follow_symlinks = false });
     defer dir.close(io);
 
     var names = std.ArrayList([]const u8).empty;
@@ -1327,7 +1322,7 @@ fn rootMetadataState(io: Io, allocator: std.mem.Allocator, cache_root: []const u
 
     var h = Blake3.init(.{});
     for (names.items) |name| {
-        const path = try std.fs.path.join(allocator, &.{ cache_root, name });
+        const path = try std.fs.path.join(allocator, &.{ images_path, name });
         const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
         hashSmokeField(&h, name);
         hashSmokeField(&h, bytes);

@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ext4 = @import("rootfs/ext4.zig");
 const ext4_writer = @import("rootfs/ext4_writer.zig");
+const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -10,7 +11,6 @@ const spore = @import("spore.zig");
 
 const Io = std.Io;
 
-const max_rootfs_metadata_bytes = 1024 * 1024;
 const min_native_image_size: u64 = 16 << 20;
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
@@ -197,7 +197,7 @@ test "native ext4 writer resolves hardlinks after sorted targets" {
     try runE2fsck(allocator, io, path);
 }
 
-test "imported tar rootfs records native ext4 writer storage" {
+test "imported tar rootfs is a complete local image" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const tmp = "zig-cache/test-rootfs-native-import-tar";
@@ -224,15 +224,11 @@ test "imported tar rootfs records native ext4 writer storage" {
         .input = layer_path,
         .ref = "local/native-default:latest",
     });
-    defer rootfs.deinitImportTarResult(import_allocator, result);
 
     try expectCompleteRootfsStorage(import_allocator, io, cache_root, result.rootfs_storage);
-    const metadata_bytes = try Io.Dir.cwd().readFileAlloc(io, result.metadata_path, allocator, .limited(max_rootfs_metadata_bytes));
-    defer allocator.free(metadata_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"ext4_writer\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"native\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_storage\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_blake3\"") == null);
+    const local = (try local_image.load(io, import_allocator, cache_root, result.image_manifest_digest)).?;
+    try std.testing.expectEqualStrings(result.rootfs_storage.index_digest, local.storage.index_digest);
+    try std.testing.expectEqualStrings(rootfs.builder_version, local.oci.?.builder_version);
 }
 
 test "native ext4 image from a representative tar passes e2fsck and reads back" {
@@ -294,8 +290,7 @@ test "native ext4 image from a representative tar passes e2fsck and reads back" 
         .input = layer_path,
         .ref = "local/native-differential:latest",
     });
-    defer rootfs.deinitImportTarResult(import_allocator, result);
-    const image = result.rootfs_path;
+    const image = try local_image.flatPath(import_allocator, cache_root, result.image_manifest_digest);
     try runE2fsck(allocator, io, image);
 
     const stats = [_]struct { path: []const u8, needles: []const []const u8 }{

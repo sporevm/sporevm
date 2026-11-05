@@ -877,38 +877,39 @@ class BenchmarkRunner:
 
     def copy_rootfs_cache_metadata(self) -> None:
         output_cache_dir = self.run_dir / "rootfs-cache"
-        if self.rootfs_cache_dir == output_cache_dir or not self.rootfs_cache_dir.exists():
+        images_dir = self.rootfs_cache_dir / "images"
+        if self.rootfs_cache_dir == output_cache_dir or not images_dir.exists():
             return
         output_cache_dir.mkdir(parents=True, exist_ok=True)
-        for metadata_path in self.rootfs_cache_dir.glob("*.json"):
-            shutil.copy2(metadata_path, output_cache_dir / metadata_path.name)
+        for record_path in images_dir.glob("*.json"):
+            shutil.copy2(record_path, output_cache_dir / record_path.name)
 
     def image_rootfs_cache_records(self) -> list[dict[str, object]]:
+        # A pinned local ref names the image identity; a pinned registry ref
+        # names the OCI manifest the image was converted from.
+        pinned_digest = self.effective_image.rpartition("@")[2]
         records: list[dict[str, object]] = []
-        for metadata_path in sorted(self.rootfs_cache_dir.glob("*.json")):
-            data = parse_json_file(metadata_path)
+        for record_path in sorted((self.rootfs_cache_dir / "images").glob("*.json")):
+            data = parse_json_file(record_path)
             if not isinstance(data, dict):
                 continue
-            if data.get("resolved_image_ref") != self.effective_image:
+            oci = data.get("oci")
+            source_digest = oci.get("manifest_digest") if isinstance(oci, dict) else None
+            if pinned_digest not in (data.get("identity"), source_digest):
                 continue
-            rootfs_path_raw = data.get("rootfs_path")
-            rootfs_size = data.get("rootfs_size")
-            storage = data.get("rootfs_storage")
-            if not isinstance(rootfs_size, int) or not isinstance(storage, dict):
+            storage = data.get("storage")
+            if not isinstance(storage, dict):
                 continue
+            rootfs_size = storage.get("logical_size")
             index_digest = storage.get("index_digest")
+            if not isinstance(rootfs_size, int):
+                continue
             if not isinstance(index_digest, str) or not index_digest.startswith("blake3:"):
                 continue
-            rootfs_path: Path | None = None
-            if isinstance(rootfs_path_raw, str) and rootfs_path_raw:
-                candidate = Path(rootfs_path_raw)
-                if not candidate.is_absolute():
-                    candidate = (metadata_path.parent / candidate).resolve()
-                if candidate.is_file():
-                    rootfs_path = candidate
+            rootfs_path = record_path.with_suffix(".ext4")
             records.append({
-                "metadata_path": str(metadata_path),
-                "rootfs_path": str(rootfs_path) if rootfs_path is not None else None,
+                "metadata_path": str(record_path),
+                "rootfs_path": str(rootfs_path) if rootfs_path.is_file() else None,
                 "rootfs_size": rootfs_size,
                 "index_digest": index_digest,
                 "flat_path": str(rootfs_digest_cache_path(self.rootfs_cache_dir, index_digest)),
@@ -1788,7 +1789,7 @@ def self_test() -> None:
         assert memory_metrics["chunks_zero_elided"] == 3
         stdout = Path(tmp) / "import.stdout"
         stdout.write_text(
-            "rootfs: /tmp/rootfs.ext4\nmetadata: /tmp/rootfs.json\nref: local/test:fixture\nresolved: local/test:fixture@sha256:abc\nrootfs_identity: blake3:"
+            "metadata: /tmp/rootfs.json\nref: local/test:fixture\nresolved: local/test:fixture@blake3:abc\nrootfs_identity: blake3:"
             + ("a" * 64)
             + "\n",
             encoding="utf-8",
@@ -1838,22 +1839,23 @@ def self_test() -> None:
         assert not is_pinned_image_ref("local/test:latest")
         assert not is_pinned_image_ref("local/test@blake3:abc")
         assert rootfs_digest_cache_path(cache_root, digest) == cache_root / "by-digest" / "blake3" / f"{'a' * 64}.ext4"
-        rootfs_path = cache_root / "image.ext4"
+        images_dir = cache_root / "images"
+        images_dir.mkdir()
+        rootfs_path = images_dir / f"{'c' * 64}.ext4"
         rootfs_path.write_bytes(b"rootfs")
         cache_runner = object.__new__(BenchmarkRunner)
         cache_runner.rootfs_cache_dir = cache_root
         cache_runner.effective_image = "local/test@blake3:" + ("c" * 64)
-        metadata = {
-            "resolved_image_ref": cache_runner.effective_image,
-            "rootfs_path": str(rootfs_path),
-            "rootfs_size": 6,
-            "rootfs_storage": {
+        record = {
+            "identity": "blake3:" + ("c" * 64),
+            "storage": {
                 "index_digest": digest,
+                "logical_size": 6,
             },
         }
-        (cache_root / "image.json").write_text(json.dumps(metadata), encoding="utf-8")
-        unrelated = metadata | {"resolved_image_ref": "local/other@blake3:" + ("d" * 64)}
-        (cache_root / "unrelated.json").write_text(json.dumps(unrelated), encoding="utf-8")
+        (images_dir / f"{'c' * 64}.json").write_text(json.dumps(record), encoding="utf-8")
+        unrelated = record | {"identity": "blake3:" + ("d" * 64)}
+        (images_dir / f"{'d' * 64}.json").write_text(json.dumps(unrelated), encoding="utf-8")
         records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
         assert len(records) == 1
         assert records[0]["index_digest"] == digest
@@ -1868,8 +1870,7 @@ def self_test() -> None:
         assert restored_count == 1
         assert flat_path.read_bytes() == b"rootfs"
         flat_path.unlink()
-        metadata["rootfs_path"] = ""
-        (cache_root / "image.json").write_text(json.dumps(metadata), encoding="utf-8")
+        rootfs_path.unlink()
         records = BenchmarkRunner.image_rootfs_cache_records(cache_runner)
         assert len(records) == 1
         assert records[0]["rootfs_path"] is None

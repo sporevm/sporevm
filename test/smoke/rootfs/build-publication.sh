@@ -135,7 +135,8 @@ mkdir -p \
   "${template_cache}/cas/rootfs/blake3/objects" \
   "${template_cache}/cas/rootfs/blake3/indexes" \
   "${template_cache}/cas/rootfs/blake3/complete" \
-  "${template_cache}/refs/local"
+  "${template_cache}/images" \
+  "${template_cache}/refs"
 
 concurrent_cache="${workdir}/concurrent-cache"
 clone_tree "${template_cache}" "${concurrent_cache}"
@@ -209,16 +210,16 @@ for boundary in object index completeness prepare-record image-metadata mutable-
   before_indexes="$(count_files "${cache}/cas/rootfs/blake3/indexes")"
   before_complete="$(count_files "${cache}/cas/rootfs/blake3/complete")"
   before_steps="$(count_files "${cache}/build/steps")"
-  before_metadata="$(count_root_json "${cache}")"
-  before_refs="$(count_files "${cache}/refs/local")"
+  before_metadata="$(count_root_json "${cache}/images")"
+  before_refs="$(count_files "${cache}/refs")"
 
   case "${boundary}" in
     object) blocked_path="${cache}/cas/rootfs/blake3/objects" ;;
     index) blocked_path="${cache}/cas/rootfs/blake3/indexes" ;;
     completeness) blocked_path="${cache}/cas/rootfs/blake3/complete" ;;
     prepare-record) blocked_path="${cache}/build/steps" ;;
-    image-metadata) blocked_path="${cache}" ;;
-    mutable-ref) blocked_path="${cache}/refs/local" ;;
+    image-metadata) blocked_path="${cache}/images" ;;
+    mutable-ref) blocked_path="${cache}/refs" ;;
     *) die "unknown publication boundary ${boundary}" ;;
   esac
 
@@ -243,8 +244,8 @@ for boundary in object index completeness prepare-record image-metadata mutable-
   after_indexes="$(count_files "${cache}/cas/rootfs/blake3/indexes")"
   after_complete="$(count_files "${cache}/cas/rootfs/blake3/complete")"
   after_steps="$(count_files "${cache}/build/steps")"
-  after_metadata="$(count_root_json "${cache}")"
-  after_refs="$(count_files "${cache}/refs/local")"
+  after_metadata="$(count_root_json "${cache}/images")"
+  after_refs="$(count_files "${cache}/refs")"
   case "${boundary}" in
     object)
       [[ "${after_objects}" == "${before_objects}" ]] || die "object failure published a CAS object"

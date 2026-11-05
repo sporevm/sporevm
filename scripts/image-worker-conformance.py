@@ -18,7 +18,7 @@ import tempfile
 from typing import Any
 
 
-SCHEMA = "spore-image-worker-conformance-v3"
+SCHEMA = "spore-image-worker-conformance-v4"
 TARGETS = ("amd64", "arm64")
 MAX_FIXTURE_FILE_BYTES = 64 * 1024 * 1024
 OCI_RUNTIME_CONFIG = {
@@ -504,20 +504,18 @@ def produce(args: argparse.Namespace) -> None:
             )
             metadata = output_value(imported, "metadata")
             metadata_value = parse_object(read_bounded(pathlib.Path(metadata)), pathlib.Path(metadata))
-            target_contract = {
-                "ext4_writer": metadata_value.get("ext4_writer"),
-                "rootfs_builder": metadata_value.get("builder_version"),
-            }
-            if target_contract["ext4_writer"] != "native" or not isinstance(
-                target_contract["rootfs_builder"], str
-            ):
-                raise ConformanceError("import metadata does not name the native conversion contract")
+            provenance = metadata_value.get("oci")
+            if not isinstance(provenance, dict):
+                raise ConformanceError("import record does not name its OCI source")
+            target_contract = {"rootfs_builder": provenance.get("builder_version")}
+            if not isinstance(target_contract["rootfs_builder"], str):
+                raise ConformanceError("import record does not name the rootfs builder")
             if conversion_contract is None:
                 conversion_contract = target_contract
             elif conversion_contract != target_contract:
                 raise ConformanceError("target imports used different conversion contracts")
-            if metadata_value.get("image_manifest_digest") != input_details["manifests"][arch]:
-                raise ConformanceError(f"import metadata selected the wrong OCI manifest for linux/{arch}")
+            if provenance.get("manifest_digest") != input_details["manifests"][arch]:
+                raise ConformanceError(f"import record selected the wrong OCI manifest for linux/{arch}")
             packed = json.loads(
                 run(
                     [

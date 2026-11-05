@@ -12,10 +12,10 @@ authoritative_cache_state() {
   local cache_root="$1"
   {
     {
-      if [[ -d "${cache_root}" ]]; then
-        find "${cache_root}" -maxdepth 1 -type f -name '*.json' -print
+      if [[ -d "${cache_root}/images" ]]; then
+        find "${cache_root}/images" -maxdepth 1 -type f -name '*.json' -print
       fi
-      for rel in refs/local build/steps cas/rootfs/blake3/indexes cas/rootfs/blake3/objects cas/rootfs/blake3/complete; do
+      for rel in refs build/steps cas/rootfs/blake3/indexes cas/rootfs/blake3/objects cas/rootfs/blake3/complete; do
         if [[ -d "${cache_root}/${rel}" ]]; then
           find "${cache_root}/${rel}" -type f -print
         fi

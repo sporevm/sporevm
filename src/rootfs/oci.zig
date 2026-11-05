@@ -63,7 +63,7 @@ const ImageName = struct {
     repository: []const u8,
 };
 
-fn parseImageName(name: []const u8) !ImageName {
+pub fn parseImageName(name: []const u8) !ImageName {
     const slash = std.mem.indexOfScalar(u8, name, '/') orelse return error.ImageRefNeedsRegistry;
     const registry = name[0..slash];
     const repository = name[slash + 1 ..];
