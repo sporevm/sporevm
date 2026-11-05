@@ -145,9 +145,6 @@ const BuildEnvironment = struct {
 };
 
 const State = struct {
-    storage: spore.RootfsStorage,
-    disk_grow_target: u64 = 0,
-    producer: ?build_exec.Producer = null,
     environment: BuildEnvironment,
     args: std.array_list.Managed(ArgValue),
     // ARG values participate in effective build state according to instruction
@@ -161,17 +158,29 @@ const State = struct {
     cmd_set: bool = false,
 };
 
-const StageArtifact = struct {
-    storage: spore.RootfsStorage,
+/// A Dockerfile step with every variable resolved. Execution binds only the
+/// COPY --from input disk and the fetched remote ADD bytes.
+const PlannedStep = union(enum) {
+    run: build_exec.RunStep,
+    workdir: build_exec.WorkdirStep,
+    context_copy: instruction_transition.InstructionTransition.ContextCopy,
+    heredoc_copy: instruction_transition.InstructionTransition.HeredocCopy,
+    build_input_copy: instruction_transition.BuildInputCopy,
+    add: remote_add.Input,
+};
+
+/// A reachable stage's planned steps plus the config and ARG state that
+/// dependent stages inherit.
+const StagePlan = struct {
+    steps: []const PlannedStep = &.{},
     config: rootfs_mod.ImageConfig,
     args: []const ArgValue = &.{},
     arg_overrides: []const ArgValue = &.{},
 };
 
-const MetadataArtifact = struct {
-    config: rootfs_mod.ImageConfig,
-    args: []const ArgValue = &.{},
-    arg_overrides: []const ArgValue = &.{},
+const StagePlans = struct {
+    stages: []const ?StagePlan,
+    remote_adds: []const remote_add.Input,
 };
 
 const StageCopyBinding = struct {
@@ -244,8 +253,6 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     }
     try preflightBuildDeviceEnvelope(allocator, plan, diagnostic);
     var remote_add_count: u64 = 0;
-    var has_context_binds = false;
-    var has_cache_mounts = false;
     for (plan.order) |stage_index| for (plan.stages[stage_index].source.instructions) |instruction| switch (instruction.value) {
         .add => {
             remote_add_count += 1;
@@ -255,10 +262,6 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
                 diagnostic.actual = remote_add_count;
                 return error.RemoteAddCountExceeded;
             }
-        },
-        .run => |run| {
-            has_context_binds = has_context_binds or run.context_bind_mounts.len != 0;
-            has_cache_mounts = has_cache_mounts or run.cache_mounts.len != 0;
         },
         else => {},
     };
@@ -285,14 +288,11 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     defer if (cache_lock) |*lock| lock.deinit();
 
     // Resolve reachable external inputs before taking the coarse cache lock;
-    // imports may take the same lock internally.
+    // imports may take the same lock internally. Base image config feeds the
+    // ARG/ENV state, so bases resolve before planning; COPY --from images
+    // only bind input disks, so they wait until the plan is valid.
     const resolved_bases = try allocator.alloc(?Base, plan.stages.len);
     @memset(resolved_bases, null);
-    const resolved_copy_bases = try allocator.alloc([]?Base, plan.stages.len);
-    for (plan.stages, 0..) |stage, stage_index| {
-        resolved_copy_bases[stage_index] = try allocator.alloc(?Base, stage.copies.len);
-        @memset(resolved_copy_bases[stage_index], null);
-    }
     for (plan.order) |stage_index| switch (plan.stages[stage_index].base) {
         .external => |source| resolved_bases[stage_index] = resolveBase(init, allocator, options, source) catch |err| switch (err) {
             error.FileNotFound => {
@@ -303,6 +303,12 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         },
         else => {},
     };
+    const stage_plans = try planStages(init.io, allocator, options, diagnostic, ctx, plan, global_args.items, resolved_bases);
+    const resolved_copy_bases = try allocator.alloc([]?Base, plan.stages.len);
+    for (plan.stages, 0..) |stage, stage_index| {
+        resolved_copy_bases[stage_index] = try allocator.alloc(?Base, stage.copies.len);
+        @memset(resolved_copy_bases[stage_index], null);
+    }
     for (plan.order) |stage_index| {
         for (plan.stages[stage_index].copies, 0..) |copy, copy_index| switch (copy.source) {
             .external => |source| resolved_copy_bases[stage_index][copy_index] = resolveBase(init, allocator, options, source) catch |err| switch (err) {
@@ -315,17 +321,7 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
             else => {},
         };
     }
-    const remote_add_inputs = if (remote_add_count == 0 and !has_context_binds and !has_cache_mounts)
-        &.{}
-    else
-        preflightBuildPlan(init.io, allocator, options, diagnostic, ctx, plan, global_args.items, resolved_bases) catch |err| switch (err) {
-            error.VariableExpansionTooLarge => {
-                diagnostic.dockerfile = .{ .line = diagnostic.instruction_line, .message = "expanded Dockerfile argument is too large" };
-                return error.DockerfilePlanFailed;
-            },
-            else => |other| return other,
-        };
-    var remote_add_batch = try remote_add.prepare(init.io, allocator, cache_root, remote_add_inputs, options.timeout_ms, .{
+    var remote_add_batch = try remote_add.prepare(init.io, allocator, cache_root, stage_plans.remote_adds, options.timeout_ms, .{
         .instruction_line = &diagnostic.instruction_line,
         .limit = &diagnostic.limit,
         .actual = &diagnostic.actual,
@@ -361,36 +357,25 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         };
     }
 
-    const artifacts = try allocator.alloc(?StageArtifact, plan.stages.len);
-    @memset(artifacts, null);
-    var shared_producer: ?build_exec.Producer = null;
+    const storages = try allocator.alloc(?spore.RootfsStorage, plan.stages.len);
+    @memset(storages, null);
+    var producer: ?build_exec.Producer = null;
     var any_exec_step = false;
     for (plan.order) |stage_index| {
         const planned_stage = plan.stages[stage_index];
-        const base_artifact: StageArtifact = switch (planned_stage.base) {
-            .external => blk: {
-                const base = resolved_bases[stage_index] orelse return error.BadManifest;
-                break :blk .{ .storage = base.storage, .config = base.config };
-            },
-            .stage => |dependency| artifacts[dependency] orelse return error.BadManifest,
-            .scratch => try scratchArtifact(init, allocator, cache_root, options.platform, &diagnostic.scratch),
+        const stage_plan = stage_plans.stages[stage_index] orelse return error.BadManifest;
+        const base_storage = switch (planned_stage.base) {
+            .external => (resolved_bases[stage_index] orelse return error.BadManifest).storage,
+            .stage => |dependency| storages[dependency] orelse return error.BadManifest,
+            .scratch => try scratchStorage(init, allocator, cache_root, options.platform, &diagnostic.scratch),
         };
-        var state = try stateFromBase(allocator, base_artifact.config, base_artifact.storage, base_artifact.args, try buildDiskGrowTarget(base_artifact.storage));
-        for (base_artifact.arg_overrides) |arg| try putArg(allocator, &state.arg_overrides, arg.key, arg.value);
-        state.producer = shared_producer;
-        const stage_inputs = try prepareStageInputs(allocator, diagnostic, planned_stage, artifacts, resolved_copy_bases[stage_index]);
-        const built = try buildStage(init, allocator, options, diagnostic, ctx, &stat_cache, global_args.items, stage_index, planned_stage.source.instructions, stage_inputs, state, if (remote_add_batch) |batch| batch.items else &.{}, build_cache_lock);
-        state = built.state;
-        if (shared_producer == null) shared_producer = state.producer;
+        const stage_inputs = try prepareStageInputs(allocator, diagnostic, planned_stage, storages, resolved_copy_bases[stage_index]);
+        const built = try buildStage(init, allocator, options, diagnostic, ctx, &stat_cache, stage_plan.steps, stage_inputs, if (remote_add_batch) |batch| batch.items else &.{}, base_storage, &producer, build_cache_lock);
         any_exec_step = any_exec_step or built.has_exec_step;
-        artifacts[stage_index] = .{
-            .storage = try spore.cloneRootfsStorage(allocator, state.storage),
-            .config = try imageConfig(allocator, options.platform, state),
-            .args = try cloneArgs(allocator, state.args.items),
-            .arg_overrides = try cloneArgs(allocator, state.arg_overrides.items),
-        };
+        storages[stage_index] = try spore.cloneRootfsStorage(allocator, built.storage);
     }
-    const final_artifact = artifacts[plan.target_index] orelse return error.BadManifest;
+    const final_storage = storages[plan.target_index] orelse return error.BadManifest;
+    const final_plan = stage_plans.stages[plan.target_index] orelse return error.BadManifest;
     if (comptime builtin.is_test) if (testing.before_final_publish_barrier) |barrier| barrier.pause(init.io);
     // Keep the exclusive cache lock through local-ref publication so every
     // PREPARE/step root and its destination ref become reachable in one GC
@@ -398,8 +383,8 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
     const publish = try rootfs_mod.publishIndexedImageWithCacheLockHeld(init.io, allocator, cache_root, .{
         .ref = options.tag,
         .platform = options.platform,
-        .config = final_artifact.config,
-        .rootfs_storage = final_artifact.storage,
+        .config = final_plan.config,
+        .rootfs_storage = final_storage,
     });
     if (any_exec_step) {
         std.log.info(
@@ -548,7 +533,7 @@ test "device preflight counts one aggregate cache after id aliases and state cha
 }
 
 const BuiltStage = struct {
-    state: State,
+    storage: spore.RootfsStorage,
     has_exec_step: bool,
 };
 
@@ -556,7 +541,7 @@ fn prepareStageInputs(
     allocator: std.mem.Allocator,
     diagnostic: *Diagnostic,
     planned_stage: build_plan.Stage,
-    artifacts: []const ?StageArtifact,
+    stage_storages: []const ?spore.RootfsStorage,
     resolved_copies: []const ?Base,
 ) !StageInputs {
     var bindings = std.array_list.Managed(StageCopyBinding).init(allocator);
@@ -564,7 +549,7 @@ fn prepareStageInputs(
     for (planned_stage.copies, 0..) |copy, copy_index| {
         const storage = switch (copy.source) {
             .context => continue,
-            .stage => |stage_index| (artifacts[stage_index] orelse return error.BadManifest).storage,
+            .stage => |stage_index| stage_storages[stage_index] orelse return error.BadManifest,
             .external => (resolved_copies[copy_index] orelse return error.BadManifest).storage,
         };
         var input_index: ?usize = null;
@@ -595,7 +580,12 @@ fn prepareStageInputs(
     return .{ .bindings = try bindings.toOwnedSlice(), .rootfs = input_rootfs };
 }
 
-fn preflightBuildPlan(
+/// Runs the ARG/ENV machine over every reachable stage and runs every check
+/// that does not depend on stage results; the input-disk limit still needs
+/// stage rootfs digests and is checked at execution. This happens before
+/// COPY --from images or remote ADD bytes are fetched, before the cache lock,
+/// and before any guest boots.
+fn planStages(
     io: Io,
     allocator: std.mem.Allocator,
     options: Options,
@@ -604,132 +594,116 @@ fn preflightBuildPlan(
     plan: build_plan.Plan,
     global_args: []const ArgValue,
     resolved_bases: []const ?Base,
-) ![]const remote_add.Input {
-    const artifacts = try allocator.alloc(?MetadataArtifact, plan.stages.len);
-    @memset(artifacts, null);
-    var inputs = std.array_list.Managed(remote_add.Input).init(allocator);
+) !StagePlans {
+    const stages = try allocator.alloc(?StagePlan, plan.stages.len);
+    @memset(stages, null);
+    var remote_adds = std.array_list.Managed(remote_add.Input).init(allocator);
 
     for (plan.order) |stage_index| {
         const planned_stage = plan.stages[stage_index];
-        const base: MetadataArtifact = switch (planned_stage.base) {
-            .external => blk: {
-                const resolved = resolved_bases[stage_index] orelse return error.BadManifest;
-                break :blk .{ .config = resolved.config };
-            },
-            .stage => |dependency| artifacts[dependency] orelse return error.BadManifest,
+        const base: StagePlan = switch (planned_stage.base) {
+            .external => .{ .config = (resolved_bases[stage_index] orelse return error.BadManifest).config },
+            .stage => |dependency| stages[dependency] orelse return error.BadManifest,
             .scratch => .{ .config = .{ .architecture = options.platform.arch, .os = options.platform.os, .config = .{} } },
         };
-        var state = try stateFromBase(allocator, base.config, metadataOnlyStorage(), base.args, 0);
+        var state = try stateFromBase(allocator, base.config, base.args);
         for (base.arg_overrides) |arg| try putArg(allocator, &state.arg_overrides, arg.key, arg.value);
         var stage_cache_mounts = std.array_list.Managed(build_cache_mount.Mount).init(allocator);
+        var steps = std.array_list.Managed(PlannedStep).init(allocator);
 
         for (planned_stage.source.instructions, 0..) |instruction, instruction_index| {
-            const metadata = applyMetadataInstruction(allocator, options, global_args, &state, instruction) catch |err| switch (err) {
+            const planned = planInstruction(io, allocator, options, diagnostic, ctx, global_args, &state, &stage_cache_mounts, stage_index, instruction_index, instruction) catch |err| switch (err) {
                 error.VariableExpansionTooLarge => {
                     diagnostic.dockerfile = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
                     return error.DockerfilePlanFailed;
                 },
                 else => |other| return other,
             };
-            if (metadata) continue;
-            if (!image.isRootUser(state.user)) {
-                diagnostic.instruction_line = instruction.line;
-                return error.UnsupportedBuildUser;
-            }
-            diagnostic.instruction_line = instruction.line;
-            switch (instruction.value) {
-                .run => |run| {
-                    const step = try runStep(allocator, diagnostic, state, instruction, run, options);
-                    try stage_cache_mounts.appendSlice(step.cache_mounts);
-                    build_cache_mount.validateCompatible(stage_cache_mounts.items) catch |err| {
-                        diagnostic.instruction_line = instruction.line;
-                        return err;
-                    };
-                    var transition_diagnostic = transitionDiagnostics(diagnostic);
-                    try instruction_transition.preflightContextBindRun(
-                        io,
-                        allocator,
-                        ctx,
-                        &transition_diagnostic,
-                        step,
-                        runResources(options).nofile,
-                    );
-                },
-                .copy => |copy| {
-                    if (copy.heredoc) |heredoc| {
-                        const transition = try heredocCopyTransition(allocator, state, instruction, copy, heredoc);
-                        try instruction_transition.preflightHeredocCopy(allocator, transition);
-                    } else if (copy.from != null) {
-                        const resolved_sources = try substituteStateList(allocator, copy.sources, state, instruction.escape);
-                        const resolved_dest = try substituteState(allocator, copy.dest, state, instruction.escape);
-                        _ = instruction_transition.buildInputCopy(
-                            allocator,
-                            instruction.line,
-                            instruction.raw,
-                            resolved_sources,
-                            resolved_dest,
-                            try effectiveEnvDigest(allocator, state),
-                            state.workdir,
-                            copy.link orelse false,
-                            0,
-                            metadataOnlyStorage(),
-                        ) catch |err| {
-                            diagnostic.instruction_line = instruction.line;
-                            return err;
-                        };
-                    } else {
-                        const resolved_sources = try substituteStateList(allocator, copy.sources, state, instruction.escape);
-                        const resolved_dest = try substituteState(allocator, copy.dest, state, instruction.escape);
-                        var transition_diagnostic = transitionDiagnostics(diagnostic);
-                        try instruction_transition.preflightContextCopy(
-                            io,
-                            allocator,
-                            ctx,
-                            &transition_diagnostic,
-                            instruction.line,
-                            resolved_sources,
-                            resolved_dest,
-                            state.workdir,
-                            copy.parents orelse false,
-                        );
-                    }
-                },
-                .add => try inputs.append(resolveRemoteAddInput(allocator, diagnostic, state, instruction, stage_index, instruction_index) catch |err| switch (err) {
-                    error.VariableExpansionTooLarge => {
-                        diagnostic.dockerfile = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
-                        return error.DockerfilePlanFailed;
-                    },
-                    else => |other| return other,
-                }),
-                .workdir => |raw| {
-                    const step = try workdirStep(allocator, state, instruction, raw);
-                    try build_exec.validateWorkdirTarget(step.target);
-                    state.workdir = step.target;
-                },
-                .from, .env, .arg, .cmd, .entrypoint => unreachable,
-            }
+            const step = planned orelse continue;
+            if (step == .add) try remote_adds.append(step.add);
+            try steps.append(step);
         }
-        artifacts[stage_index] = .{
+        stages[stage_index] = .{
+            .steps = try steps.toOwnedSlice(),
             .config = try imageConfig(allocator, options.platform, state),
             .args = try cloneArgs(allocator, state.args.items),
             .arg_overrides = try cloneArgs(allocator, state.arg_overrides.items),
         };
     }
     diagnostic.instruction_line = 0;
-    return inputs.toOwnedSlice();
+    return .{ .stages = stages, .remote_adds = try remote_adds.toOwnedSlice() };
 }
 
-fn metadataOnlyStorage() spore.RootfsStorage {
-    return .{
-        .kind = spore.rootfs_storage_kind_chunked_ext4,
-        .device = .{ .mmio_slot = 1 },
-        .logical_size = spore.disk_chunk_size,
-        .chunk_size = spore.disk_chunk_size,
-        .hash_algorithm = "blake3",
-        .index_digest = "blake3:0000000000000000000000000000000000000000000000000000000000000000",
-        .base_identity = "blake3:0000000000000000000000000000000000000000000000000000000000000000",
-        .object_namespace = "rootfs/blake3",
-    };
+/// Applies one instruction to the stage state and returns the step it plans,
+/// or null when the instruction only changes metadata.
+fn planInstruction(
+    io: Io,
+    allocator: std.mem.Allocator,
+    options: Options,
+    diagnostic: *Diagnostic,
+    ctx: build_context.BuildContext,
+    global_args: []const ArgValue,
+    state: *State,
+    stage_cache_mounts: *std.array_list.Managed(build_cache_mount.Mount),
+    stage_index: usize,
+    instruction_index: usize,
+    instruction: dockerfile.Instruction,
+) !?PlannedStep {
+    if (try applyMetadataInstruction(allocator, options, global_args, state, instruction)) return null;
+    diagnostic.instruction_line = instruction.line;
+    if (!image.isRootUser(state.user)) return error.UnsupportedBuildUser;
+    var transition_diagnostic = transitionDiagnostics(diagnostic);
+    switch (instruction.value) {
+        .run => |run| {
+            const step = try runStep(allocator, diagnostic, state.*, instruction, run, options);
+            try stage_cache_mounts.appendSlice(step.cache_mounts);
+            try build_cache_mount.validateCompatible(stage_cache_mounts.items);
+            try instruction_transition.preflightContextBindRun(io, allocator, ctx, &transition_diagnostic, step, runResources(options).nofile);
+            return .{ .run = step };
+        },
+        .copy => |copy| {
+            if (copy.heredoc) |heredoc| {
+                const transition = try heredocCopyTransition(allocator, state.*, instruction, copy, heredoc);
+                try instruction_transition.preflightHeredocCopy(allocator, transition);
+                return .{ .heredoc_copy = transition };
+            }
+            const resolved_sources = try substituteStateList(allocator, copy.sources, state.*, instruction.escape);
+            const resolved_dest = try substituteState(allocator, copy.dest, state.*, instruction.escape);
+            const env_digest = try effectiveEnvDigest(allocator, state.*);
+            if (copy.from != null) return .{ .build_input_copy = try instruction_transition.planBuildInputCopy(
+                allocator,
+                instruction_index,
+                instruction.line,
+                instruction.raw,
+                resolved_sources,
+                resolved_dest,
+                env_digest,
+                state.workdir,
+                copy.link orelse false,
+            ) };
+            return .{ .context_copy = try instruction_transition.planContextCopy(
+                io,
+                allocator,
+                ctx,
+                &transition_diagnostic,
+                instruction.line,
+                instruction.raw,
+                resolved_sources,
+                resolved_dest,
+                copy.parents orelse false,
+                env_digest,
+                state.workdir,
+            ) };
+        },
+        .add => return .{ .add = try resolveRemoteAddInput(allocator, diagnostic, state.*, instruction, stage_index, instruction_index) },
+        .workdir => |raw| {
+            const step = try workdirStep(allocator, state.*, instruction, raw);
+            try build_exec.validateWorkdirTarget(step.target);
+            state.workdir = step.target;
+            return .{ .workdir = step };
+        },
+        .from, .env, .arg, .cmd, .entrypoint => unreachable,
+    }
 }
 
 fn buildStage(
@@ -739,47 +713,40 @@ fn buildStage(
     diagnostic: *Diagnostic,
     ctx: build_context.BuildContext,
     stat_cache: *build_context.StatCache,
-    global_args: []const ArgValue,
-    stage_index: usize,
-    instructions: []const dockerfile.Instruction,
+    steps: []const PlannedStep,
     stage_inputs: StageInputs,
-    initial_state: State,
     prepared_remote_adds: []const remote_add.Prepared,
+    base_storage: spore.RootfsStorage,
+    producer: *?build_exec.Producer,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !BuiltStage {
-    var state = initial_state;
-    var transitions = std.array_list.Managed(instruction_transition.InstructionTransition).init(allocator);
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    for (instructions, 0..) |instruction, index| {
-        if (try instructionTransition(allocator, options, diagnostic, global_args, stage_inputs, stage_index, prepared_remote_adds, &state, instruction, index)) |transition| {
-            try transitions.append(transition);
-        }
-    }
-    if (transitions.items.len == 0) return .{ .state = state, .has_exec_step = false };
+    const disk_grow_target = try buildDiskGrowTarget(base_storage);
+    if (steps.len == 0) return .{ .storage = base_storage, .has_exec_step = false };
+    const transitions = try allocator.alloc(instruction_transition.InstructionTransition, steps.len);
+    for (steps, transitions) |step, *transition| transition.* = try bindStep(allocator, step, stage_inputs, prepared_remote_adds);
 
-    const pending_preparation = try ensurePrepared(init, allocator, options.platform, cache_root, &state, &diagnostic.executor);
-    const producer = state.producer orelse return error.BadManifest;
+    var storage = base_storage;
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
+    const pending_preparation = try ensurePrepared(init, allocator, options.platform, cache_root, &storage, disk_grow_target, producer, &diagnostic.executor);
+    const stage_producer = producer.* orelse return error.BadManifest;
     var transition_diagnostic = transitionDiagnostics(diagnostic);
     const miss = if (pending_preparation != null)
-        instruction_transition.CacheWalkResult.Miss{ .transition_index = 0, .storage = state.storage }
+        instruction_transition.CacheWalkResult.Miss{ .transition_index = 0, .storage = storage }
     else switch (try instruction_transition.walkCache(
         init.io,
         allocator,
         cache_root,
         options.platform,
-        producer.identity,
+        stage_producer.identity,
         runResources(options),
         options.no_cache,
         ctx,
         stat_cache,
         &transition_diagnostic,
-        state.storage,
-        transitions.items,
+        storage,
+        transitions,
     )) {
-        .complete => |storage| {
-            state.storage = storage;
-            return .{ .state = state, .has_exec_step = true };
-        },
+        .complete => |complete| return .{ .storage = complete, .has_exec_step = true },
         .miss => |value| value,
     };
 
@@ -790,17 +757,17 @@ fn buildStage(
         ctx,
         stat_cache,
         &transition_diagnostic,
-        transitions.items[miss.transition_index..],
+        transitions[miss.transition_index..],
     );
     const previous_executor = diagnostic.executor;
-    state.storage = build_exec.runSession(init, allocator, .{
+    storage = build_exec.runSession(init, allocator, .{
         .platform = options.platform,
         .cache_root = cache_root,
         .base_storage = miss.storage,
         .steps = lowered.steps,
         .rootfs_cache_lock = rootfs_cache_lock,
         .preparation = pending_preparation,
-        .producer = producer,
+        .producer = stage_producer,
         .context_disk_path = lowered.context_disk_path,
         .build_input_rootfs = stage_inputs.rootfs,
         .resources = runResources(options),
@@ -813,94 +780,25 @@ fn buildStage(
         return err;
     };
     accumulateExecutorDiagnostic(&diagnostic.executor, previous_executor);
-    return .{ .state = state, .has_exec_step = true };
+    return .{ .storage = storage, .has_exec_step = true };
 }
 
-fn instructionTransition(
+fn bindStep(
     allocator: std.mem.Allocator,
-    options: Options,
-    diagnostic: *Diagnostic,
-    global_args: []const ArgValue,
+    step: PlannedStep,
     stage_inputs: StageInputs,
-    stage_index: usize,
     prepared_remote_adds: []const remote_add.Prepared,
-    state: *State,
-    instruction: dockerfile.Instruction,
-    instruction_index: usize,
-) !?instruction_transition.InstructionTransition {
-    return instructionTransitionResolved(allocator, options, diagnostic, global_args, stage_inputs, stage_index, prepared_remote_adds, state, instruction, instruction_index) catch |err| switch (err) {
-        error.VariableExpansionTooLarge => {
-            diagnostic.dockerfile = .{ .line = instruction.line, .message = "expanded Dockerfile argument is too large" };
-            return error.DockerfilePlanFailed;
+) !instruction_transition.InstructionTransition {
+    return switch (step) {
+        .run => |run| .{ .run = run },
+        .workdir => |workdir| .{ .workdir = workdir },
+        .context_copy => |copy| .{ .copy = .{ .context = copy } },
+        .heredoc_copy => |copy| .{ .copy = .{ .heredoc = copy } },
+        .build_input_copy => |copy| blk: {
+            const binding = findStageCopyBinding(stage_inputs.bindings, copy.instruction_index) orelse return error.BadManifest;
+            break :blk .{ .copy = .{ .build_input = try instruction_transition.bindBuildInputCopy(allocator, copy, binding.input_index, binding.storage) } };
         },
-        else => |other| return other,
-    };
-}
-
-fn instructionTransitionResolved(
-    allocator: std.mem.Allocator,
-    options: Options,
-    diagnostic: *Diagnostic,
-    global_args: []const ArgValue,
-    stage_inputs: StageInputs,
-    stage_index: usize,
-    prepared_remote_adds: []const remote_add.Prepared,
-    state: *State,
-    instruction: dockerfile.Instruction,
-    instruction_index: usize,
-) !?instruction_transition.InstructionTransition {
-    if (try applyMetadataInstruction(allocator, options, global_args, state, instruction)) return null;
-    if (!image.isRootUser(state.user)) {
-        diagnostic.instruction_line = instruction.line;
-        return error.UnsupportedBuildUser;
-    }
-    return switch (instruction.value) {
-        .run => |run| .{ .run = try runStep(allocator, diagnostic, state.*, instruction, run, options) },
-        .copy => |copy| if (copy.heredoc) |heredoc| blk: {
-            const transition = try heredocCopyTransition(allocator, state.*, instruction, copy, heredoc);
-            instruction_transition.preflightHeredocCopy(allocator, transition) catch |err| {
-                diagnostic.instruction_line = instruction.line;
-                return err;
-            };
-            break :blk .{ .copy = .{ .heredoc = transition } };
-        } else if (copy.from != null) blk: {
-            const binding = findStageCopyBinding(stage_inputs.bindings, instruction_index) orelse return error.BadManifest;
-            const transition = instruction_transition.buildInputCopy(
-                allocator,
-                instruction.line,
-                instruction.raw,
-                try substituteStateList(allocator, copy.sources, state.*, instruction.escape),
-                try substituteState(allocator, copy.dest, state.*, instruction.escape),
-                try effectiveEnvDigest(allocator, state.*),
-                state.workdir,
-                copy.link orelse false,
-                binding.input_index,
-                binding.storage,
-            ) catch |err| {
-                diagnostic.instruction_line = instruction.line;
-                return err;
-            };
-            break :blk transition;
-        } else blk: {
-            const resolved_sources = try substituteStateList(allocator, copy.sources, state.*, instruction.escape);
-            break :blk .{ .copy = .{ .context = .{
-                .line = instruction.line,
-                .canonical_instruction = instruction.raw,
-                .resolved_sources = resolved_sources,
-                .resolved_dest = try substituteState(allocator, copy.dest, state.*, instruction.escape),
-                .parents = copy.parents orelse false,
-                .env_digest = try effectiveEnvDigest(allocator, state.*),
-                .workdir = state.workdir,
-            } } };
-        },
-        .add => .{ .add = remote_add.find(prepared_remote_adds, stage_index, instruction_index) orelse return error.BadManifest },
-        .workdir => |raw| blk: {
-            const step = try workdirStep(allocator, state.*, instruction, raw);
-            state.workdir = step.target;
-            break :blk .{ .workdir = step };
-        },
-        .from => unreachable,
-        else => unreachable,
+        .add => |input| .{ .add = remote_add.find(prepared_remote_adds, input.stage_index, input.instruction_index) orelse return error.BadManifest },
     };
 }
 
@@ -1115,13 +1013,13 @@ fn plannerVariables(allocator: std.mem.Allocator, args: []const ArgValue) ![]con
     return variables.toOwnedSlice();
 }
 
-fn scratchArtifact(
+fn scratchStorage(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     platform: rootfs_mod.Platform,
     diagnostic: *ScratchDiagnostic,
-) !StageArtifact {
+) !spore.RootfsStorage {
     const start_ns = monotonicNs() catch 0;
     defer diagnostic.resolve_ns +|= elapsedNs(start_ns);
     diagnostic.logical_size = automatic_build_capacity_bytes;
@@ -1129,10 +1027,7 @@ fn scratchArtifact(
     const key = try step_cache.stepKey(allocator, input);
     if (try step_cache.readHit(init.io, allocator, cache_root, input, key)) |storage| {
         diagnostic.reused += 1;
-        return .{
-            .storage = storage,
-            .config = .{ .architecture = platform.arch, .os = platform.os, .config = .{} },
-        };
+        return storage;
     }
 
     var nonce_bytes: [8]u8 = undefined;
@@ -1177,10 +1072,7 @@ fn scratchArtifact(
     try rootfs_cas.markStorageComplete(init.io, allocator, cache_root, storage.index_digest);
     _ = try step_cache.writeRecord(init.io, allocator, cache_root, input, key, storage);
     diagnostic.created += 1;
-    return .{
-        .storage = storage,
-        .config = .{ .architecture = platform.arch, .os = platform.os, .config = .{} },
-    };
+    return storage;
 }
 
 fn allocatedFileBlocks512(fd: std.c.fd_t) !u64 {
@@ -1264,7 +1156,7 @@ fn normalizeBuildImageRef(allocator: std.mem.Allocator, source: []const u8) ![]c
     return std.fmt.allocPrint(allocator, "docker.io/{s}{s}", .{ source, suffix });
 }
 
-fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, storage: spore.RootfsStorage, inherited_args: []const ArgValue, disk_grow_target: u64) !State {
+fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, inherited_args: []const ArgValue) !State {
     var config_env = std.array_list.Managed([]const u8).init(allocator);
     var args = std.array_list.Managed(ArgValue).init(allocator);
     const arg_overrides = std.array_list.Managed(ArgValue).init(allocator);
@@ -1279,8 +1171,6 @@ fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, s
         var env = std.array_list.Managed([]const u8).init(allocator);
         try env.appendSlice(try normalizeEnvLastWins(allocator, config_env.items));
         return .{
-            .storage = try spore.cloneRootfsStorage(allocator, storage),
-            .disk_grow_target = disk_grow_target,
             .environment = .{ .config = config_env, .effective = env },
             .args = args,
             .arg_overrides = arg_overrides,
@@ -1293,7 +1183,7 @@ fn stateFromBase(allocator: std.mem.Allocator, config: rootfs_mod.ImageConfig, s
     try config_env.append(default_linux_path);
     var env = std.array_list.Managed([]const u8).init(allocator);
     try env.append(default_linux_path);
-    return .{ .storage = try spore.cloneRootfsStorage(allocator, storage), .disk_grow_target = disk_grow_target, .environment = .{ .config = config_env, .effective = env }, .args = args, .arg_overrides = arg_overrides };
+    return .{ .environment = .{ .config = config_env, .effective = env }, .args = args, .arg_overrides = arg_overrides };
 }
 
 fn cloneArgs(allocator: std.mem.Allocator, args: []const ArgValue) ![]const ArgValue {
@@ -1383,32 +1273,33 @@ fn ensurePrepared(
     allocator: std.mem.Allocator,
     platform: rootfs_mod.Platform,
     cache_root: []const u8,
-    state: *State,
+    storage: *spore.RootfsStorage,
+    disk_grow_target: u64,
+    producer: *?build_exec.Producer,
     diagnostic: *build_exec.Diagnostic,
 ) !?build_exec.Preparation {
-    if (state.producer == null) {
-        state.producer = try build_exec.resolveProducer(init, allocator);
-        diagnostic.boot_artifact_file_reads += state.producer.?.eager_artifact_file_reads;
-        diagnostic.boot_artifact_bytes_read += state.producer.?.eager_artifact_bytes_read;
+    if (producer.* == null) {
+        producer.* = try build_exec.resolveProducer(init, allocator);
+        diagnostic.boot_artifact_file_reads += producer.*.?.eager_artifact_file_reads;
+        diagnostic.boot_artifact_bytes_read += producer.*.?.eager_artifact_bytes_read;
     }
-    const producer = state.producer.?;
-    if (state.storage.logical_size >= state.disk_grow_target) return null;
+    if (storage.logical_size >= disk_grow_target) return null;
     const input = try step_cache.prepareInput(
         platform,
-        state.storage.index_digest,
-        state.disk_grow_target,
-        producer.identity,
+        storage.index_digest,
+        disk_grow_target,
+        producer.*.?.identity,
     );
     const key = try step_cache.stepKey(allocator, input);
     if (try step_cache.readHit(init.io, allocator, cache_root, input, key)) |prepared| {
-        try build_exec.validatePreparedStorage(state.storage, prepared, state.disk_grow_target);
-        state.storage = prepared;
+        try build_exec.validatePreparedStorage(storage.*, prepared, disk_grow_target);
+        storage.* = prepared;
         return null;
     }
     return .{
         .input = input,
         .step_key = key,
-        .exact_target = state.disk_grow_target,
+        .exact_target = disk_grow_target,
     };
 }
 
@@ -1926,27 +1817,32 @@ fn testStorage() spore.RootfsStorage {
 
 const test_executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
+fn planInstructionForTest(
+    allocator: std.mem.Allocator,
+    ctx: build_context.BuildContext,
+    diagnostic: *Diagnostic,
+    state: *State,
+    instruction: dockerfile.Instruction,
+    instruction_index: usize,
+) !?PlannedStep {
+    var cache_mounts = std.array_list.Managed(build_cache_mount.Mount).init(allocator);
+    return planInstruction(std.testing.io, allocator, .{
+        .tag = "local/app:dev",
+        .context_dir = ctx.root,
+        .dockerfile_path = "unused",
+    }, diagnostic, ctx, &.{}, state, &cache_mounts, 0, instruction_index, instruction);
+}
+
 fn contextCopyTransitionForTest(
     allocator: std.mem.Allocator,
-    context_dir: []const u8,
+    ctx: build_context.BuildContext,
     diagnostic: *Diagnostic,
     initial_state: State,
     instruction: dockerfile.Instruction,
     instruction_index: usize,
 ) !instruction_transition.InstructionTransition.ContextCopy {
     var state = initial_state;
-    const transition = (try instructionTransition(allocator, .{
-        .tag = "local/app:dev",
-        .context_dir = context_dir,
-        .dockerfile_path = "unused",
-    }, diagnostic, &.{}, .{ .bindings = &.{}, .rootfs = &.{} }, 0, &.{}, &state, instruction, instruction_index)) orelse unreachable;
-    return switch (transition) {
-        .copy => |copy| switch (copy) {
-            .context => |context| context,
-            .heredoc, .build_input => unreachable,
-        },
-        .run, .add, .workdir => unreachable,
-    };
+    return (try planInstructionForTest(allocator, ctx, diagnostic, &state, instruction, instruction_index)).?.context_copy;
 }
 
 test "COPY heredoc transition expands from the instruction-start state" {
@@ -1970,25 +1866,19 @@ test "COPY heredoc transition expands from the instruction-start state" {
     try args.append(.{ .key = "VALUE", .value = "argument" });
     try args.append(.{ .key = "DEST", .value = "/oracle/result" });
     var state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{"ENV_VALUE=environment"}),
         .args = args,
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
     };
     var diagnostic: Diagnostic = .{};
-    const transition = (try instructionTransition(
+    const heredoc = (try planInstructionForTest(
         arena,
-        .{ .tag = "local/app:dev", .context_dir = "unused", .dockerfile_path = "unused" },
+        .{ .root = "unused", .absolute_root = "unused" },
         &diagnostic,
-        &.{},
-        .{ .bindings = &.{}, .rootfs = &.{} },
-        0,
-        &.{},
         &state,
         document.stages[0].instructions[0],
         0,
-    )).?;
-    const heredoc = transition.copy.heredoc;
+    )).?.heredoc_copy;
     try std.testing.expectEqualStrings("EOF", heredoc.source_name);
     try std.testing.expectEqualStrings("/oracle/result", heredoc.resolved_dest);
     try std.testing.expectEqualStrings(
@@ -2032,7 +1922,7 @@ test "ENV expansion uses one instruction-start snapshot" {
         \\ENV abc=bye def=$abc empty=$UNSET literal='$abc' fallback=${UNSET:-$abc}
         \\
     , &diagnostic);
-    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var state = try stateFromBase(arena, .{}, &.{});
     const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
     for (document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
@@ -2057,7 +1947,7 @@ test "COPY and WORKDIR expand exact quoted operands from stage state" {
         \\WORKDIR "$ROOT/${UNSET:-work}"
         \\
     , &diagnostic);
-    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var state = try stateFromBase(arena, .{}, &.{});
     const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
     const instructions = document.stages[0].instructions;
     try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instructions[0]));
@@ -2106,7 +1996,7 @@ test "remote ADD resolves inherited ARG and automatic platform values at instruc
     , &parse_diagnostic);
     const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
     const global_args = try globalBuildArgs(arena, options, document.global_args, &parse_diagnostic);
-    var state = try stateFromBase(arena, .{}, testStorage(), global_args.items, 0);
+    var state = try stateFromBase(arena, .{}, global_args.items);
     var diagnostic: Diagnostic = .{};
     const instructions = document.stages[0].instructions;
     for (instructions[0..4]) |instruction| {
@@ -2145,7 +2035,7 @@ test "remote ADD rejects unsupported sources and destinations before fetch" {
         var parse_diagnostic: dockerfile.Diagnostic = .{};
         const source = try std.fmt.allocPrint(arena, "FROM scratch\n{s}\n", .{case[0]});
         const document = try dockerfile.parse(arena, source, &parse_diagnostic);
-        var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+        var state = try stateFromBase(arena, .{}, &.{});
         var diagnostic: Diagnostic = .{};
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, document.stages[0].instructions[0]));
         try std.testing.expectError(case[1], resolveRemoteAddInput(
@@ -2160,7 +2050,7 @@ test "remote ADD rejects unsupported sources and destinations before fetch" {
     }
 }
 
-test "build preflight rejects later deterministic invalidity before remote ADD preparation" {
+test "stage planning rejects later deterministic invalidity before remote ADD preparation" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2173,6 +2063,7 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
         .{ "ADD https://observer.example/file /file\nCOPY definitely-missing /x", error.CopySourceNotFound },
         .{ "ADD https://observer.example/file /file\nRUN --mount=type=bind,source=definitely-missing,target=/x true", error.RunContextBindSourceNotFound },
         .{ "RUN true\nRUN --mount=type=bind,source=definitely-missing,target=/x true", error.RunContextBindSourceNotFound },
+        .{ "RUN true\nCOPY --parents src/./payload /out/", error.CopyParentsPivotUnsupported },
         .{ "ADD https://observer.example/file /file\nARG ID=same\nRUN --mount=type=cache,target=/one,id=$ID,sharing=shared true\nRUN --mount=type=cache,target=/two,id=${ID},sharing=locked true", error.RunCacheMountSharingConflict },
     }) |case| {
         var parse_diagnostic: dockerfile.Diagnostic = .{};
@@ -2191,7 +2082,7 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
         defer temporary.cleanup();
         const context_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
         const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
-        try std.testing.expectError(case[1], preflightBuildPlan(
+        try std.testing.expectError(case[1], planStages(
             std.testing.io,
             arena,
             options,
@@ -2222,8 +2113,8 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
         defer temporary.cleanup();
         const context_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
         const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
-        const inputs = try preflightBuildPlan(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved);
-        try std.testing.expectEqual(@as(usize, 1), inputs.len);
+        const planned = try planStages(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved);
+        try std.testing.expectEqual(@as(usize, 1), planned.remote_adds.len);
     }
 
     {
@@ -2242,8 +2133,8 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
         try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "input", .data = "payload" });
         const context_root = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
         const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
-        const inputs = try preflightBuildPlan(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved);
-        try std.testing.expectEqual(@as(usize, 1), inputs.len);
+        const planned = try planStages(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved);
+        try std.testing.expectEqual(@as(usize, 1), planned.remote_adds.len);
     }
 
     {
@@ -2262,7 +2153,7 @@ test "build preflight rejects later deterministic invalidity before remote ADD p
         const ctx = try build_context.load(arena, std.testing.io, context_root, &diagnostic.dockerignore);
         try std.testing.expectError(
             error.RunWorkingDirUnsupported,
-            preflightBuildPlan(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved),
+            planStages(std.testing.io, arena, options, &diagnostic, ctx, plan, &.{}, resolved),
         );
         try std.testing.expectEqual(@as(usize, 3), diagnostic.instruction_line);
     }
@@ -2302,7 +2193,7 @@ test "run environment includes declared args after env" {
         .{ .key = "TARGET", .value = "prod" },
         .{ .key = "UNSET", .value = null },
     };
-    const state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "MODE=env", "APP=/srv/app" }) } }, testStorage(), &args, 0);
+    const state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "MODE=env", "APP=/srv/app" }) } }, &args);
     const entries = try runEnvironment(arena, state, false);
     try std.testing.expectEqual(@as(usize, 5), entries.len);
     try std.testing.expectEqualStrings("MODE=env", entries[0]);
@@ -2321,7 +2212,7 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
         "PATH=/oracle/a",
         "KEEP=one",
         "PATH=/oracle/b",
-    }) } }, testStorage(), &.{}, 0);
+    }) } }, &.{});
     const entries = try runEnvironment(arena, duplicate_state, false);
     try std.testing.expectEqual(@as(usize, 3), entries.len);
     try std.testing.expectEqualStrings("KEEP=one", entries[0]);
@@ -2331,7 +2222,7 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
     const canonical_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{
         "KEEP=one",
         "PATH=/oracle/b",
-    }) } }, testStorage(), &.{}, 0);
+    }) } }, &.{});
     try std.testing.expectEqualStrings(
         try effectiveRunEnvDigest(arena, canonical_state),
         try effectiveRunEnvDigest(arena, duplicate_state),
@@ -2349,27 +2240,27 @@ test "effective RUN environment normalizes inherited duplicate keys with the las
     try std.testing.expectEqualStrings("KEEP=one", published[1]);
     try std.testing.expectEqualStrings("PATH=/oracle/b", published[2]);
 
-    const inherited_state = try stateFromBase(arena, try imageConfig(arena, .{}, overridden_state), testStorage(), &.{}, 0);
+    const inherited_state = try stateFromBase(arena, try imageConfig(arena, .{}, overridden_state), &.{});
     try std.testing.expectEqualStrings("/oracle/b", envValue(inherited_state.environment.effective.items, "PATH").?);
 
-    const missing_equals = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"BROKEN"}) } }, testStorage(), &.{}, 0);
+    const missing_equals = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"BROKEN"}) } }, &.{});
     try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, missing_equals, false), "BROKEN").?);
     try std.testing.expectEqualStrings("BROKEN=", missing_equals.environment.effective.items[0]);
     try std.testing.expectEqualStrings("BROKEN", (try imageConfig(arena, .{}, missing_equals)).config.?.Env.?[0]);
-    const missing = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    const missing = try stateFromBase(arena, .{}, &.{});
     try std.testing.expect(!std.mem.eql(
         u8,
         try effectiveRunEnvDigest(arena, missing_equals),
         try effectiveRunEnvDigest(arena, missing),
     ));
 
-    const empty_entry = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{""}) } }, testStorage(), &.{}, 0);
+    const empty_entry = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{""}) } }, &.{});
     try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, empty_entry, false));
 
-    const nul_without_equals = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"BROKEN\x00"}) } }, testStorage(), &.{}, 0);
+    const nul_without_equals = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"BROKEN\x00"}) } }, &.{});
     try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, nul_without_equals, false));
 
-    const empty_name = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"=value"}) } }, testStorage(), &.{}, 0);
+    const empty_name = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"=value"}) } }, &.{});
     try std.testing.expectError(error.InvalidRunEnvironment, runEnvironment(arena, empty_name, false));
 
     var large_env = std.array_list.Managed([]const u8).init(arena);
@@ -2391,7 +2282,7 @@ test "ARG and ENV instruction order controls RUN state without changing image co
         \\ARG ORDER=from-arg
         \\
     , &diagnostic);
-    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var state = try stateFromBase(arena, .{}, &.{});
     const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
     for (document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
@@ -2406,7 +2297,7 @@ test "ARG and ENV instruction order controls RUN state without changing image co
         \\ENV ORDER=from-env
         \\
     , &later_env_diagnostic);
-    var later_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var later_state = try stateFromBase(arena, .{}, &.{});
     for (later_env.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &later_state, instruction));
     }
@@ -2418,7 +2309,7 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const default_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    const default_state = try stateFromBase(arena, .{}, &.{});
     const defaulted = try runEnvironment(arena, default_state, false);
     try std.testing.expectEqual(@as(usize, 2), defaulted.len);
     try std.testing.expectEqualStrings(default_linux_path, defaulted[0]);
@@ -2427,13 +2318,13 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     try std.testing.expectEqual(@as(usize, 1), default_config.config.?.Env.?.len);
     try std.testing.expectEqualStrings(default_linux_path, default_config.config.?.Env.?[0]);
 
-    const explicit_home_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"HOME=/workspace"}) } }, testStorage(), &.{}, 0);
+    const explicit_home_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"HOME=/workspace"}) } }, &.{});
     const from_env = try runEnvironment(arena, explicit_home_state, false);
     try std.testing.expectEqual(@as(usize, 2), from_env.len);
     try std.testing.expectEqualStrings("HOME=/workspace", from_env[0]);
     try std.testing.expectEqualStrings(default_linux_path, from_env[1]);
 
-    const empty_home_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"HOME="}) } }, testStorage(), &.{}, 0);
+    const empty_home_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"HOME="}) } }, &.{});
     const empty_home = try runEnvironment(arena, empty_home_state, false);
     try std.testing.expectEqual(@as(usize, 2), empty_home.len);
     try std.testing.expectEqualStrings(default_root_run_home, empty_home[0]);
@@ -2442,13 +2333,13 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     try std.testing.expectEqualStrings("HOME=", empty_home_config.config.?.Env.?[0]);
 
     const home_arg = [_]ArgValue{.{ .key = "HOME", .value = "/arg-home" }};
-    const home_arg_state = try stateFromBase(arena, .{}, testStorage(), &home_arg, 0);
+    const home_arg_state = try stateFromBase(arena, .{}, &home_arg);
     const from_arg = try runEnvironment(arena, home_arg_state, false);
     try std.testing.expectEqual(@as(usize, 2), from_arg.len);
     try std.testing.expectEqualStrings(default_linux_path, from_arg[0]);
     try std.testing.expectEqualStrings("HOME=/arg-home", from_arg[1]);
 
-    const explicit_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH=/custom/bin"}) } }, testStorage(), &.{}, 0);
+    const explicit_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH=/custom/bin"}) } }, &.{});
     const explicit_path = try runEnvironment(arena, explicit_path_state, false);
     try std.testing.expectEqual(@as(usize, 2), explicit_path.len);
     try std.testing.expectEqualStrings("PATH=/custom/bin", explicit_path[0]);
@@ -2457,11 +2348,11 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     try std.testing.expectEqual(@as(usize, 1), explicit_path_config.config.?.Env.?.len);
     try std.testing.expectEqualStrings("PATH=/custom/bin", explicit_path_config.config.?.Env.?[0]);
 
-    const empty_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH="}) } }, testStorage(), &.{}, 0);
+    const empty_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH="}) } }, &.{});
     try std.testing.expectEqual(@as(usize, 1), empty_path_state.environment.effective.items.len);
     try std.testing.expectEqualStrings("PATH=", empty_path_state.environment.effective.items[0]);
 
-    const bare_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH"}) } }, testStorage(), &.{}, 0);
+    const bare_path_state = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{"PATH"}) } }, &.{});
     try std.testing.expectEqual(@as(usize, 1), bare_path_state.environment.config.items.len);
     try std.testing.expectEqualStrings("PATH", bare_path_state.environment.config.items[0]);
     try std.testing.expectEqualStrings("PATH=", bare_path_state.environment.effective.items[0]);
@@ -2472,18 +2363,18 @@ test "build stage defaults PATH and root RUN HOME when absent or empty" {
     try std.testing.expectEqual(@as(usize, 1), overridden_bare_path_state.environment.config.items.len);
     try std.testing.expectEqualStrings("PATH=/custom/bin", overridden_bare_path_state.environment.config.items[0]);
 
-    var bare_then_value = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "A", "A=last" }) } }, testStorage(), &.{}, 0);
+    var bare_then_value = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "A", "A=last" }) } }, &.{});
     try bare_then_value.environment.put(arena, "A", "new");
     try std.testing.expectEqualStrings("A=new", bare_then_value.environment.config.items[0]);
     try std.testing.expectEqualStrings("A=last", bare_then_value.environment.config.items[1]);
-    const bare_then_value_inherited = try stateFromBase(arena, try imageConfig(arena, .{}, bare_then_value), testStorage(), &.{}, 0);
+    const bare_then_value_inherited = try stateFromBase(arena, try imageConfig(arena, .{}, bare_then_value), &.{});
     try std.testing.expectEqualStrings("last", envValue(bare_then_value_inherited.environment.effective.items, "A").?);
 
-    var value_then_bare = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "A=first", "A" }) } }, testStorage(), &.{}, 0);
+    var value_then_bare = try stateFromBase(arena, .{ .config = .{ .Env = @constCast(&[_][]const u8{ "A=first", "A" }) } }, &.{});
     try value_then_bare.environment.put(arena, "A", "new");
     try std.testing.expectEqualStrings("A=new", value_then_bare.environment.config.items[0]);
     try std.testing.expectEqualStrings("A", value_then_bare.environment.config.items[1]);
-    const value_then_bare_inherited = try stateFromBase(arena, try imageConfig(arena, .{}, value_then_bare), testStorage(), &.{}, 0);
+    const value_then_bare_inherited = try stateFromBase(arena, try imageConfig(arena, .{}, value_then_bare), &.{});
     try std.testing.expectEqualStrings("", envValue(value_then_bare_inherited.environment.effective.items, "A").?);
 }
 
@@ -2500,7 +2391,7 @@ test "stage PATH participates in expansion while ARG overrides only effective st
         \\ENV AFTER=$PATH
         \\
     , &diagnostic);
-    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var state = try stateFromBase(arena, .{}, &.{});
     const instructions = document.stages[0].instructions;
     const options = Options{ .tag = "local/test:dev", .context_dir = ".", .dockerfile_path = "Dockerfile" };
 
@@ -2527,7 +2418,7 @@ test "stage PATH participates in expansion while ARG overrides only effective st
         \\ENV SNAPSHOT=$PATH
         \\
     , &env_first_diagnostic);
-    var env_first_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var env_first_state = try stateFromBase(arena, .{}, &.{});
     for (env_first_document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &env_first_state, instruction));
     }
@@ -2552,7 +2443,7 @@ test "root RUN HOME follows ENV and ARG instruction order without changing image
         \\ENV SNAPSHOT=$HOME
         \\
     , &diagnostic);
-    var state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var state = try stateFromBase(arena, .{}, &.{});
     for (document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &state, instruction));
     }
@@ -2570,7 +2461,7 @@ test "root RUN HOME follows ENV and ARG instruction order without changing image
         \\ENV HOME=
         \\
     , &later_env_diagnostic);
-    var later_env_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    var later_env_state = try stateFromBase(arena, .{}, &.{});
     for (later_env_document.stages[0].instructions) |instruction| {
         try std.testing.expect(try applyMetadataInstruction(arena, options, &.{}, &later_env_state, instruction));
     }
@@ -2586,7 +2477,6 @@ test "implicit root HOME transitions only affected RUN cache identities" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2598,7 +2488,6 @@ test "implicit root HOME transitions only affected RUN cache identities" {
     var empty_env = std.array_list.Managed([]const u8).init(arena);
     try empty_env.append("HOME=");
     const empty_state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, empty_env.items),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2610,7 +2499,6 @@ test "implicit root HOME transitions only affected RUN cache identities" {
     var explicit_env = std.array_list.Managed([]const u8).init(arena);
     try explicit_env.append("HOME=/workspace");
     const explicit_state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, explicit_env.items),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2640,7 +2528,7 @@ test "optional-absent SSH declaration injects only the inert default environment
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const default_state = try stateFromBase(arena, .{}, testStorage(), &.{}, 0);
+    const default_state = try stateFromBase(arena, .{}, &.{});
     const plain = try runEnvironment(arena, default_state, false);
     try std.testing.expect(envValue(plain, "SSH_AUTH_SOCK") == null);
     const declared = try runEnvironment(arena, default_state, true);
@@ -2649,16 +2537,16 @@ test "optional-absent SSH declaration injects only the inert default environment
 
     const inherited_state = try stateFromBase(arena, .{
         .config = .{ .Env = @constCast(&[_][]const u8{"SSH_AUTH_SOCK=/inherited/agent"}) },
-    }, testStorage(), &.{}, 0);
+    }, &.{});
     try std.testing.expectEqualStrings("/inherited/agent", envValue(try runEnvironment(arena, inherited_state, true), "SSH_AUTH_SOCK").?);
 
     const empty_state = try stateFromBase(arena, .{
         .config = .{ .Env = @constCast(&[_][]const u8{"SSH_AUTH_SOCK="}) },
-    }, testStorage(), &.{}, 0);
+    }, &.{});
     try std.testing.expectEqualStrings("", envValue(try runEnvironment(arena, empty_state, true), "SSH_AUTH_SOCK").?);
 
     const arg = [_]ArgValue{.{ .key = "SSH_AUTH_SOCK", .value = "/arg/agent" }};
-    const arg_state = try stateFromBase(arena, .{}, testStorage(), &arg, 0);
+    const arg_state = try stateFromBase(arena, .{}, &arg);
     try std.testing.expectEqualStrings("/arg/agent", envValue(try runEnvironment(arena, arg_state, true), "SSH_AUTH_SOCK").?);
 }
 
@@ -2679,7 +2567,6 @@ test "RUN executor preserves shell text for guest expansion" {
     };
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, .{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, env.items),
         .args = args,
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2705,7 +2592,6 @@ test "RUN transition carries optional-absent SSH state and inert environment" {
     , &parser_diagnostic);
     const instruction = document.stages[0].instructions[0];
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2730,7 +2616,6 @@ test "RUN transition carries optional-absent SSH state and inert environment" {
     const default_key = try step_cache.stepKey(arena, input);
 
     const inherited_state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{"SSH_AUTH_SOCK=/inherited/agent"}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2765,7 +2650,6 @@ test "RUN cache mount identity uses expanded path.Clean target" {
     const instruction = document.stages[0].instructions[0];
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, .{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = args,
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2800,7 +2684,6 @@ test "RUN cache mount resolves opaque custom id and sharing at instruction start
     const instruction = document.stages[0].instructions[0];
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, .{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = args,
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2842,7 +2725,6 @@ test "RUN cache mount rejects expanded id and sharing bounds before execution" {
         try args.append(.{ .key = "SHARING", .value = case.sharing });
         var diagnostic: Diagnostic = .{};
         try std.testing.expectError(case.expected, runStep(arena, &diagnostic, .{
-            .storage = testStorage(),
             .environment = try buildEnvironmentFromEffective(arena, &.{}),
             .args = args,
             .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2864,7 +2746,6 @@ test "RUN cache mount rejects expanded id and sharing bounds before execution" {
     try args.append(.{ .key = "SHARING", .value = "locked" });
     var diagnostic: Diagnostic = .{};
     _ = try runStep(arena, &diagnostic, .{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = args,
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -2883,7 +2764,6 @@ test "cache records reuse custom id and sharing edits but miss default shared to
             const instruction = document.stages[0].instructions[0];
             var diagnostic: Diagnostic = .{};
             return runStep(arena_allocator, &diagnostic, .{
-                .storage = testStorage(),
                 .environment = try buildEnvironmentFromEffective(arena_allocator, &.{}),
                 .args = std.array_list.Managed(ArgValue).init(arena_allocator),
                 .arg_overrides = std.array_list.Managed(ArgValue).init(arena_allocator),
@@ -2964,7 +2844,6 @@ test "RUN context bind resolves instruction-start source and WORKDIR target" {
     const instruction = document.stages[0].instructions[0];
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, .{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = args,
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -3018,7 +2897,6 @@ test "RUN executor preserves exact argv and effective ENV ARG state" {
     const instruction = document.stages[0].instructions[0];
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, .{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, env.items),
         .args = args,
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -3056,7 +2934,7 @@ test "stage config inheritance preserves entrypoint cmd user env and workdir" {
             .WorkingDir = "/srv",
             .User = "root",
         },
-    }, testStorage(), &.{.{ .key = "INHERITED", .value = "yes" }}, 0);
+    }, &.{.{ .key = "INHERITED", .value = "yes" }});
     try std.testing.expectEqualStrings("A=one", state.environment.effective.items[0]);
     try std.testing.expectEqualStrings("/entry", state.entrypoint.?[0]);
     try std.testing.expectEqualStrings("serve", state.cmd.?[0]);
@@ -3122,7 +3000,6 @@ test "RUN cache identity includes network mode and resources" {
     , &diag);
     const instruction = doc.stages[0].instructions[0];
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -3137,12 +3014,12 @@ test "RUN cache identity includes network mode and resources" {
     none_options.network = .none;
     var diagnostic: Diagnostic = .{};
     const step = try runStep(arena, &diagnostic, state, instruction, instruction.value.run, spore_options);
-    const spore_input = build_exec.cacheInputForStep(spore_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = step }, runResources(spore_options));
+    const spore_input = build_exec.cacheInputForStep(spore_options.platform, testStorage().index_digest, test_executor_identity, .{ .run = step }, runResources(spore_options));
     const spore_key = try step_cache.stepKey(arena, spore_input);
 
     var none_step = step;
     none_step.network_mode = .none;
-    const none_input = build_exec.cacheInputForStep(none_options.platform, state.storage.index_digest, test_executor_identity, .{ .run = none_step }, runResources(none_options));
+    const none_input = build_exec.cacheInputForStep(none_options.platform, testStorage().index_digest, test_executor_identity, .{ .run = none_step }, runResources(none_options));
     const none_key = try step_cache.stepKey(arena, none_input);
     try std.testing.expect(!std.mem.eql(u8, spore_key, none_key));
 
@@ -3153,7 +3030,7 @@ test "RUN cache identity includes network mode and resources" {
     resource_options.nofile = .{ .soft = 32_768, .hard = 65_536 };
     const resource_input = build_exec.cacheInputForStep(
         resource_options.platform,
-        state.storage.index_digest,
+        testStorage().index_digest,
         test_executor_identity,
         .{ .run = step },
         runResources(resource_options),
@@ -3176,7 +3053,6 @@ test "WORKDIR transition resolves environment before cache lookup" {
     var env = std.array_list.Managed([]const u8).init(arena);
     try env.append("APP_ROOT=/srv");
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, env.items),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -3251,7 +3127,6 @@ test "COPY file source can target non-slash file destination" {
         \\
     , &df_diag);
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -3261,7 +3136,7 @@ test "COPY file source can target non-slash file destination" {
     var snapshot = try build_context.CopySnapshot.init(arena, io, root);
     defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    const context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[1], 1);
+    const context = try contextCopyTransitionForTest(arena, ctx, &diagnostic, state, doc.stages[0].instructions[1], 1);
     var transition_diagnostic = transitionDiagnostics(&diagnostic);
     const step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, context);
     try std.testing.expectEqual(@as(usize, 1), step.requests.len);
@@ -3294,19 +3169,17 @@ test "COPY multiple sources require trailing slash destination" {
         \\
     , &df_diag);
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
         .workdir = "/app",
     };
     var diagnostic: Diagnostic = .{};
-    var snapshot = try build_context.CopySnapshot.init(arena, io, root);
-    defer snapshot.deinit(io);
-    var context_disk = build_context_disk.Builder.init(arena);
-    const context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[1], 1);
-    var transition_diagnostic = transitionDiagnostics(&diagnostic);
-    try std.testing.expectError(error.CopyDestinationMustBeDirectory, instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, context));
+    try std.testing.expectError(
+        error.CopyDestinationMustBeDirectory,
+        contextCopyTransitionForTest(arena, ctx, &diagnostic, state, doc.stages[0].instructions[1], 1),
+    );
+    try std.testing.expectEqual(@as(usize, 3), diagnostic.instruction_line);
 }
 
 test "COPY parents reconstructs ordered file directory and glob roots under WORKDIR" {
@@ -3337,7 +3210,6 @@ test "COPY parents reconstructs ordered file directory and glob roots under WORK
         \\
     , &df_diag);
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -3349,7 +3221,7 @@ test "COPY parents reconstructs ordered file directory and glob roots under WORK
     var context_disk = build_context_disk.Builder.init(arena);
     var transition_diagnostic = transitionDiagnostics(&diagnostic);
 
-    const parents_context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[1], 1);
+    const parents_context = try contextCopyTransitionForTest(arena, ctx, &diagnostic, state, doc.stages[0].instructions[1], 1);
     const parents_step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, parents_context);
     try std.testing.expect(parents_context.parents);
     try std.testing.expectEqual(@as(usize, 1), parents_step.requests.len);
@@ -3360,7 +3232,7 @@ test "COPY parents reconstructs ordered file directory and glob roots under WORK
     try std.testing.expectEqual(@as(usize, 9), parents_step.requests[0].entry_count);
 
     var flat_disk = build_context_disk.Builder.init(arena);
-    const flat_context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[2], 2);
+    const flat_context = try contextCopyTransitionForTest(arena, ctx, &diagnostic, state, doc.stages[0].instructions[2], 2);
     const flat_step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &flat_disk, &transition_diagnostic, flat_context);
     try std.testing.expect(!flat_context.parents);
     try std.testing.expectEqual(@as(usize, 1), flat_step.requests.len);
@@ -3369,7 +3241,7 @@ test "COPY parents reconstructs ordered file directory and glob roots under WORK
     try std.testing.expect(!std.mem.eql(u8, parents_step.input_digest, flat_step.input_digest));
 
     var single_disk = build_context_disk.Builder.init(arena);
-    const single_context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[3], 3);
+    const single_context = try contextCopyTransitionForTest(arena, ctx, &diagnostic, state, doc.stages[0].instructions[3], 3);
     const single_step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &single_disk, &transition_diagnostic, single_context);
     try std.testing.expectEqual(@as(usize, 1), single_step.requests.len);
     try std.testing.expectEqualStrings("/work/no-slash", single_step.requests[0].dest);
@@ -3378,7 +3250,7 @@ test "COPY parents reconstructs ordered file directory and glob roots under WORK
     try std.testing.expectEqual(@as(usize, 3), single_step.requests[0].entry_count);
 }
 
-test "COPY parents rejects an internal source pivot during full preflight" {
+test "COPY parents rejects an internal source pivot during planning" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -3404,32 +3276,36 @@ test "COPY parents rejects an internal source pivot during full preflight" {
         .limit = &limit,
         .actual = &actual,
     };
-    try std.testing.expectError(error.CopyParentsPivotUnsupported, instruction_transition.preflightContextCopy(
+    try std.testing.expectError(error.CopyParentsPivotUnsupported, instruction_transition.planContextCopy(
         io,
         arena,
         ctx,
         &diagnostic,
         7,
+        "COPY --parents src/./payload /out/",
         &.{"src/./payload"},
         "/out/",
-        "/",
         true,
+        "",
+        "/",
     ));
     try std.testing.expectEqual(@as(usize, 7), instruction_line);
     try std.testing.expectEqualStrings("src/./payload", copy.source);
 
     instruction_line = 0;
     copy = .{};
-    try std.testing.expectError(error.CopyParentsRootUnsupported, instruction_transition.preflightContextCopy(
+    try std.testing.expectError(error.CopyParentsRootUnsupported, instruction_transition.planContextCopy(
         io,
         arena,
         ctx,
         &diagnostic,
         8,
+        "COPY --parents . /out/",
         &.{"."},
         "/out/",
-        "/",
         true,
+        "",
+        "/",
     ));
     try std.testing.expectEqual(@as(usize, 8), instruction_line);
     try std.testing.expectEqualStrings(".", copy.source);
@@ -3454,7 +3330,6 @@ test "COPY directory source preserves empty subdirectory entry" {
         \\
     , &df_diag);
     const state = State{
-        .storage = testStorage(),
         .environment = try buildEnvironmentFromEffective(arena, &.{}),
         .args = std.array_list.Managed(ArgValue).init(arena),
         .arg_overrides = std.array_list.Managed(ArgValue).init(arena),
@@ -3463,7 +3338,7 @@ test "COPY directory source preserves empty subdirectory entry" {
     var snapshot = try build_context.CopySnapshot.init(arena, io, root);
     defer snapshot.deinit(io);
     var context_disk = build_context_disk.Builder.init(arena);
-    const context = try contextCopyTransitionForTest(arena, root, &diagnostic, state, doc.stages[0].instructions[0], 0);
+    const context = try contextCopyTransitionForTest(arena, ctx, &diagnostic, state, doc.stages[0].instructions[0], 0);
     var transition_diagnostic = transitionDiagnostics(&diagnostic);
     const step = try instruction_transition.lowerContextCopy(io, arena, ctx, null, &snapshot, &context_disk, &transition_diagnostic, context);
     try std.testing.expectEqual(@as(usize, 1), step.requests.len);
@@ -3560,7 +3435,7 @@ test "fully cached build publishes final indexed image" {
     const prepare_key = try step_cache.stepKey(arena, prepare_input);
     _ = try step_cache.writeRecord(io, arena, cache_root, prepare_input, prepare_key, prepared_storage);
 
-    const cached_state = try stateFromBase(arena, .{}, prepared_storage, &.{}, prepared_size);
+    const cached_state = try stateFromBase(arena, .{}, &.{});
     const env_digest = try effectiveRunEnvDigest(arena, cached_state);
     const run_input = step_cache.StepInput{
         .platform = .{},
@@ -3924,6 +3799,52 @@ test "literal COPY --from source restrictions fail before boot" {
         try std.testing.expectEqual(@as(usize, 3), diagnostic.instruction_line);
         try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.boot_count);
     }
+}
+
+test "an invalid later stage fails before an earlier stage boots or publishes a step" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-spore-build-later-stage-invalid";
+    const context_dir = tmp ++ "/context";
+    const cache_dir = tmp ++ "/cache";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, context_dir ++ "/src");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_dir ++ "/src/payload", .data = "payload\n" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = context_dir ++ "/Dockerfile",
+        .data =
+        \\FROM scratch AS build
+        \\RUN printf built >/built
+        \\FROM build
+        \\COPY --parents src/./payload /out/
+        \\
+        ,
+    });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_dir);
+    const init = testInit(allocator, io, &arena_state, &env);
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(error.CopyParentsPivotUnsupported, build(init, arena, .{
+        .tag = "local/app:later-stage-invalid",
+        .context_dir = context_dir,
+        .dockerfile_path = context_dir ++ "/Dockerfile",
+        // The only fresh-VM shape x86 accepts; arm64 accepts it too.
+        .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
+        .vcpus = 1,
+        .diagnostic = &diagnostic,
+    }));
+    try std.testing.expectEqual(@as(usize, 4), diagnostic.instruction_line);
+    try std.testing.expectEqualStrings("src/./payload", diagnostic.copy.source);
+    try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.boot_count);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.scratch.created);
+    // Neither the scratch base nor the first stage's RUN wrote a step record.
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, cache_dir ++ "/build/steps", .{}));
 }
 
 test "scratch stage publishes an empty native rootfs without guest execution" {

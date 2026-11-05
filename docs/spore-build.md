@@ -15,9 +15,10 @@ spore run --image local/app:dev --pull=never -- /usr/local/bin/app
 The builder deliberately implements a bounded Dockerfile subset. A feature is
 accepted only when SporeVM can match the selected Dockerfile frontend's final
 filesystem and OCI runtime configuration with sound cache invalidation.
-Unsupported instructions, flags, values, and combinations fail during
-full-file planning before a base fetch, remote `ADD`, cache mutation, or guest
-execution begins.
+Unsupported instructions, flags, and combinations fail during full-file parsing
+before a base fetch. Values that depend on ARG, ENV, or base image state fail
+while every reachable stage is planned, before a `COPY --from` image or remote
+`ADD` fetch, cache mutation, or guest execution begins.
 
 ## Command Line
 
@@ -79,10 +80,12 @@ internal `/./` pivot, or the context-root operands `.` and `./`. Context
 `COPY --link` remains unsupported; link policy is accepted only with
 `COPY --from`.
 
-Context `COPY` applies source modes and root ownership. Cross-stage `COPY`
-preserves supported source ownership and metadata. `COPY --chown` and
-`COPY --chmod` are not implemented. Public HTTPS `ADD --chmod` is the one
-current numeric-mode exception.
+Context `COPY` applies source modes and root ownership. The set of context
+files each `COPY` selects is fixed when the build is planned: a selected file
+deleted afterwards fails the build, which then needs a retry, and a file added
+afterwards is not copied. Cross-stage `COPY` preserves supported source
+ownership and metadata. `COPY --chown` and `COPY --chmod` are not implemented.
+Public HTTPS `ADD --chmod` is the one current numeric-mode exception.
 
 Shell-form `RUN` uses `/bin/sh -c`. JSON-array `RUN` executes the exact argv
 after bounded `PATH` selection when argv zero contains no slash. The shared

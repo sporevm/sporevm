@@ -27,7 +27,9 @@ pub const InstructionTransition = union(enum) {
     pub const ContextCopy = struct {
         line: usize,
         canonical_instruction: []const u8,
-        resolved_sources: []const []const u8,
+        /// Context paths resolved once while planning; cache lookup and
+        /// lowering hash and capture exactly this set.
+        resolution: build_context.CopyResolution,
         resolved_dest: []const u8,
         parents: bool = false,
         env_digest: []const u8,
@@ -43,6 +45,20 @@ pub const InstructionTransition = union(enum) {
         env_digest: []const u8,
         workdir: []const u8,
     };
+};
+
+/// A planned COPY --from whose input disk is bound only once the source stage
+/// or image has a rootfs digest.
+pub const BuildInputCopy = struct {
+    instruction_index: usize,
+    line: usize,
+    canonical_instruction: []const u8,
+    sources: []const []const u8,
+    dest: []const u8,
+    dest_is_dir: bool,
+    env_digest: []const u8,
+    workdir: []const u8,
+    destination_policy: build_exec.CopyDestinationPolicy,
 };
 
 pub const CacheWalkResult = union(enum) {
@@ -309,12 +325,7 @@ pub fn lowerContextCopy(
     diagnostic: *Diagnostics,
     context: InstructionTransition.ContextCopy,
 ) !build_exec.CopyStep {
-    try validateParentsSources(diagnostic, context.line, context.resolved_sources, context.parents);
-    const resolved = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, context.resolved_sources, diagnostic.copy) catch |err| {
-        diagnostic.instruction_line.* = context.line;
-        return err;
-    };
-    const resolution = try contextCopyResolution(allocator, resolved, context.parents);
+    const resolution = context.resolution;
     const captured = try build_context.captureCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
         .stat_cache = stat_cache,
         .diagnostic = diagnostic.context_hash,
@@ -342,17 +353,21 @@ pub fn lowerContextCopy(
     };
 }
 
-pub fn preflightContextCopy(
+/// Resolves a context COPY's sources and validates the requests it will lower
+/// to, using the longest possible context-disk prefix.
+pub fn planContextCopy(
     io: Io,
     allocator: std.mem.Allocator,
     ctx: build_context.BuildContext,
     diagnostic: *Diagnostics,
     line: usize,
+    canonical_instruction: []const u8,
     resolved_sources: []const []const u8,
     resolved_dest: []const u8,
-    workdir: []const u8,
     parents: bool,
-) !void {
+    env_digest: []const u8,
+    workdir: []const u8,
+) !InstructionTransition.ContextCopy {
     try validateParentsSources(diagnostic, line, resolved_sources, parents);
     const resolved = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, resolved_sources, diagnostic.copy) catch |err| {
         diagnostic.instruction_line.* = line;
@@ -373,6 +388,15 @@ pub fn preflightContextCopy(
         workdir,
         parents,
     );
+    return .{
+        .line = line,
+        .canonical_instruction = canonical_instruction,
+        .resolution = resolution,
+        .resolved_dest = resolved_dest,
+        .parents = parents,
+        .env_digest = env_digest,
+        .workdir = workdir,
+    };
 }
 
 fn validateParentsSources(diagnostic: *Diagnostics, line: usize, sources: []const []const u8, parents: bool) !void {
@@ -463,8 +487,9 @@ fn validatedContextCopyRequests(
     );
 }
 
-pub fn buildInputCopy(
+pub fn planBuildInputCopy(
     allocator: std.mem.Allocator,
+    instruction_index: usize,
     line: usize,
     canonical_instruction: []const u8,
     resolved_sources: []const []const u8,
@@ -472,34 +497,64 @@ pub fn buildInputCopy(
     env_digest: []const u8,
     workdir: []const u8,
     link: bool,
-    input_index: usize,
-    storage: spore.RootfsStorage,
-) !InstructionTransition {
+) !BuildInputCopy {
     if (resolved_sources.len > 1 and !copyDestEndsWithSlash(resolved_dest)) return error.CopyDestinationMustBeDirectory;
-    const dest = try normalizeGuestPath(allocator, workdir, resolved_dest);
-    const requests = try allocator.alloc(build_exec.CopyRequest, resolved_sources.len);
-    for (resolved_sources, 0..) |source, index| {
-        requests[index] = .{
-            .source = try normalizeBuildInputCopySource(allocator, source),
-            .dest = dest,
-            .source_kind = .auto,
-            .dest_is_dir = copyDestEndsWithSlash(resolved_dest) or resolved_sources.len > 1,
-            .entry_count = 0,
-            .source_disk = .build_input,
-            .input_index = input_index,
-            .destination_policy = if (link) .link else .follow,
-        };
-        try build_exec.validateCopyRequest(requests[index]);
-    }
-    return .{ .copy = .{ .build_input = .{
+    const sources = try allocator.alloc([]const u8, resolved_sources.len);
+    const copy = BuildInputCopy{
+        .instruction_index = instruction_index,
         .line = line,
         .canonical_instruction = canonical_instruction,
-        .input_digest = storage.index_digest,
+        .sources = sources,
+        .dest = try normalizeGuestPath(allocator, workdir, resolved_dest),
+        .dest_is_dir = copyDestEndsWithSlash(resolved_dest) or resolved_sources.len > 1,
         .env_digest = env_digest,
         .workdir = workdir,
         .destination_policy = if (link) .link else .follow,
+    };
+    // Input indexes are bounded by prepareStageInputs; every other request
+    // field is final here.
+    for (resolved_sources, sources) |source, *normalized| {
+        normalized.* = try normalizeBuildInputCopySource(allocator, source);
+        try build_exec.validateCopyRequest(buildInputCopyRequest(copy, normalized.*, 0));
+    }
+    return copy;
+}
+
+/// Binds a planned COPY --from to its stage input disk. The input rootfs
+/// digest is the step's cache input.
+pub fn bindBuildInputCopy(
+    allocator: std.mem.Allocator,
+    copy: BuildInputCopy,
+    input_index: usize,
+    storage: spore.RootfsStorage,
+) !build_exec.CopyStep {
+    const requests = try allocator.alloc(build_exec.CopyRequest, copy.sources.len);
+    for (copy.sources, requests) |source, *request| {
+        request.* = buildInputCopyRequest(copy, source, input_index);
+        try build_exec.validateCopyRequest(request.*);
+    }
+    return .{
+        .line = copy.line,
+        .canonical_instruction = copy.canonical_instruction,
+        .input_digest = storage.index_digest,
+        .env_digest = copy.env_digest,
+        .workdir = copy.workdir,
+        .destination_policy = copy.destination_policy,
         .requests = requests,
-    } } };
+    };
+}
+
+fn buildInputCopyRequest(copy: BuildInputCopy, source: []const u8, input_index: usize) build_exec.CopyRequest {
+    return .{
+        .source = source,
+        .dest = copy.dest,
+        .source_kind = .auto,
+        .dest_is_dir = copy.dest_is_dir,
+        .entry_count = 0,
+        .source_disk = .build_input,
+        .input_index = input_index,
+        .destination_policy = copy.destination_policy,
+    };
 }
 
 fn cacheStep(
@@ -527,24 +582,17 @@ fn cacheStep(
                 .workdir = heredoc.workdir,
                 .requests = &.{},
             } },
-            .context => |context| blk: {
-                const resolved = build_context.resolveCopySourcesWithDiagnostic(allocator, io, ctx, context.resolved_sources, diagnostic.copy) catch |err| {
-                    diagnostic.instruction_line.* = context.line;
-                    return err;
-                };
-                const resolution = try contextCopyResolution(allocator, resolved, context.parents);
-                break :blk .{ .copy = .{
-                    .line = context.line,
-                    .canonical_instruction = context.canonical_instruction,
-                    .input_digest = try contextCopyInputDigest(allocator, try build_context.hashCopyResolutionWithOptions(allocator, io, ctx, resolution, .{
-                        .stat_cache = stat_cache,
-                        .diagnostic = diagnostic.context_hash,
-                    }), resolution, context.resolved_dest, context.workdir, context.parents),
-                    .env_digest = context.env_digest,
-                    .workdir = context.workdir,
-                    .requests = &.{},
-                } };
-            },
+            .context => |context| .{ .copy = .{
+                .line = context.line,
+                .canonical_instruction = context.canonical_instruction,
+                .input_digest = try contextCopyInputDigest(allocator, try build_context.hashCopyResolutionWithOptions(allocator, io, ctx, context.resolution, .{
+                    .stat_cache = stat_cache,
+                    .diagnostic = diagnostic.context_hash,
+                }), context.resolution, context.resolved_dest, context.workdir, context.parents),
+                .env_digest = context.env_digest,
+                .workdir = context.workdir,
+                .requests = &.{},
+            } },
         },
     };
 }
@@ -1124,7 +1172,7 @@ test "cache walk advances the parent and reports only the miss suffix" {
     }
 }
 
-test "context COPY preflight reserves the longest generated source prefix" {
+test "context COPY planning reserves the longest generated source prefix" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -1158,16 +1206,18 @@ test "context COPY preflight reserves the longest generated source prefix" {
         .actual = &actual,
     };
     const ctx = build_context.BuildContext{ .root = tmp, .absolute_root = tmp };
-    try std.testing.expectError(error.CopySourceNotFound, preflightContextCopy(
+    try std.testing.expectError(error.CopySourceNotFound, planContextCopy(
         io,
         arena,
         ctx,
         &diagnostic,
         7,
+        "COPY source /dest/",
         &.{source},
         "/dest/",
-        "/",
         false,
+        "",
+        "/",
     ));
     try std.testing.expectEqual(@as(usize, 7), instruction_line);
     try std.testing.expectEqualStrings(source, copy.source);
@@ -1191,8 +1241,9 @@ test "cross-stage COPY link policy and source snapshot are cache identity" {
     source_b.index_digest = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     source_b.base_identity = source_b.index_digest;
 
-    const linked = try buildInputCopy(
+    const planned = try planBuildInputCopy(
         allocator,
+        1,
         7,
         "COPY --link --from=source /out/app /app",
         &.{"/out/app"},
@@ -1200,29 +1251,16 @@ test "cross-stage COPY link policy and source snapshot are cache identity" {
         "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         "/",
         true,
-        0,
-        source_a,
     );
-    const linked_step = linked.copy.build_input;
+    const linked_step = try bindBuildInputCopy(allocator, planned, 0, source_a);
     try std.testing.expectEqual(build_exec.CopyDestinationPolicy.link, linked_step.destination_policy);
     try std.testing.expectEqual(build_exec.CopyDestinationPolicy.link, linked_step.requests[0].destination_policy);
 
-    const changed_source = try buildInputCopy(
-        allocator,
-        7,
-        "COPY --link --from=source /out/app /app",
-        &.{"/out/app"},
-        "/app",
-        "blake3:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        "/",
-        true,
-        0,
-        source_b,
-    );
+    const changed_source = try bindBuildInputCopy(allocator, planned, 0, source_b);
     const parent = "blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const executor = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const first_key = try step_cache.stepKey(allocator, build_exec.cacheInputForStep(.{}, parent, executor, .{ .copy = linked_step }, .{}));
-    const changed_key = try step_cache.stepKey(allocator, build_exec.cacheInputForStep(.{}, parent, executor, .{ .copy = changed_source.copy.build_input }, .{}));
+    const changed_key = try step_cache.stepKey(allocator, build_exec.cacheInputForStep(.{}, parent, executor, .{ .copy = changed_source }, .{}));
     try std.testing.expect(!std.mem.eql(u8, first_key, changed_key));
 }
 
