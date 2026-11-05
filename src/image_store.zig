@@ -13,6 +13,10 @@
 //!   images/<hex>/index      canonical rootfs index
 //!   tags/<name>             "blake3:<image hex>\n"
 //!
+//! A store is a directory, an HTTP(S) URL prefix, or an S3 prefix
+//! (`s3://bucket/prefix`), read with SigV4-signed GETs using credentials
+//! from the environment and written with the aws CLI.
+//!
 //! Store bytes are untrusted. A tag only names an image digest; the metadata
 //! must recompute that digest, and an object must match the BLAKE3 digest the
 //! verified index names before it is cached or reaches the guest.
@@ -30,6 +34,7 @@ const local_paths = @import("local_paths.zig");
 const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
+const s3_sigv4 = @import("s3_sigv4.zig");
 const spore = @import("spore.zig");
 
 const digest_prefix = image.digest_prefix;
@@ -37,16 +42,20 @@ const digest_len = digest_prefix.len + chunk.ChunkId.hex_len;
 pub const tag_file_len = digest_len + 1;
 const max_tag_len = 128;
 
-pub const Scheme = enum { file, http, https };
+pub const Scheme = enum { file, http, https, s3 };
 
 /// Where a store lives: an absolute directory (`/srv/images` or
-/// `file:///srv/images`) or an HTTP(S) URL prefix. `url` is the base as
-/// written, without a trailing slash; `dir` is the directory of a file store.
+/// `file:///srv/images`), an HTTP(S) URL prefix, or an S3 bucket and key
+/// prefix (`s3://bucket/images`). `url` is the base as written, without a
+/// trailing slash; `dir` is the directory of a file store; `prefix` is empty
+/// or the `/`-led key prefix of an S3 store.
 pub const Base = struct {
     scheme: Scheme,
     url: []const u8,
     dir: []const u8 = "",
     loopback: bool = false,
+    bucket: []const u8 = "",
+    prefix: []const u8 = "",
 };
 
 pub const Target = union(enum) {
@@ -85,6 +94,20 @@ pub fn parseStoreRef(raw: []const u8) !StoreRef {
 pub fn parseBase(raw: []const u8) !Base {
     if (std.mem.startsWith(u8, raw, "/")) return .{ .scheme = .file, .url = raw, .dir = try validateDir(raw) };
     if (std.mem.startsWith(u8, raw, "file://")) return .{ .scheme = .file, .url = raw, .dir = try validateDir(raw["file://".len..]) };
+    if (std.mem.startsWith(u8, raw, "s3://")) {
+        try validateUrlBytes(raw);
+        const rest = raw["s3://".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+        const bucket = rest[0..slash];
+        try validateBucket(bucket);
+        const prefix = rest[slash..];
+        if (prefix.len != 0) {
+            _ = try validateDir(prefix);
+            // Unreserved bytes only, so a key's path is its canonical URI.
+            for (prefix) |byte| if (!(std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "/-._~", byte) != null)) return error.InvalidImageStoreRef;
+        }
+        return .{ .scheme = .s3, .url = raw, .bucket = bucket, .prefix = prefix };
+    }
     const scheme: Scheme = if (std.mem.startsWith(u8, raw, "https://"))
         .https
     else if (std.mem.startsWith(u8, raw, "http://"))
@@ -105,6 +128,16 @@ pub fn parseBase(raw: []const u8) !Base {
         .url = raw,
         .loopback = std.mem.eql(u8, host.bytes, "127.0.0.1") or std.mem.eql(u8, host.bytes, "::1") or std.mem.eql(u8, host.bytes, "[::1]"),
     };
+}
+
+/// A bucket name that is one DNS label of a virtual-hosted S3 endpoint:
+/// dots would not match the endpoint's wildcard certificate.
+fn validateBucket(bucket: []const u8) !void {
+    if (bucket.len < 3 or bucket.len > 63) return error.InvalidImageStoreRef;
+    for (bucket, 0..) |byte, index| {
+        const edge = index == 0 or index == bucket.len - 1;
+        if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or (!edge and byte == '-'))) return error.InvalidImageStoreRef;
+    }
 }
 
 /// An absolute path of plain segments: no empty, `.` or `..` segments.
@@ -169,6 +202,8 @@ pub const PushOptions = struct {
     source: []const u8,
     destination: []const u8,
     platform: rootfs.Platform,
+    /// Uploads to an S3 store.
+    aws_executable: []const u8 = "aws",
 };
 
 pub const PushResult = struct {
@@ -182,14 +217,14 @@ pub const PushResult = struct {
     bytes_written: u64,
 };
 
-/// Write the complete local image `source` into a directory store: objects,
-/// then the image's manifest, config and index, then the tag. Objects already
-/// present with the right bytes are kept, so pushing again writes nothing and
+/// Write the complete local image `source` into a directory or S3 store:
+/// objects, then the image's manifest, config and index, then the tag.
+/// Objects already present are kept, so pushing again writes nothing and
 /// pushing another tag writes only that tag.
 pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushOptions) !PushResult {
     try rootfs.validateLocalTagRef(options.source);
     const destination = try parseStoreRef(options.destination);
-    if (destination.base.scheme != .file) return error.ImageStorePushNeedsDirectory;
+    if (destination.base.scheme == .http or destination.base.scheme == .https) return error.ImageStorePushUnsupportedScheme;
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     defer allocator.free(cache_root);
@@ -201,6 +236,7 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
         .digest => |digest| if (!std.mem.eql(u8, digest, closure.image_digest)) return error.ImageIdentityMismatch,
         .tag => {},
     }
+    if (destination.base.scheme == .s3) return pushS3(init.io, allocator, options.aws_executable, destination, cache_root, &cache_lock, &closure);
 
     const dir = destination.base.dir;
     const objects_dir = try std.fs.path.join(allocator, &.{ dir, "objects", "blake3" });
@@ -272,6 +308,121 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
     };
 }
 
+/// Stage the image as a directory store under the cache's `tmp` directory,
+/// with its objects hardlinked from the cache and verified, then upload it
+/// with the aws CLI: objects, then the image's files, then the tag. The
+/// links keep the objects, so the upload does not hold the cache lock.
+/// `--size-only` skips objects the store already has: an object's key is
+/// its digest, so its size only differs when the store copy is damaged.
+fn pushS3(
+    io: Io,
+    allocator: std.mem.Allocator,
+    aws: []const u8,
+    destination: StoreRef,
+    cache_root: []const u8,
+    cache_lock: *rootfs.RootfsCacheLock,
+    closure: *const image_archive.LocalClosure,
+) !PushResult {
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var nonce: [8]u8 = undefined;
+    io.random(&nonce);
+    const stage = try std.fmt.allocPrint(arena, "{s}/tmp/image-push-{x}", .{ cache_root, std.mem.readInt(u64, &nonce, .little) });
+    defer Io.Dir.cwd().deleteTree(io, stage) catch {};
+    const objects_dir = try std.fs.path.join(arena, &.{ stage, "objects", "blake3" });
+    try Io.Dir.cwd().createDirPath(io, objects_dir);
+
+    var uploads: Uploads = .{};
+    // Linked objects, verified once the lock is released: a link pins the
+    // inode, so GC cannot change what it holds.
+    var linked: std.ArrayList(struct { path: []const u8, digest: []const u8, size: u64 }) = .empty;
+    for (closure.objects) |object| {
+        const hex = object.digest[digest_prefix.len..];
+        const staged = try std.fs.path.join(arena, &.{ objects_dir, hex });
+        const cached = try rootfs_cas.manifestObjectPath(arena, cache_root, object.digest);
+        if (Io.Dir.cwd().hardLink(cached, Io.Dir.cwd(), staged, io, .{})) {
+            try linked.append(arena, .{ .path = staged, .digest = object.digest, .size = object.size });
+        } else |_| {
+            const bytes = try rootfs_cas.readVerifiedManifestObject(allocator, cache_root, object.digest, object.size);
+            defer allocator.free(bytes);
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged, .data = bytes });
+        }
+        try uploads.sizes.put(arena, hex, object.size);
+    }
+    const image_files = [_]struct { name: []const u8, bytes: []const u8 }{
+        .{ .name = "manifest", .bytes = closure.manifest.bytes },
+        .{ .name = "config", .bytes = closure.config_bytes },
+        .{ .name = "index", .bytes = closure.index_bytes },
+    };
+    for (image_files) |file| {
+        const path = try std.fs.path.join(arena, &.{ stage, try imagePathAlloc(arena, closure.image_digest, file.name) });
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = file.bytes });
+    }
+    cache_lock.deinit();
+    for (linked.items) |object| allocator.free(try rootfs_cas.readVerifiedChunkPath(allocator, object.path, object.digest, object.size));
+
+    const base = destination.base.url;
+    try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--no-progress", try std.fs.path.join(arena, &.{ stage, "objects" }), try std.fmt.allocPrint(arena, "{s}/objects", .{base}) }, &uploads);
+    try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--only-show-errors", try std.fs.path.join(arena, &.{ stage, "images" }), try std.fmt.allocPrint(arena, "{s}/images", .{base}) }, null);
+    const name = switch (destination.target) {
+        .tag => |tag| blk: {
+            const path = try std.fs.path.join(arena, &.{ stage, "tag" });
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try std.fmt.allocPrint(arena, "{s}\n", .{closure.image_digest}) });
+            try runAws(io, arena, aws, &.{ "s3", "cp", "--only-show-errors", path, try std.fmt.allocPrint(arena, "{s}/tags/{s}", .{ base, tag }) }, null);
+            break :blk tag;
+        },
+        .digest => |digest| digest,
+    };
+
+    const ref = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, name });
+    errdefer allocator.free(ref);
+    return .{
+        .ref = ref,
+        .image_digest = try allocator.dupe(u8, closure.image_digest),
+        .objects_total = closure.objects.len,
+        .objects_written = uploads.count,
+        .bytes_written = uploads.bytes,
+    };
+}
+
+/// Counts the objects `aws s3 sync` uploads from the lines it prints:
+/// `upload: <local path> to s3://<bucket>/<prefix>/objects/blake3/<hex>`.
+const Uploads = struct {
+    /// Object sizes by digest hex.
+    sizes: std.StringHashMapUnmanaged(u64) = .empty,
+    count: usize = 0,
+    bytes: u64 = 0,
+
+    fn line(self: *Uploads, text: []const u8) void {
+        if (!std.mem.startsWith(u8, text, "upload: ")) return;
+        const key = std.mem.trimEnd(u8, text, "\r");
+        const size = self.sizes.get(key[(std.mem.lastIndexOfScalar(u8, key, '/') orelse return) + 1 ..]) orelse return;
+        self.count += 1;
+        self.bytes += size;
+    }
+};
+
+/// Run `aws ARGS...` and fail unless it exits 0. Its errors go to stderr;
+/// `uploads` counts the uploads it reports on stdout.
+fn runAws(io: Io, allocator: std.mem.Allocator, aws: []const u8, args: []const []const u8, uploads: ?*Uploads) !void {
+    const argv = try std.mem.concat(allocator, []const u8, &.{ &.{aws}, args });
+    defer allocator.free(argv);
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit }) catch return error.AwsCliUnavailable;
+    defer child.kill(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = child.stdout.?.readerStreaming(io, &buffer);
+    while (reader.interface.takeDelimiter('\n') catch return error.ImageStorePushFailed) |text| {
+        if (uploads) |counter| counter.line(text);
+    }
+    switch (try child.wait(io)) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    return error.ImageStorePushFailed;
+}
+
 pub fn deinitPushResult(allocator: std.mem.Allocator, result: PushResult) void {
     allocator.free(result.ref);
     allocator.free(result.image_digest);
@@ -281,16 +432,18 @@ pub fn deinitPushResult(allocator: std.mem.Allocator, result: PushResult) void {
 /// verifying its manifest, config and index if this cache has none, and
 /// recording the store as the origin of objects still missing locally. A tag
 /// is read from the store every time; a digest is not when the image is local.
-/// Allocates into `allocator`; use an arena.
+/// An S3 store takes its credentials from `env`. Allocates into `allocator`;
+/// use an arena.
 pub fn resolve(
     io: Io,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     raw: []const u8,
     platform: rootfs.Platform,
+    env: *const std.process.Environ.Map,
 ) !local_image.LocalImage {
     const ref = try parseStoreRef(raw);
-    var client = try Client.init(allocator, io, ref.base.url);
+    var client = try Client.init(allocator, io, ref.base.url, env);
     defer client.deinit();
     const identity = switch (ref.target) {
         .digest => |digest| digest,
@@ -387,33 +540,98 @@ pub const GetError = error{
 };
 
 /// Reads files from one store. Requests are bounded by size and time; an
-/// HTTP(S) request runs on an `Io` worker that is canceled at its deadline.
-/// Thread-safe: concurrent requests share the connection pool.
+/// HTTP(S) or S3 request runs on an `Io` worker that is canceled at its
+/// deadline. Thread-safe: concurrent requests share the connection pool.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: Io,
     base: Base,
     http: std.http.Client,
+    /// Signs requests to an S3 store.
+    s3: ?S3 = null,
 
-    /// `allocator` must be thread-safe: requests run on `Io` workers.
-    pub fn init(allocator: std.mem.Allocator, io: Io, base_url: []const u8) !Client {
+    /// Where an S3 store's requests go, and what signs them. Owns copies of
+    /// the credentials, which only the signature and the session token
+    /// header carry: no URL, log line or error holds them.
+    const S3 = struct {
+        /// Owns every slice here.
+        arena: std.heap.ArenaAllocator,
+        credentials: s3_sigv4.Credentials,
+        region: []const u8,
+        /// `https://<bucket>.s3.<region>.amazonaws.com`, without a path.
+        endpoint: []const u8,
+        /// The signed Host header: the endpoint's authority.
+        host: []const u8,
+
+        fn init(allocator: std.mem.Allocator, base: Base, env: *const std.process.Environ.Map, endpoint_override: ?[]const u8) !S3 {
+            // Reads go only to AWS, so an endpoint meant for an S3-compatible
+            // store must not be ignored silently.
+            for ([_][]const u8{ "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3" }) |name| {
+                const value: []const u8 = env.get(name) orelse "";
+                if (value.len != 0) return error.AwsEndpointUrlUnsupported;
+            }
+            const credentials = try s3_sigv4.Credentials.fromEnv(env);
+            const region = try s3_sigv4.regionFromEnv(env);
+            var arena: std.heap.ArenaAllocator = .init(allocator);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            const endpoint = if (endpoint_override) |value|
+                try a.dupe(u8, value)
+            else
+                try std.fmt.allocPrint(a, "https://{s}.s3.{s}.amazonaws.com", .{ base.bucket, region });
+            const authority = std.mem.indexOf(u8, endpoint, "://") orelse return error.InvalidImageStoreRef;
+            return .{
+                .credentials = .{
+                    .access_key_id = try a.dupe(u8, credentials.access_key_id),
+                    .secret_access_key = try a.dupe(u8, credentials.secret_access_key),
+                    .session_token = if (credentials.session_token) |token| try a.dupe(u8, token) else null,
+                },
+                .region = try a.dupe(u8, region),
+                .endpoint = endpoint,
+                .host = endpoint[authority + 3 ..],
+                .arena = arena,
+            };
+        }
+
+        fn deinit(self: *S3) void {
+            std.crypto.secureZero(u8, @constCast(self.credentials.secret_access_key));
+            self.arena.deinit();
+        }
+    };
+
+    /// `allocator` must be thread-safe: requests run on `Io` workers. An S3
+    /// store reads its credentials and region from `env` now.
+    pub fn init(allocator: std.mem.Allocator, io: Io, base_url: []const u8, env: *const std.process.Environ.Map) !Client {
+        return initWithEndpoint(allocator, io, base_url, env, null);
+    }
+
+    /// `init`, but an S3 store's requests go to `s3_endpoint`, a test stub.
+    fn initWithEndpoint(allocator: std.mem.Allocator, io: Io, base_url: []const u8, env: *const std.process.Environ.Map, s3_endpoint: ?[]const u8) !Client {
         const url = try allocator.dupe(u8, base_url);
         errdefer allocator.free(url);
         const base = try parseBase(url);
-        var http: std.http.Client = .{ .allocator = allocator, .io = io };
-        errdefer http.deinit();
-        if (base.scheme == .https) {
+        var s3: ?S3 = if (base.scheme == .s3) try S3.init(allocator, base, env, s3_endpoint) else null;
+        errdefer if (s3) |*value| value.deinit();
+        var client: Client = .{ .allocator = allocator, .io = io, .base = base, .http = .{ .allocator = allocator, .io = io }, .s3 = s3 };
+        errdefer client.http.deinit();
+        if (client.tls()) {
             // Load CA certificates now rather than on a guest fault.
             const now = Io.Clock.real.now(io);
-            http.ca_bundle.rescan(allocator, io, now) catch return error.CertificateBundleLoadFailure;
-            http.now = now;
+            client.http.ca_bundle.rescan(allocator, io, now) catch return error.CertificateBundleLoadFailure;
+            client.http.now = now;
         }
-        return .{ .allocator = allocator, .io = io, .base = base, .http = http };
+        return client;
     }
 
     pub fn deinit(self: *Client) void {
         self.http.deinit();
+        if (self.s3) |*s3| s3.deinit();
         self.allocator.free(self.base.url);
+    }
+
+    fn tls(self: *const Client) bool {
+        if (self.s3) |s3| return std.mem.startsWith(u8, s3.endpoint, "https://");
+        return self.base.scheme == .https;
     }
 
     /// GET `<base>/<path>`, retrying transient failures within `budget`.
@@ -440,7 +658,10 @@ pub const Client = struct {
 
     fn getOnce(self: *Client, allocator: std.mem.Allocator, path: []const u8, limit: Limit, timeout_ms: u64) GetError![]u8 {
         if (self.base.scheme == .file) return self.readFile(allocator, path, limit);
-        const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base.url, path });
+        const url = if (self.s3) |s3|
+            try std.fmt.allocPrint(allocator, "{s}{s}/{s}", .{ s3.endpoint, self.base.prefix, path })
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base.url, path });
         defer allocator.free(url);
 
         const Attempt = struct {
@@ -509,14 +730,33 @@ pub const Client = struct {
         // Certificate validity is checked against `now`, which init set when
         // it loaded the CA bundle; a long run must not keep that time. The
         // HTTP client updates `now` under this lock too.
-        if (self.base.scheme == .https) {
+        if (self.tls()) {
             self.http.ca_bundle_lock.lockUncancelable(self.io);
             defer self.http.ca_bundle_lock.unlock(self.io);
             self.http.now = Io.Clock.real.now(self.io);
         }
+        var headers: std.http.Client.Request.Headers = .{ .accept_encoding = .omit };
+        var amz_headers: [3]std.http.Header = undefined;
+        var extra_headers: []const std.http.Header = &.{};
+        var signed: s3_sigv4.SignedGet = undefined;
+        if (self.s3) |s3| {
+            const path = switch (uri.path) {
+                .raw, .percent_encoded => |value| value,
+            };
+            const now = Io.Clock.real.now(self.io).toSeconds();
+            signed = try s3_sigv4.signGet(s3.credentials, s3.region, s3.host, path, @intCast(now));
+            var signed_buf: [4]s3_sigv4.Header = undefined;
+            // Host goes first; the client writes it from `headers.host`.
+            const signed_headers = signed.headers(&signed_buf)[1..];
+            for (signed_headers, 0..) |header, index| amz_headers[index] = .{ .name = header.name, .value = header.value };
+            extra_headers = amz_headers[0..signed_headers.len];
+            headers.host = .{ .override = s3.host };
+            headers.authorization = .{ .override = signed.authorization() };
+        }
         var request = try self.http.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
-            .headers = .{ .accept_encoding = .omit },
+            .headers = headers,
+            .extra_headers = extra_headers,
         });
         defer request.deinit();
         try request.sendBodiless();
@@ -655,8 +895,9 @@ pub const Fetcher = struct {
     const Purpose = enum { read, window, fill };
 
     /// `allocator` must be thread-safe: faults run on vCPU threads and
-    /// requests on `Io` workers.
-    pub fn create(allocator: std.mem.Allocator, io: Io, cache_root: []const u8, origin: []const u8, storage: spore.RootfsStorage) !*Fetcher {
+    /// requests on `Io` workers. An S3 store takes its credentials from `env`
+    /// now and keeps them for the Fetcher's life.
+    pub fn create(allocator: std.mem.Allocator, io: Io, cache_root: []const u8, origin: []const u8, storage: spore.RootfsStorage, env: *const std.process.Environ.Map) !*Fetcher {
         const self = try allocator.create(Fetcher);
         errdefer allocator.destroy(self);
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -669,7 +910,7 @@ pub const Fetcher = struct {
             .arena = arena,
             .cache_root = owned_root,
             .storage = owned_storage,
-            .client = try Client.init(allocator, io, origin),
+            .client = try Client.init(allocator, io, origin, env),
         };
         return self;
     }
@@ -991,8 +1232,11 @@ test "image store tags name exactly one image digest" {
 
 test "image store refs name a store and a tag or digest" {
     const digest = "blake3:" ++ "a" ** 64;
-    const Case = struct { raw: []const u8, scheme: Scheme, url: []const u8, dir: []const u8 = "", tag: ?[]const u8 = null };
+    const Case = struct { raw: []const u8, scheme: Scheme, url: []const u8, dir: []const u8 = "", tag: ?[]const u8 = null, bucket: []const u8 = "", prefix: []const u8 = "" };
     for ([_]Case{
+        .{ .raw = "s3://my-bucket-1/team/images/app", .scheme = .s3, .url = "s3://my-bucket-1/team/images", .tag = "app", .bucket = "my-bucket-1", .prefix = "/team/images" },
+        .{ .raw = "s3://abc/app", .scheme = .s3, .url = "s3://abc", .tag = "app", .bucket = "abc" },
+        .{ .raw = "s3://abc/a_b.c~d/" ++ digest, .scheme = .s3, .url = "s3://abc/a_b.c~d", .bucket = "abc", .prefix = "/a_b.c~d" },
         .{ .raw = "/srv/store/app", .scheme = .file, .url = "/srv/store", .dir = "/srv/store", .tag = "app" },
         .{ .raw = "file:///srv/store/1.0_rc-2", .scheme = .file, .url = "file:///srv/store", .dir = "/srv/store", .tag = "1.0_rc-2" },
         .{ .raw = "https://images.example.test/team/app", .scheme = .https, .url = "https://images.example.test/team", .tag = "app" },
@@ -1005,6 +1249,8 @@ test "image store refs name a store and a tag or digest" {
         try std.testing.expectEqual(case.scheme, ref.base.scheme);
         try std.testing.expectEqualStrings(case.url, ref.base.url);
         try std.testing.expectEqualStrings(case.dir, ref.base.dir);
+        try std.testing.expectEqualStrings(case.bucket, ref.base.bucket);
+        try std.testing.expectEqualStrings(case.prefix, ref.base.prefix);
         if (case.tag) |tag| {
             try std.testing.expectEqualStrings(tag, ref.target.tag);
         } else try std.testing.expectEqualStrings(digest, ref.target.digest);
@@ -1014,8 +1260,22 @@ test "image store refs name a store and a tag or digest" {
     for ([_]Rejected{
         .{ .raw = "http://images.example.test/app", .err = error.InsecureImageStoreTag },
         .{ .raw = "http://localhost:8000/app", .err = error.InsecureImageStoreTag },
-        .{ .raw = "s3://bucket/app", .err = error.UnsupportedImageStoreScheme },
+        .{ .raw = "gs://bucket/app", .err = error.UnsupportedImageStoreScheme },
         .{ .raw = "relative/store/app", .err = error.UnsupportedImageStoreScheme },
+        // A bucket is one DNS label of the endpoint; a prefix only plain
+        // segments of unreserved bytes.
+        .{ .raw = "s3://my.bucket/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://My-bucket/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://ab/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://" ++ "a" ** 64 ++ "/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://-bucket/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3:///app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://user@bucket/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://bucket:443/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://bucket/team//app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://bucket/../app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://bucket/te:am/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://bucket/te+am/app", .err = error.InvalidImageStoreRef },
         .{ .raw = "https://user@images.example.test/app", .err = error.InvalidImageStoreRef },
         .{ .raw = "https://user:pass@images.example.test/app", .err = error.InvalidImageStoreRef },
         .{ .raw = "https://images.example.test/app?x=1", .err = error.InvalidImageStoreRef },
@@ -1175,7 +1435,90 @@ test "image push writes a complete store once and retags without rewriting" {
     try std.testing.expectEqual(@as(usize, 1), repaired.objects_written);
     try std.testing.expectEqual(@as(usize, 8), (try fixture.listStore(store)).len);
     try std.testing.expectError(error.ImageIdentityMismatch, fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, "b" ** 64 })));
-    try std.testing.expectError(error.ImageStorePushNeedsDirectory, fixture.pushTo("https://images.example.test/app"));
+    try std.testing.expectError(error.ImageStorePushUnsupportedScheme, fixture.pushTo("https://images.example.test/app"));
+}
+
+test "image push to S3 uploads objects, then the image, then the tag, with the aws CLI" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    // A fake aws CLI over a local bucket directory, with `sync --size-only`
+    // semantics, that fails while `fail-images` exists.
+    const bucket = try fixture.path("bucket");
+    const log = try fixture.path("aws.log");
+    const aws = try fixture.path("aws");
+    try Io.Dir.cwd().createDirPath(io, bucket);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = aws, .data = try std.fmt.allocPrint(allocator,
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\root="{s}"
+        \\printf '%s\n' "$*" >> "{s}"
+        \\args=("$@")
+        \\src="${{args[$# - 2]}}"
+        \\url="${{args[$# - 1]}}"
+        \\dst="$root/${{url#s3://}}"
+        \\case "$1 $2" in
+        \\  "s3 sync")
+        \\    if [[ -e "$root/fail-images" && "$url" == */images ]]; then exit 1; fi
+        \\    (cd "$src" && find . -type f | sort) | while read -r file; do
+        \\      file="${{file#./}}"
+        \\      if [[ -f "$dst/$file" && $(wc -c < "$dst/$file") == $(wc -c < "$src/$file") ]]; then continue; fi
+        \\      mkdir -p "$(dirname "$dst/$file")"
+        \\      cp "$src/$file" "$dst/$file"
+        \\      [[ " $* " == *" --only-show-errors "* ]] || echo "upload: $src/$file to $url/$file"
+        \\    done ;;
+        \\  "s3 cp") mkdir -p "$(dirname "$dst")"; cp "$src" "$dst" ;;
+        \\  *) exit 2 ;;
+        \\esac
+        \\
+    , .{ bucket, log }), .flags = .{ .permissions = .fromMode(0o755) } });
+    const options = PushOptions{ .source = "local/app:1", .destination = "s3://bucket-1/team/1", .platform = fixture.platform, .aws_executable = aws };
+
+    // The image's files reach the bucket before its tag, so a reader never
+    // sees a tag naming an image the store lacks.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ bucket, "fail-images" }), .data = "" });
+    try std.testing.expectError(error.ImageStorePushFailed, push(fixture.processInit(), allocator, options));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try std.fs.path.join(allocator, &.{ bucket, "bucket-1", "team", "tags" }), .{}));
+    try Io.Dir.cwd().deleteFile(io, try std.fs.path.join(allocator, &.{ bucket, "fail-images" }));
+
+    const pushed = try push(fixture.processInit(), allocator, options);
+    try std.testing.expectEqualStrings("s3://bucket-1/team/1", pushed.ref);
+    try std.testing.expectEqualStrings(fixture.identity, pushed.image_digest);
+    try std.testing.expectEqual(@as(usize, 3), pushed.objects_total);
+    // The failed push uploaded the objects already.
+    try std.testing.expectEqual(@as(usize, 0), pushed.objects_written);
+    const commands = try Io.Dir.cwd().readFileAlloc(io, log, allocator, .limited(64 * 1024));
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, commands, "\n"), '\n');
+    const objects_sync = .{ "s3 sync --size-only --no-progress ", " s3://bucket-1/team/objects" };
+    const images_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/images" };
+    const tag_copy = .{ "s3 cp --only-show-errors ", " s3://bucket-1/team/tags/1" };
+    inline for (.{ objects_sync, images_sync, objects_sync, images_sync, tag_copy }) |expected| {
+        const line = lines.next() orelse return error.TestExpectedAwsCommand;
+        try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
+        try std.testing.expect(std.mem.endsWith(u8, line, expected[1]));
+    }
+    try std.testing.expectEqual(null, lines.next());
+
+    // The bucket is a store: it reads back as one, and a fresh object
+    // upload is counted from what the CLI reports.
+    const store = try std.fs.path.join(allocator, &.{ bucket, "bucket-1", "team" });
+    const consumer = try fixture.path("consumer-cache");
+    const local = try resolve(io, allocator, consumer, try std.fmt.allocPrint(allocator, "{s}/1", .{store}), .{}, &fixture.env);
+    try std.testing.expectEqualStrings(fixture.identity, local.identity);
+    try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(allocator, &.{ store, "objects" }));
+    const again = try push(fixture.processInit(), allocator, .{ .source = "local/app:1", .destination = try std.fmt.allocPrint(allocator, "s3://bucket-1/team/{s}", .{fixture.identity}), .platform = fixture.platform, .aws_executable = aws });
+    try std.testing.expectEqual(@as(usize, 3), again.objects_written);
+    try std.testing.expectEqual(@as(u64, 2 * rootfs_cas.default_chunk_size + 100), again.bytes_written);
+
+    // Every push removed its staging directory.
+    const cache = fixture.env.get(local_paths.rootfs_cache_env).?;
+    var tmp = try Io.Dir.cwd().openDir(io, try std.fs.path.join(allocator, &.{ cache, "tmp" }), .{ .iterate = true });
+    defer tmp.close(io);
+    var entries = tmp.iterate();
+    try std.testing.expectEqual(null, try entries.next(io));
+    try std.testing.expectError(error.AwsCliUnavailable, push(fixture.processInit(), allocator, .{ .source = "local/app:1", .destination = "s3://bucket-1/team/1", .platform = fixture.platform, .aws_executable = try fixture.path("missing-aws") }));
 }
 
 test "a store image resolves into an empty cache with only its metadata" {
@@ -1190,17 +1533,17 @@ test "a store image resolves into an empty cache with only its metadata" {
     const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
     const platform = rootfs.Platform{};
 
-    const local = try resolve(io, allocator, consumer, ref, platform);
+    const local = try resolve(io, allocator, consumer, ref, platform, &fixture.env);
     try std.testing.expectEqualStrings(fixture.identity, local.identity);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}", .{store}), local.origin.?);
     try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, allocator, consumer, local.storage));
     const objects_dir = try std.fs.path.join(allocator, &.{ consumer, "cas", "rootfs", "blake3", "objects" });
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, objects_dir, .{}));
-    try std.testing.expectError(error.UnsupportedPlatform, resolve(io, allocator, consumer, ref, .{ .arch = .amd64 }));
+    try std.testing.expectError(error.UnsupportedPlatform, resolve(io, allocator, consumer, ref, .{ .arch = .amd64 }, &fixture.env));
 
     // A digest ref of a local image needs no store.
     const digest_ref = try std.fmt.allocPrint(allocator, "file://{s}/missing/{s}", .{ store, fixture.identity });
-    const by_digest = try resolve(io, allocator, consumer, digest_ref, platform);
+    const by_digest = try resolve(io, allocator, consumer, digest_ref, platform, &fixture.env);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}/missing", .{store}), by_digest.origin.?);
 
     // Tampered metadata never reaches the catalog.
@@ -1213,18 +1556,19 @@ test "a store image resolves into an empty cache with only its metadata" {
         bytes[bytes.len / 2] ^= 1;
         try chunk_sealer.replaceFileAtomicDurable(allocator, file_path, bytes, 0o644);
         const tampered_cache = try fixture.path(try std.fmt.allocPrint(allocator, "tampered-{s}-cache", .{file}));
-        try std.testing.expectError(error.BadProtocol, resolve(io, allocator, tampered_cache, try std.fmt.allocPrint(allocator, "{s}/1", .{tampered_store}), platform));
+        try std.testing.expectError(error.BadProtocol, resolve(io, allocator, tampered_cache, try std.fmt.allocPrint(allocator, "{s}/1", .{tampered_store}), platform, &fixture.env));
         try std.testing.expectEqual(null, try local_image.loadAllowingOrigin(io, allocator, tampered_cache, fixture.identity));
     }
     const missing_cache = try fixture.path("missing-cache");
-    try std.testing.expectError(error.ImageStoreNotFound, resolve(io, allocator, missing_cache, try std.fmt.allocPrint(allocator, "{s}/2", .{store}), platform));
+    try std.testing.expectError(error.ImageStoreNotFound, resolve(io, allocator, missing_cache, try std.fmt.allocPrint(allocator, "{s}/2", .{store}), platform, &fixture.env));
 }
 
 /// Test support: serves files from `root` over HTTP/1.1 on loopback, each
 /// connection on its own thread. `failures` answers that many requests with
 /// 500 first; `hang` holds every request open until `deinit`; `delay_ms`
 /// delays every answer, reading the file after the delay; requests for
-/// `held` wait until `releaseHeld`.
+/// `held` wait until `releaseHeld`; with `s3` set, a request without a valid
+/// SigV4 signature by those credentials gets 403, as S3 answers.
 pub const TestServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -1242,6 +1586,12 @@ pub const TestServer = struct {
     /// A request path, such as `/objects/blake3/<hex>`; set before requests.
     held: ?[]const u8 = null,
     released: std.atomic.Value(bool) = .init(false),
+    /// Set before requests.
+    s3: ?struct { credentials: s3_sigv4.Credentials, region: []const u8 } = null,
+    /// Requests whose signature did not verify.
+    unsigned: std.atomic.Value(u32) = .init(0),
+    /// Requests that carried the secret key anywhere in their head.
+    leaked: std.atomic.Value(u32) = .init(0),
 
     pub fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
         var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
@@ -1294,12 +1644,32 @@ pub const TestServer = struct {
     fn handle(self: *TestServer, stream: Io.net.Stream) !void {
         var read_buffer: [8 * 1024]u8 = undefined;
         var reader = stream.reader(self.io, &read_buffer);
-        const request_line = std.mem.trimEnd(u8, try reader.interface.takeDelimiterExclusive('\n'), "\r");
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        // The head as read: request line, then header lines.
+        var head: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            const line = std.mem.trimEnd(u8, try reader.interface.takeDelimiterInclusive('\n'), "\r\n");
+            if (line.len == 0) break;
+            try head.append(arena, try arena.dupe(u8, line));
+        }
+        const request_line = head.items[0];
         const path = request_line["GET ".len..std.mem.lastIndexOfScalar(u8, request_line, ' ').?];
-        const file_path = try std.fs.path.join(self.allocator, &.{ self.root, path[1..] });
-        defer self.allocator.free(file_path);
-        while (std.mem.trimEnd(u8, try reader.interface.takeDelimiterExclusive('\n'), "\r").len != 0) {}
+        const file_path = try std.fs.path.join(arena, &.{ self.root, path[1..] });
         _ = self.requests.fetchAdd(1, .monotonic);
+        if (self.s3) |s3| {
+            for (head.items) |line| {
+                if (std.mem.indexOf(u8, line, s3.credentials.secret_access_key) != null) _ = self.leaked.fetchAdd(1, .monotonic);
+            }
+            if (!try verifySigV4(arena, s3.credentials, s3.region, path, head.items[1..])) {
+                _ = self.unsigned.fetchAdd(1, .monotonic);
+                var forbidden_buffer: [256]u8 = undefined;
+                var forbidden = stream.writer(self.io, &forbidden_buffer);
+                try forbidden.interface.writeAll("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return forbidden.interface.flush();
+            }
+        }
         std.Io.sleep(self.io, .fromMilliseconds(self.delay_ms.load(.monotonic)), .awake) catch {};
         if (self.held) |held| if (std.mem.eql(u8, held, path)) {
             while (!self.released.load(.acquire) and !self.closed.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(5), .awake) catch {};
@@ -1326,6 +1696,45 @@ pub const TestServer = struct {
     }
 };
 
+/// Test support: checks a GET's SigV4 Authorization header the way S3 does,
+/// from the request as received. The host, payload hash, date and any
+/// session token must be signed, and the signature must be the one
+/// `credentials` give over the headers it names.
+fn verifySigV4(arena: std.mem.Allocator, credentials: s3_sigv4.Credentials, region: []const u8, path: []const u8, header_lines: []const []const u8) !bool {
+    var values: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (header_lines) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+        try values.put(arena, try std.ascii.allocLowerString(arena, line[0..colon]), std.mem.trim(u8, line[colon + 1 ..], " "));
+    }
+    const sent = values.get("authorization") orelse return false;
+    const names_start = (std.mem.indexOf(u8, sent, ",SignedHeaders=") orelse return false) + ",SignedHeaders=".len;
+    const names_end = std.mem.indexOfScalarPos(u8, sent, names_start, ',') orelse return false;
+    var signed: std.ArrayList(s3_sigv4.Header) = .empty;
+    var names = std.mem.splitScalar(u8, sent[names_start..names_end], ';');
+    while (names.next()) |name| try signed.append(arena, .{ .name = name, .value = values.get(name) orelse return false });
+    var required: std.ArrayList([]const u8) = .empty;
+    try required.appendSlice(arena, &.{ "host", "x-amz-content-sha256", "x-amz-date" });
+    if (credentials.session_token) |token| {
+        if (!std.mem.eql(u8, values.get("x-amz-security-token") orelse return false, token)) return false;
+        try required.append(arena, "x-amz-security-token");
+    }
+    for (required.items) |name| {
+        for (signed.items) |header| {
+            if (std.mem.eql(u8, header.name, name)) break;
+        } else return false;
+    }
+    var buf: [512]u8 = undefined;
+    const expected = s3_sigv4.authorization(&buf, credentials, .{
+        .method = "GET",
+        .path = path,
+        .region = region,
+        .amz_date = values.get("x-amz-date").?,
+        .payload_hash = values.get("x-amz-content-sha256").?,
+        .headers = signed.items,
+    }) catch return false;
+    return std.mem.eql(u8, expected, sent);
+}
+
 test "HTTP store reads retry transient failures and fail closed on the rest" {
     var fixture: TestImage = undefined;
     try fixture.init(.{});
@@ -1340,7 +1749,7 @@ test "HTTP store reads retry transient failures and fail closed on the rest" {
     var server: TestServer = undefined;
     try server.start(std.testing.allocator, io, store);
     defer server.stop();
-    var client = try Client.init(std.testing.allocator, io, try server.url(allocator));
+    var client = try Client.init(std.testing.allocator, io, try server.url(allocator), &fixture.env);
     defer client.deinit();
     const quick = Budget{ .attempts = 3, .attempt_ms = 2_000, .total_ms = 5_000 };
 
@@ -1365,6 +1774,84 @@ test "HTTP store reads retry transient failures and fail closed on the rest" {
     const start_ms = monotonicMs();
     try std.testing.expectError(error.ImageStoreTimeout, client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, .{ .attempts = 2, .attempt_ms = 200, .total_ms = 600 }));
     try std.testing.expect(monotonicMs() - start_ms < 2_000);
+}
+
+test "S3 store reads are signed with the environment's credentials, which only the signature carries" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const bucket = try fixture.path("bucket");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/team/1", .{bucket}));
+    const tag = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(allocator, &.{ bucket, "team", "tags", "1" }), allocator, .limited(tag_file_len + 1));
+    const objects = try testObjects(&fixture, try std.fs.path.join(allocator, &.{ bucket, "team" }));
+
+    const secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+    const token = "IQoJb3JpZ2luX2VjEXAMPLE/session+token==";
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    try env.put("AWS_SECRET_ACCESS_KEY", secret);
+    try env.put("AWS_SESSION_TOKEN", token);
+    try env.put("AWS_REGION", "eu-west-2");
+
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, bucket);
+    defer server.stop();
+    server.s3 = .{ .credentials = .{ .access_key_id = "AKIDEXAMPLE", .secret_access_key = secret, .session_token = token }, .region = "eu-west-2" };
+    const endpoint = try server.url(allocator);
+    const once = Budget{ .attempts = 1, .attempt_ms = 2_000, .total_ms = 2_000 };
+
+    var client = try Client.initWithEndpoint(std.testing.allocator, io, "s3://bucket-1/team", &env, endpoint);
+    defer client.deinit();
+    const bytes = try client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, once);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(tag, bytes);
+    const path = try objectPathAlloc(allocator, &objects[0].digest);
+    const object = try client.get(std.testing.allocator, path, .{ .max = objects[0].len, .exact = true }, once);
+    std.testing.allocator.free(object);
+    try std.testing.expectEqual(@as(u32, 0), server.unsigned.load(.monotonic));
+
+    // A wrong secret, a missing session token or another region signs
+    // something S3 rejects, and the read fails closed.
+    const Variant = struct { name: []const u8, value: ?[]const u8 };
+    for ([_]Variant{
+        .{ .name = "AWS_SECRET_ACCESS_KEY", .value = "another-secret" },
+        .{ .name = "AWS_SESSION_TOKEN", .value = null },
+        .{ .name = "AWS_REGION", .value = "us-east-1" },
+    }) |variant| {
+        var other = try env.clone(std.testing.allocator);
+        defer other.deinit();
+        if (variant.value) |value| try other.put(variant.name, value) else _ = other.swapRemove(variant.name);
+        var rejected = try Client.initWithEndpoint(std.testing.allocator, io, "s3://bucket-1/team", &other, endpoint);
+        defer rejected.deinit();
+        try std.testing.expectError(error.ImageStoreRejected, rejected.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, once));
+    }
+    try std.testing.expectEqual(@as(u32, 3), server.unsigned.load(.monotonic));
+
+    // The secret never crossed the wire, and what logs and the catalog show
+    // of the store is the ref as written.
+    try std.testing.expectEqual(@as(u32, 0), server.leaked.load(.monotonic));
+    try std.testing.expectEqualStrings("s3://bucket-1/team", client.base.url);
+
+    // Credentials and region must be present and plain before any request.
+    var missing = std.process.Environ.Map.init(std.testing.allocator);
+    defer missing.deinit();
+    try std.testing.expectError(error.AwsCredentialsMissing, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));
+    try missing.put("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    try missing.put("AWS_SECRET_ACCESS_KEY", secret);
+    try std.testing.expectError(error.AwsRegionMissing, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));
+    try missing.put("AWS_REGION", "eu-west-2");
+    try missing.put("AWS_SESSION_TOKEN", "token\r\nx-injected: 1");
+    try std.testing.expectError(error.AwsCredentialsInvalid, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));
+    // An S3-compatible endpoint is refused rather than ignored.
+    for ([_][]const u8{ "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3" }) |name| {
+        var compatible = try env.clone(std.testing.allocator);
+        defer compatible.deinit();
+        try compatible.put(name, "http://127.0.0.1:9000");
+        try std.testing.expectError(error.AwsEndpointUrlUnsupported, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &compatible));
+    }
 }
 
 /// Test support: the store's objects, each with its index-derived length.
@@ -1398,7 +1885,7 @@ test "a guest read fetches its window with it, with one GET per object" {
     const io = std.testing.io;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
-    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{}, &fixture.env);
     const objects = try testObjects(&fixture, store);
     const read, const next, const after = .{ objects[0], objects[1], objects[2] };
 
@@ -1408,7 +1895,7 @@ test "a guest read fetches its window with it, with one GET per object" {
     // Every GET is slow, so the window's two requests for `next` overlap.
     server.delay_ms.store(100, .monotonic);
     const cache = try fixture.path("cache");
-    const fetcher = try Fetcher.create(std.testing.allocator, io, cache, try server.url(allocator), local.storage);
+    const fetcher = try Fetcher.create(std.testing.allocator, io, cache, try server.url(allocator), local.storage, &fixture.env);
     defer fetcher.release();
     const buf = try allocator.alloc(u8, read.len);
     try fetcher.fetchObject(&read.digest, buf, &.{ next, next, after });
@@ -1426,7 +1913,7 @@ test "a guest read fetches its window with it, with one GET per object" {
 
     // A failed window fetch fails nothing, but stops later windows.
     server.delay_ms.store(0, .monotonic);
-    const lossy = try Fetcher.create(std.testing.allocator, io, try fixture.path("lossy-cache"), try server.url(allocator), local.storage);
+    const lossy = try Fetcher.create(std.testing.allocator, io, try fixture.path("lossy-cache"), try server.url(allocator), local.storage, &fixture.env);
     defer lossy.release();
     const hidden = try fixture.path("hidden");
     const after_path = try std.fs.path.join(allocator, &.{ store, "objects", "blake3", after.digest[digest_prefix.len..] });
@@ -1450,7 +1937,7 @@ test "a guest read returns before its window, which finishes into the cache" {
     const io = std.testing.io;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
-    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{}, &fixture.env);
     const objects = try testObjects(&fixture, store);
     const read, const next = .{ objects[0], objects[1] };
 
@@ -1458,7 +1945,7 @@ test "a guest read returns before its window, which finishes into the cache" {
     try server.start(std.testing.allocator, io, store);
     defer server.stop();
     server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
-    const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage);
+    const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage, &fixture.env);
     defer fetcher.release();
     // The window's store stalls; a fault that waited for it would wait
     // until the release below.
@@ -1487,7 +1974,7 @@ test "releasing a fetcher cancels a window fetch the store never answers" {
     const io = std.testing.io;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
-    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{}, &fixture.env);
     const objects = try testObjects(&fixture, store);
     const read, const next = .{ objects[0], objects[1] };
 
@@ -1495,7 +1982,7 @@ test "releasing a fetcher cancels a window fetch the store never answers" {
     try server.start(std.testing.allocator, io, store);
     defer server.stop();
     server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
-    const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage);
+    const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage, &fixture.env);
     try fetcher.fetchObject(&read.digest, try allocator.alloc(u8, read.len), &.{next});
     while (server.requests.load(.monotonic) < 2) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     // A canceled window fetch ends at once rather than retrying for the
@@ -1515,7 +2002,7 @@ test "a read that shares a request that could not install its object fetches it 
     const io = std.testing.io;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
-    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{}, &fixture.env);
     const objects = try testObjects(&fixture, store);
     const read, const next = .{ objects[0], objects[1] };
 
@@ -1530,7 +2017,7 @@ test "a read that shares a request that could not install its object fetches it 
     const objects_dir_z = try allocator.dupeZ(u8, objects_dir);
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(objects_dir_z, 0o555));
     defer _ = std.c.chmod(objects_dir_z, 0o755);
-    const fetcher = try Fetcher.create(std.testing.allocator, io, cache, try server.url(allocator), local.storage);
+    const fetcher = try Fetcher.create(std.testing.allocator, io, cache, try server.url(allocator), local.storage, &fixture.env);
     defer fetcher.release();
 
     // A window fetch of `next` is in flight when the guest reads `next`.
@@ -1568,7 +2055,9 @@ test "file store reads only regular files and never waits for a FIFO writer" {
     };
     try std.testing.expectEqual(@as(c_int, 0), c.mkfifo(fifo, 0o600));
 
-    var client = try Client.init(allocator, io, root);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    var client = try Client.init(allocator, io, root, &env);
     defer client.deinit();
     const budget = Budget{ .attempts = 1, .attempt_ms = 1_000, .total_ms = 1_000 };
     const bytes = try client.get(allocator, "tags/1", .{ .max = tag_file_len }, budget);

@@ -13,7 +13,8 @@ const usage =
     \\  spore image pack local/name:tag --platform os/arch --out image.tar.gz
     \\  spore image unpack image.tar.gz --archive-digest sha256:... --expected-image-digest blake3:... --platform os/arch --ref local/name:tag
     \\
-    \\STORE is a directory or file:// URL; TAG may be blake3:<digest>.
+    \\STORE is a directory, a file:// URL or s3://bucket/prefix (uploaded with
+    \\the aws CLI); TAG may be blake3:<digest>.
     \\Run a pushed image with `spore run --image <store-url>/TAG`.
     \\
     \\Options:

@@ -127,7 +127,8 @@ else. A destination of `blake3:<hex>` writes no tag and must name the image.
 Tags match `[a-z0-9][a-z0-9._-]{0,127}`.
 
 `spore run --image` and `spore create --image` treat any ref with `://` as a
-store ref: `file:///srv/images/app`, `https://images.example/app`, or
+store ref: `file:///srv/images/app`, `https://images.example/app`,
+`s3://bucket/images/app` (see [S3 stores](#s3-stores)), or
 `.../blake3:<hex>`. Tags over plain `http://` are accepted only on 127.0.0.1
 and `[::1]`; digests are accepted over any scheme. A tag is read from the store
 on every run. SporeVM fetches and verifies the manifest, config and index as
@@ -160,6 +161,31 @@ VM keeps running. `spore vm rm` and a client that quits also stop that fetch.
 before they write the spore or take the rootfs cache lock; a failure fails the
 run and removes the save directory. `--commit` takes the cache lock once the
 guest is frozen, so its fetch runs under it.
+
+### S3 stores
+
+`s3://bucket/prefix` names a store under a key prefix of an S3 bucket. The
+bucket must be one DNS label (3 to 63 lowercase letters, digits and `-`, no
+dots) and the prefix plain segments of letters, digits, `-`, `.`, `_` and `~`.
+Reads are SigV4-signed GETs to `https://<bucket>.s3.<region>.amazonaws.com`
+with the same bounds, deadlines and verification as an HTTP(S) store. They use
+only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, the optional
+`AWS_SESSION_TOKEN`, and `AWS_REGION` or `AWS_DEFAULT_REGION` from the
+environment; profiles, `~/.aws` and instance roles are not read. A run with
+`AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` set fails, since it would
+otherwise read from AWS rather than the store that variable names. A run, or a named VM's monitor, reads them when it opens the disk and
+keeps them for its life, so fetches fail once temporary credentials expire.
+The reader needs `s3:GetObject`; without `s3:ListBucket`, S3 reports a missing
+tag or object as access denied rather than not found, and either fails closed.
+
+`spore image push local/app:1 s3://bucket/images/app` stages the store under
+the rootfs cache with hard links to the cached objects, releases the cache
+lock, verifies the staged objects, and uploads with the aws CLI and its own credential chain: `aws s3 sync
+--size-only` for `objects/`, then for `images/`, then `aws s3 cp` for the tag,
+so a reader never sees a tag before its image. An object's key is its digest,
+so a size match means the bucket already has it. Credentials appear only in
+the request signature and the session token header; refs, log lines, errors
+and the catalog's origin show only the `s3://` URL.
 
 ## Converter-worker conformance
 

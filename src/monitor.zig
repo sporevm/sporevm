@@ -3140,7 +3140,7 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
 
     // The store lost an object: the save is refused and nothing paused.
     var monitor: StoreMonitor = undefined;
-    try monitor.init(try fixture.path("cache"), ref, allocator);
+    try monitor.init(try fixture.path("cache"), ref, allocator, &fixture.env);
     defer monitor.deinit();
     try std.Io.Dir.renameAbsolute(object.?, hidden, io);
     const refusal = monitor.server.imageStoreRefusal(client.monitor_end, &buf) orelse return error.TestExpectedRefusal;
@@ -3154,7 +3154,7 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     // A guest read that could not fetch its object poisoned the disk, so its
     // saves stay refused even when the store recovers.
     var poisoned: StoreMonitor = undefined;
-    try poisoned.init(try fixture.path("poisoned-cache"), ref, allocator);
+    try poisoned.init(try fixture.path("poisoned-cache"), ref, allocator, &fixture.env);
     defer poisoned.deinit();
     try std.Io.Dir.renameAbsolute(object.?, hidden, io);
     try std.testing.expectError(error.ImageStoreNotFound, poisoned.fetcher.fetchObject(digest, try allocator.alloc(u8, len), &.{}));
@@ -3164,12 +3164,12 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     // A stopping monitor cancels the fetch and says it is stopping, not that
     // the store failed; a client that left during the fetch gets no save.
     var canceled: StoreMonitor = undefined;
-    try canceled.init(try fixture.path("canceled-cache"), ref, allocator);
+    try canceled.init(try fixture.path("canceled-cache"), ref, allocator, &fixture.env);
     defer canceled.deinit();
     canceled.server.cancelImageStoreFetch();
     try std.testing.expectEqualStrings(removal_message, canceled.server.imageStoreRefusal(client.monitor_end, &buf).?);
     var gone: StoreMonitor = undefined;
-    try gone.init(try fixture.path("gone-cache"), ref, allocator);
+    try gone.init(try fixture.path("gone-cache"), ref, allocator, &fixture.env);
     defer gone.deinit();
     var left: StoreSaveClient = try .init();
     defer left.deinit();
@@ -3192,7 +3192,7 @@ test "a save is refused when a guest read fails while the monitor fetches the im
     const digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{std.fs.path.basename(object.?)});
     const len: usize = @intCast((try std.Io.Dir.cwd().statFile(io, object.?, .{})).size);
     var monitor: StoreMonitor = undefined;
-    try monitor.init(try fixture.path("cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), allocator);
+    try monitor.init(try fixture.path("cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), allocator, &fixture.env);
     defer monitor.deinit();
     var client: StoreSaveClient = try .init();
     defer client.deinit();
@@ -3245,8 +3245,8 @@ test "stopping the control plane cancels a save's pending image fetch" {
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
     const cache = try fixture.path("cache");
-    const local = try image_store_mod.resolve(io, allocator, cache, try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
-    const fetcher = try image_store_mod.Fetcher.create(std.testing.allocator, io, cache, local.origin.?, local.storage);
+    const local = try image_store_mod.resolve(io, allocator, cache, try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{}, &fixture.env);
+    const fetcher = try image_store_mod.Fetcher.create(std.testing.allocator, io, cache, local.origin.?, local.storage, &fixture.env);
     defer fetcher.release();
 
     var path_buf: [64]u8 = undefined;
@@ -3303,10 +3303,10 @@ const StoreMonitor = struct {
     fetcher: *image_store_mod.Fetcher,
     storage: spore.RootfsStorage,
 
-    fn init(self: *StoreMonitor, cache: []const u8, image_ref: []const u8, arena: std.mem.Allocator) !void {
-        const local = try image_store_mod.resolve(std.testing.io, arena, cache, image_ref, .{});
+    fn init(self: *StoreMonitor, cache: []const u8, image_ref: []const u8, arena: std.mem.Allocator, env: *const std.process.Environ.Map) !void {
+        const local = try image_store_mod.resolve(std.testing.io, arena, cache, image_ref, .{}, env);
         self.storage = local.storage;
-        self.fetcher = try image_store_mod.Fetcher.create(std.testing.allocator, std.testing.io, cache, local.origin.?, local.storage);
+        self.fetcher = try image_store_mod.Fetcher.create(std.testing.allocator, std.testing.io, cache, local.origin.?, local.storage, env);
         self.server = undefined;
         self.server.io = std.testing.io;
         self.server.mutex = .init;
