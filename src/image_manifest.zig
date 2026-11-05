@@ -6,6 +6,7 @@
 //! network, cache, filesystem, or runtime dependencies.
 
 const std = @import("std");
+const chunk = @import("chunk.zig");
 const disk_index = @import("disk_index.zig");
 const image = @import("image.zig");
 const oci = @import("rootfs/oci.zig");
@@ -239,14 +240,14 @@ const ObjectSummary = struct {
 };
 
 fn objectSummary(allocator: std.mem.Allocator, index: disk_index.DiskIndex) !ObjectSummary {
-    var seen = std.StringHashMap(u64).init(allocator);
+    var seen = std.AutoHashMap(chunk.ChunkId, u64).init(allocator);
     defer seen.deinit();
     var total: u64 = 0;
     for (index.chunks) |entry| {
         const offset = std.math.mul(u64, entry.logical_chunk, index.chunk_size) catch return error.BadProtocol;
         if (offset >= index.logical_size) return error.BadProtocol;
         const bytes = @min(index.chunk_size, index.logical_size - offset);
-        const result = try seen.getOrPut(entry.digest);
+        const result = try seen.getOrPut(entry.id);
         if (result.found_existing) {
             if (result.value_ptr.* != bytes) return error.BadProtocol;
             continue;
@@ -398,8 +399,8 @@ test "rootfs object summary counts unique immutable objects" {
         .hash_algorithm = rootfs_hash_algorithm,
         .object_namespace = rootfs_object_namespace,
         .chunks = &.{
-            .{ .logical_chunk = 0, .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-            .{ .logical_chunk = 1, .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+            .{ .logical_chunk = 0, .id = .{ .bytes = @splat(0xaa) } },
+            .{ .logical_chunk = 1, .id = .{ .bytes = @splat(0xaa) } },
         },
     };
     const summary = try objectSummary(std.testing.allocator, repeated);

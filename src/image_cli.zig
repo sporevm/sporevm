@@ -238,7 +238,7 @@ test "json image pack and unpack print their documented result documents" {
     const object_bytes = "image cli json object";
     const object_hex = chunk.ChunkId.fromContents(object_bytes).toHex();
     const object_digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{object_hex[0..]});
-    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = object_digest }};
+    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .id = try chunk.ChunkId.fromDigest(object_digest) }};
     const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, .{
         .kind = disk_index.disk_index_kind,
         .logical_size = object_bytes.len,

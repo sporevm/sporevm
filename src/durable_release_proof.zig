@@ -293,9 +293,9 @@ fn recoverForkPublication(allocator: std.mem.Allocator, io: std.Io, mode: []cons
         var parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
         defer parsed.deinit();
         try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
-        const object_path = try rootfs_cas.manifestObjectPath(allocator, cache_root, parsed.value.chunks[0].digest);
+        const object_path = try rootfs_cas.objectPath(allocator, cache_root, parsed.value.chunks[0].id);
         defer allocator.free(object_path);
-        const bytes = try rootfs_cas.readVerifiedChunkPath(allocator, object_path, parsed.value.chunks[0].digest, 512);
+        const bytes = try rootfs_cas.readVerifiedChunkPath(allocator, object_path, &parsed.value.chunks[0].id.toDigest(), 512);
         defer allocator.free(bytes);
         var expected: [512]u8 = undefined;
         @memset(&expected, 0x82);
@@ -357,7 +357,8 @@ fn recoverSourceLeaseHandoff(allocator: std.mem.Allocator, io: std.Io, mode: []c
     var parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(lease.rootfs_storage.?));
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.chunks.len);
-    const object_digest = parsed.value.chunks[0].digest;
+    const object_digest_buf = parsed.value.chunks[0].id.toDigest();
+    const object_digest: []const u8 = &object_digest_buf;
     const gc_result = try system.gc(allocator, io, .{ .cache_root = cache_root, .runtime_root = runtime_root, .dry_run = false });
     defer system.deinitRootfsGcResult(allocator, gc_result);
     const prune_result = try system.prune(allocator, io, .{

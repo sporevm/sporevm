@@ -161,7 +161,7 @@ pub const MemoryBacking = struct {
 pub const MemoryChunk = disk_index.DiskIndexChunk;
 
 /// The memory index. In the manifest it is a `spore-disk-index-v2` object plus
-/// the optional `backing`; in memory `chunks` holds one digest ref per nonzero
+/// the optional `backing`; in memory `chunks` holds one chunk id per nonzero
 /// chunk.
 pub const MemoryManifest = struct {
     kind: []const u8 = disk_index.disk_index_kind,
@@ -202,7 +202,7 @@ pub const MemoryManifest = struct {
     /// kinds have different fields and fail like any other malformed object.
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!MemoryManifest {
         const encoded = try std.json.innerParse(Encoded, allocator, source, options);
-        const decoded = disk_index.decodeChunkRanges(allocator, .{
+        const chunks = disk_index.decodeChunkRanges(allocator, .{
             .kind = encoded.kind,
             .logical_size = encoded.logical_size,
             .chunk_size = encoded.chunk_size,
@@ -220,7 +220,7 @@ pub const MemoryManifest = struct {
             .chunk_size = encoded.chunk_size,
             .hash_algorithm = encoded.hash_algorithm,
             .object_namespace = encoded.object_namespace,
-            .chunks = decoded.chunks,
+            .chunks = chunks,
             .zero_ranges = encoded.zero_ranges,
             .backing = encoded.backing,
         };
@@ -1595,8 +1595,7 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
         }
         const id = chunklib.ChunkId.fromContents(data);
         const hex = id.toHex();
-        const digest = try memoryDigestFromHex(allocator, hex[0..]);
-        chunks.append(.{ .logical_chunk = @intCast(i), .digest = digest }) catch return error.OutOfMemory;
+        chunks.append(.{ .logical_chunk = @intCast(i), .id = id }) catch return error.OutOfMemory;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, hex[0..] });
         try writeFileAllIfMissing(chunk_path, data);
         if (backing_fd >= 0) {
@@ -1636,12 +1635,12 @@ pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: Memor
     var i: usize = 0;
     while (i < plan.chunk_count) : (i += 1) {
         const range = memoryChunkRangeFromPlan(plan, ram.len, i) catch return error.BadManifest;
-        const digest: ?[]const u8 = if (nonzero_index < manifest.chunks.len and manifest.chunks[nonzero_index].logical_chunk == i) blk: {
-            const value = manifest.chunks[nonzero_index].digest;
+        const id: ?chunklib.ChunkId = if (nonzero_index < manifest.chunks.len and manifest.chunks[nonzero_index].logical_chunk == i) blk: {
+            const value = manifest.chunks[nonzero_index].id;
             nonzero_index += 1;
             break :blk value;
         } else null;
-        try loadMemoryChunkDigest(allocator, dir, digest, ram[range.start..range.end]);
+        try loadMemoryChunk(allocator, dir, id, ram[range.start..range.end]);
     }
 }
 
@@ -1670,11 +1669,10 @@ fn memoryChunkRangeFromPlan(plan: MemoryPlan, ram_len: usize, index: usize) !Mem
     return .{ .start = start, .end = end };
 }
 
-fn loadMemoryChunkDigest(allocator: std.mem.Allocator, dir: []const u8, maybe_digest: ?[]const u8, target: []u8) Error!void {
-    if (maybe_digest) |digest| {
-        const hex = try memoryChunkDigestHex(digest);
-        const id = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, hex });
+fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, maybe_id: ?chunklib.ChunkId, target: []u8) Error!void {
+    if (maybe_id) |id| {
+        const hex = id.toHex();
+        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, &hex });
         const data = try readFileAll(allocator, chunk_path, target.len);
         defer allocator.free(data);
         if (data.len != target.len) return error.BadChunk;
@@ -1846,14 +1844,13 @@ fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8,
     try ensureDir(try pathZ(allocator, "{s}", .{out_dir}));
     const shared_chunks_path = try pathZ(allocator, "{s}/shared-chunks", .{out_dir});
     try ensureNewDir(shared_chunks_path);
-    var seen = std.StringHashMap(void).init(allocator);
+    var seen = std.AutoHashMap(chunklib.ChunkId, void).init(allocator);
     defer seen.deinit();
     for (memory.chunks) |entry| {
-        const hex = try memoryChunkDigestHex(entry.digest);
-        if (seen.contains(hex)) continue;
-        try seen.put(hex, {});
-        const source = try pathZ(allocator, "{s}/{s}", .{ parent_chunks, hex });
-        const dest = try pathZ(allocator, "{s}/{s}", .{ shared_chunks_path, hex });
+        if ((try seen.getOrPut(entry.id)).found_existing) continue;
+        const hex = entry.id.toHex();
+        const source = try pathZ(allocator, "{s}/{s}", .{ parent_chunks, &hex });
+        const dest = try pathZ(allocator, "{s}/{s}", .{ shared_chunks_path, &hex });
         try hardlinkOrCopyPath(source, dest);
     }
     try fsyncDirPath(shared_chunks_path);
@@ -2928,7 +2925,7 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
     try std.testing.expectEqual(LocalBackingRestoreReason.proof_mac_mismatch, foreign_key_plan.reason);
 
     var refs = try arena.dupe(MemoryChunk, mm.chunks);
-    refs[0].digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    refs[0].id = .{ .bytes = @splat(0xaa) };
     var changed = mm;
     changed.chunks = refs;
     const mismatch_plan = try openProvenLocalMemoryBacking(arena, &env_a, dir, changed, ram.len);
@@ -3037,13 +3034,6 @@ test "memory manifest validation rejects non-canonical chunks" {
     var retired_kind = mm;
     retired_kind.kind = "spore-disk-index-v1";
     try std.testing.expectError(error.BadManifest, validateMemoryForRam(retired_kind, ram.len));
-
-    var malformed_refs = try arena.dupe(MemoryChunk, mm.chunks);
-    malformed_refs[0].digest = "not-a-blake3-id";
-    var malformed = mm;
-    malformed.chunks = malformed_refs;
-    try std.testing.expectError(error.BadManifest, validateMemoryForRam(malformed, ram.len));
-    try std.testing.expectError(error.BadManifest, loadMemory(arena, dir, malformed, ram));
 }
 
 test "corrupted chunk fails closed" {
@@ -3058,7 +3048,7 @@ test "corrupted chunk fails closed" {
     const mm = try saveMemory(arena, dir, ram);
 
     // Corrupt the stored chunk.
-    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, try memoryChunkDigestHex(mm.chunks[0].digest) });
+    const chunk_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, &mm.chunks[0].id.toHex() });
     const data = try readFileAll(arena, chunk_path, chunk_size);
     data[100] ^= 0xFF;
     try writeFileAll(chunk_path, data);
@@ -3127,9 +3117,9 @@ fn fuzzMemoryManifestParse(_: void, s: *std.testing.Smith) !void {
         .logical_size = ram_len,
         .chunk_size = chunk_size,
         .chunks = &.{
-            .{ .logical_chunk = 0, .digest = "blake3:" ++ "a" ** 64 },
-            .{ .logical_chunk = 1, .digest = "blake3:" ++ "b" ** 64 },
-            .{ .logical_chunk = 4, .digest = "blake3:" ++ "c" ** 64 },
+            .{ .logical_chunk = 0, .id = .{ .bytes = @splat(0xaa) } },
+            .{ .logical_chunk = 1, .id = .{ .bytes = @splat(0xbb) } },
+            .{ .logical_chunk = 4, .id = .{ .bytes = @splat(0xcc) } },
         },
         .zero_ranges = &.{ .{ .start = 2, .count = 2 }, .{ .start = 5, .count = 1 } },
         .backing = .{ .path = ram_backing_path, .size = ram_len },
@@ -3301,7 +3291,7 @@ test "manifest memory index uses the canonical disk-index encoding" {
     try std.testing.expectEqual(mm.chunks.len, parsed.chunks.len);
     for (mm.chunks, parsed.chunks) |expected, actual| {
         try std.testing.expectEqual(expected.logical_chunk, actual.logical_chunk);
-        try std.testing.expectEqualStrings(expected.digest, actual.digest);
+        try std.testing.expect(expected.id.eql(actual.id));
     }
     try std.testing.expectEqualSlices(disk_index.DiskIndexZeroRange, mm.zero_ranges, parsed.zero_ranges);
     try std.testing.expectEqualStrings(ram_backing_path, parsed.backing.?.path);
@@ -3312,9 +3302,11 @@ test "manifest memory index uses the canonical disk-index encoding" {
     try std.testing.expectError(error.DuplicateField, std.json.parseFromSliceLeaky(MemoryManifest, arena, duplicate, .{}));
     const unknown = try std.mem.replaceOwned(u8, arena, json, "\"zero_ranges\": ", "\"chunks\": [],\n  \"zero_ranges\": ");
     try std.testing.expectError(error.UnknownField, std.json.parseFromSliceLeaky(MemoryManifest, arena, unknown, .{}));
-    const split_hex = mm.chunks[1].digest[disk_index.digest_prefix.len..];
-    const split = try std.mem.replaceOwned(u8, arena, json, split_hex, try std.fmt.allocPrint(arena, "\"\n    }},\n    {{\n      \"start\": 1,\n      \"digests\": \"{s}", .{split_hex}));
+    const split_hex = mm.chunks[1].id.toHex();
+    const split = try std.mem.replaceOwned(u8, arena, json, &split_hex, try std.fmt.allocPrint(arena, "\"\n    }},\n    {{\n      \"start\": 1,\n      \"digests\": \"{s}", .{&split_hex}));
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(MemoryManifest, arena, split, .{}));
+    const not_hex = try std.mem.replaceOwned(u8, arena, json, split_hex[0..8], "zzzzzzzz");
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(MemoryManifest, arena, not_hex, .{}));
 }
 
 test "manifest with a v1 memory index is rejected" {

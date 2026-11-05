@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const block_source = @import("block_source.zig");
+const chunk = @import("chunk.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const Context = @import("context.zig").Context;
 const disk_index = @import("disk_index.zig");
@@ -523,22 +524,23 @@ fn installLocalRootfsStorage(
     var parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
 
-    var seen_objects = std.StringHashMap(void).init(allocator);
+    var seen_objects = std.AutoHashMap(chunk.ChunkId, void).init(allocator);
     defer seen_objects.deinit();
     for (parsed.value.chunks) |chunk_entry| {
-        const seen = try seen_objects.getOrPut(chunk_entry.digest);
+        const seen = try seen_objects.getOrPut(chunk_entry.id);
         if (seen.found_existing) continue;
+        const digest = chunk_entry.id.toDigest();
         const expected_size = try rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk);
-        const local_object_path = try rootfs_cas.manifestObjectPath(allocator, local_root, chunk_entry.digest);
+        const local_object_path = try rootfs_cas.objectPath(allocator, local_root, chunk_entry.id);
         defer allocator.free(local_object_path);
-        const object_data = try rootfs_cas.readVerifiedChunkPath(allocator, local_object_path, chunk_entry.digest, expected_size);
+        const object_data = try rootfs_cas.readVerifiedChunkPath(allocator, local_object_path, &digest, expected_size);
         defer allocator.free(object_data);
         if (comptime builtin.is_test) {
             if (testing.local_rootfs_object_reads) |count| count.* += 1;
         }
-        const cache_object_path = try rootfs_cas.manifestObjectPath(allocator, cache_root, chunk_entry.digest);
+        const cache_object_path = try rootfs_cas.objectPath(allocator, cache_root, chunk_entry.id);
         defer allocator.free(cache_object_path);
-        _ = try rootfs_cas.installChunkPath(allocator, context.io, cache_object_path, object_data, chunk_entry.digest, expected_size);
+        _ = try rootfs_cas.installChunkPath(allocator, context.io, cache_object_path, object_data, &digest, expected_size);
     }
 
     const cache_index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
@@ -931,7 +933,7 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     const index_bytes = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
     const parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
-    const first_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[0].digest);
+    const first_chunk_path = try rootfs_cas.objectPath(arena, cache_root, parsed.value.chunks[0].id);
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -1059,7 +1061,7 @@ test "runtime disk installs portable local rootfs storage and trusts complete wa
     const index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(arena, preload_result.index_path, storage);
     var parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
-    const local_object_path = try rootfs_cas.manifestObjectPath(arena, absolute_local_spore, parsed.value.chunks[0].digest);
+    const local_object_path = try rootfs_cas.objectPath(arena, absolute_local_spore, parsed.value.chunks[0].id);
     try Io.Dir.cwd().deleteFile(io, local_object_path);
     var complete_cache_runtime = try open(context, allocator, .{
         .rootfs = rootfs,
@@ -1363,7 +1365,7 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     const index_bytes = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
     const parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
-    const second_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[1].digest);
+    const second_chunk_path = try rootfs_cas.objectPath(arena, cache_root, parsed.value.chunks[1].id);
     try Io.Dir.cwd().deleteFile(io, second_chunk_path);
 
     var env = std.process.Environ.Map.init(allocator);
@@ -1431,8 +1433,8 @@ test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corr
     const index_bytes = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
     const parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
-    const first_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[0].digest);
-    const third_chunk_path = try rootfs_cas.manifestObjectPath(arena, cache_root, parsed.value.chunks[2].digest);
+    const first_chunk_path = try rootfs_cas.objectPath(arena, cache_root, parsed.value.chunks[0].id);
+    const third_chunk_path = try rootfs_cas.objectPath(arena, cache_root, parsed.value.chunks[2].id);
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -1576,9 +1578,9 @@ test "runtime disk restores chunk-index disk manifests" {
     try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(local_index_path).?);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = local_index_path, .data = index_bytes });
     for (local_index.value.chunks) |entry| {
-        const source_object = try rootfs_cas.manifestObjectPath(arena, absolute_cache_root, entry.digest);
+        const source_object = try rootfs_cas.objectPath(arena, absolute_cache_root, entry.id);
         const object_bytes = try Io.Dir.cwd().readFileAlloc(io, source_object, arena, .limited(rootfs_cas.default_chunk_size));
-        const local_object = try rootfs_cas.manifestObjectPath(arena, spore_dir, entry.digest);
+        const local_object = try rootfs_cas.objectPath(arena, spore_dir, entry.id);
         try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(local_object).?);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = local_object, .data = object_bytes });
     }
@@ -1604,7 +1606,7 @@ test "runtime disk restores chunk-index disk manifests" {
     try std.testing.expectEqualStrings(patch, &readback);
 
     runtime.deinit();
-    const missing = try rootfs_cas.manifestObjectPath(arena, moved_dir, local_index.value.chunks[0].digest);
+    const missing = try rootfs_cas.objectPath(arena, moved_dir, local_index.value.chunks[0].id);
     try Io.Dir.cwd().deleteFile(io, missing);
     var missing_runtime = try open(context, allocator, .{ .rootfs = rootfs, .disk = saved_disk, .spore_dir = moved_dir });
     defer missing_runtime.deinit();

@@ -227,16 +227,16 @@ fn materializeForkDiskStore(
     const blake3_root = try std.fs.path.join(path_allocator, &.{ rootfs_root, "blake3" });
     const objects_root = try std.fs.path.join(path_allocator, &.{ blake3_root, "objects" });
     try chunk_sealer.ensureDirPath(path_allocator, objects_root);
-    var seen = std.StringHashMap(void).init(path_allocator);
+    var seen = std.AutoHashMap(chunk.ChunkId, void).init(path_allocator);
     defer seen.deinit();
     for (parsed.value.chunks) |entry| {
-        if (seen.contains(entry.digest)) continue;
-        try seen.put(entry.digest, {});
+        if ((try seen.getOrPut(entry.id)).found_existing) continue;
+        const digest = entry.id.toDigest();
         const expected_size = try rootfs_cas.storageChunkLen(storage, entry.logical_chunk);
-        const source_object = try rootfs_cas.manifestObjectPath(path_allocator, parent_dir, entry.digest);
-        const source_bytes = try rootfs_cas.readVerifiedChunkPath(scratch_allocator, source_object, entry.digest, expected_size);
+        const source_object = try rootfs_cas.objectPath(path_allocator, parent_dir, entry.id);
+        const source_bytes = try rootfs_cas.readVerifiedChunkPath(scratch_allocator, source_object, &digest, expected_size);
         defer scratch_allocator.free(source_bytes);
-        const dest_object = try rootfs_cas.manifestObjectPath(path_allocator, shared_root, entry.digest);
+        const dest_object = try rootfs_cas.objectPath(path_allocator, shared_root, entry.id);
         const dest_parent = std.fs.path.dirname(dest_object) orelse return error.BadManifest;
         try chunk_sealer.ensureDirPath(path_allocator, dest_parent);
         if (comptime builtin.is_test) if (testing.fault.fail_before_portable_sync == testing.fault.portable_sync_count) return error.InjectedFailure;
@@ -245,7 +245,7 @@ fn materializeForkDiskStore(
             .linked, .reused_existing => try chunk_sealer.fsyncDirPath(path_allocator, dest_parent),
         }
         if (comptime builtin.is_test) testing.fault.portable_sync_count += 1;
-        const dest_bytes = try rootfs_cas.readVerifiedChunkPath(scratch_allocator, dest_object, entry.digest, expected_size);
+        const dest_bytes = try rootfs_cas.readVerifiedChunkPath(scratch_allocator, dest_object, &digest, expected_size);
         scratch_allocator.free(dest_bytes);
     }
     // The shared CAS hierarchy is new in this hidden batch. Sync bottom-up so
@@ -287,14 +287,14 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     @memset(ram, 0x5a);
     const memory = try spore.saveMemoryWithBacking(arena, parent, ram);
     try std.testing.expectEqual(@as(usize, 2), memory.chunks.len);
-    try std.testing.expectEqualStrings(memory.chunks[0].digest, memory.chunks[1].digest);
+    try std.testing.expect(memory.chunks[0].id.eql(memory.chunks[1].id));
 
     const disk_payload = try arena.alloc(u8, 512);
     @memset(disk_payload, 0x6b);
     const disk_chunk_id = chunk.ChunkId.fromContents(disk_payload);
     const disk_chunk_hex = disk_chunk_id.toHex();
     const disk_chunk_digest = try std.fmt.allocPrint(arena, "{s}{s}", .{ spore.rootfs_digest_prefix, disk_chunk_hex[0..] });
-    const disk_chunks = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = disk_chunk_digest }};
+    const disk_chunks = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .id = disk_chunk_id }};
     const disk_index_value = disk_index.DiskIndex{
         .kind = disk_index.disk_index_kind,
         .logical_size = @intCast(disk_payload.len),

@@ -398,11 +398,11 @@ fn writeArchive(io: Io, allocator: std.mem.Allocator, path: []const u8, cache_ro
 }
 
 fn uniqueSortedObjects(allocator: std.mem.Allocator, storage: spore.RootfsStorage, chunks: []const disk_index.DiskIndexChunk) ![]ObjectDescriptor {
-    var map = std.StringHashMap(usize).init(allocator);
+    var map = std.AutoHashMap(chunk.ChunkId, usize).init(allocator);
     defer map.deinit();
     for (chunks) |entry| {
         const size = try rootfs_cas.storageChunkLen(storage, entry.logical_chunk);
-        const gop = try map.getOrPut(entry.digest);
+        const gop = try map.getOrPut(entry.id);
         if (gop.found_existing) {
             if (gop.value_ptr.* != size) return error.BadManifest;
         } else gop.value_ptr.* = size;
@@ -412,7 +412,7 @@ fn uniqueSortedObjects(allocator: std.mem.Allocator, storage: spore.RootfsStorag
     var it = map.iterator();
     var index: usize = 0;
     while (it.next()) |entry| : (index += 1) {
-        objects[index] = .{ .digest = try allocator.dupe(u8, entry.key_ptr.*), .size = entry.value_ptr.* };
+        objects[index] = .{ .digest = try allocator.dupe(u8, &entry.key_ptr.toDigest()), .size = entry.value_ptr.* };
     }
     std.mem.sort(ObjectDescriptor, objects, {}, struct {
         fn lessThan(_: void, a: ObjectDescriptor, b: ObjectDescriptor) bool {
@@ -662,9 +662,10 @@ test "image pack rejects an image record that does not match its identity" {
     };
 
     const object_bytes = "local digest archive object";
-    const object_hex = chunk.ChunkId.fromContents(object_bytes).toHex();
-    const object_digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{object_hex[0..]});
-    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = object_digest }};
+    const object_id = chunk.ChunkId.fromContents(object_bytes);
+    const object_digest_buf = object_id.toDigest();
+    const object_digest: []const u8 = &object_digest_buf;
+    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .id = object_id }};
     const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, .{
         .kind = disk_index.disk_index_kind,
         .logical_size = object_bytes.len,
@@ -730,10 +731,9 @@ test "native image archive round-trips into a clean cache and rejects substituti
 
     const object_bytes = "native image archive object";
     const object_id = chunk.ChunkId.fromContents(object_bytes);
-    const object_hex = object_id.toHex();
-    const object_digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{object_hex[0..]});
-    defer allocator.free(object_digest);
-    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = object_digest }};
+    const object_digest_buf = object_id.toDigest();
+    const object_digest: []const u8 = &object_digest_buf;
+    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .id = object_id }};
     const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, .{
         .kind = disk_index.disk_index_kind,
         .logical_size = object_bytes.len,
