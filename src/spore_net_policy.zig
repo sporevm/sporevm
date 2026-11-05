@@ -682,18 +682,6 @@ pub const Runtime = struct {
         return null;
     }
 
-    pub fn hostForIpv4Port(self: *const Runtime, addr: [4]u8, port: u16) ?[]const u8 {
-        for (self.learned_exact_host_ips[0..self.learned_exact_host_ip_count]) |learned| {
-            if (!std.mem.eql(u8, &learned.addr, &addr)) continue;
-            const rule = self.exact_rules[learned.rule_index];
-            if (rule.containsPort(port)) return rule.host;
-        }
-        for (self.learned_host_ips[0..self.learned_host_ip_count]) |learned| {
-            if (std.mem.eql(u8, &learned.addr, &addr)) return self.allow_hosts[learned.host_index];
-        }
-        return null;
-    }
-
     fn hasAllowRules(self: *const Runtime) bool {
         return self.allow_cidr_count != 0 or self.allow_host_count != 0 or self.exact_rule_count != 0;
     }
@@ -1488,8 +1476,6 @@ test "spore-net exact policy learns A records and enforces host plus port" {
     try std.testing.expectEqual(Decision.allow, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 443));
     try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 80));
     try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 5 }, 443));
-    try std.testing.expectEqualStrings("github.com", policy.hostForIpv4Port(.{ 140, 82, 112, 4 }, 443).?);
-    try std.testing.expect(policy.hostForIpv4Port(.{ 140, 82, 112, 4 }, 80) == null);
 }
 
 test "spore-net exact policy ignores different DNS answer owner" {

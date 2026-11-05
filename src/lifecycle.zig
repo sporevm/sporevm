@@ -739,7 +739,6 @@ pub const ExecNamedResult = struct {
     exit_code: u8,
     stdout: []u8,
     stderr: []u8,
-    network_events_jsonl: []u8 = &.{},
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
     timing: ?NamedExecTiming = null,
@@ -1853,7 +1852,6 @@ pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLif
 pub fn deinitExecNamedResult(allocator: std.mem.Allocator, result: ExecNamedResult) void {
     allocator.free(result.stdout);
     allocator.free(result.stderr);
-    allocator.free(result.network_events_jsonl);
 }
 
 pub fn deinitNamedForkResult(allocator: std.mem.Allocator, result: NamedForkResult) void {
@@ -5413,7 +5411,6 @@ const ControlResponse = struct {
     exit_code: ?i32 = null,
     stdout_b64: ?[]const u8 = null,
     stderr_b64: ?[]const u8 = null,
-    network_events_jsonl_b64: ?[]const u8 = null,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
     out_dir: ?[]const u8 = null,
@@ -5455,16 +5452,10 @@ fn parseExecNamedResponse(
     errdefer allocator.free(stdout);
     const stderr = try decodeControlOutput(allocator, parsed.value.stderr_b64 orelse return error.BadMonitorResponse);
     errdefer allocator.free(stderr);
-    const network_events_jsonl = if (parsed.value.network_events_jsonl_b64) |encoded|
-        try decodeControlOutput(allocator, encoded)
-    else
-        try allocator.dupe(u8, "");
-    errdefer allocator.free(network_events_jsonl);
     return .{
         .exit_code = @intCast(exit_code),
         .stdout = stdout,
         .stderr = stderr,
-        .network_events_jsonl = network_events_jsonl,
         .stdout_truncated = parsed.value.stdout_truncated,
         .stderr_truncated = parsed.value.stderr_truncated,
         .timing = parsed.value.timing,
@@ -6504,7 +6495,7 @@ test "named exec response rejects truncated collector output" {
     clearLastError();
     defer clearLastError();
     const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":true}
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","stdout_truncated":false,"stderr_truncated":true}
     ;
     try std.testing.expectError(error.ExecOutputTruncated, parseExecNamedResponse(allocator, allocator, response));
     try std.testing.expectEqualStrings(
@@ -6516,7 +6507,7 @@ test "named exec response rejects truncated collector output" {
 test "named exec response decodes complete bounded output" {
     const allocator = std.testing.allocator;
     const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","network_events_jsonl_b64":"eyJldmVudCI6Im5ldHdvcmtfZGVjaXNpb24ifQo=","stdout_truncated":false,"stderr_truncated":false,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
+        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","stdout_truncated":false,"stderr_truncated":false,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
     ;
     const result = try parseExecNamedResponse(allocator, allocator, response);
     defer deinitExecNamedResult(allocator, result);
@@ -6524,7 +6515,6 @@ test "named exec response decodes complete bounded output" {
     try std.testing.expectEqual(@as(u8, 7), result.exit_code);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 'A' }, result.stdout);
     try std.testing.expectEqualSlices(u8, &.{ 0xfe, 'B' }, result.stderr);
-    try std.testing.expectEqualStrings("{\"event\":\"network_decision\"}\n", result.network_events_jsonl);
     try std.testing.expectEqual(@as(?u64, 2), result.timing.?.dispatch_ms);
     try std.testing.expectEqual(@as(?u64, 7_000), result.timing.?.guest_user_cpu_us);
     try std.testing.expectEqual(@as(u64, 13), result.timing.?.total_ms);

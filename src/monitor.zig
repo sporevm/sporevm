@@ -300,7 +300,6 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         defer if (cache_lock) |*lock| lock.deinit();
         server.disk_baseline_active = try runtime_disk_lease.acquireActive(init.io, allocator, paths.runtime_root, lease);
     }
-    if (gateway_active) server.network_events = &gateway;
     const metadata_ms = lifecycle.monotonicMs();
     server.startup = .{
         .paths = paths,
@@ -474,7 +473,6 @@ const ExecServer = struct {
     stderr_capture: [lifecycle.exec_named_capture_limit]u8 = undefined,
     stderr_capture_len: usize = 0,
     stderr_truncated: bool = false,
-    network_events: ?*net_gateway.Process = null,
     session_nonce: u64,
     next_session_id: u64 = 1,
     active_session_sequence: u64 = 0,
@@ -780,7 +778,6 @@ const ExecServer = struct {
         self.active_stream_timing_enabled = false;
         self.streaming_client_fd = -1;
         self.streaming_write_failed = false;
-        if (self.network_events) |events| events.clearEvents();
         self.active_exec_submitted_ms = lifecycle.monotonicMs();
         self.state = .pending_exec;
         if (self.wake) |wake| wake.wake();
@@ -809,7 +806,6 @@ const ExecServer = struct {
         self.active_stream_timing_enabled = timing_enabled;
         self.streaming_client_fd = client_fd;
         self.streaming_write_failed = false;
-        if (self.network_events) |events| events.clearEvents();
         self.active_exec_submitted_ms = lifecycle.monotonicMs();
         self.state = .pending_exec;
         if (self.wake) |wake| wake.wake();
@@ -1392,19 +1388,11 @@ const ExecServer = struct {
         defer self.allocator.free(stdout_b64);
         const stderr_b64 = try base64Alloc(self.allocator, self.stderr_capture[0..self.stderr_capture_len]);
         defer self.allocator.free(stderr_b64);
-        const network_events_jsonl = if (self.network_events) |events|
-            try events.drainEventJsonl(self.allocator)
-        else
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(network_events_jsonl);
-        const network_events_jsonl_b64 = try base64Alloc(self.allocator, network_events_jsonl);
-        defer self.allocator.free(network_events_jsonl_b64);
         const payload = struct {
             type: []const u8 = "exec_result",
             exit_code: i32,
             stdout_b64: []const u8,
             stderr_b64: []const u8,
-            network_events_jsonl_b64: []const u8,
             stdout_truncated: bool,
             stderr_truncated: bool,
             timing: lifecycle.NamedExecTiming,
@@ -1412,7 +1400,6 @@ const ExecServer = struct {
             .exit_code = exit_code,
             .stdout_b64 = stdout_b64,
             .stderr_b64 = stderr_b64,
-            .network_events_jsonl_b64 = network_events_jsonl_b64,
             .stdout_truncated = self.stdout_truncated,
             .stderr_truncated = self.stderr_truncated,
             .timing = timing,

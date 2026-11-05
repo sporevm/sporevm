@@ -5,7 +5,6 @@
 //! bridge between guest TCP payloads and nonblocking host `connect()` sockets.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const zmoltcp = @import("zmoltcp");
 
 const spore_net = @import("spore_net.zig");
@@ -65,7 +64,7 @@ const HostState = enum {
 };
 
 const RequestTarget = union(enum) {
-    tcp: ?[]const u8,
+    tcp,
     bound_unix: *const spore_net_policy.BoundServiceConfig,
 };
 
@@ -436,14 +435,8 @@ pub const Gateway = struct {
 
         self.stats.connect_attempts += 1;
         const open_result = switch (target) {
-            .tcp => |host| blk: {
-                emitNetworkDecision("allow", host, request.local.addr, request.local.port, "policy");
-                break :blk openHostSocket(request.local.addr, request.local.port);
-            },
-            .bound_unix => |bound| blk: {
-                emitNetworkDecision("allow", bound.guest_host, request.local.addr, request.local.port, bound.name);
-                break :blk openUnixSocket(bound.unix_path);
-            },
+            .tcp => openHostSocket(request.local.addr, request.local.port),
+            .bound_unix => |bound| openUnixSocket(bound.unix_path),
         };
         switch (open_result) {
             .connected => |fd| {
@@ -471,10 +464,11 @@ pub const Gateway = struct {
             if (self.policy.boundServiceForPort(request.local.port)) |bound| return .{ .bound_unix = bound };
         }
         const decision = self.policy.decideIpv4Port(request.local.addr, request.local.port);
-        const host = self.policy.hostForIpv4Port(request.local.addr, request.local.port);
-        if (decision == .allow) return .{ .tcp = host };
-        if (self.emit_events) emitDeniedEgressEvent(request.local.addr, request.local.port, decision);
-        emitNetworkDecision("deny", host, request.local.addr, request.local.port, decision.name());
+        if (decision == .allow) return .tcp;
+        if (self.emit_events) {
+            var line: [max_denied_event_len]u8 = undefined;
+            std.debug.print("{s}\n", .{deniedEventLine(&line, request.local.addr, request.local.port, decision)});
+        }
         std.log.debug(
             "spore-netd denied egress reason={s} dst={d}.{d}.{d}.{d}:{d}",
             .{
@@ -648,19 +642,23 @@ pub const Gateway = struct {
     }
 };
 
-fn emitNetworkDecision(action: []const u8, host: ?[]const u8, addr: ipv4.Address, port: u16, reason: []const u8) void {
-    if (builtin.is_test) return;
-    if (host) |value| {
-        std.debug.print(
-            "{{\"event\":\"network_decision\",\"action\":\"{s}\",\"host\":\"{s}\",\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"reason_code\":\"{s}\"}}\n",
-            .{ action, value, addr[0], addr[1], addr[2], addr[3], port, reason },
-        );
-    } else {
-        std.debug.print(
-            "{{\"event\":\"network_decision\",\"action\":\"{s}\",\"host\":null,\"ip\":\"{d}.{d}.{d}.{d}\",\"port\":{d},\"reason_code\":\"{s}\"}}\n",
-            .{ action, addr[0], addr[1], addr[2], addr[3], port, reason },
-        );
-    }
+/// The `spore-netd` stderr line for a denied guest connection. The parent
+/// parses it back with this type into a run `network` event.
+pub const DeniedEvent = struct {
+    event: []const u8 = "egress_denied",
+    ip: []const u8,
+    port: u16,
+    reason: []const u8,
+};
+
+pub const max_denied_event_len = 128;
+
+pub fn deniedEventLine(out: *[max_denied_event_len]u8, addr: ipv4.Address, port: u16, decision: spore_net_policy.Decision) []const u8 {
+    var ip_buf: [15]u8 = undefined;
+    const ip = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }) catch unreachable;
+    var writer = std.Io.Writer.fixed(out);
+    std.json.Stringify.value(DeniedEvent{ .ip = ip, .port = port, .reason = decision.name() }, .{}, &writer) catch unreachable;
+    return writer.buffered();
 }
 
 const OpenResult = union(enum) {
@@ -781,13 +779,6 @@ pub fn isBlockedDestination(addr: ipv4.Address) bool {
     if (std.mem.eql(u8, &addr, &spore_net.guest_ipv4)) return true;
     if (std.mem.eql(u8, &addr, &spore_net.gateway_ipv4)) return true;
     return false;
-}
-
-fn emitDeniedEgressEvent(addr: ipv4.Address, port: u16, reason: spore_net_policy.Decision) void {
-    std.debug.print(
-        "spore-net-event egress_denied {d}.{d}.{d}.{d} {d} {s}\n",
-        .{ addr[0], addr[1], addr[2], addr[3], port, reason.name() },
-    );
 }
 
 fn isGuestTcpFrame(frame: []const u8) bool {
