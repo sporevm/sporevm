@@ -123,20 +123,6 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     var boot_seed_ranges_buf: [3]dirty_ram.ChunkRange = undefined;
     var boot_seed_ranges: ?[]const dirty_ram.ChunkRange = null;
 
-    const kvm_fd = try kvm.openDevKvm();
-    defer closeFd(kvm_fd);
-    try kvm.checkApiVersion(kvm_fd);
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_USER_MEMORY, "KVM_CAP_USER_MEMORY");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
-    try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL");
-    if (prepared.restoring() or config.capture != null) {
-        try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_COUNTER_OFFSET, "KVM_CAP_COUNTER_OFFSET");
-    }
-
-    const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
-    defer closeFd(vm_fd);
-
     const map_ram_start = try monotonicMs();
     const ram_mapping = try vmm.mapRam(&prepared);
     if (restore_stats) |*stats| stats.map_ram_ms = (try monotonicMs()) - map_ram_start;
@@ -144,23 +130,21 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const ram_bytes = ram_mapping.bytes;
     var ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
     const initial_ram_len: usize = @intCast(prepared.ram_size);
+
+    var vm = try Vm.create(.{
+        .ram = ram_bytes[0..initial_ram_len],
+        .dirty_tracking = config.dirtyTrackingDir() != null,
+        .counter_offset = prepared.restoring() or config.capture != null,
+    });
+    defer vm.deinit();
+    const vm_fd = vm.fd;
+    const gic_dev = vm.gic;
+
     var hotplug_mapping: ?HotplugMapping = if (prepared.virtio_mem_region_size > 0)
         HotplugMapping.init(@alignCast(ram_bytes[initial_ram_len..]), board.ram_base + prepared.ram_size, vm_fd)
     else
         null;
     defer if (hotplug_mapping) |*mapping| mapping.deinit();
-
-    var region = kvm.UserspaceMemoryRegion{
-        .slot = 0,
-        .flags = if (config.dirtyTrackingDir() != null) kvm.KVM_MEM_LOG_DIRTY_PAGES else 0,
-        .guest_phys_addr = board.ram_base,
-        .memory_size = prepared.ram_size,
-        .userspace_addr = @intFromPtr(ram_bytes.ptr),
-    };
-    _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
-
-    const gic_dev = try createGic(vm_fd);
-    defer if (gic_dev.fd != 0) closeFd(@intCast(gic_dev.fd));
 
     var devices: vmm.Devices = undefined;
     devices.init(config, if (hotplug_mapping) |*mapping| .{
@@ -181,21 +165,19 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const vsock_transport_index = devices.vsock_index;
     const mem_transport_index = devices.mem_index;
 
-    const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
     const vcpu_count: usize = @intCast(prepared.vcpus);
-    var vcpus = try allocator.alloc(KvmVcpu, vcpu_count);
+    var vcpus = try allocator.alloc(Vcpu, vcpu_count);
     for (vcpus) |*vcpu| vcpu.* = .{};
     defer {
         for (vcpus) |*vcpu| vcpu.deinit();
         allocator.free(vcpus);
     }
     for (vcpus, 0..) |*vcpu, index| {
-        try vcpu.init(vm_fd, run_size, @intCast(index));
-        try initVcpu(vm_fd, vcpu.fd, !prepared.restoring() and index != 0);
+        try vcpu.create(&vm, @intCast(index), !prepared.restoring() and index != 0);
     }
     const primary_vcpu = &vcpus[0];
     const vcpu_fd = primary_vcpu.fd;
-    try initGic(gic_dev.fd);
+    try vm.initGic();
 
     if (prepared.manifest) |parsed| {
         const restore = config.start.restore;
@@ -268,9 +250,6 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         }
     }
 
-    var run_wake_signal = KvmRunWakeSignal.install();
-    defer run_wake_signal.deinit();
-    const run_bytes = primary_vcpu.run_bytes;
     primary_vcpu.wake.thread_id = linux.gettid();
     var multi_wake = KvmRunWakeSet{ .vcpus = vcpus };
     if (prepared.vcpus == 1) {
@@ -329,7 +308,6 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     var exec_probe_done = false;
     var handled_memory_pressure_count: u32 = 0;
     var requested_hotplug_size: u64 = if (mem_transport_index != null) mem_dev.requested_size else 0;
-    var pending_kvm_completion = false;
     var did_capture_request = false;
     while (true) {
         if (mem_transport_index != null) {
@@ -349,10 +327,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         }
         if (config.network.failed()) return error.NetworkGatewayFailed;
         if (config.exec_control) |control| {
-            if (pending_kvm_completion) {
-                try kvm.completePendingExit(vcpu_fd, run_bytes);
-                pending_kvm_completion = false;
-            }
+            try primary_vcpu.applyPendingMmio();
             control.reportStats(vmm.monitorStats(if (dirty_tracker) |*tracker| &tracker.sealer else null));
             switch (try control.poll(vsock_dev)) {
                 .keep_running => {},
@@ -405,10 +380,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         if (config.captureRequest()) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
             if (request_capture.isRequested() and !did_capture_request) {
-                if (pending_kvm_completion) {
-                    try kvm.completePendingExit(vcpu_fd, run_bytes);
-                    pending_kvm_completion = false;
-                }
+                try primary_vcpu.applyPendingMmio();
                 try takeSnapshot(allocator, config.capture.?.dir, @intCast(gic_dev.fd), vcpu_fd, transports, gen_dev, vsock_dev, ram_bytes, prepared.ram_size, if (mem_transport_index != null) mem_dev else null, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -426,11 +398,10 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 if (probe.state == .complete) {
                     const observed_ms = probe.elapsedMs();
                     var pending_completion_ms: u64 = 0;
-                    if (pending_kvm_completion) {
+                    if (primary_vcpu.pending_mmio) {
                         const completion_start = try monotonicMs();
-                        try kvm.completePendingExit(vcpu_fd, run_bytes);
+                        try primary_vcpu.applyPendingMmio();
                         pending_completion_ms = (try monotonicMs()) -| completion_start;
-                        pending_kvm_completion = false;
                     }
                     std.log.debug(
                         "kvm probe completion timing: observed_ms={d} pending_completion_ms={d} return_ms={d}",
@@ -450,14 +421,10 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             }
         }
 
-        const run_result = try kvm.runVcpu(vcpu_fd);
-        // KVM completes a prior userspace MMIO operation before checking
-        // immediate_exit or pending signals, so either return completes it.
-        pending_kvm_completion = false;
-        switch (kvmPostRunAction(run_result, run_bytes[kvm.RunLayout.immediate_exit] != 0)) {
-            .dispatch_exit => {},
-            .handle_async_wake => {
-                clearImmediateExit(run_bytes);
+        switch (try primary_vcpu.run()) {
+            .mmio => |access| primary_vcpu.completeMmio(try handleDeviceMmio(vm_fd, access, transports, gen_dev, ram)),
+            .shutdown => |kind| return kind.cause(),
+            .kicked => {
                 if (config.captureRequest()) |request_capture| {
                     if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
                 }
@@ -465,32 +432,15 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 if (config.network.consumeWake()) {
                     try flushNetworkRxKvm(vm_fd, net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
                 }
-                continue;
             },
-        }
-        switch (kvm.exitReason(run_bytes)) {
-            kvm.KVM_EXIT_MMIO => {
-                try handleMmio(vm_fd, run_bytes, transports, gen_dev, ram);
-                pending_kvm_completion = true;
-            },
-            kvm.KVM_EXIT_SYSTEM_EVENT => switch (kvm.systemEventType(run_bytes)) {
-                kvm.KVM_SYSTEM_EVENT_SHUTDOWN => return .guest_off,
-                kvm.KVM_SYSTEM_EVENT_RESET => return .guest_reset,
-                else => return error.UnexpectedExit,
-            },
-            kvm.KVM_EXIT_SHUTDOWN => return .guest_off,
-            kvm.KVM_EXIT_FAIL_ENTRY, kvm.KVM_EXIT_INTERNAL_ERROR => return error.UnexpectedExit,
-            else => |reason| {
-                std.log.err("unhandled KVM exit reason {d}", .{reason});
-                return error.UnexpectedExit;
-            },
+            .wfi, .handled => unreachable,
         }
     }
 }
 
 const kvm_run_wake_signal = posix.SIG.URG;
 
-const KvmVcpu = struct {
+const Vcpu = struct {
     index: topology.VcpuIndex = 0,
     fd: std.c.fd_t = -1,
     run_bytes: []align(std.heap.page_size_min) u8 = undefined,
@@ -498,18 +448,23 @@ const KvmVcpu = struct {
     wake: KvmRunWake = undefined,
     thread: ?std.Thread = null,
     snapshot_paused: std.atomic.Value(bool) = .init(false),
+    /// KVM applies a completed MMIO access only on the next KVM_RUN.
+    pending_mmio: bool = false,
 
-    fn init(self: *KvmVcpu, vm_fd: std.c.fd_t, run_size: usize, index: topology.VcpuIndex) !void {
-        const fd: std.c.fd_t = @intCast(try kvm.ioctl(vm_fd, kvm.KVM_CREATE_VCPU, @intCast(index), "KVM_CREATE_VCPU"));
+    /// Creates the vCPU. A parked vCPU starts powered off until PSCI CPU_ON.
+    fn create(self: *Vcpu, vm: *const Vm, index: topology.VcpuIndex, parked: bool) !void {
+        const fd: std.c.fd_t = @intCast(try kvm.ioctl(vm.fd, kvm.KVM_CREATE_VCPU, @intCast(index), "KVM_CREATE_VCPU"));
         errdefer closeFd(fd);
         const run_bytes = try std.posix.mmap(
             null,
-            run_size,
+            vm.run_size,
             .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd,
             0,
         );
+        errdefer std.posix.munmap(run_bytes);
+        try initVcpu(vm.fd, fd, parked);
         self.* = .{
             .index = index,
             .fd = fd,
@@ -523,7 +478,61 @@ const KvmVcpu = struct {
         };
     }
 
-    fn deinit(self: *KvmVcpu) void {
+    /// Enters the guest once. KVM applies a pending MMIO access on entry,
+    /// whether or not the run is then interrupted.
+    fn run(self: *Vcpu) !vmm.Exit {
+        const run_result = try kvm.runVcpu(self.fd);
+        self.pending_mmio = false;
+        if (kvmPostRunAction(run_result, self.run_bytes[kvm.RunLayout.immediate_exit] != 0) == .handle_async_wake) {
+            clearImmediateExit(self.run_bytes);
+            return .kicked;
+        }
+        switch (kvm.exitReason(self.run_bytes)) {
+            kvm.KVM_EXIT_MMIO => {
+                const exit = kvm.mmioExit(self.run_bytes);
+                const size_log2 = sizeLog2(exit.len) orelse return error.UnhandledMmio;
+                return .{ .mmio = .{
+                    .addr = exit.phys_addr,
+                    .size_log2 = size_log2,
+                    .write = if (exit.is_write) readData(exit.data, exit.len) else null,
+                } };
+            },
+            kvm.KVM_EXIT_SYSTEM_EVENT => return switch (kvm.systemEventType(self.run_bytes)) {
+                kvm.KVM_SYSTEM_EVENT_SHUTDOWN => .{ .shutdown = .off },
+                kvm.KVM_SYSTEM_EVENT_RESET => .{ .shutdown = .reset },
+                else => error.UnexpectedExit,
+            },
+            kvm.KVM_EXIT_SHUTDOWN => return .{ .shutdown = .off },
+            kvm.KVM_EXIT_FAIL_ENTRY, kvm.KVM_EXIT_INTERNAL_ERROR => return error.UnexpectedExit,
+            else => |reason| {
+                std.log.err("unhandled KVM exit reason {d} on vcpu {d}", .{ reason, self.index });
+                return error.UnexpectedExit;
+            },
+        }
+    }
+
+    /// Finishes the last `.mmio` exit; a read returns `value` to the guest.
+    /// KVM applies it on the next KVM_RUN.
+    fn completeMmio(self: *Vcpu, value: u64) void {
+        const exit = kvm.mmioExit(self.run_bytes);
+        if (!exit.is_write) writeData(exit.data, exit.len, value);
+        self.pending_mmio = true;
+    }
+
+    /// Applies a completed MMIO access now, so a capture sees the register
+    /// value and PC the guest would see next.
+    fn applyPendingMmio(self: *Vcpu) !void {
+        if (!self.pending_mmio) return;
+        try kvm.completePendingExit(self.fd, self.run_bytes);
+        self.pending_mmio = false;
+    }
+
+    /// Interrupts KVM_RUN from another thread or a signal handler.
+    fn kick(self: *Vcpu) void {
+        self.wake.wakeRun();
+    }
+
+    fn deinit(self: *Vcpu) void {
         if (self.thread) |thread| thread.join();
         self.thread = null;
         if (self.run_mapped) {
@@ -549,10 +558,10 @@ const KvmRunWake = struct {
 };
 
 const KvmRunWakeSet = struct {
-    vcpus: []KvmVcpu,
+    vcpus: []Vcpu,
 
     fn wakeAll(self: *KvmRunWakeSet) void {
-        for (self.vcpus) |*vcpu| vcpu.wake.wakeRun();
+        for (self.vcpus) |*vcpu| vcpu.kick();
     }
 };
 
@@ -658,7 +667,7 @@ const MultiKvmRunState = struct {
 const MultiKvmRunOptions = struct {
     vm_fd: std.c.fd_t,
     gic_fd: std.c.fd_t,
-    vcpus: []KvmVcpu,
+    vcpus: []Vcpu,
     wake_set: *KvmRunWakeSet,
     config: *const vmm.Config,
     transports: []mmio.Transport,
@@ -680,7 +689,7 @@ const MultiKvmRunOptions = struct {
 
 const MultiKvmThreadContext = struct {
     vm_fd: std.c.fd_t,
-    vcpu: *KvmVcpu,
+    vcpu: *Vcpu,
     state: *MultiKvmRunState,
     device_lock: *vmm.SpinLock,
     network: net.Runtime,
@@ -950,7 +959,7 @@ fn finishMultiKvmResult(result: MultiKvmResult) !ExitCause {
     };
 }
 
-fn joinKvmVcpuThreads(vcpus: []KvmVcpu) void {
+fn joinKvmVcpuThreads(vcpus: []Vcpu) void {
     for (vcpus) |*vcpu| {
         if (vcpu.thread) |thread| {
             vcpu.wake.wakeRun();
@@ -962,91 +971,71 @@ fn joinKvmVcpuThreads(vcpus: []KvmVcpu) void {
 
 fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
     ctx.vcpu.wake.thread_id = linux.gettid();
-    var pending_kvm_completion = false;
     while (!ctx.state.stopped()) {
         if (ctx.state.snapshotRequested()) {
-            if (!completePendingKvmExitBeforeSnapshot(ctx, &pending_kvm_completion)) return;
+            if (!applyPendingMmioBeforeSnapshot(ctx)) return;
             ctx.vcpu.snapshot_paused.store(true, .release);
             sleepMs(1);
             continue;
         }
         ctx.vcpu.snapshot_paused.store(false, .release);
-        const run_result = kvm.runVcpu(ctx.vcpu.fd) catch |err| {
+        const exit = ctx.vcpu.run() catch |err| {
             ctx.state.finish(.{ .err = err });
             return;
         };
-        // KVM completes a prior userspace MMIO operation before checking
-        // immediate_exit or pending signals, so either return completes it.
-        pending_kvm_completion = false;
-        const post_run_action = kvmPostRunAction(run_result, ctx.vcpu.run_bytes[kvm.RunLayout.immediate_exit] != 0);
-        if (post_run_action == .handle_async_wake) {
-            clearImmediateExit(ctx.vcpu.run_bytes);
-            if (ctx.state.snapshotRequested()) {
-                if (!completePendingKvmExitBeforeSnapshot(ctx, &pending_kvm_completion)) return;
-                ctx.vcpu.snapshot_paused.store(true, .release);
-                continue;
-            }
-            if (ctx.state.stopped()) continue;
-            if (ctx.network.failed()) {
-                ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
-                continue;
-            }
-            ctx.device_lock.lock();
-            if (ctx.network.consumeWake()) {
-                flushNetworkRxKvm(ctx.vm_fd, ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, ctx.net_transport_index) catch |err| {
-                    ctx.device_lock.unlock();
-                    ctx.state.finish(.{ .err = err });
-                    return;
-                };
-            }
-            ctx.device_lock.unlock();
-            continue;
-        }
-
-        switch (kvm.exitReason(ctx.vcpu.run_bytes)) {
-            kvm.KVM_EXIT_MMIO => {
+        switch (exit) {
+            .kicked => {
+                if (ctx.state.snapshotRequested()) {
+                    if (!applyPendingMmioBeforeSnapshot(ctx)) return;
+                    ctx.vcpu.snapshot_paused.store(true, .release);
+                    continue;
+                }
+                if (ctx.state.stopped()) continue;
+                if (ctx.network.failed()) {
+                    ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
+                    continue;
+                }
                 ctx.device_lock.lock();
-                handleMmio(ctx.vm_fd, ctx.vcpu.run_bytes, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
+                if (ctx.network.consumeWake()) {
+                    flushNetworkRxKvm(ctx.vm_fd, ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, ctx.net_transport_index) catch |err| {
+                        ctx.device_lock.unlock();
+                        ctx.state.finish(.{ .err = err });
+                        return;
+                    };
+                }
+                ctx.device_lock.unlock();
+            },
+            .mmio => |access| {
+                ctx.device_lock.lock();
+                const value = handleDeviceMmio(ctx.vm_fd, access, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
                     ctx.device_lock.unlock();
                     ctx.state.finish(.{ .err = err });
                     return;
                 };
                 ctx.device_lock.unlock();
-                pending_kvm_completion = true;
+                ctx.vcpu.completeMmio(value);
                 if (ctx.state.stopped()) {
-                    kvm.completePendingExit(ctx.vcpu.fd, ctx.vcpu.run_bytes) catch |err| {
+                    ctx.vcpu.applyPendingMmio() catch |err| {
                         ctx.state.finish(.{ .err = err });
                     };
-                    pending_kvm_completion = false;
                     return;
                 }
             },
-            kvm.KVM_EXIT_SYSTEM_EVENT => switch (kvm.systemEventType(ctx.vcpu.run_bytes)) {
-                kvm.KVM_SYSTEM_EVENT_SHUTDOWN => ctx.state.finish(.{ .exit = .guest_off }),
-                kvm.KVM_SYSTEM_EVENT_RESET => ctx.state.finish(.{ .exit = .guest_reset }),
-                else => ctx.state.finish(.{ .err = error.UnexpectedExit }),
-            },
-            kvm.KVM_EXIT_SHUTDOWN => ctx.state.finish(.{ .exit = .guest_off }),
-            kvm.KVM_EXIT_FAIL_ENTRY, kvm.KVM_EXIT_INTERNAL_ERROR => ctx.state.finish(.{ .err = error.UnexpectedExit }),
-            else => |reason| {
-                std.log.err("unhandled KVM exit reason {d} on vcpu {d}", .{ reason, ctx.vcpu.index });
-                ctx.state.finish(.{ .err = error.UnexpectedExit });
-            },
+            .shutdown => |kind| ctx.state.finish(.{ .exit = kind.cause() }),
+            .wfi, .handled => unreachable,
         }
     }
 }
 
-fn completePendingKvmExitBeforeSnapshot(ctx: *MultiKvmThreadContext, pending_kvm_completion: *bool) bool {
-    if (!pending_kvm_completion.*) return true;
-    kvm.completePendingExit(ctx.vcpu.fd, ctx.vcpu.run_bytes) catch |err| {
+fn applyPendingMmioBeforeSnapshot(ctx: *MultiKvmThreadContext) bool {
+    ctx.vcpu.applyPendingMmio() catch |err| {
         ctx.state.finish(.{ .err = err });
         return false;
     };
-    pending_kvm_completion.* = false;
     return true;
 }
 
-fn pauseKvmVcpusForSnapshot(vcpus: []KvmVcpu, state: *MultiKvmRunState, wake_set: *KvmRunWakeSet) !void {
+fn pauseKvmVcpusForSnapshot(vcpus: []Vcpu, state: *MultiKvmRunState, wake_set: *KvmRunWakeSet) !void {
     for (vcpus) |*vcpu| vcpu.snapshot_paused.store(false, .release);
     state.requestSnapshot();
     wake_set.wakeAll();
@@ -1138,7 +1127,7 @@ fn ratePerSec(count: u64, elapsed_ms: u64) u64 {
     return count * std.time.ms_per_s / elapsed_ms;
 }
 
-fn kvmVcpuRefs(buf: *[topology.max_vcpus]snapshot.VcpuRef, vcpus: []const KvmVcpu) []const snapshot.VcpuRef {
+fn kvmVcpuRefs(buf: *[topology.max_vcpus]snapshot.VcpuRef, vcpus: []const Vcpu) []const snapshot.VcpuRef {
     for (vcpus, 0..) |vcpu, i| {
         buf[i] = .{ .index = vcpu.index, .fd = vcpu.fd };
     }
@@ -1524,7 +1513,7 @@ fn takeSnapshotMulti(
     allocator: std.mem.Allocator,
     dir: []const u8,
     gic_fd: std.c.fd_t,
-    vcpus: []KvmVcpu,
+    vcpus: []Vcpu,
     transports: []mmio.Transport,
     gen_dev: *const generation.Device,
     vsock_dev: *const vsock.Vsock,
@@ -1699,6 +1688,72 @@ fn closeFd(fd: std.c.fd_t) void {
     _ = std.c.close(fd);
 }
 
+/// The KVM VM: the /dev/kvm and VM fds, guest RAM slot 0, the vGICv3 device,
+/// and the SIGURG handler that lets a kick interrupt KVM_RUN.
+const Vm = struct {
+    kvm_fd: std.c.fd_t,
+    fd: std.c.fd_t,
+    gic: kvm.CreateDevice,
+    run_size: usize,
+    wake_signal: KvmRunWakeSignal,
+
+    const Options = struct {
+        /// Initial guest RAM, mapped at board.ram_base as slot 0.
+        ram: []u8,
+        dirty_tracking: bool,
+        /// Restores and captures set the guest counter offset.
+        counter_offset: bool,
+    };
+
+    fn create(options: Options) !Vm {
+        const kvm_fd = try kvm.openDevKvm();
+        errdefer closeFd(kvm_fd);
+        try kvm.checkApiVersion(kvm_fd);
+        try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_USER_MEMORY, "KVM_CAP_USER_MEMORY");
+        try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
+        try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
+        try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL");
+        if (options.counter_offset) {
+            try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_COUNTER_OFFSET, "KVM_CAP_COUNTER_OFFSET");
+        }
+
+        const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
+        errdefer closeFd(vm_fd);
+        var region = kvm.UserspaceMemoryRegion{
+            .slot = 0,
+            .flags = if (options.dirty_tracking) kvm.KVM_MEM_LOG_DIRTY_PAGES else 0,
+            .guest_phys_addr = board.ram_base,
+            .memory_size = options.ram.len,
+            .userspace_addr = @intFromPtr(options.ram.ptr),
+        };
+        _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+
+        const gic = try createGic(vm_fd);
+        errdefer closeFd(@intCast(gic.fd));
+        const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
+        return .{
+            .kvm_fd = kvm_fd,
+            .fd = vm_fd,
+            .gic = gic,
+            .run_size = run_size,
+            .wake_signal = KvmRunWakeSignal.install(),
+        };
+    }
+
+    fn deinit(self: *Vm) void {
+        self.wake_signal.deinit();
+        closeFd(@intCast(self.gic.fd));
+        closeFd(self.fd);
+        closeFd(self.kvm_fd);
+    }
+
+    /// Initializes the vGIC. KVM requires every vCPU to exist first.
+    fn initGic(self: *Vm) !void {
+        var unused: u64 = 0;
+        try kvm.setDeviceAttr(@intCast(self.gic.fd), kvm.KVM_DEV_ARM_VGIC_GRP_CTRL, kvm.KVM_DEV_ARM_VGIC_CTRL_INIT, &unused, "vgic init");
+    }
+};
+
 fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {
     var dev = kvm.CreateDevice{ .type = kvm.KVM_DEV_TYPE_ARM_VGIC_V3, .fd = 0, .flags = 0 };
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_DEVICE, @intFromPtr(&dev), "KVM_CREATE_DEVICE vgicv3");
@@ -1707,11 +1762,6 @@ fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {
     try kvm.setDeviceAttr(@intCast(dev.fd), kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_DIST, &dist, "vgic dist addr");
     try kvm.setDeviceAttr(@intCast(dev.fd), kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_REDIST, &redist, "vgic redist addr");
     return dev;
-}
-
-fn initGic(gic_fd: u32) !void {
-    var unused: u64 = 0;
-    try kvm.setDeviceAttr(@intCast(gic_fd), kvm.KVM_DEV_ARM_VGIC_GRP_CTRL, kvm.KVM_DEV_ARM_VGIC_CTRL_INIT, &unused, "vgic init");
 }
 
 fn initVcpu(vm_fd: std.c.fd_t, vcpu_fd: std.c.fd_t, power_off: bool) !void {
@@ -1742,27 +1792,26 @@ fn maskPortableCpuFeatures(vcpu_fd: std.c.fd_t) !void {
     }
 }
 
-fn handleMmio(
+/// Handles a guest access to the generation device or a virtio transport and
+/// returns the value a read sees. Stray accesses read as zero.
+fn handleDeviceMmio(
     vm_fd: std.c.fd_t,
-    run_bytes: []u8,
+    access: vmm.Mmio,
     transports: []mmio.Transport,
     gen_dev: *generation.Device,
     ram: guestmem.GuestRam,
-) !void {
-    const exit = kvm.mmioExit(run_bytes);
-    const size_log2 = sizeLog2(exit.len) orelse return error.UnhandledMmio;
-    const ipa = exit.phys_addr;
+) !u64 {
+    const ipa = access.addr;
 
     if (ipa >= board.generation_base and ipa < board.generation_base + board.generation_size) {
         const offset = ipa - board.generation_base;
-        if (exit.is_write) {
-            if (gen_dev.write(offset, readData(exit.data, exit.len), size_log2)) {
+        if (access.write) |value| {
+            if (gen_dev.write(offset, value, access.size_log2)) {
                 try kvm.setIrq(vm_fd, board.generationIntid(), false);
             }
-        } else {
-            writeData(exit.data, exit.len, gen_dev.read(offset, size_log2));
+            return 0;
         }
-        return;
+        return gen_dev.read(offset, access.size_log2);
     }
 
     const dev_index = blk: {
@@ -1774,18 +1823,17 @@ fn handleMmio(
     if (dev_index) |idx| {
         const t = &transports[@intCast(idx)];
         const offset = ipa - board.virtioDeviceBase(@intCast(idx));
-        if (exit.is_write) {
-            const raised = t.write(offset, @truncate(readData(exit.data, exit.len)), ram);
+        if (access.write) |value| {
+            const raised = t.write(offset, @truncate(value), ram);
             if (raised) try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), true);
             if (offset == 0x064) try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), false);
-        } else {
-            writeData(exit.data, exit.len, t.read(offset));
+            return 0;
         }
-        return;
+        return t.read(offset);
     }
 
-    std.log.debug("stray KVM MMIO {s} at ipa=0x{x}", .{ if (exit.is_write) "write" else "read", ipa });
-    if (!exit.is_write) writeData(exit.data, exit.len, 0);
+    std.log.debug("stray KVM MMIO {s} at ipa=0x{x}", .{ if (access.write != null) "write" else "read", ipa });
+    return 0;
 }
 
 fn sizeLog2(len: u32) ?u2 {
