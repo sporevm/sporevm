@@ -54,18 +54,18 @@ steps:
         concurrency_group: "sporevm/macos"
         agents: *mac_agents
 
-      - label: ":computer: x86-64 Slice 3b (Linux AMD64)"
-        key: "x86-slice3b-linux-amd64"
-        command: "scripts/ci/run.sh mise run smoke:x86-slice3b"
+      - label: ":computer: x86-64 run smoke (Linux AMD64)"
+        key: "x86-run-linux-amd64"
+        command: "scripts/ci/run.sh mise run smoke:x86"
         timeout_in_minutes: 30
         plugins: *mise_plugins
         cache: *mise_cache
         agents:
           queue: sporevm-linux-amd64
 
-      - label: ":hammer_and_wrench: x86-64 Slice 3c build (Linux AMD64)"
-        key: "x86-slice3c-linux-amd64"
-        command: "scripts/ci/run.sh mise run smoke:x86-slice3c"
+      - label: ":hammer_and_wrench: x86-64 build smoke (Linux AMD64)"
+        key: "x86-build-linux-amd64"
+        command: "scripts/ci/run.sh mise run smoke:x86-build"
         timeout_in_minutes: 30
         plugins: *mise_plugins
         cache: *mise_cache

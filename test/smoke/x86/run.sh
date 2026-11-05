@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+board_smoke_bin="${SPOREVM_X86_BOARD_SMOKE_BIN:-${repo_root}/zig-out/bin/x86-board-smoke}"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
 release="${SPOREVM_KERNEL_RELEASE:-v0.7.1}"
 asset="sporevm-x86_64-linux-6.1.191-bzImage"
@@ -12,11 +13,29 @@ die() {
   exit 1
 }
 
-[[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 Slice 3b smoke requires Linux/x86_64"
+[[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 run smoke requires Linux/x86_64"
 [[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
+[[ -x "${board_smoke_bin}" ]] || die "board smoke binary not executable: ${board_smoke_bin}"
+[[ -z "${SPOREVM_KERNEL_IMAGE:-}" && -z "${SPOREVM_RUN_INITRD:-}" ]] || die "boot artifact overrides must be unset"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-slice3b.XXXXXX")"
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-run.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
+if [[ -n "${seed_dir}" ]]; then
+  kernel_path="${seed_dir}/${asset}"
+  [[ -f "${kernel_path}" ]] || die "missing managed seed asset: ${kernel_path}"
+else
+  kernel_path="$(env SPOREVM_KERNEL_ARCH=x86_64 SPOREVM_KERNEL_CACHE_DIR="${workdir}/board-kernel-cache" \
+    "${repo_root}/scripts/kernel/ensure-managed-kernel.sh" run)"
+fi
+
+# The frozen-board smoke proves generation acknowledgement, root block
+# read/write, immutable block reads and host-proven write rejection, RNG, and
+# exact virtio0..virtio7 enumeration. The product smokes then prove one-shot and
+# named lifecycle behavior and that unavailable features fail closed.
+"${board_smoke_bin}" "${kernel_path}"
+"${repo_root}/test/smoke/x86/fresh-product.sh"
+"${repo_root}/test/smoke/x86/fail-closed.sh"
+
 export SPOREVM_KERNEL_CACHE_DIR="${workdir}/kernel-cache"
 export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
@@ -50,12 +69,12 @@ fi
   --memory 512mib \
   --image docker.io/library/alpine:3.20 \
   --disk-size 2gb \
-  --commit local/x86-slice3b:growth \
+  --commit local/x86-run:growth \
   -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && test "$(df -k / | awk "NR == 2 { print \$2 }")" -gt 1500000 && echo x86-growth-ok >/x86-growth-marker'
 "${spore_bin}" run \
   --backend kvm \
   --memory 512mib \
-  --image local/x86-slice3b:growth \
+  --image local/x86-run:growth \
   --pull=never \
   -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && grep -Fxq x86-growth-ok /x86-growth-marker'
 "${repo_root}/test/smoke/network/config.sh"
@@ -65,4 +84,4 @@ fi
 "${repo_root}/test/smoke/network/bind-service.sh"
 "${repo_root}/test/smoke/network/forward.sh"
 
-echo "smoke:x86-slice3b ok"
+echo "smoke:x86 ok"

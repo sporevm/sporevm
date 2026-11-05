@@ -49,17 +49,13 @@ description = "Update source and package versions for a release"
 run = "scripts/release/build-assets.sh"
 description = "Build local release archives without publishing"
 
-[tasks."smoke:x86-slice3a"]
-run = "mise run build:release && zig build kvm-boot kvm-profile-probe kvm-profile-roundtrip x86-slice2a-smoke --release=safe && test/smoke/x86/slice3a.sh"
-description = "Run the native x86 frozen-board, fresh-product, and fail-closed Slice 3a matrix"
+[tasks."smoke:x86"]
+run = "mise run build:release && zig build x86-board-smoke --release=safe && test/smoke/x86/run.sh"
+description = "Smoke native x86 frozen-board, fresh-product, OCI/rootfs/commit, network-policy, and fail-closed behavior"
 
-[tasks."smoke:x86-slice3b"]
-run = "mise run build:release && zig build kvm-boot kvm-profile-probe kvm-profile-roundtrip x86-slice2a-smoke --release=safe && test/smoke/x86/slice3a.sh && test/smoke/x86/slice3b.sh"
-description = "Run the native x86 fresh-product, OCI/rootfs/commit, network-policy, and fail-closed Slice 3b matrix"
-
-[tasks."smoke:x86-slice3c"]
-run = "mise run build:release && bash test/smoke/x86/slice3c.sh"
-description = "Run native x86 build conformance and fail-closed checks"
+[tasks."smoke:x86-build"]
+run = "mise run build:release && bash test/smoke/x86/build.sh"
+description = "Smoke native x86 build conformance and fail-closed checks"
 
 [tasks."benchmark:disk-fork"]
 run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast -lc --test-filter 'disk fork benchmark'"

@@ -12,10 +12,10 @@ die() {
   exit 1
 }
 
-[[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 Slice 3c smoke requires Linux/x86_64"
+[[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 build smoke requires Linux/x86_64"
 [[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-slice3c.XXXXXX")"
+workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-build.XXXXXX")"
 trap 'rm -rf "${workdir}"' EXIT
 export SPOREVM_KERNEL_CACHE_DIR="${workdir}/kernel-cache"
 export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
@@ -41,21 +41,21 @@ printf 'native context payload\n' >"${build_context}/payload.txt"
 cat >"${build_context}/Dockerfile" <<'EOF'
 FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20 AS native
 ARG TARGETARCH
-COPY payload.txt /slice3c-context
-RUN --mount=type=cache,target=/cache,id=slice3c-$TARGETARCH test "$TARGETARCH" = amd64 && grep -Fxq 'native context payload' /slice3c-context && printf '%s\n' "$TARGETARCH" >/slice3c-arch
+COPY payload.txt /build-context
+RUN --mount=type=cache,target=/cache,id=build-$TARGETARCH test "$TARGETARCH" = amd64 && grep -Fxq 'native context payload' /build-context && printf '%s\n' "$TARGETARCH" >/build-arch
 
 FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20 AS second
-RUN printf '%s\n' second >/slice3c-second
+RUN printf '%s\n' second >/build-second
 
 FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20
-COPY --from=native /slice3c-context /slice3c-context
-COPY --from=native /slice3c-arch /slice3c-arch
-COPY --from=second /slice3c-second /slice3c-second
-RUN test "$(cat /slice3c-arch)" = amd64 && grep -Fxq 'native context payload' /slice3c-context && grep -Fxq second /slice3c-second
+COPY --from=native /build-context /build-context
+COPY --from=native /build-arch /build-arch
+COPY --from=second /build-second /build-second
+RUN test "$(cat /build-arch)" = amd64 && grep -Fxq 'native context payload' /build-context && grep -Fxq second /build-second
 CMD ["/bin/true"]
 EOF
 
-build_tag="local/x86-slice3c:conformance"
+build_tag="local/x86-build:conformance"
 "${spore_bin}" build --network none --tag "${build_tag}" "${build_context}" \
   >"${workdir}/build-first.log"
 "${spore_bin}" build --network none --tag "${build_tag}" "${build_context}" \
@@ -63,13 +63,13 @@ build_tag="local/x86-slice3c:conformance"
 grep -Fq 'executed_steps=0 boot_count=0' "${workdir}/build-warm.log" || \
   die "warm native build did not reuse the complete Dockerfile cache"
 "${spore_bin}" run --backend kvm --memory 512mib --image "${build_tag}" --pull=never -- \
-  /bin/sh -lc 'test "$(cat /slice3c-arch)" = amd64 && grep -Fxq "native context payload" /slice3c-context'
+  /bin/sh -lc 'test "$(cat /build-arch)" = amd64 && grep -Fxq "native context payload" /build-context'
 
 "${repo_root}/test/smoke/x86/fail-closed.sh"
 
 if find "${SPOREVM_RUNTIME_DIR}" -mindepth 2 -print -quit | grep -q .; then
   find "${SPOREVM_RUNTIME_DIR}" -mindepth 2 -maxdepth 3 -print >&2
-  die "Slice 3c checks left runtime residue"
+  die "x86 build checks left runtime residue"
 fi
 
-echo "smoke:x86-slice3c ok"
+echo "smoke:x86-build ok"

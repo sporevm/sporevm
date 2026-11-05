@@ -306,6 +306,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.UnsupportedBackend,
         error.ApiVersionMismatch,
         error.KvmCapabilityMissing,
+        error.IncompatibleCpuProfile,
         => CliError.init(.host_unsupported, ErrorCode.host_unsupported.defaultMessage(), @errorName(err)),
         error.MissingKvmDevice,
         error.KvmOpenFailed,
@@ -373,6 +374,7 @@ test "setup errors classify for API callers" {
     try std.testing.expectEqual(ErrorCode.object_invalid, fromZigError(error.UnsupportedExt4FileSize).code);
     try std.testing.expectEqual(ErrorCode.cache_integrity_failed, fromZigError(error.ManagedKernelChecksumMismatch).code);
     try std.testing.expectEqual(ErrorCode.host_unsupported, fromZigError(error.KvmCapabilityMissing).code);
+    try std.testing.expectEqual(ErrorCode.host_unsupported, fromZigError(error.IncompatibleCpuProfile).code);
     try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.MissingKvmDevice).code);
     try std.testing.expectEqual(ErrorCode.host_unavailable, fromZigError(error.KvmProbeFailed).code);
     try std.testing.expectEqual(ErrorCode.runtime_execution_failed, fromZigError(error.RuntimeFailed).code);

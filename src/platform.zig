@@ -102,7 +102,7 @@ pub const X86PlatformFacts = struct {
     os: []const u8,
     board_profile: []const u8 = x86_board.board_profile,
     cpu_profile: []const u8 = x86_cpu_profile.profile_name,
-    cpu_profile_status: []const u8 = @tagName(x86_cpu_profile.candidate_status),
+    cpu_profile_status: []const u8 = x86_cpu_profile.status,
     device_model_version: u32 = x86_board.device_model_version,
     ram: X86RamFacts = .{},
     interrupt_controller: X86InterruptController = .{},
@@ -357,8 +357,7 @@ fn unavailableReasonName(reason: backend_mod.UnavailableReason) []const u8 {
         .unsupported_host => "unsupported_os_or_arch",
         .missing_dev_kvm => "missing_dev_kvm",
         .kvm_open_failed => "kvm_open_failed",
-        .api_version_mismatch => "api_version_mismatch",
-        .missing_capability => "kvm_capability_missing",
+        .incompatible_cpu_profile => "cpu_profile_incompatible",
         .kvm_probe_failed => "kvm_probe_failed",
     };
 }

@@ -436,11 +436,14 @@ restore, and fork operations in the example above remain unavailable.
 
 SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
 runs, local and remote bundle materialization, explicit guest networking, and
-named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM has an
-experimental fresh-only development profile with one vCPU and fixed 512 MiB
-memory; native OCI/rootfs execution, image commit, networking, and build are
-available, while capture, saved-state restore/resume, disk fork, multi-vCPU,
-and elastic memory remain gated.
+named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM is a
+frozen, fresh-only profile with one vCPU and fixed 512 MiB memory; native
+OCI/rootfs execution, image commit, networking, and build are available, while
+capture, saved-state restore/resume, disk fork, multi-vCPU, and elastic memory
+are not. It needs an Intel host whose KVM provides the `sporevm-x86_64-v0` CPU
+profile, including TSC scaling to the 3 GHz guest clock; other hosts fail with
+`IncompatibleCpuProfile` and the mismatched fact, and `spore host-info` reports
+`cpu_profile_incompatible`. SporeVM never emulates another instruction set.
 
 Known limits: compatible host-class restore only, rootfs-bound writable disk
 state only, diskless named live fork, and no hardened public-cloud

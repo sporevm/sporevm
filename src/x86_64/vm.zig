@@ -24,7 +24,6 @@ const board = @import("board.zig");
 const boot = @import("boot.zig");
 const cpu = @import("cpu.zig");
 const cpu_profile = @import("cpu_profile.zig");
-const host_evidence = @import("host_evidence.zig");
 const lifecycle = @import("lifecycle.zig");
 const pio = @import("pio.zig");
 const product_preflight = @import("product_preflight.zig");
@@ -70,27 +69,6 @@ pub const ExitCause = union(enum) {
 
 pub fn formatTerminalEvidence(buffer: []u8, terminal: lifecycle.Terminal) ![]const u8 {
     return lifecycle.formatEvidence(buffer, terminal);
-}
-
-fn requireCompatibleProfile(facts: cpu_profile.HostFacts, requested_vcpus: u8) !void {
-    if (cpu_profile.compatibility(facts, requested_vcpus)) |failure| {
-        std.log.warn("refusing incompatible x86 CPU profile: {any}", .{failure});
-        switch (failure) {
-            .unsupported_cpuid => |selector| {
-                const requested = try cpu_profile.candidateCpuid(requested_vcpus, 0);
-                for (requested.entries[0..requested.nent]) |entry| {
-                    if (entry.function != selector.function or entry.index != selector.index) continue;
-                    std.log.warn("requested CPUID {x}:{x} eax={x} ebx={x} ecx={x} edx={x}", .{ entry.function, entry.index, entry.eax, entry.ebx, entry.ecx, entry.edx });
-                }
-                for (facts.supported_cpuid) |entry| {
-                    if (entry.function != selector.function or entry.index != selector.index) continue;
-                    std.log.warn("supported CPUID {x}:{x} eax={x} ebx={x} ecx={x} edx={x}", .{ entry.function, entry.index, entry.eax, entry.ebx, entry.ecx, entry.edx });
-                }
-            },
-            else => {},
-        }
-        return error.IncompatibleCpuProfile;
-    }
 }
 
 const Vcpu = struct {
@@ -394,22 +372,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
 
     const kvm_fd = try kvm.openDevKvm();
     defer _ = std.c.close(kvm_fd);
-    try kvm.checkApiVersion(kvm_fd);
-    const profile = try product_preflight.collectHostProfile(kvm_fd);
-    var host_buffer: [512]u8 = undefined;
-    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCapabilities(&host_buffer, profile.capabilities)});
-    if (profile.capabilities.nrVcpus() < config.vcpu_count) {
-        return error.UnsupportedVcpuCount;
-    }
-
-    std.log.debug("sporevm kvm-boot: {s}", .{try host_evidence.formatCpuid(&host_buffer, profile.cpuid_evidence)});
-    var profile_facts = try profile.facts(
-        // The VM-scoped frequency is verified on the first vCPU below.
-        cpu_profile.guest_tsc_khz,
-        profile.capabilityAvailable(kvm.KVM_CAP_TSC_CONTROL) and
-            profile.capabilityAvailable(kvm.KVM_CAP_VM_TSC_CONTROL),
-    );
-    try requireCompatibleProfile(profile_facts, config.vcpu_count);
+    try product_preflight.require(kvm_fd, config.vcpu_count);
     const vm_fd: std.c.fd_t = @intCast(try kvm.ioctl(kvm_fd, kvm.KVM_CREATE_VM, 0, "KVM_CREATE_VM"));
     defer _ = std.c.close(vm_fd);
 
@@ -422,7 +385,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_IRQCHIP, 0, "KVM_CREATE_IRQCHIP");
     var pit = kvm.PitConfig{};
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_PIT2, @intFromPtr(&pit), "KVM_CREATE_PIT2");
-    std.log.debug("sporevm kvm-boot: setup tss=0x{x} identity_map=0x{x} irqchip=ok pit2=ok", .{ board.tss_addr, board.identity_map_addr });
+    std.log.debug("sporevm x86 vm: setup tss=0x{x} identity_map=0x{x} irqchip=ok pit2=ok", .{ board.tss_addr, board.identity_map_addr });
 
     const ram = try std.posix.mmap(
         null,
@@ -444,7 +407,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         .userspace_addr = @intFromPtr(ram.ptr),
     };
     _ = try kvm.ioctl(vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&memory_region), "KVM_SET_USER_MEMORY_REGION");
-    std.log.debug("sporevm kvm-boot: setup memslot=ok guest_phys=0x0 size={d}", .{config.ram_size});
+    std.log.debug("sporevm x86 vm: setup memslot=ok guest_phys=0x0 size={d}", .{config.ram_size});
 
     const run_size = try kvm.ioctl(kvm_fd, kvm.KVM_GET_VCPU_MMAP_SIZE, 0, "KVM_GET_VCPU_MMAP_SIZE");
     if (run_size < kvm.RunLayout.mmio_end) return error.KvmRunMappingTooSmall;
@@ -479,22 +442,16 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
         var enforce_pv_cpuid = kvm.EnableCap{ .cap = kvm.KVM_CAP_ENFORCE_PV_FEATURE_CPUID };
         _ = try kvm.ioctl(vcpu_fd, kvm.KVM_ENABLE_CAP, @intFromPtr(&enforce_pv_cpuid), "KVM_ENABLE_CAP enforce PV CPUID");
         var cpuid = try cpu_profile.candidateCpuid(config.vcpu_count, @intCast(initialized));
-        const tsc_khz = try kvm.ioctl(vcpu_fd, kvm.KVM_GET_TSC_KHZ, 0, "KVM_GET_TSC_KHZ after create");
-        if (initialized == 0) {
-            profile_facts.tsc_khz = tsc_khz;
-            profile_facts.has_tsc_offset = try kvm.hasTscOffset(vcpu_fd);
-            try requireCompatibleProfile(profile_facts, config.vcpu_count);
-        }
         _ = try kvm.ioctl(vcpu_fd, kvm.KVM_SET_CPUID2, @intFromPtr(&cpuid), "KVM_SET_CPUID2");
     }
-    std.log.debug("sporevm kvm-boot: setup profile={s} tsc_khz={d} set_cpuid2_vcpus={d}", .{ cpu_profile.profile_name, cpu_profile.guest_tsc_khz, initialized });
+    std.log.debug("sporevm x86 vm: setup profile={s} tsc_khz={d} set_cpuid2_vcpus={d}", .{ cpu_profile.profile_name, cpu_profile.guest_tsc_khz, initialized });
     try configureProtectedMode(vcpus[0].fd, layout);
     for (vcpus[1..initialized]) |*vcpu| {
         if ((try kvm.getMpState(vcpu.fd)).mp_state != kvm.KVM_MP_STATE_UNINITIALIZED) {
             return error.UnexpectedApState;
         }
     }
-    std.log.debug("sporevm kvm-boot: setup bsp=protected-mode ap_initial_state=uninitialized ap_count={d}", .{initialized - 1});
+    std.log.debug("sporevm x86 vm: setup bsp=protected-mode ap_initial_state=uninitialized ap_count={d}", .{initialized - 1});
 
     var console_dev = virtio_console.Console{ .sink = config.console_sink };
     var block_devs: [4]virtio_blk.Blk = undefined;
@@ -1156,14 +1113,13 @@ fn validateTransportSlots(
     disk_backends: [4]?virtio_blk.Backend,
 ) !void {
     try board.validateDeviceInventory();
-    for (transports, board.stage0a2_ordinary_inventory) |transport, attachment| {
+    for (transports, board.virtio_inventory) |transport, attachment| {
         const expected = switch (attachment.role) {
             .root => if (disk_backends[0] != null) @intFromEnum(attachment.device) else 0,
             .context => if (disk_backends[1] != null) @intFromEnum(attachment.device) else 0,
             .build => if (disk_backends[2] != null) @intFromEnum(attachment.device) else 0,
             .cache => if (disk_backends[3] != null) @intFromEnum(attachment.device) else 0,
             .console, .net, .vsock, .rng => @intFromEnum(attachment.device),
-            .transient_memory => unreachable,
         };
         if (transport.dev.device_id != expected) return error.InvalidDeviceInventory;
     }
@@ -1463,30 +1419,6 @@ test "deferred exec probe refreshes watchdog when command starts" {
     watchdog.join();
     try std.testing.expect(deadline_ms.load(.acquire) > 0);
     try std.testing.expect(!state.stopped());
-}
-
-test "fresh runner routes incompatible hosts through the canonical profile predicate" {
-    var capabilities: [cpu_profile.required_capabilities.len]cpu_profile.CapabilityFact = undefined;
-    for (cpu_profile.required_capabilities, &capabilities) |required, *fact| fact.* = .{
-        .id = required.id,
-        .value = @max(required.minimum, required.required_bits),
-    };
-    var msrs: [cpu_profile.candidate_msrs.len]u32 = undefined;
-    for (cpu_profile.candidate_msrs, &msrs) |required, *index| index.* = required.index;
-    const supported = try cpu_profile.candidateCpuid(1, 0);
-    var bad_vendor = cpu_profile.vendor_id.*;
-    bad_vendor[0] = 'A';
-    try std.testing.expectError(error.IncompatibleCpuProfile, requireCompatibleProfile(.{
-        .api_version = kvm.KVM_API_VERSION,
-        .vendor = bad_vendor,
-        .max_vcpus = topology.max_vcpus,
-        .capabilities = &capabilities,
-        .msr_indices = &msrs,
-        .supported_cpuid = supported.entries[0..supported.nent],
-        .xsave_bytes = cpu_profile.kvm_xsave_min_bytes,
-        .tsc_khz = cpu_profile.guest_tsc_khz,
-        .has_tsc_offset = true,
-    }, 1));
 }
 
 test "first terminal reservation wins" {
