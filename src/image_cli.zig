@@ -1,21 +1,26 @@
-//! CLI adapter for native image archives.
+//! CLI adapter for native image archives and image stores.
 
 const std = @import("std");
 const Io = std.Io;
 const api = @import("api.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
+const run_mod = @import("run.zig");
 
 const usage =
     \\Usage:
+    \\  spore image push local/name:tag STORE/TAG [--platform os/arch]
     \\  spore image pack local/name:tag --platform os/arch --out image.tar.gz
     \\  spore image unpack image.tar.gz --archive-digest sha256:... --expected-image-digest blake3:... --platform os/arch --ref local/name:tag
+    \\
+    \\STORE is a directory or file:// URL; TAG may be blake3:<digest>.
+    \\Run a pushed image with `spore run --image <store-url>/TAG`.
     \\
     \\Options:
     \\  --archive-digest DIGEST  Expected immutable SHA-256 archive identity
     \\  --expected-image-digest DIGEST  Expected native BLAKE3 image identity
     \\  --ref local/name:tag  Local mutable image ref to publish
-    \\  --platform os/arch    linux/arm64 or linux/amd64
+    \\  --platform os/arch    linux/arm64 or linux/amd64 (push defaults to this host's)
     \\  --out PATH            New image archive path
     \\  -h, --help            Show this help
     \\
@@ -32,6 +37,16 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         return;
     }
     const allocator = init.arena.allocator();
+    if (std.mem.eql(u8, args[0], "push")) {
+        const options = try parsePushOptions(args[1..]);
+        const result = try api.imagePush(init, allocator, options);
+        if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
+        try stdout.print(
+            "ref: {s}\nimage_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
+            .{ result.ref, result.image_digest, result.objects_total, result.objects_written, result.bytes_written },
+        );
+        return;
+    }
     if (std.mem.eql(u8, args[0], "pack")) {
         const options = try parsePackOptions(args[1..]);
         const result = try api.imageArchivePack(init, allocator, options);
@@ -53,6 +68,29 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         return;
     }
     return error.UnknownImageCommand;
+}
+
+pub fn parsePushOptions(args: []const []const u8) !api.ImagePushOptions {
+    var positional: [2][]const u8 = undefined;
+    var count: usize = 0;
+    var platform: rootfs.Platform = run_mod.direct_image_platform;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--platform")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPlatform;
+            platform = try rootfs.Platform.parse(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownImageOption;
+        } else if (count < positional.len) {
+            positional[count] = arg;
+            count += 1;
+        } else return error.TooManyImageArguments;
+    }
+    if (count == 0) return error.MissingImageSource;
+    if (count == 1) return error.MissingImageReference;
+    return .{ .source = positional[0], .destination = positional[1], .platform = platform };
 }
 
 pub fn parsePackOptions(args: []const []const u8) !api.ImageArchivePackOptions {

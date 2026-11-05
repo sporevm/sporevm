@@ -12,6 +12,7 @@ const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
 const image_archive = @import("image_archive.zig");
+const image_store = @import("image_store.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const memory_config = @import("memory.zig");
@@ -33,6 +34,8 @@ pub const ImageArchivePackOptions = image_archive.PackOptions;
 pub const ImageArchivePackResult = image_archive.PackResult;
 pub const ImageArchiveUnpackOptions = image_archive.UnpackOptions;
 pub const ImageArchiveUnpackResult = image_archive.UnpackResult;
+pub const ImagePushOptions = image_store.PushOptions;
+pub const ImagePushResult = image_store.PushResult;
 
 /// Process IO and environment access shared by product operations.
 pub const Context = context_mod.Context;
@@ -440,6 +443,15 @@ pub fn rootfsResolve(
     defer arena_state.deinit();
     const resolved = try rootfs_mod.resolveReference(init, arena_state.allocator(), options);
     return allocator.dupe(u8, resolved);
+}
+
+/// Write one complete local native image into a directory image store.
+pub fn imagePush(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    options: ImagePushOptions,
+) !ImagePushResult {
+    return image_store.push(init, allocator, options);
 }
 
 /// Pack one complete local native image into an immutable transport archive.

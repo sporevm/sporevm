@@ -136,7 +136,7 @@ const approved_x86_kernel_sha256 = [_]u8{
     0xbf, 0x0a, 0x97, 0x2c, 0xda, 0xed, 0xc7, 0xf7,
     0x0f, 0x2f, 0x78, 0x27, 0x0e, 0xe7, 0xbb, 0x82,
 };
-const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
+pub const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
     @compileError("SporeVM product execution requires an arm64 or amd64 host architecture");
 pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
 
