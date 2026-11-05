@@ -4100,6 +4100,7 @@ fn writeSporeExecDefaults(allocator: std.mem.Allocator, dir: []const u8, default
 
 pub fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?std.json.Parsed(Spec) {
     const path = try std.fs.path.resolve(allocator, &.{ dir, lifecycle_spore_metadata_file });
+    defer allocator.free(path);
     const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_metadata_bytes)) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => |e| return e,
@@ -6774,6 +6775,7 @@ test "durable lifecycle metadata drops transient disk fork claims" {
     const dir = "zig-cache/test-lifecycle-transient-disk-fork-claim";
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     try Io.Dir.cwd().createDirPath(io, dir);
+    try std.testing.expect((try readSporeLifecycleSpec(allocator, io, dir)) == null);
 
     const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -6808,7 +6810,7 @@ test "durable lifecycle metadata drops transient disk fork claims" {
     );
     defer allocator.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, token) == null);
-    var parsed = try std.json.parseFromSlice(Spec, allocator, bytes, .{ .allocate = .alloc_always });
+    var parsed = (try readSporeLifecycleSpec(allocator, io, dir)).?;
     defer parsed.deinit();
     try std.testing.expect(parsed.value.disk_fork_claim == null);
 }

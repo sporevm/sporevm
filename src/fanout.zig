@@ -181,10 +181,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     }
     try requireSavedSessions(allocator, children);
 
-    const argv0 = blk: {
-        const full_args = try init.minimal.args.toSlice(allocator);
-        break :blk full_args[0];
-    };
+    const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
 
     var output_lock = OutputLock{};
     var event_write_failed = std.atomic.Value(bool).init(false);
@@ -192,7 +189,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     errdefer cleanupRunning(init.io, running.items);
 
     for (children) |child| {
-        const run = try startRunningChild(init, allocator, argv0, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, opts.event_mode, event_output, &output_lock, &event_write_failed);
+        const run = try startRunningChild(init, allocator, spore_executable, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, opts.event_mode, event_output, &output_lock, &event_write_failed);
         running.append(run) catch |err| {
             var single = [_]RunningChild{run};
             cleanupRunning(init.io, single[0..]);
@@ -243,7 +240,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
 fn spawnAttach(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    argv0: []const u8,
+    spore_executable: []const u8,
     backend: Backend,
     timeout_ms: u64,
     bound_services: []const spore_net_policy.BoundServiceBinding,
@@ -252,7 +249,7 @@ fn spawnAttach(
     const backend_arg = @tagName(backend);
     const timeout_arg = try std.fmt.allocPrint(allocator, "{d}ms", .{timeout_ms});
     var argv = std.array_list.Managed([]const u8).init(allocator);
-    try argv.appendSlice(&.{ argv0, "attach", "--backend", backend_arg, "--timeout", timeout_arg });
+    try argv.appendSlice(&.{ spore_executable, "attach", "--backend", backend_arg, "--timeout", timeout_arg });
     for (bound_services) |binding| {
         const unix_path = switch (binding.target) {
             .unix => |path| path,
@@ -273,7 +270,7 @@ fn spawnAttach(
 fn startRunningChild(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    argv0: []const u8,
+    spore_executable: []const u8,
     backend: Backend,
     timeout_ms: u64,
     bound_services: []const spore_net_policy.BoundServiceBinding,
@@ -283,7 +280,7 @@ fn startRunningChild(
     output_lock: *OutputLock,
     event_write_failed: *std.atomic.Value(bool),
 ) !RunningChild {
-    var proc = try spawnAttach(init, allocator, argv0, backend, timeout_ms, bound_services, child.path);
+    var proc = try spawnAttach(init, allocator, spore_executable, backend, timeout_ms, bound_services, child.path);
     const stdout_fd = proc.stdout.?.handle;
     const stderr_fd = proc.stderr.?.handle;
     proc.stdout = null;

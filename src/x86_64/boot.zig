@@ -212,10 +212,12 @@ pub fn plan(kernel: []const u8, initrd_len: usize, command_line: []const u8, ram
     return result;
 }
 
+/// Writes the boot structures into `ram`, which must already be zero, as a
+/// fresh anonymous mapping is. Only the planned ranges are touched, so the
+/// rest of guest RAM stays uncommitted until the guest uses it.
 pub fn load(ram: []u8, kernel: []const u8, initrd: ?[]const u8, command_line: []const u8, cpu_count: u8) Error!Plan {
     const normalized_initrd = if (initrd) |bytes| if (bytes.len == 0) null else bytes else null;
     const layout = try plan(kernel, if (normalized_initrd) |bytes| bytes.len else 0, command_line, ram.len, cpu_count);
-    @memset(ram, 0);
 
     const mp_table_end = try mp.write(ram, cpu_count);
     if (mp_table_end != layout.mp_table.end) return error.InvalidConfigurationTable;
@@ -226,6 +228,7 @@ pub fn load(ram: []u8, kernel: []const u8, initrd: ?[]const u8, command_line: []
     ram[@intCast(board.cmdline_addr + command_line.len)] = 0;
 
     const zero_page = ramSlice(ram, board.zero_page_addr, boot_params_size);
+    @memset(zero_page, 0);
     @memcpy(zero_page[setup_header_start..layout.image.header_end], kernel[setup_header_start..layout.image.header_end]);
     zero_page[type_of_loader_offset] = 0xff;
     zero_page[loadflags_offset] |= can_use_heap;
@@ -435,6 +438,33 @@ test "load writes the zero page, payload, command line, initrd, GDT, and E820" {
     try std.testing.expectEqual(@as(?Range, null), empty_layout.initrd);
     try std.testing.expectEqual(@as(u32, 0), readInt(u32, zero_page, ramdisk_image_offset));
     try std.testing.expectEqual(@as(u32, 0), readInt(u32, zero_page, ramdisk_size_offset));
+}
+
+test "load writes only the boot structures" {
+    const allocator = std.testing.allocator;
+    var image_buf: [8192]u8 = undefined;
+    const image = makeTestImage(&image_buf, 4);
+    const ram = try allocator.alloc(u8, board.min_ram_size);
+    defer allocator.free(ram);
+    const untouched: u8 = 0x5a;
+    @memset(ram, untouched);
+
+    const layout = try load(ram, image, "initrd", "console=hvc0", 2);
+
+    const zero_page = ram[@intCast(board.zero_page_addr)..][0..boot_params_size];
+    try std.testing.expect(std.mem.allEqual(u8, zero_page[0..e820_count_offset], 0));
+    var written = [_]Range{ layout.mp_table, layout.gdt, layout.zero_page, layout.command_line, layout.kernel_load, layout.initrd.? };
+    std.mem.sort(Range, &written, {}, struct {
+        fn lessThan(_: void, a: Range, b: Range) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+    var cursor: u64 = 0;
+    for (written) |range| {
+        try std.testing.expect(std.mem.allEqual(u8, ram[@intCast(cursor)..@intCast(range.start)], untouched));
+        cursor = range.end;
+    }
+    try std.testing.expect(std.mem.allEqual(u8, ram[@intCast(cursor)..], untouched));
 }
 
 test "bzImage parser and planner fail closed on malformed fields" {
