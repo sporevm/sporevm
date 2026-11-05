@@ -285,7 +285,14 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     };
 
     switch (cause) {
-        .guest_off, .guest_reset => {},
+        .guest_off, .guest_reset => {
+            // The guest stopped before sending the session's exit frame, so
+            // its exit status is unknown; `spore run` reports the same.
+            const gateway_failed = gateway_active and gateway.hasFailed();
+            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+            if (gateway_failed) return error.NetworkGatewayFailed;
+            return error.ProbeDidNotComplete;
+        },
         .probe_complete => {
             var result = try resultFromAttachStream(backend, memory_config, vcpu_count, identity_stream);
             result = result.withMemoryRestore(&ram_plan);
@@ -296,26 +303,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         },
         .snapshotted, .monitor_stopped => return error.UnexpectedAttachExit,
     }
-    const gateway_failed = gateway_active and gateway.hasFailed();
-    run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
-    if (gateway_failed) return error.NetworkGatewayFailed;
-    const connect_ms = if (identity_stream) |stream| stream.connect_ms orelse 0 else 0;
-    const response_ms = if (identity_stream) |stream| stream.response_ms orelse 0 else 0;
-    var result = run_mod.Result{
-        .backend = backend,
-        .start_ms = 0,
-        .vsock_connect_ms = connect_ms,
-        .exec_response_ms = response_ms,
-        .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
-        .exit_code = 0,
-        .vcpus = vcpu_count,
-        .memory_bytes = memory_config.initial_bytes,
-        .max_memory_bytes = memory_config.maximum_bytes,
-    };
-    result = result.withMemoryRestore(&ram_plan);
-    try events.emitExit(result);
-    if (events.write_failed) return error.EventSinkFailed;
-    return result;
 }
 
 fn consoleSink(bytes: []const u8) void {
