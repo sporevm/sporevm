@@ -11,9 +11,7 @@ const test_barrier = @import("test_barrier.zig");
 
 const Io = std.Io;
 pub const schema = "spore.saved-disk-pin.v2";
-pub const legacy_schema = "spore.saved-disk-pin.v1";
 pub const reference_schema = "spore.saved-disk-pin-ref.v2";
-pub const legacy_reference_schema = "spore.saved-disk-pin-ref.v1";
 pub const dir_name = "pins";
 pub const reference_file = "sporevm-disk-pin.json";
 pub const owner_suffix = ".owner";
@@ -45,13 +43,9 @@ pub const Record = struct {
     storage: spore.RootfsStorage,
 
     pub fn validate(self: Record) !void {
-        if ((!std.mem.eql(u8, self.schema, schema) and !std.mem.eql(u8, self.schema, legacy_schema)) or
-            !validId(self.id) or !validId(self.manifest_sha256)) return error.BadManifest;
+        if (!std.mem.eql(u8, self.schema, schema) or !validId(self.id) or !validId(self.manifest_sha256)) return error.BadManifest;
         if (self.pending_manifest_sha256) |digest| if (!validId(digest)) return error.BadManifest;
-        if (self.pending_publication) |pending| {
-            if (!std.mem.eql(u8, self.schema, schema)) return error.BadManifest;
-            try pending.validate();
-        }
+        if (self.pending_publication) |pending| try pending.validate();
         try spore.validateRootfsStorageDescriptor(self.storage);
     }
 };
@@ -61,8 +55,7 @@ pub const Reference = struct {
     id: []const u8,
 
     pub fn validate(self: Reference) !void {
-        if ((!std.mem.eql(u8, self.schema, reference_schema) and !std.mem.eql(u8, self.schema, legacy_reference_schema)) or
-            !validId(self.id)) return error.BadManifest;
+        if (!std.mem.eql(u8, self.schema, reference_schema) or !validId(self.id)) return error.BadManifest;
     }
 };
 
@@ -564,10 +557,7 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
     try ref.value.validate();
     var record = try loadRecord(io, allocator, registry.cache_root, ref.value.id);
     errdefer record.deinit();
-    const record_is_exclusive = std.mem.eql(u8, record.value.schema, schema);
-    const ref_is_exclusive = std.mem.eql(u8, ref.value.schema, reference_schema);
-    if (record_is_exclusive != ref_is_exclusive) return error.BadManifest;
-    if (record_is_exclusive) try validateExclusiveOwner(allocator, registry.cache_root, spore_dir, ref.value.id);
+    try validateExclusiveOwner(allocator, registry.cache_root, spore_dir, ref.value.id);
     const expected = try storageForDisk(disk);
     if (!spore.rootfsStorageEql(record.value.storage, expected)) return error.BadManifest;
     // Never change authorization state before proving the canonical root is
@@ -604,14 +594,9 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
     return record;
 }
 
-fn isExclusive(record: Record) bool {
-    return std.mem.eql(u8, record.schema, schema);
-}
-
-pub const OwnerState = enum { exclusive, pending, orphaned, duplicated, legacy, invalid };
+pub const OwnerState = enum { exclusive, pending, orphaned, duplicated, invalid };
 
 pub fn ownerState(allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8, record: Record) !OwnerState {
-    if (!isExclusive(record)) return .legacy;
     if (record.pending_publication != null) return .pending;
     const owner = try ownerPath(allocator, cache_root, id);
     defer allocator.free(owner);
@@ -793,6 +778,17 @@ pub fn loadRecord(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, 
     defer allocator.free(path);
     const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_record_bytes));
     defer allocator.free(bytes);
+    return parseRecord(allocator, bytes, id);
+}
+
+/// Checks the schema before the shape, so a v1 record fails as too old
+/// whatever fields it carries.
+fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8, id: []const u8) !std.json.Parsed(Record) {
+    const SchemaProbe = struct { schema: []const u8 };
+    const probe = std.json.parseFromSlice(SchemaProbe, allocator, bytes, .{ .ignore_unknown_fields = true }) catch return error.BadManifest;
+    const too_old = std.mem.eql(u8, probe.value.schema, "spore.saved-disk-pin.v1");
+    probe.deinit();
+    if (too_old) return error.FormatTooOld;
     var parsed = std.json.parseFromSlice(Record, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadManifest;
     errdefer parsed.deinit();
     try parsed.value.validate();
@@ -1146,11 +1142,7 @@ test "fuzz saved spore pin parsers" {
             var buf: [4096]u8 = undefined;
             const input = buf[0..smith.slice(&buf)];
             const allocator = std.testing.allocator;
-            if (std.json.parseFromSlice(Record, allocator, input, .{ .allocate = .alloc_always, .ignore_unknown_fields = false })) |parsed_value| {
-                var parsed = parsed_value;
-                defer parsed.deinit();
-                _ = parsed.value.validate() catch {};
-            } else |_| {}
+            if (parseRecord(allocator, input, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")) |parsed| parsed.deinit() else |_| {}
             if (std.json.parseFromSlice(Reference, allocator, input, .{ .allocate = .alloc_always, .ignore_unknown_fields = false })) |parsed_value| {
                 var parsed = parsed_value;
                 defer parsed.deinit();

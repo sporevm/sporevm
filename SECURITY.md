@@ -53,20 +53,21 @@ lease; a failed handoff leaves the old spec and lease intact. Restore and pack
 fail closed on missing or mismatched
 pin, index, and object shape; lazy restore and pack keep content verification at
 their existing boundaries. Unknown or corrupt pin records make GC and
-destructive prune retain all CAS. New pin references are hard-linked to one
-cache-side ownership anchor: the anchor and artifact must be the only two
-links. Ordinary copies have the wrong inode, hard-link duplicates raise the
-link count, and both fail closed before restore or pack. A rename preserves the
+destructive prune retain all CAS. A v1 pin record fails as too old, roots
+nothing, and GC deletes it: its save's manifest no longer loads. Pin
+references are hard-linked to one cache-side ownership anchor: the anchor and
+artifact must be the only two links. Ordinary copies have the wrong inode,
+hard-link duplicates raise the link count, and both fail closed before restore
+or pack. A rename preserves the
 identity. Deleting a save, through `spore checkpoint rm` or directly, leaves a
 one-link anchor that GC diagnoses and reclaims without scanning arbitrary
 paths; removal itself never releases a pin. Pin records remain
 explicitly pending until the artifact directory commit is durable, so GC can
 also diagnose and reclaim a two-link reference left in an unpublished save or
 batch stage after a crash. Failed ordinary publication preserves the staged
-manifest outside loadable authority for manual recovery. Legacy v1 pins remain
-readable and packable; GC keeps them after their save is removed because
-duplicate references cannot be proven absent. Portable unpack, pull, and clone
-materialize a descriptor-bound local CAS inside the saved-spore directory.
+manifest outside loadable authority for manual recovery. Portable unpack,
+pull, and clone materialize a descriptor-bound local CAS inside the saved-spore
+directory.
 Removal requires a regular `manifest.json` that parses as a spore manifest
 and does not read the checkpoint's memory or disk storage. Foreground and named
 restore publish host-private active saved-spore leases before releasing the

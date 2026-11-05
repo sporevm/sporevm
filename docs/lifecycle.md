@@ -353,9 +353,7 @@ checkpoint renamed within the same filesystem keeps its pin; `mv` to another
 filesystem copies it, which behaves like `cp -r` followed by `rm -rf`. After
 `cp -al`, neither copy restores until one is removed, and GC keeps the storage
 while either exists. A plain `cp -r` copy never owned the pin and cannot
-restore; use `spore clone` for an independent copy. Legacy v1 pins cannot
-prove their copies are gone, so GC keeps them after removal until expert-only
-`spore cache unpin PIN_ID --force`.
+restore; use `spore clone` for an independent copy.
 
 `spore cache pins` reports `index_valid` only after validating the record and
 canonical index. It deliberately does not stat or hash every object; lazy reads
