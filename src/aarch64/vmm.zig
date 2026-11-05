@@ -6,12 +6,14 @@
 //! restore, and transport snapshot helpers below.
 
 const std = @import("std");
+const aarch64_topology = @import("topology.zig");
 const board = @import("board.zig");
 const capture = @import("../capture.zig");
 const deadline = @import("../deadline.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const disk_layer = @import("../disk_layer.zig");
 const generation = @import("../generation.zig");
+const gicv3 = @import("gicv3.zig");
 const ram_restore = @import("../ram_restore.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const spore = @import("../spore.zig");
@@ -614,6 +616,74 @@ test "prepare rejects a probe-completion capture that can never fire" {
     prepared.deinit();
 }
 
+test "prepare resolves vCPUs and RAM from a multi-vCPU restore manifest" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    var vcpu_states: [2]spore.VcpuState = undefined;
+    var redistributors: [2]gicv3.RedistributorState = undefined;
+    for (&vcpu_states, &redistributors, 0..) |*state, *redistributor, index| {
+        const mpidr = aarch64_topology.mpidrForIndex(@intCast(index));
+        state.* = .{
+            .index = @intCast(index),
+            .mpidr = mpidr,
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+        };
+        redistributor.* = .{ .mpidr = mpidr, .regs = &.{} };
+    }
+    try spore.saveManifest(arena, dir, .{
+        .platform = .{
+            .cpu_profile = board.cpu_profile,
+            .device_model_version = board.device_model_version,
+            .vcpu_count = 2,
+            .ram_base = board.ram_base,
+            .ram_size = spore.chunk_size,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0802_0000,
+            .gic_redist_stride = 0x2_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{ .multi = .{
+            .vcpus = &vcpu_states,
+            .gic = .{ .kind = .gicv3_multi, .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &redistributors, .line_levels = &.{} } },
+        } },
+        .devices = &.{},
+        .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
+        .memory = .{ .logical_size = spore.chunk_size, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
+    });
+
+    // One vCPU means "use the manifest's count": the manifest supplies two
+    // vCPUs and its RAM size.
+    var config = testBoot(.{});
+    config.start = .{ .restore = .{ .dir = dir, .ram = .eager_chunks } };
+    var resolved = try prepare(std.testing.allocator, config, test_rules);
+    defer resolved.deinit();
+    try std.testing.expect(resolved.manifest != null);
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), resolved.vcpus);
+    try std.testing.expectEqual(@as(u64, spore.chunk_size), resolved.ram_size);
+    try std.testing.expectEqual(@as(u64, 0), resolved.virtio_mem_region_size);
+
+    config.vcpus = 2;
+    var matching = try prepare(std.testing.allocator, config, test_rules);
+    defer matching.deinit();
+    try std.testing.expectEqual(@as(topology.VcpuCount, 2), matching.vcpus);
+
+    config.vcpus = 3;
+    try expectRejected(error.PlatformMismatch, config, test_rules);
+}
+
 test "prepare rejects a restore without a RAM source" {
     var config = testBoot(.{});
     config.start = .{ .restore = .{ .dir = "missing.spore", .ram = .fresh } };
@@ -658,12 +728,17 @@ test "prepare rejects more disks than the board has virtio slots" {
     config.build_input_disk_backends = &backends;
     try expectRejected(error.TooManyBuildInputDisks, config, test_rules);
 
+    // Console, net, vsock, rng, four disks and virtio-mem: one over the board's eight.
     config = testBoot(.{ .virtio_mem_region_size = 1024 * 1024 * 1024 });
     config.disk_backend = .{ .file = -1 };
     config.context_disk_fd = -1;
-    config.build_input_disk_backends = backends[0..2];
+    config.build_input_disk_backends = backends[0..1];
     config.build_cache_disk_backend = .{ .file = -1 };
     try expectRejected(error.TooManyVirtioDevices, config, test_rules);
+
+    config.start.boot.virtio_mem_region_size = 0;
+    var prepared = try prepare(std.testing.allocator, config, test_rules);
+    prepared.deinit();
 }
 
 test "devices take virtio slots in the order the guest enumerates them" {
