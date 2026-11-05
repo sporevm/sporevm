@@ -3,10 +3,8 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 image="${SPORE_TTY_IMAGE:-docker.io/library/alpine:3.20}"
-timeout_bin="${TIMEOUT_BIN:-$(command -v timeout || command -v gtimeout || true)}"
 
 require_spore_bin
-[[ -n "${timeout_bin}" ]] || die "timeout binary not found"
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-tty"
 
@@ -20,7 +18,7 @@ grep -Fq "requires stdout to be a terminal" "${workdir}/raw.stderr" || {
   die "spore run -t did not reject redirected stdout with the expected message"
 }
 
-"${timeout_bin}" 60s "${spore_bin}" run -t --events=jsonl --image "${image}" -- \
+with_timeout 60 "${spore_bin}" run -t --events=jsonl --image "${image}" -- \
   /bin/sh -lc 'stty size; printf "tty-ok\n"' >"${workdir}/events.jsonl" 2>"${workdir}/events.stderr"
 
 [[ ! -s "${workdir}/events.stderr" ]] || {

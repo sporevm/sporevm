@@ -3,7 +3,6 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 image="${SPORE_ATTACH_IMAGE:-docker.io/library/alpine:3.20}"
-timeout_bin="${TIMEOUT_BIN:-$(command -v timeout || command -v gtimeout || true)}"
 
 jsonl_terminal_contains() {
   python3 - "$1" "$2" <<'PY'
@@ -55,7 +54,7 @@ needle = sys.argv[2]
 with open(sys.argv[1], encoding="utf-8") as f:
     for line in f:
         event = json.loads(line)
-        if event.get("event") != "failure":
+        if event.get("event") != "completion" or event.get("outcome") != "failed":
             continue
         message = event.get("error", {}).get("message", "")
         if needle in message:
@@ -66,9 +65,10 @@ PY
 
 backend="$(infer_backend)"
 require_spore_bin
-[[ -n "${timeout_bin}" ]] || die "timeout binary not found"
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-attach"
+# Image-backed saves must share a filesystem with the rootfs cache.
+export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 tty_capture="${workdir}/live-tty.spore"
@@ -121,7 +121,7 @@ done
   die "live TTY capture did not write a manifest"
 }
 
-"${timeout_bin}" 60s "${spore_bin}" attach \
+with_timeout 60 "${spore_bin}" attach \
   --backend "${backend}" \
   -t \
   --events=jsonl \
@@ -153,7 +153,7 @@ set -e
 [[ -f "${noninteractive_capture}/manifest.json" ]] || die "non-interactive capture did not write a manifest"
 
 set +e
-printf 'input\n' | "${timeout_bin}" 30s "${spore_bin}" attach \
+printf 'input\n' | with_timeout 30 "${spore_bin}" attach \
   --backend "${backend}" \
   -i \
   --events=jsonl \

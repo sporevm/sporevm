@@ -16,6 +16,8 @@ image_ref="${SPORE_SMOKE_LIVE_ROOTFS_IMAGE:-docker.io/library/ruby:3.3-alpine}"
 platform="${SPORE_SMOKE_LIVE_ROOTFS_PLATFORM:-linux/arm64}"
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-live-rootfs-fanout"
+# Image-backed saves must share a filesystem with the rootfs cache.
+export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 run_pid=""
 watchdog_pid=""
 cleanup() {
@@ -104,7 +106,7 @@ fi
 children=()
 while IFS= read -r child; do
   children+=("${child}")
-done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
+done < <(fork_children "${fork_dir}")
 [[ "${#children[@]}" == "${count}" ]] || die "expected ${count} child spores, found ${#children[@]}"
 
 set +e

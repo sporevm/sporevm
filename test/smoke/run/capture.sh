@@ -82,7 +82,7 @@ grep -Fq "saved spore at ${capture_dir}" "${run_stderr}" || {
 children=()
 while IFS= read -r child; do
   children+=("${child}")
-done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
+done < <(fork_children "${fork_dir}")
 [[ "${#children[@]}" -eq 1 ]] || die "fork did not create one child spore"
 child_dir="${children[0]}"
 
@@ -122,7 +122,7 @@ grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spor
 [[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base save did not write ${from_base_dir}/manifest.json"
 
 "${spore_bin}" fork "${from_base_dir}" --count 1 --out "${from_base_fork_dir}" >"${workdir}/from-base-fork.stdout" 2>"${workdir}/from-base-fork.stderr"
-from_child_dir="$(find "${from_base_fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
+from_child_dir="$(fork_children "${from_base_fork_dir}" | head -n 1)"
 [[ -n "${from_child_dir}" ]] || die "forked run --from base did not create a child spore"
 
 "${spore_bin}" run \

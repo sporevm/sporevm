@@ -3,15 +3,16 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-disk_layer_count() {
+# disk_base MANIFEST prints the digest of the saved writable disk index, which
+# changes whenever a capture records guest disk writes.
+disk_base() {
   python3 - "$1" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     manifest = json.load(f)
-disk = manifest.get("disk") or {}
-print(len(disk.get("layers") or []))
+print((manifest.get("disk") or {}).get("base", ""))
 PY
 }
 
@@ -22,6 +23,8 @@ image_ref="${SPORE_SMOKE_WRITABLE_ROOTFS_IMAGE:-docker.io/library/alpine:3.20}"
 platform="${SPORE_SMOKE_WRITABLE_ROOTFS_PLATFORM:-linux/arm64}"
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-writable-rootfs"
+# Image-backed saves must share a filesystem with the rootfs cache.
+export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 
 base_dir="${workdir}/base.spore"
 child_dir="${workdir}/child.spore"
@@ -61,9 +64,11 @@ printf 'writable rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}
 }
 
 [[ -f "${base_dir}/manifest.json" ]] || die "base capture did not write manifest"
-[[ "$(disk_layer_count "${base_dir}/manifest.json")" == "1" ]] || {
+image_disk="$(json_field "${base_dir}/manifest.json" rootfs.storage.index_digest)"
+base_disk="$(disk_base "${base_dir}/manifest.json")"
+[[ -n "${base_disk}" && "${base_disk}" != "${image_disk}" ]] || {
   cat "${base_dir}/manifest.json" >&2 || true
-  die "base capture did not record one writable disk layer"
+  die "base capture did not record its writable disk"
 }
 
 # Anything resume can restore must also pass inspect; disk-backed captures
@@ -81,9 +86,9 @@ printf 'writable rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}
 for child_name in 000000 000001 000002 000003; do
   child_manifest="${fork_dir}/${child_name}/manifest.json"
   [[ -f "${child_manifest}" ]] || die "fork child ${child_name} did not write manifest"
-  [[ "$(disk_layer_count "${child_manifest}")" == "1" ]] || {
+  [[ "$(disk_base "${child_manifest}")" == "${base_disk}" ]] || {
     cat "${child_manifest}" >&2 || true
-    die "fork child ${child_name} did not preserve parent disk layer"
+    die "fork child ${child_name} did not preserve parent disk"
   }
 done
 
@@ -98,9 +103,10 @@ done
   die "fork child 000000 writable capture failed"
 }
 
-[[ "$(disk_layer_count "${fork_child0_capture_dir}/manifest.json")" == "2" ]] || {
+fork_child0_disk="$(disk_base "${fork_child0_capture_dir}/manifest.json")"
+[[ -n "${fork_child0_disk}" && "${fork_child0_disk}" != "${base_disk}" ]] || {
   cat "${fork_child0_capture_dir}/manifest.json" >&2 || true
-  die "fork child 000000 capture did not append its own disk layer"
+  die "fork child 000000 capture did not record its own disk writes"
 }
 
 "${spore_bin}" run \
@@ -156,9 +162,10 @@ done
 }
 
 [[ -f "${child_dir}/manifest.json" ]] || die "child capture did not write manifest"
-[[ "$(disk_layer_count "${child_dir}/manifest.json")" == "2" ]] || {
+child_disk="$(disk_base "${child_dir}/manifest.json")"
+[[ -n "${child_disk}" && "${child_disk}" != "${base_disk}" ]] || {
   cat "${child_dir}/manifest.json" >&2 || true
-  die "child capture did not append a second writable disk layer"
+  die "child capture did not record its own disk writes"
 }
 
 "${spore_bin}" run \
@@ -193,9 +200,9 @@ grep -Fxq "child-layer-ok" "${verify_stdout}" || {
 }
 
 [[ -f "${unpacked_dir}/manifest.json" ]] || die "unpacked writable rootfs bundle did not write manifest"
-[[ "$(disk_layer_count "${unpacked_dir}/manifest.json")" == "2" ]] || {
+[[ "$(disk_base "${unpacked_dir}/manifest.json")" == "${child_disk}" ]] || {
   cat "${unpacked_dir}/manifest.json" >&2 || true
-  die "unpacked writable rootfs bundle did not preserve two disk layers"
+  die "unpacked writable rootfs bundle did not preserve the child disk"
 }
 
 "${spore_bin}" run \
