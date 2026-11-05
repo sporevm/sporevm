@@ -174,6 +174,4 @@ test/smoke/run/auto-memory.sh
 test/smoke/lifecycle/auto-memory.sh
 mise run smoke:counter-fanout
 test/smoke/run/capture.sh
-scripts/benchmark/kvm-dirty-tracking.sh --backend hvf --modes write-protect
-scripts/benchmark/kvm-dirty-tracking.sh --backend kvm --modes dirty-log
 ```

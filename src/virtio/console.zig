@@ -1,6 +1,6 @@
 //! Virtio console device (virtio spec 1.2 §5.3), minimal single-port.
 //!
-//! Queue 0 is receive (host input via `feed`), and queue 1 is transmit
+//! Queue 0 is receive (never fed by the host), and queue 1 is transmit
 //! (guest output, forwarded to the host sink).
 
 const std = @import("std");
@@ -9,12 +9,11 @@ const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
 
 pub const device_id: u32 = 3;
-const rx_queue = 0;
 const tx_queue = 1;
 
 pub const Console = struct {
     /// Host sink for guest output. Kept as a function pointer so the device
-    /// is testable and the harness can route to stdout.
+    /// is testable.
     sink: *const fn ([]const u8) void,
 
     pub fn device(self: *Console) mmio.Device {
@@ -25,31 +24,6 @@ pub const Console = struct {
             .queue_count = 2,
             .notifyFn = notify,
         };
-    }
-
-    /// Push host input into the guest's receive queue. Returns the number of
-    /// bytes consumed (0 when the guest has no buffers posted); the caller
-    /// raises the device interrupt when non-zero and marks interrupt status.
-    pub fn feed(self: *Console, t: *mmio.Transport, ram: guestmem.GuestRam, bytes: []const u8) usize {
-        _ = self;
-        const q = &t.queues[rx_queue];
-        var consumed: usize = 0;
-        while (consumed < bytes.len) {
-            const maybe_chain = q.popAvail(ram) catch return consumed;
-            const chain = maybe_chain orelse break;
-            var written: u32 = 0;
-            for (chain.segments.slice()) |seg| {
-                if (!seg.writable or consumed >= bytes.len) continue;
-                const n = @min(seg.data.len, bytes.len - consumed);
-                @memcpy(seg.data[0..n], bytes[consumed..][0..n]);
-                ram.markDirty(seg.addr, @intCast(n));
-                consumed += n;
-                written += @intCast(n);
-            }
-            q.pushUsed(ram, chain.head, written) catch return consumed;
-            if (written > 0) t.interrupt_status |= 1;
-        }
-        return consumed;
     }
 
     fn notify(ctx: *anyopaque, queue_index: u8, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
@@ -145,8 +119,7 @@ test "rx notify is inert" {
 
 fn fuzzConsoleQueues(_: void, s: *std.testing.Smith) !void {
     // Console queue contents are guest controlled. TX must never crash while
-    // forwarding arbitrary readable descriptors, and RX feed must fail closed
-    // when guest buffers are malformed or absent.
+    // forwarding arbitrary readable descriptors.
     test_output = .{};
     var con = Console{ .sink = testSink };
     var t = mmio.Transport.init(con.device());
@@ -155,14 +128,8 @@ fn fuzzConsoleQueues(_: void, s: *std.testing.Smith) !void {
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
-    t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x000, .avail_addr = 0x400, .used_addr = 0x800 };
     t.queues[tx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x100, .avail_addr = 0x500, .used_addr = 0x900 };
-    ram.write(u16, 0x400 + 2, s.value(u8) % 4) catch {};
     ram.write(u16, 0x500 + 2, s.value(u8) % 4) catch {};
-
-    var input: [256]u8 = undefined;
-    const input_len = s.slice(&input);
-    _ = con.feed(&t, ram, input[0..input_len]);
     _ = t.write(0x050, tx_queue, ram);
 }
 

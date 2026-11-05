@@ -43,11 +43,7 @@ pub const Config = struct {
     cmdline: []const u8 = "console=hvc0",
     initrd: ?[]const u8 = null,
     console_sink: *const fn ([]const u8) void,
-    /// Host fd backing /dev/vda, if any. Immutable rootfs callers pass a
-    /// read-only fd; guest write requests fail through the block device.
-    disk_fd: ?std.c.fd_t = null,
-    /// Full block backend for writable or layered rootfs runs. Takes
-    /// precedence over disk_fd.
+    /// Block backend for /dev/vda, if any.
     disk_backend: ?blk.Backend = null,
     /// Ephemeral feature profile for the root disk. The default remains the
     /// portable, resumable virtio-blk surface.
@@ -81,9 +77,6 @@ pub const Config = struct {
     environ_map: ?*const std.process.Environ.Map = null,
     /// Optional fd that receives one line per lazily materialized chunk.
     lazy_ram_trace_fd: ?std.c.fd_t = null,
-    /// Take a spore snapshot after this many milliseconds of run time and
-    /// stop. Requires snapshot_dir.
-    snapshot_after_ms: ?u64 = null,
     snapshot_dir: ?[]const u8 = null,
     /// Snapshot and stop when the exec probe has observed command completion.
     snapshot_on_probe_complete: bool = false,
@@ -101,7 +94,6 @@ pub const Config = struct {
     exec_probe_timeout_ms: u64 = 30_000,
     exec_probe_start: vsock.HostStreamStart = .immediate,
     exec_probe_completes_run: bool = true,
-    exec_probe_failure_fatal: bool = true,
     /// Optional virtio-net frame backend. The default remains closed.
     network: net.Runtime = .{},
     /// Optional monitor control hook for attaching host streams after boot.
@@ -109,7 +101,7 @@ pub const Config = struct {
 };
 
 fn hasFreshCaptureTrigger(config: Config) bool {
-    return config.snapshot_after_ms != null or config.snapshot_on_probe_complete or config.capture_request != null;
+    return config.snapshot_on_probe_complete or config.capture_request != null;
 }
 
 pub const DirtyTrackingOptions = struct {
@@ -283,7 +275,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ONE_REG, "KVM_CAP_ONE_REG");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_ARM_PSCI_0_2, "KVM_CAP_ARM_PSCI_0_2");
     try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_DEVICE_CTRL, "KVM_CAP_DEVICE_CTRL");
-    if (config.resume_dir != null or config.snapshot_after_ms != null or config.snapshot_on_probe_complete or config.capture_request != null) {
+    if (config.resume_dir != null or config.snapshot_on_probe_complete or config.capture_request != null) {
         try kvm.requireExtension(kvm_fd, kvm.KVM_CAP_COUNTER_OFFSET, "KVM_CAP_COUNTER_OFFSET");
     }
 
@@ -331,8 +323,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var transports_buf: [board.max_virtio_devices]mmio.Transport = undefined;
     transports_buf[0] = mmio.Transport.init(con.device());
     var transport_count: usize = 1;
-    const disk_backend: ?blk.Backend = if (config.disk_backend) |backend| backend else if (config.disk_fd) |fd| .{ .file = fd } else null;
-    if (disk_backend) |backend| {
+    if (config.disk_backend) |backend| {
         blk_dev = blk.Blk.initWithOptions(backend, config.root_blk_options);
         transports_buf[1] = mmio.Transport.init(blk_dev.device());
         transport_count = 2;
@@ -555,7 +546,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .dirty_tracker = if (dirty_tracker) |*tracker| tracker else null,
             .environ_map = config.environ_map,
             .lazy_pager = if (lazy_pager) |*pager| pager else null,
-            .start_ms = start_ms,
         });
     }
     var exec_probe_done = false;
@@ -655,15 +645,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         }
         if (config.exec_probe) |probe| {
             if (!exec_probe_done) {
-                if (probe.state == .failed) {
-                    if (config.exec_probe_failure_fatal) return error.VsockProbeFailed;
-                    if (pending_kvm_completion) {
-                        try kvm.completePendingExit(vcpu_fd, run_bytes);
-                        pending_kvm_completion = false;
-                    }
-                    vsock_dev.host_stream = null;
-                    exec_probe_done = true;
-                }
+                if (probe.state == .failed) return error.VsockProbeFailed;
                 if (probe.state == .complete) {
                     const observed_ms = probe.elapsedMs();
                     var pending_completion_ms: u64 = 0;
@@ -688,27 +670,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     vsock_dev.host_stream = null;
                     exec_probe_done = true;
                 }
-                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > config.exec_probe_timeout_ms) {
-                    if (config.exec_probe_failure_fatal) return error.VsockProbeTimedOut;
-                    if (pending_kvm_completion) {
-                        try kvm.completePendingExit(vcpu_fd, run_bytes);
-                        pending_kvm_completion = false;
-                    }
-                    vsock_dev.host_stream = null;
-                    exec_probe_done = true;
-                }
-            }
-        }
-        if (config.snapshot_after_ms) |after_ms| {
-            const elapsed_ms = (try monotonicMs()) - start_ms;
-            if (elapsed_ms >= after_ms) {
-                if (pending_kvm_completion) {
-                    try kvm.completePendingExit(vcpu_fd, run_bytes);
-                    pending_kvm_completion = false;
-                }
-                const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
-                try takeSnapshot(allocator, dir, @intCast(gic_dev.fd), vcpu_fd, transports, &gen_dev, &vsock_dev, ram_bytes, config.ram_size, if (mem_transport_index != null) &mem_dev else null, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
-                return .snapshotted;
+                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > config.exec_probe_timeout_ms) return error.VsockProbeTimedOut;
             }
         }
 
@@ -942,7 +904,6 @@ const MultiKvmRunOptions = struct {
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
     lazy_pager: ?*lazy_ram.Pager,
-    start_ms: u64,
 };
 
 const MultiKvmThreadContext = struct {
@@ -1132,12 +1093,8 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
         if (options.config.exec_probe) |probe| {
             if (!exec_probe_done) {
                 if (probe.state == .failed) {
-                    if (options.config.exec_probe_failure_fatal) {
-                        state.finish(.{ .err = error.VsockProbeFailed });
-                        continue;
-                    }
-                    options.vsock_dev.host_stream = null;
-                    exec_probe_done = true;
+                    state.finish(.{ .err = error.VsockProbeFailed });
+                    continue;
                 }
                 if (probe.state == .complete) {
                     std.log.debug("kvm multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
@@ -1153,12 +1110,8 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                     exec_probe_done = true;
                 }
                 if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > options.config.exec_probe_timeout_ms) {
-                    if (options.config.exec_probe_failure_fatal) {
-                        state.finish(.{ .err = error.VsockProbeTimedOut });
-                        continue;
-                    }
-                    options.vsock_dev.host_stream = null;
-                    exec_probe_done = true;
+                    state.finish(.{ .err = error.VsockProbeTimedOut });
+                    continue;
                 }
             }
         }
@@ -1168,13 +1121,6 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                 continue;
             }
             if (request_capture.isRequested()) {
-                state.finish(.{ .snapshot = null });
-                continue;
-            }
-        }
-        const elapsed_ms = (try monotonicMs()) -| options.start_ms;
-        if (options.config.snapshot_after_ms) |after_ms| {
-            if (elapsed_ms >= after_ms) {
                 state.finish(.{ .snapshot = null });
                 continue;
             }

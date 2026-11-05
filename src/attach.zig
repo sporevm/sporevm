@@ -259,7 +259,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_completes_run = true,
-                .exec_probe_failure_fatal = true,
             });
         },
         .kvm => blk: {
@@ -278,7 +277,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
                 .exec_control = exec_control,
                 .exec_probe_timeout_ms = opts.timeout_ms,
                 .exec_probe_completes_run = true,
-                .exec_probe_failure_fatal = true,
             });
         },
     };
