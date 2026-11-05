@@ -91,9 +91,9 @@ pub fn captureMachine(allocator: std.mem.Allocator, vcpu: hvf.VcpuHandle) !spore
     };
 }
 
-pub fn captureMachineV1(allocator: std.mem.Allocator, vcpus: []spore.VcpuState) !spore.MachineStateV1 {
+pub fn captureMachineMulti(allocator: std.mem.Allocator, vcpus: []spore.VcpuState) !spore.MachineStateMulti {
     if (vcpus.len == 0 or vcpus.len > topology.max_vcpus) return error.PlatformMismatch;
-    const machine = spore.MachineStateV1{
+    const machine = spore.MachineStateMulti{
         .vcpus = vcpus,
         .gic = try captureGicState(allocator),
     };

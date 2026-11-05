@@ -163,16 +163,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .resuming = true,
     });
 
-    var parsed: ?std.json.Parsed(spore.Manifest) = spore.loadManifest(allocator, opts.spore_dir) catch |err| blk: {
-        if (err != error.BadManifest) return @errorCast(err);
-        break :blk null;
-    };
-    defer if (parsed) |*manifest| manifest.deinit();
-    var parsed_v1: ?std.json.Parsed(spore.ManifestV1) = null;
-    defer if (parsed_v1) |*manifest| manifest.deinit();
-    if (parsed == null) parsed_v1 = try spore.loadManifestV1(allocator, opts.spore_dir);
+    const parsed = try spore.loadManifest(allocator, opts.spore_dir);
+    defer parsed.deinit();
+    const manifest = parsed.value;
 
-    const sessions = if (parsed) |manifest| manifest.value.sessions else parsed_v1.?.value.sessions;
+    const sessions = manifest.sessions;
     const session_id = opts.session_id orelse spore.defaultAttachSessionId(sessions);
     try spore.validateSessionAttach(sessions, .{
         .id = session_id,
@@ -180,7 +175,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .terminal = opts.tty,
     });
 
-    const network_options = try run_mod.networkOptionsFromManifestWithBindings(allocator, if (parsed) |manifest| manifest.value.network else parsed_v1.?.value.network, opts.bound_services.slice());
+    const network_options = try run_mod.networkOptionsFromManifestWithBindings(allocator, manifest.network, opts.bound_services.slice());
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (network_options.network == .spore) {
@@ -191,13 +186,10 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
     errdefer run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
 
-    const devices = if (parsed) |manifest| manifest.value.devices else parsed_v1.?.value.devices;
-    const rootfs = if (parsed) |manifest| manifest.value.rootfs else parsed_v1.?.value.rootfs;
-    const disk = if (parsed) |manifest| manifest.value.disk else parsed_v1.?.value.disk;
-    try validateAttachDiskManifestParts(devices, rootfs, disk);
+    try validateAttachDiskManifestParts(manifest.devices, manifest.rootfs, manifest.disk);
     var runtime_disk_state = try runtime_disk.open(context, allocator, .{
-        .rootfs = rootfs,
-        .disk = disk,
+        .rootfs = manifest.rootfs,
+        .disk = manifest.disk,
         .spore_dir = opts.spore_dir,
     });
     defer runtime_disk_state.deinit();
@@ -205,8 +197,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         try loadGenerationParams(context.io, allocator, path)
     else
         null;
-    const manifest_generation = if (parsed) |manifest| manifest.value.generation else parsed_v1.?.value.generation;
-    const attach = try prepareAttach(allocator, manifest_generation, generation_params, .{
+    const attach = try prepareAttach(allocator, manifest.generation, generation_params, .{
         .session_id = session_id,
         .interactive = opts.interactive,
         .tty = opts.tty,
@@ -234,12 +225,10 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     const exec_control = if (stdin_control) |*control| control.control() else null;
 
     if (gateway_active) try events.emitPortForwards(&network_options.policy);
-    const ram_size = if (parsed) |manifest| manifest.value.platform.ram_size else parsed_v1.?.value.platform.ram_size;
-    const memory_state = if (parsed) |manifest| manifest.value.memory_state else parsed_v1.?.value.memory_state;
-    const memory_config = try spore.memoryConfig(ram_size, memory_state);
-    const vcpu_count = if (parsed) |_| @as(u32, 1) else parsed_v1.?.value.platform.vcpu_count;
-    const memory = if (parsed) |manifest| manifest.value.memory else parsed_v1.?.value.memory;
-    var ram_plan = try ram_restore.Plan.fromMemory(allocator, context.environ_map, opts.spore_dir, memory, memory_config.maximum_bytes, vcpu_count);
+    const ram_size = manifest.platform.ram_size;
+    const memory_config = try spore.memoryConfig(ram_size, manifest.memory_state);
+    const vcpu_count = manifest.platform.vcpu_count;
+    var ram_plan = try ram_restore.Plan.fromMemory(allocator, context.environ_map, opts.spore_dir, manifest.memory, memory_config.maximum_bytes, vcpu_count);
     defer ram_plan.deinit();
     std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     const vm_config: vmm.Config = .{
@@ -583,13 +572,15 @@ fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore
         .platform = .{
             .cpu_profile = "test",
             .device_model_version = 1,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = 4096,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -607,7 +598,7 @@ fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore
                     .line_levels = &.{},
                 },
             },
-        },
+        } },
         .devices = devices,
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .rootfs = .{

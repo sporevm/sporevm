@@ -6,7 +6,8 @@
 
 Old local formats have no readers. `spore host-info` reports only
 `spore.host-info.v3`, including on arm64. A named VM whose spec still has the
-removed memory `policy` is stale; `spore vm rm` stops its monitor if it is still
+removed memory `policy`, or a writable disk with the removed `layers` field
+from an earlier build, is stale; `spore vm rm` stops its monitor if it is still
 running and removes it. `cache gc` deletes step records from every older
 builder version (`sporevm-build-v0` to `v8`) instead of keeping them as roots.
 GC treated v0 to v5 records as unknown and kept every CAS entry, so on a cache
@@ -18,6 +19,13 @@ index now uses it too, so manifest bytes change. Older disk indexes fail as too
 old, and manifests with an older memory index are rejected. `cache gc` keeps an
 old disk index that an image or record still names but reclaims the objects
 only it referenced.
+
+Spore manifests are version 6, one shape for any vCPU count and fixed or
+elastic memory: `platform` always records `vcpu_count` and `gic_redist_stride`,
+and `machine` holds either `single` or `multi` state. Manifests from versions 0
+to 5 fail with `FormatTooOld`, so saved spores, checkpoints and bundles from
+earlier builds must be re-created. The always-empty `disk.layers` field is
+gone, and every manifest save is validated.
 
 ### One ext4 writer
 

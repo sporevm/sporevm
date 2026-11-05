@@ -1,11 +1,10 @@
 # Spore Format
 
-**Status:** manifest format v2 is the current single-vCPU contract
-(`src/spore.zig`) for same-host HVF and KVM producers/consumers. Manifest
-format v3 is the current multi-vCPU contract with KVM portable
-capture/restore and HVF same-backend capture/restore. The v2/v3 flag-day
-break moves rootfs and writable disk identity to chunk indexes; manifest v0
-and v1 are intentionally rejected as too old and must be re-created.
+**Status:** manifest format v6 (`src/spore.zig`) is the only accepted
+contract. It covers one or more vCPUs and fixed or elastic memory for HVF and
+KVM producers/consumers, with KVM portable multi-vCPU capture/restore and HVF
+same-backend multi-vCPU capture/restore. Manifests from versions 0-5 are
+rejected as too old and must be re-created.
 
 A spore is sealed, content-addressed VM state. The format, not the
 implementation, is the product: two SporeVM builds on different hypervisors
@@ -215,7 +214,7 @@ under `rootfs.cache`.
 `sporevm-x86_64-board-v0`, device-model version 1, is the frozen x86-64
 Linux/KVM machine contract for fresh execution. It defines no AMD64 saved-state
 format: capture, save, restore, resume, and fork are unavailable. The
-aarch64-only v2/v3 manifest layouts documented below are unchanged. Board-v0
+aarch64-only manifest layout documented below is unchanged. Board-v0
 supports one through eight vCPUs. Local APIC IDs are consecutive from zero,
 vCPU 0 is the bootstrap processor, and IOAPIC ID 8 remains outside the vCPU ID
 range. The experimental product profile currently narrows this board contract
@@ -294,13 +293,13 @@ count, or value fails closed. The generation doorbell reports `guest_off`.
 `KVM_EXIT_SHUTDOWN`, triple fault, and a halted guest are never reclassified as
 reset or poweroff.
 
-## Manifest Format v2
+## Manifest Format v6
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
 
-- `version`: format version 2 for the fixed-memory single-vCPU shape, or 4 for
-  the elastic-memory extension described below. Consumers reject unknown
-  versions and reject v0/v1 with a format-too-old error.
+- `version`: 6. Consumers read it before the rest of the manifest, reject
+  versions 0-5 with a format-too-old error, and reject newer versions as
+  malformed.
 - `annotations`: optional opaque string map for namespaced caller metadata,
   such as `dev.buildkite.cleanroom.policy_hash`. Keys and values are UTF-8
   strings, values are not interpreted by SporeVM, and the serialized annotation
@@ -309,29 +308,19 @@ reset or poweroff.
   artifacts after the same manifest validation, so callers can recover opaque
   metadata without sidecar files.
 - `platform`: contract the restoring host must satisfy exactly — `arch`
-  (aarch64), `cpu_profile`, `device_model_version`, `ram_base`, `ram_size`,
-  `gic_dist_base`, `gic_redist_base`, and `counter_frequency_hz`. Restore
+  (aarch64), `cpu_profile`, `device_model_version`, `vcpu_count` (bounded by
+  the shared SporeVM topology cap), `ram_base`, `ram_size`, `gic_dist_base`,
+  `gic_redist_base`, `gic_redist_stride` (the redistributor frame stride used
+  to validate the exposed GIC layout), and `counter_frequency_hz`. Restore
   fails closed on any mismatch. CPU profile `sporevm-aarch64-v0` is the
   current Apple-M/Graviton common denominator; KVM enforces it by masking RNDR
   before guest boot. Device model version 4 includes the fixed virtio-mmio
   range plus the generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24
   / INTID 56. Elastic manifests attach one grow-only virtio-mem device and
   persist its normalized state; fixed manifests must not contain that device.
-- `machine`: normalized architectural state for one vCPU — `gprs` (x0–x30),
-  `pc`, `cpsr`, `fpcr`, `fpsr`, `simd` (32 Q registers as u64 pairs),
-  `sys_regs` (EL1 context registers by architectural name), `icc_regs`
-  (GICv3 CPU-interface registers by name), and `vtimer` as the guest's
-  virtual counter value plus `CNTV_CTL`/`CNTV_CVAL`, all in the platform's
-  `counter_frequency_hz` tick domain. Restore re-anchors the counter so guest
-  time continues from the snapshot only when the target backend exposes the
-  same architected counter frequency.
-- `machine.gic`: interrupt-controller state. `kind: "gicv3"` carries a
-  normalized single-vCPU GICv3 subset: distributor and redistributor register
-  values by architectural MMIO offset plus sampled PPI/SPI line levels. KVM
-  currently emits and consumes this portable shape. `kind: "backend_private"`
-  is a tagged fail-closed escape hatch for temporary same-backend restore;
-  HVF currently stores `backend: "hvf"`, `format: "hv_gic_state_v0"`, and a
-  base64 `hv_gic` blob until its GICv3 mapping lands.
+- `machine`: normalized architectural vCPU and interrupt-controller state, as
+  an object with exactly one member: `single` when `platform.vcpu_count` is 1
+  and `multi` when it is 2 or more. Both are described below.
 - `devices`: ordered virtio-mmio transport states (device id, status,
   feature negotiation registers, interrupt status, and per-queue size/ready/
   ring addresses/indices). Device order is part of the board contract.
@@ -385,13 +374,10 @@ reset or poweroff.
   is the retained OCI `Config.Env` list, bounded to 64 entries of at most 255
   bytes each, and `working_dir` is an optional absolute path of at most 255
   bytes. Named save and fork persist these defaults so restore, bundle
-  transport, and child VMs execute like the source image. The field is
-  optional within v2 and v3: producers omit it when no defaults exist, and
-  absence means no saved execution-context defaults. Readers from releases
-  predating this field use strict manifest parsing and reject a manifest that
-  contains it, so only image-context saves cross that reader-version boundary.
-  Per-exec environment and working-directory overrides are intentionally
-  excluded.
+  transport, and child VMs execute like the source image. Producers omit the
+  field when no defaults exist, and absence means no saved execution-context
+  defaults. Per-exec environment and working-directory overrides are
+  intentionally excluded.
 
 Every disk-index identity is the BLAKE3 digest of one exact canonical JSON
 encoding, `spore-disk-index-v2`. Indexes of earlier kinds
@@ -450,7 +436,8 @@ representation.
   trust root and does not prove every RAM byte still matches the manifest's
   chunk refs. KVM and HVF map a validated fd `MAP_PRIVATE` to share clean parent
   pages across fork children while child writes fault into private CoW pages.
-- `memory_state`: present only in elastic manifest versions 4/5. It records
+- `memory_state`: present only for elastic memory, which requires
+  `machine.single`. It records
   `initial_size`, `maximum_size`, total `requested_size`, total
   `captured_size`, `block_size` (currently 2 MiB), and sorted
   `plugged_ranges`. Each range has `start_block` and `block_count` relative to
@@ -459,9 +446,12 @@ representation.
   2 MiB alignment, at most 8192 elastic blocks, canonical non-overlapping
   ranges, and `captured_size == initial_size + plugged blocks`. The portable
   memory index and optional backing cover `maximum_size`; `platform.ram_size`
-  remains the initial boot RAM size. Versions 2/3 omit this member and mean
-  fixed memory where initial, maximum, requested, captured, and memory-index
-  logical size all equal `platform.ram_size`.
+  remains the initial boot RAM size. Restore allocates the maximum-sized
+  portable RAM image, maps initial RAM, recreates the virtio-mem transport,
+  maps the captured requested prefix, restores the exact plugged ranges, and
+  only then starts vCPUs. Manifests without this member mean fixed memory where
+  initial, maximum, requested, captured, and memory-index logical size all
+  equal `platform.ram_size`, and must not contain a virtio-mem device.
 - `rootfs`: optional immutable rootfs artifact required by a captured
   read-only virtio-blk root device. `kind` is
   `immutable-ext4-rootfs-v0`, `mode` is `read-only`, `device` binds the
@@ -500,78 +490,60 @@ representation.
   network kind, requirements, and bound-service requirements so callers can
   preflight restore-time bindings without parsing `manifest.json` directly.
 
-## Manifest Format v3
+### Machine state
 
-Manifest v3 is the incompatible multi-vCPU machine-state shape. Existing v2
-loaders reject it through the normal unknown-version path. The KVM runtime uses
-v3 with portable `gicv3_multi` state for multi-vCPU capture and restore. The
-HVF runtime uses v3 with a tagged same-HVF `backend_private` GIC blob. Bundle
-commands preserve v3 manifests through production, pull, and local
-materialization.
+`machine.single` records one vCPU: `gprs` (x0–x30), `pc`, `cpsr`, `fpcr`,
+`fpsr`, `simd` (32 Q registers as u64 pairs), `sys_regs` (EL1 context
+registers by architectural name), `icc_regs` (GICv3 CPU-interface registers by
+name), `vtimer` as the guest's virtual counter value plus
+`CNTV_CTL`/`CNTV_CVAL`, all in the platform's `counter_frequency_hz` tick
+domain, and `gic`. Restore re-anchors the counter so guest time continues from
+the snapshot only when the target backend exposes the same architected counter
+frequency. Its `gic.kind: "gicv3"` carries a normalized single-vCPU GICv3
+subset: distributor and redistributor register values by architectural MMIO
+offset plus sampled PPI/SPI line levels. KVM currently emits and consumes this
+portable shape.
 
-V3 keeps the v2 memory, device, generation, rootfs, disk, network, annotations,
-and optional exec-default contracts. The platform object adds:
-
-- `vcpu_count`: bounded by the shared SporeVM topology cap.
-- `gic_redist_stride`: the redistributor frame stride used to validate the
-  exposed GIC layout.
-
-The v1 `machine` object has `schema_version: 1`, `vcpus`, and `gic`.
-
-Each `machine.vcpus[]` entry records one normalized aarch64 vCPU state:
-`index`, `mpidr`, `gprs`, `pc`, `cpsr`, `fpcr`, `fpsr`, `simd`, `sys_regs`,
-`icc_regs`, and `vtimer`. The validator requires stable array order
+`machine.multi` records `vcpus` and `gic`. Each `vcpus[]` entry records one
+normalized aarch64 vCPU state: `index`, `mpidr`, `gprs`, `pc`, `cpsr`, `fpcr`,
+`fpsr`, `simd`, `sys_regs`, `icc_regs`, and `vtimer`. The validator requires
+one entry per `platform.vcpu_count`, stable array order
 (`index == array position`), unique indexes, unique MPIDRs, and the normalized
 MPIDR mapping from `src/aarch64/topology.zig`. New multi-vCPU captures store one
-shared `vtimer.cntvct` value in every entry. Restore accepts older unequal
-values by using vCPU 0 as the machine counter authority and translating each
-absolute `cntv_cval` so `cntv_cval - cntvct` remains unchanged modulo 64 bits.
-
-V3 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
+shared `vtimer.cntvct` value in every entry. Restore accepts unequal values by
+using vCPU 0 as the machine counter authority and translating each absolute
+`cntv_cval` so `cntv_cval - cntvct` remains unchanged modulo 64 bits. The
+portable multi-vCPU GIC state uses `gic.kind: "gicv3_multi"`. It carries global
 distributor registers, per-vCPU redistributor register arrays keyed by MPIDR,
 and line levels where PPIs include an owning MPIDR and SPIs do not. Validation
 rejects more redistributors than the 8-vCPU maximum, unknown register offsets,
 duplicate redistributors, duplicate line records, PPIs without a known owner,
-and SPIs with an owner. HVF same-backend v3 captures instead use
-`machine.gic.kind: "backend_private"` with `backend: "hvf"` and `format:
-"hv_gic_state_v0"`; other backends must reject that blob before mutating VM
-state.
+and SPIs with an owner. KVM emits and consumes this shape. Multi-vCPU
+manifests do not support elastic memory.
 
-## Manifest Formats v4 and v5
-
-Versions 4 and 5 are the explicit elastic-memory variants of the v2
-single-vCPU and v3 multi-vCPU shapes, respectively. Their only added top-level
-member is normalized `memory_state`; they retain the matching machine and
-platform shape. Old readers reject the new versions cleanly instead of
-mistaking maximum memory for boot RAM or dropping virtio-mem state. Current
-product execution supports elastic memory only with one vCPU, so writers emit
-v4; v5 reserves the corresponding multi-vCPU schema and remains fail-closed at
-the runtime capability gate.
-
-Restore allocates the maximum-sized portable RAM image, maps initial RAM,
-recreates the virtio-mem transport, maps the captured requested prefix, restores
-the exact plugged ranges, and only then starts vCPUs. The manifest contains no
-raw KVM or Hypervisor.framework memory-region structure.
+Either shape may instead carry `gic.kind: "backend_private"`, a tagged
+fail-closed escape hatch for temporary same-backend restore. HVF currently
+stores `backend: "hvf"`, `format: "hv_gic_state_v0"`, and a base64 `hv_gic`
+blob until its GICv3 mapping lands; other backends must reject that blob
+before mutating VM state.
 
 ## Not Yet Captured
 
 - General block-device state is still incomplete. The current writable disk
   contract is one rootfs-bound chunk index over verified rootfs CAS objects.
-- Multi-vCPU machine state in manifest v2. Manifest v3 carries this state for
-  KVM capture/restore and same-HVF capture/restore.
 - Kernel identity in the platform contract (pinned-build enforcement).
 - Durable disk/device identity fixup beyond the current diskless helper. The
   product initrd consumes generation params for hostname, mixes
   `resume_entropy_seed` into the kernel RNG, and applies host-provided
   start/resume time to the guest clock, but machine-id, MAC, and other
   disk-backed workload fixups are not final.
-- Cross-frequency architected timer restore: manifest v2 records and enforces
+- Cross-frequency architected timer restore: the manifest records and enforces
   the counter frequency, but cannot translate a running Linux guest between
   different `CNTFRQ_EL0` domains.
-- Live network flows and host port forwards: manifest v2 persists requested
+- Live network flows and host port forwards: the manifest persists requested
   network capability and policy only. Active TCP flows, learned DNS answers, and
   host loopback listeners are dropped across capture, resume, and fork.
-- Virtio-mem unplug and reclamation policy. Elastic versions persist the
+- Virtio-mem unplug and reclamation policy. Elastic manifests persist the
   grow-only requested size and exact plugged ranges, but unplug requests remain
   unsupported.
 - Transient rootfs-growth block state: write-zeroes feature bit 14, its accepted

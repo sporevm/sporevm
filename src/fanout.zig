@@ -368,16 +368,9 @@ fn requireSavedSessions(allocator: std.mem.Allocator, children: []const ChildSpe
 }
 
 fn childSessionCount(allocator: std.mem.Allocator, spore_dir: []const u8) !usize {
-    var manifest = spore.loadManifest(allocator, spore_dir) catch |err| switch (err) {
-        error.BadManifest => null,
-        else => return err,
-    };
-    defer if (manifest) |*parsed| parsed.deinit();
-    if (manifest) |parsed| return parsed.value.sessions.len;
-
-    var manifest_v1 = try spore.loadManifestV1(allocator, spore_dir);
-    defer manifest_v1.deinit();
-    return manifest_v1.value.sessions.len;
+    const manifest = try spore.loadManifest(allocator, spore_dir);
+    defer manifest.deinit();
+    return manifest.value.sessions.len;
 }
 
 fn lessChildSpec(_: void, a: ChildSpec, b: ChildSpec) bool {
@@ -676,13 +669,15 @@ fn testManifest(sessions: []const spore.Session) spore.Manifest {
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = 1,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -696,7 +691,7 @@ fn testManifest(sessions: []const spore.Session) spore.Manifest {
                 .kind = .gicv3,
                 .gicv3 = .{ .dist_regs = &.{}, .redist_regs = &.{}, .line_levels = &.{} },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .sessions = sessions,

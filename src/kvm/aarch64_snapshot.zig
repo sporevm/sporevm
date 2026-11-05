@@ -95,13 +95,13 @@ pub fn captureMachine(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu_fd:
     };
 }
 
-pub fn captureMachineV1(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpus: []const VcpuRef) !spore.MachineStateV1 {
+pub fn captureMachineMulti(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpus: []const VcpuRef) !spore.MachineStateMulti {
     if (vcpus.len == 0 or vcpus.len > topology.max_vcpus) return error.PlatformMismatch;
     const states = try allocator.alloc(spore.VcpuState, vcpus.len);
     for (vcpus, states) |vcpu, *state| {
         state.* = try captureVcpuState(allocator, gic_fd, vcpu);
     }
-    const machine = spore.MachineStateV1{
+    const machine = spore.MachineStateMulti{
         .vcpus = states,
         .gic = .{ .kind = .gicv3_multi, .gicv3_multi = try captureGicMulti(allocator, gic_fd, vcpus) },
     };
@@ -172,9 +172,9 @@ pub fn applyMachine(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std
     });
 }
 
-pub fn applyMachineV1(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, vcpus: []const VcpuRef, state: spore.MachineStateV1) !void {
+pub fn applyMachineMulti(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, vcpus: []const VcpuRef, state: spore.MachineStateMulti) !void {
     _ = allocator;
-    try validateMachineV1ForKvm(vcpus, state);
+    try validateMachineMultiForKvm(vcpus, state);
     try applyGicMulti(vm_fd, gic_fd, state.gic);
     try kvm.setCounterOffset(vm_fd, hostCounter() -% state.vcpus[0].vtimer.cntvct);
 
@@ -183,7 +183,7 @@ pub fn applyMachineV1(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: s
     }
 }
 
-fn validateMachineV1ForKvm(vcpus: []const VcpuRef, state: spore.MachineStateV1) !void {
+fn validateMachineMultiForKvm(vcpus: []const VcpuRef, state: spore.MachineStateMulti) !void {
     if (vcpus.len == 0 or vcpus.len > topology.max_vcpus) return error.PlatformMismatch;
     if (state.vcpus.len != vcpus.len) return error.PlatformMismatch;
     try gicv3.validate(state.gic);
@@ -487,7 +487,7 @@ test "KVM multi line replay skips private and generation lines" {
     try std.testing.expect(shouldReplayMultiLineLevel(.{ .intid = board.virtioDeviceIntid(0), .asserted = true }));
 }
 
-test "KVM v1 restore preflight matches local vCPU topology" {
+test "KVM multi-vCPU restore preflight matches local vCPU topology" {
     var vcpu_states = [_]spore.VcpuState{
         .{
             .index = 0,
@@ -516,7 +516,7 @@ test "KVM v1 restore preflight matches local vCPU topology" {
         .{ .index = 0, .fd = -1 },
         .{ .index = 1, .fd = -1 },
     };
-    var machine = spore.MachineStateV1{
+    var machine = spore.MachineStateMulti{
         .vcpus = &vcpu_states,
         .gic = .{
             .kind = .gicv3_multi,
@@ -524,10 +524,10 @@ test "KVM v1 restore preflight matches local vCPU topology" {
         },
     };
 
-    try validateMachineV1ForKvm(&refs, machine);
+    try validateMachineMultiForKvm(&refs, machine);
 
     refs[1].index = 0;
-    try std.testing.expectError(error.PlatformMismatch, validateMachineV1ForKvm(&refs, machine));
+    try std.testing.expectError(error.PlatformMismatch, validateMachineMultiForKvm(&refs, machine));
 
     refs[1].index = 1;
     var one_redist = [_]gicv3.RedistributorState{redists[0]};
@@ -535,7 +535,7 @@ test "KVM v1 restore preflight matches local vCPU topology" {
         .kind = .gicv3_multi,
         .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &one_redist, .line_levels = &.{} },
     };
-    try std.testing.expectError(error.PlatformMismatch, validateMachineV1ForKvm(&refs, machine));
+    try std.testing.expectError(error.PlatformMismatch, validateMachineMultiForKvm(&refs, machine));
 
     machine.gic = .{
         .kind = .backend_private,
@@ -545,5 +545,5 @@ test "KVM v1 restore preflight matches local vCPU topology" {
             .data_b64 = "AA==",
         },
     };
-    try std.testing.expectError(error.PlatformMismatch, validateMachineV1ForKvm(&refs, machine));
+    try std.testing.expectError(error.PlatformMismatch, validateMachineMultiForKvm(&refs, machine));
 }

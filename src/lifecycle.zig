@@ -1123,21 +1123,13 @@ pub fn restoreNamed(
     const arena = arena_state.allocator();
 
     const spore_dir = try resolveExistingSporeDirApi(arena, init.io, options.spore_dir);
-    var manifest = spore.loadManifest(arena, spore_dir) catch |err| switch (err) {
-        error.BadManifest => null,
+    const parsed_manifest = spore.loadManifest(arena, spore_dir) catch |err| switch (err) {
         error.FormatTooOld => return error.FormatTooOld,
         else => return error.InvalidSporeDir,
     };
-    defer if (manifest) |*parsed| parsed.deinit();
-    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
-    defer if (manifest_v1) |*parsed| parsed.deinit();
-    if (manifest == null) {
-        manifest_v1 = spore.loadManifestV1(arena, spore_dir) catch |err| switch (err) {
-            error.FormatTooOld => return error.FormatTooOld,
-            else => return error.InvalidSporeDir,
-        };
-    }
-    const network_options = run_mod.networkOptionsFromManifestWithBindings(arena, if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network, options.bound_services) catch |err| switch (err) {
+    defer parsed_manifest.deinit();
+    const manifest = parsed_manifest.value;
+    const network_options = run_mod.networkOptionsFromManifestWithBindings(arena, manifest.network, options.bound_services) catch |err| switch (err) {
         error.MissingBoundServiceBinding,
         error.UnexpectedBoundServiceBinding,
         error.DuplicateBoundServiceBinding,
@@ -1147,18 +1139,9 @@ pub fn restoreNamed(
         => return err,
         else => return error.InvalidNetworkPolicy,
     };
-    const rootfs = if (manifest) |parsed|
-        try run_mod.resumeRootfsForRun(arena, parsed.value)
-    else
-        try run_mod.resumeRootfsForRunV1(arena, manifest_v1.?.value);
-    const disk = if (manifest) |parsed|
-        try run_mod.resumeDiskForRun(arena, parsed.value)
-    else
-        try run_mod.resumeDiskForRunV1(arena, manifest_v1.?.value);
-    const devices_len = if (manifest) |parsed| parsed.value.devices.len else manifest_v1.?.value.devices.len;
-    if (rootfs == null and devices_len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
-    const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
-    const manifest_generation = if (manifest) |parsed| parsed.value.generation else manifest_v1.?.value.generation;
+    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest);
+    const disk = try run_mod.resumeDiskForRun(arena, manifest);
+    if (rootfs == null and manifest.devices.len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
     const resume_generation = if (options.generation_path) |path| blk: {
         const params = attach_mod.loadGenerationParams(init.io, arena, path) catch |err| switch (err) {
             error.BadGenerationPayload => return error.BadGenerationPayload,
@@ -1166,18 +1149,14 @@ pub fn restoreNamed(
             error.FileNotFound => return error.GenerationFileNotFound,
             else => return error.GenerationFileInvalid,
         };
-        break :blk try attach_mod.prepareRestoreGenerationState(arena, manifest_generation, params);
+        break :blk try attach_mod.prepareRestoreGenerationState(arena, manifest.generation, params);
     } else null;
-    const sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions;
-    const manifest_exec_defaults = if (manifest) |parsed| parsed.value.exec_defaults else manifest_v1.?.value.exec_defaults;
-    const memory_state = if (manifest) |parsed| parsed.value.memory_state else manifest_v1.?.value.memory_state;
-    const memory = spore.memoryConfig(ram_size, memory_state) catch return error.InvalidMemorySize;
-    const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
+    const memory = spore.memoryConfig(manifest.platform.ram_size, manifest.memory_state) catch return error.InvalidMemorySize;
 
     var lifecycle_spec = readSporeLifecycleSpec(arena, init.io, spore_dir) catch return error.InvalidLifecycleMetadata;
     defer if (lifecycle_spec) |*spec| spec.deinit();
     if (lifecycle_spec) |spec| {
-        if (spec.value.vcpus != manifest_vcpus) return error.UnsupportedLifecycleMetadata;
+        if (spec.value.vcpus != manifest.platform.vcpu_count) return error.UnsupportedLifecycleMetadata;
     }
 
     const base = if (lifecycle_spec) |spec| spec.value else Spec{ .name = options.name };
@@ -1197,11 +1176,11 @@ pub fn restoreNamed(
         .disk = disk,
         .disk_baseline_lease = if (disk_handoff) |handoff| handoff.lease else base.disk_baseline_lease,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
-        .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
-        .sessions = sessions,
-        .exec_defaults = manifest_exec_defaults orelse base.exec_defaults,
+        .annotations = manifest.annotations,
+        .sessions = manifest.sessions,
+        .exec_defaults = manifest.exec_defaults orelse base.exec_defaults,
         .memory = memory,
-        .vcpus = manifest_vcpus,
+        .vcpus = manifest.platform.vcpu_count,
         .guest_port = base.guest_port,
         .timeout_ms = base.timeout_ms,
         // Saved lifecycle metadata is part of the spore input and must not
@@ -1570,51 +1549,26 @@ fn saveStopNamed(
         } else |_| {}
     };
     var suspend_spec = spec.value;
-    var manifest = spore.loadManifest(arena, out_dir) catch |err| switch (err) {
-        error.BadManifest => null,
-        else => |e| return e,
-    };
-    defer if (manifest) |*parsed| parsed.deinit();
-    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
-    defer if (manifest_v1) |*parsed| parsed.deinit();
-    if (manifest == null) manifest_v1 = try spore.loadManifestV1(arena, out_dir);
+    var manifest = try spore.loadManifest(arena, out_dir);
+    defer manifest.deinit();
     if (suspend_spec.exec_defaults != null or !spore.annotationsEmpty(options.annotations)) {
-        if (manifest) |*parsed| {
-            if (!spore.annotationsEmpty(options.annotations)) {
-                parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
-            }
-            parsed.value.exec_defaults = suspend_spec.exec_defaults;
-            if (parsed.value.disk) |disk| {
-                const bytes = try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
-                const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
-                var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
-                defer cache_lock.deinit();
-                const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &cache_lock);
-                try saved_spore_pin.replaceAuthorizedManifest(context.io, arena, registry, out_dir, disk, bytes);
-            } else {
-                try spore.saveManifest(arena, out_dir, parsed.value);
-            }
-            suspend_spec.annotations = parsed.value.annotations;
-        } else if (manifest_v1) |*parsed| {
-            if (!spore.annotationsEmpty(options.annotations)) {
-                parsed.value.annotations = try spore.mergeAnnotations(arena, parsed.value.annotations, options.annotations);
-            }
-            parsed.value.exec_defaults = suspend_spec.exec_defaults;
-            if (parsed.value.disk) |disk| {
-                const bytes = try std.json.Stringify.valueAlloc(arena, parsed.value, .{ .whitespace = .indent_2 });
-                const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
-                var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
-                defer cache_lock.deinit();
-                const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &cache_lock);
-                try saved_spore_pin.replaceAuthorizedManifest(context.io, arena, registry, out_dir, disk, bytes);
-            } else {
-                try spore.saveManifestV1(arena, out_dir, parsed.value);
-            }
-            suspend_spec.annotations = parsed.value.annotations;
+        if (!spore.annotationsEmpty(options.annotations)) {
+            manifest.value.annotations = try spore.mergeAnnotations(arena, manifest.value.annotations, options.annotations);
         }
+        manifest.value.exec_defaults = suspend_spec.exec_defaults;
+        if (manifest.value.disk) |disk| {
+            const bytes = try spore.encodeManifestAlloc(arena, manifest.value);
+            const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
+            var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
+            defer cache_lock.deinit();
+            const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &cache_lock);
+            try saved_spore_pin.replaceAuthorizedManifest(context.io, arena, registry, out_dir, disk, bytes);
+        } else {
+            try spore.saveManifest(arena, out_dir, manifest.value);
+        }
+        suspend_spec.annotations = manifest.value.annotations;
     }
-    const saved_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
-    if (saved_disk) |disk| {
+    if (manifest.value.disk) |disk| {
         suspend_spec.disk = disk;
         const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
         suspend_spec.disk_baseline_lease = .{
@@ -1626,7 +1580,7 @@ fn saveStopNamed(
         };
     }
     try writeSporeLifecycleSpec(arena, context.io, out_dir, suspend_spec);
-    const saved_sessions = if (manifest) |parsed| parsed.value.sessions.len else manifest_v1.?.value.sessions.len;
+    const saved_sessions = manifest.value.sessions.len;
     cleanup_after_suspend = false;
     try finishAcceptedMonitorStop(context.io, paths, ready.value.pid);
     try deleteVmState(context.io, paths);
@@ -1637,7 +1591,7 @@ fn saveStopNamed(
         .pid = ready.value.pid,
         .spore_dir = out_dir,
         .saved_sessions = saved_sessions,
-        .ownership = if (saved_disk != null) saved_spore_ownership.machine_local_pinned else saved_spore_ownership.portable_self_contained,
+        .ownership = if (manifest.value.disk != null) saved_spore_ownership.machine_local_pinned else saved_spore_ownership.portable_self_contained,
     });
 }
 
@@ -4083,19 +4037,10 @@ pub fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []cons
 
 fn writeSporeExecDefaults(allocator: std.mem.Allocator, dir: []const u8, defaults: ?spore.ExecDefaults) !void {
     if (defaults == null) return;
-    var manifest = spore.loadManifest(allocator, dir) catch |err| switch (err) {
-        error.BadManifest => null,
-        else => |e| return e,
-    };
-    defer if (manifest) |*parsed| parsed.deinit();
-    if (manifest) |*parsed| {
-        parsed.value.exec_defaults = defaults;
-        return spore.saveManifest(allocator, dir, parsed.value);
-    }
-    var manifest_v1 = try spore.loadManifestV1(allocator, dir);
-    defer manifest_v1.deinit();
-    manifest_v1.value.exec_defaults = defaults;
-    try spore.saveManifestV1(allocator, dir, manifest_v1.value);
+    var manifest = try spore.loadManifest(allocator, dir);
+    defer manifest.deinit();
+    manifest.value.exec_defaults = defaults;
+    try spore.saveManifest(allocator, dir, manifest.value);
 }
 
 pub fn readSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []const u8) !?std.json.Parsed(Spec) {
@@ -4209,7 +4154,7 @@ fn ensureDiskBaselineLease(
 ) !runtime_disk_lease.Lease {
     const rootfs = spec.rootfs orelse return error.UnsupportedNamedForkDisk;
     const lease: runtime_disk_lease.Lease = spec.disk_baseline_lease orelse if (spec.disk) |disk| blk: {
-        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index) or disk.layers.len != 0) return error.UnsupportedNamedForkDisk;
+        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.UnsupportedNamedForkDisk;
         try spore.validateDiskDigest(disk.base);
         const resume_dir = spec.resume_dir orelse return error.UnsupportedNamedForkDisk;
         const root = try std.fs.path.resolve(allocator, &.{resume_dir});
@@ -4311,28 +4256,15 @@ fn startForkChildExecutable(
     disk_claim: ?ForkChildDiskClaim,
 ) !void {
     if ((base.rootfs != null) != (disk_claim != null)) return error.UnsupportedNamedForkDisk;
-    var manifest = spore.loadManifest(allocator, spore_dir) catch |err| switch (err) {
-        error.BadManifest => null,
-        else => return error.InvalidSporeDir,
-    };
-    defer if (manifest) |*parsed| parsed.deinit();
-    var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
-    defer if (manifest_v1) |*parsed| parsed.deinit();
-    if (manifest == null) {
-        manifest_v1 = spore.loadManifestV1(allocator, spore_dir) catch return error.InvalidSporeDir;
-    }
+    const parsed_manifest = spore.loadManifest(allocator, spore_dir) catch return error.InvalidSporeDir;
+    defer parsed_manifest.deinit();
+    const manifest = parsed_manifest.value;
 
-    const network = if (manifest) |parsed| parsed.value.network else manifest_v1.?.value.network;
-    if (network != null) return error.UnsupportedNamedForkNetwork;
-    const devices_len = if (manifest) |parsed| parsed.value.devices.len else manifest_v1.?.value.devices.len;
+    if (manifest.network != null) return error.UnsupportedNamedForkNetwork;
     const expected_devices = diskless_resume_device_count + @as(usize, @intFromBool(base.rootfs != null));
-    if (devices_len != expected_devices) return error.UnsupportedNamedForkDisk;
-    const captured_disk = if (manifest) |parsed| parsed.value.disk else manifest_v1.?.value.disk;
-    if (captured_disk != null) return error.UnsupportedNamedForkDisk;
-    const ram_size = if (manifest) |parsed| parsed.value.platform.ram_size else manifest_v1.?.value.platform.ram_size;
-    const memory_state = if (manifest) |parsed| parsed.value.memory_state else manifest_v1.?.value.memory_state;
-    const memory = try spore.memoryConfig(ram_size, memory_state);
-    const manifest_vcpus = if (manifest_v1) |parsed| parsed.value.platform.vcpu_count else @as(topology.VcpuCount, 1);
+    if (manifest.devices.len != expected_devices) return error.UnsupportedNamedForkDisk;
+    if (manifest.disk != null) return error.UnsupportedNamedForkDisk;
+    const memory = try spore.memoryConfig(manifest.platform.ram_size, manifest.memory_state);
     const fork_claim: ?DiskForkClaim = if (disk_claim) |claim| .{
         .source_socket_path = claim.source_socket_path,
         .request = .{
@@ -4356,11 +4288,11 @@ fn startForkChildExecutable(
         .disk = base.disk,
         .disk_baseline_lease = base.disk_baseline_lease,
         .disk_fork_claim = fork_claim,
-        .annotations = if (manifest) |parsed| parsed.value.annotations else manifest_v1.?.value.annotations,
-        .sessions = if (manifest) |parsed| parsed.value.sessions else manifest_v1.?.value.sessions,
+        .annotations = manifest.annotations,
+        .sessions = manifest.sessions,
         .exec_defaults = base.exec_defaults,
         .memory = memory,
-        .vcpus = manifest_vcpus,
+        .vcpus = manifest.platform.vcpu_count,
         .guest_port = base.guest_port,
         .timeout_ms = base.timeout_ms,
         .console_log_path = null,
@@ -7436,7 +7368,6 @@ test "named restore lease planning prefers local CAS over stale pin reference" {
         .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
-        .layers = &.{},
     };
     const local_index = try rootfs_cas.manifestIndexPath(allocator, spore_dir, digest);
     defer allocator.free(local_index);

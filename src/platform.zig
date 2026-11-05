@@ -7,6 +7,7 @@ const backend_mod = @import("backend.zig");
 const board = @import("aarch64/board.zig");
 const local_paths = @import("local_paths.zig");
 const spore = @import("spore.zig");
+const topology = @import("topology.zig");
 const x86_board = @import("x86_64/board.zig");
 const x86_cpu_profile = @import("x86_64/cpu_profile.zig");
 const x86_kvm = @import("kvm/x86_64.zig");
@@ -144,10 +145,12 @@ pub const Expected = struct {
     arch: []const u8 = machine_arch,
     cpu_profile: []const u8 = board.cpu_profile,
     device_model_version: u32 = board.device_model_version,
+    vcpu_count: topology.VcpuCount,
     ram_base: u64 = board.ram_base,
     ram_size: u64,
     gic_dist_base: u64,
     gic_redist_base: u64,
+    gic_redist_stride: u64,
     counter_frequency_hz: u64,
     device_count: usize,
 };
@@ -374,11 +377,6 @@ pub fn hostCounterFrequencyHz() !u64 {
 }
 
 pub fn checkManifest(manifest: spore.Manifest, expected: Expected) !void {
-    const expected_version = if (manifest.memory_state != null) spore.format_version_elastic else spore.format_version;
-    if (manifest.version != expected_version) {
-        std.log.err("platform mismatch: spore version={d} expected={d}", .{ manifest.version, expected_version });
-        return error.PlatformMismatch;
-    }
     if (!std.mem.eql(u8, manifest.platform.arch, expected.arch)) {
         std.log.err("platform mismatch: arch={s} expected={s}", .{ manifest.platform.arch, expected.arch });
         return error.PlatformMismatch;
@@ -389,6 +387,10 @@ pub fn checkManifest(manifest: spore.Manifest, expected: Expected) !void {
     }
     if (manifest.platform.device_model_version != expected.device_model_version) {
         std.log.err("platform mismatch: device_model_version={d} expected={d}", .{ manifest.platform.device_model_version, expected.device_model_version });
+        return error.PlatformMismatch;
+    }
+    if (manifest.platform.vcpu_count != expected.vcpu_count) {
+        std.log.err("platform mismatch: vcpu_count={d} expected={d}", .{ manifest.platform.vcpu_count, expected.vcpu_count });
         return error.PlatformMismatch;
     }
     if (manifest.platform.ram_base != expected.ram_base) {
@@ -405,6 +407,10 @@ pub fn checkManifest(manifest: spore.Manifest, expected: Expected) !void {
     }
     if (manifest.platform.gic_redist_base != expected.gic_redist_base) {
         std.log.err("platform mismatch: gic_redist_base=0x{x} expected=0x{x}", .{ manifest.platform.gic_redist_base, expected.gic_redist_base });
+        return error.PlatformMismatch;
+    }
+    if (manifest.platform.gic_redist_stride != expected.gic_redist_stride) {
+        std.log.err("platform mismatch: gic_redist_stride=0x{x} expected=0x{x}", .{ manifest.platform.gic_redist_stride, expected.gic_redist_stride });
         return error.PlatformMismatch;
     }
     if (manifest.platform.counter_frequency_hz != expected.counter_frequency_hz) {
@@ -425,13 +431,15 @@ test "manifest platform check accepts exact match" {
         .platform = .{
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
+            .vcpu_count = 1,
             .ram_base = board.ram_base,
             .ram_size = 512 * 1024 * 1024,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0802_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -449,15 +457,17 @@ test "manifest platform check accepts exact match" {
                     .data_b64 = "",
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
     const expected = Expected{
+        .vcpu_count = 1,
         .ram_size = manifest.platform.ram_size,
         .gic_dist_base = manifest.platform.gic_dist_base,
         .gic_redist_base = manifest.platform.gic_redist_base,
+        .gic_redist_stride = manifest.platform.gic_redist_stride,
         .counter_frequency_hz = manifest.platform.counter_frequency_hz,
         .device_count = 0,
     };

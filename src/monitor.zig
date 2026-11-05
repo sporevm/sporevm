@@ -1180,44 +1180,21 @@ const ExecServer = struct {
         const registry = try preparation.registry(self.allocator, self.cache_root);
         var lifecycle_spec = (try lifecycle.readSporeLifecycleSpec(self.allocator, self.io, work_dir)) orelse return error.BadManifest;
         defer lifecycle_spec.deinit();
-        var manifest = spore.loadManifest(self.allocator, work_dir) catch |err| switch (err) {
-            error.BadManifest => null,
-            else => |e| return e,
-        };
-        defer if (manifest) |*parsed| parsed.deinit();
-        var manifest_v1: ?std.json.Parsed(spore.ManifestV1) = null;
-        defer if (manifest_v1) |*parsed| parsed.deinit();
-        if (manifest) |*parsed| {
-            parsed.value.annotations = lifecycle_spec.value.annotations;
-            parsed.value.exec_defaults = lifecycle_spec.value.exec_defaults;
-            if (parsed.value.disk) |disk| {
-                const bytes = try std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{ .whitespace = .indent_2 });
-                defer self.allocator.free(bytes);
-                const authorization_started = runtime_disk_fork_capture.monotonicNs();
-                try saved_spore_pin.replaceAuthorizedManifest(self.io, self.allocator, registry, work_dir, disk, bytes);
-                metrics.manifest_pin_authorization_ns = runtime_disk_fork_capture.elapsedSince(authorization_started);
-                const lease_started = runtime_disk_fork_capture.monotonicNs();
-                try self.handoffSnapshotDiskLease(registry, work_dir, disk, &lifecycle_spec);
-                metrics.active_lease_handoff_ns = runtime_disk_fork_capture.elapsedSince(lease_started);
-            } else {
-                try spore.saveManifest(self.allocator, work_dir, parsed.value);
-            }
+        var manifest = try spore.loadManifest(self.allocator, work_dir);
+        defer manifest.deinit();
+        manifest.value.annotations = lifecycle_spec.value.annotations;
+        manifest.value.exec_defaults = lifecycle_spec.value.exec_defaults;
+        if (manifest.value.disk) |disk| {
+            const bytes = try spore.encodeManifestAlloc(self.allocator, manifest.value);
+            defer self.allocator.free(bytes);
+            const authorization_started = runtime_disk_fork_capture.monotonicNs();
+            try saved_spore_pin.replaceAuthorizedManifest(self.io, self.allocator, registry, work_dir, disk, bytes);
+            metrics.manifest_pin_authorization_ns = runtime_disk_fork_capture.elapsedSince(authorization_started);
+            const lease_started = runtime_disk_fork_capture.monotonicNs();
+            try self.handoffSnapshotDiskLease(registry, work_dir, disk, &lifecycle_spec);
+            metrics.active_lease_handoff_ns = runtime_disk_fork_capture.elapsedSince(lease_started);
         } else {
-            manifest_v1 = try spore.loadManifestV1(self.allocator, work_dir);
-            manifest_v1.?.value.annotations = lifecycle_spec.value.annotations;
-            manifest_v1.?.value.exec_defaults = lifecycle_spec.value.exec_defaults;
-            if (manifest_v1.?.value.disk) |disk| {
-                const bytes = try std.json.Stringify.valueAlloc(self.allocator, manifest_v1.?.value, .{ .whitespace = .indent_2 });
-                defer self.allocator.free(bytes);
-                const authorization_started = runtime_disk_fork_capture.monotonicNs();
-                try saved_spore_pin.replaceAuthorizedManifest(self.io, self.allocator, registry, work_dir, disk, bytes);
-                metrics.manifest_pin_authorization_ns = runtime_disk_fork_capture.elapsedSince(authorization_started);
-                const lease_started = runtime_disk_fork_capture.monotonicNs();
-                try self.handoffSnapshotDiskLease(registry, work_dir, disk, &lifecycle_spec);
-                metrics.active_lease_handoff_ns = runtime_disk_fork_capture.elapsedSince(lease_started);
-            } else {
-                try spore.saveManifestV1(self.allocator, work_dir, manifest_v1.?.value);
-            }
+            try spore.saveManifest(self.allocator, work_dir, manifest.value);
         }
         const lifecycle_started = runtime_disk_fork_capture.monotonicNs();
         try lifecycle.writeSporeLifecycleSpec(self.allocator, self.io, work_dir, lifecycle_spec.value);
@@ -2093,17 +2070,8 @@ fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
 
 fn sessionHandlesForResume(allocator: std.mem.Allocator, maybe_resume_dir: ?[]const u8) []const spore.Session {
     const resume_dir = maybe_resume_dir orelse return &.{};
-    if (spore.loadManifest(allocator, resume_dir)) |manifest| {
-        return manifest.value.sessions;
-    } else |err| switch (err) {
-        error.BadManifest => {},
-        else => return &.{},
-    }
-    if (spore.loadManifestV1(allocator, resume_dir)) |manifest| {
-        return manifest.value.sessions;
-    } else |_| {
-        return &.{};
-    }
+    const manifest = spore.loadManifest(allocator, resume_dir) catch return &.{};
+    return manifest.value.sessions;
 }
 
 fn parseMonitorArgs(allocator: std.mem.Allocator, args: []const []const u8) !MonitorOptions {
@@ -2467,7 +2435,6 @@ test "snapshot disk lease handoff preserves old authority on failure and commits
         .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
-        .layers = &.{},
     };
     const new_disk = spore.Disk{
         .kind = spore.disk_kind_chunk_index,
@@ -2477,7 +2444,6 @@ test "snapshot disk lease handoff preserves old authority on failure and commits
         .chunk_size = spore.disk_chunk_size,
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
-        .layers = &.{},
     };
     const old_lease = runtime_disk_lease.Lease{
         .store = .rootfs_cache,

@@ -1,8 +1,7 @@
 # Spore State Portability Contract
 
-**Status:** current implementation for fixed-memory manifest formats v2/v3 and
-single-vCPU elastic format v4. Version 5 reserves the matching multi-vCPU
-elastic schema, but current elastic execution remains one-vCPU and writes v4.
+**Status:** current implementation for manifest format v6, with fixed memory
+for any vCPU count and elastic memory for one vCPU.
 This document records what SporeVM can capture, map, translate, and reject when
 restoring an aarch64 spore across the KVM and Hypervisor.framework backends.
 
@@ -23,7 +22,7 @@ Portable state is deliberately narrow:
 - Backends: Linux KVM and Apple Hypervisor.framework.
 - Device model: the frozen SporeVM board contract — virtio-mmio console,
   optional blk, net, vsock, rng, generation MMIO, and one grow-only virtio-mem
-  device for elastic versions 4/5.
+  device for elastic memory.
 - Memory: portable restore is chunk-authoritative. Product same-host restore may
   use local proof-backed `ram.backing`, but that is acceleration metadata, not a
   portability authority. Elastic manifests persist normalized initial,
@@ -38,12 +37,12 @@ Portable state is deliberately narrow:
 Cross-ISA restore, portable HVF multi-vCPU GIC production, persisted access
 traces, general volumes, and broader disk/device fixups are later slices.
 
-Manifest format v3 is reserved for multi-vCPU machine state. It records a
-bounded `vcpu_count`, per-vCPU normalized aarch64 state keyed by stable
-`index`/`mpidr`, and either portable `gicv3_multi` state with global
-distributor, per-MPIDR redistributors, and owner-tagged PPI line levels, or a
-tagged same-HVF `backend_private` GIC blob. KVM produces and consumes the
-portable shape; HVF produces and consumes the private same-backend shape.
+Multi-vCPU manifests (`machine.multi`) record a bounded `vcpu_count`,
+per-vCPU normalized aarch64 state keyed by stable `index`/`mpidr`, and either
+portable `gicv3_multi` state with global distributor, per-MPIDR
+redistributors, and owner-tagged PPI line levels, or a tagged same-HVF
+`backend_private` GIC blob. KVM produces and consumes the portable shape; HVF
+produces and consumes the private same-backend shape.
 
 ## Platform contract
 
@@ -55,8 +54,9 @@ these fields exactly unless this document says a field is translatable:
 | `arch` | must be `aarch64` | Guest RAM and registers are ISA-specific. |
 | `cpu_profile` | must match `sporevm-aarch64-v0` | Guest-visible feature IDs must match the saved execution environment. |
 | `device_model_version` | must match | Virtio layout, interrupt lines, and generation MMIO are board contract. |
+| `vcpu_count` | must match | The guest has already brought up this CPU topology. |
 | `ram_base`, `ram_size` | must match; `ram_size` is initial memory | Guest physical addresses and page tables are already live; elastic maximum and captured layout come from `memory_state`. |
-| `gic_dist_base`, `gic_redist_base` | must match | Linux has mapped the GIC MMIO windows. |
+| `gic_dist_base`, `gic_redist_base`, `gic_redist_stride` | must match | Linux has mapped the GIC MMIO windows. |
 | `counter_frequency_hz` | must match | Timer state is stored in this tick domain. |
 | device count/order | must match | Virtio transport state is positional and device IDs must line up. |
 
@@ -88,7 +88,7 @@ block identical-host fork/fan-out.
 | GIC redistributor/register state | GICv3 MMIO offsets | yes | yes | no | partial apply | producer gap on HVF |
 | GIC line levels | INTID plus asserted bit | PPI/SPI | yes | no | SPI only; asserted PPI rejected | asymmetric |
 | GIC CPU interface | ICC register names and values | yes | yes | yes | yes | portable |
-| Multi-vCPU machine state | manifest v3 per-vCPU arrays plus `gicv3_multi` or HVF-private GIC | yes | yes | same-HVF only | same-HVF only | HVF not portable |
+| Multi-vCPU machine state | `machine.multi` per-vCPU arrays plus `gicv3_multi` or HVF-private GIC | yes | yes | same-HVF only | same-HVF only | HVF not portable |
 | HVF GIC blob | tagged `backend_private` escape hatch | no | reject | same-HVF only | same-HVF only | not portable |
 | Virtio-mmio transport | device ID, feature selectors, negotiated features, status, interrupt status, queue addresses/indices | yes | yes | yes | yes | portable |
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
@@ -96,7 +96,7 @@ block identical-host fork/fan-out.
 | Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | product resume base; cache contract is verify-at-install, trust-at-open |
 | Writable root disk index | optional `chunk-index-disk-v0` over the effective immutable rootfs base | yes for local CAS store | verifies disk index and chunk objects | yes for local CAS store | verifies disk index and chunk objects | product resume; bundle materialization unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows, host socket material, or host port forwards | yes | fresh gateway | yes | fresh gateway | policy portable; flows and port forwards dropped; bound services fail closed unless restored |
-| Grow-only virtio-mem hotplug | v4/v5 normalized initial, maximum, requested, captured, and plugged block ranges | yes | yes | yes | yes | portable, one vCPU currently |
+| Grow-only virtio-mem hotplug | `memory_state` normalized initial, maximum, requested, captured, and plugged block ranges | yes | yes | yes | yes | portable, one vCPU currently |
 | General writable disk contents | not represented | no | reject | no | reject | out of current format |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
 
@@ -132,8 +132,9 @@ The value is guest-visible but chosen by the board/backend contract rather than
 by the suspended workload.
 
 - `mpidr_el1` is captured for inspection but skipped on apply. The board owns
-  CPU identity: manifest v2 is single-vCPU, and manifest v3 validates stable
-  `index`/`mpidr` topology while each backend sets MPIDR during vCPU bring-up.
+  CPU identity: `machine.single` is one vCPU, and `machine.multi` validates
+  stable `index`/`mpidr` topology while each backend sets MPIDR during vCPU
+  bring-up.
 - GIC base addresses are not translated. They are platform fields and must
   match because the guest has already observed and mapped them.
 
@@ -142,7 +143,7 @@ by the suspended workload.
 The value is controlled by the CPU profile at guest creation, not by saving raw
 backend feature registers.
 
-- ID registers such as `ID_AA64*` are not serialized in manifest v2.
+- ID registers such as `ID_AA64*` are not serialized.
 - KVM masks `ID_AA64ISAR0_EL1.RNDR` so Linux does not patch in RNDR/RNDRRS
   instructions unavailable on Apple Hypervisor.framework guests.
 - Restore checks `cpu_profile` instead of trying to reconcile raw host feature
@@ -160,8 +161,8 @@ The value is meaningful only after backend-specific re-anchoring.
 - KVM restores by setting `KVM_ARM_SET_COUNTER_OFFSET` to align host counter
   time with the saved guest counter.
 - Hypervisor.framework restores by computing one vtimer offset and applying it
-  identically to every vCPU. Older manifests with unequal per-vCPU `cntvct`
-  fields use vCPU 0 as authority and translate each timer deadline into that
+  identically to every vCPU. Manifests with unequal per-vCPU `cntvct` fields
+  use vCPU 0 as authority and translate each timer deadline into that
   domain before apply.
 - This translation is only valid when `counter_frequency_hz` matches exactly.
 
@@ -173,9 +174,9 @@ escape hatch.
 - HVF same-host/same-backend GIC restore may use `backend_private` with
   `backend: "hvf"` and `format: "hv_gic_state_v0"`.
 - Other backends must reject it.
-- Portable cross-backend restore must use `kind: "gicv3"` for manifest v2 or
-  `kind: "gicv3_multi"` for manifest v3.
-- Manifest v3 also accepts tagged HVF `backend_private` GIC state for
+- Portable cross-backend restore must use `kind: "gicv3"` for `machine.single`
+  or `kind: "gicv3_multi"` for `machine.multi`.
+- `machine.multi` also accepts tagged HVF `backend_private` GIC state for
   same-HVF multi-vCPU restore; other backends must reject it.
 
 ### Outside the spore
@@ -187,7 +188,7 @@ These are intentionally not captured:
 - Network connections and host-side sockets.
 - Host memory-pressure history and policy decisions after the captured
   virtio-mem requested size; the resulting requested size and plugged layout
-  are captured in v4/v5.
+  are captured in `memory_state`.
 - Host paths, credentials, secrets, and runtime policy.
 - Kernel image identity and DTB identity, until the platform contract grows
   pinned kernel fields.
@@ -199,7 +200,7 @@ format. The manifest form is architectural: distributor and redistributor MMIO
 offsets plus ICC register names. Backend handles, object references, and raw
 kernel/HVF structs must not cross the format boundary.
 
-For manifest v3, `gicv3_multi` keeps distributor state global, stores one
+For multi-vCPU manifests, `gicv3_multi` keeps distributor state global, stores one
 redistributor register set per MPIDR, and requires per-vCPU PPIs to name their
 owning MPIDR. SPIs remain global and must not name an owner.
 
@@ -237,8 +238,8 @@ Current HVF gaps:
 
 | Direction | Current status | Gate before declaring green |
 | --- | --- | --- |
-| KVM→KVM | Manifest v2 passes same-host smoke on the `m7g.metal` KVM host. Manifest v3 multi-vCPU capture, `run --from`, and `resume` pass on the `sporevm-ops` ARM64 KVM CI host. | Keep v2 and v3 as regression coverage. |
-| HVF→HVF | Passes same-host v2 smoke locally, including HVF file-backed fork smokes. Manifest v3 multi-vCPU same-backend capture, `run --from`, and `resume` pass on Apple Silicon with private GIC state. | Keep v2 and v3 as regression coverage. |
+| KVM→KVM | Single-vCPU spores pass same-host smoke on the `m7g.metal` KVM host. Multi-vCPU capture, `run --from`, and `resume` pass on the `sporevm-ops` ARM64 KVM CI host. | Keep single- and multi-vCPU smokes as regression coverage. |
+| HVF→HVF | Passes same-host single-vCPU smoke locally, including HVF file-backed fork smokes. Multi-vCPU same-backend capture, `run --from`, and `resume` pass on Apple Silicon with private GIC state. | Keep single- and multi-vCPU smokes as regression coverage. |
 | KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` and `a1.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
 | HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
 
@@ -249,7 +250,7 @@ best-effort unknown machine state.
 
 Current hard failures include:
 
-- unknown manifest version;
+- manifest version other than 6 (older versions fail as too old);
 - platform field mismatch;
 - device count or device ID mismatch;
 - chunk hash mismatch or malformed memory manifest;
@@ -288,9 +289,9 @@ Current evidence:
   every host. That remains evidence for same-class KVM behavior, but A1 is not
   the current remote validation target and is not a timer-compatible producer
   for current Apple HVF hosts.
-- HVF v1 multi-vCPU same-backend capture, `run --from`, and `resume` passed
+- HVF multi-vCPU same-backend capture, `run --from`, and `resume` passed
   locally with `--backend hvf --vcpus 2` on Apple Silicon.
-- KVM v1 multi-vCPU fresh boot, capture, `run --from`, and `resume` passed on
+- KVM multi-vCPU fresh boot, capture, `run --from`, and `resume` passed on
   the `sporevm-ops` ARM64 Linux CI host
   `i-08fa4a14319c9c1b5` (`sporevm-ci-apse2-linux-arm64`, `c7gd.metal`) via SSM
   command `595ad080-f9ba-4b48-a3d4-49b4dc46df24`, which ran

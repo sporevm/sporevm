@@ -301,7 +301,7 @@ fn ensureDirPath(io: Io, path: []const u8) !void {
 }
 
 pub fn fromSavedDisk(root: []const u8, disk: spore.Disk) !Lease {
-    if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index) or disk.layers.len != 0) return error.BadManifest;
+    if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.BadManifest;
     const lease = Lease{
         .store = .saved_spore,
         .root = root,

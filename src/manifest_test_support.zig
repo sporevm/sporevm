@@ -12,13 +12,15 @@ pub fn manifest(annotations: spore.Annotations) spore.Manifest {
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = 1,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
             .cpsr = 0,
@@ -36,7 +38,7 @@ pub fn manifest(annotations: spore.Annotations) spore.Manifest {
                     .line_levels = &.{},
                 },
             },
-        },
+        } },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .sessions = &sessions,
@@ -107,7 +109,6 @@ pub fn diskFixture(
         .chunk_size = storage.chunk_size,
         .hash_algorithm = storage.hash_algorithm,
         .object_namespace = storage.object_namespace,
-        .layers = &.{},
     };
     const cache_object = try rootfs_cas.manifestObjectPath(allocator, cache_root, object_digest);
     try chunk_sealer.ensureDirPath(allocator, std.fs.path.dirname(cache_object).?);

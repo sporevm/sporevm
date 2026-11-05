@@ -270,17 +270,6 @@ pub fn cloneDisk(allocator: std.mem.Allocator, disk: spore.Disk) Error!spore.Dis
     const object_namespace = try allocator.dupe(u8, disk.object_namespace);
     errdefer allocator.free(object_namespace);
 
-    const layers = try allocator.alloc([]const u8, disk.layers.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (layers[0..initialized]) |layer| allocator.free(layer);
-        allocator.free(layers);
-    }
-    for (disk.layers, 0..) |layer_ref, i| {
-        layers[i] = try allocator.dupe(u8, layer_ref);
-        initialized += 1;
-    }
-
     return .{
         .kind = kind,
         .device = device,
@@ -289,7 +278,6 @@ pub fn cloneDisk(allocator: std.mem.Allocator, disk: spore.Disk) Error!spore.Dis
         .chunk_size = disk.chunk_size,
         .hash_algorithm = hash_algorithm,
         .object_namespace = object_namespace,
-        .layers = layers,
     };
 }
 

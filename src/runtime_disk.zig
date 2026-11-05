@@ -117,7 +117,6 @@ pub const RuntimeDisk = struct {
 
 pub fn storageFromSnapshotDisk(allocator: std.mem.Allocator, disk: spore.Disk) !spore.RootfsStorage {
     if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.BadManifest;
-    if (disk.layers.len != 0) return error.BadManifest;
     const base = try allocator.dupe(u8, disk.base);
     return .{
         .kind = try allocator.dupe(u8, spore.rootfs_storage_kind_chunked_ext4),
@@ -145,7 +144,6 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         const rootfs = options.rootfs orelse return error.BadManifest;
         if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.BadManifest;
         if (!spore.rootfsDeviceEql(disk.device, rootfs.device)) return error.BadManifest;
-        if (disk.layers.len != 0) return error.BadManifest;
         if (disk.size != spore.effectiveRootfsLogicalSize(rootfs)) return error.BadManifest;
         if (disk.chunk_size != spore.disk_chunk_size) return error.BadManifest;
         if (!std.mem.eql(u8, disk.hash_algorithm, spore.rootfs_storage_hash_algorithm_blake3)) return error.BadManifest;

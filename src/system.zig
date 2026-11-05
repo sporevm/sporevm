@@ -3790,7 +3790,6 @@ test "durable save pin roots GC until explicit unpin" {
         .chunk_size = fixture.storage.chunk_size,
         .hash_algorithm = fixture.storage.hash_algorithm,
         .object_namespace = fixture.storage.object_namespace,
-        .layers = &.{},
     };
     var pin_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     defer pin_lock.deinit();
@@ -3862,7 +3861,6 @@ test "cache GC diagnoses and reclaims a pin orphaned by raw directory deletion" 
         .chunk_size = fixture.storage.chunk_size,
         .hash_algorithm = fixture.storage.hash_algorithm,
         .object_namespace = fixture.storage.object_namespace,
-        .layers = &.{},
     };
     var pin_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     const registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &pin_lock);

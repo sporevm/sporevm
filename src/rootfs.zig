@@ -2578,13 +2578,15 @@ fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.Rootfs
         .platform = .{
             .cpu_profile = "sporevm-aarch64-v0",
             .device_model_version = 4,
+            .vcpu_count = 1,
             .ram_base = 0x8000_0000,
             .ram_size = spore.chunk_size,
             .gic_dist_base = 0x0800_0000,
             .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
             .counter_frequency_hz = 24_000_000,
         },
-        .machine = .{
+        .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0xffff_ffc0_0000_0000,
             .cpsr = 0x3c5,
@@ -2602,7 +2604,7 @@ fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.Rootfs
                     .line_levels = &.{},
                 },
             },
-        },
+        } },
         .devices = devices,
         .generation = .{
             .generation = 7,
@@ -2624,7 +2626,6 @@ fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.Rootfs
             .device = .{ .mmio_slot = 1 },
             .size = artifact.size,
             .base = artifact.digest,
-            .layers = &.{},
         },
         .memory = .{ .logical_size = spore.chunk_size, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
