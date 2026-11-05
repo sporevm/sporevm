@@ -69,7 +69,6 @@ BACKEND_TIMING_RE = re.compile(r"run backend timing: (?P<fields>.+)")
 GUEST_TIMING_RE = re.compile(r"vsock host stream guest timing: timing (?P<fields>.+)")
 KVM_PROBE_COMPLETION_RE = re.compile(r"kvm probe completion timing: (?P<fields>.+)")
 ROOTFS_PROFILE_RE = re.compile(r"spore rootfs profile: phase=(?P<phase>\S+) ms=(?P<ms>\d+)(?P<tail>.*)")
-HISTORY_RESET_RE = re.compile(r"(?im)^\s*spore-benchmark-reset:\s*(?P<targets>[^\n]+)")
 
 PHASE_METRIC_FIELDS = (
     "rootfs_open_verified_ms",
@@ -627,23 +626,6 @@ def load_benchmark_expectations(root: Path) -> dict[str, object]:
     return value
 
 
-def benchmark_history_reset() -> dict[str, object] | None:
-    raw = os.environ.get("SPOREVM_BENCHMARK_RESET", "").strip()
-    source = "SPOREVM_BENCHMARK_RESET"
-    if not raw:
-        message = os.environ.get("BUILDKITE_MESSAGE", "")
-        match = HISTORY_RESET_RE.search(message)
-        if match:
-            raw = match.group("targets").strip()
-            source = "BUILDKITE_MESSAGE"
-    if not raw:
-        return None
-    targets = [part.strip() for part in re.split(r"[, ]+", raw) if part.strip()]
-    if not targets:
-        targets = ["all"]
-    return {"source": source, "raw": raw, "targets": targets}
-
-
 def default_host_id() -> str:
     for key in ("SPOREVM_BENCHMARK_HOST_ID", "BUILDKITE_AGENT_NAME"):
         value = os.environ.get(key, "").strip()
@@ -712,7 +694,6 @@ class BenchmarkRunner:
         self.env["SPOREVM_BUNDLE_CACHE_DIR"] = str(self.bundle_cache_dir)
         self.effective_image = args.image
         self.expectations = load_benchmark_expectations(self.root)
-        self.history_reset = benchmark_history_reset()
 
     def setup(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -850,7 +831,6 @@ class BenchmarkRunner:
             "rootfs_cache_dir": str(self.rootfs_cache_dir),
             "bundle_cache_dir": str(self.bundle_cache_dir),
             "benchmark_expectations": self.expectations,
-            "benchmark_history_reset": self.history_reset,
         }
 
     def spore_version(self) -> str | None:
