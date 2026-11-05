@@ -364,8 +364,7 @@ import sys
 
 path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    payload = json.load(fh)
-entries = payload.get("entries", []) if isinstance(payload, dict) else payload
+    entries = json.load(fh)["entries"]
 
 ready_names = {entry.get("name") for entry in entries if entry.get("state") == "ready"}
 missing = [name for name in names if name not in ready_names]
@@ -410,8 +409,7 @@ import sys
 
 path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    payload = json.load(fh)
-entries = payload.get("entries", []) if isinstance(payload, dict) else payload
+    entries = json.load(fh)["entries"]
 
 remaining = {entry.get("name") for entry in entries}
 unexpected = [name for name in names if name in remaining]

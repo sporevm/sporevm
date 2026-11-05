@@ -264,7 +264,7 @@ import sys
 
 path, removed = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    entries = json.load(fh)
+    entries = json.load(fh)["entries"]
 if any(entry.get("name") == removed for entry in entries):
     raise SystemExit(f"removed VM still listed: {removed}")
 PY

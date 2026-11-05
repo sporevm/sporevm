@@ -154,7 +154,7 @@ import sys
 
 path, name = sys.argv[1], sys.argv[2]
 with open(path, "r", encoding="utf-8") as fh:
-    entries = json.load(fh)
+    entries = json.load(fh)["entries"]
 
 entry = next((e for e in entries if e.get("name") == name), None)
 if entry is None:
