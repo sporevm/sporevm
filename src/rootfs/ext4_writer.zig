@@ -369,7 +369,7 @@ const InlineRootfsCas = struct {
     chunk_fill: usize = 0,
     logical_chunk: u64 = 0,
     manifest_chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty,
-    manifest_zero_chunks: std.ArrayList(u64) = .empty,
+    manifest_zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty,
     chunk_count: usize = 0,
     zero_chunks: usize = 0,
     nonzero_chunks: usize = 0,
@@ -435,7 +435,7 @@ const InlineRootfsCas = struct {
         self.freeQueuedSealTasks();
         for (self.manifest_chunks.items) |entry| self.allocator.free(entry.digest);
         self.manifest_chunks.deinit(self.allocator);
-        self.manifest_zero_chunks.deinit(self.allocator);
+        self.manifest_zero_ranges.deinit(self.allocator);
         self.allocator.free(self.seal_worker_stats);
         self.allocator.free(self.seal_threads);
         self.allocator.free(self.seal_queue);
@@ -491,7 +491,7 @@ const InlineRootfsCas = struct {
             .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
             .object_namespace = spore.rootfs_storage_object_namespace,
             .chunks = self.manifest_chunks.items,
-            .zero_chunks = self.manifest_zero_chunks.items,
+            .zero_ranges = self.manifest_zero_ranges.items,
         };
         const encoded_index = try disk_index.encodeCanonicalAlloc(self.allocator, manifest_index);
         defer self.allocator.free(encoded_index.bytes);
@@ -534,7 +534,7 @@ const InlineRootfsCas = struct {
     }
 
     fn appendZeroChunk(self: *InlineRootfsCas) !void {
-        try self.manifest_zero_chunks.append(self.allocator, self.logical_chunk);
+        try disk_index.appendZeroChunk(self.allocator, &self.manifest_zero_ranges, self.logical_chunk);
         self.logical_chunk += 1;
         self.chunk_count += 1;
         self.zero_chunks += 1;

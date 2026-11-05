@@ -640,8 +640,8 @@ def memory_economics(spore_dir: Path) -> dict[str, object]:
         return {"spore_dir": str(spore_dir), "manifest_present": False}
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     memory = manifest.get("memory", {})
-    chunks = memory.get("chunks") or []
-    zero_chunks = memory.get("zero_chunks") or []
+    chunks_nonzero = sum(len(entry["digests"]) // 64 for entry in memory.get("chunk_ranges") or [])
+    chunks_zero = sum(entry["count"] for entry in memory.get("zero_ranges") or [])
     backing = memory.get("backing")
     backing_logical_bytes = None
     backing_allocated_bytes = None
@@ -658,9 +658,9 @@ def memory_economics(spore_dir: Path) -> dict[str, object]:
         "manifest_present": True,
         "configured_ram_bytes": manifest.get("platform", {}).get("ram_size"),
         "chunk_size": memory.get("chunk_size"),
-        "chunks_total": len(chunks) + len(zero_chunks),
-        "chunks_nonzero": len(chunks),
-        "chunks_zero_elided": len(zero_chunks),
+        "chunks_total": chunks_nonzero + chunks_zero,
+        "chunks_nonzero": chunks_nonzero,
+        "chunks_zero_elided": chunks_zero,
         "chunk_store_bytes": directory_size(spore_dir / "chunks"),
         "backing_logical_bytes": backing_logical_bytes,
         "backing_allocated_bytes": backing_allocated_bytes,
@@ -1778,8 +1778,8 @@ def self_test() -> None:
             "memory": {
                 "logical_size": 8,
                 "chunk_size": 2,
-                "chunks": [{"logical_chunk": 1, "digest": "blake3:test"}],
-                "zero_chunks": [0, 2, 3],
+                "chunk_ranges": [{"start": 1, "digests": "a" * 64}],
+                "zero_ranges": [{"start": 0, "count": 1}, {"start": 2, "count": 2}],
             },
         }), encoding="utf-8")
         memory_metrics = memory_economics(memory_spore)

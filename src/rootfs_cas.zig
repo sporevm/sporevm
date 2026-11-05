@@ -227,9 +227,8 @@ fn preloadFd(
         for (manifest_chunks.items) |entry| allocator.free(entry.digest);
         manifest_chunks.deinit(allocator);
     }
-    var manifest_zero_chunks: std.ArrayList(u64) = .empty;
-    try manifest_zero_chunks.ensureTotalCapacity(allocator, chunk_count);
-    defer manifest_zero_chunks.deinit(allocator);
+    var manifest_zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
+    defer manifest_zero_ranges.deinit(allocator);
 
     var zero_chunks: usize = 0;
     var nonzero_chunks: usize = 0;
@@ -255,14 +254,14 @@ fn preloadFd(
         const len_usize = std.math.cast(usize, len) orelse return error.BadManifest;
         if (chunkIsSparseHole(fd, &sparse_scan, start, len, size)) {
             zero_chunks += 1;
-            try manifest_zero_chunks.append(allocator, @intCast(i));
+            try disk_index.appendZeroChunk(allocator, &manifest_zero_ranges, @intCast(i));
             continue;
         }
         const data = read_buf[0..len_usize];
         try preadExact(fd, data, start);
         if (isZero(data)) {
             zero_chunks += 1;
-            try manifest_zero_chunks.append(allocator, @intCast(i));
+            try disk_index.appendZeroChunk(allocator, &manifest_zero_ranges, @intCast(i));
             continue;
         }
         const id = chunk.ChunkId.fromContents(data);
@@ -315,7 +314,7 @@ fn preloadFd(
         .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
         .object_namespace = spore.rootfs_storage_object_namespace,
         .chunks = manifest_chunks.items,
-        .zero_chunks = manifest_zero_chunks.items,
+        .zero_ranges = manifest_zero_ranges.items,
     };
     const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, manifest_index);
     defer allocator.free(encoded_index.bytes);

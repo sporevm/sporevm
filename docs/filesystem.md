@@ -17,7 +17,7 @@ $SPOREVM_ROOTFS_CACHE_DIR/
   <image-cache-key>.ext4
   <image-cache-key>.json              # includes rootfs_storage
   by-digest/blake3/<rootfs>.ext4      # exact fd-backed compatibility path
-  cas/rootfs/blake3/indexes/<id>.json # spore-disk-index-v1 or -v2
+  cas/rootfs/blake3/indexes/<id>.json # spore-disk-index-v2
   cas/rootfs/blake3/objects/<id>.chunk
 ```
 

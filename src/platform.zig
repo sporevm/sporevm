@@ -452,7 +452,7 @@ test "manifest platform check accepts exact match" {
         },
         .devices = &.{},
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
-        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
+        .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
     const expected = Expected{
         .ram_size = manifest.platform.ram_size,

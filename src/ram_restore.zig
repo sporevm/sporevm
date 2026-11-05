@@ -114,7 +114,7 @@ test "RAM restore plan validates one and multi-vCPU chunk restore" {
     const memory = spore.MemoryManifest{
         .logical_size = spore.chunk_size,
         .chunk_size = spore.chunk_size,
-        .zero_chunks = &.{0},
+        .zero_ranges = &.{.{ .start = 0, .count = 1 }},
     };
     const one_vcpu = try Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 1);
     try std.testing.expect(one_vcpu.strategy == .eager_chunks);

@@ -394,24 +394,22 @@ reset or poweroff.
   excluded.
 
 Every disk-index identity is the BLAKE3 digest of one exact canonical JSON
-encoding. Readers accept both versions. Existing `spore-disk-index-v1` bytes
-retain their original field order and identity unchanged; new rootfs and disk
-producers write `spore-disk-index-v2`. There is no eager rewrite or alias from a
-v1 digest to v2. A new snapshot, commit, or rootfs publication over a v1 parent
-publishes a new v2 index and therefore a new content identity.
+encoding, `spore-disk-index-v2`. Indexes of earlier kinds
+(`spore-disk-index-v1`, `rootfs-block-index-v0`) fail as too old, and
+`cache gc` reclaims them with the objects only they referenced.
 
-V2 top-level fields appear in this order: `kind`, `logical_size`, `chunk_size`,
+Top-level fields appear in this order: `kind`, `logical_size`, `chunk_size`,
 `hash_algorithm`, `object_namespace`, `chunk_ranges`, then `zero_ranges`.
 Each nonempty `chunk_ranges` entry has `start` followed by `digests`, a
 concatenation of one lowercase 64-character BLAKE3 hex digest per contiguous
 logical chunk. Each nonempty `zero_ranges` entry has `start` followed by a
 positive `count`. Ranges are ordered, non-overlapping, non-adjacent within the
-same class, and together cover every logical chunk exactly once. V2 removes the
-v1 JSON object and field-name overhead per dense chunk while keeping the whole
+same class, and together cover every logical chunk exactly once. Packing
+removes per-chunk JSON object and field-name overhead while keeping the whole
 input bounded to 64 MiB. A dense 32 GiB disk is covered by the format's focused
 capacity test.
 
-Both versions use UTF-8, LF line endings, two-space JSON indentation, `: `
+The encoding uses UTF-8, LF line endings, two-space JSON indentation, `: `
 between names and values, decimal integers, both coverage arrays even when
 empty, and no trailing newline. Parsers reject equivalent JSON with different
 member order, whitespace, escaping, omitted empty arrays, range splitting, or
@@ -428,14 +426,14 @@ head poisoned by a backend failure after a validated mutating block request
 cannot be snapshotted, forked, exported, or published and has no serialized
 representation.
 
-- `memory`: sparse memory index using the same shape as disk indexes:
-  `kind: "spore-disk-index-v1"`, `logical_size`, `chunk_size`,
+- `memory`: sparse memory index in the disk-index encoding:
+  `kind: "spore-disk-index-v2"`, `logical_size`, `chunk_size`,
   `hash_algorithm: "blake3"`, `object_namespace: "memory/blake3"`,
-  sorted nonzero `chunks` entries (`logical_chunk`, `digest`) and sorted
-  `zero_chunks`. RAM keeps the 2MiB memory chunk size; disk indexes use
-  64KiB chunks. Memory chunk digests are `blake3:<hex>` references to
-  portable `chunks/<hex>` files, and validation requires every logical chunk to
-  be covered exactly once by either list. `backing` is optional local
+  `chunk_ranges`, and `zero_ranges`, followed by the optional `backing`. RAM
+  keeps the 2MiB memory chunk size; disk indexes use 64KiB chunks. Each packed
+  digest names a portable `chunks/<hex>` file, and validation requires every
+  logical chunk to be covered exactly once by either range list. A memory
+  index of an earlier kind fails as too old. `backing` is optional local
   acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks remain the
   portable verified source of truth; imported and cold spores materialize from
@@ -480,16 +478,15 @@ representation.
   current index version `spore-disk-index-v2`, logical size, chunk size, hash
   algorithm, object namespace, packed non-zero chunk ranges, and explicit zero
   ranges; it does not repeat `base_identity` because that would make the index
-  self-referential. Existing v1 storage indexes remain readable.
+  self-referential.
 - `disk`: optional sealed writable root disk state for rootfs-backed captures.
   `kind` must be `"chunk-index-disk-v0"`; `device` binds the disk to the
   same virtio-mmio rootfs slot, `size` is the full disk size, and `base` is the
-  BLAKE3 digest of a v1 or v2 disk index in the rootfs CAS namespace.
+  BLAKE3 digest of a disk index in the rootfs CAS namespace.
   `chunk_size`, `hash_algorithm`, and `object_namespace` mirror the index
   descriptor and must be `64KiB`, `blake3`, and `rootfs/blake3` for the current
-  disk backend. Current writers pack sorted non-zero chunks and explicit zero
-  coverage into v2 ranges; either accepted version is restore authority for the
-  writable disk bytes.
+  disk backend. The index packs sorted non-zero chunks and explicit zero
+  coverage into ranges and is restore authority for the writable disk bytes.
 - `network`: optional requested network capability and policy. `kind` is
   `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the legacy CLI egress
   allow policy, while `allow_host_ports` records exact DNS-learned host plus

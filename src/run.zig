@@ -5242,7 +5242,7 @@ fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
             .size = 4096,
             .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         } else null,
-        .memory = .{ .logical_size = 4096, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
+        .memory = .{ .logical_size = 4096, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
 }
 

@@ -2626,7 +2626,7 @@ fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.Rootfs
             .base = artifact.digest,
             .layers = &.{},
         },
-        .memory = .{ .logical_size = spore.chunk_size, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
+        .memory = .{ .logical_size = spore.chunk_size, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
 }
 

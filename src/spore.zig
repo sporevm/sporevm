@@ -171,18 +171,80 @@ pub const MemoryBacking = struct {
 
 pub const MemoryChunk = disk_index.DiskIndexChunk;
 
+/// The memory index. In the manifest it is a `spore-disk-index-v2` object plus
+/// the optional `backing`; in memory `chunks` holds one digest ref per nonzero
+/// chunk.
 pub const MemoryManifest = struct {
-    kind: []const u8 = disk_index.disk_index_kind_v1,
+    kind: []const u8 = disk_index.disk_index_kind,
     logical_size: u64,
     chunk_size: u64,
     hash_algorithm: []const u8 = rootfs_storage_hash_algorithm_blake3,
     object_namespace: []const u8 = memory_object_namespace,
     chunks: []const MemoryChunk = &.{},
-    zero_chunks: []const u64 = &.{},
+    zero_ranges: []const disk_index.DiskIndexZeroRange = &.{},
     /// Optional same-host acceleration hint. Chunks remain the portable,
     /// verified source of truth; backends may ignore this and materialize
     /// from chunks instead.
     backing: ?MemoryBacking = null,
+
+    const Encoded = struct {
+        kind: []const u8,
+        logical_size: u64,
+        chunk_size: u64,
+        hash_algorithm: []const u8,
+        object_namespace: []const u8,
+        chunk_ranges: []const disk_index.DiskIndexChunkRangeV2,
+        zero_ranges: []const disk_index.DiskIndexZeroRange,
+        backing: ?MemoryBacking = null,
+    };
+
+    pub fn jsonStringify(self: MemoryManifest, jws: *std.json.Stringify) std.json.Stringify.Error!void {
+        try jws.beginObject();
+        try disk_index.writeFields(jws, memoryIndex(self));
+        if (self.backing != null or jws.options.emit_null_optional_fields) {
+            try jws.objectField("backing");
+            try jws.write(self.backing);
+        }
+        try jws.endObject();
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) std.json.ParseError(@TypeOf(source.*))!MemoryManifest {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) std.json.ParseFromValueError!MemoryManifest {
+        // A retired index kind keeps only its kind, so validation reports
+        // FormatTooOld instead of a shape mismatch.
+        if (source == .object) if (source.object.get("kind")) |kind| if (kind == .string) {
+            disk_index.checkKind(kind.string) catch |err| if (err == error.FormatTooOld) {
+                return .{ .kind = kind.string, .logical_size = 0, .chunk_size = 0 };
+            };
+        };
+        const encoded = try std.json.innerParseFromValue(Encoded, allocator, source, options);
+        const decoded = disk_index.decodeChunkRanges(allocator, .{
+            .kind = encoded.kind,
+            .logical_size = encoded.logical_size,
+            .chunk_size = encoded.chunk_size,
+            .hash_algorithm = encoded.hash_algorithm,
+            .object_namespace = encoded.object_namespace,
+            .chunk_ranges = encoded.chunk_ranges,
+            .zero_ranges = encoded.zero_ranges,
+        }) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.BadManifest, error.FormatTooOld => error.UnexpectedToken,
+        };
+        return .{
+            .kind = encoded.kind,
+            .logical_size = encoded.logical_size,
+            .chunk_size = encoded.chunk_size,
+            .hash_algorithm = encoded.hash_algorithm,
+            .object_namespace = encoded.object_namespace,
+            .chunks = decoded.chunks,
+            .zero_ranges = encoded.zero_ranges,
+            .backing = encoded.backing,
+        };
+    }
 };
 
 pub const LocalBackingRestoreSource = enum {
@@ -770,7 +832,7 @@ fn memoryIndex(manifest: MemoryManifest) disk_index.DiskIndex {
         .hash_algorithm = manifest.hash_algorithm,
         .object_namespace = manifest.object_namespace,
         .chunks = manifest.chunks,
-        .zero_chunks = manifest.zero_chunks,
+        .zero_ranges = manifest.zero_ranges,
     };
 }
 
@@ -1566,8 +1628,8 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
     const count = (ram.len + chunk_size - 1) / chunk_size;
     var chunks = std.array_list.Managed(MemoryChunk).init(allocator);
     errdefer chunks.deinit();
-    var zero_chunks = std.array_list.Managed(u64).init(allocator);
-    errdefer zero_chunks.deinit();
+    var zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
+    errdefer zero_ranges.deinit(allocator);
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
@@ -1575,7 +1637,7 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
         const end = @min(start + chunk_size, ram.len);
         const data = ram[start..end];
         if (std.mem.allEqual(u8, data, 0)) {
-            zero_chunks.append(@intCast(i)) catch return error.OutOfMemory;
+            try disk_index.appendZeroChunk(allocator, &zero_ranges, @intCast(i));
             continue;
         }
         const id = chunklib.ChunkId.fromContents(data);
@@ -1601,13 +1663,13 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
 
     const chunk_slice = chunks.toOwnedSlice() catch return error.OutOfMemory;
     errdefer allocator.free(chunk_slice);
-    const zero_slice = zero_chunks.toOwnedSlice() catch return error.OutOfMemory;
+    const zero_slice = try zero_ranges.toOwnedSlice(allocator);
     errdefer allocator.free(zero_slice);
     return .{
         .logical_size = @intCast(ram.len),
         .chunk_size = chunk_size,
         .chunks = chunk_slice,
-        .zero_chunks = zero_slice,
+        .zero_ranges = zero_slice,
         .backing = backing,
     };
 }
@@ -1631,9 +1693,10 @@ pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: Memor
 }
 
 pub fn validateMemoryForRam(manifest: MemoryManifest, ram_len: usize) Error!MemoryPlan {
-    // Memory indexes are part of normalized machine state and remain v1 even
-    // though rootfs and attached-disk storage indexes also accept v2.
-    if (!std.mem.eql(u8, manifest.kind, disk_index.disk_index_kind_v1)) return error.BadManifest;
+    disk_index.checkKind(manifest.kind) catch |err| return switch (err) {
+        error.FormatTooOld => error.FormatTooOld,
+        else => error.BadManifest,
+    };
     const expected_size: u64 = @intCast(ram_len);
     disk_index.validateDiskIndex(memoryIndex(manifest), memoryIndexDescriptor(manifest, expected_size)) catch |err| switch (err) {
         error.BadManifest => return error.BadManifest,
@@ -2736,16 +2799,16 @@ test "memory round-trips through the chunk store with zero elision" {
     ram[ram.len - 1] = 0xEE; // tail chunk non-zero
 
     const mm = try saveMemory(arena, dir, ram);
-    try std.testing.expectEqualStrings(disk_index.disk_index_kind_v1, mm.kind);
+    try std.testing.expectEqualStrings(disk_index.disk_index_kind, mm.kind);
     try std.testing.expectEqual(@as(u64, ram.len), mm.logical_size);
     try std.testing.expectEqual(@as(usize, 3), mm.chunks.len);
     try std.testing.expectEqual(@as(u64, 0), mm.chunks[0].logical_chunk);
     try std.testing.expectEqual(@as(u64, 3), mm.chunks[1].logical_chunk);
     try std.testing.expectEqual(@as(u64, 5), mm.chunks[2].logical_chunk);
-    try std.testing.expectEqual(@as(usize, 3), mm.zero_chunks.len);
-    try std.testing.expectEqual(@as(u64, 1), mm.zero_chunks[0]);
-    try std.testing.expectEqual(@as(u64, 2), mm.zero_chunks[1]);
-    try std.testing.expectEqual(@as(u64, 4), mm.zero_chunks[2]);
+    try std.testing.expectEqualSlices(disk_index.DiskIndexZeroRange, &.{
+        .{ .start = 1, .count = 2 },
+        .{ .start = 4, .count = 1 },
+    }, mm.zero_ranges);
     const plan = try validateMemoryForRam(mm, ram.len);
     try std.testing.expectEqual(@as(usize, chunk_size), plan.chunk_size);
     try std.testing.expectEqual(@as(usize, 6), plan.chunk_count);
@@ -3175,8 +3238,12 @@ test "memory manifest validation rejects non-canonical chunks" {
     try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_namespace, ram.len));
 
     var wrong_kind = mm;
-    wrong_kind.kind = disk_index.disk_index_kind;
+    wrong_kind.kind = "unknown-index-v0";
     try std.testing.expectError(error.BadManifest, validateMemoryForRam(wrong_kind, ram.len));
+
+    var retired_kind = mm;
+    retired_kind.kind = "spore-disk-index-v1";
+    try std.testing.expectError(error.FormatTooOld, validateMemoryForRam(retired_kind, ram.len));
 
     var malformed_refs = try arena.dupe(MemoryChunk, mm.chunks);
     malformed_refs[0].digest = "not-a-blake3-id";
@@ -3274,12 +3341,12 @@ fn fuzzMemoryManifest(_: void, s: *std.testing.Smith) !void {
     var ref_buf: [128]u8 = undefined;
     const ref_len = s.slice(&ref_buf);
     var refs = [_]MemoryChunk{.{ .logical_chunk = s.value(u64), .digest = ref_buf[0..ref_len] }};
-    var zero_chunks = [_]u64{ 0, 1, 2 };
+    const zero_ranges = [_]disk_index.DiskIndexZeroRange{.{ .start = 0, .count = 3 }};
     const mm = MemoryManifest{
         .logical_size = s.value(u64),
         .chunk_size = s.value(u64),
         .chunks = &refs,
-        .zero_chunks = &zero_chunks,
+        .zero_ranges = &zero_ranges,
     };
     _ = loadMemory(std.testing.allocator, "/nonexistent-spore", mm, &ram) catch return;
 }
@@ -3399,6 +3466,76 @@ test "manifest omits absent exec defaults" {
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{});
     defer allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"exec_defaults\"") == null);
+}
+
+test "manifest memory index uses the canonical disk-index encoding" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, 6 * chunk_size);
+    @memset(ram, 0);
+    ram[0] = 1;
+    ram[chunk_size] = 2;
+    ram[4 * chunk_size] = 3;
+    var mm = try saveMemory(arena, dir, ram);
+    mm.backing = .{ .path = ram_backing_path, .size = ram.len };
+
+    // Without `backing`, the memory object is byte-for-byte the canonical
+    // index whose digest fingerprints local RAM backing proofs.
+    var bare = mm;
+    bare.backing = null;
+    const bare_json = try std.json.Stringify.valueAlloc(arena, bare, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
+    const encoded = try disk_index.encodeCanonicalAlloc(arena, memoryIndex(mm));
+    try std.testing.expectEqualStrings(encoded.bytes, bare_json);
+    try std.testing.expect(std.mem.indexOf(u8, bare_json, "\"start\": 4") != null);
+
+    const json = try std.json.Stringify.valueAlloc(arena, mm, .{ .whitespace = .indent_2 });
+    const parsed = try std.json.parseFromSliceLeaky(MemoryManifest, arena, json, .{});
+    try std.testing.expectEqualStrings(disk_index.disk_index_kind, parsed.kind);
+    try std.testing.expectEqual(mm.chunks.len, parsed.chunks.len);
+    for (mm.chunks, parsed.chunks) |expected, actual| {
+        try std.testing.expectEqual(expected.logical_chunk, actual.logical_chunk);
+        try std.testing.expectEqualStrings(expected.digest, actual.digest);
+    }
+    try std.testing.expectEqualSlices(disk_index.DiskIndexZeroRange, mm.zero_ranges, parsed.zero_ranges);
+    try std.testing.expectEqualStrings(ram_backing_path, parsed.backing.?.path);
+    try std.testing.expectEqualStrings(json, try std.json.Stringify.valueAlloc(arena, parsed, .{ .whitespace = .indent_2 }));
+    _ = try validateMemoryForRam(parsed, ram.len);
+
+    const duplicate = try std.mem.replaceOwned(u8, arena, json, "\"chunk_size\": ", "\"chunk_size\": 1,\n  \"chunk_size\": ");
+    try std.testing.expectError(error.DuplicateField, std.json.parseFromSliceLeaky(MemoryManifest, arena, duplicate, .{}));
+    const unknown = try std.mem.replaceOwned(u8, arena, json, "\"zero_ranges\": ", "\"chunks\": [],\n  \"zero_ranges\": ");
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSliceLeaky(MemoryManifest, arena, unknown, .{}));
+    const split_hex = mm.chunks[1].digest[disk_index.digest_prefix.len..];
+    const split = try std.mem.replaceOwned(u8, arena, json, split_hex, try std.fmt.allocPrint(arena, "\"\n    }},\n    {{\n      \"start\": 1,\n      \"digests\": \"{s}", .{split_hex}));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(MemoryManifest, arena, split, .{}));
+}
+
+test "manifest with a retired memory index kind fails as too old" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    try saveManifest(arena, dir, testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3));
+    _ = try loadManifest(arena, dir);
+    const path = try pathZ(arena, "{s}/manifest.json", .{dir});
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, try readFileAll(arena, path, max_manifest_bytes), .{});
+    // Rewrite the memory index in the removed v1 shape.
+    const memory = &root.object.getPtr("memory").?.object;
+    try memory.put(arena, "kind", .{ .string = "spore-disk-index-v1" });
+    _ = memory.orderedRemove("chunk_ranges");
+    _ = memory.orderedRemove("zero_ranges");
+    try memory.put(arena, "chunks", .{ .array = .init(arena) });
+    var zero_chunks: std.json.Array = .init(arena);
+    for (0..(1 << 29) / chunk_size) |i| try zero_chunks.append(.{ .integer = @intCast(i) });
+    try memory.put(arena, "zero_chunks", .{ .array = zero_chunks });
+    try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, root, .{ .whitespace = .indent_2 }));
+    try std.testing.expectError(error.FormatTooOld, loadManifest(arena, dir));
 }
 
 test "manifest loaders preserve format-too-old errors" {
@@ -3626,27 +3763,21 @@ fn testRootfs(mmio_slot: u32) Rootfs {
 }
 
 const test_zero_memory_size: usize = 1 << 29;
-const test_zero_memory_chunks = initTestZeroMemoryChunks();
-const test_single_zero_memory_chunk = [_]u64{0};
-
-fn initTestZeroMemoryChunks() [test_zero_memory_size / chunk_size]u64 {
-    var out: [test_zero_memory_size / chunk_size]u64 = undefined;
-    for (&out, 0..) |*entry, i| entry.* = i;
-    return out;
-}
+const test_zero_memory_ranges = [_]disk_index.DiskIndexZeroRange{.{ .start = 0, .count = test_zero_memory_size / chunk_size }};
+const test_single_zero_memory_range = [_]disk_index.DiskIndexZeroRange{.{ .start = 0, .count = 1 }};
 
 fn testZeroMemoryManifest(ram_size: u64) MemoryManifest {
-    const zero_chunks = if (ram_size == test_zero_memory_size)
-        test_zero_memory_chunks[0..]
+    const zero_ranges = if (ram_size == test_zero_memory_size)
+        test_zero_memory_ranges[0..]
     else if (ram_size == chunk_size)
-        test_single_zero_memory_chunk[0..]
+        test_single_zero_memory_range[0..]
     else
         &.{};
     return .{
         .logical_size = ram_size,
         .chunk_size = chunk_size,
         .chunks = &.{},
-        .zero_chunks = zero_chunks,
+        .zero_ranges = zero_ranges,
     };
 }
 

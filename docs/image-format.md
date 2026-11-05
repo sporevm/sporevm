@@ -55,9 +55,9 @@ with configs and a shared two-object rootfs index beside them whose final
 logical object is one byte. Fixture files carry one source-control newline
 which is excluded from the canonical bytes. Their canonical-byte transport
 names are, respectively,
-`sha256:b657390a5d37e2f098694027575d44fee3e235d64d6ffa630c995d9be54a01ca`
+`sha256:fcc3dbd055d0d00d5100b1c53ba25c01e6ff3df509ec3442f9f3da891abb6a59`
 and
-`sha256:5204bf7ae314b9ec88c9650b445d505d5e044a577794cafd7ba927a3377f6727`.
+`sha256:3701f224c51477fb6e7a620fd74be5cdfc039afcd6a7ba583cff79c6c6d1a74c`.
 
 ## Native image archive
 
