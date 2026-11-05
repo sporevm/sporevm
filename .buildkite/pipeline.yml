@@ -29,7 +29,7 @@ steps:
         plugins: *mise_plugins
         cache: *mise_cache
         concurrency: 1
-        concurrency_group: "sporevm-benchmarks/macos"
+        concurrency_group: "sporevm/macos"
         agents: &mac_agents
           queue: sporevm-mac
 
@@ -51,7 +51,7 @@ steps:
         plugins: *mise_plugins
         cache: *mise_cache
         concurrency: 1
-        concurrency_group: "sporevm-benchmarks/macos"
+        concurrency_group: "sporevm/macos"
         agents: *mac_agents
 
       - label: ":computer: x86-64 Slice 3b (Linux AMD64)"
@@ -177,7 +177,7 @@ steps:
         plugins: *mise_plugins
         cache: *mise_cache
         concurrency: 1
-        concurrency_group: "sporevm-benchmarks/macos"
+        concurrency_group: "sporevm/macos"
         agents: *mac_agents
 
   - group: ":package: Release assets"
@@ -202,7 +202,7 @@ steps:
         plugins: *mise_plugins
         cache: *mise_cache
         concurrency: 1
-        concurrency_group: "sporevm-benchmarks/macos"
+        concurrency_group: "sporevm/macos"
         agents: *mac_agents
 
   - wait
