@@ -60,6 +60,11 @@ grep -Fxq "rng ok" "${workdir}/run.stdout" || die "virtio RNG was not functional
 "${run_env[@]}" "${spore_bin}" create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 \
   >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"
 created=1
+# The monitor runs the VM. Booting must not commit all 512 MiB of guest RAM.
+monitor_pid="$(<"${runtime_dir}/vms/${vm_name}/pid")"
+monitor_rss_kib="$(awk '$1 == "VmRSS:" { print $2 }' "/proc/${monitor_pid}/status")"
+echo "x86 named VM monitor VmRSS after boot: ${monitor_rss_kib} KiB"
+((monitor_rss_kib < 256 * 1024)) || die "monitor committed ${monitor_rss_kib} KiB for a 512 MiB guest"
 
 "${run_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/writeout \
   >"${workdir}/exec.stdout" 2>"${workdir}/exec.stderr"
