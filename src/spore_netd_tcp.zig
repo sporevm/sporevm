@@ -127,6 +127,10 @@ const Flow = struct {
     connect_deadline: Instant = Instant.ZERO,
     idle_deadline: Instant = Instant.ZERO,
     poll_revents: i16 = 0,
+    /// Index of this flow's entry in the last `fillPollFds` set. Cleared
+    /// whenever the fd closes, so a flow restarted in the same slot, or opened
+    /// after the poll set was built, cannot take another fd's revents.
+    poll_index: ?usize = null,
 
     fn init(self: *Flow) void {
         self.closeFd();
@@ -180,6 +184,7 @@ const Flow = struct {
     }
 
     fn closeFd(self: *Flow) void {
+        self.poll_index = null;
         if (self.fd >= 0) {
             _ = std.c.close(self.fd);
             self.fd = -1;
@@ -327,6 +332,7 @@ pub const Gateway = struct {
             count += 1;
         }
         for (&self.flows) |*flow| {
+            flow.poll_index = null;
             if (!flow.in_use or flow.fd < 0) continue;
             var events: i16 = 0;
             if (flow.state == .connecting or flow.to_host.len > 0) events |= std.c.POLL.OUT;
@@ -334,11 +340,15 @@ pub const Gateway = struct {
             if (events == 0) events = std.c.POLL.IN;
             if (count >= fds.len) break;
             fds[count] = .{ .fd = flow.fd, .events = events, .revents = 0 };
+            flow.poll_index = count;
             count += 1;
         }
         return count;
     }
 
+    /// Applies poll results from the set built by `fillPollFds`. Guest frames
+    /// handled in between may open or restart flows, so flows are matched by
+    /// their recorded entry rather than by position.
     pub fn servicePoll(self: *Gateway, fds: []const std.posix.pollfd) void {
         var count: usize = 0;
         for (self.port_forwards[0..self.port_forward_count]) |*forward| {
@@ -350,10 +360,9 @@ pub const Gateway = struct {
         }
         for (&self.flows) |*flow| {
             flow.poll_revents = 0;
-            if (!flow.in_use or flow.fd < 0) continue;
-            if (count >= fds.len) break;
-            flow.poll_revents = fds[count].revents;
-            count += 1;
+            const index = flow.poll_index orelse continue;
+            flow.poll_index = null;
+            if (index < fds.len and fds[index].fd == flow.fd) flow.poll_revents = fds[index].revents;
         }
     }
 
@@ -978,6 +987,58 @@ test "spore-netd TCP opens bound Unix stream sockets" {
     const n = std.c.recv(accepted, &buf, buf.len, 0);
     try std.testing.expectEqual(@as(isize, 4), n);
     try std.testing.expectEqualStrings("ping", &buf);
+}
+
+test "spore-netd TCP applies poll results only to the flow that was polled" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-poll-test-{d}.sock", .{std.c.getpid()});
+    _ = std.c.unlink(path_z.ptr);
+    defer _ = std.c.unlink(path_z.ptr);
+
+    const listener = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    try std.testing.expect(listener >= 0);
+    defer _ = std.c.close(listener);
+    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
+    sockaddr.family = std.c.AF.UNIX;
+    @memcpy(sockaddr.path[0..path_z.len], path_z);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.bind(listener, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un)));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.listen(listener, 4));
+
+    var first_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    var second_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    var config = spore_net_policy.Config{};
+    try config.addBindService(try std.fmt.bufPrint(&first_buf, "first=unix:{s}", .{path_z}));
+    try config.addBindService(try std.fmt.bufPrint(&second_buf, "second:8080=unix:{s}", .{path_z}));
+    try config.addBindService("missing:81=unix:/tmp/sporevm-netd-missing-poll-service.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+
+    // A failed flow takes the first slot and is reaped, leaving the open
+    // flow in a later slot with a free slot before it.
+    var frame_buf: [spore_net.max_frame_len]u8 = undefined;
+    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 81, &frame_buf), Instant.fromMillis(1)));
+    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
+    gateway.service(Instant.fromMillis(1));
+    const host_peer = std.c.accept(listener, null, null);
+    try std.testing.expect(host_peer >= 0);
+    defer _ = std.c.close(host_peer);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(host_peer, std.c.SHUT.WR));
+
+    var fds: [max_port_forwards + max_flows]std.posix.pollfd = undefined;
+    const count = gateway.fillPollFds(&fds);
+    try std.testing.expectEqual(@as(usize, 1), try std.posix.poll(fds[0..count], 1_000));
+
+    // A guest SYN handled between building and servicing the poll set opens
+    // a new flow in the free slot ahead of the polled one.
+    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 8080, &frame_buf), Instant.fromMillis(2)));
+    gateway.servicePoll(fds[0..count]);
+    gateway.service(Instant.fromMillis(2));
+
+    // The polled flow saw its host EOF and closed its host socket.
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), std.c.recv(host_peer, &byte, byte.len, std.c.MSG.DONTWAIT));
 }
 
 test "spore-netd TCP enforces exact learned host ports" {
