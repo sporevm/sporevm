@@ -84,16 +84,59 @@ pub fn smokeDeniedExec(io: Io) !void {
     return error.MonitorJailAllowedExec;
 }
 
-fn linuxExecDenyFilter() [9]SockFilter {
+/// x86_64 kernels with x32 enabled report x32 syscalls under the native
+/// x86_64 audit arch with this bit set in `nr`, so x32 execve would miss the
+/// native exec checks. No other supported architecture uses the bit.
+const x32_syscall_bit: u32 = 0x40000000;
+
+fn linuxExecDenyFilter() [11]SockFilter {
     return .{
         stmt(linux.BPF.LD | linux.BPF.W | linux.BPF.ABS, @offsetOf(linux.SECCOMP.data, "arch")),
         jump(linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K, audit_arch_current, 1, 0),
         stmt(linux.BPF.RET | linux.BPF.K, linux.SECCOMP.RET.KILL_PROCESS),
         stmt(linux.BPF.LD | linux.BPF.W | linux.BPF.ABS, @offsetOf(linux.SECCOMP.data, "nr")),
+        jump(linux.BPF.JMP | linux.BPF.JSET | linux.BPF.K, x32_syscall_bit, 0, 1),
+        stmt(linux.BPF.RET | linux.BPF.K, linux.SECCOMP.RET.KILL_PROCESS),
         jump(linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K, @intFromEnum(linux.SYS.execve), 0, 1),
         stmt(linux.BPF.RET | linux.BPF.K, exec_denied),
         jump(linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K, @intFromEnum(linux.SYS.execveat), 0, 1),
         stmt(linux.BPF.RET | linux.BPF.K, exec_denied),
         stmt(linux.BPF.RET | linux.BPF.K, linux.SECCOMP.RET.ALLOW),
     };
+}
+
+/// Runs the classic BPF subset used by the jail filter for one syscall, as
+/// the kernel would before dispatch.
+fn evalSeccompFilter(filter: []const SockFilter, arch: u32, nr: u32) !u32 {
+    var data = std.mem.zeroes(linux.SECCOMP.data);
+    data.arch = arch;
+    data.nr = @bitCast(nr);
+    const bytes = std.mem.asBytes(&data);
+    var acc: u32 = 0;
+    var pc: usize = 0;
+    while (pc < filter.len) : (pc += 1) {
+        const insn = filter[pc];
+        switch (insn.code) {
+            linux.BPF.LD | linux.BPF.W | linux.BPF.ABS => acc = std.mem.readInt(u32, bytes[insn.k..][0..4], builtin.cpu.arch.endian()),
+            linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K => pc += if (acc == insn.k) insn.jt else insn.jf,
+            linux.BPF.JMP | linux.BPF.JSET | linux.BPF.K => pc += if (acc & insn.k != 0) insn.jt else insn.jf,
+            linux.BPF.RET | linux.BPF.K => return insn.k,
+            else => return error.UnsupportedInstruction,
+        }
+    }
+    return error.MissingReturn;
+}
+
+test "linux monitor jail denies native exec and kills x32 syscalls" {
+    const filter = linuxExecDenyFilter();
+    const denied = linux.SECCOMP.RET.ERRNO | @as(u32, @intFromEnum(std.posix.E.ACCES));
+    const killed = linux.SECCOMP.RET.KILL_PROCESS;
+    const audit_arch_i386: u32 = 0x40000003;
+
+    try std.testing.expectEqual(denied, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.SYS.execve)));
+    try std.testing.expectEqual(denied, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.SYS.execveat)));
+    try std.testing.expectEqual(linux.SECCOMP.RET.ALLOW, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.SYS.getpid)));
+    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_i386, @intFromEnum(linux.SYS.getpid)));
+    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.syscalls.X32.execve)));
+    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.syscalls.X32.execveat)));
 }
