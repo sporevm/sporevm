@@ -3535,7 +3535,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                 .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
                 .capture_request = capture_plan.request,
                 .continue_after_capture = capture_plan.continue_after_capture,
-                .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled and opts.vcpus == 1 and !opts.memory.isElastic(), .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
+                .dirty_tracking = capture_plan.dirty_tracking and opts.vcpus == 1 and !opts.memory.isElastic(),
                 .network = network,
                 .environ_map = context.environ_map,
             });
@@ -3569,7 +3569,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
                     .snapshot_on_probe_complete = capture_plan.snapshot_on_probe_complete,
                     .capture_request = capture_plan.request,
                     .continue_after_capture = capture_plan.continue_after_capture,
-                    .dirty_tracking = .{ .enabled = capture_plan.dirty_tracking.enabled and !opts.memory.isElastic(), .epoch_ms = capture_plan.dirty_tracking.epoch_ms },
+                    .dirty_tracking = capture_plan.dirty_tracking and !opts.memory.isElastic(),
                     .network = network,
                     .environ_map = context.environ_map,
                 });

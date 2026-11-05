@@ -8,7 +8,6 @@
 const std = @import("std");
 const aarch64_topology = @import("../aarch64/topology.zig");
 const capture = @import("../capture.zig");
-const deadline = @import("../deadline.zig");
 const disk_layer = @import("../disk_layer.zig");
 const local_paths = @import("../local_paths.zig");
 const rootfs_mod = @import("../rootfs.zig");
@@ -17,7 +16,6 @@ const dirty_ram = @import("../dirty_ram.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
-const lazy_ram = @import("lazy_ram.zig");
 const board = @import("../aarch64/board.zig");
 const boot = @import("../aarch64/boot.zig");
 const generation = @import("../generation.zig");
@@ -76,8 +74,6 @@ pub const Config = struct {
     /// Product callers provide their environment so snapshot code can write
     /// local-only RAM backing proofs under the configured runtime root.
     environ_map: ?*const std.process.Environ.Map = null,
-    /// Optional fd that receives one line per lazily materialized chunk.
-    lazy_ram_trace_fd: ?std.c.fd_t = null,
     snapshot_dir: ?[]const u8 = null,
     /// Snapshot and stop when the exec probe has observed command completion.
     snapshot_on_probe_complete: bool = false,
@@ -87,9 +83,9 @@ pub const Config = struct {
     /// Continue running after a host-requested capture instead of stopping.
     continue_after_capture: bool = false,
     /// Opt-in HVF write-protect dirty tracking. When enabled, guest write
-    /// faults identify dirty chunks and snapshots only need a final dirty-tail
-    /// flush instead of a full RAM scan.
-    dirty_tracking: DirtyTrackingOptions = .{},
+    /// faults identify dirty chunks and snapshots seal only those chunks
+    /// instead of scanning all RAM.
+    dirty_tracking: bool = false,
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
@@ -114,12 +110,6 @@ fn hvfPostRunAction(reason: hvf.ExitReason) HvfPostRunAction {
     // guest work that must be dispatched before the next pre-run wake flush.
     return if (reason == .canceled) .resume_before_run else .dispatch_exit;
 }
-
-pub const DirtyTrackingOptions = struct {
-    enabled: bool = false,
-    /// 0 disables periodic sealing and measures only the final tail flush.
-    epoch_ms: u64 = 250,
-};
 
 const RestoreStats = struct {
     start_ms: u64,
@@ -241,10 +231,10 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(config.vcpus);
     if (config.exec_probe_start == .control and (config.exec_probe == null or config.exec_control == null)) return error.DeferredExecProbeRequiresControl;
-    if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
+    if (config.vcpus != 1 and (config.dirty_tracking or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
-    if (config.dirty_tracking.enabled and config.virtio_mem_region_size != 0) return error.BadManifest;
+    if (config.dirty_tracking and config.virtio_mem_region_size != 0) return error.BadManifest;
     const hv_vm_create_start = setup_start;
     try hvf.check(hvf.hv_vm_create(null), "hv_vm_create");
     const hv_vm_create_ms = monotonicMs() - hv_vm_create_start;
@@ -254,10 +244,9 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     defer if (resume_parsed) |*parsed| parsed.deinit();
     var resume_v1_parsed: ?std.json.Parsed(spore.ManifestV1) = null;
     defer if (resume_v1_parsed) |*parsed| parsed.deinit();
-    var lazy_pager: ?lazy_ram.Pager = null;
     var dirty_tracker: ?DirtyTracker = null;
     var restore_stats: ?RestoreStats = null;
-    if (config.dirty_tracking.enabled and (config.resume_dir != null or config.snapshot_dir == null or !hasFreshCaptureTrigger(config))) {
+    if (config.dirty_tracking and (config.resume_dir != null or config.snapshot_dir == null or !hasFreshCaptureTrigger(config))) {
         return error.BadManifest;
     }
     if (config.resume_dir) |spore_dir| {
@@ -286,10 +275,10 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         config.virtio_mem_region_size = restored_memory.maximum_bytes - restored_memory.initial_bytes;
     }
     try topology.validateVcpuCount(config.vcpus);
-    if (config.vcpus != 1 and (config.dirty_tracking.enabled or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
+    if (config.vcpus != 1 and (config.dirty_tracking or config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
-    if (config.dirty_tracking.enabled and config.virtio_mem_region_size != 0) return error.BadManifest;
+    if (config.dirty_tracking and config.virtio_mem_region_size != 0) return error.BadManifest;
 
     // GIC layout from runtime parameters; created before any vCPU.
     const gic_start = monotonicMs();
@@ -315,32 +304,23 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     try hvf.check(hvf.hv_gic_create(gic_config), "hv_gic_create");
     const gic_ms = monotonicMs() - gic_start;
 
-    // Guest RAM. Eager and proof-gated local backing resumes map the whole
-    // range up front; lazy chunk resumes leave it unmapped in HVF and
-    // materialize chunks from instruction/data-abort exits in the run loop.
+    // Guest RAM. Fresh boots, eager chunk resumes, and proof-gated local
+    // backing resumes all map the whole initial range up front.
     const map_ram_start = monotonicMs();
     const resume_memory: ?spore.MemoryManifest = if (resume_parsed) |parsed| parsed.value.memory else if (resume_v1_parsed) |parsed| parsed.value.memory else null;
     const ram_mapping = try mapRam(config, resume_memory);
     const map_ram_ms = monotonicMs() - map_ram_start;
     if (restore_stats) |*stats| stats.map_ram_ms = map_ram_ms;
     defer ram_mapping.deinit();
-    defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
     const initial_ram_len: usize = @intCast(config.ram_size);
-    var ram_mapped_at_start = false;
-    var hv_map_ram_ms: u64 = 0;
-    if (shouldMapRamAtStart(config, ram_mapping)) {
-        const hv_map_ram_start = monotonicMs();
-        try hvf.check(
-            hvf.hv_vm_map(ram_bytes.ptr, board.ram_base, initial_ram_len, hvf.MemoryFlags.rwx),
-            "hv_vm_map ram",
-        );
-        hv_map_ram_ms = monotonicMs() - hv_map_ram_start;
-        ram_mapped_at_start = true;
-    }
-    defer {
-        if (ram_mapped_at_start) _ = hvf.hv_vm_unmap(board.ram_base, initial_ram_len);
-    }
+    const hv_map_ram_start = monotonicMs();
+    try hvf.check(
+        hvf.hv_vm_map(ram_bytes.ptr, board.ram_base, initial_ram_len, hvf.MemoryFlags.rwx),
+        "hv_vm_map ram",
+    );
+    const hv_map_ram_ms = monotonicMs() - hv_map_ram_start;
+    defer _ = hvf.hv_vm_unmap(board.ram_base, initial_ram_len);
     defer if (dirty_tracker) |*tracker| tracker.deinit();
     var ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
     var hotplug_mapping: ?HotplugMapping = if (config.virtio_mem_region_size > 0)
@@ -490,11 +470,10 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .counter_frequency_hz = host_counter_frequency_hz,
             .device_count = transports.len,
         });
-        try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &lazy_pager, &restore_stats);
+        try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = monotonicMs();
         if (m.memory_state) |state| try mem_dev.restoreState(state);
         try applyTransports(transports, m.devices);
-        if (lazy_pager) |*pager| try materializeAllTransportQueues(pager, transports);
         try gen_dev.restore(allocator, config.resume_generation orelse m.generation);
         if (config.resume_generation == null) try spore.refreshResumeParams(allocator, &gen_dev);
         try snapshot.applyMachine(allocator, vcpu, m.machine);
@@ -531,17 +510,15 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .pc, layout.entry), "set pc");
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .x0, layout.dtb), "set x0");
 
-        if (config.dirty_tracking.enabled) {
+        if (config.dirty_tracking) {
             dirty_tracker = try DirtyTracker.start(allocator, .{
                 .dir = config.snapshot_dir.?,
                 .ram = ram_bytes,
                 .seed_ranges = seed_ranges,
-                .epoch_ms = config.dirty_tracking.epoch_ms,
             });
             if (dirty_tracker) |*tracker| {
                 ram.dirty_context = tracker;
                 ram.dirty_fn = DirtyTracker.markGuestWriteCallback;
-                try tracker.startWorker();
             }
         }
         boot_ms = monotonicMs() - boot_start;
@@ -555,8 +532,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             const attach_probe_start = monotonicMs();
             try vsock_dev.attachHostStream(probe);
             probe.markStarted();
-            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -587,8 +563,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var did_capture_request = false;
     while (true) {
         if (config.exec_probe != null and !exec_probe_done) {
-            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         }
         if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
@@ -607,8 +582,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         }
         if (config.network.failed()) return error.NetworkGatewayFailed;
         if (config.network.consumeWake()) {
-            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, pager, net_transport_index);
+            try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
             continue;
         }
         if (config.exec_control) |control| {
@@ -668,8 +642,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     ) catch |err| control.failDiskFork(err);
                 },
             }
-            const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, pager, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         }
         if (config.capture_request) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -732,12 +705,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 const ec = exit.exception.exceptionClass();
                 switch (ec) {
                     hvf.ec_instruction_abort => {
-                        if (lazy_pager) |*pager| {
-                            if (pager.isRamFault(exit.exception.physical_address)) {
-                                try pager.materializeFault(exit.exception.physical_address);
-                                continue;
-                            }
-                        }
                         std.log.err(
                             "unhandled instruction abort syndrome=0x{x} va=0x{x} ipa=0x{x}",
                             .{ exit.exception.syndrome, exit.exception.virtual_address, exit.exception.physical_address },
@@ -745,18 +712,12 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                         return error.UnhandledGuestException;
                     },
                     hvf.ec_data_abort => {
-                        if (lazy_pager) |*pager| {
-                            if (pager.isRamFault(exit.exception.physical_address)) {
-                                try pager.materializeFault(exit.exception.physical_address);
-                                continue;
-                            }
-                        }
                         if (dirty_tracker) |*tracker| {
                             if (try tracker.handleWriteFault(exit.exception.syndrome, exit.exception.physical_address)) {
                                 continue;
                             }
                         }
-                        try handleMmio(vcpu, exit, transports, &gen_dev, ram, if (lazy_pager) |*pager| pager else null, .{
+                        try handleMmio(vcpu, exit, transports, &gen_dev, ram, .{
                             .dist_base = dist_base,
                             .dist_size = dist_size,
                             .redist_base = vcpu_redist_base,
@@ -814,8 +775,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 if (config.exec_probe != null and !exec_probe_done) continue;
                 if (config.network.failed()) continue;
                 if (config.network.consumeWake()) {
-                    const pager: ?*lazy_ram.Pager = if (lazy_pager) |*p| p else null;
-                    try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, pager, net_transport_index);
+                    try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
                     continue;
                 }
                 if (config.exec_control != null) continue;
@@ -1206,7 +1166,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     if (options.resume_manifest) |manifest| {
         const restore_start = monotonicMs();
         try checkHvfManifestV1(manifest.*, options.config.*, options.transports.len, snapshot.hostCounterFreq(), options.dist_base, redist_window.base, @intCast(redist_stride));
-        try restoreMemory(allocator, options.config.*, manifest.memory, options.ram_bytes, options.ram_file_backed, null, options.restore_stats);
+        try restoreMemory(allocator, options.config.*, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
         const state_start = monotonicMs();
         try applyTransports(options.transports, manifest.devices);
         try options.gen_dev.restore(allocator, options.config.resume_generation orelse manifest.generation);
@@ -1248,7 +1208,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             try options.vsock_dev.attachHostStream(probe);
             probe.markStarted();
             wakeAfterVsockRxDelivery(
-                try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, null, @intCast(options.vsock_transport_index)),
+                try flushVsockRx(options.vsock_dev, &options.transports_buf[options.vsock_transport_index], options.ram, @intCast(options.vsock_transport_index)),
                 .{ .context = &wake_set, .wakeFn = wakeVcpuSet },
             );
             attach_probe_ms = monotonicMs() - attach_probe_start;
@@ -1294,7 +1254,6 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     options.vsock_dev,
                     &options.transports_buf[options.vsock_transport_index],
                     options.ram,
-                    null,
                     @intCast(options.vsock_transport_index),
                 ) catch |err| {
                     device_lock.unlock();
@@ -1660,7 +1619,7 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
         var flushed_network = false;
         ctx.device_lock.lock();
         if (ctx.network.consumeWake()) {
-            flushNetworkRxHvf(ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, null, ctx.net_transport_index) catch |err| {
+            flushNetworkRxHvf(ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, ctx.net_transport_index) catch |err| {
                 ctx.device_lock.unlock();
                 ctx.state.finish(.{ .err = err });
                 return;
@@ -1700,7 +1659,7 @@ fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
                         };
                         if (handled_gic) continue;
                         ctx.device_lock.lock();
-                        handleDeviceMmioAccess(ctx.vcpu.handle, access, ctx.transports, ctx.gen_dev, ctx.ram, null) catch |err| {
+                        handleDeviceMmioAccess(ctx.vcpu.handle, access, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
                             ctx.device_lock.unlock();
                             ctx.state.finish(.{ .err = err });
                             return;
@@ -1892,12 +1851,6 @@ fn wakeCaptureVcpuSet(context: ?*anyopaque) callconv(.c) void {
     wake_set.wakeAll();
 }
 
-fn shouldMapRamAtStart(config: Config, ram_mapping: RamMapping) bool {
-    if (config.resume_dir == null) return true;
-    if (ram_mapping.file_backed) return true;
-    return config.ram_restore != .lazy_chunks;
-}
-
 fn mapRam(config: Config, manifest_memory: ?spore.MemoryManifest) !RamMapping {
     const maximum_size = std.math.add(u64, config.ram_size, config.virtio_mem_region_size) catch return error.BadManifest;
     return switch (config.ram_restore) {
@@ -1907,7 +1860,7 @@ fn mapRam(config: Config, manifest_memory: ?spore.MemoryManifest) !RamMapping {
             try spore.validateMemoryBacking(backing, maximum_size);
             break :blk try mapFileBackedRamFd(fd, maximum_size);
         },
-        .fresh, .eager_chunks, .lazy_chunks => mapAnonymousRam(maximum_size),
+        .fresh, .eager_chunks => mapAnonymousRam(maximum_size),
     };
 }
 
@@ -1917,7 +1870,6 @@ fn restoreMemory(
     memory: spore.MemoryManifest,
     ram_bytes: []align(std.heap.page_size_min) u8,
     file_backed: bool,
-    lazy_pager: ?*?lazy_ram.Pager,
     restore_stats: *?RestoreStats,
 ) !void {
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
@@ -1936,19 +1888,6 @@ fn restoreMemory(
             if (restore_stats.*) |*stats| stats.mode = "eager_chunks";
             const memory_start = monotonicMs();
             try spore.loadMemory(allocator, config.resume_dir.?, memory, ram_bytes);
-            if (restore_stats.*) |*stats| stats.memory_ms = monotonicMs() - memory_start;
-        },
-        .lazy_chunks => {
-            if (file_backed) return error.BadManifest;
-            const pager_slot = lazy_pager orelse return error.UnsupportedVcpuCount;
-            if (restore_stats.*) |*stats| stats.mode = "lazy_chunks";
-            const memory_start = monotonicMs();
-            pager_slot.* = try lazy_ram.Pager.start(allocator, .{
-                .dir = config.resume_dir.?,
-                .manifest = memory,
-                .ram = ram_bytes,
-                .trace_fd = config.lazy_ram_trace_fd,
-            });
             if (restore_stats.*) |*stats| stats.memory_ms = monotonicMs() - memory_start;
         },
     }
@@ -2039,7 +1978,7 @@ fn fileSize(fd: std.c.fd_t) !u64 {
 const DirtyTracker = struct {
     sealer: dirty_ram.Sealer,
     writable_chunks: []bool,
-    core: dirty_ram.TrackerCore,
+    tracking_start_ms: u64 = 0,
     mutex: SpinLock = .{},
     stats: DirtyStats = .{},
 
@@ -2047,7 +1986,6 @@ const DirtyTracker = struct {
         dir: []const u8,
         ram: []const u8,
         seed_ranges: ?[]const dirty_ram.ChunkRange = null,
-        epoch_ms: u64,
     };
 
     const DirtyStats = struct {
@@ -2071,73 +2009,26 @@ const DirtyTracker = struct {
         var tracker = DirtyTracker{
             .sealer = sealer,
             .writable_chunks = try allocator.alloc(bool, sealer.chunkCount()),
-            .core = dirty_ram.TrackerCore.init(options.epoch_ms),
         };
         @memset(tracker.writable_chunks, false);
 
         const protect_start = monotonicMs();
         try tracker.protectAll(hvf.MemoryFlags.rx);
         tracker.stats.seed_protect_ms = monotonicMs() - protect_start;
-        tracker.core.tracking_start_ms = monotonicMs();
+        tracker.tracking_start_ms = monotonicMs();
 
         std.log.info(
-            "hvf dirty tracking started: mode=write-protect ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d} seed_protect_ms={d} epoch_ms={d}",
-            .{ options.ram.len / 1024 / 1024, tracker.sealer.chunkCount(), tracker.sealer.stats.seed_nonzero_chunks, tracker.sealer.stats.seed_ms, tracker.stats.seed_protect_ms, options.epoch_ms },
+            "hvf dirty tracking started: mode=write-protect ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d} seed_protect_ms={d}",
+            .{ options.ram.len / 1024 / 1024, tracker.sealer.chunkCount(), tracker.sealer.stats.seed_nonzero_chunks, tracker.sealer.stats.seed_ms, tracker.stats.seed_protect_ms },
         );
         return tracker;
     }
 
     fn deinit(self: *DirtyTracker) void {
-        self.stopWorker();
         if (!self.sealer.finished) {
             _ = self.protectAll(hvf.MemoryFlags.rwx) catch {};
         }
         self.sealer.deinit();
-    }
-
-    fn startWorker(self: *DirtyTracker) !void {
-        if (!self.core.shouldStartWorker()) return;
-        self.core.worker_thread = try std.Thread.spawn(.{}, dirtyWorker, .{self});
-        std.log.info("hvf dirty tracking worker started: epoch_ms={d}", .{self.core.epoch_ms});
-    }
-
-    fn stopWorker(self: *DirtyTracker) void {
-        if (self.core.worker_thread) |thread| {
-            const join_start = monotonicMs();
-            self.core.stop.store(true, .release);
-            thread.join();
-            self.core.worker_thread = null;
-            self.core.stats.worker_join_ms += monotonicMs() - join_start;
-        }
-    }
-
-    fn dirtyWorker(self: *DirtyTracker) void {
-        var next_deadline = monotonicMs() +| self.core.epoch_ms;
-        while (true) {
-            const now = monotonicMs();
-            const wait_ms = if (next_deadline > now) next_deadline - now else 0;
-            if (deadline.sleepFor(deadline.system_clock, wait_ms, 10, &self.core.stop)) return;
-            const epoch_start = monotonicMs();
-            self.flushDirty(false) catch {
-                self.markWorkerFailed();
-                return;
-            };
-            const epoch_end = monotonicMs();
-            self.recordWorkerEpochTiming(epoch_start, epoch_end, next_deadline);
-            next_deadline = epoch_start +| self.core.epoch_ms;
-        }
-    }
-
-    fn markWorkerFailed(self: *DirtyTracker) void {
-        self.mutex.lock();
-        self.core.markWorkerFailed();
-        self.mutex.unlock();
-    }
-
-    fn recordWorkerEpochTiming(self: *DirtyTracker, epoch_start: u64, epoch_end: u64, deadline_ms: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.core.recordWorkerEpochTiming(epoch_start, epoch_end, deadline_ms);
     }
 
     fn handleWriteFault(self: *DirtyTracker, syndrome: u64, ipa: u64) !bool {
@@ -2162,15 +2053,10 @@ const DirtyTracker = struct {
     }
 
     fn finish(self: *DirtyTracker) !spore.MemoryManifest {
-        const worker_stop_start = monotonicMs();
-        self.stopWorker();
-        self.core.stats.finish_worker_stop_ms = monotonicMs() - worker_stop_start;
-        if (self.core.worker_failed) return error.HvfDirtyWorkerFailed;
-
         const tail_start = monotonicMs();
-        try self.flushDirty(true);
+        try self.flushDirty();
         self.sealer.stats.tail_flush_ms = monotonicMs() - tail_start;
-        self.sealer.finishRates(self.core.tracking_start_ms, monotonicMs());
+        self.sealer.finishRates(self.tracking_start_ms, monotonicMs());
 
         // Successful dirty-tracked snapshots are one-shot captures. Re-protecting
         // every chunk here makes suspend scale with configured RAM even when the
@@ -2178,17 +2064,14 @@ const DirtyTracker = struct {
         return try self.sealer.finishBacking();
     }
 
-    fn flushDirty(self: *DirtyTracker, tail: bool) !void {
+    fn flushDirty(self: *DirtyTracker) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (!self.sealer.hasDirtyChunks()) return;
         _ = try self.sealer.flushMarked(.{
-            .tail = tail,
-            .stop = &self.core.stop,
             .before_seal = protectDirtyChunkForSeal,
             .before_seal_ctx = self,
         });
-        if (!tail) self.core.stats.dirty_epoch_count += 1;
     }
 
     fn protectDirtyChunkForSeal(ctx: *anyopaque, index: usize) !void {
@@ -2260,22 +2143,6 @@ fn logNamedSnapshotPublication(metrics: vsock.SnapshotPublishMetrics, pause_star
             vsock.SnapshotPublishMetrics.nsToMs(source_pause_ns),
         },
     );
-}
-
-fn materializeAllTransportQueues(pager: *lazy_ram.Pager, transports: []mmio.Transport) !void {
-    for (transports) |*transport| {
-        try materializeTransportQueues(pager, transport);
-    }
-}
-
-fn materializeTransportQueues(pager: *lazy_ram.Pager, transport: *const mmio.Transport) !void {
-    for (transport.queues[0..transport.dev.queue_count]) |queue| {
-        try pager.materializeVirtQueue(queue);
-    }
-}
-
-fn maybeMaterializeTransportQueues(pager: ?*lazy_ram.Pager, transport: *const mmio.Transport) !void {
-    if (pager) |p| try materializeTransportQueues(p, transport);
 }
 
 const SnapshotPlatform = struct {
@@ -2460,13 +2327,12 @@ fn takeSnapshot(
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
     if (dirty_tracker) |tracker| {
         const stats = tracker.stats;
-        const core_stats = tracker.core.stats;
         const ram_stats = tracker.sealer.stats;
         var metrics_head_buf: [2048]u8 = undefined;
         var metrics_tail_buf: [3072]u8 = undefined;
         const metrics_head = std.fmt.bufPrint(
             &metrics_head_buf,
-            "hvf snapshot metrics: mode=write-protect ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} write_fault_count={d} dirty_chunks_total={d} dirty_chunks_tail={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} seed_protect_ms={d} tail_flush_ms={d}",
+            "hvf snapshot metrics: mode=write-protect ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} write_fault_count={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} seed_protect_ms={d} tail_flush_ms={d}",
             .{
                 platform.ram_size / 1024 / 1024,
                 memory_plan.chunk_count,
@@ -2479,11 +2345,8 @@ fn takeSnapshot(
                 manifest_ms,
                 snapshot_total_ms,
                 snapshot_total_ms,
-                core_stats.dirty_epoch_ms,
-                core_stats.dirty_epoch_count,
                 stats.write_fault_count,
                 ram_stats.dirty_chunks_total,
-                ram_stats.dirty_chunks_tail,
                 ram_stats.host_dirty_ranges_total,
                 ram_stats.host_dirty_chunks_total,
                 ram_stats.sealed_chunks_total,
@@ -2496,7 +2359,7 @@ fn takeSnapshot(
         ) catch "hvf snapshot metrics: formatting_failed=1";
         const metrics_tail = std.fmt.bufPrint(
             &metrics_tail_buf,
-            " seal_ms={d} protect_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} worker_epoch_max_ms={d} worker_cadence_lag_max_ms={d} worker_cadence_lag_total_ms={d} worker_epoch_overrun_count={d} worker_epoch_overrun_ms={d} worker_join_ms={d} finish_worker_stop_ms={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_chunks_per_sec={d} sealed_chunks_per_sec={d}",
+            " seal_ms={d} protect_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_chunks_per_sec={d} sealed_chunks_per_sec={d}",
             .{
                 ram_stats.seal_ms,
                 stats.protect_ms,
@@ -2506,13 +2369,6 @@ fn takeSnapshot(
                 ram_stats.sealBackingWriteMs(),
                 ram_stats.seal_parallel_flush_count,
                 ram_stats.seal_parallel_workers_max,
-                core_stats.worker_epoch_max_ms,
-                core_stats.worker_cadence_lag_max_ms,
-                core_stats.worker_cadence_lag_total_ms,
-                core_stats.worker_epoch_overrun_count,
-                core_stats.worker_epoch_overrun_ms,
-                core_stats.worker_join_ms,
-                core_stats.finish_worker_stop_ms,
                 ram_stats.finish_fchmod_ms,
                 ram_stats.finish_close_ms,
                 ram_stats.finish_close_deferred,
@@ -2840,10 +2696,8 @@ fn flushVsockRx(
     vsock_dev: *vsock.Vsock,
     transport: *mmio.Transport,
     ram: guestmem.GuestRam,
-    lazy_pager: ?*lazy_ram.Pager,
     transport_index: u32,
 ) !bool {
-    try maybeMaterializeTransportQueues(lazy_pager, transport);
     if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
@@ -2870,10 +2724,8 @@ fn flushNetworkRxHvf(
     net_dev: *net.Net,
     transport: *mmio.Transport,
     ram: guestmem.GuestRam,
-    lazy_pager: ?*lazy_ram.Pager,
     transport_index: usize,
 ) !void {
-    try maybeMaterializeTransportQueues(lazy_pager, transport);
     if (net_dev.flushPendingRx(&transport.queues, ram)) {
         transport.interrupt_status |= 1;
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(transport_index)), true), "raise net spi");
@@ -3097,35 +2949,6 @@ test "HVF redistributor window accepts unordered frames" {
     try std.testing.expectEqual(@as(u64, 0x4_0000), window.size);
 }
 
-test "vsock rx flush materializes lazy transport queues before delivery" {
-    var ram_bytes: [spore.chunk_size]u8 align(std.heap.page_size_min) = undefined;
-    @memset(&ram_bytes, 0);
-    var mapped = [_]bool{false};
-    var pager = lazy_ram.Pager{
-        .allocator = std.testing.allocator,
-        .dir = ".",
-        .manifest = .{ .logical_size = ram_bytes.len, .chunk_size = spore.chunk_size, .zero_chunks = &.{0} },
-        .ram = ram_bytes[0..],
-        .mapped = &mapped,
-        .trace_fd = null,
-        .start_ms = 0,
-    };
-    const ram = guestmem.GuestRam{ .bytes = ram_bytes[0..], .base = board.ram_base };
-    var vsock_dev = vsock.Vsock.init(.{});
-    var transport = mmio.Transport.init(vsock_dev.device());
-
-    transport.queues[0] = .{
-        .ready = true,
-        .size = 1,
-        .desc_addr = std.math.maxInt(u64),
-    };
-
-    try std.testing.expectError(
-        error.BadManifest,
-        flushVsockRx(&vsock_dev, &transport, ram, &pager, 0),
-    );
-}
-
 test "multi-vcpu network wake preserves completed HVF MMIO exit" {
     var exit = dataAbortExitForTest(board.virtio_base + 0x050, 2, 3, true);
     try std.testing.expectEqual(hvf.ec_data_abort, exit.exception.exceptionClass());
@@ -3194,13 +3017,12 @@ fn handleMmio(
     transports: []mmio.Transport,
     gen_dev: *generation.Device,
     ram: guestmem.GuestRam,
-    lazy_pager: ?*lazy_ram.Pager,
     gic_windows: GicWindows,
     current_owner: ?*HvfVcpu,
 ) !void {
     const access = try decodeMmioAccess(exit);
     if (try handleGicMmioAccess(vcpu, access, gic_windows, current_owner)) return;
-    try handleDeviceMmioAccess(vcpu, access, transports, gen_dev, ram, lazy_pager);
+    try handleDeviceMmioAccess(vcpu, access, transports, gen_dev, ram);
 }
 
 fn handleDeviceMmioAccess(
@@ -3209,7 +3031,6 @@ fn handleDeviceMmioAccess(
     transports: []mmio.Transport,
     gen_dev: *generation.Device,
     ram: guestmem.GuestRam,
-    lazy_pager: ?*lazy_ram.Pager,
 ) !void {
     const sas = access.sas;
     const srt = access.srt;
@@ -3256,7 +3077,6 @@ fn handleDeviceMmioAccess(
             if (srt < 31) {
                 try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, srt)), &value), "mmio read xt");
             }
-            if (offset == 0x050) try maybeMaterializeTransportQueues(lazy_pager, t);
             const raised = t.write(offset, @truncate(value), ram);
             if (raised) {
                 try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(idx)), true), "raise spi");

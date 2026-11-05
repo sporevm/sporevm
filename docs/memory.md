@@ -138,18 +138,19 @@ map only the 512 MiB default (or explicit initial size) at boot, and grow the
 guest mapping when memory pressure raises the virtio-mem requested size.
 
 KVM dirty tracking uses dirty-log bitmaps plus explicit VMM-originated dirty
-marking. HVF uses write-protect faults plus explicit VMM-originated dirty
-marking. Both backends seal dirty RAM through the shared `src/dirty_ram.zig`
+marking. Single-vCPU HVF uses write-protect faults plus explicit VMM-originated
+dirty marking. Both backends seal dirty RAM through the shared `src/dirty_ram.zig`
 path: zero chunks are elided, nonzero chunks are written by BLAKE3 id, and the
 optional backing file is finalized as read-only local acceleration.
 
-Caught-up suspend should not perform a full configured-RAM scan. Active-write
-guests are different: suspend work is proportional to the unsealed dirty tail,
-and that tail must stay visible in benchmark and runtime stats.
+Capture seals the chunks dirtied since boot in one pass instead of scanning all
+configured RAM, so suspend work is proportional to the guest's dirty set. That
+cost must stay visible in benchmark and runtime stats.
 
 Elastic capture currently uses the full-scan path so the maximum-sized portable
 memory index and optional local backing remain authoritative for every plugged
-range. Fixed-memory capture retains the dirty-tracking fast path.
+range. Multi-vCPU HVF capture also uses the full scan. Fixed-memory KVM capture
+and single-vCPU HVF capture retain the dirty-tracking fast path.
 
 ## Current Limits
 

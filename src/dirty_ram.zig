@@ -14,7 +14,6 @@ pub const Stats = struct {
     seed_chunks: usize = 0,
     seed_nonzero_chunks: usize = 0,
     dirty_chunks_total: u64 = 0,
-    dirty_chunks_tail: u64 = 0,
     host_dirty_ranges_total: u64 = 0,
     host_dirty_chunks_total: u64 = 0,
     sealed_chunks_total: u64 = 0,
@@ -80,65 +79,9 @@ pub const ChunkRange = struct {
 };
 
 pub const FlushOptions = struct {
-    tail: bool,
-    stop: ?*const std.atomic.Value(bool) = null,
     record_cpu: bool = false,
     before_seal: ?*const fn (*anyopaque, usize) anyerror!void = null,
     before_seal_ctx: ?*anyopaque = null,
-};
-
-pub const TrackerCore = struct {
-    pub const Stats = struct {
-        dirty_epoch_ms: u64 = 0,
-        dirty_epoch_count: u64 = 0,
-        worker_epoch_max_ms: u64 = 0,
-        worker_cadence_lag_max_ms: u64 = 0,
-        worker_cadence_lag_total_ms: u64 = 0,
-        worker_epoch_overrun_count: u64 = 0,
-        worker_epoch_overrun_ms: u64 = 0,
-        worker_join_ms: u64 = 0,
-        finish_worker_stop_ms: u64 = 0,
-    };
-
-    epoch_ms: u64,
-    stop: std.atomic.Value(bool) = .init(false),
-    worker_thread: ?std.Thread = null,
-    worker_failed: bool = false,
-    tracking_start_ms: u64 = 0,
-    stats: @This().Stats = .{},
-
-    pub fn init(epoch_ms: u64) TrackerCore {
-        return .{
-            .epoch_ms = epoch_ms,
-            .stats = .{ .dirty_epoch_ms = epoch_ms },
-        };
-    }
-
-    pub fn shouldStartWorker(self: *const TrackerCore) bool {
-        return self.epoch_ms != 0;
-    }
-
-    pub fn markWorkerFailed(self: *TrackerCore) void {
-        self.worker_failed = true;
-    }
-
-    pub fn resetStatsAfterBaseline(self: *TrackerCore) void {
-        self.stats = .{ .dirty_epoch_ms = self.epoch_ms };
-    }
-
-    pub fn recordWorkerEpochTiming(self: *TrackerCore, epoch_start: u64, epoch_end: u64, deadline_ms: u64) void {
-        const epoch_ms = epoch_end -| epoch_start;
-        const lag_ms = if (epoch_start > deadline_ms) epoch_start - deadline_ms else 0;
-        const overrun_ms = if (epoch_ms > self.epoch_ms) epoch_ms - self.epoch_ms else 0;
-
-        self.stats.worker_epoch_max_ms = @max(self.stats.worker_epoch_max_ms, epoch_ms);
-        self.stats.worker_cadence_lag_max_ms = @max(self.stats.worker_cadence_lag_max_ms, lag_ms);
-        self.stats.worker_cadence_lag_total_ms +|= lag_ms;
-        if (overrun_ms != 0) {
-            self.stats.worker_epoch_overrun_count +|= 1;
-            self.stats.worker_epoch_overrun_ms +|= overrun_ms;
-        }
-    }
 };
 
 pub const Sealer = struct {
@@ -251,7 +194,7 @@ pub const Sealer = struct {
     }
 
     pub fn flushMarked(self: *Sealer, options: FlushOptions) !u64 {
-        var dirty_indices = try self.collectDirtyIndices(options);
+        var dirty_indices = try self.collectDirtyIndices();
         defer dirty_indices.deinit(self.allocator);
         if (dirty_indices.items.len == 0) return 0;
 
@@ -276,13 +219,11 @@ pub const Sealer = struct {
         }
         self.recordSealWork(work_stats);
         self.stats.dirty_chunks_total += dirty_chunks_this_flush;
-        if (options.tail) self.stats.dirty_chunks_tail += dirty_chunks_this_flush;
         return dirty_chunks_this_flush;
     }
 
     pub fn resetStatsAfterBaseline(self: *Sealer) void {
         self.stats.dirty_chunks_total = 0;
-        self.stats.dirty_chunks_tail = 0;
         self.stats.host_dirty_ranges_total = 0;
         self.stats.host_dirty_chunks_total = 0;
         self.stats.sealed_chunks_total = 0;
@@ -371,16 +312,11 @@ pub const Sealer = struct {
         };
     }
 
-    fn collectDirtyIndices(self: *Sealer, options: FlushOptions) !std.ArrayList(usize) {
+    fn collectDirtyIndices(self: *Sealer) !std.ArrayList(usize) {
         var dirty_indices: std.ArrayList(usize) = .empty;
         errdefer dirty_indices.deinit(self.allocator);
 
         for (self.dirty_chunks, 0..) |is_dirty, i| {
-            if (!options.tail) {
-                if (options.stop) |stop| {
-                    if (stop.load(.acquire)) break;
-                }
-            }
             if (!is_dirty) continue;
             try dirty_indices.append(self.allocator, i);
         }
@@ -389,7 +325,6 @@ pub const Sealer = struct {
 
     fn shouldParallelFlush(self: *const Sealer, options: FlushOptions, dirty_count: usize) bool {
         _ = self;
-        if (!options.tail) return false;
         if (options.before_seal != null) return false;
         return dirty_count >= 4 and chunk_sealer.parallelWorkerCount(dirty_count) > 1;
     }
@@ -625,6 +560,10 @@ fn testDir(allocator: std.mem.Allocator) ![]const u8 {
     return buf;
 }
 
+fn removeTestDir(dir: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
+}
+
 fn readFileAllForTest(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) ![]u8 {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
@@ -648,31 +587,6 @@ fn readFileAllForTest(allocator: std.mem.Allocator, path: [:0]const u8, max: usi
     return buf;
 }
 
-test "dirty tracker core records worker timing and resets baseline stats" {
-    var core = TrackerCore.init(250);
-    try std.testing.expect(core.shouldStartWorker());
-    try std.testing.expectEqual(@as(u64, 250), core.stats.dirty_epoch_ms);
-
-    core.stats.dirty_epoch_count = 3;
-    core.recordWorkerEpochTiming(1200, 1500, 1000);
-    try std.testing.expectEqual(@as(u64, 300), core.stats.worker_epoch_max_ms);
-    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_max_ms);
-    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_total_ms);
-    try std.testing.expectEqual(@as(u64, 1), core.stats.worker_epoch_overrun_count);
-    try std.testing.expectEqual(@as(u64, 50), core.stats.worker_epoch_overrun_ms);
-
-    core.recordWorkerEpochTiming(2000, 2100, 2200);
-    try std.testing.expectEqual(@as(u64, 300), core.stats.worker_epoch_max_ms);
-    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_max_ms);
-    try std.testing.expectEqual(@as(u64, 200), core.stats.worker_cadence_lag_total_ms);
-    try std.testing.expectEqual(@as(u64, 1), core.stats.worker_epoch_overrun_count);
-
-    core.resetStatsAfterBaseline();
-    try std.testing.expectEqual(@as(u64, 250), core.stats.dirty_epoch_ms);
-    try std.testing.expectEqual(@as(u64, 0), core.stats.dirty_epoch_count);
-    try std.testing.expectEqual(@as(u64, 0), core.stats.worker_epoch_max_ms);
-}
-
 test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -680,6 +594,7 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, 2 * spore.chunk_size + std.heap.page_size_min);
     @memset(ram, 0);
     ram[0] = 0x11;
@@ -719,6 +634,7 @@ test "dirty RAM sealer rejects preexisting symlink temp backing" {
     const arena = arena_state.allocator();
 
     const root_dir = try testDir(arena);
+    defer removeTestDir(root_dir);
     const dir = try pathZ(arena, "{s}/spore", .{root_dir});
     try ensureDir(dir);
     const victim_path = try pathZ(arena, "{s}/victim", .{root_dir});
@@ -747,6 +663,7 @@ test "dirty RAM sealer rejects corrupt preexisting chunks" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, spore.chunk_size);
     @memset(ram, 0x5A);
     ram[ram.len - 1] = 0xA5;
@@ -769,6 +686,7 @@ test "dirty RAM sealer can seed only known populated ranges" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, 3 * spore.chunk_size);
     @memset(ram, 0);
     ram[0] = 0x11;
@@ -804,6 +722,7 @@ test "dirty RAM sealer deduplicates overlapping seed ranges" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, 3 * spore.chunk_size);
     @memset(ram, 0);
     ram[0] = 0x11;
@@ -832,6 +751,7 @@ test "dirty RAM sealer rejects seed ranges outside RAM" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, spore.chunk_size);
     @memset(ram, 0);
 
@@ -842,13 +762,14 @@ test "dirty RAM sealer rejects seed ranges outside RAM" {
     try std.testing.expect(std.c.access(tmp_path, 0) != 0);
 }
 
-test "dirty RAM sealer tracks dirty ranges tail counts and zero transitions" {
+test "dirty RAM sealer tracks dirty ranges and zero transitions" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, 2 * spore.chunk_size);
     @memset(ram, 0);
 
@@ -862,10 +783,9 @@ test "dirty RAM sealer tracks dirty ranges tail counts and zero transitions" {
     try std.testing.expectEqual(@as(u64, 1), sealer.stats.host_dirty_chunks_total);
     try std.testing.expectEqual(@as(usize, 1), sealer.dirtyChunksPending());
 
-    const flushed = try sealer.flushMarked(.{ .tail = false });
+    const flushed = try sealer.flushMarked(.{});
     try std.testing.expectEqual(@as(u64, 1), flushed);
     try std.testing.expectEqual(@as(u64, 1), sealer.stats.dirty_chunks_total);
-    try std.testing.expectEqual(@as(u64, 0), sealer.stats.dirty_chunks_tail);
     try std.testing.expectEqual(@as(u64, 1), sealer.stats.sealed_chunks_total);
     try std.testing.expect(sealer.refs[0] != null);
     try std.testing.expectEqual(@as(usize, 1), sealer.nonzeroChunkCount());
@@ -874,10 +794,9 @@ test "dirty RAM sealer tracks dirty ranges tail counts and zero transitions" {
     ram[0] = 0;
     sealer.markCollectedChunkDirty(0);
     try std.testing.expectEqual(@as(usize, 1), sealer.dirtyChunksPending());
-    const tail_flushed = try sealer.flushMarked(.{ .tail = true });
-    try std.testing.expectEqual(@as(u64, 1), tail_flushed);
+    const zero_flushed = try sealer.flushMarked(.{});
+    try std.testing.expectEqual(@as(u64, 1), zero_flushed);
     try std.testing.expectEqual(@as(u64, 2), sealer.stats.dirty_chunks_total);
-    try std.testing.expectEqual(@as(u64, 1), sealer.stats.dirty_chunks_tail);
     try std.testing.expectEqual(@as(u64, 2), sealer.stats.sealed_chunks_total);
     try std.testing.expect(sealer.refs[0] == null);
     try std.testing.expectEqual(@as(usize, 0), sealer.nonzeroChunkCount());
@@ -896,6 +815,7 @@ test "dirty RAM host dirty ranges match chunk model" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, 4 * spore.chunk_size);
     @memset(ram, 0);
 
@@ -934,41 +854,9 @@ test "dirty RAM host dirty ranges match chunk model" {
         try std.testing.expectEqual(model[i], is_dirty);
     }
 
-    const flushed = try sealer.flushMarked(.{ .tail = true });
+    const flushed = try sealer.flushMarked(.{});
     try std.testing.expectEqual(newly_dirty, flushed);
     try std.testing.expect(!sealer.hasDirtyChunks());
-}
-
-test "dirty RAM sealer leaves stopped non-tail work for tail flush" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const dir = try testDir(arena);
-    const ram = try arena.alloc(u8, 2 * spore.chunk_size);
-    @memset(ram, 0);
-
-    var sealer = try Sealer.start(arena, .{ .dir = dir, .ram = ram });
-    defer sealer.deinit();
-    sealer.resetStatsAfterBaseline();
-
-    ram[0] = 0xAA;
-    ram[spore.chunk_size] = 0xBB;
-    sealer.markHostDirtyRange(0, spore.chunk_size + 1);
-
-    var stop = std.atomic.Value(bool).init(true);
-    const flushed = try sealer.flushMarked(.{ .tail = false, .stop = &stop });
-    try std.testing.expectEqual(@as(u64, 0), flushed);
-    try std.testing.expect(sealer.hasDirtyChunks());
-    try std.testing.expectEqual(@as(usize, 2), sealer.dirtyChunksPending());
-
-    const tail_flushed = try sealer.flushMarked(.{ .tail = true, .stop = &stop });
-    try std.testing.expectEqual(@as(u64, 2), tail_flushed);
-    try std.testing.expectEqual(@as(u64, 2), sealer.stats.dirty_chunks_total);
-    try std.testing.expectEqual(@as(u64, 2), sealer.stats.dirty_chunks_tail);
-    try std.testing.expect(!sealer.hasDirtyChunks());
-    try std.testing.expectEqual(@as(usize, 0), sealer.dirtyChunksPending());
 }
 
 test "dirty RAM sealer preserves refs when zero backing write fails" {
@@ -978,6 +866,7 @@ test "dirty RAM sealer preserves refs when zero backing write fails" {
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, spore.chunk_size);
     @memset(ram, 0);
     ram[0] = 0x77;
@@ -992,7 +881,7 @@ test "dirty RAM sealer preserves refs when zero backing write fails" {
     _ = std.c.close(sealer.backing_fd);
     sealer.backing_fd = -1;
 
-    try std.testing.expectError(error.IoFailed, sealer.flushMarked(.{ .tail = true }));
+    try std.testing.expectError(error.IoFailed, sealer.flushMarked(.{}));
     try std.testing.expect(sealer.refs[0] != null);
     try std.testing.expectEqualSlices(u8, old_ref, sealer.refs[0].?);
     try std.testing.expect(sealer.hasDirtyChunks());
@@ -1000,13 +889,14 @@ test "dirty RAM sealer preserves refs when zero backing write fails" {
     try std.testing.expectEqual(@as(usize, 1), sealer.dirtyChunksPending());
 }
 
-test "dirty RAM sealer can flush a dirty tail in parallel" {
+test "dirty RAM sealer can flush dirty chunks in parallel" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const dir = try testDir(arena);
+    defer removeTestDir(dir);
     const ram = try arena.alloc(u8, 8 * spore.chunk_size);
     @memset(ram, 0);
 
@@ -1020,10 +910,9 @@ test "dirty RAM sealer can flush a dirty tail in parallel" {
     }
     try std.testing.expectEqual(@as(usize, 8), sealer.dirtyChunksPending());
 
-    const tail_flushed = try sealer.flushMarked(.{ .tail = true, .record_cpu = true });
-    try std.testing.expectEqual(@as(u64, 8), tail_flushed);
+    const flushed = try sealer.flushMarked(.{ .record_cpu = true });
+    try std.testing.expectEqual(@as(u64, 8), flushed);
     try std.testing.expectEqual(@as(u64, 8), sealer.stats.dirty_chunks_total);
-    try std.testing.expectEqual(@as(u64, 8), sealer.stats.dirty_chunks_tail);
     try std.testing.expectEqual(@as(u64, 8), sealer.stats.sealed_chunks_total);
     try std.testing.expect(!sealer.hasDirtyChunks());
     try std.testing.expectEqual(@as(usize, 8), sealer.nonzeroChunkCount());

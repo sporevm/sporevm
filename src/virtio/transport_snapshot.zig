@@ -18,7 +18,7 @@ pub fn validateFullSnapshotDevices(transports: []const mmio.Transport, vsock_dev
     // Host-to-guest vsock packets queued outside the virtqueues are not part
     // of the manifest, so capturing now would silently drop them.
     if (vsock_dev.pending_len != 0) {
-        std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
+        std.log.warn("cannot snapshot while virtio-vsock has pending packets", .{});
         return error.DeviceStatePending;
     }
 }
@@ -42,5 +42,21 @@ test "full snapshots reject growth-only transport features" {
     try std.testing.expectError(
         error.NonResumableDeviceProfile,
         validateFullSnapshotDevices(&growth_transports, &vsock_dev),
+    );
+}
+
+test "full snapshots reject pending host vsock packets" {
+    var vsock_dev = vsock.Vsock.init(.{ .guest_cid = vsock.default_guest_cid });
+    const no_transports = [_]mmio.Transport{};
+    try validateFullSnapshotDevices(&no_transports, &vsock_dev);
+
+    // Attaching a host stream queues its connect request outside the
+    // virtqueues until the guest posts receive buffers.
+    var stream = try vsock.HostStream.init(10700, "{}\n");
+    try vsock_dev.attachHostStream(&stream);
+    try std.testing.expect(vsock_dev.pending_len != 0);
+    try std.testing.expectError(
+        error.DeviceStatePending,
+        validateFullSnapshotDevices(&no_transports, &vsock_dev),
     );
 }
