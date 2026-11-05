@@ -357,8 +357,7 @@ fn unavailableReasonName(reason: backend_mod.UnavailableReason) []const u8 {
         .unsupported_host => "unsupported_os_or_arch",
         .missing_dev_kvm => "missing_dev_kvm",
         .kvm_open_failed => "kvm_open_failed",
-        .api_version_mismatch => "api_version_mismatch",
-        .missing_capability => "kvm_capability_missing",
+        .incompatible_cpu_profile => "cpu_profile_incompatible",
         .kvm_probe_failed => "kvm_probe_failed",
     };
 }

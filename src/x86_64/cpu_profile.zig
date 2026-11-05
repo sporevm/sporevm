@@ -248,6 +248,16 @@ pub const HostFacts = struct {
     has_tsc_offset: bool,
 };
 
+/// Requested CPUID feature bits, per register, that KVM does not support.
+pub const MissingCpuid = struct {
+    function: u32,
+    index: u32,
+    eax: u32 = 0,
+    ebx: u32 = 0,
+    ecx: u32 = 0,
+    edx: u32 = 0,
+};
+
 pub const Incompatibility = union(enum) {
     api_version: u32,
     vendor,
@@ -255,11 +265,36 @@ pub const Incompatibility = union(enum) {
     missing_capability: u32,
     capability_value: u32,
     missing_msr: u32,
-    unsupported_cpuid: struct { function: u32, index: u32 },
+    unsupported_cpuid: MissingCpuid,
     xsave_size: u32,
     tsc_frequency: u64,
     tsc_offset,
+
+    pub fn format(self: Incompatibility, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .api_version => |version| try writer.print("KVM API version is {d}, need {d}", .{ version, kvm.KVM_API_VERSION }),
+            .vendor => try writer.print("host CPU vendor is not {s}", .{vendor_id}),
+            .vcpu_capacity => |count| try writer.print("vCPU count is limited to {d}", .{count}),
+            .missing_capability, .capability_value => |id| try writer.print("KVM capability {s} ({d}) is missing or insufficient", .{ capabilityName(id), id }),
+            .missing_msr => |index| try writer.print("KVM does not list MSR 0x{x}", .{index}),
+            .unsupported_cpuid => |missing| {
+                try writer.print("KVM does not support CPUID 0x{x}.{d} features:", .{ missing.function, missing.index });
+                inline for (.{ "eax", "ebx", "ecx", "edx" }) |register| {
+                    const bits = @field(missing, register);
+                    if (bits != 0) try writer.print(" {s}=0x{x}", .{ register, bits });
+                }
+            },
+            .xsave_size => |bytes| try writer.print("KVM XSAVE area is {d} bytes", .{bytes}),
+            .tsc_frequency => |khz| try writer.print("guest TSC is {d} kHz, need {d} kHz", .{ khz, guest_tsc_khz }),
+            .tsc_offset => try writer.writeAll("KVM cannot set the vCPU TSC offset"),
+        }
+    }
 };
+
+fn capabilityName(id: u32) []const u8 {
+    for (required_capabilities) |required| if (required.id == id) return required.name;
+    return "unknown";
+}
 
 pub fn compatibility(facts: HostFacts, requested_vcpus: topology.VcpuCount) ?Incompatibility {
     topology.validateVcpuCount(requested_vcpus) catch return .{ .vcpu_capacity = requested_vcpus };
@@ -276,11 +311,11 @@ pub fn compatibility(facts: HostFacts, requested_vcpus: topology.VcpuCount) ?Inc
     const requested_cpuid = candidateCpuid(requested_vcpus, 0) catch return .{ .vcpu_capacity = requested_vcpus };
     for (requested_cpuid.entries[0..requested_cpuid.nent]) |requested| {
         if (!cpuidFeatureLeaf(requested.function)) continue;
+        // A leaf KVM omits supports none of its feature bits.
         const supported = findCpuid(facts.supported_cpuid, requested.function, requested.index) orelse
-            return .{ .unsupported_cpuid = .{ .function = requested.function, .index = requested.index } };
-        if (!cpuidFeaturesSupported(requested, supported)) {
-            return .{ .unsupported_cpuid = .{ .function = requested.function, .index = requested.index } };
-        }
+            kvm.CpuidEntry{ .function = requested.function, .index = requested.index };
+        const missing = missingCpuidFeatures(requested, supported);
+        if (missing.eax | missing.ebx | missing.ecx | missing.edx != 0) return .{ .unsupported_cpuid = missing };
     }
     if (facts.xsave_bytes < kvm_xsave_min_bytes or facts.xsave_bytes > kvm_xsave_max_bytes) return .{ .xsave_size = facts.xsave_bytes };
     if (facts.tsc_khz != guest_tsc_khz) return .{ .tsc_frequency = facts.tsc_khz };
@@ -292,28 +327,38 @@ fn cpuidFeatureLeaf(function: u32) bool {
     return function == 1 or function == 7 or function == 0x4000_0001 or function == 0x8000_0001 or function == 0x8000_0007;
 }
 
-fn cpuidFeaturesSupported(requested: kvm.CpuidEntry, supported: kvm.CpuidEntry) bool {
-    const subset = struct {
-        fn of(wanted: u32, available: u32) bool {
-            return wanted & ~available == 0;
-        }
-    }.of;
-    return switch (requested.function) {
+fn missingCpuidFeatures(requested: kvm.CpuidEntry, supported: kvm.CpuidEntry) MissingCpuid {
+    var missing = MissingCpuid{ .function = requested.function, .index = requested.index };
+    switch (requested.function) {
         // EAX is the CPU signature and EBX contains topology/cache-line
         // values. EDX.HTT is synthesized with the requested topology and
         // ECX.OSXSAVE is guest-CR4-dependent, so KVM deliberately
         // omits it from KVM_GET_SUPPORTED_CPUID even though KVM_SET_CPUID2
         // accepts it and updates the visible bit with CR4.OSXSAVE.
-        1 => subset(requested.ecx & ~@as(u32, 1 << 27), supported.ecx) and
-            subset(requested.edx & ~@as(u32, 1 << 28), supported.edx),
+        1 => {
+            missing.ecx = requested.ecx & ~@as(u32, 1 << 27) & ~supported.ecx;
+            missing.edx = requested.edx & ~@as(u32, 1 << 28) & ~supported.edx;
+        },
         // Leaf 7 EAX is the maximum subleaf; EBX, ECX, and EDX are features.
-        7 => subset(requested.ebx, supported.ebx) and subset(requested.ecx, supported.ecx) and subset(requested.edx, supported.edx),
-        0x4000_0001 => subset(requested.eax, supported.eax) and subset(requested.ebx, supported.ebx) and
-            subset(requested.ecx, supported.ecx) and subset(requested.edx, supported.edx),
-        0x8000_0001 => subset(requested.ecx, supported.ecx) and subset(requested.edx, supported.edx),
-        0x8000_0007 => subset(requested.edx, supported.edx),
+        7 => {
+            missing.ebx = requested.ebx & ~supported.ebx;
+            missing.ecx = requested.ecx & ~supported.ecx;
+            missing.edx = requested.edx & ~supported.edx;
+        },
+        0x4000_0001 => {
+            missing.eax = requested.eax & ~supported.eax;
+            missing.ebx = requested.ebx & ~supported.ebx;
+            missing.ecx = requested.ecx & ~supported.ecx;
+            missing.edx = requested.edx & ~supported.edx;
+        },
+        0x8000_0001 => {
+            missing.ecx = requested.ecx & ~supported.ecx;
+            missing.edx = requested.edx & ~supported.edx;
+        },
+        0x8000_0007 => missing.edx = requested.edx & ~supported.edx,
         else => unreachable,
-    };
+    }
+    return missing;
 }
 
 fn findCpuid(entries: []const kvm.CpuidEntry, function: u32, index: u32) ?kvm.CpuidEntry {
@@ -527,8 +572,7 @@ test "candidate compatibility returns typed first failures" {
         if (entry.function == 1) entry.ecx &= ~@as(u32, 1 << 28);
     }
     facts.supported_cpuid = insufficient.entries[0..insufficient.nent];
-    const cpuid_failure = compatibility(facts, 2).?.unsupported_cpuid;
-    try std.testing.expectEqual(@as(u32, 1), cpuid_failure.function);
+    try std.testing.expectEqual(MissingCpuid{ .function = 1, .index = 0, .ecx = 1 << 28 }, compatibility(facts, 2).?.unsupported_cpuid);
     facts.supported_cpuid = supported.entries[0..supported.nent];
     facts.xsave_bytes = 832;
     try std.testing.expectEqual(@as(u32, 832), compatibility(facts, 2).?.xsave_size);
@@ -538,4 +582,20 @@ test "candidate compatibility returns typed first failures" {
     facts.tsc_khz = guest_tsc_khz;
     facts.has_tsc_offset = false;
     try std.testing.expect(compatibility(facts, 2).? == .tsc_offset);
+}
+
+test "incompatibility names the failed host fact" {
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "host CPU vendor is not GenuineIntel",
+        try std.fmt.bufPrint(&buffer, "{f}", .{@as(Incompatibility, .vendor)}),
+    );
+    try std.testing.expectEqualStrings(
+        "KVM capability tsc_control (60) is missing or insufficient",
+        try std.fmt.bufPrint(&buffer, "{f}", .{Incompatibility{ .capability_value = kvm.KVM_CAP_TSC_CONTROL }}),
+    );
+    try std.testing.expectEqualStrings(
+        "KVM does not support CPUID 0x1.0 features: ecx=0x10000000",
+        try std.fmt.bufPrint(&buffer, "{f}", .{Incompatibility{ .unsupported_cpuid = .{ .function = 1, .index = 0, .ecx = 1 << 28 } }}),
+    );
 }

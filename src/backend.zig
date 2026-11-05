@@ -7,7 +7,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const architecture = @import("architecture.zig");
-const x86_cpu_profile = @import("x86_64/cpu_profile.zig");
 const x86_product_preflight = @import("x86_64/product_preflight.zig");
 const x86_kvm = @import("kvm/x86_64.zig");
 
@@ -43,27 +42,15 @@ pub const Error = error{
     UnsupportedBackend,
     MissingKvmDevice,
     KvmOpenFailed,
-    ApiVersionMismatch,
-    KvmCapabilityMissing,
+    IncompatibleCpuProfile,
     KvmProbeFailed,
-};
-
-pub const MissingCapability = struct {
-    name: []const u8,
-    id: u32,
-};
-
-pub const ApiVersion = struct {
-    got: usize,
-    want: usize,
 };
 
 pub const UnavailableReason = union(enum) {
     unsupported_host,
     missing_dev_kvm,
     kvm_open_failed,
-    api_version_mismatch: ApiVersion,
-    missing_capability: MissingCapability,
+    incompatible_cpu_profile,
     kvm_probe_failed,
 
     pub fn toError(self: UnavailableReason) Error {
@@ -71,8 +58,7 @@ pub const UnavailableReason = union(enum) {
             .unsupported_host => error.UnsupportedBackend,
             .missing_dev_kvm => error.MissingKvmDevice,
             .kvm_open_failed => error.KvmOpenFailed,
-            .api_version_mismatch => error.ApiVersionMismatch,
-            .missing_capability => error.KvmCapabilityMissing,
+            .incompatible_cpu_profile => error.IncompatibleCpuProfile,
             .kvm_probe_failed => error.KvmProbeFailed,
         };
     }
@@ -158,61 +144,14 @@ fn resolveBindingFor(backend: Backend, os: std.Target.Os.Tag, zig_arch: std.Targ
     return error.UnsupportedBackend;
 }
 
-pub const X86ProbeSnapshot = struct {
-    dev_kvm_present: bool = true,
-    open_succeeded: bool = true,
-    api_version: ?usize = null,
-    capability_values: [x86_cpu_profile.required_capabilities.len]?usize = @splat(null),
-
-    pub fn supported() X86ProbeSnapshot {
-        var snapshot = X86ProbeSnapshot{ .api_version = x86_kvm.KVM_API_VERSION };
-        for (x86_cpu_profile.required_capabilities, &snapshot.capability_values) |requirement, *value| {
-            value.* = @max(requirement.minimum, requirement.required_bits);
-        }
-        return snapshot;
-    }
-};
-
-pub fn classifyX86Probe(snapshot: X86ProbeSnapshot) ?UnavailableReason {
-    if (!snapshot.dev_kvm_present) return .missing_dev_kvm;
-    if (!snapshot.open_succeeded) return .kvm_open_failed;
-    const api_version = snapshot.api_version orelse return .kvm_probe_failed;
-    if (api_version != x86_kvm.KVM_API_VERSION) {
-        return .{ .api_version_mismatch = .{ .got = api_version, .want = x86_kvm.KVM_API_VERSION } };
-    }
-    for (x86_cpu_profile.required_capabilities, snapshot.capability_values) |descriptor, value| {
-        const capability = value orelse return .kvm_probe_failed;
-        if (capability < descriptor.minimum or (descriptor.required_bits != 0 and capability & descriptor.required_bits != descriptor.required_bits)) {
-            return .{ .missing_capability = .{ .name = descriptor.name, .id = descriptor.id } };
-        }
-    }
-    return null;
-}
-
 fn inspectX86Kvm() ?UnavailableReason {
-    var snapshot = X86ProbeSnapshot{};
-    if (std.c.access("/dev/kvm", 0) != 0) {
-        snapshot.dev_kvm_present = false;
-        return classifyX86Probe(snapshot);
-    }
-    const fd = x86_kvm.openDevKvm() catch {
-        snapshot.open_succeeded = false;
-        return classifyX86Probe(snapshot);
-    };
+    if (std.c.access("/dev/kvm", 0) != 0) return .missing_dev_kvm;
+    const fd = x86_kvm.openDevKvm() catch return .kvm_open_failed;
     defer _ = std.c.close(fd);
-
-    snapshot.api_version = x86_kvm.ioctl(fd, x86_kvm.KVM_GET_API_VERSION, 0, "KVM_GET_API_VERSION") catch null;
-    if (snapshot.api_version == null or snapshot.api_version.? != x86_kvm.KVM_API_VERSION) {
-        return classifyX86Probe(snapshot);
-    }
-    for (x86_cpu_profile.required_capabilities, 0..) |descriptor, index| {
-        snapshot.capability_values[index] = x86_kvm.checkExtension(fd, descriptor.id) catch null;
-        if (snapshot.capability_values[index] == null or snapshot.capability_values[index].? == 0) {
-            return classifyX86Probe(snapshot);
-        }
-    }
-    if (classifyX86Probe(snapshot)) |reason| return reason;
-    x86_product_preflight.requireCompatible(fd, 1) catch return .kvm_probe_failed;
+    x86_product_preflight.require(fd, 1) catch |err| return switch (err) {
+        error.IncompatibleCpuProfile => .incompatible_cpu_profile,
+        else => .kvm_probe_failed,
+    };
     return null;
 }
 
@@ -248,28 +187,6 @@ test "public product readiness includes probed x86 KVM" {
     }
 }
 
-test "x86 KVM probe reasons fail closed in stable order" {
-    try std.testing.expectEqual(UnavailableReason.missing_dev_kvm, classifyX86Probe(.{ .dev_kvm_present = false }).?);
-    try std.testing.expectEqual(UnavailableReason.kvm_open_failed, classifyX86Probe(.{ .open_succeeded = false }).?);
-    try std.testing.expectEqual(UnavailableReason.kvm_probe_failed, classifyX86Probe(.{ .api_version = null }).?);
-
-    const api_mismatch = classifyX86Probe(.{ .api_version = 11 }).?;
-    try std.testing.expectEqual(ApiVersion{ .got = 11, .want = 12 }, api_mismatch.api_version_mismatch);
-
-    for (x86_cpu_profile.required_capabilities, 0..) |descriptor, index| {
-        var snapshot = X86ProbeSnapshot.supported();
-        snapshot.capability_values[index] = 0;
-        const reason = classifyX86Probe(snapshot).?;
-        try std.testing.expectEqual(descriptor.id, reason.missing_capability.id);
-        try std.testing.expectEqualStrings(descriptor.name, reason.missing_capability.name);
-
-        snapshot.capability_values[index] = null;
-        try std.testing.expectEqual(UnavailableReason.kvm_probe_failed, classifyX86Probe(snapshot).?);
-    }
-
-    try std.testing.expectEqual(@as(?UnavailableReason, null), classifyX86Probe(X86ProbeSnapshot.supported()));
-}
-
 test "product runner resolution depends only on the request and host facts" {
     const x86_linux = Host{ .os = .linux, .arch = .x86_64 };
     const arm_linux = Host{ .os = .linux, .arch = .aarch64 };
@@ -294,7 +211,6 @@ test "availability reasons map to explicit product errors" {
     try std.testing.expectEqual(error.UnsupportedBackend, @as(UnavailableReason, .unsupported_host).toError());
     try std.testing.expectEqual(error.MissingKvmDevice, @as(UnavailableReason, .missing_dev_kvm).toError());
     try std.testing.expectEqual(error.KvmOpenFailed, @as(UnavailableReason, .kvm_open_failed).toError());
-    try std.testing.expectEqual(error.ApiVersionMismatch, (UnavailableReason{ .api_version_mismatch = .{ .got = 11, .want = 12 } }).toError());
-    try std.testing.expectEqual(error.KvmCapabilityMissing, (UnavailableReason{ .missing_capability = .{ .name = "irqchip", .id = 0 } }).toError());
+    try std.testing.expectEqual(error.IncompatibleCpuProfile, @as(UnavailableReason, .incompatible_cpu_profile).toError());
     try std.testing.expectEqual(error.KvmProbeFailed, @as(UnavailableReason, .kvm_probe_failed).toError());
 }
