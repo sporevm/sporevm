@@ -289,6 +289,10 @@ uses the platform cache directory. Cache setup messages are shown only with
 `spore --debug ...`, so command stdout and stderr stay workload-focused by
 default.
 
+Set `SPOREVM_DOCKER_HUB_MIRROR` to an HTTPS `host[:port]` such as `mirror.gcr.io`
+to pull `docker.io` images through that mirror; refs and digests still name
+`docker.io`, and a pull falls back to Docker Hub when the mirror lacks its manifest.
+
 OCI layers may contain distinct paths that differ only by case. On hosts with
 case-insensitive filesystems, such as the default macOS APFS configuration,
 SporeVM uses managed case-sensitive staging for rootfs materialization rather
