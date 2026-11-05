@@ -23,20 +23,40 @@ pub const Error = error{
     UnsafeRemoteFetchTarget,
 } || HostName.LookupError;
 
+/// Most validated addresses a fetch keeps from one resolution and tries in
+/// turn, so a host with many dead frontends cannot stall a fetch indefinitely.
+pub const max_addresses = 4;
+
+/// The validated addresses of one resolution, in resolver order. Never empty.
+pub const Addresses = struct {
+    items: [max_addresses]IpAddress = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const Addresses) []const IpAddress {
+        return self.items[0..self.len];
+    }
+
+    fn append(self: *Addresses, address: IpAddress) void {
+        if (self.len == max_addresses) return;
+        self.items[self.len] = address;
+        self.len += 1;
+    }
+};
+
 pub fn validateUrl(io: Io, raw_url: []const u8, options: Options) !void {
-    _ = try resolveUrlAddress(io, raw_url, options);
+    _ = try resolveUrlAddresses(io, raw_url, options);
 }
 
-pub fn resolveUrlAddress(io: Io, raw_url: []const u8, options: Options) !IpAddress {
+pub fn resolveUrlAddresses(io: Io, raw_url: []const u8, options: Options) !Addresses {
     const uri = try std.Uri.parse(raw_url);
-    return resolveUriAddress(io, uri, options);
+    return resolveUriAddresses(io, uri, options);
 }
 
 pub fn validateUri(io: Io, uri: std.Uri, options: Options) Error!void {
-    _ = try resolveUriAddress(io, uri, options);
+    _ = try resolveUriAddresses(io, uri, options);
 }
 
-pub fn resolveUriAddress(io: Io, uri: std.Uri, options: Options) Error!IpAddress {
+pub fn resolveUriAddresses(io: Io, uri: std.Uri, options: Options) Error!Addresses {
     if (options.require_https) {
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.UnsupportedRemoteFetchScheme;
     } else if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
@@ -46,17 +66,21 @@ pub fn resolveUriAddress(io: Io, uri: std.Uri, options: Options) Error!IpAddress
     const port = normalizedPort(uri) orelse return error.UnsupportedRemoteFetchScheme;
     var host_buffer: [HostName.max_len]u8 = undefined;
     const host = uri.getHost(&host_buffer) catch return error.UnsafeRemoteFetchTarget;
-    return resolveHostAddress(io, host.bytes, port);
+    return resolveHostAddresses(io, host.bytes, port);
 }
 
 pub fn validateHost(io: Io, raw_host: []const u8, port: u16) Error!void {
-    _ = try resolveHostAddress(io, raw_host, port);
+    _ = try resolveHostAddresses(io, raw_host, port);
 }
 
-pub fn resolveHostAddress(io: Io, raw_host: []const u8, port: u16) Error!IpAddress {
+/// Resolves `raw_host` and validates every answer: one unsafe address fails
+/// the whole resolution, even past the `max_addresses` kept for connecting.
+pub fn resolveHostAddresses(io: Io, raw_host: []const u8, port: u16) Error!Addresses {
+    var addresses: Addresses = .{};
     if (parseIpLiteral(raw_host, port)) |addr| {
         try validateAddress(addr);
-        return addr;
+        addresses.append(addr);
+        return addresses;
     }
 
     const host = HostName.init(raw_host) catch return error.UnsafeRemoteFetchTarget;
@@ -64,19 +88,19 @@ pub fn resolveHostAddress(io: Io, raw_host: []const u8, port: u16) Error!IpAddre
     var results: Io.Queue(HostName.LookupResult) = .init(&result_buffer);
     try HostName.lookup(host, io, &results, .{ .port = port });
 
-    var selected_address: ?IpAddress = null;
     while (results.getOneUncancelable(io)) |result| {
         switch (result) {
             .address => |address| {
                 try validateAddress(address);
-                if (selected_address == null) selected_address = address;
+                addresses.append(address);
             },
             .canonical_name => {},
         }
     } else |err| switch (err) {
         error.Closed => {},
     }
-    return selected_address orelse error.UnsafeRemoteFetchTarget;
+    if (addresses.len == 0) return error.UnsafeRemoteFetchTarget;
+    return addresses;
 }
 
 pub fn connectionTarget(uri: std.Uri, address: IpAddress, address_buffer: *[HostName.max_len]u8, logical_host_buffer: *[HostName.max_len]u8) Error!ConnectionTarget {
@@ -104,6 +128,68 @@ pub fn connectResolvedUri(client: *std.http.Client, uri: std.Uri, address: IpAdd
         .proxied_host = target.logical_host,
         .proxied_port = target.port,
     });
+}
+
+/// Sends a bodiless GET for `uri` to each of `addresses` in turn and returns
+/// the first response head, leaving the request in `req` for the caller to
+/// read and `deinit`. An address is skipped only when connecting to it fails
+/// or the connection closes or resets before any response head arrives;
+/// nothing has been answered and a GET is idempotent, so the next address may
+/// serve it. Any response, whatever its status, and every other error end the
+/// attempt. The last address's error is returned when none answers.
+pub fn getHead(
+    client: *std.http.Client,
+    uri: std.Uri,
+    addresses: []const IpAddress,
+    options: std.http.Client.RequestOptions,
+    req: *std.http.Client.Request,
+    head_buffer: []u8,
+) !std.http.Client.Response {
+    for (addresses, 1..) |address, attempt| {
+        const last = attempt == addresses.len;
+        const connection = connectResolvedUri(client, uri, address) catch |err| {
+            if (last or !addressFailed(err)) return err;
+            continue;
+        };
+        var request_options = options;
+        request_options.connection = connection;
+        req.* = client.request(.GET, uri, request_options) catch |err| {
+            client.connection_pool.release(connection, client.io);
+            return err;
+        };
+        req.sendBodiless() catch |err| {
+            req.deinit();
+            if (last or !addressFailed(err)) return err;
+            continue;
+        };
+        return req.receiveHead(head_buffer) catch |err| {
+            req.deinit();
+            if (last or !addressFailed(err)) return err;
+            continue;
+        };
+    }
+    return error.UnsafeRemoteFetchTarget;
+}
+
+/// Errors that mean an address did not answer: the connection or TLS
+/// handshake failed, or the connection closed or reset before a response head.
+fn addressFailed(err: anyerror) bool {
+    return switch (err) {
+        error.AddressUnavailable,
+        error.AddressFamilyUnsupported,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.Timeout,
+        error.TlsInitializationFailed,
+        error.HttpConnectionClosing,
+        error.ReadFailed,
+        error.WriteFailed,
+        => true,
+        else => false,
+    };
 }
 
 fn ensureTlsReady(client: *std.http.Client, protocol: std.http.Client.Protocol) !void {
@@ -273,4 +359,100 @@ test "fetch target policy initializes tls state for resolved-address connects" {
     if (std.http.Client.disable_tls) return error.SkipZigTest;
     try ensureTlsReady(&client, .tls);
     try std.testing.expect(client.now != null);
+}
+
+/// Loopback HTTP server that answers its nth connection with `replies[n]`
+/// after reading the request head, and closes without replying when that
+/// entry is null or past the end.
+const TestServer = struct {
+    io: Io,
+    server: Io.net.Server,
+    replies: []const ?[]const u8,
+    thread: std.Thread = undefined,
+    closed: std.atomic.Value(bool) = .init(false),
+    accepted: usize = 0,
+
+    fn start(self: *TestServer, replies: []const ?[]const u8) !void {
+        var address = try IpAddress.parseIp4("127.0.0.1", 0);
+        self.* = .{
+            .io = std.testing.io,
+            .server = try address.listen(std.testing.io, .{ .kernel_backlog = 8, .reuse_address = true }),
+            .replies = replies,
+        };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    /// Stops the server and returns how many connections it accepted.
+    fn stop(self: *TestServer) usize {
+        self.closed.store(true, .release);
+        if (self.server.socket.address.connect(self.io, .{ .mode = .stream })) |stream| stream.close(self.io) else |_| {}
+        self.thread.join();
+        self.server.deinit(self.io);
+        return self.accepted;
+    }
+
+    fn serve(self: *TestServer) void {
+        while (true) {
+            const stream = self.server.accept(self.io) catch return;
+            defer stream.close(self.io);
+            if (self.closed.load(.acquire)) return;
+            const reply = if (self.accepted < self.replies.len) self.replies[self.accepted] else null;
+            self.accepted += 1;
+
+            var read_buffer: [1024]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            while (reader.interface.takeDelimiter('\n') catch return) |line| {
+                if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+            }
+            var write_buffer: [256]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+            writer.interface.writeAll(reply orelse continue) catch return;
+            writer.interface.flush() catch return;
+        }
+    }
+
+    /// GETs from the server through `address_count` copies of its address.
+    fn getStatus(self: *TestServer, address_count: usize) !std.http.Status {
+        var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = self.io };
+        defer client.deinit();
+        var url_buffer: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/file", .{self.server.socket.address.getPort()});
+        var addresses: Addresses = .{};
+        for (0..address_count) |_| addresses.append(self.server.socket.address);
+
+        var req: std.http.Client.Request = undefined;
+        var head_buffer: [1024]u8 = undefined;
+        const response = try getHead(&client, try std.Uri.parse(url), addresses.slice(), .{
+            .redirect_behavior = .unhandled,
+            .keep_alive = false,
+        }, &req, &head_buffer);
+        defer req.deinit();
+        return response.head.status;
+    }
+};
+
+const test_ok_reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+test "fetch GET moves to the next address when one closes before a response head" {
+    var server: TestServer = undefined;
+    try server.start(&.{ null, test_ok_reply });
+    const status = server.getStatus(2);
+    try std.testing.expectEqual(@as(usize, 2), server.stop());
+    try std.testing.expectEqual(std.http.Status.ok, try status);
+}
+
+test "fetch GET returns the last address's error when none answers" {
+    var server: TestServer = undefined;
+    try server.start(&.{ null, null });
+    const status = server.getStatus(2);
+    try std.testing.expectEqual(@as(usize, 2), server.stop());
+    try std.testing.expectError(error.HttpConnectionClosing, status);
+}
+
+test "fetch GET does not retry another address after a response head" {
+    var server: TestServer = undefined;
+    try server.start(&.{ "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", test_ok_reply });
+    const status = server.getStatus(2);
+    try std.testing.expectEqual(@as(usize, 1), server.stop());
+    try std.testing.expectEqual(std.http.Status.service_unavailable, try status);
 }
