@@ -751,7 +751,6 @@ pub const ExecNamedStreamOptions = struct {
     guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
-    terminal_name: []const u8 = "xterm",
     terminal_size: TerminalSize = .{ .rows = 24, .cols = 80 },
 };
 
@@ -1328,7 +1327,6 @@ fn execNamedStreaming(
         .guest_working_dir = options.guest_working_dir,
         .interactive = options.interactive,
         .tty = options.tty,
-        .terminal_name = terminalName(context.environ_map),
         .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
     });
 }
@@ -1919,12 +1917,13 @@ pub fn createCli(
             const message = allocLifecycleMessage(allocator, "spore create: request is outside the fresh x86-64 KVM profile: {s}", .{@errorName(err)});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },
-        error.InvalidNetworkPolicy, error.InvalidRootfsInput, error.ImageCommandMissing, error.UnsupportedImageUser, error.RunArgCountUnsupported, error.RunArgTooLong => {
+        error.InvalidNetworkPolicy, error.InvalidRootfsInput, error.ImageCommandMissing, error.UnsupportedImageUser, error.RunArgCountUnsupported, error.RunArgTooLong, error.RunProgramEmpty => {
             const message = switch (err) {
                 error.ImageCommandMissing => "spore create: image has no Entrypoint or Cmd; pass an initial command",
                 error.UnsupportedImageUser => "spore create: image Config.User must select root (root, 0, root:root, or 0:0); guest credential switching is not supported yet",
                 error.RunArgCountUnsupported => "spore create: effective image command has too many arguments (maximum 16)",
                 error.RunArgTooLong => "spore create: effective image command contains an argument longer than 8191 bytes",
+                error.RunProgramEmpty => "spore create: effective command has an empty program name",
                 else => allocLifecycleMessage(allocator, "spore create: invalid configuration: {s}", .{@errorName(err)}),
             };
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
@@ -4899,8 +4898,6 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
         env: []const []const u8,
         working_dir: ?[]const u8,
         stdio: []const u8,
-        interactive: bool,
-        term: []const u8,
         terminal_rows: u16,
         terminal_cols: u16,
     }{
@@ -4908,8 +4905,6 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
         .env = options.guest_env,
         .working_dir = options.guest_working_dir,
         .stdio = if (options.tty) "tty" else "pipe",
-        .interactive = options.interactive,
-        .term = options.terminal_name,
         .terminal_rows = options.terminal_size.rows,
         .terminal_cols = options.terminal_size.cols,
     };
@@ -5319,10 +5314,6 @@ fn handleExecResize(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*anyopa
 
 fn execResizeNotify() void {
     _ = exec_resize_count.fetchAdd(1, .acq_rel);
-}
-
-fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
-    return environ.get("TERM") orelse "xterm";
 }
 
 fn ioctlRequest(comptime request: anytype) c_int {

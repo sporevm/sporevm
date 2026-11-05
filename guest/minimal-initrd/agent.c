@@ -53,7 +53,6 @@
 #define INITIAL_OUTPUT_HEADER_LEN 3
 #define INITIAL_OUTPUT_CAP (16 * 1024 - INITIAL_OUTPUT_HEADER_LEN)
 #define REPLAY_CAP 65536
-#define SESSION_ID "default"
 #define GEN_PARAMS_MAX 4096
 #define SPORE_NET_IFACE "eth0"
 #define SPORE_NET_GUEST_IP "100.96.0.2"
@@ -239,7 +238,6 @@ struct session {
 
 struct client {
   int fd;
-  int protocol_v1;
   uint64_t stdout_offset;
   uint64_t stderr_offset;
   uint64_t stdin_offset;
@@ -1108,7 +1106,6 @@ static int write_file_atomic(const char *path, const char *data, size_t len) {
 
 static int parse_string_field(const char *req, const char *name, char *out, size_t cap);
 static int parse_u64_field(const char *req, const char *name, uint64_t *out);
-static int parse_bool_field(const char *req, const char *name, int *out);
 
 static void env_append(char *env, size_t *len, const char *key, const char *value) {
   if (value[0] == '\0' || *len >= 2048) return;
@@ -1339,26 +1336,6 @@ static void replay_append(struct replay_buffer *replay, uint64_t offset, const u
   replay->len += len;
 }
 
-static int send_stream_frame(int fd, const char *name, uint64_t offset, const unsigned char *buf, size_t len) {
-  char header[96];
-  int n = snprintf(header, sizeof(header), "%s %llu %zu\n", name, (unsigned long long)offset, len);
-  if (n <= 0 || (size_t)n >= sizeof(header)) return -1;
-  if (write_all(fd, header, (size_t)n) != 0) return -1;
-  if (len > 0 && write_all(fd, buf, len) != 0) return -1;
-  return 0;
-}
-
-static int send_stream_data(int fd, const char *name, uint64_t offset, const unsigned char *buf, size_t len) {
-  size_t sent = 0;
-  while (sent < len) {
-    size_t chunk = len - sent;
-    if (chunk > MAX_FRAME_PAYLOAD) chunk = MAX_FRAME_PAYLOAD;
-    if (send_stream_frame(fd, name, offset + sent, buf + sent, chunk) != 0) return -1;
-    sent += chunk;
-  }
-  return 0;
-}
-
 static void write_le16(unsigned char *out, uint16_t value) {
   out[0] = (unsigned char)(value & 0xff);
   out[1] = (unsigned char)((value >> 8) & 0xff);
@@ -1532,31 +1509,12 @@ static int format_timing(char *frame, size_t cap) {
   return n;
 }
 
-static int send_timing_frame(int fd) {
-  char frame[192];
-  int n = format_timing(frame, sizeof(frame));
-  if (n < 0) return -1;
-  return write_all(fd, frame, (size_t)n);
-}
-
 static int send_spio_timing_frame(int fd) {
   char frame[192];
   int n = format_timing(frame, sizeof(frame));
   if (n < 0) return -1;
   if (n > 0 && frame[n - 1] == '\n') n--;
   return send_spio_frame(fd, SPIO_EVENT, SPIO_CONTROL_STREAM, 0, (const unsigned char *)frame, (size_t)n);
-}
-
-static int send_memory_pressure_frame(int fd) {
-  return write_all(fd, "memory-pressure\n", 16);
-}
-
-static int send_exit_frame(int fd, int exit_code) {
-  char frame[32];
-  int n = snprintf(frame, sizeof(frame), "exit %d\n", exit_code);
-  if (n <= 0 || (size_t)n >= sizeof(frame)) return -1;
-  (void)send_timing_frame(fd);
-  return write_all(fd, frame, (size_t)n);
 }
 
 static int write_text_file(const char *path, const char *text) {
@@ -1699,7 +1657,6 @@ static void close_client(struct client *client) {
     close(client->fd);
     client->fd = -1;
   }
-  client->protocol_v1 = 0;
   client->stdout_offset = 0;
   client->stderr_offset = 0;
   client->stdin_offset = 0;
@@ -1718,14 +1675,8 @@ static void close_client(struct client *client) {
 static int send_client_output(struct session *session, struct client *client, const char *name, uint64_t *client_offset, uint64_t offset, const unsigned char *buf, size_t len) {
   if (client->fd < 0) return -1;
   if (*client_offset != offset) return 0;
-  int rc;
-  if (client->protocol_v1) {
-    uint32_t stream_id = strcmp(name, "stdout") == 0 ? SPIO_STDOUT_STREAM : SPIO_STDERR_STREAM;
-    rc = send_spio_data(client->fd, stream_id, offset, buf, len);
-  } else {
-    rc = send_stream_data(client->fd, name, offset, buf, len);
-  }
-  if (rc != 0) {
+  uint32_t stream_id = strcmp(name, "stdout") == 0 ? SPIO_STDOUT_STREAM : SPIO_STDERR_STREAM;
+  if (send_spio_data(client->fd, stream_id, offset, buf, len) != 0) {
     close_client_input_lost(session, client);
     return -1;
   }
@@ -1734,7 +1685,7 @@ static int send_client_output(struct session *session, struct client *client, co
 }
 
 static int send_client_terminal_output(struct session *session, struct client *client, uint64_t offset, const unsigned char *buf, size_t len) {
-  if (client->fd < 0 || !client->protocol_v1) return -1;
+  if (client->fd < 0) return -1;
   if (client->terminal_offset != offset) return 0;
   if (send_spio_data(client->fd, SPIO_TERMINAL_STREAM, offset, buf, len) != 0) {
     close_client_input_lost(session, client);
@@ -1930,123 +1881,6 @@ static int parse_json_string(const char **cursor, char *out, size_t cap) {
   return 0;
 }
 
-static int skip_json_dispatch_value(const char **cursor, char *scratch, size_t scratch_cap) {
-  const char *p = skip_ws(*cursor);
-  if (*p == '"') {
-    if (parse_json_string(&p, scratch, scratch_cap) != 0) return -1;
-    *cursor = p;
-    return 0;
-  }
-
-  const char *start = p;
-  char closers[16];
-  size_t depth = 0;
-  while (*p != '\0') {
-    if (*p == '"') {
-      if (parse_json_string(&p, scratch, scratch_cap) != 0) return -1;
-      continue;
-    }
-    if (*p == '[' || *p == '{') {
-      if (depth >= sizeof(closers)) return -1;
-      closers[depth++] = *p == '[' ? ']' : '}';
-      p++;
-      continue;
-    }
-    if (*p == ']' || *p == '}') {
-      if (depth == 0) {
-        if (*p != '}' || p == start) return -1;
-        *cursor = p;
-        return 0;
-      }
-      if (closers[depth - 1] != *p) return -1;
-      depth--;
-      p++;
-      continue;
-    }
-    if (*p == ',' && depth == 0) {
-      if (p == start) return -1;
-      *cursor = p;
-      return 0;
-    }
-    p++;
-  }
-  return -1;
-}
-
-static int parse_top_level_request_type(const char *req, char *type, size_t type_cap) {
-  const char *p = skip_ws(req);
-  if (*p != '{') return -1;
-  p++;
-  int seen_type = 0;
-  char scratch[MAX_REQUEST];
-  for (;;) {
-    p = skip_ws(p);
-    if (*p == '}') {
-      p++;
-      break;
-    }
-
-    char key[32];
-    if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
-    p = skip_ws(p);
-    if (*p != ':') return -1;
-    p = skip_ws(p + 1);
-    if (strcmp(key, "type") == 0) {
-      if (seen_type || parse_json_string(&p, type, type_cap) != 0) return -1;
-      seen_type = 1;
-    } else if (skip_json_dispatch_value(&p, scratch, sizeof(scratch)) != 0) {
-      return -1;
-    }
-
-    p = skip_ws(p);
-    if (*p == '}') {
-      p++;
-      break;
-    }
-    if (*p != ',') return -1;
-    p = skip_ws(p + 1);
-    if (*p == '}') return -1;
-  }
-  if (*skip_ws(p) != '\0') return -1;
-  return seen_type;
-}
-
-static int parse_argv(const char *req, char storage[MAX_ARG_STORAGE], char *argv[MAX_ARGC + 1]) {
-  const char *p = strstr(req, "\"argv\"");
-  if (p == NULL) p = strstr(req, "\"command\"");
-  if (p == NULL) return -1;
-  p = strchr(p, '[');
-  if (p == NULL) return -1;
-  p++;
-
-  int argc = 0;
-  size_t storage_len = 0;
-  for (;;) {
-    p = skip_ws(p);
-    if (*p == ']') {
-      argv[argc] = NULL;
-      return argc > 0 ? argc : -1;
-    }
-    if (argc >= MAX_ARGC) return -1;
-    if (storage_len >= MAX_ARG_STORAGE) return -1;
-    argv[argc] = storage + storage_len;
-    if (parse_json_string(&p, argv[argc], MAX_ARG_STORAGE - storage_len) != 0) return -1;
-    storage_len += strlen(argv[argc]) + 1;
-    argc++;
-
-    p = skip_ws(p);
-    if (*p == ',') {
-      p++;
-      continue;
-    }
-    if (*p == ']') {
-      argv[argc] = NULL;
-      return argc;
-    }
-    return -1;
-  }
-}
-
 static const char *find_field_value(const char *req, const char *name) {
   char key[64];
   snprintf(key, sizeof(key), "\"%s\"", name);
@@ -2060,45 +1894,16 @@ static const char *find_field_value(const char *req, const char *name) {
   return NULL;
 }
 
-static int parse_env(const char *req, char storage[MAX_ENVC][MAX_ENV_LEN], char *envp[MAX_ENVC + 1]) {
-  const char *p = find_field_value(req, "env");
-  if (p == NULL) {
-    envp[0] = NULL;
-    return 0;
-  }
-  if (*p != '[') return -1;
-  p++;
-
-  int envc = 0;
-  for (;;) {
-    p = skip_ws(p);
-    if (*p == ']') {
-      envp[envc] = NULL;
-      return envc;
-    }
-    if (envc >= MAX_ENVC) return -1;
-    if (parse_json_string(&p, storage[envc], MAX_ENV_LEN) != 0) return -1;
-    envp[envc] = storage[envc];
-    envc++;
-
-    p = skip_ws(p);
-    if (*p == ',') {
-      p++;
-      continue;
-    }
-    if (*p == ']') {
-      envp[envc] = NULL;
-      return envc;
-    }
-    return -1;
-  }
-}
+enum request_stdio {
+  REQUEST_STDIO_NULL,
+  REQUEST_STDIO_PIPE,
+  REQUEST_STDIO_TTY,
+};
 
 enum request_kind {
   REQUEST_READY,
   REQUEST_START,
   REQUEST_ATTACH,
-  REQUEST_GENERATION,
   REQUEST_COPY_IN,
   REQUEST_COPY_OUT,
   REQUEST_BUILD_RUN,
@@ -2116,7 +1921,7 @@ struct run_request {
   uint64_t stdout_offset;
   uint64_t stderr_offset;
   uint64_t resume_time_unix_ns;
-  int protocol_v1;
+  int stdio;
   int stdin_enabled;
   int tty;
   int interactive;
@@ -2222,7 +2027,6 @@ static int parse_exec_argv_value(const char **cursor, struct run_request *out) {
 
   int argc = 0;
   size_t storage_len = 0;
-  size_t decoded_len = 0;
   p = skip_ws(p);
   if (*p == ']') {
     out->argv[0] = NULL;
@@ -2233,10 +2037,7 @@ static int parse_exec_argv_value(const char **cursor, struct run_request *out) {
     if (argc >= MAX_ARGC || storage_len >= sizeof(out->arg_storage)) return -1;
     out->argv[argc] = out->arg_storage + storage_len;
     if (parse_json_string(&p, out->argv[argc], sizeof(out->arg_storage) - storage_len) != 0) return -1;
-    size_t arg_len = strlen(out->argv[argc]);
-    if (arg_len > MAX_BUILD_EXEC_ARGS_BYTES - decoded_len) return -1;
-    decoded_len += arg_len;
-    storage_len += arg_len + 1;
+    storage_len += strlen(out->argv[argc]) + 1;
     argc++;
 
     p = skip_ws(p);
@@ -2482,249 +2283,6 @@ static int parse_build_context_binds_value(const char **cursor, struct run_reque
   return 0;
 }
 
-// Shell form streams command_len bytes after the request and sends an empty
-// argv; exec form sends argv with command_len 0. Context binds are shell-only,
-// matching the host planner.
-static int parse_build_run_request(const char *req, size_t req_len, struct run_request *out) {
-  if (req_len == 0 || req[req_len - 1] != '\n') return -1;
-  enum {
-    SEEN_TYPE = 1u << 0,
-    SEEN_SESSION_ID = 1u << 1,
-    SEEN_RESUME_TIME = 1u << 2,
-    SEEN_ARGV = 1u << 3,
-    SEEN_ENV = 1u << 4,
-    SEEN_WORKDIR = 1u << 5,
-    SEEN_STDIO = 1u << 6,
-    SEEN_TERM = 1u << 7,
-    SEEN_ROWS = 1u << 8,
-    SEEN_COLS = 1u << 9,
-    SEEN_MEMORY_PRESSURE = 1u << 10,
-    SEEN_NOFILE_SOFT = 1u << 11,
-    SEEN_NOFILE_HARD = 1u << 12,
-    SEEN_CLOSED_ENV = 1u << 13,
-    SEEN_COMMAND_LEN = 1u << 14,
-    SEEN_CACHE_MOUNTS = 1u << 15,
-    SEEN_CONTEXT_BINDS = 1u << 16,
-    SEEN_ALL = (1u << 17) - 1,
-  };
-
-  const char *p = skip_ws(req);
-  if (*p != '{') return -1;
-  p++;
-  unsigned int seen = 0;
-  for (;;) {
-    p = skip_ws(p);
-    if (*p == '}') {
-      p++;
-      break;
-    }
-    char key[32];
-    if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
-    p = skip_ws(p);
-    if (*p != ':') return -1;
-    p = skip_ws(p + 1);
-
-    unsigned int bit = 0;
-    if (strcmp(key, "type") == 0) {
-      bit = SEEN_TYPE;
-      char type[32];
-      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-run-v4") != 0) return -1;
-    } else if (strcmp(key, "session_id") == 0) {
-      bit = SEEN_SESSION_ID;
-      if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
-    } else if (strcmp(key, "resume_time_unix_ns") == 0) {
-      bit = SEEN_RESUME_TIME;
-      if (parse_json_u64(&p, &out->resume_time_unix_ns) != 0) return -1;
-    } else if (strcmp(key, "command_len") == 0) {
-      bit = SEEN_COMMAND_LEN;
-      if (parse_json_u64(&p, &out->build_command_len) != 0 ||
-          out->build_command_len > MAX_BUILD_RUN_COMMAND_LEN) return -1;
-    } else if (strcmp(key, "argv") == 0) {
-      bit = SEEN_ARGV;
-      if (parse_exec_argv_value(&p, out) != 0) return -1;
-    } else if (strcmp(key, "env") == 0) {
-      bit = SEEN_ENV;
-      if (parse_exec_env_value(&p, out) != 0) return -1;
-    } else if (strcmp(key, "working_dir") == 0) {
-      bit = SEEN_WORKDIR;
-      if (parse_json_string(&p, out->working_dir, sizeof(out->working_dir)) != 0 || out->working_dir[0] != '/') return -1;
-    } else if (strcmp(key, "cache_mounts") == 0) {
-      bit = SEEN_CACHE_MOUNTS;
-      if (parse_build_cache_mounts_value(&p, out) != 0) return -1;
-    } else if (strcmp(key, "context_binds") == 0) {
-      bit = SEEN_CONTEXT_BINDS;
-      if (parse_build_context_binds_value(&p, out) != 0) return -1;
-    } else if (strcmp(key, "stdio") == 0) {
-      bit = SEEN_STDIO;
-      char stdio[8];
-      if (parse_json_string(&p, stdio, sizeof(stdio)) != 0 || strcmp(stdio, "pipe") != 0) return -1;
-    } else if (strcmp(key, "term") == 0) {
-      bit = SEEN_TERM;
-      char term[8];
-      if (parse_json_string(&p, term, sizeof(term)) != 0 || strcmp(term, "xterm") != 0) return -1;
-    } else if (strcmp(key, "terminal_rows") == 0) {
-      bit = SEEN_ROWS;
-      uint64_t rows = 0;
-      if (parse_json_u64(&p, &rows) != 0 || rows != 24) return -1;
-      out->terminal_rows = (uint16_t)rows;
-    } else if (strcmp(key, "terminal_cols") == 0) {
-      bit = SEEN_COLS;
-      uint64_t cols = 0;
-      if (parse_json_u64(&p, &cols) != 0 || cols != 80) return -1;
-      out->terminal_cols = (uint16_t)cols;
-    } else if (strcmp(key, "memory_pressure") == 0) {
-      bit = SEEN_MEMORY_PRESSURE;
-      int value = 0;
-      if (parse_json_bool(&p, &value) != 0 || value) return -1;
-    } else if (strcmp(key, "nofile_soft") == 0) {
-      bit = SEEN_NOFILE_SOFT;
-      if (parse_json_u64(&p, &out->nofile_soft) != 0) return -1;
-    } else if (strcmp(key, "nofile_hard") == 0) {
-      bit = SEEN_NOFILE_HARD;
-      if (parse_json_u64(&p, &out->nofile_hard) != 0) return -1;
-    } else if (strcmp(key, "closed_env") == 0) {
-      bit = SEEN_CLOSED_ENV;
-      int value = 0;
-      if (parse_json_bool(&p, &value) != 0 || !value) return -1;
-    } else {
-      return -1;
-    }
-    if ((seen & bit) != 0) return -1;
-    seen |= bit;
-    p = skip_ws(p);
-    if (*p == '}') {
-      p++;
-      break;
-    }
-    if (*p != ',') return -1;
-    p = skip_ws(p + 1);
-    if (*p == '}') return -1;
-  }
-  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
-  if (out->nofile_soft == 0 || out->nofile_soft > out->nofile_hard || out->nofile_hard > MAX_BUILD_NOFILE) return -1;
-  out->build_exec_form = out->argv[0] != NULL;
-  if (out->build_exec_form && (out->build_command_len != 0 || out->build_context_bind_count != 0)) return -1;
-  if (!out->build_exec_form && out->build_command_len == 0) return -1;
-  for (size_t i = 0; i < out->build_context_bind_count; i++) {
-    for (size_t j = 0; j < out->build_cache_mount_count; j++) {
-      if (build_cache_targets_overlap(out->build_context_binds[i].target,
-                                      out->build_cache_mounts[j].target)) return -1;
-    }
-  }
-  out->kind = REQUEST_BUILD_RUN;
-  out->protocol_v1 = 1;
-  return 0;
-}
-
-static int parse_build_copy_request(const char *req, size_t req_len, struct run_request *out) {
-  if (req_len == 0 || req[req_len - 1] != '\n') return -1;
-  enum {
-    SEEN_TYPE = 1u << 0,
-    SEEN_SESSION_ID = 1u << 1,
-    SEEN_SOURCE = 1u << 2,
-    SEEN_DEST = 1u << 3,
-    SEEN_SOURCE_KIND = 1u << 4,
-    SEEN_DEST_IS_DIR = 1u << 5,
-    SEEN_ENTRY_COUNT = 1u << 6,
-    SEEN_SOURCE_DISK = 1u << 7,
-    SEEN_INPUT_INDEX = 1u << 8,
-    SEEN_MTIME = 1u << 9,
-    SEEN_DESTINATION_POLICY = 1u << 10,
-    SEEN_ALL = (1u << 11) - 1,
-  };
-
-  const char *p = skip_ws(req);
-  if (*p != '{') return -1;
-  p++;
-  unsigned int seen = 0;
-  for (;;) {
-    p = skip_ws(p);
-    if (*p == '}') {
-      p++;
-      break;
-    }
-    char key[32];
-    if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
-    p = skip_ws(p);
-    if (*p != ':') return -1;
-    p = skip_ws(p + 1);
-
-    unsigned int bit = 0;
-    if (strcmp(key, "type") == 0) {
-      bit = SEEN_TYPE;
-      char type[32];
-      if (parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-build-copy-v5") != 0) return -1;
-    } else if (strcmp(key, "session_id") == 0) {
-      bit = SEEN_SESSION_ID;
-      if (parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
-    } else if (strcmp(key, "source") == 0) {
-      bit = SEEN_SOURCE;
-      if (parse_json_string(&p, out->copy_source, sizeof(out->copy_source)) != 0 || out->copy_source[0] == '\0') return -1;
-    } else if (strcmp(key, "dest") == 0) {
-      bit = SEEN_DEST;
-      if (parse_json_string(&p, out->copy_dest, sizeof(out->copy_dest)) != 0 || out->copy_dest[0] != '/') return -1;
-    } else if (strcmp(key, "source_kind") == 0) {
-      bit = SEEN_SOURCE_KIND;
-      char source_kind[16];
-      if (parse_json_string(&p, source_kind, sizeof(source_kind)) != 0) return -1;
-      if (strcmp(source_kind, "directory") == 0) out->copy_source_kind = COPY_KIND_DIR;
-      else if (strcmp(source_kind, "file") == 0) out->copy_source_kind = COPY_KIND_FILE;
-      else if (strcmp(source_kind, "sym_link") == 0) out->copy_source_kind = COPY_KIND_SYMLINK;
-      else if (strcmp(source_kind, "auto") == 0) out->copy_source_kind = COPY_KIND_AUTO;
-      else return -1;
-    } else if (strcmp(key, "dest_is_dir") == 0) {
-      bit = SEEN_DEST_IS_DIR;
-      if (parse_json_bool(&p, &out->copy_dest_is_dir) != 0) return -1;
-    } else if (strcmp(key, "entry_count") == 0) {
-      bit = SEEN_ENTRY_COUNT;
-      if (parse_json_u64(&p, &out->copy_entry_count) != 0 || out->copy_entry_count > MAX_BUILD_CONTEXT_COPY_ENTRIES) return -1;
-    } else if (strcmp(key, "source_disk") == 0) {
-      bit = SEEN_SOURCE_DISK;
-      char source_disk[24];
-      if (parse_json_string(&p, source_disk, sizeof(source_disk)) != 0) return -1;
-      if (strcmp(source_disk, "context") == 0) out->copy_source_disk = COPY_SOURCE_CONTEXT;
-      else if (strcmp(source_disk, "build_input") == 0) out->copy_source_disk = COPY_SOURCE_BUILD_INPUT;
-      else return -1;
-    } else if (strcmp(key, "input_index") == 0) {
-      bit = SEEN_INPUT_INDEX;
-      if (parse_json_u64(&p, &out->copy_input_index) != 0 || out->copy_input_index >= MAX_BUILD_INPUT_DISKS) return -1;
-    } else if (strcmp(key, "mtime_unix_seconds") == 0) {
-      bit = SEEN_MTIME;
-      if (parse_json_optional_i64(&p, &out->copy_mtime_present, &out->copy_mtime_unix_seconds) != 0) return -1;
-    } else if (strcmp(key, "destination_policy") == 0) {
-      bit = SEEN_DESTINATION_POLICY;
-      char destination_policy[16];
-      if (parse_json_string(&p, destination_policy, sizeof(destination_policy)) != 0) return -1;
-      if (strcmp(destination_policy, "follow") == 0) out->copy_destination_policy = COPY_DESTINATION_FOLLOW;
-      else if (strcmp(destination_policy, "link") == 0) out->copy_destination_policy = COPY_DESTINATION_LINK;
-      else return -1;
-    } else {
-      return -1;
-    }
-    if ((seen & bit) != 0) return -1;
-    seen |= bit;
-
-    p = skip_ws(p);
-    if (*p == '}') {
-      p++;
-      break;
-    }
-    if (*p != ',') return -1;
-    p = skip_ws(p + 1);
-    if (*p == '}') return -1;
-  }
-  if (seen != SEEN_ALL || *skip_ws(p) != '\0') return -1;
-  if (out->copy_source_disk == COPY_SOURCE_CONTEXT) {
-    if (out->copy_source_kind == COPY_KIND_AUTO || out->copy_entry_count == 0 || out->copy_input_index != 0) return -1;
-  } else if (out->copy_source_kind != COPY_KIND_AUTO || out->copy_entry_count != 0) {
-    return -1;
-  }
-  if (out->copy_destination_policy == COPY_DESTINATION_LINK && out->copy_source_disk != COPY_SOURCE_BUILD_INPUT) return -1;
-  out->kind = REQUEST_BUILD_COPY;
-  out->protocol_v1 = 1;
-  return 0;
-}
-
 static int parse_string_field(const char *req, const char *name, char *out, size_t cap) {
   const char *p = find_field_value(req, name);
   if (p == NULL) return 0;
@@ -2746,208 +2304,337 @@ static int json_token_finished(char c) {
   return c == '\0' || c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' || c == '\r' || c == '\t';
 }
 
-static int parse_bool_field(const char *req, const char *name, int *out) {
-  const char *p = find_field_value(req, name);
-  if (p == NULL) return 0;
-  if (strncmp(p, "true", 4) == 0 && json_token_finished(p[4])) {
-    *out = 1;
-    return 1;
+// Every request is one newline-terminated JSON object with a known type and
+// exactly that type's members, each once. parse_request walks the object once,
+// parsing each member into run_request, then checks the member set against
+// the type and applies the per-kind rules below.
+enum request_member {
+  MEMBER_TYPE,
+  MEMBER_SESSION_ID,
+  MEMBER_RESUME_TIME,
+  MEMBER_ARGV,
+  MEMBER_ENV,
+  MEMBER_WORKING_DIR,
+  MEMBER_STDIO,
+  MEMBER_TERM,
+  MEMBER_TERMINAL_ROWS,
+  MEMBER_TERMINAL_COLS,
+  MEMBER_INTERACTIVE,
+  MEMBER_MEMORY_PRESSURE,
+  MEMBER_PARAMS_JSON,
+  MEMBER_REQUIRE_GENERATION_READY,
+  MEMBER_DETACHED,
+  MEMBER_RETAIN_OUTPUT,
+  MEMBER_CLOSED_ENV,
+  MEMBER_STDOUT_OFFSET,
+  MEMBER_STDERR_OFFSET,
+  MEMBER_PATH,
+  MEMBER_COMMAND_LEN,
+  MEMBER_CACHE_MOUNTS,
+  MEMBER_CONTEXT_BINDS,
+  MEMBER_NOFILE_SOFT,
+  MEMBER_NOFILE_HARD,
+  MEMBER_SOURCE,
+  MEMBER_DEST,
+  MEMBER_SOURCE_KIND,
+  MEMBER_DEST_IS_DIR,
+  MEMBER_ENTRY_COUNT,
+  MEMBER_SOURCE_DISK,
+  MEMBER_INPUT_INDEX,
+  MEMBER_MTIME,
+  MEMBER_DESTINATION_POLICY,
+  MEMBER_COUNT,
+};
+
+static const char *const request_member_names[MEMBER_COUNT] = {
+  [MEMBER_TYPE] = "type",
+  [MEMBER_SESSION_ID] = "session_id",
+  [MEMBER_RESUME_TIME] = "resume_time_unix_ns",
+  [MEMBER_ARGV] = "argv",
+  [MEMBER_ENV] = "env",
+  [MEMBER_WORKING_DIR] = "working_dir",
+  [MEMBER_STDIO] = "stdio",
+  [MEMBER_TERM] = "term",
+  [MEMBER_TERMINAL_ROWS] = "terminal_rows",
+  [MEMBER_TERMINAL_COLS] = "terminal_cols",
+  [MEMBER_INTERACTIVE] = "interactive",
+  [MEMBER_MEMORY_PRESSURE] = "memory_pressure",
+  [MEMBER_PARAMS_JSON] = "params_json",
+  [MEMBER_REQUIRE_GENERATION_READY] = "require_generation_ready",
+  [MEMBER_DETACHED] = "detached",
+  [MEMBER_RETAIN_OUTPUT] = "retain_output",
+  [MEMBER_CLOSED_ENV] = "closed_env",
+  [MEMBER_STDOUT_OFFSET] = "stdout_offset",
+  [MEMBER_STDERR_OFFSET] = "stderr_offset",
+  [MEMBER_PATH] = "path",
+  [MEMBER_COMMAND_LEN] = "command_len",
+  [MEMBER_CACHE_MOUNTS] = "cache_mounts",
+  [MEMBER_CONTEXT_BINDS] = "context_binds",
+  [MEMBER_NOFILE_SOFT] = "nofile_soft",
+  [MEMBER_NOFILE_HARD] = "nofile_hard",
+  [MEMBER_SOURCE] = "source",
+  [MEMBER_DEST] = "dest",
+  [MEMBER_SOURCE_KIND] = "source_kind",
+  [MEMBER_DEST_IS_DIR] = "dest_is_dir",
+  [MEMBER_ENTRY_COUNT] = "entry_count",
+  [MEMBER_SOURCE_DISK] = "source_disk",
+  [MEMBER_INPUT_INDEX] = "input_index",
+  [MEMBER_MTIME] = "mtime_unix_seconds",
+  [MEMBER_DESTINATION_POLICY] = "destination_policy",
+};
+
+#define MEMBER(name) (UINT64_C(1) << MEMBER_##name)
+#define EXEC_STDIO_MEMBERS (MEMBER(STDIO) | MEMBER(TERMINAL_ROWS) | MEMBER(TERMINAL_COLS))
+
+static const struct request_spec {
+  const char *type;
+  enum request_kind kind;
+  uint64_t members;
+} request_specs[] = {
+  {"ready", REQUEST_READY, MEMBER(TYPE)},
+  {"start-v1", REQUEST_START,
+   MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(RESUME_TIME) | MEMBER(ARGV) | MEMBER(ENV) | MEMBER(WORKING_DIR) |
+       EXEC_STDIO_MEMBERS | MEMBER(MEMORY_PRESSURE) | MEMBER(PARAMS_JSON) | MEMBER(REQUIRE_GENERATION_READY) |
+       MEMBER(DETACHED) | MEMBER(RETAIN_OUTPUT) | MEMBER(CLOSED_ENV)},
+  {"attach-v1", REQUEST_ATTACH,
+   MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(STDOUT_OFFSET) | MEMBER(STDERR_OFFSET) | EXEC_STDIO_MEMBERS |
+       MEMBER(INTERACTIVE) | MEMBER(PARAMS_JSON)},
+  {"initial-output", REQUEST_INITIAL_OUTPUT, MEMBER(TYPE)},
+  {"copy-in-v1", REQUEST_COPY_IN, MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(PATH)},
+  {"copy-out-v1", REQUEST_COPY_OUT, MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(PATH)},
+  {"spore-build-run-v4", REQUEST_BUILD_RUN,
+   MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(RESUME_TIME) | MEMBER(COMMAND_LEN) | MEMBER(ARGV) | MEMBER(ENV) |
+       MEMBER(WORKING_DIR) | MEMBER(CACHE_MOUNTS) | MEMBER(CONTEXT_BINDS) | EXEC_STDIO_MEMBERS | MEMBER(TERM) |
+       MEMBER(MEMORY_PRESSURE) | MEMBER(NOFILE_SOFT) | MEMBER(NOFILE_HARD) | MEMBER(CLOSED_ENV)},
+  {"spore-build-copy-v5", REQUEST_BUILD_COPY,
+   MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(SOURCE) | MEMBER(DEST) | MEMBER(SOURCE_KIND) | MEMBER(DEST_IS_DIR) |
+       MEMBER(ENTRY_COUNT) | MEMBER(SOURCE_DISK) | MEMBER(INPUT_INDEX) | MEMBER(MTIME) | MEMBER(DESTINATION_POLICY)},
+  {"spore-build-workdir-v1", REQUEST_BUILD_WORKDIR, MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(WORKING_DIR)},
+  {"spore-rootfs-grow-v1", REQUEST_ROOTFS_GROW, MEMBER(TYPE) | MEMBER(SESSION_ID)},
+  {"fsfreeze-v1", REQUEST_FSFREEZE, MEMBER(TYPE) | MEMBER(SESSION_ID)},
+  {"fsthaw-v1", REQUEST_FSTHAW, MEMBER(TYPE) | MEMBER(SESSION_ID)},
+};
+
+static int parse_terminal_dimension(const char **cursor, uint16_t *out) {
+  uint64_t value = 0;
+  if (parse_json_u64(cursor, &value) != 0 || value == 0 || value > UINT16_MAX) return -1;
+  *out = (uint16_t)value;
+  return 0;
+}
+
+static int parse_request_member(enum request_member member, const char **cursor, struct run_request *out, char *type, size_t type_cap) {
+  const char **p = cursor;
+  switch (member) {
+  case MEMBER_TYPE:
+    return parse_json_string(p, type, type_cap);
+  case MEMBER_SESSION_ID:
+    return parse_json_string(p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0' ? -1 : 0;
+  case MEMBER_RESUME_TIME:
+    return parse_json_u64(p, &out->resume_time_unix_ns);
+  case MEMBER_ARGV:
+    return parse_exec_argv_value(p, out);
+  case MEMBER_ENV:
+    return parse_exec_env_value(p, out);
+  case MEMBER_WORKING_DIR:
+    return parse_json_string(p, out->working_dir, sizeof(out->working_dir));
+  case MEMBER_STDIO: {
+    char stdio[8];
+    if (parse_json_string(p, stdio, sizeof(stdio)) != 0) return -1;
+    if (strcmp(stdio, "null") == 0) out->stdio = REQUEST_STDIO_NULL;
+    else if (strcmp(stdio, "pipe") == 0) out->stdio = REQUEST_STDIO_PIPE;
+    else if (strcmp(stdio, "tty") == 0) out->stdio = REQUEST_STDIO_TTY;
+    else return -1;
+    return 0;
   }
-  if (strncmp(p, "false", 5) == 0 && json_token_finished(p[5])) {
-    *out = 0;
-    return 1;
+  case MEMBER_TERM: {
+    // Only build RUN carries term, and it is always xterm.
+    char term[8];
+    return parse_json_string(p, term, sizeof(term)) != 0 || strcmp(term, "xterm") != 0 ? -1 : 0;
+  }
+  case MEMBER_TERMINAL_ROWS:
+    return parse_terminal_dimension(p, &out->terminal_rows);
+  case MEMBER_TERMINAL_COLS:
+    return parse_terminal_dimension(p, &out->terminal_cols);
+  case MEMBER_INTERACTIVE:
+    return parse_json_bool(p, &out->interactive);
+  case MEMBER_MEMORY_PRESSURE:
+    return parse_json_bool(p, &out->memory_pressure);
+  case MEMBER_PARAMS_JSON:
+    return parse_json_string(p, out->generation_params, sizeof(out->generation_params));
+  case MEMBER_REQUIRE_GENERATION_READY:
+    return parse_json_bool(p, &out->require_generation_ready);
+  case MEMBER_DETACHED:
+    return parse_json_bool(p, &out->detached);
+  case MEMBER_RETAIN_OUTPUT:
+    return parse_json_bool(p, &out->retain_output);
+  case MEMBER_CLOSED_ENV: {
+    int value = 0;
+    return parse_json_bool(p, &value) != 0 || !value ? -1 : 0;
+  }
+  case MEMBER_STDOUT_OFFSET:
+    return parse_json_u64(p, &out->stdout_offset);
+  case MEMBER_STDERR_OFFSET:
+    return parse_json_u64(p, &out->stderr_offset);
+  case MEMBER_PATH:
+    return parse_json_string(p, out->copy_path, sizeof(out->copy_path));
+  case MEMBER_COMMAND_LEN:
+    return parse_json_u64(p, &out->build_command_len) != 0 || out->build_command_len > MAX_BUILD_RUN_COMMAND_LEN ? -1 : 0;
+  case MEMBER_CACHE_MOUNTS:
+    return parse_build_cache_mounts_value(p, out);
+  case MEMBER_CONTEXT_BINDS:
+    return parse_build_context_binds_value(p, out);
+  case MEMBER_NOFILE_SOFT:
+    return parse_json_u64(p, &out->nofile_soft);
+  case MEMBER_NOFILE_HARD:
+    return parse_json_u64(p, &out->nofile_hard);
+  case MEMBER_SOURCE:
+    return parse_json_string(p, out->copy_source, sizeof(out->copy_source)) != 0 || out->copy_source[0] == '\0' ? -1 : 0;
+  case MEMBER_DEST:
+    return parse_json_string(p, out->copy_dest, sizeof(out->copy_dest)) != 0 || out->copy_dest[0] != '/' ? -1 : 0;
+  case MEMBER_SOURCE_KIND: {
+    char source_kind[16];
+    if (parse_json_string(p, source_kind, sizeof(source_kind)) != 0) return -1;
+    if (strcmp(source_kind, "directory") == 0) out->copy_source_kind = COPY_KIND_DIR;
+    else if (strcmp(source_kind, "file") == 0) out->copy_source_kind = COPY_KIND_FILE;
+    else if (strcmp(source_kind, "sym_link") == 0) out->copy_source_kind = COPY_KIND_SYMLINK;
+    else if (strcmp(source_kind, "auto") == 0) out->copy_source_kind = COPY_KIND_AUTO;
+    else return -1;
+    return 0;
+  }
+  case MEMBER_DEST_IS_DIR:
+    return parse_json_bool(p, &out->copy_dest_is_dir);
+  case MEMBER_ENTRY_COUNT:
+    return parse_json_u64(p, &out->copy_entry_count) != 0 || out->copy_entry_count > MAX_BUILD_CONTEXT_COPY_ENTRIES ? -1 : 0;
+  case MEMBER_SOURCE_DISK: {
+    char source_disk[24];
+    if (parse_json_string(p, source_disk, sizeof(source_disk)) != 0) return -1;
+    if (strcmp(source_disk, "context") == 0) out->copy_source_disk = COPY_SOURCE_CONTEXT;
+    else if (strcmp(source_disk, "build_input") == 0) out->copy_source_disk = COPY_SOURCE_BUILD_INPUT;
+    else return -1;
+    return 0;
+  }
+  case MEMBER_INPUT_INDEX:
+    return parse_json_u64(p, &out->copy_input_index) != 0 || out->copy_input_index >= MAX_BUILD_INPUT_DISKS ? -1 : 0;
+  case MEMBER_MTIME:
+    return parse_json_optional_i64(p, &out->copy_mtime_present, &out->copy_mtime_unix_seconds);
+  case MEMBER_DESTINATION_POLICY: {
+    char destination_policy[16];
+    if (parse_json_string(p, destination_policy, sizeof(destination_policy)) != 0) return -1;
+    if (strcmp(destination_policy, "follow") == 0) out->copy_destination_policy = COPY_DESTINATION_FOLLOW;
+    else if (strcmp(destination_policy, "link") == 0) out->copy_destination_policy = COPY_DESTINATION_LINK;
+    else return -1;
+    return 0;
+  }
+  case MEMBER_COUNT:
+    break;
   }
   return -1;
 }
 
-static int parse_rootfs_grow_request(const char *req, size_t req_len, struct run_request *out) {
-  if (req_len == 0 || req[req_len - 1] != '\n') return -1;
+// start-v1 and attach-v1 select the session's stdio. A pipe carries host
+// stdin, a tty gives the command a PTY, and null leaves stdin at /dev/null.
+static int apply_exec_stdio(struct run_request *out) {
+  out->stdin_enabled = out->stdio == REQUEST_STDIO_PIPE;
+  out->tty = out->stdio == REQUEST_STDIO_TTY;
+  return 0;
+}
+
+// Shell form streams command_len bytes after the request and sends an empty
+// argv; exec form sends argv with command_len 0. Context binds are shell-only,
+// matching the host planner. The session and terminal members are fixed.
+static int validate_build_run_request(struct run_request *out) {
+  if (out->working_dir[0] != '/' || out->stdio != REQUEST_STDIO_PIPE ||
+      out->terminal_rows != 24 || out->terminal_cols != 80 || out->memory_pressure) return -1;
+  if (out->nofile_soft == 0 || out->nofile_soft > out->nofile_hard || out->nofile_hard > MAX_BUILD_NOFILE) return -1;
+  size_t decoded_len = 0;
+  for (size_t i = 0; out->argv[i] != NULL; i++) decoded_len += strlen(out->argv[i]);
+  if (decoded_len > MAX_BUILD_EXEC_ARGS_BYTES) return -1;
+  out->build_exec_form = out->argv[0] != NULL;
+  if (out->build_exec_form && (out->build_command_len != 0 || out->build_context_bind_count != 0)) return -1;
+  if (!out->build_exec_form && out->build_command_len == 0) return -1;
+  for (size_t i = 0; i < out->build_context_bind_count; i++) {
+    for (size_t j = 0; j < out->build_cache_mount_count; j++) {
+      if (build_cache_targets_overlap(out->build_context_binds[i].target,
+                                      out->build_cache_mounts[j].target)) return -1;
+    }
+  }
+  return 0;
+}
+
+static int validate_build_copy_request(const struct run_request *out) {
+  if (out->copy_source_disk == COPY_SOURCE_CONTEXT) {
+    if (out->copy_source_kind == COPY_KIND_AUTO || out->copy_entry_count == 0 || out->copy_input_index != 0) return -1;
+  } else if (out->copy_source_kind != COPY_KIND_AUTO || out->copy_entry_count != 0) {
+    return -1;
+  }
+  if (out->copy_destination_policy == COPY_DESTINATION_LINK && out->copy_source_disk != COPY_SOURCE_BUILD_INPUT) return -1;
+  return 0;
+}
+
+static int validate_request(struct run_request *out) {
+  switch (out->kind) {
+  case REQUEST_START:
+    if (out->argv[0] == NULL) return -1;
+    if (out->working_dir[0] != '\0' && out->working_dir[0] != '/') return -1;
+    if (out->retain_output && !out->detached) return -1;
+    if (out->detached && out->stdio != REQUEST_STDIO_NULL) return -1;
+    return apply_exec_stdio(out);
+  case REQUEST_ATTACH:
+    if (out->stdio == REQUEST_STDIO_PIPE && !out->interactive) return -1;
+    if (out->stdio == REQUEST_STDIO_NULL && out->interactive) return -1;
+    return apply_exec_stdio(out);
+  case REQUEST_BUILD_WORKDIR:
+    return out->working_dir[0] == '/' ? 0 : -1;
+  case REQUEST_BUILD_RUN:
+    return validate_build_run_request(out);
+  case REQUEST_BUILD_COPY:
+    return validate_build_copy_request(out);
+  default:
+    return 0;
+  }
+}
+
+static int parse_request(const char *req, size_t req_len, struct run_request *out) {
+  if (req_len == 0 || strlen(req) != req_len || req[req_len - 1] != '\n') return -1;
+  memset(out, 0, sizeof(*out));
+
   const char *p = skip_ws(req);
   if (*p != '{') return -1;
-  p++;
-  int seen_type = 0;
-  int seen_session_id = 0;
-  for (int member = 0; member < 2; member++) {
-    p = skip_ws(p);
+  p = skip_ws(p + 1);
+  char type[32];
+  type[0] = '\0';
+  uint64_t seen = 0;
+  for (;;) {
     char key[32];
     if (parse_json_string(&p, key, sizeof(key)) != 0) return -1;
     p = skip_ws(p);
     if (*p != ':') return -1;
     p = skip_ws(p + 1);
-    if (strcmp(key, "type") == 0) {
-      char type[32];
-      if (seen_type || parse_json_string(&p, type, sizeof(type)) != 0 || strcmp(type, "spore-rootfs-grow-v1") != 0) return -1;
-      seen_type = 1;
-    } else if (strcmp(key, "session_id") == 0) {
-      if (seen_session_id || parse_json_string(&p, out->session_id, sizeof(out->session_id)) != 0 || out->session_id[0] == '\0') return -1;
-      seen_session_id = 1;
-    } else {
-      return -1;
+    enum request_member member = MEMBER_COUNT;
+    for (int i = 0; i < MEMBER_COUNT; i++) {
+      if (strcmp(key, request_member_names[i]) == 0) member = (enum request_member)i;
     }
+    if (member == MEMBER_COUNT || (seen & (UINT64_C(1) << member)) != 0) return -1;
+    if (parse_request_member(member, &p, out, type, sizeof(type)) != 0) return -1;
+    seen |= UINT64_C(1) << member;
     p = skip_ws(p);
-    char terminator = member == 0 ? ',' : '}';
-    if (*p != terminator) return -1;
-    p++;
+    if (*p == '}') break;
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
   }
-  if (!seen_type || !seen_session_id || *skip_ws(p) != '\0') return -1;
-  out->kind = REQUEST_ROOTFS_GROW;
-  out->protocol_v1 = 1;
-  return 0;
-}
+  if (*skip_ws(p + 1) != '\0') return -1;
 
-static int parse_request(const char *req, size_t req_len, struct run_request *out) {
-  if (strlen(req) != req_len) return -1;
-  memset(out, 0, sizeof(*out));
-  out->kind = REQUEST_START;
-  out->terminal_rows = 24;
-  out->terminal_cols = 80;
-
-  char type[32];
-  int type_rc = parse_top_level_request_type(req, type, sizeof(type));
-  if (type_rc < 0) return -1;
-  if (type_rc > 0 && strcmp(type, "spore-build-run-v4") == 0) {
-    return parse_build_run_request(req, req_len, out);
+  for (size_t i = 0; i < sizeof(request_specs) / sizeof(request_specs[0]); i++) {
+    if (strcmp(type, request_specs[i].type) != 0) continue;
+    if (seen != request_specs[i].members) return -1;
+    out->kind = request_specs[i].kind;
+    return validate_request(out);
   }
-  if (type_rc > 0 && strcmp(type, "spore-build-copy-v5") == 0) {
-    return parse_build_copy_request(req, req_len, out);
-  }
-  if (type_rc > 0) {
-    if (strcmp(type, "ready") == 0) {
-      out->kind = REQUEST_READY;
-    } else if (strcmp(type, "start") == 0) {
-      out->kind = REQUEST_START;
-    } else if (strcmp(type, "start-v1") == 0) {
-      out->kind = REQUEST_START;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "attach") == 0) {
-      out->kind = REQUEST_ATTACH;
-    } else if (strcmp(type, "attach-v1") == 0) {
-      out->kind = REQUEST_ATTACH;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "generation") == 0) {
-      out->kind = REQUEST_GENERATION;
-    } else if (strcmp(type, "copy-in-v1") == 0) {
-      out->kind = REQUEST_COPY_IN;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "copy-out-v1") == 0) {
-      out->kind = REQUEST_COPY_OUT;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "spore-build-workdir-v1") == 0) {
-      out->kind = REQUEST_BUILD_WORKDIR;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "spore-rootfs-grow-v1") == 0) {
-      return parse_rootfs_grow_request(req, req_len, out);
-    } else if (strcmp(type, "fsfreeze-v1") == 0) {
-      out->kind = REQUEST_FSFREEZE;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "fsthaw-v1") == 0) {
-      out->kind = REQUEST_FSTHAW;
-      out->protocol_v1 = 1;
-    } else if (strcmp(type, "initial-output") == 0) {
-      out->kind = REQUEST_INITIAL_OUTPUT;
-    } else {
-      return -1;
-    }
-  }
-
-  char req_session_id[64];
-  int session_rc = parse_string_field(req, "session_id", req_session_id, sizeof(req_session_id));
-  if (session_rc < 0) return -1;
-  if (session_rc > 0) {
-    if (req_session_id[0] == '\0') return -1;
-    snprintf(out->session_id, sizeof(out->session_id), "%s", req_session_id);
-  } else {
-    snprintf(out->session_id, sizeof(out->session_id), "%s", SESSION_ID);
-  }
-
-  uint64_t offset = 0;
-  int stdout_rc = parse_u64_field(req, "stdout_offset", &offset);
-  if (stdout_rc < 0) return -1;
-  if (stdout_rc > 0) out->stdout_offset = offset;
-  offset = 0;
-  int stderr_rc = parse_u64_field(req, "stderr_offset", &offset);
-  if (stderr_rc < 0) return -1;
-  if (stderr_rc > 0) out->stderr_offset = offset;
-  uint64_t resume_time_unix_ns = 0;
-  int resume_time_rc = parse_u64_field(req, "resume_time_unix_ns", &resume_time_unix_ns);
-  if (resume_time_rc < 0) return -1;
-  if (resume_time_rc > 0) out->resume_time_unix_ns = resume_time_unix_ns;
-
-  if (out->kind == REQUEST_GENERATION || out->kind == REQUEST_ATTACH || out->kind == REQUEST_START) {
-    int params_rc = parse_string_field(req, "params_json", out->generation_params, sizeof(out->generation_params));
-    if (out->kind == REQUEST_GENERATION && params_rc <= 0) return -1;
-    if (params_rc < 0) return -1;
-  }
-  if (out->kind == REQUEST_COPY_IN || out->kind == REQUEST_COPY_OUT) {
-    int path_rc = parse_string_field(req, "path", out->copy_path, sizeof(out->copy_path));
-    if (path_rc <= 0) return -1;
-  }
-  if (out->kind == REQUEST_BUILD_WORKDIR) {
-    int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
-    if (working_dir_rc <= 0 || out->working_dir[0] != '/') return -1;
-  }
-  if (out->protocol_v1 && (out->kind == REQUEST_START || out->kind == REQUEST_ATTACH)) {
-    char stdio[16];
-    int stdio_rc = parse_string_field(req, "stdio", stdio, sizeof(stdio));
-    if (stdio_rc <= 0) return -1;
-    if (strcmp(stdio, "pipe") == 0) {
-      out->stdin_enabled = 1;
-    } else if (strcmp(stdio, "tty") == 0) {
-      out->tty = 1;
-      uint64_t rows = 0;
-      uint64_t cols = 0;
-      int rows_rc = parse_u64_field(req, "terminal_rows", &rows);
-      int cols_rc = parse_u64_field(req, "terminal_cols", &cols);
-      if (rows_rc < 0 || cols_rc < 0) return -1;
-      if (rows_rc > 0 && rows > 0 && rows <= UINT16_MAX) out->terminal_rows = (uint16_t)rows;
-      if (cols_rc > 0 && cols > 0 && cols <= UINT16_MAX) out->terminal_cols = (uint16_t)cols;
-    } else {
-      return -1;
-    }
-    int interactive = 0;
-    int interactive_rc = parse_bool_field(req, "interactive", &interactive);
-    if (interactive_rc < 0) return -1;
-    if (interactive_rc > 0) out->interactive = interactive;
-    if (out->kind == REQUEST_ATTACH && out->stdin_enabled && !out->interactive) return -1;
-  }
-  if (out->kind == REQUEST_START) {
-    if (parse_argv(req, out->arg_storage, out->argv) <= 0) return -1;
-    if (parse_env(req, out->env_storage, out->envp) < 0) return -1;
-    int working_dir_rc = parse_string_field(req, "working_dir", out->working_dir, sizeof(out->working_dir));
-    if (working_dir_rc < 0) return -1;
-    if (working_dir_rc == 0) out->working_dir[0] = '\0';
-    int memory_pressure = 0;
-    int memory_pressure_rc = parse_bool_field(req, "memory_pressure", &memory_pressure);
-    if (memory_pressure_rc < 0) return -1;
-    if (memory_pressure_rc > 0) out->memory_pressure = memory_pressure;
-    int detached = 0;
-    int detached_rc = parse_bool_field(req, "detached", &detached);
-    if (detached_rc < 0) return -1;
-    if (detached_rc > 0) out->detached = detached;
-    int retain_output = 0;
-    int retain_output_rc = parse_bool_field(req, "retain_output", &retain_output);
-    if (retain_output_rc < 0) return -1;
-    if (retain_output_rc > 0) out->retain_output = retain_output;
-    if (out->retain_output && !out->detached) return -1;
-    int require_generation_ready = 0;
-    int generation_ready_rc = parse_bool_field(req, "require_generation_ready", &require_generation_ready);
-    if (generation_ready_rc < 0) return -1;
-    if (generation_ready_rc > 0) out->require_generation_ready = require_generation_ready;
-    if (out->protocol_v1) {
-      if (out->detached) return -1;
-    }
-  }
-  return 0;
-}
-
-static int send_error_exit(int fd, int code, const char *message) {
-  (void)send_stream_data(fd, "stderr", 0, (const unsigned char *)message, strlen(message));
-  return send_exit_frame(fd, code);
+  return -1;
 }
 
 static int send_client_error_exit(struct client *client, int code, const char *message) {
   if (client->fd < 0) return -1;
-  if (!client->protocol_v1) return send_error_exit(client->fd, code, message);
 
   size_t len = strlen(message);
   if (len > 0) {
@@ -2959,7 +2646,7 @@ static int send_client_error_exit(struct client *client, int code, const char *m
 }
 
 static int send_client_stdout(struct client *client, const char *message) {
-  if (client->fd < 0 || !client->protocol_v1) return -1;
+  if (client->fd < 0) return -1;
   size_t len = strlen(message);
   if (len == 0) return 0;
   if (send_spio_data(client->fd, SPIO_STDOUT_STREAM, client->stdout_offset, (const unsigned char *)message, len) != 0) return -1;
@@ -2969,7 +2656,6 @@ static int send_client_stdout(struct client *client, const char *message) {
 
 static int send_client_exit(struct client *client, int code) {
   if (client->fd < 0) return -1;
-  if (!client->protocol_v1) return send_exit_frame(client->fd, code);
   if (send_spio_timing_frame(client->fd) != 0) return -1;
   return send_spio_exit(client->fd, code);
 }
@@ -4318,12 +4004,12 @@ static int send_retained_output(struct client *client, struct detached_children 
     (unsigned char)((children->retained_stdout_truncated ? 1 : 0) |
                     (children->retained_stderr_truncated ? 2 : 0)),
   };
-  if (send_stream_data(client->fd, "stdout", 0, header, sizeof(header)) != 0 ||
-      send_stream_data(client->fd, "stdout", sizeof(header), children->retained_stdout,
-                       children->retained_stdout_len) != 0 ||
-      send_stream_data(client->fd, "stderr", 0, children->retained_stderr,
-                       children->retained_stderr_len) != 0 ||
-      send_exit_frame(client->fd, 0) != 0) {
+  if (send_spio_data(client->fd, SPIO_STDOUT_STREAM, 0, header, sizeof(header)) != 0 ||
+      send_spio_data(client->fd, SPIO_STDOUT_STREAM, sizeof(header), children->retained_stdout,
+                     children->retained_stdout_len) != 0 ||
+      send_spio_data(client->fd, SPIO_STDERR_STREAM, 0, children->retained_stderr,
+                     children->retained_stderr_len) != 0 ||
+      send_client_exit(client, 0) != 0) {
     return -1;
   }
   return 0;
@@ -4765,7 +4451,7 @@ static void close_client_input_lost(struct session *session, struct client *clie
 }
 
 static void pump_client_v1(struct session *session, struct client *client) {
-  if (client->fd < 0 || !client->protocol_v1) return;
+  if (client->fd < 0) return;
   if (session->stdin_pending_len != 0 || session->terminal_pending_len != 0) return;
 
   for (;;) {
@@ -4882,25 +4568,14 @@ static void poll_session_exit(struct session *session, struct client *client) {
 static void maybe_send_session_exit(struct session *session, struct client *client) {
   if (client->fd < 0) return;
   if (!session->started || !session->exited || session->stdout_open || session->stderr_open) return;
-  int rc;
-  if (client->protocol_v1) {
-    rc = send_spio_timing_frame(client->fd);
-    if (rc == 0) rc = send_spio_exit(client->fd, session->exit_code);
-  } else {
-    rc = send_exit_frame(client->fd, session->exit_code);
-  }
-  if (rc != 0) {
-    close_client(client);
-    return;
-  }
+  (void)send_client_exit(client, session->exit_code);
   close_client(client);
 }
 
 static void maybe_send_memory_pressure(struct session *session, struct client *client) {
   if (client->fd < 0 || !session->started || session->exited || session->memory_pressure_fd < 0) return;
   drain_memory_pressure_events(session);
-  int rc = client->protocol_v1 ? send_spio_event(client->fd, "memory-pressure") : send_memory_pressure_frame(client->fd);
-  if (rc != 0) {
+  if (send_spio_event(client->fd, "memory-pressure") != 0) {
     close_client(client);
     return;
   }
@@ -4962,7 +4637,7 @@ static void run_transient_exec(struct session *session, struct client *client, c
       roles[nfds++] = 2;
     }
     fds[nfds].fd = client->fd;
-    fds[nfds].events = POLLHUP | POLLERR | (client->protocol_v1 ? POLLIN : 0);
+    fds[nfds].events = POLLIN | POLLHUP | POLLERR;
     fds[nfds].revents = 0;
     roles[nfds++] = 3;
     if (transient.stdin_open && transient.stdin_pending_len != 0) {
@@ -5393,19 +5068,19 @@ static void accept_request(int listener, struct session *session, struct client 
 
   struct run_request request;
   if (parse_request(req, (size_t)req_len, &request) != 0) {
-    (void)send_error_exit(conn, 2, "spore run: bad request\n");
+    // Keep the attached client; answer only the rejected connection.
+    struct client rejected;
+    memset(&rejected, 0, sizeof(rejected));
+    rejected.fd = conn;
+    (void)send_client_error_exit(&rejected, 2, "spore run: bad request\n");
     close(conn);
     return;
   }
 
   close_client(client);
   client->fd = conn;
-  client->protocol_v1 = request.protocol_v1;
-  client->stdout_offset = 0;
-  client->stderr_offset = 0;
-  client->stdin_offset = 0;
-  client->stdin_input_owner = request.protocol_v1 && request.stdin_enabled;
-  client->terminal_input_owner = request.protocol_v1 && request.tty && (request.kind == REQUEST_START || request.interactive);
+  client->stdin_input_owner = request.stdin_enabled;
+  client->terminal_input_owner = request.tty && (request.kind == REQUEST_START || request.interactive);
 
   if (build_run_mount_cleanup_poisoned) {
     (void)send_client_error_exit(client, 125, "spore build: prior RUN mount cleanup failed\n");
@@ -5424,25 +5099,7 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
-    (void)send_exit_frame(client->fd, 0);
-    close_client(client);
-    return;
-  }
-
-  if (request.kind == REQUEST_GENERATION) {
-    if (use_rootfs && !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
-      close_client(client);
-      return;
-    }
-    const char *root = generation_root_path(use_rootfs, rootfs_ready);
-    const char *generation_error = apply_request_generation(generation, root, request.generation_params);
-    if (generation_error != NULL) {
-      (void)send_client_error_exit(client, 126, generation_error);
-      close_client(client);
-      return;
-    }
-    (void)send_exit_frame(client->fd, 0);
+    (void)send_client_exit(client, 0);
     close_client(client);
     return;
   }
@@ -5570,11 +5227,6 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_ROOTFS_GROW) {
-    if (!request.protocol_v1) {
-      (void)send_client_error_exit(client, 2, "spore build: rootfs grow requires v1 protocol\n");
-      close_client(client);
-      return;
-    }
     if (!use_rootfs || !rootfs_ready) {
       (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
       close_client(client);
@@ -5591,11 +5243,6 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_FSFREEZE || request.kind == REQUEST_FSTHAW) {
-    if (!request.protocol_v1) {
-      (void)send_client_error_exit(client, 2, "spore build: fsfreeze requires v1 protocol\n");
-      close_client(client);
-      return;
-    }
     if (!use_rootfs || !rootfs_ready) {
       (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
       close_client(client);
@@ -5639,7 +5286,7 @@ static void accept_request(int listener, struct session *session, struct client 
         close_client(client);
         return;
       }
-      (void)send_exit_frame(client->fd, 0);
+      (void)send_client_exit(client, 0);
       close_client(client);
       return;
     }
@@ -5698,41 +5345,39 @@ static void accept_request(int listener, struct session *session, struct client 
       return;
     }
   }
-  if (request.protocol_v1) {
-    if (request.stdin_enabled) {
-      if (!session->stdin_capable) {
-        (void)send_client_error_exit(client, 2, "spore run: captured session has no interactive stdin\n");
-        close_client(client);
-        return;
-      }
-      if (!session->stdin_open) {
-        (void)send_client_error_exit(client, 2, "spore run: captured session stdin is closed\n");
-        close_client(client);
-        return;
-      }
-      (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
+  if (request.stdin_enabled) {
+    if (!session->stdin_capable) {
+      (void)send_client_error_exit(client, 2, "spore run: captured session has no interactive stdin\n");
+      close_client(client);
       return;
     }
-    if (request.tty) {
-      if (!session->tty) {
-        (void)send_client_error_exit(client, 2, "spore run: captured session has no terminal\n");
-        close_client(client);
-        return;
-      }
-      if (request.interactive && session->terminal_fd < 0) {
-        (void)send_client_error_exit(client, 2, "spore run: captured session terminal is closed\n");
-        close_client(client);
-        return;
-      }
-      if (session->terminal_fd >= 0) {
-        (void)apply_terminal_size(session->terminal_fd, request.terminal_rows, request.terminal_cols);
-      }
-      if (session->exited && !session->stdout_open) {
-        (void)send_client_exit(client, session->exit_code);
-        close_client(client);
-      }
+    if (!session->stdin_open) {
+      (void)send_client_error_exit(client, 2, "spore run: captured session stdin is closed\n");
+      close_client(client);
       return;
     }
+    (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
+    return;
+  }
+  if (request.tty) {
+    if (!session->tty) {
+      (void)send_client_error_exit(client, 2, "spore run: captured session has no terminal\n");
+      close_client(client);
+      return;
+    }
+    if (request.interactive && session->terminal_fd < 0) {
+      (void)send_client_error_exit(client, 2, "spore run: captured session terminal is closed\n");
+      close_client(client);
+      return;
+    }
+    if (session->terminal_fd >= 0) {
+      (void)apply_terminal_size(session->terminal_fd, request.terminal_rows, request.terminal_cols);
+    }
+    if (session->exited && !session->stdout_open) {
+      (void)send_client_exit(client, session->exit_code);
+      close_client(client);
+    }
+    return;
   }
   (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
 }
@@ -5750,6 +5395,8 @@ enum spore_agent_fuzz_result {
   SPORE_AGENT_FUZZ_READY_REQUEST = 5,
   SPORE_AGENT_FUZZ_GROW_REQUEST = 6,
   SPORE_AGENT_FUZZ_OTHER_REQUEST = 7,
+  SPORE_AGENT_FUZZ_START_REQUEST = 8,
+  SPORE_AGENT_FUZZ_ATTACH_REQUEST = 9,
 };
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
@@ -5766,6 +5413,8 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
   if (parsed.kind == REQUEST_ROOTFS_GROW) return SPORE_AGENT_FUZZ_GROW_REQUEST;
+  if (parsed.kind == REQUEST_START) return SPORE_AGENT_FUZZ_START_REQUEST;
+  if (parsed.kind == REQUEST_ATTACH) return SPORE_AGENT_FUZZ_ATTACH_REQUEST;
   if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_OTHER_REQUEST;
   if (parsed.build_exec_form) return SPORE_AGENT_FUZZ_RUN_COMPLETE;
 
@@ -5781,7 +5430,6 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   struct client client;
   memset(&client, 0, sizeof(client));
   client.fd = pipe_fds[0];
-  client.protocol_v1 = 1;
   char command[MAX_BUILD_RUN_COMMAND_LEN + 1];
   char error[256];
   int rc = read_build_command_from_spio(&client, parsed.build_command_len, command, sizeof(command), error, sizeof(error));
@@ -6151,7 +5799,7 @@ int main(void) {
     roles[nfds++] = 0;
     if (client.fd >= 0) {
       fds[nfds].fd = client.fd;
-      fds[nfds].events = POLLHUP | POLLERR | (client.protocol_v1 ? POLLIN : 0);
+      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
       fds[nfds].revents = 0;
       roles[nfds++] = 1;
     }

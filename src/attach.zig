@@ -201,11 +201,10 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .session_id = session_id,
         .interactive = opts.interactive,
         .tty = opts.tty,
-        .terminal_name = attach_stream.terminalName(context.environ_map),
         .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
     });
     defer attach.deinit(allocator);
-    var identity_stream: ?vsock_stream.HostStream = try vsock_stream.HostStream.initWithProtocol(default_attach_guest_port, attach.request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
+    var identity_stream: ?vsock_stream.HostStream = try vsock_stream.HostStream.init(default_attach_guest_port, attach.request);
     if (identity_stream) |*stream| {
         stream.host_port = vsock_stream.HostStream.deriveHostPort(attach.request);
         if (opts.events != null) {
@@ -341,7 +340,6 @@ const AttachRequestOptions = struct {
     session_id: []const u8,
     interactive: bool = false,
     tty: bool = false,
-    terminal_name: []const u8 = "xterm",
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
 };
 
@@ -370,21 +368,14 @@ fn prepareAttach(allocator: std.mem.Allocator, manifest_generation: spore.Genera
     errdefer allocator.free(generation_state.params_b64);
 
     const params_payload = gen_dev.paramsPayload();
-    if (options.interactive or options.tty) {
-        return .{
-            .request = try attach_stream.attachV1Request(allocator, .{
-                .session_id = options.session_id,
-                .interactive = options.interactive,
-                .tty = options.tty,
-                .terminal_name = options.terminal_name,
-                .terminal_size = options.terminal_size,
-                .generation_params = if (params_payload.len == 0) null else params_payload,
-            }),
-            .generation_state = generation_state,
-        };
-    }
     return .{
-        .request = try attach_stream.attachRequestWithGeneration(allocator, options.session_id, if (params_payload.len == 0) null else params_payload),
+        .request = try attach_stream.attachV1Request(allocator, .{
+            .session_id = options.session_id,
+            .interactive = options.interactive,
+            .tty = options.tty,
+            .terminal_size = options.terminal_size,
+            .generation_params = if (params_payload.len == 0) null else params_payload,
+        }),
         .generation_state = generation_state,
     };
 }
@@ -509,7 +500,7 @@ test "attach request omits empty generation params" {
     const manifest = testDiskGuardManifest(&.{}, false);
     const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0}\n", attach.request);
+    try std.testing.expectEqualStrings("{\"type\":\"attach-v1\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0,\"stdio\":\"null\",\"interactive\":false,\"terminal_rows\":24,\"terminal_cols\":80,\"params_json\":\"\"}\n", attach.request);
     try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
 }
 
@@ -526,7 +517,8 @@ test "attach request carries refreshed generation params" {
 
     const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
     defer attach.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"stdio\":\"null\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"params_json\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_count\\\":2") != null);
