@@ -20,7 +20,7 @@ const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const virtio_net = @import("virtio/net.zig");
 const vmm = @import("aarch64/vmm.zig");
-const vsock = @import("virtio/vsock.zig");
+const vsock_stream = @import("virtio/vsock_stream.zig");
 
 pub const Backend = run_mod.Backend;
 const default_attach_guest_port: u32 = 10700;
@@ -214,9 +214,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
     });
     defer attach.deinit(allocator);
-    var identity_stream: ?vsock.HostStream = try vsock.HostStream.initWithProtocol(default_attach_guest_port, attach.request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
+    var identity_stream: ?vsock_stream.HostStream = try vsock_stream.HostStream.initWithProtocol(default_attach_guest_port, attach.request, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
     if (identity_stream) |*stream| {
-        stream.host_port = vsock.HostStream.deriveHostPort(attach.request);
+        stream.host_port = vsock_stream.HostStream.deriveHostPort(attach.request);
         if (opts.events != null) {
             stream.setLifecycleSink(&events, attachEventLifecycleSink);
             stream.setOutputSink(&events, attachEventOutputSink);
@@ -224,7 +224,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
             stream.setOutputSink(null, identityProbeOutputSink);
         }
     }
-    const identity_probe: ?*vsock.HostStream = if (identity_stream) |*stream| stream else null;
+    const identity_probe: ?*vsock_stream.HostStream = if (identity_stream) |*stream| stream else null;
     var stdin_control = if (identity_stream) |*stream|
         if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null
     else
@@ -294,19 +294,19 @@ fn consoleSink(bytes: []const u8) void {
 
 fn discardConsoleSink(_: []const u8) void {}
 
-fn attachEventOutputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+fn attachEventOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
     const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     events.emitOutputBestEffort(output, bytes);
 }
 
-fn attachEventLifecycleSink(context: ?*anyopaque, event: vsock.HostStreamLifecycle) void {
+fn attachEventLifecycleSink(context: ?*anyopaque, event: vsock_stream.HostStreamLifecycle) void {
     const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     switch (event) {
         .ready => events.emitReadyBestEffort(),
     }
 }
 
-fn identityProbeOutputSink(_: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+fn identityProbeOutputSink(_: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
     if (output != .stderr) return;
     fd_util.writeAllBestEffort(2, bytes);
 }
@@ -321,7 +321,7 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     return parsed;
 }
 
-fn resultFromAttachStream(backend: Backend, memory_config: @import("memory.zig").Config, vcpu_count: u32, identity_stream: ?vsock.HostStream) !run_mod.Result {
+fn resultFromAttachStream(backend: Backend, memory_config: @import("memory.zig").Config, vcpu_count: u32, identity_stream: ?vsock_stream.HostStream) !run_mod.Result {
     const stream = identity_stream orelse return error.UnexpectedAttachExit;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();

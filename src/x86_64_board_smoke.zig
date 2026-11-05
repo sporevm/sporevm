@@ -6,7 +6,7 @@ const run = @import("run.zig");
 const assets = @import("run_assets");
 const board = @import("x86_64/board.zig");
 const vm = @import("x86_64/vm.zig");
-const vsock = @import("virtio/vsock.zig");
+const vsock_stream = @import("virtio/vsock_stream.zig");
 
 const max_kernel_file = 256 * 1024 * 1024;
 const guest_port: u32 = 10700;
@@ -34,7 +34,7 @@ const Capture = struct {
     stderr: [8192]u8 = undefined,
     stderr_len: usize = 0,
 
-    fn sink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn sink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         const self: *Capture = @ptrCast(@alignCast(context orelse return));
         switch (output) {
             .stdout => append(&self.stdout, &self.stdout_len, bytes),
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         .{ guest_port, descriptors },
     );
     const request = try run.execRequest(allocator, &.{ "/bin/sh", "-lc", guest_command });
-    var stream = try vsock.HostStream.init(guest_port, request);
+    var stream = try vsock_stream.HostStream.init(guest_port, request);
     var capture = Capture{};
     stream.setOutputSink(&capture, Capture.sink);
 
@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Point the host stream at a port the guest agent will never use. The
     // watchdog must interrupt KVM_RUN, join the vCPU, and return a typed error.
-    var timeout_stream = try vsock.HostStream.init(guest_port + 1, request);
+    var timeout_stream = try vsock_stream.HostStream.init(guest_port + 1, request);
     const timeout_start_ms = monotonicMs();
     const timed_out = blk: {
         _ = vm.run(allocator, .{

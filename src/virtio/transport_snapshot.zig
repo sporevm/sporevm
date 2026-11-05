@@ -5,6 +5,7 @@ const std = @import("std");
 const blk = @import("blk.zig");
 const mmio = @import("mmio.zig");
 const vsock = @import("vsock.zig");
+const vsock_stream = @import("vsock_stream.zig");
 
 pub fn validateFullSnapshotDevices(transports: []const mmio.Transport, vsock_dev: *const vsock.Vsock) !void {
     // Rootfs-only checkpoints capture queue state transiently for quiescence,
@@ -52,7 +53,7 @@ test "full snapshots reject pending host vsock packets" {
 
     // Attaching a host stream queues its connect request outside the
     // virtqueues until the guest posts receive buffers.
-    var stream = try vsock.HostStream.init(10700, "{}\n");
+    var stream = try vsock_stream.HostStream.init(10700, "{}\n");
     try vsock_dev.attachHostStream(&stream);
     try std.testing.expect(vsock_dev.pending_len != 0);
     try std.testing.expectError(

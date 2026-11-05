@@ -34,6 +34,8 @@ const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
 const version = @import("version.zig");
 const vsock = @import("virtio/vsock.zig");
+const vsock_control = @import("virtio/vsock_control.zig");
+const vsock_stream = @import("virtio/vsock_stream.zig");
 
 const max_control_request = run.max_guest_request_len + 1;
 const max_control_response = 128 * 1024;
@@ -456,9 +458,9 @@ const ExecServer = struct {
     disk_fork_allow_copy: bool = false,
     disk_fork_force_copy: bool = false,
     disk_claims: runtime_disk_claim.Registry,
-    active_stream: vsock.HostStream = undefined,
+    active_stream: vsock_stream.HostStream = undefined,
     active_stream_valid: bool = false,
-    active_stream_protocol: vsock.HostStreamProtocol = .legacy_text,
+    active_stream_protocol: vsock_stream.HostStreamProtocol = .legacy_text,
     active_streaming_exec: bool = false,
     active_stream_timing_enabled: bool = false,
     active_exec_submitted_ms: u64 = 0,
@@ -477,9 +479,9 @@ const ExecServer = struct {
     next_session_id: u64 = 1,
     active_session_sequence: u64 = 0,
     next_host_stream_sequence: u64,
-    wake: ?vsock.Wake = null,
+    wake: ?vsock_control.Wake = null,
     stats_written: bool = false,
-    stats_written_value: vsock.ControlStats = .{},
+    stats_written_value: vsock_control.ControlStats = .{},
     stats_write_ms: u64 = 0,
     last_registry_check_ms: u64 = 0,
     closed: std.atomic.Value(bool) = .init(false),
@@ -537,9 +539,9 @@ const ExecServer = struct {
         return server;
     }
 
-    fn startReadinessProbe(self: *ExecServer) !*vsock.HostStream {
+    fn startReadinessProbe(self: *ExecServer) !*vsock_stream.HostStream {
         if (self.state != .idle) return error.ControlBusy;
-        self.active_stream = try vsock.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], .legacy_text);
+        self.active_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], .legacy_text);
         self.resetExecCapture();
         self.active_stream.setOutputSink(self, captureOutputThunk);
         self.active_stream.host_port = self.nextHostStreamPort();
@@ -578,7 +580,7 @@ const ExecServer = struct {
         return self.closed.load(.acquire);
     }
 
-    fn control(self: *ExecServer) vsock.Control {
+    fn control(self: *ExecServer) vsock_control.Control {
         return .{
             .context = self,
             .pollFn = pollThunk,
@@ -593,7 +595,7 @@ const ExecServer = struct {
         };
     }
 
-    fn setWake(self: *ExecServer, wake: vsock.Wake) void {
+    fn setWake(self: *ExecServer, wake: vsock_control.Wake) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.wake = wake;
@@ -608,7 +610,7 @@ const ExecServer = struct {
         return preparation;
     }
 
-    fn poll(self: *ExecServer, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn poll(self: *ExecServer, dev: *vsock.Vsock) !vsock_control.ControlAction {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -646,7 +648,7 @@ const ExecServer = struct {
             },
             .active_disk_fork => return .keep_running,
             .pending_exec => {
-                self.active_stream = try vsock.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], self.active_stream_protocol);
+                self.active_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], self.active_stream_protocol);
                 self.resetExecCapture();
                 if (self.active_streaming_exec) {
                     self.resetStreamingOffsets();
@@ -901,7 +903,7 @@ const ExecServer = struct {
     }
 
     fn nextHostStreamPort(self: *ExecServer) u32 {
-        const port = vsock.HostStream.hostPortForSequence(self.next_host_stream_sequence);
+        const port = vsock_stream.HostStream.hostPortForSequence(self.next_host_stream_sequence);
         self.next_host_stream_sequence +%= 1;
         return port;
     }
@@ -920,7 +922,7 @@ const ExecServer = struct {
         self.streaming_write_failed = false;
     }
 
-    fn captureOutput(self: *ExecServer, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn captureOutput(self: *ExecServer, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         const capture = switch (output) {
             .stdout => &self.stdout_capture,
             .stderr => &self.stderr_capture,
@@ -945,7 +947,7 @@ const ExecServer = struct {
         if (n < bytes.len) truncated.* = true;
     }
 
-    fn streamOutput(self: *ExecServer, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn streamOutput(self: *ExecServer, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         if (bytes.len == 0) return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -1173,8 +1175,8 @@ const ExecServer = struct {
         }
     }
 
-    fn publishSnapshot(self: *ExecServer, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !vsock.SnapshotPublishMetrics {
-        var metrics = vsock.SnapshotPublishMetrics{ .cache_lock_wait_ns = preparation.wait_ns };
+    fn publishSnapshot(self: *ExecServer, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !vsock_control.SnapshotPublishMetrics {
+        var metrics = vsock_control.SnapshotPublishMetrics{ .cache_lock_wait_ns = preparation.wait_ns };
         const registry = try preparation.registry(self.allocator, self.cache_root);
         var lifecycle_spec = (try lifecycle.readSporeLifecycleSpec(self.allocator, self.io, work_dir)) orelse return error.BadManifest;
         defer lifecycle_spec.deinit();
@@ -1337,7 +1339,7 @@ const ExecServer = struct {
         return self.disk_claims.cancelBatch(batch);
     }
 
-    fn reportStats(self: *ExecServer, stats: vsock.ControlStats) void {
+    fn reportStats(self: *ExecServer, stats: vsock_control.ControlStats) void {
         if (self.stats_written and std.meta.eql(stats, self.stats_written_value)) return;
         const now = lifecycle.monotonicMs();
         const first_write = self.stats_write_ms == 0;
@@ -1440,12 +1442,12 @@ const ExecServer = struct {
         self.response_len = json.len + 1;
     }
 
-    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock_control.ControlAction {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         return self.poll(dev);
     }
 
-    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
+    fn setWakeThunk(context: *anyopaque, wake: vsock_control.Wake) void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         self.setWake(wake);
     }
@@ -1455,7 +1457,7 @@ const ExecServer = struct {
         return try self.prepareSnapshot();
     }
 
-    fn publishSnapshotThunk(context: *anyopaque, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !vsock.SnapshotPublishMetrics {
+    fn publishSnapshotThunk(context: *anyopaque, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !vsock_control.SnapshotPublishMetrics {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         return try self.publishSnapshot(preparation, work_dir, publish_dir);
     }
@@ -1480,17 +1482,17 @@ const ExecServer = struct {
         self.failDiskFork(err);
     }
 
-    fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {
+    fn reportStatsThunk(context: *anyopaque, stats: vsock_control.ControlStats) void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
         self.reportStats(stats);
     }
 
-    fn captureOutputThunk(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn captureOutputThunk(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         const self: *ExecServer = @ptrCast(@alignCast(context.?));
         self.captureOutput(output, bytes);
     }
 
-    fn streamOutputThunk(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn streamOutputThunk(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         const self: *ExecServer = @ptrCast(@alignCast(context.?));
         self.streamOutput(output, bytes);
     }
@@ -1503,7 +1505,7 @@ fn elapsedOptional(later: ?u64, earlier: ?u64) ?u64 {
     return end - start;
 }
 
-fn namedExecTiming(stream: *const vsock.HostStream, submitted_ms: u64, finished_ms: u64) lifecycle.NamedExecTiming {
+fn namedExecTiming(stream: *const vsock_stream.HostStream, submitted_ms: u64, finished_ms: u64) lifecycle.NamedExecTiming {
     const total_ms = finished_ms -| submitted_ms;
     const guest_process_start_ms = elapsedOptional(stream.guest_spawn_ms, stream.guest_accept_ms);
     const guest_execution_ms = elapsedOptional(stream.guest_exit_ms, stream.guest_spawn_ms);
@@ -2324,9 +2326,9 @@ test "monitor host streams use nonce-seeded ports without early reuse" {
     const first_exec = server.nextHostStreamPort();
     const repeated_exec = server.nextHostStreamPort();
 
-    try std.testing.expectEqual(vsock.HostStream.hostPortForSequence(0x1234_5678_9abc_def0), readiness);
-    try std.testing.expectEqual(vsock.HostStream.hostPortForSequence(0x1234_5678_9abc_def1), first_exec);
-    try std.testing.expectEqual(vsock.HostStream.hostPortForSequence(0x1234_5678_9abc_def2), repeated_exec);
+    try std.testing.expectEqual(vsock_stream.HostStream.hostPortForSequence(0x1234_5678_9abc_def0), readiness);
+    try std.testing.expectEqual(vsock_stream.HostStream.hostPortForSequence(0x1234_5678_9abc_def1), first_exec);
+    try std.testing.expectEqual(vsock_stream.HostStream.hostPortForSequence(0x1234_5678_9abc_def2), repeated_exec);
     try std.testing.expect(readiness != first_exec);
     try std.testing.expect(first_exec != repeated_exec);
 }
@@ -2918,7 +2920,7 @@ test "streaming output backpressure fails instead of blocking" {
 }
 
 test "named exec timing partitions monitor and guest phases" {
-    var stream = try vsock.HostStream.init(10700, "{}\n");
+    var stream = try vsock_stream.HostStream.init(10700, "{}\n");
     stream.started_at_ms = 110;
     stream.response_ms = 80;
     stream.guest_timing_ms = 70;

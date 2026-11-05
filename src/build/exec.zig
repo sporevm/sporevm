@@ -15,6 +15,8 @@ const spore = @import("../spore.zig");
 const run_contract = @import("run_contract.zig");
 const step_cache = @import("step_cache.zig");
 const vsock = @import("../virtio/vsock.zig");
+const vsock_control = @import("../virtio/vsock_control.zig");
+const vsock_stream = @import("../virtio/vsock_stream.zig");
 
 const guest_port: u32 = 10700;
 const max_virtio_devices = switch (builtin.cpu.arch) {
@@ -620,7 +622,7 @@ const BuildControl = struct {
     step_index: usize = 0,
     phase: Phase = .start_run,
     active_stream: ActiveStream = .run,
-    stream: vsock.HostStream = undefined,
+    stream: vsock_stream.HostStream = undefined,
     stream_valid: bool = false,
     stream_sequence: u64 = 0,
     active_input: ?step_cache.StepInput = null,
@@ -676,7 +678,7 @@ const BuildControl = struct {
         self.resize_stdout.deinit();
     }
 
-    fn control(self: *BuildControl) vsock.Control {
+    fn control(self: *BuildControl) vsock_control.Control {
         return .{
             .context = self,
             .pollFn = pollThunk,
@@ -687,7 +689,7 @@ const BuildControl = struct {
         };
     }
 
-    fn poll(self: *BuildControl, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn poll(self: *BuildControl, dev: *vsock.Vsock) !vsock_control.ControlAction {
         switch (self.phase) {
             .start_resize => {
                 try self.startResize(dev);
@@ -791,9 +793,9 @@ const BuildControl = struct {
         };
     }
 
-    fn startStream(self: *BuildControl, dev: *vsock.Vsock, request: []const u8, protocol: vsock.HostStreamProtocol, kind: ActiveStream, stdin_payload: []const u8) !void {
-        self.stream = try vsock.HostStream.initWithProtocol(guest_port, request, protocol);
-        self.stream.host_port = vsock.HostStream.hostPortForSequence(self.stream_sequence);
+    fn startStream(self: *BuildControl, dev: *vsock.Vsock, request: []const u8, protocol: vsock_stream.HostStreamProtocol, kind: ActiveStream, stdin_payload: []const u8) !void {
+        self.stream = try vsock_stream.HostStream.initWithProtocol(guest_port, request, protocol);
+        self.stream.host_port = vsock_stream.HostStream.hostPortForSequence(self.stream_sequence);
         self.stream_sequence +%= 1;
         self.active_stream = kind;
         if (kind == .run or kind == .copy or kind == .workdir or kind == .resize) self.stream.setOutputSink(self, outputSink);
@@ -807,7 +809,7 @@ const BuildControl = struct {
         _ = try dev.flushHostStreamOutbound();
     }
 
-    fn pollActiveStream(self: *BuildControl, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn pollActiveStream(self: *BuildControl, dev: *vsock.Vsock) !vsock_control.ControlAction {
         if (!self.stream_valid) return .keep_running;
         try self.pumpActiveStdin();
         _ = try dev.flushHostStreamOutbound();
@@ -973,11 +975,11 @@ const BuildControl = struct {
         self.phase = .start_thaw;
     }
 
-    fn setWake(_: *BuildControl, _: vsock.Wake) void {}
+    fn setWake(_: *BuildControl, _: vsock_control.Wake) void {}
 
     fn completeSnapshot(_: *BuildControl, _: []const u8) !void {}
 
-    fn reportStats(_: *BuildControl, _: vsock.ControlStats) void {}
+    fn reportStats(_: *BuildControl, _: vsock_control.ControlStats) void {}
 
     fn appendOutput(self: *BuildControl, bytes: []const u8) void {
         self.enospc_detector.observe(bytes);
@@ -990,7 +992,7 @@ const BuildControl = struct {
         if (take != 0) self.capture.appendSlice(bytes[0..take]) catch {};
     }
 
-    fn outputSink(context: ?*anyopaque, output: vsock.HostStreamOutput, bytes: []const u8) void {
+    fn outputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         const self: *BuildControl = @ptrCast(@alignCast(context.?));
         if (self.active_stream == .resize and output == .stdout) {
             const remaining = max_rootfs_grow_response -| self.resize_stdout.items.len;
@@ -1003,12 +1005,12 @@ const BuildControl = struct {
         self.appendOutput(bytes);
     }
 
-    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock_control.ControlAction {
         const self: *BuildControl = @ptrCast(@alignCast(context));
         return self.poll(dev);
     }
 
-    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
+    fn setWakeThunk(context: *anyopaque, wake: vsock_control.Wake) void {
         const self: *BuildControl = @ptrCast(@alignCast(context));
         self.setWake(wake);
     }
@@ -1023,7 +1025,7 @@ const BuildControl = struct {
         try self.completeRootfsSnapshot(disk);
     }
 
-    fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {
+    fn reportStatsThunk(context: *anyopaque, stats: vsock_control.ControlStats) void {
         const self: *BuildControl = @ptrCast(@alignCast(context));
         self.reportStats(stats);
     }

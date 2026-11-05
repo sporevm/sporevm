@@ -3608,6 +3608,45 @@ test "manifest rejects overflowing virtqueue base addresses" {
     try std.testing.expectError(error.BadManifest, validateManifest(manifest));
 }
 
+test "manifest rejects ready virtqueues the device could not have accepted" {
+    var queues = [_]QueueState{.{
+        .size = 8,
+        .ready = true,
+        .desc_addr = 0x1000,
+        .avail_addr = 0x2000,
+        .used_addr = 0x3000,
+        .last_avail = 0,
+        .used_idx = 0,
+    }};
+    var devices = [_]TransportState{testTransport(3)};
+    devices[0].queues = &queues;
+    var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
+    manifest.devices = &devices;
+    try validateManifest(manifest);
+
+    queues[0].size = 6;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    queues[0].size = 8;
+
+    queues[0].desc_addr = 0x1008;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    queues[0].desc_addr = 0x1000;
+
+    queues[0].avail_addr = 0x2001;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    queues[0].avail_addr = 0x2000;
+
+    queues[0].used_addr = 0x3002;
+    try std.testing.expectError(error.BadManifest, validateManifest(manifest));
+    queues[0].used_addr = 0x3000;
+
+    // A queue that is not ready carries no ring layout yet.
+    queues[0].ready = false;
+    queues[0].size = 6;
+    queues[0].used_addr = 0x3002;
+    try validateManifest(manifest);
+}
+
 fn testRootfs(mmio_slot: u32) Rootfs {
     return .{
         .device = .{ .mmio_slot = mmio_slot },

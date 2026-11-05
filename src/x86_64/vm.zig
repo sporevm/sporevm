@@ -20,6 +20,8 @@ const virtio_console = @import("../virtio/console.zig");
 const virtio_net = @import("../virtio/net.zig");
 const virtio_rng = @import("../virtio/rng.zig");
 const virtio_vsock = @import("../virtio/vsock.zig");
+const vsock_control = @import("../virtio/vsock_control.zig");
+const vsock_stream = @import("../virtio/vsock_stream.zig");
 const board = @import("board.zig");
 const boot = @import("boot.zig");
 const cpu = @import("cpu.zig");
@@ -51,11 +53,11 @@ pub const Config = struct {
     cache_disk: ?virtio_blk.Backend = null,
     cache_disk_writable: bool = false,
     network: virtio_net.Runtime = .{},
-    exec_probe: ?*virtio_vsock.HostStream = null,
-    exec_probe_start: virtio_vsock.HostStreamStart = .immediate,
+    exec_probe: ?*vsock_stream.HostStream = null,
+    exec_probe_start: vsock_stream.HostStreamStart = .immediate,
     exec_probe_completes_run: bool = true,
     exec_probe_watchdog_until_control: bool = false,
-    exec_control: ?virtio_vsock.Control = null,
+    exec_control: ?vsock_control.Control = null,
     exec_probe_timeout_ms: u64 = 30_000,
     generation_seed: ?GenerationSeed = null,
 };
@@ -125,7 +127,7 @@ var cleared_control_wake_context: u8 = 0;
 
 fn ignoreControlWake(_: *anyopaque) void {}
 
-fn clearControlWake(control: virtio_vsock.Control) void {
+fn clearControlWake(control: vsock_control.Control) void {
     control.setWake(.{ .context = &cleared_control_wake_context, .wakeFn = ignoreControlWake });
 }
 
@@ -295,14 +297,14 @@ const ThreadContext = struct {
     device_lock: *SpinLock,
     transports: *[board.max_virtio_devices]mmio.Transport,
     gen_dev: *generation.Device,
-    exec_probe: ?*virtio_vsock.HostStream,
+    exec_probe: ?*vsock_stream.HostStream,
     exec_probe_completes_run: bool,
     exec_probe_done: *std.atomic.Value(bool),
     exec_probe_completion_seen: *std.atomic.Value(bool),
     exec_probe_deadline_ms: *std.atomic.Value(u64),
     exec_probe_timeout_ms: u64,
     exec_probe_watchdog_until_control: bool,
-    exec_control: ?virtio_vsock.Control,
+    exec_control: ?vsock_control.Control,
     disk_snapshot: ?disk_layer.SnapshotState,
     vsock_dev: *virtio_vsock.Vsock,
     network: virtio_net.Runtime,
@@ -329,7 +331,7 @@ const EmptyDevice = struct {
 const ProbeWatchdogContext = struct {
     state: *RunState,
     wake_set: *WakeSet,
-    probe: *virtio_vsock.HostStream,
+    probe: *vsock_stream.HostStream,
     done: *const std.atomic.Value(bool),
     attachment_seen: *std.atomic.Value(bool),
     active: *std.atomic.Value(bool),
@@ -815,8 +817,7 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
         },
     }
     const transport = &ctx.transports[board.vsock_slot.index];
-    if (ctx.vsock_dev.flushPendingRx(&transport.queues, ctx.ram)) {
-        transport.interrupt_status |= 1;
+    if (ctx.vsock_dev.flushPendingRx(transport, ctx.ram)) {
         try kvm.setIrq(ctx.vm_fd, board.vsock_slot.gsi, true);
     }
     return false;
@@ -825,10 +826,10 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
 const X86ControlDecision = union(enum) {
     keep_running,
     stop,
-    rootfs_snapshot: virtio_vsock.RootfsSnapshotAction,
+    rootfs_snapshot: vsock_control.RootfsSnapshotAction,
 };
 
-fn x86ControlDecision(action: virtio_vsock.ControlAction) !X86ControlDecision {
+fn x86ControlDecision(action: vsock_control.ControlAction) !X86ControlDecision {
     return switch (action) {
         .keep_running => .keep_running,
         .stop => .stop,
@@ -1082,8 +1083,7 @@ fn flushNetworkRx(
     transport: *mmio.Transport,
     ram: guestmem.GuestRam,
 ) !void {
-    if (net_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (net_dev.flushPendingRx(transport, ram)) {
         try kvm.setIrq(vm_fd, board.net_slot.gsi, true);
     }
 }
@@ -1346,7 +1346,7 @@ test "probe watchdog publishes a typed timeout" {
     var state = RunState{};
     var vcpus: [0]Vcpu = .{};
     var wake_set = WakeSet{ .vcpus = vcpus[0..] };
-    var probe = try virtio_vsock.HostStream.init(10700, "timeout");
+    var probe = try vsock_stream.HostStream.init(10700, "timeout");
     var done = std.atomic.Value(bool).init(false);
     var attachment_seen = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(bool).init(true);
@@ -1373,7 +1373,7 @@ test "completed exec probe disarms watchdog without stopping commit control" {
     var state = RunState{};
     var vcpus: [0]Vcpu = .{};
     var wake_set = WakeSet{ .vcpus = vcpus[0..] };
-    var probe = try virtio_vsock.HostStream.init(10700, "complete");
+    var probe = try vsock_stream.HostStream.init(10700, "complete");
     var done = std.atomic.Value(bool).init(true);
     var attachment_seen = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(bool).init(true);
@@ -1397,7 +1397,7 @@ test "deferred exec probe refreshes watchdog when command starts" {
     var state = RunState{};
     var vcpus: [0]Vcpu = .{};
     var wake_set = WakeSet{ .vcpus = vcpus[0..] };
-    var probe = try virtio_vsock.HostStream.init(10700, "deferred");
+    var probe = try vsock_stream.HostStream.init(10700, "deferred");
     probe.markStarted();
     var done = std.atomic.Value(bool).init(false);
     var attachment_seen = std.atomic.Value(bool).init(false);

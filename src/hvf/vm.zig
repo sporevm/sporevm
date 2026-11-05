@@ -28,6 +28,7 @@ const rng = @import("../virtio/rng.zig");
 const transport_snapshot = @import("../virtio/transport_snapshot.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
+const vsock_control = @import("../virtio/vsock_control.zig");
 const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
@@ -2016,8 +2017,8 @@ const DirtyTracker = struct {
     }
 };
 
-fn monitorStats(tracker: ?*DirtyTracker) vsock.ControlStats {
-    var result = vsock.ControlStats{};
+fn monitorStats(tracker: ?*DirtyTracker) vsock_control.ControlStats {
+    var result = vsock_control.ControlStats{};
     if (tracker) |active| {
         result.chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount());
         result.dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending());
@@ -2025,17 +2026,17 @@ fn monitorStats(tracker: ?*DirtyTracker) vsock.ControlStats {
     return result;
 }
 
-fn logNamedSnapshotPublication(metrics: vsock.SnapshotPublishMetrics, pause_started_ns: u64) void {
+fn logNamedSnapshotPublication(metrics: vsock_control.SnapshotPublishMetrics, pause_started_ns: u64) void {
     const source_pause_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
     std.log.info(
         "hvf named snapshot publication metrics: cache_lock_wait_ms={d} manifest_pin_authorization_ms={d} active_lease_handoff_ms={d} lifecycle_spec_ms={d} final_publication_ms={d} source_pause_ms={d}",
         .{
-            vsock.SnapshotPublishMetrics.nsToMs(metrics.cache_lock_wait_ns),
-            vsock.SnapshotPublishMetrics.nsToMs(metrics.manifest_pin_authorization_ns),
-            vsock.SnapshotPublishMetrics.nsToMs(metrics.active_lease_handoff_ns),
-            vsock.SnapshotPublishMetrics.nsToMs(metrics.lifecycle_spec_ns),
-            vsock.SnapshotPublishMetrics.nsToMs(metrics.final_publication_ns),
-            vsock.SnapshotPublishMetrics.nsToMs(source_pause_ns),
+            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.cache_lock_wait_ns),
+            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.manifest_pin_authorization_ns),
+            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.active_lease_handoff_ns),
+            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.lifecycle_spec_ns),
+            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.final_publication_ns),
+            vsock_control.SnapshotPublishMetrics.nsToMs(source_pause_ns),
         },
     );
 }
@@ -2072,8 +2073,8 @@ fn takeRootfsSnapshot(
 
 fn captureSingleHvfDiskFork(
     allocator: std.mem.Allocator,
-    request: vsock.DiskForkAction,
-    control: vsock.Control,
+    request: vsock_control.DiskForkAction,
+    control: vsock_control.Control,
     vcpu: hvf.VcpuHandle,
     transports: []mmio.Transport,
     gen_dev: *const generation.Device,
@@ -2444,8 +2445,8 @@ fn captureMultiHvfDiskFork(
     wake_set: *HvfVcpuWakeSet,
     redist_base: u64,
     redist_stride: u64,
-    request: vsock.DiskForkAction,
-    control: vsock.Control,
+    request: vsock_control.DiskForkAction,
+    control: vsock_control.Control,
 ) !void {
     const disk = options.disk_snapshot orelse return error.BadManifest;
     const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
@@ -2593,15 +2594,14 @@ fn flushVsockRx(
     ram: guestmem.GuestRam,
     transport_index: u32,
 ) !bool {
-    if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (vsock_dev.flushPendingRx(transport, ram)) {
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
         return true;
     }
     return false;
 }
 
-fn wakeAfterVsockRxDelivery(delivered: bool, wake: vsock.Wake) void {
+fn wakeAfterVsockRxDelivery(delivered: bool, wake: vsock_control.Wake) void {
     if (delivered) wake.wake();
 }
 
@@ -2621,8 +2621,7 @@ fn flushNetworkRxHvf(
     ram: guestmem.GuestRam,
     transport_index: usize,
 ) !void {
-    if (net_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (net_dev.flushPendingRx(transport, ram)) {
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(transport_index)), true), "raise net spi");
     }
 }
@@ -2868,7 +2867,7 @@ const TestVsockWakeCounter = struct {
 
 test "multi-vcpu vsock delivery wakes once per delivered batch" {
     var counter = TestVsockWakeCounter{};
-    const wake = vsock.Wake{ .context = &counter, .wakeFn = TestVsockWakeCounter.wake };
+    const wake = vsock_control.Wake{ .context = &counter, .wakeFn = TestVsockWakeCounter.wake };
 
     wakeAfterVsockRxDelivery(false, wake);
     try std.testing.expectEqual(@as(usize, 0), counter.count);

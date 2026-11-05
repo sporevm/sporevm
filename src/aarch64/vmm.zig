@@ -14,7 +14,8 @@ const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
 const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
-const vsock = @import("../virtio/vsock.zig");
+const vsock_control = @import("../virtio/vsock_control.zig");
+const vsock_stream = @import("../virtio/vsock_stream.zig");
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
@@ -56,9 +57,9 @@ pub const Config = struct {
     /// Optional virtio-net frame backend. The default remains closed.
     network: net.Runtime = .{},
     /// Optional monitor control hook for attaching host streams after boot.
-    exec_control: ?vsock.Control = null,
+    exec_control: ?vsock_control.Control = null,
 
-    pub fn probeStream(self: Config) ?*vsock.HostStream {
+    pub fn probeStream(self: Config) ?*vsock_stream.HostStream {
         return if (self.probe) |probe| probe.stream else null;
     }
 
@@ -116,9 +117,9 @@ pub const Start = union(enum) {
 };
 
 pub const Probe = struct {
-    stream: *vsock.HostStream,
+    stream: *vsock_stream.HostStream,
     timeout_ms: u64 = 30_000,
-    start: vsock.HostStreamStart = .immediate,
+    start: vsock_stream.HostStreamStart = .immediate,
     on_complete: OnComplete = .stop,
 
     pub const OnComplete = enum {
@@ -286,14 +287,14 @@ test "prepare rejects an unsupported vCPU count" {
 }
 
 test "prepare rejects a deferred probe without a control" {
-    var stream: vsock.HostStream = undefined;
+    var stream: vsock_stream.HostStream = undefined;
     var config = testBoot(.{});
     config.probe = .{ .stream = &stream, .start = .control };
     try expectRejected(error.DeferredExecProbeRequiresControl, config, test_rules);
 }
 
 test "prepare rejects a probe-completion capture that can never fire" {
-    var stream: vsock.HostStream = undefined;
+    var stream: vsock_stream.HostStream = undefined;
     var config = testBoot(.{});
     config.capture = .{ .dir = "out.spore", .trigger = .probe_complete };
     try expectRejected(error.CaptureNeverTriggered, config, test_rules);

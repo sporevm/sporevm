@@ -6,6 +6,7 @@
 //! memory access goes through `guestmem.GuestRam`. See SECURITY.md.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const guestmem = @import("../guestmem.zig");
 
 pub const max_queue_size = 256;
@@ -19,12 +20,19 @@ pub const max_chain_len = 64;
 pub const Error = error{
     QueueNotReady,
     InvalidQueueSize,
+    MisalignedRing,
     BadDescriptorIndex,
     ChainTooLong,
     OutOfBounds,
 };
 
+// Split virtqueue part alignment and sizes (virtio 1.2 §2.7). The avail and
+// used ring sizes include the trailing event fields the driver allocates
+// even though VIRTIO_F_EVENT_IDX is not offered.
 const desc_size = 16;
+const desc_align = 16;
+const avail_align = 2;
+const used_align = 4;
 const flag_next: u16 = 1;
 const flag_write: u16 = 2;
 const flag_indirect: u16 = 4;
@@ -127,24 +135,51 @@ pub const VirtQueue = struct {
         self.* = .{};
     }
 
+    /// Validate serialized queue state before restore applies it. A queue
+    /// that is not ready only needs a size within `max_queue_size`; a ready
+    /// one must pass every check `validateRings` makes without guest RAM.
     pub fn validateLayout(self: *const VirtQueue) Error!void {
         if (self.size > max_queue_size) return error.InvalidQueueSize;
-        if (!self.ready or self.size == 0) return;
+        if (self.ready) try self.validateUsableLayout();
+    }
 
+    /// Check the guest-programmed layout before the device touches the rings:
+    /// a power-of-two size no larger than `max_queue_size`, the part
+    /// alignments of virtio 1.2 §2.7, and every part wholly inside guest RAM.
+    /// With guest RAM mapped page-aligned, aligned rings also keep the 16-bit
+    /// index loads and stores single-copy atomic against the guest.
+    pub fn validateRings(self: *const VirtQueue, ram: guestmem.GuestRam) Error!void {
+        try self.validateUsableLayout();
         const qsz: u64 = self.size;
-        _ = try checkedAdd(self.desc_addr, try checkedMul(desc_size, qsz));
-        _ = try checkedAdd(self.avail_addr, try checkedAdd(4, try checkedMul(2, qsz)));
-        _ = try checkedAdd(self.used_addr, try checkedAdd(4, try checkedMul(8, qsz)));
+        _ = ram.slice(self.desc_addr, desc_size * qsz) catch return error.OutOfBounds;
+        _ = ram.slice(self.avail_addr, 6 + 2 * qsz) catch return error.OutOfBounds;
+        _ = ram.slice(self.used_addr, 6 + 8 * qsz) catch return error.OutOfBounds;
+    }
+
+    fn validateUsableLayout(self: *const VirtQueue) Error!void {
+        if (self.size == 0 or self.size > max_queue_size or !std.math.isPowerOfTwo(self.size)) return error.InvalidQueueSize;
+        const qsz: u64 = self.size;
+        _ = try checkedAdd(self.desc_addr, desc_size * qsz);
+        _ = try checkedAdd(self.avail_addr, 6 + 2 * qsz);
+        _ = try checkedAdd(self.used_addr, 6 + 8 * qsz);
+        if (self.desc_addr % desc_align != 0 or
+            self.avail_addr % avail_align != 0 or
+            self.used_addr % used_align != 0) return error.MisalignedRing;
     }
 
     /// Pop the next available descriptor chain, or null when the ring is
     /// empty. The returned segments alias guest RAM directly.
     pub fn popAvail(self: *VirtQueue, ram: guestmem.GuestRam) Error!?Chain {
         if (!self.ready or self.size == 0) return error.QueueNotReady;
-        try self.validateLayout();
+        try self.validateRings(ram);
 
         const avail_idx = ram.read(u16, try availIdxAddr(self.avail_addr)) catch return error.OutOfBounds;
         if (avail_idx == self.last_avail) return null;
+        // Pairs with the driver's barrier before it publishes avail idx
+        // (virtio 1.2 §2.7.13.3.1): the ring entry and descriptors it exposes
+        // must not be read before idx, or another vCPU's half-written chain
+        // could be parsed.
+        acquireBarrier();
 
         const slot = self.last_avail % self.size;
         const head = ram.read(u16, try availRingAddr(self.avail_addr, slot)) catch return error.OutOfBounds;
@@ -184,16 +219,40 @@ pub const VirtQueue = struct {
     /// bytes the device wrote into device-writable segments.
     pub fn pushUsed(self: *VirtQueue, ram: guestmem.GuestRam, head: u16, written: u32) Error!void {
         if (!self.ready or self.size == 0) return error.QueueNotReady;
-        try self.validateLayout();
+        try self.validateRings(ram);
 
         const slot = self.used_idx % self.size;
         const elem = try usedRingAddr(self.used_addr, slot);
         ram.write(u32, elem, head) catch return error.OutOfBounds;
         ram.write(u32, try checkedAdd(elem, 4), written) catch return error.OutOfBounds;
         self.used_idx +%= 1;
+        // Virtio 1.2 §2.7.8.2: the element and the bytes written into the
+        // chain must be visible before used idx, and the device must have
+        // finished reading the chain before the driver may reuse it.
+        releaseBarrier();
         ram.write(u16, try usedIdxAddr(self.used_addr), self.used_idx) catch return error.OutOfBounds;
     }
 };
+
+// Device halves of the virtqueue index barriers. Zig has no standalone fence
+// builtin, so these use the barriers Linux uses for virt_rmb() and virt_mb()
+// on arm64. x86-64 (TSO) never reorders loads with loads or stores with
+// earlier loads and stores, so it only needs the compiler barrier.
+fn acquireBarrier() void {
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile ("dmb ishld" ::: .{ .memory = true }),
+        .x86_64 => asm volatile ("" ::: .{ .memory = true }),
+        else => @compileError("virtqueue barriers are defined only for aarch64 and x86_64"),
+    }
+}
+
+fn releaseBarrier() void {
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile ("dmb ish" ::: .{ .memory = true }),
+        .x86_64 => asm volatile ("" ::: .{ .memory = true }),
+        else => @compileError("virtqueue barriers are defined only for aarch64 and x86_64"),
+    }
+}
 
 pub fn availIdxAddr(avail_addr: u64) Error!u64 {
     return checkedAdd(avail_addr, 2);
@@ -397,6 +456,30 @@ test "overflowing queue ring addresses fail closed" {
     var used = TestRing.init(8);
     used.q.used_addr = std.math.maxInt(u64);
     try std.testing.expectError(error.OutOfBounds, used.q.pushUsed(used.ram(), 0, 0));
+}
+
+test "ring layouts the device cannot use fail closed" {
+    // Restored queue state never passes through QueueReady, and restore
+    // cannot check RAM bounds, so every access rechecks the rings.
+    var odd_size = TestRing.init(6);
+    try std.testing.expectError(error.InvalidQueueSize, odd_size.q.popAvail(odd_size.ram()));
+
+    var desc = TestRing.init(8);
+    desc.q.desc_addr = TestRing.desc_base + 8;
+    try std.testing.expectError(error.MisalignedRing, desc.q.popAvail(desc.ram()));
+
+    var avail = TestRing.init(8);
+    avail.q.avail_addr = TestRing.avail_base + 1;
+    try std.testing.expectError(error.MisalignedRing, avail.q.popAvail(avail.ram()));
+
+    var used = TestRing.init(8);
+    used.q.used_addr = TestRing.used_base + 2;
+    try std.testing.expectError(error.MisalignedRing, used.q.pushUsed(used.ram(), 0, 0));
+
+    // The used ring's trailing avail_event field would end past guest RAM.
+    var tail = TestRing.init(8);
+    tail.q.used_addr = tail.buf.len - (4 + 8 * 8);
+    try std.testing.expectError(error.OutOfBounds, tail.q.pushUsed(tail.ram(), 0, 0));
 }
 
 test "used ring round-trip" {

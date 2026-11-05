@@ -5,11 +5,13 @@ const std = @import("std");
 const spore = @import("spore.zig");
 const spore_stream = @import("spore_stream.zig");
 const vsock = @import("virtio/vsock.zig");
+const vsock_control = @import("virtio/vsock_control.zig");
+const vsock_stream = @import("virtio/vsock_stream.zig");
 
 const max_guest_request_len = 8191;
 
 pub const RunStdinControl = struct {
-    stream: *vsock.HostStream,
+    stream: *vsock_stream.HostStream,
     terminal: bool,
     forward_input: bool,
     resize_fd: std.c.fd_t,
@@ -24,7 +26,7 @@ pub const RunStdinControl = struct {
     resize_registration: ?TerminalResizeRegistration = null,
     raw_terminal: ?RawTerminal = null,
 
-    pub fn init(stream: *vsock.HostStream, terminal: bool, forward_input: bool, resize_fd: std.c.fd_t) RunStdinControl {
+    pub fn init(stream: *vsock_stream.HostStream, terminal: bool, forward_input: bool, resize_fd: std.c.fd_t) RunStdinControl {
         return .{
             .stream = stream,
             .terminal = terminal,
@@ -67,7 +69,7 @@ pub const RunStdinControl = struct {
         self.closeStopPipe();
     }
 
-    pub fn control(self: *RunStdinControl) vsock.Control {
+    pub fn control(self: *RunStdinControl) vsock_control.Control {
         return .{
             .context = self,
             .pollFn = pollThunk,
@@ -156,14 +158,14 @@ pub const RunStdinControl = struct {
         const wake_fn_addr = self.wake_fn_addr.load(.acquire);
         if (wake_fn_addr == 0) return;
         const wake_context_addr = self.wake_context_addr.load(.acquire);
-        const wake = vsock.Wake{
+        const wake = vsock_control.Wake{
             .context = @ptrFromInt(wake_context_addr),
             .wakeFn = @ptrFromInt(wake_fn_addr),
         };
         wake.wake();
     }
 
-    fn poll(self: *RunStdinControl, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn poll(self: *RunStdinControl, dev: *vsock.Vsock) !vsock_control.ControlAction {
         if (self.failed.load(.acquire)) self.stream.fail();
         if (self.terminal) {
             const count = self.resize_count.load(.acquire);
@@ -176,7 +178,7 @@ pub const RunStdinControl = struct {
         return .keep_running;
     }
 
-    fn setWake(self: *RunStdinControl, wake: vsock.Wake) void {
+    fn setWake(self: *RunStdinControl, wake: vsock_control.Wake) void {
         self.wake_context_addr.store(@intFromPtr(wake.context), .release);
         self.wake_fn_addr.store(@intFromPtr(wake.wakeFn), .release);
     }
@@ -185,14 +187,14 @@ pub const RunStdinControl = struct {
 
     fn completeRootfsSnapshot(_: *RunStdinControl, _: ?spore.Disk) !void {}
 
-    fn reportStats(_: *RunStdinControl, _: vsock.ControlStats) void {}
+    fn reportStats(_: *RunStdinControl, _: vsock_control.ControlStats) void {}
 
-    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock.ControlAction {
+    fn pollThunk(context: *anyopaque, dev: *vsock.Vsock) !vsock_control.ControlAction {
         const self: *RunStdinControl = @ptrCast(@alignCast(context));
         return self.poll(dev);
     }
 
-    fn setWakeThunk(context: *anyopaque, wake: vsock.Wake) void {
+    fn setWakeThunk(context: *anyopaque, wake: vsock_control.Wake) void {
         const self: *RunStdinControl = @ptrCast(@alignCast(context));
         self.setWake(wake);
     }
@@ -207,7 +209,7 @@ pub const RunStdinControl = struct {
         try self.completeRootfsSnapshot(disk);
     }
 
-    fn reportStatsThunk(context: *anyopaque, stats: vsock.ControlStats) void {
+    fn reportStatsThunk(context: *anyopaque, stats: vsock_control.ControlStats) void {
         const self: *RunStdinControl = @ptrCast(@alignCast(context));
         self.reportStats(stats);
     }
