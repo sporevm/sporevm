@@ -1,45 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
-
-json_field() {
-  python3 - "$1" "$2" <<'PY'
-import json
-import sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    value = json.load(f)
-for part in sys.argv[2].split("."):
-    value = value[part]
-print(str(value).lower() if isinstance(value, bool) else value)
-PY
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
 count="${SPORE_SMOKE_LOCAL_PULL_COUNT:-3}"
 case "${count}" in
@@ -50,7 +15,7 @@ esac
 image_ref="${SPORE_SMOKE_ROOTFS_IMAGE:-docker.io/library/ruby:3.3-alpine}"
 platform="${SPORE_SMOKE_ROOTFS_PLATFORM:-linux/arm64}"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-local-pull.XXXXXX")"
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-local-pull"
 run_pid=""
 watchdog_pid=""
 cleanup() {
@@ -62,9 +27,7 @@ cleanup() {
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
     wait "${watchdog_pid}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${workdir}"
 }
-trap cleanup EXIT
 
 pack_rootfs_cache="${workdir}/pack-rootfs-cache"
 pull_rootfs_cache="${workdir}/pull-rootfs-cache"

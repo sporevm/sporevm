@@ -1,67 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
-
-jsonl_output_contains() {
-  python3 - "$1" "$2" "$3" <<'PY'
-import base64
-import json
-import sys
-
-needle = sys.argv[3].encode()
-with open(sys.argv[1], encoding="utf-8") as f:
-    for line in f:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("event") != sys.argv[2]:
-            continue
-        if needle in base64.b64decode(event.get("data_base64", "")):
-            sys.exit(0)
-sys.exit(1)
-PY
-}
-
-manifest_field() {
-  python3 - "$1" "$2" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as f:
-    manifest = json.load(f)
-value = manifest
-for part in sys.argv[2].split("."):
-    value = value[part]
-print(value)
-PY
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 expect_manifest_v3() {
   local dir="$1"
   [[ -f "${dir}/manifest.json" ]] || die "missing manifest: ${dir}/manifest.json"
-  [[ "$(manifest_field "${dir}/manifest.json" version)" == "3" ]] || die "manifest is not v3: ${dir}/manifest.json"
-  [[ "$(manifest_field "${dir}/manifest.json" platform.vcpu_count)" == "${vcpus}" ]] || die "manifest vcpu_count mismatch: ${dir}/manifest.json"
+  [[ "$(json_field "${dir}/manifest.json" version)" == "3" ]] || die "manifest is not v3: ${dir}/manifest.json"
+  [[ "$(json_field "${dir}/manifest.json" platform.vcpu_count)" == "${vcpus}" ]] || die "manifest vcpu_count mismatch: ${dir}/manifest.json"
 }
 
 expect_nproc_equals() {
@@ -179,7 +125,7 @@ run_disk_point_in_time_case() {
     /bin/sh -lc 'printf captured > /var/sporevm-save-point; sync'
   save_named_with_metrics "${source_name}" "${saved_dir}" "${kind}"
   expect_manifest_v3 "${saved_dir}"
-  [[ "$(manifest_field "${saved_dir}/manifest.json" disk.kind)" == "chunk-index-disk-v0" ]] || \
+  [[ "$(json_field "${saved_dir}/manifest.json" disk.kind)" == "chunk-index-disk-v0" ]] || \
     die "${kind} save did not record a writable disk index"
 
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- \
@@ -225,24 +171,15 @@ expect_still_ticking() {
 }
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
 vcpus="${SPORE_SMOKE_VCPUS:-2}"
 memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-512}mib}"
 create_timeout_ms="${SPORE_SMOKE_CREATE_TIMEOUT_MS:-120000}"
 (( vcpus > 1 )) || die "multi-vCPU smoke requires SPORE_SMOKE_VCPUS greater than 1"
 online_cpu_command=(/bin/sh -c 'printf "spore cpus-online "; cat /sys/devices/system/cpu/online')
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-multi-vcpu.XXXXXX")"
-# Keep the runtime dir short: control socket paths must fit the 104-byte
-# macOS sun_path limit, and macOS TMPDIR lives under a deep /var/folders path.
-runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
-mkdir -p "${runtime_parent}"
-runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-mvcpu.XXXXXX")"
-chmod 700 "${runtime_dir}"
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-multi-vcpu"
+smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-mvcpu"
 if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   exact_spore_bin="$(cd "$(dirname "${spore_bin}")" && pwd -P)/$(basename "${spore_bin}")"
   debug_spore_bin="${workdir}/spore-debug"
@@ -258,28 +195,17 @@ vm_name="mvcpus-${backend}"
 forked_name="${vm_name}-forked"
 resumed_name="${vm_name}-resumed"
 cleanup() {
-  local status="$?"
-  if [[ -d "${runtime_dir}" ]]; then
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null 2>&1 || true
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${resumed_name}" >/dev/null 2>&1 || true
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-image" >/dev/null 2>&1 || true
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-image-restored" >/dev/null 2>&1 || true
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-explicit-rootfs" >/dev/null 2>&1 || true
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-explicit-rootfs-restored" >/dev/null 2>&1 || true
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}-auto" >/dev/null 2>&1 || true
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
-    for saved_dir in "${workdir}/image.spore" "${workdir}/explicit-rootfs.spore" "${workdir}/auto.spore"; do
-      [[ -d "${saved_dir}" ]] || continue
-      SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${saved_dir}" >/dev/null 2>&1 || true
-    done
-  fi
-  if [[ "${SPORE_SMOKE_KEEP_WORKDIR:-0}" == "1" || "${status}" != "0" ]]; then
-    echo "kept smoke workdir: ${workdir} runtime_dir=${runtime_dir}" >&2
-    exit "${status}"
-  fi
-  rm -rf "${runtime_dir}" "${workdir}"
+  local name saved_dir
+  for name in "${forked_name}" "${resumed_name}" "${vm_name}-saved" "${vm_name}-live" "${vm_name}-live-restored" \
+    "${vm_name}-image" "${vm_name}-image-restored" "${vm_name}-explicit-rootfs" "${vm_name}-explicit-rootfs-restored" \
+    "${vm_name}-auto" "${vm_name}"; do
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${name}" >/dev/null 2>&1 || true
+  done
+  for saved_dir in "${workdir}/image.spore" "${workdir}/explicit-rootfs.spore" "${workdir}/auto.spore"; do
+    [[ -d "${saved_dir}" ]] || continue
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${saved_dir}" >/dev/null 2>&1 || true
+  done
 }
-trap cleanup EXIT
 
 nproc_stdout="${workdir}/nproc.stdout"
 nproc_stderr="${workdir}/nproc.stderr"
@@ -476,7 +402,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   fi
   expect_named_online_cpus "${auto_name}" "auto-cpus-online"
   save_named_with_metrics "${auto_name}" "${auto_dir}" "default-auto-memory"
-  [[ "$(manifest_field "${auto_dir}/manifest.json" platform.ram_size)" == "17179869184" ]] || \
+  [[ "$(json_field "${auto_dir}/manifest.json" platform.ram_size)" == "17179869184" ]] || \
     die "default-memory save did not preserve the 16GiB auto contract"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${auto_name}" >/dev/null
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${auto_dir}" >/dev/null

@@ -1,57 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-jsonl_output_contains() {
-  python3 - "$1" "$2" "$3" <<'PY'
-import base64
-import json
-import sys
-
-needle = sys.argv[3].encode()
-with open(sys.argv[1], encoding="utf-8") as f:
-    for line in f:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("event") != sys.argv[2]:
-            continue
-        if needle in base64.b64decode(event.get("data_base64", "")):
-            sys.exit(0)
-sys.exit(1)
-PY
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-capture.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-capture"
 
 capture_dir="${workdir}/captured.spore"
 fork_dir="${workdir}/children"

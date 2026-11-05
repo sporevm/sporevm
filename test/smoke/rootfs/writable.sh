@@ -1,26 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 disk_layer_count() {
   python3 - "$1" <<'PY'
@@ -35,24 +16,12 @@ PY
 }
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
 image_ref="${SPORE_SMOKE_WRITABLE_ROOTFS_IMAGE:-docker.io/library/alpine:3.20}"
 platform="${SPORE_SMOKE_WRITABLE_ROOTFS_PLATFORM:-linux/arm64}"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-writable-rootfs.XXXXXX")"
-cleanup() {
-  if [[ -z "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]]; then
-    rm -rf "${workdir}"
-  else
-    echo "kept smoke workdir: ${workdir}" >&2
-  fi
-}
-trap cleanup EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-writable-rootfs"
 
 base_dir="${workdir}/base.spore"
 child_dir="${workdir}/child.spore"

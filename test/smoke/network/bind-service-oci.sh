@@ -1,37 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-bs-oci.XXXXXX")"
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-bs-oci"
 sock="${workdir}/metadata.sock"
-trap '[[ -n "${server_pid:-}" ]] && kill "${server_pid}" 2>/dev/null || true; rm -rf "${workdir}"' EXIT
+server_pid=""
+cleanup() {
+  [[ -z "${server_pid}" ]] || kill "${server_pid}" 2>/dev/null || true
+}
 
 python3 - "${sock}" <<'PY' &
 import os

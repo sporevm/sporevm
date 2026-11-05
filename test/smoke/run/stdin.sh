@@ -1,21 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 image="${SPORE_STDIN_IMAGE:-docker.io/library/alpine:3.20}"
 timeout_bin="${TIMEOUT_BIN:-$(command -v timeout || command -v gtimeout || true)}"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 [[ -n "${timeout_bin}" ]] || die "timeout binary not found"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-stdin.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-stdin"
 
 printf hi | "${spore_bin}" run -i --image "${image}" -- /bin/cat >"${workdir}/interactive.stdout" 2>"${workdir}/interactive.stderr"
 grep -Fxq "hi" "${workdir}/interactive.stdout" || {

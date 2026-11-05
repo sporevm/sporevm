@@ -1,25 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer a supported backend; set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 clone_tree() {
   local source="$1"
@@ -106,21 +88,17 @@ wait_for_builds() {
 }
 
 backend="$(infer_backend)"
+require_spore_bin
 image_ref="${SPORE_SMOKE_IMAGE:-docker.io/library/alpine@sha256:45e09956dc667c5eff3583c9d94830261fb1ca0be10a0a7db36266edf5de9e1d}"
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-build-publication.XXXXXX")"
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-build-publication"
+lock_holder_pid=""
 cleanup() {
-  if [[ -n "${lock_holder_pid:-}" ]]; then
+  if [[ -n "${lock_holder_pid}" ]]; then
     kill "${lock_holder_pid}" 2>/dev/null || true
     wait "${lock_holder_pid}" 2>/dev/null || true
   fi
-  if [[ "${SPORE_SMOKE_KEEP_WORKDIR:-0}" == "1" ]]; then
-    echo "retained smoke workdir: ${workdir}" >&2
-  else
-    rm -rf "${workdir}"
-  fi
 }
-trap cleanup EXIT
 
 template_cache="${workdir}/template-cache"
 template_runtime="${workdir}/template-runtime"

@@ -1,42 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
-
-expect_eq() {
-  local expected="$1"
-  local actual="$2"
-  local label="$3"
-  [[ "${actual}" == "${expected}" ]] || die "${label}: expected ${expected}, got ${actual}"
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
-workdir="$(mktemp -d "${SPORE_SMOKE_WORK_ROOT:-/tmp}/sporevm-image-context.XXXXXX")"
+smoke_tempdir workdir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/sporevm-image-context"
 export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 mkdir -p "${SPOREVM_RUNTIME_DIR}" "${SPOREVM_ROOTFS_CACHE_DIR}" "${workdir}/context"
@@ -52,24 +22,11 @@ saved_spore="${workdir}/child.spore"
 image_ref="local/sporevm-image-context:smoke"
 
 cleanup() {
-  local status="$?"
-  if [[ "${status}" != "0" || "${SPORE_KEEP_SMOKE_WORKDIR:-0}" == "1" ]]; then
-    echo "smoke:lifecycle-image-context kept workdir=${workdir} runtime_dir=${SPOREVM_RUNTIME_DIR}" >&2
-    for log in "${SPOREVM_RUNTIME_DIR}"/vms/*/monitor.log; do
-      [[ -f "${log}" ]] || continue
-      echo "== ${log} ==" >&2
-      tail -120 "${log}" >&2 || true
-    done
-  fi
+  local name
   for name in "${restored_name}" "${child_name}" "${failed_name}" "${lookup_name}" "${override_name}" "${source_name}"; do
     "${spore_bin}" rm "${name}" >/dev/null 2>&1 || true
   done
-  if [[ "${status}" == "0" && "${SPORE_KEEP_SMOKE_WORKDIR:-0}" != "1" ]]; then
-    rm -rf "${workdir}"
-  fi
-  return "${status}"
 }
-trap cleanup EXIT
 
 cat >"${workdir}/context/Dockerfile" <<'DOCKERFILE'
 FROM docker.io/library/alpine:3.20

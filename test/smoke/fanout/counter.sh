@@ -1,55 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-jsonl_stdout_contains() {
-  python3 - "$1" "$2" <<'PY'
-import base64
-import json
-import sys
-
-needle = sys.argv[2].encode()
-with open(sys.argv[1], encoding="utf-8") as f:
-    for line in f:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("event") != "stdout":
-            continue
-        if needle in base64.b64decode(event.get("data_base64", "")):
-            sys.exit(0)
-sys.exit(1)
-PY
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
 count="${SPORE_SMOKE_FANOUT_COUNT:-10}"
 case "${count}" in
@@ -57,9 +13,8 @@ case "${count}" in
 esac
 [[ "${count}" != "0" ]] || die "SPORE_SMOKE_FANOUT_COUNT must be greater than zero"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-counter-fanout.XXXXXX")"
-runtime_dir="$(mktemp -d "/tmp/sporevm-counter-life.XXXXXX")"
-chmod 700 "${runtime_dir}" 2>/dev/null || true
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-counter-fanout"
+smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-counter"
 named_vm="cf-$$"
 run_pid=""
 resume_pid=""
@@ -78,10 +33,7 @@ cleanup() {
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
     wait "${watchdog_pid}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${runtime_dir}"
-  rm -rf "${workdir}"
 }
-trap cleanup EXIT
 
 capture_dir="${workdir}/counter.spore"
 fork_dir="${workdir}/children"
@@ -158,7 +110,7 @@ for _ in $(seq 1 "${SPORE_SMOKE_GENERATION_POLLS:-120}"); do
   if ! kill -0 "${resume_pid}" >/dev/null 2>&1; then
     break
   fi
-  if jsonl_stdout_contains "${generation_resume_stdout}" 'spore parallel job 7/1000'; then
+  if jsonl_output_contains "${generation_resume_stdout}" stdout 'spore parallel job 7/1000'; then
     seen_generation=1
     break
   fi

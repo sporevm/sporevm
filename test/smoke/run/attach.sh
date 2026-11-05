@@ -1,28 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 image="${SPORE_ATTACH_IMAGE:-docker.io/library/alpine:3.20}"
 timeout_bin="${TIMEOUT_BIN:-$(command -v timeout || command -v gtimeout || true)}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
 
 jsonl_terminal_contains() {
   python3 - "$1" "$2" <<'PY'
@@ -84,15 +65,10 @@ PY
 }
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 [[ -n "${timeout_bin}" ]] || die "timeout binary not found"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-attach.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-attach"
 
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 tty_capture="${workdir}/live-tty.spore"

@@ -1,45 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
-
-expect_eq() {
-  local expected="$1"
-  local actual="$2"
-  local label="$3"
-  [[ "${actual}" == "${expected}" ]] || die "${label}: expected ${expected}, got ${actual}"
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
 image_ref="${SPORE_SMOKE_NAMED_DISK_FORK_IMAGE:-docker.io/library/alpine:3.20}"
 memory="${SPORE_SMOKE_NAMED_DISK_FORK_MEMORY:-512mb}"
-work_root="${SPORE_SMOKE_NAMED_DISK_FORK_WORK_ROOT:-/tmp}"
-workdir="$(mktemp -d "${work_root%/}/sporevm-named-disk-fork.XXXXXX")"
+smoke_tempdir workdir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/sporevm-named-disk-fork"
 source_console_log="${workdir}/source-console.log"
 export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
@@ -59,7 +28,6 @@ save_pid=""
 lock_release=""
 
 cleanup() {
-  local status="$?"
   if [[ -n "${lock_release}" ]]; then
     touch "${lock_release}" 2>/dev/null || true
   fi
@@ -74,21 +42,7 @@ cleanup() {
   for name in repeated-nested repeated-restored postrestore postprune restored grandchild child-1 child-0 source; do
     "${spore_bin}" rm "${name}" >/dev/null 2>&1 || true
   done
-  if [[ "${status}" != "0" ]]; then
-    for log in "${SPOREVM_RUNTIME_DIR}"/vms/*/monitor.log; do
-      [[ -f "${log}" ]] || continue
-      echo "== ${log} ==" >&2
-      tail -120 "${log}" >&2 || true
-    done
-  fi
-  if [[ "${SPORE_SMOKE_NAMED_DISK_FORK_KEEP:-0}" == "1" ]]; then
-    echo "kept workdir: ${workdir}" >&2
-  else
-    rm -rf "${workdir}"
-  fi
-  return "${status}"
 }
-trap cleanup EXIT
 
 "${spore_bin}" create source \
   --backend "${backend}" \

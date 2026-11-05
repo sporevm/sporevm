@@ -1,97 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-die() {
-  failed=1
-  echo "error: $*" >&2
-  exit 1
-}
-
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 now_ms() {
   python3 -c 'import time; print(time.time_ns() // 1000000)'
 }
 
-run_capture() {
-  local stdout_path="$1"
-  local stderr_path="$2"
-  shift 2
-
-  set +e
-  "$@" >"${stdout_path}" 2>"${stderr_path}"
-  local status=$?
-  set -e
-  return "${status}"
-}
-
-require_success() {
-  local status="$1"
-  local label="$2"
-  local stderr_path="$3"
-  [[ "${status}" == "0" ]] && return
-  failed=1
-  cat "${stderr_path}" >&2 || true
-  die "${label} exited ${status}, expected 0"
-}
-
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle-auto-memory.XXXXXX")"
-runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
-mkdir -p "${runtime_parent}"
-runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-life-auto.XXXXXX")"
-chmod 700 "${runtime_dir}" 2>/dev/null || true
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle-auto-memory"
+smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-life-auto"
 
 vm_name="life-auto-${backend}-$$"
 spore_dir="${workdir}/${vm_name}.spore"
 console_log="${workdir}/console.log"
 created=0
-suspended=0
-failed=0
 
 cleanup() {
-  local keep=0
-  [[ "${failed}" == "1" || -n "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]] && keep=1
-
-  if [[ "${created}" == "1" && "${suspended}" != "1" && -z "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]]; then
+  if [[ "${created}" == "1" ]]; then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
-
-  if [[ "${keep}" == "1" ]]; then
-    echo "smoke:lifecycle-auto-memory kept workdir=${workdir} runtime_dir=${runtime_dir}" >&2
-    for log in "${workdir}"/*.stdout "${workdir}"/*.stderr "${workdir}"/*.log; do
-      [[ -e "${log}" ]] || continue
-      echo "==> ${log}" >&2
-      tail -120 "${log}" >&2 || true
-    done
-    return
-  fi
-  rm -rf "${runtime_dir}"
-  rm -rf "${workdir}"
 }
-trap cleanup EXIT
 
 create_stdout="${workdir}/create.stdout"
 create_stderr="${workdir}/create.stderr"
@@ -187,14 +120,12 @@ print(
 )
 PY
 )"; then
-  failed=1
   die "could not read lifecycle list metrics"
 fi
 
 suspend_start_ms="$(now_ms)"
 if run_capture "${suspend_stdout}" "${suspend_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${spore_dir}" --stop; then
-  suspended=1
   created=0
 else
   status=$?
@@ -266,7 +197,6 @@ print(
 )
 PY
 )"; then
-  failed=1
   die "could not read lifecycle manifest metrics"
 fi
 

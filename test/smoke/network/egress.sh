@@ -6,20 +6,14 @@ set -euo pipefail
 # host outside the allow rules must stay blocked. Requires internet access,
 # so it is gated for offline CI.
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 if [[ "${SPORE_SMOKE_EGRESS:-0}" != "1" ]]; then
   echo "smoke:net-egress skipped (set SPORE_SMOKE_EGRESS=1 to run against the public internet)"
   exit 0
 fi
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
 image="${SPORE_SMOKE_EGRESS_IMAGE:-docker.io/library/alpine:3.20}"
 allow_host="${SPORE_SMOKE_EGRESS_HOST:-dl-cdn.alpinelinux.org}"
@@ -27,20 +21,15 @@ fetch_url="${SPORE_SMOKE_EGRESS_URL:-https://dl-cdn.alpinelinux.org/alpine/v3.20
 min_bytes="${SPORE_SMOKE_EGRESS_MIN_BYTES:-1024}"
 denied_host="${SPORE_SMOKE_EGRESS_DENIED_HOST:-example.com}"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-net-egress.XXXXXX")"
-runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
-mkdir -p "${runtime_parent}"
-runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-egress.XXXXXX")"
-chmod 700 "${runtime_dir}" 2>/dev/null || true
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-net-egress"
+smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-egress"
 
 vm_name=""
 cleanup() {
   if [[ -n "${vm_name}" ]]; then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${runtime_dir}" "${workdir}"
 }
-trap cleanup EXIT
 
 fetch_and_assert() {
   local name="$1"

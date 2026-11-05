@@ -1,35 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle-copy.XXXXXX")"
-runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
-mkdir -p "${runtime_parent}"
-runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-copy.XXXXXX")"
-chmod 700 "${runtime_dir}" 2>/dev/null || true
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle-copy"
+smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-copy"
 
 vm_name="copy-${backend}-$$"
 created=0
@@ -37,9 +15,7 @@ cleanup() {
   if [[ "${created}" == "1" ]]; then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${runtime_dir}" "${workdir}"
 }
-trap cleanup EXIT
 
 printf 'spore copy smoke\n' >"${workdir}/source.txt"
 mkdir -p "${workdir}/source-dir/nested" "${workdir}/source-dir/empty"
