@@ -556,6 +556,8 @@ pub const ForkNamedOptions = struct {
     name_pattern: []const u8,
     allow_slow_copy: bool = false,
     spore_executable: []const u8 = "spore",
+    /// Start monitors with `--debug`.
+    debug: bool = false,
 };
 
 pub const NamedNetworkOptions = struct {
@@ -625,6 +627,8 @@ pub const CreateNamedOptions = struct {
     console_log_path: ?[]const u8 = null,
     initial_output: InitialOutputDisposition = .retain,
     spore_executable: []const u8 = "spore",
+    /// Start the monitor with `--debug`.
+    debug: bool = false,
     annotations: spore.Annotations = .{},
 };
 
@@ -634,6 +638,8 @@ pub const RestoreNamedOptions = struct {
     backend: ?run_mod.Backend = null,
     generation_path: ?[]const u8 = null,
     spore_executable: []const u8 = "spore",
+    /// Start the monitor with `--debug`.
+    debug: bool = false,
     bound_services: []const spore_net_policy.BoundServiceBinding = &.{},
 };
 
@@ -1023,7 +1029,7 @@ fn createNamedWithTiming(
     if (spec.rootfs != null or spec.exec_defaults != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
 
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
-    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
+    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, options.debug, spawn_policy);
     const monitor_spawned_ms = monotonicMs();
     try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
@@ -1196,7 +1202,7 @@ pub fn restoreNamed(
 
     const prepared_ms = monotonicMs();
     const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
-    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, spawn_policy);
+    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, options.debug, spawn_policy);
     const monitor_spawned_ms = monotonicMs();
     try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
@@ -1680,7 +1686,7 @@ pub fn forkNamed(
         });
         for (child_names, prepared.value.claims, 0..) |child_name, claim, index| {
             const spore_dir = try childSporeDir(arena, children_dir, index);
-            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, .{
+            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, options.debug, .{
                 .source_socket_path = ready.value.control_socket_path,
                 .batch_name = batch_name,
                 .prepared_claim = claim,
@@ -1706,7 +1712,7 @@ pub fn forkNamed(
         });
         for (child_names, 0..) |child_name, index| {
             const spore_dir = try childSporeDir(arena, children_dir, index);
-            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, null) catch |err| {
+            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, options.debug, null) catch |err| {
                 if (err != error.ControlSocketPathCollision) started.appendAssumeCapacity(child_name);
                 cleanupStartedChildren(init, arena, started.items);
                 return err;
@@ -1879,6 +1885,7 @@ pub fn createCli(
         .console_log_path = spec.console_log_path,
         .initial_output = parsed.initial_output,
         .spore_executable = spore_executable,
+        .debug = try invokedWithDebug(init, allocator),
         .annotations = spec.annotations,
     }, .{
         .start_ms = start_ms,
@@ -2172,6 +2179,17 @@ fn requestsJsonl(args: []const []const u8) bool {
     for (args, 0..) |arg, i| {
         if (std.mem.eql(u8, arg, "--events=jsonl")) return true;
         if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
+    }
+    return false;
+}
+
+/// Whether this process was started as `spore --debug COMMAND ...`. Commands
+/// that start a monitor pass the flag on, so `monitor.log` gets debug detail.
+fn invokedWithDebug(init: std.process.Init, allocator: std.mem.Allocator) !bool {
+    const args = try init.minimal.args.toSlice(allocator);
+    for (args[@min(args.len, 1)..]) |arg| {
+        if (std.mem.eql(u8, arg, "--debug")) return true;
+        if (!std.mem.startsWith(u8, arg, "-")) return false;
     }
     return false;
 }
@@ -2528,6 +2546,7 @@ pub fn forkCli(
         .name_pattern = parsed.name_pattern,
         .allow_slow_copy = parsed.allow_slow_copy,
         .spore_executable = spore_executable,
+        .debug = try invokedWithDebug(init, allocator),
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong, error.ControlSocketPathCollision => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
         error.InvalidForkNamePattern => {
@@ -2630,6 +2649,7 @@ pub fn restoreCli(
         .backend = parsed.backend,
         .generation_path = parsed.generation_path,
         .spore_executable = spore_executable,
+        .debug = try invokedWithDebug(init, allocator),
         .bound_services = parsed.bound_services.slice(),
     }) catch |err| {
         emitRestoreFailureEvent(&event_writer, parsed.event_mode, err);
@@ -4253,6 +4273,7 @@ fn startForkChildExecutable(
     spore_dir: []const u8,
     base: Spec,
     spore_executable: []const u8,
+    debug: bool,
     disk_claim: ?ForkChildDiskClaim,
 ) !void {
     if ((base.rootfs != null) != (disk_claim != null)) return error.UnsupportedNamedForkDisk;
@@ -4299,7 +4320,7 @@ fn startForkChildExecutable(
     };
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, allocator, child_name);
     try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitorExecutable(init, allocator, paths, spec, spore_executable, null);
+    try spawnMonitorExecutable(init, allocator, paths, spec, spore_executable, debug, null);
     try waitForReadyResult(allocator, init.io, paths, spec.timeout_ms, spore_executable);
 }
 
@@ -4383,9 +4404,9 @@ fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !v
     }
 }
 
-/// Starts `exe monitor ...`. CLI callers pass the running executable's path so
-/// the monitor is always this exact build.
-fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, spec: Spec, exe: []const u8, network_policy: ?*const run_mod.NetworkPolicy) !void {
+/// Starts `exe [--debug] monitor ...`. CLI callers pass the running
+/// executable's path so the monitor is always this exact build.
+fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, spec: Spec, exe: []const u8, debug: bool, network_policy: ?*const run_mod.NetworkPolicy) !void {
     try validateControlSocketPath(paths.control_socket_path);
     try ensureVmDir(init.io, paths);
 
@@ -4394,6 +4415,7 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
 
     var argv = std.array_list.Managed([]const u8).init(allocator);
     try argv.append(exe);
+    if (debug) try argv.append("--debug");
     try argv.append("monitor");
     try argv.append(spec.name);
     try argv.append("--backend");
@@ -4448,7 +4470,7 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
     release_socket_claim = false;
 }
 
-test "lifecycle monitor spawn receives context environment" {
+test "lifecycle monitor spawn receives context environment and debug flag" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -4464,7 +4486,7 @@ test "lifecycle monitor spawn receives context environment" {
     defer allocator.free(out_path);
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = script_path,
-        .data = "#!/bin/sh\nprintf '%s\\n' \"$HOME\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
+        .data = "#!/bin/sh\nprintf '%s\\n%s %s\\n' \"$HOME\" \"$1\" \"$2\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
     });
     try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
 
@@ -4490,7 +4512,7 @@ test "lifecycle monitor spawn receives context environment" {
     }, spawn_arena, paths, .{
         .name = "env-probe",
         .backend = "auto",
-    }, script_path, null);
+    }, script_path, true, null);
 
     var observed: ?[]u8 = null;
     defer if (observed) |bytes| allocator.free(bytes);
@@ -4506,7 +4528,7 @@ test "lifecycle monitor spawn receives context environment" {
         break;
     }
     try std.testing.expect(observed != null);
-    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\n", observed.?);
+    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\n--debug monitor\n", observed.?);
 }
 
 /// The policy a monitor enforces: the caller's live policy when it has one,

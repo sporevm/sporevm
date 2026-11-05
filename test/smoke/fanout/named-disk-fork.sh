@@ -14,15 +14,6 @@ export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 mkdir -p "${SPOREVM_RUNTIME_DIR}" "${SPOREVM_ROOTFS_CACHE_DIR}"
 chmod 700 "${SPOREVM_RUNTIME_DIR}"
-exact_spore_bin="$(cd "$(dirname "${spore_bin}")" && pwd -P)/$(basename "${spore_bin}")"
-debug_spore_bin="${workdir}/spore-debug"
-{
-  printf '#!/usr/bin/env bash\n'
-  printf 'exact_spore=%q\n' "${exact_spore_bin}"
-  printf 'exec -a "$0" "$exact_spore" --debug "$@"\n'
-} >"${debug_spore_bin}"
-chmod 700 "${debug_spore_bin}"
-spore_bin="${debug_spore_bin}"
 lock_pid=""
 save_pid=""
 lock_release=""
@@ -44,7 +35,9 @@ cleanup() {
   done
 }
 
-"${spore_bin}" create source \
+# --debug reaches the source monitor, whose log carries the publication metrics
+# read below.
+"${spore_bin}" --debug create source \
   --backend "${backend}" \
   --memory "${memory}" \
   --image "${image_ref}" \
