@@ -1,14 +1,13 @@
 //! Frozen `sporevm-x86_64-board-v0` machine constants.
 //!
-//! Slice 2a promotes the reviewed eight-slot virtio-mmio inventory and
-//! generation-device page into the fresh-only KVM runner. Slots may remain
-//! unpopulated, but their addresses, roles, and GSIs are product contracts.
+//! The eight-slot virtio-mmio inventory and generation-device page are product
+//! contracts. Slots may remain unpopulated, but their addresses, roles, and
+//! GSIs are fixed.
 
 const std = @import("std");
 const generation = @import("../generation.zig");
 const virtio_blk = @import("../virtio/blk.zig");
 const virtio_console = @import("../virtio/console.zig");
-const virtio_mem = @import("../virtio/mem.zig");
 const virtio_net = @import("../virtio/net.zig");
 const virtio_rng = @import("../virtio/rng.zig");
 const virtio_vsock = @import("../virtio/vsock.zig");
@@ -60,11 +59,6 @@ pub fn generationControlAction(offset: u64, len: u32, is_write: bool, value: u64
     return .guest_off;
 }
 
-/// Preserve the Stage 0a.1 console names while Stage 0a.2 exercises the full
-/// ordinary eight-transport inventory.
-pub const virtio_console_base: u64 = virtio_base;
-pub const virtio_console_gsi: u32 = virtio_first_gsi;
-
 pub const VirtioSlot = struct {
     index: u8,
     base: u64,
@@ -72,32 +66,28 @@ pub const VirtioSlot = struct {
     gsi: u32,
 };
 
-/// Frozen board-v0 roles, including the cache-to-transient-memory substitution
-/// used by the reviewed probe inventory.
-pub const ProbeRole = enum {
+pub const VirtioRole = enum {
     console,
     root,
     context,
     build,
     cache,
-    transient_memory,
     net,
     vsock,
     rng,
 };
 
-pub const ProbeDevice = enum(u32) {
+pub const VirtioDevice = enum(u32) {
     net = virtio_net.device_id,
     block = virtio_blk.device_id,
     console = virtio_console.device_id,
     rng = virtio_rng.device_id,
     vsock = virtio_vsock.device_id,
-    memory = virtio_mem.device_id,
 };
 
-pub const ProbeAttachment = struct {
-    role: ProbeRole,
-    device: ProbeDevice,
+pub const VirtioAttachment = struct {
+    role: VirtioRole,
+    device: VirtioDevice,
     slot: VirtioSlot,
 };
 
@@ -114,45 +104,33 @@ pub const virtio_slots = blk: {
     break :blk slots;
 };
 
-pub const stage0a2_ordinary_inventory = blk: {
-    const roles = [_]ProbeRole{ .console, .root, .context, .build, .cache, .net, .vsock, .rng };
-    const devices = [_]ProbeDevice{ .console, .block, .block, .block, .block, .net, .vsock, .rng };
-    var attachments: [max_virtio_devices]ProbeAttachment = undefined;
+pub const virtio_inventory = blk: {
+    const roles = [_]VirtioRole{ .console, .root, .context, .build, .cache, .net, .vsock, .rng };
+    const devices = [_]VirtioDevice{ .console, .block, .block, .block, .block, .net, .vsock, .rng };
+    var attachments: [max_virtio_devices]VirtioAttachment = undefined;
     for (&attachments, 0..) |*attachment, index| {
         attachment.* = .{ .role = roles[index], .device = devices[index], .slot = virtio_slots[index] };
     }
     break :blk attachments;
 };
 
-fn ordinarySlot(comptime role: ProbeRole) VirtioSlot {
-    inline for (stage0a2_ordinary_inventory) |attachment| {
+fn roleSlot(comptime role: VirtioRole) VirtioSlot {
+    inline for (virtio_inventory) |attachment| {
         if (attachment.role == role) return attachment.slot;
     }
-    @compileError("role is not present in the ordinary x86 board inventory");
+    @compileError("role is not present in the x86 board inventory");
 }
 
-pub const console_slot = ordinarySlot(.console);
+pub const console_slot = roleSlot(.console);
 pub const disk_slots = [_]VirtioSlot{
-    ordinarySlot(.root),
-    ordinarySlot(.context),
-    ordinarySlot(.build),
-    ordinarySlot(.cache),
+    roleSlot(.root),
+    roleSlot(.context),
+    roleSlot(.build),
+    roleSlot(.cache),
 };
-pub const net_slot = ordinarySlot(.net);
-pub const vsock_slot = ordinarySlot(.vsock);
-pub const rng_slot = ordinarySlot(.rng);
-
-/// The transient-memory probe keeps the same eight-slot board and replaces the
-/// optional cache attachment at slot 4 with virtio-mem.
-pub const stage0a2_transient_memory_inventory = blk: {
-    const roles = [_]ProbeRole{ .console, .root, .context, .build, .transient_memory, .net, .vsock, .rng };
-    const devices = [_]ProbeDevice{ .console, .block, .block, .block, .memory, .net, .vsock, .rng };
-    var attachments: [max_virtio_devices]ProbeAttachment = undefined;
-    for (&attachments, 0..) |*attachment, index| {
-        attachment.* = .{ .role = roles[index], .device = devices[index], .slot = virtio_slots[index] };
-    }
-    break :blk attachments;
-};
+pub const net_slot = roleSlot(.net);
+pub const vsock_slot = roleSlot(.vsock);
+pub const rng_slot = roleSlot(.rng);
 
 /// Each descriptor is substantially shorter than 64 bytes. Keeping the
 /// capacity derived from the slot count gives callers one fixed stack bound.
@@ -243,35 +221,6 @@ pub fn validateDeviceInventory() Error!void {
             }
         }
     }
-}
-
-/// Accept only the two exact Stage 0a.2 inventories. Roles, device kinds, slot
-/// addresses, and GSIs all belong to the board contract.
-pub fn validateProbeInventory(inventory: *const [max_virtio_devices]ProbeAttachment) Error!void {
-    if (probeInventoriesEqual(inventory, &stage0a2_ordinary_inventory) or
-        probeInventoriesEqual(inventory, &stage0a2_transient_memory_inventory))
-    {
-        return;
-    }
-    return error.InvalidDeviceInventory;
-}
-
-fn probeInventoriesEqual(
-    actual: *const [max_virtio_devices]ProbeAttachment,
-    expected: *const [max_virtio_devices]ProbeAttachment,
-) bool {
-    for (actual, expected) |actual_attachment, expected_attachment| {
-        if (actual_attachment.role != expected_attachment.role or
-            actual_attachment.device != expected_attachment.device or
-            actual_attachment.slot.index != expected_attachment.slot.index or
-            actual_attachment.slot.base != expected_attachment.slot.base or
-            actual_attachment.slot.size != expected_attachment.slot.size or
-            actual_attachment.slot.gsi != expected_attachment.slot.gsi)
-        {
-            return false;
-        }
-    }
-    return true;
 }
 
 pub fn validateLayout(ram_size: u64) Error!void {
@@ -367,37 +316,13 @@ test "maximum virtio command line describes every reserved slot exactly once" {
     try std.testing.expectError(error.CommandLineBufferTooSmall, formatVirtioCommandLine(&too_small));
 }
 
-test "ordinary probe inventory locks current role address GSI and device multiset" {
-    const expected_roles = [_]ProbeRole{ .console, .root, .context, .build, .cache, .net, .vsock, .rng };
+test "virtio inventory locks role address GSI and device multiset" {
+    const expected_roles = [_]VirtioRole{ .console, .root, .context, .build, .cache, .net, .vsock, .rng };
     const expected_ids = [_]u32{ 3, 2, 2, 2, 2, 1, 19, 4 };
-    for (stage0a2_ordinary_inventory, 0..) |attachment, index| {
+    for (virtio_inventory, 0..) |attachment, index| {
         try std.testing.expectEqual(expected_roles[index], attachment.role);
         try std.testing.expectEqual(expected_ids[index], @intFromEnum(attachment.device));
         try std.testing.expectEqual(virtio_base + virtio_stride * index, attachment.slot.base);
         try std.testing.expectEqual(virtio_first_gsi + index, attachment.slot.gsi);
     }
-    try validateProbeInventory(&stage0a2_ordinary_inventory);
-}
-
-test "transient virtio-mem inventory replaces cache at slot four exactly" {
-    const expected_roles = [_]ProbeRole{ .console, .root, .context, .build, .transient_memory, .net, .vsock, .rng };
-    const expected_ids = [_]u32{ 3, 2, 2, 2, 24, 1, 19, 4 };
-    for (stage0a2_transient_memory_inventory, 0..) |attachment, index| {
-        try std.testing.expectEqual(expected_roles[index], attachment.role);
-        try std.testing.expectEqual(expected_ids[index], @intFromEnum(attachment.device));
-        try std.testing.expectEqual(virtio_slots[index], attachment.slot);
-    }
-    try validateProbeInventory(&stage0a2_transient_memory_inventory);
-
-    var wrong_role = stage0a2_transient_memory_inventory;
-    wrong_role[4].role = .cache;
-    try std.testing.expectError(error.InvalidDeviceInventory, validateProbeInventory(&wrong_role));
-
-    var wrong_slot = stage0a2_transient_memory_inventory;
-    wrong_slot[4].slot = virtio_slots[5];
-    try std.testing.expectError(error.InvalidDeviceInventory, validateProbeInventory(&wrong_slot));
-
-    var unexpected_memory = stage0a2_ordinary_inventory;
-    unexpected_memory[4].device = .memory;
-    try std.testing.expectError(error.InvalidDeviceInventory, validateProbeInventory(&unexpected_memory));
 }

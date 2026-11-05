@@ -1,8 +1,8 @@
 //! Finite x86 board-v0 port-I/O policy.
 //!
 //! The accepted tuples are exactly the ordinary boot and keyboard-reset
-//! accesses observed against the pinned Stage 0a.3 kernel. Every other access
-//! fails closed before the harness completes its KVM_EXIT_IO.
+//! accesses observed against the managed kernel. Every other access fails
+//! closed before the VM completes its KVM_EXIT_IO.
 
 const std = @import("std");
 

@@ -225,9 +225,8 @@ under `rootfs.cache`.
 ## x86-64 Board Profile v0
 
 `sporevm-x86_64-board-v0`, device-model version 1, is the frozen x86-64
-Linux/KVM machine contract for fresh execution. It does not define a public
-AMD64 saved-state format: capture, save, restore, resume, and fork remain
-unavailable, and a future x86 manifest must name this board identity. The
+Linux/KVM machine contract for fresh execution. It defines no AMD64 saved-state
+format: capture, save, restore, resume, and fork are unavailable. The
 aarch64-only v2/v3 manifest layouts documented below are unchanged. Board-v0
 supports one through eight vCPUs. Local APIC IDs are consecutive from zero,
 vCPU 0 is the bootstrap processor, and IOAPIC ID 8 remains outside the vCPU ID
@@ -276,19 +275,18 @@ The permanent non-RAM board ranges are:
 | `0xfffbd000..0xfffbffff` | KVM three-page TSS region |
 
 The eight virtio-mmio transport positions are fixed even when a transport is
-unpopulated. The ordinary inventory and the one allowed transient-memory
-substitution are:
+unpopulated. The inventory is:
 
-| Slot | MMIO base | GSI | Ordinary role/device | Transient-memory role/device |
-|---:|---:|---:|---|---|
-| 0 | `0xd0000000` | 5 | console (`3`) | console (`3`) |
-| 1 | `0xd0000200` | 6 | root block (`2`) | root block (`2`) |
-| 2 | `0xd0000400` | 7 | context block (`2`) | context block (`2`) |
-| 3 | `0xd0000600` | 8 | build block (`2`) | build block (`2`) |
-| 4 | `0xd0000800` | 9 | cache block (`2`) | transient virtio-mem (`24`) |
-| 5 | `0xd0000a00` | 10 | network (`1`) | network (`1`) |
-| 6 | `0xd0000c00` | 11 | vsock (`19`) | vsock (`19`) |
-| 7 | `0xd0000e00` | 12 | RNG (`4`) | RNG (`4`) |
+| Slot | MMIO base | GSI | Role/device |
+|---:|---:|---:|---|
+| 0 | `0xd0000000` | 5 | console (`3`) |
+| 1 | `0xd0000200` | 6 | root block (`2`) |
+| 2 | `0xd0000400` | 7 | context block (`2`) |
+| 3 | `0xd0000600` | 8 | build block (`2`) |
+| 4 | `0xd0000800` | 9 | cache block (`2`) |
+| 5 | `0xd0000a00` | 10 | network (`1`) |
+| 6 | `0xd0000c00` | 11 | vsock (`19`) |
+| 7 | `0xd0000e00` | 12 | RNG (`4`) |
 
 Virtio windows accept only 1-, 2-, and 4-byte MMIO accesses. Each transport
 uses level-sensitive interrupt state: any write, including device reset, that

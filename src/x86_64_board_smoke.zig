@@ -1,4 +1,4 @@
-//! Native Slice 2a acceptance smoke for the fresh-only x86 KVM VM.
+//! Native frozen-board smoke for the fresh-only x86 KVM VM.
 
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -15,7 +15,7 @@ const probe_disk_size = 1024 * 1024;
 const block_pattern = "sporevm-x86-block\x00";
 
 const generation_params =
-    \\{"schema_version":0,"parent_generation":0,"generation":1,"fork_index":0,"fork_count":1,"parallel_index":0,"parallel_count":1,"fork_batch_id":"slice2a-proof","vm_id":"slice2a-vm","hostname":"slice2a-vm","mac_seed":"00112233445566778899aabbccddeeff","mac_address":"02:00:00:00:00:2a","resume_time_unix_ns":1700000000000000000,"resume_entropy_seed":"00112233445566778899aabbccddeeff"}
+    \\{"schema_version":0,"parent_generation":0,"generation":1,"fork_index":0,"fork_count":1,"parallel_index":0,"parallel_count":1,"fork_batch_id":"x86-board-smoke","vm_id":"x86-board-smoke","hostname":"x86-board-smoke","mac_seed":"00112233445566778899aabbccddeeff","mac_address":"02:00:00:00:00:2a","resume_time_unix_ns":1700000000000000000,"resume_entropy_seed":"00112233445566778899aabbccddeeff"}
 ;
 
 const guest_command =
@@ -99,10 +99,10 @@ pub fn main(init: std.process.Init) !void {
     const stderr = capture.stderr[0..capture.stderr_len];
     if (std.mem.indexOf(u8, stdout, "spore stdout\n") == null) return error.MissingStdout;
     if (std.mem.indexOf(u8, stderr, "spore stderr\n") == null) return error.MissingStderr;
-    if (std.mem.indexOf(u8, stdout, "spore generation ready generation=1 vm_id=slice2a-vm entropy_len=32\n") == null) return error.GenerationNotObserved;
+    if (std.mem.indexOf(u8, stdout, "spore generation ready generation=1 vm_id=x86-board-smoke entropy_len=32\n") == null) return error.GenerationNotObserved;
     if (std.mem.indexOf(u8, stdout, "rng ok\n") == null) return error.RngNotObserved;
     if (std.mem.indexOf(u8, stdout, "block ok devices=4 root_rw=ok immutable_write_attempted=3\n") == null) {
-        std.debug.print("slice2a smoke: block contract missing stdout={s} stderr={s}\n", .{ stdout, stderr });
+        std.debug.print("x86 board smoke: block contract missing stdout={s} stderr={s}\n", .{ stdout, stderr });
         return error.BlockContractNotObserved;
     }
     inline for (0..8) |index| {
@@ -137,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
     if (!timed_out) return error.ExpectedProbeTimeout;
     const timeout_elapsed_ms = monotonicMs() -| timeout_start_ms;
     if (timeout_elapsed_ms > 5_000) return error.ProbeTimeoutUnbounded;
-    std.debug.print("slice2a smoke: timeout=ExecProbeTimeout bounded_ms={d}\n", .{timeout_elapsed_ms});
+    std.debug.print("x86 board smoke: timeout=ExecProbeTimeout bounded_ms={d}\n", .{timeout_elapsed_ms});
 
     var kernel_digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(kernel, &kernel_digest, .{});
@@ -145,10 +145,10 @@ pub fn main(init: std.process.Init) !void {
     var initrd_digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(assets.minimal_exec_initrd, &initrd_digest, .{});
     const initrd_hex = std.fmt.bytesToHex(initrd_digest, .lower);
-    std.debug.print("slice2a smoke: kernel_sha256={s} initrd_sha256={s} vcpus=1 ram_mib=512\n", .{ &kernel_hex, &initrd_hex });
-    std.debug.print("slice2a smoke: stdout={s}", .{stdout});
-    std.debug.print("slice2a smoke: stderr={s}", .{stderr});
-    std.debug.print("slice2a smoke: exec=ok generation=acknowledged devices=8 result=probe_complete\n", .{});
+    std.debug.print("x86 board smoke: kernel_sha256={s} initrd_sha256={s} vcpus=1 ram_mib=512\n", .{ &kernel_hex, &initrd_hex });
+    std.debug.print("x86 board smoke: stdout={s}", .{stdout});
+    std.debug.print("x86 board smoke: stderr={s}", .{stderr});
+    std.debug.print("x86 board smoke: exec=ok generation=acknowledged devices=8 result=probe_complete\n", .{});
 }
 
 fn discardConsole(_: []const u8) void {}

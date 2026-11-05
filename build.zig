@@ -298,75 +298,26 @@ pub fn build(b: *std.Build) void {
         build_inode_enospc_smoke_step.dependOn(&run_inode_enospc_cli_smoke.step);
     }
 
-    // x86-64 Linux KVM harnesses: host-only, need /dev/kvm.
+    // x86-64 frozen-board smoke: host-only, needs /dev/kvm.
     if (target_is_x86_kvm) {
-        const kvm_boot_mod = b.createModule(.{
-            .root_source_file = b.path("src/x86_64_kvm_boot.zig"),
+        const board_smoke_mod = b.createModule(.{
+            .root_source_file = b.path("src/x86_64_board_smoke.zig"),
             .target = target,
             .optimize = optimize,
             .strip = optimize != .Debug,
             .link_libc = true,
         });
-
-        const kvm_boot_exe = b.addExecutable(.{
-            .name = "kvm-boot",
-            .root_module = kvm_boot_mod,
+        board_smoke_mod.addAnonymousImport("run_assets", .{
+            .root_source_file = minimal_exec_initrd_module,
         });
-        const install_kvm_boot = b.addInstallArtifact(kvm_boot_exe, .{});
-
-        const kvm_boot_step = b.step("kvm-boot", "Build the Linux KVM kernel boot harness");
-        kvm_boot_step.dependOn(&install_kvm_boot.step);
-
-        if (target_arch == .x86_64) {
-            const slice2a_smoke_mod = b.createModule(.{
-                .root_source_file = b.path("src/x86_64_slice2a_smoke.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = optimize != .Debug,
-                .link_libc = true,
-            });
-            slice2a_smoke_mod.addAnonymousImport("run_assets", .{
-                .root_source_file = minimal_exec_initrd_module,
-            });
-            slice2a_smoke_mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
-            const slice2a_smoke_exe = b.addExecutable(.{
-                .name = "x86-slice2a-smoke",
-                .root_module = slice2a_smoke_mod,
-            });
-            const install_slice2a_smoke = b.addInstallArtifact(slice2a_smoke_exe, .{});
-            const slice2a_smoke_step = b.step("x86-slice2a-smoke", "Build the native x86 Slice 2a guest-agent smoke");
-            slice2a_smoke_step.dependOn(&install_slice2a_smoke.step);
-
-            const profile_probe_mod = b.createModule(.{
-                .root_source_file = b.path("src/x86_64_profile_probe.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = optimize != .Debug,
-                .link_libc = true,
-            });
-            const profile_probe_exe = b.addExecutable(.{
-                .name = "kvm-profile-probe",
-                .root_module = profile_probe_mod,
-            });
-            const install_profile_probe = b.addInstallArtifact(profile_probe_exe, .{});
-            const profile_probe_step = b.step("kvm-profile-probe", "Build the no-KVM_RUN x86 KVM profile probe");
-            profile_probe_step.dependOn(&install_profile_probe.step);
-
-            const profile_roundtrip_mod = b.createModule(.{
-                .root_source_file = b.path("src/x86_64_profile_roundtrip.zig"),
-                .target = target,
-                .optimize = optimize,
-                .strip = optimize != .Debug,
-                .link_libc = true,
-            });
-            const profile_roundtrip_exe = b.addExecutable(.{
-                .name = "kvm-profile-roundtrip",
-                .root_module = profile_roundtrip_mod,
-            });
-            const install_profile_roundtrip = b.addInstallArtifact(profile_roundtrip_exe, .{});
-            const profile_roundtrip_step = b.step("kvm-profile-roundtrip", "Build the x86 KVM process-boundary profile proof");
-            profile_roundtrip_step.dependOn(&install_profile_roundtrip.step);
-        }
+        board_smoke_mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
+        const board_smoke_exe = b.addExecutable(.{
+            .name = "x86-board-smoke",
+            .root_module = board_smoke_mod,
+        });
+        const install_board_smoke = b.addInstallArtifact(board_smoke_exe, .{});
+        const board_smoke_step = b.step("x86-board-smoke", "Build the native x86 frozen-board guest-agent smoke");
+        board_smoke_step.dependOn(&install_board_smoke.step);
     }
 }
 

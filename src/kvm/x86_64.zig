@@ -1,7 +1,7 @@
-//! Minimal Linux KVM UAPI used by the x86-64 profile and fresh VM runner.
+//! Minimal Linux KVM UAPI used by the x86-64 profile check and fresh VM runner.
 //!
 //! Architecture-neutral literals live in `common.zig`; this module owns the
-//! x86-specific profile, machine-state, and bounded exit-decoder surface.
+//! x86-specific profile, vCPU setup, and bounded exit-decoder surface.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -13,7 +13,6 @@ pub const KVM_GET_API_VERSION = common.KVM_GET_API_VERSION;
 pub const KVM_CREATE_VM = common.KVM_CREATE_VM;
 pub const KVM_GET_MSR_INDEX_LIST: u32 = 0xc004ae02;
 pub const KVM_GET_SUPPORTED_CPUID: u32 = 0xc008ae05;
-pub const KVM_GET_MSR_FEATURE_INDEX_LIST: u32 = 0xc004ae0a;
 pub const KVM_CHECK_EXTENSION = common.KVM_CHECK_EXTENSION;
 pub const KVM_GET_VCPU_MMAP_SIZE = common.KVM_GET_VCPU_MMAP_SIZE;
 pub const KVM_CREATE_VCPU = common.KVM_CREATE_VCPU;
@@ -21,41 +20,14 @@ pub const KVM_SET_USER_MEMORY_REGION = common.KVM_SET_USER_MEMORY_REGION;
 pub const KVM_SET_TSS_ADDR: u32 = 0xae47;
 pub const KVM_SET_IDENTITY_MAP_ADDR: u32 = 0x4008ae48;
 pub const KVM_CREATE_IRQCHIP: u32 = 0xae60;
-pub const KVM_GET_IRQCHIP: u32 = 0xc208ae62;
-pub const KVM_SET_IRQCHIP: u32 = 0x8208ae63;
-pub const KVM_IRQ_LINE = common.KVM_IRQ_LINE;
 pub const KVM_CREATE_PIT2: u32 = 0x4040ae77;
 pub const KVM_RUN = common.KVM_RUN;
-pub const KVM_GET_REGS: u32 = 0x8090ae81;
 pub const KVM_GET_SREGS: u32 = 0x8138ae83;
 pub const KVM_SET_REGS: u32 = 0x4090ae82;
 pub const KVM_SET_SREGS: u32 = 0x4138ae84;
-pub const KVM_GET_MSRS: u32 = 0xc008ae88;
-pub const KVM_SET_MSRS: u32 = 0x4008ae89;
 pub const KVM_SET_CPUID2: u32 = 0x4008ae90;
-pub const KVM_GET_CPUID2: u32 = 0xc008ae91;
 pub const KVM_GET_MP_STATE: u32 = 0x8004ae98;
-pub const KVM_SET_MP_STATE: u32 = 0x4004ae99;
-pub const KVM_GET_LAPIC: u32 = 0x8400ae8e;
-pub const KVM_SET_LAPIC: u32 = 0x4400ae8f;
-pub const KVM_GET_PIT2: u32 = 0x8070ae9f;
-pub const KVM_SET_PIT2: u32 = 0x4070aea0;
-pub const KVM_GET_VCPU_EVENTS: u32 = 0x8040ae9f;
-pub const KVM_SET_VCPU_EVENTS: u32 = 0x4040aea0;
-pub const KVM_GET_DEBUGREGS: u32 = 0x8080aea1;
-pub const KVM_SET_DEBUGREGS: u32 = 0x4080aea2;
-pub const KVM_GET_XSAVE: u32 = 0x9000aea4;
-pub const KVM_SET_XSAVE: u32 = 0x5000aea5;
-pub const KVM_GET_XCRS: u32 = 0x8188aea6;
-pub const KVM_SET_XCRS: u32 = 0x4188aea7;
-pub const KVM_KVMCLOCK_CTRL: u32 = 0xaead;
-pub const KVM_GET_XSAVE2: u32 = 0x9000aecf;
-pub const KVM_SET_DEVICE_ATTR = common.KVM_SET_DEVICE_ATTR;
-pub const KVM_GET_DEVICE_ATTR = common.KVM_GET_DEVICE_ATTR;
-pub const KVM_HAS_DEVICE_ATTR = common.KVM_HAS_DEVICE_ATTR;
 
-pub const KVM_SET_CLOCK: u32 = 0x4030ae7b;
-pub const KVM_GET_CLOCK: u32 = 0x8030ae7c;
 pub const KVM_SET_TSC_KHZ: u32 = 0xaea2;
 pub const KVM_GET_TSC_KHZ: u32 = 0xaea3;
 pub const KVM_ENABLE_CAP: u32 = 0x4068aea3;
@@ -74,7 +46,6 @@ pub const KVM_CAP_IRQCHIP: u32 = 0;
 pub const KVM_CAP_USER_MEMORY = common.KVM_CAP_USER_MEMORY;
 pub const KVM_CAP_SET_TSS_ADDR: u32 = 4;
 pub const KVM_CAP_EXT_CPUID: u32 = 7;
-pub const KVM_CAP_CLOCKSOURCE: u32 = 8;
 pub const KVM_CAP_NR_VCPUS: u32 = 9;
 pub const KVM_CAP_MP_STATE: u32 = 14;
 pub const KVM_CAP_PIT2: u32 = 33;
@@ -82,24 +53,15 @@ pub const KVM_CAP_PIT_STATE2: u32 = 35;
 pub const KVM_CAP_SET_IDENTITY_MAP_ADDR: u32 = 37;
 pub const KVM_CAP_ADJUST_CLOCK: u32 = 39;
 pub const KVM_CAP_VCPU_EVENTS: u32 = 41;
-pub const KVM_CAP_INTR_SHADOW: u32 = 49;
 pub const KVM_CAP_DEBUGREGS: u32 = 50;
-pub const KVM_CAP_ENABLE_CAP: u32 = 54;
 pub const KVM_CAP_XSAVE: u32 = 55;
 pub const KVM_CAP_XCRS: u32 = 56;
-pub const KVM_CAP_ASYNC_PF: u32 = 59;
 pub const KVM_CAP_TSC_CONTROL: u32 = 60;
 pub const KVM_CAP_GET_TSC_KHZ: u32 = 61;
-pub const KVM_CAP_TSC_DEADLINE_TIMER: u32 = 72;
 pub const KVM_CAP_KVMCLOCK_CTRL: u32 = 76;
-pub const KVM_CAP_CHECK_EXTENSION_VM: u32 = 105;
 pub const KVM_CAP_ENABLE_CAP_VM: u32 = 98;
-pub const KVM_CAP_X2APIC_API: u32 = 129;
 pub const KVM_CAP_IMMEDIATE_EXIT: u32 = 136;
-pub const KVM_CAP_GET_MSR_FEATURES: u32 = 153;
 pub const KVM_CAP_EXCEPTION_PAYLOAD: u32 = 164;
-pub const KVM_CAP_ASYNC_PF_INT: u32 = 183;
-pub const KVM_CAP_STEAL_TIME: u32 = 187;
 pub const KVM_CAP_ENFORCE_PV_FEATURE_CPUID: u32 = 190;
 pub const KVM_CAP_XSAVE2: u32 = 208;
 pub const KVM_CAP_VM_TSC_CONTROL: u32 = 214;
@@ -112,40 +74,20 @@ pub const KVM_CPUID_FLAG_SIGNIFCANT_INDEX: u32 = 1 << 0;
 
 pub const KVM_MP_STATE_RUNNABLE: u32 = 0;
 pub const KVM_MP_STATE_UNINITIALIZED: u32 = 1;
-pub const KVM_MP_STATE_INIT_RECEIVED: u32 = 2;
-pub const KVM_MP_STATE_HALTED: u32 = 3;
-pub const KVM_MP_STATE_SIPI_RECEIVED: u32 = 4;
-pub const KVM_VCPUEVENT_VALID_NMI_PENDING: u32 = 1 << 0;
-pub const KVM_VCPUEVENT_VALID_SIPI_VECTOR: u32 = 1 << 1;
-pub const KVM_VCPUEVENT_VALID_SHADOW: u32 = 1 << 2;
-pub const KVM_VCPUEVENT_VALID_SMM: u32 = 1 << 3;
-pub const KVM_VCPUEVENT_VALID_PAYLOAD: u32 = 1 << 4;
-pub const KVM_VCPUEVENT_VALID_TRIPLE_FAULT: u32 = 1 << 5;
-pub const KVM_VCPUEVENT_VALID_MASK: u32 = (1 << 6) - 1;
-pub const KVM_IRQCHIP_PIC_MASTER: u32 = 0;
-pub const KVM_IRQCHIP_PIC_SLAVE: u32 = 1;
-pub const KVM_IRQCHIP_IOAPIC: u32 = 2;
 pub const KVM_VCPU_TSC_CTRL: u32 = 0;
 pub const KVM_VCPU_TSC_OFFSET: u64 = 0;
 
 pub const max_cpuid_entries: usize = 256;
-pub const max_xcrs: usize = 16;
 pub const max_io_payload: usize = 4096;
 
 pub const Error = common.Error || error{
-    ApiVersionMismatch,
-    KvmCapabilityMissing,
     CpuidTooLarge,
     UnsupportedVcpuCount,
     InvalidVcpuIndex,
     CpuidTopologyMissing,
     MalformedCpuidTopology,
     MsrListTooLarge,
-    MsrBatchTooLarge,
-    MsrShortCount,
-    XsaveSizeInvalid,
     XsaveSizeTooLarge,
-    XsaveBufferTooSmall,
     KvmRunTooSmall,
     UnexpectedKvmExitDuringCompletion,
 };
@@ -186,8 +128,8 @@ pub const IoExit = struct {
     data: []u8,
 };
 
-/// Decode one guest-controlled KVM_EXIT_IO envelope. Port policy remains at the
-/// caller so Stage 0a.3 can freeze its finite table without weakening bounds.
+/// Decode one guest-controlled KVM_EXIT_IO envelope. Port policy remains with
+/// the caller's finite table.
 pub fn decodeIoExit(run: []u8) IoDecodeError!IoExit {
     if (run.len < RunLayout.io_envelope_end) return error.IoRunTooSmall;
 
@@ -218,124 +160,9 @@ pub fn decodeIoExit(run: []u8) IoDecodeError!IoExit {
 
 pub const UserspaceMemoryRegion = common.UserspaceMemoryRegion;
 
-pub const IrqLevel = common.IrqLevel;
-pub const DeviceAttr = common.DeviceAttr;
-
 pub const PitConfig = extern struct {
     flags: u32 = 0,
     padding: [15]u32 = @splat(0),
-};
-
-pub const PicState = extern struct {
-    last_irr: u8 = 0,
-    irr: u8 = 0,
-    imr: u8 = 0,
-    isr: u8 = 0,
-    priority_add: u8 = 0,
-    irq_base: u8 = 0,
-    read_reg_select: u8 = 0,
-    poll: u8 = 0,
-    special_mask: u8 = 0,
-    init_state: u8 = 0,
-    auto_eoi: u8 = 0,
-    rotate_on_auto_eoi: u8 = 0,
-    special_fully_nested_mode: u8 = 0,
-    init4: u8 = 0,
-    elcr: u8 = 0,
-    elcr_mask: u8 = 0,
-};
-
-pub const IoapicState = extern struct {
-    base_address: u64 = 0,
-    ioregsel: u32 = 0,
-    id: u32 = 0,
-    irr: u32 = 0,
-    padding: u32 = 0,
-    redirection_table: [24]u64 = @splat(0),
-};
-
-pub const Irqchip = extern struct {
-    chip_id: u32 = 0,
-    padding: u32 = 0,
-    chip: extern union {
-        dummy: [512]u8,
-        pic: PicState,
-        ioapic: IoapicState,
-    } = .{ .dummy = @splat(0) },
-};
-
-pub const PitChannelState = extern struct {
-    count: u32 = 0,
-    latched_count: u16 = 0,
-    count_latched: u8 = 0,
-    status_latched: u8 = 0,
-    status: u8 = 0,
-    read_state: u8 = 0,
-    write_state: u8 = 0,
-    write_latch: u8 = 0,
-    rw_mode: u8 = 0,
-    mode: u8 = 0,
-    bcd: u8 = 0,
-    gate: u8 = 0,
-    count_load_time: i64 = 0,
-};
-
-pub const PitState2 = extern struct {
-    channels: [3]PitChannelState = @splat(.{}),
-    flags: u32 = 0,
-    reserved: [9]u32 = @splat(0),
-};
-
-pub const LapicState = extern struct {
-    regs: [1024]u8 = @splat(0),
-};
-
-pub const VcpuEvents = extern struct {
-    pub const Exception = extern struct {
-        injected: u8 = 0,
-        nr: u8 = 0,
-        has_error_code: u8 = 0,
-        pending: u8 = 0,
-        error_code: u32 = 0,
-    };
-    pub const Interrupt = extern struct {
-        injected: u8 = 0,
-        nr: u8 = 0,
-        soft: u8 = 0,
-        shadow: u8 = 0,
-    };
-    pub const Nmi = extern struct {
-        injected: u8 = 0,
-        pending: u8 = 0,
-        masked: u8 = 0,
-        padding: u8 = 0,
-    };
-    pub const Smi = extern struct {
-        smm: u8 = 0,
-        pending: u8 = 0,
-        smm_inside_nmi: u8 = 0,
-        latched_init: u8 = 0,
-    };
-    pub const TripleFault = extern struct { pending: u8 = 0 };
-
-    exception: Exception = .{},
-    interrupt: Interrupt = .{},
-    nmi: Nmi = .{},
-    sipi_vector: u32 = 0,
-    flags: u32 = 0,
-    smi: Smi = .{},
-    triple_fault: TripleFault = .{},
-    reserved: [26]u8 = @splat(0),
-    exception_has_payload: u8 = 0,
-    exception_payload: u64 = 0,
-};
-
-pub const DebugRegs = extern struct {
-    db: [4]u64 = @splat(0),
-    dr6: u64 = 0,
-    dr7: u64 = 0,
-    flags: u64 = 0,
-    reserved: [9]u64 = @splat(0),
 };
 
 pub const EnableCap = extern struct {
@@ -426,12 +253,6 @@ pub const Cpuid = extern struct {
     entries: [max_cpuid_entries]CpuidEntry = @splat(.{}),
 };
 
-pub const MsrEntry = extern struct {
-    index: u32 = 0,
-    reserved: u32 = 0,
-    data: u64 = 0,
-};
-
 /// Fixed-capacity storage for the flexible `struct kvm_msr_list` UAPI.
 pub fn MsrList(comptime capacity: usize) type {
     if (capacity > std.math.maxInt(u32)) @compileError("MSR list capacity exceeds the KVM u32 count");
@@ -441,40 +262,8 @@ pub fn MsrList(comptime capacity: usize) type {
     };
 }
 
-/// Fixed-capacity storage for the flexible `struct kvm_msrs` UAPI.
-pub fn MsrBatch(comptime capacity: usize) type {
-    if (capacity > std.math.maxInt(u32)) @compileError("MSR batch capacity exceeds the KVM u32 count");
-    return extern struct {
-        nmsrs: u32 = @intCast(capacity),
-        padding: u32 = 0,
-        entries: [capacity]MsrEntry = @splat(.{}),
-    };
-}
-
 pub const Xsave = extern struct {
     region: [1024]u32 = @splat(0),
-};
-
-pub const Xcr = extern struct {
-    xcr: u32 = 0,
-    reserved: u32 = 0,
-    value: u64 = 0,
-};
-
-pub const Xcrs = extern struct {
-    nr_xcrs: u32 = 0,
-    flags: u32 = 0,
-    xcrs: [max_xcrs]Xcr = @splat(.{}),
-    padding: [16]u64 = @splat(0),
-};
-
-pub const ClockData = extern struct {
-    clock: u64 = 0,
-    flags: u32 = 0,
-    padding0: u32 = 0,
-    realtime: u64 = 0,
-    host_tsc: u64 = 0,
-    padding: [4]u32 = @splat(0),
 };
 
 pub const MpState = extern struct {
@@ -487,19 +276,6 @@ pub fn openDevKvm() Error!std.c.fd_t {
 
 pub fn ioctl(fd: std.c.fd_t, request: u32, arg: usize, op: []const u8) Error!usize {
     return common.ioctl(fd, request, arg, op);
-}
-
-pub fn checkApiVersion(kvm_fd: std.c.fd_t) Error!void {
-    if (try ioctl(kvm_fd, KVM_GET_API_VERSION, 0, "KVM_GET_API_VERSION") != KVM_API_VERSION) {
-        return error.ApiVersionMismatch;
-    }
-}
-
-pub fn requireExtension(kvm_fd: std.c.fd_t, capability: u32, name: []const u8) Error!void {
-    if (try checkExtension(kvm_fd, capability) == 0) {
-        std.log.err("required KVM capability missing: {s} ({d})", .{ name, capability });
-        return error.KvmCapabilityMissing;
-    }
 }
 
 pub fn checkExtension(kvm_fd: std.c.fd_t, capability: u32) Error!usize {
@@ -541,43 +317,6 @@ pub fn getMsrIndexList(
             return error.KvmIoctlFailed;
         },
     }
-}
-
-/// Populate a bounded MSR batch from an explicit ordered index list. Reusing a
-/// batch cannot retain values or reserved bits from an earlier transfer.
-pub fn prepareMsrBatch(
-    comptime capacity: usize,
-    batch: *MsrBatch(capacity),
-    indices: []const u32,
-) Error!void {
-    if (indices.len > batch.entries.len) return error.MsrBatchTooLarge;
-    batch.nmsrs = @intCast(indices.len);
-    batch.padding = 0;
-    for (batch.entries[0..indices.len], indices) |*entry, index| {
-        entry.* = .{ .index = index };
-    }
-}
-
-/// Validate KVM_GET_MSRS/KVM_SET_MSRS' returned completion count. KVM stops at
-/// the first unsupported entry, so accepting a short count would publish
-/// partial state as a complete profile observation.
-pub fn completedMsrEntries(
-    comptime capacity: usize,
-    batch: *MsrBatch(capacity),
-    completed: usize,
-) Error![]MsrEntry {
-    const requested = std.math.cast(usize, batch.nmsrs) orelse return error.MsrBatchTooLarge;
-    if (requested > batch.entries.len) return error.MsrBatchTooLarge;
-    if (completed != requested) return error.MsrShortCount;
-    return batch.entries[0..requested];
-}
-
-/// KVM_GET_XSAVE2 and extended KVM_SET_XSAVE transfer the byte count returned
-/// by KVM_CAP_XSAVE2 even though their ioctl numbers encode only 4 KiB.
-pub fn xsave2Buffer(buffer: []u8, capability_size: usize) Error![]u8 {
-    if (capability_size < @sizeOf(Xsave)) return error.XsaveSizeInvalid;
-    if (capability_size > buffer.len) return error.XsaveBufferTooSmall;
-    return buffer[0..capability_size];
 }
 
 fn xsaveSizeFromCapability(capability_size: usize) Error!u32 {
@@ -754,14 +493,6 @@ pub fn hasTscOffset(vcpu_fd: std.c.fd_t) Error!bool {
     return common.hasDeviceAttr(vcpu_fd, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, "KVM_HAS_DEVICE_ATTR TSC offset");
 }
 
-pub fn getTscOffset(vcpu_fd: std.c.fd_t) Error!u64 {
-    return common.getDeviceAttrU64(vcpu_fd, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, "KVM_GET_DEVICE_ATTR TSC offset");
-}
-
-pub fn setTscOffset(vcpu_fd: std.c.fd_t, value: u64) Error!void {
-    return common.setDeviceAttrU64(vcpu_fd, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, value, "KVM_SET_DEVICE_ATTR TSC offset");
-}
-
 pub const RunResult = enum {
     completed,
     interrupted,
@@ -852,16 +583,7 @@ fn makeIoRun(run: []u8, direction: u8, width: u8, port: u16, count: u32, data_of
 
 test "x86 KVM UAPI layouts match Linux" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(UserspaceMemoryRegion));
-    try std.testing.expectEqual(@as(usize, 8), @sizeOf(IrqLevel));
     try std.testing.expectEqual(@as(usize, 64), @sizeOf(PitConfig));
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(PicState));
-    try std.testing.expectEqual(@as(usize, 216), @sizeOf(IoapicState));
-    try std.testing.expectEqual(@as(usize, 520), @sizeOf(Irqchip));
-    try std.testing.expectEqual(@as(usize, 24), @sizeOf(PitChannelState));
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(PitState2));
-    try std.testing.expectEqual(@as(usize, 1024), @sizeOf(LapicState));
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(VcpuEvents));
-    try std.testing.expectEqual(@as(usize, 128), @sizeOf(DebugRegs));
     try std.testing.expectEqual(@as(usize, 104), @sizeOf(EnableCap));
     try std.testing.expectEqual(@as(usize, 144), @sizeOf(Regs));
     try std.testing.expectEqual(@as(usize, 24), @sizeOf(Segment));
@@ -869,140 +591,49 @@ test "x86 KVM UAPI layouts match Linux" {
     try std.testing.expectEqual(@as(usize, 312), @sizeOf(Sregs));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(CpuidEntry));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(MpState));
-    try std.testing.expectEqual(@as(u32, 0x8004_ae98), KVM_GET_MP_STATE);
-    try std.testing.expectEqual(@as(u32, 0x4004_ae99), KVM_SET_MP_STATE);
-    try std.testing.expectEqual(@as(u32, 0xc208_ae62), KVM_GET_IRQCHIP);
-    try std.testing.expectEqual(@as(u32, 0x8208_ae63), KVM_SET_IRQCHIP);
-    try std.testing.expectEqual(@as(u32, 0x8070_ae9f), KVM_GET_PIT2);
-    try std.testing.expectEqual(@as(u32, 0x4070_aea0), KVM_SET_PIT2);
-    try std.testing.expectEqual(@as(u32, 0x8400_ae8e), KVM_GET_LAPIC);
-    try std.testing.expectEqual(@as(u32, 0x4400_ae8f), KVM_SET_LAPIC);
-    try std.testing.expectEqual(@as(u32, 0x8040_ae9f), KVM_GET_VCPU_EVENTS);
-    try std.testing.expectEqual(@as(u32, 0x4040_aea0), KVM_SET_VCPU_EVENTS);
-    try std.testing.expectEqual(@as(u32, 0x8080_aea1), KVM_GET_DEBUGREGS);
-    try std.testing.expectEqual(@as(u32, 0x4080_aea2), KVM_SET_DEBUGREGS);
-    try std.testing.expectEqual(@as(u32, 0x4068_aea3), KVM_ENABLE_CAP);
-    try std.testing.expectEqual(@as(usize, 20), @offsetOf(VcpuEvents, "flags"));
-    try std.testing.expectEqual(@as(usize, 56), @offsetOf(VcpuEvents, "exception_payload"));
-    try std.testing.expectEqual(@as(u32, 136), KVM_CAP_IMMEDIATE_EXIT);
+    try std.testing.expectEqual(@as(usize, 4096), @sizeOf(Xsave));
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(MsrList(0)));
+    try std.testing.expectEqual(@as(usize, 12), @sizeOf(MsrList(2)));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(MsrList(2), "indices"));
     try std.testing.expectEqual(@as(usize, 1), RunLayout.immediate_exit);
 }
 
-test "x86 profile probe KVM UAPI values match Linux" {
-    try std.testing.expectEqual(@as(u32, 0xc004_ae02), KVM_GET_MSR_INDEX_LIST);
-    try std.testing.expectEqual(@as(u32, 0xc004_ae0a), KVM_GET_MSR_FEATURE_INDEX_LIST);
-    try std.testing.expectEqual(@as(u32, 0xc008_ae88), KVM_GET_MSRS);
-    try std.testing.expectEqual(@as(u32, 0x4008_ae89), KVM_SET_MSRS);
-    try std.testing.expectEqual(@as(u32, 0xc008_ae91), KVM_GET_CPUID2);
-    try std.testing.expectEqual(@as(u32, 0x9000_aea4), KVM_GET_XSAVE);
-    try std.testing.expectEqual(@as(u32, 0x5000_aea5), KVM_SET_XSAVE);
-    try std.testing.expectEqual(@as(u32, 0x8188_aea6), KVM_GET_XCRS);
-    try std.testing.expectEqual(@as(u32, 0x4188_aea7), KVM_SET_XCRS);
-    try std.testing.expectEqual(@as(u32, 0x0000_aead), KVM_KVMCLOCK_CTRL);
-    try std.testing.expectEqual(@as(u32, 0x9000_aecf), KVM_GET_XSAVE2);
-    try std.testing.expectEqual(@as(u32, 0x4030_ae7b), KVM_SET_CLOCK);
-    try std.testing.expectEqual(@as(u32, 0x8030_ae7c), KVM_GET_CLOCK);
-    try std.testing.expectEqual(@as(u32, 0x0000_aea2), KVM_SET_TSC_KHZ);
-    try std.testing.expectEqual(@as(u32, 0x0000_aea3), KVM_GET_TSC_KHZ);
+test "x86 KVM UAPI values match Linux" {
+    const requests = [_]struct { actual: u32, expected: u32 }{
+        .{ .actual = KVM_GET_MSR_INDEX_LIST, .expected = 0xc004_ae02 },
+        .{ .actual = KVM_GET_SUPPORTED_CPUID, .expected = 0xc008_ae05 },
+        .{ .actual = KVM_GET_MP_STATE, .expected = 0x8004_ae98 },
+        .{ .actual = KVM_ENABLE_CAP, .expected = 0x4068_aea3 },
+        .{ .actual = KVM_SET_TSC_KHZ, .expected = 0x0000_aea2 },
+        .{ .actual = KVM_GET_TSC_KHZ, .expected = 0x0000_aea3 },
+    };
+    for (requests) |request| try std.testing.expectEqual(request.expected, request.actual);
 
     const capabilities = [_]struct { actual: u32, expected: u32 }{
-        .{ .actual = KVM_CAP_CLOCKSOURCE, .expected = 8 },
         .{ .actual = KVM_CAP_ADJUST_CLOCK, .expected = 39 },
         .{ .actual = KVM_CAP_XSAVE, .expected = 55 },
         .{ .actual = KVM_CAP_XCRS, .expected = 56 },
-        .{ .actual = KVM_CAP_ASYNC_PF, .expected = 59 },
         .{ .actual = KVM_CAP_TSC_CONTROL, .expected = 60 },
         .{ .actual = KVM_CAP_GET_TSC_KHZ, .expected = 61 },
-        .{ .actual = KVM_CAP_TSC_DEADLINE_TIMER, .expected = 72 },
         .{ .actual = KVM_CAP_KVMCLOCK_CTRL, .expected = 76 },
-        .{ .actual = KVM_CAP_CHECK_EXTENSION_VM, .expected = 105 },
-        .{ .actual = KVM_CAP_X2APIC_API, .expected = 129 },
-        .{ .actual = KVM_CAP_GET_MSR_FEATURES, .expected = 153 },
-        .{ .actual = KVM_CAP_ASYNC_PF_INT, .expected = 183 },
-        .{ .actual = KVM_CAP_STEAL_TIME, .expected = 187 },
+        .{ .actual = KVM_CAP_IMMEDIATE_EXIT, .expected = 136 },
         .{ .actual = KVM_CAP_ENFORCE_PV_FEATURE_CPUID, .expected = 190 },
         .{ .actual = KVM_CAP_XSAVE2, .expected = 208 },
         .{ .actual = KVM_CAP_VM_TSC_CONTROL, .expected = 214 },
     };
-    for (capabilities) |capability| {
-        try std.testing.expectEqual(capability.expected, capability.actual);
-    }
+    for (capabilities) |capability| try std.testing.expectEqual(capability.expected, capability.actual);
 
     try std.testing.expectEqual(@as(u32, 2), KVM_CLOCK_TSC_STABLE);
     try std.testing.expectEqual(@as(u32, 1 << 2), KVM_CLOCK_REALTIME);
     try std.testing.expectEqual(@as(u32, 1 << 3), KVM_CLOCK_HOST_TSC);
 }
 
-test "x86 profile probe KVM ABI layouts match Linux" {
-    const MsrListHeader = MsrList(0);
-    const MsrList2 = MsrList(2);
-    const MsrBatchHeader = MsrBatch(0);
-    const MsrBatch2 = MsrBatch(2);
-
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(MsrEntry));
-    try std.testing.expectEqual(@as(usize, 8), @alignOf(MsrEntry));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MsrEntry, "index"));
-    try std.testing.expectEqual(@as(usize, 4), @offsetOf(MsrEntry, "reserved"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(MsrEntry, "data"));
-
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(MsrListHeader));
-    try std.testing.expectEqual(@as(usize, 12), @sizeOf(MsrList2));
-    try std.testing.expectEqual(@as(usize, 4), @alignOf(MsrList2));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MsrList2, "nmsrs"));
-    try std.testing.expectEqual(@as(usize, 4), @offsetOf(MsrList2, "indices"));
-
-    try std.testing.expectEqual(@as(usize, 8), @sizeOf(MsrBatchHeader));
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(MsrBatch2));
-    try std.testing.expectEqual(@as(usize, 8), @alignOf(MsrBatch2));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MsrBatch2, "nmsrs"));
-    try std.testing.expectEqual(@as(usize, 4), @offsetOf(MsrBatch2, "padding"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(MsrBatch2, "entries"));
-
-    try std.testing.expectEqual(@as(usize, 4096), @sizeOf(Xsave));
-    try std.testing.expectEqual(@as(usize, 4), @alignOf(Xsave));
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Xcr));
-    try std.testing.expectEqual(@as(usize, 8), @alignOf(Xcr));
-    try std.testing.expectEqual(@as(usize, 392), @sizeOf(Xcrs));
-    try std.testing.expectEqual(@as(usize, 8), @alignOf(Xcrs));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(Xcrs, "xcrs"));
-    try std.testing.expectEqual(@as(usize, 264), @offsetOf(Xcrs, "padding"));
-
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(ClockData));
-    try std.testing.expectEqual(@as(usize, 8), @alignOf(ClockData));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(ClockData, "clock"));
-    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ClockData, "flags"));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ClockData, "realtime"));
-    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ClockData, "host_tsc"));
-    try std.testing.expectEqual(@as(usize, 32), @offsetOf(ClockData, "padding"));
-}
-
-test "profile probe variable length UAPI fails closed" {
+test "MSR index list fails closed beyond its fixed bound" {
     var list = MsrList(2){};
     list.indices = .{ 0x10, 0x3b };
     try std.testing.expectEqualSlices(u32, &.{ 0x10, 0x3b }, try msrIndices(2, &list));
     list.nmsrs = 3;
     try std.testing.expectError(error.MsrListTooLarge, msrIndices(2, &list));
-
-    var batch = MsrBatch(2){};
-    batch.entries[0] = .{ .index = 1, .reserved = 2, .data = 3 };
-    try prepareMsrBatch(2, &batch, &.{ 0x10, 0x3b });
-    try std.testing.expectEqual(@as(u32, 2), batch.nmsrs);
-    try std.testing.expectEqualDeep(MsrEntry{ .index = 0x10 }, batch.entries[0]);
-    try std.testing.expectEqualDeep(MsrEntry{ .index = 0x3b }, batch.entries[1]);
-    const completed_entries = try completedMsrEntries(2, &batch, 2);
-    try std.testing.expectEqual(@as(usize, 2), completed_entries.len);
-    completed_entries[0].data = 4;
-    try std.testing.expectEqual(@as(u64, 4), batch.entries[0].data);
-    try std.testing.expectError(error.MsrShortCount, completedMsrEntries(2, &batch, 1));
-    try std.testing.expectError(error.MsrBatchTooLarge, prepareMsrBatch(2, &batch, &.{ 0x10, 0x3b, 0x11 }));
-    batch.nmsrs = 3;
-    try std.testing.expectError(error.MsrBatchTooLarge, completedMsrEntries(2, &batch, 3));
-
-    var xsave2: [4097]u8 = undefined;
-    try std.testing.expectError(error.XsaveSizeInvalid, xsave2Buffer(&xsave2, 4095));
-    try std.testing.expectEqual(@as(usize, 4096), (try xsave2Buffer(&xsave2, 4096)).len);
-    try std.testing.expectEqual(@as(usize, 4097), (try xsave2Buffer(&xsave2, 4097)).len);
-    try std.testing.expectError(error.XsaveBufferTooSmall, xsave2Buffer(xsave2[0..4096], 4097));
 }
 
 test "XSAVE size uses the legacy area only when XSAVE2 is absent" {

@@ -109,8 +109,8 @@ pub fn availability(requested: Backend, host: Host) Availability {
 /// Command entry points that start a fresh VM call this once with
 /// `Host.probe()`, so Linux/x86_64 reaches the reviewed KVM probe before
 /// product setup. Code below them resolves with `Backend.resolveForHost`.
-/// Slice 3a makes only the fresh, fixed-memory runner public;
-/// feature-specific gates remain in the run and lifecycle entry points.
+/// Only the fresh, fixed-memory x86 runner is public; feature-specific gates
+/// remain in the run and lifecycle entry points.
 pub fn requireProductRunner(requested: Backend, host: Host) Error!Backend {
     return switch (availability(requested, host)) {
         .available => |selected| selected,
