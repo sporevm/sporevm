@@ -13,6 +13,7 @@ const deadline = @import("../deadline.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const disk_layer = @import("../disk_layer.zig");
 const generation = @import("../generation.zig");
+const guestmem = @import("../guestmem.zig");
 const gicv3 = @import("gicv3.zig");
 const ram_restore = @import("../ram_restore.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
@@ -509,7 +510,10 @@ pub fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transp
     return out;
 }
 
-pub fn applyTransports(transports: []mmio.Transport, states: []const spore.TransportState) !void {
+/// Applies serialized transport state once guest RAM is mapped. Restored
+/// queues skip QueueReady, so a ready queue's rings are checked against
+/// `ram` here, and a manifest whose rings the device cannot use is refused.
+pub fn applyTransports(transports: []mmio.Transport, states: []const spore.TransportState, ram: guestmem.GuestRam) !void {
     if (states.len != transports.len) return error.PlatformMismatch;
     for (transports, states) |*t, s| {
         if (t.dev.device_id != s.device_id) return error.PlatformMismatch;
@@ -530,6 +534,7 @@ pub fn applyTransports(transports: []mmio.Transport, states: []const spore.Trans
                 .used_idx = qs.used_idx,
             };
             restored.validateLayout() catch return error.BadManifest;
+            if (restored.ready) restored.validateRings(ram) catch return error.BadManifest;
             t.queues[qi] = restored;
         }
     }
@@ -865,6 +870,40 @@ test "transport restore rejects unoffered block features" {
         .queues = &queues,
     }};
 
-    try std.testing.expectError(error.BadManifest, applyTransports(&transports, &states));
+    try std.testing.expectError(error.BadManifest, applyTransports(&transports, &states, .{ .bytes = &.{}, .base = 0 }));
     try std.testing.expectEqual(@as(u64, 0), transports[0].driver_features);
+}
+
+test "transport restore refuses ready queues whose rings leave guest RAM" {
+    var storage: [blk.sector_size]u8 = undefined;
+    var block = blk.Blk.initWithOptions(.{ .memory = &storage }, .{});
+    var transports = [_]mmio.Transport{mmio.Transport.init(block.device())};
+    var guest_bytes: [4096]u8 = undefined;
+    const ram = guestmem.GuestRam{ .bytes = &guest_bytes, .base = board.ram_base };
+    var queues = [_]spore.QueueState{.{
+        .size = 8,
+        .ready = true,
+        .desc_addr = board.ram_base,
+        .avail_addr = board.ram_base + 0x400,
+        .used_addr = board.ram_base + 0x800,
+        .last_avail = 0,
+        .used_idx = 0,
+    }};
+    const states = [_]spore.TransportState{.{
+        .device_id = blk.device_id,
+        .status = mmio.status_features_ok | mmio.status_driver_ok,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &queues,
+    }};
+    try applyTransports(&transports, &states, ram);
+    try std.testing.expect(transports[0].queues[0].ready);
+
+    transports[0].reset();
+    queues[0].used_addr = board.ram_base + guest_bytes.len;
+    try std.testing.expectError(error.BadManifest, applyTransports(&transports, &states, ram));
+    try std.testing.expect(!transports[0].queues[0].ready);
 }

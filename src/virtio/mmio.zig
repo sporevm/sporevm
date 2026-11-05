@@ -226,11 +226,7 @@ pub const Transport = struct {
             0x050 => {
                 // QueueNotify: value is the queue index.
                 if (value < self.dev.queue_count) {
-                    const q = &self.queues[@intCast(value)];
-                    if (q.ready) {
-                        // Restored queues skip QueueReady and were checked
-                        // without guest RAM.
-                        q.validateRings(ram) catch return self.failQueue(q);
+                    if (self.queues[@intCast(value)].ready) {
                         return self.signalUsedBuffers(self.dev.notifyFn(self.dev.context, @intCast(value), &self.queues, ram));
                     }
                 }
@@ -589,21 +585,6 @@ test "queue layout is frozen while the queue is ready" {
     try std.testing.expect(t.write(0x050, 1, ram));
     try std.testing.expectEqual(@as(u8, 1), td.notified.?);
     try std.testing.expect(t.read(0x070) & status_device_needs_reset == 0);
-}
-
-test "notify fails a restored queue with an unusable layout" {
-    var td = TestDev{};
-    var t = Transport.init(td.dev());
-    var buf: [4096]u8 = undefined;
-    const ram = testRam(&buf);
-    _ = t.write(0x070, 1 | 2 | status_features_ok | status_driver_ok, ram);
-    t.queues[1] = .{ .size = 8, .ready = true, .desc_addr = 0x008, .avail_addr = 0x400, .used_addr = 0x800 };
-
-    try std.testing.expect(t.write(0x050, 1, ram));
-    try std.testing.expectEqual(@as(?u8, null), td.notified);
-    try std.testing.expectEqual(@as(u32, 2), t.read(0x060));
-    try std.testing.expect(t.read(0x070) & status_device_needs_reset != 0);
-    try std.testing.expectEqual(@as(u32, 0), t.read(0x044));
 }
 
 test "config change latches interrupt and bumps generation" {
