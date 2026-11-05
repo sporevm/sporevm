@@ -58,6 +58,7 @@ pub const Control = struct {
     completeRootfsSnapshotFn: *const fn (context: *anyopaque, disk: ?spore.Disk) anyerror!void,
     completeDiskForkFn: ?*const fn (context: *anyopaque, batch: *runtime_disk_fork_capture.Batch) anyerror!void = null,
     failDiskForkFn: ?*const fn (context: *anyopaque, err: anyerror) void = null,
+    refuseSnapshotsFn: ?*const fn (context: *anyopaque) void = null,
     reportStatsFn: *const fn (context: *anyopaque, stats: ControlStats) void,
 
     pub fn poll(self: Control, dev: *vsock.Vsock) !ControlAction {
@@ -97,6 +98,14 @@ pub const Control = struct {
     pub fn failDiskFork(self: Control, err: anyerror) void {
         const fail = self.failDiskForkFn orelse return;
         fail(self.context, err);
+    }
+
+    /// The run's root disk reads missing objects from an image store, and no
+    /// snapshot can capture it. The controller refuses snapshot requests
+    /// rather than pausing the guest for one that fails and ends the run.
+    pub fn refuseSnapshots(self: Control) void {
+        const refuse = self.refuseSnapshotsFn orelse return;
+        refuse(self.context);
     }
 
     pub fn reportStats(self: Control, stats: ControlStats) void {

@@ -594,6 +594,10 @@ pub fn installStorageIndexPathRepairingInvalid(
     };
 }
 
+/// Installs a verified chunk unless a valid one is already there. Callers
+/// hold the rootfs cache lock so GC cannot collect the object before an index
+/// or record roots it. The image store fetcher installs without the lock: its
+/// runtime lease already roots every object of the leased index.
 pub fn installChunkPath(
     allocator: std.mem.Allocator,
     io: Io,

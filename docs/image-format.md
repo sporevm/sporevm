@@ -1,9 +1,10 @@
 # Native Image Format
 
 This document defines the canonical native image manifest, config, and rootfs
-index, and the single-platform archive that carries them for
-`spore image pack` and `spore image unpack`. The manifest `kind` keeps its
-original wire name, `spore-image-gateway-manifest-v1`.
+index, the single-platform archive that carries them for
+`spore image pack` and `spore image unpack`, and the image store that
+`spore image push` writes and `spore run --image` reads lazily. The manifest
+`kind` keeps its original wire name, `spore-image-gateway-manifest-v1`.
 
 ## Platform vocabulary
 
@@ -104,6 +105,43 @@ objects, 4 GiB object payload, and 4 GiB compressed archive bytes. The
 unpacker uses private disk staging and never creates, captures, restores, or
 carries RAM, vCPU, device, session, or suspended machine state. `spore pack`,
 `push`, `pull`, and `unpack` remain the separate saved-machine bundle protocol.
+
+## Image stores
+
+An image store is a static directory that any file server can publish. It
+holds each image's canonical files and its objects by digest:
+
+```text
+objects/blake3/<hex>    rootfs object
+images/<hex>/manifest   image manifest, named by the native image digest
+images/<hex>/config     canonical config
+images/<hex>/index      canonical rootfs index
+tags/<name>             "blake3:<image hex>\n"
+```
+
+`spore image push local/app:1 /srv/images/app` writes the image's missing
+objects, then its manifest, config and index, then `tags/app` last, and prints
+the ref to run, `file:///srv/images/app`. Objects already present with the
+right bytes are kept, so pushing again or under another tag writes nothing
+else. A destination of `blake3:<hex>` writes no tag and must name the image.
+Tags match `[a-z0-9][a-z0-9._-]{0,127}`.
+
+`spore run --image` and `spore create --image` treat any ref with `://` as a
+store ref: `file:///srv/images/app`, `https://images.example/app`, or
+`.../blake3:<hex>`. Tags over plain `http://` are accepted only on 127.0.0.1
+and `[::1]`; digests are accepted over any scheme. A tag is read from the store
+on every run. SporeVM fetches and verifies the manifest, config and index as
+`spore image unpack` does, requires the expected image digest and this host's
+platform, installs the index, and records the image in the local catalog with
+the store as its origin. It then boots without any objects: the first guest
+read of a chunk fetches its object, verifies its BLAKE3 digest, and installs it
+in the local cache. Every vCPU waits for a fetch. Over HTTP(S) a fetch makes
+at most three attempts within 10 seconds; a `file://` store has no deadline, so
+a hung mount blocks the VM. A missing or corrupt object, or an unreachable
+store, fails that guest read with an I/O error, and the disk then fetches
+nothing more: later reads of objects not yet local fail at once, so a failing
+HTTP(S) store stalls the VM for at most one 10-second fetch. `run --save`,
+`run --commit` and `spore save` are refused for images run from a store.
 
 ## Converter-worker conformance
 

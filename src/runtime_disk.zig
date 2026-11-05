@@ -9,6 +9,9 @@ const Context = @import("context.zig").Context;
 const disk_index = @import("disk_index.zig");
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
+const image = @import("image.zig");
+const image_store = @import("image_store.zig");
+const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -51,6 +54,8 @@ pub const RuntimeDisk = struct {
     chunk_mapped: ?chunk_mapped_disk.ChunkMappedDisk = null,
     base: ?disk_layer.Base = null,
     runtime_lease: ?runtime_disk_lease.Active = null,
+    /// Fetches rootfs objects that are only in the image's store.
+    fetcher: ?*image_store.Fetcher = null,
 
     pub fn backend(self: *RuntimeDisk) ?virtio_blk.Backend {
         if (self.chunk_mapped) |*disk| return .{ .chunk_mapped = disk };
@@ -97,6 +102,7 @@ pub const RuntimeDisk = struct {
 
     pub fn deinit(self: *RuntimeDisk) void {
         if (self.chunk_mapped) |*disk| disk.deinit();
+        if (self.fetcher) |fetcher| fetcher.destroy();
         if (self.overlay) |*overlay| overlay.deinit();
         if (self.rootfs_fd) |fd| _ = std.c.close(fd);
         if (self.trace_fd) |fd| _ = std.c.close(fd);
@@ -209,7 +215,9 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             const grown_size = try grownRootfsSize(storage.logical_size, storage.chunk_size, options.rootfs_grow_target);
             const cache_root = try baselineRootPath(context, allocator, options.disk_root);
             defer allocator.free(cache_root);
-            runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, options.rootfs_cache_lock);
+            var origin: ?[]u8 = null;
+            defer if (origin) |value| allocator.free(value);
+            runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, options.rootfs_cache_lock, .{ .rootfs = rootfs, .out = &origin });
             runtime.rootfs_fd = try createSparseTempFd(context, allocator, grown_size);
             const base_source = try runtime.baseSource(grown_size);
             const writable = try openWritable(context, allocator, base_source, storage.logical_size, storage.chunk_size);
@@ -218,6 +226,12 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             var parsed = try readDiskIndex(context, allocator, cache_root, storage);
             defer parsed.deinit();
             try runtime.chunk_mapped.?.attachCasIndexTraced(cache_root, parsed.value, runtime.trace_fd);
+            if (origin) |store| {
+                // Faults run on vCPU threads and fetches on Io workers, so the
+                // fetcher needs a thread-safe allocator.
+                runtime.fetcher = try image_store.Fetcher.create(std.heap.c_allocator, context.io, cache_root, store);
+                runtime.chunk_mapped.?.attachRemote(runtime.fetcher.?);
+            }
             // The sparse fd and verified parent index make every appended byte
             // authoritative zero. Preserve that fact in the source map rather
             // than manufacturing dirty zero payload.
@@ -273,7 +287,7 @@ pub fn openReadOnlyRootfs(
         }
         const cache_root = try baselineRootPath(context, allocator, disk_root);
         defer allocator.free(cache_root);
-        runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, rootfs_cache_lock);
+        runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, rootfs_cache_lock, null);
         runtime.rootfs_fd = try createSparseTempFd(context, allocator, storage.logical_size);
         const base_source = try runtime.baseSource(storage.logical_size);
         runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initReadOnly(allocator, base_source, storage.logical_size, storage.chunk_size);
@@ -601,12 +615,21 @@ fn baselineRootPath(context: Context, allocator: std.mem.Allocator, root_overrid
     return rootfsCacheRootPath(context, allocator);
 }
 
+/// Where an image rootfs may find objects missing locally.
+const StoreOrigin = struct {
+    /// Its image record names the store as origin.
+    rootfs: spore.Rootfs,
+    /// Receives the store base, owned by the caller, when storage is incomplete.
+    out: *?[]u8,
+};
+
 fn acquireLazyRootfsLease(
     context: Context,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     storage: spore.RootfsStorage,
     rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
+    store_origin: ?StoreOrigin,
 ) !?runtime_disk_lease.Active {
     const configured_cache_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(configured_cache_root);
@@ -619,7 +642,16 @@ fn acquireLazyRootfsLease(
     } else {
         cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
     }
-    if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, cache_root, storage)) return error.BadManifest;
+    if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, cache_root, storage)) {
+        // Objects still in the image's store are rooted by the lease below:
+        // GC protects every object the leased index names.
+        const origin = store_origin orelse return error.BadManifest;
+        origin.out.* = (try imageStoreOrigin(context, allocator, cache_root, origin.rootfs, storage)) orelse return error.BadManifest;
+    }
+    errdefer if (store_origin) |origin| if (origin.out.*) |value| {
+        allocator.free(value);
+        origin.out.* = null;
+    };
 
     const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
     defer allocator.free(runtime_root);
@@ -638,6 +670,19 @@ fn acquireLazyRootfsLease(
         .baseline_identity = storage.index_digest,
         .rootfs_storage = storage,
     });
+}
+
+/// The store recorded as origin by the local image `rootfs.source` names, if
+/// that image has this storage.
+fn imageStoreOrigin(context: Context, allocator: std.mem.Allocator, cache_root: []const u8, rootfs: spore.Rootfs, storage: spore.RootfsStorage) !?[]u8 {
+    const source = rootfs.source orelse return null;
+    if (!std.mem.startsWith(u8, source.image_manifest_digest, image.digest_prefix)) return null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const local = (local_image.readRecord(context.io, arena.allocator(), cache_root, source.image_manifest_digest) catch return null) orelse return null;
+    const origin = local.origin orelse return null;
+    if (!std.mem.eql(u8, local.storage.index_digest, storage.index_digest)) return null;
+    return try allocator.dupe(u8, origin);
 }
 
 fn openRootfsTraceFd(context: Context, allocator: std.mem.Allocator) !?std.c.fd_t {
@@ -1087,7 +1132,7 @@ test "build-owned cache lock permits lazy runtime disk open" {
     const wrong_cache_root = try std.fs.path.join(arena, &.{ absolute_tmp, "wrong-cache" });
     try Io.Dir.cwd().createDirPath(io, wrong_cache_root);
     try env.put(local_paths.rootfs_cache_env, wrong_cache_root);
-    try std.testing.expectError(error.RootfsCacheLockNotHeld, acquireLazyRootfsLease(context, allocator, wrong_cache_root, storage, &cache_lock));
+    try std.testing.expectError(error.RootfsCacheLockNotHeld, acquireLazyRootfsLease(context, allocator, wrong_cache_root, storage, &cache_lock, null));
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
 
     var stale_cache_lock = cache_lock;

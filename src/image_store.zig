@@ -150,6 +150,12 @@ pub fn parseTag(bytes: []const u8) ![]const u8 {
     return digest;
 }
 
+/// The digest-pinned ref of `identity` in the store `raw` names.
+pub fn resolvedRefAlloc(allocator: std.mem.Allocator, raw: []const u8, identity: []const u8) ![]u8 {
+    const ref = try parseStoreRef(raw);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.base.url, identity });
+}
+
 fn objectPathAlloc(allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "objects/blake3/{s}", .{digest[digest_prefix.len..]});
 }
@@ -268,6 +274,384 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
 pub fn deinitPushResult(allocator: std.mem.Allocator, result: PushResult) void {
     allocator.free(result.ref);
     allocator.free(result.image_digest);
+}
+
+/// Resolve the store ref `raw` to a local image for `platform`, fetching and
+/// verifying its manifest, config and index if this cache has none, and
+/// recording the store as the origin of objects still missing locally. A tag
+/// is read from the store every time; a digest is not when the image is local.
+/// Allocates into `allocator`; use an arena.
+pub fn resolve(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    raw: []const u8,
+    platform: rootfs.Platform,
+) !local_image.LocalImage {
+    const ref = try parseStoreRef(raw);
+    var client = try Client.init(allocator, io, ref.base.url);
+    defer client.deinit();
+    const identity = switch (ref.target) {
+        .digest => |digest| digest,
+        .tag => |name| blk: {
+            const path = try std.fmt.allocPrint(allocator, "tags/{s}", .{name});
+            const bytes = try client.get(allocator, path, .{ .max = tag_file_len }, metadata_budget);
+            break :blk try parseTag(bytes);
+        },
+    };
+
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    if (try local_image.loadAllowingOrigin(io, allocator, cache_root, identity)) |local| {
+        if (local.platform.arch != platform.arch or !std.mem.eql(u8, local.platform.os, platform.os)) return error.UnsupportedPlatform;
+        if (local.origin == null or std.mem.eql(u8, local.origin.?, ref.base.url)) return local;
+        // Fetch missing objects from the store this run names.
+        _ = try local_image.lockAndPublish(io, allocator, cache_root, .{
+            .platform = local.platform,
+            .config = local.config,
+            .storage = local.storage,
+            .oci = local.oci,
+            .origin = ref.base.url,
+        });
+        return (try local_image.loadAllowingOrigin(io, allocator, cache_root, identity)) orelse error.RootFSDigestCacheMiss;
+    }
+
+    const manifest_path = try imagePathAlloc(allocator, identity, "manifest");
+    const manifest_bytes = try client.get(allocator, manifest_path, .{ .max = image_manifest.max_image_manifest_bytes }, metadata_budget);
+    const summary = try image_manifest.parseImageManifest(allocator, manifest_bytes);
+    if (summary.value.image.platform.arch != platform.arch or !std.mem.eql(u8, summary.value.image.platform.os, platform.os)) return error.UnsupportedPlatform;
+    const config_path = try imagePathAlloc(allocator, identity, "config");
+    const config_bytes = try client.get(allocator, config_path, .{ .max = image_manifest.max_config_blob_bytes }, metadata_budget);
+    const index_path = try imagePathAlloc(allocator, identity, "index");
+    const index_bytes = try client.get(allocator, index_path, .{ .max = disk_index.max_index_bytes }, metadata_budget);
+
+    // The image digest binds the index and config; the manifest summary must
+    // match both, so its own transport digest needs no outside pin.
+    const manifest_digest = try image_manifest.transportDigestAlloc(allocator, manifest_bytes);
+    const verified = try image_manifest.verifyImageManifest(allocator, manifest_digest, platform, manifest_bytes, config_bytes, index_bytes);
+    if (!std.mem.eql(u8, verified.value.image.digest, identity)) return error.BadProtocol;
+    const config = try image_manifest.parseCanonicalConfig(allocator, config_bytes);
+    const storage = verified.value.image.rootfs_storage;
+
+    var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, cache_root);
+    defer cache_lock.deinit();
+    const installed_index = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
+    _ = try rootfs_cas.installStorageIndexPath(allocator, io, installed_index, index_bytes, storage);
+    _ = try local_image.publish(io, allocator, cache_root, &cache_lock, .{
+        .platform = platform,
+        .config = config.value,
+        .storage = storage,
+        .origin = ref.base.url,
+        .expected_identity = identity,
+    });
+    return (try local_image.loadAllowingOrigin(io, allocator, cache_root, identity)) orelse error.RootFSDigestCacheMiss;
+}
+
+/// Retry policy for one store read: at most `attempts` tries, each bounded by
+/// `attempt_ms`, all within `total_ms`.
+pub const Budget = struct {
+    attempts: u32,
+    attempt_ms: u64,
+    total_ms: u64,
+};
+
+/// Image metadata is read before boot, where only the caller waits.
+pub const metadata_budget = Budget{ .attempts = 3, .attempt_ms = 60_000, .total_ms = 120_000 };
+/// An object read holds the VMM device lock, so every vCPU may wait for it.
+/// Stay well under the guest's 20 s soft-lockup watchdog; a failed read
+/// poisons the disk, which then fetches nothing more.
+pub const object_budget = Budget{ .attempts = 3, .attempt_ms = 5_000, .total_ms = 10_000 };
+
+pub const Limit = struct {
+    max: usize,
+    /// The body must be exactly `max` bytes.
+    exact: bool = false,
+};
+
+pub const GetError = error{
+    /// The store has no such file (HTTP 404). Permanent.
+    ImageStoreNotFound,
+    /// The store refused the request (any other 4xx or a redirect). Permanent.
+    ImageStoreRejected,
+    /// The body is longer than allowed, a different length than expected, or
+    /// encoded. Permanent.
+    ImageStoreBadResponse,
+    /// The store did not answer (connection or read failure, 429, 5xx) after
+    /// every attempt.
+    ImageStoreUnavailable,
+    /// The budget ran out.
+    ImageStoreTimeout,
+    OutOfMemory,
+};
+
+/// Reads files from one store. Requests are bounded by size and time; an
+/// HTTP(S) request runs on an `Io` worker that is canceled at its deadline.
+/// Not thread-safe; `Fetcher` serializes callers.
+pub const Client = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    base: Base,
+    http: std.http.Client,
+
+    /// `allocator` must be thread-safe: requests run on `Io` workers.
+    pub fn init(allocator: std.mem.Allocator, io: Io, base_url: []const u8) !Client {
+        const url = try allocator.dupe(u8, base_url);
+        errdefer allocator.free(url);
+        const base = try parseBase(url);
+        var http: std.http.Client = .{ .allocator = allocator, .io = io };
+        errdefer http.deinit();
+        if (base.scheme == .https) {
+            // Load CA certificates now rather than on a guest fault.
+            const now = Io.Clock.real.now(io);
+            http.ca_bundle.rescan(allocator, io, now) catch return error.CertificateBundleLoadFailure;
+            http.now = now;
+        }
+        return .{ .allocator = allocator, .io = io, .base = base, .http = http };
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.http.deinit();
+        self.allocator.free(self.base.url);
+    }
+
+    /// GET `<base>/<path>`, retrying transient failures within `budget`.
+    pub fn get(self: *Client, allocator: std.mem.Allocator, path: []const u8, limit: Limit, budget: Budget) GetError![]u8 {
+        const start_ms = monotonicMs();
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            const remaining_ms = budget.total_ms -| (monotonicMs() -| start_ms);
+            if (remaining_ms == 0) return error.ImageStoreTimeout;
+            if (self.getOnce(allocator, path, limit, @min(budget.attempt_ms, remaining_ms))) |bytes| {
+                return bytes;
+            } else |err| switch (err) {
+                error.ImageStoreUnavailable, error.ImageStoreTimeout => {
+                    std.log.debug("image store GET {s}/{s} attempt {d} failed: {s}", .{ self.base.url, path, attempt, @errorName(err) });
+                    if (attempt >= budget.attempts) return err;
+                    const backoff_ms: u64 = 100 * @as(u64, attempt);
+                    if (monotonicMs() -| start_ms + backoff_ms >= budget.total_ms) return err;
+                    self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake) catch return err;
+                },
+                else => return err,
+            }
+        }
+    }
+
+    fn getOnce(self: *Client, allocator: std.mem.Allocator, path: []const u8, limit: Limit, timeout_ms: u64) GetError![]u8 {
+        if (self.base.scheme == .file) return self.readFile(allocator, path, limit);
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base.url, path });
+        defer allocator.free(url);
+
+        const Attempt = struct {
+            client: *Client,
+            allocator: std.mem.Allocator,
+            url: []const u8,
+            limit: Limit,
+            done: Io.Event = .unset,
+            result: GetError![]u8 = error.ImageStoreTimeout,
+
+            fn run(attempt: *@This()) Io.Cancelable!void {
+                defer attempt.done.set(attempt.client.io);
+                const bytes = attempt.client.httpGet(attempt.allocator, attempt.url, attempt.limit) catch |err| {
+                    const any: anyerror = err;
+                    attempt.result = switch (any) {
+                        error.Canceled => return error.Canceled,
+                        error.ImageStoreNotFound => error.ImageStoreNotFound,
+                        error.ImageStoreRejected => error.ImageStoreRejected,
+                        error.ImageStoreBadResponse => error.ImageStoreBadResponse,
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => blk: {
+                            std.log.debug("image store GET {s} failed: {s}", .{ attempt.url, @errorName(any) });
+                            break :blk error.ImageStoreUnavailable;
+                        },
+                    };
+                    return;
+                };
+                attempt.result = bytes;
+            }
+        };
+        var attempt = Attempt{ .client = self, .allocator = allocator, .url = url, .limit = limit };
+        const io = self.io;
+        var future = io.concurrent(Attempt.run, .{&attempt}) catch return error.ImageStoreUnavailable;
+        const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .awake });
+        var timed_out = false;
+        while (!attempt.done.isSet()) {
+            attempt.done.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
+                error.Timeout => if (Io.Clock.awake.now(io).nanoseconds >= deadline.raw.nanoseconds) {
+                    timed_out = true;
+                    break;
+                },
+                else => break,
+            };
+        }
+        // Canceling interrupts a blocked socket call; the request then
+        // closes its connection instead of returning it to the pool.
+        future.cancel(io) catch {};
+        if (timed_out) {
+            const bytes = attempt.result catch return error.ImageStoreTimeout;
+            return bytes;
+        }
+        return attempt.result;
+    }
+
+    fn httpGet(self: *Client, allocator: std.mem.Allocator, url: []const u8, limit: Limit) ![]u8 {
+        const uri = try std.Uri.parse(url);
+        // Certificate validity is checked against `now`, which init set when
+        // it loaded the CA bundle; a long run must not keep that time.
+        if (self.base.scheme == .https) self.http.now = Io.Clock.real.now(self.io);
+        var request = try self.http.request(.GET, uri, .{
+            .redirect_behavior = .unhandled,
+            .headers = .{ .accept_encoding = .omit },
+        });
+        defer request.deinit();
+        try request.sendBodiless();
+        var no_redirects: [0]u8 = undefined;
+        var response = try request.receiveHead(&no_redirects);
+        switch (response.head.status) {
+            .ok => {},
+            .not_found => return error.ImageStoreNotFound,
+            .too_many_requests => return error.ImageStoreUnavailable,
+            else => |status| return if (status.class() == .server_error) error.ImageStoreUnavailable else error.ImageStoreRejected,
+        }
+        if (response.head.content_encoding != .identity) return error.ImageStoreBadResponse;
+        if (response.head.content_length) |length| {
+            if (length > limit.max or (limit.exact and length != limit.max)) return error.ImageStoreBadResponse;
+        }
+        var transfer_buffer: [64 * 1024]u8 = undefined;
+        const body = response.reader(&transfer_buffer);
+        var out: Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        var scratch: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = body.readSliceShort(&scratch) catch |err| switch (err) {
+                error.ReadFailed => return response.bodyErr() orelse err,
+            };
+            if (n == 0) break;
+            if (out.written().len + n > limit.max) return error.ImageStoreBadResponse;
+            try out.writer.writeAll(scratch[0..n]);
+        }
+        if (limit.exact and out.written().len != limit.max) return error.ImageStoreBadResponse;
+        return out.toOwnedSlice();
+    }
+
+    /// Reads a regular file of a directory store. A file store has no
+    /// deadline: opening never waits for a FIFO writer, but a hung mount can
+    /// still block the read.
+    fn readFile(self: *Client, allocator: std.mem.Allocator, path: []const u8, limit: Limit) GetError![]u8 {
+        const full_path = try std.fs.path.joinZ(allocator, &.{ self.base.dir, path });
+        defer allocator.free(full_path);
+        const fd = std.c.open(full_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, @as(c_uint, 0));
+        if (fd < 0) return switch (std.c.errno(fd)) {
+            .NOENT, .NOTDIR => error.ImageStoreNotFound,
+            .NOMEM => error.OutOfMemory,
+            else => error.ImageStoreUnavailable,
+        };
+        // O_NONBLOCK does not change reads of a regular file.
+        const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+        defer file.close(self.io);
+        const stat = file.stat(self.io) catch return error.ImageStoreUnavailable;
+        if (stat.kind != .file) return error.ImageStoreBadResponse;
+        if (stat.size > limit.max or (limit.exact and stat.size != limit.max)) return error.ImageStoreBadResponse;
+        const bytes = try allocator.alloc(u8, @intCast(stat.size));
+        errdefer allocator.free(bytes);
+        const read = file.readPositionalAll(self.io, bytes, 0) catch return error.ImageStoreUnavailable;
+        if (read != bytes.len) return error.ImageStoreBadResponse;
+        return bytes;
+    }
+};
+
+pub const FetchStats = struct {
+    fetches: u64 = 0,
+    bytes: u64 = 0,
+    fetch_ns: u64 = 0,
+    errors: u64 = 0,
+    install_errors: u64 = 0,
+};
+
+/// Fetches rootfs objects missing from the local CAS during a guest fault and
+/// installs them there. Installs skip the rootfs cache lock: the runtime
+/// lease, taken with the cache lock held after the index was installed,
+/// already roots every object the index names.
+pub const Fetcher = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    client: Client,
+    /// Serializes use of `client` and `stats`.
+    mutex: Io.Mutex = .init,
+    stats: FetchStats = .{},
+
+    /// `allocator` must be thread-safe: faults run on vCPU threads and
+    /// requests on `Io` workers.
+    pub fn create(allocator: std.mem.Allocator, io: Io, cache_root: []const u8, origin: []const u8) !*Fetcher {
+        const self = try allocator.create(Fetcher);
+        errdefer allocator.destroy(self);
+        const owned_root = try allocator.dupe(u8, cache_root);
+        errdefer allocator.free(owned_root);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .cache_root = owned_root,
+            .client = try Client.init(allocator, io, origin),
+        };
+        return self;
+    }
+
+    pub fn destroy(self: *Fetcher) void {
+        const stats = self.stats;
+        std.log.debug("image store {s}: fetched {d} objects, {d} bytes in {d} ms; {d} errors, {d} install errors", .{
+            self.client.base.url, stats.fetches, stats.bytes, stats.fetch_ns / std.time.ns_per_ms, stats.errors, stats.install_errors,
+        });
+        self.client.deinit();
+        self.allocator.free(self.cache_root);
+        self.allocator.destroy(self);
+    }
+
+    /// Fill `buf` with the object `digest` names, whose length is `buf.len`,
+    /// verified against its BLAKE3 digest. The caller has found it missing
+    /// locally; disk reads hold the VMM device lock, so a second fault on the
+    /// same object finds it installed. A failed local install is counted, not
+    /// returned: the bytes are already verified.
+    pub fn fetchObject(self: *Fetcher, digest: []const u8, buf: []u8) (GetError || error{BadChunk})!void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const start_ns = monotonicNs();
+        const id = chunk.ChunkId.fromHex(digest[digest_prefix.len..]) catch return error.BadChunk;
+        const path = try objectPathAlloc(self.allocator, digest);
+        defer self.allocator.free(path);
+        const bytes = self.client.get(self.allocator, path, .{ .max = buf.len, .exact = true }, object_budget) catch |err| {
+            self.stats.errors += 1;
+            std.log.debug("image store {s}: fetching {s} failed: {s}", .{ self.client.base.url, digest, @errorName(err) });
+            return err;
+        };
+        defer self.allocator.free(bytes);
+        if (!id.matches(bytes)) {
+            self.stats.errors += 1;
+            std.log.debug("image store {s}: object {s} failed verification", .{ self.client.base.url, digest });
+            return error.BadChunk;
+        }
+        @memcpy(buf, bytes);
+        self.stats.fetches += 1;
+        self.stats.bytes += bytes.len;
+        self.stats.fetch_ns += monotonicNs() -| start_ns;
+
+        const installed_path = rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, digest) catch {
+            self.stats.install_errors += 1;
+            return;
+        };
+        defer self.allocator.free(installed_path);
+        _ = rootfs_cas.installChunkPath(self.allocator, self.io, installed_path, bytes, digest, bytes.len) catch {
+            self.stats.install_errors += 1;
+        };
+    }
+};
+
+fn monotonicMs() u64 {
+    return monotonicNs() / std.time.ns_per_ms;
+}
+
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 fn fuzzTagParse(_: void, smith: *std.testing.Smith) !void {
@@ -481,4 +865,194 @@ test "image push writes a complete store once and retags without rewriting" {
     try std.testing.expectEqual(@as(usize, 8), (try fixture.listStore(store)).len);
     try std.testing.expectError(error.ImageIdentityMismatch, fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, "b" ** 64 })));
     try std.testing.expectError(error.ImageStorePushNeedsDirectory, fixture.pushTo("https://images.example.test/app"));
+}
+
+test "a store image resolves into an empty cache with only its metadata" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const consumer = try fixture.path("consumer-cache");
+    const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
+    const platform = rootfs.Platform{};
+
+    const local = try resolve(io, allocator, consumer, ref, platform);
+    try std.testing.expectEqualStrings(fixture.identity, local.identity);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}", .{store}), local.origin.?);
+    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, allocator, consumer, local.storage));
+    const objects_dir = try std.fs.path.join(allocator, &.{ consumer, "cas", "rootfs", "blake3", "objects" });
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, objects_dir, .{}));
+    try std.testing.expectError(error.UnsupportedPlatform, resolve(io, allocator, consumer, ref, .{ .arch = .amd64 }));
+
+    // A digest ref of a local image needs no store.
+    const digest_ref = try std.fmt.allocPrint(allocator, "file://{s}/missing/{s}", .{ store, fixture.identity });
+    const by_digest = try resolve(io, allocator, consumer, digest_ref, platform);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}/missing", .{store}), by_digest.origin.?);
+
+    // Tampered metadata never reaches the catalog.
+    const hex = fixture.identity[digest_prefix.len..];
+    for ([_][]const u8{ "manifest", "config", "index" }) |file| {
+        const tampered_store = try fixture.path(try std.fmt.allocPrint(allocator, "tampered-{s}", .{file}));
+        _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{tampered_store}));
+        const file_path = try std.fs.path.join(allocator, &.{ tampered_store, "images", hex, file });
+        var bytes = try Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(disk_index.max_index_bytes));
+        bytes[bytes.len / 2] ^= 1;
+        try chunk_sealer.replaceFileAtomicDurable(allocator, file_path, bytes, 0o644);
+        const tampered_cache = try fixture.path(try std.fmt.allocPrint(allocator, "tampered-{s}-cache", .{file}));
+        try std.testing.expectError(error.BadProtocol, resolve(io, allocator, tampered_cache, try std.fmt.allocPrint(allocator, "{s}/1", .{tampered_store}), platform));
+        try std.testing.expectEqual(null, try local_image.loadAllowingOrigin(io, allocator, tampered_cache, fixture.identity));
+    }
+    const missing_cache = try fixture.path("missing-cache");
+    try std.testing.expectError(error.ImageStoreNotFound, resolve(io, allocator, missing_cache, try std.fmt.allocPrint(allocator, "{s}/2", .{store}), platform));
+}
+
+/// Serves files from `root` over HTTP/1.1 on loopback, one connection at a
+/// time. `failures` answers that many requests with 500 first; `hang` holds
+/// every request open until `deinit`.
+const TestServer = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+    server: Io.net.Server,
+    thread: std.Thread,
+    closed: std.atomic.Value(bool) = .init(false),
+    failures: std.atomic.Value(u32) = .init(0),
+    requests: std.atomic.Value(u32) = .init(0),
+    hang: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
+        var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .root = root,
+            .server = try address.listen(io, .{ .kernel_backlog = 8, .reuse_address = true }),
+            .thread = undefined,
+        };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn stop(self: *TestServer) void {
+        self.closed.store(true, .release);
+        if (self.server.socket.address.connect(self.io, .{ .mode = .stream })) |stream| {
+            stream.close(self.io);
+        } else |_| {}
+        self.thread.join();
+        self.server.deinit(self.io);
+    }
+
+    fn url(self: *TestServer, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn serve(self: *TestServer) void {
+        while (!self.closed.load(.acquire)) {
+            const stream = self.server.accept(self.io) catch continue;
+            defer stream.close(self.io);
+            if (self.closed.load(.acquire)) return;
+            self.handle(stream) catch {};
+        }
+    }
+
+    fn handle(self: *TestServer, stream: Io.net.Stream) !void {
+        var read_buffer: [8 * 1024]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        const request_line = std.mem.trimEnd(u8, try reader.interface.takeDelimiterExclusive('\n'), "\r");
+        const path = request_line["GET ".len..std.mem.lastIndexOfScalar(u8, request_line, ' ').?];
+        const file_path = try std.fs.path.join(self.allocator, &.{ self.root, path[1..] });
+        defer self.allocator.free(file_path);
+        while (std.mem.trimEnd(u8, try reader.interface.takeDelimiterExclusive('\n'), "\r").len != 0) {}
+        _ = self.requests.fetchAdd(1, .monotonic);
+        if (self.hang.load(.acquire)) {
+            while (!self.closed.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+            return;
+        }
+        var write_buffer: [8 * 1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        if (self.failures.load(.monotonic) != 0) {
+            _ = self.failures.fetchSub(1, .monotonic);
+            try writer.interface.writeAll("HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return writer.interface.flush();
+        }
+        const data = Io.Dir.cwd().readFileAlloc(self.io, file_path, self.allocator, .limited(disk_index.max_index_bytes)) catch {
+            try writer.interface.writeAll("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return writer.interface.flush();
+        };
+        defer self.allocator.free(data);
+        try writer.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{data.len});
+        try writer.interface.writeAll(data);
+        try writer.interface.flush();
+    }
+};
+
+test "HTTP store reads retry transient failures and fail closed on the rest" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const tag_path = try std.fs.path.join(allocator, &.{ store, "tags", "1" });
+    const tag = try Io.Dir.cwd().readFileAlloc(io, tag_path, allocator, .limited(tag_file_len + 1));
+
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    var client = try Client.init(std.testing.allocator, io, try server.url(allocator));
+    defer client.deinit();
+    const quick = Budget{ .attempts = 3, .attempt_ms = 2_000, .total_ms = 5_000 };
+
+    const bytes = try client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, quick);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(tag, bytes);
+
+    server.failures.store(1, .monotonic);
+    const retried = try client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, quick);
+    std.testing.allocator.free(retried);
+
+    server.failures.store(3, .monotonic);
+    try std.testing.expectError(error.ImageStoreUnavailable, client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, quick));
+
+    const before_missing = server.requests.load(.monotonic);
+    try std.testing.expectError(error.ImageStoreNotFound, client.get(std.testing.allocator, "tags/2", .{ .max = tag_file_len }, quick));
+    try std.testing.expectEqual(before_missing + 1, server.requests.load(.monotonic));
+    try std.testing.expectError(error.ImageStoreBadResponse, client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len - 1 }, quick));
+    try std.testing.expectError(error.ImageStoreBadResponse, client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len + 1, .exact = true }, quick));
+
+    server.hang.store(true, .release);
+    const start_ms = monotonicMs();
+    try std.testing.expectError(error.ImageStoreTimeout, client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, .{ .attempts = 2, .attempt_ms = 200, .total_ms = 600 }));
+    try std.testing.expect(monotonicMs() - start_ms < 2_000);
+}
+
+test "file store reads only regular files and never waits for a FIFO writer" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.createDirPath(io, "tags/dir");
+    try tmp.dir.writeFile(io, .{ .sub_path = "tags/1", .data = "blake3:" ++ "a" ** 64 ++ "\n" });
+    const fifo = try std.fs.path.joinZ(allocator, &.{ root, "tags", "fifo" });
+    defer allocator.free(fifo);
+    const c = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    try std.testing.expectEqual(@as(c_int, 0), c.mkfifo(fifo, 0o600));
+
+    var client = try Client.init(allocator, io, root);
+    defer client.deinit();
+    const budget = Budget{ .attempts = 1, .attempt_ms = 1_000, .total_ms = 1_000 };
+    const bytes = try client.get(allocator, "tags/1", .{ .max = tag_file_len }, budget);
+    defer allocator.free(bytes);
+    try std.testing.expectEqualStrings("blake3:" ++ "a" ** 64, try parseTag(bytes));
+    try std.testing.expectError(error.ImageStoreBadResponse, client.get(allocator, "tags/fifo", .{ .max = tag_file_len }, budget));
+    try std.testing.expectError(error.ImageStoreBadResponse, client.get(allocator, "tags/dir", .{ .max = tag_file_len }, budget));
+    try std.testing.expectError(error.ImageStoreNotFound, client.get(allocator, "tags/2", .{ .max = tag_file_len }, budget));
+    try std.testing.expectError(error.ImageStoreBadResponse, client.get(allocator, "tags/1", .{ .max = tag_file_len - 1 }, budget));
 }

@@ -12,6 +12,7 @@ const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
 const fd_util = @import("fd.zig");
+const image_store = @import("image_store.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
@@ -35,6 +36,9 @@ pub const Error = error{
     FlushFailed,
     Poisoned,
     FastForkUnavailable,
+    /// Objects the disk names may exist only in its image store, so a
+    /// snapshot would claim storage this host does not have.
+    RemoteBackedSnapshot,
 } || chunk_sealer.Error || rootfs_cas.SourceError || runtime_disk_fork.Error || spore.Error || block_source.Error || std.mem.Allocator.Error;
 
 const Source = enum(u8) {
@@ -247,6 +251,8 @@ pub const ChunkMappedDisk = struct {
     /// a prefix. This latch is monotonic for the lifetime of the head.
     poisoned: std.atomic.Value(bool) = .init(false),
     lazy_cas_trace: ?LazyCasTrace = null,
+    /// Fetches CAS objects missing locally. Owned by the caller.
+    remote: ?*image_store.Fetcher = null,
 
     pub fn initReadOnly(
         allocator: std.mem.Allocator,
@@ -450,15 +456,44 @@ pub const ChunkMappedDisk = struct {
             .overlay, .overlay_clean => try readExact(self.overlay_fd orelse return error.ShortRead, buf, offset),
             .zero, .zero_dirty => @memset(buf, 0),
             .cas => {
-                const cache_root = self.cas_root orelse return error.BadManifest;
                 const id = self.digest_index.get(@intCast(chunk_index)) orelse return error.BadManifest;
                 var digest_buf: ManifestDigest = undefined;
-                const digest = manifestDigest(id, &digest_buf);
-                const data = try rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, buf.len);
+                const data = try self.readCasObject(manifestDigest(id, &digest_buf), buf.len, null);
                 defer self.allocator.free(data);
                 @memcpy(buf, data);
             },
         }
+    }
+
+    /// Reads a verified CAS object, fetching it from the attached image store
+    /// when it is missing locally. A corrupt local object stays an error.
+    /// After one failed fetch the disk is poisoned and fetches no more, so a
+    /// hung store costs one fetch budget per disk, not one per guest read.
+    fn readCasObject(self: *ChunkMappedDisk, digest: []const u8, len: usize, stats: ?*rootfs_cas.ManifestObjectReadStats) Error![]u8 {
+        const cache_root = self.cas_root orelse return error.BadManifest;
+        const local = if (stats) |value|
+            rootfs_cas.readVerifiedManifestObjectTimed(self.allocator, cache_root, digest, len, value)
+        else
+            rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, len);
+        return local catch |err| {
+            if (err != error.MissingChunk) return err;
+            const remote = self.remote orelse return err;
+            if (self.isPoisoned()) return error.Poisoned;
+            const data = try self.allocator.alloc(u8, len);
+            errdefer self.allocator.free(data);
+            remote.fetchObject(digest, data) catch |fetch_err| {
+                // The guest sees an I/O error; a head that failed a read of
+                // its own base must not be published.
+                self.poison();
+                return switch (fetch_err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.BadChunk, error.ImageStoreBadResponse => error.BadChunk,
+                    error.ImageStoreNotFound => error.MissingChunk,
+                    else => error.IoFailed,
+                };
+            };
+            return data;
+        };
     }
 
     pub fn chunkLen(self: ChunkMappedDisk, chunk_index: usize) Error!usize {
@@ -839,6 +874,12 @@ pub const ChunkMappedDisk = struct {
         }
     }
 
+    /// Fetches CAS objects missing from `cas_root` through `fetcher`, which
+    /// must outlive the disk. A failed fetch poisons the disk.
+    pub fn attachRemote(self: *ChunkMappedDisk, fetcher: *image_store.Fetcher) void {
+        self.remote = fetcher;
+    }
+
     /// Attaches a verified index as snapshot baseline metadata while keeping
     /// reads on the already-open flat rootfs artifact.
     pub fn attachParentIndex(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!void {
@@ -945,6 +986,7 @@ pub const ChunkMappedDisk = struct {
     ) Error!spore.Disk {
         std.debug.assert(quiesced);
         if (self.isPoisoned()) return error.Poisoned;
+        if (self.remote != null) return error.RemoteBackedSnapshot;
         var chunks: std.ArrayList(disk_index.DiskIndexChunk) = .empty;
         errdefer {
             for (chunks.items) |entry| self.allocator.free(entry.digest);
@@ -1343,15 +1385,11 @@ pub const ChunkMappedDisk = struct {
         defer if (trace_enabled and !fault_recorded) {
             self.recordLazyCasFault(false, 0, fault_start_ns, write_ns, object_stats);
         };
-        const cache_root = self.cas_root orelse return error.BadManifest;
         const id = self.digest_index.get(@intCast(chunk_index)) orelse return error.BadManifest;
         var digest_buf: ManifestDigest = undefined;
         const digest = manifestDigest(id, &digest_buf);
         const len = try self.chunkLen(chunk_index);
-        const data = if (trace_enabled)
-            try rootfs_cas.readVerifiedManifestObjectTimed(self.allocator, cache_root, digest, len, &object_stats)
-        else
-            try rootfs_cas.readVerifiedManifestObject(self.allocator, cache_root, digest, len);
+        const data = try self.readCasObject(digest, len, if (trace_enabled) &object_stats else null);
         defer self.allocator.free(data);
         const offset = std.math.mul(u64, chunk_index, self.chunk_size) catch return error.OutOfRange;
         const write_start_ns = if (trace_enabled) monotonicNs() catch 0 else 0;
@@ -1395,10 +1433,11 @@ pub const ChunkMappedDisk = struct {
         for (self.sources) |source| {
             if (source == .cas) remaining +|= 1;
         }
-        var line_buf: [1024]u8 = undefined;
+        const remote: image_store.FetchStats = if (self.remote) |fetcher| fetcher.stats else .{};
+        var line_buf: [1536]u8 = undefined;
         const line = std.fmt.bufPrint(
             &line_buf,
-            "{{\"event\":\"lazy_cas_fault_summary\",\"version\":1,\"runtime_open_ns\":{d},\"index_attach_ns\":{d},\"index_payload_bytes\":{d},\"total_chunks\":{d},\"cas_chunks_initial\":{d},\"cas_chunks_remaining\":{d},\"fault_attempts\":{d},\"fault_errors\":{d},\"unique_chunks\":{d},\"fault_bytes\":{d},\"fault_total_ns\":{d},\"object_prepare_ns\":{d},\"object_read_ns\":{d},\"object_verify_ns\":{d},\"sparse_write_ns\":{d}}}\n",
+            "{{\"event\":\"lazy_cas_fault_summary\",\"version\":1,\"runtime_open_ns\":{d},\"index_attach_ns\":{d},\"index_payload_bytes\":{d},\"total_chunks\":{d},\"cas_chunks_initial\":{d},\"cas_chunks_remaining\":{d},\"fault_attempts\":{d},\"fault_errors\":{d},\"unique_chunks\":{d},\"fault_bytes\":{d},\"fault_total_ns\":{d},\"object_prepare_ns\":{d},\"object_read_ns\":{d},\"object_verify_ns\":{d},\"sparse_write_ns\":{d},\"remote_fetches\":{d},\"remote_bytes\":{d},\"remote_fetch_ns\":{d},\"remote_errors\":{d},\"remote_install_errors\":{d}}}\n",
             .{
                 stats.runtime_open_ns,
                 stats.index_attach_ns,
@@ -1415,6 +1454,11 @@ pub const ChunkMappedDisk = struct {
                 stats.object_read_ns,
                 stats.object_verify_ns,
                 stats.sparse_write_ns,
+                remote.fetches,
+                remote.bytes,
+                remote.fetch_ns,
+                remote.errors,
+                remote.install_errors,
             },
         ) catch return;
         fd_util.writeAllBestEffort(trace.fd, line);
