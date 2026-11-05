@@ -18,6 +18,7 @@ const resolver_placeholder_bytes =
 const debugfs_candidates = [_][]const u8{
     "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
     "debugfs",
+    "/usr/sbin/debugfs",
 };
 
 test "native ext4 writer emits deterministic fsck-clean image" {
@@ -355,6 +356,261 @@ test "native ext4 image from a representative tar passes e2fsck and reads back" 
     try std.testing.expectEqualSlices(u8, &cap, xattr);
 }
 
+test "native ext4 writer trees match debugfs listings and contents" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-native-ext4-debugfs-trees";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    const debugfs = try findTool(allocator, io, &debugfs_candidates);
+    defer allocator.free(debugfs);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Every entry kind, owners, special mode bits, an xattr, fast and slow
+    // symlinks, an empty directory, and one inode with three names in two
+    // directories.
+    var cap = [_]u8{ 1, 0, 0, 2, 0, 0x20, 0, 0 } ++ [_]u8{0} ** 12;
+    const attrs = [_]xattrs_mod.Attribute{.{ .name = xattrs_mod.security_capability_name, .value = &cap }};
+    const mixed = [_]ext4_writer.Entry{
+        .{ .path = "bin", .kind = .directory, .mode = 0o755 },
+        .{ .path = "bin/ping", .kind = .{ .file = "ping\n" }, .mode = 0o755, .xattrs = &attrs },
+        .{ .path = "bin/su", .kind = .{ .file = "su\n" }, .mode = 0o4755 },
+        .{ .path = "dev", .kind = .directory, .mode = 0o755 },
+        .{ .path = "dev/null", .kind = .{ .device = .{ .kind = .char, .major = 1, .minor = 3 } }, .mode = 0o666 },
+        .{ .path = "dev/vda", .kind = .{ .device = .{ .kind = .block, .major = 254, .minor = 0 } }, .mode = 0o660, .gid = 6 },
+        .{ .path = "etc", .kind = .directory, .mode = 0o755 },
+        .{ .path = "etc/empty", .kind = .{ .file = "" } },
+        .{ .path = "etc/shared", .kind = .{ .file = "shared\n" }, .mode = 0o640, .uid = 1000, .gid = 1001 },
+        .{ .path = "etc/shared-2", .kind = .{ .hardlink = "etc/shared" } },
+        .{ .path = "home", .kind = .directory, .mode = 0o700, .uid = 1000, .gid = 1000 },
+        .{ .path = "home/fast", .kind = .{ .symlink = "../etc/shared" }, .uid = 1000, .gid = 1000 },
+        .{ .path = "home/shared-3", .kind = .{ .hardlink = "etc/shared" } },
+        .{ .path = "home/slow", .kind = .{ .symlink = "../" ++ "s" ** 70 } },
+        .{ .path = "run", .kind = .directory, .mode = 0o755 },
+        .{ .path = "run/fifo", .kind = .fifo, .mode = 0o600 },
+        .{ .path = "run/socket", .kind = .socket, .mode = 0o755 },
+        .{ .path = "srv", .kind = .directory, .mode = 0o1777 },
+    };
+    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/mixed", &mixed, 1024, min_native_image_size);
+
+    // A path 100 directories deep.
+    var deep = std.ArrayList(ext4_writer.Entry).empty;
+    var deep_path: []const u8 = "level-00";
+    for (0..100) |depth| {
+        if (depth != 0) deep_path = try std.fmt.allocPrint(arena, "{s}/level-{d:0>2}", .{ deep_path, depth });
+        try deep.append(arena, .{ .path = deep_path, .kind = .directory, .mode = 0o755 });
+    }
+    try deep.append(arena, .{ .path = try std.fmt.allocPrint(arena, "{s}/bottom", .{deep_path}), .kind = .{ .file = "deep\n" } });
+    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/deep", deep.items, 1024, min_native_image_size);
+
+    // One directory whose entries need more blocks than the 12 direct
+    // pointers reach.
+    var wide = std.ArrayList(ext4_writer.Entry).empty;
+    try wide.append(arena, .{ .path = "wide", .kind = .directory, .mode = 0o755 });
+    for (0..1200) |index| {
+        const path = try std.fmt.allocPrint(arena, "wide/{d:0>4}{s}", .{ index, "w" ** 196 });
+        try wide.append(arena, .{ .path = path, .kind = .{ .file = path[path.len - 200 .. path.len - 196] } });
+    }
+    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/wide", wide.items, 2048, min_native_image_size);
+
+    // Source-backed files with holes: one past the direct and single
+    // indirect blocks, and one slice at a tar-like payload offset.
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const source_path = try arena.dupe(u8, tmp ++ "/sparse-source.bin");
+    const source_size: u64 = 40 << 20;
+    {
+        var source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        defer source.close(io);
+        try source.setLength(io, source_size);
+        for ([_]u64{ 0, 512, 1036 * 4096, source_size - 7 }) |offset| try source.writePositionalAll(io, "marker!", offset);
+    }
+    const sparse = [_]ext4_writer.Entry{
+        .{ .path = "var", .kind = .directory, .mode = 0o755 },
+        .{ .path = "var/sparse.bin", .kind = .{ .file_source = .{ .file = .{ .path = source_path, .offset = 0, .size = source_size } } } },
+        .{ .path = "var/slice.bin", .kind = .{ .file_source = .{ .file = .{ .path = source_path, .offset = 512, .size = 10_000 } } } },
+    };
+    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/sparse", &sparse, 1024, 64 << 20);
+}
+
+/// Writes `entries` with the native ext4 writer and checks the image with
+/// e2fsprogs: e2fsck must pass, `ls -p` must list exactly the entry paths
+/// with their type, mode, owner, size, and hard-link inode, and `dump`,
+/// `stat`, and `ea_get` must return each file's data, symlink target, device
+/// number, and xattr. Parent directories must be listed as entries.
+fn expectDebugfsMatchesEntries(
+    arena: std.mem.Allocator,
+    io: Io,
+    debugfs: []const u8,
+    dir: []const u8,
+    entries: []const ext4_writer.Entry,
+    inode_count: u32,
+    image_size: u64,
+) !void {
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const image = try std.fmt.allocPrint(arena, "{s}/image.ext4", .{dir});
+    _ = try ext4_writer.emit(arena, io, image, entries, .{
+        .image_size = image_size,
+        .inode_count = inode_count,
+        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-debugfs-trees"),
+    });
+    try runE2fsck(arena, io, image);
+
+    var by_path = std.StringHashMap(ext4_writer.Entry).init(arena);
+    var ls_commands = std.ArrayList([]const u8).empty;
+    try ls_commands.append(arena, "ls -p /");
+    for (entries) |entry| {
+        try by_path.put(try std.fmt.allocPrint(arena, "/{s}", .{entry.path}), entry);
+        if (entry.kind == .directory) try ls_commands.append(arena, try std.fmt.allocPrint(arena, "ls -p /{s}", .{entry.path}));
+    }
+
+    var inodes = std.StringHashMap(u64).init(arena);
+    const listings = try runDebugfsScript(arena, io, debugfs, image, dir, ls_commands.items);
+    for (ls_commands.items, listings) |command, listing| {
+        const parent = command["ls -p ".len..];
+        var lines = std.mem.tokenizeScalar(u8, listing, '\n');
+        while (lines.next()) |line| {
+            // /inode/mode/uid/gid/name/size/
+            var fields = std.mem.splitScalar(u8, line, '/');
+            _ = fields.next();
+            const inode = try std.fmt.parseInt(u64, fields.next() orelse return error.TestUnexpectedResult, 10);
+            const mode = try std.fmt.parseInt(u32, fields.next() orelse return error.TestUnexpectedResult, 8);
+            const uid = try std.fmt.parseInt(u32, fields.next() orelse return error.TestUnexpectedResult, 10);
+            const gid = try std.fmt.parseInt(u32, fields.next() orelse return error.TestUnexpectedResult, 10);
+            const name = fields.next() orelse return error.TestUnexpectedResult;
+            const size = fields.next() orelse return error.TestUnexpectedResult;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ if (parent.len == 1) "" else parent, name });
+            if (std.mem.eql(u8, path, "/lost+found")) continue;
+
+            var entry = by_path.get(path) orelse {
+                std.debug.print("unexpected path {s} in {s}\n", .{ path, image });
+                return error.TestUnexpectedResult;
+            };
+            if (entry.kind == .hardlink) entry = by_path.get(try std.fmt.allocPrint(arena, "/{s}", .{entry.kind.hardlink})).?;
+            const expected_type: u32, const expected_size: u64 = switch (entry.kind) {
+                .directory => .{ 0o040000, 0 },
+                .file => |data| .{ 0o100000, data.len },
+                .file_source => |source| .{ 0o100000, source.size() },
+                .symlink => |target| .{ 0o120000, target.len },
+                .device => |device| .{ if (device.kind == .char) 0o020000 else 0o060000, 0 },
+                .fifo => .{ 0o010000, 0 },
+                .socket => .{ 0o140000, 0 },
+                .hardlink => unreachable,
+            };
+            const expected_mode = expected_type | if (entry.kind == .symlink) 0o777 else entry.mode;
+            std.testing.expectEqual(expected_mode, mode) catch |err| {
+                std.debug.print("{s}: mode {o}\n", .{ path, mode });
+                return err;
+            };
+            try std.testing.expectEqual(entry.uid, uid);
+            try std.testing.expectEqual(entry.gid, gid);
+            if (entry.kind != .directory) try std.testing.expectEqual(expected_size, try std.fmt.parseInt(u64, size, 10));
+            try inodes.put(path, inode);
+        }
+    }
+    try std.testing.expectEqual(by_path.count(), inodes.count());
+
+    var commands = std.ArrayList([]const u8).empty;
+    var expected = std.ArrayList(struct { command: []const u8, dump: ?[]const u8 = null, needle: ?[]const u8 = null, data: []const u8 }).empty;
+    for (entries, 0..) |entry, index| {
+        if (entry.kind == .hardlink) {
+            const target = try std.fmt.allocPrint(arena, "/{s}", .{entry.kind.hardlink});
+            try std.testing.expectEqual(inodes.get(target).?, inodes.get(try std.fmt.allocPrint(arena, "/{s}", .{entry.path})).?);
+            continue;
+        }
+        const dump = try std.fmt.allocPrint(arena, "{s}/dump-{d}", .{ dir, index });
+        const dump_command = try std.fmt.allocPrint(arena, "dump /{s} {s}", .{ entry.path, dump });
+        const stat_command = try std.fmt.allocPrint(arena, "stat /{s}", .{entry.path});
+        switch (entry.kind) {
+            .file => |data| if (data.len != 0) try expected.append(arena, .{ .command = dump_command, .dump = dump, .data = data }),
+            .file_source => |source| {
+                const data = try arena.alloc(u8, @intCast(source.size()));
+                var file = try Io.Dir.cwd().openFile(io, source.file.path, .{});
+                defer file.close(io);
+                try std.testing.expectEqual(data.len, try file.readPositionalAll(io, data, source.file.offset));
+                try expected.append(arena, .{ .command = dump_command, .dump = dump, .data = data });
+            },
+            .symlink => |target| if (target.len < 60)
+                try expected.append(arena, .{ .command = stat_command, .needle = try std.fmt.allocPrint(arena, "Fast link dest: \"{s}\"", .{target}), .data = "" })
+            else
+                try expected.append(arena, .{ .command = dump_command, .dump = dump, .data = target }),
+            .device => |device| try expected.append(arena, .{
+                .command = stat_command,
+                .needle = try std.fmt.allocPrint(arena, "Device major/minor number: {d:0>2}:{d:0>2}", .{ device.major, device.minor }),
+                .data = "",
+            }),
+            else => {},
+        }
+        for (entry.xattrs) |attr| {
+            const out = try std.fmt.allocPrint(arena, "{s}/xattr-{d}", .{ dir, index });
+            try expected.append(arena, .{
+                .command = try std.fmt.allocPrint(arena, "ea_get -f {s} /{s} {s}", .{ out, entry.path, attr.name }),
+                .dump = out,
+                .data = attr.value,
+            });
+        }
+    }
+    for (expected.items) |item| try commands.append(arena, item.command);
+    const outputs = try runDebugfsScript(arena, io, debugfs, image, dir, commands.items);
+    for (expected.items, outputs) |item, output| {
+        if (item.needle) |needle| {
+            if (std.mem.indexOf(u8, output, needle) == null) {
+                std.debug.print("{s}: missing {s} in:\n{s}\n", .{ item.command, needle, output });
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (item.dump) |path| {
+            const data = try Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(item.data.len + 1));
+            std.testing.expectEqualSlices(u8, item.data, data) catch |err| {
+                std.debug.print("{s}: contents differ\n", .{item.command});
+                return err;
+            };
+        }
+    }
+}
+
+/// Runs `commands` in one debugfs process and returns each command's output.
+fn runDebugfsScript(
+    arena: std.mem.Allocator,
+    io: Io,
+    debugfs: []const u8,
+    image: []const u8,
+    dir: []const u8,
+    commands: []const []const u8,
+) ![]const []const u8 {
+    const script_path = try std.fmt.allocPrint(arena, "{s}/debugfs.commands", .{dir});
+    var script: Io.Writer.Allocating = .init(arena);
+    for (commands) |command| {
+        try script.writer.writeAll(command);
+        try script.writer.writeByte('\n');
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script.written() });
+    const result = try std.process.run(arena, io, .{
+        .argv = &.{ debugfs, "-f", script_path, image },
+        .stdout_limit = .limited(16 << 20),
+        .stderr_limit = .limited(16 << 20),
+    });
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.DebugfsFailed,
+        else => return error.DebugfsFailed,
+    }
+
+    // debugfs echoes each command as "debugfs: COMMAND" before its output.
+    const outputs = try arena.alloc([]const u8, commands.len);
+    var rest = result.stdout;
+    for (commands, outputs) |command, *output| {
+        const echo = try std.fmt.allocPrint(arena, "debugfs: {s}\n", .{command});
+        if (!std.mem.startsWith(u8, rest, echo)) return error.TestUnexpectedResult;
+        rest = rest[echo.len..];
+        const end = std.mem.indexOf(u8, rest, "debugfs: ") orelse rest.len;
+        output.* = rest[0..end];
+        rest = rest[end..];
+    }
+    return outputs;
+}
+
 fn expectCompleteRootfsStorage(
     allocator: std.mem.Allocator,
     io: Io,
@@ -436,6 +692,7 @@ fn runE2fsck(allocator: std.mem.Allocator, io: Io, path: []const u8) !void {
     const candidates = [_][]const u8{
         "/opt/homebrew/opt/e2fsprogs/sbin/e2fsck",
         "e2fsck",
+        "/usr/sbin/e2fsck",
     };
     for (candidates) |candidate| {
         const result = std.process.run(allocator, io, .{
