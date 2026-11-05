@@ -550,11 +550,12 @@ absolute `cntv_cval` so `cntv_cval - cntvct` remains unchanged modulo 64 bits.
 V3 portable GIC state uses `machine.gic.kind: "gicv3_multi"`. It carries global
 distributor registers, per-vCPU redistributor register arrays keyed by MPIDR,
 and line levels where PPIs include an owning MPIDR and SPIs do not. Validation
-rejects unknown register offsets, duplicate redistributors, duplicate line
-records, PPIs without a known owner, and SPIs with an owner. HVF same-backend
-v3 captures instead use `machine.gic.kind: "backend_private"` with `backend:
-"hvf"` and `format: "hv_gic_state_v0"`; other backends must reject that blob
-before mutating VM state.
+rejects more redistributors than the 8-vCPU maximum, unknown register offsets,
+duplicate redistributors, duplicate line records, PPIs without a known owner,
+and SPIs with an owner. HVF same-backend v3 captures instead use
+`machine.gic.kind: "backend_private"` with `backend: "hvf"` and `format:
+"hv_gic_state_v0"`; other backends must reject that blob before mutating VM
+state.
 
 ## Manifest Formats v4 and v5
 

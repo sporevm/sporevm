@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const board = @import("board.zig");
+const topology = @import("../topology.zig");
 
 pub const schema_version: u32 = 0;
 pub const multi_schema_version: u32 = 1;
@@ -157,7 +158,9 @@ pub fn validateGicV3(state: GicV3State) !void {
 
 pub fn validateGicV3Multi(state: GicV3MultiState) !void {
     if (state.schema_version != multi_schema_version) return error.PlatformMismatch;
-    if (state.redistributors.len == 0) return error.PlatformMismatch;
+    // One redistributor per vCPU. Bounding the count first keeps the
+    // pairwise MPIDR and line-owner checks small on hostile manifests.
+    if (state.redistributors.len == 0 or state.redistributors.len > topology.max_vcpus) return error.PlatformMismatch;
     try validateRegs(state.dist_regs, .distributor);
     for (state.redistributors, 0..) |redist, i| {
         if (redist.mpidr == 0) return error.PlatformMismatch;
@@ -339,6 +342,14 @@ test "rejects invalid multi-vCPU GICv3 state" {
         .{ .intid = 16, .asserted = false, .mpidr = 0x8000_0000 },
     };
     try std.testing.expectError(error.PlatformMismatch, validate(.{ .kind = .gicv3_multi, .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &redists, .line_levels = &duplicate_lines } }));
+}
+
+test "rejects more redistributors than the vCPU maximum" {
+    var redists: [topology.max_vcpus + 1]RedistributorState = undefined;
+    for (&redists, 0..) |*redist, i| redist.* = .{ .mpidr = 0x8000_0000 | @as(u64, i), .regs = &.{} };
+
+    try validate(.{ .kind = .gicv3_multi, .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = redists[0..topology.max_vcpus], .line_levels = &.{} } });
+    try std.testing.expectError(error.PlatformMismatch, validate(.{ .kind = .gicv3_multi, .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &redists, .line_levels = &.{} } }));
 }
 
 fn fuzzGicV3Multi(_: void, s: *std.testing.Smith) !void {
