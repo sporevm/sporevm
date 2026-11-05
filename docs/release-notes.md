@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### One ext4 writer
+
+The native ext4 writer now maps files through triple-indirect blocks, so image
+rootfs builds no longer fail on files larger than 4 GiB. The e2fsprogs writer
+(`SPOREVM_EXT4_WRITER=external`), the `--mkfs` and `--debugfs` options of
+`spore build` and `spore rootfs`, and the macOS case-sensitive sparse-image
+staging volume are removed. Rootfs cache entries written by the e2fsprogs
+writer are rebuilt with the native writer.
+
 ### Embedding libraries removed
 
 The C ABI (`spore.h` and the `libspore` archives), the Go binding, and the Zig

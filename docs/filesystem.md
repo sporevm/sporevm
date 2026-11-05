@@ -210,9 +210,8 @@ reverse-order cache teardown, freeze, and publication rules are unchanged.
 Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, and
 exec-form heredocs remain fail-closed before execution.
 
-Automatic growth supports SporeVM's journal-less native ext4 profile and
-journal-less layouts from SporeVM's e2fsprogs writer, or equivalent layouts the
-pinned guest kernel can online-grow. Before the first writable mount, the initrd
+Automatic growth supports SporeVM's journal-less native ext4 profile, or
+equivalent journal-less layouts the pinned guest kernel can online-grow. Before the first writable mount, the initrd
 reads the primary superblock and rejects journal presence, recovery or
 journal-device flags, filesystem error or orphan state, a nonzero legacy orphan
 head, and the orphan-file pending-cleanup flag. A frozen journal-less checkpoint

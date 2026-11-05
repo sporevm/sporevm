@@ -493,7 +493,6 @@ def produce(args: argparse.Namespace) -> None:
             for name in list(env):
                 if name.startswith("SPOREVM_"):
                     del env[name]
-            env["SPOREVM_EXT4_WRITER"] = "native"
             env["SPOREVM_ROOTFS_CACHE_DIR"] = str(cache)
             imported = run(
                 [

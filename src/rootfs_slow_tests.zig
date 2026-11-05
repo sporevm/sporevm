@@ -10,13 +10,11 @@ const spore = @import("spore.zig");
 
 const Io = std.Io;
 
-const ext4_writer_env = "SPOREVM_EXT4_WRITER";
 const max_rootfs_metadata_bytes = 1024 * 1024;
 const min_native_image_size: u64 = 16 << 20;
 const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
-
 const debugfs_candidates = [_][]const u8{
     "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
     "debugfs",
@@ -199,7 +197,7 @@ test "native ext4 writer resolves hardlinks after sorted targets" {
     try runE2fsck(allocator, io, path);
 }
 
-test "imported tar rootfs uses native ext4 writer by default" {
+test "imported tar rootfs records native ext4 writer storage" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const tmp = "zig-cache/test-rootfs-native-import-tar";
@@ -235,86 +233,6 @@ test "imported tar rootfs uses native ext4 writer by default" {
     try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"native\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_storage\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_blake3\"") == null);
-}
-
-test "native and external imported rootfs expose matching files" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-native-external-import-tar";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-
-    const mkfs = try findTool(allocator, io, &.{
-        "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4",
-        "mkfs.ext4",
-    });
-    defer allocator.free(mkfs);
-    const debugfs = try findTool(allocator, io, &debugfs_candidates);
-    defer allocator.free(debugfs);
-
-    const layer_path = tmp ++ "/rootfs.tar";
-    try writeTestTar(allocator, io, layer_path, "etc/native-writer", "native\n");
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    const cache_root = try absoluteTestPath(allocator, io, tmp, "rootfs-cache");
-    defer allocator.free(cache_root);
-    try env.put(local_paths.rootfs_cache_env, cache_root);
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = testInit(allocator, io, &process_arena, &env);
-
-    var import_arena = std.heap.ArenaAllocator.init(allocator);
-    defer import_arena.deinit();
-    const import_allocator = import_arena.allocator();
-
-    try env.put(ext4_writer_env, "external");
-    const external_result = try rootfs.importTar(init, import_allocator, .{
-        .input = layer_path,
-        .ref = "local/native-external:external",
-        .mkfs = mkfs,
-        .debugfs = debugfs,
-    });
-    defer rootfs.deinitImportTarResult(import_allocator, external_result);
-    try expectCompleteRootfsStorage(import_allocator, io, cache_root, external_result.rootfs_storage);
-
-    try env.put(ext4_writer_env, "native");
-    const native_result = try rootfs.importTar(init, import_allocator, .{
-        .input = layer_path,
-        .ref = "local/native-external:native",
-        .mkfs = mkfs,
-        .debugfs = debugfs,
-    });
-    defer rootfs.deinitImportTarResult(import_allocator, native_result);
-    try expectCompleteRootfsStorage(import_allocator, io, cache_root, native_result.rootfs_storage);
-
-    const native_repeat_result = try rootfs.importTar(init, import_allocator, .{
-        .input = layer_path,
-        .ref = "local/native-external:native-repeat",
-        .mkfs = mkfs,
-        .debugfs = debugfs,
-    });
-    defer rootfs.deinitImportTarResult(import_allocator, native_repeat_result);
-    try expectCompleteRootfsStorage(import_allocator, io, cache_root, native_repeat_result.rootfs_storage);
-    try std.testing.expectEqualStrings(native_result.rootfs_storage.index_digest, native_repeat_result.rootfs_storage.index_digest);
-
-    const paths = [_]struct {
-        path: []const u8,
-        expected: []const u8,
-    }{
-        .{ .path = "/etc/native-writer", .expected = "native\n" },
-        .{ .path = "/" ++ resolver_placeholder_path, .expected = resolver_placeholder_bytes },
-    };
-    for (paths) |entry| {
-        const command = try std.fmt.allocPrint(allocator, "cat {s}", .{entry.path});
-        defer allocator.free(command);
-        const external = try runDebugfs(allocator, io, debugfs, external_result.rootfs_path, command);
-        defer allocator.free(external);
-        const native = try runDebugfs(allocator, io, debugfs, native_result.rootfs_path, command);
-        defer allocator.free(native);
-        try std.testing.expectEqualStrings(entry.expected, external);
-        try std.testing.expectEqualStrings(external, native);
-    }
 }
 
 fn expectCompleteRootfsStorage(

@@ -2118,15 +2118,6 @@ fn resolveImageRootfs(
     };
     try ensureDirPath(init.io, cache_root);
 
-    const ext4_writer_choice = rootfs_mod.selectedExt4Writer(init.environ_map) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            machine_output.fromZigError(err).code,
-            command_name,
-            "spore {s}: rootfs writer selection failed: {s}",
-            .{ command_name, @errorName(err) },
-        ) };
-    };
     if (rootfs_mod.isLocalImageRef(image_ref)) {
         const resolved = rootfs_mod.resolveLocalCachedRef(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
             return .{ .failure = rootfsInputFailure(
@@ -2137,7 +2128,7 @@ fn resolveImageRootfs(
                 .{ command_name, image_ref, @errorName(err) },
             ) };
         };
-        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
+        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved) catch |err| {
             return .{ .failure = rootfsInputFailure(
                 allocator,
                 .cache_integrity_failed,
@@ -2163,7 +2154,7 @@ fn resolveImageRootfs(
     const digest_pinned = try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform);
 
     if (digest_pinned) |resolved| {
-        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
+        if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved) catch |err| {
             return .{ .failure = rootfsInputFailure(
                 allocator,
                 .cache_integrity_failed,
@@ -2188,7 +2179,7 @@ fn resolveImageRootfs(
             ) };
         };
         if (useMutableImageRefCache(pull_policy)) {
-            if (rootfs_mod.cachedImageRefRootfsPath(init.io, allocator, cache_root, image_ref, direct_image_platform, ext4_writer_choice) catch |err| {
+            if (rootfs_mod.cachedImageRefRootfsPath(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
                 return .{ .failure = rootfsInputFailure(
                     allocator,
                     .cache_integrity_failed,
@@ -2220,7 +2211,7 @@ fn resolveImageRootfs(
             .{ command_name, image_ref, @errorName(err) },
         ) };
     };
-    if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
+    if (rootfs_mod.cachedImageRootfsPath(init.io, allocator, cache_root, resolved) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
             .cache_integrity_failed,
@@ -2243,16 +2234,7 @@ fn resolveImageRootfs(
     if (try resolvedIndexedImageRootfsInputResult(init, allocator, cache_root, image_ref, resolved, command_name)) |indexed| {
         return indexed;
     }
-    const path = rootfs_mod.buildCachedImageRootfs(init, allocator, cache_root, resolved, ext4_writer_choice) catch |err| {
-        if (err == error.UnsupportedExt4FileSize) {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                machine_output.fromZigError(err).code,
-                command_name,
-                "spore {s}: image rootfs build failed for {s}: native ext4 writer does not support files larger than 4 GiB yet; set SPOREVM_EXT4_WRITER=external to use the e2fsprogs writer",
-                .{ command_name, resolved.ref },
-            ) };
-        }
+    const path = rootfs_mod.buildCachedImageRootfs(init, allocator, cache_root, resolved) catch |err| {
         return .{ .failure = rootfsInputFailure(
             allocator,
             machine_output.fromZigError(err).code,

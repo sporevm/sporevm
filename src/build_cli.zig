@@ -26,8 +26,6 @@ pub const usage =
     \\  --vcpus COUNT                  Build VM vCPUs, from 1 through 8
     \\  --timeout DURATION             Per-step timeout, for example 30s or 5m
     \\  --ulimit nofile=SOFT[:HARD]    RUN open-file limit, up to 1048576
-    \\  --mkfs PATH                    mkfs helper for OCI layout imports
-    \\  --debugfs PATH                 debugfs helper for OCI layout imports
     \\  -h, --help                     Show this help
     \\
     \\Executor-backed RUN, COPY, and WORKDIR misses run in Dockerfile order.
@@ -48,8 +46,6 @@ const ParsedOptions = struct {
     vcpus: topology.VcpuCount = build_mod.default_build_vcpus,
     timeout_ms: u64 = build_mod.default_step_timeout_ms,
     nofile: build_mod.NofileLimit = build_mod.default_build_nofile,
-    mkfs: ?[]const u8 = null,
-    debugfs: ?[]const u8 = null,
 };
 
 pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
@@ -101,8 +97,6 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
         .timeout_ms = parsed.timeout_ms,
         .nofile = parsed.nofile,
         .spore_executable = spore_executable,
-        .mkfs = parsed.mkfs,
-        .debugfs = parsed.debugfs,
         .output = if (mode == .json) null else stdout,
         .diagnostic = &diagnostic,
         .host = .probe(),
@@ -243,14 +237,6 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
             parsed.nofile = try parseUlimit(try nextValue(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "--ulimit=")) {
             parsed.nofile = try parseUlimit(try nonEmptyValue(arg["--ulimit=".len..]));
-        } else if (std.mem.eql(u8, arg, "--mkfs")) {
-            parsed.mkfs = try nextValue(args, &i, arg);
-        } else if (std.mem.startsWith(u8, arg, "--mkfs=")) {
-            parsed.mkfs = try nonEmptyValue(arg["--mkfs=".len..]);
-        } else if (std.mem.eql(u8, arg, "--debugfs")) {
-            parsed.debugfs = try nextValue(args, &i, arg);
-        } else if (std.mem.startsWith(u8, arg, "--debugfs=")) {
-            parsed.debugfs = try nonEmptyValue(arg["--debugfs=".len..]);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.UnknownArgument;
         } else if (parsed.context_dir == null) {

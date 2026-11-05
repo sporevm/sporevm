@@ -81,8 +81,6 @@ pub const Options = struct {
     nofile: NofileLimit = default_build_nofile,
     timeout_ms: u64 = default_step_timeout_ms,
     spore_executable: []const u8 = "spore",
-    mkfs: ?[]const u8 = null,
-    debugfs: ?[]const u8 = null,
     output: ?*Io.Writer = null,
     diagnostic: ?*Diagnostic = null,
     /// `spore build` passes `Host.probe()`. The default assumes the build
@@ -1229,8 +1227,6 @@ fn resolveBase(init: std.process.Init, allocator: std.mem.Allocator, options: Op
             .ref = "local/spore-build-base:cache",
             .platform = options.platform,
             .rootfs_storage = .chunked,
-            .mkfs = options.mkfs,
-            .debugfs = options.debugfs,
         });
         const metadata = try readCachedMetadata(allocator, init.io, imported.metadata_path);
         return .{ .cache_root = cache_root, .storage = imported.rootfs_storage, .config = metadata.config };

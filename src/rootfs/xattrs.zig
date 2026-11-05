@@ -11,12 +11,6 @@ pub const Attribute = struct {
     value: []u8,
 };
 
-pub const Entry = struct {
-    attrs: []Attribute,
-};
-
-pub const Map = std.StringHashMap(Entry);
-
 pub fn cloneAttributes(allocator: std.mem.Allocator, attrs: []const Attribute) ![]Attribute {
     const out = try allocator.alloc(Attribute, attrs.len);
     var initialized: usize = 0;
@@ -37,61 +31,6 @@ pub fn cloneAttributes(allocator: std.mem.Allocator, attrs: []const Attribute) !
 pub fn freeAttributes(allocator: std.mem.Allocator, attrs: []Attribute) void {
     for (attrs) |attr| allocator.free(attr.value);
     allocator.free(attrs);
-}
-
-pub fn record(
-    allocator: std.mem.Allocator,
-    xattrs: *Map,
-    rel: []const u8,
-    attrs: []const Attribute,
-) !void {
-    const key = try allocator.dupe(u8, rel);
-    errdefer allocator.free(key);
-    const cloned = try cloneAttributes(allocator, attrs);
-    errdefer freeAttributes(allocator, cloned);
-
-    const entry = try xattrs.getOrPut(key);
-    if (entry.found_existing) {
-        allocator.free(key);
-        freeAttributes(allocator, entry.value_ptr.attrs);
-    }
-    entry.value_ptr.* = .{ .attrs = cloned };
-}
-
-pub fn clearPath(allocator: std.mem.Allocator, xattrs: *Map, rel: []const u8) void {
-    if (xattrs.fetchRemove(rel)) |entry| {
-        allocator.free(entry.key);
-        freeAttributes(allocator, entry.value.attrs);
-    }
-}
-
-pub fn deinit(allocator: std.mem.Allocator, xattrs: *Map) void {
-    var it = xattrs.iterator();
-    while (it.next()) |entry| {
-        allocator.free(entry.key_ptr.*);
-        freeAttributes(allocator, entry.value_ptr.attrs);
-    }
-    xattrs.deinit();
-}
-
-pub fn removeSubtree(allocator: std.mem.Allocator, xattrs: *Map, rel: []const u8) !void {
-    var keys = std.ArrayList([]const u8).empty;
-    defer keys.deinit(allocator);
-    const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{rel});
-    defer allocator.free(prefix);
-
-    var it = xattrs.iterator();
-    while (it.next()) |entry| {
-        const key = entry.key_ptr.*;
-        if (std.mem.eql(u8, key, rel) or std.mem.startsWith(u8, key, prefix)) {
-            try keys.append(allocator, key);
-        }
-    }
-    for (keys.items) |key| {
-        const entry = xattrs.fetchRemove(key).?;
-        allocator.free(entry.key);
-        freeAttributes(allocator, entry.value.attrs);
-    }
 }
 
 pub fn validateSecurityCapability(value: []const u8) !void {
