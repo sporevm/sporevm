@@ -161,9 +161,10 @@ The value is meaningful only after backend-specific re-anchoring.
 - KVM restores by setting `KVM_ARM_SET_COUNTER_OFFSET` to align host counter
   time with the saved guest counter.
 - Hypervisor.framework restores by computing one vtimer offset and applying it
-  identically to every vCPU. Manifests with unequal per-vCPU `cntvct` fields
-  use vCPU 0 as authority and translate each timer deadline into that
-  domain before apply.
+  identically to every vCPU.
+- On both backends, manifests with unequal per-vCPU `cntvct` fields use vCPU 0
+  as authority and translate each timer deadline into that domain before
+  apply.
 - This translation is only valid when `counter_frequency_hz` matches exactly.
 
 ### Backend-private

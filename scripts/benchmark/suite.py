@@ -100,7 +100,6 @@ PHASE_METRIC_FIELDS = (
     "guest_spawn_delay_ms",
     "guest_exit_delay_ms",
     "kvm_probe_complete_observed_ms",
-    "kvm_pending_exit_completion_ms",
     "kvm_probe_return_ms",
     "lazy_cas_runtime_open_ms",
     "lazy_cas_index_attach_ms",
@@ -394,7 +393,6 @@ def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
     for match in KVM_PROBE_COMPLETION_RE.finditer(text):
         fields = parse_key_value_tail(match.group("fields"))
         metrics["kvm_probe_complete_observed_ms"] = parse_ms_field(fields.get("observed_ms"))
-        metrics["kvm_pending_exit_completion_ms"] = parse_ms_field(fields.get("pending_completion_ms"))
         metrics["kvm_probe_return_ms"] = parse_ms_field(fields.get("return_ms"))
     return {key: value for key, value in metrics.items() if value is not None}
 
@@ -1713,7 +1711,7 @@ def self_test() -> None:
                 "run exec probe timing: attach_ms=1 connect_request_delivered_ms=2 connect_ms=3 request_delivered_ms=4 first_output_ms=5 guest_timing_ms=6 response_ms=8",
                 "run backend timing: elapsed_ms=12 stream_response_ms=8 tail_ms=4 cause=probe_complete",
                 "vsock host stream guest timing: timing listen=20 accept=30 decode=31 spawn=34 exit=39 now=40",
-                "kvm probe completion timing: observed_ms=8 pending_completion_ms=2 return_ms=10",
+                "kvm probe completion timing: observed_ms=8 return_ms=10",
             ]) + "\n",
             encoding="utf-8",
         )
@@ -1731,7 +1729,7 @@ def self_test() -> None:
         assert metrics["guest_listen_ms"] == 20
         assert metrics["guest_accept_delay_ms"] == 10
         assert metrics["guest_exit_delay_ms"] == 5
-        assert metrics["kvm_pending_exit_completion_ms"] == 2
+        assert metrics["kvm_probe_return_ms"] == 10
         assert metrics["exec_response_ms"] == 8
         assert summarize_field([metrics], "exec_response_ms")["median"] == 8.0
         trace = Path(tmp) / "rootfs-trace.jsonl"

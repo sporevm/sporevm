@@ -79,37 +79,7 @@ pub fn hostCounterFreq() u64 {
     );
 }
 
-pub fn captureMachine(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu_fd: std.c.fd_t) !spore.MachineState {
-    const vcpu = try captureVcpuState(allocator, gic_fd, .{ .index = 0, .fd = vcpu_fd });
-    return .{
-        .gprs = vcpu.gprs,
-        .pc = vcpu.pc,
-        .cpsr = vcpu.cpsr,
-        .fpcr = vcpu.fpcr,
-        .fpsr = vcpu.fpsr,
-        .simd = vcpu.simd,
-        .sys_regs = vcpu.sys_regs,
-        .icc_regs = vcpu.icc_regs,
-        .vtimer = vcpu.vtimer,
-        .gic = .{ .kind = .gicv3, .gicv3 = try captureGic(allocator, gic_fd) },
-    };
-}
-
-pub fn captureMachineMulti(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpus: []const VcpuRef) !spore.MachineStateMulti {
-    if (vcpus.len == 0 or vcpus.len > topology.max_vcpus) return error.PlatformMismatch;
-    const states = try allocator.alloc(spore.VcpuState, vcpus.len);
-    for (vcpus, states) |vcpu, *state| {
-        state.* = try captureVcpuState(allocator, gic_fd, vcpu);
-    }
-    const machine = spore.MachineStateMulti{
-        .vcpus = states,
-        .gic = .{ .kind = .gicv3_multi, .gicv3_multi = try captureGicMulti(allocator, gic_fd, vcpus) },
-    };
-    try gicv3.validate(machine.gic);
-    return machine;
-}
-
-fn captureVcpuState(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu: VcpuRef) !spore.VcpuState {
+pub fn captureVcpuState(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu: VcpuRef) !spore.VcpuState {
     var state: spore.VcpuState = undefined;
     state.index = vcpu.index;
     state.mpidr = aarch64_topology.mpidrForIndex(vcpu.index);
@@ -153,51 +123,6 @@ fn captureVcpuState(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu: Vcpu
     return state;
 }
 
-pub fn applyMachine(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, vcpu_fd: std.c.fd_t, state: spore.MachineState) !void {
-    _ = allocator;
-    try applyGic(vm_fd, gic_fd, state.gic);
-    try kvm.setCounterOffset(vm_fd, hostCounter() -% state.vtimer.cntvct);
-    try applyVcpuState(gic_fd, .{ .index = 0, .fd = vcpu_fd }, .{
-        .index = 0,
-        .mpidr = aarch64_topology.mpidrForIndex(0),
-        .gprs = state.gprs,
-        .pc = state.pc,
-        .cpsr = state.cpsr,
-        .fpcr = state.fpcr,
-        .fpsr = state.fpsr,
-        .simd = state.simd,
-        .sys_regs = state.sys_regs,
-        .icc_regs = state.icc_regs,
-        .vtimer = state.vtimer,
-    });
-}
-
-pub fn applyMachineMulti(allocator: std.mem.Allocator, vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, vcpus: []const VcpuRef, state: spore.MachineStateMulti) !void {
-    _ = allocator;
-    try validateMachineMultiForKvm(vcpus, state);
-    try applyGicMulti(vm_fd, gic_fd, state.gic);
-    try kvm.setCounterOffset(vm_fd, hostCounter() -% state.vcpus[0].vtimer.cntvct);
-
-    for (state.vcpus, 0..) |vcpu_state, i| {
-        try applyVcpuState(gic_fd, vcpus[i], vcpu_state);
-    }
-}
-
-fn validateMachineMultiForKvm(vcpus: []const VcpuRef, state: spore.MachineStateMulti) !void {
-    if (vcpus.len == 0 or vcpus.len > topology.max_vcpus) return error.PlatformMismatch;
-    if (state.vcpus.len != vcpus.len) return error.PlatformMismatch;
-    try gicv3.validate(state.gic);
-    const g = state.gic.gicv3_multi orelse return error.PlatformMismatch;
-    if (g.redistributors.len != vcpus.len) return error.PlatformMismatch;
-
-    for (state.vcpus, 0..) |vcpu_state, i| {
-        if (vcpu_state.index != i) return error.PlatformMismatch;
-        if (vcpu_state.mpidr != aarch64_topology.mpidrForIndex(vcpu_state.index)) return error.PlatformMismatch;
-        if (vcpus[i].index != vcpu_state.index) return error.PlatformMismatch;
-        if (!hasRedistributor(g.redistributors, vcpu_state.mpidr)) return error.PlatformMismatch;
-    }
-}
-
 fn hasRedistributor(redistributors: []const gicv3.RedistributorState, mpidr: aarch64_topology.Mpidr) bool {
     for (redistributors) |redist| {
         if (redist.mpidr == mpidr) return true;
@@ -205,7 +130,7 @@ fn hasRedistributor(redistributors: []const gicv3.RedistributorState, mpidr: aar
     return false;
 }
 
-fn applyVcpuState(gic_fd: std.c.fd_t, vcpu: VcpuRef, state: spore.VcpuState) !void {
+pub fn applyVcpuState(gic_fd: std.c.fd_t, vcpu: VcpuRef, state: spore.VcpuState) !void {
     for (0..31) |i| {
         try kvm.setOneRegU64(vcpu.fd, kvm.gprReg(@intCast(i)), state.gprs[i]);
     }
@@ -256,6 +181,28 @@ fn findIccReg(name: []const u8) ?IccReg {
     return null;
 }
 
+/// Captures the vGIC in the shape the manifest stores for `vcpu_count` vCPUs.
+pub fn captureGicState(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu_count: usize) !gicv3.State {
+    if (vcpu_count == 1) return .{ .kind = .gicv3, .gicv3 = try captureGic(allocator, gic_fd) };
+    return .{ .kind = .gicv3_multi, .gicv3_multi = try captureGicMulti(allocator, gic_fd, vcpu_count) };
+}
+
+/// Restores the vGIC. A multi-vCPU state needs a redistributor for each vCPU.
+pub fn applyGicState(vm_fd: std.c.fd_t, gic_fd: std.c.fd_t, vcpu_count: usize, state: gicv3.State) !void {
+    if (vcpu_count == 1) return applyGic(vm_fd, gic_fd, state);
+    try validateGicForVcpus(vcpu_count, state);
+    try applyGicMulti(vm_fd, gic_fd, state);
+}
+
+fn validateGicForVcpus(vcpu_count: usize, state: gicv3.State) !void {
+    try gicv3.validate(state);
+    const g = state.gicv3_multi orelse return error.PlatformMismatch;
+    if (g.redistributors.len != vcpu_count) return error.PlatformMismatch;
+    for (0..vcpu_count) |index| {
+        if (!hasRedistributor(g.redistributors, aarch64_topology.mpidrForIndex(@intCast(index)))) return error.PlatformMismatch;
+    }
+}
+
 fn captureGic(allocator: std.mem.Allocator, gic_fd: std.c.fd_t) !gicv3.GicV3State {
     var dist_regs: std.ArrayList(gicv3.MmioReg) = .empty;
     defer dist_regs.deinit(allocator);
@@ -277,24 +224,24 @@ fn captureGic(allocator: std.mem.Allocator, gic_fd: std.c.fd_t) !gicv3.GicV3Stat
     return state;
 }
 
-fn captureGicMulti(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpus: []const VcpuRef) !gicv3.GicV3MultiState {
+fn captureGicMulti(allocator: std.mem.Allocator, gic_fd: std.c.fd_t, vcpu_count: usize) !gicv3.GicV3MultiState {
     var dist_regs: std.ArrayList(gicv3.MmioReg) = .empty;
     defer dist_regs.deinit(allocator);
     var line_levels: std.ArrayList(gicv3.MultiLineLevel) = .empty;
     defer line_levels.deinit(allocator);
-    const redistributors = try allocator.alloc(gicv3.RedistributorState, vcpus.len);
+    const redistributors = try allocator.alloc(gicv3.RedistributorState, vcpu_count);
 
     try appendDistRegs(allocator, &dist_regs, gic_fd);
-    for (vcpus, redistributors) |vcpu, *redist| {
+    for (redistributors, 0..) |*redist, index| {
         var regs: std.ArrayList(gicv3.MmioReg) = .empty;
         defer regs.deinit(allocator);
-        try appendRedistRegs(allocator, &regs, gic_fd, kvmMpidrAffinityForIndex(vcpu.index));
+        try appendRedistRegs(allocator, &regs, gic_fd, kvmMpidrAffinityForIndex(@intCast(index)));
         redist.* = .{
-            .mpidr = aarch64_topology.mpidrForIndex(vcpu.index),
+            .mpidr = aarch64_topology.mpidrForIndex(@intCast(index)),
             .regs = try regs.toOwnedSlice(allocator),
         };
     }
-    try appendLevelRegsMulti(allocator, &line_levels, gic_fd, vcpus);
+    try appendLevelRegsMulti(allocator, &line_levels, gic_fd, vcpu_count);
 
     const state = gicv3.GicV3MultiState{
         .dist_regs = try dist_regs.toOwnedSlice(allocator),
@@ -381,14 +328,15 @@ fn appendLevelRegs(allocator: std.mem.Allocator, levels: *std.ArrayList(gicv3.Li
     }
 }
 
-fn appendLevelRegsMulti(allocator: std.mem.Allocator, levels: *std.ArrayList(gicv3.MultiLineLevel), gic_fd: std.c.fd_t, vcpus: []const VcpuRef) !void {
+fn appendLevelRegsMulti(allocator: std.mem.Allocator, levels: *std.ArrayList(gicv3.MultiLineLevel), gic_fd: std.c.fd_t, vcpu_count: usize) !void {
     // KVM exposes line-level state for PPIs and SPIs, not SGIs.
     var intid: u32 = 16;
     while (intid <= board.generationIntid()) : (intid += 1) {
         if (intid < 32) {
-            for (vcpus) |vcpu| {
-                if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(kvmMpidrAffinityForIndex(vcpu.index), intid), "get vgic ppi line level")) |value| {
-                    try levels.append(allocator, .{ .intid = intid, .asserted = value != 0, .mpidr = aarch64_topology.mpidrForIndex(vcpu.index) });
+            for (0..vcpu_count) |i| {
+                const index: topology.VcpuIndex = @intCast(i);
+                if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(kvmMpidrAffinityForIndex(index), intid), "get vgic ppi line level")) |value| {
+                    try levels.append(allocator, .{ .intid = intid, .asserted = value != 0, .mpidr = aarch64_topology.mpidrForIndex(index) });
                 }
             }
         } else if (try kvm.getDeviceAttrMaybeU32(gic_fd, kvm.KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, levelAttr(0, intid), "get vgic spi line level")) |value| {
@@ -487,63 +435,30 @@ test "KVM multi line replay skips private and generation lines" {
     try std.testing.expect(shouldReplayMultiLineLevel(.{ .intid = board.virtioDeviceIntid(0), .asserted = true }));
 }
 
-test "KVM multi-vCPU restore preflight matches local vCPU topology" {
-    var vcpu_states = [_]spore.VcpuState{
-        .{
-            .index = 0,
-            .mpidr = aarch64_topology.mpidrForIndex(0),
-            .gprs = [_]u64{0} ** 31,
-            .pc = 0,
-            .cpsr = 0,
-            .fpcr = 0,
-            .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
-            .sys_regs = &.{},
-            .icc_regs = &.{},
-            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
-        },
-        undefined,
-    };
-    vcpu_states[1] = vcpu_states[0];
-    vcpu_states[1].index = 1;
-    vcpu_states[1].mpidr = aarch64_topology.mpidrForIndex(1);
-
+test "KVM multi-vCPU GIC restore needs a redistributor for each vCPU" {
     var redists = [_]gicv3.RedistributorState{
         .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
         .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
     };
-    var refs = [_]VcpuRef{
-        .{ .index = 0, .fd = -1 },
-        .{ .index = 1, .fd = -1 },
-    };
-    var machine = spore.MachineStateMulti{
-        .vcpus = &vcpu_states,
-        .gic = .{
-            .kind = .gicv3_multi,
-            .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &redists, .line_levels = &.{} },
-        },
-    };
-
-    try validateMachineMultiForKvm(&refs, machine);
-
-    refs[1].index = 0;
-    try std.testing.expectError(error.PlatformMismatch, validateMachineMultiForKvm(&refs, machine));
-
-    refs[1].index = 1;
-    var one_redist = [_]gicv3.RedistributorState{redists[0]};
-    machine.gic = .{
+    const both = gicv3.State{
         .kind = .gicv3_multi,
-        .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &one_redist, .line_levels = &.{} },
+        .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &redists, .line_levels = &.{} },
     };
-    try std.testing.expectError(error.PlatformMismatch, validateMachineMultiForKvm(&refs, machine));
+    try validateGicForVcpus(2, both);
+    try std.testing.expectError(error.PlatformMismatch, validateGicForVcpus(3, both));
 
-    machine.gic = .{
+    var duplicate = [_]gicv3.RedistributorState{ redists[0], redists[0] };
+    try std.testing.expectError(error.PlatformMismatch, validateGicForVcpus(2, .{
+        .kind = .gicv3_multi,
+        .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &duplicate, .line_levels = &.{} },
+    }));
+
+    try std.testing.expectError(error.PlatformMismatch, validateGicForVcpus(2, .{
         .kind = .backend_private,
         .backend_private = .{
             .backend = .hvf,
             .format = gicv3.hvf_backend_private_format,
             .data_b64 = "AA==",
         },
-    };
-    try std.testing.expectError(error.PlatformMismatch, validateMachineMultiForKvm(&refs, machine));
+    }));
 }
