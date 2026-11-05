@@ -78,6 +78,11 @@ instead of text.
 
 `spore image pull` (experimental since v0.15) is removed.
 
+### fs-verity RAM backing proofs removed
+
+Local RAM backing proofs no longer enable or record Linux fs-verity; existing
+schema v2 proofs are ignored and those spores restore from verified chunks.
+
 ## v0.17.1
 
 ### Managed kernel security update

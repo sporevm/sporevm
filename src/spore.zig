@@ -26,7 +26,6 @@ const topology = @import("topology.zig");
 const virtqueue = @import("virtio/queue.zig");
 const Blake3 = std.crypto.hash.Blake3;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const format_version_legacy_v0: u32 = 0;
 pub const format_version_legacy_v1: u32 = 1;
@@ -44,13 +43,10 @@ pub const memory_object_namespace = "memory/blake3";
 pub const virtio_mem_device_id: u32 = 24;
 
 const local_backing_proof_version_v1: u32 = 1;
-const local_backing_proof_version_v2: u32 = 2;
 const local_backing_producer = "sporevm-local-ram-backing-v0";
-const local_backing_verity_algorithm_sha256 = "sha256";
 const local_backing_key_path = "local-ram-backing.key";
 const local_backing_key_len = HmacSha256.key_length;
 const local_backing_proof_max_bytes = 16 * 1024;
-const fs_verity_hash_alg_sha256: u16 = 1;
 
 pub const Error = error{
     BadManifest,
@@ -206,8 +202,6 @@ pub const LocalBackingRestoreReason = enum {
     proof_mismatch,
     proof_mac_invalid,
     proof_mac_mismatch,
-    verity_unavailable,
-    verity_mismatch,
     proof_valid,
 };
 
@@ -223,13 +217,7 @@ const LocalBackingProof = struct {
     backing: LocalBackingProofBacking,
     file: LocalBackingFileIdentity,
     producer: []const u8,
-    verity: ?LocalBackingVerity = null,
     mac: []const u8,
-};
-
-const LocalBackingVerity = struct {
-    algorithm: []const u8,
-    digest: []const u8,
 };
 
 const LocalBackingProofBacking = struct {
@@ -277,14 +265,6 @@ fn localBackingFileIdentityEqual(a: LocalBackingFileIdentity, b: LocalBackingFil
         a.size == b.size and
         a.mtime_sec == b.mtime_sec and
         a.mtime_nsec == b.mtime_nsec;
-}
-
-fn localBackingFileIdentityEqualWithoutMtime(a: LocalBackingFileIdentity, b: LocalBackingFileIdentity) bool {
-    return std.mem.eql(u8, a.file_type, b.file_type) and
-        a.device == b.device and
-        a.inode == b.inode and
-        a.owner_uid == b.owner_uid and
-        a.size == b.size;
 }
 
 pub const rootfs_kind = "immutable-ext4-rootfs-v0";
@@ -819,16 +799,13 @@ fn memoryIndexIdentity(allocator: std.mem.Allocator, memory: MemoryManifest, exp
 fn proofMac(
     key: *const [local_backing_key_len]u8,
     memory_fingerprint: []const u8,
-    schema_version: u32,
     backing: LocalBackingProofBacking,
     file: LocalBackingFileIdentity,
     producer: []const u8,
-    verity: ?LocalBackingVerity,
-) Error![HmacSha256.mac_length]u8 {
-    if (!proofVersionAcceptsVerity(schema_version, verity)) return error.BadManifest;
+) [HmacSha256.mac_length]u8 {
     var mac = HmacSha256.init(key);
     mac.update("sporevm-local-ram-backing-proof-v1");
-    macU64(&mac, schema_version);
+    macU64(&mac, local_backing_proof_version_v1);
     macBytes(&mac, memory_fingerprint);
     macBytes(&mac, backing.kind);
     macBytes(&mac, backing.path);
@@ -841,21 +818,9 @@ fn proofMac(
     macI64(&mac, file.mtime_sec);
     macI64(&mac, file.mtime_nsec);
     macBytes(&mac, producer);
-    if (verity) |v| {
-        macBytes(&mac, v.algorithm);
-        macBytes(&mac, v.digest);
-    }
     var out: [HmacSha256.mac_length]u8 = undefined;
     mac.final(&out);
     return out;
-}
-
-fn proofVersionAcceptsVerity(schema_version: u32, verity: ?LocalBackingVerity) bool {
-    return switch (schema_version) {
-        local_backing_proof_version_v1 => verity == null,
-        local_backing_proof_version_v2 => verity != null,
-        else => false,
-    };
 }
 
 fn macU64(mac: *HmacSha256, value: u64) void {
@@ -1012,11 +977,8 @@ fn proofFieldsMatch(
     backing: LocalBackingProofBacking,
     file: LocalBackingFileIdentity,
 ) bool {
-    if (!proofVersionAcceptsVerity(proof.schema_version, proof.verity)) return false;
-    if (proof.verity) |verity| {
-        if (!proofVerityShapeValid(verity)) return false;
-    }
-    return std.mem.eql(u8, proof.memory_fingerprint, memory_fingerprint) and
+    return proof.schema_version == local_backing_proof_version_v1 and
+        std.mem.eql(u8, proof.memory_fingerprint, memory_fingerprint) and
         std.mem.eql(u8, proof.backing.kind, backing.kind) and
         std.mem.eql(u8, proof.backing.path, backing.path) and
         proof.backing.size == backing.size and
@@ -1028,206 +990,6 @@ fn proofFieldsMatch(
         proof.file.mtime_sec == file.mtime_sec and
         proof.file.mtime_nsec == file.mtime_nsec and
         std.mem.eql(u8, proof.producer, local_backing_producer);
-}
-
-fn proofVerityShapeValid(verity: LocalBackingVerity) bool {
-    return std.mem.eql(u8, verity.algorithm, local_backing_verity_algorithm_sha256) and
-        isLowerHexDigest(verity.digest, Sha256.digest_length);
-}
-
-fn isLowerHexDigest(value: []const u8, comptime digest_len: usize) bool {
-    if (value.len != digest_len * 2) return false;
-    for (value) |byte| {
-        const is_digit = byte >= '0' and byte <= '9';
-        const is_lower_hex = byte >= 'a' and byte <= 'f';
-        if (!is_digit and !is_lower_hex) return false;
-    }
-    return true;
-}
-
-const FsVerityEnableArg = extern struct {
-    version: u32,
-    hash_algorithm: u32,
-    block_size: u32,
-    salt_size: u32,
-    salt_ptr: u64,
-    sig_size: u32,
-    reserved1: u32,
-    sig_ptr: u64,
-    reserved2: [11]u64,
-};
-
-const FsVerityDigestHeader = extern struct {
-    digest_algorithm: u16,
-    digest_size: u16,
-};
-
-const FsVerityDigestSha256 = extern struct {
-    header: FsVerityDigestHeader,
-    digest: [Sha256.digest_length]u8,
-};
-
-fn proofVerityForRead(allocator: std.mem.Allocator, fd: std.c.fd_t) Error!?LocalBackingVerity {
-    if (comptime builtin.os.tag != .linux) return null;
-    return linuxMeasureFsVerity(allocator, fd);
-}
-
-const FsVerityEnableError = error{
-    Unavailable,
-    IoFailed,
-};
-
-fn linuxEnableFsVerity(fd: std.c.fd_t) FsVerityEnableError!void {
-    const linux = std.os.linux;
-    var arg = FsVerityEnableArg{
-        .version = 1,
-        .hash_algorithm = fs_verity_hash_alg_sha256,
-        .block_size = @intCast(std.heap.pageSize()),
-        .salt_size = 0,
-        .salt_ptr = 0,
-        .sig_size = 0,
-        .reserved1 = 0,
-        .sig_ptr = 0,
-        .reserved2 = .{0} ** 11,
-    };
-    const request = linux.IOCTL.IOW('f', 133, FsVerityEnableArg);
-    try fsVerityEnableResult(linux.errno(linux.ioctl(fd, request, @intFromPtr(&arg))));
-}
-
-fn fsVerityEnableResult(result: std.os.linux.E) FsVerityEnableError!void {
-    switch (result) {
-        .SUCCESS, .EXIST => {},
-        .ACCES, .INVAL, .NOTTY, .OPNOTSUPP => return error.Unavailable,
-        else => return error.IoFailed,
-    }
-}
-
-fn linuxMeasureFsVerity(allocator: std.mem.Allocator, fd: std.c.fd_t) Error!?LocalBackingVerity {
-    const linux = std.os.linux;
-    var measured = FsVerityDigestSha256{
-        .header = .{
-            .digest_algorithm = fs_verity_hash_alg_sha256,
-            .digest_size = Sha256.digest_length,
-        },
-        .digest = .{0} ** Sha256.digest_length,
-    };
-    const request = linux.IOCTL.IOWR('f', 134, FsVerityDigestHeader);
-    if (!try fsVerityMeasureAvailable(linux.errno(linux.ioctl(fd, request, @intFromPtr(&measured))))) return null;
-    if (measured.header.digest_algorithm != fs_verity_hash_alg_sha256) return error.IoFailed;
-    if (measured.header.digest_size != Sha256.digest_length) return error.IoFailed;
-    return .{
-        .algorithm = local_backing_verity_algorithm_sha256,
-        .digest = try hexAlloc(allocator, &measured.digest),
-    };
-}
-
-fn fsVerityMeasureAvailable(result: std.os.linux.E) Error!bool {
-    return switch (result) {
-        .SUCCESS => true,
-        .NODATA, .NOTTY, .OPNOTSUPP => false,
-        else => error.IoFailed,
-    };
-}
-
-const LocalBackingProofWriteOps = struct {
-    fn proofForWrite(self: @This(), allocator: std.mem.Allocator, fd: std.c.fd_t) Error!ProofVerityWriteResult {
-        if (comptime builtin.os.tag != .linux) return .{};
-        return proofVerityForWriteWithOps(allocator, fd, self);
-    }
-
-    fn measure(_: @This(), allocator: std.mem.Allocator, fd: std.c.fd_t) Error!?LocalBackingVerity {
-        return linuxMeasureFsVerity(allocator, fd);
-    }
-
-    fn enable(_: @This(), fd: std.c.fd_t) FsVerityEnableError!void {
-        return linuxEnableFsVerity(fd);
-    }
-
-    fn chmod(_: @This(), fd: std.c.fd_t, mode: std.c.mode_t) Error!void {
-        if (std.c.fchmod(fd, mode) != 0) return error.IoFailed;
-    }
-
-    fn stat(_: @This(), fd: std.c.fd_t) Error!LocalFileStat {
-        return fstatLocalFile(fd);
-    }
-};
-
-const ProofVerityWriteAttempt = union(enum) {
-    success: ?LocalBackingVerity,
-    failure: Error,
-};
-
-const ProofVerityWriteResult = struct {
-    verity: ?LocalBackingVerity = null,
-    accepts_mtime_transition: bool = false,
-};
-
-fn proofVerityForWriteWithOps(
-    allocator: std.mem.Allocator,
-    fd: std.c.fd_t,
-    ops: anytype,
-) Error!ProofVerityWriteResult {
-    if (try ops.measure(allocator, fd)) |existing| return .{ .verity = existing };
-
-    const initial_stat = try ops.stat(fd);
-    const initial_file = initial_stat.identity();
-    const original_mode: std.c.mode_t = @intCast(initial_stat.mode & 0o7777);
-    if (initial_file.owner_uid != std.c.getuid() or original_mode & 0o222 != 0) return error.IoFailed;
-
-    try ops.chmod(fd, original_mode | 0o200);
-    // A crash can leave the optional backing owner-writable, but the proof is
-    // published only after exact mode and identity restoration. Chunks remain
-    // authoritative, so an unproved backing falls back instead of being trusted.
-    const attempt: ProofVerityWriteAttempt = blk: {
-        const writable_stat = ops.stat(fd) catch |err| break :blk .{ .failure = err };
-        if (!localBackingFileIdentityEqual(initial_file, writable_stat.identity()) or
-            writable_stat.owner_uid != initial_file.owner_uid)
-        {
-            break :blk .{ .failure = error.IoFailed };
-        }
-        ops.enable(fd) catch |err| break :blk switch (err) {
-            error.Unavailable => .{ .success = null },
-            error.IoFailed => .{ .failure = error.IoFailed },
-        };
-        const measured = ops.measure(allocator, fd) catch |err| break :blk .{ .failure = err };
-        break :blk if (measured) |verity|
-            .{ .success = verity }
-        else
-            .{ .failure = error.IoFailed };
-    };
-    var release_attempt = true;
-    defer if (release_attempt) switch (attempt) {
-        .success => |verity| if (verity) |value| allocator.free(value.digest),
-        .failure => {},
-    };
-
-    ops.chmod(fd, original_mode) catch return error.IoFailed;
-    const restored_stat = try ops.stat(fd);
-    const enabled_new_verity = switch (attempt) {
-        .success => |verity| verity != null,
-        .failure => false,
-    };
-    const restored_file = restored_stat.identity();
-    const identity_matches = if (enabled_new_verity)
-        localBackingFileIdentityEqualWithoutMtime(initial_file, restored_file)
-    else
-        localBackingFileIdentityEqual(initial_file, restored_file);
-    if ((restored_stat.mode & 0o7777) != original_mode or !identity_matches or
-        restored_stat.owner_uid != initial_file.owner_uid)
-    {
-        return error.IoFailed;
-    }
-
-    return switch (attempt) {
-        .success => |verity| blk: {
-            release_attempt = false;
-            break :blk .{
-                .verity = verity,
-                .accepts_mtime_transition = enabled_new_verity,
-            };
-        },
-        .failure => |err| return err,
-    };
 }
 
 pub fn writeLocalMemoryBackingProof(
@@ -1245,23 +1007,18 @@ pub fn writeLocalMemoryBackingProof(
     try writeLocalMemoryBackingProofForFd(allocator, environ, dir, memory, expected_size, fd, null);
 }
 
-fn formatLocalBackingProofWriteOk(buf: []u8, schema_version: u32, has_verity: bool, elapsed_us: u64) []const u8 {
+fn formatLocalBackingProofWriteOk(buf: []u8, elapsed_us: u64) []const u8 {
     return std.fmt.bufPrint(
         buf,
-        "local RAM backing proof metrics: operation=write status=ok reason={s} schema={d} verity={s} elapsed_us={d}",
-        .{
-            if (has_verity) "verity_enabled" else "verity_unavailable",
-            schema_version,
-            if (has_verity) local_backing_verity_algorithm_sha256 else "none",
-            elapsed_us,
-        },
+        "local RAM backing proof metrics: operation=write status=ok elapsed_us={d}",
+        .{elapsed_us},
     ) catch "local RAM backing proof metrics: formatting_failed=1";
 }
 
 fn formatLocalBackingProofWriteError(buf: []u8, elapsed_us: u64, err: anyerror) []const u8 {
     return std.fmt.bufPrint(
         buf,
-        "local RAM backing proof metrics: operation=write status=error reason=error schema=0 verity=unknown elapsed_us={d} error={s}",
+        "local RAM backing proof metrics: operation=write status=error elapsed_us={d} error={s}",
         .{ elapsed_us, @errorName(err) },
     ) catch "local RAM backing proof metrics: formatting_failed=1";
 }
@@ -1269,12 +1026,10 @@ fn formatLocalBackingProofWriteError(buf: []u8, elapsed_us: u64, err: anyerror) 
 fn formatLocalBackingProofValidationOk(buf: []u8, opened: LocalBackingOpen, validation_us: u64, precharge_us: u64) []const u8 {
     return std.fmt.bufPrint(
         buf,
-        "local RAM backing proof metrics: operation=validate status=ok source={s} reason={s} schema={d} verity={s} validation_us={d} precharge_us={d}",
+        "local RAM backing proof metrics: operation=validate status=ok source={s} reason={s} validation_us={d} precharge_us={d}",
         .{
             @tagName(opened.plan.source),
             @tagName(opened.plan.reason),
-            opened.proof_schema_version,
-            if (opened.proof_has_verity) local_backing_verity_algorithm_sha256 else "none",
             validation_us,
             precharge_us,
         },
@@ -1284,7 +1039,7 @@ fn formatLocalBackingProofValidationOk(buf: []u8, opened: LocalBackingOpen, vali
 fn formatLocalBackingProofValidationError(buf: []u8, validation_us: u64, err: anyerror) []const u8 {
     return std.fmt.bufPrint(
         buf,
-        "local RAM backing proof metrics: operation=validate status=error source=error reason=error schema=0 verity=unknown validation_us={d} precharge_us=0 error={s}",
+        "local RAM backing proof metrics: operation=validate status=error validation_us={d} precharge_us=0 error={s}",
         .{ validation_us, @errorName(err) },
     ) catch "local RAM backing proof metrics: formatting_failed=1";
 }
@@ -1298,28 +1053,6 @@ fn writeLocalMemoryBackingProofForFd(
     fd: std.c.fd_t,
     expected_file: ?LocalBackingFileIdentity,
 ) Error!void {
-    return writeLocalMemoryBackingProofForFdWithOps(
-        allocator,
-        environ,
-        dir,
-        memory,
-        expected_size,
-        fd,
-        expected_file,
-        LocalBackingProofWriteOps{},
-    );
-}
-
-fn writeLocalMemoryBackingProofForFdWithOps(
-    allocator: std.mem.Allocator,
-    environ: *const std.process.Environ.Map,
-    dir: []const u8,
-    memory: MemoryManifest,
-    expected_size: u64,
-    fd: std.c.fd_t,
-    expected_file: ?LocalBackingFileIdentity,
-    verity_ops: anytype,
-) Error!void {
     const backing = memory.backing orelse return;
     const start_ns = localBackingMonotonicNs();
     errdefer |err| {
@@ -1327,55 +1060,41 @@ fn writeLocalMemoryBackingProofForFdWithOps(
         std.log.debug("{s}", .{formatLocalBackingProofWriteError(&metrics_buf, localBackingElapsedUs(start_ns), err)});
     }
     try validateMemoryBacking(backing, expected_size);
-    const initial_file = (try verity_ops.stat(fd)).identity();
-    if (initial_file.size != expected_size) return error.BadManifest;
+    const file = (try fstatLocalFile(fd)).identity();
+    if (file.size != expected_size) return error.BadManifest;
     if (expected_file) |expected| {
-        if (!localBackingFileIdentityEqual(initial_file, expected)) return error.IoFailed;
+        if (!localBackingFileIdentityEqual(file, expected)) return error.IoFailed;
     }
     const key = (try localBackingKey(allocator, environ, true)) orelse return error.IoFailed;
     const memory_fingerprint = try memoryIndexIdentity(allocator, memory, expected_size);
     defer allocator.free(memory_fingerprint);
     const proof_backing = proofBackingFromManifest(backing);
-    const verity_result = try verity_ops.proofForWrite(allocator, fd);
-    defer if (verity_result.verity) |value| allocator.free(value.digest);
-    const file = (try verity_ops.stat(fd)).identity();
-    if (file.size != expected_size) return error.BadManifest;
-    const identity_matches = if (verity_result.accepts_mtime_transition)
-        localBackingFileIdentityEqualWithoutMtime(initial_file, file)
-    else
-        localBackingFileIdentityEqual(initial_file, file);
-    if (!identity_matches) return error.IoFailed;
-    const schema_version: u32 = if (verity_result.verity == null) local_backing_proof_version_v1 else local_backing_proof_version_v2;
-    const mac = try proofMac(&key, memory_fingerprint, schema_version, proof_backing, file, local_backing_producer, verity_result.verity);
+    const mac = proofMac(&key, memory_fingerprint, proof_backing, file, local_backing_producer);
     const mac_hex = try hexAlloc(allocator, &mac);
     defer allocator.free(mac_hex);
     const proof = LocalBackingProof{
-        .schema_version = schema_version,
+        .schema_version = local_backing_proof_version_v1,
         .memory_fingerprint = memory_fingerprint,
         .backing = proof_backing,
         .file = file,
         .producer = local_backing_producer,
-        .verity = verity_result.verity,
         .mac = mac_hex,
     };
     const json = std.json.Stringify.valueAlloc(allocator, proof, .{
         .whitespace = .indent_2,
-        .emit_null_optional_fields = false,
     }) catch return error.OutOfMemory;
     defer allocator.free(json);
-    const pre_publish_file = (try verity_ops.stat(fd)).identity();
+    const pre_publish_file = (try fstatLocalFile(fd)).identity();
     if (!localBackingFileIdentityEqual(file, pre_publish_file)) return error.IoFailed;
     const proof_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_proof_path });
     try writeNewFileAll(proof_path, json);
     var metrics_buf: [256]u8 = undefined;
-    std.log.debug("{s}", .{formatLocalBackingProofWriteOk(&metrics_buf, schema_version, verity_result.verity != null, localBackingElapsedUs(start_ns))});
+    std.log.debug("{s}", .{formatLocalBackingProofWriteOk(&metrics_buf, localBackingElapsedUs(start_ns))});
 }
 
 const LocalBackingOpen = struct {
     plan: LocalBackingPlan,
     file: ?LocalBackingFileIdentity = null,
-    proof_schema_version: u32 = 0,
-    proof_has_verity: bool = false,
 };
 
 fn localBackingOpenChunks(reason: LocalBackingRestoreReason) LocalBackingOpen {
@@ -1476,31 +1195,12 @@ fn openProvenLocalMemoryBackingDetailedUnmeasured(
     if (parsed.value.mac.len != HmacSha256.mac_length * 2) return localBackingOpenChunks(.proof_mac_invalid);
     var actual_mac: [HmacSha256.mac_length]u8 = undefined;
     _ = std.fmt.hexToBytes(&actual_mac, parsed.value.mac) catch return localBackingOpenChunks(.proof_mac_invalid);
-    const expected_mac = try proofMac(
-        &key,
-        memory_fingerprint,
-        parsed.value.schema_version,
-        proof_backing,
-        file,
-        local_backing_producer,
-        parsed.value.verity,
-    );
+    const expected_mac = proofMac(&key, memory_fingerprint, proof_backing, file, local_backing_producer);
     if (!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, actual_mac, expected_mac)) return localBackingOpenChunks(.proof_mac_mismatch);
-    if (parsed.value.verity) |proof_verity| {
-        const measured_verity = (try proofVerityForRead(allocator, fd)) orelse return localBackingOpenChunks(.verity_unavailable);
-        defer allocator.free(measured_verity.digest);
-        if (!std.mem.eql(u8, measured_verity.algorithm, proof_verity.algorithm) or
-            !std.mem.eql(u8, measured_verity.digest, proof_verity.digest))
-        {
-            return localBackingOpenChunks(.verity_mismatch);
-        }
-    }
     handoff_fd = true;
     return .{
         .plan = .{ .fd = fd, .source = .local_backing, .reason = .proof_valid },
         .file = file,
-        .proof_schema_version = parsed.value.schema_version,
-        .proof_has_verity = parsed.value.verity != null,
     };
 }
 
@@ -3306,209 +3006,33 @@ test "optional local RAM path and hardlink errno classifiers preserve fatal fail
     try std.testing.expect(classifyOptionalHardlinkErrno(.IO) == error.IoFailed);
 }
 
-test "fs-verity result classification preserves unexpected I/O" {
-    try fsVerityEnableResult(.SUCCESS);
-    try std.testing.expectError(error.Unavailable, fsVerityEnableResult(.ACCES));
-    try std.testing.expectError(error.Unavailable, fsVerityEnableResult(.INVAL));
-    try std.testing.expectError(error.Unavailable, fsVerityEnableResult(.NOTTY));
-    try std.testing.expectError(error.IoFailed, fsVerityEnableResult(.IO));
-    try std.testing.expect(try fsVerityMeasureAvailable(.SUCCESS));
-    try std.testing.expect(!try fsVerityMeasureAvailable(.NODATA));
-    try std.testing.expectError(error.IoFailed, fsVerityMeasureAvailable(.BADF));
-}
-
-const TestProofVerityBehavior = enum {
-    existing,
-    enable,
-    unavailable,
-    unexpected,
-    identity_change,
-    ownership_change,
-    mtime_transition,
-    unavailable_mtime_transition,
-    unexpected_mtime_transition,
-    restore_failure,
-};
-
-const TestProofVerityOps = struct {
-    behavior: TestProofVerityBehavior,
-    enabled: bool = false,
-    enable_count: usize = 0,
-    chmod_count: usize = 0,
-
-    fn proofForWrite(self: *@This(), allocator: std.mem.Allocator, fd: std.c.fd_t) Error!ProofVerityWriteResult {
-        return proofVerityForWriteWithOps(allocator, fd, self);
-    }
-
-    fn measure(self: *@This(), allocator: std.mem.Allocator, _: std.c.fd_t) Error!?LocalBackingVerity {
-        if (self.behavior != .existing and !self.enabled) return null;
-        return .{
-            .algorithm = local_backing_verity_algorithm_sha256,
-            .digest = try allocator.dupe(u8, "0000000000000000000000000000000000000000000000000000000000000000"),
-        };
-    }
-
-    fn enable(self: *@This(), _: std.c.fd_t) FsVerityEnableError!void {
-        self.enable_count += 1;
-        switch (self.behavior) {
-            .existing => return error.IoFailed,
-            .enable, .mtime_transition, .restore_failure => self.enabled = true,
-            .unavailable => return error.Unavailable,
-            .unavailable_mtime_transition => {
-                self.enabled = true;
-                return error.Unavailable;
-            },
-            .unexpected, .unexpected_mtime_transition => return error.IoFailed,
-            .identity_change, .ownership_change => return error.IoFailed,
-        }
-    }
-
-    fn chmod(self: *@This(), fd: std.c.fd_t, mode: std.c.mode_t) Error!void {
-        self.chmod_count += 1;
-        if (self.behavior == .restore_failure and self.chmod_count == 2) return error.IoFailed;
-        if (std.c.fchmod(fd, mode) != 0) return error.IoFailed;
-    }
-
-    fn stat(self: *@This(), fd: std.c.fd_t) Error!LocalFileStat {
-        var file_stat = try fstatLocalFile(fd);
-        if (self.chmod_count == 1) switch (self.behavior) {
-            .identity_change => file_stat.inode +%= 1,
-            .ownership_change => file_stat.owner_uid +%= 1,
-            else => {},
-        };
-        if (self.chmod_count >= 2) switch (self.behavior) {
-            .mtime_transition, .unavailable_mtime_transition, .unexpected_mtime_transition => file_stat.mtime_nsec +%= 1,
-            else => {},
-        };
-        return file_stat;
-    }
-};
-
-fn testProofVerityWriteCase(
-    behavior: TestProofVerityBehavior,
-    original_mode: std.c.mode_t,
-    expected_schema: ?u32,
-) !void {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const dir = try pathZ(arena, "{s}/spore", .{root_dir});
-    const runtime_dir = try pathZ(arena, "{s}/runtime", .{root_dir});
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.runtime_dir_env, runtime_dir);
-
-    var ram: [4096]u8 = undefined;
-    @memset(&ram, 0x5A);
-    const memory = try saveMemoryWithBacking(arena, dir, &ram);
-    const backing_path = try memoryBackingPath(arena, dir, memory.backing.?);
-    const fd = try openReadOnlyNoFollow(backing_path);
-    defer _ = std.c.close(fd);
-    if (std.c.fchmod(fd, original_mode) != 0) return error.IoFailed;
-    const initial_stat = try fstatLocalFile(fd);
-    try std.testing.expectEqual(@as(u64, original_mode), initial_stat.mode & 0o7777);
-
-    var ops = TestProofVerityOps{ .behavior = behavior };
-    const proof_path = try pathZ(arena, "{s}/{s}", .{ dir, ram_backing_proof_path });
-    if (expected_schema) |schema| {
-        try writeLocalMemoryBackingProofForFdWithOps(
-            arena,
-            &env,
-            dir,
-            memory,
-            ram.len,
-            fd,
-            null,
-            &ops,
-        );
-        const proof_bytes = try readRegularFileAllNoFollow(arena, proof_path, local_backing_proof_max_bytes);
-        const parsed = try std.json.parseFromSlice(LocalBackingProof, arena, proof_bytes, .{ .allocate = .alloc_always });
-        defer parsed.deinit();
-        try std.testing.expectEqual(schema, parsed.value.schema_version);
-        if (behavior == .mtime_transition) {
-            try std.testing.expectEqual(initial_stat.mtime_nsec +% 1, parsed.value.file.mtime_nsec);
-        }
-    } else {
-        try std.testing.expectError(error.IoFailed, writeLocalMemoryBackingProofForFdWithOps(
-            arena,
-            &env,
-            dir,
-            memory,
-            ram.len,
-            fd,
-            null,
-            &ops,
-        ));
-        try std.testing.expect(std.c.access(proof_path, 0) != 0);
-    }
-
-    const final_stat = try fstatLocalFile(fd);
-    if (behavior == .restore_failure) {
-        try std.testing.expect((initial_stat.mode & 0o7777) != (final_stat.mode & 0o7777));
-    } else {
-        try std.testing.expectEqual(initial_stat.mode & 0o7777, final_stat.mode & 0o7777);
-    }
-    try std.testing.expect(localBackingFileIdentityEqual(initial_stat.identity(), final_stat.identity()));
-    const permission_cycle = original_mode & 0o222 == 0 and behavior != .existing;
-    try std.testing.expectEqual(@as(usize, if (permission_cycle) 2 else 0), ops.chmod_count);
-    const expected_enable_count: usize = if (!permission_cycle) 0 else switch (behavior) {
-        .identity_change, .ownership_change => 0,
-        else => 1,
-    };
-    try std.testing.expectEqual(expected_enable_count, ops.enable_count);
-}
-
-test "proof write restores backing mode across fs-verity outcomes" {
-    try testProofVerityWriteCase(.existing, 0o444, 2);
-    try testProofVerityWriteCase(.enable, 0o444, 2);
-    try testProofVerityWriteCase(.enable, 0o440, 2);
-    try testProofVerityWriteCase(.enable, 0o644, null);
-    try testProofVerityWriteCase(.unavailable, 0o444, 1);
-    try testProofVerityWriteCase(.unexpected, 0o444, null);
-    try testProofVerityWriteCase(.identity_change, 0o444, null);
-    try testProofVerityWriteCase(.ownership_change, 0o444, null);
-    try testProofVerityWriteCase(.mtime_transition, 0o444, 2);
-    try testProofVerityWriteCase(.unavailable_mtime_transition, 0o444, null);
-    try testProofVerityWriteCase(.unexpected_mtime_transition, 0o444, null);
-    try testProofVerityWriteCase(.restore_failure, 0o444, null);
-}
-
 test "local RAM backing proof metric lines are stable" {
     var buf: [320]u8 = undefined;
     try std.testing.expectEqualStrings(
-        "local RAM backing proof metrics: operation=write status=ok reason=verity_enabled schema=2 verity=sha256 elapsed_us=41",
-        formatLocalBackingProofWriteOk(&buf, 2, true, 41),
+        "local RAM backing proof metrics: operation=write status=ok elapsed_us=41",
+        formatLocalBackingProofWriteOk(&buf, 41),
     );
     try std.testing.expectEqualStrings(
-        "local RAM backing proof metrics: operation=write status=ok reason=verity_unavailable schema=1 verity=none elapsed_us=42",
-        formatLocalBackingProofWriteOk(&buf, 1, false, 42),
-    );
-    try std.testing.expectEqualStrings(
-        "local RAM backing proof metrics: operation=write status=error reason=error schema=0 verity=unknown elapsed_us=43 error=IoFailed",
+        "local RAM backing proof metrics: operation=write status=error elapsed_us=43 error=IoFailed",
         formatLocalBackingProofWriteError(&buf, 43, error.IoFailed),
     );
 
     const valid = LocalBackingOpen{
         .plan = .{ .source = .local_backing, .reason = .proof_valid },
-        .proof_schema_version = 2,
-        .proof_has_verity = true,
     };
     try std.testing.expectEqualStrings(
-        "local RAM backing proof metrics: operation=validate status=ok source=local_backing reason=proof_valid schema=2 verity=sha256 validation_us=44 precharge_us=5",
+        "local RAM backing proof metrics: operation=validate status=ok source=local_backing reason=proof_valid validation_us=44 precharge_us=5",
         formatLocalBackingProofValidationOk(&buf, valid, 44, 5),
     );
     const fallback = LocalBackingOpen{
         .plan = localBackingChunksPlan(.key_unavailable),
     };
     try std.testing.expectEqualStrings(
-        "local RAM backing proof metrics: operation=validate status=ok source=chunks reason=key_unavailable schema=0 verity=none validation_us=45 precharge_us=0",
+        "local RAM backing proof metrics: operation=validate status=ok source=chunks reason=key_unavailable validation_us=45 precharge_us=0",
         formatLocalBackingProofValidationOk(&buf, fallback, 45, 0),
     );
     try std.testing.expectEqualStrings(
-        "local RAM backing proof metrics: operation=validate status=error source=error reason=error schema=0 verity=unknown validation_us=46 precharge_us=0 error=IoFailed",
+        "local RAM backing proof metrics: operation=validate status=error validation_us=46 precharge_us=0 error=IoFailed",
         formatLocalBackingProofValidationError(&buf, 46, error.IoFailed),
     );
 }
@@ -3562,67 +3086,52 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
     try std.testing.expectEqual(LocalBackingRestoreReason.proof_mismatch, mismatch_plan.reason);
 }
 
-test "local memory backing proof MAC covers verity digest" {
-    const key = [_]u8{0xA5} ** local_backing_key_len;
-    const memory_fingerprint = "memory-fingerprint";
-    const backing = LocalBackingProofBacking{
-        .kind = ram_backing_kind,
-        .path = ram_backing_path,
-        .size = 4096,
-    };
-    const file = LocalBackingFileIdentity{
-        .device = 1,
-        .inode = 2,
-        .owner_uid = 501,
-        .size = 4096,
-        .mtime_sec = 3,
-        .mtime_nsec = 4,
-    };
-    const verity_a = LocalBackingVerity{
-        .algorithm = local_backing_verity_algorithm_sha256,
-        .digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    };
-    const verity_b = LocalBackingVerity{
-        .algorithm = local_backing_verity_algorithm_sha256,
-        .digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    };
+test "local memory backing proof written by the removed fs-verity schema falls back to chunks" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const mac_a = try proofMac(&key, memory_fingerprint, local_backing_proof_version_v2, backing, file, local_backing_producer, verity_a);
-    const mac_b = try proofMac(&key, memory_fingerprint, local_backing_proof_version_v2, backing, file, local_backing_producer, verity_b);
-    try std.testing.expect(!std.crypto.timing_safe.eql([HmacSha256.mac_length]u8, mac_a, mac_b));
-    try std.testing.expectError(error.BadManifest, proofMac(&key, memory_fingerprint, local_backing_proof_version_v1, backing, file, local_backing_producer, verity_a));
-    try std.testing.expectError(error.BadManifest, proofMac(&key, memory_fingerprint, local_backing_proof_version_v2, backing, file, local_backing_producer, null));
+    const root_dir = try testDir(arena);
+    const dir = try pathZ(arena, "{s}/spore", .{root_dir});
+    const runtime_dir = try pathZ(arena, "{s}/runtime", .{root_dir});
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.runtime_dir_env, runtime_dir);
 
-    const proof_v1 = LocalBackingProof{
-        .schema_version = local_backing_proof_version_v1,
-        .memory_fingerprint = memory_fingerprint,
-        .backing = backing,
-        .file = file,
-        .producer = local_backing_producer,
-        .mac = "",
-    };
-    try std.testing.expect(proofFieldsMatch(proof_v1, memory_fingerprint, backing, file));
+    const ram = try arena.alloc(u8, chunk_size);
+    @memset(ram, 0x3C);
+    const mm = try saveMemoryWithBacking(arena, dir, ram);
+    try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
+    const proof_path = try pathZ(arena, "{s}/{s}", .{ dir, ram_backing_proof_path });
+    const v1_proof = try readRegularFileAllNoFollow(arena, proof_path, local_backing_proof_max_bytes);
 
-    const proof_v2 = LocalBackingProof{
-        .schema_version = local_backing_proof_version_v2,
-        .memory_fingerprint = memory_fingerprint,
-        .backing = backing,
-        .file = file,
-        .producer = local_backing_producer,
-        .verity = verity_a,
-        .mac = "",
-    };
-    try std.testing.expect(proofFieldsMatch(proof_v2, memory_fingerprint, backing, file));
+    // Schema v2 proofs carried a `verity` object next to the MAC.
+    const v2_schema = try std.mem.replaceOwned(u8, arena, v1_proof, "\"schema_version\": 1,", "\"schema_version\": 2,");
+    try std.testing.expect(!std.mem.eql(u8, v1_proof, v2_schema));
+    const v2_proof = try std.mem.replaceOwned(
+        u8,
+        arena,
+        v2_schema,
+        "\"mac\":",
+        "\"verity\": {\"algorithm\": \"sha256\", \"digest\": \"0000000000000000000000000000000000000000000000000000000000000000\"},\n  \"mac\":",
+    );
+    try std.testing.expect(!std.mem.eql(u8, v2_schema, v2_proof));
 
-    const bad_v2 = LocalBackingProof{
-        .schema_version = local_backing_proof_version_v2,
-        .memory_fingerprint = memory_fingerprint,
-        .backing = backing,
-        .file = file,
-        .producer = local_backing_producer,
-        .mac = "",
+    const cases = [_]struct { bytes: []const u8, reason: LocalBackingRestoreReason }{
+        .{ .bytes = v2_proof, .reason = .proof_invalid },
+        .{ .bytes = v2_schema, .reason = .proof_mismatch },
     };
-    try std.testing.expect(!proofFieldsMatch(bad_v2, memory_fingerprint, backing, file));
+    for (cases) |case| {
+        try writeFileAll(proof_path, case.bytes);
+        const plan = try openProvenLocalMemoryBacking(arena, &env, dir, mm, ram.len);
+        defer if (plan.fd) |fd| {
+            _ = std.c.close(fd);
+        };
+        try std.testing.expectEqual(LocalBackingRestoreSource.chunks, plan.source);
+        try std.testing.expect(plan.fd == null);
+        try std.testing.expectEqual(case.reason, plan.reason);
+    }
 }
 
 test "memory backing rejects non-canonical paths" {
