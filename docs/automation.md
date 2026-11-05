@@ -46,7 +46,7 @@ The bounded schema inventory is:
 
 | Operations | Result schemas |
 | --- | --- |
-| `version`, `host-info`, `inspect` | `spore.version.result.v1`, `spore.host-info.v2` or `.v3`, `spore.inspect.result.v1` |
+| `version`, `host-info`, `inspect` | `spore.version.result.v1`, `spore.host-info.v3`, `spore.inspect.result.v1` |
 | checkpoint `fork`/`clone`, bundle `pack`/`push`/`inspect-bundle`, checkpoint `unpack`/`pull` | `spore.fork.result.v1`, `spore.clone.result.v1`, `spore.pack.result.v1`, `spore.unpack.result.v1`, `spore.push.result.v1`, `spore.bundle.inspect.v1`, `spore.pull.result.v1` |
 | `create`, `logs`, `save`, `restore`, `vm rm`, `vm fork`, `checkpoint rm`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v2`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
 | `build`, rootfs operations, image archive operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v1`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1` |

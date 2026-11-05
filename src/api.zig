@@ -47,56 +47,8 @@ pub const CacheRoot = union(enum) {
     path: []const u8,
 };
 
-/// ARM host capability and cache summary returned by `hostInfo`.
-///
-/// The result owns `backends` and any resolved cache-root paths. This v2
-/// compatibility surface returns `error.UnsupportedArchitecture` on x86-64;
-/// use `HostInfoV3` and `hostInfoV3` for either supported architecture.
-pub const HostInfo = struct {
-    schema: []const u8 = platform.host_info_schema,
-    schema_version: u32 = platform.host_info_schema_version,
-    host_class: []const u8,
-    platform: PlatformFacts,
-    backends: []const BackendAvailability,
-    cache_roots: CacheRoots,
-};
-
-pub const PlatformFacts = struct {
-    os: []const u8,
-    arch: architecture.Architecture,
-    cpu_profile: []const u8,
-    device_model_version: u32,
-    ram_base: u64,
-    gic_dist_base: u64,
-    gic_redist_base: u64,
-    counter_frequency_source: []const u8,
-    counter_frequency_hz: u64,
-};
-
-pub const BackendAvailability = struct {
-    name: []const u8,
-    supported: bool,
-    available: bool,
-    reason: []const u8,
-};
-
-pub const CacheRoots = struct {
-    kernels: PathFact,
-    rootfs: PathFact,
-    bundles: PathFact,
-    runtime: PathFact,
-};
-
-pub const PathFact = struct {
-    path: ?[]const u8,
-    resolved: bool,
-    source: []const u8,
-};
-
-/// Versioned architecture-discriminated host information. Unlike v2, this
-/// surface is valid on both aarch64 and x86-64 and never represents
-/// not-applicable architecture fields with sentinel zeroes.
-pub const HostInfoV3 = platform.HostInfoV3;
+/// Architecture-discriminated `spore.host-info.v3` host facts.
+pub const HostInfo = platform.HostInfo;
 
 /// Rootfs storage policy used when packing a spore into a bundle.
 pub const RootfsBundlePolicy = enum {
@@ -431,60 +383,13 @@ pub const SporeInspectResult = struct {
     annotation_keys: []const []const u8 = &.{},
 };
 
-/// Return ARM-shaped v2 host facts, backend availability, and cache roots.
-///
-/// The caller owns returned slices and optional paths. This compatibility
-/// function returns
-/// `error.UnsupportedArchitecture` on x86-64; use `hostInfoV3` for either
-/// supported architecture.
+/// Return architecture-discriminated `spore.host-info.v3` facts on either
+/// aarch64 or x86-64.
 pub fn hostInfo(
     context: Context,
     allocator: std.mem.Allocator,
 ) !HostInfo {
-    const info = try platform.hostInfo(allocator, context.environ_map);
-    errdefer platform.deinitHostInfo(allocator, info);
-
-    const backends = try allocator.alloc(BackendAvailability, info.backends.len);
-    errdefer allocator.free(backends);
-    for (info.backends, backends) |backend, *out| {
-        out.* = .{
-            .name = backend.name,
-            .supported = backend.supported,
-            .available = backend.available,
-            .reason = backend.reason,
-        };
-    }
-
-    return .{
-        .host_class = info.host_class,
-        .platform = .{
-            .os = info.platform.os,
-            .arch = info.platform.arch,
-            .cpu_profile = info.platform.cpu_profile,
-            .device_model_version = info.platform.device_model_version,
-            .ram_base = info.platform.ram_base,
-            .gic_dist_base = info.platform.gic_dist_base,
-            .gic_redist_base = info.platform.gic_redist_base,
-            .counter_frequency_source = info.platform.counter_frequency_source,
-            .counter_frequency_hz = info.platform.counter_frequency_hz,
-        },
-        .backends = backends,
-        .cache_roots = .{
-            .kernels = pathFact(info.cache_roots.kernels),
-            .rootfs = pathFact(info.cache_roots.rootfs),
-            .bundles = pathFact(info.cache_roots.bundles),
-            .runtime = pathFact(info.cache_roots.runtime),
-        },
-    };
-}
-
-/// Return architecture-discriminated `spore.host-info.v3` facts on either
-/// aarch64 or x86-64.
-pub fn hostInfoV3(
-    context: Context,
-    allocator: std.mem.Allocator,
-) !HostInfoV3 {
-    return platform.hostInfoV3(allocator, context.environ_map);
+    return platform.hostInfo(allocator, context.environ_map);
 }
 
 /// Build an ext4 rootfs from an OCI image reference.
@@ -1607,14 +1512,6 @@ fn testVcpuState(index: u32) spore.VcpuState {
         .sys_regs = &.{},
         .icc_regs = &.{},
         .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
-    };
-}
-
-fn pathFact(fact: platform.PathFact) PathFact {
-    return .{
-        .path = fact.path,
-        .resolved = fact.resolved,
-        .source = fact.source,
     };
 }
 

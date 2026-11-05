@@ -312,20 +312,11 @@ fn runCommand(
             }
             exitUnexpectedArgument(arena, stderr, mode, "host-info", command_args[0]);
         }
-        if (comptime builtin.cpu.arch == .aarch64) {
-            const info = try spore_api.hostInfo(context, arena);
-            if (mode == .json) {
-                try machine_output.writeJson(arena, stdout, info);
-            } else {
-                try writeHostInfo(stdout, info);
-            }
+        const info = try spore_api.hostInfo(context, arena);
+        if (mode == .json) {
+            try machine_output.writeJson(arena, stdout, info);
         } else {
-            const info = try spore_api.hostInfoV3(context, arena);
-            if (mode == .json) {
-                try machine_output.writeJson(arena, stdout, info);
-            } else {
-                try writeHostInfoV3(stdout, info);
-            }
+            try writeHostInfo(stdout, info);
         }
     } else if (std.mem.eql(u8, command, "inspect")) {
         if (wantsCommandHelp(command_args)) {
@@ -1014,29 +1005,6 @@ fn parseRootfsBundlePolicy(value: []const u8) ?spore_api.RootfsBundlePolicy {
 }
 
 fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
-    try writer.writeAll("Host info\n");
-    try writer.print("  Class: {s}\n", .{info.host_class});
-    try writer.print("  Platform: {s}/{s}\n", .{ info.platform.os, info.platform.arch.name() });
-    try writer.print("  CPU profile: {s}\n", .{info.platform.cpu_profile});
-    try writer.print("  Device model version: {d}\n", .{info.platform.device_model_version});
-    try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ info.platform.counter_frequency_hz, info.platform.counter_frequency_source });
-    try writer.writeAll("  Backends:\n");
-    for (info.backends) |backend| {
-        try writer.print("    {s}: supported={s} available={s} reason={s}\n", .{
-            backend.name,
-            yesNo(backend.supported),
-            yesNo(backend.available),
-            backend.reason,
-        });
-    }
-    try writer.writeAll("  Cache roots:\n");
-    try writePathFact(writer, "kernels", info.cache_roots.kernels);
-    try writePathFact(writer, "rootfs", info.cache_roots.rootfs);
-    try writePathFact(writer, "bundles", info.cache_roots.bundles);
-    try writePathFact(writer, "runtime", info.cache_roots.runtime);
-}
-
-fn writeHostInfoV3(writer: *Io.Writer, info: spore_api.HostInfoV3) !void {
     try writer.writeAll("Host info\n");
     try writer.print("  Class: {s}\n", .{info.host_class});
     try writer.print("  Architecture: {s}\n", .{info.architecture});
