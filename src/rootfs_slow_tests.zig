@@ -17,6 +17,11 @@ const resolver_placeholder_path = "etc/resolv.conf";
 const resolver_placeholder_bytes =
     "# SporeVM generated placeholder; --net bind-mounts the guest resolver here.\n";
 
+const debugfs_candidates = [_][]const u8{
+    "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
+    "debugfs",
+};
+
 test "native ext4 writer emits deterministic fsck-clean image" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -114,6 +119,68 @@ test "native ext4 writer supports double indirect regular files" {
     try runE2fsck(allocator, io, path);
 }
 
+test "native ext4 writer maps a file through triple-indirect blocks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-native-ext4-triple-indirect";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const debugfs = try findTool(allocator, io, &debugfs_candidates);
+    defer allocator.free(debugfs);
+
+    // Direct, single, and double indirect pointers reach 12 + 1024 + 1024^2
+    // blocks, just over 4 GiB. The last two blocks need the triple tree.
+    const block_size = ext4.rootfs_ext4_block_size;
+    const double_reach: u64 = 12 + 1024 + 1024 * 1024;
+    const size: u64 = (double_reach + 1) * block_size + 100;
+    const markers = [_]struct { block: u64, bytes: []const u8 }{
+        .{ .block = 0, .bytes = "first block" },
+        .{ .block = double_reach - 1, .bytes = "last double-indirect block" },
+        .{ .block = double_reach, .bytes = "first triple-indirect block" },
+        .{ .block = double_reach + 1, .bytes = "partial tail" },
+    };
+
+    // Only the marker blocks of the source occupy disk.
+    const source_path = try allocator.dupe(u8, tmp ++ "/source.bin");
+    defer allocator.free(source_path);
+    {
+        var source = try Io.Dir.cwd().createFile(io, source_path, .{});
+        defer source.close(io);
+        try source.setLength(io, size);
+        for (markers) |marker| try source.writePositionalAll(io, marker.bytes, marker.block * block_size);
+    }
+
+    const image_path = tmp ++ "/image.ext4";
+    const entries = [_]ext4_writer.Entry{.{
+        .path = "big.bin",
+        .kind = .{ .file_source = .{ .file = .{ .path = source_path, .offset = 0, .size = size } } },
+    }};
+    _ = try ext4_writer.emit(allocator, io, image_path, &entries, .{
+        .image_size = ext4.computeImageSize(size),
+        .inode_count = 1024,
+        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-triple-indirect"),
+    });
+    try runE2fsck(allocator, io, image_path);
+
+    const stat = try runDebugfs(allocator, io, debugfs, image_path, "stat /big.bin");
+    defer allocator.free(stat);
+    const expected_size = std.fmt.comptimePrint("Size: {d}\n", .{size});
+    try std.testing.expect(std.mem.indexOf(u8, stat, expected_size) != null);
+
+    var image = try Io.Dir.cwd().openFile(io, image_path, .{});
+    defer image.close(io);
+    for (markers) |marker| {
+        const command = try std.fmt.allocPrint(allocator, "bmap /big.bin {d}", .{marker.block});
+        defer allocator.free(command);
+        const output = try runDebugfs(allocator, io, debugfs, image_path, command);
+        defer allocator.free(output);
+        const physical = try std.fmt.parseInt(u64, std.mem.trim(u8, output, " \n"), 10);
+        var bytes: [64]u8 = undefined;
+        const read = try image.readPositionalAll(io, bytes[0..marker.bytes.len], physical * block_size);
+        try std.testing.expectEqualStrings(marker.bytes, bytes[0..read]);
+    }
+}
+
 test "native ext4 writer resolves hardlinks after sorted targets" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -182,10 +249,7 @@ test "native and external imported rootfs expose matching files" {
         "mkfs.ext4",
     });
     defer allocator.free(mkfs);
-    const debugfs = try findTool(allocator, io, &.{
-        "/opt/homebrew/opt/e2fsprogs/sbin/debugfs",
-        "debugfs",
-    });
+    const debugfs = try findTool(allocator, io, &debugfs_candidates);
     defer allocator.free(debugfs);
 
     const layer_path = tmp ++ "/rootfs.tar";
@@ -242,9 +306,11 @@ test "native and external imported rootfs expose matching files" {
         .{ .path = "/" ++ resolver_placeholder_path, .expected = resolver_placeholder_bytes },
     };
     for (paths) |entry| {
-        const external = try debugfsCat(allocator, io, debugfs, external_result.rootfs_path, entry.path);
+        const command = try std.fmt.allocPrint(allocator, "cat {s}", .{entry.path});
+        defer allocator.free(command);
+        const external = try runDebugfs(allocator, io, debugfs, external_result.rootfs_path, command);
         defer allocator.free(external);
-        const native = try debugfsCat(allocator, io, debugfs, native_result.rootfs_path, entry.path);
+        const native = try runDebugfs(allocator, io, debugfs, native_result.rootfs_path, command);
         defer allocator.free(native);
         try std.testing.expectEqualStrings(entry.expected, external);
         try std.testing.expectEqualStrings(external, native);
@@ -304,17 +370,15 @@ fn findTool(allocator: std.mem.Allocator, io: Io, candidates: []const []const u8
     return error.SkipZigTest;
 }
 
-fn debugfsCat(
+fn runDebugfs(
     allocator: std.mem.Allocator,
     io: Io,
     debugfs: []const u8,
     image: []const u8,
-    path: []const u8,
+    request: []const u8,
 ) ![]u8 {
-    const command = try std.fmt.allocPrint(allocator, "cat {s}", .{path});
-    defer allocator.free(command);
     const result = try std.process.run(allocator, io, .{
-        .argv = &.{ debugfs, "-R", command, image },
+        .argv = &.{ debugfs, "-R", request, image },
         .stdout_limit = .limited(256 * 1024),
         .stderr_limit = .limited(256 * 1024),
     });

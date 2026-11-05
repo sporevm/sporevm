@@ -164,8 +164,8 @@ const InodePlan = struct {
     xattrs: []const xattrs_mod.Attribute = &.{},
     data_blocks: []u32 = &.{},
     indirect_blocks: []u32 = &.{},
-    single_indirect_block: u32 = 0,
-    double_indirect_block: u32 = 0,
+    /// Single, double, and triple indirect root blocks, or zero when unused.
+    indirect_roots: [3]u32 = .{ 0, 0, 0 },
     xattr_block: u32 = 0,
     mtime: ?EncodedMtime = null,
 
@@ -1334,47 +1334,51 @@ fn allocateIndirectBlocks(
     blocks: *BlockStore,
 ) !void {
     if (inode.data_blocks.len <= max_direct_blocks) return;
-    const double_capacity = pointers_per_block * pointers_per_block;
-    if (inode.data_blocks.len > max_direct_blocks + pointers_per_block + double_capacity) return error.UnsupportedExt4FileSize;
 
     var metadata_blocks = std.ArrayList(u32).empty;
     errdefer metadata_blocks.deinit(allocator);
 
-    var data_index: usize = max_direct_blocks;
-    if (data_index < inode.data_blocks.len) {
-        inode.single_indirect_block = try block_allocator.alloc();
-        try metadata_blocks.append(allocator, inode.single_indirect_block);
-        const table = try zeroBlock(allocator);
-        const table_count = @min(inode.data_blocks.len - data_index, pointers_per_block);
-        for (inode.data_blocks[data_index .. data_index + table_count], 0..) |block, i| {
-            put(u32, table, i * @sizeOf(u32), block);
-        }
-        try blocks.put(inode.single_indirect_block, table);
-        data_index += table_count;
+    // i_block[12..15] root the single, double, and triple indirect trees.
+    var remaining: []const u32 = inode.data_blocks[max_direct_blocks..];
+    for (&inode.indirect_roots, 1..) |*root, depth| {
+        if (remaining.len == 0) break;
+        root.* = try allocateIndirectTree(allocator, depth, &remaining, block_allocator, blocks, &metadata_blocks);
     }
+    if (remaining.len != 0) return error.UnsupportedExt4FileSize;
 
-    if (data_index < inode.data_blocks.len) {
-        inode.double_indirect_block = try block_allocator.alloc();
-        try metadata_blocks.append(allocator, inode.double_indirect_block);
-        const root = try zeroBlock(allocator);
-        var root_index: usize = 0;
-        while (data_index < inode.data_blocks.len) : (root_index += 1) {
-            if (root_index >= pointers_per_block) return error.UnsupportedExt4FileSize;
-            const leaf_block = try block_allocator.alloc();
-            try metadata_blocks.append(allocator, leaf_block);
-            put(u32, root, root_index * @sizeOf(u32), leaf_block);
-            const leaf = try zeroBlock(allocator);
-            const leaf_count = @min(inode.data_blocks.len - data_index, pointers_per_block);
-            for (inode.data_blocks[data_index .. data_index + leaf_count], 0..) |block, i| {
-                put(u32, leaf, i * @sizeOf(u32), block);
-            }
-            try blocks.put(leaf_block, leaf);
-            data_index += leaf_count;
-        }
-        try blocks.put(inode.double_indirect_block, root);
-    }
-
+    // Without huge_file, i_blocks counts 512-byte sectors in 32 bits.
+    const allocated = inode.data_blocks.len + metadata_blocks.items.len + @intFromBool(inode.xattr_block != 0);
+    if (allocated > std.math.maxInt(u32) / (block_size / 512)) return error.UnsupportedExt4FileSize;
     inode.indirect_blocks = try metadata_blocks.toOwnedSlice(allocator);
+}
+
+/// Allocates one indirect block whose pointers cover `depth` levels and maps
+/// the next data blocks from `remaining` beneath it. Parents are allocated
+/// before their children, so files that fit the double-indirect tree keep the
+/// same block layout they had before triple-indirect support.
+fn allocateIndirectTree(
+    allocator: std.mem.Allocator,
+    depth: usize,
+    remaining: *[]const u32,
+    block_allocator: *BlockAllocator,
+    blocks: *BlockStore,
+    metadata_blocks: *std.ArrayList(u32),
+) error{ OutOfMemory, Ext4ImageTooSmall }!u32 {
+    const block = try block_allocator.alloc();
+    try metadata_blocks.append(allocator, block);
+    const table = try zeroBlock(allocator);
+    errdefer allocator.free(table);
+    var index: usize = 0;
+    while (index < pointers_per_block and remaining.len != 0) : (index += 1) {
+        const pointer = if (depth == 1) leaf: {
+            const data_block = remaining.*[0];
+            remaining.* = remaining.*[1..];
+            break :leaf data_block;
+        } else try allocateIndirectTree(allocator, depth - 1, remaining, block_allocator, blocks, metadata_blocks);
+        put(u32, table, index * @sizeOf(u32), pointer);
+    }
+    try blocks.put(block, table);
+    return block;
 }
 
 fn directoryBytes(allocator: std.mem.Allocator, planned: *const PlannedImage, inode: InodePlan) ![]u8 {
@@ -1717,8 +1721,9 @@ fn writeBlockPointers(buf: []u8, inode: InodePlan) void {
     for (inode.data_blocks[0..direct_count], 0..) |block, i| {
         put(u32, buf, i * @sizeOf(u32), block);
     }
-    if (inode.single_indirect_block != 0) put(u32, buf, max_direct_blocks * @sizeOf(u32), inode.single_indirect_block);
-    if (inode.double_indirect_block != 0) put(u32, buf, (max_direct_blocks + 1) * @sizeOf(u32), inode.double_indirect_block);
+    for (inode.indirect_roots, max_direct_blocks..) |root, i| {
+        if (root != 0) put(u32, buf, i * @sizeOf(u32), root);
+    }
 }
 
 fn xattrBlock(allocator: std.mem.Allocator, attrs: []const xattrs_mod.Attribute) ![]u8 {
