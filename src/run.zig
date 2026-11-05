@@ -70,10 +70,14 @@ const embedded_run_initrd_sha256 = blk: {
         @compileError("generated minimal initrd SHA-256 is not canonical hex");
     break :blk digest;
 };
-const default_kernel_repository = "sporevm/kernels";
-const default_kernel_release = "v0.7.1";
-const default_x86_kernel_release = "v0.7.1";
-const default_kernel_version = "6.1.191";
+const managed_kernel = parseManagedKernelPins(@embedFile("managed_kernel.env"));
+// Some pins are only used on one architecture; check the file on every target.
+comptime {
+    _ = managed_kernel;
+}
+const default_kernel_repository = managed_kernel.repository;
+const default_kernel_release = managed_kernel.release;
+const default_kernel_version = managed_kernel.linux_version;
 pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
 const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
 const force_write_zeroes_backend_failure_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_BACKEND_FAILURE_EXPERIMENT";
@@ -131,12 +135,67 @@ const managed_x86_kernel_forbidden_config_symbols = [_][]const u8{
     "CONFIG_MOUSE_PS2",
     "CONFIG_SERIO_I8042",
 };
-const approved_x86_kernel_sha256 = [_]u8{
-    0x13, 0xca, 0x22, 0xff, 0x42, 0xb7, 0x95, 0xc3,
-    0x33, 0x65, 0xc8, 0x9f, 0xad, 0x3e, 0x7d, 0x5b,
-    0xbf, 0x0a, 0x97, 0x2c, 0xda, 0xed, 0xc7, 0xf7,
-    0x0f, 0x2f, 0x78, 0x27, 0x0e, 0xe7, 0xbb, 0x82,
+const approved_x86_kernel_sha256 = managed_kernel.x86_64_sha256;
+
+const ManagedKernelPins = struct {
+    repository: []const u8,
+    release: []const u8,
+    linux_version: []const u8,
+    x86_64_sha256: [Sha256.digest_length]u8,
 };
+
+/// Shell scripts `source` the same file, so accept only comments and
+/// unquoted, unrepeated `key=value` lines that both readers see alike.
+fn parseManagedKernelPins(comptime text: []const u8) ManagedKernelPins {
+    comptime {
+        @setEvalBranchQuota(10_000);
+        const keys = [_][]const u8{
+            "managed_kernel_repository",
+            "managed_kernel_release",
+            "managed_kernel_linux_version",
+            "managed_kernel_x86_64_sha256",
+        };
+        var values: [keys.len]?[]const u8 = .{null} ** keys.len;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0 or line[0] == '#') continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse
+                @compileError("src/managed_kernel.env: expected key=value: " ++ line);
+            const index = for (keys, 0..) |key, i| {
+                if (std.mem.eql(u8, line[0..eq], key)) break i;
+            } else @compileError("src/managed_kernel.env: unknown key: " ++ line);
+            if (values[index] != null) @compileError("src/managed_kernel.env repeats " ++ keys[index]);
+            const value = line[eq + 1 ..];
+            if (value.len == 0) @compileError("src/managed_kernel.env: empty value: " ++ line);
+            for (value) |c| {
+                if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "._/-", c) == null) {
+                    @compileError("src/managed_kernel.env: value must match [0-9A-Za-z._/-]+: " ++ line);
+                }
+            }
+            values[index] = value;
+        }
+        for (keys, values) |key, value| {
+            if (value == null) @compileError("src/managed_kernel.env is missing " ++ key);
+        }
+
+        const hex = values[3].?;
+        var digest: [Sha256.digest_length]u8 = undefined;
+        if (hex.len != 2 * digest.len) @compileError("managed_kernel_x86_64_sha256 is not a SHA-256 digest");
+        for (hex) |c| {
+            if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) {
+                @compileError("managed_kernel_x86_64_sha256 must be lowercase hex");
+            }
+        }
+        _ = std.fmt.hexToBytes(&digest, hex) catch unreachable;
+        return .{
+            .repository = values[0].?,
+            .release = values[1].?,
+            .linux_version = values[2].?,
+            .x86_64_sha256 = digest,
+        };
+    }
+}
+
 pub const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
     @compileError("SporeVM product execution requires an arm64 or amd64 host architecture");
 pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
@@ -2389,13 +2448,9 @@ const ManagedKernelOptions = struct {
 fn managedKernelOptions(init: std.process.Init) ManagedKernelOptions {
     return .{
         .repository = init.environ_map.get("SPOREVM_KERNEL_REPOSITORY") orelse default_kernel_repository,
-        .release = init.environ_map.get("SPOREVM_KERNEL_RELEASE") orelse defaultManagedKernelReleaseFor(builtin.cpu.arch),
+        .release = init.environ_map.get("SPOREVM_KERNEL_RELEASE") orelse default_kernel_release,
         .linux_version = init.environ_map.get("SPOREVM_KERNEL_VERSION") orelse default_kernel_version,
     };
-}
-
-fn defaultManagedKernelReleaseFor(zig_arch: std.Target.Cpu.Arch) []const u8 {
-    return if (zig_arch == .x86_64) default_x86_kernel_release else default_kernel_release;
 }
 
 fn managedRunKernelAssetName(allocator: std.mem.Allocator, linux_version: []const u8) ![]const u8 {
@@ -5935,11 +5990,6 @@ test "managed run kernel asset names validate input" {
     try std.testing.expectEqualStrings(native_config_expected, config_asset);
 
     try std.testing.expectError(error.BadManagedKernelVersion, managedRunKernelAssetName(allocator, "../bad"));
-}
-
-test "managed kernel release defaults select the security baseline on both architectures" {
-    try std.testing.expectEqualStrings("v0.7.1", defaultManagedKernelReleaseFor(.x86_64));
-    try std.testing.expectEqualStrings("v0.7.1", defaultManagedKernelReleaseFor(.aarch64));
 }
 
 test "managed kernel repository cache name validates owner and repo" {

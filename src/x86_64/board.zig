@@ -27,7 +27,7 @@ pub const kernel_addr: u64 = 0x0010_0000;
 /// complete maximum-size table must remain below the GDT.
 pub const mp_floating_pointer_addr: u64 = 0x0000_0000;
 pub const mp_config_table_addr: u64 = 0x0000_0010;
-/// The pinned Linux 6.1.155 kernel scans the bottom 1KiB in 16-byte steps for
+/// The managed Linux kernel scans the bottom 1KiB in 16-byte steps for
 /// the MP floating pointer. Keep that complete search window reserved in E820.
 pub const mp_scan_window_size: u64 = 0x0000_0400;
 
