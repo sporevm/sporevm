@@ -65,9 +65,9 @@ const embedded_run_initrd_sha256 = blk: {
     break :blk digest;
 };
 const default_kernel_repository = "sporevm/kernels";
-const default_kernel_release = "v0.6.3";
-const default_x86_kernel_release = "v0.7.0";
-const default_kernel_version = "6.1.155";
+const default_kernel_release = "v0.7.1";
+const default_x86_kernel_release = "v0.7.1";
+const default_kernel_version = "6.1.191";
 pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
 const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
 const force_write_zeroes_backend_failure_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_BACKEND_FAILURE_EXPERIMENT";
@@ -126,10 +126,10 @@ const managed_x86_kernel_forbidden_config_symbols = [_][]const u8{
     "CONFIG_SERIO_I8042",
 };
 const approved_x86_kernel_sha256 = [_]u8{
-    0x07, 0xa9, 0xb6, 0xd8, 0xa9, 0xef, 0xd2, 0xb7,
-    0xc5, 0xe8, 0x86, 0xd1, 0xc0, 0x10, 0xe6, 0x72,
-    0x45, 0xfa, 0x13, 0x2c, 0x8b, 0x48, 0xcf, 0x56,
-    0x7f, 0x20, 0x00, 0x99, 0xb5, 0x5a, 0xbe, 0xe8,
+    0x13, 0xca, 0x22, 0xff, 0x42, 0xb7, 0x95, 0xc3,
+    0x33, 0x65, 0xc8, 0x9f, 0xad, 0x3e, 0x7d, 0x5b,
+    0xbf, 0x0a, 0x97, 0x2c, 0xda, 0xed, 0xc7, 0xf7,
+    0x0f, 0x2f, 0x78, 0x27, 0x0e, 0xe7, 0xbb, 0x82,
 };
 const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
     @compileError("SporeVM product execution requires an arm64 or amd64 host architecture");
@@ -6234,9 +6234,9 @@ test "managed run kernel asset names validate input" {
     try std.testing.expectError(error.BadManagedKernelVersion, managedRunKernelAssetName(allocator, "../bad"));
 }
 
-test "managed kernel release defaults are architecture specific" {
-    try std.testing.expectEqualStrings("v0.7.0", defaultManagedKernelReleaseFor(.x86_64));
-    try std.testing.expectEqualStrings("v0.6.3", defaultManagedKernelReleaseFor(.aarch64));
+test "managed kernel release defaults select the security baseline on both architectures" {
+    try std.testing.expectEqualStrings("v0.7.1", defaultManagedKernelReleaseFor(.x86_64));
+    try std.testing.expectEqualStrings("v0.7.1", defaultManagedKernelReleaseFor(.aarch64));
 }
 
 test "managed kernel repository cache name validates owner and repo" {
