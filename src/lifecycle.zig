@@ -200,8 +200,9 @@ const rm_usage =
     \\  spore rm --spore DIR
     \\
     \\`vm rm` stops the live VM monitor and deletes only its runtime state.
-    \\`checkpoint rm` deletes the checkpoint directory unless a live VM uses it.
-    \\`spore cache gc --force` then reclaims storage nothing else references.
+    \\`checkpoint rm` deletes the checkpoint directory unless a foreground or
+    \\named restore holds a lazy-disk lease on it. `spore cache gc --force` then
+    \\reclaims storage nothing else references.
     \\
     \\The top-level forms remain compatible throughout the 0.x release line.
     \\
@@ -2404,13 +2405,18 @@ pub fn rmCli(
     }
     const allocator = init.arena.allocator();
     if (args.len == 2 and std.mem.eql(u8, args[0], "--spore")) {
+        // An empty path resolves to the working directory.
+        if (args[1].len == 0) {
+            const message = "spore checkpoint rm: DIR must not be empty";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "rm"), message);
+        }
         const removed = removeSavedSpore(.{ .io = init.io, .environ_map = init.environ_map }, allocator, args[1]) catch |err| switch (err) {
             error.FileNotFound => {
                 const message = allocLifecycleMessage(allocator, "spore checkpoint rm: checkpoint not found: {s}", .{args[1]});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
             },
             error.InvalidSporeDir, error.BadManifest => {
-                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove {s}: not a checkpoint directory with a regular manifest.json", .{args[1]});
+                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove {s}: not a checkpoint (no readable spore manifest.json)", .{args[1]});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
             },
             error.SavedSporeInUse => {

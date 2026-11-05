@@ -68,6 +68,16 @@ cd "${workdir}/run"
 "${spore_bin}" inspect stopped-1.spore > inspect-1.txt
 grep -Fq "vCPUs: 1" inspect-1.txt
 saved_1="$(cd stopped-1.spore && pwd -P)"
+# An empty DIR would resolve to the working directory, here a real save.
+for form in "checkpoint rm" "rm --spore"; do
+  status=0
+  # shellcheck disable=SC2086 # split the subcommand words
+  (cd stopped-1.spore && "${spore_bin}" ${form} "") >/dev/null 2>&1 || status=$?
+  [[ "${status}" == 2 && -f stopped-1.spore/manifest.json ]] || {
+    echo "spore ${form} \"\" exited ${status} or removed the working directory" >&2
+    exit 1
+  }
+done
 "${spore_bin}" rm --spore stopped-1.spore > removed-1.txt
 grep -Fq "removed checkpoint ${saved_1};" removed-1.txt
 [[ ! -e stopped-1.spore ]]

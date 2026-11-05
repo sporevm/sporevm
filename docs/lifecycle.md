@@ -339,20 +339,24 @@ spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
 Delete a checkpoint with `spore checkpoint rm DIR`. It requires a directory
-containing a regular `manifest.json`, refuses with `SavedSporeInUse` while a
-foreground or named restore holds a lazy-disk lease on that directory, then
-deletes the directory and durably syncs its parent. It does not read or verify
-the checkpoint's contents, so corrupt checkpoints can be removed. A
-machine-local checkpoint's pin is released by GC, not by removal: deleting the
-directory, whether through `spore checkpoint rm` or `rm -rf`, leaves a one-link
-ownership anchor that `spore cache pins` reports as `orphaned`, and `spore
-cache gc --force` reclaims the pin and any CAS content no other root
-references. A moved checkpoint keeps its pin. After `cp -al`, neither copy
-restores until one is removed, and GC keeps the storage while either exists. A
-plain `cp -r` copy never owned the pin and cannot restore; use `spore clone`
-for an independent copy. Legacy v1
-pins cannot prove their copies are gone, so GC keeps them after removal until
-expert-only `spore cache unpin PIN_ID --force`.
+whose regular `manifest.json` parses as a spore manifest, refuses with
+`SavedSporeInUse` while a foreground or named restore holds a lazy-disk lease on
+that directory, then deletes the directory and durably syncs its parent. It
+does not read the checkpoint's memory or disk storage, so checkpoints with
+corrupt storage can be removed. A save whose manifest no longer parses cannot
+be told apart from another program's directory; remove it with `rm -rf`, and
+`spore cache gc --force` then reclaims its storage. A machine-local
+checkpoint's pin is released by GC, not by removal: deleting the directory,
+whether through `spore checkpoint rm` or `rm -rf`, leaves a one-link ownership
+anchor that `spore cache pins` reports as `orphaned`, and `spore cache gc
+--force` reclaims the pin and any CAS content no other root references. A
+checkpoint renamed within the same filesystem keeps its pin; `mv` to another
+filesystem copies it, which behaves like `cp -r` followed by `rm -rf`. After
+`cp -al`, neither copy restores until one is removed, and GC keeps the storage
+while either exists. A plain `cp -r` copy never owned the pin and cannot
+restore; use `spore clone` for an independent copy. Legacy v1 pins cannot
+prove their copies are gone, so GC keeps them after removal until expert-only
+`spore cache unpin PIN_ID --force`.
 
 `spore cache pins` reports `index_valid` only after validating the record and
 canonical index. It deliberately does not stat or hash every object; lazy reads

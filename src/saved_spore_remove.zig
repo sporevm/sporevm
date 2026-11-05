@@ -7,8 +7,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const aarch64_topology = @import("aarch64/topology.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const Context = @import("context.zig").Context;
+const gicv3 = @import("aarch64/gicv3.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -68,6 +70,23 @@ fn requireManifest(io: Io, allocator: std.mem.Allocator, dir: []const u8) !void 
         else => err,
     };
     if (stat.kind != .file) return error.BadManifest;
+    // Other tools also write `manifest.json`, so only a spore manifest proves
+    // the directory is a save. Parsing never reads the save's storage, so a
+    // save with corrupt objects stays removable.
+    if (spore.loadManifestPath(allocator, path)) |parsed| {
+        parsed.deinit();
+        return;
+    } else |err| switch (err) {
+        error.FormatTooOld => return,
+        error.BadManifest => {},
+        else => |e| return e,
+    }
+    if (spore.loadManifestV1Path(allocator, path)) |parsed| {
+        parsed.deinit();
+    } else |err| switch (err) {
+        error.FormatTooOld => {},
+        else => |e| return e,
+    }
 }
 
 const TestHost = struct {
@@ -164,7 +183,7 @@ fn exists(io: Io, path: []const u8) !bool {
     return true;
 }
 
-test "saved-spore removal deletes any checkpoint without validating its contents" {
+test "saved-spore removal deletes spore checkpoints without reading their storage" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var tmp = std.testing.tmpDir(.{});
@@ -181,19 +200,59 @@ test "saved-spore removal deletes any checkpoint without validating its contents
     try std.testing.expect(!try exists(io, diskless));
     try std.testing.expectError(error.FileNotFound, host.rm(diskless));
 
-    // Corrupt local CAS and unparseable manifests are exactly the saves users
-    // most need to delete, so removal only requires the manifest file.
+    // Saves from older releases no longer load but are still spores.
+    const legacy = try host.path("legacy.spore");
+    try Io.Dir.cwd().createDirPath(io, legacy);
+    var legacy_manifest = manifest_test_support.manifest(.{});
+    legacy_manifest.version = spore.format_version_legacy_v1;
+    const legacy_json = try std.json.Stringify.valueAlloc(host.arena, legacy_manifest, .{});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(host.arena, &.{ legacy, "manifest.json" }), .data = legacy_json });
+    try host.rm(legacy);
+    try std.testing.expect(!try exists(io, legacy));
+
+    // Multi-vCPU saves use the v1 manifest layout.
+    const multi = try host.path("multi.spore");
+    try Io.Dir.cwd().createDirPath(io, multi);
+    const base = manifest_test_support.manifest(.{});
+    var vcpus: [2]spore.VcpuState = undefined;
+    var redists: [2]gicv3.RedistributorState = undefined;
+    for (&vcpus, &redists, 0..) |*vcpu, *redist, index| {
+        const mpidr = aarch64_topology.mpidrForIndex(@intCast(index));
+        vcpu.* = .{ .index = @intCast(index), .mpidr = mpidr, .gprs = base.machine.gprs, .pc = 0, .cpsr = 0, .fpcr = 0, .fpsr = 0, .simd = base.machine.simd, .sys_regs = &.{}, .icc_regs = &.{}, .vtimer = base.machine.vtimer };
+        redist.* = .{ .mpidr = mpidr, .regs = &.{} };
+    }
+    try spore.saveManifestV1(host.arena, multi, .{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .vcpu_count = 2,
+            .ram_base = 0x8000_0000,
+            .ram_size = 1,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0802_0000,
+            .gic_redist_stride = 0x2_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{ .vcpus = &vcpus, .gic = .{ .kind = .gicv3_multi, .gicv3_multi = .{ .dist_regs = &.{}, .redistributors = &redists, .line_levels = &.{} } } },
+        .devices = &.{},
+        .generation = base.generation,
+        .memory = base.memory,
+    });
+    try host.rm(multi);
+    try std.testing.expect(!try exists(io, multi));
+
+    // Saves with corrupt storage are exactly the ones users most need to
+    // delete, so removal never reads the CAS.
     const corrupt = try host.path("corrupt.spore");
     const fixture = try manifest_test_support.diskFixture(host.arena, io, host.cache_root, corrupt, 0x41, true);
     try spore.saveManifest(host.arena, corrupt, fixture.manifest);
     try Io.Dir.cwd().deleteFile(io, try rootfs_cas.manifestObjectPath(host.arena, corrupt, fixture.object_digest));
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(host.arena, &.{ corrupt, "manifest.json" }), .data = "{" });
     try host.rm(corrupt);
     try std.testing.expect(!try exists(io, corrupt));
     try std.testing.expect(try host.storageKept(fixture));
 }
 
-test "saved-spore removal refuses non-checkpoints and live saved-spore leases" {
+test "saved-spore removal refuses directories that are not spores and live saved-spore leases" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -205,6 +264,17 @@ test "saved-spore removal refuses non-checkpoints and live saved-spore leases" {
     const plain = try host.path("plain");
     try Io.Dir.cwd().createDirPath(io, plain);
     try std.testing.expectError(error.InvalidSporeDir, host.rm(plain));
+    // Browser extensions, PWAs, and many other projects have a manifest.json.
+    const extension = try host.path("extension");
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(host.arena, &.{ extension, ".git" }));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(host.arena, &.{ extension, "manifest.json" }), .data = "{\"manifest_version\":3,\"name\":\"ext\"}" });
+    try std.testing.expectError(error.BadManifest, host.rm(extension));
+    // A save whose manifest no longer parses is indistinguishable from any
+    // other directory; users delete it with `rm -rf` and let GC reclaim it.
+    const damaged = try host.path("damaged.spore");
+    try Io.Dir.cwd().createDirPath(io, damaged);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(host.arena, &.{ damaged, "manifest.json" }), .data = "{" });
+    try std.testing.expectError(error.BadManifest, host.rm(damaged));
     const linked_manifest = try host.path("linked-manifest.spore");
     try Io.Dir.cwd().createDirPath(io, linked_manifest);
     try Io.Dir.cwd().symLink(io, try host.path("elsewhere.json"), try std.fs.path.join(host.arena, &.{ linked_manifest, "manifest.json" }), .{});
@@ -215,7 +285,8 @@ test "saved-spore removal refuses non-checkpoints and live saved-spore leases" {
     const linked_dir = try host.path("linked.spore");
     try Io.Dir.cwd().symLink(io, portable, linked_dir, .{});
     try std.testing.expectError(error.InvalidSporeDir, host.rm(linked_dir));
-    try std.testing.expect(try exists(io, plain) and try exists(io, linked_manifest));
+    for ([_][]const u8{ plain, extension, damaged, linked_manifest }) |dir| try std.testing.expect(try exists(io, dir));
+    try std.testing.expect(try exists(io, try std.fs.path.join(host.arena, &.{ extension, ".git" })));
 
     var active = try runtime_disk_lease.acquireActive(io, std.testing.allocator, host.runtime_root, try runtime_disk_lease.fromSavedDisk(portable, fixture.disk));
     try std.testing.expectError(error.SavedSporeInUse, host.rm(portable));

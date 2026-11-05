@@ -9,11 +9,12 @@ The C ABI (`spore.h` and the `libspore` archives), the Go binding, and the Zig
 
 ### Checkpoint removal leaves pin release to GC
 
-`spore checkpoint rm DIR` now deletes any directory with a `manifest.json`
-unless a live VM uses it, without verifying contents, so corrupt checkpoints
-can be removed. `spore cache gc --force` releases the pin and storage. The
-removal journal is gone, and JSON output advances to
-`spore.saved.remove.result.v2` without `ownership`, `pin_id`, or `pin_removed`.
+`spore checkpoint rm DIR` now deletes a checkpoint whose manifest parses,
+refusing while a foreground or named restore holds a lazy-disk lease on it. It
+no longer verifies disk objects, so checkpoints with corrupt storage can be
+removed. `spore cache gc --force` releases the pin and storage. The removal
+journal is gone, and JSON output advances to `spore.saved.remove.result.v2`
+without `ownership`, `pin_id`, or `pin_removed`.
 
 ### Experimental AMD64 fresh workloads
 

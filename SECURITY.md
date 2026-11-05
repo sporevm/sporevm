@@ -67,13 +67,13 @@ manifest outside loadable authority for manual recovery. Legacy v1 pins remain
 readable and packable; GC keeps them after their save is removed because
 duplicate references cannot be proven absent. Portable unpack, pull, and clone
 materialize a descriptor-bound local CAS inside the saved-spore directory.
-Removal requires only a regular `manifest.json` and does not read the
-checkpoint's contents. Foreground and named restore publish
-host-private active saved-spore leases before releasing the registry lock that
-serializes authority selection with removal. Removal refuses any live lease
-for the canonical directory, regardless of the descriptor currently named by
-its manifest, then holds the same lock through deletion. Ownership reporting
-changes no portable manifest or device format.
+Removal requires a regular `manifest.json` that parses as a spore manifest
+and does not read the checkpoint's memory or disk storage. Foreground and named
+restore publish host-private active saved-spore leases before releasing the
+registry lock that serializes authority selection with removal. Removal refuses
+any live lease for the canonical directory, regardless of the descriptor
+currently named by its manifest, then holds the same lock through deletion.
+Ownership reporting changes no portable manifest or device format.
 
 | Surface | Input source | Status |
 |---|---|---|
