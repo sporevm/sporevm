@@ -3079,7 +3079,14 @@ fn fuzzManifestParse(_: void, s: *std.testing.Smith) !void {
 }
 
 test "fuzz manifest parsing" {
-    try std.testing.fuzz({}, fuzzManifestParse, .{});
+    // Valid single- and multi-vCPU manifests let the fuzzer reach the
+    // machine union arms and validation.
+    try std.testing.fuzz({}, fuzzManifestParse, .{ .corpus = &.{
+        \\{"version":6,"platform":{"cpu_profile":"sporevm-aarch64-v0","device_model_version":4,"vcpu_count":1,"ram_base":2147483648,"ram_size":2097152,"gic_dist_base":134217728,"gic_redist_base":134283264,"gic_redist_stride":131072,"counter_frequency_hz":24000000},"machine":{"single":{"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0},"gic":{"kind":"gicv3","gicv3":{"dist_regs":[],"redist_regs":[],"line_levels":[{"intid":56,"asserted":false}]}}}},"devices":[],"generation":{"generation":1,"interrupt_status":0,"params_b64":""},"memory":{"kind":"spore-disk-index-v2","logical_size":2097152,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunk_ranges":[],"zero_ranges":[{"start":0,"count":1}]}}
+        ,
+        \\{"version":6,"platform":{"cpu_profile":"sporevm-aarch64-v0","device_model_version":4,"vcpu_count":2,"ram_base":2147483648,"ram_size":2097152,"gic_dist_base":134217728,"gic_redist_base":134348800,"gic_redist_stride":131072,"counter_frequency_hz":24000000},"machine":{"multi":{"vcpus":[{"index":0,"mpidr":2147483648,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0}},{"index":1,"mpidr":2147483649,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0}}],"gic":{"kind":"gicv3_multi","gicv3_multi":{"schema_version":1,"dist_regs":[],"redistributors":[{"mpidr":2147483648,"regs":[]},{"mpidr":2147483649,"regs":[]}],"line_levels":[]}}}},"devices":[],"generation":{"generation":1,"interrupt_status":0,"params_b64":""},"memory":{"kind":"spore-disk-index-v2","logical_size":2097152,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunk_ranges":[],"zero_ranges":[{"start":0,"count":1}]}}
+        ,
+    } });
 }
 
 fn fuzzElasticMemoryState(_: void, s: *std.testing.Smith) !void {
@@ -3399,17 +3406,30 @@ test "manifest machine state is one tagged union" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 6,") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"machine\": {\n    \"single\": {\n      \"gprs\"") != null);
 
+    var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };
+    const redists = [_]gicv3.RedistributorState{
+        .{ .mpidr = aarch64_topology.mpidrForIndex(0), .regs = &.{} },
+        .{ .mpidr = aarch64_topology.mpidrForIndex(1), .regs = &.{} },
+    };
+    const multi_json = try std.json.Stringify.valueAlloc(arena, testManifestMulti(testZeroMemoryManifest(1 << 29), 1 << 29, &vcpus, &redists), .{ .whitespace = .indent_2 });
+    _ = try parseManifest(arena, multi_json);
+
+    // Both complete arms under one machine object.
+    var two_tags = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    const multi_value = try std.json.parseFromSliceLeaky(std.json.Value, arena, multi_json, .{});
+    try two_tags.object.getPtr("machine").?.object.put(arena, "multi", multi_value.object.get("machine").?.object.get("multi").?);
+
     const malformed = [_][]const u8{
         // Two tags, an unknown tag, a duplicate field, and the removed
         // multi-vCPU schema_version field are all rejected.
-        try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"multi\": {}, \"single\": {"),
+        try std.json.Stringify.valueAlloc(arena, two_tags, .{}),
         try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"single_v2\": {"),
         try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"single\": {\"pc\": 0, "),
         try std.mem.replaceOwned(u8, arena, json, "\"vcpu_count\": 1,", "\"vcpu_count\": 1, \"vcpu_count\": 1,"),
-        try std.mem.replaceOwned(u8, arena, json, "\"single\": {", "\"single\": {\"schema_version\": 1, "),
+        try std.mem.replaceOwned(u8, arena, multi_json, "\"multi\": {", "\"multi\": {\"schema_version\": 1, "),
     };
     for (malformed) |bytes| {
-        try std.testing.expect(!std.mem.eql(u8, bytes, json));
+        try std.testing.expect(!std.mem.eql(u8, bytes, json) and !std.mem.eql(u8, bytes, multi_json));
         try std.testing.expectError(error.BadManifest, parseManifest(arena, bytes));
     }
 }
