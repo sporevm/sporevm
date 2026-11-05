@@ -85,6 +85,9 @@ pub const Options = struct {
     debugfs: ?[]const u8 = null,
     output: ?*Io.Writer = null,
     diagnostic: ?*Diagnostic = null,
+    /// `spore build` passes `Host.probe()`. The default assumes the build
+    /// target's hypervisor is usable.
+    host: backend_mod.Host = .{},
 };
 
 pub const Diagnostic = struct {
@@ -195,7 +198,7 @@ const CachedMetadata = struct {
 const automatic_build_capacity_bytes: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Result {
-    const backend = try backend_mod.requireProductRunner(.auto);
+    const backend = try backend_mod.requireProductRunner(.auto, options.host);
     try run_mod.validateFreshProductPolicy(backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -489,49 +492,22 @@ fn preflightBuildDeviceEnvelope(
 }
 
 test "build requires a product runner before reading inputs" {
-    const backend = backend_mod.requireProductRunner(.auto) catch |expected_err| {
-        const allocator = std.testing.allocator;
-        var arena_state = std.heap.ArenaAllocator.init(allocator);
-        defer arena_state.deinit();
-        var env = std.process.Environ.Map.init(allocator);
-        defer env.deinit();
-        const init = testInit(allocator, std.testing.io, &arena_state, &env);
-        var diagnostic: Diagnostic = .{};
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const init = testInit(allocator, std.testing.io, &arena_state, &env);
+    var diagnostic: Diagnostic = .{};
 
-        try std.testing.expectError(expected_err, build(init, arena_state.allocator(), .{
-            .tag = "local/runner-gate:dev",
-            .context_dir = "zig-cache/test-spore-build-runner-gate/missing-context",
-            .dockerfile_path = "zig-cache/test-spore-build-runner-gate/missing-Dockerfile",
-            .diagnostic = &diagnostic,
-        }));
-        try std.testing.expect(diagnostic.missing_input == null);
-        return;
-    };
-    run_mod.validateFreshProductPolicy(backend, .{
-        .memory = .{},
-        .vcpus = 1,
-    }) catch |expected_err| {
-        const allocator = std.testing.allocator;
-        var arena_state = std.heap.ArenaAllocator.init(allocator);
-        defer arena_state.deinit();
-        var env = std.process.Environ.Map.init(allocator);
-        defer env.deinit();
-        const init = testInit(allocator, std.testing.io, &arena_state, &env);
-        var diagnostic: Diagnostic = .{};
-
-        try std.testing.expectError(expected_err, build(init, arena_state.allocator(), .{
-            .tag = "local/runner-gate:dev",
-            .context_dir = "zig-cache/test-spore-build-runner-gate/missing-context",
-            .dockerfile_path = "zig-cache/test-spore-build-runner-gate/missing-Dockerfile",
-            .diagnostic = &diagnostic,
-        }));
-        try std.testing.expect(diagnostic.missing_input == null);
-        return;
-    };
-
-    {
-        return error.SkipZigTest;
-    }
+    try std.testing.expectError(error.MissingKvmDevice, build(init, arena_state.allocator(), .{
+        .tag = "local/runner-gate:dev",
+        .context_dir = "zig-cache/test-spore-build-runner-gate/missing-context",
+        .dockerfile_path = "zig-cache/test-spore-build-runner-gate/missing-Dockerfile",
+        .diagnostic = &diagnostic,
+        .host = .{ .os = .linux, .arch = .x86_64, .x86_kvm_unavailable = .missing_dev_kvm },
+    }));
+    try std.testing.expect(diagnostic.missing_input == null);
 }
 
 test "device preflight counts one aggregate cache after id aliases and state changes" {

@@ -952,6 +952,7 @@ pub fn run(
     allocator: std.mem.Allocator,
     options: RunOptions,
 ) !RunResult {
+    _ = try backend_mod.requireProductRunner(options.backend, .probe());
     return run_mod.execute(context, allocator, .{
         .backend = options.backend,
         .kernel_path = options.kernel_path,
@@ -1005,7 +1006,7 @@ pub fn runManaged(
     if (options.disk_size) |disk_size| {
         if (options.commit_ref == null or disk_size == 0 or disk_size % rootfs_cas.default_chunk_size != 0) return error.InvalidRunDiskSize;
     }
-    const selected_backend = try backend_mod.requireProductRunner(options.backend);
+    const selected_backend = try backend_mod.requireProductRunner(options.backend, .probe());
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -1097,7 +1098,7 @@ pub fn runFromSpore(
     options: RunFromSporeOptions,
 ) !RunResult {
     if (options.command.len == 0) return error.InvalidGuestCommand;
-    const selected_backend = try backend_mod.requireProductRunner(options.backend);
+    const selected_backend = try options.backend.resolveForHost();
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = .{},
         .vcpus = options.vcpus,
@@ -1232,7 +1233,7 @@ pub fn createNamed(
     allocator: std.mem.Allocator,
     options: CreateNamedOptions,
 ) !NamedLifecycleResult {
-    return lifecycle.createNamed(init, allocator, options);
+    return lifecycle.createNamed(init, allocator, .probe(), options);
 }
 
 /// Restore a spore as a long-lived named VM.

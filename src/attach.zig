@@ -5,7 +5,6 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 const attach_stream = @import("attach_stream.zig");
-const backend_mod = @import("backend.zig");
 const Context = @import("context.zig").Context;
 const fd_util = @import("fd.zig");
 const hvf = @import("hvf/hvf.zig");
@@ -155,7 +154,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     try events.emitStart(opts.backend);
     errdefer |err| events.emitFailure(err) catch {};
 
-    const backend = try backend_mod.requireProductRunner(opts.backend);
+    const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
     try run_mod.validateFreshProductPolicy(backend, .{
         .memory = .{},

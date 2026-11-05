@@ -1,4 +1,8 @@
 //! Compile-time backend selection and internal product-runner availability.
+//!
+//! Resolution is a pure function of the requested backend and a `Host`.
+//! `Host.probe` is the only code here that touches the host; command entry
+//! points call it once and pass the result in.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,6 +31,9 @@ pub const Backend = enum {
         return productSupportedOn(self, builtin.os.tag, builtin.cpu.arch);
     }
 
+    /// Resolve for the build target without probing the host. Code below the
+    /// command entry points uses this for policy checks; resume and capture
+    /// paths need no probe because x86 rejects them by policy.
     pub fn resolveForHost(self: Backend) error{UnsupportedBackend}!Backend {
         return resolveProductFor(self, builtin.os.tag, builtin.cpu.arch);
     }
@@ -85,26 +92,41 @@ fn unavailable(selected: ?Backend, reason: UnavailableReason) Availability {
     return .{ .unavailable = .{ .selected = selected, .reason = reason } };
 }
 
-pub fn availability(requested: Backend) Availability {
-    const selected = resolveBindingFor(requested, builtin.os.tag, builtin.cpu.arch) catch return unavailable(null, .unsupported_host);
-    if (!bindingSupportedOn(selected, builtin.os.tag, builtin.cpu.arch)) return unavailable(selected, .unsupported_host);
+/// The OS, architecture, and probed hypervisor facts that availability
+/// depends on. The defaults describe the build target with every probed
+/// capability present.
+pub const Host = struct {
+    os: std.Target.Os.Tag = builtin.os.tag,
+    arch: std.Target.Cpu.Arch = builtin.cpu.arch,
+    /// Why Linux/x86_64 KVM cannot run the product, or null when it can.
+    x86_kvm_unavailable: ?UnavailableReason = null,
 
-    return switch (selected) {
-        .auto => unreachable,
-        .hvf => .{ .available = .hvf },
-        .kvm => if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
-            if (inspectX86Kvm()) |reason| unavailable(.kvm, reason) else .{ .available = .kvm }
-        else
-            .{ .available = .kvm },
-    };
+    /// Probe the running host. Only Linux/x86_64 reads `/dev/kvm`.
+    pub fn probe() Host {
+        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+            return .{ .x86_kvm_unavailable = inspectX86Kvm() };
+        }
+        return .{};
+    }
+};
+
+pub fn availability(requested: Backend, host: Host) Availability {
+    const selected = resolveBindingFor(requested, host.os, host.arch) catch return unavailable(null, .unsupported_host);
+    if (!bindingSupportedOn(selected, host.os, host.arch)) return unavailable(selected, .unsupported_host);
+    if (selected == .kvm and host.arch == .x86_64) {
+        if (host.x86_kvm_unavailable) |reason| return unavailable(.kvm, reason);
+    }
+    return .{ .available = selected };
 }
 
 /// Resolve the requested backend before any artifact, disk, or VM work.
-/// Linux/x86_64 reaches the reviewed KVM probe before product setup. Slice 3a
-/// makes only the fresh, fixed-memory runner public; feature-specific gates
-/// remain in the run and lifecycle entry points.
-pub fn requireProductRunner(requested: Backend) Error!Backend {
-    return switch (availability(requested)) {
+/// Command entry points that start a fresh VM call this once with
+/// `Host.probe()`, so Linux/x86_64 reaches the reviewed KVM probe before
+/// product setup. Code below them resolves with `Backend.resolveForHost`.
+/// Slice 3a makes only the fresh, fixed-memory runner public;
+/// feature-specific gates remain in the run and lifecycle entry points.
+pub fn requireProductRunner(requested: Backend, host: Host) Error!Backend {
+    return switch (availability(requested, host)) {
         .available => |selected| selected,
         .unavailable => |result| result.reason.toError(),
     };
@@ -115,8 +137,9 @@ fn productSupportedOn(backend: Backend, os: std.Target.Os.Tag, zig_arch: std.Tar
 }
 
 fn resolveProductFor(backend: Backend, os: std.Target.Os.Tag, zig_arch: std.Target.Cpu.Arch) error{UnsupportedBackend}!Backend {
-    if (!productSupportedOn(.auto, os, zig_arch)) return error.UnsupportedBackend;
-    return resolveBindingFor(backend, os, zig_arch);
+    const selected = try resolveBindingFor(backend, os, zig_arch);
+    if (!productSupportedOn(selected, os, zig_arch)) return error.UnsupportedBackend;
+    return selected;
 }
 
 fn bindingSupportedOn(backend: Backend, os: std.Target.Os.Tag, zig_arch: std.Target.Cpu.Arch) bool {
@@ -209,6 +232,8 @@ test "public product readiness includes probed x86 KVM" {
     try std.testing.expectEqual(Backend.kvm, try resolveProductFor(.auto, .linux, .aarch64));
     try std.testing.expectEqual(Backend.kvm, try resolveProductFor(.auto, .linux, .x86_64));
     try std.testing.expectEqual(Backend.kvm, try resolveProductFor(.kvm, .linux, .x86_64));
+    try std.testing.expectError(error.UnsupportedBackend, resolveProductFor(.hvf, .linux, .aarch64));
+    try std.testing.expectError(error.UnsupportedBackend, resolveProductFor(.kvm, .macos, .aarch64));
 
     try std.testing.expectEqual(Backend.hvf, try resolveBindingFor(.auto, .macos, .aarch64));
     try std.testing.expectEqual(Backend.kvm, try resolveBindingFor(.auto, .linux, .aarch64));
@@ -243,6 +268,26 @@ test "x86 KVM probe reasons fail closed in stable order" {
     }
 
     try std.testing.expectEqual(@as(?UnavailableReason, null), classifyX86Probe(X86ProbeSnapshot.supported()));
+}
+
+test "product runner resolution depends only on the request and host facts" {
+    const x86_linux = Host{ .os = .linux, .arch = .x86_64 };
+    const arm_linux = Host{ .os = .linux, .arch = .aarch64 };
+    try std.testing.expectEqual(Backend.kvm, try requireProductRunner(.auto, x86_linux));
+    try std.testing.expectEqual(Backend.kvm, try requireProductRunner(.auto, arm_linux));
+    try std.testing.expectEqual(Backend.hvf, try requireProductRunner(.auto, .{ .os = .macos, .arch = .aarch64 }));
+    try std.testing.expectError(error.UnsupportedBackend, requireProductRunner(.hvf, x86_linux));
+    try std.testing.expectError(error.UnsupportedBackend, requireProductRunner(.auto, .{ .os = .macos, .arch = .x86_64 }));
+
+    var x86_without_kvm = x86_linux;
+    x86_without_kvm.x86_kvm_unavailable = .missing_dev_kvm;
+    try std.testing.expectError(error.MissingKvmDevice, requireProductRunner(.auto, x86_without_kvm));
+    try std.testing.expectError(error.MissingKvmDevice, requireProductRunner(.kvm, x86_without_kvm));
+    try std.testing.expectEqual(Unavailable{ .selected = .kvm, .reason = .missing_dev_kvm }, availability(.kvm, x86_without_kvm).unavailable);
+
+    var arm_with_x86_fact = arm_linux;
+    arm_with_x86_fact.x86_kvm_unavailable = .missing_dev_kvm;
+    try std.testing.expectEqual(Backend.kvm, try requireProductRunner(.auto, arm_with_x86_fact));
 }
 
 test "availability reasons map to explicit product errors" {

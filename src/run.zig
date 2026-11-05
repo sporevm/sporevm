@@ -3358,7 +3358,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         });
     }
 
-    const backend = try backend_mod.requireProductRunner(opts.backend);
+    const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
     try validateFreshProductPolicy(backend, .{
         .memory = opts.memory,
@@ -3743,7 +3743,7 @@ pub fn loadMonitorBootArtifacts(
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock.Control, startup_probe: ?*vsock.HostStream) !MonitorResult {
-    _ = try backend_mod.requireProductRunner(opts.backend);
+    _ = try opts.backend.resolveForHost();
     const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
     return executeMonitorWithBootArtifacts(context, allocator, opts, artifacts, control, startup_probe);
 }
@@ -3756,7 +3756,7 @@ pub fn executeMonitorWithRootfsCacheLock(
     startup_probe: ?*vsock.HostStream,
     rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
 ) !MonitorResult {
-    _ = try backend_mod.requireProductRunner(opts.backend);
+    _ = try opts.backend.resolveForHost();
     const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
     return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
 }
@@ -3796,7 +3796,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
 
-    const backend = try backend_mod.requireProductRunner(opts.backend);
+    const backend = try opts.backend.resolveForHost();
     try validateFreshProductPolicy(backend, .{
         .memory = opts.memory,
         .vcpus = opts.vcpus,
