@@ -272,10 +272,6 @@ fn handleTerminalResize(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*an
     if (active_terminal_resize) |control| control.notifyResize();
 }
 
-pub fn terminalName(environ: *const std.process.Environ.Map) []const u8 {
-    return environ.get("TERM") orelse "xterm";
-}
-
 fn ioctlRequest(comptime request: anytype) c_int {
     const raw: u32 = @truncate(@as(usize, request));
     return @bitCast(raw);
@@ -298,45 +294,17 @@ pub fn terminalSizeFd() std.c.fd_t {
     return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
 }
 
-pub fn attachRequest(allocator: std.mem.Allocator, session_id: []const u8) ![]const u8 {
-    return attachRequestWithGeneration(allocator, session_id, null);
-}
-
-pub fn attachRequestWithGeneration(allocator: std.mem.Allocator, session_id: []const u8, generation_params: ?[]const u8) ![]const u8 {
-    if (generation_params) |params| {
-        const payload = struct {
-            type: []const u8 = "attach",
-            session_id: []const u8,
-            stdout_offset: u64 = 0,
-            stderr_offset: u64 = 0,
-            params_json: []const u8,
-        }{ .session_id = session_id, .params_json = params };
-        const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-        defer allocator.free(json);
-        if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-        return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-    }
-    const payload = struct {
-        type: []const u8 = "attach",
-        session_id: []const u8,
-        stdout_offset: u64 = 0,
-        stderr_offset: u64 = 0,
-    }{ .session_id = session_id };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-}
-
 pub const AttachV1Options = struct {
     session_id: []const u8 = spore.default_session_id,
     interactive: bool = false,
     tty: bool = false,
-    terminal_name: []const u8 = "xterm",
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
     generation_params: ?[]const u8 = null,
 };
 
+/// Encodes the guest agent's `attach-v1` request. `stdio` is `tty` for a
+/// terminal, `pipe` when host stdin is forwarded, and `null` to only read the
+/// session's output.
 pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) ![]const u8 {
     const payload = struct {
         type: []const u8 = "attach-v1",
@@ -345,15 +313,13 @@ pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) !
         stderr_offset: u64 = 0,
         stdio: []const u8,
         interactive: bool,
-        term: []const u8,
         terminal_rows: u16,
         terminal_cols: u16,
         params_json: []const u8,
     }{
         .session_id = options.session_id,
-        .stdio = if (options.tty) "tty" else "pipe",
+        .stdio = if (options.tty) "tty" else if (options.interactive) "pipe" else "null",
         .interactive = options.interactive,
-        .term = options.terminal_name,
         .terminal_rows = options.terminal_size.rows,
         .terminal_cols = options.terminal_size.cols,
         .params_json = options.generation_params orelse "",
@@ -365,9 +331,9 @@ pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) !
 }
 
 test "attach request can target recorded session id" {
-    const request = try attachRequest(std.testing.allocator, "run-1234");
+    const request = try attachV1Request(std.testing.allocator, .{ .session_id = "run-1234" });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"attach\",\"session_id\":\"run-1234\",\"stdout_offset\":0,\"stderr_offset\":0}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"attach-v1\",\"session_id\":\"run-1234\",\"stdout_offset\":0,\"stderr_offset\":0,\"stdio\":\"null\",\"interactive\":false,\"terminal_rows\":24,\"terminal_cols\":80,\"params_json\":\"\"}\n", request);
 }
 
 test "interactive attach request uses v1 pipe stdio" {
@@ -382,13 +348,11 @@ test "tty attach request uses v1 terminal metadata" {
     const request = try attachV1Request(std.testing.allocator, .{
         .interactive = true,
         .tty = true,
-        .terminal_name = "xterm-256color",
         .terminal_size = .{ .rows = 40, .cols = 120 },
     });
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"attach-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"tty\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"term\":\"xterm-256color\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_rows\":40") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_cols\":120") != null);
 }

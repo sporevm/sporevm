@@ -123,16 +123,6 @@ const RequestState = enum {
     stop_requested,
 };
 
-const legacy_readiness_error = "spore run: bad request\n";
-
-fn readinessProbeSucceeded(exit_code: i32, stderr: []const u8) bool {
-    if (exit_code == 0) return true;
-    // Saved parents contain the guest agent that created them. Agents from
-    // before the explicit ready request still prove that their accept loop is
-    // live by returning the bounded unknown-request response.
-    return exit_code == 2 and std.mem.eql(u8, stderr, legacy_readiness_error);
-}
-
 fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: lifecycle.DiskForkClaim) !runtime_disk_fork.Head {
     const address = try net.UnixAddress.init(claim.source_socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
@@ -460,7 +450,6 @@ const ExecServer = struct {
     disk_claims: runtime_disk_claim.Registry,
     active_stream: vsock_stream.HostStream = undefined,
     active_stream_valid: bool = false,
-    active_stream_protocol: vsock_stream.HostStreamProtocol = .legacy_text,
     active_streaming_exec: bool = false,
     active_stream_timing_enabled: bool = false,
     active_exec_submitted_ms: u64 = 0,
@@ -534,17 +523,15 @@ const ExecServer = struct {
             .session_nonce = session_nonce,
             .next_host_stream_sequence = session_nonce,
         };
-        var nonce_bytes: [8]u8 = undefined;
-        io.random(&nonce_bytes);
-        const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
-        const request = try std.fmt.bufPrint(&server.request, "{{\"type\":\"ready\",\"nonce\":\"{x}\"}}\n", .{nonce});
+        const request = "{\"type\":\"ready\"}\n";
+        @memcpy(server.request[0..request.len], request);
         server.request_len = request.len;
         return server;
     }
 
     fn startReadinessProbe(self: *ExecServer) !*vsock_stream.HostStream {
         if (self.state != .idle) return error.ControlBusy;
-        self.active_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], .legacy_text);
+        self.active_stream = try vsock_stream.HostStream.init(self.guest_port, self.request[0..self.request_len]);
         self.resetExecCapture();
         self.active_stream.setOutputSink(self, captureOutputThunk);
         self.active_stream.host_port = self.nextHostStreamPort();
@@ -658,7 +645,7 @@ const ExecServer = struct {
             },
             .active_disk_fork => return .keep_running,
             .pending_exec => {
-                self.active_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, self.request[0..self.request_len], self.active_stream_protocol);
+                self.active_stream = try vsock_stream.HostStream.init(self.guest_port, self.request[0..self.request_len]);
                 self.resetExecCapture();
                 if (self.active_streaming_exec) {
                     self.resetStreamingOffsets();
@@ -717,7 +704,7 @@ const ExecServer = struct {
                         return .keep_running;
                     };
                     if (readiness_probe) {
-                        if (!readinessProbeSucceeded(exit_code, self.stderr_capture[0..self.stderr_capture_len])) return error.GuestReadinessProbeFailed;
+                        if (exit_code != 0) return error.GuestReadinessProbeFailed;
                         std.log.info(
                             "monitor readiness metrics: attach_ms={?d} connect_request_delivered_ms={?d} connect_ms={?d} request_delivered_ms={?d} guest_timing_ms={?d} response_ms={?d} ready_ms={d}",
                             .{
@@ -785,7 +772,6 @@ const ExecServer = struct {
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
         self.response_len = 0;
-        self.active_stream_protocol = .legacy_text;
         self.active_streaming_exec = false;
         self.active_stream_timing_enabled = false;
         self.streaming_client_fd = -1;
@@ -813,7 +799,6 @@ const ExecServer = struct {
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
         self.response_len = 0;
-        self.active_stream_protocol = .spore_stream_v1;
         self.active_streaming_exec = true;
         self.active_stream_timing_enabled = timing_enabled;
         self.streaming_client_fd = client_fd;
@@ -857,7 +842,7 @@ const ExecServer = struct {
         return @intCast(ns);
     }
 
-    fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, interactive: bool, tty: bool, terminal_name: []const u8, terminal_size: spore_stream.Resize) ![]const u8 {
+    fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, tty: bool, terminal_size: spore_stream.Resize) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try self.nextSessionId(&id_buf);
         var merged_env: [run.max_guest_envc][]const u8 = undefined;
@@ -865,9 +850,7 @@ const ExecServer = struct {
         return run.interactiveExecRequestWithSession(self.allocator, argv, session_id, .{
             .env = exec_context.env,
             .working_dir = exec_context.working_dir,
-            .interactive = interactive,
             .tty = tty,
-            .terminal_name = terminal_name,
             .terminal_size = terminal_size,
             .resume_time_unix_ns = self.wallClockUnixNs(),
             .generation_params = self.generation_params,
@@ -1798,13 +1781,11 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             try writeStreamingControlError(stream.socket.handle, "unsupported stream stdio");
             return false;
         }
-        const interactive = parsed.value.interactive orelse false;
         const terminal_size = spore_stream.Resize{
             .rows = parsed.value.terminal_rows orelse 24,
             .cols = parsed.value.terminal_cols orelse 80,
         };
-        const terminal_name = parsed.value.term orelse "xterm";
-        const request = server.interactiveExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, interactive, tty, terminal_name, terminal_size) catch |err| {
+        const request = server.interactiveExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, tty, terminal_size) catch |err| {
             try writeStreamingControlError(stream.socket.handle, guestCommandErrorMessage(err));
             return false;
         };
@@ -1869,6 +1850,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
 fn guestCommandErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.RunArgCountUnsupported => "guest command must contain between 1 and 16 arguments",
+        error.RunProgramEmpty => "guest command has an empty program name",
         error.RunArgTooLong, error.RunRequestTooLarge => "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest",
         error.RunEnvCountUnsupported => "guest environment contains more than 64 entries",
         error.RunEnvTooLong => "guest environment entry exceeds 255 bytes",
@@ -1906,8 +1888,6 @@ const ControlRequest = struct {
     path: ?[]const u8 = null,
     @"continue": ?bool = null,
     stdio: ?[]const u8 = null,
-    interactive: ?bool = null,
-    term: ?[]const u8 = null,
     terminal_rows: ?u16 = null,
     terminal_cols: ?u16 = null,
     retain_output: ?bool = null,
@@ -2234,13 +2214,6 @@ test "named exec context applies image defaults and ephemeral overrides" {
     try std.testing.expectEqualStrings("/app", inherited.working_dir.?);
 }
 
-test "readiness probe accepts current and bounded legacy guest replies" {
-    try std.testing.expect(readinessProbeSucceeded(0, ""));
-    try std.testing.expect(readinessProbeSucceeded(2, legacy_readiness_error));
-    try std.testing.expect(!readinessProbeSucceeded(2, "different failure\n"));
-    try std.testing.expect(!readinessProbeSucceeded(126, "spore run: rootfs unavailable\n"));
-}
-
 test "monitor parser enables networking with the encoded policy" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2301,7 +2274,7 @@ test "streaming named exec carries the restored generation" {
     server.session_nonce = 1;
     server.next_session_id = 1;
 
-    const request = try server.interactiveExecRequest(&.{"/bin/gencheck"}, &.{}, null, false, false, "xterm", .{ .rows = 24, .cols = 80 });
+    const request = try server.interactiveExecRequest(&.{"/bin/gencheck"}, &.{}, null, false, .{ .rows = 24, .cols = 80 });
     defer std.testing.allocator.free(request);
     const parsed = try std.json.parseFromSlice(struct { params_json: []const u8 }, std.testing.allocator, request, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();

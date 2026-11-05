@@ -64,19 +64,13 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
             run_mod.printNetworkGatewayError(err);
             std.process.exit(1);
         }
-        if (err == error.InteractiveStreamProtocolFailed) {
-            const classified = api.classifyFailure(err);
-            writeStderr(classified.message);
-            writeStderr("\n");
-            std.process.exit(classified.exit_code);
-        }
         if (run_mod.isX86ProductPolicyError(err)) {
             const classified = api.classifyFailure(err);
             writeStderr(classified.message);
             writeStderr("\n");
             std.process.exit(classified.exit_code);
         }
-        if (err == error.ImageCommandMissing or err == error.UnsupportedImageUser or err == error.RunArgCountUnsupported or err == error.RunArgTooLong or err == error.RemoteImageNotSnapshotable) {
+        if (err == error.ImageCommandMissing or err == error.UnsupportedImageUser or err == error.RunArgCountUnsupported or err == error.RunArgTooLong or err == error.RunProgramEmpty or err == error.RemoteImageNotSnapshotable) {
             const classified = api.classifyFailure(err);
             writeStderr(classified.message);
             writeStderr("\n");

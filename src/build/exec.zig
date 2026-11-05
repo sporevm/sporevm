@@ -724,7 +724,7 @@ const BuildControl = struct {
         if (self.preparation_start_ns != null) return error.BadManifest;
         self.preparation_start_ns = try monotonicNs();
         const request = try run_mod.simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
-        try self.startStream(dev, request, .spore_stream_v1, .resize, "");
+        try self.startStream(dev, request, .resize, "");
         self.phase = .active_resize;
     }
 
@@ -744,7 +744,7 @@ const BuildControl = struct {
                     .shell => |shell| shell,
                     .exec => "",
                 };
-                try self.startStream(dev, request, .spore_stream_v1, .run, stdin_payload);
+                try self.startStream(dev, request, .run, stdin_payload);
             },
             .copy => |copy| {
                 if (copy.requests.len == 0) return error.CopyEntryCountUnsupported;
@@ -756,7 +756,7 @@ const BuildControl = struct {
             },
             .workdir => |workdir| {
                 const request = try workdirRequest(self.allocator, session_id, workdir.target);
-                try self.startStream(dev, request, .spore_stream_v1, .workdir, "");
+                try self.startStream(dev, request, .workdir, "");
             },
         }
         self.phase = .active_run;
@@ -770,7 +770,7 @@ const BuildControl = struct {
         if (self.active_copy_request_index >= copy.requests.len) return error.BadManifest;
         const session_id = try std.fmt.allocPrint(self.allocator, "spore-build-{d}-{d}", .{ self.step_index + 1, self.active_copy_request_index + 1 });
         const request = try copyRequest(self.allocator, session_id, copy.requests[self.active_copy_request_index]);
-        try self.startStream(dev, request, .spore_stream_v1, .copy, "");
+        try self.startStream(dev, request, .copy, "");
         self.phase = .active_run;
     }
 
@@ -785,7 +785,7 @@ const BuildControl = struct {
             .thaw => try run_mod.simpleControlRequest(self.allocator, "fsthaw-v1", session_id),
             .resize, .run, .copy, .workdir => unreachable,
         };
-        try self.startStream(dev, request, .spore_stream_v1, kind, "");
+        try self.startStream(dev, request, kind, "");
         self.phase = switch (kind) {
             .freeze => .active_freeze,
             .thaw => .active_thaw,
@@ -793,8 +793,8 @@ const BuildControl = struct {
         };
     }
 
-    fn startStream(self: *BuildControl, dev: *vsock.Vsock, request: []const u8, protocol: vsock_stream.HostStreamProtocol, kind: ActiveStream, stdin_payload: []const u8) !void {
-        self.stream = try vsock_stream.HostStream.initWithProtocol(guest_port, request, protocol);
+    fn startStream(self: *BuildControl, dev: *vsock.Vsock, request: []const u8, kind: ActiveStream, stdin_payload: []const u8) !void {
+        self.stream = try vsock_stream.HostStream.init(guest_port, request);
         self.stream.host_port = vsock_stream.HostStream.hostPortForSequence(self.stream_sequence);
         self.stream_sequence +%= 1;
         self.active_stream = kind;
@@ -1392,6 +1392,8 @@ const guest_agent_fuzz_workdir_request: c_int = 4;
 const guest_agent_fuzz_ready_request: c_int = 5;
 const guest_agent_fuzz_grow_request: c_int = 6;
 const guest_agent_fuzz_other_request: c_int = 7;
+const guest_agent_fuzz_start_request: c_int = 8;
+const guest_agent_fuzz_attach_request: c_int = 9;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
 extern fn spore_agent_fuzz_exec_arg_equals(request: [*]const u8, request_len: usize, arg_index: usize, expected: [*]const u8, expected_len: usize) c_int;
@@ -1443,13 +1445,50 @@ extern fn spore_build_copy_apply(
     error_cap: usize,
 ) c_int;
 
+// start-v1 and attach-v1 requests as the host encodes them, without the
+// closing "}\n". They seed the guest request fuzz target, each with a
+// duplicate-key and an unknown-key variant, so mutations start from requests
+// that reach every member parser.
+const guest_exec_request_seeds = [_]struct { body: []const u8, kind: c_int, last_member: []const u8 }{
+    .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"run-1\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
+    .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/sh\",\"-c\",\"cat\"],\"env\":[\"A=1\"],\"working_dir\":\"/work\",\"stdio\":\"pipe\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":true,\"params_json\":\"{\\\"generation\\\":2}\",\"require_generation_ready\":true,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
+    .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-2\",\"resume_time_unix_ns\":1,\"argv\":[\"sh\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"tty\",\"terminal_rows\":40,\"terminal_cols\":120,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
+    .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-3\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/sleep\",\"60\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":true,\"retain_output\":true,\"closed_env\":true" },
+    .{ .kind = guest_agent_fuzz_attach_request, .last_member = ",\"params_json\":\"\"", .body = "{\"type\":\"attach-v1\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0,\"stdio\":\"null\",\"interactive\":false,\"terminal_rows\":24,\"terminal_cols\":80,\"params_json\":\"\"" },
+};
+
+// The removed term member doubles as the unknown key.
+const guest_exec_request_unknown_member = ",\"term\":\"xterm\"";
+
+// Fuzz inputs for fuzzGuestBuildRequest: each is one Smith slice (a u32
+// little-endian length, then the bytes) holding raw mode 5 and a request.
+const guest_request_fuzz_corpus = corpus: {
+    var corpus: [3 * guest_exec_request_seeds.len][]const u8 = undefined;
+    for (guest_exec_request_seeds, 0..) |seed, i| {
+        corpus[3 * i] = guestRawRequestFuzzInput(seed.body ++ "}\n");
+        corpus[3 * i + 1] = guestRawRequestFuzzInput(seed.body ++ seed.last_member ++ "}\n");
+        corpus[3 * i + 2] = guestRawRequestFuzzInput(seed.body ++ guest_exec_request_unknown_member ++ "}\n");
+    }
+    break :corpus corpus;
+};
+
+fn guestRawRequestFuzzInput(comptime request: []const u8) []const u8 {
+    comptime {
+        const payload = "\x05" ++ request;
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, payload.len, .little);
+        return len ++ payload;
+    }
+}
+
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
-        var fuzz_bytes: [128]u8 = undefined;
+        // Raw mode (5) must fit any request the guest accepts.
+        var fuzz_bytes: [max_guest_request_len + 1]u8 = undefined;
         const fuzz_len = s.slice(&fuzz_bytes);
-        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 9;
+        const mode = if (fuzz_len == 0) 0 else fuzz_bytes[0] % 11;
         const command = if (fuzz_len <= 1) "x" else fuzz_bytes[1..fuzz_len];
-        var stream: [256]u8 = undefined;
+        var stream: [2 * 24 + fuzz_bytes.len]u8 = undefined;
         var stream_len: usize = 0;
 
         if (mode == 4) {
@@ -1504,6 +1543,21 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
 
         if (mode == 8) {
             const request = runRequest(std.testing.allocator, "spore-build-fuzz", .{ .exec = &.{ "printf", "%s", command } }, &.{"PATH=/usr/bin"}, "/", default_build_nofile, std.testing.io) catch return;
+            defer std.testing.allocator.free(request);
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        if (mode == 9) {
+            const tty = fuzz_len > 1 and (fuzz_bytes[1] & 1) != 0;
+            const request = run_mod.interactiveExecRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", command }, "spore-exec-fuzz", .{ .tty = tty }) catch return;
+            defer std.testing.allocator.free(request);
+            _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
+            return;
+        }
+
+        if (mode == 10) {
+            const request = @import("../attach_stream.zig").attachV1Request(std.testing.allocator, .{ .session_id = command }) catch return;
             defer std.testing.allocator.free(request);
             _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
             return;
@@ -2679,10 +2733,18 @@ fn execBesideCapturedSession(captured_script: [*:0]const u8, argv: []const []con
     var input: [2 * spore_stream.header_len + 64]u8 = undefined;
     const data = if (stdin.len == 0) input[0..0] else try spore_stream.writeFrame(input[0..], .{ .frame_type = .data, .stream_id = .stdin }, stdin);
     const close = try spore_stream.writeFrame(input[data.len..], .{ .frame_type = .close, .stream_id = .stdin, .offset = stdin.len }, "");
+    return agentRequestBesideCapturedSession(captured_script, request, input[0 .. data.len + close.len]);
+}
+
+// Sends one request and its input frames to the guest agent while its
+// captured session runs, and decodes the SPIO reply.
+fn agentRequestBesideCapturedSession(captured_script: [*:0]const u8, request: []const u8, input: []const u8) !BesideCapturedResult {
+    const spore_stream = @import("../spore_stream.zig");
+    const allocator = std.testing.allocator;
 
     var response: [8192]u8 = undefined;
     var captured_stdout: u64 = 0;
-    const response_len = spore_agent_test_exec_beside_running_session(captured_script, request.ptr, request.len, &input, data.len + close.len, &response, response.len, &captured_stdout);
+    const response_len = spore_agent_test_exec_beside_running_session(captured_script, request.ptr, request.len, input.ptr, input.len, &response, response.len, &captured_stdout);
     if (response_len <= 0) return error.AgentHarnessFailed;
 
     var stdout: std.ArrayList(u8) = .empty;
@@ -2715,6 +2777,30 @@ test "guest agent runs named exec beside a running captured session" {
     try std.testing.expectEqualStrings("", result.stderr);
     try std.testing.expectEqualStrings("beside:hi\n", result.stdout);
     try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
+}
+
+test "guest agent gives a null-stdio exec /dev/null stdin" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    const request = try run_mod.execRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", "cat; echo stdin-closed" }, "exec-1", 0);
+    defer std.testing.allocator.free(request);
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"null\"") != null);
+    const result = try agentRequestBesideCapturedSession("read line", request, "");
+    defer result.deinit();
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings("stdin-closed\n", result.stdout);
+    try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
+}
+
+test "guest agent answers a legacy start request with an SPIO bad request" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    const legacy = "{\"type\":\"start\",\"session_id\":\"exec-1\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n";
+    const result = try agentRequestBesideCapturedSession("read line", legacy, "");
+    defer result.deinit();
+    try std.testing.expectEqualStrings("spore run: bad request\n", result.stderr);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expectEqual(@as(?u32, 2), result.exit_code);
 }
 
 test "guest agent drains the captured session while a named exec runs" {
@@ -2850,15 +2936,6 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     const escaped_type_key = "{\"\\u0074ype\":\"spore-build-run-v4\",\"session_id\":\"s\",\"resume_time_unix_ns\":1,\"command_len\":0,\"argv\":[\"true\"],\"env\":[],\"working_dir\":\"/\",\"cache_mounts\":[],\"context_binds\":[],\"stdio\":\"pipe\",\"term\":\"xterm\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"nofile_soft\":1,\"nofile_hard\":1,\"closed_env\":true}\n";
     try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(escaped_type_key.ptr, escaped_type_key.len, stream[0..0].ptr, 0));
 
-    const ordinary_start = "{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n";
-    try std.testing.expectEqual(guest_agent_fuzz_other_request, spore_agent_fuzz_build_request(ordinary_start.ptr, ordinary_start.len, stream[0..0].ptr, 0));
-
-    const escaped_ordinary_start = "{\"type\":\"st\\u0061rt\",\"argv\":[\"/bin/true\"]}\n";
-    try std.testing.expectEqual(guest_agent_fuzz_other_request, spore_agent_fuzz_build_request(escaped_ordinary_start.ptr, escaped_ordinary_start.len, stream[0..0].ptr, 0));
-
-    const invalid_ordinary_start = "{\"type\":\"st\xffrt\",\"argv\":[\"/bin/true\"]}\n";
-    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(invalid_ordinary_start.ptr, invalid_ordinary_start.len, stream[0..0].ptr, 0));
-
     const copy_request = try copyRequest(std.testing.allocator, "spore-build-1", .{
         .source = "input",
         .dest = "/output",
@@ -2889,12 +2966,139 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     defer std.testing.allocator.free(stale_resize_request);
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(stale_resize_request.ptr, stale_resize_request.len, stream[0..0].ptr, 0));
 
-    const ready_request = "{\"type\":\"ready\",\"nonce\":\"1234\"}\n";
+    const ready_request = "{\"type\":\"ready\"}\n";
     try std.testing.expectEqual(guest_agent_fuzz_ready_request, spore_agent_fuzz_build_request(ready_request.ptr, ready_request.len, stream[0..0].ptr, 0));
+    const ready_with_nonce = "{\"type\":\"ready\",\"nonce\":\"1234\"}\n";
+    try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(ready_with_nonce.ptr, ready_with_nonce.len, stream[0..0].ptr, 0));
 
     const grow_request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
     defer std.testing.allocator.free(grow_request);
     try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(grow_request.ptr, grow_request.len, stream[0..0].ptr, 0));
+}
+
+fn expectGuestRequestKind(expected: c_int, request: []const u8) !void {
+    std.testing.expectEqual(expected, spore_agent_fuzz_build_request(request.ptr, request.len, request[0..0].ptr, 0)) catch |err| {
+        std.debug.print("guest request: {s}\n", .{request});
+        return err;
+    };
+}
+
+fn expectGuestRequestEdit(expected: c_int, base: []const u8, edits: []const [2][]const u8) !void {
+    const allocator = std.testing.allocator;
+    var request = try allocator.dupe(u8, base);
+    defer allocator.free(request);
+    for (edits) |edit| {
+        try std.testing.expect(std.mem.indexOf(u8, request, edit[0]) != null);
+        const next = try std.mem.replaceOwned(u8, allocator, request, edit[0], edit[1]);
+        allocator.free(request);
+        request = next;
+    }
+    try expectGuestRequestKind(expected, request);
+}
+
+test "guest agent parses exec and control requests strictly" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const attach_stream = @import("../attach_stream.zig");
+    const start = guest_agent_fuzz_start_request;
+    const attach = guest_agent_fuzz_attach_request;
+    const other = guest_agent_fuzz_other_request;
+    const invalid = guest_agent_fuzz_invalid;
+
+    const null_start = try run_mod.execRequestWithSession(allocator, &.{"/bin/true"}, "s", 1);
+    defer allocator.free(null_start);
+    try expectGuestRequestKind(start, null_start);
+    const pipe_start = try run_mod.interactiveExecRequestWithSession(allocator, &.{"/bin/cat"}, "s", .{ .working_dir = "/work" });
+    defer allocator.free(pipe_start);
+    try expectGuestRequestKind(start, pipe_start);
+    const tty_start = try run_mod.interactiveExecRequestWithSession(allocator, &.{"/bin/sh"}, "s", .{ .tty = true, .terminal_size = .{ .rows = 65535, .cols = 1 } });
+    defer allocator.free(tty_start);
+    try expectGuestRequestKind(start, tty_start);
+    const detached_start = try run_mod.detachedExecRequestWithSessionContext(allocator, &.{"/bin/true"}, "s", .{ .retain_output = true });
+    defer allocator.free(detached_start);
+    try expectGuestRequestKind(start, detached_start);
+
+    // Each edit of a valid start-v1 request breaks one rule.
+    const start_rejects = [_][]const [2][]const u8{
+        &.{.{ "\"type\":\"start-v1\"", "\"type\":\"start\"" }},
+        &.{.{ "\"type\":\"start-v1\",", "" }},
+        &.{.{ ",\"closed_env\":true", "" }},
+        &.{.{ "\"closed_env\":true", "\"closed_env\":false" }},
+        &.{.{ "\"closed_env\":true", "\"closed_env\":true,\"closed_env\":true" }},
+        &.{.{ "\"closed_env\":true", "\"closed_env\":true,\"interactive\":false" }},
+        &.{.{ "\"closed_env\":true", "\"closed_env\":true,\"nonce\":\"1\"" }},
+        &.{.{ "\"stdio\":\"null\"", "\"stdio\":\"file\"" }},
+        &.{ .{ "\"stdio\":\"null\"", "\"stdio\":\"pipe\"" }, .{ "\"detached\":false", "\"detached\":true" } },
+        &.{.{ "\"retain_output\":false", "\"retain_output\":true" }},
+        &.{.{ "\"working_dir\":\"\"", "\"working_dir\":\"work\"" }},
+        &.{.{ "\"argv\":[\"/bin/true\"]", "\"argv\":[]" }},
+        &.{.{ "\"terminal_rows\":24", "\"terminal_rows\":65536" }},
+        &.{.{ "\"terminal_rows\":24", "\"terminal_rows\":0" }},
+        &.{.{ "\"terminal_cols\":80", "\"terminal_cols\":0" }},
+        &.{.{ "\"stdio\":\"null\"", "\"stdio\":\"null\",\"term\":\"xterm\"" }},
+        &.{.{ "\"session_id\":\"s\"", "\"session_id\":\"\"" }},
+        &.{.{ "}\n", "}" }},
+    };
+    for (start_rejects) |edits| try expectGuestRequestEdit(invalid, null_start, edits);
+
+    const null_attach = try attach_stream.attachV1Request(allocator, .{ .session_id = "s" });
+    defer allocator.free(null_attach);
+    try expectGuestRequestKind(attach, null_attach);
+    const pipe_attach = try attach_stream.attachV1Request(allocator, .{ .session_id = "s", .interactive = true });
+    defer allocator.free(pipe_attach);
+    try expectGuestRequestKind(attach, pipe_attach);
+    const tty_attach = try attach_stream.attachV1Request(allocator, .{ .session_id = "s", .tty = true });
+    defer allocator.free(tty_attach);
+    try expectGuestRequestKind(attach, tty_attach);
+
+    const attach_rejects = [_][]const [2][]const u8{
+        &.{.{ "\"type\":\"attach-v1\"", "\"type\":\"attach\"" }},
+        &.{.{ "\"stdio\":\"null\"", "\"stdio\":\"pipe\"" }},
+        &.{.{ "\"interactive\":false", "\"interactive\":true" }},
+        &.{.{ "\"stdout_offset\":0,", "" }},
+        &.{.{ "\"params_json\":\"\"", "\"params_json\":\"\",\"detached\":false" }},
+        &.{.{ "\"params_json\":\"\"", "\"params_json\":\"\",\"term\":\"xterm\"" }},
+        &.{.{ "\"terminal_cols\":80", "\"terminal_cols\":0" }},
+    };
+    for (attach_rejects) |edits| try expectGuestRequestEdit(invalid, null_attach, edits);
+
+    const freeze = try run_mod.simpleControlRequest(allocator, "fsfreeze-v1", "spore-run-commit-freeze");
+    defer allocator.free(freeze);
+    try expectGuestRequestKind(other, freeze);
+    const thaw = try run_mod.simpleControlRequest(allocator, "fsthaw-v1", "spore-run-commit-thaw");
+    defer allocator.free(thaw);
+    try expectGuestRequestKind(other, thaw);
+    try expectGuestRequestKind(other, "{\"type\":\"initial-output\"}\n");
+    try expectGuestRequestKind(other, "{\"type\":\"copy-in-v1\",\"session_id\":\"s\",\"path\":\"/in\"}\n");
+    try expectGuestRequestKind(other, "{\"type\":\"copy-out-v1\",\"session_id\":\"s\",\"path\":\"/out\"}\n");
+
+    const control_rejects = [_][]const u8{
+        "{\"type\":\"ready\",\"session_id\":\"s\"}\n",
+        "{\"type\":\"fsfreeze-v1\"}\n",
+        "{\"type\":\"fsthaw-v1\",\"session_id\":\"s\",\"path\":\"/\"}\n",
+        "{\"type\":\"spore-build-workdir-v1\",\"working_dir\":\"/work\"}\n",
+        "{\"type\":\"spore-build-workdir-v1\",\"session_id\":\"s\",\"working_dir\":\"work\"}\n",
+        "{\"type\":\"generation\",\"session_id\":\"default\",\"params_json\":\"{}\"}\n",
+        "{\"type\":\"initial-output\",\"session_id\":\"s\"}\n",
+        "{\"type\":\"copy-in-v1\",\"session_id\":\"s\"}\n",
+        "{\"type\":\"copy-out-v1\",\"session_id\":\"s\",\"path\":\"/a\",\"path\":\"/b\"}\n",
+        "{\"session_id\":\"s\",\"path\":\"/in\"}\n",
+    };
+    for (control_rejects) |request| try expectGuestRequestKind(invalid, request);
+
+    // Build RUN alone still carries term, pinned to xterm.
+    const build_run = try runRequest(allocator, "spore-build-1", .{ .exec = &.{"true"} }, &.{}, "/", default_build_nofile, std.testing.io);
+    defer allocator.free(build_run);
+    try expectGuestRequestKind(guest_agent_fuzz_run_complete, build_run);
+    try expectGuestRequestEdit(invalid, build_run, &.{.{ "\"term\":\"xterm\",", "" }});
+    try expectGuestRequestEdit(invalid, build_run, &.{.{ "\"term\":\"xterm\"", "\"term\":\"xterm-256color\"" }});
+
+    // The fuzz seeds are valid requests, and their variants are rejected.
+    inline for (guest_exec_request_seeds) |seed| {
+        try expectGuestRequestKind(seed.kind, seed.body ++ "}\n");
+        try expectGuestRequestKind(invalid, seed.body ++ seed.last_member ++ "}\n");
+        try expectGuestRequestKind(invalid, seed.body ++ guest_exec_request_unknown_member ++ "}\n");
+    }
 }
 
 test "guest proc stat parser identifies kernel threads with adversarial task names" {
@@ -2973,7 +3177,7 @@ test "ENOSPC detector survives output truncation and frame splits" {
 test "fuzz build control request framing" {
     try std.testing.fuzz({}, fuzzSimpleRequest, .{});
     try std.testing.fuzz({}, fuzzCopyRequest, .{});
-    try std.testing.fuzz({}, fuzzGuestBuildRequest, .{});
+    try std.testing.fuzz({}, fuzzGuestBuildRequest, .{ .corpus = &guest_request_fuzz_corpus });
     try std.testing.fuzz({}, fuzzGuestProcStat, .{});
     try std.testing.fuzz({}, fuzzGuestBuildResolvTarget, .{});
     try std.testing.fuzz({}, fuzzGuestCopyTree, .{});

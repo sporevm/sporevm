@@ -577,7 +577,7 @@ test "host stream connects, sends request, and parses streamed frames" {
     configureQueue(&t, rx_queue, rx_desc, rx_avail, rx_used, ram);
     configureQueue(&t, tx_queue, tx_desc, tx_avail, tx_used, ram);
 
-    const request = "{\"command\":[\"/bin/true\"],\"closed_env\":true}\n";
+    const request = "{\"type\":\"ready\"}\n";
     var stream = try HostStream.init(10700, request);
     var capture = vsock_stream.StreamCapture{};
     stream.setOutputSink(&capture, vsock_stream.captureSink);
@@ -648,7 +648,8 @@ test "host stream connects, sends request, and parses streamed frames" {
     try std.testing.expectEqual(@as(u32, @intCast(request.len)), delivered.len);
     try std.testing.expectEqualStrings(request, buf[rx_buf_payload + header_len ..][0..request.len]);
 
-    const stdout_frame = "stdout 0 6\nhello\n";
+    var stdout_frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+    const stdout_frame = try spore_stream.writeFrame(&stdout_frame_buf, .{ .frame_type = .data, .stream_id = .stdout }, "hello\n");
     var stdout_rw: [header_len]u8 = undefined;
     writeHeader(&stdout_rw, .{
         .src_cid = default_guest_cid,
@@ -665,7 +666,8 @@ test "host stream connects, sends request, and parses streamed frames" {
     try pushAvail(ram, tx_avail, 8, 2);
     try std.testing.expect(t.write(0x050, tx_queue, ram));
 
-    const stderr_frame = "stderr 0 4\nerr\n";
+    var stderr_frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+    const stderr_frame = try spore_stream.writeFrame(&stderr_frame_buf, .{ .frame_type = .data, .stream_id = .stderr }, "err\n");
     var stderr_rw: [header_len]u8 = undefined;
     writeHeader(&stderr_rw, .{
         .src_cid = default_guest_cid,
@@ -682,7 +684,10 @@ test "host stream connects, sends request, and parses streamed frames" {
     try pushAvail(ram, tx_avail, 8, 3);
     try std.testing.expect(t.write(0x050, tx_queue, ram));
 
-    const exit_frame = "exit 7\n";
+    var exit_payload: [4]u8 = undefined;
+    spore_stream.writeExitPayload(&exit_payload, 7);
+    var exit_frame_buf: [spore_stream.max_frame_len]u8 = undefined;
+    const exit_frame = try spore_stream.writeFrame(&exit_frame_buf, .{ .frame_type = .exit, .stream_id = .control }, &exit_payload);
     var rw: [header_len]u8 = undefined;
     writeHeader(&rw, .{
         .src_cid = default_guest_cid,
@@ -856,13 +861,10 @@ test "host proactively updates credit while consuming guest stream data" {
     stream.state = .connected;
     dev.host_stream = &stream;
 
-    // 16-byte lines the legacy frame parser consumes without failing.
-    const line = "timing 12345678\n";
+    // Each packet is one whole SPIO stdout frame the parser consumes.
     var payload: [4096]u8 = undefined;
-    var off: usize = 0;
-    while (off < payload.len) : (off += line.len) {
-        @memcpy(payload[off..][0..line.len], line);
-    }
+    const frame_data_len = payload.len - spore_stream.header_len;
+    @memset(payload[spore_stream.header_len..], 'x');
 
     // The guest sends half the advertised credit without the host ever writing
     // back; the host must volunteer a credit update or the guest stalls.
@@ -870,6 +872,12 @@ test "host proactively updates credit while consuming guest stream data" {
     var sent: usize = 0;
     var head: u16 = 0;
     while (sent < host_stream_credit / 2) : (head += 1) {
+        spore_stream.writeHeader(payload[0..spore_stream.header_len], .{
+            .frame_type = .data,
+            .stream_id = .stdout,
+            .offset = head * frame_data_len,
+            .payload_len = frame_data_len,
+        });
         writeHeader(&header, .{
             .src_cid = default_guest_cid,
             .dst_cid = host_cid,

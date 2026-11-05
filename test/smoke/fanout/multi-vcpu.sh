@@ -6,7 +6,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 expect_multi_vcpu_manifest() {
   local dir="$1"
   [[ -f "${dir}/manifest.json" ]] || die "missing manifest: ${dir}/manifest.json"
-  [[ "$(json_field "${dir}/manifest.json" version)" == "6" ]] || die "manifest is not v6: ${dir}/manifest.json"
+  [[ "$(json_field "${dir}/manifest.json" version)" == "7" ]] || die "manifest is not v7: ${dir}/manifest.json"
   [[ "$(json_field "${dir}/manifest.json" platform.vcpu_count)" == "${vcpus}" ]] || die "manifest vcpu_count mismatch: ${dir}/manifest.json"
   [[ -n "$(json_field "${dir}/manifest.json" machine.multi.gic.kind)" ]] || die "manifest has no multi-vCPU machine state: ${dir}/manifest.json"
 }

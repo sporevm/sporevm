@@ -1,8 +1,8 @@
 //! Host end of the exec stream: one host-initiated virtio-vsock stream
 //! connection to the guest agent. It holds the request the host sends, the
 //! credit state the vsock device drives, queued stdin and terminal frames, and
-//! the parser for the guest's framed output (legacy text or SPIO v1). Output
-//! bytes are guest controlled. See SECURITY.md.
+//! the parser for the guest's SPIO v1 output frames. Output bytes are guest
+//! controlled. See SECURITY.md.
 
 const std = @import("std");
 const spore_stream = @import("../spore_stream.zig");
@@ -12,8 +12,6 @@ const vsock = @import("vsock.zig");
 pub const default_host_port: u32 = 49152;
 const dynamic_host_port_first: u32 = 49154;
 const dynamic_host_port_count: u32 = 65535 - dynamic_host_port_first + 1;
-const max_frame_header = 128;
-const max_frame_payload = 64 * 1024;
 const max_outbound_frames = 16;
 const max_v1_control_payload = 512;
 const max_payload = vsock.max_payload;
@@ -65,11 +63,6 @@ const HostStreamStartState = enum(u8) {
     timed_out,
 };
 
-pub const HostStreamProtocol = enum {
-    legacy_text,
-    spore_stream_v1,
-};
-
 const OutboundFrame = struct {
     data: [max_payload]u8 = [_]u8{0} ** max_payload,
     len: usize = 0,
@@ -78,7 +71,6 @@ const OutboundFrame = struct {
 pub const HostStream = struct {
     guest_port: u32,
     host_port: u32 = default_host_port,
-    protocol: HostStreamProtocol = .legacy_text,
     request: [max_payload]u8 = [_]u8{0} ** max_payload,
     request_len: usize = 0,
     state: HostStreamState = .idle,
@@ -110,10 +102,6 @@ pub const HostStream = struct {
     peer_fwd_cnt: u32 = 0,
     request_sent: bool = false,
     exit_code: ?i32 = null,
-    header_buf: [max_frame_header]u8 = undefined,
-    header_len: usize = 0,
-    payload_output: ?HostStreamOutput = null,
-    payload_remaining: usize = 0,
     v1_header_buf: [spore_stream.header_len]u8 = undefined,
     v1_header_len: usize = 0,
     v1_payload_header: ?spore_stream.Header = null,
@@ -144,12 +132,6 @@ pub const HostStream = struct {
         stream.request_len = request.len;
         stream.started_at_ms = monotonicMs();
         stream.state = .connecting;
-        return stream;
-    }
-
-    pub fn initWithProtocol(guest_port: u32, request: []const u8, protocol: HostStreamProtocol) !HostStream {
-        var stream = try init(guest_port, request);
-        stream.protocol = protocol;
         return stream;
     }
 
@@ -216,129 +198,6 @@ pub const HostStream = struct {
     }
 
     pub fn appendOutput(self: *HostStream, data: []const u8) void {
-        if (self.protocol == .spore_stream_v1) {
-            self.appendOutputV1(data);
-            return;
-        }
-
-        const inc: u32 = if (data.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(data.len);
-        self.received_bytes +%= inc;
-
-        var rest = data;
-        while (rest.len > 0 and self.state != .failed and self.state != .complete) {
-            if (self.payload_output) |output| {
-                const take = @min(rest.len, self.payload_remaining);
-                self.emitOutput(output, rest[0..take]);
-                self.payload_remaining -= take;
-                rest = rest[take..];
-                if (self.payload_remaining == 0) self.payload_output = null;
-                continue;
-            }
-
-            if (std.mem.indexOfScalar(u8, rest, '\n')) |newline| {
-                if (self.header_len + newline > self.header_buf.len) {
-                    self.fail();
-                    return;
-                }
-                @memcpy(self.header_buf[self.header_len..][0..newline], rest[0..newline]);
-                self.header_len += newline;
-                const line = self.header_buf[0..self.header_len];
-                self.header_len = 0;
-                self.handleFrameHeader(line);
-                rest = rest[newline + 1 ..];
-            } else {
-                if (self.header_len + rest.len > self.header_buf.len) {
-                    self.fail();
-                    return;
-                }
-                @memcpy(self.header_buf[self.header_len..][0..rest.len], rest);
-                self.header_len += rest.len;
-                return;
-            }
-        }
-    }
-
-    fn handleFrameHeader(self: *HostStream, line: []const u8) void {
-        var fields = std.mem.splitScalar(u8, line, ' ');
-        const kind = fields.next() orelse {
-            self.fail();
-            return;
-        };
-        if (std.mem.eql(u8, kind, "stdout") or std.mem.eql(u8, kind, "stderr")) {
-            const offset_raw = fields.next() orelse {
-                self.fail();
-                return;
-            };
-            const len_raw = fields.next() orelse {
-                self.fail();
-                return;
-            };
-            if (fields.next() != null) {
-                self.fail();
-                return;
-            }
-            const offset = std.fmt.parseInt(u64, offset_raw, 10) catch {
-                self.fail();
-                return;
-            };
-            const len = std.fmt.parseInt(usize, len_raw, 10) catch {
-                self.fail();
-                return;
-            };
-            if (len > max_frame_payload) {
-                self.fail();
-                return;
-            }
-            const output: HostStreamOutput = if (std.mem.eql(u8, kind, "stdout")) .stdout else .stderr;
-            const expected = switch (output) {
-                .stdout => self.stdout_offset,
-                .stderr => self.stderr_offset,
-                .terminal => unreachable,
-            };
-            if (offset != expected) {
-                self.fail();
-                return;
-            }
-            self.payload_output = output;
-            self.payload_remaining = len;
-            if (len == 0) self.payload_output = null;
-            return;
-        }
-        if (std.mem.eql(u8, kind, "exit")) {
-            const code_raw = fields.next() orelse {
-                self.fail();
-                return;
-            };
-            if (fields.next() != null) {
-                self.fail();
-                return;
-            }
-            const code = std.fmt.parseInt(i32, code_raw, 10) catch {
-                self.fail();
-                return;
-            };
-            if (code < 0 or code > 255) {
-                self.fail();
-                return;
-            }
-            self.exit_code = code;
-            if (self.response_ms == null) self.response_ms = self.elapsedMs();
-            self.state = .complete;
-            return;
-        }
-        if (std.mem.eql(u8, kind, "timing")) {
-            self.recordGuestTiming(line);
-            return;
-        }
-        if (std.mem.eql(u8, kind, "memory-pressure")) {
-            if (self.memory_pressure_ms == null) self.memory_pressure_ms = self.elapsedMs();
-            self.memory_pressure_count +|= 1;
-            return;
-        }
-        self.fail();
-    }
-
-    fn appendOutputV1(self: *HostStream, data: []const u8) void {
         const inc: u32 = if (data.len > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(data.len);
         self.received_bytes +%= inc;
 
@@ -745,7 +604,7 @@ fn appendV1Frame(stream: *HostStream, frame_type: spore_stream.FrameType, stream
 }
 
 test "host stream parses spore stream v1 frames" {
-    var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+    var stream = try HostStream.init(10700, "{}\n");
     var capture = StreamCapture{};
     stream.setOutputSink(&capture, captureSink);
     stream.state = .connected;
@@ -776,14 +635,14 @@ test "host stream parses spore stream v1 frames" {
 
 test "host stream v1 parser fails closed on malformed frames" {
     {
-        var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+        var stream = try HostStream.init(10700, "{}\n");
         stream.state = .connected;
         var bad: [spore_stream.header_len]u8 = [_]u8{0} ** spore_stream.header_len;
         stream.appendOutput(&bad);
         try std.testing.expectEqual(HostStreamState.failed, stream.state);
     }
     {
-        var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+        var stream = try HostStream.init(10700, "{}\n");
         stream.state = .connected;
         var header: [spore_stream.header_len]u8 = undefined;
         spore_stream.writeHeader(&header, .{
@@ -797,13 +656,13 @@ test "host stream v1 parser fails closed on malformed frames" {
         try std.testing.expectEqual(HostStreamState.failed, stream.state);
     }
     {
-        var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+        var stream = try HostStream.init(10700, "{}\n");
         stream.state = .connected;
         try appendV1Frame(&stream, .data, .stdout, 1, "x");
         try std.testing.expectEqual(HostStreamState.failed, stream.state);
     }
     {
-        var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+        var stream = try HostStream.init(10700, "{}\n");
         stream.state = .connected;
         var header: [spore_stream.header_len]u8 = undefined;
         spore_stream.writeHeader(&header, .{
@@ -818,7 +677,7 @@ test "host stream v1 parser fails closed on malformed frames" {
 }
 
 test "host stream queues stdin v1 frames with offsets" {
-    var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+    var stream = try HostStream.init(10700, "{}\n");
     var stop = std.atomic.Value(bool).init(false);
     try std.testing.expect(try stream.enqueueStdinDataBlocking("hi", &stop));
     try std.testing.expect(try stream.enqueueStdinCloseBlocking(&stop));
@@ -844,7 +703,7 @@ test "host stream queues stdin v1 frames with offsets" {
 }
 
 test "host stream queues terminal v1 frames and resize" {
-    var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+    var stream = try HostStream.init(10700, "{}\n");
     var stop = std.atomic.Value(bool).init(false);
     try std.testing.expect(try stream.enqueueTerminalDataBlocking("ab", &stop));
     try std.testing.expect(stream.enqueueResize(.{ .rows = 40, .cols = 120 }));
@@ -879,7 +738,7 @@ test "host stream queues terminal v1 frames and resize" {
 }
 
 test "host stream resize does not wait for a full outbound ring and sends the latest size" {
-    var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
+    var stream = try HostStream.init(10700, "{}\n");
     for (0..max_outbound_frames) |_| {
         try std.testing.expectEqual(@as(usize, 1), try stream.enqueueStdinDataNonblocking("x"));
     }
@@ -923,74 +782,6 @@ test "host stream sequences dynamic host ports without early reuse" {
     try std.testing.expectEqual(dynamic_host_port_first, HostStream.hostPortForSequence(dynamic_host_port_count));
 }
 
-test "host stream frame parser handles split frames" {
-    var stream = try HostStream.init(10700, "{}\n");
-    var capture = StreamCapture{};
-    stream.state = .connected;
-    stream.setOutputSink(&capture, captureSink);
-
-    stream.appendOutput("stdout 0 11\nhello");
-    try std.testing.expectEqual(HostStreamState.connected, stream.state);
-    stream.appendOutput(" worldmemory-pressure\nstderr 0 4\n");
-    stream.appendOutput("err\nexit 3\n");
-
-    try std.testing.expectEqual(HostStreamState.complete, stream.state);
-    try std.testing.expectEqual(@as(i32, 3), stream.exit_code.?);
-    try std.testing.expect(stream.memory_pressure_ms != null);
-    try std.testing.expectEqual(@as(u32, 1), stream.memory_pressure_count);
-    try std.testing.expectEqualStrings("hello world", capture.stdout[0..capture.stdout_len]);
-    try std.testing.expectEqualStrings("err\n", capture.stderr[0..capture.stderr_len]);
-}
-
-test "host stream frame parser counts memory pressure frames" {
-    var stream = try HostStream.init(10700, "{}\n");
-    stream.state = .connected;
-
-    stream.appendOutput("memory-pressure\nmemory-pressure\n");
-
-    try std.testing.expectEqual(@as(u32, 2), stream.memory_pressure_count);
-}
-
-test "host stream frame parser is independent of two-part packetization" {
-    const frames = "stdout 0 5\nhello" ++
-        "stderr 0 4\nwarn" ++
-        "exit 9\n";
-
-    var split: usize = 0;
-    while (split <= frames.len) : (split += 1) {
-        var stream = try HostStream.init(10700, "{}\n");
-        var capture = StreamCapture{};
-        stream.state = .connected;
-        stream.setOutputSink(&capture, captureSink);
-
-        stream.appendOutput(frames[0..split]);
-        stream.appendOutput(frames[split..]);
-
-        try std.testing.expectEqual(HostStreamState.complete, stream.state);
-        try std.testing.expectEqual(@as(i32, 9), stream.exit_code.?);
-        try std.testing.expectEqualStrings("hello", capture.stdout[0..capture.stdout_len]);
-        try std.testing.expectEqualStrings("warn", capture.stderr[0..capture.stderr_len]);
-    }
-}
-
-test "host stream frame parser rejects offset mismatch" {
-    var stream = try HostStream.init(10700, "{}\n");
-    stream.state = .connected;
-
-    stream.appendOutput("stdout 1 1\nx");
-
-    try std.testing.expectEqual(HostStreamState.failed, stream.state);
-}
-
-test "host stream frame parser rejects oversized payloads" {
-    var stream = try HostStream.init(10700, "{}\n");
-    stream.state = .connected;
-
-    stream.appendOutput("stderr 0 65537\n");
-
-    try std.testing.expectEqual(HostStreamState.failed, stream.state);
-}
-
 fn fuzzHostStreamFrames(_: void, s: *std.testing.Smith) !void {
     var stream = try HostStream.init(10700, "{}\n");
     stream.state = .connected;
@@ -1001,18 +792,6 @@ fn fuzzHostStreamFrames(_: void, s: *std.testing.Smith) !void {
 
 test "fuzz host stream frame parsing" {
     try std.testing.fuzz({}, fuzzHostStreamFrames, .{});
-}
-
-fn fuzzHostStreamV1Frames(_: void, s: *std.testing.Smith) !void {
-    var stream = try HostStream.initWithProtocol(10700, "{}\n", .spore_stream_v1);
-    stream.state = .connected;
-    var buf: [4096]u8 = undefined;
-    const len = s.slice(&buf);
-    stream.appendOutput(buf[0..len]);
-}
-
-test "fuzz host stream v1 frame parsing" {
-    try std.testing.fuzz({}, fuzzHostStreamV1Frames, .{});
 }
 
 fn fuzzGuestTimingEvent(_: void, s: *std.testing.Smith) !void {

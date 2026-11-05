@@ -30,12 +30,18 @@ old, and manifests with an older memory index are rejected. `cache gc` keeps an
 old disk index that an image or record still names but reclaims the objects
 only it referenced.
 
-Spore manifests are version 6, one shape for any vCPU count and fixed or
+Spore manifests are version 7, one shape for any vCPU count and fixed or
 elastic memory: `platform` always records `vcpu_count` and `gic_redist_stride`,
 and `machine` holds either `single` or `multi` state. Manifests from versions 0
-to 5 fail with `FormatTooOld`, so saved spores, checkpoints and bundles from
+to 6 fail with `FormatTooOld`, so saved spores, checkpoints and bundles from
 earlier builds must be re-created. The always-empty `disk.layers` field is
 gone, and every manifest save is validated.
+
+The guest agent speaks only the SPIO exec protocol and parses every request
+strictly; the text exec protocol and the `start`, `attach` and `generation`
+requests are gone.
+Saved RAM carries the agent that was running, so version 6 manifests, whose
+agent still answers the text protocol, are too old as well.
 
 ### One ext4 writer
 

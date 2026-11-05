@@ -1070,6 +1070,13 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
             @errorName(err),
         );
     }
+    if (err == error.RunProgramEmpty) {
+        return machine_output.CliError.init(
+            .usage_invalid_argument,
+            "spore run: effective command has an empty program name",
+            @errorName(err),
+        );
+    }
     if (err == error.X86ElasticMemoryUnsupported or err == error.X86ExperimentalMemorySizeUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
@@ -1158,13 +1165,6 @@ pub fn classifyFailure(err: anyerror) ClassifiedFailure {
         return machine_output.CliError.init(
             .usage_invalid_argument,
             "spore run: -t with --from command execution is not supported yet; use `spore attach -t <spore>` to connect to a saved terminal session",
-            @errorName(err),
-        );
-    }
-    if (err == error.InteractiveStreamProtocolFailed) {
-        return machine_output.CliError.init(
-            .runtime_start_failed,
-            "spore run: interactive stream protocol failed; ensure the guest initrd supports start-v1 or omit -i/-t",
             @errorName(err),
         );
     }
@@ -2922,7 +2922,7 @@ const CommitControl = struct {
         switch (self.phase) {
             .start_resize => {
                 const request = try simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-run-commit-resize");
-                self.resize_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
+                self.resize_stream = try vsock_stream.HostStream.init(self.guest_port, request);
                 self.resize_stream.host_port = vsock_stream.HostStream.deriveHostPort(request);
                 self.resize_stream.setOutputSink(self, resizeOutputSink);
                 try self.startStream(dev, &self.resize_stream);
@@ -2969,7 +2969,7 @@ const CommitControl = struct {
             },
             .start_freeze => {
                 const request = try simpleControlRequest(self.allocator, "fsfreeze-v1", "spore-run-commit-freeze");
-                self.freeze_stream = try vsock_stream.HostStream.initWithProtocol(self.guest_port, request, .spore_stream_v1);
+                self.freeze_stream = try vsock_stream.HostStream.init(self.guest_port, request);
                 self.freeze_stream.host_port = vsock_stream.HostStream.deriveHostPort(request);
                 try dev.attachHostStream(&self.freeze_stream);
                 self.freeze_stream.markStarted();
@@ -3148,7 +3148,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const boot_args = if (resuming) "" else try productBootArgs(allocator, base_boot_args);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
-    var stream = try vsock_stream.HostStream.initWithProtocol(opts.guest_port, request.bytes, if (opts.interactive or opts.tty) .spore_stream_v1 else .legacy_text);
+    var stream = try vsock_stream.HostStream.init(opts.guest_port, request.bytes);
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock_stream.HostStream.deriveHostPort(request.bytes);
     if (opts.events != null) {
@@ -3299,7 +3299,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             return error.UnsupportedBackend;
         },
     }) catch |err| {
-        if ((opts.interactive or opts.tty) and err == error.VsockProbeFailed) return error.InteractiveStreamProtocolFailed;
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             var result = resultFromAbortedSignalCapture(backend, opts, &stream);
             if (resuming) result = result.withMemoryRestore(&ram_plan);
@@ -3708,35 +3707,23 @@ const RunRequestInfo = struct {
 
 fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) !RunRequestInfo {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
-    if (opts.resume_dir != null and opts.command.len == 0) {
-        if (opts.interactive or opts.tty) {
-            return .{
-                .bytes = try attach_stream.attachV1Request(allocator, .{
-                    .session_id = opts.attach_session_id,
-                    .interactive = opts.interactive,
-                    .tty = opts.tty,
-                    .terminal_name = attach_stream.terminalName(context.environ_map),
-                    .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
-                }),
-                .session_id = opts.attach_session_id,
-                .attaches_existing = true,
-            };
-        }
-        return .{
-            .bytes = try attach_stream.attachRequest(allocator, opts.attach_session_id),
+    if (opts.resume_dir != null and opts.command.len == 0) return .{
+        .bytes = try attach_stream.attachV1Request(allocator, .{
             .session_id = opts.attach_session_id,
-            .attaches_existing = true,
-        };
-    }
+            .interactive = opts.interactive,
+            .tty = opts.tty,
+            .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
+        }),
+        .session_id = opts.attach_session_id,
+        .attaches_existing = true,
+    };
     if (opts.resume_dir == null) return .{
         .bytes = try execRequestWithSessionOptions(allocator, opts.command, spore.default_session_id, .{
             .env = opts.guest_env,
             .working_dir = opts.guest_working_dir,
             .resume_time_unix_ns = resume_time_unix_ns,
             .memory_pressure = memory_pressure,
-            .interactive = opts.interactive,
-            .tty = opts.tty,
-            .terminal_name = attach_stream.terminalName(context.environ_map),
+            .stdio = runStdio(opts),
             .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
         }),
         .session_id = spore.default_session_id,
@@ -3748,15 +3735,21 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
             .env = opts.guest_env,
             .resume_time_unix_ns = resume_time_unix_ns,
             .memory_pressure = memory_pressure,
-            .interactive = opts.interactive,
-            .tty = opts.tty,
-            .terminal_name = attach_stream.terminalName(context.environ_map),
+            .stdio = runStdio(opts),
             .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
             .generation_params = opts.start_generation_params,
             .require_generation_ready = opts.require_generation_ready,
         }),
         .session_id = session_id,
     };
+}
+
+// `spore run` forwards host stdin only with -i; without it the command
+// reads /dev/null, as it did before the guest agent spoke only SPIO.
+fn runStdio(opts: Options) GuestStdio {
+    if (opts.tty) return .tty;
+    if (opts.interactive) return .pipe;
+    return .null;
 }
 
 fn randomRunSessionId(context: Context, allocator: std.mem.Allocator) ![]const u8 {
@@ -3780,121 +3773,60 @@ pub const ExecRequestContextOptions = struct {
     retain_output: bool = false,
 };
 
-pub fn execRequestWithSessionGenerationParams(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64, generation_params: []const u8) ![]const u8 {
-    return execRequestWithSessionOptions(allocator, argv, session_id, .{
-        .resume_time_unix_ns = resume_time_unix_ns,
-        .generation_params = generation_params,
-    });
-}
-
 pub const InteractiveExecRequestOptions = struct {
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
-    interactive: bool = false,
     tty: bool = false,
-    terminal_name: []const u8 = "xterm",
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
     resume_time_unix_ns: u64 = 0,
     generation_params: ?[]const u8 = null,
 };
 
+/// Encodes a streamed exec. Stdin is always a pipe (or the terminal): the
+/// caller forwards input and closes the stream when it has none.
 pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: InteractiveExecRequestOptions) ![]const u8 {
-    const exec_options = GuestExecOptions{
+    return execRequestWithSessionOptions(allocator, argv, session_id, .{
         .env = options.env,
         .working_dir = options.working_dir,
-        .interactive = options.interactive,
-        .tty = options.tty,
-        .terminal_name = options.terminal_name,
+        .stdio = if (options.tty) .tty else .pipe,
         .terminal_size = options.terminal_size,
         .resume_time_unix_ns = options.resume_time_unix_ns,
         .generation_params = options.generation_params,
-    };
-    try validateGuestArgv(argv);
-    try validateGuestExecOptions(exec_options);
-    return execV1RequestWithSessionOptions(allocator, argv, session_id, exec_options);
-}
-
-pub fn detachedExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64) ![]const u8 {
-    return detachedExecRequestWithSessionContext(allocator, argv, session_id, .{
-        .resume_time_unix_ns = resume_time_unix_ns,
     });
 }
 
 pub fn detachedExecRequestWithSessionContext(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: ExecRequestContextOptions) ![]const u8 {
-    try validateGuestArgv(argv);
-    try validateGuestExecContext(options.env, options.working_dir);
-    const payload = struct {
-        type: []const u8 = "start",
-        session_id: []const u8,
-        resume_time_unix_ns: u64,
-        argv: []const []const u8,
-        env: []const []const u8,
-        working_dir: []const u8,
-        memory_pressure: bool = false,
-        detached: bool = true,
-        retain_output: bool,
-        closed_env: bool = true,
-    }{
-        .session_id = session_id,
-        .resume_time_unix_ns = options.resume_time_unix_ns,
-        .argv = argv,
+    return execRequestWithSessionOptions(allocator, argv, session_id, .{
         .env = options.env,
-        .working_dir = options.working_dir orelse "",
+        .working_dir = options.working_dir,
+        .resume_time_unix_ns = options.resume_time_unix_ns,
+        .detached = true,
         .retain_output = options.retain_output,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    });
 }
+
+/// The guest command's stdio: `null` gives it /dev/null stdin and piped
+/// output, `pipe` also pipes stdin, and `tty` gives it a terminal.
+const GuestStdio = enum { null, pipe, tty };
 
 const GuestExecOptions = struct {
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
     resume_time_unix_ns: u64 = 0,
     memory_pressure: bool = false,
-    interactive: bool = false,
-    tty: bool = false,
-    terminal_name: []const u8 = "xterm",
+    stdio: GuestStdio = .null,
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
     generation_params: ?[]const u8 = null,
     require_generation_ready: bool = false,
+    detached: bool = false,
+    retain_output: bool = false,
 };
 
+/// Encodes the guest agent's `start-v1` request. Every member is always
+/// present; detached commands require `null` stdio.
 fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
     try validateGuestArgv(argv);
     try validateGuestExecOptions(options);
-    if (options.interactive or options.tty) return execV1RequestWithSessionOptions(allocator, argv, session_id, options);
-    const working_dir = options.working_dir orelse "";
-
-    const payload = struct {
-        type: []const u8 = "start",
-        session_id: []const u8,
-        resume_time_unix_ns: u64,
-        argv: []const []const u8,
-        env: []const []const u8,
-        working_dir: []const u8,
-        memory_pressure: bool,
-        params_json: []const u8,
-        require_generation_ready: bool,
-        closed_env: bool = true,
-    }{
-        .session_id = session_id,
-        .resume_time_unix_ns = options.resume_time_unix_ns,
-        .argv = argv,
-        .env = options.env,
-        .working_dir = working_dir,
-        .memory_pressure = options.memory_pressure,
-        .params_json = options.generation_params orelse "",
-        .require_generation_ready = options.require_generation_ready,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-}
-
-fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
     const payload = struct {
         type: []const u8 = "start-v1",
         session_id: []const u8,
@@ -3903,12 +3835,13 @@ fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const [
         env: []const []const u8,
         working_dir: []const u8,
         stdio: []const u8,
-        term: []const u8,
         terminal_rows: u16,
         terminal_cols: u16,
         memory_pressure: bool,
         params_json: []const u8,
         require_generation_ready: bool,
+        detached: bool,
+        retain_output: bool,
         closed_env: bool = true,
     }{
         .session_id = session_id,
@@ -3916,26 +3849,15 @@ fn execV1RequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const [
         .argv = argv,
         .env = options.env,
         .working_dir = options.working_dir orelse "",
-        .stdio = if (options.tty) "tty" else "pipe",
-        .term = options.terminal_name,
+        .stdio = @tagName(options.stdio),
         .terminal_rows = options.terminal_size.rows,
         .terminal_cols = options.terminal_size.cols,
         .memory_pressure = options.memory_pressure,
         .params_json = options.generation_params orelse "",
         .require_generation_ready = options.require_generation_ready,
+        .detached = options.detached,
+        .retain_output = options.retain_output,
     };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-}
-
-pub fn generationRequest(allocator: std.mem.Allocator, params_json: []const u8) ![]const u8 {
-    const payload = struct {
-        type: []const u8 = "generation",
-        session_id: []const u8 = "default",
-        params_json: []const u8,
-    }{ .params_json = params_json };
     const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
@@ -4279,6 +4201,7 @@ fn parseGuestPort(name: []const u8, raw: []const u8) !u32 {
 
 fn validateGuestArgv(argv: []const []const u8) !void {
     if (argv.len == 0 or argv.len > max_guest_argc) return error.RunArgCountUnsupported;
+    if (argv[0].len == 0) return error.RunProgramEmpty;
     for (argv) |arg| {
         if (arg.len > max_guest_arg_len) return error.RunArgTooLong;
     }
@@ -4363,13 +4286,13 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
 test "run request encodes argv" {
     const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true}\n", request);
 }
 
 test "run request can encode explicit session id" {
     const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42", 1_700_000_000_000_000_000);
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true}\n", request);
 }
 
 test "run detached exec request asks guest to start without waiting" {
@@ -4380,7 +4303,7 @@ test "run detached exec request asks guest to start without waiting" {
         .retain_output = true,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[\"SPORE_CONTEXT=detached\"],\"working_dir\":\"/work\",\"memory_pressure\":false,\"detached\":true,\"retain_output\":true,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[\"SPORE_CONTEXT=detached\"],\"working_dir\":\"/work\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":true,\"retain_output\":true,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes image env and working directory" {
@@ -4393,7 +4316,7 @@ test "run request encodes image env and working directory" {
         .require_generation_ready = true,
     });
     defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"memory_pressure\":true,\"params_json\":\"{\\\"resume_entropy_seed\\\":\\\"abcd\\\"}\",\"require_generation_ready\":true,\"closed_env\":true}\n", request);
+    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":true,\"params_json\":\"{\\\"resume_entropy_seed\\\":\\\"abcd\\\"}\",\"require_generation_ready\":true,\"detached\":false,\"retain_output\":false,\"closed_env\":true}\n", request);
 }
 
 test "run request encodes env for run from spore command" {
@@ -4678,10 +4601,15 @@ test "image runtime command enforces guest argv bounds" {
     try std.testing.expectError(error.RunArgTooLong, resolveImageRuntimeCommand(allocator, null, &.{&too_long}));
 }
 
-test "generation request encodes params json as a string" {
-    const request = try generationRequest(std.testing.allocator, "{\"parallel_index\":2,\"parallel_count\":5}");
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"generation\",\"session_id\":\"default\",\"params_json\":\"{\\\"parallel_index\\\":2,\\\"parallel_count\\\":5}\"}\n", request);
+test "guest requests reject an empty program name before the guest sees them" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.RunProgramEmpty, resolveImageRuntimeCommand(allocator, null, &.{ "", "arg" }));
+    try std.testing.expectError(error.RunProgramEmpty, execRequestWithSession(allocator, &.{""}, "default", 0));
+    try std.testing.expectError(error.RunProgramEmpty, interactiveExecRequestWithSession(allocator, &.{""}, "lifecycle-1", .{}));
+    try std.testing.expectError(error.RunProgramEmpty, detachedExecRequestWithSessionContext(allocator, &.{""}, "lifecycle-1", .{}));
+    const later_empty = try execRequestWithSession(allocator, &.{ "/bin/echo", "" }, "default", 0);
+    allocator.free(later_empty);
+    try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classifyFailure(error.RunProgramEmpty).code);
 }
 
 test "event writer emits JSONL lifecycle and output records" {
@@ -4810,13 +4738,6 @@ test "event writer serializes cancellation as a canceled completion" {
     try expectJsonStringField(allocator, completion_line, "outcome", "canceled");
     try expectJsonIntegerField(allocator, completion_line, "exit_code", 130);
     try expectNestedJsonStringField(allocator, completion_line, "error", "code", "operation.canceled");
-}
-
-test "interactive stream protocol failure has a clear public message" {
-    const classified = classifyFailure(error.InteractiveStreamProtocolFailed);
-    try std.testing.expectEqual(machine_output.ErrorCode.runtime_start_failed, classified.code);
-    try std.testing.expect(std.mem.indexOf(u8, classified.message, "start-v1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, classified.message, "omit -i/-t") != null);
 }
 
 test "saved session attach failures are usage errors" {
@@ -4975,7 +4896,7 @@ test "run request rejects encoded line overflow" {
 }
 
 test "interactive run request uses start v1 pipe stdio" {
-    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/cat"}, "default", .{ .interactive = true });
+    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/cat"}, "default", .{ .stdio = .pipe });
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
@@ -4996,14 +4917,12 @@ test "streaming exec request uses start v1 with closed pipe stdin" {
 
 test "tty run request uses start v1 terminal metadata" {
     const request = try execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/sh"}, "default", .{
-        .tty = true,
-        .terminal_name = "xterm-256color",
+        .stdio = .tty,
         .terminal_size = .{ .rows = 40, .cols = 120 },
     });
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"tty\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"term\":\"xterm-256color\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_rows\":40") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_cols\":120") != null);
 }
