@@ -1169,8 +1169,7 @@ fn flushVsockRxKvm(
     ram: guestmem.GuestRam,
     transport_index: usize,
 ) !void {
-    if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (vsock_dev.flushPendingRx(transport, ram)) {
         try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(transport_index)), true);
     }
 }
@@ -1182,8 +1181,7 @@ fn flushNetworkRxKvm(
     ram: guestmem.GuestRam,
     transport_index: usize,
 ) !void {
-    if (net_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (net_dev.flushPendingRx(transport, ram)) {
         try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(transport_index)), true);
     }
 }

@@ -123,9 +123,11 @@ pub const Net = struct {
         self.backend.shutdown();
     }
 
-    pub fn flushPendingRx(self: *Net, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    /// Delivers pending backend frames the guest did not notify for. Returns
+    /// true when the caller must raise the transport's interrupt line.
+    pub fn flushPendingRx(self: *Net, transport: *mmio.Transport, ram: guestmem.GuestRam) bool {
         var budget: queue.NotifyBudget = .{};
-        return self.flushRx(&queues[rx_queue], ram, &budget);
+        return transport.signalUsedBuffers(self.flushRx(&transport.queues[rx_queue], ram, &budget));
     }
 
     fn configRead(ctx: *anyopaque, offset: u64) u32 {
@@ -470,7 +472,9 @@ test "net device exposes explicit pending rx flush for async backends" {
     try setDesc(ram, rx_desc, 0, packet, header_len + frame.len, 2);
     try pushAvail(ram, rx_avail, 8, 0);
 
-    try std.testing.expect(dev.flushPendingRx(&t.queues, ram));
+    try std.testing.expectEqual(@as(u32, 0), t.read(0x060));
+    try std.testing.expect(dev.flushPendingRx(&t, ram));
+    try std.testing.expectEqual(@as(u32, 1), t.read(0x060));
     try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, rx_used + 2));
     try std.testing.expectEqual(@as(u32, header_len + frame.len), try ram.read(u32, rx_used + 8));
     try std.testing.expectEqualStrings(frame, buf[packet + header_len ..][0..frame.len]);
@@ -574,19 +578,58 @@ fn fuzzNetTx(_: void, s: *std.testing.Smith) !void {
     var buf: [4096]u8 = [_]u8{0} ** 4096;
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
-    var rx_frame: [max_frame_len]u8 = undefined;
-    const rx_len = @min(s.slice(&rx_frame), max_frame_len);
-    if (rx_len > 0) backend.queueRx(rx_frame[0..rx_len]);
-
-    t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x1000, .avail_addr = 0x1200, .used_addr = 0x1400 };
     t.queues[tx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x0000, .avail_addr = 0x0400, .used_addr = 0x0800 };
-    ram.write(u16, 0x1200 + 2, s.value(u8) % 4) catch {};
     ram.write(u16, 0x0400 + 2, s.value(u8) % 4) catch {};
-    _ = t.write(0x050, rx_queue, ram);
     _ = t.write(0x050, tx_queue, ram);
     dev.shutdown();
 }
 
 test "fuzz net tx handling" {
     try std.testing.fuzz({}, fuzzNetTx, .{});
+}
+
+/// Backend with a short queue of fuzz-sized frames, including the empty and
+/// oversized frames RX delivery must drop.
+const FuzzRxBackend = struct {
+    frame: [max_frame_len + 1]u8 = undefined,
+    lens: [4]u16 = undefined,
+    count: usize = 0,
+    next: usize = 0,
+
+    fn backend(self: *FuzzRxBackend) Backend {
+        return .{ .context = self, .peekRxFn = peekRx, .consumeRxFn = consumeRx };
+    }
+
+    fn peekRx(ctx: ?*anyopaque) ?[]const u8 {
+        const self: *FuzzRxBackend = @ptrCast(@alignCast(ctx.?));
+        if (self.next == self.count) return null;
+        return self.frame[0..self.lens[self.next]];
+    }
+
+    fn consumeRx(ctx: ?*anyopaque) void {
+        const self: *FuzzRxBackend = @ptrCast(@alignCast(ctx.?));
+        self.next += 1;
+    }
+};
+
+fn fuzzNetRxDelivery(_: void, s: *std.testing.Smith) !void {
+    var rx = FuzzRxBackend{};
+    _ = s.slice(&rx.frame);
+    rx.count = s.valueRangeAtMost(u8, 0, rx.lens.len);
+    for (rx.lens[0..rx.count]) |*len| len.* = s.valueRangeAtMost(u16, 0, max_frame_len + 1);
+
+    var dev = Net.init(.{ .backend = rx.backend() });
+    var t = mmio.Transport.init(dev.device());
+    // Guest-controlled RX ring indexes, descriptor chains, and buffer layouts
+    // decide where host frames land.
+    var buf: [8192]u8 = [_]u8{0} ** 8192;
+    _ = s.slice(&buf);
+    const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
+    t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x1000, .avail_addr = 0x1200, .used_addr = 0x1400 };
+    _ = t.write(0x050, rx_queue, ram);
+    _ = dev.flushPendingRx(&t, ram);
+}
+
+test "fuzz net rx delivery" {
+    try std.testing.fuzz({}, fuzzNetRxDelivery, .{});
 }

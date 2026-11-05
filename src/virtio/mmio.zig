@@ -18,8 +18,14 @@ pub const window_size: u64 = 0x200;
 
 pub const max_queues = 4;
 
+pub const status_driver_ok: u32 = 4;
 pub const status_features_ok: u32 = 8;
+pub const status_device_needs_reset: u32 = 64;
 pub const status_failed: u32 = 128;
+
+// InterruptStatus bits (virtio 1.2 §4.2.2).
+const interrupt_used_buffer: u32 = 1;
+const interrupt_config_change: u32 = 2;
 
 /// What the transport asks of a concrete device.
 pub const Device = struct {
@@ -71,6 +77,51 @@ pub const Transport = struct {
     fn selectedQueue(self: *Transport) ?*queue.VirtQueue {
         if (self.queue_sel >= self.dev.queue_count) return null;
         return &self.queues[@intCast(self.queue_sel)];
+    }
+
+    /// The selected queue while its size and ring addresses may change. The
+    /// driver must not write them while QueueReady is set (virtio 1.2
+    /// §4.2.2.2), and ignoring such writes keeps the layout validated at
+    /// QueueReady in force.
+    fn configurableQueue(self: *Transport) ?*queue.VirtQueue {
+        const q = self.selectedQueue() orelse return null;
+        if (q.ready) return null;
+        return q;
+    }
+
+    /// Enable the selected queue only if the device can use its layout.
+    /// Otherwise the queue stays disabled and the device reports
+    /// DEVICE_NEEDS_RESET. Returns true when the caller must raise the
+    /// interrupt line.
+    fn enableQueue(self: *Transport, q: *queue.VirtQueue, ram: guestmem.GuestRam) bool {
+        q.validateRings(ram) catch return self.failQueue(q);
+        q.ready = true;
+        return false;
+    }
+
+    /// Virtio 1.2 §2.1.2: a device that needs a reset sets
+    /// DEVICE_NEEDS_RESET and, once DRIVER_OK is set, sends a configuration
+    /// change notification. Returns true when the caller must raise the
+    /// interrupt line.
+    fn failQueue(self: *Transport, q: *queue.VirtQueue) bool {
+        q.ready = false;
+        if (self.status & status_device_needs_reset != 0) return false;
+        self.status |= status_device_needs_reset;
+        if (self.status & status_driver_ok == 0) return false;
+        self.interrupt_status |= interrupt_config_change;
+        return true;
+    }
+
+    /// Latch a used buffer notification after the device returned buffers,
+    /// whether for a guest queue notify or for host-initiated delivery such as
+    /// receive. Returns true when the caller must raise the interrupt line.
+    /// VIRTIO_F_EVENT_IDX is not offered and VIRTQ_AVAIL_F_NO_INTERRUPT is only
+    /// a SHOULD NOT (virtio 1.2 §2.7.7.2), so every batch of used buffers
+    /// notifies.
+    pub fn signalUsedBuffers(self: *Transport, returned: bool) bool {
+        if (!returned) return false;
+        self.interrupt_status |= interrupt_used_buffer;
+        return true;
     }
 
     pub fn offeredFeatures(self: *const Transport) u64 {
@@ -147,8 +198,9 @@ pub const Transport = struct {
         };
     }
 
-    /// MMIO write at `offset`. Returns true if the device raised a
-    /// used-buffer interrupt (caller forwards to the interrupt controller).
+    /// MMIO write at `offset`. Returns true if the write latched a used
+    /// buffer or configuration change notification (caller forwards to the
+    /// interrupt controller).
     pub fn write(self: *Transport, offset: u64, value: u32, ram: guestmem.GuestRam) bool {
         switch (offset) {
             0x014 => self.device_features_sel = value,
@@ -161,22 +213,25 @@ pub const Transport = struct {
             },
             0x024 => self.driver_features_sel = value,
             0x030 => self.queue_sel = value,
-            0x038 => if (self.selectedQueue()) |q| {
+            0x038 => if (self.configurableQueue()) |q| {
                 q.size = @intCast(@min(value, queue.max_queue_size));
             },
             0x044 => if (self.selectedQueue()) |q| {
-                q.ready = value & 1 != 0;
+                if (value & 1 == 0) {
+                    q.ready = false;
+                } else {
+                    return self.enableQueue(q, ram);
+                }
             },
             0x050 => {
                 // QueueNotify: value is the queue index.
                 if (value < self.dev.queue_count) {
                     const q = &self.queues[@intCast(value)];
                     if (q.ready) {
-                        q.validateLayout() catch return false;
-                        if (self.dev.notifyFn(self.dev.context, @intCast(value), &self.queues, ram)) {
-                            self.interrupt_status |= 1;
-                            return true;
-                        }
+                        // Restored queues skip QueueReady and were checked
+                        // without guest RAM.
+                        q.validateRings(ram) catch return self.failQueue(q);
+                        return self.signalUsedBuffers(self.dev.notifyFn(self.dev.context, @intCast(value), &self.queues, ram));
                     }
                 }
             },
@@ -201,12 +256,12 @@ pub const Transport = struct {
                     self.status = next_status;
                 }
             },
-            0x080 => if (self.selectedQueue()) |q| setLow(&q.desc_addr, value),
-            0x084 => if (self.selectedQueue()) |q| setHigh(&q.desc_addr, value),
-            0x090 => if (self.selectedQueue()) |q| setLow(&q.avail_addr, value),
-            0x094 => if (self.selectedQueue()) |q| setHigh(&q.avail_addr, value),
-            0x0a0 => if (self.selectedQueue()) |q| setLow(&q.used_addr, value),
-            0x0a4 => if (self.selectedQueue()) |q| setHigh(&q.used_addr, value),
+            0x080 => if (self.configurableQueue()) |q| setLow(&q.desc_addr, value),
+            0x084 => if (self.configurableQueue()) |q| setHigh(&q.desc_addr, value),
+            0x090 => if (self.configurableQueue()) |q| setLow(&q.avail_addr, value),
+            0x094 => if (self.configurableQueue()) |q| setHigh(&q.avail_addr, value),
+            0x0a0 => if (self.configurableQueue()) |q| setLow(&q.used_addr, value),
+            0x0a4 => if (self.configurableQueue()) |q| setHigh(&q.used_addr, value),
             else => {},
         }
         return false;
@@ -214,7 +269,7 @@ pub const Transport = struct {
 
     pub fn raiseConfigChange(self: *Transport) bool {
         self.config_generation +%= 1;
-        self.interrupt_status |= 2;
+        self.interrupt_status |= interrupt_config_change;
         return true;
     }
 
@@ -423,14 +478,22 @@ test "queue configuration and clamping" {
     try std.testing.expectEqual(@as(u32, 0), t.read(0x038));
 }
 
+fn configureTestQueue(t: *Transport, qi: u32, ram: guestmem.GuestRam) void {
+    _ = t.write(0x030, qi, ram);
+    _ = t.write(0x038, 8, ram);
+    _ = t.write(0x080, 0x000, ram);
+    _ = t.write(0x090, 0x400, ram);
+    _ = t.write(0x0a0, 0x800, ram);
+    _ = t.write(0x044, 1, ram);
+}
+
 test "notify routes to device and latches interrupt until ack" {
     var td = TestDev{};
     var t = Transport.init(td.dev());
-    var buf: [16]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const ram = testRam(&buf);
-    _ = t.write(0x030, 1, ram);
-    _ = t.write(0x038, 8, ram);
-    _ = t.write(0x044, 1, ram); // ready
+    configureTestQueue(&t, 1, ram);
+    try std.testing.expectEqual(@as(u32, 1), t.read(0x044));
     const raised = t.write(0x050, 1, ram);
     try std.testing.expect(raised);
     try std.testing.expectEqual(@as(u8, 1), td.notified.?);
@@ -459,6 +522,90 @@ test "notify ignores queues with overflowing ring addresses" {
     try std.testing.expectEqual(@as(?u8, null), td.notified);
 }
 
+test "QueueReady refuses ring layouts the device cannot use" {
+    var buf: [4096]u8 = undefined;
+    const ram = testRam(&buf);
+    const Case = struct { size: u32, desc: u32 = 0x000, avail: u32 = 0x400, used: u32 = 0x800 };
+    const cases = [_]Case{
+        .{ .size = 0 },
+        .{ .size = 6 },
+        .{ .size = 8, .desc = 0x008 },
+        .{ .size = 8, .avail = 0x401 },
+        .{ .size = 8, .used = 0x802 },
+        // The used ring, including its trailing avail_event, ends past RAM.
+        .{ .size = 8, .used = 4096 - (4 + 8 * 8) },
+    };
+    for (cases) |case| {
+        var td = TestDev{};
+        var t = Transport.init(td.dev());
+        _ = t.write(0x070, 1 | 2 | status_features_ok, ram);
+        _ = t.write(0x030, 1, ram);
+        _ = t.write(0x038, case.size, ram);
+        _ = t.write(0x080, case.desc, ram);
+        _ = t.write(0x090, case.avail, ram);
+        _ = t.write(0x0a0, case.used, ram);
+
+        // Before DRIVER_OK the failure is only reported in the status.
+        try std.testing.expect(!t.write(0x044, 1, ram));
+        try std.testing.expectEqual(@as(u32, 0), t.read(0x044));
+        try std.testing.expect(t.read(0x070) & status_device_needs_reset != 0);
+        try std.testing.expectEqual(@as(u32, 0), t.read(0x060));
+        try std.testing.expect(!t.write(0x050, 1, ram));
+        try std.testing.expectEqual(@as(?u8, null), td.notified);
+    }
+
+    // After DRIVER_OK the device also sends a configuration change
+    // notification, once.
+    var td = TestDev{};
+    var t = Transport.init(td.dev());
+    _ = t.write(0x070, 1 | 2 | status_features_ok | status_driver_ok, ram);
+    _ = t.write(0x030, 1, ram);
+    _ = t.write(0x038, 6, ram);
+    try std.testing.expect(t.write(0x044, 1, ram));
+    try std.testing.expectEqual(@as(u32, 2), t.read(0x060));
+    try std.testing.expect(!t.write(0x044, 1, ram));
+
+    // Reset clears the failure and a usable layout is accepted.
+    _ = t.write(0x070, 0, ram);
+    try std.testing.expectEqual(@as(u32, 0), t.read(0x070));
+    configureTestQueue(&t, 1, ram);
+    try std.testing.expectEqual(@as(u32, 1), t.read(0x044));
+    try std.testing.expect(t.write(0x050, 1, ram));
+}
+
+test "queue layout is frozen while the queue is ready" {
+    var td = TestDev{};
+    var t = Transport.init(td.dev());
+    var buf: [4096]u8 = undefined;
+    const ram = testRam(&buf);
+    configureTestQueue(&t, 1, ram);
+
+    // The driver must not touch these while QueueReady is set; a hostile one
+    // cannot swap in a layout that was never validated.
+    _ = t.write(0x038, 6, ram);
+    _ = t.write(0x080, 0x008, ram);
+    _ = t.write(0x094, 0xffff_ffff, ram);
+    _ = t.write(0x0a0, 0xffd, ram);
+    try std.testing.expect(t.write(0x050, 1, ram));
+    try std.testing.expectEqual(@as(u8, 1), td.notified.?);
+    try std.testing.expect(t.read(0x070) & status_device_needs_reset == 0);
+}
+
+test "notify fails a restored queue with an unusable layout" {
+    var td = TestDev{};
+    var t = Transport.init(td.dev());
+    var buf: [4096]u8 = undefined;
+    const ram = testRam(&buf);
+    _ = t.write(0x070, 1 | 2 | status_features_ok | status_driver_ok, ram);
+    t.queues[1] = .{ .size = 8, .ready = true, .desc_addr = 0x008, .avail_addr = 0x400, .used_addr = 0x800 };
+
+    try std.testing.expect(t.write(0x050, 1, ram));
+    try std.testing.expectEqual(@as(?u8, null), td.notified);
+    try std.testing.expectEqual(@as(u32, 2), t.read(0x060));
+    try std.testing.expect(t.read(0x070) & status_device_needs_reset != 0);
+    try std.testing.expectEqual(@as(u32, 0), t.read(0x044));
+}
+
 test "config change latches interrupt and bumps generation" {
     var td = TestDev{};
     var t = Transport.init(td.dev());
@@ -473,12 +620,11 @@ test "config change latches interrupt and bumps generation" {
 test "status write of zero resets transport state" {
     var td = TestDev{};
     var t = Transport.init(td.dev());
-    var buf: [16]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const ram = testRam(&buf);
     _ = t.write(0x070, 0xf, ram);
-    _ = t.write(0x030, 0, ram);
-    _ = t.write(0x038, 8, ram);
-    _ = t.write(0x044, 1, ram);
+    configureTestQueue(&t, 0, ram);
+    try std.testing.expect(t.queues[0].ready);
     _ = t.write(0x070, 0, ram);
     try std.testing.expectEqual(@as(u32, 0), t.read(0x070));
     try std.testing.expect(!t.queues[0].ready);

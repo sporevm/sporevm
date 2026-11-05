@@ -2594,8 +2594,7 @@ fn flushVsockRx(
     ram: guestmem.GuestRam,
     transport_index: u32,
 ) !bool {
-    if (vsock_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (vsock_dev.flushPendingRx(transport, ram)) {
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(transport_index), true), "raise vsock spi");
         return true;
     }
@@ -2622,8 +2621,7 @@ fn flushNetworkRxHvf(
     ram: guestmem.GuestRam,
     transport_index: usize,
 ) !void {
-    if (net_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (net_dev.flushPendingRx(transport, ram)) {
         try hvf.check(hvf.hv_gic_set_spi(board.virtioDeviceIntid(@intCast(transport_index)), true), "raise net spi");
     }
 }

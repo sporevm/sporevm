@@ -817,8 +817,7 @@ fn pollControlLocked(ctx: *ThreadContext) !bool {
         },
     }
     const transport = &ctx.transports[board.vsock_slot.index];
-    if (ctx.vsock_dev.flushPendingRx(&transport.queues, ctx.ram)) {
-        transport.interrupt_status |= 1;
+    if (ctx.vsock_dev.flushPendingRx(transport, ctx.ram)) {
         try kvm.setIrq(ctx.vm_fd, board.vsock_slot.gsi, true);
     }
     return false;
@@ -1084,8 +1083,7 @@ fn flushNetworkRx(
     transport: *mmio.Transport,
     ram: guestmem.GuestRam,
 ) !void {
-    if (net_dev.flushPendingRx(&transport.queues, ram)) {
-        transport.interrupt_status |= 1;
+    if (net_dev.flushPendingRx(transport, ram)) {
         try kvm.setIrq(vm_fd, board.net_slot.gsi, true);
     }
 }

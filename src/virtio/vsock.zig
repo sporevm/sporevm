@@ -123,9 +123,11 @@ pub const Vsock = struct {
         );
     }
 
-    pub fn flushPendingRx(self: *Vsock, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
+    /// Delivers pending host packets the guest did not notify for. Returns
+    /// true when the caller must raise the transport's interrupt line.
+    pub fn flushPendingRx(self: *Vsock, transport: *mmio.Transport, ram: guestmem.GuestRam) bool {
         var budget: queue.NotifyBudget = .{};
-        return self.flushRx(&queues[rx_queue], ram, &budget);
+        return transport.signalUsedBuffers(self.flushRx(&transport.queues[rx_queue], ram, &budget));
     }
 
     fn enqueueHostConnectRequest(self: *Vsock, stream: *HostStream) !void {
