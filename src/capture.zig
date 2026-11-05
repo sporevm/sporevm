@@ -3,8 +3,6 @@
 const std = @import("std");
 const posix = std.posix;
 
-const default_dirty_tracking_epoch_ms = 250;
-
 pub const Signal = posix.SIG;
 
 pub const Trigger = union(enum) {
@@ -32,23 +30,14 @@ pub const Trigger = union(enum) {
     }
 };
 
-pub const DirtyTrackingPolicy = struct {
-    enabled: bool = false,
-    epoch_ms: u64 = default_dirty_tracking_epoch_ms,
-};
-
 pub const Plan = struct {
     snapshot_dir: ?[]const u8 = null,
     snapshot_on_probe_complete: bool = false,
     request: ?*Request = null,
     signal: ?Signal = null,
     continue_after_capture: bool = false,
-    dirty_tracking: DirtyTrackingPolicy = .{},
-
-    // Product captures need coherent run-bridge snapshots, so they seal the
-    // final dirty set at capture time instead of racing a periodic worker
-    // against the active exec/vsock session.
-    const product_run_capture_dirty_epoch_ms = 0;
+    /// Fresh captures track dirty RAM and seal the dirty set at capture time.
+    dirty_tracking: bool = false,
 
     pub const ProductRunOptions = struct {
         capture_path: ?[]const u8 = null,
@@ -61,7 +50,6 @@ pub const Plan = struct {
     pub fn productRun(options: ProductRunOptions) Plan {
         const has_capture = options.capture_path != null;
         const signal = if (has_capture) options.trigger.signalValue() else null;
-        const dirty_tracking_enabled = has_capture and options.resume_dir == null;
 
         return .{
             .snapshot_dir = options.capture_path,
@@ -69,10 +57,7 @@ pub const Plan = struct {
             .request = if (signal != null) options.request else null,
             .signal = signal,
             .continue_after_capture = signal != null and options.continue_after_capture,
-            .dirty_tracking = .{
-                .enabled = dirty_tracking_enabled,
-                .epoch_ms = if (dirty_tracking_enabled) product_run_capture_dirty_epoch_ms else default_dirty_tracking_epoch_ms,
-            },
+            .dirty_tracking = has_capture and options.resume_dir == null,
         };
     }
 
@@ -280,7 +265,7 @@ test "capture trigger parser accepts exit and signals" {
     try std.testing.expect(Trigger.parse("KILL") == null);
 }
 
-test "product run capture plan enables tail-only dirty tracking for fresh captures" {
+test "product run capture plan enables dirty tracking for fresh captures" {
     var request_value = Request{};
     const plan = Plan.productRun(.{
         .capture_path = "base.spore",
@@ -295,8 +280,7 @@ test "product run capture plan enables tail-only dirty tracking for fresh captur
     try std.testing.expectEqual(Signal.USR1, plan.signal.?);
     try std.testing.expectEqual(&request_value, plan.request.?);
     try std.testing.expect(plan.continue_after_capture);
-    try std.testing.expect(plan.dirty_tracking.enabled);
-    try std.testing.expectEqual(@as(u64, 0), plan.dirty_tracking.epoch_ms);
+    try std.testing.expect(plan.dirty_tracking);
     try std.testing.expect(plan.isSignalCapture());
     try std.testing.expect(!plan.isExitCapture());
 }
@@ -315,8 +299,7 @@ test "product run capture plan keeps resume captures on full snapshot path" {
     try std.testing.expect(plan.request == null);
     try std.testing.expect(plan.signal == null);
     try std.testing.expect(!plan.continue_after_capture);
-    try std.testing.expect(!plan.dirty_tracking.enabled);
-    try std.testing.expectEqual(@as(u64, 250), plan.dirty_tracking.epoch_ms);
+    try std.testing.expect(!plan.dirty_tracking);
     try std.testing.expect(!plan.isSignalCapture());
     try std.testing.expect(plan.isExitCapture());
 }

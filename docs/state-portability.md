@@ -99,7 +99,6 @@ block identical-host fork/fan-out.
 | Grow-only virtio-mem hotplug | v4/v5 normalized initial, maximum, requested, captured, and plugged block ranges | yes | yes | yes | yes | portable, one vCPU currently |
 | General writable disk contents | not represented | no | reject | no | reject | out of current format |
 | Kernel identity | not yet represented | no | no | no | no | planned contract field |
-| Access trace | not yet represented | no | no | no | no | local KVM/HVF lazy traces only; not a portability contract |
 
 ## Register classes
 
@@ -239,7 +238,7 @@ Current HVF gaps:
 | Direction | Current status | Gate before declaring green |
 | --- | --- | --- |
 | KVM→KVM | Manifest v2 passes same-host smoke on the `m7g.metal` KVM host. Manifest v3 multi-vCPU capture, `run --from`, and `resume` pass on the `sporevm-ops` ARM64 KVM CI host. | Keep v2 and v3 as regression coverage. |
-| HVF→HVF | Passes same-host v2 smoke locally, including HVF lazy RAM and file-backed fork smokes. Manifest v3 multi-vCPU same-backend capture, `run --from`, and `resume` pass on Apple Silicon with private GIC state. | Keep v2 and v3 as regression coverage. |
+| HVF→HVF | Passes same-host v2 smoke locally, including HVF file-backed fork smokes. Manifest v3 multi-vCPU same-backend capture, `run --from`, and `resume` pass on Apple Silicon with private GIC state. | Keep v2 and v3 as regression coverage. |
 | KVM→HVF | Portable vCPU, virtio, generation, GIC apply, and CPU profile machinery exist. `m7g.metal` and `a1.metal` spores fail closed on counter-frequency mismatch. | Need a KVM producer whose guest counter frequency matches HVF's 24MHz, or a designed cross-frequency timer contract. |
 | HVF→KVM | Blocked because HVF still produces backend-private GIC state. Timer compatibility still applies. | Make HVF produce portable GICv3 state, then run with compatible counter frequency. |
 
@@ -308,5 +307,4 @@ Current evidence:
    creation, frequency-neutral timer state plus guest-visible constraints, or
    host-class matching only.
 4. Make HVF emit portable GICv3 state instead of only the backend-private blob.
-5. Extend the matrix when persisted access traces/readahead hints or additional
-   fork generation semantics land.
+5. Extend the matrix when additional fork generation semantics land.

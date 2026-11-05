@@ -16,7 +16,6 @@ const saved_spore_pin = @import("../saved_spore_pin.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const kvm = @import("aarch64.zig");
-const lazy_ram = @import("lazy_ram.zig");
 const snapshot = @import("aarch64_snapshot.zig");
 const board = @import("../aarch64/board.zig");
 const boot = @import("../aarch64/boot.zig");
@@ -75,8 +74,6 @@ pub const Config = struct {
     /// Product callers provide their environment so snapshot code can write
     /// local-only RAM backing proofs under the configured runtime root.
     environ_map: ?*const std.process.Environ.Map = null,
-    /// Optional fd that receives one line per lazily materialized chunk.
-    lazy_ram_trace_fd: ?std.c.fd_t = null,
     snapshot_dir: ?[]const u8 = null,
     /// Snapshot and stop when the exec probe has observed command completion.
     snapshot_on_probe_complete: bool = false,
@@ -85,10 +82,9 @@ pub const Config = struct {
     capture_request: ?*capture.Request = null,
     /// Continue running after a host-requested capture instead of stopping.
     continue_after_capture: bool = false,
-    /// Opt-in KVM dirty-log capture path. When enabled, guest writes are
-    /// collected in epochs and snapshot only needs a final dirty-log tail flush
-    /// instead of a full RAM scan.
-    dirty_tracking: DirtyTrackingOptions = .{},
+    /// Opt-in KVM dirty-log capture path. When enabled, snapshot collects the
+    /// dirty log and seals only dirty chunks instead of scanning all RAM.
+    dirty_tracking: bool = false,
     /// Optional minimal host-initiated vsock stream used by benchmark harnesses.
     exec_probe: ?*vsock.HostStream = null,
     exec_probe_timeout_ms: u64 = 30_000,
@@ -103,12 +99,6 @@ pub const Config = struct {
 fn hasFreshCaptureTrigger(config: Config) bool {
     return config.snapshot_on_probe_complete or config.capture_request != null;
 }
-
-pub const DirtyTrackingOptions = struct {
-    enabled: bool = false,
-    /// 0 disables periodic collection and measures only the final tail flush.
-    epoch_ms: u64 = 250,
-};
 
 pub const ExitCause = enum { guest_off, guest_reset, snapshotted, probe_complete, monitor_stopped };
 
@@ -230,7 +220,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     defer if (resume_parsed) |*parsed| parsed.deinit();
     var resume_v1_parsed: ?std.json.Parsed(spore.ManifestV1) = null;
     defer if (resume_v1_parsed) |*parsed| parsed.deinit();
-    var lazy_pager: ?lazy_ram.Pager = null;
     var dirty_tracker: ?DirtyTracker = null;
     defer if (dirty_tracker) |*tracker| tracker.deinit();
     var restore_stats: ?RestoreStats = null;
@@ -266,7 +255,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     if (config.vcpus != 1 and (config.virtio_mem_region_size != 0 or config.continue_after_capture)) {
         return error.UnsupportedVcpuCount;
     }
-    if (config.dirty_tracking.enabled and config.virtio_mem_region_size != 0) return error.BadManifest;
+    if (config.dirty_tracking and config.virtio_mem_region_size != 0) return error.BadManifest;
 
     const kvm_fd = try kvm.openDevKvm();
     defer closeFd(kvm_fd);
@@ -287,7 +276,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     const ram_mapping = try mapRam(allocator, config, resume_memory);
     if (restore_stats) |*stats| stats.map_ram_ms = (try monotonicMs()) - map_ram_start;
     defer ram_mapping.deinit();
-    defer if (lazy_pager) |*pager| pager.deinit();
     const ram_bytes = ram_mapping.bytes;
     var ram = guestmem.GuestRam{ .bytes = ram_bytes, .base = board.ram_base };
     const initial_ram_len: usize = @intCast(config.ram_size);
@@ -299,7 +287,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
 
     var region = kvm.UserspaceMemoryRegion{
         .slot = 0,
-        .flags = if (config.dirty_tracking.enabled) kvm.KVM_MEM_LOG_DIRTY_PAGES else 0,
+        .flags = if (config.dirty_tracking) kvm.KVM_MEM_LOG_DIRTY_PAGES else 0,
         .guest_phys_addr = board.ram_base,
         .memory_size = config.ram_size,
         .userspace_addr = @intFromPtr(ram_bytes.ptr),
@@ -396,7 +384,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                 .counter_frequency_hz = host_counter_frequency_hz,
                 .device_count = transports.len,
             });
-            try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &lazy_pager, &restore_stats);
+            try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
             const state_start = try monotonicMs();
             if (m.memory_state) |state| try mem_dev.restoreState(state);
             try applyTransports(transports, m.devices);
@@ -408,7 +396,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         } else {
             const m = resume_v1_parsed.?.value;
             try checkKvmManifestV1(m, config, transports.len, host_counter_frequency_hz);
-            try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &lazy_pager, &restore_stats);
+            try restoreMemory(allocator, config, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
             const state_start = try monotonicMs();
             if (m.memory_state) |state| try mem_dev.restoreState(state);
             try applyTransports(transports, m.devices);
@@ -448,7 +436,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
         try kvm.setOneRegU64(vcpu_fd, kvm.gprReg(0), layout.dtb);
     }
 
-    if (config.dirty_tracking.enabled) {
+    if (config.dirty_tracking) {
         const dir = config.snapshot_dir orelse return error.KvmIoctlFailed;
         dirty_tracker = try DirtyTracker.start(allocator, .{
             .vm_fd = vm_fd,
@@ -456,12 +444,10 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .dir = dir,
             .ram = ram_bytes,
             .seed_ranges = boot_seed_ranges,
-            .epoch_ms = config.dirty_tracking.epoch_ms,
         });
         if (dirty_tracker) |*tracker| {
             ram.dirty_context = tracker;
             ram.dirty_fn = DirtyTracker.markGuestWriteCallback;
-            try tracker.startWorker();
         }
     }
 
@@ -489,13 +475,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     }
     defer config.network.clearWake();
     defer if (config.capture_request) |request_capture| request_capture.clearWake();
-    if (lazy_pager) |*pager| {
-        if (config.vcpus == 1) {
-            pager.setFailureWake(.{ .context = &primary_vcpu.wake, .wakeFn = wakeNetworkKvmRun });
-        } else {
-            pager.setFailureWake(.{ .context = &multi_wake, .wakeFn = wakeNetworkKvmRunSet });
-        }
-    }
 
     const start_ms = try monotonicMs();
     if (restore_stats) |*stats| {
@@ -545,7 +524,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             .annotations = config.annotations,
             .dirty_tracker = if (dirty_tracker) |*tracker| tracker else null,
             .environ_map = config.environ_map,
-            .lazy_pager = if (lazy_pager) |*pager| pager else null,
         });
     }
     var exec_probe_done = false;
@@ -554,7 +532,6 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var pending_kvm_completion = false;
     var did_capture_request = false;
     while (true) {
-        if (lazy_pager) |*pager| try pager.checkFailed();
         if (mem_transport_index != null) {
             if (config.exec_probe) |probe| {
                 const new_pressure_events = probe.memory_pressure_count -| handled_memory_pressure_count;
@@ -903,7 +880,6 @@ const MultiKvmRunOptions = struct {
     annotations: spore.Annotations,
     dirty_tracker: ?*DirtyTracker,
     environ_map: ?*const std.process.Environ.Map,
-    lazy_pager: ?*lazy_ram.Pager,
 };
 
 const MultiKvmThreadContext = struct {
@@ -948,12 +924,6 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
 
     var exec_probe_done = false;
     while (true) {
-        if (options.lazy_pager) |pager| {
-            pager.checkFailed() catch |err| {
-                state.finish(.{ .err = err });
-                continue;
-            };
-        }
         if (state.result()) |result| {
             options.wake_set.wakeAll();
             switch (result) {
@@ -1386,7 +1356,7 @@ fn mapRam(allocator: std.mem.Allocator, config: Config, manifest_memory: ?spore.
             try spore.validateMemoryBacking(backing, maximum_size);
             break :blk try mapFileBackedRamFd(fd, maximum_size);
         },
-        .fresh, .eager_chunks, .lazy_chunks => mapAnonymousRam(maximum_size),
+        .fresh, .eager_chunks => mapAnonymousRam(maximum_size),
     };
 }
 
@@ -1396,7 +1366,6 @@ fn restoreMemory(
     memory: spore.MemoryManifest,
     ram_bytes: []u8,
     file_backed: bool,
-    lazy_pager: *?lazy_ram.Pager,
     restore_stats: *?RestoreStats,
 ) !void {
     // The file-backed path is only enabled for proof-gated local backing.
@@ -1417,18 +1386,6 @@ fn restoreMemory(
             if (restore_stats.*) |*stats| stats.mode = "eager_chunks";
             const memory_start = try monotonicMs();
             try spore.loadMemory(allocator, config.resume_dir.?, memory, ram_bytes);
-            if (restore_stats.*) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
-        },
-        .lazy_chunks => {
-            if (file_backed) return error.BadManifest;
-            if (restore_stats.*) |*stats| stats.mode = "lazy_chunks";
-            const memory_start = try monotonicMs();
-            lazy_pager.* = try lazy_ram.Pager.start(.{
-                .dir = config.resume_dir.?,
-                .manifest = memory,
-                .ram = ram_bytes,
-                .trace_fd = config.lazy_ram_trace_fd,
-            });
             if (restore_stats.*) |*stats| stats.memory_ms = (try monotonicMs()) - memory_start;
         },
     }
@@ -1527,10 +1484,8 @@ const DirtyTracker = struct {
     vm_fd: std.c.fd_t,
     slot: u32,
     bitmap: []usize,
-    core: dirty_ram.TrackerCore,
+    tracking_start_ms: u64 = 0,
     mutex: SpinLock = .{},
-    stop_read_fd: std.c.fd_t = -1,
-    stop_write_fd: std.c.fd_t = -1,
     stats: DirtyStats = .{},
 
     const Options = struct {
@@ -1539,12 +1494,10 @@ const DirtyTracker = struct {
         dir: []const u8,
         ram: []const u8,
         seed_ranges: ?[]const dirty_ram.ChunkRange = null,
-        epoch_ms: u64,
     };
 
     const DirtyStats = struct {
         dirty_pages_total: u64 = 0,
-        dirty_pages_tail: u64 = 0,
         get_dirty_log_ms: u64 = 0,
         get_dirty_log_cpu_ms: u64 = 0,
         dirty_pages_per_sec: u64 = 0,
@@ -1569,141 +1522,45 @@ const DirtyTracker = struct {
             .vm_fd = options.vm_fd,
             .slot = options.slot,
             .bitmap = try allocator.alloc(usize, bitmap_word_count),
-            .core = dirty_ram.TrackerCore.init(options.epoch_ms),
         };
 
         // Some kernels conservatively mark a logging memslot dirty at
         // creation. Drop that baseline after the host has loaded the kernel,
-        // initrd, and DTB so subsequent epochs measure guest writes only.
-        _ = try tracker.collectDirtyLog(false);
+        // initrd, and DTB so the capture-time flush covers guest writes only.
+        _ = try tracker.collectDirtyLog();
         tracker.resetDirtyStatsAfterBaseline();
-        tracker.core.tracking_start_ms = try monotonicMs();
+        tracker.tracking_start_ms = try monotonicMs();
 
         std.log.info(
-            "kvm dirty tracking started: mode=dirty-log ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d} epoch_ms={d}",
-            .{ options.ram.len / 1024 / 1024, tracker.sealer.chunkCount(), tracker.sealer.stats.seed_nonzero_chunks, tracker.sealer.stats.seed_ms, options.epoch_ms },
+            "kvm dirty tracking started: mode=dirty-log ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d}",
+            .{ options.ram.len / 1024 / 1024, tracker.sealer.chunkCount(), tracker.sealer.stats.seed_nonzero_chunks, tracker.sealer.stats.seed_ms },
         );
         return tracker;
     }
 
     fn deinit(self: *DirtyTracker) void {
-        self.stopWorker();
         self.sealer.deinit();
     }
 
-    fn startWorker(self: *DirtyTracker) !void {
-        if (!self.core.shouldStartWorker()) return;
-        var stop_pipe: [2]std.c.fd_t = undefined;
-        try linuxCall(linux.pipe2(&stop_pipe, .{ .CLOEXEC = true }));
-        errdefer closeFd(stop_pipe[0]);
-        errdefer closeFd(stop_pipe[1]);
-        self.stop_read_fd = stop_pipe[0];
-        self.stop_write_fd = stop_pipe[1];
-        errdefer {
-            closeFd(self.stop_read_fd);
-            closeFd(self.stop_write_fd);
-            self.stop_read_fd = -1;
-            self.stop_write_fd = -1;
-        }
-        self.core.worker_thread = try std.Thread.spawn(.{}, dirtyWorker, .{self});
-        std.log.info("kvm dirty tracking worker started: epoch_ms={d}", .{self.core.epoch_ms});
-    }
-
-    fn stopWorker(self: *DirtyTracker) void {
-        if (self.core.worker_thread) |thread| {
-            const join_start = monotonicMs() catch 0;
-            self.core.stop.store(true, .release);
-            var byte: [1]u8 = .{1};
-            if (self.stop_write_fd >= 0) _ = linux.write(self.stop_write_fd, &byte, byte.len);
-            thread.join();
-            self.core.worker_thread = null;
-            const join_end = monotonicMs() catch join_start;
-            self.core.stats.worker_join_ms += join_end - join_start;
-        }
-        if (self.stop_read_fd >= 0) {
-            closeFd(self.stop_read_fd);
-            self.stop_read_fd = -1;
-        }
-        if (self.stop_write_fd >= 0) {
-            closeFd(self.stop_write_fd);
-            self.stop_write_fd = -1;
-        }
-    }
-
-    fn dirtyWorker(self: *DirtyTracker) void {
-        var next_deadline = (monotonicMs() catch 0) +| self.core.epoch_ms;
-        while (true) {
-            if (self.core.stop.load(.acquire)) return;
-            const now = monotonicMs() catch 0;
-            const wait_ms = if (next_deadline > now) next_deadline - now else 0;
-            const timeout_ms: i32 = if (wait_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(wait_ms);
-            var fds = [_]linux.pollfd{.{ .fd = self.stop_read_fd, .events = linux.POLL.IN, .revents = 0 }};
-            const rc = linux.poll(&fds, fds.len, timeout_ms);
-            switch (linux.errno(rc)) {
-                .SUCCESS => {},
-                .INTR => continue,
-                else => {
-                    self.markWorkerFailed();
-                    return;
-                },
-            }
-            if (rc > 0 and fds[0].revents != 0) return;
-            if (self.core.stop.load(.acquire)) return;
-            const epoch_start = monotonicMs() catch 0;
-            self.flushDirty(false) catch {
-                self.markWorkerFailed();
-                return;
-            };
-            const epoch_end = monotonicMs() catch epoch_start;
-            self.recordWorkerEpochTiming(epoch_start, epoch_end, next_deadline);
-            next_deadline = epoch_start +| self.core.epoch_ms;
-        }
-    }
-
-    fn markWorkerFailed(self: *DirtyTracker) void {
-        self.mutex.lock();
-        self.core.markWorkerFailed();
-        self.mutex.unlock();
-    }
-
-    fn recordWorkerEpochTiming(self: *DirtyTracker, epoch_start: u64, epoch_end: u64, deadline_ms: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.core.recordWorkerEpochTiming(epoch_start, epoch_end, deadline_ms);
-    }
-
     fn finish(self: *DirtyTracker) !spore.MemoryManifest {
-        const worker_stop_start = try monotonicMs();
-        self.stopWorker();
-        self.core.stats.finish_worker_stop_ms = (try monotonicMs()) - worker_stop_start;
-        if (self.core.worker_failed) return error.KvmDirtyWorkerFailed;
-
         const tail_start = try monotonicMs();
-        try self.flushDirty(true);
+        try self.flushDirty();
         self.sealer.stats.tail_flush_ms = (try monotonicMs()) - tail_start;
         const now_ms = try monotonicMs();
-        self.sealer.finishRates(self.core.tracking_start_ms, now_ms);
+        self.sealer.finishRates(self.tracking_start_ms, now_ms);
         self.stats.dirty_pages_per_sec = ratePerSec(self.stats.dirty_pages_total, self.sealer.stats.tracking_ms);
         return try self.sealer.finishBacking();
     }
 
-    fn flushDirty(self: *DirtyTracker, tail: bool) !void {
+    fn flushDirty(self: *DirtyTracker) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.flushDirtyLocked(tail);
-    }
-
-    fn flushDirtyLocked(self: *DirtyTracker, tail: bool) !void {
-        const dirty_pages = try self.collectDirtyLog(tail);
+        const dirty_pages = try self.collectDirtyLog();
         if (dirty_pages == 0 and !self.sealer.hasDirtyChunks()) return;
-        _ = try self.sealer.flushMarked(.{
-            .tail = tail,
-            .stop = &self.core.stop,
-            .record_cpu = true,
-        });
+        _ = try self.sealer.flushMarked(.{ .record_cpu = true });
     }
 
-    fn collectDirtyLog(self: *DirtyTracker, tail: bool) !u64 {
+    fn collectDirtyLog(self: *DirtyTracker) !u64 {
         @memset(self.bitmap, 0);
         var log = kvm.DirtyLog{
             .slot = self.slot,
@@ -1714,7 +1571,6 @@ const DirtyTracker = struct {
         _ = try kvm.ioctl(self.vm_fd, kvm.KVM_GET_DIRTY_LOG, @intFromPtr(&log), "KVM_GET_DIRTY_LOG");
         self.stats.get_dirty_log_ms += (try monotonicMs()) - log_start;
         self.stats.get_dirty_log_cpu_ms += elapsedCpuMs(log_cpu_start);
-        if (!tail) self.core.stats.dirty_epoch_count += 1;
 
         var dirty_pages: u64 = 0;
         const page_count = (self.sealer.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
@@ -1731,7 +1587,6 @@ const DirtyTracker = struct {
             }
         }
         self.stats.dirty_pages_total += dirty_pages;
-        if (tail) self.stats.dirty_pages_tail += dirty_pages;
         return dirty_pages;
     }
 
@@ -1757,11 +1612,9 @@ const DirtyTracker = struct {
 
     fn resetDirtyStatsAfterBaseline(self: *DirtyTracker) void {
         self.stats.dirty_pages_total = 0;
-        self.stats.dirty_pages_tail = 0;
         self.stats.get_dirty_log_ms = 0;
         self.stats.get_dirty_log_cpu_ms = 0;
         self.stats.dirty_pages_per_sec = 0;
-        self.core.resetStatsAfterBaseline();
         self.sealer.resetStatsAfterBaseline();
         @memset(self.bitmap, 0);
     }
@@ -1970,13 +1823,12 @@ fn takeSnapshot(
     const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
     if (dirty_tracker) |tracker| {
         const stats = tracker.stats;
-        const core_stats = tracker.core.stats;
         const ram_stats = tracker.sealer.stats;
         var metrics_head_buf: [2048]u8 = undefined;
         var metrics_tail_buf: [3072]u8 = undefined;
         const metrics_head = std.fmt.bufPrint(
             &metrics_head_buf,
-            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_epoch_ms={d} dirty_epoch_count={d} dirty_pages_total={d} dirty_pages_tail={d} dirty_chunks_total={d} dirty_chunks_tail={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d}",
+            "kvm snapshot metrics: mode=dirty-log ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} dirty_pages_total={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} tail_flush_ms={d}",
             .{
                 ram_size / 1024 / 1024,
                 memory_plan.chunk_count,
@@ -1989,12 +1841,8 @@ fn takeSnapshot(
                 manifest_ms,
                 snapshot_total_ms,
                 snapshot_total_ms,
-                core_stats.dirty_epoch_ms,
-                core_stats.dirty_epoch_count,
                 stats.dirty_pages_total,
-                stats.dirty_pages_tail,
                 ram_stats.dirty_chunks_total,
-                ram_stats.dirty_chunks_tail,
                 ram_stats.host_dirty_ranges_total,
                 ram_stats.host_dirty_chunks_total,
                 ram_stats.sealed_chunks_total,
@@ -2006,7 +1854,7 @@ fn takeSnapshot(
         ) catch "kvm snapshot metrics: formatting_failed=1";
         const metrics_tail = std.fmt.bufPrint(
             &metrics_tail_buf,
-            " get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} worker_epoch_max_ms={d} worker_cadence_lag_max_ms={d} worker_cadence_lag_total_ms={d} worker_epoch_overrun_count={d} worker_epoch_overrun_ms={d} worker_join_ms={d} finish_worker_stop_ms={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
+            " get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
             .{
                 stats.get_dirty_log_ms,
                 stats.get_dirty_log_cpu_ms,
@@ -2018,13 +1866,6 @@ fn takeSnapshot(
                 ram_stats.sealBackingWriteMs(),
                 ram_stats.seal_parallel_flush_count,
                 ram_stats.seal_parallel_workers_max,
-                core_stats.worker_epoch_max_ms,
-                core_stats.worker_cadence_lag_max_ms,
-                core_stats.worker_cadence_lag_total_ms,
-                core_stats.worker_epoch_overrun_count,
-                core_stats.worker_epoch_overrun_ms,
-                core_stats.worker_join_ms,
-                core_stats.finish_worker_stop_ms,
                 ram_stats.finish_fchmod_ms,
                 ram_stats.finish_close_ms,
                 ram_stats.finish_close_deferred,
@@ -2316,13 +2157,6 @@ fn raiseGenerationIrqIfPending(vm_fd: std.c.fd_t, gen_dev: *const generation.Dev
 
 fn closeFd(fd: std.c.fd_t) void {
     _ = std.c.close(fd);
-}
-
-fn linuxCall(rc: usize) !void {
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        else => return error.IoFailed,
-    }
 }
 
 fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {

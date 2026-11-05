@@ -1953,17 +1953,6 @@ pub fn validateMemoryForRam(manifest: MemoryManifest, ram_len: usize) Error!Memo
     };
 }
 
-pub fn memoryChunkRange(manifest: MemoryManifest, ram_len: usize, index: usize) Error!MemoryChunkRange {
-    const plan = try validateMemoryForRam(manifest, ram_len);
-    return memoryChunkRangeFromPlan(plan, ram_len, index) catch return error.BadManifest;
-}
-
-pub fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram_len: usize, index: usize, target: []u8) Error!void {
-    const range = try memoryChunkRange(manifest, ram_len, index);
-    if (target.len != range.end - range.start) return error.BadManifest;
-    try loadMemoryChunkDigest(allocator, dir, memoryChunkDigestForIndex(manifest, index), target);
-}
-
 fn memoryChunkRangeFromPlan(plan: MemoryPlan, ram_len: usize, index: usize) !MemoryChunkRange {
     if (index >= plan.chunk_count) return error.BadManifest;
     const start = index * plan.chunk_size;
@@ -1984,23 +1973,6 @@ fn loadMemoryChunkDigest(allocator: std.mem.Allocator, dir: []const u8, maybe_di
     } else {
         @memset(target, 0);
     }
-}
-
-pub fn memoryChunkDigestForIndex(manifest: MemoryManifest, index: usize) ?[]const u8 {
-    const target: u64 = @intCast(index);
-    var lo: usize = 0;
-    var hi: usize = manifest.chunks.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const logical_chunk = manifest.chunks[mid].logical_chunk;
-        if (logical_chunk == target) return manifest.chunks[mid].digest;
-        if (logical_chunk < target) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return null;
 }
 
 pub fn memoryChunkDigestHex(digest: []const u8) Error![]const u8 {
@@ -3081,29 +3053,11 @@ test "memory round-trips through the chunk store with zero elision" {
     try std.testing.expectEqual(@as(usize, chunk_size), plan.chunk_size);
     try std.testing.expectEqual(@as(usize, 6), plan.chunk_count);
     try std.testing.expectEqual(@as(usize, 3), plan.nonzero_chunk_count);
-    const tail_range = try memoryChunkRange(mm, ram.len, 5);
-    try std.testing.expectEqual(@as(usize, 5 * chunk_size), tail_range.start);
-    try std.testing.expectEqual(ram.len, tail_range.end);
 
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0xAA);
     try loadMemory(arena, dir, mm, out);
     try std.testing.expectEqualSlices(u8, ram, out);
-
-    const zero_chunk = try arena.alloc(u8, chunk_size);
-    @memset(zero_chunk, 0xAA);
-    try loadMemoryChunk(arena, dir, mm, ram.len, 1, zero_chunk);
-    try std.testing.expect(std.mem.allEqual(u8, zero_chunk, 0));
-
-    const nonzero_chunk = try arena.alloc(u8, chunk_size);
-    @memset(nonzero_chunk, 0xAA);
-    try loadMemoryChunk(arena, dir, mm, ram.len, 3, nonzero_chunk);
-    try std.testing.expectEqualSlices(u8, ram[3 * chunk_size .. 4 * chunk_size], nonzero_chunk);
-
-    const tail_chunk = try arena.alloc(u8, ram.len - 5 * chunk_size);
-    @memset(tail_chunk, 0xAA);
-    try loadMemoryChunk(arena, dir, mm, ram.len, 5, tail_chunk);
-    try std.testing.expectEqualSlices(u8, ram[5 * chunk_size ..], tail_chunk);
 }
 
 test "memory backing is sparse local acceleration metadata" {
@@ -3745,7 +3699,6 @@ test "corrupted chunk fails closed" {
 
     const out = try arena.alloc(u8, ram.len);
     try std.testing.expectError(error.BadChunk, loadMemory(arena, dir, mm, out));
-    try std.testing.expectError(error.BadChunk, loadMemoryChunk(arena, dir, mm, ram.len, 0, out));
 }
 
 fn fuzzManifestParse(_: void, s: *std.testing.Smith) !void {

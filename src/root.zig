@@ -80,6 +80,7 @@ pub const virtio = struct {
     pub const rng = @import("virtio/rng.zig");
     pub const mem = @import("virtio/mem.zig");
     pub const vsock = @import("virtio/vsock.zig");
+    pub const transport_snapshot = @import("virtio/transport_snapshot.zig");
 };
 
 pub const version = @import("version.zig").value;
@@ -150,4 +151,5 @@ test {
     testing.refAllDecls(virtio.rng);
     testing.refAllDecls(virtio.mem);
     testing.refAllDecls(virtio.vsock);
+    testing.refAllDecls(virtio.transport_snapshot);
 }

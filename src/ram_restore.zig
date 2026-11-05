@@ -16,7 +16,6 @@ pub const Strategy = union(enum) {
     /// Borrowed from an owning Plan and valid for its lifetime.
     local_backing: std.c.fd_t,
     eager_chunks,
-    lazy_chunks,
 };
 
 pub const Plan = struct {
@@ -60,7 +59,7 @@ pub const Plan = struct {
         return switch (self.strategy) {
             .fresh => null,
             .local_backing => .local_backing,
-            .eager_chunks, .lazy_chunks => .chunks,
+            .eager_chunks => .chunks,
         };
     }
 
