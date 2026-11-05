@@ -640,7 +640,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                         null;
                     defer if (prepared_root) |*root| root.deinit();
                     const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    try takeSnapshot(allocator, request.dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                    try takeSnapshot(allocator, request.dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .ram_size = config.ram_size,
@@ -687,7 +687,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
             if (request_capture.isRequested() and !did_capture_request) {
                 const dir = config.snapshot_dir orelse return error.HvCallFailed;
-                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
@@ -713,7 +713,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
                     if (config.exec_probe_completes_run) {
                         if (config.snapshot_on_probe_complete) {
                             const dir = config.snapshot_dir orelse return error.HvCallFailed;
-                            try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                            try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .ram_size = config.ram_size,
@@ -737,7 +737,7 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
             const elapsed_ms = (snapshot.hostCounter() - counter_start) * 1000 / counter_freq;
             if (elapsed_ms >= after_ms) {
                 const dir = config.snapshot_dir orelse return error.HvCallFailed;
-                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, ram_bytes, .{
+                try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .ram_size = config.ram_size,
@@ -2428,13 +2428,13 @@ fn captureSingleHvfDiskFork(
 ) !void {
     const disk = config.disk_snapshot orelse return error.BadManifest;
     const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-    if (vsock_dev.pending_len != 0) return error.DeviceStatePending;
     try takeSnapshot(
         allocator,
         request.dir,
         vcpu,
         transports,
         gen_dev,
+        vsock_dev,
         ram_bytes,
         platform,
         config.rootfs,
@@ -2464,6 +2464,7 @@ fn takeSnapshot(
     vcpu: hvf.VcpuHandle,
     transports: []mmio.Transport,
     gen_dev: *const generation.Device,
+    vsock_dev: *const vsock.Vsock,
     ram_bytes: []const u8,
     platform: SnapshotPlatform,
     rootfs: ?spore.Rootfs,
@@ -2476,7 +2477,7 @@ fn takeSnapshot(
     environ_map: ?*const std.process.Environ.Map,
     rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !void {
-    try transport_snapshot.validateFullSnapshotTransports(transports);
+    try transport_snapshot.validateFullSnapshotDevices(transports, vsock_dev);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2687,11 +2688,7 @@ fn takeSnapshotV1(
     // Feature selection is guest-mutable MMIO state. Validate it only after
     // every vCPU has stopped, immediately before transport capture, so a guest
     // cannot race validation with a reset or DRIVER_FEATURES write.
-    try transport_snapshot.validateFullSnapshotTransports(transports);
-    if (vsock_dev.pending_len != 0) {
-        std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
-        return error.DeviceStatePending;
-    }
+    try transport_snapshot.validateFullSnapshotDevices(transports, vsock_dev);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();

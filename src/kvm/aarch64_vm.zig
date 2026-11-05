@@ -1977,11 +1977,7 @@ fn takeSnapshot(
     environ_map: ?*const std.process.Environ.Map,
     rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !void {
-    try transport_snapshot.validateFullSnapshotTransports(transports);
-    if (vsock_dev.pending_len != 0) {
-        std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
-        return error.DeviceStatePending;
-    }
+    try transport_snapshot.validateFullSnapshotDevices(transports, vsock_dev);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2176,11 +2172,7 @@ fn takeSnapshotV1(
     environ_map: ?*const std.process.Environ.Map,
     rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !void {
-    try transport_snapshot.validateFullSnapshotTransports(transports);
-    if (vsock_dev.pending_len != 0) {
-        std.log.err("cannot snapshot while virtio-vsock has pending packets", .{});
-        return error.DeviceStatePending;
-    }
+    try transport_snapshot.validateFullSnapshotDevices(transports, vsock_dev);
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
