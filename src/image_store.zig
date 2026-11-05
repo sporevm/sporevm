@@ -381,6 +381,8 @@ pub const GetError = error{
     ImageStoreUnavailable,
     /// The budget ran out.
     ImageStoreTimeout,
+    /// The task making the request was canceled. Not retried.
+    Canceled,
     OutOfMemory,
 };
 
@@ -429,7 +431,7 @@ pub const Client = struct {
                     if (attempt >= budget.attempts) return err;
                     const backoff_ms: u64 = 100 * @as(u64, attempt);
                     if (monotonicMs() -| start_ms + backoff_ms >= budget.total_ms) return err;
-                    self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake) catch return err;
+                    try self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake);
                 },
                 else => return err,
             }
@@ -474,18 +476,27 @@ pub const Client = struct {
         var future = io.concurrent(Attempt.run, .{&attempt}) catch return error.ImageStoreUnavailable;
         const deadline = Io.Clock.Timestamp.fromNow(io, .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .awake });
         var timed_out = false;
+        var canceled = false;
         while (!attempt.done.isSet()) {
             attempt.done.waitTimeout(io, .{ .deadline = deadline }) catch |err| switch (err) {
                 error.Timeout => if (Io.Clock.awake.now(io).nanoseconds >= deadline.raw.nanoseconds) {
                     timed_out = true;
                     break;
                 },
-                else => break,
+                error.Canceled => {
+                    canceled = true;
+                    break;
+                },
             };
         }
         // Canceling interrupts a blocked socket call; the request then
         // closes its connection instead of returning it to the pool.
         future.cancel(io) catch {};
+        if (canceled) {
+            // The caller is going away, so the request ends here.
+            if (attempt.result) |bytes| allocator.free(bytes) else |_| {}
+            return error.Canceled;
+        }
         if (timed_out) {
             const bytes = attempt.result catch return error.ImageStoreTimeout;
             return bytes;
@@ -570,10 +581,24 @@ pub const FetchStats = struct {
     fetch_ns: u64 = 0,
     errors: u64 = 0,
     install_errors: u64 = 0,
+    /// Objects fault windows fetched.
+    window_fetches: u64 = 0,
+    /// Objects fault windows fetched that no guest read has used yet.
+    window_unused: u64 = 0,
 };
 
 /// Store reads at once while `Fetcher.fetchAll` fills the cache.
 pub const fill_concurrency = 16;
+
+/// A fault on chunk `i` also starts fetches of the missing chunks in
+/// `[i + 1, i + window_chunks)`, and at most `window_chunks - 1` such fetches
+/// run at once.
+pub const window_chunks = 8;
+
+pub const Object = struct {
+    digest: chunk.ChunkId.Digest,
+    len: usize,
+};
 
 /// Fetches the rootfs objects of one leased storage that are missing from the
 /// local CAS and installs them there. Installs skip the rootfs cache lock: the
@@ -602,6 +627,32 @@ pub const Fetcher = struct {
     read_failed: std.atomic.Value(bool) = .init(false),
     /// `fetchAll` stops and fails; set when the VM is stopping.
     canceled: std.atomic.Value(bool) = .init(false),
+    /// Objects being fetched, so that concurrent requesters share one GET.
+    /// Guarded by `mutex`.
+    in_flight: std.AutoHashMapUnmanaged(chunk.ChunkId, *InFlight) = .empty,
+    /// Objects fault windows fetched that no guest read has used yet.
+    /// Guarded by `mutex`.
+    window_unread: std.AutoHashMapUnmanaged(chunk.ChunkId, void) = .empty,
+    /// A window fetch failed, so faults fetch only what the guest reads.
+    window_failed: std.atomic.Value(bool) = .init(false),
+    /// Window fetches, which outlive the fault that started them. Faults
+    /// add to it one at a time, under the VMM's device lock.
+    windows: Io.Group = .init,
+    /// Window fetches still running.
+    windows_running: std.atomic.Value(u32) = .init(0),
+
+    const InFlight = struct {
+        done: Io.Event = .unset,
+        /// Why the shared request failed; waiters fail with it too.
+        err: ?anyerror = null,
+        /// The object is in the cache. A shared request that fetched it but
+        /// could not install it leaves each waiter to fetch it itself.
+        installed: bool = false,
+        /// The fetching requester and its waiters; the last one frees it.
+        refs: u32 = 1,
+    };
+
+    const Purpose = enum { read, window, fill };
 
     /// `allocator` must be thread-safe: faults run on vCPU threads and
     /// requests on `Io` workers.
@@ -630,10 +681,14 @@ pub const Fetcher = struct {
 
     pub fn release(self: *Fetcher) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        // The disk is closed, so its window fetches are of no further use.
+        self.windows.cancel(self.io);
         const stats = self.stats;
         std.log.debug("image store {s}: fetched {d} objects, {d} bytes in {d} ms; {d} errors, {d} install errors", .{
             self.client.base.url, stats.fetches, stats.bytes, stats.fetch_ns / std.time.ns_per_ms, stats.errors, stats.install_errors,
         });
+        self.in_flight.deinit(self.allocator);
+        self.window_unread.deinit(self.allocator);
         self.client.deinit();
         self.arena.deinit();
         self.allocator.destroy(self);
@@ -642,21 +697,144 @@ pub const Fetcher = struct {
     pub fn currentStats(self: *Fetcher) FetchStats {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.stats;
+        var stats = self.stats;
+        stats.window_unused = self.window_unread.count();
+        return stats;
     }
 
     /// Fill `buf` with the object `digest` names for a guest read, verified
     /// against its BLAKE3 digest; its length is `buf.len`. The caller has found
-    /// it missing locally. A failed local install is counted, not returned:
-    /// the bytes are already verified.
-    pub fn fetchObject(self: *Fetcher, digest: []const u8, buf: []u8) (GetError || error{BadChunk})!void {
-        const bytes = self.fetchVerified(digest, buf.len) catch |err| {
-            self.read_failed.store(true, .release);
-            return err;
-        };
+    /// it missing locally. Fetches of the objects of `window`, which the guest
+    /// is likely to read next, start too and finish into the cache after this
+    /// returns; a failure there only stops later windows. A failed local
+    /// install of the read object is counted, not returned: the bytes are
+    /// already verified.
+    pub fn fetchObject(self: *Fetcher, digest: []const u8, buf: []u8, window: []const Object) !void {
+        if (!self.window_failed.load(.acquire)) {
+            for (window) |object| {
+                if (self.windows_running.fetchAdd(1, .monotonic) >= window_chunks - 1) {
+                    _ = self.windows_running.fetchSub(1, .monotonic);
+                    break;
+                }
+                self.windows.concurrent(self.io, prefetch, .{ self, object }) catch {
+                    _ = self.windows_running.fetchSub(1, .monotonic);
+                    break;
+                };
+            }
+        }
+        errdefer self.read_failed.store(true, .release);
+        var object = Object{ .digest = undefined, .len = buf.len };
+        if (digest.len != object.digest.len) return error.BadChunk;
+        @memcpy(&object.digest, digest);
+        if (try self.fetchOnce(object, .read)) |bytes| {
+            defer self.allocator.free(bytes);
+            @memcpy(buf, bytes);
+            return;
+        }
+        // Another requester installed it.
+        const bytes = try rootfs_cas.readVerifiedManifestObject(self.allocator, self.cache_root, digest, buf.len);
         defer self.allocator.free(bytes);
         @memcpy(buf, bytes);
-        self.install(digest, bytes) catch {};
+        self.noteRead(digest);
+    }
+
+    /// A guest read used the local object `digest`.
+    pub fn noteRead(self: *Fetcher, digest: []const u8) void {
+        const id = chunk.ChunkId.fromHex(digest[digest_prefix.len..]) catch return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        _ = self.window_unread.remove(id);
+    }
+
+    fn prefetch(self: *Fetcher, object: Object) Io.Cancelable!void {
+        defer _ = self.windows_running.fetchSub(1, .monotonic);
+        if (self.fetchOnce(object, .window)) |_| {} else |_| self.window_failed.store(true, .release);
+    }
+
+    /// Fetch, verify and install `object` unless it is local, or wait while
+    /// another requester does, so concurrent requesters issue one GET per
+    /// object. Returns the bytes when this call fetched them for a guest
+    /// read, else null once the object is installed.
+    fn fetchOnce(self: *Fetcher, object: Object, purpose: Purpose) !?[]u8 {
+        const id = chunk.ChunkId.fromDigest(&object.digest) catch return error.BadChunk;
+        self.mutex.lockUncancelable(self.io);
+        while (self.in_flight.get(id)) |entry| {
+            entry.refs += 1;
+            self.mutex.unlock(self.io);
+            entry.done.waitUncancelable(self.io);
+            self.mutex.lockUncancelable(self.io);
+            const err = entry.err;
+            const installed = entry.installed;
+            entry.refs -= 1;
+            if (entry.refs == 0) self.allocator.destroy(entry);
+            if (err) |e| {
+                self.mutex.unlock(self.io);
+                return e;
+            }
+            if (installed) {
+                self.mutex.unlock(self.io);
+                return null;
+            }
+            // Fetched but not installed: fetch it here, unless someone
+            // else already is.
+        }
+        const entry = self.allocator.create(InFlight) catch |err| {
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        entry.* = .{};
+        self.in_flight.put(self.allocator, id, entry) catch |err| {
+            self.allocator.destroy(entry);
+            self.mutex.unlock(self.io);
+            return err;
+        };
+        self.mutex.unlock(self.io);
+
+        var bytes: ?[]u8 = null;
+        var fetch_err: ?anyerror = null;
+        var install_err: ?anyerror = null;
+        if (self.isLocal(object)) |local| {
+            if (!local) {
+                if (self.fetchVerified(&object.digest, object.len)) |fetched| {
+                    bytes = fetched;
+                    self.install(&object.digest, fetched) catch |err| {
+                        install_err = err;
+                    };
+                } else |err| fetch_err = err;
+            }
+        } else |err| fetch_err = err;
+
+        self.mutex.lockUncancelable(self.io);
+        _ = self.in_flight.remove(id);
+        if (purpose == .window and bytes != null and install_err == null) {
+            self.stats.window_fetches += 1;
+            self.window_unread.put(self.allocator, id, {}) catch {};
+        }
+        // Waiters wake with the outcome, and the last one out frees it.
+        entry.err = fetch_err;
+        entry.installed = fetch_err == null and install_err == null;
+        entry.refs -= 1;
+        if (entry.refs == 0) self.allocator.destroy(entry) else entry.done.set(self.io);
+        self.mutex.unlock(self.io);
+
+        // A guest read already has verified bytes, so its failed install is
+        // only counted.
+        if (purpose == .read) if (bytes) |value| return value;
+        if (bytes) |value| self.allocator.free(value);
+        if (fetch_err) |e| return e;
+        if (install_err) |e| return e;
+        return null;
+    }
+
+    /// Whether `object` is in the local CAS at its indexed length.
+    fn isLocal(self: *Fetcher, object: Object) !bool {
+        const path = try rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, &object.digest);
+        defer self.allocator.free(path);
+        const stat = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => |e| return e,
+        };
+        return stat.kind == .file and stat.size == object.len;
     }
 
     /// Make `fetchAll` stop at its next object and fail, so a VM that is
@@ -698,11 +876,6 @@ pub const Fetcher = struct {
         std.log.info("image store {s}: fetched the root disk's {d} missing objects in {d} ms", .{ self.client.base.url, missing.len, (monotonicNs() -| start_ns) / std.time.ns_per_ms });
     }
 
-    const Object = struct {
-        digest: []const u8,
-        len: usize,
-    };
-
     const Fill = struct {
         fetcher: *Fetcher,
         objects: []const Object,
@@ -716,10 +889,7 @@ pub const Fetcher = struct {
                 if (fill.fetcher.canceled.load(.acquire)) return fill.fail(error.ImageStoreFetchCanceled);
                 const i = fill.next.fetchAdd(1, .monotonic);
                 if (i >= fill.objects.len) return;
-                const object = fill.objects[i];
-                const bytes = fill.fetcher.fetchVerified(object.digest, object.len) catch |err| return fill.fail(err);
-                defer fill.fetcher.allocator.free(bytes);
-                fill.fetcher.install(object.digest, bytes) catch |err| return fill.fail(err);
+                _ = fill.fetcher.fetchOnce(fill.objects[i], .fill) catch |err| return fill.fail(err);
             }
         }
 
@@ -741,16 +911,8 @@ pub const Fetcher = struct {
         var missing: std.ArrayList(Object) = .empty;
         for (parsed.value.chunks) |entry| {
             if ((try seen.getOrPut(entry.id)).found_existing) continue;
-            const len = try rootfs_cas.storageChunkLen(self.storage, entry.logical_chunk);
-            const digest = try arena.dupe(u8, &entry.id.toDigest());
-            const path = try rootfs_cas.manifestObjectPath(self.allocator, self.cache_root, digest);
-            defer self.allocator.free(path);
-            const stat = Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-                error.FileNotFound => null,
-                else => |e| return e,
-            };
-            if (stat) |value| if (value.kind == .file and value.size == len) continue;
-            try missing.append(arena, .{ .digest = digest, .len = len });
+            const object = Object{ .digest = entry.id.toDigest(), .len = try rootfs_cas.storageChunkLen(self.storage, entry.logical_chunk) };
+            if (!try self.isLocal(object)) try missing.append(arena, object);
         }
         return missing.items;
     }
@@ -1058,21 +1220,28 @@ test "a store image resolves into an empty cache with only its metadata" {
     try std.testing.expectError(error.ImageStoreNotFound, resolve(io, allocator, missing_cache, try std.fmt.allocPrint(allocator, "{s}/2", .{store}), platform));
 }
 
-/// Test support: serves files from `root` over HTTP/1.1 on loopback, one
-/// connection at a time. `failures` answers that many requests with 500
-/// first; `hang` holds every request open until `deinit`; `delay_ms` delays
-/// every answer, reading the file after the delay.
+/// Test support: serves files from `root` over HTTP/1.1 on loopback, each
+/// connection on its own thread. `failures` answers that many requests with
+/// 500 first; `hang` holds every request open until `deinit`; `delay_ms`
+/// delays every answer, reading the file after the delay; requests for
+/// `held` wait until `releaseHeld`.
 pub const TestServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
     root: []const u8,
     server: Io.net.Server,
     thread: std.Thread,
+    /// Connection threads; guarded by `mutex`.
+    handlers: std.ArrayList(std.Thread) = .empty,
+    mutex: Io.Mutex = .init,
     closed: std.atomic.Value(bool) = .init(false),
     failures: std.atomic.Value(u32) = .init(0),
     requests: std.atomic.Value(u32) = .init(0),
     hang: std.atomic.Value(bool) = .init(false),
     delay_ms: std.atomic.Value(u32) = .init(0),
+    /// A request path, such as `/objects/blake3/<hex>`; set before requests.
+    held: ?[]const u8 = null,
+    released: std.atomic.Value(bool) = .init(false),
 
     pub fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
         var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
@@ -1092,7 +1261,13 @@ pub const TestServer = struct {
             stream.close(self.io);
         } else |_| {}
         self.thread.join();
+        for (self.handlers.items) |thread| thread.join();
+        self.handlers.deinit(self.allocator);
         self.server.deinit(self.io);
+    }
+
+    pub fn releaseHeld(self: *TestServer) void {
+        self.released.store(true, .release);
     }
 
     pub fn url(self: *TestServer, allocator: std.mem.Allocator) ![]u8 {
@@ -1102,10 +1277,18 @@ pub const TestServer = struct {
     fn serve(self: *TestServer) void {
         while (!self.closed.load(.acquire)) {
             const stream = self.server.accept(self.io) catch continue;
-            defer stream.close(self.io);
-            if (self.closed.load(.acquire)) return;
-            self.handle(stream) catch {};
+            if (self.closed.load(.acquire)) return stream.close(self.io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.handlers.ensureUnusedCapacity(self.allocator, 1) catch return stream.close(self.io);
+            const thread = std.Thread.spawn(.{}, connection, .{ self, stream }) catch return stream.close(self.io);
+            self.handlers.appendAssumeCapacity(thread);
         }
+    }
+
+    fn connection(self: *TestServer, stream: Io.net.Stream) void {
+        defer stream.close(self.io);
+        self.handle(stream) catch {};
     }
 
     fn handle(self: *TestServer, stream: Io.net.Stream) !void {
@@ -1118,6 +1301,9 @@ pub const TestServer = struct {
         while (std.mem.trimEnd(u8, try reader.interface.takeDelimiterExclusive('\n'), "\r").len != 0) {}
         _ = self.requests.fetchAdd(1, .monotonic);
         std.Io.sleep(self.io, .fromMilliseconds(self.delay_ms.load(.monotonic)), .awake) catch {};
+        if (self.held) |held| if (std.mem.eql(u8, held, path)) {
+            while (!self.released.load(.acquire) and !self.closed.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(5), .awake) catch {};
+        };
         if (self.hang.load(.acquire)) {
             while (!self.closed.load(.acquire)) std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
             return;
@@ -1179,6 +1365,191 @@ test "HTTP store reads retry transient failures and fail closed on the rest" {
     const start_ms = monotonicMs();
     try std.testing.expectError(error.ImageStoreTimeout, client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, .{ .attempts = 2, .attempt_ms = 200, .total_ms = 600 }));
     try std.testing.expect(monotonicMs() - start_ms < 2_000);
+}
+
+/// Test support: the store's objects, each with its index-derived length.
+fn testObjects(fixture: *TestImage, store: []const u8) ![]const Object {
+    const allocator = fixture.arena.allocator();
+    var objects: std.ArrayList(Object) = .empty;
+    for (try fixture.listStore(store)) |file| {
+        if (!std.mem.startsWith(u8, file, "objects/blake3/")) continue;
+        const size = (try Io.Dir.cwd().statFile(std.testing.io, try std.fs.path.join(allocator, &.{ store, file }), .{})).size;
+        var object = Object{ .digest = undefined, .len = @intCast(size) };
+        _ = try std.fmt.bufPrint(&object.digest, "blake3:{s}", .{std.fs.path.basename(file)});
+        try objects.append(allocator, object);
+    }
+    return objects.items;
+}
+
+/// Test support: wait for `fetcher`'s window fetches to finish.
+pub fn awaitWindows(fetcher: *Fetcher) !void {
+    const start_ms = monotonicMs();
+    while (fetcher.windows_running.load(.acquire) != 0) {
+        if (monotonicMs() - start_ms > 5_000) return error.TestWindowsDidNotFinish;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(5), .awake);
+    }
+}
+
+test "a guest read fetches its window with it, with one GET per object" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const objects = try testObjects(&fixture, store);
+    const read, const next, const after = .{ objects[0], objects[1], objects[2] };
+
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    // Every GET is slow, so the window's two requests for `next` overlap.
+    server.delay_ms.store(100, .monotonic);
+    const cache = try fixture.path("cache");
+    const fetcher = try Fetcher.create(std.testing.allocator, io, cache, try server.url(allocator), local.storage);
+    defer fetcher.release();
+    const buf = try allocator.alloc(u8, read.len);
+    try fetcher.fetchObject(&read.digest, buf, &.{ next, next, after });
+    try std.testing.expect((try chunk.ChunkId.fromDigest(&read.digest)).matches(buf));
+    try awaitWindows(fetcher);
+    try std.testing.expectEqual(@as(u32, 3), server.requests.load(.monotonic));
+    var stats = fetcher.currentStats();
+    try std.testing.expectEqual(@as(u64, 3), stats.fetches);
+    try std.testing.expectEqual(@as(u64, 2), stats.window_fetches);
+    try std.testing.expectEqual(@as(u64, 2), stats.window_unused);
+    for ([_]Object{ next, after }) |object| try std.testing.expect(try fetcher.isLocal(object));
+    fetcher.noteRead(&next.digest);
+    stats = fetcher.currentStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.window_unused);
+
+    // A failed window fetch fails nothing, but stops later windows.
+    server.delay_ms.store(0, .monotonic);
+    const lossy = try Fetcher.create(std.testing.allocator, io, try fixture.path("lossy-cache"), try server.url(allocator), local.storage);
+    defer lossy.release();
+    const hidden = try fixture.path("hidden");
+    const after_path = try std.fs.path.join(allocator, &.{ store, "objects", "blake3", after.digest[digest_prefix.len..] });
+    try Io.Dir.renameAbsolute(after_path, hidden, io);
+    try lossy.fetchObject(&read.digest, buf, &.{after});
+    try awaitWindows(lossy);
+    try std.testing.expect(!lossy.readFailed());
+    try Io.Dir.renameAbsolute(hidden, after_path, io);
+    const before = server.requests.load(.monotonic);
+    try lossy.fetchObject(&next.digest, try allocator.alloc(u8, next.len), &.{after});
+    try awaitWindows(lossy);
+    try std.testing.expectEqual(before + 1, server.requests.load(.monotonic));
+    try std.testing.expect(!try lossy.isLocal(after));
+}
+
+test "a guest read returns before its window, which finishes into the cache" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const objects = try testObjects(&fixture, store);
+    const read, const next = .{ objects[0], objects[1] };
+
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
+    const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage);
+    defer fetcher.release();
+    // The window's store stalls; a fault that waited for it would wait
+    // until the release below.
+    const Releaser = struct {
+        fn run(test_server: *TestServer) void {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1_000), .awake) catch {};
+            test_server.releaseHeld();
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{&server});
+    defer releaser.join();
+    const start_ms = monotonicMs();
+    try fetcher.fetchObject(&read.digest, try allocator.alloc(u8, read.len), &.{next});
+    try std.testing.expect(monotonicMs() - start_ms < 800);
+    try std.testing.expect(!try fetcher.isLocal(next));
+    try awaitWindows(fetcher);
+    try std.testing.expect(try fetcher.isLocal(next));
+    try std.testing.expectEqual(@as(u64, 1), fetcher.currentStats().window_fetches);
+}
+
+test "releasing a fetcher cancels a window fetch the store never answers" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const objects = try testObjects(&fixture, store);
+    const read, const next = .{ objects[0], objects[1] };
+
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
+    const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage);
+    try fetcher.fetchObject(&read.digest, try allocator.alloc(u8, read.len), &.{next});
+    while (server.requests.load(.monotonic) < 2) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    // A canceled window fetch ends at once rather than retrying for the
+    // rest of its 10 s budget.
+    const start_ms = monotonicMs();
+    fetcher.release();
+    try std.testing.expect(monotonicMs() - start_ms < 2_000);
+    try std.testing.expectEqual(@as(u32, 2), server.requests.load(.monotonic));
+}
+
+test "a read that shares a request that could not install its object fetches it itself" {
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const local = try resolve(io, allocator, try fixture.path("metadata-cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const objects = try testObjects(&fixture, store);
+    const read, const next = .{ objects[0], objects[1] };
+
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
+    // Nothing can be installed into this cache.
+    const cache = try fixture.path("cache");
+    const objects_dir = std.fs.path.dirname(try rootfs_cas.manifestObjectPath(allocator, cache, &next.digest)).?;
+    try Io.Dir.cwd().createDirPath(io, objects_dir);
+    const objects_dir_z = try allocator.dupeZ(u8, objects_dir);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(objects_dir_z, 0o555));
+    defer _ = std.c.chmod(objects_dir_z, 0o755);
+    const fetcher = try Fetcher.create(std.testing.allocator, io, cache, try server.url(allocator), local.storage);
+    defer fetcher.release();
+
+    // A window fetch of `next` is in flight when the guest reads `next`.
+    try fetcher.fetchObject(&read.digest, try allocator.alloc(u8, read.len), &.{next});
+    while (server.requests.load(.monotonic) < 2) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    const Releaser = struct {
+        fn run(test_server: *TestServer) void {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+            test_server.releaseHeld();
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{&server});
+    defer releaser.join();
+    const buf = try allocator.alloc(u8, next.len);
+    try fetcher.fetchObject(&next.digest, buf, &.{});
+    try std.testing.expect((try chunk.ChunkId.fromDigest(&next.digest)).matches(buf));
+    try std.testing.expect(!fetcher.readFailed());
+    try awaitWindows(fetcher);
+    try std.testing.expectEqual(@as(u32, 3), server.requests.load(.monotonic));
 }
 
 test "file store reads only regular files and never waits for a FIFO writer" {

@@ -4507,11 +4507,22 @@ test "a store image runs lazily from an empty cache and fails closed without its
     {
         defer runtime.deinit();
         const disk = &runtime.chunk_mapped.?;
+        // A read of chunk 0 also fetches the objects of the chunks after it;
+        // chunk 1 is zero.
+        var block: [512]u8 = undefined;
+        try disk.readAt(&block, 0);
+        try image_store.awaitWindows(runtime.fetcher.?);
+        var stats = runtime.fetcher.?.currentStats();
+        try std.testing.expectEqual(@as(u64, 3), stats.fetches);
+        try std.testing.expectEqual(@as(u64, 2), stats.window_fetches);
+        try std.testing.expectEqual(@as(u64, 2), stats.window_unused);
         const readback = try allocator.alloc(u8, fixture.rootfs_bytes.len);
         try disk.readAt(readback, 0);
         try std.testing.expectEqualSlices(u8, fixture.rootfs_bytes, readback);
-        try std.testing.expectEqual(@as(u64, 3), runtime.fetcher.?.stats.fetches);
-        try std.testing.expectEqual(@as(u64, 0), runtime.fetcher.?.stats.install_errors);
+        stats = runtime.fetcher.?.currentStats();
+        try std.testing.expectEqual(@as(u64, 3), stats.fetches);
+        try std.testing.expectEqual(@as(u64, 0), stats.window_unused);
+        try std.testing.expectEqual(@as(u64, 0), stats.install_errors);
     }
     // Every object is local now, so the next run fetches nothing.
     try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, consumer, resolved.rootfs.?.storage.?));
@@ -4550,10 +4561,12 @@ test "a store image runs lazily from an empty cache and fails closed without its
         var block: [512]u8 = undefined;
         try std.testing.expectError(if (corrupt) error.BadChunk else error.MissingChunk, failing.chunk_mapped.?.readAt(&block, 0));
         try std.testing.expect(failing.chunk_mapped.?.isPoisoned());
-        try std.testing.expectEqual(@as(u64, 1), failing.fetcher.?.stats.errors);
+        try image_store.awaitWindows(failing.fetcher.?);
+        const errors = failing.fetcher.?.currentStats().errors;
+        try std.testing.expect(errors >= 1);
         // A poisoned disk does not ask the store again for another object.
         try std.testing.expectError(error.Poisoned, failing.chunk_mapped.?.readAt(&block, 2 * rootfs_cas.default_chunk_size));
-        try std.testing.expectEqual(@as(u64, 1), failing.fetcher.?.stats.errors);
+        try std.testing.expectEqual(errors, failing.fetcher.?.currentStats().errors);
         try std.testing.expect(!try rootfs_cas.storageContentComplete(io, allocator, cache, cold.rootfs.?.storage.?));
         const objects_dir = try std.fs.path.join(allocator, &.{ cache, "cas", "rootfs", "blake3", "objects" });
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, objects_dir, .{}));
@@ -4580,19 +4593,12 @@ test "a snapshot of a store image's disk first fetches every missing object, and
     var runtime = try runtime_disk_mod.open(.{ .io = io, .environ_map = &fixture.env }, std.testing.allocator, .{ .rootfs = resolved.rootfs });
     defer runtime.deinit();
     const disk = &runtime.chunk_mapped.?;
-    var block: [512]u8 = undefined;
-    try disk.readAt(&block, 0);
-    try std.testing.expectEqual(@as(u64, 1), runtime.fetcher.?.stats.fetches);
 
-    // The store lost an object the guest has not read. The snapshot fails
-    // before it writes anything, and the disk keeps serving reads.
+    // The store lost an object. The snapshot fails before it writes anything
+    // and does not poison the disk.
     var lost: ?[]const u8 = null;
     for (try fixture.listStore(store)) |file| {
-        if (!std.mem.startsWith(u8, file, "objects/blake3/")) continue;
-        const local = try rootfs_cas.manifestObjectPath(allocator, cache, try std.fmt.allocPrint(allocator, "blake3:{s}", .{std.fs.path.basename(file)}));
-        std.Io.Dir.cwd().access(io, local, .{}) catch {
-            lost = try std.fs.path.join(allocator, &.{ store, file });
-        };
+        if (std.mem.startsWith(u8, file, "objects/blake3/")) lost = try std.fs.path.join(allocator, &.{ store, file });
     }
     const hidden = try fixture.path("hidden");
     try std.Io.Dir.renameAbsolute(lost.?, hidden, io);
@@ -4600,10 +4606,9 @@ test "a snapshot of a store image's disk first fetches every missing object, and
     try std.testing.expectError(error.ImageStoreIncomplete, disk.snapshotIndex(failed_dir, .{ .mmio_slot = 1 }, true));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, failed_dir, .{}));
     try std.testing.expect(!disk.isPoisoned());
-    try disk.readAt(&block, 0);
 
     // With the object back, the snapshot fetches the rest and names only
-    // local objects.
+    // local objects, and the disk reads on.
     try std.Io.Dir.renameAbsolute(hidden, lost.?, io);
     const snapshot = try disk.snapshotIndex(try fixture.path("snapshot"), .{ .mmio_slot = 1 }, true);
     defer {
@@ -4618,6 +4623,9 @@ test "a snapshot of a store image's disk first fetches every missing object, and
     try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, cache, storage));
     const snapshot_storage = try runtime_disk_mod.storageFromSnapshotDisk(allocator, snapshot);
     try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, try fixture.path("snapshot"), snapshot_storage));
+    const readback = try allocator.alloc(u8, fixture.rootfs_bytes.len);
+    try disk.readAt(readback, 0);
+    try std.testing.expectEqualSlices(u8, fixture.rootfs_bytes, readback);
 }
 
 test "image runtime command composes entrypoint defaults and caller override" {
