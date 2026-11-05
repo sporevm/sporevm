@@ -7,6 +7,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
+const aarch64_vmm = @import("../aarch64/vmm.zig");
 const disk_layer = @import("../disk_layer.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
@@ -458,7 +459,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var console_dev = virtio_console.Console{ .sink = config.console_sink };
     var block_devs: [4]virtio_blk.Blk = undefined;
     var empty_devs: [4]EmptyDevice = @splat(.{});
-    if (config.build_input_disks.len > 2) return error.TooManyBuildInputDisks;
+    if (config.build_input_disks.len > aarch64_vmm.max_build_input_disks) return error.TooManyBuildInputDisks;
     var disk_backends: [4]?virtio_blk.Backend = @splat(null);
     var disk_writable: [4]bool = @splat(false);
     disk_backends[0] = config.root_disk;

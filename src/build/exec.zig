@@ -46,7 +46,7 @@ pub const max_guest_working_dir_len = run_mod.max_guest_working_dir_len;
 pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
 pub const max_context_bind_mounts = 8;
-pub const max_build_input_disks: usize = 2;
+pub const max_build_input_disks = @import("../aarch64/vmm.zig").max_build_input_disks;
 const enospc_patterns = [_][]const u8{
     "SPORE_BUILD_ENOSPC",
     "No space left on device",

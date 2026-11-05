@@ -5748,7 +5748,10 @@ test "removed capture flags map to save rename hints" {
 test "run cli parser accepts save flags" {
     const opts = try parseCliArgs(std.testing.allocator, &.{ "--save", "out.spore", "--save-on", "USR1", "--continue-after-save", "--", "/bin/sleeper" });
     try std.testing.expectEqualStrings("out.spore", opts.save_path.?);
-    try std.testing.expectEqual(capture.Signal.USR1, opts.save_trigger.signalValue().?);
+    switch (opts.save_trigger) {
+        .signal => |signal| try std.testing.expectEqual(capture.Signal.USR1, signal),
+        .exit => return error.TestUnexpectedResult,
+    }
     try std.testing.expect(opts.continue_after_save);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
     try std.testing.expectEqualStrings("/bin/sleeper", opts.command[0]);

@@ -21,10 +21,8 @@ const boot = @import("../aarch64/boot.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const mmio = @import("../virtio/mmio.zig");
-const console = @import("../virtio/console.zig");
 const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
-const rng = @import("../virtio/rng.zig");
 const transport_snapshot = @import("../virtio/transport_snapshot.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
@@ -44,55 +42,6 @@ fn hvfPostRunAction(reason: hvf.ExitReason) HvfPostRunAction {
     // guest work that must be dispatched before the next pre-run wake flush.
     return if (reason == .canceled) .resume_before_run else .dispatch_exit;
 }
-
-const RestoreStats = struct {
-    start_ms: u64,
-    manifest_ms: u64 = 0,
-    map_ram_ms: u64 = 0,
-    memory_ms: u64 = 0,
-    state_ms: u64 = 0,
-    pre_run_ms: u64 = 0,
-    mode: []const u8 = "none",
-    chunk_count: usize = 0,
-    nonzero_chunk_count: usize = 0,
-};
-
-fn formatRestoreMetrics(buffer: []u8, ram_size: u64, stats: *RestoreStats, start_ms: u64) []const u8 {
-    stats.pre_run_ms = start_ms - stats.start_ms;
-    return std.fmt.bufPrint(
-        buffer,
-        "hvf restore metrics: mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} manifest_ms={d} map_ram_ms={d} memory_ms={d} state_ms={d} pre_run_ms={d}",
-        .{
-            stats.mode,
-            ram_size / 1024 / 1024,
-            stats.chunk_count,
-            stats.nonzero_chunk_count,
-            stats.manifest_ms,
-            stats.map_ram_ms,
-            stats.memory_ms,
-            stats.state_ms,
-            stats.pre_run_ms,
-        },
-    ) catch unreachable;
-}
-
-fn emitRestoreMetrics(prepared: *const vmm.Prepared, restore_stats: *?RestoreStats, start_ms: u64) void {
-    if (restore_stats.*) |*stats| {
-        var buffer: [512]u8 = undefined;
-        const message = formatRestoreMetrics(&buffer, prepared.ram_size, stats, start_ms);
-        if (prepared.config.probeStream()) |probe| probe.setBackendRestoreMetrics(stats.memory_ms, stats.state_ms, stats.pre_run_ms);
-        std.log.info("{s}", .{message});
-    }
-}
-
-const RamMapping = struct {
-    bytes: []align(std.heap.page_size_min) u8,
-    file_backed: bool,
-
-    fn deinit(self: RamMapping) void {
-        std.posix.munmap(self.bytes);
-    }
-};
 
 const HotplugMapping = struct {
     bytes: []align(std.heap.page_size_min) u8,
@@ -130,20 +79,6 @@ const HotplugMapping = struct {
     }
 };
 
-const SpinLock = struct {
-    locked: std.atomic.Value(bool) = .init(false),
-
-    fn lock(self: *SpinLock) void {
-        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.Thread.yield() catch {};
-        }
-    }
-
-    fn unlock(self: *SpinLock) void {
-        self.locked.store(false, .release);
-    }
-};
-
 // PSCI v1.x (ARM DEN 0022) function ids and return codes.
 const psci_version: u32 = 0x8400_0000;
 const psci_cpu_off: u32 = 0x8400_0002;
@@ -165,7 +100,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     var prepared = try vmm.prepare(allocator, input, .{ .multi_vcpu_dirty_tracking = false });
     defer prepared.deinit();
     const config = &prepared.config;
-    var restore_stats: ?RestoreStats = if (prepared.restoring()) .{
+    var restore_stats: ?vmm.RestoreStats = if (prepared.restoring()) .{
         .start_ms = setup_start,
         .manifest_ms = monotonicMs() - setup_start,
     } else null;
@@ -206,7 +141,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     // Guest RAM. Fresh boots, eager chunk resumes, and proof-gated local
     // backing resumes all map the whole initial range up front.
     const map_ram_start = monotonicMs();
-    const ram_mapping = try mapRam(&prepared);
+    const ram_mapping = try vmm.mapRam(&prepared);
     const map_ram_ms = monotonicMs() - map_ram_start;
     if (restore_stats) |*stats| stats.map_ram_ms = map_ram_ms;
     defer ram_mapping.deinit();
@@ -227,67 +162,25 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         null;
     defer if (hotplug_mapping) |*mapping| mapping.deinit();
 
-    // Devices: console is virtio-mmio slot 0, rootfs disk (if any) follows,
-    // then optional build context, immutable input disks, the transient build
-    // cache disk, net, vsock, rng.
-    // The generation device is a separate fixed MMIO window after the reserved virtio range.
     const devices_start = monotonicMs();
-    var con = console.Console{ .sink = config.console_sink };
-    var blk_dev: blk.Blk = undefined;
-    var context_blk_dev: blk.Blk = undefined;
-    var build_input_blk_devs: [vmm.max_build_input_disks]blk.Blk = undefined;
-    var build_cache_blk_dev: blk.Blk = undefined;
-    var net_dev = net.Net.init(.{ .backend = config.network.backend });
-    defer net_dev.shutdown();
-    var rng_dev = rng.Rng{};
-    var vsock_dev = vsock.Vsock.init(.{});
-    var mem_dev: virtio_mem.Mem = undefined;
-    var gen_dev = generation.Device{};
-    var transports_buf: [board.max_virtio_devices]mmio.Transport = undefined;
-    transports_buf[0] = mmio.Transport.init(con.device());
-    var transport_count: usize = 1;
-    if (config.disk_backend) |backend| {
-        blk_dev = blk.Blk.initWithOptions(backend, config.root_blk_options);
-        transports_buf[1] = mmio.Transport.init(blk_dev.device());
-        transport_count = 2;
-    }
-    if (config.context_disk_fd) |fd| {
-        context_blk_dev = blk.Blk.initImmutableSource(.{ .file = fd });
-        transports_buf[transport_count] = mmio.Transport.init(context_blk_dev.device());
-        transport_count += 1;
-    }
-    for (config.build_input_disk_backends, 0..) |backend, index| {
-        build_input_blk_devs[index] = blk.Blk.initImmutableSource(backend);
-        transports_buf[transport_count] = mmio.Transport.init(build_input_blk_devs[index].device());
-        transport_count += 1;
-    }
-    if (config.build_cache_disk_backend) |backend| {
-        build_cache_blk_dev = blk.Blk.init(backend);
-        transports_buf[transport_count] = mmio.Transport.init(build_cache_blk_dev.device());
-        transport_count += 1;
-    }
-    const net_transport_index = transport_count;
-    transports_buf[transport_count] = mmio.Transport.init(net_dev.device());
-    transport_count += 1;
-    const vsock_transport_index = transport_count;
-    transports_buf[transport_count] = mmio.Transport.init(vsock_dev.device());
-    transport_count += 1;
-    transports_buf[transport_count] = mmio.Transport.init(rng_dev.device());
-    transport_count += 1;
-    var mem_transport_index: ?usize = null;
-    if (hotplug_mapping) |*mapping| {
-        mem_dev = virtio_mem.Mem.init(.{
-            .addr = mapping.guest_addr,
-            .region_size = @intCast(mapping.bytes.len),
-            .requested_size = 0,
-            .plug_context = mapping,
-            .plugFn = HotplugMapping.plug,
-        });
-        mem_transport_index = transport_count;
-        transports_buf[transport_count] = mmio.Transport.init(mem_dev.device());
-        transport_count += 1;
-    }
-    const transports = transports_buf[0..transport_count];
+    var devices: vmm.Devices = undefined;
+    devices.init(config, if (hotplug_mapping) |*mapping| .{
+        .addr = mapping.guest_addr,
+        .region_size = @intCast(mapping.bytes.len),
+        .requested_size = 0,
+        .plug_context = mapping,
+        .plugFn = HotplugMapping.plug,
+    } else null);
+    defer devices.net.shutdown();
+    const transports = devices.transports();
+    const transports_buf = &devices.transports_buf;
+    const net_dev = &devices.net;
+    const vsock_dev = &devices.vsock;
+    const mem_dev = &devices.mem;
+    const gen_dev = &devices.gen;
+    const net_transport_index = devices.net_index;
+    const vsock_transport_index = devices.vsock_index;
+    const mem_transport_index = devices.mem_index;
     const devices_ms = monotonicMs() - devices_start;
 
     if (prepared.vcpus != 1) {
@@ -295,13 +188,13 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             .prepared = &prepared,
             .restore_stats = &restore_stats,
             .transports = transports,
-            .transports_buf = &transports_buf,
-            .gen_dev = &gen_dev,
+            .transports_buf = transports_buf,
+            .gen_dev = gen_dev,
             .ram = ram,
             .ram_bytes = ram_bytes,
             .ram_file_backed = ram_mapping.file_backed,
-            .net_dev = &net_dev,
-            .vsock_dev = &vsock_dev,
+            .net_dev = net_dev,
+            .vsock_dev = vsock_dev,
             .net_transport_index = net_transport_index,
             .vsock_transport_index = vsock_transport_index,
             .rootfs = config.rootfs,
@@ -370,14 +263,14 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             .counter_frequency_hz = snapshot.hostCounterFreq(),
             .device_count = transports.len,
         });
-        try restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
+        try vmm.restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = monotonicMs();
         if (m.memory_state) |state| try mem_dev.restoreState(state);
-        try applyTransports(transports, m.devices);
+        try vmm.applyTransports(transports, m.devices);
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
-        if (restore.generation == null) try spore.refreshResumeParams(allocator, &gen_dev);
+        if (restore.generation == null) try spore.refreshResumeParams(allocator, gen_dev);
         try snapshot.applyMachine(allocator, vcpu, machine);
-        try raiseGenerationIrqIfPending(&gen_dev);
+        try raiseGenerationIrqIfPending(gen_dev);
         if (restore_stats) |*stats| stats.state_ms = monotonicMs() - state_start;
     } else {
         const fresh = config.start.boot;
@@ -426,14 +319,14 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     }
 
     const start_ms = monotonicMs();
-    emitRestoreMetrics(&prepared, &restore_stats, start_ms);
+    vmm.emitRestoreMetrics("hvf", &prepared, &restore_stats, start_ms);
     var attach_probe_ms: u64 = 0;
     if (config.probe) |probe| {
         if (probe.start == .immediate) {
             const attach_probe_start = monotonicMs();
             try vsock_dev.attachHostStream(probe.stream);
             probe.stream.markStarted();
-            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -464,7 +357,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     var did_capture_request = false;
     while (true) {
         if (config.probe != null and !exec_probe_done) {
-            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         }
         if (mem_transport_index != null) {
             if (config.probeStream()) |probe| {
@@ -483,12 +376,12 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         }
         if (config.network.failed()) return error.NetworkGatewayFailed;
         if (config.network.consumeWake()) {
-            try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
+            try flushNetworkRxHvf(net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
             continue;
         }
         if (config.exec_control) |control| {
-            control.reportStats(monitorStats(if (dirty_tracker) |*tracker| tracker else null));
-            switch (try control.poll(&vsock_dev)) {
+            control.reportStats(vmm.monitorStats(if (dirty_tracker) |*tracker| &tracker.sealer else null));
+            switch (try control.poll(vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
                 .snapshot => |request| snapshot_action: {
@@ -503,24 +396,24 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                         null;
                     defer if (prepared_root) |*root| root.deinit();
                     const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    try takeSnapshot(allocator, request.dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
+                    try takeSnapshot(allocator, request.dir, vcpu, transports, gen_dev, vsock_dev, ram_bytes, .{
                         .dist_base = dist_base,
                         .redist_base = vcpu_redist_base,
                         .redist_stride = @intCast(redist_stride),
                         .ram_size = prepared.ram_size,
-                        .memory_device = if (mem_transport_index != null) &mem_dev else null,
+                        .memory_device = if (mem_transport_index != null) mem_dev else null,
                     }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, if (preparation) |*owned| owned.cacheLock() else null);
                     if (!request.continue_after) return .snapshotted;
                     const completed_dir = if (request.publish_dir) |publish_dir| blk: {
                         const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
                         if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (config.environ_map != null) .shared_no_rebind else .local_rebind);
-                        logNamedSnapshotPublication(publish_metrics, source_pause_started_ns);
+                        vmm.logNamedSnapshotPublication("hvf", publish_metrics, source_pause_started_ns);
                         break :blk publish_dir;
                     } else request.dir;
                     try control.completeSnapshot(completed_dir);
                 },
                 .rootfs_snapshot => |request| {
-                    const disk_manifest = try takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
+                    const disk_manifest = try vmm.takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
                     try control.completeRootfsSnapshot(disk_manifest);
                 },
                 .disk_fork => |request| {
@@ -530,32 +423,32 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                         control,
                         vcpu,
                         transports,
-                        &gen_dev,
-                        &vsock_dev,
+                        gen_dev,
+                        vsock_dev,
                         ram_bytes,
                         .{
                             .dist_base = dist_base,
                             .redist_base = vcpu_redist_base,
                             .redist_stride = @intCast(redist_stride),
                             .ram_size = prepared.ram_size,
-                            .memory_device = if (mem_transport_index != null) &mem_dev else null,
+                            .memory_device = if (mem_transport_index != null) mem_dev else null,
                         },
                         config,
                         if (dirty_tracker) |*tracker| tracker else null,
                     ) catch |err| control.failDiskFork(err);
                 },
             }
-            _ = try flushVsockRx(&vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
+            _ = try flushVsockRx(vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
         }
         if (config.captureRequest()) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
             if (request_capture.isRequested() and !did_capture_request) {
-                try takeSnapshot(allocator, config.capture.?.dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
+                try takeSnapshot(allocator, config.capture.?.dir, vcpu, transports, gen_dev, vsock_dev, ram_bytes, .{
                     .dist_base = dist_base,
                     .redist_base = vcpu_redist_base,
                     .redist_stride = @intCast(redist_stride),
                     .ram_size = prepared.ram_size,
-                    .memory_device = if (mem_transport_index != null) &mem_dev else null,
+                    .memory_device = if (mem_transport_index != null) mem_dev else null,
                 }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -573,12 +466,12 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 if (probe.state == .complete) {
                     if (exec_probe.on_complete == .stop) {
                         if (config.probeCaptureDir()) |dir| {
-                            try takeSnapshot(allocator, dir, vcpu, transports, &gen_dev, &vsock_dev, ram_bytes, .{
+                            try takeSnapshot(allocator, dir, vcpu, transports, gen_dev, vsock_dev, ram_bytes, .{
                                 .dist_base = dist_base,
                                 .redist_base = vcpu_redist_base,
                                 .redist_stride = @intCast(redist_stride),
                                 .ram_size = prepared.ram_size,
-                                .memory_device = if (mem_transport_index != null) &mem_dev else null,
+                                .memory_device = if (mem_transport_index != null) mem_dev else null,
                             }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
                             return .snapshotted;
                         }
@@ -621,7 +514,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                                 continue;
                             }
                         }
-                        try handleMmio(vcpu, exit, transports, &gen_dev, ram, .{
+                        try handleMmio(vcpu, exit, transports, gen_dev, ram, .{
                             .dist_base = dist_base,
                             .dist_size = dist_size,
                             .redist_base = vcpu_redist_base,
@@ -679,7 +572,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 if (config.probe != null and !exec_probe_done) continue;
                 if (config.network.failed()) continue;
                 if (config.network.consumeWake()) {
-                    try flushNetworkRxHvf(&net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
+                    try flushNetworkRxHvf(net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
                     continue;
                 }
                 if (config.exec_control != null) continue;
@@ -740,7 +633,7 @@ const HvfVcpuCommandResult = union(enum) {
 const HvfVcpuCommandSlot = struct {
     const State = enum { idle, pending, running, complete };
 
-    lock: SpinLock = .{},
+    lock: vmm.SpinLock = .{},
     state: State = .idle,
     command: HvfVcpuCommand = undefined,
     result: HvfVcpuCommandResult = .ok,
@@ -911,7 +804,7 @@ const MultiHvfResult = union(enum) {
 };
 
 const MultiHvfRunState = struct {
-    mutex: SpinLock = .{},
+    mutex: vmm.SpinLock = .{},
     stop: std.atomic.Value(bool) = .init(false),
     snapshot_requested: std.atomic.Value(bool) = .init(false),
     result_value: ?MultiHvfResult = null,
@@ -948,7 +841,7 @@ const MultiHvfRunState = struct {
 
 const MultiHvfRunOptions = struct {
     prepared: *const vmm.Prepared,
-    restore_stats: *?RestoreStats,
+    restore_stats: *?vmm.RestoreStats,
     transports: []mmio.Transport,
     transports_buf: *[board.max_virtio_devices]mmio.Transport,
     gen_dev: *generation.Device,
@@ -981,7 +874,7 @@ const MultiHvfThreadContext = struct {
     vcpus: []HvfVcpu,
     wake_set: *HvfVcpuWakeSet,
     state: *MultiHvfRunState,
-    device_lock: *SpinLock,
+    device_lock: *vmm.SpinLock,
     network: net.Runtime,
     transports: []mmio.Transport,
     gen_dev: *generation.Device,
@@ -999,7 +892,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     for (vcpus, 0..) |*vcpu, index| vcpu.initEmpty(@intCast(index));
 
     var state = MultiHvfRunState{};
-    var device_lock = SpinLock{};
+    var device_lock = vmm.SpinLock{};
     var exec_probe_done = false;
     var wake_set = HvfVcpuWakeSet{ .vcpus = vcpus };
     config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetworkVcpuSet });
@@ -1086,9 +979,9 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         });
         // HVF restores only its own private GIC blob.
         if (machine.gic.kind != .backend_private) return error.PlatformMismatch;
-        try restoreMemory(allocator, restore, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
+        try vmm.restoreMemory(allocator, restore, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
         const state_start = monotonicMs();
-        try applyTransports(options.transports, manifest.devices);
+        try vmm.applyTransports(options.transports, manifest.devices);
         try options.gen_dev.restore(allocator, restore.generation orelse manifest.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, options.gen_dev);
         try snapshot.applyGicState(allocator, vcpus[0].handle, machine.gic);
@@ -1120,7 +1013,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         boot_ms = monotonicMs() - boot_start;
     }
 
-    emitRestoreMetrics(options.prepared, options.restore_stats, monotonicMs());
+    vmm.emitRestoreMetrics("hvf", options.prepared, options.restore_stats, monotonicMs());
 
     var attach_probe_ms: u64 = 0;
     if (config.probe) |probe| {
@@ -1162,7 +1055,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             continue;
         }
         if (config.exec_control) |control| {
-            control.reportStats(monitorStats(null));
+            control.reportStats(vmm.monitorStats(null));
             device_lock.lock();
             const action = control.poll(options.vsock_dev) catch |err| {
                 device_lock.unlock();
@@ -1246,7 +1139,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                                 state.finish(.{ .err = err });
                                 continue;
                             };
-                            logNamedSnapshotPublication(publish_metrics, source_pause_started_ns);
+                            vmm.logNamedSnapshotPublication("hvf", publish_metrics, source_pause_started_ns);
                             break :blk publish_dir;
                         } else request.dir;
                         state.clearSnapshot();
@@ -1769,119 +1662,11 @@ fn wakeCaptureVcpuSet(context: ?*anyopaque) callconv(.c) void {
     wake_set.wakeAll();
 }
 
-fn mapRam(prepared: *const vmm.Prepared) !RamMapping {
-    const maximum_size = std.math.add(u64, prepared.ram_size, prepared.virtio_mem_region_size) catch return error.BadManifest;
-    return switch (prepared.ramRestore()) {
-        .local_backing => |fd| blk: {
-            const memory = prepared.memory() orelse return error.BadManifest;
-            const backing = memory.backing orelse return error.BadManifest;
-            try spore.validateMemoryBacking(backing, maximum_size);
-            break :blk try mapFileBackedRamFd(fd, maximum_size);
-        },
-        .fresh, .eager_chunks => mapAnonymousRam(maximum_size),
-    };
-}
-
-fn restoreMemory(
-    allocator: std.mem.Allocator,
-    restore: vmm.Start.Restore,
-    memory: spore.MemoryManifest,
-    ram_bytes: []align(std.heap.page_size_min) u8,
-    file_backed: bool,
-    restore_stats: *?RestoreStats,
-) !void {
-    const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
-    if (restore_stats.*) |*stats| {
-        stats.chunk_count = memory_plan.chunk_count;
-        stats.nonzero_chunk_count = memory_plan.nonzero_chunk_count;
-    }
-    switch (restore.ram) {
-        .fresh => return error.BadManifest,
-        .local_backing => {
-            if (!file_backed) return error.BadManifest;
-            if (restore_stats.*) |*stats| stats.mode = "local_backing";
-        },
-        .eager_chunks => {
-            if (file_backed) return error.BadManifest;
-            if (restore_stats.*) |*stats| stats.mode = "eager_chunks";
-            const memory_start = monotonicMs();
-            try spore.loadMemory(allocator, restore.dir, memory, ram_bytes);
-            if (restore_stats.*) |*stats| stats.memory_ms = monotonicMs() - memory_start;
-        },
-    }
-}
-
-fn mapAnonymousRam(size: u64) !RamMapping {
-    const bytes = try std.posix.mmap(
-        null,
-        @intCast(size),
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
-        -1,
-        0,
-    );
-    return .{ .bytes = bytes, .file_backed = false };
-}
-
-fn mapFileBackedRamFd(fd: std.c.fd_t, size: u64) !RamMapping {
-    const actual_size = try fileSize(fd);
-    if (actual_size != size) return error.BadManifest;
-
-    const bytes = try std.posix.mmap(
-        null,
-        @intCast(size),
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .PRIVATE },
-        fd,
-        0,
-    );
-    std.log.info("mapped RAM from file backing fd: size={d} mode=MAP_PRIVATE", .{size});
-    return .{ .bytes = bytes, .file_backed = true };
-}
-
-test "file-backed RAM mappings isolate parent and siblings" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var backing = try tmp.dir.createFile(io, "ram.backing", .{ .read = true });
-    defer backing.close(io);
-    const size: u64 = std.heap.page_size_min;
-    if (std.c.ftruncate(backing.handle, @intCast(size)) != 0) return error.IoFailed;
-    try backing.writePositionalAll(io, &[_]u8{0x42}, 0);
-
-    const parent = try mapFileBackedRamFd(backing.handle, size);
-    defer parent.deinit();
-    const first = try mapFileBackedRamFd(backing.handle, size);
-    defer first.deinit();
-    const second = try mapFileBackedRamFd(backing.handle, size);
-    defer second.deinit();
-    parent.bytes[0] = 0x11;
-    try std.testing.expectEqual(@as(u8, 0x42), first.bytes[0]);
-    try std.testing.expectEqual(@as(u8, 0x42), second.bytes[0]);
-    first.bytes[0] = 0x22;
-    second.bytes[0] = 0x33;
-    try std.testing.expectEqual(@as(u8, 0x11), parent.bytes[0]);
-    try std.testing.expectEqual(@as(u8, 0x22), first.bytes[0]);
-    try std.testing.expectEqual(@as(u8, 0x33), second.bytes[0]);
-    var stored: [1]u8 = undefined;
-    try std.testing.expectEqual(stored.len, try backing.readPositionalAll(io, &stored, 0));
-    try std.testing.expectEqual(@as(u8, 0x42), stored[0]);
-}
-
-fn fileSize(fd: std.c.fd_t) !u64 {
-    const cur = std.c.lseek(fd, 0, std.c.SEEK.CUR);
-    if (cur < 0) return error.IoFailed;
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-    if (end < 0) return error.IoFailed;
-    if (std.c.lseek(fd, cur, std.c.SEEK.SET) < 0) return error.IoFailed;
-    return @intCast(end);
-}
-
 const DirtyTracker = struct {
     sealer: dirty_ram.Sealer,
     writable_chunks: []bool,
     tracking_start_ms: u64 = 0,
-    mutex: SpinLock = .{},
+    mutex: vmm.SpinLock = .{},
     stats: DirtyStats = .{},
 
     const Options = struct {
@@ -2023,30 +1808,6 @@ const DirtyTracker = struct {
     }
 };
 
-fn monitorStats(tracker: ?*DirtyTracker) vsock_control.ControlStats {
-    var result = vsock_control.ControlStats{};
-    if (tracker) |active| {
-        result.chunks_nonzero = @intCast(active.sealer.nonzeroChunkCount());
-        result.dirty_chunks_pending = @intCast(active.sealer.dirtyChunksPending());
-    }
-    return result;
-}
-
-fn logNamedSnapshotPublication(metrics: vsock_control.SnapshotPublishMetrics, pause_started_ns: u64) void {
-    const source_pause_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
-    std.log.info(
-        "hvf named snapshot publication metrics: cache_lock_wait_ms={d} manifest_pin_authorization_ms={d} active_lease_handoff_ms={d} lifecycle_spec_ms={d} final_publication_ms={d} source_pause_ms={d}",
-        .{
-            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.cache_lock_wait_ns),
-            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.manifest_pin_authorization_ns),
-            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.active_lease_handoff_ns),
-            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.lifecycle_spec_ns),
-            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.final_publication_ns),
-            vsock_control.SnapshotPublishMetrics.nsToMs(source_pause_ns),
-        },
-    );
-}
-
 const SnapshotPlatform = struct {
     dist_base: u64,
     redist_base: u64,
@@ -2054,28 +1815,6 @@ const SnapshotPlatform = struct {
     ram_size: u64,
     memory_device: ?*const virtio_mem.Mem = null,
 };
-
-fn takeRootfsSnapshot(
-    allocator: std.mem.Allocator,
-    dir: []const u8,
-    transports: []mmio.Transport,
-    disk_snapshot: ?disk_layer.SnapshotState,
-) !?spore.Disk {
-    // Keep this in sync with src/kvm/aarch64_vm.zig:takeRootfsSnapshot. The
-    // transport type is backend-local, so only the quiescence/snapshot contract
-    // is shared.
-    const disk_state = disk_snapshot orelse return error.BadManifest;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const devices = try captureTransports(arena, transports);
-    if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
-        std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
-        return error.DeviceStatePending;
-    }
-    return try disk_state.finish(allocator, dir, true);
-}
 
 fn captureSingleHvfDiskFork(
     allocator: std.mem.Allocator,
@@ -2155,7 +1894,7 @@ fn takeSnapshot(
     const machine = try snapshot.captureMachine(arena, vcpu);
     const machine_ms = monotonicMs() - machine_start;
     const devices_start = monotonicMs();
-    const devices = try captureTransports(arena, transports);
+    const devices = try vmm.captureTransports(arena, transports);
     const devices_ms = monotonicMs() - devices_start;
     var disk_quiesced = false;
     if (disk_snapshot orelse quiescence_disk) |disk_state| {
@@ -2313,7 +2052,7 @@ fn takeRootfsSnapshotMulti(
     disk_snapshot: ?disk_layer.SnapshotState,
 ) !?spore.Disk {
     try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
-    return try takeRootfsSnapshot(allocator, dir, transports, disk_snapshot);
+    return try vmm.takeRootfsSnapshot(allocator, dir, transports, disk_snapshot);
 }
 
 fn takeSnapshotMulti(
@@ -2357,7 +2096,7 @@ fn takeSnapshotMulti(
     const machine = try snapshot.captureMachineMulti(arena, vcpu_states);
     const machine_ms = monotonicMs() - machine_start;
     const devices_start = monotonicMs();
-    const devices = try captureTransports(arena, transports);
+    const devices = try vmm.captureTransports(arena, transports);
     const devices_ms = monotonicMs() - devices_start;
     var disk_quiesced = false;
     if (disk_snapshot orelse quiescence_disk) |disk_state| {
@@ -2493,90 +2232,6 @@ fn captureMultiHvfDiskFork(
     batch.pause_started_ns = pause_started_ns;
     batch.ram_capture_ns = ram_capture_ns;
     try control.completeDiskFork(&batch);
-}
-
-fn captureTransports(allocator: std.mem.Allocator, transports: []mmio.Transport) ![]spore.TransportState {
-    const out = try allocator.alloc(spore.TransportState, transports.len);
-    for (transports, 0..) |*t, i| {
-        const queues = try allocator.alloc(spore.QueueState, t.dev.queue_count);
-        for (queues, 0..) |*qs, qi| {
-            const q = t.queues[qi];
-            qs.* = .{
-                .size = q.size,
-                .ready = q.ready,
-                .desc_addr = q.desc_addr,
-                .avail_addr = q.avail_addr,
-                .used_addr = q.used_addr,
-                .last_avail = q.last_avail,
-                .used_idx = q.used_idx,
-            };
-        }
-        out[i] = .{
-            .device_id = t.dev.device_id,
-            .status = t.status,
-            .device_features_sel = t.device_features_sel,
-            .driver_features_sel = t.driver_features_sel,
-            .driver_features = t.driver_features,
-            .queue_sel = t.queue_sel,
-            .interrupt_status = t.interrupt_status,
-            .queues = queues,
-        };
-    }
-    return out;
-}
-
-fn applyTransports(transports: []mmio.Transport, states: []const spore.TransportState) !void {
-    if (states.len != transports.len) return error.PlatformMismatch;
-    for (transports, states) |*t, s| {
-        if (t.dev.device_id != s.device_id) return error.PlatformMismatch;
-        if (s.queues.len != t.dev.queue_count) return error.PlatformMismatch;
-        t.applyRestoredFeatureState(s.status, s.driver_features) catch return error.BadManifest;
-        t.device_features_sel = s.device_features_sel;
-        t.driver_features_sel = s.driver_features_sel;
-        t.queue_sel = s.queue_sel;
-        t.interrupt_status = s.interrupt_status;
-        for (s.queues, 0..) |qs, qi| {
-            const restored: @TypeOf(t.queues[qi]) = .{
-                .size = qs.size,
-                .ready = qs.ready,
-                .desc_addr = qs.desc_addr,
-                .avail_addr = qs.avail_addr,
-                .used_addr = qs.used_addr,
-                .last_avail = qs.last_avail,
-                .used_idx = qs.used_idx,
-            };
-            restored.validateLayout() catch return error.BadManifest;
-            t.queues[qi] = restored;
-        }
-    }
-}
-
-test "transport restore rejects unoffered block features" {
-    var storage: [blk.sector_size]u8 = undefined;
-    var block = blk.Blk.initWithOptions(.{ .memory = &storage }, .{});
-    var transports = [_]mmio.Transport{mmio.Transport.init(block.device())};
-    var queues = [_]spore.QueueState{.{
-        .size = 0,
-        .ready = false,
-        .desc_addr = 0,
-        .avail_addr = 0,
-        .used_addr = 0,
-        .last_avail = 0,
-        .used_idx = 0,
-    }};
-    const states = [_]spore.TransportState{.{
-        .device_id = blk.device_id,
-        .status = mmio.status_features_ok,
-        .device_features_sel = 0,
-        .driver_features_sel = 0,
-        .driver_features = blk.feature_write_zeroes,
-        .queue_sel = 0,
-        .interrupt_status = 0,
-        .queues = &queues,
-    }};
-
-    try std.testing.expectError(error.BadManifest, applyTransports(&transports, &states));
-    try std.testing.expectEqual(@as(u64, 0), transports[0].driver_features);
 }
 
 fn raiseGenerationIrqIfPending(gen_dev: *const generation.Device) !void {
@@ -2804,25 +2459,6 @@ fn dataAbortExitForTest(ipa: u64, sas: u2, srt: u5, is_write: bool) hvf.VcpuExit
             .physical_address = ipa,
         },
     };
-}
-
-test "restore metrics include source, RAM size, and backend timings" {
-    var stats = RestoreStats{
-        .start_ms = 100,
-        .manifest_ms = 1,
-        .map_ram_ms = 2,
-        .memory_ms = 3,
-        .state_ms = 4,
-        .mode = "local_backing",
-        .chunk_count = 5,
-        .nonzero_chunk_count = 6,
-    };
-    var buffer: [512]u8 = undefined;
-    const line = formatRestoreMetrics(&buffer, 1024 * 1024 * 1024, &stats, 110);
-    try std.testing.expectEqualStrings(
-        "hvf restore metrics: mode=local_backing ram_mib=1024 chunks=5 nonzero_chunks=6 manifest_ms=1 map_ram_ms=2 memory_ms=3 state_ms=4 pre_run_ms=10",
-        line,
-    );
 }
 
 test "psci target index accepts normalized mpidr affinity" {

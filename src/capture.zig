@@ -21,13 +21,6 @@ pub const Trigger = union(enum) {
             .signal => false,
         };
     }
-
-    pub fn signalValue(self: Trigger) ?Signal {
-        return switch (self) {
-            .exit => null,
-            .signal => |value| value,
-        };
-    }
 };
 
 /// What the VMM captures, where, and when.
