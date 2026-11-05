@@ -235,6 +235,126 @@ test "imported tar rootfs records native ext4 writer storage" {
     try std.testing.expect(std.mem.indexOf(u8, metadata_bytes, "\"rootfs_blake3\"") == null);
 }
 
+test "native ext4 image from a representative tar passes e2fsck and reads back" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-rootfs-native-differential";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const debugfs = try findTool(allocator, io, &debugfs_candidates);
+    defer allocator.free(debugfs);
+
+    // Tar import rejects device, fifo, and sparse entries, so the zero-run
+    // file stands in for sparse content.
+    const big = try allocator.alloc(u8, 5 * 1024 * 1024 + 123);
+    defer allocator.free(big);
+    for (big, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 12));
+    const zeros = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(zeros);
+    @memset(zeros, 0);
+    const slow_target = "../" ++ "long-symlink-target/" ** 4 ++ "hostname";
+    // VFS_CAP_REVISION_2, effective, permitted CAP_NET_RAW.
+    const cap = [_]u8{ 1, 0, 0, 2, 0, 0x20, 0, 0 } ++ [_]u8{0} ** 12;
+    const pax = try testPaxRecord(allocator, "SCHILY.xattr." ++ xattrs_mod.security_capability_name, &cap);
+    defer allocator.free(pax);
+
+    const layer_path = tmp ++ "/rootfs.tar";
+    {
+        var tar_bytes = std.ArrayList(u8).empty;
+        defer tar_bytes.deinit(allocator);
+        const entries = [_]TestTarEntry{
+            .{ .name = "etc", .kind = '5', .mode = 0o755 },
+            .{ .name = "etc/hostname", .data = "spore\n", .mode = 0o640, .uid = 1000, .gid = 1001 },
+            .{ .name = "etc/hostname-hard", .kind = '1', .link = "etc/hostname", .uid = 1000, .gid = 1001 },
+            .{ .name = "bin", .kind = '5', .mode = 0o750 },
+            .{ .name = "bin/fast-link", .kind = '2', .link = "../etc/hostname" },
+            .{ .name = "bin/slow-link", .kind = '2', .link = slow_target },
+            .{ .name = "usr/bin/ping", .kind = 'x', .data = pax },
+            .{ .name = "usr/bin/ping", .data = "#!/bin/true\n", .mode = 0o755 },
+            .{ .name = "var/big.bin", .data = big },
+            .{ .name = "var/zeros.bin", .data = zeros },
+        };
+        for (entries) |entry| try appendTestTarEntry(allocator, &tar_bytes, entry);
+        try tar_bytes.appendNTimes(allocator, 0, 1024);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer_path, .data = tar_bytes.items });
+    }
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    const cache_root = try absoluteTestPath(allocator, io, tmp, "rootfs-cache");
+    defer allocator.free(cache_root);
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = testInit(allocator, io, &process_arena, &env);
+    var import_arena = std.heap.ArenaAllocator.init(allocator);
+    defer import_arena.deinit();
+    const import_allocator = import_arena.allocator();
+    const result = try rootfs.importTar(init, import_allocator, .{
+        .input = layer_path,
+        .ref = "local/native-differential:latest",
+    });
+    defer rootfs.deinitImportTarResult(import_allocator, result);
+    const image = result.rootfs_path;
+    try runE2fsck(allocator, io, image);
+
+    const stats = [_]struct { path: []const u8, needles: []const []const u8 }{
+        .{ .path = "/etc/hostname", .needles = &.{ "Type: regular    Mode:  0640", "User:  1000   Group:  1001", "Size: 6\n", "Links: 2" } },
+        .{ .path = "/bin", .needles = &.{"Type: directory    Mode:  0750"} },
+        .{ .path = "/bin/fast-link", .needles = &.{ "Type: symlink", "Fast link dest: \"../etc/hostname\"" } },
+        .{ .path = "/bin/slow-link", .needles = &.{ "Type: symlink", std.fmt.comptimePrint("Size: {d}\n", .{slow_target.len}) } },
+        .{ .path = "/usr/bin/ping", .needles = &.{"Type: regular    Mode:  0755"} },
+        .{ .path = "/tmp", .needles = &.{"Type: directory    Mode:  01777"} },
+        .{ .path = "/var/big.bin", .needles = &.{std.fmt.comptimePrint("Size: {d}\n", .{5 * 1024 * 1024 + 123})} },
+    };
+    for (stats) |expected| {
+        const command = try std.fmt.allocPrint(allocator, "stat {s}", .{expected.path});
+        defer allocator.free(command);
+        const output = try runDebugfs(allocator, io, debugfs, image, command);
+        defer allocator.free(output);
+        for (expected.needles) |needle| {
+            if (std.mem.indexOf(u8, output, needle) == null) {
+                std.debug.print("{s}: missing {s} in:\n{s}\n", .{ expected.path, needle, output });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+
+    const target_stat = try runDebugfs(allocator, io, debugfs, image, "stat /etc/hostname");
+    defer allocator.free(target_stat);
+    const hard_stat = try runDebugfs(allocator, io, debugfs, image, "stat /etc/hostname-hard");
+    defer allocator.free(hard_stat);
+    try std.testing.expectEqualStrings(try debugfsStatInode(target_stat), try debugfsStatInode(hard_stat));
+
+    const cats = [_]struct { path: []const u8, data: []const u8 }{
+        .{ .path = "/etc/hostname", .data = "spore\n" },
+        .{ .path = "/bin/slow-link", .data = slow_target },
+        .{ .path = "/" ++ resolver_placeholder_path, .data = resolver_placeholder_bytes },
+        .{ .path = "/var/big.bin", .data = big },
+        .{ .path = "/var/zeros.bin", .data = zeros },
+    };
+    const dump_path = try absoluteTestPath(allocator, io, tmp, "dump.out");
+    defer allocator.free(dump_path);
+    for (cats) |expected| {
+        Io.Dir.cwd().deleteFile(io, dump_path) catch {};
+        const command = try std.fmt.allocPrint(allocator, "dump {s} {s}", .{ expected.path, dump_path });
+        defer allocator.free(command);
+        allocator.free(try runDebugfs(allocator, io, debugfs, image, command));
+        const dumped = try Io.Dir.cwd().readFileAlloc(io, dump_path, allocator, .limited(big.len + 1));
+        defer allocator.free(dumped);
+        try std.testing.expectEqualSlices(u8, expected.data, dumped);
+    }
+
+    const xattr_path = try absoluteTestPath(allocator, io, tmp, "xattr.out");
+    defer allocator.free(xattr_path);
+    const xattr_command = try std.fmt.allocPrint(allocator, "ea_get -f {s} /usr/bin/ping " ++ xattrs_mod.security_capability_name, .{xattr_path});
+    defer allocator.free(xattr_command);
+    allocator.free(try runDebugfs(allocator, io, debugfs, image, xattr_command));
+    const xattr = try Io.Dir.cwd().readFileAlloc(io, xattr_path, allocator, .limited(64));
+    defer allocator.free(xattr);
+    try std.testing.expectEqualSlices(u8, &cap, xattr);
+}
+
 fn expectCompleteRootfsStorage(
     allocator: std.mem.Allocator,
     io: Io,
@@ -342,31 +462,55 @@ fn runE2fsck(allocator: std.mem.Allocator, io: Io, path: []const u8) !void {
 fn writeTestTar(allocator: std.mem.Allocator, io: Io, path: []const u8, name: []const u8, data: []const u8) !void {
     var tar_bytes = std.ArrayList(u8).empty;
     defer tar_bytes.deinit(allocator);
-    try tar_bytes.appendNTimes(allocator, 0, 512);
-    writeTestTarHeader(tar_bytes.items[0..512], name, '0', data.len);
-    try tar_bytes.appendSlice(allocator, data);
-    const padding = (512 - (data.len % 512)) % 512;
-    try tar_bytes.appendNTimes(allocator, 0, padding + 1024);
+    try appendTestTarEntry(allocator, &tar_bytes, .{ .name = name, .data = data });
+    try tar_bytes.appendNTimes(allocator, 0, 1024);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = tar_bytes.items });
 }
 
-fn writeTestTarHeader(header: []u8, name: []const u8, kind: u8, size: u64) void {
-    std.debug.assert(header.len == 512);
-    std.debug.assert(name.len <= 100);
-    @memset(header, 0);
-    @memcpy(header[0..name.len], name);
-    writeTestTarOctal(header[100..108], if (kind == '5') 0o755 else 0o644);
-    writeTestTarOctal(header[108..116], 0);
-    writeTestTarOctal(header[116..124], 0);
-    writeTestTarOctal(header[124..136], size);
+const TestTarEntry = struct {
+    name: []const u8,
+    kind: u8 = '0',
+    data: []const u8 = "",
+    link: []const u8 = "",
+    mode: u32 = 0o644,
+    uid: u32 = 0,
+    gid: u32 = 0,
+};
+
+fn appendTestTarEntry(allocator: std.mem.Allocator, tar_bytes: *std.ArrayList(u8), entry: TestTarEntry) !void {
+    std.debug.assert(entry.name.len <= 100 and entry.link.len <= 100);
+    var header = [_]u8{0} ** 512;
+    @memcpy(header[0..entry.name.len], entry.name);
+    writeTestTarOctal(header[100..108], entry.mode);
+    writeTestTarOctal(header[108..116], entry.uid);
+    writeTestTarOctal(header[116..124], entry.gid);
+    writeTestTarOctal(header[124..136], entry.data.len);
     writeTestTarOctal(header[136..148], 0);
     @memset(header[148..156], ' ');
-    header[156] = kind;
+    header[156] = entry.kind;
+    @memcpy(header[157 .. 157 + entry.link.len], entry.link);
     @memcpy(header[257..263], "ustar\x00");
     @memcpy(header[263..265], "00");
     var sum: u64 = 0;
-    for (header[0..512]) |b| sum += b;
+    for (header) |b| sum += b;
     writeTestTarOctal(header[148..156], sum);
+    try tar_bytes.appendSlice(allocator, &header);
+    try tar_bytes.appendSlice(allocator, entry.data);
+    try tar_bytes.appendNTimes(allocator, 0, (512 - (entry.data.len % 512)) % 512);
+}
+
+fn testPaxRecord(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
+    const body_len = 1 + key.len + 1 + value.len + 1;
+    var total = body_len + 1;
+    while (body_len + std.fmt.count("{d}", .{total}) != total) total = body_len + std.fmt.count("{d}", .{total});
+    return std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ total, key, value });
+}
+
+fn debugfsStatInode(output: []const u8) ![]const u8 {
+    const prefix = "Inode: ";
+    if (!std.mem.startsWith(u8, output, prefix)) return error.TestUnexpectedResult;
+    const rest = output[prefix.len..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len];
 }
 
 fn writeTestTarOctal(field: []u8, value: u64) void {
