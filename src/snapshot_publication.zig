@@ -46,7 +46,7 @@ pub const SnapshotPreparation = struct {
 
 pub const Metrics = struct {
     cache_lock_wait_ns: u64 = 0,
-    manifest_pin_authorization_ns: u64 = 0,
+    manifest_write_ns: u64 = 0,
     active_lease_handoff_ns: u64 = 0,
     lifecycle_spec_ns: u64 = 0,
     final_publication_ns: u64 = 0,

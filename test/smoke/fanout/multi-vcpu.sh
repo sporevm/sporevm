@@ -97,7 +97,7 @@ print(
     f"ram_mib={ram_mib} snapshot_total_ms={snapshot['snapshot_total_ms']} "
     f"source_pause_ms={publication['source_pause_ms']} "
     f"cache_lock_wait_ms={publication['cache_lock_wait_ms']} "
-    f"manifest_pin_authorization_ms={publication['manifest_pin_authorization_ms']} "
+    f"manifest_write_ms={publication['manifest_write_ms']} "
     f"active_lease_handoff_ms={publication['active_lease_handoff_ms']} "
     f"lifecycle_spec_ms={publication['lifecycle_spec_ms']} "
     f"final_publication_ms={publication['final_publication_ms']}"

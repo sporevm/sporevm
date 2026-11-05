@@ -1186,7 +1186,7 @@ const ExecServer = struct {
         const manifest_path = try std.fs.path.join(self.allocator, &.{ work_dir, "manifest.json" });
         defer self.allocator.free(manifest_path);
         try chunk_sealer.replaceFileAtomicDurable(self.allocator, manifest_path, bytes, 0o644);
-        metrics.manifest_pin_authorization_ns = runtime_disk_fork_capture.elapsedSince(manifest_started);
+        metrics.manifest_write_ns = runtime_disk_fork_capture.elapsedSince(manifest_started);
         if (manifest.value.disk) |disk| {
             const lease_started = runtime_disk_fork_capture.monotonicNs();
             try self.handoffSnapshotDiskLease(registry, work_dir, disk, &lifecycle_spec);

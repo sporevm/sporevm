@@ -573,10 +573,10 @@ pub fn monitorStats(sealer: ?*const dirty_ram.Sealer) vsock_control.ControlStats
 pub fn logNamedSnapshotPublication(comptime backend: []const u8, metrics: vsock_control.SnapshotPublishMetrics, pause_started_ns: u64) void {
     const source_pause_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
     std.log.info(
-        backend ++ " named snapshot publication metrics: cache_lock_wait_ms={d} manifest_pin_authorization_ms={d} active_lease_handoff_ms={d} lifecycle_spec_ms={d} final_publication_ms={d} source_pause_ms={d}",
+        backend ++ " named snapshot publication metrics: cache_lock_wait_ms={d} manifest_write_ms={d} active_lease_handoff_ms={d} lifecycle_spec_ms={d} final_publication_ms={d} source_pause_ms={d}",
         .{
             vsock_control.SnapshotPublishMetrics.nsToMs(metrics.cache_lock_wait_ns),
-            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.manifest_pin_authorization_ns),
+            vsock_control.SnapshotPublishMetrics.nsToMs(metrics.manifest_write_ns),
             vsock_control.SnapshotPublishMetrics.nsToMs(metrics.active_lease_handoff_ns),
             vsock_control.SnapshotPublishMetrics.nsToMs(metrics.lifecycle_spec_ns),
             vsock_control.SnapshotPublishMetrics.nsToMs(metrics.final_publication_ns),

@@ -325,9 +325,9 @@ stops the VM and the command reports the error (parity with single-vCPU save).
 Named saves try the global cache lock before pausing any vCPU. While the lock
 is contended, the request stays pending and the guest continues running; the
 same acquired lock then spans capture and durable publication. Named saves
-report the complete source-pause time through manifest/pin
-authorization, active baseline-lease handoff, lifecycle metadata, final rename,
-and destination-parent sync. Cache-lock wait and each publication phase are
+report the complete source-pause time through the manifest write, active
+baseline-lease handoff, lifecycle metadata, final rename, and
+destination-parent sync. Cache-lock wait and each publication phase are
 logged separately, so backend RAM/disk capture time is not mistaken for the
 full pause experienced by the guest.
 Repeated `--annotation KEY=VALUE` flags merge save-time annotations into the
