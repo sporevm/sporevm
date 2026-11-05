@@ -50,7 +50,9 @@ canonical native image closure and every BLAKE3 rootfs object, and publishes an
 ordinary local ref only after
 the complete image is installed. The archive carries no suspended machine
 state; existing top-level bundle `pack`, `push`, `pull`, and `unpack` commands
-remain reserved for saved spores.
+remain reserved for saved spores. `spore --json image pack` and
+`spore --json image unpack` now print their documented result documents
+instead of text.
 
 ## v0.17.1
 

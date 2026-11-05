@@ -31,6 +31,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     if (std.mem.eql(u8, args[0], "pack")) {
         const options = try parsePackOptions(args[1..]);
         const result = try api.imageArchivePack(init, init.arena.allocator(), options);
+        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
         try stdout.print(
             "archive: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\nbytes: {d}\n",
             .{ options.output_path, result.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count, result.archive_bytes },
@@ -40,6 +41,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     if (std.mem.eql(u8, args[0], "unpack")) {
         const options = try parseUnpackOptions(args[1..]);
         const result = try api.imageArchiveUnpack(init, init.arena.allocator(), options);
+        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
         try stdout.print(
             "ref: {s}\nresolved: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\n",
             .{ options.ref, result.resolved_image_ref, options.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count },
@@ -291,4 +293,89 @@ test "image archive options require immutable digest and explicit platform" {
         "--ref",
         "local/app:ci",
     }));
+}
+
+test "json image pack and unpack print their documented result documents" {
+    const chunk = @import("chunk.zig");
+    const disk_index = @import("disk_index.zig");
+    const local_paths = @import("local_paths.zig");
+    const rootfs_cas = @import("rootfs_cas.zig");
+    const spore = @import("spore.zig");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-image-cli-json";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp);
+
+    const producer_cache = tmp ++ "/producer-cache";
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, producer_cache);
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const object_bytes = "image cli json object";
+    const object_hex = chunk.ChunkId.fromContents(object_bytes).toHex();
+    const object_digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{object_hex[0..]});
+    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = object_digest }};
+    const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, .{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = object_bytes.len,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+        .chunks = &entries,
+    });
+    const storage = spore.RootfsStorage{
+        .kind = spore.rootfs_storage_kind_chunked_ext4,
+        .device = .{ .mmio_slot = 1 },
+        .logical_size = object_bytes.len,
+        .chunk_size = spore.disk_chunk_size,
+        .hash_algorithm = spore.rootfs_storage_hash_algorithm_blake3,
+        .index_digest = encoded_index.digest,
+        .base_identity = encoded_index.digest,
+        .object_namespace = spore.rootfs_storage_object_namespace,
+    };
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, producer_cache, storage.index_digest);
+    _ = try rootfs_cas.installStorageIndexPath(allocator, io, index_path, encoded_index.bytes, storage);
+    const object_path = try rootfs_cas.manifestObjectPath(allocator, producer_cache, object_digest);
+    _ = try rootfs_cas.installChunkPath(allocator, io, object_path, object_bytes, object_digest, object_bytes.len);
+    try rootfs_cas.markStorageComplete(io, allocator, producer_cache, storage.index_digest);
+    _ = try rootfs.publishIndexedImage(init, allocator, .{
+        .ref = "local/cli-json:producer",
+        .platform = .{},
+        .config = .{ .architecture = .arm64, .os = "linux" },
+        .rootfs_storage = storage,
+    });
+
+    var pack_out: Io.Writer.Allocating = .init(allocator);
+    try run(init, &.{ "pack", "local/cli-json:producer", "--platform", "linux/arm64", "--out", tmp ++ "/image.tar.gz" }, &pack_out.writer, .json);
+    const pack = try std.json.parseFromSliceLeaky(std.json.Value, allocator, pack_out.written(), .{});
+    try std.testing.expectEqualStrings("spore.image.archive.pack.result.v1", pack.object.get("schema").?.string);
+    try std.testing.expectEqualStrings("image", pack.object.get("resource_type").?.string);
+    const archive_digest = pack.object.get("archive_digest").?.string;
+    const image_digest = pack.object.get("image_digest").?.string;
+
+    try env.put(local_paths.rootfs_cache_env, tmp ++ "/consumer-cache");
+    var unpack_out: Io.Writer.Allocating = .init(allocator);
+    try run(init, &.{
+        "unpack",                  tmp ++ "/image.tar.gz",
+        "--archive-digest",        archive_digest,
+        "--expected-image-digest", image_digest,
+        "--platform",              "linux/arm64",
+        "--ref",                   "local/cli-json:consumer",
+    }, &unpack_out.writer, .json);
+    const unpack = try std.json.parseFromSliceLeaky(std.json.Value, allocator, unpack_out.written(), .{});
+    try std.testing.expectEqualStrings("spore.image.archive.unpack.result.v1", unpack.object.get("schema").?.string);
+    try std.testing.expectEqualStrings(image_digest, unpack.object.get("image_digest").?.string);
 }
