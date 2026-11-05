@@ -494,7 +494,7 @@ representation.
   ranges; it does not repeat `base_identity` because that would make the index
   self-referential. Existing v1 storage indexes remain readable.
 - `disk`: optional sealed writable root disk state for rootfs-backed captures.
-  Saves use `kind: "chunk-index-disk-v0"`; `device` binds the disk to the
+  `kind` must be `"chunk-index-disk-v0"`; `device` binds the disk to the
   same virtio-mmio rootfs slot, `size` is the full disk size, and `base` is the
   BLAKE3 digest of a v1 or v2 disk index in the rootfs CAS namespace.
   `chunk_size`, `hash_algorithm`, and `object_namespace` mirror the index
@@ -502,8 +502,6 @@ representation.
   disk backend. Current writers pack sorted non-zero chunks and explicit zero
   coverage into v2 ranges; either accepted version is restore authority for the
   writable disk bytes.
-  `cow-block-v0` manifests are old-format artifacts and are rejected with a
-  format-too-old error.
 - `network`: optional requested network capability and policy. `kind` is
   `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the legacy CLI egress
   allow policy, while `allow_host_ports` records exact DNS-learned host plus

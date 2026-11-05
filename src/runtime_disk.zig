@@ -49,7 +49,7 @@ pub const RuntimeDisk = struct {
     rootfs_fd: ?std.c.fd_t = null,
     overlay: ?disk_layer.TempOverlay = null,
     chunk_mapped: ?chunk_mapped_disk.ChunkMappedDisk = null,
-    base_disk: ?spore.Disk = null,
+    base: ?disk_layer.Base = null,
     runtime_lease: ?runtime_disk_lease.Active = null,
 
     pub fn backend(self: *RuntimeDisk) ?virtio_blk.Backend {
@@ -63,7 +63,7 @@ pub const RuntimeDisk = struct {
     }
 
     pub fn snapshotWithMetrics(self: *RuntimeDisk, metrics: ?*disk_layer.SnapshotMetrics) ?disk_layer.SnapshotState {
-        const base = self.base_disk orelse return null;
+        const base = self.base orelse return null;
         if (self.chunk_mapped) |*disk| return .{ .base = base, .active = .{ .chunk_mapped = disk }, .metrics = metrics };
         return null;
     }
@@ -110,7 +110,7 @@ pub const RuntimeDisk = struct {
     }
 
     fn forkBaseline(self: *RuntimeDisk) !runtime_disk_fork.Baseline {
-        const base = self.base_disk orelse return error.ReadOnly;
+        const base = self.base orelse return error.ReadOnly;
         return disk_layer.forkBaseline(base);
     }
 };
@@ -143,10 +143,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     // artifact, which may legitimately have been pruned after the save.
     if (options.disk) |disk| {
         const rootfs = options.rootfs orelse return error.BadManifest;
-        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) {
-            if (std.mem.eql(u8, disk.kind, spore.disk_kind_cow_block)) return error.FormatTooOld;
-            return error.BadManifest;
-        }
+        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.BadManifest;
         if (!spore.rootfsDeviceEql(disk.device, rootfs.device)) return error.BadManifest;
         if (disk.layers.len != 0) return error.BadManifest;
         if (disk.size != spore.effectiveRootfsLogicalSize(rootfs)) return error.BadManifest;
@@ -166,7 +163,10 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
         var parsed = try readDiskIndex(context, allocator, disk_root, diskStorageDescriptor(disk));
         defer parsed.deinit();
         try runtime.chunk_mapped.?.attachCasIndexTraced(disk_root, parsed.value, runtime.trace_fd);
-        runtime.base_disk = disk;
+        runtime.base = .{
+            .baseline = .{ .kind = .disk_index, .identity = disk.base },
+            .device = disk.device,
+        };
         runtime.chunk_mapped.?.setLazyCasRuntimeOpenNs(elapsedNs(trace_open_start_ns));
         return runtime;
     }
@@ -205,7 +205,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     if (runtime.rootfs_fd == null and rootfs_lazy_storage == null) return runtime;
 
     if (options.rootfs) |rootfs| {
-        const base = diskFromRootfs(rootfs);
+        const base = baseFromRootfs(rootfs);
         if (runtime.rootfs_fd == null) {
             const storage = rootfs_lazy_storage orelse return error.BadManifest;
             const grown_size = try grownRootfsSize(storage.logical_size, storage.chunk_size, options.rootfs_grow_target);
@@ -224,13 +224,14 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             // authoritative zero. Preserve that fact in the source map rather
             // than manufacturing dirty zero payload.
             try runtime.chunk_mapped.?.growKnownZero(grown_size);
-            runtime.base_disk = base;
-            runtime.base_disk.?.size = grown_size;
+            runtime.base = base;
             runtime.chunk_mapped.?.setLazyCasRuntimeOpenNs(elapsedNs(trace_open_start_ns));
             return runtime;
         }
-        const base_source = try runtime.baseSource(base.size);
-        const writable = try openWritable(context, allocator, base_source, base.size, base.chunk_size);
+        const size = spore.effectiveRootfsLogicalSize(rootfs);
+        const chunk_size = if (rootfs.storage) |storage| storage.chunk_size else spore.disk_chunk_size;
+        const base_source = try runtime.baseSource(size);
+        const writable = try openWritable(context, allocator, base_source, size, chunk_size);
         runtime.overlay = writable.overlay;
         runtime.chunk_mapped = writable.disk;
         if (rootfs.storage) |storage| {
@@ -240,7 +241,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             defer parsed.deinit();
             try runtime.chunk_mapped.?.attachParentIndex(cache_root, parsed.value);
         }
-        runtime.base_disk = base;
+        runtime.base = base;
         return runtime;
     }
 
@@ -434,20 +435,17 @@ fn grownRootfsSize(logical_size: u64, chunk_size: u64, grow_target: u64) !u64 {
     return std.math.add(u64, grow_target, chunk_size - remainder) catch return error.BadManifest;
 }
 
-fn diskFromRootfs(rootfs: spore.Rootfs) spore.Disk {
-    if (rootfs.storage) |storage| {
-        return .{
-            .kind = spore.disk_kind_chunk_index,
-            .device = storage.device,
-            .size = storage.logical_size,
-            .base = storage.index_digest,
-            .chunk_size = storage.chunk_size,
-            .hash_algorithm = storage.hash_algorithm,
-            .object_namespace = storage.object_namespace,
-            .layers = &.{},
-        };
-    }
-    return disk_layer.diskFromRootfs(rootfs);
+/// A chunked rootfs is already a published disk index; an exact rootfs
+/// artifact has no index until the first save publishes one.
+fn baseFromRootfs(rootfs: spore.Rootfs) disk_layer.Base {
+    if (rootfs.storage) |storage| return .{
+        .baseline = .{ .kind = .disk_index, .identity = storage.index_digest },
+        .device = storage.device,
+    };
+    return .{
+        .baseline = .{ .kind = .rootfs, .identity = rootfs.artifact.digest },
+        .device = rootfs.device,
+    };
 }
 
 fn diskStorageDescriptor(disk: spore.Disk) spore.RootfsStorage {

@@ -849,7 +849,7 @@ fn takeRootfsSnapshot(
     const arena = arena_state.allocator();
 
     const devices = try captureTransports(arena, transports);
-    if (!try spore.diskQueuesQuiescent(disk_state.base, devices)) {
+    if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
         std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
         return error.DeviceStatePending;
     }
