@@ -343,13 +343,13 @@ pub const Gateway = struct {
         for (&self.flows) |*flow| {
             flow.poll_index = null;
             if (flow.fd < 0) continue;
-            // After host EOF with nothing left to write there is nothing to
-            // poll for; an EOF socket would otherwise report readable forever.
-            if (flow.host_eof and flow.to_host.len == 0) continue;
             var events: i16 = 0;
             if (flow.state == .connecting or flow.to_host.len > 0) events |= std.c.POLL.OUT;
             if (flow.state == .connected and !flow.host_eof and flow.to_guest.freeLen() > 0) events |= std.c.POLL.IN;
-            if (events == 0) events = std.c.POLL.IN;
+            // Nothing to write and no room for host bytes (or host EOF): a
+            // readable socket would wake every poll until the guest catches
+            // up, so leave it out until there is something to do.
+            if (events == 0) continue;
             if (count >= fds.len) break;
             fds[count] = .{ .fd = flow.fd, .events = events, .revents = 0 };
             flow.poll_index = count;
@@ -1252,6 +1252,59 @@ test "spore-netd TCP delivers guest bytes sent after host EOF" {
     guest.sock.close();
     guest.exchange(&gateway, Instant.fromMillis(4));
     try std.testing.expectEqual(@as(isize, 0), std.c.recv(host_peer, &buf, buf.len, std.c.MSG.DONTWAIT));
+}
+
+test "spore-netd TCP stops polling a host socket while the guest cannot take more" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-backpressure-test-{d}.sock", .{std.c.getpid()});
+    const listener = try listenUnix(path);
+    defer _ = std.c.close(listener);
+    defer _ = std.c.unlink(path.ptr);
+
+    var config = spore_net_policy.Config{};
+    try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49153);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+    try std.testing.expectEqual(tcp_socket.State.established, guest.sock.getState());
+    const host_peer = std.c.accept(listener, null, null);
+    try std.testing.expect(host_peer >= 0);
+    defer _ = std.c.close(host_peer);
+
+    // The host keeps writing while the guest reads nothing, until the guest
+    // window and every gateway buffer are full and the host fd leaves the
+    // poll set even though it still has bytes to read.
+    try std.testing.expect(setNonBlocking(host_peer));
+    var chunk: [4096]u8 = undefined;
+    @memset(&chunk, 'x');
+    var written: usize = 0;
+    var fds: [max_port_forwards + max_flows]std.posix.pollfd = undefined;
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        while (written < 1024 * 1024) {
+            const n = std.c.send(host_peer, &chunk, chunk.len, 0);
+            if (n <= 0) break;
+            written += @intCast(n);
+        }
+        const count = gateway.fillPollFds(&fds);
+        if (count == 0) break;
+        _ = try std.posix.poll(fds[0..count], 1_000);
+        gateway.servicePoll(fds[0..count]);
+        guest.exchange(&gateway, Instant.fromMillis(2));
+    }
+    try std.testing.expect(rounds < 64);
+
+    // Once the guest reads, the gateway forwards what it has buffered.
+    var drained: [tcp_rx_buffer_len]u8 = undefined;
+    try std.testing.expect(try guest.sock.recvSlice(&drained) > 0);
+    guest.exchange(&gateway, Instant.fromMillis(3));
+    try std.testing.expect(try guest.sock.recvSlice(&drained) > 0);
 }
 
 test "spore-netd TCP enforces exact learned host ports" {
