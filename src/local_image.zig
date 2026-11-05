@@ -316,13 +316,13 @@ pub fn tag(
     return path;
 }
 
-/// A name outside `local/` may only point at an image pulled from a registry,
-/// never at a build, commit, unpack or import.
+/// A name outside `local/` may only point at an image converted from OCI
+/// layers, never at a build, commit or unpack. A registry pull may find an
+/// image imported from the same manifest, so the source repository is not
+/// checked.
 fn validateName(name: []const u8, provenance: ?OciProvenance) !void {
     _ = try oci.ImageTag.parse(name);
-    if (rootfs.isLocalImageRef(name)) return;
-    const source = provenance orelse return error.LocalRefMustUseLocalRegistry;
-    if (rootfs.isLocalImageRef(source.ref)) return error.LocalRefMustUseLocalRegistry;
+    if (!rootfs.isLocalImageRef(name) and provenance == null) return error.LocalRefMustUseLocalRegistry;
 }
 
 /// The digest-pinned reference a run records for `requested`: local names
@@ -495,12 +495,11 @@ test "local image names resolve through refs, identities and derivations across 
     try std.testing.expectEqualStrings(old.identity, (try find(io, allocator, cache.root, "registry.example.test/app:old", arm64)).?.identity);
     try std.testing.expectEqual(null, try lookup(io, allocator, cache.root, "registry.example.test/app@" ++ old_manifest, arm64));
 
-    // Registry names only point at registry pulls.
+    // Registry names only point at images converted from OCI layers.
     try std.testing.expectError(error.LocalRefMustUseLocalRegistry, lockAndPublish(io, allocator, cache.root, .{
         .platform = arm64,
         .storage = try cache.storage(4),
-        .oci = .{ .ref = "local/app@" ++ manifest, .manifest_digest = manifest, .builder_version = rootfs.builder_version },
-        .name = "registry.example.test/app:imported",
+        .name = "registry.example.test/app:native",
     }));
     var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, cache.root);
     defer cache_lock.deinit();

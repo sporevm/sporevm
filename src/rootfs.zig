@@ -1222,11 +1222,12 @@ fn materializeRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts:
         },
         .catalog => |catalog| {
             // An existing digest-addressed file wins over this output; the
-            // catalog links whichever file the digest path names.
+            // catalog links whichever file the digest path names. Without
+            // hard links the image keeps no flat file; runs read its chunks.
             const flat_path = if (try rootfs_cache.installTrustedMaterializationByHardlink(init.io, allocator, cache_root, output, rootfs_storage.index_digest, stat.size)) |_|
                 try rootfs_cache.digestPath(allocator, cache_root, rootfs_storage.index_digest)
             else
-                output;
+                null;
             const published = try local_image.publish(init.io, allocator, cache_root, &cache_lock, .{
                 .platform = opts.platform,
                 .config = opts.config,

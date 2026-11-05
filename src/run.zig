@@ -5247,6 +5247,85 @@ test "run pull never fails closed on mutable image ref cache miss" {
     }
 }
 
+test "run points a registry tag at the image imported from the same OCI manifest" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const layout = try std.fs.path.join(arena, &.{ root, "layout" });
+    const blobs = try std.fs.path.join(arena, &.{ layout, "blobs", "sha256" });
+    try Io.Dir.cwd().createDirPath(io, blobs);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ layout, "oci-layout" }), .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
+    const Blob = struct {
+        fn write(a: std.mem.Allocator, dir: []const u8, bytes: []const u8) ![]const u8 {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, &hex }), .data = bytes });
+            return std.fmt.allocPrint(a, "sha256:{s}", .{&hex});
+        }
+    };
+    var layer: Io.Writer.Allocating = .init(arena);
+    var layer_writer = std.tar.Writer{ .underlying_writer = &layer.writer };
+    try layer_writer.writeFileBytes("etc/hello", "hello\n", .{ .mode = 0o644 });
+    try layer_writer.finishPedantically();
+    const arch = direct_image_platform.arch.name();
+    const config = try std.fmt.allocPrint(arena, "{{\"architecture\":\"{s}\",\"os\":\"linux\"}}", .{arch});
+    const manifest = try std.fmt.allocPrint(
+        arena,
+        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
+        .{ try Blob.write(arena, blobs, config), config.len, try Blob.write(arena, blobs, layer.written()), layer.written().len },
+    );
+    const manifest_digest = try Blob.write(arena, blobs, manifest);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(arena, &.{ layout, "index.json" }),
+        .data = try std.fmt.allocPrint(
+            arena,
+            "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"{s}\"}}}}]}}",
+            .{ manifest_digest, manifest.len, arch },
+        ),
+    });
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    var process_arena = std.heap.ArenaAllocator.init(allocator);
+    defer process_arena.deinit();
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &process_arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    // `spore build --build-context` imports its base like this.
+    const imported = try rootfs_mod.importOciLayout(init, arena, .{ .input = layout, .ref = "local/app:dev", .platform = direct_image_platform });
+    // `spore run registry.example.test/app:1` after the registry resolved the
+    // tag to the same manifest.
+    const resolved_ref = try std.fmt.allocPrint(arena, "registry.example.test/app@{s}", .{manifest_digest});
+    const pulled = try pulledImage(init, arena, cache_root, .{ .ref = resolved_ref, .manifest_digest = manifest_digest, .platform = direct_image_platform }, "registry.example.test/app:1");
+    try std.testing.expectEqualStrings(imported.image_manifest_digest, pulled.identity);
+
+    const result = try resolveRootfsInputDetailedResult(init, arena, .{
+        .rootfs_path = null,
+        .image_ref = "registry.example.test/app:1",
+        .pull_policy = .never,
+        .command_name = "run",
+    });
+    const input = switch (result) {
+        .resolved => |input| input,
+        .failure => return error.ExpectedLocalImage,
+    };
+    try std.testing.expectEqualStrings(resolved_ref, input.rootfs.?.source.?.resolved_image_ref);
+}
+
 test "run --pull=missing converts a registry tag again after a rootfs builder change" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
