@@ -12,6 +12,7 @@ const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const memory_config = @import("memory.zig");
+const named_copy_archive = @import("named_copy_archive.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -2210,7 +2211,7 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     const parsed = CopyNamedOptions{ .name = args[0], .host_path = args[1], .guest_path = args[2] };
     try rejectX86NamedCopy();
 
-    var archive = createCopyArchive(allocator, init.io, parsed.host_path) catch |err| {
+    var archive = named_copy_archive.createTempFromHostPath(allocator, init.io, parsed.host_path) catch |err| {
         if (mode == .json) return err;
         std.debug.print("spore copy-in: cannot archive host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
         std.process.exit(1);
@@ -2284,14 +2285,14 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
     const parsed = CopyNamedOptions{ .name = args[0], .guest_path = args[1], .host_path = args[2] };
     try rejectX86NamedCopy();
 
-    var archive = createEmptyCopyArchive(allocator, init.io) catch |err| {
+    var archive = named_copy_archive.createTemp(allocator) catch |err| {
         if (mode == .json) return err;
         std.debug.print("spore copy-out: cannot create transfer archive: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
     defer archive.deinit(init.io);
 
-    const archive_fd = openHostFileCreate(allocator, archive.path) catch |err| {
+    const archive_fd = named_copy_archive.openHostFileCreate(allocator, archive.path) catch |err| {
         if (mode == .json) return err;
         std.debug.print("spore copy-out: cannot open transfer archive: {s}\n", .{@errorName(err)});
         exitAfterCopyArchiveCleanup(&archive, init.io, 1);
@@ -2343,7 +2344,7 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
         }
         exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
     }
-    extractCopyArchive(allocator, init.io, archive.path, parsed.host_path) catch |err| {
+    named_copy_archive.extractFile(allocator, init.io, archive.path, parsed.host_path) catch |err| {
         if (mode == .json) return err;
         std.debug.print("spore copy-out: cannot write host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
         exitAfterCopyArchiveCleanup(&archive, init.io, 1);
@@ -5544,291 +5545,9 @@ fn decodeControlOutput(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 
     return decoded;
 }
 
-const copy_archive_magic = "SPCP1\n\x00\n";
-const copy_record_header_len = 16;
-const max_copy_archive_path = 512;
-
-const CopyArchiveKind = enum(u8) {
-    file = 'F',
-    directory = 'D',
-    end = 'E',
-};
-
-const CopyArchive = struct {
-    allocator: std.mem.Allocator,
-    dir: [:0]u8,
-    path: []const u8,
-
-    fn deinit(self: *CopyArchive, io: Io) void {
-        Io.Dir.cwd().deleteTree(io, self.dir) catch {};
-        self.allocator.free(self.path);
-        self.allocator.free(self.dir);
-    }
-};
-
-fn exitAfterCopyArchiveCleanup(archive: *CopyArchive, io: Io, code: u8) noreturn {
+fn exitAfterCopyArchiveCleanup(archive: *named_copy_archive.TempArchive, io: Io, code: u8) noreturn {
     archive.deinit(io);
     std.process.exit(code);
-}
-
-const CopyRecord = struct {
-    kind: CopyArchiveKind,
-    path: []const u8,
-    mode: u32,
-    size: u64,
-};
-
-extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
-
-fn createCopyArchive(allocator: std.mem.Allocator, io: Io, host_path: []const u8) !CopyArchive {
-    var archive = try createEmptyCopyArchive(allocator, io);
-    errdefer archive.deinit(io);
-
-    var file = try Io.Dir.createFileAbsolute(io, archive.path, .{
-        .exclusive = true,
-        .permissions = @enumFromInt(0o600),
-    });
-    defer file.close(io);
-
-    try file.writeStreamingAll(io, copy_archive_magic);
-    try writeHostPathArchive(allocator, io, file, host_path);
-    try writeCopyRecordHeader(file, io, .end, "", 0, 0);
-    return archive;
-}
-
-fn createEmptyCopyArchive(allocator: std.mem.Allocator, io: Io) !CopyArchive {
-    _ = io;
-    const tmpl = "/tmp/sporevm-copy-XXXXXX";
-    const dir = try allocator.dupeZ(u8, tmpl);
-    errdefer allocator.free(dir);
-    if (mkdtemp(dir) == null) return error.IoFailed;
-    const path = try std.fmt.allocPrint(allocator, "{s}/payload.spcp", .{std.mem.sliceTo(dir, 0)});
-    errdefer allocator.free(path);
-    return .{ .allocator = allocator, .dir = dir, .path = path };
-}
-
-fn writeHostPathArchive(allocator: std.mem.Allocator, io: Io, archive: Io.File, host_path: []const u8) !void {
-    const stat = try Io.Dir.cwd().statFile(io, host_path, .{ .follow_symlinks = false });
-    switch (stat.kind) {
-        .file => try writeHostFileRecord(io, archive, Io.Dir.cwd(), host_path, "", stat),
-        .directory => {
-            try writeCopyRecordHeader(archive, io, .directory, "", modeFromStat(stat), 0);
-            var dir = try openDirPath(io, host_path, .{ .iterate = true, .follow_symlinks = false });
-            defer dir.close(io);
-            var walker = try dir.walk(allocator);
-            defer walker.deinit();
-            while (try walker.next(io)) |entry| {
-                try validateCopyArchivePath(entry.path, false);
-                const entry_stat = try entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = false });
-                switch (entry.kind) {
-                    .file => try writeHostFileRecord(io, archive, entry.dir, entry.basename, entry.path, entry_stat),
-                    .directory => try writeCopyRecordHeader(archive, io, .directory, entry.path, modeFromStat(entry_stat), 0),
-                    else => return error.UnsupportedCopyEntry,
-                }
-            }
-        },
-        else => return error.UnsupportedCopyEntry,
-    }
-}
-
-fn writeHostFileRecord(
-    io: Io,
-    archive: Io.File,
-    source_dir: Io.Dir,
-    source_path: []const u8,
-    archive_path: []const u8,
-    stat: Io.File.Stat,
-) !void {
-    if (stat.kind != .file) return error.UnsupportedCopyEntry;
-    try writeCopyRecordHeader(archive, io, .file, archive_path, modeFromStat(stat), stat.size);
-    const open_options: Io.Dir.OpenFileOptions = .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-    };
-    var source = if (Io.Dir.path.isAbsolute(source_path))
-        try Io.Dir.openFileAbsolute(io, source_path, open_options)
-    else
-        try source_dir.openFile(io, source_path, open_options);
-    defer source.close(io);
-    var buf: [64 * 1024]u8 = undefined;
-    var remaining = stat.size;
-    while (remaining > 0) {
-        const want: usize = @intCast(@min(remaining, buf.len));
-        const n = source.readStreaming(io, &.{buf[0..want]}) catch |err| switch (err) {
-            error.EndOfStream => return error.ShortRead,
-            else => |e| return e,
-        };
-        if (n == 0) return error.ShortRead;
-        try archive.writeStreamingAll(io, buf[0..n]);
-        remaining -= n;
-    }
-}
-
-fn writeCopyRecordHeader(
-    archive: Io.File,
-    io: Io,
-    kind: CopyArchiveKind,
-    archive_path: []const u8,
-    mode: u32,
-    size: u64,
-) !void {
-    if (kind != .end) try validateCopyArchivePath(archive_path, true);
-    if (archive_path.len > max_copy_archive_path) return error.NameTooLong;
-    var header: [copy_record_header_len]u8 = undefined;
-    header[0] = @intFromEnum(kind);
-    std.mem.writeInt(u16, header[1..3], @intCast(archive_path.len), .little);
-    std.mem.writeInt(u32, header[3..7], mode & 0o777, .little);
-    std.mem.writeInt(u64, header[7..15], size, .little);
-    header[15] = 0;
-    try archive.writeStreamingAll(io, &header);
-    if (archive_path.len != 0) try archive.writeStreamingAll(io, archive_path);
-}
-
-fn extractCopyArchive(allocator: std.mem.Allocator, io: Io, archive_path: []const u8, host_path: []const u8) !void {
-    var archive = try Io.Dir.openFileAbsolute(io, archive_path, .{ .mode = .read_only, .allow_directory = false });
-    defer archive.close(io);
-
-    var magic: [copy_archive_magic.len]u8 = undefined;
-    try readArchiveExact(archive, io, &magic);
-    if (!std.mem.eql(u8, &magic, copy_archive_magic)) return error.BadCopyArchive;
-
-    var path_buf: [max_copy_archive_path]u8 = undefined;
-    const root = try readCopyRecord(archive, io, &path_buf);
-    if (root.path.len != 0) return error.BadCopyArchive;
-    switch (root.kind) {
-        .file => {
-            const fd = try createHostOutputFile(allocator, host_path, root.mode);
-            var keep = false;
-            defer {
-                _ = std.c.close(fd);
-                if (!keep) Io.Dir.cwd().deleteFile(io, host_path) catch {};
-            }
-            try copyArchiveFileToFd(archive, io, fd, root.size);
-            try expectCopyArchiveEnd(archive, io, &path_buf);
-            try expectCopyArchiveEof(archive, io);
-            keep = true;
-        },
-        .directory => {
-            try createHostOutputDir(allocator, host_path, root.mode);
-            var keep = false;
-            defer if (!keep) Io.Dir.cwd().deleteTree(io, host_path) catch {};
-            while (true) {
-                const record = try readCopyRecord(archive, io, &path_buf);
-                if (record.kind == .end) break;
-                if (record.path.len == 0) return error.BadCopyArchive;
-                const target = try std.fs.path.join(allocator, &.{ host_path, record.path });
-                defer allocator.free(target);
-                switch (record.kind) {
-                    .file => {
-                        const fd = try createHostOutputFile(allocator, target, record.mode);
-                        defer _ = std.c.close(fd);
-                        try copyArchiveFileToFd(archive, io, fd, record.size);
-                    },
-                    .directory => try createHostOutputDir(allocator, target, record.mode),
-                    .end => unreachable,
-                }
-            }
-            try expectCopyArchiveEof(archive, io);
-            keep = true;
-        },
-        .end => return error.BadCopyArchive,
-    }
-}
-
-fn readCopyRecord(archive: Io.File, io: Io, path_buf: *[max_copy_archive_path]u8) !CopyRecord {
-    var header: [copy_record_header_len]u8 = undefined;
-    try readArchiveExact(archive, io, &header);
-    const kind: CopyArchiveKind = switch (header[0]) {
-        @intFromEnum(CopyArchiveKind.file) => .file,
-        @intFromEnum(CopyArchiveKind.directory) => .directory,
-        @intFromEnum(CopyArchiveKind.end) => .end,
-        else => return error.BadCopyArchive,
-    };
-    const path_len = std.mem.readInt(u16, header[1..3], .little);
-    const mode = std.mem.readInt(u32, header[3..7], .little);
-    const size = std.mem.readInt(u64, header[7..15], .little);
-    if (header[15] != 0 or path_len > path_buf.len or (mode & ~@as(u32, 0o777)) != 0) return error.BadCopyArchive;
-    const path = path_buf[0..path_len];
-    if (path.len != 0) try readArchiveExact(archive, io, path);
-    if (kind == .end) {
-        if (path.len != 0 or mode != 0 or size != 0) return error.BadCopyArchive;
-    } else {
-        try validateCopyArchivePath(path, true);
-        if (kind == .directory and size != 0) return error.BadCopyArchive;
-    }
-    return .{ .kind = kind, .path = path, .mode = mode & 0o777, .size = size };
-}
-
-fn expectCopyArchiveEnd(archive: Io.File, io: Io, path_buf: *[max_copy_archive_path]u8) !void {
-    const record = try readCopyRecord(archive, io, path_buf);
-    if (record.kind != .end) return error.BadCopyArchive;
-}
-
-fn expectCopyArchiveEof(archive: Io.File, io: Io) !void {
-    var byte: [1]u8 = undefined;
-    const n = archive.readStreaming(io, &.{byte[0..]}) catch |err| switch (err) {
-        error.EndOfStream => return,
-        else => |e| return e,
-    };
-    if (n == 0) return;
-    return error.BadCopyArchive;
-}
-
-fn readArchiveExact(archive: Io.File, io: Io, buf: []u8) !void {
-    var filled: usize = 0;
-    while (filled < buf.len) {
-        const n = archive.readStreaming(io, &.{buf[filled..]}) catch |err| switch (err) {
-            error.EndOfStream => return error.BadCopyArchive,
-            else => |e| return e,
-        };
-        if (n == 0) return error.BadCopyArchive;
-        filled += n;
-    }
-}
-
-fn copyArchiveFileToFd(archive: Io.File, io: Io, fd: std.c.fd_t, size: u64) !void {
-    var remaining = size;
-    var buf: [64 * 1024]u8 = undefined;
-    while (remaining > 0) {
-        const want: usize = @intCast(@min(remaining, buf.len));
-        try readArchiveExact(archive, io, buf[0..want]);
-        try writeFdAll(fd, buf[0..want]);
-        remaining -= want;
-    }
-}
-
-fn validateCopyArchivePath(path: []const u8, allow_root: bool) !void {
-    if (path.len == 0) {
-        if (allow_root) return;
-        return error.BadCopyArchivePath;
-    }
-    if (path.len > max_copy_archive_path or path[0] == '/' or path[path.len - 1] == '/') return error.BadCopyArchivePath;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |part| {
-        if (part.len == 0) return error.BadCopyArchivePath;
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.BadCopyArchivePath;
-        if (std.mem.indexOfScalar(u8, part, 0) != null) return error.BadCopyArchivePath;
-    }
-}
-
-fn createHostOutputFile(allocator: std.mem.Allocator, path: []const u8, mode: u32) !std.c.fd_t {
-    const fd = try openHostFileCreate(allocator, path);
-    if (std.c.fchmod(fd, @intCast(mode & 0o777)) != 0) {
-        _ = std.c.close(fd);
-        return error.ChmodFailed;
-    }
-    return fd;
-}
-
-fn createHostOutputDir(allocator: std.mem.Allocator, path: []const u8, mode: u32) !void {
-    const pathz = try allocator.dupeZ(u8, path);
-    defer allocator.free(pathz);
-    if (std.c.mkdir(pathz, @intCast((mode & 0o777) | 0o700)) != 0) return error.CreateDirFailed;
-}
-
-fn modeFromStat(stat: Io.File.Stat) u32 {
-    return @intCast(@intFromEnum(stat.permissions) & 0o777);
 }
 
 fn openHostFileRead(allocator: std.mem.Allocator, io: Io, path: []const u8) !std.c.fd_t {
@@ -5837,14 +5556,6 @@ fn openHostFileRead(allocator: std.mem.Allocator, io: Io, path: []const u8) !std
     const pathz = try allocator.dupeZ(u8, path);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
-    if (fd < 0) return error.OpenFailed;
-    return fd;
-}
-
-fn openHostFileCreate(allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
-    const pathz = try allocator.dupeZ(u8, path);
-    defer allocator.free(pathz);
-    const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
     if (fd < 0) return error.OpenFailed;
     return fd;
 }
@@ -6385,56 +6096,6 @@ test "lifecycle validates VM names" {
     try std.testing.expectError(error.InvalidVMName, validateName("."));
     try std.testing.expectError(error.InvalidVMName, validateName("bad/name"));
     try std.testing.expectError(error.InvalidVMName, validateName("bad name"));
-}
-
-test "copy archive paths reject traversal" {
-    try validateCopyArchivePath("", true);
-    try validateCopyArchivePath("dir/file.txt", false);
-    try validateCopyArchivePath("one-two/three_four", false);
-
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("", false));
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("/absolute", true));
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir/", true));
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir//file", true));
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath(".", true));
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir/..", true));
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir/./file", true));
-    try std.testing.expectError(error.BadCopyArchivePath, validateCopyArchivePath("dir\x00/file", true));
-}
-
-test "copy archive extraction writes children under read-only directories" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const pid = if (comptime builtin.os.tag == .windows) 1 else std.c.getpid();
-    const root = try std.fmt.allocPrint(allocator, "/tmp/sporevm-test-copy-archive-readonly-{d}", .{pid});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    _ = try Io.Dir.cwd().createDirPathStatus(io, root, @enumFromInt(0o755));
-
-    const archive_path = try std.fs.path.join(allocator, &.{ root, "payload.spcp" });
-    defer allocator.free(archive_path);
-    const out_path = try std.fs.path.join(allocator, &.{ root, "out" });
-    defer allocator.free(out_path);
-    const child_path = try std.fs.path.join(allocator, &.{ out_path, "child.txt" });
-    defer allocator.free(child_path);
-
-    {
-        var archive = try Io.Dir.createFileAbsolute(io, archive_path, .{
-            .exclusive = true,
-            .permissions = @enumFromInt(0o600),
-        });
-        defer archive.close(io);
-        try archive.writeStreamingAll(io, copy_archive_magic);
-        try writeCopyRecordHeader(archive, io, .directory, "", 0o555, 0);
-        try writeCopyRecordHeader(archive, io, .file, "child.txt", 0o644, 8);
-        try archive.writeStreamingAll(io, "readonly");
-        try writeCopyRecordHeader(archive, io, .end, "", 0, 0);
-    }
-
-    try extractCopyArchive(allocator, io, archive_path, out_path);
-    const data = try Io.Dir.cwd().readFileAlloc(io, child_path, allocator, .limited(32));
-    defer allocator.free(data);
-    try std.testing.expectEqualStrings("readonly", data);
 }
 
 test "named exec response rejects truncated collector output" {
