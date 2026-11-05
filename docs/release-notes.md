@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Managed kernel security update
+
+New managed-kernel selections on ARM64 and x86_64 use Linux 6.1.191 from
+`sporevm/kernels` release `v0.7.1`, replacing Linux 6.1.155. The approved x86
+image digest advances with the release; verification remains fail closed.
+Running VMs and saved spores retain their existing kernels. Create fresh VMs
+with the updated defaults to use the new kernel.
+
 ### Experimental AMD64 fresh workloads
 
 Linux/AMD64 KVM fresh workloads now use native `linux/amd64` OCI selection,

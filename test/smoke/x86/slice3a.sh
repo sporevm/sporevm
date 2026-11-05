@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
-asset="sporevm-x86_64-linux-6.1.155-bzImage"
+asset="sporevm-x86_64-linux-6.1.191-bzImage"
 slice2a_bin="${SPOREVM_X86_SLICE2A_BIN:-${repo_root}/zig-out/bin/x86-slice2a-smoke}"
 
 [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || {

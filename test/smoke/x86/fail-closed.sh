@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
-release="${SPOREVM_KERNEL_RELEASE:-v0.7.0}"
-asset="sporevm-x86_64-linux-6.1.155-bzImage"
+release="${SPOREVM_KERNEL_RELEASE:-v0.7.1}"
+asset="sporevm-x86_64-linux-6.1.191-bzImage"
 
 die() {
   echo "error: $*" >&2
