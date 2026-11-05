@@ -27,8 +27,7 @@ durable command and compatibility contract lives in
 The remaining work is proof and operational closure rather than another broad
 parser expansion. We still need a normalized Docker-versus-Spore filesystem and
 OCI-config oracle over the real workload, an exact COPY invalidation proof,
-repeatable wrapper-level cold/warm/incremental measurements, and a safe way to
-retire obsolete build records without making reachable CAS storage collectable.
+and repeatable wrapper-level cold/warm/incremental measurements.
 
 New Dockerfile features stay evidence-gated. A real public workload failure may
 justify another narrow slice, but the roadmap does not end in blanket BuildKit
@@ -48,10 +47,6 @@ rebuilds inputs before invoking it. Benchmarks must separate wrapper setup,
 builder planning, cache lookup, VM work, image publication, named readiness,
 setup, and the downstream test command.
 
-Finally, builder-v9 correctly retains complete v6, v7, and v8 records as
-conservative GC roots. That is safe but grows without a retirement contract.
-Removing old records is a reachability problem, not a file-age cleanup.
-
 ## Goals
 
 - Prove the frozen real workload's normalized filesystem and OCI runtime config
@@ -60,8 +55,6 @@ Removing old records is a reachability problem, not a file-age cleanup.
   cannot return stale output.
 - Record repeatable cold, warm, and one-file incremental behavior across the
   complete downstream wrapper and named acceptance path.
-- Define conservative step-record retirement that cannot delete a reachable
-  rootfs index or chunk.
 - Keep unsupported syntax fail-closed during full-file planning.
 - Add compatibility only from concrete public corpus failures with matching
   differential, cache, security, and fuzz coverage.
@@ -123,7 +116,7 @@ useful point measurements, not the repeatable wrapper benchmark required below.
 | Normalized real-workload filesystem and OCI-config differential | Active |
 | Exact real-workload COPY invalidation proof | Active |
 | Wrapper integration and repeatable cold/warm/incremental measurements | Follow-up |
-| Obsolete step-record retirement and GC proof | Follow-up |
+| Obsolete step-record retirement and GC proof | Landed |
 | Build cache-mount accounting, prune, and GC | Landed |
 | Additional Dockerfile compatibility | Evidence-gated |
 
@@ -184,25 +177,6 @@ regression from context preparation, queueing, or host noise.
 This slice is done when the complete wrapper has a repeatable baseline and a
 one-file change demonstrates the intended prepare-once, execute-the-suffix
 behavior without a hidden full context or image rebuild.
-
-### C5c — Retire Obsolete Step Records Safely
-
-Define retirement from reachability rather than age alone. Current records,
-image refs, runtime manifests, durable pins, and every other documented root
-must keep their selected indexes and objects alive. Complete older builder
-records remain roots until a bounded operation can prove they are no longer
-needed; malformed known records may remain misses and unknown future record
-kinds must stay conservative roots.
-
-The first implementation should reuse the existing rootfs-cache lock and GC
-marking model. It must cover concurrent build publication, interruption at each
-record/index/object boundary, corrupt or oversized records, shared children,
-and retry after failure. Do not add a second CAS collector or delete records as
-a side effect of ordinary warm lookup.
-
-This slice is done when obsolete known records can be selected and retired
-without changing image/ref behavior, while a concurrent or interrupted
-operation cannot expose a missing child index or object.
 
 ### C6 — Evidence-Gated Compatibility
 

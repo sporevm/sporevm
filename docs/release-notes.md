@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Format reset
+
+Old local formats have no readers. `spore host-info` reports only
+`spore.host-info.v3`, including on arm64. A named VM whose spec still has the
+removed memory `policy` is stale; `spore vm rm` stops its monitor if it is still
+running and removes it. `cache gc` deletes step records from every older
+builder version (`sporevm-build-v0` to `v8`) instead of keeping them as roots.
+GC treated v0 to v5 records as unknown and kept every CAS entry, so on a cache
+that holds them the first GC now runs a real sweep. JSON output advances to
+`spore.cache.gc.result.v2` without `legacy_step_record_count`.
+
 ### One ext4 writer
 
 The native ext4 writer now maps files through triple-indirect blocks, so image

@@ -49,9 +49,9 @@ Dockerfile result. RUN/COPY/ADD/WORKDIR keys separately bind the same exact
 executor identity. The managed default derives that identity from canonical
 kernel and embedded-initrd digests without reading the artifact bodies on a
 fully cached build; a later miss verifies the once-opened kernel bytes and
-boots that same allocation. Explicit overrides are eagerly retained. Old
-builder-v8, builder-v7, and builder-v6 records remain conservative GC roots but
-miss under v9; existing rootfs indexes and local images remain readable. Failed
+boots that same allocation. Explicit overrides are eagerly retained. Records
+from older builder versions miss and are pruned by GC; existing rootfs indexes
+and local images remain readable. Failed
 growth, quiescence, completeness, PREPARE, step, or ref publication never
 rewrites the parent or makes incomplete storage reachable.
 
@@ -417,10 +417,10 @@ and objects from cache metadata, ref records, live runtime manifests, and
 process-owned lazy-runtime leases; it is dry-run by default and requires
 `--force` to delete candidates. Destructive prune consults the same runtime
 leases before selecting explicit CAS entries.
-Current build step records are roots. GC also reports recognized legacy and
-stale build step records, removes them under the rootfs cache lock on `--force`
-before the CAS sweep, and preserves unknown future record kinds or schema
-versions conservatively.
+Current build step records are roots. GC also reports stale build step
+records, including records from older builder versions, removes them under the
+rootfs cache lock on `--force` before the CAS sweep, and preserves unknown
+future record kinds or builder versions conservatively.
 
 Default `spore system prune --rootfs` selects rebuildable image rootfs entries
 and unreferenced regular build cache-mount storage. Flat digest artifacts are
