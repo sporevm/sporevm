@@ -123,34 +123,21 @@ fn extractTarReaderToDir(
     reader: *Io.Reader,
 ) !void {
     var limits: LayoutTarLimits = .{};
-
-    while (true) {
-        var header: [512]u8 = undefined;
-        if (!try readTarHeader(reader, &header)) break;
-        if (isZeroBlock(&header)) break;
-        try verifyTarHeader(&header);
-
-        const size = try tarSize(&header);
-        try accountLayoutTarEntry(&limits, size);
-        const kind = header[156];
-        const raw_name = try tarFullName(allocator, &header);
+    var records: tar.RecordIterator = .{ .reader = reader };
+    while (try records.next()) |record| {
+        try accountLayoutTarEntry(&limits, record.size);
+        const raw_name = try record.name(allocator);
         defer allocator.free(raw_name);
         const maybe_rel = try safeLayoutPath(allocator, raw_name);
         defer if (maybe_rel) |rel| allocator.free(rel);
 
-        switch (kind) {
+        switch (record.kind()) {
             0, '0' => {
                 const rel = maybe_rel orelse return error.UnsafeOciLayoutTarPath;
-                try extractRegularFile(allocator, io, dest, rel, reader, size);
+                try extractRegularFile(allocator, io, dest, rel, &records);
             },
-            '5' => {
-                if (maybe_rel) |rel| try dest.createDirPath(io, rel);
-                try discardTarPayload(reader, size);
-            },
-            else => {
-                try discardTarPayload(reader, size);
-                return error.UnsupportedOciLayoutTarEntry;
-            },
+            '5' => if (maybe_rel) |rel| try dest.createDirPath(io, rel),
+            else => return error.UnsupportedOciLayoutTarEntry,
         }
     }
 }
@@ -243,10 +230,8 @@ fn extractRegularFile(
     io: Io,
     dest: Io.Dir,
     rel: []const u8,
-    reader: *Io.Reader,
-    size: u64,
+    records: *tar.RecordIterator,
 ) !void {
-    if (size > tar.max_content_bytes) return error.RootFSArchiveTooLarge;
     if (dest.statFile(io, rel, .{ .follow_symlinks = false })) |_| {
         return error.DuplicateOciLayoutTarPath;
     } else |err| switch (err) {
@@ -258,9 +243,8 @@ fn extractRegularFile(
     defer file.close(io);
     var file_buf: [64 * 1024]u8 = undefined;
     var writer: Io.File.Writer = .initStreaming(file, io, &file_buf);
-    try copyTarPayload(reader, &writer.interface, size);
+    try records.streamPayload(&writer.interface);
     try writer.interface.flush();
-    try discardTarPadding(reader, size);
 }
 
 fn ensureParent(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, rel: []const u8) !void {
@@ -296,78 +280,6 @@ fn safeLayoutPath(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
 fn parentPath(rel: []const u8) []const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, rel, '/') orelse return "";
     return rel[0..slash];
-}
-
-fn readTarHeader(reader: *Io.Reader, header: *[512]u8) !bool {
-    var filled: usize = 0;
-    while (filled < header.len) {
-        const n = try reader.readSliceShort(header[filled..]);
-        if (n == 0) {
-            if (filled == 0) return false;
-            return error.TruncatedTarHeader;
-        }
-        filled += n;
-    }
-    return true;
-}
-
-fn copyTarPayload(reader: *Io.Reader, writer: *Io.Writer, size: u64) !void {
-    var remaining = size;
-    var buf: [64 * 1024]u8 = undefined;
-    while (remaining > 0) {
-        const want: usize = @intCast(@min(remaining, buf.len));
-        const n = try reader.readSliceShort(buf[0..want]);
-        if (n == 0) return error.UnexpectedEndOfStream;
-        try writer.writeAll(buf[0..n]);
-        remaining -= n;
-    }
-}
-
-fn discardTarPayload(reader: *Io.Reader, size: u64) !void {
-    try reader.discardAll64(size);
-    try discardTarPadding(reader, size);
-}
-
-fn discardTarPadding(reader: *Io.Reader, size: u64) !void {
-    const padding = (512 - (size % 512)) % 512;
-    if (padding != 0) try reader.discardAll(@intCast(padding));
-}
-
-fn tarFullName(allocator: std.mem.Allocator, header: *const [512]u8) ![]u8 {
-    const name = trimTarField(header[0..100]);
-    const prefix = trimTarField(header[345..500]);
-    if (prefix.len == 0) return allocator.dupe(u8, name);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
-}
-
-fn tarSize(header: *const [512]u8) !u64 {
-    return parseTarNumber(header[124..136]);
-}
-
-fn parseTarNumber(raw: []const u8) !u64 {
-    const trimmed = std.mem.trim(u8, raw, " \x00");
-    if (trimmed.len == 0) return 0;
-    return std.fmt.parseInt(u64, trimmed, 8) catch return error.BadTarHeader;
-}
-
-fn trimTarField(raw: []const u8) []const u8 {
-    const nul = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
-    return std.mem.trim(u8, raw[0..nul], " ");
-}
-
-fn verifyTarHeader(header: *const [512]u8) !void {
-    const stored = try parseTarNumber(header[148..156]);
-    var unsigned_sum: u64 = 0;
-    for (header, 0..) |b, i| {
-        const value: u8 = if (i >= 148 and i < 156) ' ' else b;
-        unsigned_sum += value;
-    }
-    if (stored != unsigned_sum) return error.BadTarChecksum;
-}
-
-fn isZeroBlock(block: *const [512]u8) bool {
-    for (block) |b| if (b != 0) return false;
-    return true;
 }
 
 fn makeTarHeader(header: []u8, name: []const u8, kind: u8, size: u64) void {
