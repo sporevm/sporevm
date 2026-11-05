@@ -216,7 +216,9 @@ pub fn main(init: std.process.Init) !void {
     const command = parsed.command.?;
     const command_args = parsed.command_args;
     runCommand(init, arena, stdout, stderr, command, command_args, parsed.mode) catch |err| {
-        if (parsed.mode == .json) {
+        // Any command can meet an old local format; tell a person to
+        // re-create it instead of printing an error trace.
+        if (parsed.mode == .json or err == error.FormatTooOld) {
             exitWithCliError(arena, stderr, parsed.mode, machine_output.fromZigError(err), machine_output.fromZigError(err).message);
         }
         return err;
