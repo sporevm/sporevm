@@ -578,7 +578,9 @@ pub const NamedNetworkOptions = struct {
     enabled: bool = false,
     allow_cidrs: []const []const u8 = &.{},
     allow_hosts: []const []const u8 = &.{},
-    policy: spore_net_policy.NetworkPolicy = .{},
+    /// Null leaves public egress unrestricted, like plain `--net`. A policy
+    /// denies everything its rules do not allow, so `.{}` denies all egress.
+    policy: ?spore_net_policy.NetworkPolicy = null,
     bound_services: []const spore_net_policy.BoundService = &.{},
     port_forwards: []const spore_net_policy.PortForwardConfig = &.{},
 };
@@ -932,7 +934,7 @@ fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
     if (!options.enabled) {
         if (options.allow_cidrs.len != 0 or
             options.allow_hosts.len != 0 or
-            options.policy.allow.len != 0 or
+            options.policy != null or
             options.bound_services.len != 0 or
             options.port_forwards.len != 0) return error.InvalidNetworkPolicy;
         return .{};
@@ -944,8 +946,8 @@ fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
     for (options.allow_hosts) |host| {
         try config.addAllowHost(host);
     }
-    if (options.policy.allow.len != 0) {
-        try config.addNetworkPolicy(options.policy);
+    if (options.policy) |policy| {
+        try config.addNetworkPolicy(policy);
     }
     for (options.bound_services) |service| {
         try config.addBoundService(service);
@@ -1995,8 +1997,7 @@ pub fn createCli(
     parsed = try applyCreateOptionsFileLifecycleCli(init.io, allocator, stderr, mode, parsed);
     const parsed_ms = monotonicMs();
     const spec = parsed.spec;
-    const network_rules = try createNetworkRulesFromConfig(allocator, &parsed.network_policy);
-    const bound_services = try createBoundServicesFromConfig(allocator, &parsed.network_policy);
+    const network = try createCliNetworkOptions(allocator, &parsed);
     const caller_command: []const []const u8 = if (parsed.command.len == 0)
         &.{}
     else
@@ -2017,14 +2018,7 @@ pub fn createCli(
         .image_ref = spec.image_ref,
         .image_pull_policy = parsed.image_pull_policy,
         .initial_command = caller_command,
-        .network = .{
-            .enabled = parsed.network == .spore,
-            .allow_cidrs = if (parsed.network == .spore) parsed.network_policy.allowCidrSlice() else &.{},
-            .allow_hosts = if (parsed.network == .spore) parsed.network_policy.allowHostSlice() else &.{},
-            .policy = if (parsed.network == .spore) .{ .allow = network_rules } else .{},
-            .bound_services = if (parsed.network == .spore) bound_services else &.{},
-            .port_forwards = if (parsed.network == .spore) parsed.network_policy.portForwardSlice() else &.{},
-        },
+        .network = network,
         .memory = spec.memory,
         .vcpus = spec.vcpus,
         .guest_port = spec.guest_port,
@@ -3474,6 +3468,21 @@ fn writeOptionalCount(writer: *Io.Writer, value: ?u64) !void {
     } else {
         try writer.writeByte('?');
     }
+}
+
+/// Plain `--net` passes no policy and keeps public egress unrestricted; exact
+/// `--allow-host-port` rules become a policy, which denies by default.
+fn createCliNetworkOptions(allocator: std.mem.Allocator, parsed: *const CreateOptions) !NamedNetworkOptions {
+    if (parsed.network != .spore) return .{};
+    const network_rules = try createNetworkRulesFromConfig(allocator, &parsed.network_policy);
+    return .{
+        .enabled = true,
+        .allow_cidrs = parsed.network_policy.allowCidrSlice(),
+        .allow_hosts = parsed.network_policy.allowHostSlice(),
+        .policy = if (network_rules.len != 0) .{ .allow = network_rules } else null,
+        .bound_services = try createBoundServicesFromConfig(allocator, &parsed.network_policy),
+        .port_forwards = parsed.network_policy.portForwardSlice(),
+    };
 }
 
 fn createNetworkRulesFromConfig(
@@ -7530,6 +7539,32 @@ test "named network config keeps bare network unrestricted" {
     try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
     try std.testing.expect(!config.policy.default_deny);
     try std.testing.expect(!config.policy.hasRules());
+}
+
+test "named network config enforces an explicit deny-all policy" {
+    const config = try namedNetworkConfig(.{ .enabled = true, .policy = .{} });
+    const runtime = try spore_net_policy.Runtime.init(config.policy);
+
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
+    try std.testing.expectEqual(spore_net_policy.Decision.deny_not_allowed, runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+}
+
+test "create cli keeps plain --net unrestricted and exact rules deny by default" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var stderr: Io.Writer.Allocating = .init(arena);
+
+    const plain = try parseCreateArgs(&.{ "bench-1", "--net" }, arena, &stderr.writer, .human);
+    const plain_config = try namedNetworkConfig(try createCliNetworkOptions(arena, &plain));
+    try std.testing.expectEqual(run_mod.NetworkMode.spore, plain_config.mode);
+    try std.testing.expect(!plain_config.policy.default_deny);
+    try std.testing.expect(!plain_config.policy.hasRules());
+
+    const exact = try parseCreateArgs(&.{ "bench-1", "--net", "--allow-host-port", "github.com:443" }, arena, &stderr.writer, .human);
+    const exact_config = try namedNetworkConfig(try createCliNetworkOptions(arena, &exact));
+    try std.testing.expect(exact_config.policy.default_deny);
+    try std.testing.expectEqualStrings("github.com", exact_config.policy.exact_rules[0].host);
 }
 
 test "lifecycle monitor policy args preserve default deny" {
