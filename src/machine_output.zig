@@ -262,8 +262,6 @@ pub fn fromZigError(err: anyerror) CliError {
         error.X86DiskForkUnsupported,
         error.X86NamedCopyUnsupported,
         => CliError.init(.usage_invalid_argument, ErrorCode.usage_invalid_argument.defaultMessage(), @errorName(err)),
-        error.MissingGatewayUrl,
-        error.MissingGatewayRepository,
         error.MissingImageReference,
         error.MissingImageSource,
         error.MissingMetadataPath,

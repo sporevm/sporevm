@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate and verify architecture-independent image-gateway conversion fixtures."""
+"""Generate and verify architecture-independent native image conversion fixtures."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import tempfile
 from typing import Any
 
 
-SCHEMA = "spore-image-gateway-worker-conformance-v2"
+SCHEMA = "spore-image-worker-conformance-v3"
 TARGETS = ("amd64", "arm64")
 MAX_FIXTURE_FILE_BYTES = 64 * 1024 * 1024
 OCI_RUNTIME_CONFIG = {
@@ -263,11 +263,22 @@ def read_bounded(path: pathlib.Path) -> bytes:
     return path.read_bytes()
 
 
-def only_file(root: pathlib.Path, name: str) -> pathlib.Path:
-    matches = sorted(path for path in root.rglob(name) if path.is_file())
-    if len(matches) != 1:
-        raise ConformanceError(f"expected exactly one {name!r} below {root}, found {len(matches)}")
-    return matches[0]
+def read_image_archive(path: pathlib.Path) -> dict[str, bytes]:
+    entries: dict[str, bytes] = {}
+    with tarfile.open(path, mode="r:gz") as archive:
+        for member in archive:
+            if not member.isreg() or member.size > MAX_FIXTURE_FILE_BYTES or member.name in entries:
+                raise ConformanceError(f"unexpected image archive entry: {member.name}")
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise ConformanceError(f"unreadable image archive entry: {member.name}")
+            entries[member.name] = stream.read()
+    names = list(entries)
+    if names[:3] != ["spore-image-manifest.json", "image-config.json", "rootfs-index.json"] or any(
+        not name.startswith("objects/") for name in names[3:]
+    ):
+        raise ConformanceError(f"image archive entries are out of order: {names}")
+    return entries
 
 
 def parse_object(data: bytes, source: pathlib.Path) -> dict[str, Any]:
@@ -328,34 +339,32 @@ def disk_index_chunks(index: dict[str, Any]) -> list[dict[str, Any]]:
 def normalize_target(
     output: pathlib.Path,
     arch: str,
-    gateway_root: pathlib.Path,
+    archive_path: pathlib.Path,
+    packed: dict[str, Any],
     selected_source_manifest: str,
 ) -> dict[str, Any]:
     target_root = output / "targets" / f"linux-{arch}"
-    source_platform_index = only_file(gateway_root, "index")
-    manifest_path = only_file(gateway_root, "manifest")
-    config_path = only_file(gateway_root, "config")
-    rootfs_index_path = only_file(gateway_root, "rootfs-index")
+    if packed.get("archive_digest") != sha256_digest(read_bounded(archive_path)):
+        raise ConformanceError("image pack reported the wrong archive digest")
+    entries = read_image_archive(archive_path)
     copied = {
-        "config.json": read_bounded(config_path),
-        "image-manifest.json": read_bounded(manifest_path),
-        "platform-index.json": read_bounded(source_platform_index),
-        "rootfs-index.json": read_bounded(rootfs_index_path),
+        "config.json": entries["image-config.json"],
+        "image-manifest.json": entries["spore-image-manifest.json"],
+        "rootfs-index.json": entries["rootfs-index.json"],
     }
     for name, data in copied.items():
         write_bytes(target_root / name, data)
 
-    manifest = parse_object(copied["image-manifest.json"], manifest_path)
-    index = parse_object(copied["rootfs-index.json"], rootfs_index_path)
-    config = parse_object(copied["config.json"], config_path)
-    platform_index = parse_object(copied["platform-index.json"], source_platform_index)
+    manifest = parse_object(copied["image-manifest.json"], archive_path)
+    index = parse_object(copied["rootfs-index.json"], archive_path)
+    config = parse_object(copied["config.json"], archive_path)
     image = manifest.get("image")
     rootfs = manifest.get("rootfs_index")
     if not isinstance(image, dict) or not isinstance(rootfs, dict):
-        raise ConformanceError("gateway manifest is missing image or rootfs_index")
+        raise ConformanceError("image manifest is missing image or rootfs_index")
     manifest_platform = image.get("platform")
     if manifest_platform != {"os": "linux", "arch": arch}:
-        raise ConformanceError(f"gateway manifest selected the wrong platform for linux/{arch}")
+        raise ConformanceError(f"image manifest selected the wrong platform for linux/{arch}")
     if config.get("os") != "linux" or config.get("architecture") != arch:
         raise ConformanceError(f"canonical config selected the wrong platform for linux/{arch}")
     if config.get("config") != EXPECTED_RUNTIME_CONFIG:
@@ -366,25 +375,17 @@ def normalize_target(
     storage = image.get("rootfs_storage")
     config_blob = image.get("config_blob")
     if not isinstance(storage, dict) or storage.get("index_digest") != rootfs_index_digest:
-        raise ConformanceError("gateway manifest rootfs descriptors disagree")
+        raise ConformanceError("image manifest rootfs descriptors disagree")
     if not isinstance(config_blob, dict):
-        raise ConformanceError("gateway manifest is missing config_blob")
+        raise ConformanceError("image manifest is missing config_blob")
     if config_blob.get("bytes") != len(copied["config.json"]) or config_blob.get(
         "transport_digest"
     ) != sha256_digest(copied["config.json"]):
-        raise ConformanceError("gateway manifest config descriptor disagrees with config bytes")
+        raise ConformanceError("image manifest config descriptor disagrees with config bytes")
 
-    gateway_manifest_digest = sha256_digest(copied["image-manifest.json"])
-    descriptors = platform_index.get("manifests")
-    if not isinstance(descriptors, list) or len(descriptors) != 1:
-        raise ConformanceError("fixture platform index must contain one descriptor")
-    descriptor = descriptors[0]
-    if not isinstance(descriptor, dict) or descriptor != {
-        "platform": {"os": "linux", "arch": arch},
-        "manifest_digest": gateway_manifest_digest,
-        "image_digest": native_image_digest,
-    }:
-        raise ConformanceError("fixture platform descriptor disagrees with selected manifest")
+    image_manifest_digest = sha256_digest(copied["image-manifest.json"])
+    if packed.get("manifest_digest") != image_manifest_digest or packed.get("image_digest") != native_image_digest:
+        raise ConformanceError("image pack result disagrees with the archived manifest")
 
     chunks = disk_index_chunks(index)
     logical_chunks = [chunk.get("logical_chunk") for chunk in chunks if isinstance(chunk, dict)]
@@ -394,7 +395,6 @@ def normalize_target(
         or logical_chunks != sorted(set(logical_chunks))
     ):
         raise ConformanceError("rootfs index logical chunks are unordered or duplicated")
-    objects_root = manifest_path.parent / "objects"
     objects = []
     seen = {}
     for chunk in chunks:
@@ -411,31 +411,29 @@ def normalize_target(
                 raise ConformanceError(f"object {digest} is referenced with inconsistent sizes")
             continue
         seen[digest] = expected_size
-        object_bytes = read_bounded(objects_root / digest)
-        if len(object_bytes) != expected_size:
-            raise ConformanceError(f"object {digest} has the wrong size")
+        object_bytes = entries.get("objects/" + digest.removeprefix("blake3:"))
+        if object_bytes is None or len(object_bytes) != expected_size:
+            raise ConformanceError(f"object {digest} is missing or has the wrong size")
         objects.append(
             {"bytes": len(object_bytes), "digest": digest, "sha256": sha256_digest(object_bytes)}
         )
     objects.sort(key=lambda item: item["digest"])
-    object_entries = list(objects_root.iterdir())
-    if any(not entry.is_file() for entry in object_entries) or {
-        entry.name for entry in object_entries
-    } != set(seen):
-        raise ConformanceError("exported object set disagrees with the rootfs closure")
+    archived_objects = [name.removeprefix("objects/") for name in list(entries)[3:]]
+    if archived_objects != sorted(digest.removeprefix("blake3:") for digest in seen):
+        raise ConformanceError("archived object set disagrees with the rootfs closure")
     if (
         rootfs.get("bytes") != len(copied["rootfs-index.json"])
         or rootfs.get("object_count") != len(objects)
         or rootfs.get("object_bytes") != sum(item["bytes"] for item in objects)
     ):
-        raise ConformanceError("gateway manifest object summary disagrees with the rootfs closure")
+        raise ConformanceError("image manifest object summary disagrees with the rootfs closure")
 
     files = {
         name: {"bytes": len(data), "sha256": sha256_digest(data)} for name, data in sorted(copied.items())
     }
     return {
         "files": files,
-        "gateway_manifest_digest": gateway_manifest_digest,
+        "image_manifest_digest": image_manifest_digest,
         "native_image_digest": native_image_digest,
         "objects": objects,
         "platform": f"linux/{arch}",
@@ -483,15 +481,14 @@ def produce(args: argparse.Namespace) -> None:
         raise ConformanceError(f"worker mismatch: requested {args.worker}, running on {worker}")
 
     output.mkdir(parents=True)
-    with tempfile.TemporaryDirectory(prefix="image-gateway-worker-conformance.") as temporary:
+    with tempfile.TemporaryDirectory(prefix="image-worker-conformance.") as temporary:
         work = pathlib.Path(temporary)
         input_details = build_oci_layout(work / "oci-layout")
-        source = f"registry.example.invalid/sporevm/worker-conformance@{input_details['index_digest']}"
         target_results = []
         conversion_contract = None
         for arch in TARGETS:
             cache = work / f"cache-{arch}"
-            gateway = work / f"gateway-{arch}"
+            archive = work / f"image-{arch}.tar.gz"
             env = os.environ.copy()
             for name in list(env):
                 if name.startswith("SPOREVM_"):
@@ -505,7 +502,7 @@ def produce(args: argparse.Namespace) -> None:
                     "import-oci",
                     str(work / "oci-layout"),
                     "--ref",
-                    f"local/gateway-worker-conformance:{arch}",
+                    f"local/image-worker-conformance:{arch}",
                     "--platform",
                     f"linux/{arch}",
                 ],
@@ -528,24 +525,25 @@ def produce(args: argparse.Namespace) -> None:
                 raise ConformanceError("target imports used different conversion contracts")
             if metadata_value.get("image_manifest_digest") != input_details["manifests"][arch]:
                 raise ConformanceError(f"import metadata selected the wrong OCI manifest for linux/{arch}")
-            run(
-                [
-                    str(spore_bin),
-                    "image",
-                    "export-fixture",
-                    source,
-                    "--repository",
-                    "worker-conformance",
-                    "--metadata",
-                    metadata,
-                    "--out",
-                    str(gateway),
-                ],
-                env=env,
-                cwd=repo_root,
+            packed = json.loads(
+                run(
+                    [
+                        str(spore_bin),
+                        "--json",
+                        "image",
+                        "pack",
+                        f"local/image-worker-conformance:{arch}",
+                        "--platform",
+                        f"linux/{arch}",
+                        "--out",
+                        str(archive),
+                    ],
+                    env=env,
+                    cwd=repo_root,
+                )
             )
             target_results.append(
-                normalize_target(output, arch, gateway, input_details["manifests"][arch])
+                normalize_target(output, arch, archive, packed, input_details["manifests"][arch])
             )
 
     if target_results[0]["native_image_digest"] == target_results[1]["native_image_digest"]:
@@ -562,11 +560,11 @@ def produce(args: argparse.Namespace) -> None:
     write_bytes(output / "bundle.json", canonical_json(bundle))
     if args.expected:
         compare_directories(output, pathlib.Path(args.expected).resolve())
-    print(f"image-gateway worker conformance passed on {worker}: {output}")
+    print(f"image worker conformance passed on {worker}: {output}")
 
 
 def self_test() -> None:
-    with tempfile.TemporaryDirectory(prefix="image-gateway-worker-conformance-self-test.") as temporary:
+    with tempfile.TemporaryDirectory(prefix="image-worker-conformance-self-test.") as temporary:
         root = pathlib.Path(temporary)
         expected = root / "expected"
         actual = root / "actual"
@@ -603,11 +601,11 @@ def self_test() -> None:
         if first_details != second_details:
             raise ConformanceError("self-test produced different OCI layout metadata")
         compare_directories(first_layout, second_layout)
-    print("image-gateway worker conformance self-test ok")
+    print("image worker conformance self-test ok")
 
 
 def check(args: argparse.Namespace) -> None:
-    with tempfile.TemporaryDirectory(prefix="image-gateway-worker-conformance-check.") as temporary:
+    with tempfile.TemporaryDirectory(prefix="image-worker-conformance-check.") as temporary:
         produce(
             argparse.Namespace(
                 expected=args.expected,
@@ -644,7 +642,7 @@ def main() -> int:
         else:
             self_test()
     except (ConformanceError, OSError) as error:
-        print(f"image-gateway-worker-conformance: {error}", file=sys.stderr)
+        print(f"image-worker-conformance: {error}", file=sys.stderr)
         return 1
     return 0
 

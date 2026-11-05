@@ -11,8 +11,6 @@ spec_refs:
   - src/build/
   - src/build_cli.zig
   - test/build/conformance/
-related_plans:
-  - docs/plans/image-gateway.md
 ---
 
 # Spore-Native Dockerfile Builder Compatibility Roadmap

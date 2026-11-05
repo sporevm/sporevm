@@ -1,37 +1,41 @@
-//! CLI adapter for explicit image-gateway pulls.
+//! CLI adapter for native image archives.
 
 const std = @import("std");
 const Io = std.Io;
 const api = @import("api.zig");
-const image_archive = @import("image_archive.zig");
-const gateway_pull = @import("image_gateway_pull.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
+
+const usage =
+    \\Usage:
+    \\  spore image pack local/name:tag --platform os/arch --out image.tar.gz
+    \\  spore image unpack image.tar.gz --archive-digest sha256:... --expected-image-digest blake3:... --platform os/arch --ref local/name:tag
+    \\
+    \\Options:
+    \\  --archive-digest DIGEST  Expected immutable SHA-256 archive identity
+    \\  --expected-image-digest DIGEST  Expected native BLAKE3 image identity
+    \\  --ref local/name:tag  Local mutable image ref to publish
+    \\  --platform os/arch    linux/arm64 or linux/amd64
+    \\  --out PATH            New image archive path
+    \\  -h, --help            Show this help
+    \\
+;
 
 pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
     if (args.len == 0) {
         if (mode == .json) return error.MissingImageCommand;
-        try stdout.writeAll(gateway_pull.usage);
+        try stdout.writeAll(usage);
         return;
     }
     if (wantsHelp(args)) {
-        try stdout.writeAll(gateway_pull.usage);
+        try stdout.writeAll(usage);
         return;
     }
-    if (std.mem.eql(u8, args[0], "pull")) {
-        const options = try parsePullOptions(args[1..]);
-        const result = try api.imageGatewayPull(init, init.arena.allocator(), options);
-        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
-        try stdout.print(
-            "ref: {s}\nresolved: {s}\nplatform: {s}/{s}\nobjects_fetched: {d}\nbytes_fetched: {d}\n",
-            .{ options.ref, result.resolved_image_ref, options.platform.os, options.platform.arch.name(), result.objects_fetched, result.bytes_fetched },
-        );
-        return;
-    }
+    const allocator = init.arena.allocator();
     if (std.mem.eql(u8, args[0], "pack")) {
         const options = try parsePackOptions(args[1..]);
-        const result = try api.imageArchivePack(init, init.arena.allocator(), options);
-        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
+        const result = try api.imageArchivePack(init, allocator, options);
+        if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
         try stdout.print(
             "archive: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\nbytes: {d}\n",
             .{ options.output_path, result.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count, result.archive_bytes },
@@ -40,24 +44,12 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     }
     if (std.mem.eql(u8, args[0], "unpack")) {
         const options = try parseUnpackOptions(args[1..]);
-        const result = try api.imageArchiveUnpack(init, init.arena.allocator(), options);
-        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
+        const result = try api.imageArchiveUnpack(init, allocator, options);
+        if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
         try stdout.print(
             "ref: {s}\nresolved: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\n",
             .{ options.ref, result.resolved_image_ref, options.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count },
         );
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "export-fixture")) {
-        const options = try parseExportFixtureOptions(args[1..]);
-        const result = try gateway_pull.exportFixture(init, init.arena.allocator(), options);
-        if (mode == .json) return machine_output.writeJson(init.arena.allocator(), stdout, result);
-        try stdout.print("fixture: {s}\nmanifest: {s}\nimage: {s}\nobjects: {d}\n", .{
-            options.output_dir,
-            result.manifest_digest,
-            result.image_digest,
-            result.object_count,
-        });
         return;
     }
     return error.UnknownImageCommand;
@@ -84,11 +76,10 @@ pub fn parsePackOptions(args: []const []const u8) !api.ImageArchivePackOptions {
             source = arg;
         } else return error.TooManyImageArguments;
     }
-    const selected = platform orelse return error.MissingPlatform;
     return .{
         .source = source orelse return error.MissingImageSource,
         .output_path = output_path orelse return error.MissingImageArchiveOutput,
-        .platform = .{ .os = selected.os, .arch = selected.arch },
+        .platform = platform orelse return error.MissingPlatform,
     };
 }
 
@@ -123,137 +114,18 @@ pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptio
             archive_path = arg;
         } else return error.TooManyImageArguments;
     }
-    const selected = platform orelse return error.MissingPlatform;
     return .{
         .archive_path = archive_path orelse return error.MissingImageArchive,
         .archive_digest = archive_digest orelse return error.MissingImageArchiveDigest,
         .expected_image_digest = expected_image_digest orelse return error.MissingExpectedImageDigest,
         .ref = ref orelse return error.MissingImageReference,
-        .platform = .{ .os = selected.os, .arch = selected.arch },
-    };
-}
-
-pub fn parsePullOptions(args: []const []const u8) !api.ImageGatewayPullOptions {
-    var source: ?[]const u8 = null;
-    var gateway_url: ?[]const u8 = null;
-    var repository: ?[]const u8 = null;
-    var ref: ?[]const u8 = null;
-    var platform = rootfs.Platform{
-        .os = gateway_pull.default_platform.os,
-        .arch = gateway_pull.default_platform.arch,
-    };
-    var allow_insecure_http = false;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--gateway")) {
-            i += 1;
-            if (i >= args.len) return error.MissingGatewayUrl;
-            gateway_url = args[i];
-        } else if (std.mem.eql(u8, arg, "--repository")) {
-            i += 1;
-            if (i >= args.len) return error.MissingGatewayRepository;
-            repository = args[i];
-        } else if (std.mem.eql(u8, arg, "--ref")) {
-            i += 1;
-            if (i >= args.len) return error.MissingImageReference;
-            ref = args[i];
-        } else if (std.mem.eql(u8, arg, "--platform")) {
-            i += 1;
-            if (i >= args.len) return error.MissingPlatform;
-            platform = try rootfs.Platform.parse(args[i]);
-        } else if (std.mem.eql(u8, arg, "--allow-insecure-http")) {
-            allow_insecure_http = true;
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            return error.UnknownImageOption;
-        } else if (source == null) {
-            source = arg;
-        } else {
-            return error.TooManyImageArguments;
-        }
-    }
-    return .{
-        .source = source orelse return error.MissingImageSource,
-        .gateway_url = gateway_url orelse return error.MissingGatewayUrl,
-        .repository = repository orelse return error.MissingGatewayRepository,
-        .ref = ref orelse return error.MissingImageReference,
-        .platform = .{ .os = platform.os, .arch = platform.arch },
-        .allow_insecure_http = allow_insecure_http,
-    };
-}
-
-pub fn parseExportFixtureOptions(args: []const []const u8) !gateway_pull.ExportFixtureOptions {
-    var source: ?[]const u8 = null;
-    var repository: ?[]const u8 = null;
-    var metadata_path: ?[]const u8 = null;
-    var output_dir: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--repository")) {
-            i += 1;
-            if (i >= args.len) return error.MissingGatewayRepository;
-            repository = args[i];
-        } else if (std.mem.eql(u8, arg, "--metadata")) {
-            i += 1;
-            if (i >= args.len) return error.MissingMetadataPath;
-            metadata_path = args[i];
-        } else if (std.mem.eql(u8, arg, "--out")) {
-            i += 1;
-            if (i >= args.len) return error.MissingOutputPath;
-            output_dir = args[i];
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            return error.UnknownImageOption;
-        } else if (source == null) {
-            source = arg;
-        } else {
-            return error.TooManyImageArguments;
-        }
-    }
-    return .{
-        .source = source orelse return error.MissingImageSource,
-        .repository = repository orelse return error.MissingGatewayRepository,
-        .metadata_path = metadata_path orelse return error.MissingMetadataPath,
-        .output_dir = output_dir orelse return error.MissingOutputPath,
+        .platform = platform orelse return error.MissingPlatform,
     };
 }
 
 fn wantsHelp(args: []const []const u8) bool {
     for (args) |arg| if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return true;
     return false;
-}
-
-test "image pull options require explicit gateway repository and local ref" {
-    const parsed = try parsePullOptions(&.{
-        "docker.io/library/alpine:3.20",
-        "--gateway",
-        "https://images.example.test",
-        "--repository",
-        "team/base-images",
-        "--ref",
-        "local/alpine:gateway",
-        "--platform",
-        "linux/amd64",
-    });
-    try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", parsed.source);
-    try std.testing.expectEqual(.amd64, parsed.platform.arch);
-    try std.testing.expectError(error.MissingGatewayUrl, parsePullOptions(&.{
-        "docker.io/library/alpine:3.20",
-        "--repository",
-        "team/base-images",
-        "--ref",
-        "local/alpine:gateway",
-    }));
-    const defaults = try parsePullOptions(&.{
-        "docker.io/library/alpine:3.20",
-        "--gateway",
-        "https://images.example.test",
-        "--repository",
-        "team/base-images",
-        "--ref",
-        "local/alpine:gateway",
-    });
-    try std.testing.expectEqual(gateway_pull.default_platform.arch, defaults.platform.arch);
 }
 
 test "image archive options require immutable digest and explicit platform" {

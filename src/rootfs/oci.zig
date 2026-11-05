@@ -1,7 +1,6 @@
 const std = @import("std");
 const architecture = @import("../architecture.zig");
 const image = @import("../image.zig");
-const image_gateway = @import("../image_gateway.zig");
 
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -100,8 +99,11 @@ pub const Descriptor = struct {
     platform: ?DescriptorPlatform = null,
 };
 
-pub const DescriptorPlatform = image_gateway.OciPlatform;
-const PlatformSelector = image_gateway.OciPlatformSelector;
+pub const DescriptorPlatform = struct {
+    os: []const u8,
+    architecture: []const u8,
+    variant: ?[]const u8 = null,
+};
 
 pub const ImageIndex = struct {
     schemaVersion: u32,
@@ -124,23 +126,26 @@ pub const LayerMetadata = struct {
     digest: []const u8,
 };
 
-/// Select one eligible image manifest using the gateway's platform
-/// normalization and ambiguity rules. Non-image descriptors and descriptors
-/// without platform metadata are not runtime image candidates.
+/// Select one eligible image manifest for `platform`. Non-image descriptors,
+/// descriptors without platform metadata, and other operating systems or
+/// architectures are ignored. An arm64 descriptor may omit `variant` or use
+/// `v8`; amd64 must omit it. Any other variant for the requested platform, or
+/// two eligible matches, fails closed rather than falling back.
 pub fn selectImageManifestIndex(manifests: []const Descriptor, platform: Platform) !usize {
-    var selector = try PlatformSelector.init(.{ .os = platform.os, .arch = platform.arch });
+    if (!std.mem.eql(u8, platform.os, "linux")) return error.UnsupportedPlatform;
+    var selected: ?usize = null;
     for (manifests, 0..) |desc, index| {
         if (!isManifestMediaType(desc.mediaType)) continue;
         const candidate = desc.platform orelse continue;
-        selector.consider(candidate, index) catch |err| return switch (err) {
-            error.AmbiguousPlatform => error.AmbiguousPlatformManifest,
-            else => err,
-        };
+        if (!std.mem.eql(u8, candidate.os, platform.os) or
+            !std.mem.eql(u8, candidate.architecture, platform.arch.name())) continue;
+        if (candidate.variant) |variant| {
+            if (platform.arch != .arm64 or !std.mem.eql(u8, variant, "v8")) return error.UnsupportedPlatform;
+        }
+        if (selected != null) return error.AmbiguousPlatformManifest;
+        selected = index;
     }
-    const index = selector.finish() catch |err| return switch (err) {
-        error.PlatformNotFound => error.PlatformManifestNotFound,
-        else => err,
-    };
+    const index = selected orelse return error.PlatformManifestNotFound;
     if (!isSha256Digest(manifests[index].digest)) return error.UnsupportedDigest;
     return index;
 }

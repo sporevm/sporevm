@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
+# Builds OCI layouts of the pinned ~4.8 GB buildkite-sporevm image (the base CI
+# stage and the final image) under zig-cache/buildkite-sporevm-image/<arch>/ for
+# the planned lazy remote image work. Run from the repository root.
+# Set SPOREVM_BUILDKITE_SOURCE_DIR to a local buildkite/buildkite checkout that
+# contains the pinned commit; otherwise the script clones it on a Buildkite agent
+# using the SPOREVM_GITHUB_TOKEN secret.
 set -euo pipefail
 
 platform="${1:-}"
 case "${platform}" in
   linux/arm64|linux/amd64) ;;
-  *) echo "usage: scripts/ci/image-gateway-buildkite-workload-benchmark.sh linux/arm64|linux/amd64" >&2; exit 2 ;;
+  *) echo "usage: scripts/build-buildkite-sporevm-image.sh linux/arm64|linux/amd64" >&2; exit 2 ;;
 esac
 
 command -v docker >/dev/null
 
 arch="${platform#linux/}"
-output="zig-cache/image-gateway-transport/${arch}/buildkite-sporevm"
+output="zig-cache/buildkite-sporevm-image/${arch}"
 run_id="${BUILDKITE_JOB_ID:-manual-$$}"
 sporevm_commit="${BUILDKITE_COMMIT:-$(git rev-parse HEAD)}"
-scratch="${TMPDIR:-/tmp}/image-gateway-buildkite-${run_id}"
+scratch="${TMPDIR:-/tmp}/buildkite-sporevm-image-${run_id}"
 source_dir="${scratch}/buildkite"
 context="${scratch}/context"
-base_layout="${scratch}/base-layout"
-outer_layout="${scratch}/outer-layout"
-backend="${SPOREVM_IMAGE_GATEWAY_BACKEND:-}"
-if [[ -z "${backend}" && -n "${BUILDKITE_BUILD_NUMBER:-}" ]]; then
-  backend="s3://sporevm-benchmarks-data/builds/${BUILDKITE_BUILD_NUMBER}/${sporevm_commit}/image-gateway/${arch}/buildkite-sporevm"
-fi
+base_layout="${output}/base-layout"
+outer_layout="${output}/outer-layout"
 buildkite_commit="e446c1b8a74d317a7abd08c42140152a5d9e8462"
 dynamodb_sha256="55b425a9a42cfc728436eaf0e4ae64d688b64d177c99c4f4c4d7e3dbb3ac6c09"
 buildkite_sporevm_commit="ad8967125968098b917090e49b6410dd5a6b19c5"
@@ -70,7 +72,7 @@ jq -n \
   --arg buildkite_sporevm_commit "${buildkite_sporevm_commit}" \
   --arg dynamodb_sha256 "${dynamodb_sha256}" \
   '{
-    schema: "spore-image-gateway-buildkite-workload-v1",
+    schema: "spore-buildkite-sporevm-image-v1",
     platform: $platform,
     sporevm_commit: $sporevm_commit,
     buildkite_commit: $buildkite_commit,
@@ -114,7 +116,7 @@ curl -fsSL --retry 3 \
 printf '%s  %s\n' "${dynamodb_sha256}" "${scratch}/dynamodb-local.tar.gz" | sha256sum -c -
 tar -xzf "${scratch}/dynamodb-local.tar.gz" -C "${context}/dynamodb-local"
 
-cp -R test/image-gateway/benchmark/buildkite-sporevm/. "${context}/"
+cp -R test/image/buildkite-sporevm/. "${context}/"
 docker buildx build \
   --platform "${platform}" \
   --build-context "base=oci-layout://${base_layout}" \
@@ -123,30 +125,4 @@ docker buildx build \
 mkdir -p "${outer_layout}"
 tar -xf "${scratch}/outer-layout.tar" -C "${outer_layout}"
 
-mise run build
-scripts/benchmark/image-gateway-transport.py prepare \
-  --source-layout "${base_layout}" \
-  --platform "${platform}" \
-  --spore-bin zig-out/bin/spore \
-  --output "${output}/buildkite-ci" \
-  --iterations 5
-scripts/benchmark/image-gateway-transport.py prepare \
-  --source-layout "${outer_layout}" \
-  --platform "${platform}" \
-  --spore-bin zig-out/bin/spore \
-  --output "${output}/outer" \
-  --iterations 5
-transport_output="${output}/local"
-transport_args=()
-if [[ -n "${backend}" ]]; then
-  transport_output="${output}/s3"
-  transport_args+=(--s3-uri "${backend}" --s3-region ap-southeast-2)
-fi
-scripts/benchmark/image-gateway-transport.py run \
-  --fixture "${output}/outer/fixture" \
-  --overlap-fixture "${output}/buildkite-ci/fixture" \
-  --output "${transport_output}" \
-  --iterations 5 \
-  "${transport_args[@]}"
-
-echo "buildkite-sporevm gateway benchmark passed: ${platform} ${transport_output}/summary.json"
+echo "buildkite-sporevm image built: ${platform} ${outer_layout} (base ${base_layout})"

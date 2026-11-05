@@ -444,7 +444,7 @@ test "OCI layout reader selects platform manifest and verifies blobs" {
     try std.testing.expectEqualStrings(layer_digest, selected.layers[0].digest);
 }
 
-test "OCI layout selection shares gateway variant and ambiguity rules" {
+test "OCI layout selection shares registry variant and ambiguity rules" {
     const allocator = std.testing.allocator;
     const arm64_v8 =
         \\{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","platform":{"os":"linux","architecture":"arm64","variant":"v8"}}]}

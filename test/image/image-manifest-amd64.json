@@ -1,14 +1,14 @@
 {
   "kind": "spore-image-gateway-manifest-v1",
   "image": {
-    "digest": "blake3:792e35d2abe3a9155e79ae1e57bdedffaefe9be673852eda44e87297e8ddbcca",
+    "digest": "blake3:8817e359af38ba3e65881b4ccd3c68e387ffbfe0eb59cc1c79146657d7b2fe4c",
     "platform": {
       "os": "linux",
-      "arch": "arm64"
+      "arch": "amd64"
     },
     "config_blob": {
-      "transport_digest": "sha256:d6f56bc20064075ce319ac2e6fcef5de9ea21773b0a8a4398c4405222971f9c0",
-      "config_digest": "blake3:ee7321583d1b2c5f8a267ef397029f50cebaf70a93cd34278bbcc022dbddcca9",
+      "transport_digest": "sha256:9d99a75171aea000c711b34c0e5e3f28d3d537dd99d110eafbfbc2bd8e52c2bf",
+      "config_digest": "blake3:aac27e967a2900e8dbb62822e610fca9c00058fbaf25a1dede98be5778786b8e",
       "bytes": 37
     },
     "rootfs_storage": {
@@ -25,17 +25,6 @@
       "index_digest": "blake3:e9dc19f238360c2cee5b0f24630e550affa8d6f219163b89ec4ff25a128cb12b",
       "base_identity": "blake3:e9dc19f238360c2cee5b0f24630e550affa8d6f219163b89ec4ff25a128cb12b",
       "object_namespace": "rootfs/blake3"
-    }
-  },
-  "source": {
-    "kind": "oci-image",
-    "requested_ref": "registry.example/spore/demo:latest",
-    "resolved_ref": "registry.example/spore/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "source_index_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    "selected_manifest_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "conversion_contract": {
-      "rootfs_builder": "sporevm-rootfs-v6",
-      "ext4_writer": "native"
     }
   },
   "rootfs_index": {

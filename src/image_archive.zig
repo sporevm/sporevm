@@ -10,10 +10,8 @@ const std = @import("std");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
-const gateway = @import("image_gateway.zig");
-const gateway_manifest = @import("image_gateway_manifest.zig");
-const gateway_pull = @import("image_gateway_pull.zig");
 const image = @import("image.zig");
+const image_manifest = @import("image_manifest.zig");
 const local_paths = @import("local_paths.zig");
 const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
@@ -26,6 +24,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const media_type = "application/vnd.sporevm.image.archive.v1+tar+gzip";
 pub const max_archive_bytes: u64 = 4 * 1024 * 1024 * 1024;
+const max_rootfs_logical_bytes: u64 = 16 * 1024 * 1024 * 1024;
+const max_object_count: u64 = 65_536;
+const max_object_bytes: u64 = 4 * 1024 * 1024 * 1024;
 
 const manifest_entry = "spore-image-manifest.json";
 const config_entry = "image-config.json";
@@ -35,7 +36,7 @@ const object_prefix = "objects/";
 pub const PackOptions = struct {
     source: []const u8,
     output_path: []const u8,
-    platform: gateway.Platform,
+    platform: rootfs.Platform,
 };
 
 pub const PackResult = struct {
@@ -54,7 +55,7 @@ pub const UnpackOptions = struct {
     archive_digest: []const u8,
     expected_image_digest: []const u8,
     ref: []const u8,
-    platform: gateway.Platform,
+    platform: rootfs.Platform,
 };
 
 pub const UnpackResult = struct {
@@ -87,13 +88,7 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
     defer allocator.free(cache_root);
     var cache_lock = try rootfs.lockRootfsCacheExclusive(init.io, allocator, cache_root);
     defer cache_lock.deinit();
-    const resolved = try rootfs.resolveLocalCachedRef(
-        init.io,
-        allocator,
-        cache_root,
-        options.source,
-        .{ .os = options.platform.os, .arch = options.platform.arch },
-    );
+    const resolved = try rootfs.resolveLocalCachedRef(init.io, allocator, cache_root, options.source, options.platform);
     defer {
         allocator.free(resolved.ref);
         allocator.free(resolved.manifest_digest);
@@ -144,16 +139,20 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
 
     const config_bytes = try image.canonicalConfigJson(allocator, metadata.value.config);
     defer allocator.free(config_bytes);
-    const config_transport = try gateway.transportDigestAlloc(allocator, config_bytes);
+    const config_transport = try image_manifest.transportDigestAlloc(allocator, config_bytes);
     defer allocator.free(config_transport);
     const config_digest = try image.configDigestAlloc(allocator, config_bytes);
     defer allocator.free(config_digest);
     const image_digest = try image.imageDigestAlloc(allocator, storage.index_digest, config_bytes);
     errdefer allocator.free(image_digest);
-    if (!std.mem.eql(u8, image_digest, resolved.manifest_digest)) return error.ImageIdentityMismatch;
+    // Tags from `spore rootfs import-oci` or `import-tar` resolve to SHA-256
+    // local digests bound by the metadata check above, so they are packed
+    // under their recomputed native identity.
+    if (std.mem.startsWith(u8, resolved.manifest_digest, "blake3:") and
+        !std.mem.eql(u8, image_digest, resolved.manifest_digest)) return error.ImageIdentityMismatch;
 
-    const manifest_value = gateway_manifest.ImageManifest{
-        .kind = gateway_manifest.image_manifest_kind,
+    const manifest_value = image_manifest.ImageManifest{
+        .kind = image_manifest.image_manifest_kind,
         .image = .{
             .digest = image_digest,
             .platform = options.platform,
@@ -162,7 +161,7 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
                 .config_digest = config_digest,
                 .bytes = config_bytes.len,
             },
-            .rootfs_storage = gatewayStorage(storage),
+            .rootfs_storage = storage,
         },
         .rootfs_index = .{
             .digest = storage.index_digest,
@@ -171,7 +170,7 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
             .object_bytes = object_bytes,
         },
     };
-    const encoded_manifest = try gateway_manifest.encodeImageManifestAlloc(allocator, manifest_value);
+    const encoded_manifest = try image_manifest.encodeImageManifestAlloc(allocator, manifest_value);
     defer encoded_manifest.deinit(allocator);
 
     const temp_path = try temporarySiblingPath(allocator, init.io, options.output_path);
@@ -200,8 +199,8 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
 
 pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: UnpackOptions) !UnpackResult {
     try rootfs.validateLocalTagRef(options.ref);
-    try gateway.validateDigest(options.archive_digest, "sha256:");
-    try gateway.validateDigest(options.expected_image_digest, "blake3:");
+    try image_manifest.validateDigest(options.archive_digest, "sha256:");
+    try image_manifest.validateDigest(options.expected_image_digest, "blake3:");
     const stat = try Io.Dir.cwd().statFile(init.io, options.archive_path, .{ .follow_symlinks = false });
     if (stat.kind != .file or stat.size == 0 or stat.size > max_archive_bytes) return error.ImageArchiveTooLarge;
 
@@ -225,7 +224,7 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
     defer extracted.deinit(allocator);
     if (!std.mem.eql(u8, extracted.verified.value.image.digest, options.expected_image_digest))
         return error.ImageIdentityMismatch;
-    const storage = gatewayStorageToSpore(extracted.verified.value.image.rootfs_storage);
+    const storage = extracted.verified.value.image.rootfs_storage;
 
     var cache_lock = try rootfs.lockRootfsCacheExclusive(init.io, allocator, cache_root);
     defer cache_lock.deinit();
@@ -246,7 +245,7 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
     try rootfs_cas.markStorageComplete(init.io, allocator, cache_root, storage.index_digest);
     const published = try rootfs.publishIndexedImageWithCacheLockHeld(init.io, allocator, cache_root, .{
         .ref = options.ref,
-        .platform = .{ .os = options.platform.os, .arch = options.platform.arch },
+        .platform = options.platform,
         .config = extracted.config.value,
         .rootfs_storage = storage,
         .expected_image_digest = options.expected_image_digest,
@@ -277,7 +276,7 @@ const Extracted = struct {
     manifest_digest: []const u8,
     index_bytes: []const u8,
     config: std.json.Parsed(image.Config),
-    verified: std.json.Parsed(gateway_manifest.ImageManifest),
+    verified: std.json.Parsed(image_manifest.ImageManifest),
     objects: []ObjectDescriptor,
 
     fn deinit(self: *Extracted, allocator: std.mem.Allocator) void {
@@ -295,7 +294,7 @@ fn extractArchive(
     archive_path: []const u8,
     expected_archive_digest: []const u8,
     stage_dir: []const u8,
-    platform: gateway.Platform,
+    platform: rootfs.Platform,
 ) !Extracted {
     var file = try Io.Dir.cwd().openFile(io, archive_path, .{});
     defer file.close(io);
@@ -306,34 +305,27 @@ fn extractArchive(
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&hashed.reader, .gzip, &decompress_buf);
 
-    const manifest_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, manifest_entry, gateway_manifest.max_image_manifest_bytes);
+    const manifest_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, manifest_entry, image_manifest.max_image_manifest_bytes);
     defer allocator.free(manifest_bytes);
-    const config_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, config_entry, gateway_manifest.max_config_blob_bytes);
+    const config_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, config_entry, image_manifest.max_config_blob_bytes);
     defer allocator.free(config_bytes);
     const index_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, index_entry, disk_index.max_index_bytes);
     errdefer allocator.free(index_bytes);
 
-    const manifest_digest = try gateway.transportDigestAlloc(allocator, manifest_bytes);
+    const manifest_digest = try image_manifest.transportDigestAlloc(allocator, manifest_bytes);
     errdefer allocator.free(manifest_digest);
-    var parsed_manifest = try gateway_manifest.parseImageManifest(allocator, manifest_bytes);
-    defer parsed_manifest.deinit();
-    const descriptor = gateway.ManifestDescriptor{
-        .platform = platform,
-        .manifest_digest = manifest_digest,
-        .image_digest = parsed_manifest.value.image.digest,
-    };
-    var verified = try gateway_manifest.verifySelectedImageManifest(
+    var verified = try image_manifest.verifyImageManifest(
         allocator,
-        descriptor,
-        null,
+        manifest_digest,
+        platform,
         manifest_bytes,
         config_bytes,
         index_bytes,
     );
     errdefer verified.deinit();
-    var parsed_config = try gateway_manifest.parseCanonicalConfig(allocator, config_bytes);
+    var parsed_config = try image_manifest.parseCanonicalConfig(allocator, config_bytes);
     errdefer parsed_config.deinit();
-    const storage = gatewayStorageToSpore(verified.value.image.rootfs_storage);
+    const storage = verified.value.image.rootfs_storage;
     var parsed_index = try disk_index.parseDiskIndex(allocator, index_bytes, .{
         .logical_size = storage.logical_size,
         .chunk_size = storage.chunk_size,
@@ -430,11 +422,9 @@ fn validateArchiveBounds(logical_bytes: u64, objects: []const ObjectDescriptor) 
     var object_bytes: u64 = 0;
     for (objects) |object|
         object_bytes = std.math.add(u64, object_bytes, object.size) catch return error.ImageArchiveTooLarge;
-    try gateway_pull.validateEagerTransferBounds(
-        logical_bytes,
-        objects.len,
-        object_bytes,
-    );
+    if (logical_bytes > max_rootfs_logical_bytes or
+        objects.len > max_object_count or
+        object_bytes > max_object_bytes) return error.ImageArchiveTooLarge;
     return object_bytes;
 }
 
@@ -563,42 +553,6 @@ fn discardTarPadding(reader: *Io.Reader, size: u64) !void {
     if (padding != 0) try reader.discardAll(@intCast(padding));
 }
 
-fn gatewayStorage(storage: spore.RootfsStorage) gateway_manifest.RootfsStorage {
-    return .{
-        .kind = storage.kind,
-        .device = .{
-            .kind = storage.device.kind,
-            .role = storage.device.role,
-            .virtio_device_id = storage.device.virtio_device_id,
-            .mmio_slot = storage.device.mmio_slot,
-        },
-        .logical_size = storage.logical_size,
-        .chunk_size = storage.chunk_size,
-        .hash_algorithm = storage.hash_algorithm,
-        .index_digest = storage.index_digest,
-        .base_identity = storage.base_identity,
-        .object_namespace = storage.object_namespace,
-    };
-}
-
-fn gatewayStorageToSpore(storage: gateway_manifest.RootfsStorage) spore.RootfsStorage {
-    return .{
-        .kind = storage.kind,
-        .device = .{
-            .kind = storage.device.kind,
-            .role = storage.device.role,
-            .virtio_device_id = storage.device.virtio_device_id,
-            .mmio_slot = storage.device.mmio_slot,
-        },
-        .logical_size = storage.logical_size,
-        .chunk_size = storage.chunk_size,
-        .hash_algorithm = storage.hash_algorithm,
-        .index_digest = storage.index_digest,
-        .base_identity = storage.base_identity,
-        .object_namespace = storage.object_namespace,
-    };
-}
-
 fn validateOutputPath(io: Io, path: []const u8) !void {
     if (path.len == 0) return error.MissingImageArchiveOutput;
     Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
@@ -659,11 +613,99 @@ test "image archive tar header parser is fuzzed" {
     try std.testing.fuzz({}, fuzzTarHeader, .{});
 }
 
-test "native image archive import enforces eager transfer bounds" {
+test "native image archive import enforces aggregate bounds" {
     try std.testing.expectError(
-        error.GatewayImageTooLarge,
-        validateArchiveBounds(gateway_pull.max_eager_rootfs_logical_bytes + 1, &.{}),
+        error.ImageArchiveTooLarge,
+        validateArchiveBounds(max_rootfs_logical_bytes + 1, &.{}),
     );
+
+    const half = max_object_bytes / 2 + 1;
+    const large = [_]ObjectDescriptor{ .{ .digest = "", .size = half }, .{ .digest = "", .size = half } };
+    try std.testing.expectError(error.ImageArchiveTooLarge, validateArchiveBounds(1, &large));
+
+    const many = try std.testing.allocator.alloc(ObjectDescriptor, max_object_count + 1);
+    defer std.testing.allocator.free(many);
+    @memset(many, .{ .digest = "", .size = 0 });
+    try std.testing.expectError(error.ImageArchiveTooLarge, validateArchiveBounds(1, many));
+}
+
+test "image pack recomputes identity only for SHA-256 local refs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-image-archive-local-digests";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    const cache = tmp ++ "/cache";
+    try Io.Dir.cwd().createDirPath(io, cache);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache);
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const object_bytes = "local digest archive object";
+    const object_hex = chunk.ChunkId.fromContents(object_bytes).toHex();
+    const object_digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{object_hex[0..]});
+    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .digest = object_digest }};
+    const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, .{
+        .kind = disk_index.disk_index_kind,
+        .logical_size = object_bytes.len,
+        .chunk_size = image_manifest.rootfs_chunk_size,
+        .hash_algorithm = image_manifest.rootfs_hash_algorithm,
+        .object_namespace = image_manifest.rootfs_object_namespace,
+        .chunks = &entries,
+    });
+    const storage = spore.RootfsStorage{
+        .kind = image_manifest.rootfs_storage_kind,
+        .device = .{ .mmio_slot = image_manifest.rootfs_mmio_slot },
+        .logical_size = object_bytes.len,
+        .chunk_size = image_manifest.rootfs_chunk_size,
+        .hash_algorithm = image_manifest.rootfs_hash_algorithm,
+        .index_digest = encoded_index.digest,
+        .base_identity = encoded_index.digest,
+        .object_namespace = image_manifest.rootfs_object_namespace,
+    };
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, cache, storage.index_digest);
+    _ = try rootfs_cas.installStorageIndexPath(allocator, io, index_path, encoded_index.bytes, storage);
+    const object_path = try rootfs_cas.manifestObjectPath(allocator, cache, object_digest);
+    _ = try rootfs_cas.installChunkPath(allocator, io, object_path, object_bytes, object_digest, object_bytes.len);
+    try rootfs_cas.markStorageComplete(io, allocator, cache, storage.index_digest);
+    const published = try rootfs.publishIndexedImage(init, allocator, .{
+        .ref = "local/archive:native",
+        .platform = .{},
+        .config = .{ .architecture = .arm64, .os = "linux" },
+        .rootfs_storage = storage,
+    });
+    const arm64 = rootfs.Platform{ .os = "linux", .arch = .arm64 };
+    const native = try pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/native.tar.gz", .platform = arm64 });
+    const metadata = try Io.Dir.cwd().readFileAlloc(io, published.metadata_path, allocator, .limited(1024 * 1024));
+
+    // An import-oci or import-tar tag names the same metadata under a SHA-256
+    // local digest; it packs to the identical native archive.
+    const local_digest = "sha256:" ++ "c" ** 64;
+    const imported = rootfs.ResolvedImage{ .ref = "local/archive@" ++ local_digest, .manifest_digest = local_digest, .platform = arm64 };
+    const imported_metadata = try std.mem.replaceOwned(u8, allocator, metadata, published.image_manifest_digest, local_digest);
+    const imported_metadata_path = try rootfs.cachedImageRootfsMetadataPath(allocator, cache, imported);
+    try chunk_sealer.replaceFileAtomicDurable(allocator, imported_metadata_path, imported_metadata, 0o644);
+    _ = try rootfs.writeLocalRefCache(io, allocator, cache, "local/archive:imported", imported);
+    const imported_result = try pack(init, allocator, .{ .source = "local/archive:imported", .output_path = tmp ++ "/imported.tar.gz", .platform = arm64 });
+    try std.testing.expectEqualStrings(native.archive_digest, imported_result.archive_digest);
+    try std.testing.expectEqualStrings(published.image_manifest_digest, imported_result.image_digest);
+
+    // A native BLAKE3 ref whose metadata no longer recomputes to that identity
+    // is rejected.
+    const tampered = try std.mem.replaceOwned(u8, allocator, metadata, "\"architecture\": \"arm64\"", "\"architecture\": \"arm64\", \"config\": {\"WorkingDir\": \"/tampered\"}");
+    try chunk_sealer.replaceFileAtomicDurable(allocator, published.metadata_path, tampered, 0o644);
+    try std.testing.expectError(error.ImageIdentityMismatch, pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/tampered.tar.gz", .platform = arm64 }));
 }
 
 test "native image archive round-trips into a clean cache and rejects substitution" {
@@ -697,21 +739,21 @@ test "native image archive round-trips into a clean cache and rejects substituti
     const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, .{
         .kind = disk_index.disk_index_kind,
         .logical_size = object_bytes.len,
-        .chunk_size = gateway_manifest.rootfs_chunk_size,
-        .hash_algorithm = gateway_manifest.rootfs_hash_algorithm,
-        .object_namespace = gateway_manifest.rootfs_object_namespace,
+        .chunk_size = image_manifest.rootfs_chunk_size,
+        .hash_algorithm = image_manifest.rootfs_hash_algorithm,
+        .object_namespace = image_manifest.rootfs_object_namespace,
         .chunks = &entries,
     });
     defer encoded_index.deinit(allocator);
     const storage = spore.RootfsStorage{
-        .kind = gateway_manifest.rootfs_storage_kind,
-        .device = .{ .mmio_slot = gateway_manifest.rootfs_mmio_slot },
+        .kind = image_manifest.rootfs_storage_kind,
+        .device = .{ .mmio_slot = image_manifest.rootfs_mmio_slot },
         .logical_size = object_bytes.len,
-        .chunk_size = gateway_manifest.rootfs_chunk_size,
-        .hash_algorithm = gateway_manifest.rootfs_hash_algorithm,
+        .chunk_size = image_manifest.rootfs_chunk_size,
+        .hash_algorithm = image_manifest.rootfs_hash_algorithm,
         .index_digest = encoded_index.digest,
         .base_identity = encoded_index.digest,
-        .object_namespace = gateway_manifest.rootfs_object_namespace,
+        .object_namespace = image_manifest.rootfs_object_namespace,
     };
     const producer_cache = tmp ++ "/producer-cache";
     const installed_index = try rootfs_cas.manifestIndexPath(allocator, producer_cache, storage.index_digest);
