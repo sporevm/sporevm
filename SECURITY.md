@@ -56,30 +56,19 @@ their existing boundaries. Unknown or corrupt pin records make GC and
 destructive prune retain all CAS. New pin references are hard-linked to one
 cache-side ownership anchor: the anchor and artifact must be the only two
 links. Ordinary copies have the wrong inode, hard-link duplicates raise the
-link count, and both fail closed before restore, pack, or removal. A rename
-preserves the identity. Raw deletion leaves a one-link anchor that GC can
-diagnose and reclaim without scanning arbitrary paths. Pin records remain
+link count, and both fail closed before restore or pack. A rename preserves the
+identity. Deleting a save, through `spore checkpoint rm` or directly, leaves a
+one-link anchor that GC diagnoses and reclaims without scanning arbitrary
+paths; removal itself never releases a pin. Pin records remain
 explicitly pending until the artifact directory commit is durable, so GC can
 also diagnose and reclaim a two-link reference left in an unpublished save or
 batch stage after a crash. Failed ordinary publication preserves the staged
 manifest outside loadable authority for manual recovery. Legacy v1 pins remain
-readable and packable but refuse destructive removal because duplicate
-references cannot be proven absent. Supported machine-local removal writes a
-bounded, host-private, versioned removal journal before deleting the save. The
-journal is keyed by canonical path, names only the already validated exclusive
-pin, and is fuzzed under the same fail-closed local-record assumptions. It lets
-an absent-path retry finish pin release only for that exact prior operation;
-arbitrary absent paths and malformed journals remain errors. A save recreated
-at the same path must pass normal manifest and ownership validation before its
-operation can replace the idempotency record. A pending pin is released only
-after the old deletion is made durable and the cache-side ownership link proves
-it is orphaned; moved, duplicated, or pending owners fail closed. Supported
-portable and diskless removals durably invalidate older completed path history.
-Portable unpack, pull, and clone materialize a descriptor-bound local CAS inside
-the saved-spore directory. Destructive
-removal classifies that authority only after verifying the canonical index and
-every referenced object against their BLAKE3 digests; a simultaneous
-host-private pin reference fails closed. Foreground and named restore publish
+readable and packable; GC keeps them after their save is removed because
+duplicate references cannot be proven absent. Portable unpack, pull, and clone
+materialize a descriptor-bound local CAS inside the saved-spore directory.
+Removal requires only a regular `manifest.json` and does not read the
+checkpoint's contents. Foreground and named restore publish
 host-private active saved-spore leases before releasing the registry lock that
 serializes authority selection with removal. Removal refuses any live lease
 for the canonical directory, regardless of the descriptor currently named by

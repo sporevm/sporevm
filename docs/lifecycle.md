@@ -338,40 +338,26 @@ manifest without dropping create-time annotations:
 spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
-Delete a checkpoint with `spore checkpoint rm DIR`. Diskless checkpoints
-have no pin, so removal validates the manifest, deletes the directory, and
-durably syncs its parent. Portable disk-backed spores from pack/unpack or pull
-carry their authoritative disk index locally and likewise have no host-private
-pin, so removal verifies the descriptor-bound index and referenced objects,
-then deletes and syncs only that self-contained directory. Foreground and named
-restores publish active authority records for lazy disk faults; removal returns
-`SavedSporeInUse` until those readers stop. Corrupt or partial local CAS state,
-and ambiguous directories containing both local CAS and a host-private pin
-reference, fail closed without deleting either authority.
-Machine-local disk-backed removal keeps the cache lock while it validates the
-exclusive ownership link, deletes the visible save, syncs the parent, and
-unregisters the pin. Before deleting, it durably records the canonical path and
-exclusive pin identity in a machine-local removal journal. Retrying that exact
-supported removal after the directory disappears finishes pin release, or
-returns the completed result; an unrelated absent path still fails with
-`FileNotFound`, and a save recreated at the path must pass normal ownership and
-authority validation rather than consuming the old result. If the path is
-reused while the prior operation is still pending, removal first proves the old
-pin is orphaned and makes the old deletion durable before releasing it and
-recording authority for the new save. A moved or duplicated owner therefore
-fails closed. Completed records are retained to preserve idempotence, replaced
-by a newly validated pinned save, and invalidated before a supported portable
-or diskless generation at the same path is removed. If `rm -rf` bypasses the
-command, `spore cache pins`
-reports the remaining one-link anchor as `orphaned`, and `spore cache gc
---force` reclaims the pin and newly unrooted CAS content. Legacy v1 pins have no
-such proof, so removal refuses them; clone first, then use expert-only `spore
-cache unpin PIN_ID --force` only after accounting for every legacy copy.
+Delete a checkpoint with `spore checkpoint rm DIR`. It requires a directory
+containing a regular `manifest.json`, refuses with `SavedSporeInUse` while a
+foreground or named restore holds a lazy-disk lease on that directory, then
+deletes the directory and durably syncs its parent. It does not read or verify
+the checkpoint's contents, so corrupt checkpoints can be removed. A
+machine-local checkpoint's pin is released by GC, not by removal: deleting the
+directory, whether through `spore checkpoint rm` or `rm -rf`, leaves a one-link
+ownership anchor that `spore cache pins` reports as `orphaned`, and `spore
+cache gc --force` reclaims the pin and any CAS content no other root
+references. A moved checkpoint keeps its pin. After `cp -al`, neither copy
+restores until one is removed, and GC keeps the storage while either exists. A
+plain `cp -r` copy never owned the pin and cannot restore; use `spore clone`
+for an independent copy. Legacy v1
+pins cannot prove their copies are gone, so GC keeps them after removal until
+expert-only `spore cache unpin PIN_ID --force`.
 
 `spore cache pins` reports `index_valid` only after validating the record and
 canonical index. It deliberately does not stat or hash every object; lazy reads
 and `spore pack` still verify object bytes and may fail closed on missing or
-corrupt content. Inspect, save, and removal output name the ownership class.
+corrupt content. Inspect and save output name the ownership class.
 The hard-link anchor supplies local proof without a global save-path registry.
 
 If a saved manifest declares bound services, named restore requires fresh host
