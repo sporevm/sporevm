@@ -78,16 +78,7 @@ const monitor_usage =
     \\  --rootfs rootfs.ext4    Resolved rootfs image path
     \\  --image REF             Original OCI image ref for metadata
     \\  --resume DIR            Resume from a spore directory
-    \\  --net                   Experimental SporeVM-managed networking
-    \\  --default-action deny   With --net, deny public egress unless allowed
-    \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
-    \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
-    \\  --allow-host-port HOST:PORT
-    \\                          With --net, allow only DNS-learned HOST on PORT
-    \\  --bound-unix-service NAME HOST PORT PATH
-    \\                          With --net, expose a host Unix socket as HOST:PORT
-    \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
-    \\                          With --net, forward host loopback TCP to a guest port
+    \\  --net-policy JSON       Enable SporeVM-managed networking with this encoded policy
     \\  --memory SIZE           Initial guest memory (default: 512mb)
     \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
@@ -165,7 +156,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         return;
     }
 
-    const opts = try parseMonitorArgs(args);
+    const opts = try parseMonitorArgs(allocator, args);
     const parsed_ms = lifecycle.monotonicMs();
     const selected_backend = backend_mod.requireProductRunner(opts.backend, .probe()) catch |err| {
         std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
@@ -2126,7 +2117,7 @@ fn sessionHandlesForResume(allocator: std.mem.Allocator, maybe_resume_dir: ?[]co
     }
 }
 
-fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
+fn parseMonitorArgs(allocator: std.mem.Allocator, args: []const []const u8) !MonitorOptions {
     if (args.len == 0) usageExit();
     var opts = MonitorOptions{ .name = args[0] };
     var max_memory_set = false;
@@ -2149,55 +2140,11 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             opts.image_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--resume")) {
             opts.resume_dir = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--net")) {
+        } else if (std.mem.eql(u8, args[i], "--net-policy")) {
+            const raw = takeValue(args, &i, args[i]);
             opts.network = .spore;
-        } else if (std.mem.eql(u8, args[i], "--default-action")) {
-            const raw = takeValue(args, &i, args[i]);
-            if (!std.mem.eql(u8, raw, spore.network_default_deny)) {
-                std.debug.print("spore monitor: invalid --default-action {s}\n", .{raw});
-                std.process.exit(2);
-            }
-            opts.network_policy.default_deny = true;
-        } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.network_policy.addAllowCidr(raw) catch |err| {
-                std.debug.print("spore monitor: invalid --allow-cidr {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--allow-host")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.network_policy.addAllowHost(raw) catch |err| {
-                std.debug.print("spore monitor: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--allow-host-port")) {
-            const raw = takeValue(args, &i, args[i]);
-            const parsed = spore_net_policy.parseHostPort(raw) catch |err| {
-                std.debug.print("spore monitor: invalid --allow-host-port {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-            opts.network_policy.addExactHostPorts(parsed.host, &.{parsed.port}) catch |err| {
-                std.debug.print("spore monitor: invalid --allow-host-port {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--bound-unix-service")) {
-            const flag = args[i];
-            const name = takeValue(args, &i, flag);
-            const guest_host = takeValue(args, &i, flag);
-            const guest_port_raw = takeValue(args, &i, flag);
-            const unix_path = takeValue(args, &i, flag);
-            const guest_port = std.fmt.parseUnsigned(u16, guest_port_raw, 10) catch {
-                std.debug.print("spore monitor: invalid --bound-unix-service port {s}\n", .{guest_port_raw});
-                std.process.exit(2);
-            };
-            opts.network_policy.addBoundUnixService(name, guest_host, guest_port, unix_path) catch |err| {
-                std.debug.print("spore monitor: invalid --bound-unix-service {s}: {s}\n", .{ name, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--forward")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.network_policy.addPortForward(raw) catch |err| {
-                std.debug.print("spore monitor: invalid --forward {s}: {s}\n", .{ raw, @errorName(err) });
+            opts.network_policy = spore_net_policy.parseArg(allocator, raw) catch |err| {
+                std.debug.print("spore monitor: invalid --net-policy: {s}\n", .{@errorName(err)});
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "--memory")) {
@@ -2225,10 +2172,6 @@ fn parseMonitorArgs(args: []const []const u8) !MonitorOptions {
             std.debug.print("unknown monitor argument: {s}\n\n{s}", .{ args[i], monitor_usage });
             std.process.exit(2);
         }
-    }
-    if (opts.network == .disabled and opts.network_policy.hasRules()) {
-        std.debug.print("spore monitor: network flags require --net\n", .{});
-        std.process.exit(2);
     }
     memory_config.validateCliOrExit("spore monitor", opts.memory);
     return opts;
@@ -2319,33 +2262,26 @@ test "readiness probe accepts current and bounded legacy guest replies" {
     try std.testing.expect(!readinessProbeSucceeded(126, "spore run: rootfs unavailable\n"));
 }
 
-test "monitor parser accepts network allow policy" {
-    const opts = try parseMonitorArgs(&.{
-        "bench-1",
-        "--net",
-        "--default-action",
-        "deny",
-        "--allow-cidr",
-        "93.184.216.34/32",
-        "--allow-host",
-        "example.com",
-        "--forward",
-        "127.0.0.1:8080:80",
-    });
+test "monitor parser enables networking with the encoded policy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var policy = run.NetworkPolicy{};
+    try policy.addNetworkPolicy(.{});
+    try policy.addAllowCidr("93.184.216.34/32");
+    try policy.addPortForward("127.0.0.1:8080:80");
 
+    const opts = try parseMonitorArgs(allocator, &.{
+        "bench-1",
+        "--net-policy",
+        try spore_net_policy.encodeArgAlloc(allocator, &policy),
+    });
     try std.testing.expectEqual(run.NetworkMode.spore, opts.network);
-    try std.testing.expect(opts.network_policy.default_deny);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
-    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
-    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.port_forward_count);
-    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.port_forwards[0].host_port);
-    try std.testing.expectEqual(@as(u16, 80), opts.network_policy.port_forwards[0].guest_port);
+    try std.testing.expectEqualDeep(policy, opts.network_policy);
 }
 
 test "monitor parser accepts bounded vcpu count" {
-    const opts = try parseMonitorArgs(&.{ "bench-1", "--vcpus", "2" });
+    const opts = try parseMonitorArgs(std.testing.allocator, &.{ "bench-1", "--vcpus", "2" });
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.vcpus);
 }
 

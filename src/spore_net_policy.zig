@@ -261,7 +261,11 @@ pub const Config = struct {
     }
 
     pub fn addPortForward(self: *Config, raw: []const u8) ParseError!void {
-        const forward = try parsePortForward(raw);
+        try self.appendPortForward(try parsePortForward(raw));
+    }
+
+    fn appendPortForward(self: *Config, forward: PortForwardConfig) ParseError!void {
+        if (forward.host_port == 0 or forward.guest_port == 0) return error.InvalidPortForward;
         if (self.port_forward_count >= max_port_forwards) return error.TooManyPortForwards;
         self.port_forwards[self.port_forward_count] = forward;
         self.port_forward_count += 1;
@@ -453,6 +457,53 @@ pub fn manifestNetworkFromConfig(allocator: std.mem.Allocator, policy: *const Co
             .bound_services = policy.bound_service_count != 0,
         },
     };
+}
+
+/// Argument form of a `Config` for the CLI -> monitor -> netd process hops.
+/// Every hop is a re-exec of the same binary, so the shape is internal. All
+/// top-level fields are required, so a dropped field fails closed instead of
+/// defaulting to a more permissive policy.
+const PolicyArg = struct {
+    default_deny: bool,
+    allow_cidrs: []const []const u8,
+    allow_hosts: []const []const u8,
+    allow_host_ports: []const spore.NetworkHostPortRule,
+    bound_services: []const BoundServiceConfig,
+    port_forwards: []const PortForwardConfig,
+};
+
+pub fn encodeArgAlloc(allocator: std.mem.Allocator, config: *const Config) std.mem.Allocator.Error![]u8 {
+    const host_ports = try allocator.alloc(spore.NetworkHostPortRule, config.exact_rule_count);
+    defer allocator.free(host_ports);
+    for (config.exactRuleSlice(), host_ports) |*rule, *out| {
+        out.* = .{ .host = rule.host, .ports = rule.portSlice() };
+    }
+    return std.json.Stringify.valueAlloc(allocator, PolicyArg{
+        .default_deny = config.default_deny,
+        .allow_cidrs = config.allowCidrSlice(),
+        .allow_hosts = config.allowHostSlice(),
+        .allow_host_ports = host_ports,
+        .bound_services = config.boundServiceSlice(),
+        .port_forwards = config.portForwardSlice(),
+    }, .{});
+}
+
+/// Parses `encodeArgAlloc` output and rebuilds the config through the same
+/// validating `add*` methods as the CLI. Slices point into `allocator`.
+pub fn parseArg(allocator: std.mem.Allocator, bytes: []const u8) (ParseError || std.mem.Allocator.Error)!Config {
+    const arg = std.json.parseFromSliceLeaky(PolicyArg, allocator, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidNetworkPolicy,
+    };
+    var config = Config{ .default_deny = arg.default_deny };
+    for (arg.allow_cidrs) |cidr| try config.addAllowCidr(cidr);
+    for (arg.allow_hosts) |host| try config.addAllowHost(host);
+    for (arg.allow_host_ports) |rule| try config.addExactHostPorts(rule.host, rule.ports);
+    for (arg.bound_services) |service| {
+        try config.addBoundUnixService(service.name, service.guest_host, service.guest_port, service.unix_path);
+    }
+    for (arg.port_forwards) |forward| try config.appendPortForward(forward);
+    return config;
 }
 
 const LearnedHostIp = struct {
@@ -1316,6 +1367,73 @@ test "spore-net CLI bound services produce a valid saved manifest network" {
     try std.testing.expectEqualStrings("metadata", network.bound_services[0].name);
     try std.testing.expectEqualStrings("metadata.spore.internal", network.bound_services[0].guest_host);
     try std.testing.expectEqual(@as(u16, 8080), network.bound_services[0].guest_port);
+}
+
+test "spore-net policy argument round trips every rule kind" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var config = Config{};
+    try config.addNetworkPolicy(.{ .allow = &.{
+        .{ .host = "github.com", .ports = &.{ 443, 22 } },
+        .{ .host = "example.com", .ports = &.{80} },
+    } });
+    try config.addAllowCidr("93.184.216.34/32");
+    try config.addAllowHost("example.org");
+    try config.addBindService(allocator, "metadata:8080=unix:/tmp/metadata.sock");
+    try config.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/gateway.sock");
+    try config.addPortForward("127.0.0.1:18080:80");
+
+    const parsed = try parseArg(allocator, try encodeArgAlloc(allocator, &config));
+    try std.testing.expectEqualDeep(config, parsed);
+}
+
+test "spore-net policy argument keeps default deny with no rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var config = Config{};
+    try config.addNetworkPolicy(.{});
+
+    const parsed = try parseArg(arena.allocator(), try encodeArgAlloc(arena.allocator(), &config));
+    try std.testing.expectEqualDeep(config, parsed);
+    const policy = try Runtime.init(parsed);
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+}
+
+test "spore-net policy argument rejects missing fields and invalid rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    try std.testing.expectError(error.InvalidNetworkPolicy, parseArg(allocator,
+        \\{"allow_cidrs":[],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[]}
+    ));
+    try std.testing.expectError(error.InvalidNetworkPolicy, parseArg(allocator,
+        \\{"default_deny":true,"allow_cidrs":[],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[],"default_allow":true}
+    ));
+    try std.testing.expectError(error.InvalidCidr, parseArg(allocator,
+        \\{"default_deny":true,"allow_cidrs":["10.0.0.0/33"],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[]}
+    ));
+    try std.testing.expectError(error.InvalidPortForward, parseArg(allocator,
+        \\{"default_deny":false,"allow_cidrs":[],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[{"host_port":0,"guest_port":80}]}
+    ));
+}
+
+fn fuzzPolicyArg(_: void, s: *std.testing.Smith) !void {
+    var bytes: [4096]u8 = undefined;
+    const len = @min(s.slice(&bytes), bytes.len);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const config = parseArg(allocator, bytes[0..len]) catch return;
+    const parsed = try parseArg(allocator, try encodeArgAlloc(allocator, &config));
+    try std.testing.expectEqualDeep(config, parsed);
+}
+
+test "fuzz spore-net policy argument parser" {
+    try std.testing.fuzz({}, fuzzPolicyArg, .{ .corpus = &.{
+        \\{"default_deny":true,"allow_cidrs":["93.184.216.34/32"],"allow_hosts":["example.org"],"allow_host_ports":[{"host":"github.com","ports":[443]}],"bound_services":[{"name":"metadata","guest_host":"metadata.spore.internal","guest_port":80,"unix_path":"/tmp/metadata.sock"}],"port_forwards":[{"host_port":18080,"guest_port":80}]}
+        ,
+    } });
 }
 
 test "spore-net policy exposes first-slice capability facts" {

@@ -4511,10 +4511,10 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
         try argv.append("--resume");
         try argv.append(path);
     }
-    if (network_policy) |policy| {
-        if (spec.network != null) try appendMonitorNetworkPolicyArgs(allocator, &argv, policy);
-    } else if (spec.network) |network| {
-        try appendMonitorNetworkManifestArgs(allocator, &argv, network);
+    if (spec.network) |network| {
+        const policy = try monitorNetworkPolicy(allocator, network, network_policy);
+        try argv.append("--net-policy");
+        try argv.append(try spore_net_policy.encodeArgAlloc(allocator, &policy));
     }
     try appendMemoryArg(allocator, &argv, spec.memory);
     try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
@@ -4602,61 +4602,12 @@ test "lifecycle monitor spawn receives context environment" {
     try std.testing.expectEqualStrings("/tmp/sporevm-context-home\n", observed.?);
 }
 
-fn appendMonitorNetworkPolicyArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), policy: *const run_mod.NetworkPolicy) !void {
-    try argv.append("--net");
-    if (policy.default_deny) {
-        try argv.append("--default-action");
-        try argv.append(spore.network_default_deny);
-    }
-    for (policy.allowCidrSlice()) |cidr| {
-        try argv.append("--allow-cidr");
-        try argv.append(cidr);
-    }
-    for (policy.allowHostSlice()) |host| {
-        try argv.append("--allow-host");
-        try argv.append(host);
-    }
-    for (policy.exactRuleSlice()) |rule| {
-        for (rule.portSlice()) |port| {
-            try argv.append("--allow-host-port");
-            try argv.append(try std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }));
-        }
-    }
-    for (policy.boundServiceSlice()) |service| {
-        try argv.append("--bound-unix-service");
-        try argv.append(service.name);
-        try argv.append(service.guest_host);
-        try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}));
-        try argv.append(service.unix_path);
-    }
-    for (policy.portForwardSlice()) |forward| {
-        try argv.append("--forward");
-        try argv.append(try std.fmt.allocPrint(allocator, "127.0.0.1:{d}:{d}", .{ forward.host_port, forward.guest_port }));
-    }
-}
-
-fn appendMonitorNetworkManifestArgs(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), network: spore.Network) !void {
+/// The policy a monitor enforces: the caller's live policy when it has one,
+/// otherwise the policy recorded with the VM.
+fn monitorNetworkPolicy(allocator: std.mem.Allocator, network: spore.Network, live: ?*const run_mod.NetworkPolicy) !run_mod.NetworkPolicy {
+    if (live) |policy| return policy.*;
     if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
-    try argv.append("--net");
-    if (network.default_action) |action| {
-        if (!std.mem.eql(u8, action, spore.network_default_deny)) return error.InvalidNetworkPolicy;
-        try argv.append("--default-action");
-        try argv.append(action);
-    }
-    for (network.allow_cidrs) |cidr| {
-        try argv.append("--allow-cidr");
-        try argv.append(cidr);
-    }
-    for (network.allow_hosts) |host| {
-        try argv.append("--allow-host");
-        try argv.append(host);
-    }
-    for (network.allow_host_ports) |rule| {
-        for (rule.ports) |port| {
-            try argv.append("--allow-host-port");
-            try argv.append(try std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }));
-        }
-    }
+    return spore_net_policy.configFromManifestNetwork(allocator, network);
 }
 
 fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), flag: []const u8, value: anytype) !void {
@@ -7350,31 +7301,17 @@ test "create cli keeps plain --net unrestricted and exact rules deny by default"
     try std.testing.expectEqualStrings("github.com", exact_config.policy.exact_rules[0].host);
 }
 
-test "lifecycle monitor policy args preserve default deny" {
-    var argv = std.array_list.Managed([]const u8).init(std.testing.allocator);
-    defer argv.deinit();
-    const policy = run_mod.NetworkPolicy{ .default_deny = true };
+test "lifecycle monitor policy from a recorded network keeps default deny" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    try appendMonitorNetworkPolicyArgs(std.testing.allocator, &argv, &policy);
-
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("--net", argv.items[0]);
-    try std.testing.expectEqualStrings("--default-action", argv.items[1]);
-    try std.testing.expectEqualStrings(spore.network_default_deny, argv.items[2]);
-}
-
-test "lifecycle monitor manifest args preserve default action" {
-    var argv = std.array_list.Managed([]const u8).init(std.testing.allocator);
-    defer argv.deinit();
-
-    try appendMonitorNetworkManifestArgs(std.testing.allocator, &argv, .{
-        .default_action = spore.network_default_deny,
-    });
-
-    try std.testing.expectEqual(@as(usize, 3), argv.items.len);
-    try std.testing.expectEqualStrings("--net", argv.items[0]);
-    try std.testing.expectEqualStrings("--default-action", argv.items[1]);
-    try std.testing.expectEqualStrings(spore.network_default_deny, argv.items[2]);
+    const policy = try monitorNetworkPolicy(arena, .{ .default_action = spore.network_default_deny }, null);
+    try std.testing.expect(policy.default_deny);
+    try std.testing.expect(!policy.hasBoundServices());
+    try std.testing.expectError(error.UnsupportedBoundServiceRestore, monitorNetworkPolicy(arena, .{
+        .bound_services = &.{.{ .name = "metadata", .guest_host = "metadata.spore.internal", .guest_port = 80 }},
+    }, null));
 }
 
 test "new output dirs resolve to absolute paths" {

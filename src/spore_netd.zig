@@ -10,7 +10,6 @@ const Io = std.Io;
 const spore_net = @import("spore_net.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd_tcp = @import("spore_netd_tcp.zig");
-const spore = @import("spore.zig");
 
 pub const max_frame_len = spore_net.max_frame_len;
 pub const frame_header_len = 4;
@@ -44,7 +43,7 @@ const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
 const netd_usage =
     \\Usage:
-    \\  spore netd --stdio [--default-action deny] [--allow-cidr CIDR] [--allow-host HOST] [--allow-host-port HOST:PORT] [--bound-unix-service NAME HOST PORT PATH] [--forward 127.0.0.1:HOST_PORT:GUEST_PORT]
+    \\  spore netd --stdio --policy JSON
     \\
     \\Internal helper for SporeVM-managed networking.
     \\
@@ -115,8 +114,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         try stdout.writeAll(netd_usage);
         return;
     }
-    const opts = parseCliArgs(args);
-    var policy = spore_net_policy.Runtime.init(opts.policy) catch |err| {
+    const config = parseCliArgs(init.arena.allocator(), args);
+    var policy = spore_net_policy.Runtime.init(config) catch |err| {
         std.debug.print("spore netd: invalid network policy: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };
@@ -126,7 +125,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     };
     const dns_forwarder = host_dns.forwarder();
     var tcp_gateway: spore_netd_tcp.Gateway = undefined;
-    tcp_gateway.init(&policy, opts.policy.portForwardSlice()) catch |err| {
+    tcp_gateway.init(&policy, config.portForwardSlice()) catch |err| {
         std.debug.print("spore netd: forward setup failed: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };
@@ -165,64 +164,17 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
 }
 
-const CliOptions = struct {
-    policy: spore_net_policy.Config = .{},
-};
-
-fn parseCliArgs(args: []const []const u8) CliOptions {
-    var opts = CliOptions{};
+fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) spore_net_policy.Config {
+    var policy: ?spore_net_policy.Config = null;
     var stdio = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--stdio")) {
             stdio = true;
-        } else if (std.mem.eql(u8, args[i], "--default-action")) {
+        } else if (std.mem.eql(u8, args[i], "--policy")) {
             const raw = takeValue(args, &i, args[i]);
-            if (!std.mem.eql(u8, raw, spore.network_default_deny)) {
-                std.debug.print("spore netd: invalid --default-action {s}\n", .{raw});
-                std.process.exit(2);
-            }
-            opts.policy.default_deny = true;
-        } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.policy.addAllowCidr(raw) catch |err| {
-                std.debug.print("spore netd: invalid --allow-cidr {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--allow-host")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.policy.addAllowHost(raw) catch |err| {
-                std.debug.print("spore netd: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--allow-host-port")) {
-            const raw = takeValue(args, &i, args[i]);
-            const parsed = spore_net_policy.parseHostPort(raw) catch |err| {
-                std.debug.print("spore netd: invalid --allow-host-port {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-            opts.policy.addExactHostPorts(parsed.host, &.{parsed.port}) catch |err| {
-                std.debug.print("spore netd: invalid --allow-host-port {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--bound-unix-service")) {
-            const flag = args[i];
-            const name = takeValue(args, &i, flag);
-            const guest_host = takeValue(args, &i, flag);
-            const guest_port_raw = takeValue(args, &i, flag);
-            const unix_path = takeValue(args, &i, flag);
-            const guest_port = std.fmt.parseUnsigned(u16, guest_port_raw, 10) catch {
-                std.debug.print("spore netd: invalid --bound-unix-service port {s}\n", .{guest_port_raw});
-                std.process.exit(2);
-            };
-            opts.policy.addBoundUnixService(name, guest_host, guest_port, unix_path) catch |err| {
-                std.debug.print("spore netd: invalid --bound-unix-service {s}: {s}\n", .{ name, @errorName(err) });
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--forward")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.policy.addPortForward(raw) catch |err| {
-                std.debug.print("spore netd: invalid --forward {s}: {s}\n", .{ raw, @errorName(err) });
+            policy = spore_net_policy.parseArg(allocator, raw) catch |err| {
+                std.debug.print("spore netd: invalid --policy: {s}\n", .{@errorName(err)});
                 std.process.exit(2);
             };
         } else {
@@ -230,11 +182,11 @@ fn parseCliArgs(args: []const []const u8) CliOptions {
             std.process.exit(2);
         }
     }
-    if (!stdio) {
+    if (!stdio or policy == null) {
         std.debug.print("{s}", .{netd_usage});
         std.process.exit(2);
     }
-    return opts;
+    return policy.?;
 }
 
 fn wantsHelp(args: []const []const u8) bool {
@@ -1003,43 +955,6 @@ test "spore-netd parses host resolver nameserver lines" {
     ).?;
     try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 0, 2, 53 }, &parsed);
     try std.testing.expect(parseNameserver("nameserver ::1\n") == null);
-}
-
-test "spore-netd cli parser accepts network policy rules" {
-    const opts = parseCliArgs(&.{
-        "--stdio",
-        "--allow-cidr",
-        "93.184.216.34/32",
-        "--allow-host",
-        "example.com",
-        "--allow-host-port",
-        "github.com:443",
-        "--bound-unix-service",
-        "cleanroom-gateway",
-        "gateway.cleanroom.internal",
-        "8170",
-        "/tmp/gateway.sock",
-    });
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_cidr_count);
-    try std.testing.expectEqualStrings("93.184.216.34/32", opts.policy.allow_cidrs[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_host_count);
-    try std.testing.expectEqualStrings("example.com", opts.policy.allow_hosts[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.exact_rule_count);
-    try std.testing.expectEqualStrings("github.com", opts.policy.exact_rules[0].host);
-    try std.testing.expectEqual(@as(u16, 443), opts.policy.exact_rules[0].ports[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.bound_service_count);
-    try std.testing.expectEqualStrings("cleanroom-gateway", opts.policy.bound_services[0].name);
-}
-
-test "spore-netd cli parser preserves default deny policy" {
-    const opts = parseCliArgs(&.{ "--stdio", "--default-action", spore.network_default_deny });
-    try std.testing.expect(opts.policy.default_deny);
-
-    const policy = try spore_net_policy.Runtime.init(opts.policy);
-    try std.testing.expectEqual(
-        spore_net_policy.Decision.deny_not_allowed,
-        policy.decideIpv4Port(.{ 93, 184, 216, 34 }, 443),
-    );
 }
 
 test "spore-netd frame stream round trips bounded frames" {

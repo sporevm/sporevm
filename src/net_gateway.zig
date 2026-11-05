@@ -10,7 +10,6 @@ const Io = std.Io;
 const spore_net = @import("spore_net.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_netd = @import("spore_netd.zig");
-const spore = @import("spore.zig");
 const virtio_net = @import("virtio/net.zig");
 
 const ready_timeout_ms = 1_000;
@@ -89,38 +88,10 @@ pub const Process = struct {
         if (debug) argv.append("--debug") catch return error.OutOfMemory;
         argv.append("netd") catch return error.OutOfMemory;
         argv.append("--stdio") catch return error.OutOfMemory;
-        if (policy.default_deny) {
-            argv.append("--default-action") catch return error.OutOfMemory;
-            argv.append(spore.network_default_deny) catch return error.OutOfMemory;
-        }
-        for (policy.allowCidrSlice()) |cidr| {
-            argv.append("--allow-cidr") catch return error.OutOfMemory;
-            argv.append(cidr) catch return error.OutOfMemory;
-        }
-        for (policy.allowHostSlice()) |host| {
-            argv.append("--allow-host") catch return error.OutOfMemory;
-            argv.append(host) catch return error.OutOfMemory;
-        }
-        for (policy.exactRuleSlice()) |rule| {
-            for (rule.portSlice()) |port| {
-                const host_port = std.fmt.allocPrint(allocator, "{s}:{d}", .{ rule.host, port }) catch return error.OutOfMemory;
-                argv.append("--allow-host-port") catch return error.OutOfMemory;
-                argv.append(host_port) catch return error.OutOfMemory;
-            }
-        }
-        for (policy.boundServiceSlice()) |service| {
-            const port = std.fmt.allocPrint(allocator, "{d}", .{service.guest_port}) catch return error.OutOfMemory;
-            argv.append("--bound-unix-service") catch return error.OutOfMemory;
-            argv.append(service.name) catch return error.OutOfMemory;
-            argv.append(service.guest_host) catch return error.OutOfMemory;
-            argv.append(port) catch return error.OutOfMemory;
-            argv.append(service.unix_path) catch return error.OutOfMemory;
-        }
-        for (policy.portForwardSlice()) |forward| {
-            const value = std.fmt.allocPrint(allocator, "127.0.0.1:{d}:{d}", .{ forward.host_port, forward.guest_port }) catch return error.OutOfMemory;
-            argv.append("--forward") catch return error.OutOfMemory;
-            argv.append(value) catch return error.OutOfMemory;
-        }
+        argv.append("--policy") catch return error.OutOfMemory;
+        const policy_arg = spore_net_policy.encodeArgAlloc(allocator, &policy) catch return error.OutOfMemory;
+        defer allocator.free(policy_arg);
+        argv.append(policy_arg) catch return error.OutOfMemory;
         const child = std.process.spawn(io, .{
             .argv = argv.items,
             .stdin = .pipe,
@@ -594,7 +565,14 @@ test "spore-net gateway spawns netd with policy arguments" {
 
     const observed = try Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(4096));
     defer allocator.free(observed);
-    try std.testing.expectEqualStrings("netd\n--stdio\n--default-action\ndeny\n", observed);
+    var lines = std.mem.splitScalar(u8, observed, '\n');
+    try std.testing.expectEqualStrings("netd", lines.next().?);
+    try std.testing.expectEqualStrings("--stdio", lines.next().?);
+    try std.testing.expectEqualStrings("--policy", lines.next().?);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const policy = try spore_net_policy.parseArg(arena.allocator(), lines.next().?);
+    try std.testing.expectEqualDeep(spore_net_policy.Config{ .default_deny = true }, policy);
 }
 
 test "spore-net gateway buffers multiple rx frames" {
