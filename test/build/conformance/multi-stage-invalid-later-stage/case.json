@@ -1,0 +1,39 @@
+{
+  "description": "an invalid later stage fails during planning, before the changed first stage runs or publishes a step",
+  "expect": {
+    "docker": "success",
+    "spore": "success"
+  },
+  "initial_cache": "miss",
+  "initial_execution": {
+    "expect_executed_steps": 2,
+    "expect_boot_count": 2,
+    "expect_resize_count": 1
+  },
+  "scan_prefixes": [
+    "/oracle",
+    "/out"
+  ],
+  "transitions": [
+    {
+      "name": "invalid-later-stage-publishes-nothing",
+      "writes": {
+        "Dockerfile": "# syntax=docker/dockerfile:1.20\nFROM base AS build\nRUN mkdir -p /oracle && printf two >/oracle/built\nFROM build\nCOPY --parents src/./payload /out/\n"
+      },
+      "outcome": "failure",
+      "spore_diagnostic": "spore build: Dockerfile line 5: COPY --parents does not support an internal /./ source pivot: src/./payload"
+    },
+    {
+      "name": "recovery-runs-the-first-stage",
+      "writes": {
+        "Dockerfile": "# syntax=docker/dockerfile:1.20\nFROM base AS build\nRUN mkdir -p /oracle && printf two >/oracle/built\nFROM build\nCOPY src/payload /out/\n"
+      },
+      "expect_cache": "miss",
+      "expect_index": "changed",
+      "expect_executed_steps": 2,
+      "expect_boot_count": 2,
+      "expect_resize_count": 0,
+      "compare": true
+    }
+  ]
+}

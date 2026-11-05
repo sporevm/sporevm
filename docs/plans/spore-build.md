@@ -84,8 +84,9 @@ Removing old records is a reachability problem, not a file-age cleanup.
 
 The landed foundation includes:
 
-- full-file source-spanned parsing and reachable-stage planning before any
-  fetch or execution;
+- full-file source-spanned parsing before any fetch, and reachable-stage
+  planning after base images resolve but before any `COPY --from` or `ADD`
+  fetch, cache write, or guest execution;
 - multi-stage `FROM`, target selection, local/registry/named OCI-layout bases,
   previous-stage inheritance, and final `CMD`/`ENTRYPOINT` publication;
 - builder-owned ARG/ENV/platform expansion, parent-relative `WORKDIR`, shell
@@ -280,8 +281,9 @@ golden invalidation test and at least one differential fixture.
   only remaining work and future decision gates.
 - SporeVM matches final filesystem and OCI runtime configuration for accepted
   features, not BuildKit layer identity or exact cache keys.
-- The complete Dockerfile is parsed and planned before execution or network
-  access.
+- The complete Dockerfile is parsed before any network access. Every reachable
+  stage is planned after base images resolve and before any `COPY --from` or
+  `ADD` fetch, cache write, or guest execution.
 - Uncached work runs in one persistent VM and publishes rootfs indexes, not
   Docker layers.
 - Cache correctness wins over hit rate; conservative invalidation is allowed,
