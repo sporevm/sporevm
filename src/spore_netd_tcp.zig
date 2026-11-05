@@ -1286,6 +1286,95 @@ test "spore-netd TCP routes configured bound service ports to Unix sockets" {
     try std.testing.expect(gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8171)) == null);
 }
 
+/// Builds checksum-correct guest TCP frames from fuzz input, so the stack
+/// does not drop them before they reach the gateway's policy and flows.
+/// Each frame takes a 21-byte header (flags, destination selector and
+/// address, ports, sequence and acknowledgment numbers, window, payload
+/// length) followed by its payload.
+fn fuzzGatewayReceiveFrame(_: void, s: *std.testing.Smith) !void {
+    var config = spore_net_policy.Config{};
+    try config.addNetworkPolicy(.{});
+    try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-fuzz-missing.sock");
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+
+    var input: [4096]u8 = undefined;
+    const len = @min(s.slice(&input), input.len);
+    const header_len = 21;
+    var offset: usize = 0;
+    var now_ms: i64 = 0;
+    while (offset + header_len <= len) {
+        const header = input[offset..][0..header_len];
+        offset += header_len;
+        const payload_len = @min(header[20], len - offset);
+        const payload = input[offset..][0..payload_len];
+        offset += payload_len;
+
+        const dst_addr: ipv4.Address = if ((header[1] & 1) != 0) spore_net.gateway_ipv4 else header[2..6].*;
+        var frame_buf: [spore_net.max_frame_len]u8 = undefined;
+        const tcp_start = ethernet.HEADER_LEN + ipv4.HEADER_LEN;
+        const tcp_header_len = tcp_wire.emit(.{
+            .src_port = std.mem.readInt(u16, header[8..10], .big),
+            .dst_port = std.mem.readInt(u16, header[6..8], .big),
+            .seq_number = std.mem.readInt(u32, header[10..14], .big),
+            .ack_number = std.mem.readInt(u32, header[14..18], .big),
+            .data_offset = 5,
+            .flags = .{
+                .fin = (header[0] & 0x01) != 0,
+                .syn = (header[0] & 0x02) != 0,
+                .rst = (header[0] & 0x04) != 0,
+                .psh = (header[0] & 0x08) != 0,
+                .ack = (header[0] & 0x10) != 0,
+                .urg = (header[0] & 0x20) != 0,
+            },
+            .window_size = std.mem.readInt(u16, header[18..20], .big),
+            .checksum = 0,
+            .urgent_pointer = 0,
+        }, frame_buf[tcp_start..]) catch unreachable;
+        @memcpy(frame_buf[tcp_start + tcp_header_len ..][0..payload.len], payload);
+        const tcp_len = tcp_header_len + payload.len;
+        _ = ethernet.emit(.{
+            .dst_addr = spore_net.gateway_mac,
+            .src_addr = spore_net.guest_mac,
+            .ethertype = .ipv4,
+        }, frame_buf[0..ethernet.HEADER_LEN]) catch unreachable;
+        _ = ipv4.emit(.{
+            .version = 4,
+            .ihl = 5,
+            .dscp_ecn = 0,
+            .total_length = @intCast(ipv4.HEADER_LEN + tcp_len),
+            .identification = 0,
+            .dont_fragment = true,
+            .more_fragments = false,
+            .fragment_offset = 0,
+            .ttl = 64,
+            .protocol = .tcp,
+            .checksum = 0,
+            .src_addr = spore_net.guest_ipv4,
+            .dst_addr = dst_addr,
+        }, frame_buf[ethernet.HEADER_LEN..][0..ipv4.HEADER_LEN]) catch unreachable;
+        const tcp = frame_buf[tcp_start..][0..tcp_len];
+        std.mem.writeInt(u16, tcp[16..18], tcp_wire.computeChecksum(spore_net.guest_ipv4, dst_addr, tcp), .big);
+
+        const now = Instant.fromMillis(now_ms);
+        _ = gateway.receiveFrame(frame_buf[0 .. tcp_start + tcp_len], now);
+        gateway.service(now);
+        while (gateway.dequeueFrame()) |_| {}
+        now_ms += 50;
+    }
+}
+
+test "fuzz spore-netd TCP gateway guest frames" {
+    // A SYN to the bound service, its ACK with data, then a denied SYN.
+    try std.testing.fuzz({}, fuzzGatewayReceiveFrame, .{ .corpus = &.{
+        "\x02\x01\x00\x00\x00\x00\x00\x50\xc0\x00\x00\x00\x03\xe8\x00\x00\x00\x00\x04\x00\x00" ++
+            "\x18\x01\x00\x00\x00\x00\x00\x50\xc0\x00\x00\x00\x03\xe9\x00\x00\x00\x01\x04\x00\x04ping" ++
+            "\x02\x00\x5d\xb8\xd8\x22\x01\xbb\xc0\x01\x00\x00\x07\xd0\x00\x00\x00\x00\x04\x00\x00",
+    } });
+}
+
 fn fuzzGuestTcpFrameClassifier(_: void, s: *std.testing.Smith) !void {
     var bytes: [spore_net.max_frame_len]u8 = undefined;
     const len = @min(s.slice(&bytes), bytes.len);
