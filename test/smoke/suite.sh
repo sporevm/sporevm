@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Runs a fixed list of aarch64 smoke scripts against zig-out/bin/spore (or
-# SPORE_BIN) and prints one result line per script. Each script's output goes
-# to zig-cache/smoke/<script>.log; failing scripts also copy their work logs to
-# zig-cache/smoke/<script>/. `mise run smoke core|full` builds first.
+# Runs a smoke suite (core or full, aarch64) or one script under test/smoke
+# (for example run/attach or x86/run, with any further arguments passed to it)
+# against zig-out/bin/spore (or SPORE_BIN), and prints one result line per
+# script. Each script's output goes to zig-cache/smoke/<script>.log; failing
+# scripts also copy their work logs to zig-cache/smoke/<script>/. With --build,
+# as `mise run smoke` passes, it builds first: Debug for aarch64, and the
+# shipped ReleaseSafe settings plus the board smoke binary for x86/ scripts.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -54,16 +57,44 @@ full=(
   rootfs/build-publication.sh
 )
 
-case "${1:-}" in
+usage() {
+  echo "usage: test/smoke/suite.sh [--build] core|full|<script> [args...]" >&2
+  echo "  <script> is a path under test/smoke without .sh, such as run/attach or x86/run" >&2
+  exit 2
+}
+
+build=0
+if [[ "${1:-}" == "--build" ]]; then
+  build=1
+  shift
+fi
+suite="${1:-}"
+[[ -n "${suite}" ]] || usage
+shift
+script_args=("$@")
+case "${suite}" in
   core) scripts=("${core[@]}") ;;
   full) scripts=("${full[@]}") ;;
   *)
-    echo "usage: test/smoke/suite.sh core|full" >&2
-    exit 2
+    suite="${suite%.sh}"
+    case "${suite}" in
+      lib | suite | /* | ../* | */../*) usage ;;
+    esac
+    [[ -f "${repo_root}/test/smoke/${suite}.sh" ]] || usage
+    scripts=("${suite}.sh")
     ;;
 esac
-suite="$1"
+if ((${#script_args[@]})) && [[ "${suite}" == core || "${suite}" == full ]]; then
+  usage
+fi
 
+if ((build)); then
+  if [[ "${suite}" == x86/* ]]; then
+    (cd "${repo_root}" && zig build install x86-board-smoke --release=safe)
+  else
+    (cd "${repo_root}" && zig build)
+  fi
+fi
 require_spore_bin
 
 duration() {
@@ -86,12 +117,12 @@ failed=()
 suite_start="${SECONDS}"
 for entry in "${scripts[@]}"; do
   script="${entry%% *}"
-  args="${entry#"${script}"}"
+  # shellcheck disable=SC2206 # suite entries hold fixed, space-separated flags.
+  args=(${entry#"${script}"} ${script_args[@]+"${script_args[@]}"})
   name="${script%.sh}"
   log="${log_root}/${name//\//-}.log"
   start="${SECONDS}"
-  # shellcheck disable=SC2086 # args holds fixed, space-separated flags.
-  if SPORE_SMOKE_LOG_DIR="${log_root}/${name//\//-}" "${repo_root}/test/smoke/${script}" ${args} </dev/null >"${log}" 2>&1; then
+  if SPORE_SMOKE_LOG_DIR="${log_root}/${name//\//-}" "${repo_root}/test/smoke/${script}" ${args[@]+"${args[@]}"} </dev/null >"${log}" 2>&1; then
     status=0
   else
     status=$?

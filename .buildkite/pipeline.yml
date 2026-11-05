@@ -56,7 +56,8 @@ steps:
 
       - label: ":computer: x86-64 run smoke (Linux AMD64)"
         key: "x86-run-linux-amd64"
-        command: "scripts/ci/run.sh mise run smoke:x86"
+        command: "scripts/ci/run.sh mise run smoke x86/run"
+        artifact_paths: *smoke_artifacts
         timeout_in_minutes: 30
         plugins: *mise_plugins
         cache: *mise_cache
@@ -65,7 +66,8 @@ steps:
 
       - label: ":hammer_and_wrench: x86-64 build smoke (Linux AMD64)"
         key: "x86-build-linux-amd64"
-        command: "scripts/ci/run.sh mise run smoke:x86-build"
+        command: "scripts/ci/run.sh mise run smoke x86/build"
+        artifact_paths: *smoke_artifacts
         timeout_in_minutes: 30
         plugins: *mise_plugins
         cache: *mise_cache
@@ -117,7 +119,7 @@ steps:
         cache: *mise_cache
         agents: *linux_agents
 
-      - label: ":fire: VM smoke (Linux ARM64)"
+      - label: ":fire: RUN executor smoke (Linux ARM64)"
         key: "spore-build-run-smoke-linux-arm64"
         command: "scripts/ci/run.sh scripts/ci/spore-build-smoke.sh"
         artifact_paths:
