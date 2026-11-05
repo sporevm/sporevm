@@ -454,10 +454,11 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var exit: *hvf.VcpuExit = undefined;
     try hvf.check(hvf.hv_vcpu_create(&vcpu, &exit, null), "hv_vcpu_create");
     defer _ = hvf.hv_vcpu_destroy(vcpu);
+    var capture_wake: capture.WakeThread = .{};
     if (config.capture_request) |request_capture| {
-        request_capture.setWake(wakeCaptureVcpu, &vcpu);
+        try capture_wake.start(request_capture, wakeCaptureVcpu, &vcpu);
     }
-    defer if (config.capture_request) |request_capture| request_capture.clearWake();
+    defer if (config.capture_request) |request_capture| capture_wake.stop(request_capture);
     if (config.exec_control) |control| {
         control.setWake(.{ .context = &vcpu, .wakeFn = wakeVcpu });
     }
@@ -1142,10 +1143,11 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     if (options.config.exec_control) |control| {
         control.setWake(.{ .context = &wake_set, .wakeFn = wakeVcpuSet });
     }
+    var capture_wake: capture.WakeThread = .{};
     if (options.config.capture_request) |request_capture| {
-        request_capture.setWake(wakeCaptureVcpuSet, &wake_set);
+        try capture_wake.start(request_capture, wakeCaptureVcpuSet, &wake_set);
     }
-    defer if (options.config.capture_request) |request_capture| request_capture.clearWake();
+    defer if (options.config.capture_request) |request_capture| capture_wake.stop(request_capture);
 
     const contexts = try allocator.alloc(MultiHvfThreadContext, vcpus.len);
     defer allocator.free(contexts);
