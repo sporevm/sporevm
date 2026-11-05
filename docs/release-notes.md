@@ -43,10 +43,13 @@ requests are gone.
 Saved RAM carries the agent that was running, so version 6 manifests, whose
 agent still answers the text protocol, are too old as well.
 
-Saved-spore pins use only `spore.saved-disk-pin.v2`. A v1 pin record fails as
-too old and roots nothing, and `cache gc` deletes it as a
-`saved-spore-stale-pin` entry. Before, GC kept v1 pins and their storage even
-after the save was removed.
+Saved-spore pins are `spore.saved-disk-pin.v3`: the pin id, the disk storage
+it roots and, until the save is durable, its pending publication. A pin no
+longer records the manifest hash, so editing a pinned save's manifest no longer
+stops it restoring. Pin records from earlier builds (v1 and v2) fail as too
+old, root nothing, and `cache gc` deletes them as `saved-spore-stale-pin`
+entries; as with manifests, saves from earlier builds must be re-created.
+Before, GC kept v1 pins and their storage even after the save was removed.
 
 ### One ext4 writer
 

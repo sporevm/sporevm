@@ -1303,8 +1303,8 @@ fn collectOrphanPinGcCandidates(
     // Snapshot the registry before replay or orphan cleanup mutates it. Some
     // filesystems can otherwise skip the directory entry following a delete.
     for (ids.items) |id| {
-        // A v1 pin can only protect a save whose manifest predates v6 and no
-        // longer loads, so it is deleted like an orphaned pin.
+        // An older pin's save no longer restores, so the pin is deleted like
+        // an orphaned one.
         var record: ?std.json.Parsed(saved_spore_pin.Record) = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch |err| switch (err) {
             error.FormatTooOld => null,
             else => continue,
@@ -1406,7 +1406,7 @@ fn collectStorageRootsFromPins(
     }
     for (ids.items) |id| {
         var record = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch |err| switch (err) {
-            // A v1 pin roots nothing: its save no longer loads.
+            // An older pin roots nothing: its save no longer restores.
             error.FormatTooOld => continue,
             else => {
                 conservative_roots.pin_count += 1;
@@ -3785,7 +3785,7 @@ test "durable save pin roots GC until explicit unpin" {
     var pin_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     defer pin_lock.deinit();
     const pin_registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &pin_lock);
-    const pin_id = try saved_spore_pin.create(io, allocator, pin_registry, root ++ "/save", disk);
+    const pin_id = try saved_spore_pin.testing.pinSave(io, allocator, pin_registry, root ++ "/save", disk);
     pin_lock.deinit();
     var original_pin = try saved_spore_pin.loadRecord(io, allocator, root, pin_id);
     defer original_pin.deinit();
@@ -3797,7 +3797,6 @@ test "durable save pin roots GC until explicit unpin" {
         const record = saved_spore_pin.Record{
             .schema = saved_spore_pin.schema,
             .id = id,
-            .manifest_sha256 = original_pin.value.manifest_sha256,
             .storage = original_pin.value.storage,
         };
         const json = try std.json.Stringify.valueAlloc(allocator, record, .{});
@@ -3867,8 +3866,8 @@ test "cache GC diagnoses and reclaims a pin orphaned by raw directory deletion" 
     };
     var pin_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     const registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &pin_lock);
-    const pin_id = try saved_spore_pin.create(io, allocator, registry, root ++ "/save", disk);
-    const second_pin_id = try saved_spore_pin.create(io, allocator, registry, root ++ "/save-2", disk);
+    const pin_id = try saved_spore_pin.testing.pinSave(io, allocator, registry, root ++ "/save", disk);
+    const second_pin_id = try saved_spore_pin.testing.pinSave(io, allocator, registry, root ++ "/save-2", disk);
     pin_lock.deinit();
     try Io.Dir.cwd().deleteTree(io, root ++ "/save");
     try Io.Dir.cwd().deleteTree(io, root ++ "/save-2");
@@ -3916,16 +3915,17 @@ test "corrupt save pin makes destructive prune retain all CAS" {
     try std.testing.expect(try fileExists(io, object_path));
 }
 
-test "cache GC deletes v1 pins and the storage only they rooted" {
+test "cache GC deletes older pins and the storage only they rooted" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-v1-pin";
+    const root = "zig-cache/test-system-cache-gc-old-pin";
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
     Io.Dir.cwd().deleteTree(io, root) catch {};
     try Io.Dir.cwd().createDirPath(io, root ++ "/pins");
     try Io.Dir.cwd().createDirPath(io, root ++ "/save");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/save-v2");
     const fixture = try writeGcStorageFixture(allocator, io, root, false, 0x68);
     // A v1 save: an old manifest, a copied reference and no ownership anchor.
     const id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -3939,6 +3939,18 @@ test "cache GC deletes v1 pins and the storage only they rooted" {
     }, .{});
     const record_path = try saved_spore_pin.recordPath(allocator, root, id);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = record_json });
+    // A v2 save whose reference still holds the ownership anchor.
+    const v2_id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const v2_record_path = try saved_spore_pin.recordPath(allocator, root, v2_id);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = v2_record_path, .data = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = "spore.saved-disk-pin.v2",
+        .id = v2_id,
+        .manifest_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        .storage = fixture.storage,
+    }, .{}) });
+    const v2_owner = try saved_spore_pin.ownerPath(allocator, root, v2_id);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = v2_owner, .data = "{\"schema\":\"spore.saved-disk-pin-ref.v2\",\"id\":\"" ++ v2_id ++ "\"}" });
+    try Io.Dir.cwd().hardLink(v2_owner, Io.Dir.cwd(), root ++ "/save-v2/" ++ saved_spore_pin.reference_file, io, .{});
     const index_path = try rootfs_cas.manifestIndexPath(allocator, root, fixture.storage.index_digest);
     const object_path = try rootfs_cas.manifestObjectPath(allocator, root, fixture.object_digest);
 
@@ -3952,17 +3964,20 @@ test "cache GC deletes v1 pins and the storage only they rooted" {
     const planned = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = true });
     try std.testing.expectEqual(@as(usize, 0), planned.unparseable_pin_count);
     try std.testing.expectEqual(@as(usize, 0), planned.rooted_indexes);
-    try std.testing.expectEqual(@as(usize, 3), planned.candidate_count);
+    try std.testing.expectEqual(@as(usize, 4), planned.candidate_count);
     var stale_pin_count: usize = 0;
     for (planned.entries) |entry| {
         if (std.mem.eql(u8, entry.kind, "saved-spore-stale-pin")) stale_pin_count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 1), stale_pin_count);
+    try std.testing.expectEqual(@as(usize, 2), stale_pin_count);
     try std.testing.expect(try fileExists(io, record_path));
+    try std.testing.expect(try fileExists(io, v2_record_path));
 
     const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
-    try std.testing.expectEqual(@as(usize, 3), forced.deleted_count);
+    try std.testing.expectEqual(@as(usize, 4), forced.deleted_count);
     try std.testing.expect(!try fileExists(io, record_path));
+    try std.testing.expect(!try fileExists(io, v2_record_path));
+    try std.testing.expect(!try fileExists(io, v2_owner));
     try std.testing.expect(!try fileExists(io, index_path));
     try std.testing.expect(!try fileExists(io, object_path));
 }

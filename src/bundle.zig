@@ -4005,7 +4005,7 @@ test "pack and unpack disk indexes" {
         var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
         defer pin_lock.deinit();
         const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &pin_lock);
-        break :blk try saved_spore_pin.create(io, arena, pin_registry, parent_dir, disk);
+        break :blk try saved_spore_pin.testing.pinSave(io, arena, pin_registry, parent_dir, disk);
     };
     const source_index = try rootfs_cas.manifestIndexPath(arena, pack_cache_root, storage.index_digest);
     const index_bytes = try readFileAllNoSymlink(arena, source_index, disk_index.max_index_bytes);
