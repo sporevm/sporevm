@@ -56,11 +56,14 @@ pub const Stats = struct {
     output_drops: usize = 0,
 };
 
-const HostState = enum {
-    none,
+const FlowState = enum {
+    free,
     connecting,
     connected,
+    /// The host socket failed to open or connect; aborted on next service.
     failed,
+    /// The host socket is closed; the slot is reaped once the guest socket is.
+    closed,
 };
 
 const RequestTarget = union(enum) {
@@ -111,9 +114,8 @@ const ByteBuffer = struct {
 };
 
 const Flow = struct {
-    in_use: bool = false,
     fd: std.c.fd_t = -1,
-    state: HostState = .none,
+    state: FlowState = .free,
     request: ForwardRequest = undefined,
     sock: TcpSock = undefined,
     rx_storage: [tcp_rx_buffer_len]u8 = undefined,
@@ -146,8 +148,7 @@ const Flow = struct {
 
     fn start(self: *Flow, request: ForwardRequest, now: Instant) void {
         self.closeFd();
-        self.in_use = true;
-        self.state = .none;
+        self.state = .failed;
         self.request = request;
         self.to_host.reset();
         self.to_guest.reset();
@@ -162,7 +163,6 @@ const Flow = struct {
 
     fn startPortForward(self: *Flow, host_fd: std.c.fd_t, guest_port: u16, local_port: u16, now: Instant) bool {
         self.closeFd();
-        self.in_use = true;
         self.state = .connected;
         self.fd = host_fd;
         self.to_host.reset();
@@ -176,7 +176,7 @@ const Flow = struct {
         self.initSocket();
         self.sock.connect(spore_net.guest_ipv4, guest_port, spore_net.gateway_ipv4, local_port) catch {
             self.closeFd();
-            self.in_use = false;
+            self.state = .free;
             return false;
         };
         return true;
@@ -332,7 +332,10 @@ pub const Gateway = struct {
         }
         for (&self.flows) |*flow| {
             flow.poll_index = null;
-            if (!flow.in_use or flow.fd < 0) continue;
+            if (flow.fd < 0) continue;
+            // After host EOF with nothing left to write there is nothing to
+            // poll for; an EOF socket would otherwise report readable forever.
+            if (flow.host_eof and flow.to_host.len == 0) continue;
             var events: i16 = 0;
             if (flow.state == .connecting or flow.to_host.len > 0) events |= std.c.POLL.OUT;
             if (flow.state == .connected and !flow.host_eof and flow.to_guest.freeLen() > 0) events |= std.c.POLL.IN;
@@ -369,7 +372,7 @@ pub const Gateway = struct {
         var next: ?Instant = null;
         if (self.stack.pollAt()) |at| next = minInstant(next, at);
         for (&self.flows) |*flow| {
-            if (!flow.in_use) continue;
+            if (flow.state == .free) continue;
             next = minInstant(next, flow.idle_deadline);
             if (flow.state == .connecting) next = minInstant(next, flow.connect_deadline);
         }
@@ -485,13 +488,13 @@ pub const Gateway = struct {
 
     fn freeFlow(self: *Gateway) ?*Flow {
         for (&self.flows) |*flow| {
-            if (!flow.in_use) return flow;
+            if (flow.state == .free) return flow;
         }
         return null;
     }
 
     fn serviceFlow(self: *Gateway, flow: *Flow, now: Instant) void {
-        if (!flow.in_use) return;
+        if (flow.state == .free) return;
         if (now.greaterThanOrEqual(flow.idle_deadline)) {
             self.abortFlow(flow);
             return;
@@ -530,6 +533,7 @@ pub const Gateway = struct {
         }
         if (flow.sock.getState() == .closed and flow.to_host.len == 0) {
             flow.closeFd();
+            flow.state = .closed;
             flow.host_eof = true;
             return;
         }
@@ -544,9 +548,13 @@ pub const Gateway = struct {
             flow.host_write_shutdown = true;
         }
         if (flow.host_eof and flow.to_guest.len == 0) {
-            flow.closeFd();
-            flow.state = .none;
+            // The host has finished sending, so FIN the guest, but keep the
+            // host socket until the guest's remaining bytes have reached it.
             flow.sock.close();
+            if (flow.host_write_shutdown) {
+                flow.closeFd();
+                flow.state = .closed;
+            }
         }
     }
 
@@ -618,7 +626,7 @@ pub const Gateway = struct {
 
     fn abortFlow(_: *Gateway, flow: *Flow) void {
         flow.closeFd();
-        flow.state = .none;
+        flow.state = .closed;
         flow.host_eof = true;
         flow.to_host.reset();
         flow.to_guest.reset();
@@ -626,7 +634,7 @@ pub const Gateway = struct {
     }
 
     fn reapFlow(_: *Gateway, flow: *Flow) void {
-        if (!flow.in_use) return;
+        if (flow.state == .free) return;
         if (flow.fd >= 0) return;
         if (flow.sock.getState() != .closed) return;
         if (flow.sock.localEndpoint() != null) return;
@@ -842,6 +850,72 @@ fn buildTcpSynFrame(dst_addr: ipv4.Address, dst_port: u16, out: *[spore_net.max_
     return out[0 .. ethernet.HEADER_LEN + ipv4.HEADER_LEN + tcp_len];
 }
 
+const GuestSockets = struct { tcp4_sockets: []*TcpSock };
+const GuestStack = stack_mod.Stack(Device, GuestSockets);
+
+/// A guest-side zmoltcp stack wired to a `Gateway` through its frame
+/// interface, for tests that need a real guest TCP peer.
+const TestGuest = struct {
+    device: Device,
+    sock: TcpSock,
+    sock_ptrs: [1]*TcpSock,
+    stack: GuestStack,
+    rx_storage: [tcp_rx_buffer_len]u8,
+    tx_storage: [tcp_tx_buffer_len]u8,
+
+    fn init(self: *TestGuest, now: Instant) void {
+        self.device = Device.init();
+        self.sock = TcpSock.init(&self.rx_storage, &self.tx_storage);
+        self.sock.ack_delay = null;
+        self.sock_ptrs = .{&self.sock};
+        self.stack = GuestStack.init(spore_net.guest_mac, .{ .tcp4_sockets = &self.sock_ptrs });
+        self.stack.iface.v4.addIpAddr(.{ .address = spore_net.guest_ipv4, .prefix_len = 30 });
+        _ = self.stack.iface.v4.routes.add(zmoltcp.iface.Route.newDefaultGateway(spore_net.gateway_ipv4));
+        self.stack.iface.neighbor_cache.fill(spore_net.gateway_ipv4, spore_net.gateway_mac, now);
+    }
+
+    /// Moves frames between the guest and the gateway until both are idle.
+    fn exchange(self: *TestGuest, gateway: *Gateway, now: Instant) void {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            _ = self.stack.poll(now, &self.device);
+            var moved = false;
+            while (self.device.dequeueTx()) |frame| {
+                _ = gateway.receiveFrame(frame, now);
+                moved = true;
+            }
+            gateway.service(now);
+            while (gateway.dequeueFrame()) |frame| {
+                self.device.enqueueRx(frame);
+                moved = true;
+            }
+            if (!moved) return;
+        }
+    }
+};
+
+/// One iteration of the netd host side: poll host sockets, then service.
+fn pollHost(gateway: *Gateway, now: Instant) !void {
+    var fds: [max_port_forwards + max_flows]std.posix.pollfd = undefined;
+    const count = gateway.fillPollFds(&fds);
+    _ = try std.posix.poll(fds[0..count], 1_000);
+    gateway.servicePoll(fds[0..count]);
+    gateway.service(now);
+}
+
+fn listenUnix(path: [:0]const u8) !std.c.fd_t {
+    _ = std.c.unlink(path.ptr);
+    const listener = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (listener < 0) return error.TestUnexpectedResult;
+    errdefer _ = std.c.close(listener);
+    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
+    sockaddr.family = std.c.AF.UNIX;
+    @memcpy(sockaddr.path[0..path.len], path);
+    if (std.c.bind(listener, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un)) != 0) return error.TestUnexpectedResult;
+    if (std.c.listen(listener, 4) != 0) return error.TestUnexpectedResult;
+    return listener;
+}
+
 fn testForwardRequest(dst_addr: ipv4.Address, dst_port: u16) ForwardRequest {
     return .{
         .local = .{ .addr = dst_addr, .port = dst_port },
@@ -984,43 +1058,33 @@ test "spore-netd TCP opens bound Unix stream sockets" {
 
 test "spore-netd TCP applies poll results only to the flow that was polled" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-poll-test-{d}.sock", .{std.c.getpid()});
-    _ = std.c.unlink(path_z.ptr);
-    defer _ = std.c.unlink(path_z.ptr);
-
-    const listener = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    try std.testing.expect(listener >= 0);
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-poll-test-{d}.sock", .{std.c.getpid()});
+    const listener = try listenUnix(path);
     defer _ = std.c.close(listener);
-    var sockaddr = std.mem.zeroInit(std.c.sockaddr.un, .{});
-    sockaddr.family = std.c.AF.UNIX;
-    @memcpy(sockaddr.path[0..path_z.len], path_z);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.bind(listener, @ptrCast(&sockaddr), @sizeOf(std.c.sockaddr.un)));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.listen(listener, 4));
+    defer _ = std.c.unlink(path.ptr);
 
-    var first_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    var second_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
     var config = spore_net_policy.Config{};
-    try config.addBindService(allocator, try std.fmt.bufPrint(&first_buf, "first=unix:{s}", .{path_z}));
-    try config.addBindService(allocator, try std.fmt.bufPrint(&second_buf, "second:8080=unix:{s}", .{path_z}));
-    try config.addBindService(allocator, "missing:81=unix:/tmp/sporevm-netd-missing-poll-service.sock");
+    try config.addBoundUnixService("first", "first.spore.internal", 80, path);
+    try config.addBoundUnixService("second", "second.spore.internal", 8080, path);
+    try config.addBoundUnixService("missing", "missing.spore.internal", 81, "/tmp/sporevm-netd-missing-poll-service.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
     defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
 
-    // A failed flow takes the first slot and is reaped, leaving the open
-    // flow in a later slot with a free slot before it.
+    // A failed flow takes the first slot and is reaped, leaving the guest's
+    // connection in a later slot with a free slot before it.
     var frame_buf: [spore_net.max_frame_len]u8 = undefined;
     try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 81, &frame_buf), Instant.fromMillis(1)));
-    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
-    gateway.service(Instant.fromMillis(1));
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49153);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+    try std.testing.expectEqual(tcp_socket.State.established, guest.sock.getState());
     const host_peer = std.c.accept(listener, null, null);
     try std.testing.expect(host_peer >= 0);
     defer _ = std.c.close(host_peer);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(host_peer, std.c.SHUT.WR));
+    try std.testing.expectEqual(@as(isize, 1), std.c.send(host_peer, "x", 1, 0));
 
     var fds: [max_port_forwards + max_flows]std.posix.pollfd = undefined;
     const count = gateway.fillPollFds(&fds);
@@ -1030,11 +1094,54 @@ test "spore-netd TCP applies poll results only to the flow that was polled" {
     // a new flow in the free slot ahead of the polled one.
     try std.testing.expect(gateway.receiveFrame(buildTcpSynFrame(spore_net.gateway_ipv4, 8080, &frame_buf), Instant.fromMillis(2)));
     gateway.servicePoll(fds[0..count]);
-    gateway.service(Instant.fromMillis(2));
+    guest.exchange(&gateway, Instant.fromMillis(2));
 
-    // The polled flow saw its host EOF and closed its host socket.
+    // The polled flow read the host byte and relayed it to the guest.
     var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 0), std.c.recv(host_peer, &byte, byte.len, std.c.MSG.DONTWAIT));
+    try std.testing.expectEqual(@as(usize, 1), try guest.sock.recvSlice(&byte));
+    try std.testing.expectEqualStrings("x", &byte);
+}
+
+test "spore-netd TCP delivers guest bytes sent after host EOF" {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-eof-test-{d}.sock", .{std.c.getpid()});
+    const listener = try listenUnix(path);
+    defer _ = std.c.close(listener);
+    defer _ = std.c.unlink(path.ptr);
+
+    var config = spore_net_policy.Config{};
+    try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49153);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+    try std.testing.expectEqual(tcp_socket.State.established, guest.sock.getState());
+    const host_peer = std.c.accept(listener, null, null);
+    try std.testing.expect(host_peer >= 0);
+    defer _ = std.c.close(host_peer);
+
+    // The host half-closes before the guest has sent anything; the guest
+    // sees the FIN but can still send.
+    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(host_peer, std.c.SHUT.WR));
+    try pollHost(&gateway, Instant.fromMillis(2));
+    guest.exchange(&gateway, Instant.fromMillis(2));
+    try std.testing.expectEqual(tcp_socket.State.close_wait, guest.sock.getState());
+
+    try std.testing.expectEqual(@as(usize, 4), try guest.sock.sendSlice("ping"));
+    guest.exchange(&gateway, Instant.fromMillis(3));
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 4), std.c.recv(host_peer, &buf, buf.len, std.c.MSG.DONTWAIT));
+    try std.testing.expectEqualStrings("ping", buf[0..4]);
+
+    // Once the guest closes too, the gateway closes the host socket.
+    guest.sock.close();
+    guest.exchange(&gateway, Instant.fromMillis(4));
+    try std.testing.expectEqual(@as(isize, 0), std.c.recv(host_peer, &buf, buf.len, std.c.MSG.DONTWAIT));
 }
 
 test "spore-netd TCP enforces exact learned host ports" {
