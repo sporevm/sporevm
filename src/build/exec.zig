@@ -11,6 +11,7 @@ const memory_config = @import("../memory.zig");
 const topology = @import("../topology.zig");
 const runtime_disk = @import("../runtime_disk.zig");
 const cache_mount = @import("cache_mount.zig");
+const fuzz_support = @import("../fuzz_support.zig");
 const spore = @import("../spore.zig");
 const run_contract = @import("run_contract.zig");
 const step_cache = @import("step_cache.zig");
@@ -1460,26 +1461,16 @@ const guest_exec_request_seeds = [_]struct { body: []const u8, kind: c_int, last
 // The removed term member doubles as the unknown key.
 const guest_exec_request_unknown_member = ",\"term\":\"xterm\"";
 
-// Fuzz inputs for fuzzGuestBuildRequest: each is one Smith slice (a u32
-// little-endian length, then the bytes) holding raw mode 5 and a request.
+// Fuzz inputs for fuzzGuestBuildRequest: raw mode 5 followed by a request.
 const guest_request_fuzz_corpus = corpus: {
     var corpus: [3 * guest_exec_request_seeds.len][]const u8 = undefined;
     for (guest_exec_request_seeds, 0..) |seed, i| {
-        corpus[3 * i] = guestRawRequestFuzzInput(seed.body ++ "}\n");
-        corpus[3 * i + 1] = guestRawRequestFuzzInput(seed.body ++ seed.last_member ++ "}\n");
-        corpus[3 * i + 2] = guestRawRequestFuzzInput(seed.body ++ guest_exec_request_unknown_member ++ "}\n");
+        corpus[3 * i] = fuzz_support.sliceSeed("\x05" ++ seed.body ++ "}\n");
+        corpus[3 * i + 1] = fuzz_support.sliceSeed("\x05" ++ seed.body ++ seed.last_member ++ "}\n");
+        corpus[3 * i + 2] = fuzz_support.sliceSeed("\x05" ++ seed.body ++ guest_exec_request_unknown_member ++ "}\n");
     }
     break :corpus corpus;
 };
-
-fn guestRawRequestFuzzInput(comptime request: []const u8) []const u8 {
-    comptime {
-        const payload = "\x05" ++ request;
-        var len: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len, payload.len, .little);
-        return len ++ payload;
-    }
-}
 
 fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
@@ -1843,13 +1834,14 @@ fn fuzzGuestBuildResolvTarget(_: void, s: *std.testing.Smith) !void {
 fn fuzzGuestCopyTree(_: void, s: *std.testing.Smith) !void {
     if (comptime guest_agent_fuzz_supported) {
         const io = std.testing.io;
-        const tmp = "zig-cache/fuzz-guest-copy-tree";
-        const source = tmp ++ "/source";
-        const dest = tmp ++ "/dest";
-        Io.Dir.cwd().deleteTree(io, tmp) catch {};
-        defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-        try Io.Dir.cwd().createDirPath(io, source);
-        try Io.Dir.cwd().createDirPath(io, dest);
+        var tmp = fuzz_support.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "source");
+        try tmp.dir.createDirPath(io, "dest");
+        var source_buf: [64]u8 = undefined;
+        var dest_buf: [64]u8 = undefined;
+        const source = try std.fmt.bufPrint(&source_buf, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+        const dest = try std.fmt.bufPrint(&dest_buf, ".zig-cache/tmp/{s}/dest", .{tmp.sub_path});
         var bytes: [256]u8 = undefined;
         const len = s.slice(&bytes);
         _ = spore_build_copy_fuzz_tree(source.ptr, source.len, dest.ptr, dest.len, bytes[0..len].ptr, len);
@@ -3174,11 +3166,28 @@ test "ENOSPC detector survives output truncation and frame splits" {
     try std.testing.expect(stable.seen);
 }
 
+// One fuzz call per test: the fuzzer keeps one corpus per test, and with a
+// single test selected the first call would take every run.
 test "fuzz build control request framing" {
     try std.testing.fuzz({}, fuzzSimpleRequest, .{});
+}
+
+test "fuzz build copy request framing" {
     try std.testing.fuzz({}, fuzzCopyRequest, .{});
+}
+
+test "fuzz guest build request parser" {
     try std.testing.fuzz({}, fuzzGuestBuildRequest, .{ .corpus = &guest_request_fuzz_corpus });
+}
+
+test "fuzz guest proc stat parser" {
     try std.testing.fuzz({}, fuzzGuestProcStat, .{});
+}
+
+test "fuzz guest build resolv target" {
     try std.testing.fuzz({}, fuzzGuestBuildResolvTarget, .{});
+}
+
+test "fuzz guest copy tree" {
     try std.testing.fuzz({}, fuzzGuestCopyTree, .{});
 }

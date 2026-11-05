@@ -7,6 +7,7 @@
 const std = @import("std");
 const zmoltcp = @import("zmoltcp");
 
+const fuzz_support = @import("fuzz_support.zig");
 const spore_net = @import("spore_net.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 
@@ -1422,9 +1423,9 @@ fn fuzzGatewayReceiveFrame(_: void, s: *std.testing.Smith) !void {
 test "fuzz spore-netd TCP gateway guest frames" {
     // A SYN to the bound service, its ACK with data, then a denied SYN.
     try std.testing.fuzz({}, fuzzGatewayReceiveFrame, .{ .corpus = &.{
-        "\x02\x01\x00\x00\x00\x00\x00\x50\xc0\x00\x00\x00\x03\xe8\x00\x00\x00\x00\x04\x00\x00" ++
+        fuzz_support.sliceSeed("\x02\x01\x00\x00\x00\x00\x00\x50\xc0\x00\x00\x00\x03\xe8\x00\x00\x00\x00\x04\x00\x00" ++
             "\x18\x01\x00\x00\x00\x00\x00\x50\xc0\x00\x00\x00\x03\xe9\x00\x00\x00\x01\x04\x00\x04ping" ++
-            "\x02\x00\x5d\xb8\xd8\x22\x01\xbb\xc0\x01\x00\x00\x07\xd0\x00\x00\x00\x00\x04\x00\x00",
+            "\x02\x00\x5d\xb8\xd8\x22\x01\xbb\xc0\x01\x00\x00\x07\xd0\x00\x00\x00\x00\x04\x00\x00"),
     } });
 }
 
