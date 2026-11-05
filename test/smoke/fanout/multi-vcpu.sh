@@ -316,6 +316,9 @@ jsonl_output_contains "${resume_stdout}" stdout "spore finite" || {
 grep -Fq '"exit_code":0' "${resume_stdout}" || die "multi-vCPU attach did not report exit_code 0"
 
 if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
+  # Pinned named saves of disk-backed VMs must be on the rootfs cache's
+  # filesystem, and the saves below go to the work directory.
+  export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
   named_dir="${workdir}/named.spore"
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${vm_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"; then
     cat "${workdir}/create.stdout" >&2 || true
@@ -377,9 +380,9 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
     >"${workdir}/explicit-rootfs-build.stdout" 2>"${workdir}/explicit-rootfs-build.stderr"
   run_disk_point_in_time_case explicit-rootfs --rootfs "${explicit_rootfs}"
 
-  # The default memory contract is auto/16GiB. Keep this as a separate sparse
-  # diskless save so the native gate records its complete source pause without
-  # conflating it with rootfs publication work.
+  # Default memory is a fixed 512 MiB. Keep this as a separate diskless save so
+  # the native gate records its complete source pause without conflating it
+  # with rootfs publication work.
   auto_name="${vm_name}-auto"
   auto_dir="${workdir}/auto.spore"
   if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --debug create "${auto_name}" \
@@ -393,8 +396,8 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   fi
   expect_named_online_cpus "${auto_name}" "auto-cpus-online"
   save_named_with_metrics "${auto_name}" "${auto_dir}" "default-auto-memory"
-  [[ "$(json_field "${auto_dir}/manifest.json" platform.ram_size)" == "17179869184" ]] || \
-    die "default-memory save did not preserve the 16GiB auto contract"
+  [[ "$(json_field "${auto_dir}/manifest.json" platform.ram_size)" == "536870912" ]] || \
+    die "default-memory save did not keep the 512 MiB default"
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${auto_name}" >/dev/null
   SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${auto_dir}" >/dev/null
 
