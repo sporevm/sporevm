@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 
+const deadline = @import("deadline.zig");
 const fd_util = @import("fd.zig");
 const machine_output = @import("machine_output.zig");
 const run_mod = @import("run.zig");
@@ -533,21 +534,10 @@ fn terminateChildren(children: []RunningChild, signal: std.posix.SIG) void {
 }
 
 fn terminateAfter(children: []RunningChild, duration_ms: u64, done: *std.atomic.Value(bool)) void {
-    if (sleepUntilDone(duration_ms, done)) return;
+    if (deadline.sleepFor(deadline.system_clock, duration_ms, 100, done)) return;
     terminateChildren(children, .TERM);
-    if (sleepUntilDone(2 * std.time.ms_per_s, done)) return;
+    if (deadline.sleepFor(deadline.system_clock, 2 * std.time.ms_per_s, 100, done)) return;
     terminateChildren(children, .KILL);
-}
-
-fn sleepUntilDone(duration_ms: u64, done: *std.atomic.Value(bool)) bool {
-    var remaining = duration_ms;
-    while (remaining > 0) {
-        if (done.load(.acquire)) return true;
-        const step = @min(remaining, 100);
-        sleepMs(step);
-        remaining -= step;
-    }
-    return done.load(.acquire);
 }
 
 fn termOk(term: std.process.Child.Term, duration_limited: bool) bool {
