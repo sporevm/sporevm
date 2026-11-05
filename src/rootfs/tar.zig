@@ -358,13 +358,16 @@ fn applyTarRecordsToMergedTree(
 
         try accountTarEntry(&limits);
 
+        // The deferred reset below clears pax.path and long_name first, so
+        // decide ownership of raw_name now.
+        const owns_name = pax.path == null and long_name == null;
         const raw_name = if (pax.path) |p|
             p
         else if (long_name) |p|
             p
         else
             try record.name(allocator);
-        defer if (pax.path == null and long_name == null) allocator.free(raw_name);
+        defer if (owns_name) allocator.free(raw_name);
         const payload_size = pax.size orelse record.size;
         records.setPayloadSize(payload_size);
         defer {
@@ -1761,6 +1764,30 @@ test "pax size overrides ustar file size" {
     try expectMergedFileData(allocator, &tree, "file", "hello");
 }
 
+test "pax paths and GNU long names name the next entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    var block = [_]u8{0} ** 4096;
+    const pax_record = "17 path=pax-name\n";
+    makeTarHeader(block[0..512], "pax", 'x', pax_record.len);
+    @memcpy(block[512 .. 512 + pax_record.len], pax_record);
+    makeTarHeader(block[1024..1536], "ignored", '0', 1);
+    block[1536] = 'p';
+    const long_name = "gnu-name\x00";
+    makeTarHeader(block[2048..2560], "././@LongLink", 'L', long_name.len);
+    @memcpy(block[2560 .. 2560 + long_name.len], long_name);
+    makeTarHeader(block[3072..3584], "ignored", '0', 1);
+    block[3584] = 'g';
+
+    try applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block);
+    try expectMergedFileData(allocator, &tree, "pax-name", "p");
+    try expectMergedFileData(allocator, &tree, "gnu-name", "g");
+    try std.testing.expect(tree.entries.get("ignored") == null);
+}
+
 test "root tar entries are ignored only for directories" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1835,12 +1862,14 @@ fn fuzzTarLayer(_: void, s: *std.testing.Smith) !void {
     var buf: [8192]u8 = undefined;
     const len = s.slice(&buf);
 
+    // The checking allocator, not an arena, so leaks and double frees on
+    // error paths fail the run.
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var tree = MergedTree.init(arena_state.allocator());
-    applyTestLayer(arena_state.allocator(), &tmp, &tree, "layer.tar", buf[0..len]) catch return;
+    var tree = MergedTree.init(allocator);
+    defer tree.deinit(allocator);
+    applyTestLayer(allocator, &tmp, &tree, "layer.tar", buf[0..len]) catch return;
 }
 
 test "fuzz OCI tar layer parsing" {
