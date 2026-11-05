@@ -4116,6 +4116,7 @@ pub const InteractiveExecRequestOptions = struct {
     terminal_name: []const u8 = "xterm",
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
     resume_time_unix_ns: u64 = 0,
+    generation_params: ?[]const u8 = null,
 };
 
 pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: InteractiveExecRequestOptions) ![]const u8 {
@@ -4127,6 +4128,7 @@ pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []c
         .terminal_name = options.terminal_name,
         .terminal_size = options.terminal_size,
         .resume_time_unix_ns = options.resume_time_unix_ns,
+        .generation_params = options.generation_params,
     };
     try validateGuestArgv(argv);
     try validateGuestExecOptions(exec_options);

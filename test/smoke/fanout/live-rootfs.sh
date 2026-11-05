@@ -1,33 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
 count="${SPORE_SMOKE_LIVE_ROOTFS_FANOUT_COUNT:-3}"
 case "${count}" in
@@ -38,7 +15,9 @@ esac
 image_ref="${SPORE_SMOKE_LIVE_ROOTFS_IMAGE:-docker.io/library/ruby:3.3-alpine}"
 platform="${SPORE_SMOKE_LIVE_ROOTFS_PLATFORM:-linux/arm64}"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-live-rootfs-fanout.XXXXXX")"
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-live-rootfs-fanout"
+# Image-backed saves must share a filesystem with the rootfs cache.
+export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 run_pid=""
 watchdog_pid=""
 cleanup() {
@@ -50,9 +29,7 @@ cleanup() {
     kill "${watchdog_pid}" >/dev/null 2>&1 || true
     wait "${watchdog_pid}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${workdir}"
 }
-trap cleanup EXIT
 
 capture_dir="${workdir}/live-rootfs.spore"
 fork_dir="${workdir}/children"
@@ -129,7 +106,7 @@ fi
 children=()
 while IFS= read -r child; do
   children+=("${child}")
-done < <(find "${fork_dir}" -mindepth 1 -maxdepth 1 -type d | sort)
+done < <(fork_children "${fork_dir}")
 [[ "${#children[@]}" == "${count}" ]] || die "expected ${count} child spores, found ${#children[@]}"
 
 set +e

@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
+require_spore_bin
 
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
-
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-cgroup.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-cgroup"
 
 set +e
 "${spore_bin}" run -- /bin/cgroupcheck >"${workdir}/stdout" 2>"${workdir}/stderr"

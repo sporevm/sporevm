@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
+require_spore_bin
 
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
-
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-net-forward.XXXXXX")"
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-net-forward"
 run_pid=""
-trap '[[ -n "${run_pid}" ]] && kill "${run_pid}" 2>/dev/null || true; rm -rf "${workdir}"' EXIT
+cleanup() {
+  [[ -z "${run_pid}" ]] || kill "${run_pid}" 2>/dev/null || true
+}
 
 host_port="$(python3 - <<'PY'
 import socket

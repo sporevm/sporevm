@@ -8,6 +8,7 @@
 const std = @import("std");
 const aarch64_topology = @import("../aarch64/topology.zig");
 const capture = @import("../capture.zig");
+const deadline = @import("../deadline.zig");
 const disk_layer = @import("../disk_layer.zig");
 const local_paths = @import("../local_paths.zig");
 const rootfs_mod = @import("../rootfs.zig");
@@ -453,10 +454,11 @@ pub fn run(allocator: std.mem.Allocator, input_config: Config) !ExitCause {
     var exit: *hvf.VcpuExit = undefined;
     try hvf.check(hvf.hv_vcpu_create(&vcpu, &exit, null), "hv_vcpu_create");
     defer _ = hvf.hv_vcpu_destroy(vcpu);
+    var capture_wake: capture.WakeThread = .{};
     if (config.capture_request) |request_capture| {
-        request_capture.setWake(wakeCaptureVcpu, &vcpu);
+        try capture_wake.start(request_capture, wakeCaptureVcpu, &vcpu);
     }
-    defer if (config.capture_request) |request_capture| request_capture.clearWake();
+    defer if (config.capture_request) |request_capture| capture_wake.stop(request_capture);
     if (config.exec_control) |control| {
         control.setWake(.{ .context = &vcpu, .wakeFn = wakeVcpu });
     }
@@ -1141,10 +1143,11 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     if (options.config.exec_control) |control| {
         control.setWake(.{ .context = &wake_set, .wakeFn = wakeVcpuSet });
     }
+    var capture_wake: capture.WakeThread = .{};
     if (options.config.capture_request) |request_capture| {
-        request_capture.setWake(wakeCaptureVcpuSet, &wake_set);
+        try capture_wake.start(request_capture, wakeCaptureVcpuSet, &wake_set);
     }
-    defer if (options.config.capture_request) |request_capture| request_capture.clearWake();
+    defer if (options.config.capture_request) |request_capture| capture_wake.stop(request_capture);
 
     const contexts = try allocator.alloc(MultiHvfThreadContext, vcpus.len);
     defer allocator.free(contexts);
@@ -2113,7 +2116,7 @@ const DirtyTracker = struct {
         while (true) {
             const now = monotonicMs();
             const wait_ms = if (next_deadline > now) next_deadline - now else 0;
-            if (self.waitForStop(wait_ms)) return;
+            if (deadline.sleepFor(deadline.system_clock, wait_ms, 10, &self.core.stop)) return;
             const epoch_start = monotonicMs();
             self.flushDirty(false) catch {
                 self.markWorkerFailed();
@@ -2123,18 +2126,6 @@ const DirtyTracker = struct {
             self.recordWorkerEpochTiming(epoch_start, epoch_end, next_deadline);
             next_deadline = epoch_start +| self.core.epoch_ms;
         }
-    }
-
-    fn waitForStop(self: *DirtyTracker, wait_ms: u64) bool {
-        var slept_ms: u64 = 0;
-        while (slept_ms < wait_ms) {
-            if (self.core.stop.load(.acquire)) return true;
-            const remaining = wait_ms - slept_ms;
-            const slice_ms = @min(remaining, 10);
-            sleepMs(slice_ms);
-            slept_ms += slice_ms;
-        }
-        return self.core.stop.load(.acquire);
     }
 
     fn markWorkerFailed(self: *DirtyTracker) void {

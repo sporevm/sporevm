@@ -1,28 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    Linux-x86_64) echo "kvm" ;;
-    *) die "cannot infer a supported backend; set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
+require_spore_bin
 image_ref="${SPORE_SMOKE_IMAGE:-docker.io/library/alpine:3.20}"
 if [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]]; then
   default_smoke_memory="512mib"
@@ -35,8 +17,7 @@ else
 fi
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-${default_smoke_memory%mib}}mib}"
 smoke_platform="${SPORE_SMOKE_PLATFORM:-${default_smoke_platform}}"
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-run-image-commit.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-run-image-commit"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 
 expect_rejected() {

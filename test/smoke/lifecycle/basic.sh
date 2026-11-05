@@ -1,73 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
-
-run_capture() {
-  local stdout_path="$1"
-  local stderr_path="$2"
-  shift 2
-
-  set +e
-  "$@" >"${stdout_path}" 2>"${stderr_path}"
-  local status=$?
-  set -e
-  return "${status}"
-}
-
-require_success() {
-  local status="$1"
-  local label="$2"
-  local stderr_path="$3"
-  [[ "${status}" == "0" ]] && return
-  failed=1
-  cat "${stderr_path}" >&2 || true
-  die "${label} exited ${status}, expected 0"
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle.XXXXXX")"
-runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
-mkdir -p "${runtime_parent}"
-runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-life.XXXXXX")"
-chmod 700 "${runtime_dir}" 2>/dev/null || true
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle"
+smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-life"
 
 vm_name="life-${backend}-$$"
 worker0="${vm_name}-worker-0"
 worker1="${vm_name}-worker-1"
 created=0
 worker_created=0
-failed=0
 cleanup() {
-  if [[ "${failed}" == "1" && -n "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]]; then
-    echo "smoke:lifecycle kept workdir=${workdir} runtime_dir=${runtime_dir}" >&2
-    return
-  fi
   if [[ "${worker_created}" == "1" ]]; then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${worker0}" >/dev/null 2>&1 || true
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${worker1}" >/dev/null 2>&1 || true
@@ -75,10 +22,7 @@ cleanup() {
   if [[ "${created}" == "1" ]]; then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${runtime_dir}"
-  rm -rf "${workdir}"
 }
-trap cleanup EXIT
 
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 timeout_ms="${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}"
@@ -364,8 +308,7 @@ import sys
 
 path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    payload = json.load(fh)
-entries = payload.get("entries", []) if isinstance(payload, dict) else payload
+    entries = json.load(fh)["entries"]
 
 ready_names = {entry.get("name") for entry in entries if entry.get("state") == "ready"}
 missing = [name for name in names if name not in ready_names]
@@ -410,8 +353,7 @@ import sys
 
 path, *names = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    payload = json.load(fh)
-entries = payload.get("entries", []) if isinstance(payload, dict) else payload
+    entries = json.load(fh)["entries"]
 
 remaining = {entry.get("name") for entry in entries}
 unexpected = [name for name in names if name in remaining]

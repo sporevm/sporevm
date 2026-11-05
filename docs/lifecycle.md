@@ -473,7 +473,7 @@ measure CLI process wall time.
 
 Monitor processes deny child process execution through an embedded macOS
 sandbox profile or Linux seccomp filter after optional startup helpers are
-spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
+spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
 
 ## Limits
 
@@ -521,13 +521,13 @@ spawned. `mise run smoke:monitor-jail` covers the denied-operation path.
 Useful focused checks:
 
 ```bash
-mise run smoke:lifecycle
-mise run smoke:lifecycle-copy
-mise run smoke:lifecycle-tty
-mise run smoke:lifecycle-auto-memory
-mise run smoke:monitor-jail
-mise run smoke:monitor-failure-modes
-mise run smoke:named-disk-fork
+test/smoke/lifecycle/basic.sh
+test/smoke/lifecycle/copy.sh
+test/smoke/lifecycle/tty.sh
+test/smoke/lifecycle/auto-memory.sh
+test/smoke/monitor/jail.sh
+test/smoke/monitor/failure-modes.sh
+test/smoke/fanout/named-disk-fork.sh
 scripts/benchmark/sporevm-lifecycle.sh
 scripts/benchmark/sporevm-lifecycle.sh --backend kvm --image docker.io/library/node:22-bookworm-slim -n 3 --max-cleanup-ms 1000
 ```

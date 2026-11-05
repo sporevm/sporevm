@@ -1,21 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 image="${SPORE_STDIN_IMAGE:-docker.io/library/alpine:3.20}"
-timeout_bin="${TIMEOUT_BIN:-$(command -v timeout || command -v gtimeout || true)}"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
+require_spore_bin
 
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
-[[ -n "${timeout_bin}" ]] || die "timeout binary not found"
-
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-run-stdin.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-stdin"
 
 printf hi | "${spore_bin}" run -i --image "${image}" -- /bin/cat >"${workdir}/interactive.stdout" 2>"${workdir}/interactive.stderr"
 grep -Fxq "hi" "${workdir}/interactive.stdout" || {
@@ -27,7 +18,7 @@ grep -Fxq "hi" "${workdir}/interactive.stdout" || {
   die "spore run -i wrote unexpected stderr"
 }
 
-printf hi | "${timeout_bin}" 30s "${spore_bin}" run --image "${image}" -- /bin/sh -lc 'if read x; then printf "read:%s\n" "$x"; else printf "eof\n"; fi' >"${workdir}/default.stdout" 2>"${workdir}/default.stderr"
+printf hi | with_timeout 30 "${spore_bin}" run --image "${image}" -- /bin/sh -lc 'if read x; then printf "read:%s\n" "$x"; else printf "eof\n"; fi' >"${workdir}/default.stdout" 2>"${workdir}/default.stderr"
 grep -Fxq "eof" "${workdir}/default.stdout" || {
   cat "${workdir}/default.stdout" >&2 || true
   die "spore run without -i did not leave guest stdin at EOF"

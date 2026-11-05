@@ -276,10 +276,10 @@ State portability checks should use product-created spores wherever possible:
 Current evidence:
 
 - Product smokes cover same-host diskless capture/resume, diskless fork/fan-out,
-  and OCI-rootfs child execution through `mise run smoke`,
-  `mise run smoke:counter-fanout`, and `mise run smoke:rootfs-fanout`.
+  and OCI-rootfs child execution through `mise run smoke core` and
+  `test/smoke/fanout/rootfs.sh`.
 - Local writable rootfs persistence, fork divergence, and local
-  bundle-carried disk index replay are covered by `mise run smoke:writable-rootfs`.
+  bundle-carried disk index replay are covered by `test/smoke/rootfs/writable.sh`.
 - Same-class KVM writable-rootfs bundle materialization previously passed on
   two `a1.metal` hosts in run `writable-rootfs-20260619T212758Z`.
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records

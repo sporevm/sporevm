@@ -10,6 +10,7 @@ const rootfs_cas = @import("rootfs_cas.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const snapshot_publication = @import("snapshot_publication.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
+const generation = @import("generation.zig");
 const Io = std.Io;
 const net = std.Io.net;
 
@@ -228,6 +229,11 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const spec_disk_baseline_lease = if (existing_spec) |spec| spec.value.disk_baseline_lease else null;
     const spec_disk_fork_claim = if (existing_spec) |spec| spec.value.disk_fork_claim else null;
     const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
+    const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
+        var gen_dev = generation.Device{};
+        try gen_dev.restore(allocator, state);
+        break :blk try allocator.dupe(u8, gen_dev.paramsPayload());
+    } else null;
     const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
     const spec_exec_defaults = if (existing_spec) |spec| spec.value.exec_defaults orelse lifecycle.ExecDefaults{} else lifecycle.ExecDefaults{};
     const spec_sessions = if (existing_spec) |spec|
@@ -292,7 +298,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     });
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_exec_defaults);
+    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
     if (spec_disk_baseline_lease) |lease| {
@@ -439,6 +445,7 @@ const ExecServer = struct {
     guest_port: u32,
     timeout_ms: u64,
     server: net.Server,
+    generation_params: ?[]const u8,
     exec_defaults: lifecycle.ExecDefaults,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -491,7 +498,7 @@ const ExecServer = struct {
     disk_baseline_active: ?runtime_disk_lease.Active = null,
     snapshot_publication_wait: snapshot_publication.Wait = .{},
 
-    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
         // sun_path holds only 104; enforce the real platform limit before
         // listen so an oversized path fails with a clear log line instead
@@ -527,6 +534,7 @@ const ExecServer = struct {
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = 8 }),
+            .generation_params = generation_params,
             .exec_defaults = exec_defaults,
             .disk_claims = runtime_disk_claim.Registry.init(allocator),
             .session_nonce = session_nonce,
@@ -863,6 +871,7 @@ const ExecServer = struct {
             .terminal_name = terminal_name,
             .terminal_size = terminal_size,
             .resume_time_unix_ns = self.wallClockUnixNs(),
+            .generation_params = self.generation_params,
         });
     }
 
@@ -2366,6 +2375,22 @@ test "monitor records the exact generated request sequence for stream logging" {
         "monitor vsock stream start: kind=exec session_id=lifecycle-123456789abcdef-41 host_port=54321",
         formatExecHostStreamStart(&log_buffer, server.session_nonce, server.active_session_sequence, 54321),
     );
+}
+
+test "streaming named exec carries the restored generation" {
+    var server: ExecServer = undefined;
+    server.allocator = std.testing.allocator;
+    server.io = std.testing.io;
+    server.exec_defaults = .{};
+    server.generation_params = "{\"generation\":2,\"vm_id\":\"child-0\"}";
+    server.session_nonce = 1;
+    server.next_session_id = 1;
+
+    const request = try server.interactiveExecRequest(&.{"/bin/gencheck"}, &.{}, null, false, false, "xterm", .{ .rows = 24, .cols = 80 });
+    defer std.testing.allocator.free(request);
+    const parsed = try std.json.parseFromSlice(struct { params_json: []const u8 }, std.testing.allocator, request, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(server.generation_params.?, parsed.value.params_json);
 }
 
 test "monitor host streams use nonce-seeded ports without early reuse" {

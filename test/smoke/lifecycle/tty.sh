@@ -1,77 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 image="${SPORE_LIFECYCLE_TTY_IMAGE:-docker.io/library/alpine:3.20}"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer supported backend for $(uname -s)-$(uname -m); set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
-
-run_capture() {
-  local stdout_path="$1"
-  local stderr_path="$2"
-  shift 2
-
-  set +e
-  "$@" >"${stdout_path}" 2>"${stderr_path}"
-  local status=$?
-  set -e
-  return "${status}"
-}
-
-require_success() {
-  local status="$1"
-  local label="$2"
-  local stderr_path="$3"
-  [[ "${status}" == "0" ]] && return
-  cat "${stderr_path}" >&2 || true
-  die "${label} exited ${status}, expected 0"
-}
-
 backend="$(infer_backend)"
-case "${backend}" in
-  hvf|kvm) ;;
-  *) die "SPORE_BACKEND must be hvf or kvm" ;;
-esac
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+require_spore_bin
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle-tty.XXXXXX")"
-runtime_parent="${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}"
-mkdir -p "${runtime_parent}"
-runtime_dir="$(mktemp -d "${runtime_parent%/}/svm-life-tty.XXXXXX")"
-chmod 700 "${runtime_dir}" 2>/dev/null || true
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-lifecycle-tty"
+smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-life-tty"
 
 vm_name="life-tty-${backend}-$$"
 created=0
-failed=0
 cleanup() {
-  if [[ "${failed}" == "1" && -n "${SPORE_KEEP_SMOKE_WORKDIR:-}" ]]; then
-    echo "smoke:lifecycle-tty kept workdir=${workdir} runtime_dir=${runtime_dir}" >&2
-    return
-  fi
   if [[ "${created}" == "1" ]]; then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${runtime_dir}"
-  rm -rf "${workdir}"
 }
-trap cleanup EXIT
 
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 timeout_ms="${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}"
@@ -99,7 +44,6 @@ if run_capture "${create_stdout}" "${create_stderr}" \
   created=1
 else
   status=$?
-  failed=1
   require_success "${status}" "spore create" "${create_stderr}"
 fi
 
@@ -109,17 +53,14 @@ if printf 'named-input\n' | run_capture "${interactive_stdout}" "${interactive_s
   :
 else
   status=$?
-  failed=1
   require_success "${status}" "spore exec -i" "${interactive_stderr}"
 fi
 grep -Fxq "named-input" "${interactive_stdout}" || {
-  failed=1
   cat "${interactive_stdout}" >&2 || true
   cat "${interactive_stderr}" >&2 || true
   die "spore exec -i did not forward stdin through the monitor stream"
 }
 [[ ! -s "${interactive_stderr}" ]] || {
-  failed=1
   cat "${interactive_stderr}" >&2 || true
   die "spore exec -i wrote unexpected stderr"
 }
@@ -130,11 +71,9 @@ if run_capture "${bounded_stdout}" "${bounded_stderr}" \
   :
 else
   status=$?
-  failed=1
   require_success "${status}" "plain spore exec after interactive exec" "${bounded_stderr}"
 fi
 grep -Fxq "bounded-ok" "${bounded_stdout}" || {
-  failed=1
   cat "${bounded_stdout}" >&2 || true
   cat "${bounded_stderr}" >&2 || true
   die "plain spore exec did not work after interactive exec"
@@ -156,7 +95,6 @@ live_output=0
 for _ in $(seq 1 50); do
   if grep -Fq "stdout-prompt" "${streamed_stdout}" && grep -Fq "stderr-prompt" "${streamed_stderr}"; then
     kill -0 "${streamed_pid}" 2>/dev/null || {
-      failed=1
       die "plain spore exec delayed prompt output until command exit"
     }
     live_output=1
@@ -165,7 +103,6 @@ for _ in $(seq 1 50); do
   sleep 0.05
 done
 [[ "${live_output}" == "1" ]] || {
-  failed=1
   die "plain spore exec did not stream prompt output"
 }
 
@@ -174,7 +111,6 @@ wait "${streamed_pid}"
 streamed_status=$?
 set -e
 [[ "${streamed_status}" == "7" ]] || {
-  failed=1
   cat "${streamed_stderr}" >&2 || true
   die "plain streamed spore exec exited ${streamed_status}, expected 7"
 }
@@ -198,17 +134,14 @@ if run_capture "${tty_stdout}" "${tty_stderr}" \
   :
 else
   status=$?
-  failed=1
   require_success "${status}" "redirected spore exec -t" "${tty_stderr}"
 fi
 grep -Fq "tty-out" "${tty_stdout}" && grep -Fq "tty-err" "${tty_stdout}" || {
-  failed=1
   cat "${tty_stdout}" >&2 || true
   cat "${tty_stderr}" >&2 || true
   die "spore exec -t did not merge terminal output on redirected stdout"
 }
 [[ ! -s "${tty_stderr}" ]] || {
-  failed=1
   cat "${tty_stderr}" >&2 || true
   die "spore exec -t wrote separate stderr output"
 }
@@ -222,17 +155,14 @@ head -c "${bulk_bytes}" /dev/urandom >"${workdir}/bulk.bin"
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" exec -i "${vm_name}" -- /bin/sh -c 'cat > /tmp/spore-exec-bulk.bin' \
   <"${workdir}/bulk.bin" || {
-  failed=1
   die "bulk exec stdin transfer failed"
 }
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" exec -i "${vm_name}" -- /bin/cat /tmp/spore-exec-bulk.bin \
   </dev/null >"${workdir}/bulk-stdout.bin" || {
-  failed=1
   die "bulk exec stdout transfer failed"
 }
 cmp -s "${workdir}/bulk.bin" "${workdir}/bulk-stdout.bin" || {
-  failed=1
   die "bulk exec stdio roundtrip mismatch"
 }
 
@@ -248,12 +178,10 @@ wait "${failed_stream_pid}" 2>/dev/null || true
 after_failed_stream="$(env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" exec "${vm_name}" -- /bin/sh -c 'echo usable')"
 [[ "${after_failed_stream}" == "usable" ]] || {
-  failed=1
   die "VM unusable after deliberately failed stream"
 }
 
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null || {
-  failed=1
   die "named VM cleanup after streamed exec failed"
 }
 created=0
@@ -264,7 +192,7 @@ import sys
 
 path, removed = sys.argv[1:]
 with open(path, "r", encoding="utf-8") as fh:
-    entries = json.load(fh)
+    entries = json.load(fh)["entries"]
 if any(entry.get("name") == removed for entry in entries):
     raise SystemExit(f"removed VM still listed: {removed}")
 PY

@@ -1,25 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer a supported backend; set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 authoritative_cache_state() {
   local cache_root="$1"
@@ -35,10 +17,10 @@ authoritative_cache_state() {
 }
 
 backend="$(infer_backend)"
+require_spore_bin
 image_ref="${SPORE_SMOKE_IMAGE:-docker.io/library/alpine:3.20}"
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-run-disk-size.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-run-disk-size"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
 
 if "${spore_bin}" run --image "${image_ref}" --disk-size 2gb -- /bin/true >"${workdir}/invalid.stdout" 2>"${workdir}/invalid.stderr"; then

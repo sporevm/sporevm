@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
+
 usage() {
   cat <<'EOF'
 usage:
@@ -13,21 +15,16 @@ rootfs through `spore run --rootfs`.
 Options:
   --image REF        OCI image ref to build (default: docker.io/library/alpine:3.20)
   --platform VALUE   OCI platform to select (default: linux/arm64)
-  --workdir DIR      Work directory for smoke artifacts (default: mktemp)
+  --workdir DIR      Work directory for smoke artifacts (default: temporary, removed on exit)
   --output PATH      Rootfs ext4 output path (default: <workdir>/rootfs.ext4)
   --metadata PATH    Metadata output path (default: <output>.json)
-  --spore-bin PATH   Prebuilt spore CLI (default: zig-out/bin/spore)
+  --spore-bin PATH   Prebuilt spore CLI (default: SPORE_BIN or zig-out/bin/spore)
   --no-build         Do not run `zig build`
   -h, --help         Show this help
 
 Example:
   test/smoke/rootfs/oci-run.sh -- /bin/echo hi
 EOF
-}
-
-die() {
-  echo "error: $*" >&2
-  exit 1
 }
 
 need_value() {
@@ -43,7 +40,6 @@ shell_join() {
   done
 }
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 if [[ -f "${repo_root}/mise.toml" ]]; then
   case ":${MISE_TRUSTED_CONFIG_PATHS:-}:" in
     *":${repo_root}/mise.toml:"*) ;;
@@ -56,7 +52,6 @@ platform="linux/arm64"
 workdir=""
 output_path=""
 metadata_path=""
-spore_bin=""
 build=1
 run_argv=()
 
@@ -118,7 +113,7 @@ fi
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
 if [[ -z "${workdir}" ]]; then
-  workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-oci-rootfs-smoke.XXXXXX")"
+  smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-oci-rootfs-smoke"
 else
   mkdir -p "${workdir}"
 fi
@@ -129,9 +124,6 @@ fi
 if [[ -z "${metadata_path}" ]]; then
   metadata_path="${output_path}.json"
 fi
-if [[ -z "${spore_bin}" ]]; then
-  spore_bin="${repo_root}/zig-out/bin/spore"
-fi
 
 if [[ "${build}" == "1" ]]; then
   if command -v mise >/dev/null 2>&1; then
@@ -140,7 +132,7 @@ if [[ "${build}" == "1" ]]; then
     (cd "${repo_root}" && zig build)
   fi
 fi
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
+require_spore_bin
 
 printf 'workdir: %s\n' "${workdir}"
 printf 'building rootfs from %s for %s\n' "${image_ref}" "${platform}"

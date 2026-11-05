@@ -1,25 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
-infer_backend() {
-  if [[ -n "${SPORE_BACKEND:-}" ]]; then
-    echo "${SPORE_BACKEND}"
-    return
-  fi
-  case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) echo "hvf" ;;
-    Linux-aarch64|Linux-arm64) echo "kvm" ;;
-    *) die "cannot infer a supported backend; set SPORE_BACKEND=hvf or SPORE_BACKEND=kvm" ;;
-  esac
-}
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 rootfs_field() {
   local manifest="$1"
@@ -104,21 +86,14 @@ assert_no_resize() {
 }
 
 backend="$(infer_backend)"
+require_spore_bin
 image_ref="${SPORE_SMOKE_IMAGE:-docker.io/library/alpine@sha256:45e09956dc667c5eff3583c9d94830261fb1ca0be10a0a7db36266edf5de9e1d}"
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 capacity_16=$((16 * 1024 * 1024 * 1024))
 capacity_20=$((20 * 1024 * 1024 * 1024))
 sectors_16=$((capacity_16 / 512))
 sectors_20=$((capacity_20 / 512))
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-build-capacity.XXXXXX")"
-cleanup() {
-  if [[ "${SPORE_SMOKE_KEEP_WORKDIR:-0}" == "1" ]]; then
-    echo "retained smoke workdir: ${workdir}" >&2
-  else
-    rm -rf "${workdir}"
-  fi
-}
-trap cleanup EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-build-capacity"
 
 primary_cache="${workdir}/rootfs-cache"
 runtime_dir="${workdir}/runtime"

@@ -1544,6 +1544,7 @@ extern fn spore_agent_fuzz_rootfs_grow_geometry(target_blocks: u64, before_block
 extern fn spore_agent_fuzz_proc_stat(stat: [*]const u8, stat_len: usize) c_int;
 extern fn spore_agent_fuzz_build_resolv_target(target: [*]const u8, target_len: usize, logical: [*]u8, logical_cap: usize) c_int;
 extern fn spore_agent_test_bounded_readlink(target: [*]const u8, target_len: usize) c_int;
+extern fn spore_agent_test_exec_beside_running_session(captured_script: [*:0]const u8, request: [*]const u8, request_len: usize, input: [*]const u8, input_len: usize, response: [*]u8, response_cap: usize, captured_stdout: *u64) isize;
 extern fn spore_build_copy_test_confined_source_parent(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
 extern fn spore_build_copy_test_confined_mtime(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize, unix_seconds: i64) c_int;
 extern fn spore_build_copy_test_context_bind_source(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
@@ -2751,6 +2752,98 @@ test "builder and runtime share bounded guest PATH resolution" {
         @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
         spore_agent_test_resolve_exec_path(long_command, long_command.len, "/bin", 4, 1, &resolved, resolved.len),
     );
+}
+
+const BesideCapturedResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    exit_code: ?u32,
+    captured_stdout: u64,
+
+    fn deinit(self: BesideCapturedResult) void {
+        std.testing.allocator.free(self.stdout);
+        std.testing.allocator.free(self.stderr);
+    }
+};
+
+// Runs `argv` the way `spore exec` does, with `stdin` streamed and closed,
+// while the guest agent's captured session runs `/bin/sh -c captured_script`.
+fn execBesideCapturedSession(captured_script: [*:0]const u8, argv: []const []const u8, stdin: []const u8) !BesideCapturedResult {
+    const spore_stream = @import("../spore_stream.zig");
+    const allocator = std.testing.allocator;
+
+    const request = try run_mod.interactiveExecRequestWithSession(allocator, argv, "exec-1", .{});
+    defer allocator.free(request);
+    var input: [2 * spore_stream.header_len + 64]u8 = undefined;
+    const data = if (stdin.len == 0) input[0..0] else try spore_stream.writeFrame(input[0..], .{ .frame_type = .data, .stream_id = .stdin }, stdin);
+    const close = try spore_stream.writeFrame(input[data.len..], .{ .frame_type = .close, .stream_id = .stdin, .offset = stdin.len }, "");
+
+    var response: [8192]u8 = undefined;
+    var captured_stdout: u64 = 0;
+    const response_len = spore_agent_test_exec_beside_running_session(captured_script, request.ptr, request.len, &input, data.len + close.len, &response, response.len, &captured_stdout);
+    if (response_len <= 0) return error.AgentHarnessFailed;
+
+    var stdout: std.ArrayList(u8) = .empty;
+    errdefer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    errdefer stderr.deinit(allocator);
+    var exit_code: ?u32 = null;
+    var rest = response[0..@intCast(response_len)];
+    while (rest.len >= spore_stream.header_len) {
+        const header = try spore_stream.readHeader(rest[0..spore_stream.header_len]);
+        const payload = rest[spore_stream.header_len..][0..header.payload_len];
+        if (header.frame_type == .data and header.stream_id == .stdout) try stdout.appendSlice(allocator, payload);
+        if (header.frame_type == .data and header.stream_id == .stderr) try stderr.appendSlice(allocator, payload);
+        if (header.frame_type == .exit) exit_code = try spore_stream.readExitPayload(payload);
+        rest = rest[spore_stream.header_len + payload.len ..];
+    }
+    return .{
+        .stdout = try stdout.toOwnedSlice(allocator),
+        .stderr = try stderr.toOwnedSlice(allocator),
+        .exit_code = exit_code,
+        .captured_stdout = captured_stdout,
+    };
+}
+
+test "guest agent runs named exec beside a running captured session" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+
+    const result = try execBesideCapturedSession("read line", &.{ "/bin/sh", "-c", "read line; echo beside:$line" }, "hi\n");
+    defer result.deinit();
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings("beside:hi\n", result.stdout);
+    try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
+}
+
+test "guest agent drains the captured session while a named exec runs" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "drain");
+    const dir = try tmp.dir.realPathFileAlloc(io, "drain", allocator);
+    defer allocator.free(dir);
+
+    // The captured workload writes more than a pipe holds, then leaves a
+    // marker. The exec waits up to 10s for the marker, so it only succeeds if
+    // the agent keeps reading the captured output while the exec runs. A
+    // default pipe holds 16 pages, at most 1 MiB with 64 KiB pages.
+    const max_pipe_bytes = 1024 * 1024;
+    const captured_bytes = 4 * max_pipe_bytes;
+    const captured_script = try std.fmt.allocPrintSentinel(allocator, "head -c {d} /dev/zero && : > '{s}/written'", .{ captured_bytes, dir }, 0);
+    defer allocator.free(captured_script);
+    const wait_script = try std.fmt.allocPrint(allocator, "i=0; while [ ! -e '{s}/written' ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; [ -e '{s}/written' ] && echo beside:written", .{ dir, dir });
+    defer allocator.free(wait_script);
+
+    const result = try execBesideCapturedSession(captured_script.ptr, &.{ "/bin/sh", "-c", wait_script }, "");
+    defer result.deinit();
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings("beside:written\n", result.stdout);
+    try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
+    // At most one pipe of output can still be unread when the marker appears.
+    try std.testing.expect(result.captured_stdout >= captured_bytes - max_pipe_bytes);
 }
 
 test "build nofile limit is bounded" {

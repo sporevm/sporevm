@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
+
 mode="${1:-}"
-spore_bin="${2:-${SPORE_BIN:-${repo_root}/zig-out/bin/spore}}"
+spore_bin="${2:-${spore_bin}}"
 harness_bin="${3:-${repo_root}/zig-out/bin/spore-build-run-smoke}"
 helper_bin="${4:-${repo_root}/zig-out/bin/spore-build-smoke-sh}"
-tmp=""
-
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
 
 authoritative_cache_state() {
   local cache_root="$1"
@@ -32,17 +27,6 @@ authoritative_cache_state() {
   } | cksum | awk '{ print $1 ":" $2 }'
 }
 
-cleanup() {
-  if [[ -z "${tmp}" || ! -d "${tmp}" ]]; then
-    return
-  fi
-  case "$(basename "${tmp}")" in
-    "sporevm-build-${mode}-enospc."*) rm -rf -- "${tmp}" ;;
-    *) echo "warning: refusing to remove unexpected smoke workspace: ${tmp}" >&2 ;;
-  esac
-}
-trap cleanup EXIT
-
 case "${mode}" in
   block)
     destination="local/build-smoke-block-enospc:dev"
@@ -59,9 +43,8 @@ for executable in "${spore_bin}" "${harness_bin}" "${helper_bin}"; do
   [[ -x "${executable}" ]] || die "required smoke executable is missing or not executable: ${executable}"
 done
 
-temp_parent="${TMPDIR:-/tmp}"
-[[ "${temp_parent}" == /* ]] || die "TMPDIR must be absolute"
-tmp="$(mktemp -d "${temp_parent%/}/sporevm-build-${mode}-enospc.XXXXXX")"
+[[ "${TMPDIR:-/tmp}" == /* ]] || die "TMPDIR must be absolute"
+smoke_tempdir tmp "${TMPDIR:-/tmp}/sporevm-build-${mode}-enospc"
 "${harness_bin}" "${helper_bin}" "--${mode}-enospc" "${tmp}"
 
 cache_root="${tmp}/rootfs-cache"
