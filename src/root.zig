@@ -41,6 +41,7 @@ pub const memory = @import("memory.zig");
 pub const machine_output = @import("machine_output.zig");
 pub const monitor = @import("monitor.zig");
 pub const monitor_jail = @import("monitor_jail.zig");
+pub const named_copy_archive = @import("named_copy_archive.zig");
 pub const net_gateway = @import("net_gateway.zig");
 pub const platform = @import("platform.zig");
 pub const ram_restore = @import("ram_restore.zig");
@@ -123,6 +124,7 @@ test {
     testing.refAllDecls(machine_output);
     testing.refAllDecls(monitor);
     testing.refAllDecls(monitor_jail);
+    testing.refAllDecls(named_copy_archive);
     testing.refAllDecls(net_gateway);
     testing.refAllDecls(platform);
     testing.refAllDecls(ram_restore);
