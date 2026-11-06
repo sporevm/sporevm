@@ -269,7 +269,9 @@ pub fn ownerAlive(pid: OwnerPid) bool {
     return true;
 }
 
-fn ensurePrivateDir(io: Io, path: []const u8) !void {
+/// Creates `path` private to this user if it is missing, and fails with
+/// `InsecureRuntimeDir` if others can reach it.
+pub fn ensurePrivateDir(io: Io, path: []const u8) !void {
     try ensureDirPath(io, path);
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != .directory) return error.InvalidRuntimeDir;

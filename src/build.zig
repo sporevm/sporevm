@@ -3685,6 +3685,32 @@ test "unsupported reachable platform fails before context or base resolution" {
     try std.testing.expectEqualStrings("spore build FROM --platform must match linux/arm64", diagnostic.dockerfile.message);
 }
 
+test "an insecure runtime directory fails the build before it resolves a base" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-spore-build-insecure-runtime";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp ++ "/runtime");
+    if (std.c.chmod(tmp ++ "/runtime", 0o755) != 0) return error.IoFailed;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/Dockerfile", .data = "FROM local/missing:base\nRUN true\n" });
+    const cwd = try std.process.currentPathAlloc(io, arena);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, tmp ++ "/cache");
+    try env.put(local_paths.runtime_dir_env, try std.fs.path.resolve(arena, &.{ cwd, tmp, "runtime" }));
+    const init = testInit(allocator, io, &arena_state, &env);
+    try std.testing.expectError(error.InsecureRuntimeDir, build(init, arena, .{
+        .tag = "local/app:insecure-runtime",
+        .context_dir = tmp,
+        .dockerfile_path = tmp ++ "/Dockerfile",
+    }));
+}
+
 test "cross-architecture product platform fails before input IO" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

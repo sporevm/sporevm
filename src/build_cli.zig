@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const build_mod = @import("build.zig");
+const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -660,6 +661,12 @@ fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diag
         error.UnsupportedOnBuild => {
             try stderr.writeAll("spore build: reachable base image contains unsupported ONBUILD triggers\n");
         },
+        error.InvalidRuntimeDir => {
+            try stderr.print("spore build: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path\n", .{local_paths.runtime_dir_env});
+        },
+        error.InsecureRuntimeDir => {
+            try stderr.writeAll("spore build: insecure runtime directory; it must be private to the current user (mode 0700)\n");
+        },
         else => {
             if (diagnostic.instruction_line != 0) {
                 try stderr.print("spore build: Dockerfile line {d}: {s}\n", .{ diagnostic.instruction_line, @errorName(err) });
@@ -727,6 +734,19 @@ test "build CLI reports a recognized platform with no runtime backend" {
     try writeBuildError(&stderr.writer, error.UnsupportedPlatform, .{});
     try std.testing.expectEqualStrings(
         "spore build: runtime execution requires the native linux/arm64 or linux/amd64 platform\n",
+        stderr.written(),
+    );
+}
+
+test "build CLI explains a bad runtime directory" {
+    const allocator = std.testing.allocator;
+    var stderr: Io.Writer.Allocating = .init(allocator);
+    defer stderr.deinit();
+    try writeBuildError(&stderr.writer, error.InsecureRuntimeDir, .{});
+    try writeBuildError(&stderr.writer, error.InvalidRuntimeDir, .{});
+    try std.testing.expectEqualStrings(
+        "spore build: insecure runtime directory; it must be private to the current user (mode 0700)\n" ++
+            "spore build: invalid runtime directory; set SPOREVM_RUNTIME_DIR or XDG_RUNTIME_DIR to an absolute path\n",
         stderr.written(),
     );
 }

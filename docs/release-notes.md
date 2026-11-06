@@ -42,7 +42,8 @@ so `run --image`, saves and `cache gc` no longer wait for a long build.
 Builds that miss the same first step still run that stage once; a build that
 starts while another is mid-build may rerun steps the other has not recorded
 yet. `cache gc` and `prune` skip the build cache-mount disk while a build is
-using it.
+using it. Like lazy `run --image`, `spore build` now needs a runtime directory
+private to the current user and fails early if `SPOREVM_RUNTIME_DIR` is not.
 
 ### Format reset
 

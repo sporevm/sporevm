@@ -108,14 +108,19 @@ pub const StorageLeases = struct {
     runtime_root: []const u8,
     held: std.ArrayList(runtime_disk_lease.Active) = .empty,
 
+    /// Checks the runtime directory up front so a bad one fails the build
+    /// before it pulls anything.
     pub fn init(io: Io, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, cache_root: []const u8) !StorageLeases {
+        const runtime_root = try local_paths.runtimeRootPath(allocator, environ);
+        errdefer allocator.free(runtime_root);
+        try runtime_disk_lease.ensurePrivateDir(io, runtime_root);
         const cwd = try std.process.currentPathAlloc(io, allocator);
         defer allocator.free(cwd);
         return .{
             .io = io,
             .allocator = allocator,
             .cache_root = try std.fs.path.resolve(allocator, &.{ cwd, cache_root }),
-            .runtime_root = try local_paths.runtimeRootPath(allocator, environ),
+            .runtime_root = runtime_root,
         };
     }
 
