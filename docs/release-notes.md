@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### `spore push` writes spores to image stores
+
+`spore push SPORE STORE/TAG` now writes a saved spore to a directory or S3
+image store: its RAM chunks and disk objects go in the store's shared
+`objects/`, so a spore pushed to a store holding its image uploads only its
+RAM, changed disk chunks, disk index and manifest. It prints the
+digest-pinned ref, and `--json` prints `spore.push.result.v2`. Pushing a
+bundle directory to S3 (`spore push BUNDLE s3://... [--region]`) is gone;
+copy a bundle with `aws s3 sync` to pull it with `spore pull s3://...`.
+
 ### Performance
 
 - On aarch64 each virtio-blk disk serves its requests on a thread of its own

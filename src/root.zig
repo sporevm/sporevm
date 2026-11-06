@@ -74,6 +74,7 @@ pub const spore_net = @import("spore_net.zig");
 pub const spore_net_policy = @import("spore_net_policy.zig");
 pub const spore_netd = @import("spore_netd.zig");
 pub const spore_netd_tcp = @import("spore_netd_tcp.zig");
+pub const spore_store = @import("spore_store.zig");
 pub const spore_stream = @import("spore_stream.zig");
 pub const spore = @import("spore.zig");
 const spore_fork = @import("spore_fork.zig");
@@ -162,6 +163,7 @@ test {
     testing.refAllDecls(spore_net_policy);
     testing.refAllDecls(spore_netd);
     testing.refAllDecls(spore_netd_tcp);
+    testing.refAllDecls(spore_store);
     testing.refAllDecls(spore_stream);
     testing.refAllDecls(spore_fork);
     testing.refAllDecls(system);

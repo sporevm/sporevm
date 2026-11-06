@@ -31,6 +31,7 @@ const gicv3 = @import("aarch64/gicv3.zig");
 const spore = @import("spore.zig");
 const spore_fork = @import("spore_fork.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
+const spore_store = @import("spore_store.zig");
 const topology = @import("topology.zig");
 
 pub const ImageArchivePackOptions = image_archive.PackOptions;
@@ -302,26 +303,11 @@ pub const CloneResult = struct {
     ownership: []const u8 = saved_spore_ownership.portable_self_contained,
 };
 
-/// Options for pushing a bundle to a remote destination.
-pub const PushOptions = struct {
-    bundle_dir: []const u8,
-    destination: []const u8,
-    aws_region: ?[]const u8 = null,
-    aws_executable: []const u8 = "aws",
-};
+/// Options for pushing a saved spore to an image store.
+pub const PushOptions = spore_store.PushOptions;
 
 /// Result returned by `push`.
-pub const PushResult = struct {
-    schema: []const u8 = "spore.push.result.v1",
-    schema_version: u32 = 1,
-    resource_type: ResourceType = .bundle,
-    source: []const u8,
-    destination: []const u8,
-    store: []const u8 = "s3",
-    bundle_digest: []const u8,
-    uploaded_file_count: usize,
-    uploaded_bytes: u64,
-};
+pub const PushResult = spore_store.PushResult;
 
 /// Options for pulling a bundle into a local spore directory.
 pub const PullOptions = struct {
@@ -1064,27 +1050,13 @@ test "clone spore makes a pinned save independently portable" {
     try std.testing.expectEqualStrings("owned elsewhere", try std.Io.Dir.cwd().readFileAlloc(io, sentinel, arena, .limited(64)));
 }
 
-/// Push a bundle to a remote destination.
+/// Push a saved spore to a directory or S3 image store.
 pub fn push(
     context: Context,
     allocator: std.mem.Allocator,
     options: PushOptions,
 ) !PushResult {
-    const result = try bundle.push(allocator, .{
-        .io = context.io,
-        .bundle_dir = options.bundle_dir,
-        .destination = options.destination,
-        .aws_region = options.aws_region,
-        .aws_executable = options.aws_executable,
-    });
-    return .{
-        .source = result.source,
-        .destination = result.destination,
-        .store = result.store,
-        .bundle_digest = result.bundle_digest,
-        .uploaded_file_count = result.uploaded_file_count,
-        .uploaded_bytes = result.uploaded_bytes,
-    };
+    return spore_store.push(context, allocator, options);
 }
 
 /// Inspect bundle metadata without materializing a child spore.
