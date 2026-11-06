@@ -88,13 +88,15 @@ allocation; explicit overrides are eagerly loaded and retained. This prevents
 two producer versions that happen to emit the same prepared index from
 aliasing downstream step results.
 
-Build publication keeps the exclusive rootfs cache lock through final image-ref
-replacement. A quiesced rootfs checkpoint durably publishes verified objects
-first and its canonical index second; only then does the build publish the
-completeness stamp and atomically replace the step record. Final image metadata
-and the mutable local ref are published after the selected storage is
-revalidated. PREPARE records use the existing step-record GC root and introduce
-no portable manifest, rootfs descriptor, index, or object kind.
+A build holds the exclusive rootfs cache lock only to look up step records and
+emit its context disk, seal a checkpoint, and publish the final image;
+process-owned runtime leases keep every storage it uses from GC in between. A
+quiesced rootfs checkpoint durably publishes verified objects first and its
+canonical index second; only then does the build publish the completeness
+stamp and atomically replace the step record. Final image metadata and the
+mutable local ref are published after the selected storage is revalidated.
+PREPARE records use the existing step-record GC root and introduce no portable
+manifest, rootfs descriptor, index, or object kind.
 
 Rootfs cache GC prunes records from older builder versions, malformed or
 incomplete known records, and semantically stale builder-v9 records. Unknown

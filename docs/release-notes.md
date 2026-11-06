@@ -34,6 +34,14 @@ manifest, config and index local, fetching each rootfs object the guest reads
 on first use. `--save`, `--commit` and `spore save` are refused for images run
 from a store. See `docs/image-format.md`.
 
+### Builds no longer block the cache
+
+`spore build` holds the rootfs cache lock only to look up step records, seal
+each step, and publish the image, and leases the storage it uses in between,
+so `run --image`, saves and `cache gc` no longer wait for a long build.
+Concurrent builds of the same step still run it once. `cache gc` and `prune`
+skip the build cache-mount disk while a build is using it.
+
 ### Format reset
 
 Old local formats have no readers. `spore host-info` reports only

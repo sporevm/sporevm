@@ -3531,18 +3531,6 @@ pub fn executeMonitorWithBootArtifacts(
     return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, null);
 }
 
-pub fn executeMonitorWithBootArtifactsAndRootfsCacheLock(
-    context: Context,
-    allocator: std.mem.Allocator,
-    opts: Options,
-    artifacts: MonitorBootArtifacts,
-    control: vsock_control.Control,
-    startup_probe: ?*vsock_stream.HostStream,
-    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
-) !MonitorResult {
-    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
-}
-
 fn executeMonitorWithOptionalRootfsCacheLock(
     context: Context,
     allocator: std.mem.Allocator,

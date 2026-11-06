@@ -71,8 +71,8 @@ relative target is joined to `WORKDIR`; an explicit ID is an opaque expanded
 string. Both select the same domain-separated BLAKE3-named directory inside the
 aggregate disk, so equal resolved IDs share storage without becoming host path
 authority. `sharing=shared` and `sharing=locked` are accepted, but both are
-conservatively serialized by the aggregate lock and the existing whole-build
-rootfs-cache lock. The guest bind-mounts those directories in
+conservatively serialized by the aggregate lock, which a build holds for its
+whole executor session. The guest bind-mounts those directories in
 instruction order, unmounts them in reverse order after killing RUN descendants,
 syncs and cleanly unmounts the cache filesystem, and removes target directories
 it created before the rootfs freeze handshake. Failed RUN writes are retained,
@@ -88,11 +88,10 @@ records, so a completed build does not make the disk reachable. `spore system
 df --rootfs` reports the aggregate and any abandoned emit temp files with
 separate logical and host-allocated byte counts. Default prune and root-aware GC
 may reclaim every regular cache-mount storage entry, and report its allocated
-bytes separately from rootfs/CAS reclamation. Both cleanup paths take the same
-coarse rootfs-cache `flock` held
-for the complete build publication epoch and then the aggregate-store lock, so
-they cannot select or unlink the disk while a build has it open. The store
-asserts that its caller already holds the coarse lock. Both locks are
+bytes separately from rootfs/CAS reclamation. Both cleanup paths take the
+rootfs-cache `flock` and then try the aggregate-store lock; while a build holds
+it they skip the aggregate, so they cannot select or unlink the disk while a
+build has it open and do not wait for the build. Both locks are
 process-bound and the kernel drops them when a builder exits, including a crash;
 inert lock files are not leases or retention roots. A later store open removes
 abandoned emit temps and rejects or replaces an unclean aggregate, while prune

@@ -93,18 +93,23 @@ image_ref="${SPORE_SMOKE_IMAGE:-docker.io/library/alpine@sha256:45e09956dc667c5e
 smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-build-publication"
 lock_holder_pid=""
+gc_build_pid=""
 cleanup() {
-  if [[ -n "${lock_holder_pid}" ]]; then
-    kill "${lock_holder_pid}" 2>/dev/null || true
-    wait "${lock_holder_pid}" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "${lock_holder_pid}" "${gc_build_pid}"; do
+    [[ -n "${pid}" ]] || continue
+    kill "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+  done
 }
 
 template_cache="${workdir}/template-cache"
 template_runtime="${workdir}/template-runtime"
 old_context="${workdir}/old-context"
 build_context="${workdir}/build-context"
-mkdir -p "${template_cache}" "${template_runtime}" "${old_context}" "${build_context}"
+mkdir -p "${template_cache}" "${old_context}" "${build_context}"
+# Builds lease storage in the runtime directory, which must be private.
+mkdir -m 700 "${template_runtime}"
 
 base_ref="local/build-publication-smoke:compact"
 old_ref="local/build-publication-smoke:destination"
@@ -201,6 +206,45 @@ for ref in "${concurrent_a}" "${concurrent_b}"; do
       'grep -Fxq publication-ok /publication-marker'
 done
 
+# A RUN step holds no rootfs cache lock, so GC finishes while it runs; the
+# build's leases keep its inputs and outputs, so it still publishes.
+gc_context="${workdir}/gc-context"
+gc_cache="${workdir}/gc-cache"
+gc_runtime="${workdir}/gc-runtime"
+gc_ref="local/build-publication-smoke:gc"
+mkdir -p "${gc_context}"
+cat >"${gc_context}/Dockerfile" <<EOF
+FROM ${base_ref}
+RUN sleep 20 && printf 'gc-ok\n' >/gc-marker
+EOF
+clone_tree "${template_cache}" "${gc_cache}"
+SPOREVM_ROOTFS_CACHE_DIR="${gc_cache}" \
+SPOREVM_RUNTIME_DIR="${gc_runtime}" \
+  "${spore_bin}" --debug build --network none -t "${gc_ref}" "${gc_context}" \
+    >"${workdir}/gc-build.stdout" 2>"${workdir}/gc-build.stderr" &
+gc_build_pid=$!
+gc_deadline=$((SECONDS + 60))
+until grep -Fq 'rootfs preparation metrics:' "${workdir}/gc-build.stderr"; do
+  kill -0 "${gc_build_pid}" 2>/dev/null || die "GC-window build exited before its RUN step"
+  ((SECONDS < gc_deadline)) || die "GC-window build did not reach its RUN step"
+  sleep 0.1
+done
+gc_start="${SECONDS}"
+SPOREVM_ROOTFS_CACHE_DIR="${gc_cache}" \
+SPOREVM_RUNTIME_DIR="${gc_runtime}" \
+  with_timeout 10 "${spore_bin}" --json cache gc --rootfs --force >"${workdir}/gc-window.json" ||
+  die "GC did not finish within 10 s while the build ran"
+gc_seconds=$((SECONDS - gc_start))
+kill -0 "${gc_build_pid}" 2>/dev/null || die "GC-window build finished before GC ran"
+wait "${gc_build_pid}" || {
+  cat "${workdir}/gc-build.stderr" >&2 || true
+  die "build failed after GC ran during its RUN step"
+}
+gc_build_pid=""
+SPOREVM_ROOTFS_CACHE_DIR="${gc_cache}" \
+  "${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" \
+    --image "${gc_ref}" --pull=never -- /bin/sh -lc 'grep -Fxq gc-ok /gc-marker'
+
 for boundary in object index completeness prepare-record image-metadata mutable-ref; do
   cache="${workdir}/failure-${boundary}-cache"
   runtime="${workdir}/failure-${boundary}-runtime"
@@ -293,4 +337,4 @@ for boundary in object index completeness prepare-record image-metadata mutable-
       'grep -Fxq publication-ok /publication-marker'
 done
 
-echo "smoke:build-publication ok backend=${backend} image=${image_ref} index=${concurrent_a_index}"
+echo "smoke:build-publication ok backend=${backend} image=${image_ref} index=${concurrent_a_index} gc_during_run=${gc_seconds}s"

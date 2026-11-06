@@ -352,6 +352,34 @@ pub fn envDigest(allocator: std.mem.Allocator, env: []const []const u8, args: []
     return finishDigest(allocator, &h);
 }
 
+/// Locks the slot `key` hashes to, or returns null while another build holds
+/// it. A build holds the slot of its first missed step through its session,
+/// so a concurrent build of the same step waits (`waitForStepSlot`) and then
+/// reuses the record instead of running the step again. Slots bound the
+/// number of lock files; a collision only makes two builds take turns.
+pub fn tryLockStepSlot(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) !?rootfs_mod.RootfsCacheLock {
+    const dir = try stepSlotDir(allocator, cache_root, key);
+    defer allocator.free(dir);
+    return rootfs_mod.tryLockRootfsCacheExclusive(io, allocator, dir) catch |err| switch (err) {
+        error.LockBusy => null,
+        else => |e| e,
+    };
+}
+
+/// Blocks until no build holds the slot of `key`.
+pub fn waitForStepSlot(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) !void {
+    const dir = try stepSlotDir(allocator, cache_root, key);
+    defer allocator.free(dir);
+    var lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, dir);
+    lock.deinit();
+}
+
+fn stepSlotDir(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ![]const u8 {
+    var slot: [2]u8 = undefined;
+    _ = std.fmt.bufPrint(&slot, "{x:0>2}", .{@as(u8, @truncate(std.hash.Wyhash.hash(0, key)))}) catch unreachable;
+    return std.fs.path.join(allocator, &.{ cache_root, "build", "step-locks", &slot });
+}
+
 pub fn recordPath(allocator: std.mem.Allocator, cache_root: []const u8, key: []const u8) ![]const u8 {
     const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{key});
     defer allocator.free(file_name);
@@ -802,6 +830,21 @@ fn hashCount(h: *Blake3, count: usize) void {
     var count_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &count_buf, count, .little);
     h.update(&count_buf);
+}
+
+test "a step slot admits one build at a time" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cache_root = "zig-cache/test-build-step-slot";
+    defer Io.Dir.cwd().deleteTree(io, cache_root) catch {};
+    const key = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    var held = (try tryLockStepSlot(io, allocator, cache_root, key)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((try tryLockStepSlot(io, allocator, cache_root, key)) == null);
+    held.deinit();
+    try waitForStepSlot(io, allocator, cache_root, key);
+    var again = (try tryLockStepSlot(io, allocator, cache_root, key)) orelse return error.TestUnexpectedResult;
+    again.deinit();
 }
 
 test "step key changes with parent index" {
