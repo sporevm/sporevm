@@ -22,6 +22,11 @@ image tag to a digest and runs an untimed prewarm before the timed loops, so
 registry lookups and rootfs materialization are not counted; pass
 `--no-prewarm-rootfs` to measure the cold image path.
 
+`warm_spore_tti` runs forked children on the same host, which restore from
+their proven local RAM backing. An iteration whose restore used anything else,
+such as verified chunks, counts as failed, so a silent fallback lowers the
+success rate instead of only looking slow.
+
 Each run writes `config.json`, raw `results.jsonl`, `summary.json`, and logs
 under `zig-cache/sporevm-benchmarks/<run-id>/`, and copies the summary to
 `zig-cache/sporevm-benchmarks/latest-summary.json`. Use `--scratch-dir PATH`

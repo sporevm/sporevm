@@ -25,7 +25,7 @@ import time
 import uuid
 
 
-SUITE_VERSION = "1.5"
+SUITE_VERSION = "1.6"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
@@ -395,6 +395,15 @@ def parse_run_stderr_metrics(path: Path) -> dict[str, object]:
         metrics["kvm_probe_complete_observed_ms"] = parse_ms_field(fields.get("observed_ms"))
         metrics["kvm_probe_return_ms"] = parse_ms_field(fields.get("return_ms"))
     return {key: value for key, value in metrics.items() if value is not None}
+
+
+def warm_restore_error(metrics: dict[str, object]) -> str | None:
+    """warm_spore_tti times restores from the proven local RAM backing, so a
+    silent fallback to chunks fails the iteration instead of just looking slow."""
+    mode = metrics.get("backend_restore_mode")
+    if mode == "local_backing":
+        return None
+    return f"restored RAM from {mode or 'an unreported source'}, expected local_backing"
 
 
 def parse_lazy_cas_trace_metrics(path: Path) -> dict[str, object]:
@@ -1282,7 +1291,10 @@ class BenchmarkRunner:
                 *self.command,
             ]
             status, tti_ms, error = run_command(argv, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
-            success = status == 0
+            metrics = parse_run_stderr_metrics(stderr)
+            if status == 0:
+                error = warm_restore_error(metrics)
+            success = status == 0 and error is None
             return {
                 "benchmark": "warm_spore_tti",
                 "mode": mode,
@@ -1296,7 +1308,7 @@ class BenchmarkRunner:
                 "stdout_first_line": first_output_line(stdout),
                 "stdout_path": str(stdout),
                 "stderr_path": str(stderr),
-                **parse_run_stderr_metrics(stderr),
+                **metrics,
             }
 
         self.run_batch("warm_spore_tti", mode, count, worker)
@@ -1716,6 +1728,9 @@ def self_test() -> None:
             encoding="utf-8",
         )
         metrics = parse_run_stderr_metrics(stderr)
+        assert warm_restore_error(metrics) is None
+        assert "eager_chunks" in str(warm_restore_error(metrics | {"backend_restore_mode": "eager_chunks"}))
+        assert "unreported" in str(warm_restore_error({}))
         assert metrics["rootfs_open_verified_ms"] == 7
         assert metrics["rootfs_bytes_verified"] == 4096
         assert metrics["backend_restore_mode"] == "local_backing"
