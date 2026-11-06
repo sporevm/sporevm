@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const board = @import("aarch64/board.zig");
 const aarch64_topology = @import("aarch64/topology.zig");
 const chunklib = @import("chunk.zig");
+const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
 const fuzz_support = @import("fuzz_support.zig");
 const generation = @import("generation.zig");
@@ -527,18 +528,6 @@ fn writeNewFileAll(path: [:0]const u8, data: []const u8) Error!void {
     try writeAllFd(fd, data);
 }
 
-fn writeFileAllIfMissing(path: [:0]const u8, data: []const u8) Error!void {
-    const fd = createNewFile(path, 0o644) catch |err| switch (err) {
-        error.AlreadyExists => {
-            try verifyExistingFile(path, data);
-            return;
-        },
-        else => |e| return e,
-    };
-    defer _ = std.c.close(fd);
-    try writeAllFd(fd, data);
-}
-
 fn createNewFile(path: [:0]const u8, mode: c_uint) Error!std.c.fd_t {
     const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
     if (fd < 0) {
@@ -559,26 +548,6 @@ fn writeAllFd(fd: std.c.fd_t, data: []const u8) Error!void {
     }
 }
 
-fn verifyExistingFile(path: [:0]const u8, expected: []const u8) Error!void {
-    const fd = try openReadOnlyNoFollow(path);
-    defer _ = std.c.close(fd);
-
-    const stat = try fstatLocalFile(fd);
-    if (stat.identity().size != expected.len) return error.BadChunk;
-
-    var buf: [8192]u8 = undefined;
-    var done: usize = 0;
-    while (done < expected.len) {
-        const len = @min(buf.len, expected.len - done);
-        const offset = std.math.cast(std.c.off_t, done) orelse return error.BadChunk;
-        const n = std.c.pread(fd, buf[0..len].ptr, len, offset);
-        if (n <= 0) return error.BadChunk;
-        const read_len: usize = @intCast(n);
-        if (!std.mem.eql(u8, buf[0..read_len], expected[done..][0..read_len])) return error.BadChunk;
-        done += read_len;
-    }
-}
-
 fn publishFileNoOverwrite(tmp_path: [:0]const u8, final_path: [:0]const u8) Error!void {
     const rc = std.c.link(tmp_path.ptr, final_path.ptr);
     if (rc != 0) {
@@ -590,15 +559,6 @@ fn publishFileNoOverwrite(tmp_path: [:0]const u8, final_path: [:0]const u8) Erro
     if (std.c.unlink(tmp_path.ptr) != 0) {
         _ = std.c.unlink(final_path.ptr);
         return error.IoFailed;
-    }
-}
-
-fn pwriteFileAll(fd: std.c.fd_t, offset: usize, data: []const u8) Error!void {
-    var done: usize = 0;
-    while (done < data.len) {
-        const n = std.c.pwrite(fd, data.ptr + done, data.len - done, @intCast(offset + done));
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
     }
 }
 
@@ -1548,6 +1508,8 @@ pub fn memoryBackingPath(allocator: std.mem.Allocator, dir: []const u8, backing:
 // --- save / load -------------------------------------------------------------
 
 /// Write guest memory into the chunk store, returning the memory manifest.
+/// Chunks go through the same durable `chunk_sealer` write as the dirty RAM
+/// sealer: each is fsynced with its directory entry before this returns.
 pub fn saveMemory(allocator: std.mem.Allocator, dir: []const u8, ram: []const u8) Error!MemoryManifest {
     return saveMemoryInternal(allocator, dir, ram, false);
 }
@@ -1585,22 +1547,25 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
     var zero_ranges: std.ArrayList(disk_index.DiskIndexZeroRange) = .empty;
     errdefer zero_ranges.deinit(allocator);
 
+    var work_stats: chunk_sealer.WorkStats = .{};
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const start = i * chunk_size;
         const end = @min(start + chunk_size, ram.len);
         const data = ram[start..end];
-        if (std.mem.allEqual(u8, data, 0)) {
-            try disk_index.appendZeroChunk(allocator, &zero_ranges, @intCast(i));
-            continue;
-        }
-        const id = chunklib.ChunkId.fromContents(data);
+        const id = switch (chunk_sealer.sealBytes(data, &work_stats) catch |err| return sealerError(err)) {
+            .zero => {
+                try disk_index.appendZeroChunk(allocator, &zero_ranges, @intCast(i));
+                continue;
+            },
+            .data => |id| id,
+        };
         const hex = id.toHex();
         chunks.append(.{ .logical_chunk = @intCast(i), .id = id }) catch return error.OutOfMemory;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, hex[0..] });
-        try writeFileAllIfMissing(chunk_path, data);
+        chunk_sealer.writeFileAllIfMissing(allocator, chunk_path, data) catch |err| return sealerError(err);
         if (backing_fd >= 0) {
-            try pwriteFileAll(backing_fd, start, data);
+            chunk_sealer.pwriteFileAll(backing_fd, start, data) catch |err| return sealerError(err);
         }
     }
 
@@ -1624,6 +1589,13 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
         .chunks = chunk_slice,
         .zero_ranges = zero_slice,
         .backing = backing,
+    };
+}
+
+fn sealerError(err: chunk_sealer.Error) Error {
+    return switch (err) {
+        error.ClockFailed => error.IoFailed,
+        else => |e| e,
     };
 }
 
@@ -4225,7 +4197,7 @@ test "fork backing link rejects a path swap after proof validation" {
         _ = std.c.close(replacement_fd);
         return error.IoFailed;
     }
-    try pwriteFileAll(replacement_fd, 0, &.{0x42});
+    try chunk_sealer.pwriteFileAll(replacement_fd, 0, &.{0x42});
     _ = std.c.close(replacement_fd);
 
     const backing_link = try pathZ(arena, "{s}/{s}", .{ child_dir, ram_backing_path });
