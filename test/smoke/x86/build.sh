@@ -1,24 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
 # shellcheck source=src/managed_kernel.env
 source "${repo_root}/src/managed_kernel.env"
 release="${SPOREVM_KERNEL_RELEASE:-${managed_kernel_release}}"
 asset="sporevm-x86_64-linux-${managed_kernel_linux_version}-bzImage"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
 [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 build smoke requires Linux/x86_64"
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
+require_spore_bin
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-build.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-x86-build"
 export SPOREVM_KERNEL_CACHE_DIR="${workdir}/kernel-cache"
 export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"

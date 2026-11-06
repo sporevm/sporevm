@@ -1,5 +1,4 @@
-# Shared helpers for the aarch64 smoke scripts. Source it after
-# `set -euo pipefail`:
+# Shared helpers for the smoke scripts. Source it after `set -euo pipefail`:
 #
 #   source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 #
