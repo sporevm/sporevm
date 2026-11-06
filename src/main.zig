@@ -74,8 +74,8 @@ const usage =
     \\                        Push a saved spore to an image store
     \\    inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
     \\                        Inspect bundle metadata without materializing it
-    \\    pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
-    \\                        Pull one child into a spore dir
+    \\    pull STORE/TAG --out DIR
+    \\                        Pull a saved spore from an image store
     \\
     \\  Rootfs and local system:
     \\    build [options] CONTEXT
@@ -149,14 +149,15 @@ const inspect_bundle_usage =
 
 const pull_usage =
     \\Usage:
-    \\  spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
+    \\  spore pull STORE/TAG --out DIR
+    \\
+    \\STORE is a directory, a file://, http(s):// or s3://bucket/prefix URL; TAG
+    \\may be blake3:<digest>. DIR must not exist and must be on the rootfs cache's
+    \\filesystem. Run the pulled spore with `spore run --from DIR`.
     \\
     \\Options:
-    \\  --child ID                    Pull one child from the bundle
-    \\  --allow-metadata-only-rootfs  Allow metadata-only rootfs descriptors
-    \\  --out DIR                     Write the materialized spore to DIR
-    \\  --region REGION              AWS region for S3 sources
-    \\  -h, --help                    Show this help
+    \\  --out DIR            Write the pulled spore to DIR
+    \\  -h, --help           Show this help
     \\
 ;
 
@@ -923,23 +924,11 @@ fn pullCommand(
 ) !spore_api.PullResult {
     var source: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
-    var child_id: ?[]const u8 = null;
-    var aws_region: ?[]const u8 = null;
-    var allow_metadata_only_rootfs = false;
-
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
-        } else if (std.mem.eql(u8, args[i], "--child") and i + 1 < args.len) {
-            i += 1;
-            child_id = args[i];
-        } else if (std.mem.eql(u8, args[i], "--region") and i + 1 < args.len) {
-            i += 1;
-            aws_region = args[i];
-        } else if (std.mem.eql(u8, args[i], "--allow-metadata-only-rootfs")) {
-            allow_metadata_only_rootfs = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             exitUnknownArgument(allocator, stderr, mode, "pull", args[i]);
         } else if (source == null) {
@@ -948,18 +937,16 @@ fn pullCommand(
             exitUnexpectedArgument(allocator, stderr, mode, "pull", args[i]);
         }
     }
-
     if (source == null or out_dir == null) {
-        exitUsage(allocator, stderr, mode, "pull", "usage: spore pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]");
+        exitUsage(allocator, stderr, mode, "pull", "usage: spore pull STORE/TAG --out DIR");
     }
-
-    return spore_api.pull(context, allocator, .{
-        .source = source.?,
-        .out_dir = out_dir.?,
-        .child_id = child_id,
-        .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
-        .aws_region = aws_region,
-    });
+    return spore_api.pull(context, allocator, .{ .source = source.?, .out_dir = out_dir.? }) catch |err| switch (err) {
+        error.CrossDeviceOwnershipLink => {
+            const message = allocMessage(allocator, "spore pull: {s} must be on the rootfs cache's filesystem", .{out_dir.?});
+            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "pull"), message);
+        },
+        else => |e| return e,
+    };
 }
 
 fn exitWithInvalidCombination(
@@ -1170,15 +1157,14 @@ fn writeInspectBundleResult(writer: *Io.Writer, result: spore_api.InspectBundleR
 }
 
 fn writePullResult(writer: *Io.Writer, result: spore_api.PullResult) !void {
-    try writer.writeAll("Bundle pulled\n");
-    try writer.print("  Source: {s}\n", .{result.source});
-    try writer.print("  Output: {s}\n", .{result.out_dir});
-    try writer.print("  Bundle digest: {s}:{s}\n", .{ result.bundle_digest.algorithm, result.bundle_digest.hex });
-    try writer.print("  Chunks: {d} materialized of {d}\n", .{ result.materialization.materialized_chunk_count, result.materialization.chunk_count });
-    try writer.print("  Payload bytes: {d}\n", .{result.materialization.payload_bytes});
-    try writer.print("  Chunk cache: {d} hits, {d} misses, {d} fetched bytes, {d} reused bytes\n", .{ result.materialization.cache.hit_count, result.materialization.cache.miss_count, result.materialization.cache.bytes_fetched, result.materialization.cache.bytes_reused });
-    try writer.print("  Rootfs cache: {d} hits, {d} misses, {d} fetched bytes, {d} reused bytes\n", .{ result.rootfs.cache.hit_count, result.rootfs.cache.miss_count, result.rootfs.cache.bytes_fetched, result.rootfs.cache.bytes_reused });
-    if (result.children.selected_child) |child| try writer.print("  Selected child: {s}\n", .{child});
+    try writer.print(
+        "ref: {s}\nspore_digest: {s}\nout_dir: {s}\nram: {d} objects, {d} fetched, {d} bytes\ndisk: {d} objects, {d} fetched, {d} bytes\n",
+        .{
+            result.ref,          result.spore_digest,         result.out_dir,
+            result.ram.objects,  result.ram.objects_fetched,  result.ram.bytes_fetched,
+            result.disk.objects, result.disk.objects_fetched, result.disk.bytes_fetched,
+        },
+    );
 }
 
 test "usage names every command" {

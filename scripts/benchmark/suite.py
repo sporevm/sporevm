@@ -1315,40 +1315,31 @@ class BenchmarkRunner:
 
     def run_distribution_tti(self, mode: str, base_dir: Path) -> None:
         count = self.count_for_mode(mode)
-        children_dir = self.fork_children(base_dir, "distribution_tti", mode, count)
-        bundle_dir = self.work_dir / "distribution_tti" / mode / "bundle"
-        shutil.rmtree(bundle_dir, ignore_errors=True)
-        bundle_dir.parent.mkdir(parents=True, exist_ok=True)
-        pack_stdout = self.log_dir / "distribution_tti" / mode / "pack.stdout"
-        pack_stderr = self.log_dir / "distribution_tti" / mode / "pack.stderr"
-        pack_argv = [
-            str(self.spore_bin),
-            "pack",
-            str(base_dir),
-            "--children",
-            str(children_dir),
-            "--out",
-            str(bundle_dir),
-        ]
-        pack_status, pack_ms, pack_error = run_command(pack_argv, env=self.env, stdout_path=pack_stdout, stderr_path=pack_stderr, timeout_s=self.args.timeout_s)
-        pack_result = parse_json_file(pack_stdout)
-        pack_success = pack_status == 0 and bundle_dir.exists()
+        store_dir = self.work_dir / "distribution_tti" / mode / "store"
+        shutil.rmtree(store_dir, ignore_errors=True)
+        store_dir.parent.mkdir(parents=True, exist_ok=True)
+        push_stdout = self.log_dir / "distribution_tti" / mode / "push.stdout"
+        push_stderr = self.log_dir / "distribution_tti" / mode / "push.stderr"
+        push_argv = [str(self.spore_bin), "--json", "push", str(base_dir), f"{store_dir}/base"]
+        push_status, push_ms, push_error = run_command(push_argv, env=self.env, stdout_path=push_stdout, stderr_path=push_stderr, timeout_s=self.args.timeout_s)
+        push_result = parse_json_file(push_stdout)
+        push_success = push_status == 0 and store_dir.exists()
         self.emit({
             "benchmark": "distribution_tti",
-            "mode": f"{mode}_pack",
-            "success": pack_success,
-            "status": pack_status,
-            "elapsed_ms": pack_ms,
-            "error": pack_error,
-            "bundle_dir": str(bundle_dir),
-            "bundle_bytes": directory_size(bundle_dir),
-            "pack_result": pack_result,
-            "stdout_path": str(pack_stdout),
-            "stderr_path": str(pack_stderr),
+            "mode": f"{mode}_push",
+            "success": push_success,
+            "status": push_status,
+            "elapsed_ms": push_ms,
+            "error": push_error,
+            "store_dir": str(store_dir),
+            "store_bytes": directory_size(store_dir),
+            "push_result": push_result,
+            "stdout_path": str(push_stdout),
+            "stderr_path": str(push_stderr),
         })
-        if not pack_success:
-            die(f"pack failed for distribution/{mode} status={pack_status} stdout={pack_stdout} stderr={pack_stderr}")
-        source = f"file://{bundle_dir}"
+        if not push_success:
+            die(f"push failed for distribution/{mode} status={push_status} stdout={push_stdout} stderr={push_stderr}")
+        source = f"file://{store_dir}/base"
 
         def worker(iteration: int, launch_offset_ms: int) -> dict[str, object]:
             child_name = f"{iteration:06d}"
@@ -1358,15 +1349,7 @@ class BenchmarkRunner:
             pull_prefix = self.log_dir / "distribution_tti" / mode / f"pull-{child_name}"
             pull_stdout = pull_prefix.with_suffix(".stdout")
             pull_stderr = pull_prefix.with_suffix(".stderr")
-            pull_argv = [
-                str(self.spore_bin),
-                "pull",
-                source,
-                "--child",
-                str(iteration),
-                "--out",
-                str(pulled_dir),
-            ]
+            pull_argv = [str(self.spore_bin), "--json", "pull", source, "--out", str(pulled_dir)]
             pull_status, pull_ms, pull_error = run_command(pull_argv, env=self.env, stdout_path=pull_stdout, stderr_path=pull_stderr, timeout_s=self.args.timeout_s)
             pull_result = parse_json_file(pull_stdout)
             if pull_status != 0:

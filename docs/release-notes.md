@@ -2,15 +2,21 @@
 
 ## Unreleased
 
-### `spore push` writes spores to image stores
+### `spore push` and `spore pull` move spores through image stores
 
 `spore push SPORE STORE/TAG` now writes a saved spore to a directory or S3
 image store: its RAM chunks and disk objects go in the store's shared
 `objects/`, so a spore pushed to a store holding its image uploads only its
 RAM, changed disk chunks, disk index and manifest. It prints the
-digest-pinned ref, and `--json` prints `spore.push.result.v2`. Pushing a
-bundle directory to S3 (`spore push BUNDLE s3://... [--region]`) is gone;
-copy a bundle with `aws s3 sync` to pull it with `spore pull s3://...`.
+digest-pinned ref, and `--json` prints `spore.push.result.v2`.
+`spore pull STORE/TAG --out DIR` fetches it back from a directory, HTTP(S) or
+S3 store, verifying every object, and writes a save pinned in the rootfs
+cache; `--json` prints `spore.pull.result.v2`. Bundles no longer travel:
+pushing a bundle to S3 (`spore push BUNDLE s3://... [--region]`) and pulling
+one (`spore pull file://|s3://|http(s)://... [--child] [--region]
+[--allow-metadata-only-rootfs]`) are gone. To run one child of a fork batch
+elsewhere, push the parent, pull it there and pass the child's identity to
+`spore run --from DIR --generation FILE`.
 
 ### Performance
 

@@ -16,7 +16,6 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const contracts = @import("contracts.zig");
 const chunklib = @import("chunk.zig");
 const disk_layer = @import("disk_layer.zig");
-const fetch_policy = @import("host_fetch_policy.zig");
 const gicv3 = @import("aarch64/gicv3.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -52,12 +51,7 @@ pub const rootfs_index_path = "rootfs.index.json";
 pub const rootfs_policy_exact_bytes = "exact-bytes";
 pub const rootfs_policy_metadata_only = "metadata-only";
 pub const inspect_bundle_schema = contracts.inspect_bundle_schema;
-pub const pull_result_schema = contracts.pull_result_schema;
 pub const bundle_schema_version = contracts.bundle_schema_version;
-
-const max_remote_bundle_metadata_file_bytes: u64 = 64 * 1024 * 1024;
-const max_remote_bundle_metadata_bytes: u64 = 256 * 1024 * 1024;
-const max_remote_bundle_materialization_bytes: u64 = 128 * 1024 * 1024 * 1024;
 
 const testing = if (builtin.is_test) struct {
     var pack_authority_barrier: ?*test_barrier.Barrier = null;
@@ -114,26 +108,6 @@ pub const UnpackResult = struct {
     child_count: usize = 0,
     selected_child: ?[]const u8 = null,
 };
-
-pub const PullOptions = struct {
-    io: Io,
-    source: []const u8,
-    out_dir: []const u8,
-    rootfs_cache_dir: ?[]const u8 = null,
-    bundle_cache_dir: ?[]const u8 = null,
-    child_id: ?[]const u8 = null,
-    allow_metadata_only_rootfs: bool = false,
-    aws_region: ?[]const u8 = null,
-    aws_executable: []const u8 = "aws",
-};
-
-pub const DigestRef = contracts.DigestRef;
-pub const CacheState = contracts.CacheState;
-pub const ChunkMaterializationSummary = contracts.ChunkMaterializationSummary;
-pub const RootfsMaterializationSummary = contracts.RootfsMaterializationSummary;
-pub const RemoteBundleCache = contracts.RemoteBundleCache;
-pub const BundleChildrenSummary = contracts.BundleChildrenSummary;
-pub const PullResult = contracts.PullResult;
 
 pub const ChildRange = struct {
     start: u32,
@@ -257,40 +231,6 @@ const MaterializeResult = struct {
     chunk_count: usize,
     materialized_chunk_count: usize = 0,
     payload_bytes: u64 = 0,
-    cache_hit_count: usize = 0,
-    cache_miss_count: usize = 0,
-    cache_reused_bytes: u64 = 0,
-    linked_chunk_count: usize = 0,
-    copied_chunk_count: usize = 0,
-};
-
-const RemoteBundleFileClass = enum {
-    metadata,
-    payload,
-};
-
-const RemoteBundleDownloadBudget = struct {
-    total_read: u64 = 0,
-    metadata_read: u64 = 0,
-
-    fn limitFor(self: RemoteBundleDownloadBudget, class: RemoteBundleFileClass, file_limit: u64) Error!u64 {
-        if (self.total_read >= max_remote_bundle_materialization_bytes) return error.BundleBodyTooLarge;
-        var limit = @min(file_limit, max_remote_bundle_materialization_bytes - self.total_read);
-        if (class == .metadata) {
-            if (self.metadata_read >= max_remote_bundle_metadata_bytes) return error.BundleBodyTooLarge;
-            limit = @min(limit, max_remote_bundle_metadata_bytes - self.metadata_read);
-        }
-        return limit;
-    }
-
-    fn record(self: *RemoteBundleDownloadBudget, class: RemoteBundleFileClass, bytes: u64) Error!void {
-        if (bytes > max_remote_bundle_materialization_bytes - self.total_read) return error.BundleBodyTooLarge;
-        self.total_read += bytes;
-        if (class == .metadata) {
-            if (bytes > max_remote_bundle_metadata_bytes - self.metadata_read) return error.BundleBodyTooLarge;
-            self.metadata_read += bytes;
-        }
-    }
 };
 
 const RootfsMaterializeResult = struct {
@@ -633,7 +573,7 @@ pub fn pack(allocator: std.mem.Allocator, options: PackOptions) Error!PackResult
 }
 
 pub fn unpack(allocator: std.mem.Allocator, options: UnpackOptions) Error!UnpackResult {
-    const materialized = try materialize(allocator, options, null, null);
+    const materialized = try materialize(allocator, options);
     return .{
         .bundle = options.bundle_dir,
         .out_dir = options.out_dir,
@@ -657,14 +597,8 @@ const Materialized = struct {
 };
 
 /// Write the parent, or the child selected by `options.child_id`, from a local
-/// bundle directory into `options.out_dir`. Pull adds its node-local chunk
-/// cache and, for a remote bundle, the digest it already verified.
-fn materialize(
-    allocator: std.mem.Allocator,
-    options: UnpackOptions,
-    chunk_cache_dir: ?[]const u8,
-    verified_digest: ?[]const u8,
-) Error!Materialized {
+/// bundle directory into `options.out_dir`.
+fn materialize(allocator: std.mem.Allocator, options: UnpackOptions) Error!Materialized {
     const parsed_bundle = try loadBundleIndex(allocator, options.bundle_dir);
     defer parsed_bundle.deinit();
     const bundle_index = parsed_bundle.value;
@@ -693,7 +627,6 @@ fn materialize(
         plan,
         &by_id,
         local_source.source(),
-        chunk_cache_dir,
     );
     errdefer Io.Dir.cwd().deleteTree(options.io, options.out_dir) catch {};
 
@@ -714,10 +647,7 @@ fn materialize(
         try unpackDiskIndexForManifest(allocator, options.io, options.bundle_dir, options.out_dir, manifest.value.disk);
     }
     try spore.saveManifest(allocator, options.out_dir, manifest.value);
-    const bundle_digest = if (verified_digest) |digest|
-        allocator.dupe(u8, digest) catch return error.OutOfMemory
-    else
-        try digestHex(allocator, options.bundle_dir);
+    const bundle_digest = try digestHex(allocator, options.bundle_dir);
 
     return .{
         .bundle_digest = bundle_digest,
@@ -725,80 +655,6 @@ fn materialize(
         .rootfs = rootfs_result,
         .child_count = bundle_index.children.len,
         .selected_child = child_id,
-    };
-}
-
-pub fn pull(allocator: std.mem.Allocator, options: PullOptions) Error!PullResult {
-    if (std.mem.startsWith(u8, options.source, "s3://")) {
-        const remote = try parseS3Source(allocator, options.source);
-        const cached = try materializeS3Bundle(allocator, options, remote);
-        var result = try pullBundleDir(allocator, options, cached.bundle_dir, remote.expected_digest);
-        result.remote.origin_bytes_read = cached.origin_bytes_read;
-        result.remote.cache_hit = cached.cache_hit;
-        return result;
-    }
-    if (std.mem.startsWith(u8, options.source, "http://") or std.mem.startsWith(u8, options.source, "https://")) {
-        const remote = try parseHttpSource(allocator, options.source);
-        var client: std.http.Client = .{ .allocator = allocator, .io = options.io };
-        defer client.deinit();
-        const cached = try materializeHttpBundle(allocator, options, &client, remote);
-        var result = try pullBundleDir(allocator, options, cached.bundle_dir, remote.expected_digest);
-        result.remote.peer_bytes_read = cached.origin_bytes_read;
-        result.remote.cache_hit = cached.cache_hit;
-        return result;
-    }
-    const bundle_dir = try localFileUriPath(allocator, options.source);
-    return pullBundleDir(allocator, options, bundle_dir, null);
-}
-
-fn pullBundleDir(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    bundle_dir: []const u8,
-    verified_digest: ?[]const u8,
-) Error!PullResult {
-    const materialized = try materialize(allocator, .{
-        .io = options.io,
-        .bundle_dir = bundle_dir,
-        .out_dir = options.out_dir,
-        .rootfs_cache_dir = options.rootfs_cache_dir,
-        .child_id = options.child_id,
-        .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
-    }, options.bundle_cache_dir, verified_digest);
-    const chunks = materialized.chunks;
-    const rootfs = materialized.rootfs;
-    return .{
-        .source = options.source,
-        .bundle_dir = bundle_dir,
-        .out_dir = options.out_dir,
-        .bundle_digest = contracts.digestRef(materialized.bundle_digest),
-        .materialization = .{
-            .chunk_count = chunks.chunk_count,
-            .materialized_chunk_count = chunks.materialized_chunk_count,
-            .payload_bytes = chunks.payload_bytes,
-            .linked_chunk_count = chunks.linked_chunk_count,
-            .copied_chunk_count = chunks.copied_chunk_count,
-            .cache = .{
-                .hit_count = chunks.cache_hit_count,
-                .miss_count = chunks.cache_miss_count,
-                .bytes_fetched = chunks.payload_bytes,
-                .bytes_reused = chunks.cache_reused_bytes,
-            },
-        },
-        .rootfs = .{
-            .artifact_count = rootfs.artifact_count,
-            .payload_bytes = rootfs.payload_bytes,
-            .cache = .{
-                .hit_count = rootfs.cache_hit_count,
-                .miss_count = rootfs.cache_miss_count,
-                .bytes_fetched = rootfs.bytes_fetched,
-                .bytes_reused = rootfs.bytes_reused,
-            },
-        },
-        .children = .{
-            .count = materialized.child_count,
-            .selected_child = materialized.selected_child,
-        },
     };
 }
 
@@ -1035,15 +891,6 @@ fn validateChunk(entry: IndexChunk) Error!void {
     _ = std.fmt.hexToBytes(&digest, entry.sha256) catch return error.BadManifest;
 }
 
-fn chunkPackPayloadBytes(index: Index) Error!u64 {
-    var max_end: u64 = 0;
-    for (index.chunks) |entry| {
-        const end = std.math.add(u64, entry.offset, entry.size) catch return error.BadManifest;
-        max_end = @max(max_end, end);
-    }
-    return max_end;
-}
-
 fn indexById(allocator: std.mem.Allocator, index: Index) Error!std.StringHashMap(IndexChunk) {
     var by_id = std.StringHashMap(IndexChunk).init(allocator);
     errdefer by_id.deinit();
@@ -1062,7 +909,6 @@ fn materializeChunks(
     plan: spore.MemoryPlan,
     by_id: *const std.StringHashMap(IndexChunk),
     source: VerifiedContentSource,
-    chunk_cache_dir: ?[]const u8,
 ) Error!MaterializeResult {
     try ensureNewDir(try pathZ(allocator, "{s}", .{out_dir}));
     errdefer Io.Dir.cwd().deleteTree(io, out_dir) catch {};
@@ -1080,121 +926,14 @@ fn materializeChunks(
         const range = chunkRange(plan, @intCast(ram_size), @intCast(memory_chunk.logical_chunk)) catch return error.BadManifest;
         const expected_size = range.end - range.start;
         const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ out_dir, ref });
-        if (chunk_cache_dir) |cache_dir| {
-            try materializeChunkViaCache(
-                allocator,
-                io,
-                cache_dir,
-                chunk_path,
-                source,
-                entry,
-                ref,
-                expected_size,
-                &result,
-            );
-        } else {
-            const data = try source.readChunk(allocator, entry, ref, expected_size);
-            defer allocator.free(data);
-            try writeFileAll(chunk_path, data);
-            result.materialized_chunk_count += 1;
-            result.payload_bytes += @intCast(data.len);
-            result.copied_chunk_count += 1;
-        }
-    }
-
-    return result;
-}
-
-fn materializeChunkViaCache(
-    allocator: std.mem.Allocator,
-    io: Io,
-    cache_dir: []const u8,
-    out_chunk_path: []const u8,
-    source: VerifiedContentSource,
-    entry: IndexChunk,
-    expected_id: []const u8,
-    expected_size: usize,
-    result: *MaterializeResult,
-) Error!void {
-    const cache_path = try chunkCachePath(allocator, cache_dir, expected_id);
-    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
-    try ensureDirPath(io, cache_parent);
-
-    if (try pathExistsNoSymlink(io, cache_path)) {
-        try verifyChunkPath(io, allocator, cache_path, expected_id, expected_size);
-        result.cache_hit_count += 1;
-        result.cache_reused_bytes += @intCast(expected_size);
-    } else {
-        const data = try source.readChunk(allocator, entry, expected_id, expected_size);
+        const data = try source.readChunk(allocator, entry, ref, expected_size);
         defer allocator.free(data);
-        try installChunkCachePath(allocator, io, cache_path, data, expected_id, expected_size);
-        result.cache_miss_count += 1;
+        try writeFileAll(chunk_path, data);
+        result.materialized_chunk_count += 1;
         result.payload_bytes += @intCast(data.len);
     }
 
-    const linked = try linkOrCopyVerifiedChunk(allocator, io, cache_path, out_chunk_path, expected_id, expected_size);
-    if (linked) {
-        result.linked_chunk_count += 1;
-    } else {
-        result.copied_chunk_count += 1;
-    }
-    result.materialized_chunk_count += 1;
-}
-
-fn installChunkCachePath(
-    allocator: std.mem.Allocator,
-    io: Io,
-    cache_path: []const u8,
-    data: []const u8,
-    expected_id: []const u8,
-    expected_size: usize,
-) Error!void {
-    if (data.len != expected_size) return error.BadChunk;
-    const id = chunklib.ChunkId.fromHex(expected_id) catch return error.BadManifest;
-    if (!id.matches(data)) return error.BadChunk;
-
-    var temp_nonce_bytes: [8]u8 = undefined;
-    io.random(&temp_nonce_bytes);
-    const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
-    const temp_path = std.fmt.allocPrintSentinel(allocator, "{s}.{x}.tmp", .{ cache_path, temp_nonce }, 0) catch return error.OutOfMemory;
-    defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-    try writeFileExclusive(temp_path, data, 0o444);
-    try verifyChunkPath(io, allocator, temp_path, expected_id, expected_size);
-    try renamePath(io, temp_path, cache_path);
-    try verifyChunkPath(io, allocator, cache_path, expected_id, expected_size);
-}
-
-fn linkOrCopyVerifiedChunk(
-    allocator: std.mem.Allocator,
-    io: Io,
-    source_path: []const u8,
-    dest_path: []const u8,
-    expected_id: []const u8,
-    expected_size: usize,
-) Error!bool {
-    const source_z = try pathZ(allocator, "{s}", .{source_path});
-    const dest_z = try pathZ(allocator, "{s}", .{dest_path});
-    if (std.c.link(source_z, dest_z) == 0) {
-        try verifyChunkPath(io, allocator, dest_path, expected_id, expected_size);
-        return true;
-    }
-
-    const data = try readVerifiedChunkPath(io, allocator, source_path, expected_id, expected_size);
-    defer allocator.free(data);
-    try writeFileAll(dest_z, data);
-    try verifyChunkPath(io, allocator, dest_path, expected_id, expected_size);
-    return false;
-}
-
-fn verifyChunkPath(
-    io: Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    expected_id: []const u8,
-    expected_size: usize,
-) Error!void {
-    const data = try readVerifiedChunkPath(io, allocator, path, expected_id, expected_size);
-    allocator.free(data);
+    return result;
 }
 
 fn readVerifiedChunkPath(
@@ -1212,11 +951,6 @@ fn readVerifiedChunkPath(
     const id = chunklib.ChunkId.fromHex(expected_id) catch return error.BadManifest;
     if (!id.matches(data)) return error.BadChunk;
     return data;
-}
-
-fn chunkCachePath(allocator: std.mem.Allocator, cache_dir: []const u8, chunk_id: []const u8) Error![]const u8 {
-    _ = chunklib.ChunkId.fromHex(chunk_id) catch return error.BadManifest;
-    return std.fs.path.join(allocator, &.{ cache_dir, "chunks", "blake3", chunk_id }) catch return error.OutOfMemory;
 }
 
 fn packManifestChunks(
@@ -1549,7 +1283,7 @@ fn unpackRootfsStorageIndexed(
     }
     // The flat digest-addressed artifact is the only runtime base source;
     // assemble it eagerly from the just-installed verified chunks so the
-    // first resume of a pulled child does not pay the assembly cost.
+    // first resume of an unpacked child does not pay the assembly cost.
     rootfs_cas.materializeFlatFromChunks(options.io, allocator, cache_root, rootfs) catch |err| return rootfsError(err);
     return result;
 }
@@ -1849,120 +1583,6 @@ fn localFileUriPath(allocator: std.mem.Allocator, source: []const u8) Error![]co
     return std.fs.path.resolve(allocator, &.{path}) catch return error.IoFailed;
 }
 
-const S3Location = struct {
-    bucket: []const u8,
-    prefix: []const u8,
-
-    fn objectKey(self: S3Location, allocator: std.mem.Allocator, rel_path: []const u8) Error![]const u8 {
-        try validateBundleRelPath(rel_path);
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.prefix, rel_path }) catch return error.OutOfMemory;
-    }
-};
-
-const S3Source = struct {
-    location: S3Location,
-    expected_digest: []const u8,
-};
-
-const HttpLocation = struct {
-    base_url: []const u8,
-
-    fn objectUrl(self: HttpLocation, allocator: std.mem.Allocator, rel_path: []const u8) Error![]const u8 {
-        try validateBundleRelPath(rel_path);
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base_url, rel_path }) catch return error.OutOfMemory;
-    }
-};
-
-const HttpSource = struct {
-    location: HttpLocation,
-    expected_digest: []const u8,
-};
-
-const RemoteBundleMaterialization = struct {
-    bundle_dir: []const u8,
-    origin_bytes_read: u64,
-    cache_hit: bool,
-};
-
-fn parseS3Source(allocator: std.mem.Allocator, uri: []const u8) Error!S3Source {
-    const marker = "@sha256:";
-    const marker_index = std.mem.lastIndexOf(u8, uri, marker) orelse return error.BadManifest;
-    const location_uri = uri[0..marker_index];
-    const digest = uri[marker_index + marker.len ..];
-    try validateSha256DigestHex(digest);
-    return .{
-        .location = try parseS3Location(allocator, location_uri),
-        .expected_digest = allocator.dupe(u8, digest) catch return error.OutOfMemory,
-    };
-}
-
-fn parseHttpSource(allocator: std.mem.Allocator, uri: []const u8) Error!HttpSource {
-    const marker = "@sha256:";
-    const marker_index = std.mem.lastIndexOf(u8, uri, marker) orelse return error.BadManifest;
-    const location_url = uri[0..marker_index];
-    const digest = uri[marker_index + marker.len ..];
-    try validateSha256DigestHex(digest);
-    return .{
-        .location = try parseHttpLocation(allocator, location_url),
-        .expected_digest = allocator.dupe(u8, digest) catch return error.OutOfMemory,
-    };
-}
-
-fn parseHttpLocation(allocator: std.mem.Allocator, raw_url: []const u8) Error!HttpLocation {
-    if (std.mem.indexOfScalar(u8, raw_url, '@') != null) return error.BadManifest;
-    if (std.mem.indexOfScalar(u8, raw_url, '%') != null) return error.BadManifest;
-    const trimmed = std.mem.trimEnd(u8, raw_url, "/");
-    if (trimmed.len == 0) return error.BadManifest;
-    const uri = std.Uri.parse(trimmed) catch return error.BadManifest;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.BadManifest;
-    if (uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.BadManifest;
-    const path = uriComponentText(uri.path);
-    if (path.len > 0) {
-        if (path[0] != '/') return error.BadManifest;
-        if (path.len > 1) try validateRelativeSegments(path[1..]);
-    }
-    return .{ .base_url = allocator.dupe(u8, trimmed) catch return error.OutOfMemory };
-}
-
-fn parseS3Location(allocator: std.mem.Allocator, uri: []const u8) Error!S3Location {
-    const prefix = "s3://";
-    if (!std.mem.startsWith(u8, uri, prefix)) return error.BadManifest;
-    const rest = uri[prefix.len..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.BadManifest;
-    const bucket = rest[0..slash];
-    try validateS3Bucket(bucket);
-    const raw_key = rest[slash + 1 ..];
-    var key_end = raw_key.len;
-    while (key_end > 0 and raw_key[key_end - 1] == '/') key_end -= 1;
-    const key = raw_key[0..key_end];
-    try validateS3KeyPrefix(key);
-    return .{
-        .bucket = allocator.dupe(u8, bucket) catch return error.OutOfMemory,
-        .prefix = allocator.dupe(u8, key) catch return error.OutOfMemory,
-    };
-}
-
-fn uriComponentText(component: std.Uri.Component) []const u8 {
-    return switch (component) {
-        .raw => |s| s,
-        .percent_encoded => |s| s,
-    };
-}
-
-fn validateS3Bucket(bucket: []const u8) Error!void {
-    if (bucket.len == 0 or bucket.len > 63) return error.BadManifest;
-    for (bucket) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '.' or c == '-') continue;
-        return error.BadManifest;
-    }
-}
-
-fn validateS3KeyPrefix(key: []const u8) Error!void {
-    if (key.len == 0) return error.BadManifest;
-    if (std.mem.indexOfScalar(u8, key, '@') != null) return error.BadManifest;
-    try validateRelativeSegments(key);
-}
-
 fn validateBundleRelPath(rel_path: []const u8) Error!void {
     if (rel_path.len == 0 or rel_path[0] == '/') return error.BadManifest;
     if (std.mem.indexOfScalar(u8, rel_path, '\\') != null) return error.BadManifest;
@@ -1986,121 +1606,6 @@ fn validateRelativeSegment(segment: []const u8) Error!void {
     if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.BadManifest;
 }
 
-fn validateSha256DigestHex(digest: []const u8) Error!void {
-    if (digest.len != Sha256.digest_length * 2) return error.BadManifest;
-    var bytes: [Sha256.digest_length]u8 = undefined;
-    _ = std.fmt.hexToBytes(&bytes, digest) catch return error.BadManifest;
-}
-
-fn indexedBundleFiles(allocator: std.mem.Allocator, bundle_dir: []const u8) Error![][]const u8 {
-    const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
-    defer parsed_bundle.deinit();
-    const bundle_index = parsed_bundle.value;
-
-    const parsed_chunk_index = try loadIndex(allocator, bundle_dir);
-    defer parsed_chunk_index.deinit();
-    _ = parsed_chunk_index.value.chunks.len;
-
-    var files = std.array_list.Managed([]const u8).init(allocator);
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-
-    try appendBundleFile(allocator, &files, &seen, bundle_index_path);
-    try appendBundleFile(allocator, &files, &seen, bundle_index.parent_manifest);
-    for (bundle_index.children) |child| {
-        try appendBundleFile(allocator, &files, &seen, child.manifest);
-    }
-    try appendBundleFile(allocator, &files, &seen, index_path);
-    try appendBundleFile(allocator, &files, &seen, pack_path);
-    if (bundle_index.rootfs_index) |rootfs_index_rel| {
-        try appendBundleFile(allocator, &files, &seen, rootfs_index_rel);
-        const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
-        defer parsed_rootfs_index.deinit();
-        try appendRootfsIndexPayloadFiles(allocator, bundle_dir, parsed_rootfs_index.value, &files, &seen);
-    }
-    try appendDiskBundleFilesForManifestPath(allocator, bundle_dir, bundle_index.parent_manifest, &files, &seen);
-    for (bundle_index.children) |child| {
-        try appendDiskBundleFilesForManifestPath(allocator, bundle_dir, child.manifest, &files, &seen);
-    }
-
-    return files.toOwnedSlice() catch return error.OutOfMemory;
-}
-
-fn appendRootfsIndexPayloadFiles(
-    allocator: std.mem.Allocator,
-    bundle_dir: []const u8,
-    index: RootfsIndex,
-    files: *std.array_list.Managed([]const u8),
-    seen: *std.StringHashMap(void),
-) Error!void {
-    for (index.artifacts) |artifact| {
-        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-            try appendBundleFileIfMissing(allocator, files, seen, artifact.path orelse return error.BadManifest);
-        }
-    }
-    for (index.storages) |storage_entry| {
-        try appendBundleFileIfMissing(allocator, files, seen, storage_entry.index_path);
-        const storage = rootfsStorageEntryDescriptor(storage_entry);
-        const parsed_index = try loadDiskIndexForEntry(allocator, bundle_dir, storage_entry, storage);
-        defer parsed_index.deinit();
-        for (parsed_index.value.chunks) |chunk_entry| {
-            const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.id);
-            try appendBundleFileIfMissing(allocator, files, seen, object_rel);
-        }
-    }
-}
-
-fn appendDiskBundleFilesForManifestPath(
-    allocator: std.mem.Allocator,
-    bundle_dir: []const u8,
-    manifest_rel: []const u8,
-    files: *std.array_list.Managed([]const u8),
-    seen: *std.StringHashMap(void),
-) Error!void {
-    const parsed_manifest = try spore.loadManifestPath(
-        allocator,
-        try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
-    );
-    defer parsed_manifest.deinit();
-    const disk = parsed_manifest.value.disk orelse return;
-    const storage = try diskStorageDescriptor(disk);
-    const index_rel = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
-    try appendBundleFileIfMissing(allocator, files, seen, index_rel);
-
-    const parsed_index = try loadDiskIndexForDisk(allocator, bundle_dir, storage);
-    defer parsed_index.deinit();
-    for (parsed_index.value.chunks) |chunk_entry| {
-        const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.id);
-        try appendBundleFileIfMissing(allocator, files, seen, object_rel);
-    }
-}
-
-fn appendBundleFile(
-    allocator: std.mem.Allocator,
-    files: *std.array_list.Managed([]const u8),
-    seen: *std.StringHashMap(void),
-    rel_path: []const u8,
-) Error!void {
-    try validateBundleRelPath(rel_path);
-    if (seen.contains(rel_path)) return error.BadManifest;
-    const copy = allocator.dupe(u8, rel_path) catch return error.OutOfMemory;
-    seen.put(copy, {}) catch return error.OutOfMemory;
-    files.append(copy) catch return error.OutOfMemory;
-}
-
-fn appendBundleFileIfMissing(
-    allocator: std.mem.Allocator,
-    files: *std.array_list.Managed([]const u8),
-    seen: *std.StringHashMap(void),
-    rel_path: []const u8,
-) Error!void {
-    try validateBundleRelPath(rel_path);
-    if (seen.contains(rel_path)) return;
-    const copy = allocator.dupe(u8, rel_path) catch return error.OutOfMemory;
-    seen.put(copy, {}) catch return error.OutOfMemory;
-    files.append(copy) catch return error.OutOfMemory;
-}
-
 fn markBundleFileSeen(
     seen: *std.StringHashMap(void),
     rel_path: []const u8,
@@ -2109,676 +1614,6 @@ fn markBundleFileSeen(
     if (seen.contains(rel_path)) return false;
     seen.put(rel_path, {}) catch return error.OutOfMemory;
     return true;
-}
-
-fn materializeS3Bundle(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    source: S3Source,
-) Error!RemoteBundleMaterialization {
-    const cache_root = options.bundle_cache_dir orelse return error.IoFailed;
-    const bundle_dir = try remoteBundleCacheBundleDir(allocator, cache_root, "s3", source.expected_digest);
-    const complete_path = try remoteBundleCacheCompletePath(allocator, cache_root, "s3", source.expected_digest);
-    if (try pathExistsNoSymlink(options.io, complete_path)) {
-        const cached_digest = try digestHex(allocator, bundle_dir);
-        if (!std.mem.eql(u8, cached_digest, source.expected_digest)) return error.BadChunk;
-        return .{
-            .bundle_dir = bundle_dir,
-            .origin_bytes_read = 0,
-            .cache_hit = true,
-        };
-    }
-
-    const cache_parent = try remoteBundleCacheParent(allocator, cache_root, "s3");
-    try ensureDirPath(options.io, cache_parent);
-    var nonce_bytes: [8]u8 = undefined;
-    options.io.random(&nonce_bytes);
-    const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
-    const temp_dir = try pathZ(allocator, "{s}/.tmp-{s}-{x}", .{ cache_parent, source.expected_digest[0..16], nonce });
-    defer Io.Dir.cwd().deleteTree(options.io, temp_dir) catch {};
-    try ensureNewDir(temp_dir);
-    const temp_bundle_dir = try pathZ(allocator, "{s}/bundle", .{temp_dir});
-
-    const origin_bytes = try downloadS3BundleToDir(allocator, options, source.location, temp_bundle_dir);
-    const downloaded_digest = try digestHex(allocator, temp_bundle_dir);
-    if (!std.mem.eql(u8, downloaded_digest, source.expected_digest)) return error.BadChunk;
-    const temp_complete = try pathZ(allocator, "{s}/.complete", .{temp_dir});
-    try writeFileAll(temp_complete, source.expected_digest);
-
-    const final_dir = try remoteBundleCacheDir(allocator, cache_root, "s3", source.expected_digest);
-    renamePath(options.io, temp_dir, final_dir) catch |err| {
-        if (try pathExistsNoSymlink(options.io, complete_path)) {
-            const cached_digest = try digestHex(allocator, bundle_dir);
-            if (!std.mem.eql(u8, cached_digest, source.expected_digest)) return error.BadChunk;
-            return .{
-                .bundle_dir = bundle_dir,
-                .origin_bytes_read = 0,
-                .cache_hit = true,
-            };
-        }
-        return err;
-    };
-
-    return .{
-        .bundle_dir = bundle_dir,
-        .origin_bytes_read = origin_bytes,
-        .cache_hit = false,
-    };
-}
-
-fn materializeHttpBundle(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    source: HttpSource,
-) Error!RemoteBundleMaterialization {
-    const cache_root = options.bundle_cache_dir orelse return error.IoFailed;
-    const bundle_dir = try remoteBundleCacheBundleDir(allocator, cache_root, "http", source.expected_digest);
-    const complete_path = try remoteBundleCacheCompletePath(allocator, cache_root, "http", source.expected_digest);
-    if (try pathExistsNoSymlink(options.io, complete_path)) {
-        const cached_digest = try digestHex(allocator, bundle_dir);
-        if (!std.mem.eql(u8, cached_digest, source.expected_digest)) return error.BadChunk;
-        return .{
-            .bundle_dir = bundle_dir,
-            .origin_bytes_read = 0,
-            .cache_hit = true,
-        };
-    }
-
-    const cache_parent = try remoteBundleCacheParent(allocator, cache_root, "http");
-    try ensureDirPath(options.io, cache_parent);
-    var nonce_bytes: [8]u8 = undefined;
-    options.io.random(&nonce_bytes);
-    const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
-    const temp_dir = try pathZ(allocator, "{s}/.tmp-{s}-{x}", .{ cache_parent, source.expected_digest[0..16], nonce });
-    defer Io.Dir.cwd().deleteTree(options.io, temp_dir) catch {};
-    try ensureNewDir(temp_dir);
-    const temp_bundle_dir = try pathZ(allocator, "{s}/bundle", .{temp_dir});
-
-    const peer_bytes = try downloadHttpBundleToDir(allocator, options, client, source.location, temp_bundle_dir);
-    const downloaded_digest = try digestHex(allocator, temp_bundle_dir);
-    if (!std.mem.eql(u8, downloaded_digest, source.expected_digest)) return error.BadChunk;
-    const temp_complete = try pathZ(allocator, "{s}/.complete", .{temp_dir});
-    try writeFileAll(temp_complete, source.expected_digest);
-
-    const final_dir = try remoteBundleCacheDir(allocator, cache_root, "http", source.expected_digest);
-    renamePath(options.io, temp_dir, final_dir) catch |err| {
-        if (try pathExistsNoSymlink(options.io, complete_path)) {
-            const cached_digest = try digestHex(allocator, bundle_dir);
-            if (!std.mem.eql(u8, cached_digest, source.expected_digest)) return error.BadChunk;
-            return .{
-                .bundle_dir = bundle_dir,
-                .origin_bytes_read = 0,
-                .cache_hit = true,
-            };
-        }
-        return err;
-    };
-
-    return .{
-        .bundle_dir = bundle_dir,
-        .origin_bytes_read = peer_bytes,
-        .cache_hit = false,
-    };
-}
-
-fn downloadS3BundleToDir(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    location: S3Location,
-    bundle_dir: []const u8,
-) Error!u64 {
-    try ensureNewDir(try pathZ(allocator, "{s}", .{bundle_dir}));
-
-    var origin_bytes: u64 = 0;
-    var budget = RemoteBundleDownloadBudget{};
-    origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, bundle_index_path, &budget);
-
-    const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
-    defer parsed_bundle.deinit();
-    const bundle_index = parsed_bundle.value;
-
-    origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, bundle_index.parent_manifest, &budget);
-    for (bundle_index.children) |child| {
-        origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, child.manifest, &budget);
-    }
-    origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, index_path, &budget);
-
-    const parsed_chunk_index = try loadIndex(allocator, bundle_dir);
-    defer parsed_chunk_index.deinit();
-    _ = parsed_chunk_index.value.chunks.len;
-    origin_bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, pack_path, &budget, try chunkPackPayloadBytes(parsed_chunk_index.value));
-
-    if (bundle_index.rootfs_index) |rootfs_index_rel| {
-        origin_bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, rootfs_index_rel, &budget);
-        const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
-        defer parsed_rootfs_index.deinit();
-        origin_bytes += try downloadS3RootfsIndexPayloadFiles(allocator, options, location, bundle_dir, parsed_rootfs_index.value, &budget);
-    }
-    var seen_disk_files = std.StringHashMap(void).init(allocator);
-    defer seen_disk_files.deinit();
-    origin_bytes += try downloadS3DiskFilesForManifestPath(allocator, options, location, bundle_dir, bundle_index.parent_manifest, &seen_disk_files, &budget);
-    for (bundle_index.children) |child| {
-        origin_bytes += try downloadS3DiskFilesForManifestPath(allocator, options, location, bundle_dir, child.manifest, &seen_disk_files, &budget);
-    }
-    return origin_bytes;
-}
-
-fn downloadHttpBundleToDir(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    location: HttpLocation,
-    bundle_dir: []const u8,
-) Error!u64 {
-    try ensureNewDir(try pathZ(allocator, "{s}", .{bundle_dir}));
-
-    var peer_bytes: u64 = 0;
-    var budget = RemoteBundleDownloadBudget{};
-    peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, bundle_index_path, &budget);
-
-    const parsed_bundle = try loadBundleIndex(allocator, bundle_dir);
-    defer parsed_bundle.deinit();
-    const bundle_index = parsed_bundle.value;
-
-    peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, bundle_index.parent_manifest, &budget);
-    for (bundle_index.children) |child| {
-        peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, child.manifest, &budget);
-    }
-    peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, index_path, &budget);
-
-    const parsed_chunk_index = try loadIndex(allocator, bundle_dir);
-    defer parsed_chunk_index.deinit();
-    _ = parsed_chunk_index.value.chunks.len;
-    peer_bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, pack_path, &budget, try chunkPackPayloadBytes(parsed_chunk_index.value));
-
-    if (bundle_index.rootfs_index) |rootfs_index_rel| {
-        peer_bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, rootfs_index_rel, &budget);
-        const parsed_rootfs_index = try loadRootfsIndex(allocator, bundle_dir);
-        defer parsed_rootfs_index.deinit();
-        peer_bytes += try downloadHttpRootfsIndexPayloadFiles(allocator, options, client, location, bundle_dir, parsed_rootfs_index.value, &budget);
-    }
-    var seen_disk_files = std.StringHashMap(void).init(allocator);
-    defer seen_disk_files.deinit();
-    peer_bytes += try downloadHttpDiskFilesForManifestPath(allocator, options, client, location, bundle_dir, bundle_index.parent_manifest, &seen_disk_files, &budget);
-    for (bundle_index.children) |child| {
-        peer_bytes += try downloadHttpDiskFilesForManifestPath(allocator, options, client, location, bundle_dir, child.manifest, &seen_disk_files, &budget);
-    }
-    return peer_bytes;
-}
-
-fn downloadS3RootfsIndexPayloadFiles(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    location: S3Location,
-    bundle_dir: []const u8,
-    index: RootfsIndex,
-    budget: *RemoteBundleDownloadBudget,
-) Error!u64 {
-    var bytes: u64 = 0;
-    for (index.artifacts) |artifact| {
-        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-            bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, artifact.path orelse return error.BadManifest, budget, artifact.size);
-        }
-    }
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-    for (index.storages) |storage_entry| {
-        if (try markBundleFileSeen(&seen, storage_entry.index_path)) {
-            bytes += try downloadS3BundleSizedMetadataFile(allocator, options, location, bundle_dir, storage_entry.index_path, budget, storage_entry.index_bytes);
-        }
-        const storage = rootfsStorageEntryDescriptor(storage_entry);
-        const parsed_index = try loadDiskIndexForEntry(allocator, bundle_dir, storage_entry, storage);
-        defer parsed_index.deinit();
-        for (parsed_index.value.chunks) |chunk_entry| {
-            const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.id);
-            if (try markBundleFileSeen(&seen, object_rel)) {
-                const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
-                bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, object_rel, budget, @intCast(expected_size));
-            }
-        }
-    }
-    return bytes;
-}
-
-fn downloadHttpRootfsIndexPayloadFiles(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    location: HttpLocation,
-    bundle_dir: []const u8,
-    index: RootfsIndex,
-    budget: *RemoteBundleDownloadBudget,
-) Error!u64 {
-    var bytes: u64 = 0;
-    for (index.artifacts) |artifact| {
-        if (std.mem.eql(u8, artifact.policy, rootfs_policy_exact_bytes)) {
-            bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, artifact.path orelse return error.BadManifest, budget, artifact.size);
-        }
-    }
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-    for (index.storages) |storage_entry| {
-        if (try markBundleFileSeen(&seen, storage_entry.index_path)) {
-            bytes += try downloadHttpBundleSizedMetadataFile(allocator, options, client, location, bundle_dir, storage_entry.index_path, budget, storage_entry.index_bytes);
-        }
-        const storage = rootfsStorageEntryDescriptor(storage_entry);
-        const parsed_index = try loadDiskIndexForEntry(allocator, bundle_dir, storage_entry, storage);
-        defer parsed_index.deinit();
-        for (parsed_index.value.chunks) |chunk_entry| {
-            const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.id);
-            if (try markBundleFileSeen(&seen, object_rel)) {
-                const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
-                bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, object_rel, budget, @intCast(expected_size));
-            }
-        }
-    }
-    return bytes;
-}
-
-fn downloadS3DiskFilesForManifestPath(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    location: S3Location,
-    bundle_dir: []const u8,
-    manifest_rel: []const u8,
-    seen: *std.StringHashMap(void),
-    budget: *RemoteBundleDownloadBudget,
-) Error!u64 {
-    const parsed_manifest = try spore.loadManifestPath(
-        allocator,
-        try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
-    );
-    defer parsed_manifest.deinit();
-    const disk = parsed_manifest.value.disk orelse return 0;
-    var bytes: u64 = 0;
-    const storage = try diskStorageDescriptor(disk);
-    const index_rel = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
-    if (try markBundleFileSeen(seen, index_rel)) {
-        bytes += try downloadS3BundleMetadataFile(allocator, options, location, bundle_dir, index_rel, budget);
-    }
-    const parsed_index = try loadDiskIndexForDisk(allocator, bundle_dir, storage);
-    defer parsed_index.deinit();
-    for (parsed_index.value.chunks) |chunk_entry| {
-        const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.id);
-        if (try markBundleFileSeen(seen, object_rel)) {
-            const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
-            bytes += try downloadS3BundlePayloadFile(allocator, options, location, bundle_dir, object_rel, budget, @intCast(expected_size));
-        }
-    }
-    return bytes;
-}
-
-fn downloadHttpDiskFilesForManifestPath(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    location: HttpLocation,
-    bundle_dir: []const u8,
-    manifest_rel: []const u8,
-    seen: *std.StringHashMap(void),
-    budget: *RemoteBundleDownloadBudget,
-) Error!u64 {
-    const parsed_manifest = try spore.loadManifestPath(
-        allocator,
-        try pathZ(allocator, "{s}/{s}", .{ bundle_dir, manifest_rel }),
-    );
-    defer parsed_manifest.deinit();
-    const disk = parsed_manifest.value.disk orelse return 0;
-    var bytes: u64 = 0;
-    const storage = try diskStorageDescriptor(disk);
-    const index_rel = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
-    if (try markBundleFileSeen(seen, index_rel)) {
-        bytes += try downloadHttpBundleMetadataFile(allocator, options, client, location, bundle_dir, index_rel, budget);
-    }
-    const parsed_index = try loadDiskIndexForDisk(allocator, bundle_dir, storage);
-    defer parsed_index.deinit();
-    for (parsed_index.value.chunks) |chunk_entry| {
-        const object_rel = try rootfsStorageObjectRelPath(allocator, chunk_entry.id);
-        if (try markBundleFileSeen(seen, object_rel)) {
-            const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
-            bytes += try downloadHttpBundlePayloadFile(allocator, options, client, location, bundle_dir, object_rel, budget, @intCast(expected_size));
-        }
-    }
-    return bytes;
-}
-
-fn downloadS3BundleMetadataFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    location: S3Location,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-) Error!u64 {
-    return downloadS3BundleFile(allocator, options, location, bundle_dir, rel_path, budget, .metadata, max_remote_bundle_metadata_file_bytes);
-}
-
-fn downloadS3BundleSizedMetadataFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    location: S3Location,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-    max_body_bytes: u64,
-) Error!u64 {
-    return downloadS3BundleFile(allocator, options, location, bundle_dir, rel_path, budget, .metadata, max_body_bytes);
-}
-
-fn downloadS3BundlePayloadFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    location: S3Location,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-    max_body_bytes: u64,
-) Error!u64 {
-    return downloadS3BundleFile(allocator, options, location, bundle_dir, rel_path, budget, .payload, max_body_bytes);
-}
-
-fn downloadS3BundleFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    location: S3Location,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-    file_class: RemoteBundleFileClass,
-    max_body_bytes: u64,
-) Error!u64 {
-    try validateBundleRelPath(rel_path);
-    const dest_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, rel_path });
-    if (std.fs.path.dirname(dest_path)) |parent| try ensureDirPath(options.io, parent);
-    errdefer Io.Dir.cwd().deleteFile(options.io, dest_path) catch {};
-
-    const object_key = try location.objectKey(allocator, rel_path);
-    const limit = try budget.limitFor(file_class, max_body_bytes);
-    const object_size = try runAwsS3HeadObjectContentLength(allocator, options.io, options.aws_executable, location.bucket, object_key, options.aws_region);
-    if (object_size > limit) return error.BundleBodyTooLarge;
-
-    if (object_size == 0) {
-        var file = Io.Dir.cwd().createFile(options.io, dest_path, .{}) catch return error.IoFailed;
-        file.close(options.io);
-    } else {
-        try runAwsS3GetObject(allocator, options.io, options.aws_executable, location.bucket, object_key, dest_path, options.aws_region, limit);
-    }
-    const copied = try fileSizeNoSymlink(options.io, dest_path);
-    if (copied != object_size) return error.BadChunk;
-    try budget.record(file_class, copied);
-    return copied;
-}
-
-fn downloadHttpBundleMetadataFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    location: HttpLocation,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-) Error!u64 {
-    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .metadata, max_remote_bundle_metadata_file_bytes);
-}
-
-fn downloadHttpBundleSizedMetadataFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    location: HttpLocation,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-    max_body_bytes: u64,
-) Error!u64 {
-    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .metadata, max_body_bytes);
-}
-
-fn downloadHttpBundlePayloadFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    location: HttpLocation,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-    max_body_bytes: u64,
-) Error!u64 {
-    return downloadHttpBundleFile(allocator, options, client, location, bundle_dir, rel_path, budget, .payload, max_body_bytes);
-}
-
-fn downloadHttpBundleFile(
-    allocator: std.mem.Allocator,
-    options: PullOptions,
-    client: *std.http.Client,
-    location: HttpLocation,
-    bundle_dir: []const u8,
-    rel_path: []const u8,
-    budget: *RemoteBundleDownloadBudget,
-    file_class: RemoteBundleFileClass,
-    max_body_bytes: u64,
-) Error!u64 {
-    try validateBundleRelPath(rel_path);
-    const dest_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, rel_path });
-    if (std.fs.path.dirname(dest_path)) |parent| try ensureDirPath(options.io, parent);
-    const url = try location.objectUrl(allocator, rel_path);
-    const limit = try budget.limitFor(file_class, max_body_bytes);
-    const copied = try httpGetToFile(options.io, client, url, dest_path, limit);
-    try budget.record(file_class, copied);
-    return copied;
-}
-
-fn httpGetToFile(
-    io: Io,
-    client: *std.http.Client,
-    url: []const u8,
-    path: []const u8,
-    max_body_bytes: u64,
-) Error!u64 {
-    const uri = std.Uri.parse(url) catch return error.BadManifest;
-    const target_address = resolveHttpFetchTarget(client.io, uri) catch |err| return err;
-    return httpGetToFileAfterPolicy(io, client, uri, target_address, path, max_body_bytes);
-}
-
-fn httpGetToFileAfterPolicy(
-    io: Io,
-    client: *std.http.Client,
-    uri: std.Uri,
-    target_address: Io.net.IpAddress,
-    path: []const u8,
-    max_body_bytes: u64,
-) Error!u64 {
-    var file = Io.Dir.cwd().createFile(io, path, .{}) catch return error.IoFailed;
-    errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
-    defer file.close(io);
-
-    var file_buffer: [64 * 1024]u8 = undefined;
-    var file_writer: Io.File.Writer = .initStreaming(file, io, &file_buffer);
-    const connection = fetch_policy.connectResolvedUri(client, uri, target_address) catch return error.IoFailed;
-    var req = client.request(.GET, uri, .{
-        .headers = .{ .accept_encoding = .omit },
-        .extra_headers = &.{std.http.Header{ .name = "accept", .value = "application/octet-stream" }},
-        .redirect_behavior = .unhandled,
-        .keep_alive = false,
-        .connection = connection,
-    }) catch {
-        client.connection_pool.release(connection, client.io);
-        return error.IoFailed;
-    };
-    defer req.deinit();
-    req.sendBodiless() catch return error.IoFailed;
-    var header_buffer: [8 * 1024]u8 = undefined;
-    var response = req.receiveHead(&header_buffer) catch return error.IoFailed;
-    if (response.head.status != .ok) return error.BadChunk;
-    if (try httpContentLength(response.head.bytes)) |content_length| {
-        if (content_length > max_body_bytes) return error.BundleBodyTooLarge;
-    }
-
-    var transfer_buffer: [64 * 1024]u8 = undefined;
-    var body = response.reader(&transfer_buffer);
-    var copied: u64 = 0;
-    var copy_buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = body.readSliceShort(&copy_buffer) catch return error.IoFailed;
-        if (n == 0) break;
-        const n_u64: u64 = @intCast(n);
-        if (n_u64 > max_body_bytes - copied) return error.BundleBodyTooLarge;
-        copied += n_u64;
-        file_writer.interface.writeAll(copy_buffer[0..n]) catch return error.IoFailed;
-    }
-    file_writer.interface.flush() catch return error.IoFailed;
-    return copied;
-}
-
-fn httpContentLength(head: []const u8) Error!?u64 {
-    var lines = std.mem.splitSequence(u8, head, "\r\n");
-    _ = lines.first();
-    var found: ?u64 = null;
-    while (lines.next()) |line| {
-        if (line.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const header_name = line[0..colon];
-        if (!std.ascii.eqlIgnoreCase(header_name, "content-length")) continue;
-        if (found != null) return error.BadChunk;
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
-        if (value.len == 0) return error.BadChunk;
-        found = std.fmt.parseInt(u64, value, 10) catch return error.BadChunk;
-    }
-    return found;
-}
-
-fn resolveHttpFetchTarget(io: Io, uri: std.Uri) Error!Io.net.IpAddress {
-    return (fetch_policy.resolveUriAddresses(io, uri, .{}) catch |err| switch (err) {
-        error.UnsupportedRemoteFetchScheme,
-        error.UnsafeRemoteFetchTarget,
-        => return error.BadManifest,
-        else => return error.IoFailed,
-    }).items[0];
-}
-
-fn validateHttpFetchTarget(io: Io, uri: std.Uri) Error!void {
-    _ = try resolveHttpFetchTarget(io, uri);
-}
-
-fn appendAwsRegion(argv: *std.array_list.Managed([]const u8), region: ?[]const u8) Error!void {
-    if (region) |value| {
-        if (value.len == 0) return error.BadManifest;
-        argv.append("--region") catch return error.OutOfMemory;
-        argv.append(value) catch return error.OutOfMemory;
-    }
-}
-
-fn runAwsS3HeadObjectContentLength(
-    allocator: std.mem.Allocator,
-    io: Io,
-    aws_executable: []const u8,
-    bucket: []const u8,
-    key: []const u8,
-    region: ?[]const u8,
-) Error!u64 {
-    var argv = std.array_list.Managed([]const u8).init(allocator);
-    argv.append(aws_executable) catch return error.OutOfMemory;
-    argv.append("s3api") catch return error.OutOfMemory;
-    argv.append("head-object") catch return error.OutOfMemory;
-    argv.append("--bucket") catch return error.OutOfMemory;
-    argv.append(bucket) catch return error.OutOfMemory;
-    argv.append("--key") catch return error.OutOfMemory;
-    argv.append(key) catch return error.OutOfMemory;
-    argv.append("--query") catch return error.OutOfMemory;
-    argv.append("ContentLength") catch return error.OutOfMemory;
-    argv.append("--output") catch return error.OutOfMemory;
-    argv.append("text") catch return error.OutOfMemory;
-    try appendAwsRegion(&argv, region);
-
-    const result = std.process.run(allocator, io, .{
-        .argv = argv.items,
-        .stdout_limit = .limited(8 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch return error.IoFailed;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) {
-            const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-            if (trimmed.len == 0) return error.BadChunk;
-            return std.fmt.parseInt(u64, trimmed, 10) catch return error.BadChunk;
-        },
-        else => {},
-    }
-    return error.IoFailed;
-}
-
-fn runAwsS3GetObject(
-    allocator: std.mem.Allocator,
-    io: Io,
-    aws_executable: []const u8,
-    bucket: []const u8,
-    key: []const u8,
-    destination: []const u8,
-    region: ?[]const u8,
-    max_body_bytes: u64,
-) Error!void {
-    var argv = std.array_list.Managed([]const u8).init(allocator);
-    argv.append(aws_executable) catch return error.OutOfMemory;
-    argv.append("s3api") catch return error.OutOfMemory;
-    argv.append("get-object") catch return error.OutOfMemory;
-    argv.append("--bucket") catch return error.OutOfMemory;
-    argv.append(bucket) catch return error.OutOfMemory;
-    argv.append("--key") catch return error.OutOfMemory;
-    argv.append(key) catch return error.OutOfMemory;
-    if (max_body_bytes > 0) {
-        const range = std.fmt.allocPrint(allocator, "bytes=0-{d}", .{max_body_bytes - 1}) catch return error.OutOfMemory;
-        argv.append("--range") catch return error.OutOfMemory;
-        argv.append(range) catch return error.OutOfMemory;
-    }
-    try appendAwsRegion(&argv, region);
-    argv.append(destination) catch return error.OutOfMemory;
-
-    const result = std.process.run(allocator, io, .{
-        .argv = argv.items,
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch return error.IoFailed;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return,
-        else => {},
-    }
-    return error.IoFailed;
-}
-
-fn fileSizeNoSymlink(io: Io, path: []const u8) Error!u64 {
-    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return error.BadChunk,
-        else => return error.IoFailed,
-    };
-    if (stat.kind != .file) return error.BadChunk;
-    return stat.size;
-}
-
-fn remoteBundleCacheParent(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8) Error![]const u8 {
-    try validateRelativeSegment(source_kind);
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256" }) catch return error.OutOfMemory;
-}
-
-fn remoteBundleCacheDir(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8, digest: []const u8) Error![]const u8 {
-    try validateRelativeSegment(source_kind);
-    try validateSha256DigestHex(digest);
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256", digest }) catch return error.OutOfMemory;
-}
-
-fn remoteBundleCacheBundleDir(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8, digest: []const u8) Error![]const u8 {
-    try validateRelativeSegment(source_kind);
-    try validateSha256DigestHex(digest);
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256", digest, "bundle" }) catch return error.OutOfMemory;
-}
-
-fn remoteBundleCacheCompletePath(allocator: std.mem.Allocator, cache_root: []const u8, source_kind: []const u8, digest: []const u8) Error![]const u8 {
-    try validateRelativeSegment(source_kind);
-    try validateSha256DigestHex(digest);
-    return std.fs.path.join(allocator, &.{ cache_root, "remote", source_kind, "sha256", digest, ".complete" }) catch return error.OutOfMemory;
 }
 
 const ChildDir = struct {
@@ -2962,19 +1797,6 @@ fn readFileRange(allocator: std.mem.Allocator, path: [:0]const u8, offset: u64, 
     return out;
 }
 
-fn writeFileExclusive(path: [:0]const u8, data: []const u8, mode: c_uint) Error!void {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, mode);
-    if (fd < 0) return error.IoFailed;
-    defer _ = std.c.close(fd);
-    var done: usize = 0;
-    while (done < data.len) {
-        const n = std.c.write(fd, data.ptr + done, data.len - done);
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
-    if (std.c.fchmod(fd, @intCast(mode)) != 0) return error.IoFailed;
-}
-
 fn regularFileNoSymlink(io: Io, path: []const u8) Error!bool {
     const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
@@ -3093,294 +1915,6 @@ fn testDir(allocator: std.mem.Allocator) ![]const u8 {
     const buf = try allocator.dupeZ(u8, tmpl);
     if (mkdtemp(buf) == null) return error.IoFailed;
     return buf;
-}
-
-const StaticHttpBundleServer = struct {
-    allocator: std.mem.Allocator,
-    io: Io,
-    bundle_dir: []const u8,
-    url_prefix: []const u8,
-    server: std.Io.net.Server,
-    thread: std.Thread,
-    closed: std.atomic.Value(bool),
-    request_count: std.atomic.Value(usize),
-
-    fn init(self: *StaticHttpBundleServer, allocator: std.mem.Allocator, io: Io, bundle_dir: []const u8, url_prefix: []const u8) !void {
-        var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-        self.* = .{
-            .allocator = allocator,
-            .io = io,
-            .bundle_dir = bundle_dir,
-            .url_prefix = url_prefix,
-            .server = try address.listen(io, .{ .kernel_backlog = 8, .reuse_address = true }),
-            .thread = undefined,
-            .closed = .init(false),
-            .request_count = .init(0),
-        };
-        self.thread = try std.Thread.spawn(.{}, StaticHttpBundleServer.serveThread, .{self});
-    }
-
-    fn deinit(self: *StaticHttpBundleServer) void {
-        const wake_address = self.server.socket.address;
-        self.closed.store(true, .release);
-        if (wake_address.connect(self.io, .{ .mode = .stream })) |stream| {
-            stream.close(self.io);
-        } else |_| {}
-        self.server.deinit(self.io);
-        self.thread.join();
-    }
-
-    fn baseUrl(self: *StaticHttpBundleServer, allocator: std.mem.Allocator) ![]const u8 {
-        const port = self.server.socket.address.getPort();
-        if (self.url_prefix.len == 0) return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{port});
-        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/{s}", .{ port, self.url_prefix });
-    }
-
-    fn serveThread(self: *StaticHttpBundleServer) void {
-        while (!self.closed.load(.acquire)) {
-            var stream = self.server.accept(self.io) catch {
-                if (self.closed.load(.acquire)) return;
-                continue;
-            };
-            self.handle(stream) catch {};
-            stream.close(self.io);
-        }
-    }
-
-    fn handle(self: *StaticHttpBundleServer, stream: std.Io.net.Stream) !void {
-        _ = self.request_count.fetchAdd(1, .monotonic);
-        var read_buffer: [8 * 1024]u8 = undefined;
-        var reader = stream.reader(self.io, &read_buffer);
-        const request_line_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
-        const request_line = std.mem.trimEnd(u8, request_line_raw, "\r");
-        while (true) {
-            const header_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
-            const header = std.mem.trimEnd(u8, header_raw, "\r");
-            if (header.len == 0) break;
-        }
-
-        const method_prefix = "GET ";
-        if (!std.mem.startsWith(u8, request_line, method_prefix)) return self.writeStatus(stream, 405);
-        const rest = request_line[method_prefix.len..];
-        const path_end = std.mem.indexOfScalar(u8, rest, ' ') orelse return self.writeStatus(stream, 400);
-        const path = rest[0..path_end];
-        if (path.len == 0 or path[0] != '/' or std.mem.indexOfScalar(u8, path, '?') != null) return self.writeStatus(stream, 404);
-        var rel_path = path[1..];
-        if (self.url_prefix.len > 0) {
-            if (!std.mem.startsWith(u8, rel_path, self.url_prefix)) return self.writeStatus(stream, 404);
-            rel_path = rel_path[self.url_prefix.len..];
-            if (rel_path.len == 0 or rel_path[0] != '/') return self.writeStatus(stream, 404);
-            rel_path = rel_path[1..];
-        }
-        validateBundleRelPath(rel_path) catch return self.writeStatus(stream, 404);
-        const file_path = try pathZ(self.allocator, "{s}/{s}", .{ self.bundle_dir, rel_path });
-        const data = readFileAll(self.allocator, file_path, std.math.maxInt(usize)) catch return self.writeStatus(stream, 404);
-        defer self.allocator.free(data);
-
-        var write_buffer: [8 * 1024]u8 = undefined;
-        var writer = stream.writer(self.io, &write_buffer);
-        try writer.interface.print(
-            "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{data.len},
-        );
-        try writer.interface.writeAll(data);
-        try writer.interface.flush();
-    }
-
-    fn writeStatus(self: *StaticHttpBundleServer, stream: std.Io.net.Stream, status: u16) !void {
-        var write_buffer: [256]u8 = undefined;
-        var writer = stream.writer(self.io, &write_buffer);
-        try writer.interface.print(
-            "HTTP/1.1 {d} Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            .{status},
-        );
-        try writer.interface.flush();
-    }
-};
-
-const TestHttpBodyServer = struct {
-    const Mode = enum {
-        content_length,
-        chunked,
-    };
-
-    io: Io,
-    server: std.Io.net.Server,
-    thread: std.Thread,
-    closed: std.atomic.Value(bool),
-    request_count: std.atomic.Value(usize),
-    body: []const u8,
-    mode: Mode,
-    content_length: ?u64,
-
-    fn init(self: *TestHttpBodyServer, io: Io, body: []const u8, mode: Mode, content_length: ?u64) !void {
-        var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
-        self.* = .{
-            .io = io,
-            .server = try address.listen(io, .{ .kernel_backlog = 8, .reuse_address = true }),
-            .thread = undefined,
-            .closed = .init(false),
-            .request_count = .init(0),
-            .body = body,
-            .mode = mode,
-            .content_length = content_length,
-        };
-        self.thread = try std.Thread.spawn(.{}, TestHttpBodyServer.serveThread, .{self});
-    }
-
-    fn deinit(self: *TestHttpBodyServer) void {
-        const wake_address = self.server.socket.address;
-        self.closed.store(true, .release);
-        if (wake_address.connect(self.io, .{ .mode = .stream })) |stream| {
-            stream.close(self.io);
-        } else |_| {}
-        self.server.deinit(self.io);
-        self.thread.join();
-    }
-
-    fn url(self: *TestHttpBodyServer, allocator: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/body", .{self.server.socket.address.getPort()});
-    }
-
-    fn serveThread(self: *TestHttpBodyServer) void {
-        while (!self.closed.load(.acquire)) {
-            var stream = self.server.accept(self.io) catch {
-                if (self.closed.load(.acquire)) return;
-                continue;
-            };
-            self.handle(stream) catch {};
-            stream.close(self.io);
-        }
-    }
-
-    fn handle(self: *TestHttpBodyServer, stream: std.Io.net.Stream) !void {
-        _ = self.request_count.fetchAdd(1, .monotonic);
-        var read_buffer: [8 * 1024]u8 = undefined;
-        var reader = stream.reader(self.io, &read_buffer);
-        _ = reader.interface.takeDelimiterExclusive('\n') catch return;
-        while (true) {
-            const header_raw = reader.interface.takeDelimiterExclusive('\n') catch return;
-            const header = std.mem.trimEnd(u8, header_raw, "\r");
-            if (header.len == 0) break;
-        }
-
-        var write_buffer: [8 * 1024]u8 = undefined;
-        var writer = stream.writer(self.io, &write_buffer);
-        switch (self.mode) {
-            .content_length => {
-                try writer.interface.print(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-                    .{self.content_length orelse self.body.len},
-                );
-                try writer.interface.writeAll(self.body);
-            },
-            .chunked => {
-                try writer.interface.writeAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
-                if (self.body.len > 0) {
-                    try writer.interface.print("{x}\r\n", .{self.body.len});
-                    try writer.interface.writeAll(self.body);
-                    try writer.interface.writeAll("\r\n");
-                }
-                try writer.interface.writeAll("0\r\n\r\n");
-            },
-        }
-        try writer.interface.flush();
-    }
-};
-
-/// Copies a bundle's files under a fake S3 prefix directory, as the bundle
-/// push did with `aws s3 cp`. Returns the bytes copied.
-fn copyBundleToFakeS3(allocator: std.mem.Allocator, io: Io, bundle_dir: []const u8, prefix_dir: []const u8) !u64 {
-    var bytes: u64 = 0;
-    for (try indexedBundleFiles(allocator, bundle_dir)) |rel_path| {
-        const data = try readFileAll(allocator, try pathZ(allocator, "{s}/{s}", .{ bundle_dir, rel_path }), 64 * 1024 * 1024);
-        const dest = try pathZ(allocator, "{s}/{s}", .{ prefix_dir, rel_path });
-        try ensureDirPath(io, std.fs.path.dirname(dest).?);
-        try writeFileAll(dest, data);
-        bytes += data.len;
-    }
-    return bytes;
-}
-
-fn writeFakeAwsScript(allocator: std.mem.Allocator, script_path: [:0]const u8, fake_s3_root: []const u8) !void {
-    try writeFakeAwsScriptWithLog(allocator, script_path, fake_s3_root, null);
-}
-
-fn writeFakeAwsScriptWithLog(
-    allocator: std.mem.Allocator,
-    script_path: [:0]const u8,
-    fake_s3_root: []const u8,
-    log_path: ?[]const u8,
-) !void {
-    const script = try std.fmt.allocPrint(
-        allocator,
-        \\#!/usr/bin/env bash
-        \\set -euo pipefail
-        \\root="{s}"
-        \\log_path="{s}"
-        \\if [[ -n "$log_path" ]]; then
-        \\  printf '%s\n' "$*" >> "$log_path"
-        \\fi
-        \\map_path() {{
-        \\  case "$1" in
-        \\    s3://*) key="$(printf '%s' "$1" | sed 's#^s3://##')"; printf '%s/%s' "$root" "$key" ;;
-        \\    *) printf '%s' "$1" ;;
-        \\  esac
-        \\}}
-        \\parse_s3api_args() {{
-        \\  bucket=""
-        \\  key=""
-        \\  range=""
-        \\  outfile=""
-        \\  while [[ "$#" -gt 0 ]]; do
-        \\    case "$1" in
-        \\      --bucket) bucket="$2"; shift 2 ;;
-        \\      --key) key="$2"; shift 2 ;;
-        \\      --range) range="$2"; shift 2 ;;
-        \\      --region|--query|--output) shift 2 ;;
-        \\      *) outfile="$1"; shift ;;
-        \\    esac
-        \\  done
-        \\  if [[ -z "$bucket" || -z "$key" ]]; then
-        \\    echo "missing fake aws bucket/key" >&2
-        \\    exit 64
-        \\  fi
-        \\}}
-        \\if [[ "$#" -ge 4 && "$1" == "s3" && "$2" == "cp" ]]; then
-        \\  src="$3"
-        \\  dst="$4"
-        \\  src_path="$(map_path "$src")"
-        \\  dst_path="$(map_path "$dst")"
-        \\  mkdir -p "$(dirname "$dst_path")"
-        \\  cp "$src_path" "$dst_path"
-        \\elif [[ "$#" -ge 2 && "$1" == "s3api" && "$2" == "head-object" ]]; then
-        \\  shift 2
-        \\  parse_s3api_args "$@"
-        \\  src_path="$root/$bucket/$key"
-        \\  wc -c < "$src_path" | tr -d '[:space:]'
-        \\  printf '\n'
-        \\elif [[ "$#" -ge 2 && "$1" == "s3api" && "$2" == "get-object" ]]; then
-        \\  shift 2
-        \\  parse_s3api_args "$@"
-        \\  if [[ -z "$outfile" ]]; then
-        \\    echo "missing fake aws output path" >&2
-        \\    exit 64
-        \\  fi
-        \\  src_path="$root/$bucket/$key"
-        \\  mkdir -p "$(dirname "$outfile")"
-        \\  cp "$src_path" "$outfile"
-        \\  size="$(wc -c < "$outfile" | tr -d '[:space:]')"
-        \\  printf '{{"ContentLength":%s}}\n' "$size"
-        \\else
-        \\  echo "unsupported fake aws invocation: $*" >&2
-        \\  exit 64
-        \\fi
-        \\
-    ,
-        .{ fake_s3_root, log_path orelse "" },
-    );
-    try writeFileAll(script_path, script);
-    if (std.c.chmod(script_path, 0o755) != 0) return error.IoFailed;
 }
 
 const test_line_levels = [_]gicv3.LineLevel{.{ .intid = 56, .asserted = false }};
@@ -3575,29 +2109,6 @@ test "fuzz rootfs index parsing" {
     try std.testing.fuzz({}, fuzzRootfsIndexParse, .{});
 }
 
-fn fuzzHttpSourceParse(_: void, s: *std.testing.Smith) !void {
-    // HTTP peer pull sources are attacker-influenced URI strings. They must
-    // either fail closed or parse to a digest-pinned, path-safe base URL.
-    var buf: [1024]u8 = undefined;
-    const len = s.slice(&buf);
-    const parsed = parseHttpSource(std.testing.allocator, buf[0..len]) catch return;
-    defer std.testing.allocator.free(parsed.location.base_url);
-    defer std.testing.allocator.free(parsed.expected_digest);
-    try validateSha256DigestHex(parsed.expected_digest);
-    const uri = std.Uri.parse(parsed.location.base_url) catch return error.BadManifest;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.BadManifest;
-    if (uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.BadManifest;
-    const path = uriComponentText(uri.path);
-    if (path.len > 0) {
-        if (path[0] != '/') return error.BadManifest;
-        if (path.len > 1) try validateRelativeSegments(path[1..]);
-    }
-}
-
-test "fuzz http pull source parsing" {
-    try std.testing.fuzz({}, fuzzHttpSourceParse, .{});
-}
-
 test "pack and unpack chunkpack bundle strips local backing" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -3718,7 +2229,7 @@ test "pack and unpack preserves multi-vCPU manifests" {
     try std.testing.expectError(error.IoFailed, unpack(arena, .{ .io = io, .bundle_dir = bundle_dir, .out_dir = missing_out_dir }));
 }
 
-test "indexed bundle pull preserves multi-vCPU manifests" {
+test "unpacking a child preserves multi-vCPU manifests" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -3730,8 +2241,7 @@ test "indexed bundle pull preserves multi-vCPU manifests" {
     const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
     const child_dir = try pathZ(arena, "{s}/000000", .{children_dir});
     const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out_dir = try pathZ(arena, "{s}/pulled", .{root_dir});
-    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
+    const out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir});
 
     const ram = try arena.alloc(u8, spore.chunk_size + 3);
     @memset(ram, 0);
@@ -3743,9 +2253,9 @@ test "indexed bundle pull preserves multi-vCPU manifests" {
     try spore.saveManifest(arena, child_dir, testManifestMulti(try spore.saveMemory(arena, child_dir, ram), ram.len, &vcpus));
 
     const pack_result = try pack(arena, .{ .io = io, .spore_dir = parent_dir, .out_dir = bundle_dir, .children_dir = children_dir });
-    const pulled = try pull(arena, .{ .io = io, .source = source_uri, .out_dir = out_dir, .child_id = "0" });
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled.bundle_digest.hex);
-    try std.testing.expectEqualStrings("000000", pulled.children.selected_child.?);
+    const unpacked = try unpack(arena, .{ .io = io, .bundle_dir = bundle_dir, .out_dir = out_dir, .child_id = "0" });
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, unpacked.bundle_digest);
+    try std.testing.expectEqualStrings("000000", unpacked.selected_child.?);
 
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();
@@ -3805,8 +2315,6 @@ test "flat bundles fail as too old" {
 
     try std.testing.expectError(error.FormatTooOld, unpack(arena, .{ .io = io, .bundle_dir = bundle_dir, .out_dir = try pathZ(arena, "{s}/unpacked", .{root_dir}) }));
     try std.testing.expectError(error.FormatTooOld, inspectBundle(arena, .{ .source = bundle_dir }));
-    const source = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
-    try std.testing.expectError(error.FormatTooOld, pull(arena, .{ .io = io, .source = source, .out_dir = try pathZ(arena, "{s}/pulled", .{root_dir}) }));
 }
 
 test "pack and unpack rootfs artifact" {
@@ -4442,627 +2950,6 @@ test "pack children writes bundle index and unpacks selected child" {
     try std.testing.expectEqualSlices(u8, ram, out);
 }
 
-test "pull file bundle materializes children through chunk cache" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out0_dir = try pathZ(arena, "{s}/pulled-0", .{root_dir});
-    const out1_dir = try pathZ(arena, "{s}/pulled-1", .{root_dir});
-    const chunk_cache_dir = try pathZ(arena, "{s}/chunk-cache", .{root_dir});
-    const pack_cache_root = try pathZ(arena, "{s}/pack-rootfs-cache", .{root_dir});
-    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
-    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
-    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
-
-    const ram = try arena.alloc(u8, spore.chunk_size + 11);
-    @memset(ram, 0);
-    ram[7] = 0x53;
-    ram[spore.chunk_size + 3] = 0xA7;
-    const memory = try spore.saveMemory(arena, parent_dir, ram);
-    try writeFileAll(rootfs_source_path, "pull rootfs artifact bytes");
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
-    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 71, artifact));
-    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
-
-    const pack_result = try pack(arena, .{
-        .io = io,
-        .spore_dir = parent_dir,
-        .out_dir = bundle_dir,
-        .rootfs_cache_dir = pack_cache_root,
-        .children_dir = children_dir,
-    });
-
-    const pulled0 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out0_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = chunk_cache_dir,
-        .child_id = "0",
-    });
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
-    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.materialized_chunk_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.materialization.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.materialization.cache.bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.linked_chunk_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs.cache.miss_count);
-    try std.testing.expectEqual(artifact.size, pulled0.rootfs.cache.bytes_fetched);
-
-    const pulled1 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out1_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = chunk_cache_dir,
-        .child_id = "1",
-    });
-    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.materialized_chunk_count);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.materialization.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.materialization.cache.bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.linked_chunk_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs.cache.bytes_fetched);
-
-    const restored_manifest = try spore.loadManifest(arena, out1_dir);
-    defer restored_manifest.deinit();
-    const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
-    const fd = try rootfs_cache.openVerifiedFromCache(io, arena, pull_rootfs_cache, restored_rootfs);
-    _ = std.c.close(fd);
-    const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0);
-    try spore.loadMemory(arena, out1_dir, restored_manifest.value.memory, out);
-    try std.testing.expectEqualSlices(u8, ram, out);
-}
-
-test "push and pull s3 indexed bundle through verified remote cache" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out0_dir = try pathZ(arena, "{s}/s3-pulled-0", .{root_dir});
-    const out1_dir = try pathZ(arena, "{s}/s3-pulled-1", .{root_dir});
-    const out_bad_dir = try pathZ(arena, "{s}/s3-pulled-bad", .{root_dir});
-    const pack_cache_root = try pathZ(arena, "{s}/pack-rootfs-cache", .{root_dir});
-    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
-    const remote_cache_dir = try pathZ(arena, "{s}/remote-cache", .{root_dir});
-    const bad_remote_cache_dir = try pathZ(arena, "{s}/bad-remote-cache", .{root_dir});
-    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
-    const fake_s3_root = try pathZ(arena, "{s}/fake-s3", .{root_dir});
-    const fake_aws = try pathZ(arena, "{s}/fake-aws", .{root_dir});
-    try ensureDirPath(io, fake_s3_root);
-    try writeFakeAwsScript(arena, fake_aws, fake_s3_root);
-
-    const ram = try arena.alloc(u8, spore.chunk_size + 19);
-    @memset(ram, 0);
-    ram[11] = 0x74;
-    ram[spore.chunk_size + 9] = 0x45;
-    const memory = try spore.saveMemory(arena, parent_dir, ram);
-    try writeFileAll(rootfs_source_path, "s3 pull rootfs artifact bytes");
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
-    try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 101, artifact));
-    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
-
-    const pack_result = try pack(arena, .{
-        .io = io,
-        .spore_dir = parent_dir,
-        .out_dir = bundle_dir,
-        .rootfs_cache_dir = pack_cache_root,
-        .children_dir = children_dir,
-    });
-
-    const uploaded_bytes = try copyBundleToFakeS3(arena, io, bundle_dir, try pathZ(arena, "{s}/bucket/runs/demo.bundle", .{fake_s3_root}));
-    const source_uri = try std.fmt.allocPrint(arena, "s3://bucket/runs/demo.bundle@sha256:{s}", .{pack_result.bundle_digest});
-    const pulled0 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out0_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = remote_cache_dir,
-        .child_id = "0",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    });
-    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
-    try std.testing.expect(!pulled0.remote.cache_hit);
-    try std.testing.expectEqual(uploaded_bytes, pulled0.remote.origin_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.materialization.cache.bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled0.rootfs.cache.miss_count);
-    try std.testing.expectEqual(artifact.size, pulled0.rootfs.cache.bytes_fetched);
-
-    const pulled1 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out1_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = remote_cache_dir,
-        .child_id = "1",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    });
-    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
-    try std.testing.expect(pulled1.remote.cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.origin_bytes_read);
-    try std.testing.expectEqual(@as(usize, 2), pulled1.materialization.cache.hit_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.materialization.cache.bytes_fetched);
-    try std.testing.expectEqual(@as(usize, 1), pulled1.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled1.rootfs.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.rootfs.cache.bytes_fetched);
-
-    const restored_manifest = try spore.loadManifest(arena, out1_dir);
-    defer restored_manifest.deinit();
-    const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
-    const fd = try rootfs_cache.openVerifiedFromCache(io, arena, pull_rootfs_cache, restored_rootfs);
-    _ = std.c.close(fd);
-    const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0);
-    try spore.loadMemory(arena, out1_dir, restored_manifest.value.memory, out);
-    try std.testing.expectEqualSlices(u8, ram, out);
-
-    const remote_pack_path = try pathZ(arena, "{s}/bucket/runs/demo.bundle/{s}", .{ fake_s3_root, pack_path });
-    const data = try readFileAll(arena, remote_pack_path, 2 * spore.chunk_size);
-    data[0] ^= 0x11;
-    try writeFileAll(remote_pack_path, data);
-    try std.testing.expectError(error.BadChunk, pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out_bad_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = bad_remote_cache_dir,
-        .child_id = "1",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    }));
-}
-
-test "push and pull s3 indexed bundle carries disk indexes" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out0_dir = try pathZ(arena, "{s}/s3-disk-pulled-0", .{root_dir});
-    const out1_dir = try pathZ(arena, "{s}/s3-disk-pulled-1", .{root_dir});
-    const out_bad_dir = try pathZ(arena, "{s}/s3-disk-pulled-bad", .{root_dir});
-    const pack_cache_root = try pathZ(arena, "{s}/pack-rootfs-cache", .{root_dir});
-    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
-    const remote_cache_dir = try pathZ(arena, "{s}/remote-cache", .{root_dir});
-    const bad_remote_cache_dir = try pathZ(arena, "{s}/bad-remote-cache", .{root_dir});
-    const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
-    const fake_s3_root = try pathZ(arena, "{s}/fake-s3", .{root_dir});
-    const fake_aws = try pathZ(arena, "{s}/fake-aws", .{root_dir});
-    try ensureDirPath(io, fake_s3_root);
-    try writeFakeAwsScript(arena, fake_aws, fake_s3_root);
-
-    const ram = try arena.alloc(u8, spore.chunk_size + 29);
-    @memset(ram, 0);
-    ram[17] = 0x6A;
-    ram[spore.chunk_size + 13] = 0xB4;
-    const memory = try spore.saveMemory(arena, parent_dir, ram);
-    const base_bytes = try arena.alloc(u8, 8192);
-    @memset(base_bytes, 0);
-    base_bytes[0] = 0x41;
-    base_bytes[4096] = 0x42;
-    try writeFileAll(rootfs_source_path, base_bytes);
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
-    var manifest = testRootfsManifest(memory, ram.len, 121, artifact);
-    try attachTestDiskIndex(arena, parent_dir, &manifest, rootfs_source_path, 4096, "remote disk bundle payload");
-    try spore.saveManifest(arena, parent_dir, manifest);
-    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
-
-    const pack_result = try pack(arena, .{
-        .io = io,
-        .spore_dir = parent_dir,
-        .out_dir = bundle_dir,
-        .rootfs_cache_dir = pack_cache_root,
-        .children_dir = children_dir,
-    });
-    const files = try indexedBundleFiles(arena, bundle_dir);
-    try std.testing.expectEqual(@as(usize, 10), files.len);
-
-    const uploaded_bytes = try copyBundleToFakeS3(arena, io, bundle_dir, try pathZ(arena, "{s}/bucket/runs/disk-demo.bundle", .{fake_s3_root}));
-    const source_uri = try std.fmt.allocPrint(arena, "s3://bucket/runs/disk-demo.bundle@sha256:{s}", .{pack_result.bundle_digest});
-    const pulled0 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out0_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = remote_cache_dir,
-        .child_id = "0",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    });
-    try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
-    try std.testing.expect(!pulled0.remote.cache_hit);
-    try std.testing.expectEqual(uploaded_bytes, pulled0.remote.origin_bytes_read);
-    const restored0 = try spore.loadManifest(arena, out0_dir);
-    defer restored0.deinit();
-    const restored0_disk = restored0.value.disk orelse return error.BadManifest;
-    try std.testing.expectEqualStrings(spore.disk_kind_chunk_index, restored0_disk.kind);
-    const restored0_index_path = try rootfs_cas.manifestIndexPath(arena, out0_dir, restored0_disk.base);
-    try std.testing.expect(try pathExistsNoSymlink(io, restored0_index_path));
-
-    const pulled1 = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out1_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = remote_cache_dir,
-        .child_id = "1",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    });
-    try std.testing.expectEqualStrings("000001", pulled1.children.selected_child.?);
-    try std.testing.expect(pulled1.remote.cache_hit);
-    try std.testing.expectEqual(@as(u64, 0), pulled1.remote.origin_bytes_read);
-    const restored1 = try spore.loadManifest(arena, out1_dir);
-    defer restored1.deinit();
-    const restored1_disk = restored1.value.disk orelse return error.BadManifest;
-    try std.testing.expectEqualStrings(spore.disk_kind_chunk_index, restored1_disk.kind);
-    const restored1_index_path = try rootfs_cas.manifestIndexPath(arena, out1_dir, restored1_disk.base);
-    try std.testing.expect(try pathExistsNoSymlink(io, restored1_index_path));
-
-    const disk = manifest.disk orelse return error.BadManifest;
-    const storage = try diskStorageDescriptor(disk);
-    const parsed_index = try loadDiskIndexForDisk(arena, bundle_dir, storage);
-    defer parsed_index.deinit();
-    const object_rel = try rootfsStorageObjectRelPath(arena, parsed_index.value.chunks[0].id);
-    const remote_object_path = try pathZ(arena, "{s}/bucket/runs/disk-demo.bundle/{s}", .{ fake_s3_root, object_rel });
-    const object_data = try readFileAll(arena, remote_object_path, 8192);
-    object_data[0] ^= 0x55;
-    try writeFileAll(remote_object_path, object_data);
-    try std.testing.expectError(error.BadChunk, pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out_bad_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = bad_remote_cache_dir,
-        .child_id = "1",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    }));
-}
-
-test "s3 bundle file uses head-object and bounded get-object range" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const fake_s3_root = try pathZ(arena, "{s}/fake-s3", .{root_dir});
-    const remote_bundle_dir = try pathZ(arena, "{s}/bucket/runs/demo.bundle", .{fake_s3_root});
-    const fake_aws = try pathZ(arena, "{s}/fake-aws", .{root_dir});
-    const log_path = try pathZ(arena, "{s}/fake-aws.log", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/downloaded", .{root_dir});
-    try ensureDirPath(io, remote_bundle_dir);
-    try writeFileAll(try pathZ(arena, "{s}/{s}", .{ remote_bundle_dir, bundle_index_path }), "1234");
-    try writeFakeAwsScriptWithLog(arena, fake_aws, fake_s3_root, log_path);
-
-    const location = try parseS3Location(arena, "s3://bucket/runs/demo.bundle");
-    var budget = RemoteBundleDownloadBudget{};
-    const copied = try downloadS3BundleFile(arena, .{
-        .io = io,
-        .source = "s3://bucket/runs/demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .out_dir = root_dir,
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    }, location, bundle_dir, bundle_index_path, &budget, .metadata, 4);
-    try std.testing.expectEqual(@as(u64, 4), copied);
-    try std.testing.expectEqual(@as(u64, 4), budget.total_read);
-    try std.testing.expectEqual(@as(u64, 4), budget.metadata_read);
-
-    const downloaded = try readFileAll(arena, try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path }), 16);
-    try std.testing.expectEqualStrings("1234", downloaded);
-    const log = try readFileAll(arena, log_path, 4096);
-    try std.testing.expect(std.mem.indexOf(u8, log, "s3api head-object") != null);
-    try std.testing.expect(std.mem.indexOf(u8, log, "s3api get-object") != null);
-    try std.testing.expect(std.mem.indexOf(u8, log, "--range bytes=0-3") != null);
-}
-
-test "s3 bundle file rejects oversized head before get-object" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const fake_s3_root = try pathZ(arena, "{s}/fake-s3", .{root_dir});
-    const remote_bundle_dir = try pathZ(arena, "{s}/bucket/runs/demo.bundle", .{fake_s3_root});
-    const fake_aws = try pathZ(arena, "{s}/fake-aws", .{root_dir});
-    const log_path = try pathZ(arena, "{s}/fake-aws.log", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/downloaded", .{root_dir});
-    try ensureDirPath(io, remote_bundle_dir);
-    try writeFileAll(try pathZ(arena, "{s}/{s}", .{ remote_bundle_dir, bundle_index_path }), "12345");
-    try writeFakeAwsScriptWithLog(arena, fake_aws, fake_s3_root, log_path);
-
-    const location = try parseS3Location(arena, "s3://bucket/runs/demo.bundle");
-    var budget = RemoteBundleDownloadBudget{};
-    try std.testing.expectError(error.BundleBodyTooLarge, downloadS3BundleFile(arena, .{
-        .io = io,
-        .source = "s3://bucket/runs/demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .out_dir = root_dir,
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    }, location, bundle_dir, bundle_index_path, &budget, .metadata, 4));
-    try std.testing.expectEqual(@as(u64, 0), budget.total_read);
-    try std.testing.expectEqual(@as(u64, 0), budget.metadata_read);
-    try std.testing.expect(!try pathExistsNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path })));
-
-    const log = try readFileAll(arena, log_path, 4096);
-    try std.testing.expect(std.mem.indexOf(u8, log, "s3api head-object") != null);
-    try std.testing.expect(std.mem.indexOf(u8, log, "s3api get-object") == null);
-}
-
-test "s3 bundle file deletes partial file when observed size changes" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const fake_aws = try pathZ(arena, "{s}/fake-aws-racy", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/downloaded", .{root_dir});
-    const script =
-        \\#!/usr/bin/env bash
-        \\set -euo pipefail
-        \\if [[ "$1" == "s3api" && "$2" == "head-object" ]]; then
-        \\  printf '4\n'
-        \\  exit 0
-        \\fi
-        \\if [[ "$1" == "s3api" && "$2" == "get-object" ]]; then
-        \\  shift 2
-        \\  outfile=""
-        \\  while [[ "$#" -gt 0 ]]; do
-        \\    case "$1" in
-        \\      --bucket|--key|--range|--region) shift 2 ;;
-        \\      *) outfile="$1"; shift ;;
-        \\    esac
-        \\  done
-        \\  mkdir -p "$(dirname "$outfile")"
-        \\  printf '12345' > "$outfile"
-        \\  printf '{"ContentLength":5}\n'
-        \\  exit 0
-        \\fi
-        \\exit 64
-        \\
-    ;
-    try writeFileAll(fake_aws, script);
-    if (std.c.chmod(fake_aws, 0o755) != 0) return error.IoFailed;
-
-    const location = try parseS3Location(arena, "s3://bucket/runs/demo.bundle");
-    var budget = RemoteBundleDownloadBudget{};
-    try std.testing.expectError(error.BadChunk, downloadS3BundleFile(arena, .{
-        .io = io,
-        .source = "s3://bucket/runs/demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        .out_dir = root_dir,
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    }, location, bundle_dir, bundle_index_path, &budget, .metadata, 8));
-    try std.testing.expect(!try pathExistsNoSymlink(io, try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path })));
-    try std.testing.expectEqual(@as(u64, 0), budget.total_read);
-}
-
-test "http bundle pull rejects loopback source before request" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    try ensureDirPath(io, bundle_dir);
-    try writeFileAll(try pathZ(arena, "{s}/{s}", .{ bundle_dir, bundle_index_path }), "{}");
-
-    var server: StaticHttpBundleServer = undefined;
-    try server.init(arena, io, bundle_dir, "spore.bundle");
-    defer server.deinit();
-
-    const base_url = try server.baseUrl(arena);
-    const url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base_url, bundle_index_path });
-    const dest_path = try pathZ(arena, "{s}/downloaded-bundle.json", .{root_dir});
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-    try std.testing.expectError(error.BadManifest, httpGetToFile(io, &client, url, dest_path, max_remote_bundle_metadata_file_bytes));
-    try std.testing.expectEqual(@as(usize, 0), server.request_count.load(.monotonic));
-}
-
-test "http bundle file rejects oversized content length before writing" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const dest_path = try pathZ(arena, "{s}/oversized-body", .{root_dir});
-    var server: TestHttpBodyServer = undefined;
-    try server.init(io, "", .content_length, 17);
-    defer server.deinit();
-
-    const url = try server.url(arena);
-    const uri = try std.Uri.parse(url);
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-    try std.testing.expectError(error.BundleBodyTooLarge, httpGetToFileAfterPolicy(io, &client, uri, server.server.socket.address, dest_path, 16));
-    try std.testing.expect(!try pathExistsNoSymlink(io, dest_path));
-    try std.testing.expectEqual(@as(usize, 1), server.request_count.load(.monotonic));
-}
-
-test "http bundle file stops chunked bodies at the streaming limit" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const body = try arena.alloc(u8, 128 * 1024);
-    @memset(body, 0xAB);
-    const root_dir = try testDir(arena);
-    const dest_path = try pathZ(arena, "{s}/oversized-chunked-body", .{root_dir});
-    var server: TestHttpBodyServer = undefined;
-    try server.init(io, body, .chunked, null);
-    defer server.deinit();
-
-    const url = try server.url(arena);
-    const uri = try std.Uri.parse(url);
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-    try std.testing.expectError(error.BundleBodyTooLarge, httpGetToFileAfterPolicy(io, &client, uri, server.server.socket.address, dest_path, 16 * 1024));
-    try std.testing.expect(!try pathExistsNoSymlink(io, dest_path));
-    try std.testing.expectEqual(@as(usize, 1), server.request_count.load(.monotonic));
-}
-
-test "pull fails closed on corrupt chunk cache entries" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const root_dir = try testDir(arena);
-    const parent_dir = try pathZ(arena, "{s}/parent", .{root_dir});
-    const children_dir = try pathZ(arena, "{s}/children", .{root_dir});
-    const bundle_dir = try pathZ(arena, "{s}/bundle", .{root_dir});
-    const out0_dir = try pathZ(arena, "{s}/pulled-0", .{root_dir});
-    const out_bad_dir = try pathZ(arena, "{s}/pulled-bad", .{root_dir});
-    const chunk_cache_dir = try pathZ(arena, "{s}/chunk-cache", .{root_dir});
-    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
-
-    const ram = try arena.alloc(u8, spore.chunk_size);
-    @memset(ram, 0x62);
-    const memory = try spore.saveMemory(arena, parent_dir, ram);
-    try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 81));
-    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
-    _ = try pack(arena, .{
-        .io = io,
-        .spore_dir = parent_dir,
-        .out_dir = bundle_dir,
-        .children_dir = children_dir,
-    });
-    _ = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out0_dir,
-        .bundle_cache_dir = chunk_cache_dir,
-        .child_id = "000000",
-    });
-
-    const restored_manifest = try spore.loadManifest(arena, out0_dir);
-    defer restored_manifest.deinit();
-    if (restored_manifest.value.memory.chunks.len == 0) return error.BadManifest;
-    const first_ref_buf = restored_manifest.value.memory.chunks[0].id.toHex();
-    const first_ref: []const u8 = &first_ref_buf;
-    const cache_path = try chunkCachePath(arena, chunk_cache_dir, first_ref);
-    try Io.Dir.cwd().deleteFile(io, cache_path);
-    try writeFileAll(try pathZ(arena, "{s}", .{cache_path}), "tampered");
-
-    try std.testing.expectError(error.BadChunk, pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out_bad_dir,
-        .bundle_cache_dir = chunk_cache_dir,
-        .child_id = "000000",
-    }));
-    const manifest_path = try pathZ(arena, "{s}/manifest.json", .{out_bad_dir});
-    try std.testing.expect(std.c.access(manifest_path, 0) != 0);
-}
-
-test "pull rejects mutable or ambiguous sources" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.BadManifest, pull(allocator, .{
-        .io = std.testing.io,
-        .source = "https://example.test/spore.bundle",
-        .out_dir = "zig-cache/pull-unsupported",
-    }));
-    try std.testing.expectError(error.BadManifest, pull(allocator, .{
-        .io = std.testing.io,
-        .source = "s3://bucket/spore.bundle",
-        .out_dir = "zig-cache/pull-unsupported",
-    }));
-    try std.testing.expectError(error.BadManifest, pull(allocator, .{
-        .io = std.testing.io,
-        .source = "file://relative.bundle",
-        .out_dir = "zig-cache/pull-relative",
-    }));
-    try std.testing.expectError(error.BadManifest, pull(allocator, .{
-        .io = std.testing.io,
-        .source = "file:///tmp/with%20escape.bundle",
-        .out_dir = "zig-cache/pull-escaped",
-    }));
-}
-
-test "http uri parser requires immutable digest and path-safe source" {
-    const allocator = std.testing.allocator;
-    const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/spore.bundle"));
-    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/spore.bundle@sha256:not-hex"));
-    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://user@127.0.0.1:20000/spore.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/runs/../spore.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-    try std.testing.expectError(error.BadManifest, parseHttpSource(allocator, "http://127.0.0.1:20000/spore.bundle?mutable=1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-
-    const source = try std.fmt.allocPrint(allocator, "http://127.0.0.1:20000/spore.bundle/@sha256:{s}", .{digest});
-    defer allocator.free(source);
-    const parsed = try parseHttpSource(allocator, source);
-    defer allocator.free(parsed.location.base_url);
-    defer allocator.free(parsed.expected_digest);
-    try std.testing.expectEqualStrings("http://127.0.0.1:20000/spore.bundle", parsed.location.base_url);
-    try std.testing.expectEqualStrings(digest, parsed.expected_digest);
-}
-
-test "http fetch target policy rejects private bundle sources" {
-    try std.testing.expectError(error.BadManifest, validateHttpFetchTarget(std.testing.io, try std.Uri.parse("https://127.0.0.1/spore.bundle")));
-    try std.testing.expectError(error.BadManifest, validateHttpFetchTarget(std.testing.io, try std.Uri.parse("https://169.254.169.254/spore.bundle")));
-    try std.testing.expectError(error.BadManifest, validateHttpFetchTarget(std.testing.io, try std.Uri.parse("https://10.0.0.1/spore.bundle")));
-}
-
-test "s3 uri parser requires immutable digest for sources" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.BadManifest, parseS3Source(allocator, "s3://bucket/runs/demo.bundle"));
-    try std.testing.expectError(error.BadManifest, parseS3Source(allocator, "s3://bucket/runs/demo.bundle@sha256:not-hex"));
-
-    const parsed = try parseS3Source(allocator, "s3://bucket/runs/demo.bundle/@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    defer allocator.free(parsed.location.bucket);
-    defer allocator.free(parsed.location.prefix);
-    defer allocator.free(parsed.expected_digest);
-    try std.testing.expectEqualStrings("bucket", parsed.location.bucket);
-    try std.testing.expectEqualStrings("runs/demo.bundle", parsed.location.prefix);
-    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", parsed.expected_digest);
-
-    try std.testing.expectError(error.BadManifest, parseS3Source(allocator, "s3://bucket/runs/../demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-}
-
 test "local bundle content source rejects out-of-bounds ranges" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -5148,7 +3035,7 @@ test "pack children writes exact rootfs policy and unpacks selected rootfs child
     _ = std.c.close(fd);
 }
 
-test "pack reads chunked rootfs directly from CAS and pull materializes it" {
+test "pack reads chunked rootfs directly from CAS and unpack materializes it" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -5164,18 +3051,16 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     const metadata_only_storage_bundle_dir = try pathZ(arena, "{s}/metadata-only-storage-bundle", .{root_dir});
     const single_out_dir = try pathZ(arena, "{s}/single-unpacked", .{root_dir});
     const corrupt_unpack_out_dir = try pathZ(arena, "{s}/corrupt-unpack", .{root_dir});
-    const out_dir = try pathZ(arena, "{s}/pulled-child", .{root_dir});
-    const out_cached_dir = try pathZ(arena, "{s}/pulled-cached-child", .{root_dir});
-    const out_repaired_dir = try pathZ(arena, "{s}/pulled-repaired-child", .{root_dir});
-    const out_bad_dir = try pathZ(arena, "{s}/pulled-bad-child", .{root_dir});
+    const out_dir = try pathZ(arena, "{s}/unpacked-child", .{root_dir});
+    const out_cached_dir = try pathZ(arena, "{s}/unpacked-cached-child", .{root_dir});
+    const out_repaired_dir = try pathZ(arena, "{s}/unpacked-repaired-child", .{root_dir});
+    const out_bad_dir = try pathZ(arena, "{s}/unpacked-bad-child", .{root_dir});
     const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
     const single_rootfs_cache = try pathZ(arena, "{s}/single-rootfs-cache", .{root_dir});
     const empty_repack_cache = try pathZ(arena, "{s}/empty-repack-cache", .{root_dir});
     const corrupt_unpack_cache = try pathZ(arena, "{s}/corrupt-unpack-cache", .{root_dir});
-    const pull_rootfs_cache = try pathZ(arena, "{s}/pull-rootfs-cache", .{root_dir});
+    const unpack_rootfs_cache = try pathZ(arena, "{s}/unpack-rootfs-cache", .{root_dir});
     const bad_rootfs_cache = try pathZ(arena, "{s}/bad-rootfs-cache", .{root_dir});
-    const pull_bundle_cache = try pathZ(arena, "{s}/pull-bundle-cache", .{root_dir});
-    const bad_bundle_cache = try pathZ(arena, "{s}/bad-bundle-cache", .{root_dir});
     const incomplete_source_bundle_dir = try pathZ(arena, "{s}/incomplete-source-bundle", .{root_dir});
     const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
 
@@ -5272,77 +3157,72 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try std.testing.expectEqual(preload_result.nonzero_chunks, storage_entry.object_count);
     const storage = rootfsStorageEntryDescriptor(storage_entry);
 
-    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
     var disk_source_reads: usize = 0;
     testing.disk_unpack_source_object_reads = &disk_source_reads;
     defer testing.disk_unpack_source_object_reads = null;
-    const pulled = try pull(arena, .{
+    const unpacked = try materialize(arena, .{
         .io = io,
-        .source = source_uri,
+        .bundle_dir = bundle_dir,
         .out_dir = out_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = pull_bundle_cache,
+        .rootfs_cache_dir = unpack_rootfs_cache,
         .child_id = "000000",
     });
     testing.disk_unpack_source_object_reads = null;
     try std.testing.expectEqual(@as(usize, 0), disk_source_reads);
-    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.artifact_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled.rootfs.cache.hit_count);
-    try std.testing.expectEqual(unique_source_objects.count() + 1, pulled.rootfs.cache.miss_count);
-    try std.testing.expect(pulled.rootfs.cache.bytes_fetched > 0);
-    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_reused);
-    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
+    try std.testing.expectEqual(@as(usize, 1), unpacked.rootfs.artifact_count);
+    try std.testing.expectEqual(@as(usize, 0), unpacked.rootfs.cache_hit_count);
+    try std.testing.expectEqual(unique_source_objects.count() + 1, unpacked.rootfs.cache_miss_count);
+    try std.testing.expect(unpacked.rootfs.bytes_fetched > 0);
+    try std.testing.expectEqual(@as(u64, 0), unpacked.rootfs.bytes_reused);
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, unpack_rootfs_cache, storage));
 
     const repair_entry = source_index.parsed.value.chunks[0];
-    const missing_cached_object = try rootfs_cas.objectPath(arena, pull_rootfs_cache, repair_entry.id);
+    const missing_cached_object = try rootfs_cas.objectPath(arena, unpack_rootfs_cache, repair_entry.id);
     try Io.Dir.cwd().deleteFile(io, missing_cached_object);
-    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, unpack_rootfs_cache, storage));
 
-    const pulled_cached = try pull(arena, .{
+    const unpacked_cached = try materialize(arena, .{
         .io = io,
-        .source = source_uri,
+        .bundle_dir = bundle_dir,
         .out_dir = out_cached_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = pull_bundle_cache,
+        .rootfs_cache_dir = unpack_rootfs_cache,
         .child_id = "000000",
     });
-    try std.testing.expectEqual(unique_source_objects.count(), pulled_cached.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 1), pulled_cached.rootfs.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, spore.disk_chunk_size), pulled_cached.rootfs.cache.bytes_fetched);
-    try std.testing.expectEqual(pulled.rootfs.payload_bytes - spore.disk_chunk_size, pulled_cached.rootfs.cache.bytes_reused);
-    try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled_cached.materialization.cache.bytes_reused);
+    try std.testing.expectEqual(unique_source_objects.count(), unpacked_cached.rootfs.cache_hit_count);
+    try std.testing.expectEqual(@as(usize, 1), unpacked_cached.rootfs.cache_miss_count);
+    try std.testing.expectEqual(@as(u64, spore.disk_chunk_size), unpacked_cached.rootfs.bytes_fetched);
+    try std.testing.expectEqual(unpacked.rootfs.payload_bytes - spore.disk_chunk_size, unpacked_cached.rootfs.bytes_reused);
     const repaired_cached_object = try rootfs_cas.readVerifiedChunkPath(arena, missing_cached_object, &repair_entry.id.toDigest(), spore.disk_chunk_size);
     try std.testing.expectEqual(@as(usize, spore.disk_chunk_size), repaired_cached_object.len);
 
     // A completed cache can contain a structurally invalid regular file after
     // truncation or an interrupted external repair. Keep the old stamp present
-    // to prove pull removes it before atomically replacing both invalid entries.
-    const cached_index_path = try rootfs_cas.manifestIndexPath(arena, pull_rootfs_cache, storage.index_digest);
-    const cached_stamp_path = try rootfs_cas.storageCompleteStampPath(arena, pull_rootfs_cache, storage.index_digest);
+    // to prove unpack removes it before atomically replacing both invalid entries.
+    const cached_index_path = try rootfs_cas.manifestIndexPath(arena, unpack_rootfs_cache, storage.index_digest);
+    const cached_stamp_path = try rootfs_cas.storageCompleteStampPath(arena, unpack_rootfs_cache, storage.index_digest);
     try Io.Dir.cwd().deleteFile(io, missing_cached_object);
     try writeFileAll(try arena.dupeZ(u8, missing_cached_object), "truncated");
     try Io.Dir.cwd().deleteFile(io, cached_index_path);
     try writeFileAll(try arena.dupeZ(u8, cached_index_path), "{}");
     try std.testing.expect(try pathExistsNoSymlink(io, cached_stamp_path));
-    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
+    try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, unpack_rootfs_cache, storage));
 
-    _ = try pull(arena, .{
+    _ = try materialize(arena, .{
         .io = io,
-        .source = source_uri,
+        .bundle_dir = bundle_dir,
         .out_dir = out_repaired_dir,
-        .rootfs_cache_dir = pull_rootfs_cache,
-        .bundle_cache_dir = pull_bundle_cache,
+        .rootfs_cache_dir = unpack_rootfs_cache,
         .child_id = "000000",
     });
-    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
+    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, unpack_rootfs_cache, storage));
     const repaired_truncated_object = try rootfs_cas.readVerifiedChunkPath(arena, missing_cached_object, &repair_entry.id.toDigest(), spore.disk_chunk_size);
     try std.testing.expectEqual(@as(usize, spore.disk_chunk_size), repaired_truncated_object.len);
     const repaired_index = try rootfs_cas.readStorageIndexPath(arena, cached_index_path, storage);
     try std.testing.expectEqualStrings(source_index.bytes, repaired_index.bytes);
 
-    // Chunked pulls eagerly assemble the flat digest-addressed artifact from
+    // Chunked unpacks eagerly assemble the flat digest-addressed artifact from
     // the installed verified chunks; it is the only runtime base source.
-    const exact_cache_path = try rootfs_cache.digestPath(arena, pull_rootfs_cache, preload_result.index_digest);
+    const exact_cache_path = try rootfs_cache.digestPath(arena, unpack_rootfs_cache, preload_result.index_digest);
     try std.testing.expect(try pathExistsNoSymlink(io, exact_cache_path));
     const restored_manifest = try spore.loadManifest(arena, out_dir);
     defer restored_manifest.deinit();
@@ -5391,12 +3271,11 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try writeFileAll(object_path, object_data);
     const corrupt_digest = try digestHex(arena, bundle_dir);
     try std.testing.expect(!std.mem.eql(u8, clean_digest, corrupt_digest));
-    try std.testing.expectError(error.BadChunk, pull(arena, .{
+    try std.testing.expectError(error.BadChunk, materialize(arena, .{
         .io = io,
-        .source = source_uri,
+        .bundle_dir = bundle_dir,
         .out_dir = out_bad_dir,
         .rootfs_cache_dir = bad_rootfs_cache,
-        .bundle_cache_dir = bad_bundle_cache,
         .child_id = "000000",
     }));
     try std.testing.expect(!try pathExistsNoSymlink(io, out_bad_dir));
@@ -5447,13 +3326,9 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     const out_dir = try pathZ(arena, "{s}/unpacked-child", .{root_dir});
     const out_missing_dir = try pathZ(arena, "{s}/unpacked-missing-child", .{root_dir});
     const out_prepared_dir = try pathZ(arena, "{s}/unpacked-prepared-child", .{root_dir});
-    const out_pull_denied_dir = try pathZ(arena, "{s}/pulled-denied-child", .{root_dir});
-    const out_pull_missing_dir = try pathZ(arena, "{s}/pulled-missing-child", .{root_dir});
-    const out_pull_dir = try pathZ(arena, "{s}/pulled-prepared-child", .{root_dir});
     const pack_cache_root = try pathZ(arena, "{s}/pack-cache", .{root_dir});
     const unpack_cache_root = try pathZ(arena, "{s}/unpack-cache", .{root_dir});
     const missing_cache_root = try pathZ(arena, "{s}/missing-cache", .{root_dir});
-    const pull_chunk_cache = try pathZ(arena, "{s}/pull-chunk-cache", .{root_dir});
     const rootfs_source_path = try pathZ(arena, "{s}/rootfs-source.ext4", .{root_dir});
 
     const ram = try arena.alloc(u8, 4096);
@@ -5515,27 +3390,6 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     }));
     try std.testing.expect(!try pathExistsNoSymlink(io, out_missing_dir));
 
-    const source_uri = try std.fmt.allocPrint(arena, "file://{s}", .{bundle_dir});
-    try std.testing.expectError(error.BadManifest, pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out_pull_denied_dir,
-        .rootfs_cache_dir = unpack_cache_root,
-        .bundle_cache_dir = pull_chunk_cache,
-        .child_id = "000000",
-    }));
-    try std.testing.expect(!try pathExistsNoSymlink(io, out_pull_denied_dir));
-    try std.testing.expectError(error.BadChunk, pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out_pull_missing_dir,
-        .rootfs_cache_dir = missing_cache_root,
-        .bundle_cache_dir = pull_chunk_cache,
-        .child_id = "000000",
-        .allow_metadata_only_rootfs = true,
-    }));
-    try std.testing.expect(!try pathExistsNoSymlink(io, out_pull_missing_dir));
-
     const trusted_cache_path = try rootfs_cache.digestPath(arena, unpack_cache_root, artifact.digest);
     const trusted_cache_parent = std.fs.path.dirname(trusted_cache_path) orelse return error.BadManifest;
     try ensureDirPath(io, trusted_cache_parent);
@@ -5551,21 +3405,6 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     });
     try std.testing.expectEqual(@as(usize, 1), unpacked.rootfs_artifact_count);
     try std.testing.expectEqual(@as(u64, 0), unpacked.rootfs_payload_bytes);
-
-    const pulled = try pull(arena, .{
-        .io = io,
-        .source = source_uri,
-        .out_dir = out_pull_dir,
-        .rootfs_cache_dir = unpack_cache_root,
-        .bundle_cache_dir = pull_chunk_cache,
-        .child_id = "000000",
-        .allow_metadata_only_rootfs = true,
-    });
-    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.artifact_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.payload_bytes);
-    try std.testing.expectEqual(@as(usize, 1), pulled.rootfs.cache.hit_count);
-    try std.testing.expectEqual(@as(usize, 0), pulled.rootfs.cache.miss_count);
-    try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_fetched);
 }
 
 test "pack rejects rootfs manifests without cache artifact" {

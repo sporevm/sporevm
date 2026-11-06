@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Saves a Ruby spore, pushes it to a directory store, serves the store over
+# loopback HTTP, and pulls it COUNT times (the first from the directory, the
+# rest over HTTP), each into an empty rootfs cache. Each pulled spore runs with
+# its own --generation identity, which the guest must see.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
@@ -16,150 +20,103 @@ image_ref="${SPORE_SMOKE_ROOTFS_IMAGE:-docker.io/library/ruby:3.3-alpine}"
 platform="${SPORE_SMOKE_ROOTFS_PLATFORM:-linux/arm64}"
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-local-pull"
-run_pid=""
-watchdog_pid=""
+server_pid=""
 cleanup() {
-  if [[ -n "${run_pid}" ]]; then
-    kill -TERM "${run_pid}" >/dev/null 2>&1 || true
-    wait "${run_pid}" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${watchdog_pid}" ]]; then
-    kill "${watchdog_pid}" >/dev/null 2>&1 || true
-    wait "${watchdog_pid}" >/dev/null 2>&1 || true
+  if [[ -n "${server_pid}" ]]; then
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
   fi
 }
 
-pack_rootfs_cache="${workdir}/pack-rootfs-cache"
-pull_rootfs_cache="${workdir}/pull-rootfs-cache"
-bundle_cache="${workdir}/bundle-cache"
-capture_dir="${workdir}/ruby-counter.spore"
-fork_dir="${workdir}/children"
-bundle_dir="${workdir}/ruby.bundle"
-pulled_dir="${workdir}/pulled"
-run_stdout="${workdir}/run.stdout"
-run_stderr="${workdir}/run.stderr"
-fanout_stdout="${workdir}/fanout.stdout"
-fanout_stderr="${workdir}/fanout.stderr"
+push_rootfs_cache="${workdir}/push-rootfs-cache"
+capture_dir="${workdir}/ruby.spore"
+store_dir="${workdir}/store"
 
-mkdir -p "${pack_rootfs_cache}" "${pull_rootfs_cache}" "${bundle_cache}" "${pulled_dir}"
-
-resolved_image_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" rootfs resolve "${image_ref}" --platform "${platform}")"
+resolved_image_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" rootfs resolve "${image_ref}" --platform "${platform}")"
 printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 
-SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" run \
+SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
   --save "${capture_dir}" \
-  --save-on USR1 \
-  -- /usr/local/bin/ruby \
-  -e 'def spore_env; File.readlines("/run/sporevm/env").to_h { |l| l.strip.split("=", 2) }; rescue; {}; end' \
-  -e 'STDOUT.sync = true; puts "spore run ready"; printed = false; i = 0' \
-  -e 'loop do' \
-  -e 'e = spore_env; if !printed && e["SPORE_PARALLEL_JOB"] && e["SPORE_PARALLEL_JOB_COUNT"]' \
-  -e 'puts "spore parallel job #{e["SPORE_PARALLEL_JOB"]}/#{e["SPORE_PARALLEL_JOB_COUNT"]}"; printed = true; end' \
-  -e 'puts "ruby counter #{i}"; i += 1; sleep 1; end' \
-  >"${run_stdout}" 2>"${run_stderr}" &
-run_pid="$!"
+  -- /bin/sh -c 'echo saved >/saved-marker' \
+  >"${workdir}/run.stdout" 2>"${workdir}/run.stderr" || {
+  cat "${workdir}/run.stderr" >&2 || true
+  die "spore run --save failed"
+}
+[[ -f "${capture_dir}/manifest.json" ]] || die "save did not write ${capture_dir}/manifest.json"
 
-seen_counter=0
-for _ in $(seq 1 "${SPORE_SMOKE_ROOTFS_CAPTURE_POLLS:-600}"); do
-  if grep -Eaq 'ruby counter [0-9]+' "${run_stdout}"; then
-    seen_counter=1
-    break
-  fi
-  if ! kill -0 "${run_pid}" >/dev/null 2>&1; then
-    break
-  fi
-  sleep "${SPORE_SMOKE_ROOTFS_CAPTURE_POLL_INTERVAL:-0.5}"
+SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" --json push "${capture_dir}" "${store_dir}/ruby" >"${workdir}/push.json"
+spore_digest="$(json_field "${workdir}/push.json" spore_digest)"
+[[ "${spore_digest}" == blake3:* ]] || die "push reported spore digest ${spore_digest}"
+
+# `python3 -m http.server` with a listen backlog above its 5: a pull fetches
+# 16 objects at once, and Linux retries connections past the backlog a second
+# later.
+python3 -u - "${store_dir}" >"${workdir}/server.out" 2>"${workdir}/server.err" <<'PY' &
+import functools
+import http.server
+import sys
+
+
+class Server(http.server.ThreadingHTTPServer):
+    request_queue_size = 128
+
+
+handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1])
+with Server(("127.0.0.1", 0), handler) as server:
+    print(f"port {server.server_address[1]}")
+    server.serve_forever()
+PY
+server_pid=$!
+port=""
+for _ in $(seq 1 100); do
+  port="$(sed -n 's/^port \([0-9][0-9]*\)$/\1/p' "${workdir}/server.out")"
+  [[ -n "${port}" ]] && break
+  sleep 0.1
 done
-if [[ "${seen_counter}" != "1" ]]; then
-  tail -80 "${run_stdout}" >&2 || true
-  tail -160 "${run_stderr}" >&2 || true
-  die "local pull smoke did not see the fresh Ruby counter"
-fi
-
-sleep "${SPORE_SMOKE_ROOTFS_CAPTURE_SETTLE_SECONDS:-1}"
-kill -USR1 "${run_pid}"
-
-(
-  sleep "${SPORE_SMOKE_CAPTURE_TIMEOUT_SECONDS:-30}"
-  kill -TERM "${run_pid}" >/dev/null 2>&1 || true
-) &
-watchdog_pid="$!"
-
-set +e
-wait "${run_pid}"
-run_rc="$?"
-set -e
-run_pid=""
-kill "${watchdog_pid}" >/dev/null 2>&1 || true
-wait "${watchdog_pid}" >/dev/null 2>&1 || true
-watchdog_pid=""
-
-if [[ "${run_rc}" != "0" ]]; then
-  cat "${run_stdout}" >&2 || true
-  cat "${run_stderr}" >&2 || true
-  die "spore run capture exited ${run_rc}, expected 0"
-fi
-[[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
-grep -Fq '"rootfs"' "${capture_dir}/manifest.json" || die "capture manifest did not record rootfs metadata"
-
-SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
-SPOREVM_ROOTFS_CACHE_DIR="${pack_rootfs_cache}" "${spore_bin}" --json pack "${capture_dir}" --children "${fork_dir}" --out "${bundle_dir}" >"${workdir}/pack.json"
+[[ -n "${port}" ]] || die "image store server did not start"
 
 for i in $(seq 0 $((count - 1))); do
-  child_name="$(printf '%06d' "${i}")"
-  pull_json="${workdir}/pull-${child_name}.json"
-  SPOREVM_ROOTFS_CACHE_DIR="${pull_rootfs_cache}" \
-    SPOREVM_BUNDLE_CACHE_DIR="${bundle_cache}" \
-    "${spore_bin}" --json pull "file://${bundle_dir}" --child "${i}" --out "${pulled_dir}/${child_name}" >"${pull_json}"
-  selected_child="$(json_field "${pull_json}" children.selected_child)"
-  [[ "${selected_child}" == "${child_name}" ]] || die "pull selected ${selected_child}, expected ${child_name}"
-  chunk_bytes_fetched="$(json_field "${pull_json}" materialization.cache.bytes_fetched)"
-  rootfs_bytes_fetched="$(json_field "${pull_json}" rootfs.cache.bytes_fetched)"
-  rootfs_bytes_reused="$(json_field "${pull_json}" rootfs.cache.bytes_reused)"
-  rootfs_cache_hits="$(json_field "${pull_json}" rootfs.cache.hit_count)"
-  rootfs_cache_misses="$(json_field "${pull_json}" rootfs.cache.miss_count)"
-  if [[ "${i}" == "0" ]]; then
-    [[ "${chunk_bytes_fetched}" -gt 0 ]] || die "first pull did not fetch chunk bytes"
-    [[ "${rootfs_bytes_fetched}" -gt 0 ]] || die "first pull did not populate the rootfs cache"
-    [[ "${rootfs_cache_misses}" -gt 0 ]] || die "first pull did not report a rootfs cache miss"
-  fi
-  if [[ "${i}" -gt 0 ]]; then
-    cache_hits="$(json_field "${pull_json}" materialization.cache.hit_count)"
-    [[ "${cache_hits}" -gt 0 ]] || die "pull ${child_name} did not reuse the local chunk cache"
-    [[ "${chunk_bytes_fetched}" == "0" ]] || die "pull ${child_name} fetched ${chunk_bytes_fetched} chunk bytes from the bundle"
-    [[ "${rootfs_bytes_fetched}" == "0" ]] || die "pull ${child_name} fetched ${rootfs_bytes_fetched} rootfs bytes"
-    [[ "${rootfs_bytes_reused}" -gt 0 ]] || die "pull ${child_name} did not report reused rootfs bytes"
-    [[ "${rootfs_cache_hits}" -gt 0 ]] || die "pull ${child_name} did not report a rootfs cache hit"
-    [[ "${rootfs_cache_misses}" == "0" ]] || die "pull ${child_name} reported ${rootfs_cache_misses} rootfs cache misses"
+  ref="http://127.0.0.1:${port}/ruby"
+  [[ "${i}" == "0" ]] && ref="file://${store_dir}/ruby"
+  cache="${workdir}/pull-rootfs-cache-${i}"
+  pulled="${workdir}/pulled-${i}.spore"
+  pull_json="${workdir}/pull-${i}.json"
+  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" --json pull "${ref}" --out "${pulled}" >"${pull_json}"
+  expect_eq "$(json_field "${pull_json}" spore_digest)" "${spore_digest}" "pull ${i} spore digest"
+  ram_fetched="$(json_field "${pull_json}" ram.objects_fetched)"
+  disk_objects="$(json_field "${pull_json}" disk.objects)"
+  disk_fetched="$(json_field "${pull_json}" disk.objects_fetched)"
+  ((ram_fetched > 0)) || die "pull ${i} fetched no RAM objects"
+  expect_eq "${disk_fetched}" "${disk_objects}" "pull ${i} disk objects fetched into an empty cache"
+  printf 'pull %s: %s RAM objects (%s bytes), %s disk objects (%s bytes)\n' "${i}" \
+    "${ram_fetched}" "$(json_field "${pull_json}" ram.bytes_fetched)" \
+    "${disk_fetched}" "$(json_field "${pull_json}" disk.bytes_fetched)"
+
+  generation_json="${workdir}/generation-${i}.json"
+  cat >"${generation_json}" <<JSON
+{"run_id":"local-pull-smoke","child_id":${i},"parallel_index":${i},"parallel_count":${count},"fork_index":${i},"fork_count":${count},"fork_batch_id":"local-pull-batch","vm_id":"local-pull-${i}"}
+JSON
+  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" run \
+    --backend "${backend}" \
+    --from "${pulled}" \
+    --generation "${generation_json}" \
+    -- /bin/sh -c 'cat /saved-marker /run/sporevm/env /run/sporevm/generation.json' \
+    >"${workdir}/from-${i}.stdout" 2>"${workdir}/from-${i}.stderr" || {
+    cat "${workdir}/from-${i}.stderr" >&2 || true
+    die "spore run --from pulled spore ${i} failed"
+  }
+  grep -Fxq saved "${workdir}/from-${i}.stdout" || die "pulled spore ${i} lost the saved disk change"
+  if ! grep -Fxq "SPORE_VM_ID=local-pull-${i}" "${workdir}/from-${i}.stdout" ||
+    ! grep -Fxq "SPORE_PARALLEL_JOB=${i}" "${workdir}/from-${i}.stdout" ||
+    ! grep -Fq "\"local-pull-${i}\"" "${workdir}/from-${i}.stdout"; then
+    cat "${workdir}/from-${i}.stdout" >&2 || true
+    die "pulled spore ${i} did not see its generation identity"
   fi
 done
 
-set +e
-SPOREVM_ROOTFS_CACHE_DIR="${pull_rootfs_cache}" "${spore_bin}" fanout --backend "${backend}" "${pulled_dir}" --for "${SPORE_SMOKE_LOCAL_PULL_FANOUT_DURATION:-20s}" \
-  >"${fanout_stdout}" 2>"${fanout_stderr}"
-fanout_rc="$?"
-set -e
-
-if [[ "${fanout_rc}" != "0" ]]; then
-  cat "${fanout_stdout}" >&2 || true
-  cat "${fanout_stderr}" >&2 || true
-  die "spore fanout from pulled children exited ${fanout_rc}, expected 0"
-fi
-
-for i in $(seq 0 $((count - 1))); do
-  child_name="$(printf '%06d' "${i}")"
-  if ! grep -Eaq "^\[${child_name}\] spore parallel job ${i}/${count}" "${fanout_stdout}"; then
-    tail -160 "${fanout_stdout}" >&2 || true
-    cat "${fanout_stderr}" >&2 || true
-    die "pulled child ${child_name} did not report SPORE_PARALLEL_JOB=${i} SPORE_PARALLEL_JOB_COUNT=${count}"
-  fi
-  if ! grep -Eaq "^\[${child_name}\] .*ruby counter [0-9]+" "${fanout_stdout}"; then
-    tail -120 "${fanout_stdout}" >&2 || true
-    cat "${fanout_stderr}" >&2 || true
-    die "pulled child ${child_name} did not stream a prefixed resumed Ruby counter line"
-  fi
-done
+served="$(grep -c '"GET /spores/' "${workdir}/server.err" || true)"
+expect_eq "${served}" "$((count - 1))" "spore manifests served over HTTP"
 
 echo "smoke:local-pull ok backend=${backend} count=${count} image=${resolved_image_ref}"

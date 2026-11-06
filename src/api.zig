@@ -81,7 +81,7 @@ pub const InspectBundleOptions = struct {
     child_range: ?ChildRange = null,
 };
 
-pub const PullResult = contracts.PullResult;
+pub const PullResult = spore_store.PullResult;
 pub const BundleChildSummary = contracts.BundleChildSummary;
 pub const InspectBundleResult = contracts.InspectBundleResult;
 
@@ -309,17 +309,8 @@ pub const PushOptions = spore_store.PushOptions;
 /// Result returned by `push`.
 pub const PushResult = spore_store.PushResult;
 
-/// Options for pulling a bundle into a local spore directory.
-pub const PullOptions = struct {
-    source: []const u8,
-    out_dir: []const u8,
-    rootfs_cache: CacheRoot = .env,
-    bundle_cache: CacheRoot = .env,
-    child_id: ?[]const u8 = null,
-    allow_metadata_only_rootfs: bool = false,
-    aws_region: ?[]const u8 = null,
-    aws_executable: []const u8 = "aws",
-};
+/// Options for pulling a saved spore from an image store.
+pub const PullOptions = spore_store.PullOptions;
 
 /// Platform summary returned by `inspectSpore`.
 pub const SporePlatformSummary = struct {
@@ -874,7 +865,7 @@ pub fn pack(
     allocator: std.mem.Allocator,
     options: PackOptions,
 ) !PackResult {
-    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
+    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map);
     defer rootfs_cache.deinit(allocator);
     const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
     defer allocator.free(runtime_root);
@@ -908,7 +899,7 @@ pub fn unpack(
     allocator: std.mem.Allocator,
     options: UnpackOptions,
 ) !UnpackResult {
-    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
+    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map);
     defer rootfs_cache.deinit(allocator);
 
     const result = try bundle.unpack(allocator, .{
@@ -1071,28 +1062,13 @@ pub fn inspectBundle(
     });
 }
 
-/// Pull a bundle into a local spore directory.
+/// Pull a saved spore from a directory, HTTP(S) or S3 image store.
 pub fn pull(
     context: Context,
     allocator: std.mem.Allocator,
     options: PullOptions,
 ) !PullResult {
-    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map, .rootfs);
-    defer rootfs_cache.deinit(allocator);
-    const bundle_cache = resolveCacheRoot(options.bundle_cache, allocator, context.environ_map, .bundle);
-    defer bundle_cache.deinit(allocator);
-
-    return bundle.pull(allocator, .{
-        .io = context.io,
-        .source = options.source,
-        .out_dir = options.out_dir,
-        .rootfs_cache_dir = rootfs_cache.path,
-        .bundle_cache_dir = bundle_cache.path,
-        .child_id = options.child_id,
-        .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
-        .aws_region = options.aws_region,
-        .aws_executable = options.aws_executable,
-    });
+    return spore_store.pull(context, allocator, options);
 }
 
 fn summarizeSpore(allocator: std.mem.Allocator, spore_dir: []const u8, manifest: spore.Manifest) !SporeInspectResult {
@@ -1465,11 +1441,6 @@ fn testVcpuState(index: u32) spore.VcpuState {
     };
 }
 
-const CacheKind = enum {
-    rootfs,
-    bundle,
-};
-
 const ResolvedCacheRoot = struct {
     path: ?[]const u8 = null,
     owned: bool = false,
@@ -1483,15 +1454,11 @@ fn resolveCacheRoot(
     requested: CacheRoot,
     allocator: std.mem.Allocator,
     environ_map: *const std.process.Environ.Map,
-    kind: CacheKind,
 ) ResolvedCacheRoot {
     return switch (requested) {
         .none => .{},
         .path => |path| .{ .path = path },
-        .env => switch (kind) {
-            .rootfs => if (local_paths.rootfsCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
-            .bundle => if (local_paths.bundleCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
-        },
+        .env => if (local_paths.rootfsCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
     };
 }
 

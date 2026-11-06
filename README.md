@@ -374,25 +374,24 @@ Pack a spore, optionally with forked children:
 spore pack base.spore --children forks --out base.bundle
 ```
 
-Unpack or pull one selected child before attach:
+Unpack one selected child before attach:
 
 ```bash
 spore unpack base.bundle --child 000042 --out child.spore
 spore attach child.spore
 ```
 
-Remote pulls are digest-pinned:
+`spore pack` and `spore unpack` carry the manifest-selected memory, rootfs,
+and writable disk bytes. To move a saved spore between hosts, push it to an
+[image store](docs/image-format.md#spores) and pull it on the other host:
 
 ```bash
-spore pull s3://bucket/path/base.bundle@sha256:<bundle-digest> \
-  --child 000042 \
-  --out child.spore
+spore push base.spore s3://bucket/spores/base
+spore pull s3://bucket/spores/base --out base.spore
+spore run --from base.spore -- ./bin/test
 ```
 
-`spore pack`, `spore unpack`, and `spore pull` carry the
-manifest-selected memory, rootfs, and writable disk bytes. `spore push
-base.spore /srv/images/base` writes a saved spore to an
-[image store](docs/image-format.md#spores) instead. See
+See
 [docs/spore-format.md](docs/spore-format.md) and
 [docs/filesystem.md](docs/filesystem.md) for the artifact contract.
 

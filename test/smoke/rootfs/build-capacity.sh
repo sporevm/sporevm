@@ -99,8 +99,7 @@ primary_cache="${workdir}/rootfs-cache"
 runtime_dir="${workdir}/runtime"
 unpack_cache="${workdir}/unpack-rootfs-cache"
 pull_cache="${workdir}/pull-rootfs-cache"
-bundle_cache="${workdir}/bundle-cache"
-mkdir -p "${primary_cache}" "${unpack_cache}" "${pull_cache}" "${bundle_cache}"
+mkdir -p "${primary_cache}" "${unpack_cache}" "${pull_cache}"
 export SPOREVM_ROOTFS_CACHE_DIR="${primary_cache}"
 export SPOREVM_RUNTIME_DIR="${runtime_dir}"
 
@@ -167,9 +166,9 @@ SPOREVM_ROOTFS_CACHE_DIR="${unpack_cache}" \
   "${spore_bin}" run --backend "${backend}" --from "${unpacked_dir}" -- \
     /bin/sh -lc "grep -Fxq prepared-build /prepared-build-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_16} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 15000000"
 
+"${spore_bin}" --json push "${capture_dir}" "${workdir}/store/built" >"${workdir}/push.json"
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
-  SPOREVM_BUNDLE_CACHE_DIR="${bundle_cache}" \
-  "${spore_bin}" --json pull "file://${bundle_dir}" --out "${pulled_dir}" >"${workdir}/pull.json"
+  "${spore_bin}" --json pull "file://${workdir}/store/built" --out "${pulled_dir}" >"${workdir}/pull.json"
 assert_manifest_rootfs "${pulled_dir}/manifest.json" "${built_index}" "${capacity_16}"
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
   "${spore_bin}" run --backend "${backend}" --from "${pulled_dir}" -- \
