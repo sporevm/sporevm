@@ -1014,7 +1014,7 @@ pub fn captureDiskFork(
 fn captureMachine(arena: std.mem.Allocator, vm: anytype, vcpus: anytype) !spore.Machine {
     const states = try arena.alloc(spore.VcpuState, vcpus.len);
     for (vcpus, states) |*vcpu, *state| state.* = try vcpu.capture(vm, arena);
-    const gic = try vm.captureGic(arena, vcpus);
+    const gic = try vm.captureGic(arena, vcpus.len);
     try gicv3.validate(gic);
     if (states.len == 1) {
         const s = states[0];
@@ -1040,6 +1040,15 @@ fn captureMachine(arena: std.mem.Allocator, vm: anytype, vcpus: anytype) !spore.
 /// counter. `vm` provides `applyGic(allocator, vcpus, state)` and
 /// `setCounter(guest_cntvct)`; each vCPU provides `apply(vm, state)`.
 pub fn restoreMachine(allocator: std.mem.Allocator, vm: anytype, vcpus: anytype, machine: spore.Machine) !void {
+    const states = try restoreVm(allocator, vm, vcpus, machine);
+    defer allocator.free(states);
+    for (vcpus, states) |*vcpu, state| try vcpu.apply(vm, state);
+}
+
+/// The once-per-VM half of `restoreMachine`: checks `machine` against
+/// `vcpus`, applies the GIC and sets the guest counter. Returns each vCPU's
+/// state on that counter, for its `apply`; the caller frees it.
+fn restoreVm(allocator: std.mem.Allocator, vm: anytype, vcpus: anytype, machine: spore.Machine) ![]spore.VcpuState {
     var single: [1]spore.VcpuState = undefined;
     const saved: []const spore.VcpuState, const gic: gicv3.State = switch (machine) {
         .single => |m| blk: {
@@ -1064,14 +1073,13 @@ pub fn restoreMachine(allocator: std.mem.Allocator, vm: anytype, vcpus: anytype,
     for (saved, 0..) |state, index| {
         if (state.index != index or state.mpidr != aarch64_topology.mpidrForIndex(state.index)) return error.PlatformMismatch;
     }
+    const states = try allocator.dupe(spore.VcpuState, saved);
+    errdefer allocator.free(states);
     try vm.applyGic(allocator, vcpus, gic);
     const guest_cntvct = saved[0].vtimer.cntvct;
     try vm.setCounter(guest_cntvct);
-    for (vcpus, saved) |*vcpu, state| {
-        var shared = state;
-        moveVtimer(&shared.vtimer, guest_cntvct);
-        try vcpu.apply(vm, shared);
-    }
+    shareVcpuCounter(states, guest_cntvct);
+    return states;
 }
 
 /// Puts every vCPU timer on one guest counter value, as KVM and HVF give the
@@ -1087,6 +1095,417 @@ fn moveVtimer(vtimer: *spore.VtimerState, guest_cntvct: u64) void {
     const delta = guest_cntvct -% vtimer.cntvct;
     vtimer.cntv_cval +%= delta;
     vtimer.cntvct = guest_cntvct;
+}
+
+/// Runs a VM with more than one vCPU: each vCPU on its own thread, while the
+/// calling thread serves the control, the probe, capture requests and
+/// snapshots.
+///
+/// `Vm` provides `name`, `spi_needs_kick` (whether a vCPU must be kicked to
+/// see a raised interrupt) and what the device and snapshot code above use.
+/// `Vcpu` provides `kick()`, callable from any thread, and, on its own
+/// thread: `threadStart()`, `threadExit()`, `handleCommands()` (true if it
+/// served a request from another vCPU), `run(vm, vcpus)`,
+/// `completeMmio(value)`, `capture(vm, arena)` and `apply(vm, state)`.
+/// `Tracker` is the backend's `DirtyTracker` type.
+///
+/// One pause protocol stops the guest. The main thread kicks every vCPU and
+/// waits until each thread has parked; then each thread in turn does an
+/// action on its own vCPU (capture its state, or apply a restored one), and
+/// waits until resumed. KVM refuses VGIC register access while any other vCPU
+/// is in an ioctl, hence one at a time and only once all have parked.
+/// Threads start paused, so the backend can boot or restore the vCPUs before
+/// `run`.
+pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) type {
+    return struct {
+        const Self = @This();
+
+        vm: *Vm,
+        vcpus: []Vcpu,
+        devices: *Devices,
+        ram: guestmem.GuestRam,
+        config: *const Config,
+        dirty_tracker: ?*Tracker = null,
+        slots: []Slot = &.{},
+        /// What each vCPU captured, or will apply, at a pause.
+        states: []Captured = &.{},
+        /// Serializes device emulation between the vCPU threads and the
+        /// main thread.
+        device_lock: SpinLock = .{},
+        /// Held by a vCPU thread while it does a pause action.
+        action_lock: SpinLock = .{},
+        stop: std.atomic.Value(bool) = .init(false),
+        result_lock: SpinLock = .{},
+        result_value: ?Result = null,
+        pause: Pause = .{},
+
+        const Result = union(enum) { exit: ExitCause, err: anyerror };
+
+        const Pause = struct {
+            active: std.atomic.Value(bool) = .init(true),
+            /// Each request gets the next sequence number; a vCPU thread
+            /// acknowledges it once it has done `action`.
+            seq: std.atomic.Value(u32) = .init(0),
+            action: std.atomic.Value(Action) = .init(.none),
+        };
+
+        const Action = enum(u8) { none, capture, apply };
+
+        const Slot = struct {
+            thread: ?std.Thread = null,
+            started: std.atomic.Value(bool) = .init(false),
+            start_error: ?anyerror = null,
+            acked: std.atomic.Value(u32) = .init(0),
+            /// Holds this vCPU's captured state until the next capture.
+            arena: std.heap.ArenaAllocator,
+        };
+
+        /// Starts one thread per vCPU and returns once each has started its
+        /// vCPU. The threads stay paused until `run`. Call `deinit` even if
+        /// this fails.
+        pub fn start(self: *Self, allocator: std.mem.Allocator) !void {
+            self.slots = try allocator.alloc(Slot, self.vcpus.len);
+            for (self.slots) |*slot| slot.* = .{ .arena = .init(std.heap.page_allocator) };
+            self.states = try allocator.alloc(Captured, self.vcpus.len);
+            for (self.slots, 0..) |*slot, index| {
+                slot.thread = try std.Thread.spawn(.{}, threadMain, .{ self, index });
+            }
+            // The vCPU threads flush network RX, so a network wake kicks them.
+            // The main thread polls the control and capture requests itself.
+            self.config.network.setWake(.{ .context = self, .wakeFn = kickAllFromNetwork });
+            for (self.slots) |*slot| {
+                while (!slot.started.load(.acquire)) {
+                    if (self.stopped()) return self.stopError();
+                    sleepMs(1);
+                }
+                if (slot.start_error) |err| return err;
+            }
+        }
+
+        /// Stops and joins every vCPU thread.
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.config.network.clearWake();
+            self.stop.store(true, .release);
+            self.kickAll();
+            for (self.slots) |*slot| {
+                if (slot.thread) |thread| thread.join();
+                slot.arena.deinit();
+            }
+            allocator.free(self.slots);
+            allocator.free(self.states);
+        }
+
+        /// Restores `machine`: the GIC and counter here, then each vCPU
+        /// thread applies its own state. Call between `start` and `run`.
+        pub fn restore(self: *Self, allocator: std.mem.Allocator, machine: spore.Machine) !void {
+            const states = try restoreVm(allocator, self.vm, self.vcpus, machine);
+            defer allocator.free(states);
+            for (self.states, states) |*captured, state| captured.state = state;
+            try self.pauseAll(.apply);
+        }
+
+        pub fn kickAll(self: *Self) void {
+            for (self.vcpus) |*vcpu| vcpu.kick();
+        }
+
+        fn kickAllFromNetwork(context: ?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(context orelse return));
+            self.kickAll();
+        }
+
+        fn stopped(self: *const Self) bool {
+            return self.stop.load(.acquire);
+        }
+
+        /// Records how the run ends and stops every vCPU. The first result
+        /// wins.
+        fn finish(self: *Self, outcome: Result) void {
+            self.result_lock.lock();
+            defer self.result_lock.unlock();
+            if (self.result_value == null) self.result_value = outcome;
+            self.stop.store(true, .release);
+        }
+
+        fn result(self: *Self) ?Result {
+            self.result_lock.lock();
+            defer self.result_lock.unlock();
+            return self.result_value;
+        }
+
+        /// Why a stopped run cannot go on: its error, or `CaptureAborted`
+        /// when it ended without one.
+        fn stopError(self: *Self) anyerror {
+            return switch (self.result() orelse return error.CaptureAborted) {
+                .err => |err| err,
+                .exit => error.CaptureAborted,
+            };
+        }
+
+        /// Parks every vCPU thread, then has each do `action` on its own vCPU.
+        fn pauseAll(self: *Self, action: Action) !void {
+            try self.pauseFor(.none);
+            if (action != .none) try self.pauseFor(action);
+        }
+
+        fn pauseFor(self: *Self, action: Action) !void {
+            if (action == .capture) {
+                for (self.slots) |*slot| _ = slot.arena.reset(.retain_capacity);
+            }
+            self.pause.action.store(action, .monotonic);
+            const seq = self.pause.seq.fetchAdd(1, .release) + 1;
+            self.pause.active.store(true, .release);
+            self.kickAll();
+            for (self.slots) |*slot| {
+                while (slot.acked.load(.acquire) != seq) {
+                    if (self.stopped()) return self.stopError();
+                    sleepMs(1);
+                }
+            }
+        }
+
+        fn resumeAll(self: *Self) void {
+            self.pause.active.store(false, .release);
+        }
+
+        fn threadMain(self: *Self, index: usize) void {
+            const vcpu = &self.vcpus[index];
+            const slot = &self.slots[index];
+            vcpu.threadStart() catch |err| {
+                slot.start_error = err;
+                slot.started.store(true, .release);
+                self.finish(.{ .err = err });
+                return;
+            };
+            defer vcpu.threadExit();
+            slot.started.store(true, .release);
+            self.vcpuLoop(vcpu, slot, &self.states[index]) catch |err| self.finish(.{ .err = err });
+        }
+
+        fn vcpuLoop(self: *Self, vcpu: *Vcpu, slot: *Slot, captured: *Captured) !void {
+            const transports = self.devices.transports();
+            while (!self.stopped()) {
+                // Served even while paused: a running vCPU may be waiting on
+                // this one before it can see the pause.
+                if (vcpu.handleCommands()) continue;
+                if (self.pause.active.load(.acquire)) {
+                    const seq = self.pause.seq.load(.acquire);
+                    if (slot.acked.load(.monotonic) != seq) {
+                        const action = self.pause.action.load(.monotonic);
+                        if (action != .none) {
+                            self.action_lock.lock();
+                            defer self.action_lock.unlock();
+                            switch (action) {
+                                .none => unreachable,
+                                .capture => captured.state = try vcpu.capture(self.vm, slot.arena.allocator()),
+                                .apply => try vcpu.apply(self.vm, captured.state),
+                            }
+                        }
+                        slot.acked.store(seq, .release);
+                    }
+                    sleepMs(1);
+                    continue;
+                }
+                if (self.config.network.failed()) return error.NetworkGatewayFailed;
+                if (self.config.network.consumeWake()) {
+                    self.device_lock.lock();
+                    defer self.device_lock.unlock();
+                    _ = try flushRx(self.vm, &self.devices.net, transports, self.devices.net_index, self.ram);
+                    continue;
+                }
+                const exit = try vcpu.run(self.vm, self.vcpus);
+                if (self.stopped()) return;
+                switch (exit) {
+                    .mmio => |access| {
+                        const value = value: {
+                            self.device_lock.lock();
+                            defer self.device_lock.unlock();
+                            break :value try dispatchMmio(self.vm, access, transports, &self.devices.gen, self.ram);
+                        };
+                        try vcpu.completeMmio(value);
+                    },
+                    .wfi => sleepMs(1),
+                    .shutdown => |kind| self.finish(.{ .exit = kind.cause() }),
+                    .handled, .kicked => {},
+                }
+            }
+        }
+
+        /// Lets the guest run and serves the control, the probe and capture
+        /// requests until the run ends.
+        pub fn run(self: *Self, allocator: std.mem.Allocator, source: SnapshotSource) !ExitCause {
+            const config = self.config;
+            var probe_done = false;
+            self.resumeAll();
+            while (true) {
+                if (self.result()) |outcome| {
+                    self.kickAll();
+                    return switch (outcome) {
+                        .exit => |cause| cause,
+                        .err => |err| err,
+                    };
+                }
+                if (config.network.failed()) {
+                    self.finish(.{ .err = error.NetworkGatewayFailed });
+                    continue;
+                }
+                if (config.exec_control) |control| {
+                    control.reportStats(monitorStats(if (self.dirty_tracker) |tracker| &tracker.sealer else null));
+                    const action = self.pollControl(control) catch |err| {
+                        self.finish(.{ .err = err });
+                        continue;
+                    };
+                    switch (action) {
+                        .keep_running => {},
+                        .stop => self.finish(.{ .exit = .monitor_stopped }),
+                        .snapshot => |request| if (request.continue_after) {
+                            self.snapshotAndContinue(allocator, source, control, request) catch |err| self.finish(.{ .err = err });
+                        } else {
+                            self.snapshotAndStop(allocator, source, request.dir, null);
+                        },
+                        .rootfs_snapshot => |request| self.rootfsSnapshot(allocator, control, request.dir) catch |err| self.finish(.{ .err = err }),
+                        .disk_fork => |request| self.diskFork(allocator, source, control, request) catch |err| control.failDiskFork(err),
+                    }
+                    if (self.stopped()) continue;
+                }
+                if (config.probe) |exec_probe| {
+                    const probe = exec_probe.stream;
+                    if (!probe_done) {
+                        if (probe.state == .failed) {
+                            self.finish(.{ .err = error.VsockProbeFailed });
+                            continue;
+                        }
+                        if (probe.state == .complete) {
+                            std.log.debug(Vm.name ++ " multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
+                            if (exec_probe.on_complete == .stop) {
+                                if (config.probeCaptureDir()) |dir| {
+                                    self.snapshotAndStop(allocator, source, dir, null);
+                                } else {
+                                    self.finish(.{ .exit = .probe_complete });
+                                }
+                                continue;
+                            }
+                            // A detached stream stays attached until the
+                            // control replaces or resets it.
+                            probe_done = true;
+                        }
+                        if (!probe_done and probe.state != .idle and probe.elapsedMs() > exec_probe.timeout_ms) {
+                            self.finish(.{ .err = error.VsockProbeTimedOut });
+                            continue;
+                        }
+                    }
+                }
+                if (config.captureRequest()) |request_capture| {
+                    if (request_capture.isAbortRequested()) {
+                        self.finish(.{ .err = error.CaptureAborted });
+                        continue;
+                    }
+                    if (request_capture.isRequested()) {
+                        self.snapshotAndStop(allocator, source, config.capture.?.dir, request_capture);
+                        continue;
+                    }
+                }
+                sleepMs(1);
+            }
+        }
+
+        /// Polls the control and, unless it asked for something else,
+        /// delivers the host-to-guest vsock packets it queued.
+        fn pollControl(self: *Self, control: vsock_control.Control) !vsock_control.ControlAction {
+            const vsock_dev = &self.devices.vsock;
+            const delivered = delivered: {
+                self.device_lock.lock();
+                defer self.device_lock.unlock();
+                const action = try control.poll(vsock_dev);
+                if (action != .keep_running) return action;
+                break :delivered try flushRx(self.vm, vsock_dev, self.devices.transports(), self.devices.vsock_index, self.ram);
+            };
+            if (delivered and Vm.spi_needs_kick) self.kickAll();
+            return .keep_running;
+        }
+
+        /// Writes a spore from the states the paused vCPUs captured.
+        fn writeSpore(self: *Self, allocator: std.mem.Allocator, source: SnapshotSource, target: SnapshotTarget) !void {
+            try writeSnapshot(allocator, Vm.name, self.vm, self.states, self.dirty_tracker, source, target);
+        }
+
+        /// Writes a spore and ends the run, as `snapshotted` unless that
+        /// fails.
+        fn snapshotAndStop(self: *Self, allocator: std.mem.Allocator, source: SnapshotSource, dir: []const u8, request_capture: ?*capture.Request) void {
+            self.snapshotOnce(allocator, source, dir, request_capture) catch |err| self.finish(.{ .err = err });
+            self.finish(.{ .exit = .snapshotted });
+        }
+
+        fn snapshotOnce(self: *Self, allocator: std.mem.Allocator, source: SnapshotSource, dir: []const u8, request_capture: ?*capture.Request) !void {
+            try self.pauseAll(.capture);
+            try self.writeSpore(allocator, source, .{ .dir = dir });
+            if (request_capture) |request| {
+                request.markCompleted();
+                if (request.isAbortRequested()) return error.CaptureAborted;
+            }
+        }
+
+        fn snapshotAndContinue(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            source: SnapshotSource,
+            control: vsock_control.Control,
+            request: vsock_control.SnapshotAction,
+        ) !void {
+            const config = self.config;
+            var preparation = if (request.publish_dir != null)
+                (try control.prepareSnapshot()) orelse return
+            else
+                null;
+            defer if (preparation) |*owned| owned.deinit();
+            var prepared_root = if (request.publish_dir) |publish_dir|
+                if (config.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
+            else
+                null;
+            defer if (prepared_root) |*root| root.deinit();
+            try self.pauseAll(.capture);
+            const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
+            try self.writeSpore(allocator, source, .{
+                .dir = request.dir,
+                .rootfs_cache_lock = if (preparation) |*owned| owned.cacheLock() else null,
+            });
+            const completed_dir = if (request.publish_dir) |publish_dir| blk: {
+                const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
+                if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (config.environ_map != null) .shared_no_rebind else .local_rebind);
+                logNamedSnapshotPublication(Vm.name, publish_metrics, source_pause_started_ns);
+                break :blk publish_dir;
+            } else request.dir;
+            self.resumeAll();
+            try control.completeSnapshot(completed_dir);
+        }
+
+        fn rootfsSnapshot(self: *Self, allocator: std.mem.Allocator, control: vsock_control.Control, dir: []const u8) !void {
+            try self.pauseAll(.none);
+            const disk_manifest = try takeRootfsSnapshot(allocator, dir, self.devices.transports(), self.config.disk_snapshot);
+            self.resumeAll();
+            try control.completeRootfsSnapshot(disk_manifest);
+        }
+
+        fn diskFork(self: *Self, allocator: std.mem.Allocator, source: SnapshotSource, control: vsock_control.Control, fork: vsock_control.DiskForkAction) !void {
+            const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
+            defer self.resumeAll();
+            try self.pauseAll(.capture);
+            try captureDiskFork(allocator, Vm.name, self.vm, self.states, self.dirty_tracker, source, fork, control, pause_started_ns);
+        }
+    };
+}
+
+/// A vCPU state its own thread captured, in the shape `writeSnapshot` reads
+/// vCPUs.
+const Captured = struct {
+    state: spore.VcpuState,
+
+    pub fn capture(self: *Captured, _: anytype, _: std.mem.Allocator) !spore.VcpuState {
+        return self.state;
+    }
+};
+
+fn sleepMs(ms: u64) void {
+    deadline.system_clock.sleepMs(ms);
 }
 
 pub const SpinLock = struct {
@@ -1539,7 +1958,7 @@ const TestVm = struct {
     gic_applied: bool = false,
     counter: ?u64 = null,
 
-    pub fn captureGic(_: *const TestVm, _: std.mem.Allocator, _: []TestVcpu) !gicv3.State {
+    pub fn captureGic(_: *const TestVm, _: std.mem.Allocator, _: usize) !gicv3.State {
         return test_gic;
     }
 
@@ -1671,4 +2090,199 @@ test "restore rejects vCPU state that does not match the VM before touching it" 
     saved[1].mpidr = aarch64_topology.mpidrForIndex(2);
     try std.testing.expectError(error.PlatformMismatch, restoreMachine(std.testing.allocator, &vm, @as([]TestVcpu, &two), machine));
     try std.testing.expect(!vm.gic_applied);
+}
+
+const ThreadTestVm = struct {
+    pub const name = "test";
+    pub const spi_needs_kick = true;
+
+    gic_layout: GicLayout = .{ .dist_base = 0, .redist_base = 0, .redist_stride = 0 },
+    counter: ?u64 = null,
+    /// vCPU 1 shuts the guest down once this is set.
+    shutdown: std.atomic.Value(bool) = .init(false),
+
+    pub fn setSpi(_: *const ThreadTestVm, _: u32, _: bool) !void {}
+
+    pub fn captureGic(_: *const ThreadTestVm, _: std.mem.Allocator, _: usize) !gicv3.State {
+        return test_gic;
+    }
+
+    pub fn applyGic(_: *ThreadTestVm, _: std.mem.Allocator, _: []ThreadTestVcpu, _: gicv3.State) !void {}
+
+    pub fn setCounter(self: *ThreadTestVm, guest_cntvct: u64) !void {
+        self.counter = guest_cntvct;
+    }
+};
+
+/// Records which thread captured and applied it, and how often it was kicked.
+const ThreadTestVcpu = struct {
+    index: topology.VcpuIndex,
+    live: spore.VcpuState,
+    owner: ?std.Thread.Id = null,
+    on_owner: bool = true,
+    applied: ?spore.VcpuState = null,
+    kicks: std.atomic.Value(u32) = .init(0),
+
+    pub fn threadStart(self: *ThreadTestVcpu) !void {
+        self.owner = std.Thread.getCurrentId();
+    }
+
+    pub fn threadExit(_: *ThreadTestVcpu) void {}
+
+    pub fn handleCommands(_: *ThreadTestVcpu) bool {
+        return false;
+    }
+
+    pub fn run(self: *ThreadTestVcpu, vm: *const ThreadTestVm, _: []ThreadTestVcpu) !Exit {
+        if (self.index == 1 and vm.shutdown.load(.acquire)) return .{ .shutdown = .off };
+        return .wfi;
+    }
+
+    pub fn completeMmio(_: *ThreadTestVcpu, _: u64) !void {}
+
+    pub fn capture(self: *ThreadTestVcpu, _: *const ThreadTestVm, _: std.mem.Allocator) !spore.VcpuState {
+        self.checkOwner();
+        return self.live;
+    }
+
+    pub fn apply(self: *ThreadTestVcpu, _: *const ThreadTestVm, state: spore.VcpuState) !void {
+        self.checkOwner();
+        self.applied = state;
+    }
+
+    pub fn kick(self: *ThreadTestVcpu) void {
+        _ = self.kicks.fetchAdd(1, .monotonic);
+    }
+
+    fn checkOwner(self: *ThreadTestVcpu) void {
+        if (self.owner != std.Thread.getCurrentId()) self.on_owner = false;
+    }
+};
+
+test "threaded vCPUs restore and capture themselves on their own threads" {
+    const allocator = std.testing.allocator;
+    var config = testBoot(.{ .vcpus = 2 });
+    var devices: Devices = undefined;
+    devices.init(&config, null);
+    defer devices.net.shutdown();
+    var vm = ThreadTestVm{};
+    var vcpus = [_]ThreadTestVcpu{
+        .{ .index = 0, .live = testVcpuState(0, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 530 }) },
+        .{ .index = 1, .live = testVcpuState(1, .{ .cntvct = 503, .cntv_ctl = 1, .cntv_cval = 540 }) },
+    };
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = .{ .bytes = &.{}, .base = board.ram_base },
+        .config = &config,
+    };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
+
+    var saved = [_]spore.VcpuState{
+        testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 1, .cntv_cval = 130 }),
+        testVcpuState(1, .{ .cntvct = 104, .cntv_ctl = 1, .cntv_cval = 150 }),
+    };
+    try threaded.restore(allocator, .{ .multi = .{ .vcpus = &saved, .gic = test_gic } });
+    try std.testing.expectEqual(@as(?u64, 100), vm.counter);
+    try std.testing.expectEqual(@as(u64, 146), vcpus[1].applied.?.vtimer.cntv_cval);
+
+    // A pause leaves each vCPU's own capture for the snapshot writer.
+    try threaded.pauseAll(.capture);
+    try std.testing.expectEqual(@as(u64, 500), threaded.states[0].state.vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 0x1001), threaded.states[1].state.pc);
+    for (vcpus) |vcpu| try std.testing.expect(vcpu.on_owner);
+
+    vm.shutdown.store(true, .release);
+    try std.testing.expectEqual(ExitCause.guest_off, try threaded.run(allocator, .{
+        .config = &config,
+        .transports = devices.transports(),
+        .gen_dev = &devices.gen,
+        .vsock_dev = &devices.vsock,
+        .ram_bytes = &.{},
+        .ram_size = 0,
+    }));
+}
+
+/// Attaches a host stream when asked to, as a monitor does to start an exec,
+/// which queues the stream's connect request for the guest.
+const AttachTestControl = struct {
+    stream: vsock_stream.HostStream,
+    attach: bool = false,
+
+    fn control(self: *AttachTestControl) vsock_control.Control {
+        return .{
+            .context = self,
+            .pollFn = poll,
+            .setWakeFn = setWake,
+            .completeSnapshotFn = completeSnapshot,
+            .completeRootfsSnapshotFn = completeRootfsSnapshot,
+            .reportStatsFn = reportStats,
+        };
+    }
+
+    fn poll(context: *anyopaque, dev: *vsock.Vsock) !vsock_control.ControlAction {
+        const self: *AttachTestControl = @ptrCast(@alignCast(context));
+        if (self.attach) try dev.attachHostStream(&self.stream);
+        self.attach = false;
+        return .keep_running;
+    }
+
+    fn setWake(_: *anyopaque, _: vsock_control.Wake) void {}
+    fn completeSnapshot(_: *anyopaque, _: []const u8) !void {}
+    fn completeRootfsSnapshot(_: *anyopaque, _: ?spore.Disk) !void {}
+    fn reportStats(_: *anyopaque, _: vsock_control.ControlStats) void {}
+};
+
+test "threaded control delivery kicks every vCPU once per delivered batch" {
+    var config = testBoot(.{ .vcpus = 2 });
+    var devices: Devices = undefined;
+    devices.init(&config, null);
+    defer devices.net.shutdown();
+
+    // The guest's vsock RX queue holds one buffer.
+    var bytes = [_]u8{0} ** 0x2000;
+    const ram = guestmem.GuestRam{ .bytes = &bytes, .base = board.ram_base };
+    const desc = board.ram_base;
+    const avail = board.ram_base + 0x400;
+    const used = board.ram_base + 0x800;
+    const rx = &devices.transports()[devices.vsock_index];
+    _ = rx.write(0x030, 0, ram);
+    _ = rx.write(0x038, 8, ram);
+    inline for (.{ .{ 0x080, desc }, .{ 0x090, avail }, .{ 0x0a0, used } }) |reg| {
+        _ = rx.write(reg[0], @truncate(reg[1]), ram);
+        _ = rx.write(reg[0] + 4, @truncate(reg[1] >> 32), ram);
+    }
+    try std.testing.expect(!rx.write(0x044, 1, ram));
+    try ram.write(u64, desc, board.ram_base + 0x1000);
+    try ram.write(u32, desc + 8, 0x100);
+    try ram.write(u16, desc + 12, 2); // VIRTQ_DESC_F_WRITE
+    try ram.write(u16, avail + 4, 0);
+    try ram.write(u16, avail + 2, 1);
+
+    var vm = ThreadTestVm{};
+    var vcpus = [_]ThreadTestVcpu{ .{ .index = 0, .live = undefined }, .{ .index = 1, .live = undefined } };
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = ram,
+        .config = &config,
+    };
+    var test_control = AttachTestControl{ .stream = try vsock_stream.HostStream.init(1024, "exec") };
+    const control = test_control.control();
+
+    // Nothing queued: the vCPUs keep running undisturbed.
+    try std.testing.expect(try threaded.pollControl(control) == .keep_running);
+    for (&vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 0), vcpu.kicks.load(.monotonic));
+
+    // A delivered packet kicks each vCPU once so it sees the interrupt.
+    test_control.attach = true;
+    try std.testing.expect(try threaded.pollControl(control) == .keep_running);
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, used + 2));
+    for (&vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 1), vcpu.kicks.load(.monotonic));
+
+    try std.testing.expect(try threaded.pollControl(control) == .keep_running);
+    for (&vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 1), vcpu.kicks.load(.monotonic));
 }

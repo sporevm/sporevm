@@ -3017,8 +3017,10 @@ const CommitControl = struct {
                 if (self.command_stream.state != .complete) return .keep_running;
                 const exit_code = self.command_stream.exit_code orelse return error.BadRunExitFrame;
                 self.phase = if (exit_code == 0) .start_freeze else .done;
-                // The backend detaches the completed exec probe later in this
-                // loop. Start the freeze stream on the following poll.
+                // The command stream is the run's exec probe; the backend
+                // leaves the finished stream attached for this control to
+                // drop. The freeze stream starts on the following poll.
+                dev.resetHostStream();
                 self.requestPoll();
                 return .keep_running;
             },

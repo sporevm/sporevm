@@ -8,7 +8,6 @@
 const std = @import("std");
 const aarch64_topology = @import("../aarch64/topology.zig");
 const capture = @import("../capture.zig");
-const disk_layer = @import("../disk_layer.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const hvf = @import("hvf.zig");
@@ -16,13 +15,10 @@ const gic = @import("gic.zig");
 const board = @import("../aarch64/board.zig");
 const boot = @import("../aarch64/boot.zig");
 const gicv3 = @import("../aarch64/gicv3.zig");
-const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
-const mmio = @import("../virtio/mmio.zig");
 const net = @import("../virtio/net.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
-const vsock_control = @import("../virtio/vsock_control.zig");
 const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
@@ -139,21 +135,14 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const devices_ms = monotonicMs() - devices_start;
 
     if (prepared.vcpus != 1) {
-        return runFreshMultiVcpu(allocator, .{
+        return runMultiVcpu(allocator, .{
             .vm = &vm,
             .prepared = &prepared,
             .restore_stats = &restore_stats,
-            .transports = transports,
-            .gen_dev = gen_dev,
+            .devices = &devices,
             .ram = ram,
             .ram_bytes = ram_bytes,
             .ram_file_backed = ram_mapping.file_backed,
-            .net_dev = net_dev,
-            .vsock_dev = vsock_dev,
-            .net_transport_index = net_transport_index,
-            .vsock_transport_index = vsock_transport_index,
-            .disk_snapshot = config.disk_snapshot,
-            .environ_map = config.environ_map,
             .dist_base = dist_base,
             .dist_size = dist_size,
             .redist_region_base = redist_base,
@@ -195,6 +184,12 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     );
     const vcpu_ms = monotonicMs() - vcpu_start;
     vm.gic_layout = .{ .dist_base = dist_base, .redist_base = vcpu_redist_base, .redist_stride = redist_stride };
+    vm.gic_windows = .{
+        .dist_base = dist_base,
+        .dist_size = dist_size,
+        .redist_base = vcpu_redist_base,
+        .redist_size = redist_stride,
+    };
     const vcpus = (&primary)[0..1];
 
     var boot_ms: u64 = 0;
@@ -267,6 +262,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     }
 
     const tracker_ref: ?*DirtyTracker = if (dirty_tracker) |*tracker| tracker else null;
+    vm.dirty_tracker = tracker_ref;
     const snapshot_source = vmm.SnapshotSource{
         .config = config,
         .transports = transports,
@@ -402,7 +398,8 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                         }
                         return .probe_complete;
                     }
-                    vsock_dev.host_stream = null;
+                    // A detached stream stays attached until the control
+                    // replaces or resets it.
                     exec_probe_done = true;
                 }
                 if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > exec_probe.timeout_ms) return error.VsockProbeTimedOut;
@@ -412,16 +409,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             logged_first_vcpu_entry = true;
             std.log.debug("hvf exec probe timing: first_vcpu_entry_ms={d}", .{monotonicMs() -| start_ms});
         }
-        const run_exit = try primary.run(.{
-            .all = vcpus,
-            .gic_windows = .{
-                .dist_base = dist_base,
-                .dist_size = dist_size,
-                .redist_base = vcpu_redist_base,
-                .redist_size = redist_stride,
-            },
-            .dirty_tracker = tracker_ref,
-        });
+        const run_exit = try primary.run(&vm, vcpus);
         if (config.probe != null and !exec_probe_done and run_exit != .kicked) {
             if (prepared.restoring() and !logged_first_guest_exit) {
                 logged_first_guest_exit = true;
@@ -479,22 +467,10 @@ const HvfVcpuGicWriteCommand = struct {
     value: u64,
 };
 
-const HvfVcpuCaptureCommand = struct {
-    allocator: std.mem.Allocator,
-    out: *spore.VcpuState,
-};
-
-const HvfVcpuApplyCommand = struct {
-    state: spore.VcpuState,
-    vtimer_offset: u64,
-};
-
 const HvfVcpuCommand = union(enum) {
     start: HvfVcpuStartCommand,
     gic_read: HvfVcpuGicReadCommand,
     gic_write: HvfVcpuGicWriteCommand,
-    capture: *HvfVcpuCaptureCommand,
-    apply: *const HvfVcpuApplyCommand,
 };
 
 const HvfVcpuCommandResult = union(enum) {
@@ -520,7 +496,7 @@ const HvfVcpuCommandSlot = struct {
                 self.result = .ok;
                 self.state = .pending;
                 self.lock.unlock();
-                target.wake();
+                target.kick();
                 break;
             }
             self.lock.unlock();
@@ -565,11 +541,18 @@ const HvfVcpuCommandSlot = struct {
 /// counter offset every vCPU shares, interrupt lines and the virtio-mem
 /// mapping. HVF has one VM per process, so most calls need no handle.
 const Vm = struct {
-    /// Set once vCPU 0 exists: HVF places each redistributor frame by the
+    /// Set once the vCPUs exist: HVF places each redistributor frame by the
     /// vCPU's MPIDR.
     gic_layout: vmm.GicLayout = undefined,
+    /// The GIC windows a vCPU emulates; set with `gic_layout`.
+    gic_windows: GicWindows = undefined,
     /// Host counter minus guest counter; a restore sets it on every vCPU.
     vtimer_offset: u64 = 0,
+    dirty_tracker: ?*DirtyTracker = null,
+
+    pub const name = "hvf";
+    /// `hv_gic_set_spi` does not interrupt a running vCPU.
+    pub const spi_needs_kick = true;
 
     pub fn setSpi(_: *const Vm, intid: u32, level: bool) !void {
         try hvf.check(hvf.hv_gic_set_spi(intid, level), "hv_gic_set_spi");
@@ -589,7 +572,7 @@ const Vm = struct {
         _ = hvf.hv_vm_unmap(guest_addr, mapped_bytes);
     }
 
-    pub fn captureGic(_: *const Vm, arena: std.mem.Allocator, _: []const Vcpu) !gicv3.State {
+    pub fn captureGic(_: *const Vm, arena: std.mem.Allocator, _: usize) !gicv3.State {
         return snapshot.captureGicState(arena);
     }
 
@@ -609,27 +592,12 @@ const Vcpu = struct {
     redist_base: u64 = 0,
     created: bool = false,
     ready: std.atomic.Value(bool) = .init(false),
-    creation_error: ?anyerror = null,
-    thread: ?std.Thread = null,
     run_state: std.atomic.Value(u8) = .init(hvf_vcpu_state_off),
-    snapshot_paused: std.atomic.Value(bool) = .init(false),
     command_slot: HvfVcpuCommandSlot = .{},
     /// The device access the last `.mmio` exit reported.
     mmio_access: MmioAccess = undefined,
     /// HVF accepts vCPU calls only on the thread that created the vCPU.
     owner_thread: std.Thread.Id = undefined,
-
-    const RunContext = struct {
-        /// Every vCPU, for PSCI CPU_ON and redistributor forwarding. The
-        /// inline single-vCPU loop passes just its own.
-        all: []Vcpu,
-        gic_windows: GicWindows,
-        dirty_tracker: ?*DirtyTracker = null,
-    };
-
-    fn initEmpty(self: *Vcpu, index: topology.VcpuIndex) void {
-        self.* = .{ .index = index };
-    }
 
     fn createOnOwnerThread(self: *Vcpu) !void {
         try hvf.check(hvf.hv_vcpu_create(&self.handle, &self.exit, null), "hv_vcpu_create");
@@ -676,27 +644,39 @@ const Vcpu = struct {
         return self.command_slot.submit(self, command);
     }
 
-    /// Captures the stopped vCPU, on its owner thread.
+    /// Creates the vCPU on the thread that will own it.
+    pub fn threadStart(self: *Vcpu) !void {
+        errdefer self.destroyOnOwnerThread();
+        try self.createOnOwnerThread();
+        self.ready.store(true, .release);
+    }
+
+    pub fn threadExit(self: *Vcpu) void {
+        self.destroyOnOwnerThread();
+    }
+
+    /// Serves one start or GIC request another thread submitted; returns
+    /// whether there was one.
+    pub fn handleCommands(self: *Vcpu) bool {
+        const command = self.command_slot.take() orelse return false;
+        processHvfVcpuCommand(self, command);
+        return true;
+    }
+
+    /// Captures the stopped vCPU.
     pub fn capture(self: *Vcpu, _: *const Vm, arena: std.mem.Allocator) !spore.VcpuState {
-        if (std.Thread.getCurrentId() == self.owner_thread) {
-            return snapshot.captureVcpuState(arena, .{ .index = self.index, .handle = self.handle });
-        }
-        var state: spore.VcpuState = undefined;
-        var command = HvfVcpuCaptureCommand{ .allocator = arena, .out = &state };
-        _ = try self.submit(.{ .capture = &command });
-        return state;
+        self.assertOwnerThread();
+        return snapshot.captureVcpuState(arena, .{ .index = self.index, .handle = self.handle });
     }
 
-    /// Restores the vCPU on its owner thread, on the VM's shared counter.
+    /// Restores the vCPU on the VM's shared counter; it then runs.
     pub fn apply(self: *Vcpu, vm: *const Vm, state: spore.VcpuState) !void {
-        if (std.Thread.getCurrentId() == self.owner_thread) {
-            return snapshot.applyVcpuState(self.handle, state, vm.vtimer_offset);
-        }
-        const command = HvfVcpuApplyCommand{ .state = state, .vtimer_offset = vm.vtimer_offset };
-        _ = try self.submit(.{ .apply = &command });
+        self.assertOwnerThread();
+        try snapshot.applyVcpuState(self.handle, state, vm.vtimer_offset);
+        self.setRunning();
     }
 
-    fn wake(self: *const Vcpu) void {
+    pub fn kick(self: *const Vcpu) void {
         if (!self.ready.load(.acquire)) return;
         var handles = [_]hvf.VcpuHandle{self.handle};
         _ = hvf.hv_vcpus_exit(&handles, handles.len);
@@ -704,9 +684,12 @@ const Vcpu = struct {
 
     /// Runs the guest once. The vtimer, unknown sysregs, PSCI, GIC MMIO and
     /// dirty-tracking write faults are handled here; device MMIO is returned
-    /// to the loop and finished with `completeMmio`.
-    fn run(self: *Vcpu, ctx: RunContext) !vmm.Exit {
+    /// to the loop and finished with `completeMmio`. `all` is every vCPU, for
+    /// PSCI CPU_ON and redistributor forwarding. A vCPU that PSCI has turned
+    /// off returns `.wfi`.
+    pub fn run(self: *Vcpu, vm: *const Vm, all: []Vcpu) !vmm.Exit {
         self.assertOwnerThread();
+        if (all.len > 1 and !self.isRunning()) return .wfi;
         try hvf.check(hvf.hv_vcpu_run(self.handle), "hv_vcpu_run");
         const exit = self.exit;
         if (hvfPostRunAction(exit.reason) == .resume_before_run) return .kicked;
@@ -722,13 +705,13 @@ const Vcpu = struct {
                         return error.UnhandledGuestException;
                     },
                     hvf.ec_data_abort => {
-                        if (ctx.dirty_tracker) |tracker| {
+                        if (vm.dirty_tracker) |tracker| {
                             if (try WriteProtect.handleWriteFault(tracker, exit.exception.syndrome, exit.exception.physical_address)) return .handled;
                         }
                         const access = try decodeMmioAccess(exit);
                         // Redistributor MMIO can forward to another vCPU and wait
                         // for completion, so it stays out of the loop's device lock.
-                        if (try handleGicMmioAccess(self.handle, access, ctx.gic_windows, self)) return .handled;
+                        if (try handleGicMmioAccess(self.handle, access, vm.gic_windows, self)) return .handled;
                         var value: ?u64 = null;
                         if (access.is_write) {
                             value = 0;
@@ -739,11 +722,11 @@ const Vcpu = struct {
                         self.mmio_access = access;
                         return .{ .mmio = .{ .addr = access.ipa, .size_log2 = access.sas, .write = value } };
                     },
-                    hvf.ec_hvc => return self.psci(ctx.all),
+                    hvf.ec_hvc => return self.psci(all),
                     hvf.ec_smc => {
                         // Treat SMC like HVC but advance PC (trapped SMC
                         // returns to the same instruction).
-                        const result = try self.psci(ctx.all);
+                        const result = try self.psci(all);
                         try advancePc(self.handle);
                         return result;
                     },
@@ -781,7 +764,7 @@ const Vcpu = struct {
     /// Finishes the last `.mmio` exit: a read loads `value`, masked to the
     /// access size, into the target register; then the guest moves past the
     /// faulting instruction.
-    fn completeMmio(self: *Vcpu, value: u64) !void {
+    pub fn completeMmio(self: *Vcpu, value: u64) !void {
         self.assertOwnerThread();
         const access = self.mmio_access;
         if (!access.is_write and access.srt < 31) {
@@ -874,78 +857,16 @@ fn hvfRedistributorWindow(vcpus: []const Vcpu, stride: u64) !HvfRedistributorWin
     return .{ .base = base, .size = size };
 }
 
-const HvfVcpuWakeSet = struct {
-    vcpus: []const Vcpu,
-
-    fn wakeAll(self: *HvfVcpuWakeSet) void {
-        var handles: [topology.max_vcpus]hvf.VcpuHandle = undefined;
-        var count: usize = 0;
-        for (self.vcpus) |vcpu_entry| {
-            if (!vcpu_entry.ready.load(.acquire)) continue;
-            handles[count] = vcpu_entry.handle;
-            count += 1;
-        }
-        if (count != 0) _ = hvf.hv_vcpus_exit(handles[0..count].ptr, @intCast(count));
-    }
-};
-
-const MultiHvfResult = union(enum) {
-    exit: ExitCause,
-    err: anyerror,
-};
-
-const MultiHvfRunState = struct {
-    mutex: vmm.SpinLock = .{},
-    stop: std.atomic.Value(bool) = .init(false),
-    snapshot_requested: std.atomic.Value(bool) = .init(false),
-    result_value: ?MultiHvfResult = null,
-
-    fn stopped(self: *MultiHvfRunState) bool {
-        return self.stop.load(.acquire);
-    }
-
-    fn requestSnapshot(self: *MultiHvfRunState) void {
-        self.snapshot_requested.store(true, .release);
-    }
-
-    fn snapshotRequested(self: *MultiHvfRunState) bool {
-        return self.snapshot_requested.load(.acquire);
-    }
-
-    fn clearSnapshot(self: *MultiHvfRunState) void {
-        self.snapshot_requested.store(false, .release);
-    }
-
-    fn finish(self: *MultiHvfRunState, new_result: MultiHvfResult) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.result_value == null) self.result_value = new_result;
-        self.stop.store(true, .release);
-    }
-
-    fn result(self: *MultiHvfRunState) ?MultiHvfResult {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.result_value;
-    }
-};
+const Threaded = vmm.Threaded(Vm, Vcpu, DirtyTracker);
 
 const MultiHvfRunOptions = struct {
-    /// The GIC layout is set once the vCPUs exist.
     vm: *Vm,
     prepared: *const vmm.Prepared,
     restore_stats: *?vmm.RestoreStats,
-    transports: []mmio.Transport,
-    gen_dev: *generation.Device,
+    devices: *vmm.Devices,
     ram: guestmem.GuestRam,
     ram_bytes: []align(std.heap.page_size_min) u8,
     ram_file_backed: bool,
-    net_dev: *net.Net,
-    vsock_dev: *vsock.Vsock,
-    net_transport_index: usize,
-    vsock_transport_index: usize,
-    disk_snapshot: ?disk_layer.SnapshotState,
-    environ_map: ?*const std.process.Environ.Map,
     dist_base: u64,
     dist_size: u64,
     redist_region_base: u64,
@@ -956,88 +877,23 @@ const MultiHvfRunOptions = struct {
     map_ram_ms: u64,
     hv_map_ram_ms: u64,
     devices_ms: u64,
-
-    fn snapshotSource(self: MultiHvfRunOptions) vmm.SnapshotSource {
-        return .{
-            .config = &self.prepared.config,
-            .transports = self.transports,
-            .gen_dev = self.gen_dev,
-            .vsock_dev = self.vsock_dev,
-            .ram_bytes = self.ram_bytes,
-            .ram_size = self.prepared.ram_size,
-        };
-    }
 };
 
-const MultiHvfThreadContext = struct {
-    vm: *const Vm,
-    vcpu: *Vcpu,
-    vcpus: []Vcpu,
-    state: *MultiHvfRunState,
-    device_lock: *vmm.SpinLock,
-    network: net.Runtime,
-    transports: []mmio.Transport,
-    gen_dev: *generation.Device,
-    ram: guestmem.GuestRam,
-    net_dev: *net.Net,
-    net_transport_index: usize,
-    gic_windows: GicWindows,
-};
-
-fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !ExitCause {
+/// Runs a VM with more than one vCPU on the shared threaded loop. HVF
+/// creates each vCPU on its own thread, so the GIC layout, boot and restore
+/// wait for the threads.
+fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !ExitCause {
     const config = &options.prepared.config;
-    const vcpu_count: usize = @intCast(options.prepared.vcpus);
-    var vcpus = try allocator.alloc(Vcpu, vcpu_count);
+    const vm = options.vm;
+    const devices = options.devices;
+    const transports = devices.transports();
+    const vcpus = try allocator.alloc(Vcpu, options.prepared.vcpus);
     defer allocator.free(vcpus);
-    for (vcpus, 0..) |*vcpu, index| vcpu.initEmpty(@intCast(index));
+    for (vcpus, 0..) |*vcpu, index| vcpu.* = .{ .index = @intCast(index) };
 
-    var state = MultiHvfRunState{};
-    var device_lock = vmm.SpinLock{};
-    var exec_probe_done = false;
-    var wake_set = HvfVcpuWakeSet{ .vcpus = vcpus };
-    config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetworkVcpuSet });
-    defer config.network.clearWake();
-    if (config.exec_control) |control| {
-        control.setWake(.{ .context = &wake_set, .wakeFn = wakeVcpuSet });
-    }
-    var capture_wake: capture.WakeThread = .{};
-    if (config.captureRequest()) |request_capture| {
-        try capture_wake.start(request_capture, wakeCaptureVcpuSet, &wake_set);
-    }
-    defer if (config.captureRequest()) |request_capture| capture_wake.stop(request_capture);
-
-    const contexts = try allocator.alloc(MultiHvfThreadContext, vcpus.len);
-    defer allocator.free(contexts);
-    defer joinHvfVcpuThreads(vcpus, &wake_set);
-    errdefer {
-        state.finish(.{ .err = error.HvfThreadStartFailed });
-        wake_set.wakeAll();
-    }
-
-    for (vcpus, contexts) |*vcpu_entry, *ctx| {
-        ctx.* = .{
-            .vm = options.vm,
-            .vcpu = vcpu_entry,
-            .vcpus = vcpus,
-            .state = &state,
-            .device_lock = &device_lock,
-            .network = config.network,
-            .transports = options.transports,
-            .gen_dev = options.gen_dev,
-            .ram = options.ram,
-            .net_dev = options.net_dev,
-            .net_transport_index = options.net_transport_index,
-            .gic_windows = .{
-                .dist_base = options.dist_base,
-                .dist_size = options.dist_size,
-                .redist_base = 0,
-                .redist_size = 0,
-            },
-        };
-        vcpu_entry.thread = try std.Thread.spawn(.{}, hvfVcpuThreadMain, .{ctx});
-    }
-
-    try waitHvfVcpusReady(vcpus, &state);
+    var threaded: Threaded = .{ .vm = vm, .vcpus = vcpus, .devices = devices, .ram = options.ram, .config = config };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
 
     const vcpu_start = monotonicMs();
     var redist_stride: usize = 0;
@@ -1045,7 +901,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     const redist_window = try hvfRedistributorWindow(vcpus, @intCast(redist_stride));
     if (redist_window.size > options.redist_region_size) return error.UnsupportedVcpuCount;
     const vcpu_ms = monotonicMs() - vcpu_start;
-    const gic_windows = GicWindows{
+    vm.gic_windows = .{
         .dist_base = options.dist_base,
         .dist_size = options.dist_size,
         .redist_base = redist_window.base,
@@ -1053,8 +909,6 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         .redist_stride = @intCast(redist_stride),
         .redist_vcpus = vcpus,
     };
-    for (contexts) |*ctx| ctx.gic_windows = gic_windows;
-    const vm = options.vm;
     vm.gic_layout = .{ .dist_base = options.dist_base, .redist_base = redist_window.base, .redist_stride = @intCast(redist_stride) };
     std.log.debug(
         "gic: dist=0x{x}+0x{x} redist=0x{x}+0x{x} stride=0x{x} count={d} (region 0x{x}+0x{x})",
@@ -1077,18 +931,17 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
             .gic_redist_base = redist_window.base,
             .gic_redist_stride = @intCast(redist_stride),
             .counter_frequency_hz = snapshot.hostCounterFreq(),
-            .device_count = options.transports.len,
+            .device_count = transports.len,
         });
         // HVF restores only its own private GIC blob.
         if (machine.gic.kind != .backend_private) return error.PlatformMismatch;
         try vmm.restoreMemory(allocator, restore, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
         const state_start = monotonicMs();
-        try vmm.applyTransports(options.transports, manifest.devices, options.ram);
-        try options.gen_dev.restore(allocator, restore.generation orelse manifest.generation);
-        if (restore.generation == null) try spore.refreshResumeParams(allocator, options.gen_dev);
-        try vmm.restoreMachine(allocator, vm, vcpus, manifest.machine);
-        for (vcpus) |*vcpu| vcpu.setRunning();
-        try vmm.raiseGenerationIrqIfPending(vm, options.gen_dev);
+        try vmm.applyTransports(transports, manifest.devices, options.ram);
+        try devices.gen.restore(allocator, restore.generation orelse manifest.generation);
+        if (restore.generation == null) try spore.refreshResumeParams(allocator, &devices.gen);
+        try threaded.restore(allocator, manifest.machine);
+        try vmm.raiseGenerationIrqIfPending(vm, &devices.gen);
         if (options.restore_stats.*) |*stats| stats.state_ms = monotonicMs() - state_start;
         boot_ms = monotonicMs() - restore_start;
     } else {
@@ -1104,7 +957,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 .redistributor_base = redist_window.base,
                 .redistributor_size = redist_window.size,
             },
-            .virtio_count = @intCast(options.transports.len),
+            .virtio_count = @intCast(transports.len),
             .bootargs = fresh.cmdline,
             .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
         });
@@ -1120,12 +973,9 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
     if (config.probe) |probe| {
         if (probe.start == .immediate) {
             const attach_probe_start = monotonicMs();
-            try options.vsock_dev.attachHostStream(probe.stream);
+            try devices.vsock.attachHostStream(probe.stream);
             probe.stream.markStarted();
-            wakeAfterVsockRxDelivery(
-                try vmm.flushRx(vm, options.vsock_dev, options.transports, options.vsock_transport_index, options.ram),
-                .{ .context = &wake_set, .wakeFn = wakeVcpuSet },
-            );
+            if (try vmm.flushRx(vm, &devices.vsock, transports, devices.vsock_index, options.ram)) threaded.kickAll();
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -1146,316 +996,14 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         },
     );
 
-    while (true) {
-        if (state.result()) |result| {
-            wake_set.wakeAll();
-            return finishMultiHvfResult(result);
-        }
-        if (config.network.failed()) {
-            state.finish(.{ .err = error.NetworkGatewayFailed });
-            continue;
-        }
-        if (config.exec_control) |control| {
-            control.reportStats(vmm.monitorStats(null));
-            device_lock.lock();
-            const action = control.poll(options.vsock_dev) catch |err| {
-                device_lock.unlock();
-                state.finish(.{ .err = err });
-                continue;
-            };
-            var vsock_rx_delivered = false;
-            switch (action) {
-                .keep_running => vsock_rx_delivered = vmm.flushRx(
-                    vm,
-                    options.vsock_dev,
-                    options.transports,
-                    options.vsock_transport_index,
-                    options.ram,
-                ) catch |err| {
-                    device_lock.unlock();
-                    state.finish(.{ .err = err });
-                    continue;
-                },
-                else => {},
-            }
-            device_lock.unlock();
-            wakeAfterVsockRxDelivery(
-                vsock_rx_delivered,
-                .{ .context = &wake_set, .wakeFn = wakeVcpuSet },
-            );
-            switch (action) {
-                .keep_running => {},
-                .stop => {
-                    state.finish(.{ .exit = .monitor_stopped });
-                    continue;
-                },
-                .snapshot => |request| snapshot_action: {
-                    if (request.continue_after) {
-                        var preparation = if (request.publish_dir != null)
-                            (control.prepareSnapshot() catch |err| {
-                                state.finish(.{ .err = err });
-                                break :snapshot_action;
-                            }) orelse break :snapshot_action
-                        else
-                            null;
-                        defer if (preparation) |*owned| owned.deinit();
-                        var prepared_root = if (request.publish_dir) |publish_dir|
-                            if (options.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
-                        else
-                            null;
-                        defer if (prepared_root) |*root| root.deinit();
-                        const source_pause_started_ns = snapshotMultiHvf(allocator, options, vm, vcpus, &state, &wake_set, .{
-                            .dir = request.dir,
-                            .rootfs_cache_lock = if (preparation) |*owned| owned.cacheLock() else null,
-                        }) catch |err| {
-                            state.clearSnapshot();
-                            state.finish(.{ .err = err });
-                            continue;
-                        };
-                        const completed_dir = if (request.publish_dir) |publish_dir| blk: {
-                            const publish_metrics = control.publishSnapshot(&preparation.?, request.dir, publish_dir) catch |err| {
-                                state.clearSnapshot();
-                                state.finish(.{ .err = err });
-                                continue;
-                            };
-                            if (prepared_root) |*root| options.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (options.environ_map != null) .shared_no_rebind else .local_rebind) catch |err| {
-                                state.clearSnapshot();
-                                state.finish(.{ .err = err });
-                                continue;
-                            };
-                            vmm.logNamedSnapshotPublication("hvf", publish_metrics, source_pause_started_ns);
-                            break :blk publish_dir;
-                        } else request.dir;
-                        state.clearSnapshot();
-                        control.completeSnapshot(completed_dir) catch |err| {
-                            state.finish(.{ .err = err });
-                            continue;
-                        };
-                        continue;
-                    }
-                    return snapshotMultiHvfAndStop(allocator, options, vm, vcpus, &state, &wake_set, request.dir, null);
-                },
-                .rootfs_snapshot => |request| {
-                    const disk_manifest = takeRootfsSnapshotMulti(
-                        allocator,
-                        request.dir,
-                        vcpus,
-                        &state,
-                        &wake_set,
-                        options.transports,
-                        options.disk_snapshot,
-                    ) catch |err| {
-                        state.clearSnapshot();
-                        state.finish(.{ .err = err });
-                        continue;
-                    };
-                    state.clearSnapshot();
-                    control.completeRootfsSnapshot(disk_manifest) catch |err| {
-                        state.finish(.{ .err = err });
-                        continue;
-                    };
-                    continue;
-                },
-                .disk_fork => |request| {
-                    captureMultiHvfDiskFork(allocator, options, vm, vcpus, &state, &wake_set, request, control) catch |err| control.failDiskFork(err);
-                    continue;
-                },
-            }
-        }
-        if (config.probe) |exec_probe| {
-            const probe = exec_probe.stream;
-            if (!exec_probe_done) {
-                if (probe.state == .failed) {
-                    state.finish(.{ .err = error.VsockProbeFailed });
-                    continue;
-                }
-                if (probe.state == .complete) {
-                    std.log.debug("hvf multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
-                    if (exec_probe.on_complete == .stop) {
-                        if (config.probeCaptureDir()) |dir| {
-                            return snapshotMultiHvfAndStop(allocator, options, vm, vcpus, &state, &wake_set, dir, null);
-                        }
-                        state.finish(.{ .exit = .probe_complete });
-                        continue;
-                    }
-                    exec_probe_done = true;
-                }
-                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > exec_probe.timeout_ms) {
-                    state.finish(.{ .err = error.VsockProbeTimedOut });
-                    continue;
-                }
-            }
-        }
-        if (config.captureRequest()) |request_capture| {
-            if (request_capture.isAbortRequested()) {
-                state.finish(.{ .err = error.CaptureAborted });
-                continue;
-            }
-            if (request_capture.isRequested()) {
-                return snapshotMultiHvfAndStop(allocator, options, vm, vcpus, &state, &wake_set, config.capture.?.dir, request_capture);
-            }
-        }
-        sleepMs(1);
-    }
-}
-
-fn finishMultiHvfResult(result: MultiHvfResult) !ExitCause {
-    return switch (result) {
-        .exit => |cause| cause,
-        .err => |err| err,
-    };
-}
-
-/// Stops every vCPU and writes a spore. Returns when the source paused.
-fn snapshotMultiHvf(
-    allocator: std.mem.Allocator,
-    options: MultiHvfRunOptions,
-    vm: *const Vm,
-    vcpus: []Vcpu,
-    state: *MultiHvfRunState,
-    wake_set: *HvfVcpuWakeSet,
-    target: vmm.SnapshotTarget,
-) !u64 {
-    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
-    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-    try vmm.writeSnapshot(allocator, "hvf", vm, vcpus, @as(?*DirtyTracker, null), options.snapshotSource(), target);
-    return pause_started_ns;
-}
-
-fn snapshotMultiHvfAndStop(
-    allocator: std.mem.Allocator,
-    options: MultiHvfRunOptions,
-    vm: *const Vm,
-    vcpus: []Vcpu,
-    state: *MultiHvfRunState,
-    wake_set: *HvfVcpuWakeSet,
-    snapshot_dir: []const u8,
-    request_capture: ?*capture.Request,
-) !ExitCause {
-    _ = snapshotMultiHvf(allocator, options, vm, vcpus, state, wake_set, .{ .dir = snapshot_dir }) catch |err| {
-        if (state.result()) |result| return finishMultiHvfResult(result);
-        state.finish(.{ .err = err });
-        return err;
-    };
-    if (request_capture) |request| {
-        request.markCompleted();
-        if (request.isAbortRequested()) {
-            state.finish(.{ .err = error.CaptureAborted });
-            return error.CaptureAborted;
-        }
-    }
-    state.finish(.{ .exit = .snapshotted });
-    return .snapshotted;
-}
-
-fn waitHvfVcpusReady(vcpus: []Vcpu, state: *MultiHvfRunState) !void {
-    while (true) {
-        if (state.result()) |result| switch (result) {
-            .err => |err| return err,
-            .exit => return error.UnexpectedExit,
-        };
-        var ready_count: usize = 0;
-        for (vcpus) |*vcpu| {
-            if (!vcpu.ready.load(.acquire)) break;
-            if (vcpu.creation_error) |err| return err;
-            ready_count += 1;
-        }
-        if (ready_count == vcpus.len) return;
-        sleepMs(1);
-    }
-}
-
-fn joinHvfVcpuThreads(vcpus: []Vcpu, wake_set: *HvfVcpuWakeSet) void {
-    wake_set.wakeAll();
-    for (vcpus) |*vcpu_entry| {
-        if (vcpu_entry.thread) |thread| {
-            thread.join();
-            vcpu_entry.thread = null;
-        }
-    }
-}
-
-fn pauseHvfVcpusForSnapshot(vcpus: []Vcpu, state: *MultiHvfRunState, wake_set: *HvfVcpuWakeSet) !void {
-    for (vcpus) |*vcpu| vcpu.snapshot_paused.store(false, .release);
-    state.requestSnapshot();
-    wake_set.wakeAll();
-    while (true) {
-        if (state.result() != null) return error.CaptureAborted;
-        var paused_count: usize = 0;
-        for (vcpus) |*vcpu| {
-            if (!vcpu.snapshot_paused.load(.acquire)) break;
-            paused_count += 1;
-        }
-        if (paused_count == vcpus.len) return;
-        sleepMs(1);
-    }
-}
-
-fn hvfVcpuThreadMain(ctx: *MultiHvfThreadContext) void {
-    ctx.vcpu.createOnOwnerThread() catch |err| {
-        ctx.vcpu.creation_error = err;
-        ctx.vcpu.ready.store(true, .release);
-        ctx.state.finish(.{ .err = err });
-        return;
-    };
-    ctx.vcpu.ready.store(true, .release);
-    defer ctx.vcpu.destroyOnOwnerThread();
-
-    while (!ctx.state.stopped()) {
-        if (ctx.vcpu.command_slot.take()) |command| {
-            processHvfVcpuCommand(ctx.vcpu, command);
-            continue;
-        }
-        if (ctx.state.snapshotRequested()) {
-            ctx.vcpu.snapshot_paused.store(true, .release);
-            sleepMs(1);
-            continue;
-        }
-        ctx.vcpu.snapshot_paused.store(false, .release);
-        if (!ctx.vcpu.isRunning()) {
-            sleepMs(1);
-            continue;
-        }
-        if (ctx.network.failed()) {
-            ctx.state.finish(.{ .err = error.NetworkGatewayFailed });
-            continue;
-        }
-        var flushed_network = false;
-        ctx.device_lock.lock();
-        if (ctx.network.consumeWake()) {
-            _ = vmm.flushRx(ctx.vm, ctx.net_dev, ctx.transports, ctx.net_transport_index, ctx.ram) catch |err| {
-                ctx.device_lock.unlock();
-                ctx.state.finish(.{ .err = err });
-                return;
-            };
-            flushed_network = true;
-        }
-        ctx.device_lock.unlock();
-        if (flushed_network) continue;
-        const run_exit = ctx.vcpu.run(.{ .all = ctx.vcpus, .gic_windows = ctx.gic_windows }) catch |err| {
-            ctx.state.finish(.{ .err = err });
-            return;
-        };
-        if (ctx.state.stopped()) continue;
-        switch (run_exit) {
-            .mmio => |access| {
-                ctx.device_lock.lock();
-                const value = vmm.dispatchMmio(ctx.vm, access, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
-                    ctx.device_lock.unlock();
-                    ctx.state.finish(.{ .err = err });
-                    return;
-                };
-                ctx.device_lock.unlock();
-                ctx.vcpu.completeMmio(value) catch |err| {
-                    ctx.state.finish(.{ .err = err });
-                    return;
-                };
-            },
-            .wfi => sleepMs(1),
-            .shutdown => |kind| ctx.state.finish(.{ .exit = kind.cause() }),
-            .handled, .kicked => {},
-        }
-    }
+    return threaded.run(allocator, .{
+        .config = config,
+        .transports = transports,
+        .gen_dev = &devices.gen,
+        .vsock_dev = &devices.vsock,
+        .ram_bytes = options.ram_bytes,
+        .ram_size = options.prepared.ram_size,
+    });
 }
 
 fn processHvfVcpuCommand(vcpu: *Vcpu, command: HvfVcpuCommand) void {
@@ -1469,14 +1017,6 @@ fn processHvfVcpuCommand(vcpu: *Vcpu, command: HvfVcpuCommand) void {
             gic.mmioWrite(write.region, vcpu.handle, write.offset, write.value);
             break :blk .ok;
         },
-        .capture => |capture_cmd| blk: {
-            capture_cmd.out.* = snapshot.captureVcpuState(capture_cmd.allocator, .{ .index = vcpu.index, .handle = vcpu.handle }) catch |err| break :blk .{ .err = err };
-            break :blk .ok;
-        },
-        .apply => |apply_cmd| blk: {
-            snapshot.applyVcpuState(vcpu.handle, apply_cmd.state, apply_cmd.vtimer_offset) catch |err| break :blk .{ .err = err };
-            break :blk .ok;
-        },
     };
     vcpu.command_slot.finish(result);
 }
@@ -1486,8 +1026,7 @@ fn psciCpuOn(all: []Vcpu, target_mpidr: u64, entry: u64, context_id: u64) !u64 {
     const target = &all[target_index];
     if (target.isRunning()) return psci_ret_already_on;
     _ = try target.submit(.{ .start = .{ .entry = entry, .arg0 = context_id } });
-    var wake_set = HvfVcpuWakeSet{ .vcpus = all };
-    wake_set.wakeAll();
+    for (all) |*vcpu| vcpu.kick();
     return 0;
 }
 
@@ -1528,11 +1067,6 @@ fn wakeCaptureVcpu(context: ?*anyopaque) callconv(.c) void {
     const vcpu_ptr: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
     var vcpus = [_]hvf.VcpuHandle{vcpu_ptr.*};
     _ = hvf.hv_vcpus_exit(&vcpus, vcpus.len);
-}
-
-fn wakeCaptureVcpuSet(context: ?*anyopaque) callconv(.c) void {
-    const wake_set: *HvfVcpuWakeSet = @ptrCast(@alignCast(context orelse return));
-    wake_set.wakeAll();
 }
 
 const DirtyTracker = vmm.DirtyTracker(WriteProtect);
@@ -1694,57 +1228,14 @@ const WriteProtect = struct {
     }
 };
 
-fn takeRootfsSnapshotMulti(
-    allocator: std.mem.Allocator,
-    dir: []const u8,
-    vcpus: []Vcpu,
-    state: *MultiHvfRunState,
-    wake_set: *HvfVcpuWakeSet,
-    transports: []mmio.Transport,
-    disk_snapshot: ?disk_layer.SnapshotState,
-) !?spore.Disk {
-    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
-    return try vmm.takeRootfsSnapshot(allocator, dir, transports, disk_snapshot);
-}
-
-fn captureMultiHvfDiskFork(
-    allocator: std.mem.Allocator,
-    options: MultiHvfRunOptions,
-    vm: *const Vm,
-    vcpus: []Vcpu,
-    state: *MultiHvfRunState,
-    wake_set: *HvfVcpuWakeSet,
-    request: vsock_control.DiskForkAction,
-    control: vsock_control.Control,
-) !void {
-    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-    defer state.clearSnapshot();
-    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
-    try vmm.captureDiskFork(allocator, "hvf", vm, vcpus, @as(?*DirtyTracker, null), options.snapshotSource(), request, control, pause_started_ns);
-}
-
 fn wakeVcpu(context: *anyopaque) void {
     const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context));
     _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
 }
 
-fn wakeVcpuSet(context: *anyopaque) void {
-    const wake_set: *HvfVcpuWakeSet = @ptrCast(@alignCast(context));
-    wake_set.wakeAll();
-}
-
-fn wakeAfterVsockRxDelivery(delivered: bool, wake: vsock_control.Wake) void {
-    if (delivered) wake.wake();
-}
-
 fn wakeNetworkVcpu(context: ?*anyopaque) void {
     const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
     _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
-}
-
-fn wakeNetworkVcpuSet(context: ?*anyopaque) void {
-    const wake_set: *HvfVcpuWakeSet = @ptrCast(@alignCast(context orelse return));
-    wake_set.wakeAll();
 }
 
 fn advancePc(vcpu: hvf.VcpuHandle) !void {
@@ -1931,28 +1422,6 @@ test "multi-vcpu network wake preserves completed HVF MMIO exit" {
     // A canceled return has no completed guest exit; its still-pending network
     // wake is consumed by the pre-run flush on the next iteration.
     try std.testing.expectEqual(HvfPostRunAction.resume_before_run, hvfPostRunAction(.canceled));
-}
-
-const TestVsockWakeCounter = struct {
-    count: usize = 0,
-
-    fn wake(context: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(context));
-        self.count += 1;
-    }
-};
-
-test "multi-vcpu vsock delivery wakes once per delivered batch" {
-    var counter = TestVsockWakeCounter{};
-    const wake = vsock_control.Wake{ .context = &counter, .wakeFn = TestVsockWakeCounter.wake };
-
-    wakeAfterVsockRxDelivery(false, wake);
-    try std.testing.expectEqual(@as(usize, 0), counter.count);
-
-    wakeAfterVsockRxDelivery(true, wake);
-    try std.testing.expectEqual(@as(usize, 1), counter.count);
-    wakeAfterVsockRxDelivery(true, wake);
-    try std.testing.expectEqual(@as(usize, 2), counter.count);
 }
 
 test "gic data-abort classification routes remote redistributor before device lock" {
