@@ -279,7 +279,9 @@ pub const Blk = struct {
     backend: Backend,
     capacity_sectors: u64,
     options: Options = .{},
-    accepted_features: u64 = 0,
+    /// Set by the transport with the device lock held; read by requests,
+    /// which the worker runs without it.
+    accepted_features: std.atomic.Value(u64) = .init(0),
     /// When set, `notify` leaves the requests to this worker.
     worker: ?*Worker = null,
 
@@ -317,9 +319,7 @@ pub const Blk = struct {
 
     fn featuresAccepted(ctx: *anyopaque, accepted_features: u64) void {
         const self: *Blk = @ptrCast(@alignCast(ctx));
-        // A request the worker is running may read them.
-        if (self.worker) |worker| worker.waitWhileBusy();
-        self.accepted_features = accepted_features;
+        self.accepted_features.store(accepted_features, .monotonic);
         if (self.options.stats) |stats| {
             stats.accepted_features.store(accepted_features, .monotonic);
         }
@@ -498,7 +498,7 @@ pub const Blk = struct {
             request_number = stats.write_zeroes_requests.fetchAdd(1, .monotonic) + 1;
         }
 
-        if (!self.options.write_zeroes or self.accepted_features & feature_write_zeroes == 0) {
+        if (!self.options.write_zeroes or self.accepted_features.load(.monotonic) & feature_write_zeroes == 0) {
             if (self.options.stats) |stats| {
                 _ = stats.write_zeroes_unsupported.fetchAdd(1, .monotonic);
             }
@@ -768,11 +768,11 @@ test "write zeroes feature and config are opt in and negotiation is resettable" 
     const ram: guestmem.GuestRam = .{ .bytes = &ram_bytes, .base = 0 };
     _ = transport.write(0x020, @truncate(feature_write_zeroes), ram);
     _ = transport.write(0x070, mmio.status_features_ok, ram);
-    try std.testing.expectEqual(feature_write_zeroes, growth.accepted_features & feature_write_zeroes);
+    try std.testing.expectEqual(feature_write_zeroes, growth.accepted_features.load(.monotonic) & feature_write_zeroes);
     try std.testing.expectEqual(feature_write_zeroes, stats.snapshot().accepted_features & feature_write_zeroes);
 
     _ = transport.write(0x070, 0, ram);
-    try std.testing.expectEqual(@as(u64, 0), growth.accepted_features);
+    try std.testing.expectEqual(@as(u64, 0), growth.accepted_features.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), stats.snapshot().accepted_features);
 }
 
@@ -787,7 +787,7 @@ test "immutable build input rejects WRITE_ZEROES negotiation without mutation" {
     _ = transport.write(0x020, @truncate(feature_write_zeroes), ram);
     _ = transport.write(0x070, mmio.status_features_ok, ram);
     try std.testing.expectEqual(@as(u32, 0), transport.read(0x070) & mmio.status_features_ok);
-    try std.testing.expectEqual(@as(u64, 0), source.accepted_features);
+    try std.testing.expectEqual(@as(u64, 0), source.accepted_features.load(.monotonic));
     try std.testing.expect(std.mem.allEqual(u8, &disk, 0x5a));
 }
 
