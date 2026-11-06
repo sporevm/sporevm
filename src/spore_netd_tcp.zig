@@ -211,7 +211,7 @@ const PortForward = struct {
 
 const OutputQueue = struct {
     frames: [output_queue_len][spore_net.max_frame_len]u8 = undefined,
-    lens: [output_queue_len]usize = .{0} ** output_queue_len,
+    lens: [output_queue_len]usize = @splat(0),
     head: usize = 0,
     count: usize = 0,
 
@@ -242,7 +242,7 @@ const OutputQueue = struct {
 pub const Gateway = struct {
     device: Device = Device.init(),
     flows: [max_flows]Flow = undefined,
-    port_forwards: [max_port_forwards]PortForward = [_]PortForward{.{}} ** max_port_forwards,
+    port_forwards: [max_port_forwards]PortForward = @splat(.{}),
     port_forward_count: usize = 0,
     sock_ptrs: [max_flows]*TcpSock = undefined,
     forwarder: Forwarder = undefined,
@@ -259,7 +259,7 @@ pub const Gateway = struct {
     pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime, port_forwards: []const spore_net_policy.PortForwardConfig) !void {
         self.device = Device.init();
         self.policy = policy;
-        self.port_forwards = [_]PortForward{.{}} ** max_port_forwards;
+        self.port_forwards = @splat(.{});
         self.port_forward_count = 0;
         self.output.reset();
         self.current_now = Instant.ZERO;
@@ -1132,7 +1132,7 @@ test "spore-netd TCP routes two bound services independently and rejects duplica
 
 test "spore-netd TCP opens bound Unix stream sockets" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-unix-test-{d}.sock", .{std.c.getpid()});
+    const path_z = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sporevm-netd-unix-test-{d}.sock", .{std.c.getpid()}, 0);
     const path = path_z[0..path_z.len];
     _ = std.c.unlink(path_z.ptr);
     defer _ = std.c.unlink(path_z.ptr);
@@ -1167,7 +1167,7 @@ test "spore-netd TCP opens bound Unix stream sockets" {
 
 test "spore-netd TCP applies poll results only to the flow that was polled" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-poll-test-{d}.sock", .{std.c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sporevm-netd-poll-test-{d}.sock", .{std.c.getpid()}, 0);
     const listener = try listenUnix(path);
     defer _ = std.c.close(listener);
     defer _ = std.c.unlink(path.ptr);
@@ -1213,7 +1213,7 @@ test "spore-netd TCP applies poll results only to the flow that was polled" {
 
 test "spore-netd TCP delivers guest bytes sent after host EOF" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-eof-test-{d}.sock", .{std.c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sporevm-netd-eof-test-{d}.sock", .{std.c.getpid()}, 0);
     const listener = try listenUnix(path);
     defer _ = std.c.close(listener);
     defer _ = std.c.unlink(path.ptr);
@@ -1255,7 +1255,7 @@ test "spore-netd TCP delivers guest bytes sent after host EOF" {
 
 test "spore-netd TCP stops polling a host socket while the guest cannot take more" {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sporevm-netd-backpressure-test-{d}.sock", .{std.c.getpid()});
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sporevm-netd-backpressure-test-{d}.sock", .{std.c.getpid()}, 0);
     const listener = try listenUnix(path);
     defer _ = std.c.close(listener);
     defer _ = std.c.unlink(path.ptr);

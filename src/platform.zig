@@ -360,12 +360,12 @@ test "manifest platform check accepts its contract and rejects each differing fi
     var manifest = spore.Manifest{
         .platform = contract(1, 512 * 1024 * 1024, 24_000_000),
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0,
             .cpsr = 0,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },

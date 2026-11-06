@@ -552,7 +552,7 @@ fn closeTruncatedRights(control: []const u8) void {
 }
 
 fn encodeFrameHeader(descriptor_len: usize) [frame_header_len]u8 {
-    var header = [_]u8{0} ** frame_header_len;
+    var header = @as([frame_header_len]u8, @splat(0));
     @memcpy(header[0..frame_magic.len], frame_magic);
     std.mem.writeInt(u16, header[8..10], frame_version, .little);
     std.mem.writeInt(u32, header[12..16], @intCast(descriptor_len), .little);
@@ -633,7 +633,7 @@ fn socketPair() Error![2]std.c.fd_t {
 }
 
 fn createUnlinkedSizedFd(allocator: std.mem.Allocator, logical_size: u64) Error!std.c.fd_t {
-    const template = try allocator.dupeZ(u8, "/tmp/sporevm-disk-claim-XXXXXX");
+    const template = try allocator.dupeSentinel(u8, "/tmp/sporevm-disk-claim-XXXXXX", 0);
     defer allocator.free(template);
     const fd = mkstemp(template.ptr);
     if (fd < 0) return error.IoFailed;
@@ -693,7 +693,7 @@ test "claim request is bounded, canonical, and strict" {
     defer _ = std.c.close(pair[0]);
     defer _ = std.c.close(pair[1]);
 
-    const token = [_]u8{0xAB} ** token_bytes;
+    const token = @as([token_bytes]u8, @splat(0xAB));
     var token_hex: [token_hex_bytes]u8 = undefined;
     const request = ClaimRequest{
         .type = claim_type,
@@ -731,7 +731,7 @@ test "claim request rejects an unterminated 8192-byte control line" {
     const pair = try socketPair();
     defer _ = std.c.close(pair[0]);
     defer _ = std.c.close(pair[1]);
-    const oversized = [_]u8{'a'} ** max_claim_request_bytes;
+    const oversized = @as([max_claim_request_bytes]u8, @splat('a'));
     try writeAll(pair[0], &oversized);
     try std.testing.expectError(error.ControlRequestTooLarge, readClaimRequest(std.testing.allocator, pair[1]));
 }
@@ -977,7 +977,7 @@ test "head receiver rejects short malformed trailing and wrongly sized frames" {
         const pair = try socketPair();
         defer _ = std.c.close(pair[0]);
         defer _ = std.c.close(pair[1]);
-        const invalid_descriptor = [_]u8{0} ** runtime_disk_fork.header_len;
+        const invalid_descriptor = @as([runtime_disk_fork.header_len]u8, @splat(0));
         const invalid_header = encodeFrameHeader(invalid_descriptor.len);
         try sendWithFds(pair[0], &invalid_header, &.{head.overlay_fd});
         try writeAll(pair[0], &invalid_descriptor);
@@ -988,7 +988,7 @@ test "head receiver rejects short malformed trailing and wrongly sized frames" {
 
 test "ancillary parser rejects unknown control messages" {
     const control_len = comptime cmsgSpace(@sizeOf(std.c.fd_t));
-    var control: [control_len]u8 align(@alignOf(std.c.cmsghdr)) = [_]u8{0} ** control_len;
+    var control: [control_len]u8 align(@alignOf(std.c.cmsghdr)) = @splat(0);
     const cmsg: *std.c.cmsghdr = @ptrCast(&control);
     cmsg.len = @intCast(cmsgLen(@sizeOf(std.c.fd_t)));
     cmsg.level = std.c.SOL.SOCKET;

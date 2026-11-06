@@ -2599,11 +2599,11 @@ fn createCacheMountFixture(io: Io, allocator: std.mem.Allocator, root: []const u
 }
 
 fn createSparseFileFixture(allocator: std.mem.Allocator, path: []const u8, logical_bytes: u64) !std.c.fd_t {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
     if (fd < 0) return error.CacheMountDiskOpenFailed;
     errdefer _ = std.c.close(fd);
-    const block = [_]u8{0x5a} ** 4096;
+    const block = @as([4096]u8, @splat(0x5a));
     if (std.c.pwrite(fd, &block, block.len, 0) != block.len or std.c.ftruncate(fd, @intCast(logical_bytes)) != 0) {
         return error.CacheMountDiskSyncFailed;
     }
@@ -2633,7 +2633,7 @@ test "system accounts for and reclaims aggregate build cache mount storage" {
     try std.testing.expectEqual(image_size, summary.build_cache_mounts.logical_bytes);
     try std.testing.expectEqual(disk.allocated_bytes, summary.build_cache_mounts.allocated_bytes);
 
-    const image_bytes = [_]u8{0x6b} ** 8192;
+    const image_bytes = @as([8192]u8, @splat(0x6b));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(allocator, &.{ root, "image.ext4" }), .data = &image_bytes });
     const bounded = try prune(allocator, io, .{ .cache_root = root, .max_bytes = disk.allocated_bytes + image_bytes.len }, Io.Clock.real.now(io).nanoseconds);
     defer deinitRootfsPruneResult(allocator, bounded);

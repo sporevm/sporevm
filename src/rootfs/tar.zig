@@ -1467,13 +1467,13 @@ test "merged tree rejects hardlink that replaces target ancestor" {
 }
 
 test "oversized binary tar numbers fail closed" {
-    var raw = [_]u8{0xff} ** 12;
+    var raw = @as([12]u8, @splat(0xff));
     raw[0] = 0x80;
     try std.testing.expectError(error.BadTarHeader, parseTarNumber(&raw));
 }
 
 test "oversized binary tar modes fail closed" {
-    var header = [_]u8{0} ** 512;
+    var header = @as([512]u8, @splat(0));
     header[100] = 0x80;
     header[103] = 0x01;
     try std.testing.expectError(error.BadTarHeader, tarMode(&header));
@@ -1651,8 +1651,8 @@ test "merged tree hardlinks share ownership and xattrs across paths" {
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
 
-    const cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
-    var pax = [_]u8{0} ** 512;
+    const cap = [_]u8{ 1, 0, 0, 2 } ++ @as([16]u8, @splat(0));
+    var pax = @as([512]u8, @splat(0));
     var pax_len: usize = 0;
     pax_len += writePaxRecord(pax[pax_len..], "uid", "2");
     pax_len += writePaxRecord(pax[pax_len..], "gid", "3");
@@ -1683,7 +1683,7 @@ test "unsupported tar entry types fail closed" {
     defer tmp.cleanup();
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
-    var block = [_]u8{0} ** 1024;
+    var block = @as([1024]u8, @splat(0));
     makeTarHeader(block[0..512], "dev/null", '3', 0);
 
     try std.testing.expectError(error.UnsupportedTarEntryType, applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block));
@@ -1695,7 +1695,7 @@ test "truncated tar headers fail closed" {
     defer tmp.cleanup();
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
-    const block = [_]u8{0} ** 511;
+    const block = @as([511]u8, @splat(0));
 
     try std.testing.expectError(error.TruncatedTarHeader, applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block));
 }
@@ -1706,7 +1706,7 @@ test "truncated tar payloads fail closed" {
     defer tmp.cleanup();
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
-    var block = [_]u8{0} ** 612;
+    var block = @as([612]u8, @splat(0));
     makeTarHeader(block[0..512], "file", '0', 1000);
 
     try std.testing.expectError(error.EndOfStream, applyTestLayer(allocator, &tmp, &tree, "layer.tar", &block));
@@ -1718,7 +1718,7 @@ test "global pax uid gid defaults apply to following entries" {
     defer tmp.cleanup();
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
-    var block = [_]u8{0} ** 2560;
+    var block = @as([2560]u8, @splat(0));
     const record = "10 uid=12\n10 gid=34\n13 comment=x\n";
     makeTarHeader(block[0..512], "global-pax", 'g', record.len);
     @memcpy(block[512 .. 512 + record.len], record);
@@ -1738,14 +1738,14 @@ test "global pax extraction fields and xattrs fail closed" {
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
 
-    var path_block = [_]u8{0} ** 1024;
+    var path_block = @as([1024]u8, @splat(0));
     const path_record = "13 path=file\n";
     makeTarHeader(path_block[0..512], "global-pax", 'g', path_record.len);
     @memcpy(path_block[512 .. 512 + path_record.len], path_record);
     try std.testing.expectError(error.UnsupportedGlobalPaxRecord, applyTestLayer(allocator, &tmp, &tree, "path.tar", &path_block));
 
-    const cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
-    var xattr_block = [_]u8{0} ** 1024;
+    const cap = [_]u8{ 1, 0, 0, 2 } ++ @as([16]u8, @splat(0));
+    var xattr_block = @as([1024]u8, @splat(0));
     const len = writePaxRecord(xattr_block[512..], "SCHILY.xattr.security.capability", &cap);
     makeTarHeader(xattr_block[0..512], "global-pax", 'g', len);
     try std.testing.expectError(error.UnsupportedTarXattr, applyTestLayer(allocator, &tmp, &tree, "xattr.tar", &xattr_block));
@@ -1754,7 +1754,7 @@ test "global pax extraction fields and xattrs fail closed" {
 /// A pax `size` near 2^64 for a directory entry, whose payload the parser
 /// skips instead of reading.
 fn hugePaxSizeLayer() [1536]u8 {
-    var layer = [_]u8{0} ** 1536;
+    var layer = @as([1536]u8, @splat(0));
     const record = "29 size=18446744073709551615\n";
     makeTarHeader(layer[0..512], "pax", 'x', record.len);
     @memcpy(layer[512 .. 512 + record.len], record);
@@ -1773,9 +1773,9 @@ test "tar payload sizes past the content limit fail closed" {
     try std.testing.expectError(error.RootFSArchiveTooLarge, applyTestLayer(allocator, &tmp, &tree, "pax.tar", &pax_layer));
 
     // The same size as a base-256 header field.
-    var header = [_]u8{0} ** 512;
+    var header = @as([512]u8, @splat(0));
     makeTarHeader(&header, "dir", '5', 0);
-    header[124..136].* = .{ 0x80, 0, 0, 0 } ++ .{0xff} ** 8;
+    header[124..136].* = .{ 0x80, 0, 0, 0 } ++ @as([8]u8, @splat(0xff));
     @memset(header[148..156], ' ');
     var sum: u64 = 0;
     for (header) |b| sum += b;
@@ -1789,7 +1789,7 @@ test "pax size overrides ustar file size" {
     defer tmp.cleanup();
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
-    var block = [_]u8{0} ** 2560;
+    var block = @as([2560]u8, @splat(0));
     const record = "10 size=5\n";
     makeTarHeader(block[0..512], "pax", 'x', record.len);
     @memcpy(block[512 .. 512 + record.len], record);
@@ -1806,7 +1806,7 @@ test "pax paths and GNU long names name the next entry" {
     defer tmp.cleanup();
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
-    var block = [_]u8{0} ** 4096;
+    var block = @as([4096]u8, @splat(0));
     const pax_record = "17 path=pax-name\n";
     makeTarHeader(block[0..512], "pax", 'x', pax_record.len);
     @memcpy(block[512 .. 512 + pax_record.len], pax_record);
@@ -1831,7 +1831,7 @@ test "root tar entries are ignored only for directories" {
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);
 
-    var block = [_]u8{0} ** 1024;
+    var block = @as([1024]u8, @splat(0));
     makeTarHeader(block[0..512], ".", '5', 0);
     try applyTestLayer(allocator, &tmp, &tree, "dir.tar", &block);
     try std.testing.expectEqual(@as(u32, 0), tree.entries.count());
@@ -1853,8 +1853,8 @@ test "pax records fail closed unless supported" {
         try std.testing.expectError(case.err, parsePaxHeaderBytes(allocator, case.record, &pax));
     }
 
-    const cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
-    var block = [_]u8{0} ** 512;
+    const cap = [_]u8{ 1, 0, 0, 2 } ++ @as([16]u8, @splat(0));
+    var block = @as([512]u8, @splat(0));
     const len = writePaxRecord(&block, "SCHILY.xattr.security.capability", &cap);
     var pax: PendingPax = .{};
     defer pax.clear(allocator);

@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().createDirPath(io, cache_dir);
     try Io.Dir.cwd().createDirPath(io, runtime_dir);
-    const runtime_dir_z = try allocator.dupeZ(u8, runtime_dir);
+    const runtime_dir_z = try allocator.dupeSentinel(u8, runtime_dir, 0);
     if (std.c.chmod(runtime_dir_z, 0o700) != 0) return error.IoFailed;
     try writeSmokeContext(allocator, io, context_dir, "beta\n");
 
@@ -1375,7 +1375,7 @@ fn stepRecordsContain(io: Io, allocator: std.mem.Allocator, cache_root: []const 
 }
 
 fn enableExtentsFeature(allocator: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;

@@ -56,7 +56,7 @@ extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 /// Reserves a private path for an archive the guest will produce.
 pub fn createTemp(allocator: std.mem.Allocator) !TempArchive {
     const tmpl = "/tmp/sporevm-copy-XXXXXX";
-    const dir = try allocator.dupeZ(u8, tmpl);
+    const dir = try allocator.dupeSentinel(u8, tmpl, 0);
     errdefer allocator.free(dir);
     if (mkdtemp(dir) == null) return error.IoFailed;
     const path = try std.fmt.allocPrint(allocator, "{s}/payload.spcp", .{std.mem.sliceTo(dir, 0)});
@@ -180,7 +180,7 @@ fn extract(allocator: std.mem.Allocator, io: Io, in: *Io.Reader, host_path: []co
 
     var parent = try openDirPath(io, std.fs.path.dirname(host_path) orelse ".", .{});
     defer parent.close(io);
-    const base = try allocator.dupeZ(u8, std.fs.path.basename(host_path));
+    const base = try allocator.dupeSentinel(u8, std.fs.path.basename(host_path), 0);
     defer allocator.free(base);
     switch (root.kind) {
         .file => {
@@ -335,7 +335,7 @@ fn validatePath(path: []const u8, allow_root: bool) !void {
 
 /// Creates a new private file without following a final symlink.
 pub fn openHostFileCreate(allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
     if (fd < 0) return error.OpenFailed;

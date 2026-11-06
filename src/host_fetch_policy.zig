@@ -65,8 +65,17 @@ pub fn resolveUriAddresses(io: Io, uri: std.Uri, options: Options) Error!Address
 
     const port = normalizedPort(uri) orelse return error.UnsupportedRemoteFetchScheme;
     var host_buffer: [HostName.max_len]u8 = undefined;
-    const host = uri.getHost(&host_buffer) catch return error.UnsafeRemoteFetchTarget;
+    const host = rawHost(uri, &host_buffer) catch return error.UnsafeRemoteFetchTarget;
     return resolveHostAddresses(io, host.bytes, port);
+}
+
+/// The URI's host as written, IP literals included. Zig 0.17 removes
+/// `std.Uri.getHost`, and its replacement `HostName.fromUri` rejects IP
+/// literals such as `[::1]`; callers here check the host against the fetch
+/// policy instead.
+pub fn rawHost(uri: std.Uri, buffer: *[HostName.max_len]u8) !HostName {
+    const component = uri.host orelse return error.UriMissingHost;
+    return .{ .bytes = try component.toRaw(buffer) };
 }
 
 pub fn validateHost(io: Io, raw_host: []const u8, port: u16) Error!void {
@@ -106,7 +115,7 @@ pub fn resolveHostAddresses(io: Io, raw_host: []const u8, port: u16) Error!Addre
 pub fn connectionTarget(uri: std.Uri, address: IpAddress, address_buffer: *[HostName.max_len]u8, logical_host_buffer: *[HostName.max_len]u8) Error!ConnectionTarget {
     const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.UnsupportedRemoteFetchScheme;
     const port = normalizedPort(uri) orelse return error.UnsupportedRemoteFetchScheme;
-    const logical_host = uri.getHost(logical_host_buffer) catch return error.UnsafeRemoteFetchTarget;
+    const logical_host = rawHost(uri, logical_host_buffer) catch return error.UnsafeRemoteFetchTarget;
     const connect_host = HostName{ .bytes = formatAddressHost(address, address_buffer) catch return error.UnsafeRemoteFetchTarget };
     return .{
         .connect_host = connect_host,

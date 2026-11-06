@@ -339,7 +339,7 @@ fn idFromLowerHex(hex: *const [chunk.ChunkId.hex_len]u8) ?chunk.ChunkId {
 
 /// Maps each lowercase hex digit to its value and every other byte to 0xff.
 const lower_hex_values: [256]u8 = values: {
-    var values = [_]u8{0xff} ** 256;
+    var values: [256]u8 = @splat(0xff);
     for ("0123456789abcdef", 0..) |digit, value| values[digit] = value;
     break :values values;
 };

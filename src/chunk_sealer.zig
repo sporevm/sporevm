@@ -104,7 +104,7 @@ pub fn writePathAllIfMissingTimedResult(
     data: []const u8,
     work_stats: *WorkStats,
 ) Error!WriteIfMissingResult {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     return try writeFileAllIfMissingTimedResult(allocator, path_z, data, work_stats);
 }
@@ -120,7 +120,7 @@ pub fn writePathAllIfMissingTimedForBatch(
     data: []const u8,
     work_stats: *WorkStats,
 ) Error!WriteIfMissingResult {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const start = try monotonicNs();
     const result = try writeFileAllIfMissingResultInternal(allocator, path_z, data, false);
@@ -143,9 +143,9 @@ pub fn publishTrustedFileIfMissing(
     dest_path: []const u8,
     expected_size: usize,
 ) Error!PublishTrustedFileResult {
-    const source_z = try allocator.dupeZ(u8, source_path);
+    const source_z = try allocator.dupeSentinel(u8, source_path, 0);
     defer allocator.free(source_z);
-    const dest_z = try allocator.dupeZ(u8, dest_path);
+    const dest_z = try allocator.dupeSentinel(u8, dest_path, 0);
     defer allocator.free(dest_z);
 
     const source_fd = std.c.open(source_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
@@ -246,7 +246,7 @@ pub fn writeFileAtomicDurable(
     data: []const u8,
     mode: c_uint,
 ) Error!void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const existing_fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
@@ -274,7 +274,7 @@ pub fn replaceFileAtomicDurable(
     data: []const u8,
     mode: c_uint,
 ) Error!void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const parent = std.fs.path.dirname(path) orelse ".";
@@ -298,7 +298,7 @@ pub fn replaceFileAtomicDurable(
 
 pub fn ensureDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
     if (path.len == 0) return error.IoFailed;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     for (path_z[0..path_z.len], 0..) |byte, i| {
@@ -382,7 +382,7 @@ pub fn fsyncParentDirPath(allocator: std.mem.Allocator, path: []const u8) Error!
 /// Follows symlinks: callers pass user paths such as macOS's /tmp, and
 /// syncing a directory reached through one grants nothing.
 pub fn fsyncDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
@@ -587,7 +587,7 @@ test "write-if-missing verifies existing data" {
     var tmp = try TestDir.init();
     defer tmp.deinit();
     const path = try tmp.path("chunk");
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     try writeFileAllIfMissing(allocator, path_z, "abc");
@@ -633,7 +633,7 @@ test "write-if-missing handles same-digest races" {
     var tmp = try TestDir.init();
     defer tmp.deinit();
     const path = try tmp.path("chunk");
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const worker_count = @max(parallelWorkerCount(8), @as(usize, 2));

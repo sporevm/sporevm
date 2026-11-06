@@ -138,7 +138,7 @@ test "round-trips frame headers" {
 }
 
 test "rejects malformed headers" {
-    var buf: [header_len]u8 = [_]u8{0} ** header_len;
+    var buf: [header_len]u8 = @splat(0);
     try std.testing.expectError(error.BadMagic, readHeader(&buf));
 
     @memcpy(buf[0..4], magic);

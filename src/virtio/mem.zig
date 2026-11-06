@@ -56,7 +56,7 @@ pub const Mem = struct {
     region_size: u64,
     requested_size: u64,
     plugged_size: u64 = 0,
-    plugged: std.StaticBitSet(max_blocks) = .initEmpty(),
+    plugged: std.StaticBitSet(max_blocks) = .empty,
     plug_context: ?*anyopaque = null,
     plugFn: ?*const fn (*anyopaque, u64) bool = null,
 
@@ -124,7 +124,7 @@ pub const Mem = struct {
         const requested_region_size = captured.requested_size - captured.initial_size;
         if (requested_region_size % self.block_size != 0) return error.InvalidVirtioMemState;
 
-        var plugged: std.StaticBitSet(max_blocks) = .initEmpty();
+        var plugged: std.StaticBitSet(max_blocks) = .empty;
         var plugged_size: u64 = 0;
         for (captured.plugged_ranges) |range| {
             if (range.block_count == 0) return error.InvalidVirtioMemState;
@@ -453,7 +453,7 @@ test "invalid captured state does not mutate device state" {
 fn fuzzMemQueue(_: void, s: *std.testing.Smith) !void {
     var mem = Mem.init(.{ .addr = 0x1000_0000, .region_size = default_block_size * 4, .requested_size = default_block_size * 4 });
     var t = mmio.Transport.init(mem.device());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 

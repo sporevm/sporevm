@@ -408,7 +408,7 @@ test "OCI layout tar extraction accepts buildx-shaped paths" {
     const tar_path = try root_dir.path("layout.tar");
     const out_dir = try root_dir.path("out");
 
-    var archive = [_]u8{0} ** (512 * 7);
+    var archive = @as([(512 * 7)]u8, @splat(0));
     makeTarHeader(archive[0..512], "blobs", '5', 0);
     makeTarHeader(archive[512..1024], "blobs/sha256", '5', 0);
     makeTarHeader(archive[1024..1536], "oci-layout", '0', 4);
@@ -429,7 +429,7 @@ test "OCI layout tar extraction rejects unsafe paths" {
     var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
     defer tmp.cleanup();
 
-    var archive = [_]u8{0} ** (512 * 3);
+    var archive = @as([(512 * 3)]u8, @splat(0));
     makeTarHeader(archive[0..512], "../oci-layout", '0', 4);
     @memcpy(archive[512..516], "json");
 
@@ -447,7 +447,7 @@ test "OCI layout tar extraction rejects duplicate paths" {
     var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
     defer tmp.cleanup();
 
-    var archive = [_]u8{0} ** (512 * 5);
+    var archive = @as([(512 * 5)]u8, @splat(0));
     makeTarHeader(archive[0..512], "oci-layout", '0', 4);
     @memcpy(archive[512..516], "json");
     makeTarHeader(archive[1024..1536], "oci-layout", '0', 2);

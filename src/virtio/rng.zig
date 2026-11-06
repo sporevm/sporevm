@@ -121,8 +121,8 @@ fn makeChain(segs: []const queue.Segment) queue.Chain {
 test "fills writable descriptors only" {
     var rng = Rng{ .fillFn = testFill };
     var readable: [4]u8 = .{ 1, 2, 3, 4 };
-    var out_a: [3]u8 = [_]u8{0} ** 3;
-    var out_b: [5]u8 = [_]u8{0} ** 5;
+    var out_a: [3]u8 = @splat(0);
+    var out_b: [5]u8 = @splat(0);
 
     const chain = makeChain(&.{
         .{ .data = &readable, .writable = false },
@@ -140,7 +140,7 @@ test "queue notification returns entropy buffer used" {
     var rng = Rng{ .fillFn = testFill };
     var t = mmio.Transport.init(rng.device());
 
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     _ = t.write(0x030, request_queue, ram);
@@ -170,7 +170,7 @@ test "queue notification caps hostile avail ring delta" {
     var rng = Rng{ .fillFn = countedTestFill };
     var t = mmio.Transport.init(rng.device());
 
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     _ = t.write(0x030, request_queue, ram);
@@ -210,7 +210,7 @@ fn fuzzRngQueue(_: void, s: *std.testing.Smith) !void {
     var rng = Rng{ .fillFn = testFill };
     var t = mmio.Transport.init(rng.device());
 
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 

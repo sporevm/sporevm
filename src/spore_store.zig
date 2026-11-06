@@ -296,6 +296,7 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const system = @import("system.zig");
+const test_support = @import("test_support.zig");
 
 /// Test support: a saved spore in `<fixture>/saved` whose disk is the fixture
 /// image with its first chunk changed, with a nonzero full RAM chunk, a
@@ -413,7 +414,7 @@ test "spore push writes a spore once, without its RAM backing, and dedupes again
     const again = try testPush(&fixture, saved.dir, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ store, first.spore_digest }), "aws");
     try std.testing.expectEqualStrings(first.spore_digest, again.spore_digest);
     try std.testing.expectEqual(@as(usize, 0), again.objects_written);
-    try std.testing.expectError(error.SporeIdentityMismatch, testPush(&fixture, saved.dir, try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, "b" ** 64 }), "aws"));
+    try std.testing.expectError(error.SporeIdentityMismatch, testPush(&fixture, saved.dir, try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, test_support.repeat("b", 64) }), "aws"));
     try std.testing.expectError(error.ImageStorePushUnsupportedScheme, testPush(&fixture, saved.dir, "https://images.example.test/warm", "aws"));
 }
 

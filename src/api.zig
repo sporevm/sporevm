@@ -975,9 +975,9 @@ pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: Clone
 }
 
 fn renameDirectoryNoReplace(allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
-    const source_z = try allocator.dupeZ(u8, source);
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(source_z);
-    const destination_z = try allocator.dupeZ(u8, destination);
+    const destination_z = try allocator.dupeSentinel(u8, destination, 0);
     defer allocator.free(destination_z);
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
@@ -1435,12 +1435,12 @@ fn testVcpuState(index: u32) spore.VcpuState {
     return .{
         .index = index,
         .mpidr = aarch64_topology.mpidrForIndex(index),
-        .gprs = [_]u64{0} ** 31,
+        .gprs = @splat(0),
         .pc = 0,
         .cpsr = 0,
         .fpcr = 0,
         .fpsr = 0,
-        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .simd = @splat(.{ 0, 0 }),
         .sys_regs = &.{},
         .icc_regs = &.{},
         .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },

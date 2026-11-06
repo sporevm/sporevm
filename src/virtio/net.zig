@@ -375,7 +375,7 @@ test "tx queue drains packets and returns descriptors used" {
     var backend = TestBackend{};
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [8192]u8 = [_]u8{0} ** 8192;
+    var buf: [8192]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const tx_desc = 0x000;
@@ -403,7 +403,7 @@ test "tx queue drops malformed virtio net headers and oversized frames" {
     var backend = TestBackend{};
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [8192]u8 = [_]u8{0} ** 8192;
+    var buf: [8192]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const tx_desc = 0x000;
@@ -432,7 +432,7 @@ test "rx queue injects pending backend frame with virtio net header" {
 
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -447,7 +447,7 @@ test "rx queue injects pending backend frame with virtio net header" {
     try std.testing.expect(t.write(0x050, rx_queue, ram));
     try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, rx_used + 2));
     try std.testing.expectEqual(@as(u32, header_len + frame.len), try ram.read(u32, rx_used + 8));
-    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** header_len, buf[packet..][0..header_len]);
+    try std.testing.expectEqualSlices(u8, &@as([header_len]u8, @splat(0)), buf[packet..][0..header_len]);
     try std.testing.expectEqualStrings(frame, buf[packet + header_len ..][0..frame.len]);
     try std.testing.expect(!backend.rx_pending);
     try std.testing.expectEqual(@as(usize, 1), backend.rx_consumed);
@@ -460,7 +460,7 @@ test "net device exposes explicit pending rx flush for async backends" {
 
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -490,7 +490,7 @@ test "tx notify also flushes pending rx frames" {
 
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const tx_desc = 0x000;
@@ -528,7 +528,7 @@ test "rx queue preserves pending frame when buffers are absent or too small" {
 
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -561,7 +561,7 @@ test "net backend reset and shutdown hooks run explicitly" {
     var backend = TestBackend{};
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [16]u8 = [_]u8{0} ** 16;
+    var buf: [16]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     _ = t.write(0x070, 0, ram);
@@ -575,7 +575,7 @@ fn fuzzNetTx(_: void, s: *std.testing.Smith) !void {
     var backend = TestBackend{};
     var dev = Net.init(.{ .backend = backend.backend() });
     var t = mmio.Transport.init(dev.device());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
     t.queues[tx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x0000, .avail_addr = 0x0400, .used_addr = 0x0800 };
@@ -622,7 +622,7 @@ fn fuzzNetRxDelivery(_: void, s: *std.testing.Smith) !void {
     var t = mmio.Transport.init(dev.device());
     // Guest-controlled RX ring indexes, descriptor chains, and buffer layouts
     // decide where host frames land.
-    var buf: [8192]u8 = [_]u8{0} ** 8192;
+    var buf: [8192]u8 = @splat(0);
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
     t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x1000, .avail_addr = 0x1200, .used_addr = 0x1400 };

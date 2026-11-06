@@ -7,6 +7,7 @@
 //! into the board inertly: generation zero, empty params, no interrupt.
 
 const std = @import("std");
+const test_support = @import("test_support.zig");
 
 pub const magic: u32 = 0x4e47_5053; // "SPGN", little-endian MMIO word
 pub const version: u32 = 1;
@@ -43,7 +44,7 @@ pub const State = struct {
 pub const Device = struct {
     generation: u64 = 0,
     interrupt_status: u32 = 0,
-    params: [params_size]u8 = [_]u8{0} ** params_size,
+    params: [params_size]u8 = @splat(0),
 
     pub fn read(self: *const Device, offset: u64, size_log2: u2) u64 {
         const size = @as(usize, 1) << size_log2;
@@ -71,7 +72,7 @@ pub const Device = struct {
     pub fn setResume(self: *Device, generation: u64, params: []const u8) Error!bool {
         if (params.len > params_size) return error.BadState;
 
-        var next_params: [params_size]u8 = [_]u8{0} ** params_size;
+        var next_params: [params_size]u8 = @splat(0);
         @memcpy(next_params[0..params.len], params);
 
         const changed = self.generation != generation or !std.mem.eql(u8, &self.params, &next_params);
@@ -278,16 +279,16 @@ test "fanout params follow the guest agent's rules for the members it reads" {
     const allocator = std.testing.allocator;
     const head = "{\"run_id\":\"r\",\"child_id\":0,\"parallel_index\":0,\"parallel_count\":1,\"fork_index\":0,\"fork_count\":1";
     const ids = ",\"fork_batch_id\":\"b\",\"vm_id\":\"v\"";
-    const cases = [_]struct { tail: []const u8, accepted: bool }{
-        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "v" ** 127 ++ "\"}", .accepted = true },
-        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "v" ** 128 ++ "\"}", .accepted = false },
+    const cases = comptime [_]struct { tail: []const u8, accepted: bool }{
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ test_support.repeat("v", 127) ++ "\"}", .accepted = true },
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ test_support.repeat("v", 128) ++ "\"}", .accepted = false },
         // Strings are measured decoded: each \u00e9 is two bytes.
-        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "\\u00e9" ** 63 ++ "v\"}", .accepted = true },
-        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "\\u00e9" ** 64 ++ "\"}", .accepted = false },
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ test_support.repeat("\\u00e9", 63) ++ "v\"}", .accepted = true },
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ test_support.repeat("\\u00e9", 64) ++ "\"}", .accepted = false },
         .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"v\\u0000\"}", .accepted = false },
-        .{ .tail = ",\"fork_batch_id\":\"" ++ "b" ** 128 ++ "\",\"vm_id\":\"v\"}", .accepted = false },
+        .{ .tail = ",\"fork_batch_id\":\"" ++ test_support.repeat("b", 128) ++ "\",\"vm_id\":\"v\"}", .accepted = false },
         .{ .tail = ids ++ ",\"hostname\":\"spore-child-7\",\"resume_entropy_seed\":\"\"}", .accepted = true },
-        .{ .tail = ids ++ ",\"hostname\":\"" ++ "h" ** 128 ++ "\"}", .accepted = false },
+        .{ .tail = ids ++ ",\"hostname\":\"" ++ test_support.repeat("h", 128) ++ "\"}", .accepted = false },
         .{ .tail = ids ++ ",\"hostname\":7}", .accepted = false },
         .{ .tail = ids ++ ",\"resume_entropy_seed\":null}", .accepted = false },
         .{ .tail = ids ++ ",\"resume_entropy_seed\":\"s\\u0000\"}", .accepted = false },

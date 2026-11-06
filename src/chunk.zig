@@ -7,6 +7,7 @@
 //! use. See SECURITY.md.
 
 const std = @import("std");
+const test_support = @import("test_support.zig");
 const Blake3 = std.crypto.hash.Blake3;
 
 /// A content-addressed chunk identity: the BLAKE3-256 digest of the chunk
@@ -72,7 +73,7 @@ pub const ChunkId = struct {
 
 test "fromHex rejects malformed input" {
     try std.testing.expectError(error.InvalidChunkId, ChunkId.fromHex("abc"));
-    const not_hex = "zz" ** 32;
+    const not_hex = test_support.repeat("zz", 32);
     try std.testing.expectError(error.InvalidChunkId, ChunkId.fromHex(not_hex));
 }
 

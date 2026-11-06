@@ -251,15 +251,15 @@ fn completeStampPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8
 }
 
 fn chmodReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     if (std.c.chmod(path_z.ptr, 0o444) != 0) return error.ContextDiskPublishFailed;
 }
 
 fn renameReplace(allocator: std.mem.Allocator, from: []const u8, to: []const u8) !void {
-    const from_z = try allocator.dupeZ(u8, from);
+    const from_z = try allocator.dupeSentinel(u8, from, 0);
     defer allocator.free(from_z);
-    const to_z = try allocator.dupeZ(u8, to);
+    const to_z = try allocator.dupeSentinel(u8, to, 0);
     defer allocator.free(to_z);
     if (std.c.rename(from_z.ptr, to_z.ptr) != 0) return error.ContextDiskPublishFailed;
 }

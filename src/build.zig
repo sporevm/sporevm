@@ -1083,7 +1083,7 @@ fn scratchStorage(
     });
     diagnostic.first_emit_map_bytes = emitted.profile.emit_map_bytes;
     diagnostic.first_counted_emitter_buffers_bytes = emitted.profile.counted_emitter_buffers_bytes;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const temp_fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (temp_fd < 0) return error.IoFailed;

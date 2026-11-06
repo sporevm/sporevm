@@ -103,7 +103,7 @@ test "file source range checks against logical size" {
 
     var file = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer file.close(io);
-    try file.writeStreamingAll(io, &([_]u8{0x44} ** 4096));
+    try file.writeStreamingAll(io, &(@as([4096]u8, @splat(0x44))));
 
     const source = FileBlockSource.init(file.handle, 1024);
     var buf: [1]u8 = undefined;

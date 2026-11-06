@@ -21,6 +21,7 @@ const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 const tar = @import("rootfs/tar.zig");
 const test_barrier = @import("test_barrier.zig");
+const test_support = @import("test_support.zig");
 
 const Io = std.Io;
 
@@ -177,7 +178,7 @@ pub const RootfsCacheLock = struct {
 
         const path = try std.fs.path.join(allocator, &.{ cache_root, rootfs_cache_lock_name });
         defer allocator.free(path);
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
         const expected_fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
         if (expected_fd < 0) return false;
@@ -209,7 +210,7 @@ fn openRootfsCacheLock(io: Io, allocator: std.mem.Allocator, cache_root: []const
     try ensureDirPath(io, cache_root);
     const path = try std.fs.path.join(allocator, &.{ cache_root, rootfs_cache_lock_name });
     defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
     if (fd < 0) return error.IoFailed;
@@ -1644,7 +1645,7 @@ test "cas preload can attach manifest-bound rootfs storage to a spore" {
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, spore_dir);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = (test_support.repeat("abcd", 1024)) ++ (test_support.repeat("efgh", 1024)) });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
@@ -1731,12 +1732,12 @@ fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.Rootfs
             .counter_frequency_hz = 24_000_000,
         },
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0xffff_ffc0_0000_0000,
             .cpsr = 0x3c5,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 123, .cntv_ctl = 1, .cntv_cval = 456 },

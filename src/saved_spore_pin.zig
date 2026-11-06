@@ -375,7 +375,7 @@ pub fn syncRegistry(allocator: std.mem.Allocator, registry: LockedRegistry) !voi
 fn ensureRegistryDurable(allocator: std.mem.Allocator, registry: LockedRegistry) !void {
     const pins_dir = try std.fs.path.join(allocator, &.{ registry.cache_root, dir_name });
     defer allocator.free(pins_dir);
-    const pins_dir_z = try allocator.dupeZ(u8, pins_dir);
+    const pins_dir_z = try allocator.dupeSentinel(u8, pins_dir, 0);
     defer allocator.free(pins_dir_z);
     const created_registry = if (std.c.mkdir(pins_dir_z.ptr, 0o700) == 0)
         true
@@ -531,13 +531,13 @@ fn validateExclusiveOwner(allocator: std.mem.Allocator, cache_root: []const u8, 
 const FileIdentity = struct { device: u64, inode: u64, nlink: u64 };
 
 fn statDirectory(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     return statPath(path_z, .directory, 0);
 }
 
 fn statRegularNoFollow(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     return statPath(path_z, .file, std.c.AT.SYMLINK_NOFOLLOW);
 }
@@ -587,9 +587,9 @@ fn statPath(path: [:0]const u8, expected: std.Io.File.Kind, flags: u32) !FileIde
 }
 
 fn hardLink(allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
-    const source_z = try allocator.dupeZ(u8, source);
+    const source_z = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(source_z);
-    const destination_z = try allocator.dupeZ(u8, destination);
+    const destination_z = try allocator.dupeSentinel(u8, destination, 0);
     defer allocator.free(destination_z);
     if (std.c.link(source_z.ptr, destination_z.ptr) != 0) return switch (std.c.errno(-1)) {
         .EXIST => error.PathAlreadyExists,
@@ -599,7 +599,7 @@ fn hardLink(allocator: std.mem.Allocator, source: []const u8, destination: []con
 }
 
 fn unlinkPath(allocator: std.mem.Allocator, path: []const u8) void {
-    const path_z = allocator.dupeZ(u8, path) catch return;
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch return;
     defer allocator.free(path_z);
     _ = std.c.unlink(path_z.ptr);
 }
@@ -711,7 +711,7 @@ fn replaceRecord(allocator: std.mem.Allocator, registry: LockedRegistry, record:
 
 /// Creates and fsyncs `path`; the caller syncs its directory.
 fn createFileExclusiveDurable(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: c_uint) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
     if (fd < 0) return switch (std.c.errno(fd)) {
@@ -730,7 +730,7 @@ fn createFileExclusiveDurable(allocator: std.mem.Allocator, path: []const u8, by
 }
 
 fn createDirectoryExclusive(allocator: std.mem.Allocator, path: []const u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     if (std.c.mkdir(path_z.ptr, 0o700) == 0) return;
     return switch (std.c.errno(-1)) {

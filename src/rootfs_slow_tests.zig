@@ -9,6 +9,7 @@ const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const xattrs_mod = @import("rootfs/xattrs.zig");
 const spore = @import("spore.zig");
+const test_support = @import("test_support.zig");
 
 const Io = std.Io;
 
@@ -30,7 +31,7 @@ test "native ext4 writer emits deterministic fsck-clean image" {
     const path_a = try tmp_dir.path("a.img");
     const path_b = try tmp_dir.path("b.img");
 
-    var cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    var cap = [_]u8{ 1, 0, 0, 2 } ++ @as([16]u8, @splat(0));
     const attrs = [_]xattrs_mod.Attribute{.{ .name = xattrs_mod.security_capability_name, .value = &cap }};
     const entries = [_]ext4_writer.Entry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755 },
@@ -83,9 +84,9 @@ test "native ext4 writer emits fsck-clean symlinks at the fast/slow boundary" {
     const path = try tmp_dir.path("symlink-boundary.img");
 
     const prefix = "/usr/share/ca-certificates/mozilla/";
-    const target_59 = prefix ++ "a" ** (59 - prefix.len);
-    const target_60 = prefix ++ "b" ** (60 - prefix.len);
-    const target_61 = prefix ++ "c" ** (61 - prefix.len);
+    const target_59 = prefix ++ test_support.repeat("a", (59 - prefix.len));
+    const target_60 = prefix ++ test_support.repeat("b", (60 - prefix.len));
+    const target_61 = prefix ++ test_support.repeat("c", (61 - prefix.len));
 
     const entries = [_]ext4_writer.Entry{
         .{ .path = "etc/link-59", .kind = .{ .symlink = target_59 } },
@@ -253,9 +254,9 @@ test "native ext4 image from a representative tar passes e2fsck and reads back" 
     const zeros = try allocator.alloc(u8, 2 * 1024 * 1024);
     defer allocator.free(zeros);
     @memset(zeros, 0);
-    const slow_target = "../" ++ "long-symlink-target/" ** 4 ++ "hostname";
+    const slow_target = "../" ++ test_support.repeat("long-symlink-target/", 4) ++ "hostname";
     // VFS_CAP_REVISION_2, effective, permitted CAP_NET_RAW.
-    const cap = [_]u8{ 1, 0, 0, 2, 0, 0x20, 0, 0 } ++ [_]u8{0} ** 12;
+    const cap = [_]u8{ 1, 0, 0, 2, 0, 0x20, 0, 0 } ++ @as([12]u8, @splat(0));
     const pax = try testPaxRecord(allocator, "SCHILY.xattr." ++ xattrs_mod.security_capability_name, &cap);
     defer allocator.free(pax);
 
@@ -369,7 +370,7 @@ test "native ext4 writer trees match debugfs listings and contents" {
     // Every entry kind, owners, special mode bits, an xattr, fast and slow
     // symlinks, an empty directory, and one inode with three names in two
     // directories.
-    var cap = [_]u8{ 1, 0, 0, 2, 0, 0x20, 0, 0 } ++ [_]u8{0} ** 12;
+    var cap = [_]u8{ 1, 0, 0, 2, 0, 0x20, 0, 0 } ++ @as([12]u8, @splat(0));
     const attrs = [_]xattrs_mod.Attribute{.{ .name = xattrs_mod.security_capability_name, .value = &cap }};
     const mixed = [_]ext4_writer.Entry{
         .{ .path = "bin", .kind = .directory, .mode = 0o755 },
@@ -385,7 +386,7 @@ test "native ext4 writer trees match debugfs listings and contents" {
         .{ .path = "home", .kind = .directory, .mode = 0o700, .uid = 1000, .gid = 1000 },
         .{ .path = "home/fast", .kind = .{ .symlink = "../etc/shared" }, .uid = 1000, .gid = 1000 },
         .{ .path = "home/shared-3", .kind = .{ .hardlink = "etc/shared" } },
-        .{ .path = "home/slow", .kind = .{ .symlink = "../" ++ "s" ** 70 } },
+        .{ .path = "home/slow", .kind = .{ .symlink = "../" ++ test_support.repeat("s", 70) } },
         .{ .path = "run", .kind = .directory, .mode = 0o755 },
         .{ .path = "run/fifo", .kind = .fifo, .mode = 0o600 },
         .{ .path = "run/socket", .kind = .socket, .mode = 0o755 },
@@ -408,7 +409,7 @@ test "native ext4 writer trees match debugfs listings and contents" {
     var wide = std.ArrayList(ext4_writer.Entry).empty;
     try wide.append(arena, .{ .path = "wide", .kind = .directory, .mode = 0o755 });
     for (0..1200) |index| {
-        const path = try std.fmt.allocPrint(arena, "wide/{d:0>4}{s}", .{ index, "w" ** 196 });
+        const path = try std.fmt.allocPrint(arena, "wide/{d:0>4}{s}", .{ index, test_support.repeat("w", 196) });
         try wide.append(arena, .{ .path = path, .kind = .{ .file = path[path.len - 200 .. path.len - 196] } });
     }
     try expectDebugfsMatchesEntries(arena, io, debugfs, try tmp_dir.path("wide"), wide.items, 2048, min_native_image_size);
@@ -733,7 +734,7 @@ const TestTarEntry = struct {
 
 fn appendTestTarEntry(allocator: std.mem.Allocator, tar_bytes: *std.ArrayList(u8), entry: TestTarEntry) !void {
     std.debug.assert(entry.name.len <= 100 and entry.link.len <= 100);
-    var header = [_]u8{0} ** 512;
+    var header = @as([512]u8, @splat(0));
     @memcpy(header[0..entry.name.len], entry.name);
     writeTestTarOctal(header[100..108], entry.mode);
     writeTestTarOctal(header[108..116], entry.uid);

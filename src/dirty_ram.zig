@@ -564,7 +564,7 @@ extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
 fn testDir(allocator: std.mem.Allocator) ![]const u8 {
     const tmpl = "/tmp/sporevm-dirty-ram-test-XXXXXX";
-    const buf = try allocator.dupeZ(u8, tmpl);
+    const buf = try allocator.dupeSentinel(u8, tmpl, 0);
     if (mkdtemp(buf) == null) return error.IoFailed;
     return buf;
 }
@@ -847,7 +847,7 @@ test "dirty RAM host dirty ranges match chunk model" {
         .{ .offset = 3 * spore.chunk_size + 17, .len = 19 },
     };
 
-    var model = [_]bool{false} ** 4;
+    var model = @as([4]bool, @splat(false));
     var newly_dirty: u64 = 0;
     for (ranges) |range| {
         sealer.markHostDirtyRange(range.offset, range.len);

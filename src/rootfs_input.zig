@@ -18,6 +18,7 @@ const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
 const spore = @import("spore.zig");
+const test_support = @import("test_support.zig");
 
 pub const PullPolicy = enum {
     missing,
@@ -620,12 +621,12 @@ test "run --pull=missing converts a registry tag again after a rootfs builder ch
     const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, cache_root);
     const rootfs_path = try tmp_dir.path("rootfs.ext4");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = (test_support.repeat("abcd", 1024)) ++ (test_support.repeat("efgh", 1024)) });
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
 
     // The loopback registry fails every registry request before connecting.
-    const manifest = "sha256:" ++ "a" ** 64;
+    const manifest = "sha256:" ++ test_support.repeat("a", 64);
     for ([_]struct { name: []const u8, source: []const u8, builder: []const u8, workdir: []const u8 }{
         .{ .name = "127.0.0.1:1/app:old", .source = "127.0.0.1:1/app@" ++ manifest, .builder = "sporevm-rootfs-previous", .workdir = "/old" },
         .{ .name = "127.0.0.1:1/app:current", .source = "127.0.0.1:1/app@" ++ manifest, .builder = rootfs_mod.builder_version, .workdir = "/current" },

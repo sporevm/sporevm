@@ -1912,7 +1912,7 @@ extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
 fn testDir(allocator: std.mem.Allocator) ![]const u8 {
     const tmpl = "/tmp/sporevm-bundle-test-XXXXXX";
-    const buf = try allocator.dupeZ(u8, tmpl);
+    const buf = try allocator.dupeSentinel(u8, tmpl, 0);
     if (mkdtemp(buf) == null) return error.IoFailed;
     return buf;
 }
@@ -1943,12 +1943,12 @@ fn testManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation:
             .counter_frequency_hz = 24_000_000,
         },
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0,
             .cpsr = 0,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
@@ -1971,12 +1971,12 @@ fn testVcpuState(index: topology.VcpuIndex) spore.VcpuState {
     return .{
         .index = index,
         .mpidr = aarch64_topology.mpidrForIndex(index),
-        .gprs = [_]u64{0} ** 31,
+        .gprs = @splat(0),
         .pc = 0,
         .cpsr = 0,
         .fpcr = 0,
         .fpsr = 0,
-        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .simd = @splat(.{ 0, 0 }),
         .sys_regs = &.{},
         .icc_regs = &.{},
         .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
@@ -2858,8 +2858,8 @@ test "unpack rejects symlinked rootfs artifact" {
     const bundle_rootfs_path = try pathZ(arena, "{s}/{s}", .{ bundle_dir, rel_path });
     const cache_rootfs_path = try rootfs_cache.digestPath(arena, pack_cache_root, artifact.digest);
     try Io.Dir.cwd().deleteFile(io, bundle_rootfs_path);
-    const bundle_rootfs_z = try arena.dupeZ(u8, bundle_rootfs_path);
-    const cache_rootfs_z = try arena.dupeZ(u8, cache_rootfs_path);
+    const bundle_rootfs_z = try arena.dupeSentinel(u8, bundle_rootfs_path, 0);
+    const cache_rootfs_z = try arena.dupeSentinel(u8, cache_rootfs_path, 0);
     if (std.c.symlink(cache_rootfs_z, bundle_rootfs_z) != 0) return error.SkipZigTest;
 
     try std.testing.expectError(error.BadChunk, unpack(arena, .{
@@ -3201,9 +3201,9 @@ test "pack reads chunked rootfs directly from CAS and unpack materializes it" {
     const cached_index_path = try rootfs_cas.manifestIndexPath(arena, unpack_rootfs_cache, storage.index_digest);
     const cached_stamp_path = try rootfs_cas.storageCompleteStampPath(arena, unpack_rootfs_cache, storage.index_digest);
     try Io.Dir.cwd().deleteFile(io, missing_cached_object);
-    try writeFileAll(try arena.dupeZ(u8, missing_cached_object), "truncated");
+    try writeFileAll(try arena.dupeSentinel(u8, missing_cached_object, 0), "truncated");
     try Io.Dir.cwd().deleteFile(io, cached_index_path);
-    try writeFileAll(try arena.dupeZ(u8, cached_index_path), "{}");
+    try writeFileAll(try arena.dupeSentinel(u8, cached_index_path, 0), "{}");
     try std.testing.expect(try pathExistsNoSymlink(io, cached_stamp_path));
     try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, unpack_rootfs_cache, storage));
 
@@ -3228,7 +3228,7 @@ test "pack reads chunked rootfs directly from CAS and unpack materializes it" {
     defer restored_manifest.deinit();
     const restored_rootfs = restored_manifest.value.rootfs orelse return error.BadManifest;
     try std.testing.expect(restored_rootfs.storage != null);
-    const exact_cache_path_z = try arena.dupeZ(u8, exact_cache_path);
+    const exact_cache_path_z = try arena.dupeSentinel(u8, exact_cache_path, 0);
     const assembled = try readFileAll(arena, exact_cache_path_z, 1 << 20);
     try std.testing.expectEqual(@as(u8, 0x11), assembled[0]);
     try std.testing.expectEqual(@as(u8, 0x11), assembled[spore.disk_chunk_size]);

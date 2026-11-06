@@ -1141,7 +1141,7 @@ fn absoluteFallback(allocator: std.mem.Allocator, root: []const u8) ![]const u8 
 }
 
 fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved = std.c.realpath(path_z, &buf) orelse return error.FileNotFound;
