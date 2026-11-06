@@ -876,7 +876,8 @@ fn sealerError(err: chunk_sealer.Error) Error {
 /// Materializes guest memory from the chunk store into `ram`, which must
 /// already be all zero, such as a fresh anonymous mapping. Only non-zero
 /// chunks are written, so zero chunks commit no host memory. Verifies every
-/// chunk against its id; fails closed on mismatch.
+/// chunk against its id; fails closed on mismatch, leaving `ram` partly
+/// written for the caller to discard.
 pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram: []u8) Error!void {
     const plan = try validateMemoryForRam(manifest, ram.len);
     for (manifest.chunks) |entry| {
@@ -911,14 +912,22 @@ fn memoryChunkRangeFromPlan(plan: MemoryPlan, ram_len: usize, index: usize) !Mem
     return .{ .start = start, .end = end };
 }
 
+/// Reads the chunk straight into guest RAM and verifies it there.
 fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, id: chunklib.ChunkId, target: []u8) Error!void {
     const hex = id.toHex();
     const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, &hex });
-    const data = try readFileAll(allocator, chunk_path, target.len);
-    defer allocator.free(data);
-    if (data.len != target.len) return error.BadChunk;
-    if (!id.matches(data)) return error.BadChunk;
-    @memcpy(target, data);
+    defer allocator.free(chunk_path);
+    const fd = std.c.open(chunk_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    if (try seekFileSize(fd) != target.len) return error.BadChunk;
+    var done: usize = 0;
+    while (done < target.len) {
+        const n = std.c.read(fd, target.ptr + done, target.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+    if (!id.matches(target)) return error.BadChunk;
 }
 
 pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Manifest) Error!void {
@@ -1551,6 +1560,15 @@ test "corrupted chunk fails closed" {
     try writeFileAll(chunk_path, data);
 
     const out = try arena.alloc(u8, ram.len);
+    try std.testing.expectError(error.BadChunk, loadMemory(arena, dir, mm, out));
+
+    // A short chunk, or the right bytes followed by more, is not the chunk.
+    try writeFileAll(chunk_path, ram[0 .. ram.len - 1]);
+    try std.testing.expectError(error.BadChunk, loadMemory(arena, dir, mm, out));
+    const longer = try arena.alloc(u8, ram.len + 1);
+    @memcpy(longer[0..ram.len], ram);
+    longer[ram.len] = 0x42;
+    try writeFileAll(chunk_path, longer);
     try std.testing.expectError(error.BadChunk, loadMemory(arena, dir, mm, out));
 }
 

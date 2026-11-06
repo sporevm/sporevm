@@ -9,6 +9,9 @@
   of an object fetched from an image store, now stalls only that disk: the
   vCPUs keep running, and the console, network, other disks and `spore exec`
   keep working.
+- Restores from memory chunks read each chunk straight into guest RAM instead
+  of through a heap buffer, taking another 28 to 43 percent off loads with a
+  warm page cache and 10 to 35 percent with a cold one.
 
 ### Fixes
 
