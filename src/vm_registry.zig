@@ -23,6 +23,7 @@ const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
 const topology = @import("topology.zig");
+const test_support = @import("test_support.zig");
 
 pub const max_name_len = 128;
 pub const max_metadata_bytes = 128 * 1024;
@@ -836,8 +837,8 @@ pub const Iterator = struct {
 
 test "named control socket paths ignore long runtime roots and maximum VM names" {
     const allocator = std.testing.allocator;
-    const deep_root = "/var/folders/ab/" ++ ("r" ** 160) ++ "/deep-runtime-dir";
-    const long_name = "n" ** max_name_len;
+    const deep_root = "/var/folders/ab/" ++ (test_support.repeat("r", 160)) ++ "/deep-runtime-dir";
+    const long_name = test_support.repeat("n", max_name_len);
     const long_paths = try pathsFromRoot(allocator, deep_root, long_name);
     defer long_paths.deinit(allocator);
     const short_paths = try pathsFromRoot(allocator, "/tmp/sporevm-runtime", long_name);
@@ -850,7 +851,7 @@ test "named control socket paths ignore long runtime roots and maximum VM names"
     try validateControlSocketPath(long_paths.control_socket_path);
 
     try validateControlSocketPath("/tmp/ok.sock");
-    const at_limit = "/" ++ ("a" ** (max_control_socket_path_len - 1));
+    const at_limit = "/" ++ (test_support.repeat("a", (max_control_socket_path_len - 1)));
     try validateControlSocketPath(at_limit);
     try std.testing.expectError(error.ControlSocketPathTooLong, validateControlSocketPath(at_limit ++ "b"));
 }
@@ -1092,8 +1093,8 @@ test "registry claims a name exactly once" {
         }
     };
     var start = std.atomic.Value(bool).init(false);
-    var results = [_]?Claim{null} ** 8;
-    var failures = [_]?anyerror{null} ** 8;
+    var results = @as([8]?Claim, @splat(null));
+    var failures = @as([8]?anyerror, @splat(null));
     var threads: [8]std.Thread = undefined;
     for (&threads, &results, &failures) |*thread, *result, *failure| {
         thread.* = try std.Thread.spawn(.{}, Claimer.run, .{ io, paths, &start, result, failure });
@@ -1214,7 +1215,7 @@ test "fork disk claims are read once and must name the child" {
         .request = .{
             .type = runtime_disk_claim.claim_type,
             .schema = runtime_disk_claim.claim_schema,
-            .token = "b" ** 64,
+            .token = test_support.repeat("b", 64),
             .batch = "batch",
             .child = "other",
             .child_index = 0,

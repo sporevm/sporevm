@@ -26,6 +26,7 @@ const Io = std.Io;
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
+const host_fetch_policy = @import("host_fetch_policy.zig");
 const image = @import("image.zig");
 const image_archive = @import("image_archive.zig");
 const image_manifest = @import("image_manifest.zig");
@@ -36,6 +37,7 @@ const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const s3_sigv4 = @import("s3_sigv4.zig");
 const spore = @import("spore.zig");
+const test_support = @import("test_support.zig");
 
 const digest_prefix = image.digest_prefix;
 const digest_len = digest_prefix.len + chunk.ChunkId.hex_len;
@@ -118,7 +120,7 @@ pub fn parseBase(raw: []const u8) !Base {
     const uri = std.Uri.parse(raw) catch return error.InvalidImageStoreRef;
     if (uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidImageStoreRef;
     var host_buffer: [Io.net.HostName.max_len]u8 = undefined;
-    const host = uri.getHost(&host_buffer) catch return error.InvalidImageStoreRef;
+    const host = host_fetch_policy.rawHost(uri, &host_buffer) catch return error.InvalidImageStoreRef;
     const path = switch (uri.path) {
         .raw, .percent_encoded => |value| value,
     };
@@ -1296,20 +1298,20 @@ test "fuzz image store tag" {
 }
 
 test "image store tags name exactly one image digest" {
-    const digest = "blake3:" ++ "0123456789abcdef" ** 4;
+    const digest = "blake3:" ++ test_support.repeat("0123456789abcdef", 4);
     try std.testing.expectEqualStrings(digest, try parseTag(digest ++ "\n"));
     for ([_][]const u8{
         digest,
         digest ++ "\n\n",
         digest ++ " \n",
-        "blake3:" ++ "0123456789ABCDEF" ** 4 ++ "\n",
-        "sha256:" ++ "0123456789abcdef" ** 4 ++ "\n",
+        "blake3:" ++ test_support.repeat("0123456789ABCDEF", 4) ++ "\n",
+        "sha256:" ++ test_support.repeat("0123456789abcdef", 4) ++ "\n",
         "",
     }) |bytes| try std.testing.expectError(error.BadImageStoreTag, parseTag(bytes));
 }
 
 test "image store refs name a store and a tag or digest" {
-    const digest = "blake3:" ++ "a" ** 64;
+    const digest = "blake3:" ++ test_support.repeat("a", 64);
     const Case = struct { raw: []const u8, scheme: Scheme, url: []const u8, dir: []const u8 = "", tag: ?[]const u8 = null, bucket: []const u8 = "", prefix: []const u8 = "" };
     for ([_]Case{
         .{ .raw = "s3://my-bucket-1/team/images/app", .scheme = .s3, .url = "s3://my-bucket-1/team/images", .tag = "app", .bucket = "my-bucket-1", .prefix = "/team/images" },
@@ -1345,7 +1347,7 @@ test "image store refs name a store and a tag or digest" {
         .{ .raw = "s3://my.bucket/app", .err = error.InvalidImageStoreRef },
         .{ .raw = "s3://My-bucket/app", .err = error.InvalidImageStoreRef },
         .{ .raw = "s3://ab/app", .err = error.InvalidImageStoreRef },
-        .{ .raw = "s3://" ++ "a" ** 64 ++ "/app", .err = error.InvalidImageStoreRef },
+        .{ .raw = "s3://" ++ test_support.repeat("a", 64) ++ "/app", .err = error.InvalidImageStoreRef },
         .{ .raw = "s3://-bucket/app", .err = error.InvalidImageStoreRef },
         .{ .raw = "s3:///app", .err = error.InvalidImageStoreRef },
         .{ .raw = "s3://user@bucket/app", .err = error.InvalidImageStoreRef },
@@ -1368,8 +1370,8 @@ test "image store refs name a store and a tag or digest" {
         .{ .raw = "/srv/store/App", .err = error.InvalidImageStoreTag },
         .{ .raw = "/srv/store/-app", .err = error.InvalidImageStoreTag },
         .{ .raw = "/srv/store/", .err = error.InvalidImageStoreTag },
-        .{ .raw = "/srv/store/" ++ "a" ** (max_tag_len + 1), .err = error.InvalidImageStoreTag },
-        .{ .raw = "/srv/store/blake3:" ++ "A" ** 64, .err = error.InvalidImageStoreRef },
+        .{ .raw = "/srv/store/" ++ test_support.repeat("a", (max_tag_len + 1)), .err = error.InvalidImageStoreTag },
+        .{ .raw = "/srv/store/blake3:" ++ test_support.repeat("A", 64), .err = error.InvalidImageStoreRef },
         .{ .raw = "/srv/store/blake3:abc", .err = error.InvalidImageStoreRef },
     }) |case| try std.testing.expectError(case.err, parseStoreRef(case.raw));
 
@@ -1548,7 +1550,7 @@ test "image push writes a complete store once and retags without rewriting" {
     const repaired = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ store, fixture.identity }));
     try std.testing.expectEqual(@as(usize, 1), repaired.objects_written);
     try std.testing.expectEqual(@as(usize, 8), (try fixture.listStore(store)).len);
-    try std.testing.expectError(error.ImageIdentityMismatch, fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, "b" ** 64 })));
+    try std.testing.expectError(error.ImageIdentityMismatch, fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, test_support.repeat("b", 64) })));
     try std.testing.expectError(error.ImageStorePushUnsupportedScheme, fixture.pushTo("https://images.example.test/app"));
 }
 
@@ -2101,7 +2103,7 @@ test "a read that shares a request that could not install its object fetches it 
     const cache = try fixture.path("cache");
     const objects_dir = std.fs.path.dirname(try rootfs_cas.manifestObjectPath(allocator, cache, &next.digest)).?;
     try Io.Dir.cwd().createDirPath(io, objects_dir);
-    const objects_dir_z = try allocator.dupeZ(u8, objects_dir);
+    const objects_dir_z = try allocator.dupeSentinel(u8, objects_dir, 0);
     try std.testing.expectEqual(@as(c_int, 0), std.c.chmod(objects_dir_z, 0o555));
     defer _ = std.c.chmod(objects_dir_z, 0o755);
     const fetcher = try Fetcher.create(std.testing.allocator, io, cache, try server.url(allocator), local.storage, &fixture.env);
@@ -2155,7 +2157,7 @@ test "file store reads only regular files and never waits for a FIFO writer" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     try tmp.dir.createDirPath(io, "tags/dir");
-    try tmp.dir.writeFile(io, .{ .sub_path = "tags/1", .data = "blake3:" ++ "a" ** 64 ++ "\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tags/1", .data = "blake3:" ++ test_support.repeat("a", 64) ++ "\n" });
     const fifo = try std.fs.path.joinZ(allocator, &.{ root, "tags", "fifo" });
     defer allocator.free(fifo);
     const c = struct {
@@ -2170,7 +2172,7 @@ test "file store reads only regular files and never waits for a FIFO writer" {
     const budget = Budget{ .attempts = 1, .attempt_ms = 1_000, .total_ms = 1_000 };
     const bytes = try client.get(allocator, "tags/1", .{ .max = tag_file_len }, budget);
     defer allocator.free(bytes);
-    try std.testing.expectEqualStrings("blake3:" ++ "a" ** 64, try parseTag(bytes));
+    try std.testing.expectEqualStrings("blake3:" ++ test_support.repeat("a", 64), try parseTag(bytes));
     try std.testing.expectError(error.ImageStoreBadResponse, client.get(allocator, "tags/fifo", .{ .max = tag_file_len }, budget));
     try std.testing.expectError(error.ImageStoreBadResponse, client.get(allocator, "tags/dir", .{ .max = tag_file_len }, budget));
     try std.testing.expectError(error.ImageStoreNotFound, client.get(allocator, "tags/2", .{ .max = tag_file_len }, budget));

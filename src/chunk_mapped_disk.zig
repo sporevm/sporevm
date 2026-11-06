@@ -17,6 +17,7 @@ const image_store = @import("image_store.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
+const test_support = @import("test_support.zig");
 
 extern "c" fn mkstemp(template: [*:0]u8) c_int;
 extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
@@ -1721,7 +1722,7 @@ test "sparse raw digest index reduces dense lazy runtime ownership" {
         .{ .source_count = 30_336, .nonzero_chunks = 1 },
         .{ .source_count = 30_336, .nonzero_chunks = 0 },
     };
-    const cache_root = "x" ** 81;
+    const cache_root = test_support.repeat("x", 81);
     const id = chunk.ChunkId.fromContents("runtime digest ownership fixture");
 
     for (cases, 0..) |case, case_index| {
@@ -1841,7 +1842,7 @@ fn testKnownZeroGrowthFromPartialTail(tail_source: PartialGrowthSource) !void {
         .cas => try std.testing.expectEqual(Source.cas, disk.sources[tail_index]),
         .zero => try std.testing.expectEqual(Source.zero, disk.sources[tail_index]),
         .overlay => {
-            const patch = [_]u8{0xe7} ** 19;
+            const patch = @as([19]u8, @splat(0xe7));
             const patch_offset = chunk_size + 23;
             try disk.writeAt(&patch, patch_offset);
             @memcpy(expected[patch_offset..][0..patch.len], &patch);
@@ -1946,7 +1947,7 @@ test "known zero growth rejects a corrupt partial CAS tail before mutation" {
     const tail_id = try idForChunk(index.value, 1);
     const object_path = try rootfs_cas.objectPath(arena, parent_cache, tail_id);
     try std.Io.Dir.cwd().deleteFile(io, object_path);
-    const corrupt_tail = [_]u8{0xa5} ** (old_size - chunk_size);
+    const corrupt_tail = @as([(old_size - chunk_size)]u8, @splat(0xa5));
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = object_path, .data = &corrupt_tail });
 
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
@@ -2022,9 +2023,9 @@ test "chunk mapped disk matches byte model across partial writes" {
     var disk = try ChunkMappedDisk.initWritable(std.testing.allocator, base_source, overlay.handle, base_bytes.len, 512);
     defer disk.deinit();
 
-    const patch_a = [_]u8{0xAA} ** 13;
-    const patch_b = [_]u8{0xBB} ** 700;
-    const patch_c = [_]u8{0xCC} ** 37;
+    const patch_a = @as([13]u8, @splat(0xAA));
+    const patch_b = @as([700]u8, @splat(0xBB));
+    const patch_c = @as([37]u8, @splat(0xCC));
     const writes = [_]struct {
         offset: usize,
         data: []const u8,
@@ -2034,7 +2035,7 @@ test "chunk mapped disk matches byte model across partial writes" {
         .{ .offset = base_bytes.len - patch_c.len, .data = &patch_c },
     };
 
-    var dirty_model = [_]bool{false} ** 5;
+    var dirty_model = @as([5]bool, @splat(false));
     for (writes) |write| {
         try disk.writeAt(write.data, write.offset);
         @memcpy(model[write.offset..][0..write.data.len], write.data);
@@ -2070,7 +2071,7 @@ test "zero chunks seed partial overlay writes from zeroes" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
 
-    const base_bytes = [_]u8{0x11} ** 1024;
+    const base_bytes = @as([1024]u8, @splat(0x11));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
@@ -2078,7 +2079,7 @@ test "zero chunks seed partial overlay writes from zeroes" {
     defer disk.deinit();
     try disk.markZeroChunk(1);
 
-    const patch = [_]u8{0x7B} ** 4;
+    const patch = @as([4]u8, @splat(0x7B));
     try disk.writeAt(&patch, 512 + 10);
 
     var readback: [512]u8 = undefined;
@@ -2290,7 +2291,7 @@ test "known zero growth reuses appended coverage without sealing" {
     const oracle = try rootfs_cas.preloadPath(io, arena, oracle_dir, oracle_path, chunk_size);
     try std.testing.expectEqualStrings(oracle.index_digest, grown.base);
 
-    const tail_patch = [_]u8{0x7a} ** 97;
+    const tail_patch = @as([97]u8, @splat(0x7a));
     try disk.writeAt(&tail_patch, chunk_size + 23);
     @memcpy(base_bytes[chunk_size + 23 ..][0..tail_patch.len], &tail_patch);
     var tail_stats: SnapshotStats = .{};
@@ -2313,7 +2314,7 @@ test "known zero growth rolls back every fallible allocation" {
             defer tmp.cleanup();
 
             const chunk_size: usize = 512;
-            const base_bytes = [_]u8{0x4c} ** chunk_size;
+            const base_bytes = @as([chunk_size]u8, @splat(0x4c));
             var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
             defer base.close(io);
             try base.writeStreamingAll(io, &base_bytes);
@@ -2377,14 +2378,14 @@ test "snapshot writes disk index and chunk objects" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
 
-    const base_bytes = [_]u8{0} ** 1024;
+    const base_bytes = @as([1024]u8, @splat(0));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, base_bytes.len, spore.disk_chunk_size);
     defer disk.deinit();
 
-    const patch = [_]u8{0x5A} ** 16;
+    const patch = @as([16]u8, @splat(0x5A));
     try disk.writeAt(&patch, 600);
 
     var stats: SnapshotStats = .{};
@@ -2457,7 +2458,7 @@ test "snapshot output does not become live disk storage" {
     var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, base_bytes.len, chunk_size);
     defer disk.deinit();
 
-    const first_patch = [_]u8{0xA1} ** 31;
+    const first_patch = @as([31]u8, @splat(0xA1));
     try disk.writeAt(&first_patch, 17);
     @memcpy(model[17..][0..first_patch.len], &first_patch);
 
@@ -2480,7 +2481,7 @@ test "snapshot output does not become live disk storage" {
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
 
-    const overlay_patch = [_]u8{0xB2} ** 47;
+    const overlay_patch = @as([47]u8, @splat(0xB2));
     try disk.writeAt(&overlay_patch, 101);
     @memcpy(model[101..][0..overlay_patch.len], &overlay_patch);
     try std.Io.Dir.cwd().createDirPath(io, second_dir);
@@ -2490,7 +2491,7 @@ test "snapshot output does not become live disk storage" {
     try std.testing.expect(!stats.full_scan);
     try std.testing.expectEqual(@as(usize, 1), stats.parent_chunks_reused);
 
-    const base_patch = [_]u8{0xC3} ** 53;
+    const base_patch = @as([53]u8, @splat(0xC3));
     const base_patch_offset = chunk_size + 23;
     try disk.writeAt(&base_patch, base_patch_offset);
     @memcpy(model[base_patch_offset..][0..base_patch.len], &base_patch);
@@ -2508,7 +2509,7 @@ test "failed write cannot leave overlay bytes classified clean" {
 
     const spore_dir = try tmp.path("spore");
     try std.Io.Dir.cwd().createDirPath(io, spore_dir);
-    const base_bytes = [_]u8{0xD4} ** 512;
+    const base_bytes = @as([512]u8, @splat(0xD4));
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer base.close(io);
     try base.writeStreamingAll(io, &base_bytes);
@@ -2517,14 +2518,14 @@ test "failed write cannot leave overlay bytes classified clean" {
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     var disk = try ChunkMappedDisk.initWritable(allocator, base_source, overlay.handle, base_bytes.len, 512);
     defer disk.deinit();
-    const first_patch = [_]u8{0xE5} ** 16;
+    const first_patch = @as([16]u8, @splat(0xE5));
     try disk.writeAt(&first_patch, 8);
     const saved = try disk.snapshotIndex(spore_dir, .{ .mmio_slot = 1 }, true);
     defer freeTestDisk(allocator, saved);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
 
     overlay.close(io);
-    const second_patch = [_]u8{0xF6} ** 16;
+    const second_patch = @as([16]u8, @splat(0xF6));
     try std.testing.expectError(error.ShortWrite, disk.writeAt(&second_patch, 32));
     try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
 }
@@ -2597,15 +2598,15 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     try disk.writeAt(replacement, 2 * spore.disk_chunk_size);
     try disk.writeAt(parent_bytes[2 * chunk_size ..][0..chunk_size], 2 * spore.disk_chunk_size);
 
-    const patch_a = [_]u8{0x3C} ** 113;
+    const patch_a = @as([113]u8, @splat(0x3C));
     try disk.writeAt(&patch_a, 3 * spore.disk_chunk_size + 29);
     @memcpy(model[3 * chunk_size + 29 ..][0..patch_a.len], &patch_a);
 
-    const patch_b = [_]u8{0x4D} ** 257;
+    const patch_b = @as([257]u8, @splat(0x4D));
     try disk.writeAt(&patch_b, 5 * spore.disk_chunk_size + 41);
     @memcpy(model[5 * chunk_size + 41 ..][0..patch_b.len], &patch_b);
 
-    const patch_c = [_]u8{0x5E} ** 211;
+    const patch_c = @as([211]u8, @splat(0x5E));
     try disk.writeAt(&patch_c, 73);
     @memcpy(model[73..][0..patch_c.len], &patch_c);
 
@@ -2666,7 +2667,7 @@ test "snapshot from parent index seals only dirty chunks and matches full rescan
     try disk.readAt(&promoted_after_snapshot, @intCast(promoted_offset));
     try std.testing.expectEqualSlices(u8, model[promoted_offset..][0..promoted_after_snapshot.len], &promoted_after_snapshot);
 
-    const patch_d = [_]u8{0x71} ** 31;
+    const patch_d = @as([31]u8, @splat(0x71));
     try disk.writeAt(&patch_d, 7 * spore.disk_chunk_size + 9);
     @memcpy(model[7 * chunk_size + 9 ..][0..patch_d.len], &patch_d);
     try std.testing.expectEqual(@as(usize, 1), disk.dirtyChunkCount());
@@ -2707,14 +2708,14 @@ test "read only disk rejects writes" {
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer base.close(io);
 
-    const base_bytes = [_]u8{0x11} ** 512;
+    const base_bytes = @as([512]u8, @splat(0x11));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     var disk = try ChunkMappedDisk.initReadOnly(std.testing.allocator, base_source, base_bytes.len, 512);
     defer disk.deinit();
 
-    const patch = [_]u8{0x22} ** 4;
+    const patch = @as([4]u8, @splat(0x22));
     try std.testing.expectError(error.ReadOnly, disk.writeAt(&patch, 0));
     try std.testing.expectError(error.ReadOnly, disk.zeroRange(0, 4));
     try std.testing.expectError(error.ReadOnly, disk.markZeroChunk(0));
@@ -2732,7 +2733,7 @@ test "read only disk rejects fork head export" {
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer base.close(io);
 
-    const base_bytes = [_]u8{0x11} ** 512;
+    const base_bytes = @as([512]u8, @splat(0x11));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
@@ -2755,7 +2756,7 @@ test "cas index attach rejects incomplete coverage" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
 
-    const base_bytes = [_]u8{0x33} ** 1024;
+    const base_bytes = @as([1024]u8, @splat(0x33));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
@@ -2803,7 +2804,7 @@ test "portable fork head round trips overlay and zero overrides" {
     defer _ = std.c.close(parent_fd);
     var parent = try ChunkMappedDisk.initWritable(allocator, base_source, parent_fd, disk_size, spore.disk_chunk_size);
     defer parent.deinit();
-    const patch = [_]u8{0xA7} ** 127;
+    const patch = @as([127]u8, @splat(0xA7));
     try parent.writeAt(&patch, spore.disk_chunk_size - 31);
     @memcpy(model[spore.disk_chunk_size - 31 ..][0..patch.len], &patch);
     try parent.markZeroChunk(2);
@@ -2841,12 +2842,12 @@ test "portable fork head round trips overlay and zero overrides" {
     try child.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
 
-    const parent_patch = [_]u8{0xB8} ** 33;
+    const parent_patch = @as([33]u8, @splat(0xB8));
     try parent.writeAt(&parent_patch, 7);
     try child.readAt(readback[0..parent_patch.len], 7);
     try std.testing.expectEqualSlices(u8, model[7..][0..parent_patch.len], readback[0..parent_patch.len]);
 
-    const child_patch = [_]u8{0xC9} ** 41;
+    const child_patch = @as([41]u8, @splat(0xC9));
     try child.writeAt(&child_patch, spore.disk_chunk_size + 91);
     try parent.readAt(readback[0..child_patch.len], spore.disk_chunk_size + 91);
     try std.testing.expectEqualSlices(u8, model[spore.disk_chunk_size + 91 ..][0..child_patch.len], readback[0..child_patch.len]);
@@ -2882,7 +2883,7 @@ test "post-snapshot fast fork uses sealed baseline without native overlay clone"
     );
     defer parent.deinit();
 
-    const saved_patch = [_]u8{0x72} ** 113;
+    const saved_patch = @as([113]u8, @splat(0x72));
     try parent.writeAt(&saved_patch, 73);
     @memcpy(expected[73..][0..saved_patch.len], &saved_patch);
     const snapshot = try parent.snapshotIndex(snapshot_dir, .{ .mmio_slot = 1 }, true);
@@ -2962,12 +2963,12 @@ test "post-snapshot fast fork uses sealed baseline without native overlay clone"
     try child.readAt(&readback, 0);
     try std.testing.expectEqualSlices(u8, expected[0..readback.len], &readback);
 
-    const child_patch = [_]u8{0x93} ** 41;
+    const child_patch = @as([41]u8, @splat(0x93));
     try child.writeAt(&child_patch, 101);
     try parent.readAt(&readback, 0);
     try std.testing.expectEqualSlices(u8, expected[0..readback.len], &readback);
 
-    const continued_parent_patch = [_]u8{0xa4} ** 37;
+    const continued_parent_patch = @as([37]u8, @splat(0xa4));
     try parent.writeAt(&continued_parent_patch, 211);
     try std.testing.expectEqual(Source.overlay, parent.sources[0]);
     var dirty_head = try parent.exportForkHead(.{
@@ -3057,7 +3058,7 @@ test "native portable fork head uses its configured overlay filesystem" {
 
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer base.close(io);
-    const base_bytes = [_]u8{0x5A} ** spore.disk_chunk_size;
+    const base_bytes = @as([spore.disk_chunk_size]u8, @splat(0x5A));
     try base.writeStreamingAll(io, &base_bytes);
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
     const overlay_fd = try createTempOverlayFd(allocator, overlay_dir);
@@ -3136,7 +3137,7 @@ test "8GiB native disk fork benchmark" {
         try std.testing.expect(elapsed_ns < 100 * std.time.ns_per_ms);
     }
 
-    var batch_heads = [_]?runtime_disk_fork.Head{null} ** 32;
+    var batch_heads = @as([32]?runtime_disk_fork.Head, @splat(null));
     defer for (&batch_heads) |*head| {
         if (head.*) |*value| value.deinit();
     };

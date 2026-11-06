@@ -107,7 +107,7 @@ fn parseManagedKernelPins(comptime text: []const u8) ManagedKernelPins {
             "managed_kernel_linux_version",
             "managed_kernel_x86_64_sha256",
         };
-        var values: [keys.len]?[]const u8 = .{null} ** keys.len;
+        var values: [keys.len]?[]const u8 = @splat(null);
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (line.len == 0 or line[0] == '#') continue;
@@ -485,7 +485,7 @@ fn readRegularFileNoSymlinkAlloc(
     max_size: usize,
     require_read_only: bool,
 ) ![]u8 {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.ManagedKernelAssetOpenFailed;
@@ -615,13 +615,13 @@ fn httpGetToWriter(client: *std.http.Client, url: []const u8, writer: *Io.Writer
 }
 
 fn chmodFileReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     if (std.c.chmod(pathz, 0o444) != 0) return error.ChmodFailed;
 }
 
 fn chmodFileWritable(allocator: std.mem.Allocator, path: []const u8) !void {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     if (std.c.chmod(pathz, 0o644) != 0) return error.ChmodFailed;
 }
@@ -653,7 +653,7 @@ pub fn readInjectedFileSources(io: Io, allocator: std.mem.Allocator, files: []co
 }
 
 fn readInjectedFileSource(allocator: std.mem.Allocator, io: Io, path: []const u8, max_bytes: usize) ![]const u8 {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.InjectedFileOpenFailed;

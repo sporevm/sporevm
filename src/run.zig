@@ -52,6 +52,7 @@ const vmm = @import("aarch64/vmm.zig");
 const vsock = @import("virtio/vsock.zig");
 const vsock_control = @import("virtio/vsock_control.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
+const test_support = @import("test_support.zig");
 
 const max_guest_port = 65535;
 pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
@@ -782,8 +783,20 @@ const CommitControl = struct {
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !events_mod.Result {
     var events = events_mod.EventEmitter.init(opts.events, "run");
     try events.emitStart(opts.backend);
-    errdefer |err| events.emitFailure(err) catch {};
+    var created_save_dir = false;
+    return executeWithEvents(context, allocator, opts, &events, &created_save_dir) catch |err| {
+        // A store that cannot supply the image fails the save before it
+        // publishes anything, so remove the directory this run created
+        // (dirty-RAM tracking may already have written memory into it).
+        if (err == error.ImageStoreIncomplete and created_save_dir) Io.Dir.cwd().deleteTree(context.io, opts.save_path.?) catch {};
+        events.emitFailure(err) catch {};
+        return err;
+    };
+}
 
+/// Sets `created_save_dir` once the save directory exists, for `execute` to
+/// clean up.
+fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Options, events: *events_mod.EventEmitter, created_save_dir: *bool) !events_mod.Result {
     const setup_start = monotonicMs();
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
@@ -811,7 +824,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     defer if (gateway_active) gateway.deinit();
     if (gateway_active) try events.emitPortForwards(&opts.network.spore);
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
-    errdefer finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+    errdefer finishGatewayNetworkEvents(&gateway, &gateway_active, events);
     const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &opts.network);
 
     const resuming = opts.resume_dir != null;
@@ -859,8 +872,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock_stream.HostStream.deriveHostPort(request.bytes);
     if (opts.events != null) {
-        stream.setLifecycleSink(&events, runEventLifecycleSink);
-        stream.setOutputSink(&events, runEventOutputSink);
+        stream.setLifecycleSink(events, runEventLifecycleSink);
+        stream.setOutputSink(events, runEventOutputSink);
     }
     var stdin_control = if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(&stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null;
     if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
@@ -909,10 +922,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
             try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, vm_capture.dir);
         }
     }
-    // A store that cannot supply the image fails the save before it publishes
-    // anything, so remove the directory this run created (dirty-RAM tracking
-    // may already have written memory into it).
-    errdefer |err| if (err == error.ImageStoreIncomplete) if (capture_plan.capture) |vm_capture| Io.Dir.cwd().deleteTree(context.io, vm_capture.dir) catch {};
+    created_save_dir.* = capture_plan.capture != null;
     const saved_sessions = [_]spore.Session{spore.processSession(request.session_id, opts.interactive, opts.tty)};
     if (capture_plan.signal) |signal| {
         signal_registration = capture.SignalRegistration.install(signal, &capture_request);
@@ -1006,7 +1016,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             var result = resultFromAbortedSignalCapture(backend, opts, &stream);
             if (resuming) result = result.withMemoryRestore(&ram_plan);
-            finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+            finishGatewayNetworkEvents(&gateway, &gateway_active, events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
             return result;
@@ -1060,7 +1070,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
         }
     }
     if (resuming) result = result.withMemoryRestore(&ram_plan);
-    finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+    finishGatewayNetworkEvents(&gateway, &gateway_active, events);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
     return result;
@@ -1228,7 +1238,7 @@ pub fn executeMonitorWithBootArtifacts(
 }
 
 fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.ContextDiskOpenFailed;
@@ -1260,7 +1270,7 @@ pub fn consoleSink(bytes: []const u8) void {
 
 pub fn openConsoleLog(path: ?[]const u8) !void {
     if (path == null) return;
-    const pathz = try std.heap.page_allocator.dupeZ(u8, path.?);
+    const pathz = try std.heap.page_allocator.dupeSentinel(u8, path.?, 0);
     defer std.heap.page_allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
     if (fd < 0) return error.ConsoleLogOpenFailed;
@@ -1635,7 +1645,7 @@ test "local image supplies run env, working directory and rootfs identity" {
     try Io.Dir.cwd().createDirPath(io, cache_root);
 
     const rootfs_path = try tmp_dir.path("rootfs.ext4");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = (test_support.repeat("abcd", 1024)) ++ (test_support.repeat("efgh", 1024)) });
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
     var image_env = [_][]const u8{ "GEM_HOME=/usr/local/bundle", "BUNDLE_APP_CONFIG=/usr/local/bundle" };
@@ -1877,12 +1887,12 @@ fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
             .counter_frequency_hz = 24_000_000,
         },
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0,
             .cpsr = 0,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },

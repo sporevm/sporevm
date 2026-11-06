@@ -914,8 +914,8 @@ test "COPY parents synthetic tree captures parent directory modes without mtimes
     try Io.Dir.cwd().createDirPath(io, try root_dir.path("selected"));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("secret/value"), .data = "secret\n" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("selected/value"), .data = "selected\n" });
-    const secret_z = try arena.dupeZ(u8, try root_dir.path("secret"));
-    const selected_z = try arena.dupeZ(u8, try root_dir.path("selected"));
+    const secret_z = try arena.dupeSentinel(u8, try root_dir.path("secret"), 0);
+    const selected_z = try arena.dupeSentinel(u8, try root_dir.path("selected"), 0);
     if (std.c.chmod(secret_z.ptr, 0o700) != 0 or std.c.chmod(selected_z.ptr, 0o710) != 0) return error.TestUnexpectedResult;
 
     var ignore_diagnostic: build_context.IgnoreDiagnostic = .{};

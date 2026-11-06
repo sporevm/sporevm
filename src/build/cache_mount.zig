@@ -240,7 +240,7 @@ pub const Store = struct {
             };
             try emitDisk(io, allocator, dir, path, image_size, inode_count);
         }
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
         if (fd < 0) return error.CacheMountDiskOpenFailed;
         errdefer _ = std.c.close(fd);
@@ -263,7 +263,7 @@ pub const Store = struct {
 };
 
 fn fileStats(io: Io, allocator: std.mem.Allocator, path: []const u8, kind: StorageEntry.Kind) !?StorageEntry {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return switch (std.c.errno(-1)) {
@@ -320,7 +320,7 @@ fn allocatedFileBlocks512(fd: std.c.fd_t) !u64 {
 }
 
 fn validDisk(io: Io, allocator: std.mem.Allocator, path: []const u8, image_size: u64) !bool {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return switch (std.c.errno(-1)) {
         .NOENT => false,
@@ -351,7 +351,7 @@ fn emitDisk(io: Io, allocator: std.mem.Allocator, dir: []const u8, path: []const
         .inode_count = inode_count,
         .determinism = ext4.Determinism.fromDigest("spore-build-cache-mount-disk-v1"),
     });
-    const temp_z = try allocator.dupeZ(u8, temp);
+    const temp_z = try allocator.dupeSentinel(u8, temp, 0);
     const fd = std.c.open(temp_z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.CacheMountDiskOpenFailed;
     defer _ = std.c.close(fd);
@@ -509,7 +509,7 @@ test "cache store recreates a host-visible unclean aggregate" {
     var initial = try Store.openSized(io, allocator, root, image_size, 4096);
     initial.deinit();
     const path = try std.fs.path.join(allocator, &.{ root, store_rel, disk_name });
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.CacheMountDiskOpenFailed;
     const dirty = [_]u8{ 0, 0 };

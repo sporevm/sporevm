@@ -24,6 +24,7 @@ const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
 const virtio_blk = @import("virtio/blk.zig");
+const test_support = @import("test_support.zig");
 
 const Io = std.Io;
 const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
@@ -402,7 +403,7 @@ test "filesystem identity distinguishes Linux anonymous backing" {
 
 fn openRootfsDisk(allocator: std.mem.Allocator, rootfs_path: ?[]const u8) !?std.c.fd_t {
     const path = rootfs_path orelse return null;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
@@ -681,7 +682,7 @@ fn imageStoreOrigin(context: Context, allocator: std.mem.Allocator, cache_root: 
 fn openRootfsTraceFd(context: Context, allocator: std.mem.Allocator) !?std.c.fd_t {
     const path = context.environ_map.get(rootfs_trace_env) orelse return null;
     if (path.len == 0) return null;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, @as(c_uint, 0o644));
     if (fd < 0) return null;
@@ -780,7 +781,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     defer tmp_dir.deinit();
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -835,7 +836,7 @@ test "runtime disk exports and adopts a portable fork head" {
     const tmp = tmp_dir.root;
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384)) ++ (test_support.repeat("ijkl", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
 
@@ -856,7 +857,7 @@ test "runtime disk exports and adopts a portable fork head" {
     try std.testing.expectEqualStrings(absolute_tmp_root, parent.chunk_mapped.?.overlay.?.dir);
     try std.testing.expectEqualStrings(absolute_tmp_root, child.chunk_mapped.?.overlay.?.dir);
 
-    const parent_patch = [_]u8{0xA5} ** 97;
+    const parent_patch = @as([97]u8, @splat(0xA5));
     try parent.chunk_mapped.?.writeAt(&parent_patch, spore.disk_chunk_size - 17);
     try parent.chunk_mapped.?.markZeroChunk(2);
     var head = try parent.snapshot().?.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
@@ -906,7 +907,7 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
     const trace_path = try tmp_dir.path("lazy-cas-trace.jsonl");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -988,7 +989,7 @@ test "runtime disk installs portable local rootfs storage and trusts complete wa
     const local_spore = try tmp_dir.path("portable.spore");
     const cache_root = try tmp_dir.path("empty-cache");
     const runtime_root = try tmp_dir.path("runtime");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const source_artifact = try rootfs_cache.cacheByDigestPath(io, arena, local_spore, rootfs_path);
@@ -1076,7 +1077,7 @@ test "runtime disk benchmark env eagerly materializes missing flat rootfs from c
     defer tmp_dir.deinit();
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1126,7 +1127,7 @@ test "runtime disk ignores wrong-sized flat cache entries and lazily faults cas 
     defer tmp_dir.deinit();
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
-    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    const rootfs_bytes = (test_support.repeat("abcd", 1024)) ++ (test_support.repeat("efgh", 1024));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1227,7 +1228,7 @@ test "lazy runtime disk refuses a stamped cache index swapped for another valid 
     var artifacts: [2]spore.RootfsArtifactRef = undefined;
     for (&indexes, &storages, &artifacts, [_][]const u8{ "abcd", "wxyz" }) |*index, *storage, *artifact, contents| {
         const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_tmp, contents });
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = try std.mem.concat(arena, u8, &(.{contents} ** 16384)) });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = try std.mem.concat(arena, u8, &@as([16384][]const u8, @splat(contents))) });
         artifact.* = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
         const result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
         storage.* = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, result);
@@ -1310,7 +1311,7 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
     const trace_path = try tmp_dir.path("lazy-cas-trace.jsonl");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1376,7 +1377,7 @@ test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corr
     defer tmp_dir.deinit();
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384)) ++ (test_support.repeat("ijkl", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1450,7 +1451,7 @@ test "runtime disk rejects unknown disk kinds" {
     const spore_dir = try tmp_dir.path("saved.spore");
     try Io.Dir.cwd().createDirPath(io, spore_dir);
 
-    const rootfs_bytes = "abcd" ** 1024;
+    const rootfs_bytes = test_support.repeat("abcd", 1024);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
 
@@ -1488,11 +1489,11 @@ test "runtime disk restores chunk-index disk manifests" {
     const spore_dir = try tmp_dir.path("saved.spore");
     try Io.Dir.cwd().createDirPath(io, spore_dir);
 
-    const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
+    const rootfs_bytes = (test_support.repeat("abcd", 1024)) ++ (test_support.repeat("efgh", 1024));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
 
-    const base_fd = std.c.open(try arena.dupeZ(u8, rootfs_path), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    const base_fd = std.c.open(try arena.dupeSentinel(u8, rootfs_path, 0), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (base_fd < 0) return error.IoFailed;
     defer _ = std.c.close(base_fd);
     var overlay = try disk_layer.createTempOverlay(arena);

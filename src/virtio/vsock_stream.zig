@@ -64,14 +64,14 @@ const HostStreamStartState = enum(u8) {
 };
 
 const OutboundFrame = struct {
-    data: [max_payload]u8 = [_]u8{0} ** max_payload,
+    data: [max_payload]u8 = @splat(0),
     len: usize = 0,
 };
 
 pub const HostStream = struct {
     guest_port: u32,
     host_port: u32 = default_host_port,
-    request: [max_payload]u8 = [_]u8{0} ** max_payload,
+    request: [max_payload]u8 = @splat(0),
     request_len: usize = 0,
     state: HostStreamState = .idle,
     started_at_ms: u64 = 0,
@@ -548,9 +548,9 @@ fn monotonicMs() u64 {
 
 /// Output and lifecycle capture shared with the vsock device tests.
 pub const StreamCapture = struct {
-    stdout: [64]u8 = [_]u8{0} ** 64,
-    stderr: [64]u8 = [_]u8{0} ** 64,
-    terminal: [64]u8 = [_]u8{0} ** 64,
+    stdout: [64]u8 = @splat(0),
+    stderr: [64]u8 = @splat(0),
+    terminal: [64]u8 = @splat(0),
     stdout_len: usize = 0,
     stderr_len: usize = 0,
     terminal_len: usize = 0,
@@ -637,7 +637,7 @@ test "host stream v1 parser fails closed on malformed frames" {
     {
         var stream = try HostStream.init(10700, "{}\n");
         stream.state = .connected;
-        var bad: [spore_stream.header_len]u8 = [_]u8{0} ** spore_stream.header_len;
+        var bad: [spore_stream.header_len]u8 = @splat(0);
         stream.appendOutput(&bad);
         try std.testing.expectEqual(HostStreamState.failed, stream.state);
     }

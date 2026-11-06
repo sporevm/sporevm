@@ -293,7 +293,7 @@ fn checkedMul(a: u64, b: u64) Error!u64 {
 // --- test helpers -----------------------------------------------------------
 
 const TestRing = struct {
-    buf: [4096]u8 = [_]u8{0} ** 4096,
+    buf: [4096]u8 = @splat(0),
     q: VirtQueue,
 
     const desc_base: u64 = 0;
@@ -497,7 +497,7 @@ fn fuzzPop(_: void, s: *std.testing.Smith) !void {
     // Treat fuzz input as raw guest memory: rings and descriptors are fully
     // attacker controlled. popAvail must never crash, hang, or touch memory
     // outside the provided region.
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     _ = s.slice(&buf);
     var q = VirtQueue{
         .size = 8,

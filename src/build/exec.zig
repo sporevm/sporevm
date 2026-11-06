@@ -54,6 +54,7 @@ pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
 pub const max_context_bind_mounts = 8;
 pub const max_build_input_disks = @import("../aarch64/vmm.zig").max_build_input_disks;
+const test_support = @import("../test_support.zig");
 const enospc_patterns = [_][]const u8{
     "SPORE_BUILD_ENOSPC",
     "No space left on device",
@@ -1227,7 +1228,7 @@ pub fn validateRunRequestWithContextBinds(
     cache_mounts: []const cache_mount.Mount,
     context_bind_mounts: []const ContextBindMount,
 ) !void {
-    const max_session_id = "x" ** 63;
+    const max_session_id = test_support.repeat("x", 63);
     const json = try runRequestJson(allocator, max_session_id, command, env, workdir, nofile, cache_mounts, context_bind_mounts, std.math.maxInt(u64));
     defer allocator.free(json);
     if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
@@ -1746,19 +1747,19 @@ test "build COPY parents preserves conflicts without changing auto directory mer
 
         const source_root = try tmp.dir.realPathFileAlloc(io, "source", allocator);
         defer allocator.free(source_root);
-        const source_root_z = try allocator.dupeZ(u8, source_root);
+        const source_root_z = try allocator.dupeSentinel(u8, source_root, 0);
         defer allocator.free(source_root_z);
         const root_conflict = try tmp.dir.realPathFileAlloc(io, "root-conflict", allocator);
         defer allocator.free(root_conflict);
-        const root_conflict_z = try allocator.dupeZ(u8, root_conflict);
+        const root_conflict_z = try allocator.dupeSentinel(u8, root_conflict, 0);
         defer allocator.free(root_conflict_z);
         const nested_conflict = try tmp.dir.realPathFileAlloc(io, "nested-conflict", allocator);
         defer allocator.free(nested_conflict);
-        const nested_conflict_z = try allocator.dupeZ(u8, nested_conflict);
+        const nested_conflict_z = try allocator.dupeSentinel(u8, nested_conflict, 0);
         defer allocator.free(nested_conflict_z);
         const auto_directory = try tmp.dir.realPathFileAlloc(io, "auto-directory", allocator);
         defer allocator.free(auto_directory);
-        const auto_directory_z = try allocator.dupeZ(u8, auto_directory);
+        const auto_directory_z = try allocator.dupeSentinel(u8, auto_directory, 0);
         defer allocator.free(auto_directory_z);
 
         var diagnostic: [384]u8 = undefined;
@@ -1988,13 +1989,13 @@ test "build rootfs grow request stays bounded" {
             "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"capacity\":1}\n",
             "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\",\"stdout_offset\":0}\n",
             "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"} trailing\n",
-            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ ("a" ** 64) ++ "\"}\n",
+            "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ (test_support.repeat("a", 64)) ++ "\"}\n",
             "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"a\"}\x00extra\n",
         };
         for (invalid) |raw| {
             try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(raw.ptr, raw.len, raw[0..0].ptr, 0));
         }
-        const max_session = "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ ("a" ** 63) ++ "\"}\n";
+        const max_session = "{\"type\":\"spore-rootfs-grow-v1\",\"session_id\":\"" ++ (test_support.repeat("a", 63)) ++ "\"}\n";
         try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(max_session.ptr, max_session.len, max_session[0..0].ptr, 0));
     }
 }
@@ -2552,15 +2553,15 @@ test "build exec-form RUN request carries exact bounded argv" {
     try std.testing.expectError(error.RunArgCountUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{} }, &.{}, "/", default_build_nofile, std.testing.io));
     try std.testing.expectError(error.RunArgUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{""} }, &.{}, "/", default_build_nofile, std.testing.io));
 
-    const sixteen = [_][]const u8{"x"} ** max_run_exec_args;
+    const sixteen: [max_run_exec_args][]const u8 = @splat("x");
     const max_count_request = try runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &sixteen }, &.{}, "/", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(max_count_request);
-    const seventeen = [_][]const u8{"x"} ** (max_run_exec_args + 1);
+    const seventeen: [max_run_exec_args + 1][]const u8 = @splat("x");
     try std.testing.expectError(error.RunArgCountUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &seventeen }, &.{}, "/", default_build_nofile, std.testing.io));
 
-    const max_bytes_request = try runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{"x" ** max_run_exec_args_bytes} }, &.{}, "/", default_build_nofile, std.testing.io);
+    const max_bytes_request = try runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{test_support.repeat("x", max_run_exec_args_bytes)} }, &.{}, "/", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(max_bytes_request);
-    try std.testing.expectError(error.RunRequestTooLarge, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{"x" ** (max_run_exec_args_bytes + 1)} }, &.{}, "/", default_build_nofile, std.testing.io));
+    try std.testing.expectError(error.RunRequestTooLarge, runRequest(std.testing.allocator, "spore-build-1", .{ .exec = &.{test_support.repeat("x", (max_run_exec_args_bytes + 1))} }, &.{}, "/", default_build_nofile, std.testing.io));
 
     if (comptime guest_agent_fuzz_supported) {
         try std.testing.expectEqual(guest_agent_fuzz_run_complete, spore_agent_fuzz_build_request(max_count_request.ptr, max_count_request.len, max_count_request[0..0].ptr, 0));
@@ -2568,12 +2569,12 @@ test "build exec-form RUN request carries exact bounded argv" {
         const too_many_request = try rawExecRequestForTest(std.testing.allocator, &seventeen);
         defer std.testing.allocator.free(too_many_request);
         try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(too_many_request.ptr, too_many_request.len, too_many_request[0..0].ptr, 0));
-        const too_large_request = try rawExecRequestForTest(std.testing.allocator, &.{"x" ** (max_run_exec_args_bytes + 1)});
+        const too_large_request = try rawExecRequestForTest(std.testing.allocator, &.{test_support.repeat("x", (max_run_exec_args_bytes + 1))});
         defer std.testing.allocator.free(too_large_request);
         try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(too_large_request.ptr, too_large_request.len, too_large_request[0..0].ptr, 0));
     }
 
-    const escaped_controls = "\x01" ** 1366;
+    const escaped_controls = test_support.repeat("\x01", 1366);
     try std.testing.expectError(error.RunRequestTooLarge, validateRunRequest(std.testing.allocator, .{ .exec = &.{ "printf", escaped_controls } }, &.{"PATH=/usr/bin"}, "/", default_build_nofile));
 }
 
@@ -2834,13 +2835,13 @@ test "builder and runtime share bounded guest PATH resolution" {
         spore_agent_test_resolve_exec_path("tool", 4, max_path.ptr, max_path.len, 1, &resolved, resolved.len),
     );
 
-    const long_path = "/" ** 251;
+    const long_path = test_support.repeat("/", 251);
     try std.testing.expectEqual(
         @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
         spore_agent_test_resolve_exec_path("missing", 7, long_path, long_path.len, 1, &resolved, resolved.len),
     );
 
-    const long_command = "x" ** 511;
+    const long_command = test_support.repeat("x", 511);
     try std.testing.expectEqual(
         @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
         spore_agent_test_resolve_exec_path(long_command, long_command.len, "/bin", 4, 1, &resolved, resolved.len),
@@ -3044,13 +3045,13 @@ test "build RUN resources validate as one execution contract" {
 }
 
 test "build run request accepts multi-kib command and rejects configured bound" {
-    const multi_kib = "x" ** 4096;
+    const multi_kib = test_support.repeat("x", 4096);
     const request = try runRequest(std.testing.allocator, "spore-build-1", .{ .shell = multi_kib }, &.{}, "/", default_build_nofile, std.testing.io);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"command_len\":4096") != null);
-    const command = "x" ** (max_run_command_len + 1);
+    const command = test_support.repeat("x", (max_run_command_len + 1));
     try std.testing.expectError(error.RunCommandTooLong, runRequest(std.testing.allocator, "spore-build-1", .{ .shell = command }, &.{}, "/", default_build_nofile, std.testing.io));
-    const workdir = "/" ** (max_guest_working_dir_len + 1);
+    const workdir = test_support.repeat("/", (max_guest_working_dir_len + 1));
     try std.testing.expectError(error.RunWorkingDirUnsupported, runRequest(std.testing.allocator, "spore-build-1", .{ .shell = "true" }, &.{}, workdir, default_build_nofile, std.testing.io));
 }
 
@@ -3308,14 +3309,14 @@ test "guest generation params are read only from their top-level members" {
         .{ .params = "{\"schema_version\":0,\"parent_generation\":1,\"generation\":2,\"fork_index\":3,\"fork_count\":4,\"parallel_index\":5,\"parallel_count\":6,\"fork_batch_id\":\"0123456789abcdef0123456789abcdef\",\"vm_id\":\"spore-0123456789abcdef0123456789abcdef\",\"hostname\":\"spore-01234567-000000\",\"mac_seed\":\"0123456789abcdef0123456789abcdef\",\"mac_address\":\"02:00:00:00:00:01\"}", .result = 1, .generation = 2, .fork_index = 3, .vm_id = "spore-0123456789abcdef0123456789abcdef" },
         .{ .params = "{\"run_id\":\"r\",\"child_id\":7,\"note\":null,\"ok\":true,\"ratio\":-1.5e+3,\"tree\":[[{\"a\":[]}],{}],\"generation\":3}", .result = 1, .generation = 3 },
         .{ .params = " { } ", .result = 0 },
-        .{ .params = "{\"tree\":" ++ "[" ** 1900 ++ "]" ** 1900 ++ ",\"generation\":4}", .result = 1, .generation = 4 },
+        .{ .params = "{\"tree\":" ++ test_support.repeat("[", 1900) ++ test_support.repeat("]", 1900) ++ ",\"generation\":4}", .result = 1, .generation = 4 },
         .{ .params = "{\"generation\":1,\"generation\":2}", .result = -1 },
         .{ .params = "{\"generation\":\"7\"}", .result = -1 },
         .{ .params = "{\"generation\":-1}", .result = -1 },
         .{ .params = "{\"generation\":1.5}", .result = -1 },
         .{ .params = "{\"generation\":07}", .result = -1 },
         .{ .params = "{\"hostname\":7}", .result = -1 },
-        .{ .params = "{\"hostname\":\"" ++ "h" ** 128 ++ "\"}", .result = -1 },
+        .{ .params = "{\"hostname\":\"" ++ test_support.repeat("h", 128) ++ "\"}", .result = -1 },
         .{ .params = "{\"generation\":7", .result = -1 },
         .{ .params = "{\"generation\":7}x", .result = -1 },
         .{ .params = "{\"generation\":7,}", .result = -1 },
@@ -3342,7 +3343,7 @@ test "guest generation params are read only from their top-level members" {
     var generation: u64 = 0;
     var fork_index: u64 = 0;
     var vm_id: [128]u8 = undefined;
-    const longest_hostname = "{\"hostname\":\"" ++ "h" ** 127 ++ "\"}";
+    const longest_hostname = "{\"hostname\":\"" ++ test_support.repeat("h", 127) ++ "\"}";
     try std.testing.expectEqual(@as(c_int, 0), spore_agent_test_generation_params(longest_hostname.ptr, longest_hostname.len, &generation, &fork_index, &vm_id));
 }
 
@@ -3404,7 +3405,7 @@ test "managed producer identity resolves without materializing boot artifact byt
 
 test "ENOSPC detector survives output truncation and frame splits" {
     var detector: EnospcDetector = .{};
-    const noise = [_]u8{'x'} ** 4096;
+    const noise = @as([4096]u8, @splat('x'));
     for (0..20) |_| detector.observe(&noise);
     try std.testing.expect(!detector.seen);
 

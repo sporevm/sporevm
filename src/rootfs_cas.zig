@@ -11,6 +11,7 @@ const chunk_sealer = @import("chunk_sealer.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
+const test_support = @import("test_support.zig");
 
 const Io = std.Io;
 
@@ -151,7 +152,7 @@ pub fn materializeFlatFromChunks(
     }
 
     if (std.c.fchmod(temp_fd, 0o444) != 0) return error.IoFailed;
-    const dest_z = try allocator.dupeZ(u8, dest_path);
+    const dest_z = try allocator.dupeSentinel(u8, dest_path, 0);
     defer allocator.free(dest_z);
     if (std.c.rename(temp_path.ptr, dest_z.ptr) != 0) return error.IoFailed;
     std.log.debug("materialized flat rootfs artifact from chunks: digest={s} size={d}", .{ rootfs.artifact.digest, rootfs.artifact.size });
@@ -193,7 +194,7 @@ pub fn preloadPath(
     chunk_size: u64,
 ) !PreloadResult {
     if (chunk_size == 0 or chunk_size % 512 != 0 or chunk_size > std.math.maxInt(usize)) return error.BadManifest;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
@@ -579,7 +580,7 @@ pub fn verifyStorageIndexPath(
 ) !void {
     const digest = (try spore.diskIndexDescriptorForStorage(storage)).index_digest.?;
     if (!std.mem.startsWith(u8, digest, disk_index.digest_prefix)) return error.BadManifest;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.MissingChunk;
@@ -664,7 +665,7 @@ fn installCheckedIndex(allocator: std.mem.Allocator, io: Io, cache_path: []const
 
 /// Fails unless `path` is a regular file holding exactly `expected`.
 fn expectFileBytes(allocator: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.MissingChunk;
@@ -973,7 +974,7 @@ fn readFileAllTimed(
     stats: ?*ManifestObjectReadStats,
 ) SourceError![]u8 {
     const prepare_start_ns = if (stats != null) monotonicNs() else 0;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.MissingChunk;
@@ -1126,7 +1127,7 @@ test "materialize assembles the flat artifact from verified chunks" {
     defer tmp_dir.deinit();
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
-    const bytes = "abcd" ++ ("\x00" ** 4096) ++ "efgh";
+    const bytes = "abcd" ++ (test_support.repeat("\x00", 4096)) ++ "efgh";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
@@ -1318,7 +1319,7 @@ test "a stamped index swapped for another valid index is incomplete until repair
     var storages: [2]spore.RootfsStorage = undefined;
     for (&indexes, &storages, [_][]const u8{ "abcd", "wxyz" }) |*index, *storage, contents| {
         const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ tmp_dir.root, contents });
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = try std.mem.concat(arena, u8, &(.{contents} ** 16384)) });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = try std.mem.concat(arena, u8, &@as([16384][]const u8, @splat(contents))) });
         const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
         const result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
         storage.* = storageDescriptor(.{ .mmio_slot = 1 }, result);
@@ -1343,5 +1344,5 @@ test "a stamped index swapped for another valid index is incomplete until repair
     defer loaded.deinit();
     try std.testing.expectEqualStrings(indexes[0], loaded.bytes);
     try std.testing.expectEqual(1, loaded.parsed.value.chunks.len);
-    try std.testing.expectEqual(chunk.ChunkId.fromContents(try std.mem.concat(arena, u8, &(.{"abcd"} ** 16384))), loaded.parsed.value.chunks[0].id);
+    try std.testing.expectEqual(chunk.ChunkId.fromContents(try std.mem.concat(arena, u8, &@as([16384][]const u8, @splat("abcd")))), loaded.parsed.value.chunks[0].id);
 }

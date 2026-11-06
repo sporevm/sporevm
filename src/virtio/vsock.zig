@@ -60,7 +60,7 @@ pub const Config = struct {
 
 const Packet = struct {
     header: Header,
-    data: [max_payload]u8 = [_]u8{0} ** max_payload,
+    data: [max_payload]u8 = @splat(0),
     data_len: usize = 0,
 };
 
@@ -506,7 +506,7 @@ test "config reports guest cid" {
 test "stream connect request is answered with rst" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
-    var buf: [16 * 1024]u8 = [_]u8{0} ** (16 * 1024);
+    var buf: [16 * 1024]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -556,7 +556,7 @@ test "stream connect request is answered with rst" {
 test "host stream connects, sends request, and parses streamed frames" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
-    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    var buf: [32 * 1024]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -713,7 +713,7 @@ test "host stream connects, sends request, and parses streamed frames" {
 test "rx delivery splits stream data across small guest buffers" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
-    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    var buf: [32 * 1024]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -768,7 +768,7 @@ test "rx delivery splits stream data across small guest buffers" {
 test "rx delivery makes no empty fragments for header-only guest buffers" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
-    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    var buf: [32 * 1024]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -804,7 +804,7 @@ test "rx delivery makes no empty fragments for header-only guest buffers" {
 test "rx delivery keeps packets pending when a guest buffer cannot hold the header" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
-    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    var buf: [32 * 1024]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -910,7 +910,7 @@ test "host proactively updates credit while consuming guest stream data" {
 test "host defers stream data until the guest advertises credit" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
-    var buf: [32 * 1024]u8 = [_]u8{0} ** (32 * 1024);
+    var buf: [32 * 1024]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     const rx_desc = 0x000;
@@ -998,7 +998,7 @@ test "completed host stream reset drops stale packets before next attach" {
 fn fuzzVsockTx(_: void, s: *std.testing.Smith) !void {
     var dev = Vsock.init(.{});
     var t = mmio.Transport.init(dev.device());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
     t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x1000, .avail_addr = 0x1200, .used_addr = 0x1400 };
@@ -1013,7 +1013,7 @@ test "fuzz vsock tx handling" {
 fn fuzzVsockRxDelivery(_: void, s: *std.testing.Smith) !void {
     var dev = Vsock.init(.{});
     var t = mmio.Transport.init(dev.device());
-    var buf: [8192]u8 = [_]u8{0} ** 8192;
+    var buf: [8192]u8 = @splat(0);
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
     t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x1000, .avail_addr = 0x1200, .used_addr = 0x1400 };

@@ -54,7 +54,7 @@ pub fn openTrustedFromCache(
     const path = try digestPath(allocator, cache_root, rootfs.artifact.digest);
     defer allocator.free(path);
     if (!try regularFileNoSymlink(io, path)) return error.RootFSDigestCacheMiss;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSDigestCacheMiss;
@@ -75,7 +75,7 @@ pub fn openVerifiedFromCache(
     const path = try digestPath(allocator, cache_root, rootfs.artifact.digest);
     defer allocator.free(path);
     if (!try regularFileNoSymlink(io, path)) return error.RootFSDigestCacheMiss;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSDigestCacheMiss;
@@ -297,9 +297,9 @@ fn copyVerifiedPathAfterSourceVerified(
     defer allocator.free(temp_path);
     defer Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
-    const source_z = try allocator.dupeZ(u8, source_path);
+    const source_z = try allocator.dupeSentinel(u8, source_path, 0);
     defer allocator.free(source_z);
-    const temp_z = try allocator.dupeZ(u8, temp_path);
+    const temp_z = try allocator.dupeSentinel(u8, temp_path, 0);
     defer allocator.free(temp_z);
     const source_fd = std.c.open(source_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (source_fd < 0) return error.RootFSOpenFailed;
@@ -345,7 +345,7 @@ pub fn verifyPath(
 }
 
 pub fn hashPath(io: Io, allocator: std.mem.Allocator, path: []const u8) !RootfsHash {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.RootFSOpenFailed;
@@ -384,9 +384,9 @@ fn hardlinkVerifiedPath(
     dest_path: []const u8,
     artifact: spore.RootfsArtifactRef,
 ) !bool {
-    const source_z = try allocator.dupeZ(u8, source_path);
+    const source_z = try allocator.dupeSentinel(u8, source_path, 0);
     defer allocator.free(source_z);
-    const dest_z = try allocator.dupeZ(u8, dest_path);
+    const dest_z = try allocator.dupeSentinel(u8, dest_path, 0);
     defer allocator.free(dest_z);
     if (std.c.link(source_z, dest_z) != 0) return false;
     errdefer Io.Dir.cwd().deleteFile(io, dest_path) catch {};
@@ -402,9 +402,9 @@ fn hardlinkTrustedPath(
     dest_path: []const u8,
     expected_size: u64,
 ) !bool {
-    const source_z = try allocator.dupeZ(u8, source_path);
+    const source_z = try allocator.dupeSentinel(u8, source_path, 0);
     defer allocator.free(source_z);
-    const dest_z = try allocator.dupeZ(u8, dest_path);
+    const dest_z = try allocator.dupeSentinel(u8, dest_path, 0);
     defer allocator.free(dest_z);
     if (std.c.link(source_z, dest_z) != 0) return false;
     errdefer Io.Dir.cwd().deleteFile(io, dest_path) catch {};
@@ -446,7 +446,7 @@ fn fdIsRegularFile(io: Io, fd: std.c.fd_t) !bool {
 }
 
 fn chmodReadOnly(allocator: std.mem.Allocator, path: []const u8) !void {
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     if (std.c.chmod(pathz, 0o444) != 0) return error.RootFSOpenFailed;
 }
@@ -546,8 +546,8 @@ test "trusted open accepts installed entry and fails closed on size and shape" {
     try std.testing.expectError(error.RootFSDigestCacheMiss, openTrustedFromCache(io, arena, cache_root, rootfs));
 
     // Symlinked entry is rejected even when it points at matching bytes.
-    const digest_z = try arena.dupeZ(u8, digest_path);
-    const rootfs_z = try arena.dupeZ(u8, rootfs_path);
+    const digest_z = try arena.dupeSentinel(u8, digest_path, 0);
+    const rootfs_z = try arena.dupeSentinel(u8, rootfs_path, 0);
     if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
     try std.testing.expectError(error.RootFSDigestCacheMiss, openTrustedFromCache(io, arena, cache_root, rootfs));
 }
@@ -769,8 +769,8 @@ test "digest cache rejects unsafe existing paths" {
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     try Io.Dir.cwd().deleteFile(io, digest_path);
-    const digest_z = try arena.dupeZ(u8, digest_path);
-    const rootfs_z = try arena.dupeZ(u8, rootfs_path);
+    const digest_z = try arena.dupeSentinel(u8, digest_path, 0);
+    const rootfs_z = try arena.dupeSentinel(u8, rootfs_path, 0);
     if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
 
     try std.testing.expectError(error.RootFSDigestMismatch, installExpectedPath(io, arena, cache_root, rootfs_path, artifact, .{}));
@@ -783,7 +783,7 @@ test "rootfs hashing rejects non-file descriptors" {
     defer tmp_dir.deinit();
     const tmp = tmp_dir.root;
 
-    const tmp_z = try allocator.dupeZ(u8, tmp);
+    const tmp_z = try allocator.dupeSentinel(u8, tmp, 0);
     defer allocator.free(tmp_z);
     const fd = std.c.open(tmp_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.SkipZigTest;

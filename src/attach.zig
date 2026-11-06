@@ -159,8 +159,13 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !events_mod.Result {
     var events = events_mod.EventEmitter.init(opts.events, "attach");
     try events.emitStart(opts.backend);
-    errdefer |err| events.emitFailure(err) catch {};
+    return executeWithEvents(context, allocator, opts, &events) catch |err| {
+        events.emitFailure(err) catch {};
+        return err;
+    };
+}
 
+fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Options, events: *events_mod.EventEmitter) !events_mod.Result {
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
     try run_mod.validateFreshProductPolicy(backend, .{
@@ -190,7 +195,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     }
     defer if (gateway_active) gateway.deinit();
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
-    errdefer run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+    errdefer run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
 
     try validateAttachDiskManifestParts(manifest.devices, manifest.rootfs, manifest.disk);
     var runtime_disk_state = try runtime_disk.open(context, allocator, .{
@@ -214,8 +219,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     if (identity_stream) |*stream| {
         stream.host_port = vsock_stream.HostStream.deriveHostPort(attach.request);
         if (opts.events != null) {
-            stream.setLifecycleSink(&events, attachEventLifecycleSink);
-            stream.setOutputSink(&events, attachEventOutputSink);
+            stream.setLifecycleSink(events, attachEventLifecycleSink);
+            stream.setOutputSink(events, attachEventOutputSink);
         } else {
             stream.setOutputSink(null, identityProbeOutputSink);
         }
@@ -267,14 +272,14 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
             // The guest stopped before sending the session's exit frame, so
             // its exit status is unknown; `spore run` reports the same.
             const gateway_failed = gateway_active and gateway.hasFailed();
-            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
             if (gateway_failed) return error.NetworkGatewayFailed;
             return error.ProbeDidNotComplete;
         },
         .probe_complete => {
             var result = try resultFromAttachStream(backend, memory_config, vcpu_count, identity_stream);
             result = result.withMemoryRestore(&ram_plan);
-            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
+            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
             return result;
@@ -580,12 +585,12 @@ fn testDiskGuardManifest(devices: []spore.TransportState, with_disk: bool) spore
             .counter_frequency_hz = 24_000_000,
         },
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0,
             .cpsr = 0,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },

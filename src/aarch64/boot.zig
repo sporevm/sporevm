@@ -145,7 +145,7 @@ fn makeImage(allocator: std.mem.Allocator, text_offset: u64, image_size: u64, pa
 
 test "parse rejects bad magic and short files" {
     try std.testing.expectError(error.BadImageMagic, parseImage("short"));
-    var junk = [_]u8{0} ** 128;
+    var junk = @as([128]u8, @splat(0));
     try std.testing.expectError(error.BadImageMagic, parseImage(&junk));
 }
 

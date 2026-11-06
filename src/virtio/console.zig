@@ -78,7 +78,7 @@ test "tx chains reach the sink and are returned used" {
     var con = Console{ .sink = testSink };
     var t = mmio.Transport.init(con.device());
 
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 
     // Configure tx queue (index 1) via transport registers.
@@ -108,7 +108,7 @@ test "rx notify is inert" {
     test_output = .{};
     var con = Console{ .sink = testSink };
     var t = mmio.Transport.init(con.device());
-    var buf: [256]u8 = [_]u8{0} ** 256;
+    var buf: [256]u8 = @splat(0);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
     _ = t.write(0x030, 0, ram);
     _ = t.write(0x038, 4, ram);
@@ -124,7 +124,7 @@ fn fuzzConsoleQueues(_: void, s: *std.testing.Smith) !void {
     var con = Console{ .sink = testSink };
     var t = mmio.Transport.init(con.device());
 
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     _ = s.slice(&buf);
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
 

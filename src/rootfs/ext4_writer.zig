@@ -2124,7 +2124,7 @@ fn xattrEntryHash(name: []const u8, value: []const u8) u32 {
     for (name) |c| hash = rotateHash(hash, 5) ^ c;
     var offset: usize = 0;
     while (offset < value.len) : (offset += 4) {
-        var word_bytes = [_]u8{0} ** 4;
+        var word_bytes = @as([4]u8, @splat(0));
         const take = @min(value.len - offset, 4);
         @memcpy(word_bytes[0..take], value[offset .. offset + take]);
         hash = rotateHash(hash, 16) ^ std.mem.readInt(u32, &word_bytes, .little);
@@ -2354,7 +2354,7 @@ fn fuzzNativeExt4PlannerAndMetadataEmitter(_: void, s: *std.testing.Smith) !void
     _ = s.slice(&link_target);
     const link_len = 1 + @as(usize, s.value(u8) % link_target.len);
 
-    var cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
+    var cap = [_]u8{ 1, 0, 0, 2 } ++ @as([16]u8, @splat(0));
     const cap_fuzz_len = @min(s.slice(&cap), cap.len);
     if (cap_fuzz_len < cap.len) @memset(cap[cap_fuzz_len..], 0);
     cap[0..4].* = .{ 1, 0, 0, 2 };

@@ -1875,12 +1875,12 @@ test "prepare resolves vCPUs and RAM from a multi-vCPU restore manifest" {
         state.* = .{
             .index = @intCast(index),
             .mpidr = mpidr,
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0,
             .cpsr = 0,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
@@ -2220,12 +2220,12 @@ fn testVcpuState(index: topology.VcpuIndex, vtimer: spore.VtimerState) spore.Vcp
     return .{
         .index = index,
         .mpidr = aarch64_topology.mpidrForIndex(index),
-        .gprs = [_]u64{0} ** 31,
+        .gprs = @splat(0),
         .pc = 0x1000 + @as(u64, index),
         .cpsr = 0,
         .fpcr = 0,
         .fpsr = 0,
-        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .simd = @splat(.{ 0, 0 }),
         .sys_regs = &.{},
         .icc_regs = &.{},
         .vtimer = vtimer,
@@ -2599,7 +2599,7 @@ test "threaded control delivery kicks every vCPU once per delivered batch" {
     devices.init(&config, null);
     defer devices.net.shutdown();
 
-    var bytes = [_]u8{0} ** 0x2000;
+    var bytes = @as([0x2000]u8, @splat(0));
     const ram = guestmem.GuestRam{ .bytes = &bytes, .base = board.ram_base };
     const used = try testVsockRxBuffer(&devices, ram);
 
@@ -2712,7 +2712,7 @@ test "threaded run delivers a running probe's queued packets without a guest not
     var devices: Devices = undefined;
     devices.init(&config, null);
     defer devices.net.shutdown();
-    var bytes = [_]u8{0} ** 0x2000;
+    var bytes = @as([0x2000]u8, @splat(0));
     const ram = guestmem.GuestRam{ .bytes = &bytes, .base = board.ram_base };
     const used = try testVsockRxBuffer(&devices, ram);
     var stream = try vsock_stream.HostStream.init(1024, "exec");

@@ -379,10 +379,24 @@ fn writeLocalMemoryBackingProofForFd(
 ) Error!void {
     const backing = memory.backing orelse return;
     const start_ns = localBackingMonotonicNs();
-    errdefer |err| {
+    writeLocalMemoryBackingProofForFdTimed(allocator, environ, dir, memory, backing, expected_size, fd, expected_file, start_ns) catch |err| {
         var metrics_buf: [256]u8 = undefined;
         std.log.debug("{s}", .{formatLocalBackingProofWriteError(&metrics_buf, localBackingElapsedUs(start_ns), err)});
-    }
+        return err;
+    };
+}
+
+fn writeLocalMemoryBackingProofForFdTimed(
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    dir: []const u8,
+    memory: MemoryManifest,
+    backing: MemoryBacking,
+    expected_size: u64,
+    fd: std.c.fd_t,
+    expected_file: ?LocalBackingFileIdentity,
+    start_ns: u64,
+) Error!void {
     try validateMemoryBacking(backing, expected_size);
     const file = (try fstatLocalFile(fd)).identity();
     if (file.size != expected_size) return error.BadManifest;
@@ -725,9 +739,9 @@ fn classifyOptionalHardlinkErrno(value: std.c.E) OptionalHardlinkError {
 }
 
 fn hardlinkOptionalPath(target: []const u8, link_path: []const u8) OptionalHardlinkError!void {
-    const target_z = try std.heap.c_allocator.dupeZ(u8, target);
+    const target_z = try std.heap.c_allocator.dupeSentinel(u8, target, 0);
     defer std.heap.c_allocator.free(target_z);
-    const link_z = try std.heap.c_allocator.dupeZ(u8, link_path);
+    const link_z = try std.heap.c_allocator.dupeSentinel(u8, link_path, 0);
     defer std.heap.c_allocator.free(link_z);
     const rc = std.c.link(target_z, link_z);
     if (rc != 0) return classifyOptionalHardlinkErrno(std.c.errno(rc));
@@ -848,7 +862,7 @@ extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 fn testDirFromTemplate(allocator: std.mem.Allocator, template: []const u8) ![:0]const u8 {
-    const buf = try allocator.dupeZ(u8, template);
+    const buf = try allocator.dupeSentinel(u8, template, 0);
     if (mkdtemp(buf) == null) return error.IoFailed;
     return buf;
 }

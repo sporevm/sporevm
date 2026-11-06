@@ -2,6 +2,7 @@ const std = @import("std");
 const remote_add_policy = @import("remote_add_policy.zig");
 const run_contract = @import("run_contract.zig");
 const variable_expansion = @import("variables.zig");
+const test_support = @import("../test_support.zig");
 
 pub const Diagnostic = struct {
     line: usize = 0,
@@ -1704,7 +1705,7 @@ test "Dockerfile parser enforces production input bounds" {
     try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, large, &diag));
     try std.testing.expectEqualStrings("Dockerfile is too large", diag.message);
 
-    const long_line = try std.fmt.allocPrint(allocator, "FROM base\nRUN {s}\n", .{"x" ** (max_logical_line_bytes + 1)});
+    const long_line = try std.fmt.allocPrint(allocator, "FROM base\nRUN {s}\n", .{test_support.repeat("x", (max_logical_line_bytes + 1))});
     try std.testing.expectError(error.DockerfileParseFailed, parse(allocator, long_line, &diag));
     try std.testing.expectEqualStrings("Dockerfile logical line is too long", diag.message);
 }

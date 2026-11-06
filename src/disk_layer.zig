@@ -301,7 +301,7 @@ test "snapshot returns null for a clean exact-rootfs baseline" {
     defer base.close(io);
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
-    const bytes = [_]u8{0x42} ** 4096;
+    const bytes = @as([4096]u8, @splat(0x42));
     try base.writeStreamingAll(io, &bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, bytes.len);
@@ -336,7 +336,7 @@ test "clean chunk-index save publishes its index" {
 
     const out_dir = try tmp.path("saved.spore");
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
-    const bytes = [_]u8{0x62} ** 512;
+    const bytes = @as([512]u8, @splat(0x62));
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer base.close(io);
     try base.writeStreamingAll(io, &bytes);
@@ -373,7 +373,7 @@ test "clean save after dirty cow snapshot keeps current identity" {
     const second_dir = try tmp.path("second.spore");
     try std.Io.Dir.cwd().createDirPath(io, first_dir);
     try std.Io.Dir.cwd().createDirPath(io, second_dir);
-    const bytes = [_]u8{0x73} ** 512;
+    const bytes = @as([512]u8, @splat(0x73));
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer base.close(io);
     try base.writeStreamingAll(io, &bytes);
@@ -383,7 +383,7 @@ test "clean save after dirty cow snapshot keeps current identity" {
     var disk = try chunk_mapped_disk.ChunkMappedDisk.initWritable(arena, base_source, overlay.handle, bytes.len, 512);
     defer disk.deinit();
 
-    const patch = [_]u8{0x84} ** 37;
+    const patch = @as([37]u8, @splat(0x84));
     try disk.writeAt(&patch, 101);
     const state = SnapshotState{
         .base = .{

@@ -79,7 +79,7 @@ test "slice bounds" {
 }
 
 test "typed read/write round-trip" {
-    var buf = [_]u8{0} ** 16;
+    var buf = @as([16]u8, @splat(0));
     const ram = GuestRam{ .bytes = &buf, .base = 0 };
     try ram.write(u32, 1, 0xdeadbeef); // deliberately unaligned
     try std.testing.expectEqual(@as(u32, 0xdeadbeef), try ram.read(u32, 1));
@@ -87,7 +87,7 @@ test "typed read/write round-trip" {
 }
 
 test "typed writes notify dirty observer" {
-    var buf = [_]u8{0} ** 16;
+    var buf = @as([16]u8, @splat(0));
     var probe = DirtyProbe{};
     const ram = GuestRam{ .bytes = &buf, .base = 0x1000, .dirty_context = &probe, .dirty_fn = DirtyProbe.mark };
     try ram.write(u32, 0x1004, 0x12345678);

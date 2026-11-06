@@ -18,6 +18,7 @@ const spore = @import("../spore.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
 const test_barrier = @import("../test_barrier.zig");
+const test_support = @import("../test_support.zig");
 
 const Io = std.Io;
 
@@ -672,7 +673,7 @@ const TestNotifyResult = struct {
 };
 
 const TestBlkQueue = struct {
-    buf: [4096]u8 = [_]u8{0} ** 4096,
+    buf: [4096]u8 = @splat(0),
     queues: [mmio.max_queues]queue.VirtQueue,
 
     const desc_base: u64 = 0;
@@ -686,7 +687,7 @@ const TestBlkQueue = struct {
     const flag_write: u16 = 2;
 
     fn init() TestBlkQueue {
-        var queues = [_]queue.VirtQueue{.{}} ** mmio.max_queues;
+        var queues = @as([mmio.max_queues]queue.VirtQueue, @splat(.{}));
         queues[0] = .{
             .size = 8,
             .ready = true,
@@ -748,7 +749,7 @@ const TestBlkQueue = struct {
 };
 
 test "write zeroes feature and config are opt in and negotiation is resettable" {
-    var disk = [_]u8{0} ** (8 * sector_size);
+    var disk = @as([(8 * sector_size)]u8, @splat(0));
     var ordinary = Blk.init(.{ .memory = &disk });
     const ordinary_device = ordinary.device();
     try std.testing.expectEqual(@as(u64, 0), ordinary_device.device_features & feature_write_zeroes);
@@ -777,7 +778,7 @@ test "write zeroes feature and config are opt in and negotiation is resettable" 
 }
 
 test "immutable build input rejects WRITE_ZEROES negotiation without mutation" {
-    var disk = [_]u8{0x5a} ** (4 * sector_size);
+    var disk = @as([(4 * sector_size)]u8, @splat(0x5a));
     var source = Blk.initImmutableSource(.{ .memory = &disk });
     var transport = mmio.Transport.init(source.device());
     try std.testing.expectEqual(@as(u64, 0), transport.dev.device_features & feature_write_zeroes);
@@ -792,12 +793,12 @@ test "immutable build input rejects WRITE_ZEROES negotiation without mutation" {
 }
 
 test "immutable memory source rejects ordinary OUT without mutation" {
-    var disk = [_]u8{0x5a} ** (2 * sector_size);
+    var disk = @as([(2 * sector_size)]u8, @splat(0x5a));
     var source = Blk.initImmutableSource(.{ .memory = &disk });
-    var header = [_]u8{0} ** 16;
+    var header = @as([16]u8, @splat(0));
     std.mem.writeInt(u32, header[0..4], req_out, .little);
     std.mem.writeInt(u64, header[8..16], 0, .little);
-    var attempted = [_]u8{0xa5} ** sector_size;
+    var attempted = @as([sector_size]u8, @splat(0xa5));
     var status: [1]u8 = .{0xff};
     const chain = makeChain(&.{
         .{ .data = &header, .writable = false },
@@ -815,19 +816,19 @@ test "immutable build input rejects ordinary OUT on a product-style read-only fd
     var tmp_dir = try TestDir.init();
     defer tmp_dir.deinit();
     const path = try tmp_dir.path("source.img");
-    const canonical = [_]u8{0x5a} ** (2 * sector_size);
+    const canonical = @as([(2 * sector_size)]u8, @splat(0x5a));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &canonical });
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.FileNotFound;
     defer _ = std.c.close(fd);
 
     var source = Blk.initImmutableSource(.{ .file = fd });
-    var header = [_]u8{0} ** 16;
+    var header = @as([16]u8, @splat(0));
     std.mem.writeInt(u32, header[0..4], req_out, .little);
     std.mem.writeInt(u64, header[8..16], 0, .little);
-    var attempted = [_]u8{0xa5} ** sector_size;
+    var attempted = @as([sector_size]u8, @splat(0xa5));
     var status: [1]u8 = .{0xff};
     const chain = makeChain(&.{
         .{ .data = &header, .writable = false },
@@ -842,7 +843,7 @@ test "immutable build input rejects ordinary OUT on a product-style read-only fd
 }
 
 test "write zeroes requires negotiated feature without mutating memory" {
-    var disk = [_]u8{0x5a} ** (4 * sector_size);
+    var disk = @as([(4 * sector_size)]u8, @splat(0x5a));
     var stats: Stats = .{};
     var blk = Blk.initWithOptions(.{ .memory = &disk }, .{ .write_zeroes = true, .stats = &stats });
 
@@ -867,7 +868,7 @@ test "write zeroes requires negotiated feature without mutating memory" {
 }
 
 test "write zeroes handles bounded memory ranges and records stats" {
-    var disk = [_]u8{0x5a} ** (6 * sector_size);
+    var disk = @as([(6 * sector_size)]u8, @splat(0x5a));
     var stats: Stats = .{};
     var blk = Blk.initWithOptions(.{ .memory = &disk }, .{ .write_zeroes = true, .stats = &stats });
     acceptWriteZeroes(&blk);
@@ -909,7 +910,7 @@ test "write zeroes handles bounded memory ranges and records stats" {
 }
 
 test "forced unsupported write zeroes is a non-mutating fallback control" {
-    var disk = [_]u8{0x5a} ** (4 * sector_size);
+    var disk = @as([(4 * sector_size)]u8, @splat(0x5a));
     var stats: Stats = .{};
     var blk = Blk.initWithOptions(.{ .memory = &disk }, .{
         .write_zeroes = true,
@@ -941,7 +942,7 @@ test "forced unsupported write zeroes is a non-mutating fallback control" {
 }
 
 test "forced backend failure is distinguished from structural rejection" {
-    var disk = [_]u8{0x5a} ** (2 * sector_size);
+    var disk = @as([(2 * sector_size)]u8, @splat(0x5a));
     var stats: Stats = .{};
     var blk = Blk.initWithOptions(.{ .memory = &disk }, .{
         .write_zeroes = true,
@@ -969,12 +970,12 @@ test "forced backend failure is distinguished from structural rejection" {
 }
 
 test "OUT telemetry detects block-layer all-zero fallback only when enabled" {
-    var disk = [_]u8{0x11} ** (2 * sector_size);
+    var disk = @as([(2 * sector_size)]u8, @splat(0x11));
     var stats: Stats = .{};
     var blk = Blk.initWithOptions(.{ .memory = &disk }, .{ .stats = &stats });
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_out, .little);
-    var zero_data: [sector_size]u8 = [_]u8{0} ** sector_size;
+    var zero_data: [sector_size]u8 = @splat(0);
     var status: [1]u8 = .{0xff};
     var chain = makeChain(&.{
         .{ .data = &header, .writable = false },
@@ -985,7 +986,7 @@ test "OUT telemetry detects block-layer all-zero fallback only when enabled" {
     try std.testing.expectEqual(status_ok, status[0]);
 
     std.mem.writeInt(u64, header[8..16], 1, .little);
-    var nonzero_data: [sector_size]u8 = [_]u8{0x22} ** sector_size;
+    var nonzero_data: [sector_size]u8 = @splat(0x22);
     status[0] = 0xff;
     chain = makeChain(&.{
         .{ .data = &header, .writable = false },
@@ -1031,11 +1032,11 @@ test "malformed write zeroes requests fail before changing memory" {
     };
 
     for (cases) |malformation| {
-        var disk = [_]u8{0x5a} ** (4 * sector_size);
+        var disk = @as([(4 * sector_size)]u8, @splat(0x5a));
         var blk = Blk.initWithOptions(.{ .memory = &disk }, .{ .write_zeroes = true });
         acceptWriteZeroes(&blk);
-        var header_buf: [17]u8 = [_]u8{0} ** 17;
-        var range_buf: [16]u8 = [_]u8{0} ** 16;
+        var header_buf: [17]u8 = @splat(0);
+        var range_buf: [16]u8 = @splat(0);
         var status_buf: [2]u8 = .{ 0xff, 0xff };
         var extra: [1]u8 = .{0};
         var header: []u8 = header_buf[0..16];
@@ -1081,7 +1082,7 @@ test "write zeroes uses chunk mapped full and partial zero ranges" {
     defer base.close(io);
     var overlay = try tmp.dir.createFile(io, "zero-overlay.img", .{ .read = true });
     defer overlay.close(io);
-    var base_bytes = [_]u8{0x7b} ** (4 * sector_size);
+    var base_bytes = @as([(4 * sector_size)]u8, @splat(0x7b));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
@@ -1140,7 +1141,7 @@ test "validated write zeroes backend failure poisons the mutable head" {
     defer base.close(io);
     var overlay = try tmp.dir.createFile(io, "poison-overlay.img", .{ .read = true });
     const overlay_fd = overlay.handle;
-    const base_bytes = [_]u8{0x7b} ** (2 * sector_size);
+    const base_bytes = @as([(2 * sector_size)]u8, @splat(0x7b));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
@@ -1197,7 +1198,7 @@ test "validated ordinary write failure poisons a partially mutated head" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base_bytes = [_]u8{0x7b} ** (2 * sector_size);
+    const base_bytes = @as([(2 * sector_size)]u8, @splat(0x7b));
     var base = try tmp.dir.createFile(io, "out-poison-base.img", .{ .read = true });
     defer base.close(io);
     try base.writeStreamingAll(io, &base_bytes);
@@ -1217,10 +1218,10 @@ test "validated ordinary write failure poisons a partially mutated head" {
         .test_fail_out_after_segments = 1,
     });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_out, .little);
-    var first = [_]u8{0xa1} ** sector_size;
-    var second = [_]u8{0xb2} ** sector_size;
+    var first = @as([sector_size]u8, @splat(0xa1));
+    var second = @as([sector_size]u8, @splat(0xb2));
     var status: [1]u8 = .{0xff};
     const chain = makeChain(&.{
         .{ .data = &header, .writable = false },
@@ -1255,11 +1256,11 @@ test "validated ordinary write failure poisons a partially mutated head" {
 }
 
 test "read request returns sector data" {
-    var disk = [_]u8{0} ** (4 * sector_size);
+    var disk = @as([(4 * sector_size)]u8, @splat(0));
     disk[sector_size] = 0xAB; // first byte of sector 1
     var blk = Blk.init(.{ .memory = &disk });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_in, .little);
     std.mem.writeInt(u64, header[8..16], 1, .little);
     var data: [sector_size]u8 = undefined;
@@ -1277,12 +1278,12 @@ test "read request returns sector data" {
 }
 
 test "read request validates every descriptor before changing guest buffers" {
-    var disk = [_]u8{0x5a} ** (2 * sector_size);
+    var disk = @as([(2 * sector_size)]u8, @splat(0x5a));
     var blk = Blk.init(.{ .memory = &disk });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_in, .little);
-    var first: [sector_size]u8 = [_]u8{0xaa} ** sector_size;
+    var first: [sector_size]u8 = @splat(0xaa);
     var malformed: [1]u8 = .{0xaa};
     var status: [1]u8 = .{0xff};
 
@@ -1300,12 +1301,12 @@ test "read request validates every descriptor before changing guest buffers" {
 }
 
 test "write request validates every descriptor before changing backend bytes" {
-    var disk = [_]u8{0x11} ** (2 * sector_size);
+    var disk = @as([(2 * sector_size)]u8, @splat(0x11));
     var blk = Blk.init(.{ .memory = &disk });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_out, .little);
-    var first: [sector_size]u8 = [_]u8{0x5a} ** sector_size;
+    var first: [sector_size]u8 = @splat(0x5a);
     var malformed: [1]u8 = .{0x5a};
     var status: [1]u8 = .{0xff};
 
@@ -1322,13 +1323,13 @@ test "write request validates every descriptor before changing backend bytes" {
 }
 
 test "write request persists and out-of-range is io error" {
-    var disk = [_]u8{0} ** (2 * sector_size);
+    var disk = @as([(2 * sector_size)]u8, @splat(0));
     var blk = Blk.init(.{ .memory = &disk });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_out, .little);
     std.mem.writeInt(u64, header[8..16], 0, .little);
-    var data: [sector_size]u8 = [_]u8{0x5A} ** sector_size;
+    var data: [sector_size]u8 = @splat(0x5A);
     var status: [1]u8 = .{0xff};
 
     var chain = makeChain(&.{
@@ -1361,7 +1362,7 @@ test "chunk mapped backend serves dirty writes without mutating base" {
     var overlay = try tmp.dir.createFile(io, "overlay.img", .{ .read = true });
     defer overlay.close(io);
 
-    var base_bytes = [_]u8{0x11} ** (2 * sector_size);
+    var base_bytes = @as([(2 * sector_size)]u8, @splat(0x11));
     try base.writeStreamingAll(io, &base_bytes);
 
     const base_source = block_source.FileBlockSource.init(base.handle, base_bytes.len);
@@ -1369,10 +1370,10 @@ test "chunk mapped backend serves dirty writes without mutating base" {
     defer disk.deinit();
     var blk = Blk.init(.{ .chunk_mapped = &disk });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_out, .little);
     std.mem.writeInt(u64, header[8..16], 1, .little);
-    var write_data: [sector_size]u8 = [_]u8{0x5A} ** sector_size;
+    var write_data: [sector_size]u8 = @splat(0x5A);
     var status: [1]u8 = .{0xff};
 
     var chain = makeChain(&.{
@@ -1420,7 +1421,7 @@ fn expectLazyFaultInFailureViaVirtio(kind: LazyFaultKind) !void {
     defer tmp_dir.deinit();
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
+    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384)) ++ (test_support.repeat("ijkl", 16384));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1470,11 +1471,11 @@ fn expectLazyFaultInFailureViaVirtio(kind: LazyFaultKind) !void {
 
     const bad_sector = @as(u64, @intCast(bad_chunk)) * (spore.disk_chunk_size / sector_size);
     const prefix_sector = @as(u64, @intCast(bad_chunk - 1)) * (spore.disk_chunk_size / sector_size);
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_in, .little);
     std.mem.writeInt(u64, header[8..16], prefix_sector, .little);
-    var healthy_prefix: [spore.disk_chunk_size]u8 = [_]u8{0xaa} ** spore.disk_chunk_size;
-    var failing_suffix: [spore.disk_chunk_size]u8 = [_]u8{0xaa} ** spore.disk_chunk_size;
+    var healthy_prefix: [spore.disk_chunk_size]u8 = @splat(0xaa);
+    var failing_suffix: [spore.disk_chunk_size]u8 = @splat(0xaa);
     var status: [1]u8 = .{0xff};
     const multi_chunk = makeChain(&.{
         .{ .data = &header, .writable = false },
@@ -1519,7 +1520,7 @@ test "flush request reports backend failure" {
         .capacity_sectors = 0,
     };
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_flush, .little);
     var status: [1]u8 = .{0xff};
 
@@ -1533,7 +1534,7 @@ test "flush request reports backend failure" {
 }
 
 test "malformed framing and unknown types are safe" {
-    var disk = [_]u8{0} ** sector_size;
+    var disk = @as([sector_size]u8, @splat(0));
     var blk = Blk.init(.{ .memory = &disk });
 
     // Header too short.
@@ -1547,7 +1548,7 @@ test "malformed framing and unknown types are safe" {
     try std.testing.expectEqual(status_ioerr, status[0]);
 
     // Unknown request type.
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], 0x77, .little);
     status[0] = 0xff;
     chain = makeChain(&.{
@@ -1559,10 +1560,10 @@ test "malformed framing and unknown types are safe" {
 }
 
 test "huge sector fails closed" {
-    var disk = [_]u8{0} ** sector_size;
+    var disk = @as([sector_size]u8, @splat(0));
     var blk = Blk.init(.{ .memory = &disk });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_in, .little);
     std.mem.writeInt(u64, header[8..16], std.math.maxInt(u64), .little);
     var data: [sector_size]u8 = undefined;
@@ -1578,10 +1579,10 @@ test "huge sector fails closed" {
 }
 
 test "GET_ID rejects max u32 writable byte count" {
-    var disk = [_]u8{0} ** sector_size;
+    var disk = @as([sector_size]u8, @splat(0));
     var blk = Blk.init(.{ .memory = &disk });
 
-    var header: [16]u8 = [_]u8{0} ** 16;
+    var header: [16]u8 = @splat(0);
     std.mem.writeInt(u32, header[0..4], req_get_id, .little);
     var scratch: [1]u8 = .{0xaa};
     const huge_data = scratch[0..].ptr[0..std.math.maxInt(u32)];
@@ -1602,7 +1603,7 @@ fn fuzzBlkRequest(_: void, s: *std.testing.Smith) !void {
     // Request headers, segment writability, lengths, and data are guest
     // controlled. The block parser must fail closed rather than crash or walk
     // outside its backend.
-    var disk = [_]u8{0} ** (4 * sector_size);
+    var disk = @as([(4 * sector_size)]u8, @splat(0));
     var blk = Blk.initWithOptions(.{ .memory = &disk }, .{ .write_zeroes = true });
     acceptWriteZeroes(&blk);
 
@@ -1647,8 +1648,8 @@ fn fuzzWriteZeroesSemantics(_: void, s: *std.testing.Smith) !void {
     const range_sector: u64 = s.value(u8) % disk_sectors;
     const remaining: u32 = disk_sectors - @as(u32, @intCast(range_sector));
     const num_sectors: u32 = 1 + @as(u32, s.value(u8)) % remaining;
-    var header_buf: [17]u8 = [_]u8{0} ** 17;
-    var range_buf: [16]u8 = [_]u8{0} ** 16;
+    var header_buf: [17]u8 = @splat(0);
+    var range_buf: [16]u8 = @splat(0);
     var status_buf: [2]u8 = .{ 0xff, 0xff };
     var extra_buf: [1]u8 = .{0};
     setWriteZeroesRequest(header_buf[0..16], &range_buf, range_sector, num_sectors, s.value(u8) & write_zeroes_flag_unmap);
@@ -1730,7 +1731,7 @@ test "fuzz write zeroes state transitions" {
 }
 
 test "config space reports capacity in sectors" {
-    var disk = [_]u8{0} ** (8 * sector_size);
+    var disk = @as([(8 * sector_size)]u8, @splat(0));
     var blk = Blk.init(.{ .memory = &disk });
     try std.testing.expectEqual(@as(u32, 8), Blk.configRead(&blk, 0));
     try std.testing.expectEqual(@as(u32, 0), Blk.configRead(&blk, 4));

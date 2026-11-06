@@ -111,7 +111,7 @@ pub const Cidr = struct {
 
 pub const ExactRuleConfig = struct {
     host: []const u8,
-    ports: [max_rule_ports]u16 = [_]u16{0} ** max_rule_ports,
+    ports: [max_rule_ports]u16 = @splat(0),
     port_count: usize = 0,
 
     pub fn portSlice(self: *const ExactRuleConfig) []const u16 {
@@ -378,7 +378,7 @@ fn addManifestBoundServices(
         return error.MissingBoundServiceBinding;
     }
 
-    var matched = [_]bool{false} ** max_bound_services;
+    var matched = @as([max_bound_services]bool, @splat(false));
     for (requirements) |requirement| {
         const binding_index = findBoundServiceBinding(bindings, requirement.name) orelse {
             setMissingBindingName(diagnostic, requirement.name);

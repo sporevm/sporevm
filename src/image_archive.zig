@@ -21,6 +21,7 @@ const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 const tar = @import("rootfs/tar.zig");
+const test_support = @import("test_support.zig");
 
 const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
@@ -481,7 +482,7 @@ fn verifyTarHeader(header: *const [512]u8, expected_name: []const u8, expected_s
         !std.mem.eql(u8, header[136..148], "00000000000\x00") or
         !allZero(header[157..257]) or
         !allZero(header[265..512])) return error.BadImageArchive;
-    var canonical_size = [_]u8{'0'} ** 12;
+    var canonical_size = @as([12]u8, @splat('0'));
     canonical_size[11] = 0;
     var value = expected_size;
     var position: usize = 11;
@@ -494,7 +495,7 @@ fn verifyTarHeader(header: *const [512]u8, expected_name: []const u8, expected_s
     if (!std.mem.eql(u8, header[124..136], &canonical_size)) return error.BadImageArchive;
     var sum: u64 = 0;
     for (header, 0..) |byte, index| sum += if (index >= 148 and index < 156) ' ' else byte;
-    var canonical_checksum = [_]u8{' '} ** 8;
+    var canonical_checksum = @as([8]u8, @splat(' '));
     canonical_checksum[7] = 0;
     value = sum;
     position = 7;
@@ -556,7 +557,7 @@ fn sha256FileDigestAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8)
 }
 
 fn chmodPath(allocator: std.mem.Allocator, path: []const u8, mode: std.c.mode_t) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     if (std.c.chmod(path_z.ptr, mode) != 0) return error.ImageArchiveStagingUnavailable;
 }
@@ -613,7 +614,7 @@ test "image archive must end with exactly two zero blocks after its last object"
     try std.testing.expect(allZero(seed_tar[end..]));
     try std.testing.expectError(error.ImageArchiveDigestMismatch, extractTestTar(allocator, dir, seed_tar));
 
-    const zero_blocks = [_]u8{0} ** 1024;
+    const zero_blocks = @as([1024]u8, @splat(0));
     const cases = [_][]const u8{
         seed_tar[0..end],
         seed_tar[0 .. end + 512],
@@ -647,7 +648,7 @@ fn extractTestTar(allocator: std.mem.Allocator, dir: []const u8, tar_bytes: []co
     defer allocator.free(stage_dir);
     Io.Dir.cwd().deleteTree(io, stage_dir) catch {};
     try Io.Dir.cwd().createDirPath(io, stage_dir);
-    var extracted = try extractArchive(io, allocator, archive_path, "sha256:" ++ "0" ** 64, stage_dir, .{ .os = "linux", .arch = .arm64 });
+    var extracted = try extractArchive(io, allocator, archive_path, "sha256:" ++ test_support.repeat("0", 64), stage_dir, .{ .os = "linux", .arch = .arm64 });
     extracted.deinit(allocator);
 }
 

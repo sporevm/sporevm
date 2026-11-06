@@ -1219,7 +1219,7 @@ test "MMIO data helpers zero extend reads and truncate writes" {
     var target: [8]u8 = @splat(0xa5);
     writeMmioValue(&target, 2, 0x1122_3344_5566_7788);
     try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x77 }, target[0..2]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 6), target[2..]);
+    try std.testing.expectEqualSlices(u8, &(@as([6]u8, @splat(0xa5))), target[2..]);
 }
 
 test "wake state requests and consumes immediate exit once" {

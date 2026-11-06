@@ -12,6 +12,7 @@ const Context = @import("context.zig").Context;
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
+const test_support = @import("test_support.zig");
 const memory_config = @import("memory.zig");
 const monitor_protocol = @import("monitor_protocol.zig");
 const ExecNamedStream = monitor_protocol.ExecNamedStream;
@@ -1291,7 +1292,7 @@ pub fn listStatsFromMemory(memory: ListMemory) ListStats {
 fn readBackingFileStats(allocator: std.mem.Allocator, dir: []const u8) !ListStats {
     const backing_path = try std.fs.path.resolve(allocator, &.{ dir, spore.ram_backing_path });
     defer allocator.free(backing_path);
-    const backing_path_z = try allocator.dupeZ(u8, backing_path);
+    const backing_path_z = try allocator.dupeSentinel(u8, backing_path, 0);
     defer allocator.free(backing_path_z);
 
     const fd = std.c.open(backing_path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
@@ -1396,7 +1397,7 @@ fn resolveNewOutputDirApi(allocator: std.mem.Allocator, io: Io, raw: []const u8)
 }
 
 fn absoluteExistingDirPath(allocator: std.mem.Allocator, path: []const u8) error{ OutOfMemory, InvalidOutputDir }![]const u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     var buf: [std.c.PATH_MAX]u8 = undefined;
     const resolved = std.c.realpath(path_z, &buf) orelse return error.InvalidOutputDir;
@@ -2629,8 +2630,8 @@ test "lifecycle fork leaves the source spec to its monitor" {
     defer env.deinit();
     try env.put(runtime_dir_env, root);
 
-    const old_digest = "blake3:" ++ "a" ** 64;
-    const new_digest = "blake3:" ++ "b" ** 64;
+    const old_digest = "blake3:" ++ test_support.repeat("a", 64);
+    const new_digest = "blake3:" ++ test_support.repeat("b", 64);
     const old_disk = spore.Disk{ .device = .{ .mmio_slot = 1 }, .size = spore.disk_chunk_size, .base = old_digest };
     const source_spec = Spec{
         .name = "source",

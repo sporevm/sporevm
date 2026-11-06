@@ -2482,7 +2482,7 @@ fn exitAfterCopyArchiveCleanup(archive: *named_copy_archive.TempArchive, io: Io,
 fn openHostFileRead(allocator: std.mem.Allocator, io: Io, path: []const u8) !std.c.fd_t {
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != .file) return error.NotRegularFile;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.OpenFailed;

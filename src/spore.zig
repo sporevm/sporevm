@@ -1284,7 +1284,7 @@ const testRootfs = manifest_test_support.testRootfs;
 const testTransport = manifest_test_support.testTransport;
 const testVcpuState = manifest_test_support.testVcpuState;
 fn testDirFromTemplate(allocator: std.mem.Allocator, template: []const u8) ![:0]const u8 {
-    const buf = try allocator.dupeZ(u8, template);
+    const buf = try allocator.dupeSentinel(u8, template, 0);
     if (mkdtemp(buf) == null) return error.IoFailed;
     return buf;
 }
@@ -1704,12 +1704,12 @@ test "manifest json round-trip" {
             .counter_frequency_hz = 24_000_000,
         },
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0xffff_ffc0_0000_0000,
             .cpsr = 0x3c5,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &sys_regs,
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 123, .cntv_ctl = 1, .cntv_cval = 456 },
@@ -2387,12 +2387,12 @@ test "backend-private GIC state json round-trip" {
             .counter_frequency_hz = 24_000_000,
         },
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0,
             .cpsr = 0,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
@@ -2431,12 +2431,12 @@ test "manifest rejects invalid counter frequency" {
             .counter_frequency_hz = 0,
         },
         .machine = .{ .single = .{
-            .gprs = [_]u64{0} ** 31,
+            .gprs = @splat(0),
             .pc = 0,
             .cpsr = 0,
             .fpcr = 0,
             .fpsr = 0,
-            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .simd = @splat(.{ 0, 0 }),
             .sys_regs = &.{},
             .icc_regs = &.{},
             .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },

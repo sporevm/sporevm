@@ -411,9 +411,9 @@ fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) Error![]const u
 }
 
 fn symlinkPath(target: []const u8, link_path: []const u8) Error!void {
-    const target_z = try std.heap.c_allocator.dupeZ(u8, target);
+    const target_z = try std.heap.c_allocator.dupeSentinel(u8, target, 0);
     defer std.heap.c_allocator.free(target_z);
-    const link_z = try std.heap.c_allocator.dupeZ(u8, link_path);
+    const link_z = try std.heap.c_allocator.dupeSentinel(u8, link_path, 0);
     defer std.heap.c_allocator.free(link_z);
     if (std.c.symlink(target_z, link_z) != 0) {
         if (std.c.access(link_z, 0) == 0) return error.AlreadyExists;
@@ -452,7 +452,7 @@ const writeLocalMemoryBackingProof = local_backing.writeLocalMemoryBackingProof;
 extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
 fn testDirFromTemplate(allocator: std.mem.Allocator, template: []const u8) ![:0]const u8 {
-    const buf = try allocator.dupeZ(u8, template);
+    const buf = try allocator.dupeSentinel(u8, template, 0);
     if (mkdtemp(buf) == null) return error.IoFailed;
     return buf;
 }

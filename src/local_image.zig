@@ -32,6 +32,7 @@ const oci = @import("rootfs/oci.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
+const test_support = @import("test_support.zig");
 
 pub const Platform = oci.Platform;
 
@@ -467,8 +468,8 @@ test "local image names resolve through refs, identities and derivations across 
     try std.testing.expectEqualStrings(native.identity, (try find(io, allocator, cache.root, pinned, arm64)).?.identity);
     try std.testing.expectError(error.UnsupportedPlatform, find(io, allocator, cache.root, pinned, amd64));
 
-    const manifest = "sha256:" ++ "a" ** 64;
-    const index = "sha256:" ++ "b" ** 64;
+    const manifest = "sha256:" ++ test_support.repeat("a", 64);
+    const index = "sha256:" ++ test_support.repeat("b", 64);
     const pulled = try lockAndPublish(io, allocator, cache.root, .{
         .platform = arm64,
         .storage = try cache.storage(2),
@@ -485,7 +486,7 @@ test "local image names resolve through refs, identities and derivations across 
 
     // A name keeps resolving after the builder changes; only the source
     // digest must be converted again.
-    const old_manifest = "sha256:" ++ "c" ** 64;
+    const old_manifest = "sha256:" ++ test_support.repeat("c", 64);
     const old = try lockAndPublish(io, allocator, cache.root, .{
         .platform = arm64,
         .storage = try cache.storage(3),

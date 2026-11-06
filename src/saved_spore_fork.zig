@@ -19,6 +19,7 @@ const saved_spore_pin = @import("saved_spore_pin.zig");
 const spore = @import("spore.zig");
 const spore_fork = @import("spore_fork.zig");
 const system = @import("system.zig");
+const test_support = @import("test_support.zig");
 
 const Context = context_mod.Context;
 const TestDir = @import("test_dir.zig").TestDir;
@@ -139,12 +140,12 @@ test "a save pinned by an earlier build fails as too old after GC" {
     try spore.saveManifest(arena, save, fixture.manifest);
     // An earlier build's pin: a v2 record and a v2 reference that is the
     // second link of its ownership anchor.
-    const id = "c" ** 64;
+    const id = test_support.repeat("c", 64);
     try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ cache, saved_spore_pin.dir_name }));
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try saved_spore_pin.recordPath(arena, cache, id), .data = try std.json.Stringify.valueAlloc(arena, .{
         .schema = "spore.saved-disk-pin.v2",
         .id = id,
-        .manifest_sha256 = "e" ** 64,
+        .manifest_sha256 = test_support.repeat("e", 64),
         .storage = fixture.storage,
     }, .{}) });
     const owner = try saved_spore_pin.ownerPath(arena, cache, id);

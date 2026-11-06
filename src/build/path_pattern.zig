@@ -130,8 +130,8 @@ pub const Pattern = struct {
 
     fn matchPath(self: Pattern, path: []const u8, append_slash: bool, require_accept: bool) bool {
         if (self.tokens.len > max_pattern_tokens) return false;
-        var active_storage = [_]bool{false} ** (max_pattern_tokens + 1);
-        var next_storage = [_]bool{false} ** (max_pattern_tokens + 1);
+        var active_storage = @as([(max_pattern_tokens + 1)]bool, @splat(false));
+        var next_storage = @as([(max_pattern_tokens + 1)]bool, @splat(false));
         var active = active_storage[0 .. self.tokens.len + 1];
         var next = next_storage[0 .. self.tokens.len + 1];
         active[0] = true;

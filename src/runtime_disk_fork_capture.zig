@@ -108,7 +108,7 @@ test "batch owns every cloned head until registration moves it" {
         spore.disk_chunk_size,
     );
     defer disk.deinit();
-    const patch = [_]u8{0xa5} ** 16;
+    const patch = @as([16]u8, @splat(0xa5));
     try disk.writeAt(&patch, 8);
     var batch = try prepare(allocator, .{
         .base = .{

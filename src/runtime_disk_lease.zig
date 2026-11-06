@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
+const test_support = @import("test_support.zig");
 
 const Io = std.Io;
 
@@ -101,7 +102,7 @@ pub fn lockRegistry(io: Io, allocator: std.mem.Allocator, runtime_root: []const 
     try ensurePrivateDir(io, runtime_root);
     const path = try std.fs.path.resolve(allocator, &.{ runtime_root, registry_lock_name });
     defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o600));
     if (fd < 0) return error.IoFailed;
@@ -397,7 +398,7 @@ test "scanning leases deletes records whose owner has exited" {
     var child = try std.process.spawn(io, .{ .argv = &.{"/usr/bin/true"}, .stdin = .ignore });
     const dead_pid = child.id.?;
     _ = try child.wait(io);
-    const dead_name = try std.fmt.allocPrint(allocator, "runtime-{d}-{s}.json", .{ dead_pid, "0" ** (active_nonce_bytes * 2) });
+    const dead_name = try std.fmt.allocPrint(allocator, "runtime-{d}-{s}.json", .{ dead_pid, test_support.repeat("0", (active_nonce_bytes * 2)) });
     defer allocator.free(dead_name);
     const dead_path = try std.fs.path.join(allocator, &.{ runtime_root, active_dir_name, dead_name });
     defer allocator.free(dead_path);

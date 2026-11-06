@@ -443,19 +443,19 @@ test "run request rejects guest argv count overflow" {
 }
 
 test "run request rejects guest argv length overflow" {
-    var arg = [_]u8{'a'} ** (max_guest_arg_len + 1);
+    var arg = @as([max_guest_arg_len + 1]u8, @splat('a'));
     try std.testing.expectError(error.RunArgTooLong, execRequest(std.testing.allocator, &.{arg[0..]}));
 }
 
 test "run request accepts 4096 byte argv within total request limit" {
-    var arg = [_]u8{'a'} ** 4096;
+    var arg = @as([4096]u8, @splat('a'));
     const request = try execRequest(std.testing.allocator, &.{arg[0..]});
     defer std.testing.allocator.free(request);
     try std.testing.expect(request.len > arg.len);
 }
 
 test "run request rejects encoded line overflow" {
-    var env_entry = [_]u8{'A'} ** max_guest_env_len;
+    var env_entry = @as([max_guest_env_len]u8, @splat('A'));
     var env: [max_guest_envc][]const u8 = undefined;
     for (&env) |*slot| slot.* = env_entry[0..];
     try std.testing.expectError(error.RunRequestTooLarge, execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/true"}, "default", .{ .env = &env }));

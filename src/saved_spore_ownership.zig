@@ -27,7 +27,7 @@ pub fn classify(allocator: std.mem.Allocator, spore_dir: []const u8, disk: ?spor
 fn hasBatchRelativeChunks(allocator: std.mem.Allocator, spore_dir: []const u8) !bool {
     const path = try std.fs.path.join(allocator, &.{ spore_dir, "chunks" });
     defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     if (!try pathHasKindNoFollow(path_z, .sym_link)) return false;
     var target: [64]u8 = undefined;
@@ -39,7 +39,7 @@ fn hasBatchRelativeChunks(allocator: std.mem.Allocator, spore_dir: []const u8) !
 
 fn regularPathExists(allocator: std.mem.Allocator, owned_path: []const u8) !bool {
     defer allocator.free(owned_path);
-    const path_z = try allocator.dupeZ(u8, owned_path);
+    const path_z = try allocator.dupeSentinel(u8, owned_path, 0);
     defer allocator.free(path_z);
     return pathHasKindNoFollow(path_z, .file);
 }

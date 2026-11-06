@@ -618,7 +618,7 @@ fn fuzzMmio(_: void, s: *std.testing.Smith) !void {
     // content of register accesses.
     var td = TestDev{};
     var t = Transport.init(td.dev());
-    var buf: [4096]u8 = [_]u8{0} ** 4096;
+    var buf: [4096]u8 = @splat(0);
     const ram = testRam(&buf);
     var ops: usize = 64;
     while (ops > 0 and !s.eos()) : (ops -= 1) {

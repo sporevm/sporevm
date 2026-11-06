@@ -99,7 +99,7 @@ const PendingDns = struct {
 const DnsProxy = struct {
     server_ipv4: [4]u8,
     server_port: u16 = dns_port,
-    pending: [max_pending_dns]PendingDns = [_]PendingDns{.{}} ** max_pending_dns,
+    pending: [max_pending_dns]PendingDns = @splat(.{}),
 
     const Step = union(enum) {
         not_dns,
