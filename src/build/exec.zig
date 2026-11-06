@@ -1420,6 +1420,10 @@ const GuestRequestLimits = extern struct {
     copy_entries: u64,
     build_input_disks: u64,
     nofile: u64,
+    session_id_bytes: u64,
+    generation_params_bytes: u64,
+    frame_payload_bytes: u64,
+    initial_output_bytes: u64,
 };
 extern fn spore_agent_test_request_limits(out: *GuestRequestLimits) void;
 extern fn spore_agent_test_serve_requests(captured_script: [*:0]const u8, captured_finishes: c_int, attach: [*]const u8, attach_len: usize, requests: [*]const u8, request_lens: [*]const usize, request_count: usize, response: [*]u8, response_cap: usize, captured_stdout: *u64) isize;
@@ -1578,9 +1582,14 @@ test "host request limits match the guest agent" {
     try std.testing.expectEqual(@as(u64, max_context_bind_mounts), guest.context_binds);
     try std.testing.expectEqual(@as(u64, max_copy_entry_path_len), guest.copy_path_bytes);
     try std.testing.expectEqual(@as(u64, cache_mount.max_target_bytes), guest.copy_path_bytes);
+    try std.testing.expectEqual(@as(u64, @import("../named_copy_archive.zig").max_path), guest.copy_path_bytes);
     try std.testing.expectEqual(@as(u64, max_copy_entries), guest.copy_entries);
     try std.testing.expectEqual(@as(u64, max_build_input_disks), guest.build_input_disks);
     try std.testing.expectEqual(max_build_nofile, guest.nofile);
+    try std.testing.expectEqual(@as(u64, spore.max_session_id_len), guest.session_id_bytes);
+    try std.testing.expectEqual(@as(u64, @import("../generation.zig").params_size), guest.generation_params_bytes);
+    try std.testing.expectEqual(@as(u64, @import("../spore_stream.zig").max_payload_len), guest.frame_payload_bytes);
+    try std.testing.expectEqual(@as(u64, @import("../lifecycle.zig").initial_output_limit_bytes_per_stream), guest.initial_output_bytes);
 }
 
 test "build agent fd budget covers every bounded hardlink authority" {

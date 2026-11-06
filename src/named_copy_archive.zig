@@ -16,7 +16,8 @@ const Io = std.Io;
 
 const magic = "SPCP1\n\x00\n";
 const record_header_len = 16;
-const max_path = 512;
+/// The longest record path; the guest agent's MAX_COPY_PATH_LEN.
+pub const max_path = 512;
 
 const Kind = enum(u8) {
     file = 'F',

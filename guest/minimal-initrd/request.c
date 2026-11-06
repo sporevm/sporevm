@@ -910,6 +910,10 @@ struct spore_agent_request_limits {
   uint64_t copy_entries;
   uint64_t build_input_disks;
   uint64_t nofile;
+  uint64_t session_id_bytes;
+  uint64_t generation_params_bytes;
+  uint64_t frame_payload_bytes;
+  uint64_t initial_output_bytes;
 };
 
 __attribute__((visibility("hidden"))) void spore_agent_test_request_limits(struct spore_agent_request_limits *out) {
@@ -928,6 +932,10 @@ __attribute__((visibility("hidden"))) void spore_agent_test_request_limits(struc
   out->copy_entries = MAX_BUILD_CONTEXT_COPY_ENTRIES;
   out->build_input_disks = MAX_BUILD_INPUT_DISKS;
   out->nofile = MAX_BUILD_NOFILE;
+  out->session_id_bytes = sizeof(((struct run_request *)0)->session_id) - 1;
+  out->generation_params_bytes = sizeof(((struct run_request *)0)->generation_params) - 1;
+  out->frame_payload_bytes = MAX_FRAME_PAYLOAD;
+  out->initial_output_bytes = INITIAL_OUTPUT_CAP;
 }
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_exec_arg_equals(
