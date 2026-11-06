@@ -8,6 +8,7 @@ const rootfs_mod = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
 const test_barrier = @import("test_barrier.zig");
+const TestDir = @import("test_dir.zig").TestDir;
 
 const Io = std.Io;
 pub const schema = "spore.saved-disk-pin.v3";
@@ -262,11 +263,12 @@ pub fn hasLocalIndex(io: Io, allocator: std.mem.Allocator, spore_dir: []const u8
 }
 
 /// Refuse a machine-local save before guest execution when its reference
-/// cannot be hard-linked to the cache-side owner anchor.
+/// cannot be hard-linked to the cache-side owner anchor. It compares only
+/// devices, so it follows symlinks, such as macOS's /tmp.
 pub fn ensureOwnershipLinkCompatible(allocator: std.mem.Allocator, cache_root: []const u8, spore_dir: []const u8) !void {
-    const cache_identity = try statDirectoryNoFollow(allocator, cache_root);
-    const spore_identity = statDirectoryNoFollow(allocator, spore_dir) catch |err| switch (err) {
-        error.FileNotFound => try statDirectoryNoFollow(allocator, std.fs.path.dirname(spore_dir) orelse "."),
+    const cache_identity = try statDirectory(allocator, cache_root);
+    const spore_identity = statDirectory(allocator, spore_dir) catch |err| switch (err) {
+        error.FileNotFound => try statDirectory(allocator, std.fs.path.dirname(spore_dir) orelse "."),
         else => |e| return e,
     };
     if (cache_identity.device != spore_identity.device) return error.CrossDeviceOwnershipLink;
@@ -528,23 +530,23 @@ fn validateExclusiveOwner(allocator: std.mem.Allocator, cache_root: []const u8, 
 
 const FileIdentity = struct { device: u64, inode: u64, nlink: u64 };
 
-fn statDirectoryNoFollow(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
+fn statDirectory(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    return statPathNoFollow(path_z, .directory);
+    return statPath(path_z, .directory, 0);
 }
 
 fn statRegularNoFollow(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    return statPathNoFollow(path_z, .file);
+    return statPath(path_z, .file, std.c.AT.SYMLINK_NOFOLLOW);
 }
 
-fn statPathNoFollow(path: [:0]const u8, expected: std.Io.File.Kind) !FileIdentity {
+fn statPath(path: [:0]const u8, expected: std.Io.File.Kind, flags: u32) !FileIdentity {
     if (comptime builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var stat: linux.Statx = undefined;
-        const rc = linux.statx(std.c.AT.FDCWD, path, std.c.AT.SYMLINK_NOFOLLOW, .{
+        const rc = linux.statx(std.c.AT.FDCWD, path, flags, .{
             .TYPE = true,
             .MODE = true,
             .INO = true,
@@ -569,7 +571,7 @@ fn statPathNoFollow(path: [:0]const u8, expected: std.Io.File.Kind) !FileIdentit
         };
     } else {
         var stat: std.c.Stat = undefined;
-        const rc = std.c.fstatat(std.c.AT.FDCWD, path, &stat, std.c.AT.SYMLINK_NOFOLLOW);
+        const rc = std.c.fstatat(std.c.AT.FDCWD, path, &stat, flags);
         if (rc != 0) return switch (std.c.errno(rc)) {
             .NOENT, .NOTDIR => error.FileNotFound,
             else => error.IoFailed,
@@ -735,6 +737,22 @@ fn createDirectoryExclusive(allocator: std.mem.Allocator, path: []const u8) !voi
         .EXIST => error.SavedSporePublicationRecoveryRequired,
         else => error.IoFailed,
     };
+}
+
+test "the same-filesystem check follows a symlinked parent of a new save" {
+    const io = std.testing.io;
+    var test_dir = try TestDir.init();
+    defer test_dir.deinit();
+    const allocator = test_dir.arena.allocator();
+    const root = try test_dir.dir.realPathFileAlloc(io, ".", allocator);
+    const cache = try std.fs.path.join(allocator, &.{ root, "cache" });
+    try Io.Dir.cwd().createDirPath(io, cache);
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ root, "real" }));
+    // As /tmp is on macOS, where `spore save NAME --out /tmp/x.spore` passes
+    // the absolute path through unchanged.
+    const link = try std.fs.path.join(allocator, &.{ root, "link" });
+    try Io.Dir.cwd().symLink(io, try std.fs.path.join(allocator, &.{ root, "real" }), link, .{});
+    try ensureOwnershipLinkCompatible(allocator, cache, try std.fs.path.join(allocator, &.{ link, "x.spore" }));
 }
 
 test "locked pin registry binds the exact held cache lock" {
