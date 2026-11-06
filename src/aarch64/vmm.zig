@@ -2094,7 +2094,7 @@ test "restore rejects vCPU state that does not match the VM before touching it" 
 
 const ThreadTestVm = struct {
     pub const name = "test";
-    pub const spi_needs_kick = false;
+    pub const spi_needs_kick = true;
 
     gic_layout: GicLayout = .{ .dist_base = 0, .redist_base = 0, .redist_stride = 0 },
     counter: ?u64 = null,
@@ -2114,13 +2114,14 @@ const ThreadTestVm = struct {
     }
 };
 
-/// Records which thread captured and applied it.
+/// Records which thread captured and applied it, and how often it was kicked.
 const ThreadTestVcpu = struct {
     index: topology.VcpuIndex,
     live: spore.VcpuState,
     owner: ?std.Thread.Id = null,
     on_owner: bool = true,
     applied: ?spore.VcpuState = null,
+    kicks: std.atomic.Value(u32) = .init(0),
 
     pub fn threadStart(self: *ThreadTestVcpu) !void {
         self.owner = std.Thread.getCurrentId();
@@ -2149,7 +2150,9 @@ const ThreadTestVcpu = struct {
         self.applied = state;
     }
 
-    pub fn kick(_: *ThreadTestVcpu) void {}
+    pub fn kick(self: *ThreadTestVcpu) void {
+        _ = self.kicks.fetchAdd(1, .monotonic);
+    }
 
     fn checkOwner(self: *ThreadTestVcpu) void {
         if (self.owner != std.Thread.getCurrentId()) self.on_owner = false;
@@ -2200,4 +2203,86 @@ test "threaded vCPUs restore and capture themselves on their own threads" {
         .ram_bytes = &.{},
         .ram_size = 0,
     }));
+}
+
+/// Attaches a host stream when asked to, as a monitor does to start an exec,
+/// which queues the stream's connect request for the guest.
+const AttachTestControl = struct {
+    stream: vsock_stream.HostStream,
+    attach: bool = false,
+
+    fn control(self: *AttachTestControl) vsock_control.Control {
+        return .{
+            .context = self,
+            .pollFn = poll,
+            .setWakeFn = setWake,
+            .completeSnapshotFn = completeSnapshot,
+            .completeRootfsSnapshotFn = completeRootfsSnapshot,
+            .reportStatsFn = reportStats,
+        };
+    }
+
+    fn poll(context: *anyopaque, dev: *vsock.Vsock) !vsock_control.ControlAction {
+        const self: *AttachTestControl = @ptrCast(@alignCast(context));
+        if (self.attach) try dev.attachHostStream(&self.stream);
+        self.attach = false;
+        return .keep_running;
+    }
+
+    fn setWake(_: *anyopaque, _: vsock_control.Wake) void {}
+    fn completeSnapshot(_: *anyopaque, _: []const u8) !void {}
+    fn completeRootfsSnapshot(_: *anyopaque, _: ?spore.Disk) !void {}
+    fn reportStats(_: *anyopaque, _: vsock_control.ControlStats) void {}
+};
+
+test "threaded control delivery kicks every vCPU once per delivered batch" {
+    var config = testBoot(.{ .vcpus = 2 });
+    var devices: Devices = undefined;
+    devices.init(&config, null);
+    defer devices.net.shutdown();
+
+    // The guest's vsock RX queue holds one buffer.
+    var bytes = [_]u8{0} ** 0x2000;
+    const ram = guestmem.GuestRam{ .bytes = &bytes, .base = board.ram_base };
+    const desc = board.ram_base;
+    const avail = board.ram_base + 0x400;
+    const used = board.ram_base + 0x800;
+    const rx = &devices.transports()[devices.vsock_index];
+    _ = rx.write(0x030, 0, ram);
+    _ = rx.write(0x038, 8, ram);
+    inline for (.{ .{ 0x080, desc }, .{ 0x090, avail }, .{ 0x0a0, used } }) |reg| {
+        _ = rx.write(reg[0], @truncate(reg[1]), ram);
+        _ = rx.write(reg[0] + 4, @truncate(reg[1] >> 32), ram);
+    }
+    try std.testing.expect(!rx.write(0x044, 1, ram));
+    try ram.write(u64, desc, board.ram_base + 0x1000);
+    try ram.write(u32, desc + 8, 0x100);
+    try ram.write(u16, desc + 12, 2); // VIRTQ_DESC_F_WRITE
+    try ram.write(u16, avail + 4, 0);
+    try ram.write(u16, avail + 2, 1);
+
+    var vm = ThreadTestVm{};
+    var vcpus = [_]ThreadTestVcpu{ .{ .index = 0, .live = undefined }, .{ .index = 1, .live = undefined } };
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = ram,
+        .config = &config,
+    };
+    var test_control = AttachTestControl{ .stream = try vsock_stream.HostStream.init(1024, "exec") };
+    const control = test_control.control();
+
+    // Nothing queued: the vCPUs keep running undisturbed.
+    try std.testing.expect(try threaded.pollControl(control) == .keep_running);
+    for (&vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 0), vcpu.kicks.load(.monotonic));
+
+    // A delivered packet kicks each vCPU once so it sees the interrupt.
+    test_control.attach = true;
+    try std.testing.expect(try threaded.pollControl(control) == .keep_running);
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, used + 2));
+    for (&vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 1), vcpu.kicks.load(.monotonic));
+
+    try std.testing.expect(try threaded.pollControl(control) == .keep_running);
+    for (&vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 1), vcpu.kicks.load(.monotonic));
 }
