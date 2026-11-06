@@ -1,7 +1,8 @@
 //! Local system inspection and cleanup commands.
 
 const std = @import("std");
-const Ctx = @import("cli.zig").Ctx;
+const cli = @import("cli.zig");
+const Ctx = cli.Ctx;
 const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -25,6 +26,10 @@ const test_barrier = @import("test_barrier.zig");
 const vm_registry = @import("vm_registry.zig");
 const default_prune_max_bytes = 0;
 const max_root_record_bytes = 1024 * 1024;
+
+const allocMessage = cli.allocMessage;
+const exitWithCliError = cli.exitWithCliError;
+const exitInvalidValue = cli.exitInvalidValue;
 
 pub const testing = if (builtin.is_test) struct {
     pub var gc_mutation_barrier: ?*test_barrier.Barrier = null;
@@ -583,29 +588,8 @@ pub fn cacheGcCli(ctx: *const Ctx, args: []const []const u8) !void {
     }
 }
 
-fn allocMessage(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
-    return std.fmt.allocPrint(allocator, fmt, args) catch "CLI argument error";
-}
-
 fn messageWithUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
     return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, usage }) catch message;
-}
-
-fn exitWithCliError(
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    err: machine_output.CliError,
-    human_text: []const u8,
-) noreturn {
-    if (mode == .json) {
-        machine_output.writeError(allocator, stderr, err) catch {};
-    } else {
-        stderr.writeAll(human_text) catch {};
-        if (!std.mem.endsWith(u8, human_text, "\n")) stderr.writeByte('\n') catch {};
-    }
-    stderr.flush() catch {};
-    std.process.exit(err.exit_code);
 }
 
 fn exitLocalJsonUnsupported(
@@ -638,18 +622,6 @@ fn exitMissingValue(
 ) noreturn {
     const message = allocMessage(allocator, "spore {s}: {s} requires a value", .{ command, flag });
     exitWithCliError(allocator, stderr, mode, machine_output.usageMissingArgument(message, command), message);
-}
-
-fn exitInvalidValue(
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    command: []const u8,
-    flag: []const u8,
-    value: []const u8,
-) noreturn {
-    const message = allocMessage(allocator, "spore {s}: invalid {s}: {s}", .{ command, flag, value });
-    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
 
 fn normalizePruneOptions(options: PruneOptions) !PrunePlanOptions {

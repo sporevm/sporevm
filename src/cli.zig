@@ -37,7 +37,7 @@ pub const Command = struct {
     run: *const fn (ctx: *const Ctx, args: []const []const u8) anyerror!void,
 };
 
-pub const Resolved = union(enum) {
+const Resolved = union(enum) {
     command: struct { command: *const Command, args: []const []const u8 },
     /// A group word alone or followed by `help`, `-h` or `--help`.
     group_help: []const u8,
@@ -46,7 +46,7 @@ pub const Resolved = union(enum) {
 };
 
 /// Finds the command `argv` names; `argv[0]` is the command word.
-pub fn resolve(commands: []const Command, argv: []const []const u8) Resolved {
+fn resolve(commands: []const Command, argv: []const []const u8) Resolved {
     std.debug.assert(argv.len != 0);
     const word = argv[0];
     if (!isGroup(commands, word)) {
@@ -69,6 +69,10 @@ pub fn run(commands: []const Command, ctx: *const Ctx, argv: []const []const u8)
     switch (resolve(commands, argv)) {
         .command => |found| return invoke(found.command, ctx, found.args),
         .group_help => |group| {
+            if (ctx.mode == .json and argv.len > 1) {
+                const message = allocMessage(allocator, "spore --json {s} does not print help", .{group});
+                exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, group), message);
+            }
             if (ctx.mode == .json) {
                 const message = allocMessage(allocator, "usage: spore {s} <command>", .{group});
                 exitUsage(allocator, ctx.stderr, ctx.mode, group, message);
@@ -108,7 +112,7 @@ fn invoke(command: *const Command, ctx: *const Ctx, args: []const []const u8) !v
 
 /// Whether `args` asks for a command's help: `help` alone, or `-h` or
 /// `--help` anywhere before `--`.
-pub fn wantsHelp(args: []const []const u8) bool {
+fn wantsHelp(args: []const []const u8) bool {
     if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--")) return false;
