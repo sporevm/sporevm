@@ -82,8 +82,11 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
 
     const dist_base = board.gic_dist_base;
     const redist_base = board.gic_redist_base;
-    if (dist_size != board.gic_dist_size or dist_base % dist_align != 0 or redist_base % redist_align != 0) {
-        std.log.err("HVF GIC cannot use the board layout: distributor size=0x{x} align=0x{x} redistributor align=0x{x}", .{ dist_size, dist_align, redist_align });
+    // The redistributor region covers every vCPU the VM supports.
+    if (dist_size != board.gic_dist_size or dist_base % dist_align != 0 or redist_base % redist_align != 0 or
+        redist_size > board.virtio_base - redist_base)
+    {
+        std.log.err("HVF GIC cannot use the board layout: distributor size=0x{x} align=0x{x} redistributor size=0x{x} align=0x{x}", .{ dist_size, dist_align, redist_size, redist_align });
         return error.UnsupportedHost;
     }
 
