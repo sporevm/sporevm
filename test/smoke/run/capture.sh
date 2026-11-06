@@ -113,6 +113,44 @@ grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore attach --events=jsonl 
 grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore attach --events=jsonl did not report local RAM restore"
 grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore attach --events=jsonl did not report proof-backed restore"
 
+# A guest that powers off before its command exits has no exit status, so run
+# and attach must fail with ProbeDidNotComplete rather than report exit 0.
+expect_probe_incomplete() {
+  local label="$1" rc="$2" jsonl="$3" stderr="$4"
+  [[ "${rc}" != "0" ]] && grep -Fq '"source":"ProbeDidNotComplete"' "${jsonl}" && return
+  cat "${jsonl}" "${stderr}" >&2 || true
+  die "${label} of a guest that powers off exited ${rc} without ProbeDidNotComplete"
+}
+set +e
+"${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" --events=jsonl -- /bin/poweroff \
+  >"${workdir}/poweroff-run.jsonl" 2>"${workdir}/poweroff-run.stderr"
+poweroff_rc="$?"
+set -e
+expect_probe_incomplete "spore run" "${poweroff_rc}" "${workdir}/poweroff-run.jsonl" "${workdir}/poweroff-run.stderr"
+
+# The guest powers itself off 5 s in, so this run ends even if the save does not.
+poweroff_dir="${workdir}/poweroff.spore"
+"${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" \
+  --save "${poweroff_dir}" --save-on USR1 -- /bin/poweroff 5 \
+  >"${workdir}/poweroff-save.stdout" 2>"${workdir}/poweroff-save.stderr" &
+run_pid="$!"
+for _ in $(seq 1 "${SPORE_SMOKE_CAPTURE_POLLS:-120}"); do
+  grep -Fxq "spore poweroff ready" "${workdir}/poweroff-save.stdout" && break
+  sleep "${SPORE_SMOKE_CAPTURE_POLL_INTERVAL:-0.1}"
+done
+sleep "${SPORE_SMOKE_CAPTURE_SETTLE_SECONDS:-0.3}"
+kill -USR1 "${run_pid}" || true
+wait "${run_pid}" && [[ -f "${poweroff_dir}/manifest.json" ]] || {
+  cat "${workdir}/poweroff-save.stderr" >&2 || true
+  die "spore run did not save the guest before it powered off"
+}
+set +e
+with_timeout 60 "${spore_bin}" attach --events=jsonl --backend "${backend}" "${poweroff_dir}" \
+  >"${workdir}/poweroff-attach.jsonl" 2>"${workdir}/poweroff-attach.stderr"
+poweroff_rc="$?"
+set -e
+expect_probe_incomplete "spore attach" "${poweroff_rc}" "${workdir}/poweroff-attach.jsonl" "${workdir}/poweroff-attach.stderr"
+
 # Two vCPUs: the first command after restoring a finished multi-vCPU guest
 # once hung on a lost wakeup.
 "${spore_bin}" run \
