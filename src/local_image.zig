@@ -510,8 +510,10 @@ test "local image names resolve through refs, identities and derivations across 
 test "a local name's ref does not depend on the rootfs builder" {
     // Refs used to be keyed by the rootfs builder version, so a builder bump
     // orphaned every `local/...` name. This is the ref the current format
-    // writes for `local/app:dev` on linux/arm64; with no builder in its path
-    // or record, the name keeps resolving whatever the builder.
+    // writes for `local/app:dev` on linux/arm64, named
+    // `sha256("spore-image-ref-v1\nlinux\narm64\nlocal/app:dev\n")`; with no
+    // builder in its path or record, the name keeps resolving whatever the
+    // builder.
     const io = std.testing.io;
     var cache = try TestCache.init();
     defer cache.deinit();

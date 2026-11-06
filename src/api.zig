@@ -88,9 +88,7 @@ pub const Backend = run_mod.Backend;
 pub const MemoryConfig = run_mod.MemoryConfig;
 pub const SaveTrigger = run_mod.SaveTrigger;
 pub const ImagePullPolicy = run_mod.PullPolicy;
-pub const NetworkMode = run_mod.NetworkMode;
-pub const NetworkConfig = run_mod.NetworkPolicy;
-pub const NetworkPolicy = spore_net_policy.NetworkPolicy;
+pub const Network = run_mod.Network;
 pub const BoundServiceBinding = spore_net_policy.BoundServiceBinding;
 pub const BoundServiceBindingDiagnostic = spore_net_policy.BoundServiceBindingDiagnostic;
 pub const Rootfs = run_mod.Rootfs;
@@ -152,8 +150,7 @@ pub const ManagedRunOptions = struct {
     /// Absolute logical root-disk size for a commit run. Must not shrink the source image.
     disk_size: ?u64 = null,
     annotations: Annotations = .{},
-    network: NetworkMode = .disabled,
-    network_policy: NetworkConfig = .{},
+    network: Network = .disabled,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     /// Optional synchronous event sink. Output byte slices are callback-scoped.
@@ -676,7 +673,6 @@ pub fn runManaged(
         } else null,
         .annotations = options.annotations,
         .network = options.network,
-        .network_policy = options.network_policy,
         .spore_executable = options.spore_executable,
         .debug = options.debug,
         .events = options.events,
@@ -708,7 +704,7 @@ pub fn runFromSpore(
 
     const rootfs = try run_mod.resumeRootfsForRun(arena, manifest);
     const disk = try run_mod.resumeDiskForRun(arena, manifest);
-    const network_options = try run_mod.networkOptionsFromManifestWithBindingDiagnostic(arena, manifest.network, options.bound_services, options.bound_service_diagnostic);
+    const network = try run_mod.networkFromManifestWithBindingDiagnostic(arena, manifest.network, options.bound_services, options.bound_service_diagnostic);
     if (options.vcpus != 1 and options.vcpus != manifest.platform.vcpu_count) return error.PlatformMismatch;
     const explicit_generation_params = if (options.generation_path) |path|
         attach_mod.loadGenerationParams(context.io, arena, path) catch |err| switch (err) {
@@ -742,8 +738,7 @@ pub fn runFromSpore(
         .save_trigger = options.save_trigger,
         .continue_after_save = options.continue_after_save,
         .annotations = manifest.annotations,
-        .network = network_options.network,
-        .network_policy = network_options.policy,
+        .network = network,
         .spore_executable = options.spore_executable,
         .debug = options.debug,
         .events = options.events,

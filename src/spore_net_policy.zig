@@ -69,28 +69,9 @@ pub fn capabilities() NetworkCapabilities {
     };
 }
 
-pub const NetworkDefault = enum { deny };
-
-pub const NetworkRule = struct {
-    host: []const u8,
-    ports: []const u16,
-};
-
-pub const NetworkPolicy = struct {
-    default: NetworkDefault = .deny,
-    allow: []const NetworkRule = &.{},
-};
-
 pub const BoundServiceTarget = union(enum) {
     unix: []const u8,
     tcp: struct { host: []const u8, port: u16 },
-};
-
-pub const BoundService = struct {
-    name: []const u8,
-    guest_host: []const u8,
-    guest_port: u16,
-    target: BoundServiceTarget,
 };
 
 pub const BoundServiceBinding = struct {
@@ -129,7 +110,7 @@ pub const Cidr = struct {
 };
 
 pub const ExactRuleConfig = struct {
-    host: []const u8 = "",
+    host: []const u8,
     ports: [max_rule_ports]u16 = [_]u16{0} ** max_rule_ports,
     port_count: usize = 0,
 
@@ -146,42 +127,65 @@ pub const ExactRuleConfig = struct {
 };
 
 pub const BoundServiceConfig = struct {
-    name: []const u8 = "",
-    guest_host: []const u8 = "",
-    guest_port: u16 = 0,
-    unix_path: []const u8 = "",
+    name: []const u8,
+    guest_host: []const u8,
+    guest_port: u16,
+    unix_path: []const u8,
 };
 
 pub const PortForwardConfig = struct {
-    host_port: u16 = 0,
-    guest_port: u16 = 0,
+    host_port: u16,
+    guest_port: u16,
+};
+
+/// Public egress for a spore-managed network. Every policy states which one
+/// it means; there is no default, so a forgotten field cannot open egress.
+pub const Egress = union(enum) {
+    unrestricted,
+    /// Only the listed destinations are reachable. An empty allowlist denies
+    /// all public egress.
+    allowlist: Allowlist,
+
+    pub const deny_all: Egress = .{ .allowlist = .{} };
+};
+
+pub const Allowlist = struct {
+    cidrs: [max_allow_cidrs][]const u8 = undefined,
+    cidr_count: usize = 0,
+    hosts: [max_allow_hosts][]const u8 = undefined,
+    host_count: usize = 0,
+    exact_rules: [max_exact_rules]ExactRuleConfig = undefined,
+    exact_rule_count: usize = 0,
 };
 
 pub const Config = struct {
-    default_deny: bool = false,
-    allow_cidrs: [max_allow_cidrs][]const u8 = [_][]const u8{""} ** max_allow_cidrs,
-    allow_cidr_count: usize = 0,
-    allow_hosts: [max_allow_hosts][]const u8 = [_][]const u8{""} ** max_allow_hosts,
-    allow_host_count: usize = 0,
-    exact_rules: [max_exact_rules]ExactRuleConfig = [_]ExactRuleConfig{.{}} ** max_exact_rules,
-    exact_rule_count: usize = 0,
-    bound_services: [max_bound_services]BoundServiceConfig = [_]BoundServiceConfig{.{}} ** max_bound_services,
+    egress: Egress,
+    bound_services: [max_bound_services]BoundServiceConfig = undefined,
     bound_service_count: usize = 0,
-    port_forwards: [max_port_forwards]PortForwardConfig = [_]PortForwardConfig{.{}} ** max_port_forwards,
+    port_forwards: [max_port_forwards]PortForwardConfig = undefined,
     port_forward_count: usize = 0,
+
+    /// Allow rules restrict egress: the first one added to an unrestricted
+    /// config turns it into an allowlist holding only that rule.
+    fn allowlist(self: *Config) *Allowlist {
+        if (self.egress == .unrestricted) self.egress = .deny_all;
+        return &self.egress.allowlist;
+    }
 
     pub fn addAllowCidr(self: *Config, raw: []const u8) ParseError!void {
         _ = try parseCidr(raw);
-        if (self.allow_cidr_count >= max_allow_cidrs) return error.TooManyAllowCidrs;
-        self.allow_cidrs[self.allow_cidr_count] = raw;
-        self.allow_cidr_count += 1;
+        const list = self.allowlist();
+        if (list.cidr_count >= max_allow_cidrs) return error.TooManyAllowCidrs;
+        list.cidrs[list.cidr_count] = raw;
+        list.cidr_count += 1;
     }
 
     pub fn addAllowHost(self: *Config, raw: []const u8) ParseError!void {
         try validateHost(raw);
-        if (self.allow_host_count >= max_allow_hosts) return error.TooManyAllowHosts;
-        self.allow_hosts[self.allow_host_count] = raw;
-        self.allow_host_count += 1;
+        const list = self.allowlist();
+        if (list.host_count >= max_allow_hosts) return error.TooManyAllowHosts;
+        list.hosts[list.host_count] = raw;
+        list.host_count += 1;
     }
 
     /// Adds a CLI `NAME[:PORT]=unix:/path.sock` binding, exposed to the guest
@@ -209,19 +213,10 @@ pub const Config = struct {
         try self.addBoundUnixService(name, guest_host, guest_port, path);
     }
 
-    pub fn addNetworkPolicy(self: *Config, policy: NetworkPolicy) ParseError!void {
-        if (policy.default != .deny) return error.InvalidNetworkPolicy;
-        self.default_deny = true;
-        for (policy.allow) |rule| {
-            try self.addExactHostPorts(rule.host, rule.ports);
-        }
-    }
-
     pub fn addExactHostPorts(self: *Config, host: []const u8, ports: []const u16) ParseError!void {
         try validateHost(host);
         if (ports.len == 0) return error.InvalidPort;
         if (ports.len > max_rule_ports) return error.TooManyRulePorts;
-        if (self.exact_rule_count >= max_exact_rules) return error.TooManyExactRules;
         var rule = ExactRuleConfig{ .host = host };
         for (ports) |port| {
             if (port == 0) return error.InvalidPort;
@@ -230,15 +225,10 @@ pub const Config = struct {
                 rule.port_count += 1;
             }
         }
-        self.exact_rules[self.exact_rule_count] = rule;
-        self.exact_rule_count += 1;
-    }
-
-    pub fn addBoundService(self: *Config, service: BoundService) ParseError!void {
-        switch (service.target) {
-            .unix => |path| try self.addBoundUnixService(service.name, service.guest_host, service.guest_port, path),
-            .tcp => return error.UnsupportedBoundServiceTarget,
-        }
+        const list = self.allowlist();
+        if (list.exact_rule_count >= max_exact_rules) return error.TooManyExactRules;
+        list.exact_rules[list.exact_rule_count] = rule;
+        list.exact_rule_count += 1;
     }
 
     pub fn addBoundUnixService(self: *Config, name: []const u8, guest_host: []const u8, guest_port: u16, unix_path: []const u8) ParseError!void {
@@ -272,11 +262,9 @@ pub const Config = struct {
         self.port_forward_count += 1;
     }
 
+    /// Whether anything beyond unrestricted egress was configured.
     pub fn hasRules(self: Config) bool {
-        return self.default_deny or
-            self.allow_cidr_count != 0 or
-            self.allow_host_count != 0 or
-            self.exact_rule_count != 0 or
+        return self.egress == .allowlist or
             self.bound_service_count != 0 or
             self.port_forward_count != 0;
     }
@@ -286,15 +274,24 @@ pub const Config = struct {
     }
 
     pub fn allowCidrSlice(self: *const Config) []const []const u8 {
-        return self.allow_cidrs[0..self.allow_cidr_count];
+        return switch (self.egress) {
+            .unrestricted => &.{},
+            .allowlist => |*list| list.cidrs[0..list.cidr_count],
+        };
     }
 
     pub fn allowHostSlice(self: *const Config) []const []const u8 {
-        return self.allow_hosts[0..self.allow_host_count];
+        return switch (self.egress) {
+            .unrestricted => &.{},
+            .allowlist => |*list| list.hosts[0..list.host_count],
+        };
     }
 
     pub fn exactRuleSlice(self: *const Config) []const ExactRuleConfig {
-        return self.exact_rules[0..self.exact_rule_count];
+        return switch (self.egress) {
+            .unrestricted => &.{},
+            .allowlist => |*list| list.exact_rules[0..list.exact_rule_count],
+        };
     }
 
     pub fn boundServiceSlice(self: *const Config) []const BoundServiceConfig {
@@ -326,11 +323,13 @@ pub fn configFromManifestNetworkWithBindingDiagnostic(
 ) !Config {
     if (diagnostic) |diag| diag.* = .{};
     try spore.validateNetwork(network);
-    var policy = Config{};
+    var policy = Config{ .egress = .unrestricted };
     if (network.default_action) |action| {
         if (!std.mem.eql(u8, action, spore.network_default_deny)) return error.InvalidNetworkPolicy;
-        policy.default_deny = true;
+        policy.egress = .deny_all;
     }
+    // Any allow entry restricts egress to the allowlist, with or without
+    // `default_action`.
     for (network.allow_cidrs) |cidr| {
         try policy.addAllowCidr(try allocator.dupe(u8, cidr));
     }
@@ -432,7 +431,7 @@ fn findBoundServiceBinding(bindings: []const BoundServiceBinding, name: []const 
 }
 
 pub fn manifestNetworkFromConfig(allocator: std.mem.Allocator, policy: *const Config) !spore.Network {
-    const exact_rules = try allocator.alloc(spore.NetworkHostPortRule, policy.exact_rule_count);
+    const exact_rules = try allocator.alloc(spore.NetworkHostPortRule, policy.exactRuleSlice().len);
     for (policy.exactRuleSlice(), exact_rules) |*rule, *out| {
         out.* = .{
             .host = rule.host,
@@ -448,42 +447,54 @@ pub fn manifestNetworkFromConfig(allocator: std.mem.Allocator, policy: *const Co
         };
     }
     return .{
-        .default_action = if (policy.default_deny) spore.network_default_deny else null,
+        .default_action = switch (policy.egress) {
+            .unrestricted => null,
+            .allowlist => spore.network_default_deny,
+        },
         .allow_cidrs = policy.allowCidrSlice(),
         .allow_hosts = policy.allowHostSlice(),
         .allow_host_ports = exact_rules,
         .bound_services = bound_services,
         .requirements = .{
-            .exact_host_port = policy.default_deny or policy.exact_rule_count != 0,
+            .exact_host_port = policy.exactRuleSlice().len != 0,
             .bound_services = policy.bound_service_count != 0,
         },
     };
 }
 
 /// Argument form of a `Config` for the CLI -> monitor -> netd process hops.
-/// Every hop is a re-exec of the same binary, so the shape is internal. All
-/// top-level fields are required, so a dropped field fails closed instead of
-/// defaulting to a more permissive policy.
+/// Every hop is a re-exec of the same binary, so the shape is internal. Every
+/// field is required and egress is a tagged union, so a dropped field or an
+/// unknown egress kind fails closed instead of defaulting to a more
+/// permissive policy.
 const PolicyArg = struct {
-    default_deny: bool,
-    allow_cidrs: []const []const u8,
-    allow_hosts: []const []const u8,
-    allow_host_ports: []const spore.NetworkHostPortRule,
+    egress: union(enum) {
+        unrestricted,
+        allowlist: struct {
+            cidrs: []const []const u8,
+            hosts: []const []const u8,
+            host_ports: []const spore.NetworkHostPortRule,
+        },
+    },
     bound_services: []const BoundServiceConfig,
     port_forwards: []const PortForwardConfig,
 };
 
 pub fn encodeArgAlloc(allocator: std.mem.Allocator, config: *const Config) std.mem.Allocator.Error![]u8 {
-    const host_ports = try allocator.alloc(spore.NetworkHostPortRule, config.exact_rule_count);
+    const host_ports = try allocator.alloc(spore.NetworkHostPortRule, config.exactRuleSlice().len);
     defer allocator.free(host_ports);
     for (config.exactRuleSlice(), host_ports) |*rule, *out| {
         out.* = .{ .host = rule.host, .ports = rule.portSlice() };
     }
     return std.json.Stringify.valueAlloc(allocator, PolicyArg{
-        .default_deny = config.default_deny,
-        .allow_cidrs = config.allowCidrSlice(),
-        .allow_hosts = config.allowHostSlice(),
-        .allow_host_ports = host_ports,
+        .egress = switch (config.egress) {
+            .unrestricted => .unrestricted,
+            .allowlist => .{ .allowlist = .{
+                .cidrs = config.allowCidrSlice(),
+                .hosts = config.allowHostSlice(),
+                .host_ports = host_ports,
+            } },
+        },
         .bound_services = config.boundServiceSlice(),
         .port_forwards = config.portForwardSlice(),
     }, .{});
@@ -496,10 +507,16 @@ pub fn parseArg(allocator: std.mem.Allocator, bytes: []const u8) (ParseError || 
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidNetworkPolicy,
     };
-    var config = Config{ .default_deny = arg.default_deny };
-    for (arg.allow_cidrs) |cidr| try config.addAllowCidr(cidr);
-    for (arg.allow_hosts) |host| try config.addAllowHost(host);
-    for (arg.allow_host_ports) |rule| try config.addExactHostPorts(rule.host, rule.ports);
+    var config = Config{ .egress = .unrestricted };
+    switch (arg.egress) {
+        .unrestricted => {},
+        .allowlist => |list| {
+            config.egress = .deny_all;
+            for (list.cidrs) |cidr| try config.addAllowCidr(cidr);
+            for (list.hosts) |host| try config.addAllowHost(host);
+            for (list.host_ports) |rule| try config.addExactHostPorts(rule.host, rule.ports);
+        },
+    }
     for (arg.bound_services) |service| {
         try config.addBoundUnixService(service.name, service.guest_host, service.guest_port, service.unix_path);
     }
@@ -518,14 +535,14 @@ const LearnedExactHostIp = struct {
 };
 
 pub const Runtime = struct {
-    default_deny: bool = false,
+    unrestricted: bool,
     allow_cidrs: [max_allow_cidrs]Cidr = undefined,
     allow_cidr_count: usize = 0,
-    allow_hosts: [max_allow_hosts][]const u8 = [_][]const u8{""} ** max_allow_hosts,
+    allow_hosts: [max_allow_hosts][]const u8 = undefined,
     allow_host_count: usize = 0,
-    exact_rules: [max_exact_rules]ExactRuleConfig = [_]ExactRuleConfig{.{}} ** max_exact_rules,
+    exact_rules: [max_exact_rules]ExactRuleConfig = undefined,
     exact_rule_count: usize = 0,
-    bound_services: [max_bound_services]BoundServiceConfig = [_]BoundServiceConfig{.{}} ** max_bound_services,
+    bound_services: [max_bound_services]BoundServiceConfig = undefined,
     bound_service_count: usize = 0,
     learned_host_ips: [max_learned_host_ips]LearnedHostIp = undefined,
     learned_host_ip_count: usize = 0,
@@ -533,8 +550,7 @@ pub const Runtime = struct {
     learned_exact_host_ip_count: usize = 0,
 
     pub fn init(config: Config) ParseError!Runtime {
-        var runtime = Runtime{};
-        runtime.default_deny = config.default_deny;
+        var runtime = Runtime{ .unrestricted = config.egress == .unrestricted };
         for (config.allowCidrSlice()) |raw| {
             runtime.allow_cidrs[runtime.allow_cidr_count] = try parseCidr(raw);
             runtime.allow_cidr_count += 1;
@@ -564,6 +580,7 @@ pub const Runtime = struct {
 
     pub fn decideIpv4Port(self: *const Runtime, addr: [4]u8, port: u16) Decision {
         if (isHardFloorBlocked(addr)) return .deny_hard_floor;
+        if (self.unrestricted) return .allow;
         for (self.allow_cidrs[0..self.allow_cidr_count]) |cidr| {
             if (cidr.contains(addr)) return .allow;
         }
@@ -576,7 +593,6 @@ pub const Runtime = struct {
                 if (self.exact_rules[learned.rule_index].containsPort(port)) return .allow;
             }
         }
-        if (!self.default_deny and !self.hasAllowRules()) return .allow;
         return .deny_not_allowed;
     }
 
@@ -657,7 +673,7 @@ pub const Runtime = struct {
     }
 
     pub fn dnsForwardDecision(self: *const Runtime, packet: []const u8, name_offset: usize, qtype: u16, qclass: u16) DnsForwardDecision {
-        if (!self.restrictsPublicEgress()) return .forward;
+        if (self.unrestricted) return .forward;
         const allowed_name = if (self.allowedHostIndexForDnsName(packet, name_offset) != null)
             true
         else allowed: {
@@ -681,14 +697,6 @@ pub const Runtime = struct {
             if (service.guest_port == port) return service;
         }
         return null;
-    }
-
-    fn hasAllowRules(self: *const Runtime) bool {
-        return self.allow_cidr_count != 0 or self.allow_host_count != 0 or self.exact_rule_count != 0;
-    }
-
-    fn restrictsPublicEgress(self: *const Runtime) bool {
-        return self.default_deny or self.hasAllowRules();
     }
 
     fn allowedHostIndexForDnsName(self: *const Runtime, packet: []const u8, offset: usize) ?usize {
@@ -1077,7 +1085,7 @@ fn dnsTestNameLen(name: []const u8) usize {
 }
 
 test "spore-net policy allow host learns A records behind a CNAME chain" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("dl-cdn.alpinelinux.org");
     var policy = try Runtime.init(config);
 
@@ -1095,7 +1103,7 @@ test "spore-net policy allow host learns A records behind a CNAME chain" {
 }
 
 test "spore-net exact policy learns A records behind a CNAME chain" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addExactHostPorts("dl-cdn.alpinelinux.org", &.{443});
     var policy = try Runtime.init(config);
 
@@ -1112,7 +1120,7 @@ test "spore-net exact policy learns A records behind a CNAME chain" {
 }
 
 test "spore-net policy follows multi-hop CNAME chains" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try Runtime.init(config);
 
@@ -1129,7 +1137,7 @@ test "spore-net policy follows multi-hop CNAME chains" {
 }
 
 test "spore-net policy ignores A records not chained from the query name" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try Runtime.init(config);
 
@@ -1147,7 +1155,7 @@ test "spore-net policy ignores A records not chained from the query name" {
 }
 
 test "spore-net policy ignores CNAME records not chained from the query name" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try Runtime.init(config);
 
@@ -1165,7 +1173,7 @@ test "spore-net policy ignores CNAME records not chained from the query name" {
 }
 
 test "spore-net policy bounds CNAME chain length" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("h.example");
     var policy = try Runtime.init(config);
 
@@ -1191,7 +1199,7 @@ test "spore-net policy bounds CNAME chain length" {
 }
 
 test "spore-net policy CNAME loops terminate and learn nothing extra" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try Runtime.init(config);
 
@@ -1208,7 +1216,7 @@ test "spore-net policy CNAME loops terminate and learn nothing extra" {
 }
 
 fn fuzzNoteDnsResponse(_: void, s: *std.testing.Smith) !void {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     config.addAllowHost("example.com") catch return;
     config.addExactHostPorts("cdn.example.com", &.{443}) catch return;
     var policy = Runtime.init(config) catch return;
@@ -1233,14 +1241,14 @@ test "fuzz spore-net policy DNS answer learning" {
     try std.testing.fuzz({}, fuzzNoteDnsResponse, .{});
 }
 
-test "spore-net policy default allows public and blocks hard floor" {
-    const policy = try Runtime.init(.{});
+test "spore-net policy unrestricted egress allows public and blocks hard floor" {
+    const policy = try Runtime.init(.{ .egress = .unrestricted });
     try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 93, 184, 216, 34 }));
     try std.testing.expectEqual(Decision.deny_hard_floor, policy.decideIpv4(.{ 169, 254, 169, 254 }));
 }
 
 test "spore-net policy allow CIDR uses exact prefix matches" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowCidr("93.184.216.0/24");
     const policy = try Runtime.init(config);
     try std.testing.expectEqual(Decision.allow, policy.decideIpv4(.{ 93, 184, 216, 34 }));
@@ -1248,14 +1256,14 @@ test "spore-net policy allow CIDR uses exact prefix matches" {
 }
 
 test "spore-net policy hard floor wins over allow CIDR" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowCidr("169.254.0.0/16");
     const policy = try Runtime.init(config);
     try std.testing.expectEqual(Decision.deny_hard_floor, policy.decideIpv4(.{ 169, 254, 169, 254 }));
 }
 
 test "spore-net policy allow host learns matching public DNS answers" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try Runtime.init(config);
 
@@ -1270,7 +1278,7 @@ test "spore-net policy allow host learns matching public DNS answers" {
 }
 
 test "spore-net policy ignores unrelated additional DNS answer owners" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try Runtime.init(config);
 
@@ -1283,7 +1291,7 @@ test "spore-net policy ignores unrelated additional DNS answer owners" {
 }
 
 test "spore-net policy DNS rebinding answers cannot override hard floor" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try Runtime.init(config);
 
@@ -1299,7 +1307,7 @@ test "spore-net policy DNS rebinding answers cannot override hard floor" {
 test "spore-net policy parses bound unix service declarations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var config = Config{};
+    var config = Config{ .egress = .unrestricted };
     try config.addBindService(arena.allocator(), "metadata=unix:/tmp/metadata.sock");
     try config.addBindService(arena.allocator(), "cache:8080=unix:/tmp/cache.sock");
 
@@ -1336,7 +1344,7 @@ test "spore-net policy parses bound unix service bindings" {
 
 test "spore-net policy rejects invalid bound service declarations" {
     const allocator = std.testing.allocator;
-    var config = Config{};
+    var config = Config{ .egress = .unrestricted };
     try std.testing.expectError(error.InvalidBoundService, config.addBindService(allocator, "metadata"));
     try std.testing.expectError(error.InvalidBoundServiceName, config.addBindService(allocator, "MetaData=unix:/tmp/metadata.sock"));
     try std.testing.expectError(error.InvalidPort, config.addBindService(allocator, "metadata:0=unix:/tmp/metadata.sock"));
@@ -1347,7 +1355,7 @@ test "spore-net policy rejects invalid bound service declarations" {
 test "spore-net CLI bound services produce a valid saved manifest network" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var config = Config{};
+    var config = Config{ .egress = .unrestricted };
     try config.addBindService(arena.allocator(), "metadata:8080=unix:/tmp/metadata.sock");
 
     const network = try manifestNetworkFromConfig(arena.allocator(), &config);
@@ -1358,52 +1366,79 @@ test "spore-net CLI bound services produce a valid saved manifest network" {
     try std.testing.expectEqual(@as(u16, 8080), network.bound_services[0].guest_port);
 }
 
-test "spore-net policy argument round trips every rule kind" {
+fn expectEqualConfig(expected: *const Config, actual: *const Config) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected.egress), std.meta.activeTag(actual.egress));
+    try std.testing.expectEqualDeep(expected.allowCidrSlice(), actual.allowCidrSlice());
+    try std.testing.expectEqualDeep(expected.allowHostSlice(), actual.allowHostSlice());
+    try std.testing.expectEqualDeep(expected.exactRuleSlice(), actual.exactRuleSlice());
+    try std.testing.expectEqualDeep(expected.boundServiceSlice(), actual.boundServiceSlice());
+    try std.testing.expectEqualDeep(expected.portForwardSlice(), actual.portForwardSlice());
+}
+
+test "spore-net policy argument round trips every egress variant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var config = Config{};
-    try config.addNetworkPolicy(.{ .allow = &.{
-        .{ .host = "github.com", .ports = &.{ 443, 22 } },
-        .{ .host = "example.com", .ports = &.{80} },
-    } });
-    try config.addAllowCidr("93.184.216.34/32");
-    try config.addAllowHost("example.org");
-    try config.addBindService(allocator, "metadata:8080=unix:/tmp/metadata.sock");
-    try config.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/gateway.sock");
-    try config.addPortForward("127.0.0.1:18080:80");
 
-    const parsed = try parseArg(allocator, try encodeArgAlloc(allocator, &config));
-    try std.testing.expectEqualDeep(config, parsed);
+    var unrestricted = Config{ .egress = .unrestricted };
+    try unrestricted.addBindService(allocator, "metadata:8080=unix:/tmp/metadata.sock");
+    try unrestricted.addPortForward("127.0.0.1:18080:80");
+
+    const deny_all = Config{ .egress = .deny_all };
+
+    var allowlist = Config{ .egress = .deny_all };
+    try allowlist.addExactHostPorts("github.com", &.{ 443, 22 });
+    try allowlist.addExactHostPorts("example.com", &.{80});
+    try allowlist.addAllowCidr("93.184.216.34/32");
+    try allowlist.addAllowHost("example.org");
+    try allowlist.addBindService(allocator, "metadata:8080=unix:/tmp/metadata.sock");
+    try allowlist.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/gateway.sock");
+    try allowlist.addPortForward("127.0.0.1:18080:80");
+
+    for ([_]*const Config{ &unrestricted, &deny_all, &allowlist }) |config| {
+        const parsed = try parseArg(allocator, try encodeArgAlloc(allocator, config));
+        try expectEqualConfig(config, &parsed);
+    }
+
+    const open = try Runtime.init(try parseArg(allocator, try encodeArgAlloc(allocator, &unrestricted)));
+    try std.testing.expectEqual(Decision.allow, open.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+    const closed = try Runtime.init(try parseArg(allocator, try encodeArgAlloc(allocator, &deny_all)));
+    try std.testing.expectEqual(Decision.deny_not_allowed, closed.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
 }
 
-test "spore-net policy argument keeps default deny with no rules" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var config = Config{};
-    try config.addNetworkPolicy(.{});
-
-    const parsed = try parseArg(arena.allocator(), try encodeArgAlloc(arena.allocator(), &config));
-    try std.testing.expectEqualDeep(config, parsed);
-    const policy = try Runtime.init(parsed);
-    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
-}
-
-test "spore-net policy argument rejects missing fields and invalid rules" {
+test "spore-net policy argument rejects missing fields, unknown egress and invalid rules" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    try std.testing.expectError(error.InvalidNetworkPolicy, parseArg(allocator,
-        \\{"allow_cidrs":[],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[]}
-    ));
-    try std.testing.expectError(error.InvalidNetworkPolicy, parseArg(allocator,
-        \\{"default_deny":true,"allow_cidrs":[],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[],"default_allow":true}
-    ));
+    for ([_][]const u8{
+        // No egress at all.
+        \\{"bound_services":[],"port_forwards":[]}
+        ,
+        // The pre-egress shape, whose `default_deny:false` meant unrestricted.
+        \\{"default_deny":false,"allow_cidrs":[],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[]}
+        ,
+        \\{"egress":{},"bound_services":[],"port_forwards":[]}
+        ,
+        \\{"egress":{"allow_all":{}},"bound_services":[],"port_forwards":[]}
+        ,
+        \\{"egress":{"unrestricted":{},"allowlist":{"cidrs":[],"hosts":[],"host_ports":[]}},"bound_services":[],"port_forwards":[]}
+        ,
+        \\{"egress":{"allowlist":{}},"bound_services":[],"port_forwards":[]}
+        ,
+        \\{"egress":{"unrestricted":{}},"bound_services":[{"name":"metadata","guest_port":80,"unix_path":"/tmp/metadata.sock"}],"port_forwards":[]}
+        ,
+        \\{"egress":{"unrestricted":{}},"bound_services":[],"port_forwards":[],"default_allow":true}
+    }) |bytes| {
+        try std.testing.expectError(error.InvalidNetworkPolicy, parseArg(allocator, bytes));
+    }
     try std.testing.expectError(error.InvalidCidr, parseArg(allocator,
-        \\{"default_deny":true,"allow_cidrs":["10.0.0.0/33"],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[]}
+        \\{"egress":{"allowlist":{"cidrs":["10.0.0.0/33"],"hosts":[],"host_ports":[]}},"bound_services":[],"port_forwards":[]}
+    ));
+    try std.testing.expectError(error.InvalidHost, parseArg(allocator,
+        \\{"egress":{"unrestricted":{}},"bound_services":[{"name":"metadata","guest_host":"","guest_port":80,"unix_path":"/tmp/metadata.sock"}],"port_forwards":[]}
     ));
     try std.testing.expectError(error.InvalidPortForward, parseArg(allocator,
-        \\{"default_deny":false,"allow_cidrs":[],"allow_hosts":[],"allow_host_ports":[],"bound_services":[],"port_forwards":[{"host_port":0,"guest_port":80}]}
+        \\{"egress":{"unrestricted":{}},"bound_services":[],"port_forwards":[{"host_port":0,"guest_port":80}]}
     ));
 }
 
@@ -1415,13 +1450,16 @@ fn fuzzPolicyArg(_: void, s: *std.testing.Smith) !void {
     const allocator = arena.allocator();
     const config = parseArg(allocator, bytes[0..len]) catch return;
     const parsed = try parseArg(allocator, try encodeArgAlloc(allocator, &config));
-    try std.testing.expectEqualDeep(config, parsed);
+    try expectEqualConfig(&config, &parsed);
 }
 
 test "fuzz spore-net policy argument parser" {
     try std.testing.fuzz({}, fuzzPolicyArg, .{ .corpus = &.{
         fuzz_support.sliceSeed(
-            \\{"default_deny":true,"allow_cidrs":["93.184.216.34/32"],"allow_hosts":["example.org"],"allow_host_ports":[{"host":"github.com","ports":[443]}],"bound_services":[{"name":"metadata","guest_host":"metadata.spore.internal","guest_port":80,"unix_path":"/tmp/metadata.sock"}],"port_forwards":[{"host_port":18080,"guest_port":80}]}
+            \\{"egress":{"allowlist":{"cidrs":["93.184.216.34/32"],"hosts":["example.org"],"host_ports":[{"host":"github.com","ports":[443]}]}},"bound_services":[{"name":"metadata","guest_host":"metadata.spore.internal","guest_port":80,"unix_path":"/tmp/metadata.sock"}],"port_forwards":[{"host_port":18080,"guest_port":80}]}
+        ),
+        fuzz_support.sliceSeed(
+            \\{"egress":{"unrestricted":{}},"bound_services":[],"port_forwards":[]}
         ),
     } });
 }
@@ -1450,7 +1488,7 @@ test "spore-net policy parses loopback port forwards" {
     try std.testing.expectEqual(PortForwardConfig{ .host_port = 8080, .guest_port = 80 }, try parsePortForward("8080:80"));
     try std.testing.expectEqual(PortForwardConfig{ .host_port = 8443, .guest_port = 443 }, try parsePortForward("127.0.0.1:8443:443"));
 
-    var config = Config{};
+    var config = Config{ .egress = .unrestricted };
     try config.addPortForward("8080:80");
     try std.testing.expectEqual(@as(usize, 1), config.port_forward_count);
     try std.testing.expectError(error.TooManyPortForwards, config.addPortForward("8081:81"));
@@ -1459,13 +1497,8 @@ test "spore-net policy parses loopback port forwards" {
 }
 
 test "spore-net exact policy learns A records and enforces host plus port" {
-    var config = Config{};
-    try config.addNetworkPolicy(.{
-        .allow = &.{.{
-            .host = "github.com",
-            .ports = &.{443},
-        }},
-    });
+    var config = Config{ .egress = .deny_all };
+    try config.addExactHostPorts("github.com", &.{443});
     var policy = try Runtime.init(config);
 
     try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 443));
@@ -1481,7 +1514,7 @@ test "spore-net exact policy learns A records and enforces host plus port" {
 }
 
 test "spore-net exact policy ignores different DNS answer owner" {
-    var config = Config{};
+    var config = Config{ .egress = .deny_all };
     try config.addExactHostPorts("github.com", &.{443});
     var policy = try Runtime.init(config);
 
@@ -1493,21 +1526,15 @@ test "spore-net exact policy ignores different DNS answer owner" {
     try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 140, 82, 112, 4 }, 443));
 }
 
-test "spore-net exact default deny with no allow rules blocks public egress" {
-    var config = Config{};
-    try config.addNetworkPolicy(.{});
-    const policy = try Runtime.init(config);
+test "spore-net empty allowlist blocks public egress" {
+    const policy = try Runtime.init(.{ .egress = .deny_all });
     try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+    try std.testing.expectEqual(Decision.deny_not_allowed, policy.decideIpv4(.{ 93, 184, 216, 34 }));
 }
 
 test "spore-net bound Unix services validate and lookup by DNS name and guest port" {
-    var config = Config{};
-    try config.addBoundService(.{
-        .name = "cleanroom-gateway",
-        .guest_host = "gateway.cleanroom.internal",
-        .guest_port = 8170,
-        .target = .{ .unix = "/tmp/cleanroom-gateway.sock" },
-    });
+    var config = Config{ .egress = .unrestricted };
+    try config.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/cleanroom-gateway.sock");
     const policy = try Runtime.init(config);
 
     var query_buf: [512]u8 = undefined;

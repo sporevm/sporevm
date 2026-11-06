@@ -254,9 +254,10 @@ spore run --net --allow-host example.com \
   -- wget -qO- https://example.com
 ```
 
-Use `--allow-host` or `--allow-cidr` to open egress beyond the built-in deny
-floor. Saved network policy is replayed by `spore run --from`; omit `--net`
-and allow flags on run-from commands.
+Plain `--net` allows public egress outside the built-in hard floor;
+`--allow-host` or `--allow-cidr` restrict it to those hosts or CIDRs. Saved
+network policy is replayed by `spore run --from`; omit `--net` and allow flags
+on run-from commands.
 
 Use `--forward 127.0.0.1:HOST_PORT:GUEST_PORT` to expose one live guest TCP
 port on host loopback while the run or named VM monitor is alive.

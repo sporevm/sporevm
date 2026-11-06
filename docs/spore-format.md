@@ -487,7 +487,11 @@ representation.
   disk backend. The index packs sorted non-zero chunks and explicit zero
   coverage into ranges and is restore authority for the writable disk bytes.
 - `network`: optional requested network capability and policy. `kind` is
-  `spore-net-v0`; `allow_cidrs` and `allow_hosts` record the legacy CLI egress
+  `spore-net-v0`; `default_action` is `"deny"` when public egress is limited
+  to the allow lists (empty lists deny it all), and writers omit it only for
+  unrestricted egress. Readers also limit egress to the lists when any allow
+  entry is present without `default_action`, so only a network with neither
+  is unrestricted. `allow_cidrs` and `allow_hosts` record the legacy CLI egress
   allow policy, while `allow_host_ports` records exact DNS-learned host plus
   port rules and `bound_services` records restore-time guest service
   requirements by name, guest host, and guest port. The manifest does not carry

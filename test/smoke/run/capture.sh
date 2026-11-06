@@ -122,27 +122,40 @@ expect_probe_incomplete() {
   die "${label} of a guest that powers off exited ${rc} without ProbeDidNotComplete"
 }
 set +e
-"${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" --events=jsonl -- /bin/poweroff \
+with_timeout 60 "${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" --events=jsonl -- /bin/poweroff \
   >"${workdir}/poweroff-run.jsonl" 2>"${workdir}/poweroff-run.stderr"
 poweroff_rc="$?"
 set -e
 expect_probe_incomplete "spore run" "${poweroff_rc}" "${workdir}/poweroff-run.jsonl" "${workdir}/poweroff-run.stderr"
 
-# The guest powers itself off 5 s in, so this run ends even if the save does not.
+# The guest powers itself off 5 s in; the watchdog stops the run if it hangs.
+# Backgrounding `with_timeout` would put a bash subshell, not spore, behind
+# `$!`, and USR1 would kill that subshell instead of saving.
 poweroff_dir="${workdir}/poweroff.spore"
 "${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" \
   --save "${poweroff_dir}" --save-on USR1 -- /bin/poweroff 5 \
   >"${workdir}/poweroff-save.stdout" 2>"${workdir}/poweroff-save.stderr" &
 run_pid="$!"
+(
+  sleep 60
+  kill -TERM "${run_pid}" >/dev/null 2>&1 || true
+) &
+watchdog_pid="$!"
 for _ in $(seq 1 "${SPORE_SMOKE_CAPTURE_POLLS:-120}"); do
   grep -Fxq "spore poweroff ready" "${workdir}/poweroff-save.stdout" && break
   sleep "${SPORE_SMOKE_CAPTURE_POLL_INTERVAL:-0.1}"
 done
 sleep "${SPORE_SMOKE_CAPTURE_SETTLE_SECONDS:-0.3}"
 kill -USR1 "${run_pid}" || true
-wait "${run_pid}" && [[ -f "${poweroff_dir}/manifest.json" ]] || {
+set +e
+wait "${run_pid}"
+run_rc="$?"
+set -e
+kill "${watchdog_pid}" >/dev/null 2>&1 || true
+wait "${watchdog_pid}" >/dev/null 2>&1 || true
+[[ "${run_rc}" == "0" && -f "${poweroff_dir}/manifest.json" ]] || {
   cat "${workdir}/poweroff-save.stderr" >&2 || true
-  die "spore run did not save the guest before it powered off"
+  die "spore run did not save the guest before it powered off (exit ${run_rc})"
 }
 set +e
 with_timeout 60 "${spore_bin}" attach --events=jsonl --backend "${backend}" "${poweroff_dir}" \

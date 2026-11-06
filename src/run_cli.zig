@@ -119,7 +119,7 @@ fn runParsed(
         else => return err,
     };
     if (parsed.from_spore_dir) |spore_dir| {
-        if (parsed.network_requested or parsed.network_policy.hasRules()) {
+        if (parsed.network != .disabled) {
             failRunSetup("spore run: --from uses the saved network policy; omit --net and network flags", .{});
         }
         const command = if (parsed.command.len == 0)
@@ -204,7 +204,6 @@ fn runParsed(
         .commit_ref = parsed.commit_ref,
         .disk_size = parsed.disk_size,
         .network = parsed.network,
-        .network_policy = parsed.network_policy,
         .spore_executable = spore_executable,
         .debug = debug,
         .events = events,
