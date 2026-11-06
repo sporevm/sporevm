@@ -369,11 +369,18 @@ static int drop_capabilities(char *error, size_t cap) {
   return 0;
 }
 
+/*
+ * x86_64 kernels with x32 enabled report x32 syscalls under AUDIT_ARCH_X86_64
+ * with this bit set in nr, so they would miss the number checks below. No
+ * other supported architecture uses the bit.
+ */
+#define SPORE_X32_SYSCALL_BIT 0x40000000U
+
 enum syscall_filter_instruction {
   SYSCALL_LOAD_ARCH,
   SYSCALL_REQUIRE_ARCH,
-  SYSCALL_KILL_WRONG_ARCH,
   SYSCALL_LOAD_NUMBER,
+  SYSCALL_KILL_X32,
   SYSCALL_DENY_IO_URING,
   SYSCALL_CHECK_SOCKET,
   SYSCALL_CHECK_SOCKETPAIR,
@@ -383,6 +390,7 @@ enum syscall_filter_instruction {
   SYSCALL_ALLOW_OTHER_FAMILY,
   SYSCALL_DENY_RESULT,
   SYSCALL_ALLOW_RESULT,
+  SYSCALL_KILL_RESULT,
   SYSCALL_FILTER_INSTRUCTION_COUNT,
 };
 
@@ -390,9 +398,10 @@ static int install_syscall_policy(char *error, size_t cap) {
   const struct sock_filter filter[] = {
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SPORE_AUDIT_ARCH,
-             FORWARD_OFFSET(SYSCALL_REQUIRE_ARCH, SYSCALL_LOAD_NUMBER), 0),
-    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+             0, FORWARD_OFFSET(SYSCALL_REQUIRE_ARCH, SYSCALL_KILL_RESULT)),
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+    BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, SPORE_X32_SYSCALL_BIT,
+             FORWARD_OFFSET(SYSCALL_KILL_X32, SYSCALL_KILL_RESULT), 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup,
              FORWARD_OFFSET(SYSCALL_DENY_IO_URING, SYSCALL_DENY_RESULT), 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket,
@@ -408,6 +417,7 @@ static int install_syscall_policy(char *error, size_t cap) {
              FORWARD_OFFSET(SYSCALL_ALLOW_OTHER_FAMILY, SYSCALL_ALLOW_RESULT)),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
   };
   _Static_assert(sizeof(filter) / sizeof(filter[0]) == SYSCALL_FILTER_INSTRUCTION_COUNT,
                  "syscall filter labels must describe every instruction");

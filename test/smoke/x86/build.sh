@@ -40,10 +40,43 @@ python3 "${repo_root}/scripts/spore-build-conformance.py" --self-test-schema
 build_context="${workdir}/build-context"
 mkdir -p "${build_context}"
 printf 'native context payload\n' >"${build_context}/payload.txt"
+# x32 syscalls report the x86_64 audit arch with bit 30 set in the number, so
+# the RUN seccomp filter must kill them instead of letting x32 socket(AF_VSOCK)
+# slip past its socket check.
+cat >"${workdir}/x32-probe.zig" <<'EOF'
+const std = @import("std");
+const linux = std.os.linux;
+
+pub fn main() u8 {
+    const fork_rc = linux.fork();
+    if (linux.errno(fork_rc) != .SUCCESS) return 1;
+    if (fork_rc == 0) {
+        const rc = asm volatile ("syscall"
+            : [ret] "={rax}" (-> usize),
+            : [number] "{rax}" (0x40000000 | @intFromEnum(linux.SYS.socket)),
+              [family] "{rdi}" (@as(usize, linux.AF.VSOCK)),
+              [kind] "{rsi}" (@as(usize, linux.SOCK.STREAM)),
+              [protocol] "{rdx}" (@as(usize, 0)),
+            : .{ .rcx = true, .r11 = true, .memory = true });
+        linux.exit_group(@intFromEnum(linux.errno(rc)));
+    }
+    var status: u32 = 0;
+    if (linux.errno(linux.waitpid(@intCast(fork_rc), &status, 0)) != .SUCCESS) return 1;
+    if (linux.W.IFSIGNALED(status) and linux.W.TERMSIG(status) == .SYS) return 0;
+    var buf: [128]u8 = undefined;
+    const message = std.fmt.bufPrint(&buf, "x32 socket(AF_VSOCK) survived the RUN seccomp filter: wait status {d}\n", .{status}) catch unreachable;
+    _ = linux.write(2, message.ptr, message.len);
+    return 1;
+}
+EOF
+zig build-exe "${workdir}/x32-probe.zig" -target x86_64-linux -O ReleaseSmall -fstrip \
+  --cache-dir "${workdir}/zig-cache" -femit-bin="${build_context}/x32-probe" >/dev/null
 cat >"${build_context}/Dockerfile" <<'EOF'
 FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20 AS native
 ARG TARGETARCH
 COPY payload.txt /build-context
+COPY x32-probe /x32-probe
+RUN /x32-probe
 RUN --mount=type=cache,target=/cache,id=build-$TARGETARCH test "$TARGETARCH" = amd64 && grep -Fxq 'native context payload' /build-context && printf '%s\n' "$TARGETARCH" >/build-arch
 
 FROM --platform=$TARGETPLATFORM docker.io/library/alpine:3.20 AS second
