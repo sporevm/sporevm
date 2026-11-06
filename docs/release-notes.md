@@ -61,7 +61,10 @@ https://images.example/app` (or `create`) boots it with only the image's
 manifest, config and index local, fetching each rootfs object the guest reads
 on first use, along with the objects of the next 7 chunks. `--save`,
 `--commit` and `spore save` first fetch the rest of the image, so the result
-needs nothing from the store. See `docs/image-format.md`.
+needs nothing from the store. A store can also live in S3 (`s3://bucket/prefix`):
+reads are SigV4-signed with the standard `AWS_*` credential and region
+environment variables, and `image push` uploads with the aws CLI. See
+`docs/image-format.md`.
 
 ### Builds no longer block the cache
 

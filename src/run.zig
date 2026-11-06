@@ -2103,7 +2103,7 @@ fn resolveImageRootfs(
     try ensureDirPath(init.io, cache_root);
 
     if (image_store.isStoreRef(image_ref)) {
-        const local = image_store.resolve(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
+        const local = image_store.resolve(init.io, allocator, cache_root, image_ref, direct_image_platform, init.environ_map) catch |err| {
             return .{ .failure = rootfsInputFailure(
                 allocator,
                 machine_output.fromZigError(err).code,
