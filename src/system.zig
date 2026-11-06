@@ -1,6 +1,8 @@
 //! Local system inspection and cleanup commands.
 
 const std = @import("std");
+const cli = @import("cli.zig");
+const Ctx = cli.Ctx;
 const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -25,12 +27,16 @@ const vm_registry = @import("vm_registry.zig");
 const default_prune_max_bytes = 0;
 const max_root_record_bytes = 1024 * 1024;
 
+const allocMessage = cli.allocMessage;
+const exitWithCliError = cli.exitWithCliError;
+const exitInvalidValue = cli.exitInvalidValue;
+
 pub const testing = if (builtin.is_test) struct {
     pub var gc_mutation_barrier: ?*test_barrier.Barrier = null;
     pub var prune_mutation_barrier: ?*test_barrier.Barrier = null;
 } else struct {};
 
-const usage =
+pub const usage =
     \\Usage:
     \\  spore system df [--rootfs]
     \\  spore system prune [--rootfs] [--dry-run|--force] [--older-than DURATION] [--max-bytes SIZE] [--include-digest-artifacts] [--include-rootfs-chunks]
@@ -51,7 +57,7 @@ const usage =
     \\
 ;
 
-const cache_usage =
+pub const cache_usage =
     \\Usage:
     \\  spore cache gc [--rootfs] [--dry-run|--force]
     \\  spore cache pins
@@ -383,96 +389,39 @@ pub fn deinitRootfsGcResult(allocator: std.mem.Allocator, result: RootfsGcResult
     allocator.free(result.entries);
 }
 
-pub fn run(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (args.len == 0 or wantsHelp(args[0])) {
-        if (mode == .json) {
-            exitWithCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageMissingArgument("usage: spore system <df|prune>", "system"),
-                "usage: spore system <df|prune>",
-            );
-        }
-        try stdout.writeAll(usage);
-        return;
-    }
-
-    if (std.mem.eql(u8, args[0], "df")) {
-        try dfCli(init, args[1..], stdout, stderr, mode);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "prune")) {
-        try pruneCli(init, args[1..], stdout, stderr, mode);
-        return;
-    }
-
-    const message = allocMessage(init.arena.allocator(), "unknown system command: {s}", .{args[0]});
-    exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageInvalidArgument(message, "system"), messageWithUsage(init.arena.allocator(), message));
+pub fn pinsCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    if (args.len != 0) exitUnknownArgument(init.arena.allocator(), ctx.stderr, ctx.mode, "cache pins", args[0]);
+    const root = try local_paths.rootfsCacheRootPath(init.arena.allocator(), init.environ_map);
+    const entries = try saved_spore_pin.list(init.io, init.arena.allocator(), root);
+    try writePinListings(init.arena.allocator(), ctx.stdout, entries, ctx.mode);
 }
 
-pub fn cacheRun(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (args.len == 0 or wantsHelp(args[0])) {
-        if (mode == .json and args.len == 0) {
-            exitWithCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageMissingArgument("usage: spore cache <gc>", "cache"),
-                "usage: spore cache <gc>",
-            );
-        }
-        try stdout.writeAll(cache_usage);
-        return;
+pub fn unpinCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
+    if (args.len != 2 or !std.mem.eql(u8, args[1], "--force")) {
+        const message = "usage: spore cache unpin PIN_ID --force";
+        exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageMissingArgument(message, "cache unpin"), message);
     }
-    if (std.mem.eql(u8, args[0], "gc")) {
-        try cacheGcCli(init, args[1..], stdout, stderr, mode);
-        return;
+    const root = try local_paths.rootfsCacheRootPath(init.arena.allocator(), init.environ_map);
+    var lock = try rootfs.lockRootfsCacheExclusive(init.io, init.arena.allocator(), root);
+    defer lock.deinit();
+    const registry = try saved_spore_pin.LockedRegistry.init(init.arena.allocator(), root, &lock);
+    if (mode != .json) try stderr.print("warning: force-unpinning {s} may invalidate every raw copy that shares this pin\n", .{args[0]});
+    try saved_spore_pin.remove(init.io, init.arena.allocator(), registry, args[0]);
+    const result = struct {
+        schema: []const u8 = "spore.cache.unpin.result.v1",
+        schema_version: u32 = 1,
+        action: []const u8 = "unpinned",
+        id: []const u8,
+    }{ .id = args[0] };
+    if (mode == .json) try machine_output.writeJson(init.arena.allocator(), stdout, result) else {
+        try stdout.print("unpinned {s}\n", .{args[0]});
+        try stdout.flush();
     }
-    if (std.mem.eql(u8, args[0], "pins")) {
-        if (args.len != 1) exitUnknownArgument(init.arena.allocator(), stderr, mode, "cache pins", args[1]);
-        const root = try local_paths.rootfsCacheRootPath(init.arena.allocator(), init.environ_map);
-        const entries = try saved_spore_pin.list(init.io, init.arena.allocator(), root);
-        try writePinListings(init.arena.allocator(), stdout, entries, mode);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "unpin")) {
-        if (args.len != 3 or !std.mem.eql(u8, args[2], "--force")) {
-            const message = "usage: spore cache unpin PIN_ID --force";
-            exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageMissingArgument(message, "cache unpin"), message);
-        }
-        const root = try local_paths.rootfsCacheRootPath(init.arena.allocator(), init.environ_map);
-        var lock = try rootfs.lockRootfsCacheExclusive(init.io, init.arena.allocator(), root);
-        defer lock.deinit();
-        const registry = try saved_spore_pin.LockedRegistry.init(init.arena.allocator(), root, &lock);
-        if (mode != .json) try stderr.print("warning: force-unpinning {s} may invalidate every raw copy that shares this pin\n", .{args[1]});
-        try saved_spore_pin.remove(init.io, init.arena.allocator(), registry, args[1]);
-        const result = struct {
-            schema: []const u8 = "spore.cache.unpin.result.v1",
-            schema_version: u32 = 1,
-            action: []const u8 = "unpinned",
-            id: []const u8,
-        }{ .id = args[1] };
-        if (mode == .json) try machine_output.writeJson(init.arena.allocator(), stdout, result) else {
-            try stdout.print("unpinned {s}\n", .{args[1]});
-            try stdout.flush();
-        }
-        return;
-    }
-    const message = allocMessage(init.arena.allocator(), "unknown cache command: {s}", .{args[0]});
-    exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageInvalidArgument(message, "cache"), messageWithCacheUsage(init.arena.allocator(), message));
 }
 
 fn writePinListings(allocator: std.mem.Allocator, writer: *Io.Writer, entries: []const saved_spore_pin.Listing, mode: machine_output.Mode) !void {
@@ -485,21 +434,13 @@ fn writePinListings(allocator: std.mem.Allocator, writer: *Io.Writer, entries: [
     try writer.flush();
 }
 
-fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
+pub fn dfCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     for (args) |arg| {
-        if (wantsHelp(arg)) {
-            if (mode == .json) {
-                exitWithCliError(
-                    init.arena.allocator(),
-                    stderr,
-                    mode,
-                    machine_output.usageInvalidArgument("spore --json system df does not support help output", "system df"),
-                    "spore --json system df does not support help output",
-                );
-            }
-            try stdout.writeAll(usage);
-            return;
-        } else if (std.mem.eql(u8, arg, "--json")) {
+        if (std.mem.eql(u8, arg, "--json")) {
             exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "system df");
         } else if (!std.mem.eql(u8, arg, "--rootfs")) {
             exitUnknownArgument(init.arena.allocator(), stderr, mode, "system df", arg);
@@ -527,25 +468,17 @@ fn dfCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, s
     }
 }
 
-fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
+pub fn pruneCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     var opts = PruneOptions{ .cache_root = "" };
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (wantsHelp(arg)) {
-            if (mode == .json) {
-                exitWithCliError(
-                    init.arena.allocator(),
-                    stderr,
-                    mode,
-                    machine_output.usageInvalidArgument("spore --json system prune does not support help output", "system prune"),
-                    "spore --json system prune does not support help output",
-                );
-            }
-            try stdout.writeAll(usage);
-            return;
-        } else if (std.mem.eql(u8, arg, "--json")) {
+        if (std.mem.eql(u8, arg, "--json")) {
             exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "system prune");
         } else if (std.mem.eql(u8, arg, "--rootfs")) {
             opts.rootfs_only = true;
@@ -608,23 +541,15 @@ fn pruneCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer
     }
 }
 
-fn cacheGcCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
+pub fn cacheGcCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     var dry_run = true;
 
     for (args) |arg| {
-        if (wantsHelp(arg)) {
-            if (mode == .json) {
-                exitWithCliError(
-                    init.arena.allocator(),
-                    stderr,
-                    mode,
-                    machine_output.usageInvalidArgument("spore --json cache gc does not support help output", "cache gc"),
-                    "spore --json cache gc does not support help output",
-                );
-            }
-            try stdout.writeAll(cache_usage);
-            return;
-        } else if (std.mem.eql(u8, arg, "--json")) {
+        if (std.mem.eql(u8, arg, "--json")) {
             exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "cache gc");
         } else if (std.mem.eql(u8, arg, "--rootfs")) {
             // The rootfs CAS is the only cache scope in U1.
@@ -663,33 +588,8 @@ fn cacheGcCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writ
     }
 }
 
-fn allocMessage(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
-    return std.fmt.allocPrint(allocator, fmt, args) catch "CLI argument error";
-}
-
 fn messageWithUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
     return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, usage }) catch message;
-}
-
-fn messageWithCacheUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
-    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, cache_usage }) catch message;
-}
-
-fn exitWithCliError(
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    err: machine_output.CliError,
-    human_text: []const u8,
-) noreturn {
-    if (mode == .json) {
-        machine_output.writeError(allocator, stderr, err) catch {};
-    } else {
-        stderr.writeAll(human_text) catch {};
-        if (!std.mem.endsWith(u8, human_text, "\n")) stderr.writeByte('\n') catch {};
-    }
-    stderr.flush() catch {};
-    std.process.exit(err.exit_code);
 }
 
 fn exitLocalJsonUnsupported(
@@ -722,18 +622,6 @@ fn exitMissingValue(
 ) noreturn {
     const message = allocMessage(allocator, "spore {s}: {s} requires a value", .{ command, flag });
     exitWithCliError(allocator, stderr, mode, machine_output.usageMissingArgument(message, command), message);
-}
-
-fn exitInvalidValue(
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    command: []const u8,
-    flag: []const u8,
-    value: []const u8,
-) noreturn {
-    const message = allocMessage(allocator, "spore {s}: invalid {s}: {s}", .{ command, flag, value });
-    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
 
 fn normalizePruneOptions(options: PruneOptions) !PrunePlanOptions {
@@ -2219,10 +2107,6 @@ fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
     }
     return true;
-}
-
-fn wantsHelp(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
 fn openDirPath(io: Io, path: []const u8, flags: Io.Dir.OpenOptions) !Io.Dir {

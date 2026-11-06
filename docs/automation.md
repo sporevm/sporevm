@@ -7,10 +7,11 @@ programmatic interface. Human output remains intentionally unstable.
 
 Bounded commands use global `spore --json <command> ...` and emit exactly one
 schema-versioned JSON result on stdout. SporeVM failures emit one
-`spore.error.v1` document on stderr and nothing on stdout. The bounded surface
-includes version and inspection, system and cache operations, rootfs and image
-operations, build, named lifecycle and copy operations, and checkpoint push and
-pull.
+`spore.error.v1` document on stderr and nothing on stdout. Help is human
+output: `spore --json <command> --help` fails with `usage.invalid_argument`.
+The bounded surface includes version and inspection, system and cache
+operations, rootfs and image operations, build, named lifecycle and copy
+operations, and checkpoint push and pull.
 
 Runtime streams use command-local `--events=jsonl`. `run`, `attach`, `restore`,
 `exec`, and `fanout` emit `spore.automation.event.v1` records. Each completed stream ends

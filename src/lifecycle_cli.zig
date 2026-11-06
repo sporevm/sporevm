@@ -3,6 +3,7 @@
 //! orchestration they call is in lifecycle.zig.
 
 const std = @import("std");
+const Ctx = @import("cli.zig").Ctx;
 const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -70,7 +71,7 @@ const monitorRequestFailed = lifecycle.monitorRequestFailed;
 const listMemoryFromConfig = lifecycle.listMemoryFromConfig;
 const listStatsFromMemory = lifecycle.listStatsFromMemory;
 
-const create_usage =
+pub const create_usage =
     \\Usage:
     \\  spore create NAME --image REF [options]
     \\  spore create NAME [options] ['shell command']
@@ -107,7 +108,7 @@ const create_usage =
     \\
 ;
 
-const logs_usage =
+pub const logs_usage =
     \\Usage:
     \\  spore logs NAME
     \\
@@ -119,7 +120,7 @@ const logs_usage =
     \\
 ;
 
-const exec_usage =
+pub const exec_usage =
     \\Usage:
     \\  spore exec [options] NAME 'shell command'
     \\  spore exec [options] NAME -- <argv...>
@@ -136,7 +137,7 @@ const exec_usage =
     \\
 ;
 
-const copy_in_usage =
+pub const copy_in_usage =
     \\Usage:
     \\  spore copy-in NAME HOST_PATH GUEST_PATH
     \\
@@ -145,7 +146,7 @@ const copy_in_usage =
     \\
 ;
 
-const copy_out_usage =
+pub const copy_out_usage =
     \\Usage:
     \\  spore copy-out NAME GUEST_PATH HOST_PATH
     \\
@@ -154,7 +155,7 @@ const copy_out_usage =
     \\
 ;
 
-const rm_usage =
+pub const rm_usage =
     \\Usage:
     \\  spore vm rm NAME
     \\  spore checkpoint rm DIR
@@ -173,7 +174,7 @@ const rm_usage =
     \\
 ;
 
-const save_usage =
+pub const save_usage =
     \\Usage:
     \\  spore save NAME --out DIR [--stop]
     \\
@@ -188,7 +189,7 @@ const save_usage =
     \\
 ;
 
-const fork_usage =
+pub const fork_usage =
     \\Usage:
     \\  spore checkpoint fork DIR --count N --out DIR
     \\  spore vm fork NAME --count N --name PATTERN
@@ -214,7 +215,7 @@ const fork_usage =
     \\
 ;
 
-const restore_usage =
+pub const restore_usage =
     \\Usage:
     \\  spore restore DIR --name NAME
     \\
@@ -229,7 +230,7 @@ const restore_usage =
     \\
 ;
 
-const ls_usage =
+pub const ls_usage =
     \\Usage:
     \\  spore ls
     \\  spore ps
@@ -338,27 +339,12 @@ const ExecNamedStreamingResult = struct {
     timing: ?NamedExecTiming,
 };
 
-pub fn createCli(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
+pub fn createCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const start_ms = monotonicMs();
-    if (wantsHelp(args)) {
-        if (mode == .json) {
-            exitLifecycleCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageInvalidArgument("spore --json create does not support help output", "create"),
-                "spore --json create does not support help output",
-            );
-        }
-        try stdout.writeAll(create_usage);
-        return;
-    }
     if (args.len == 0) {
         exitLifecycleCliError(
             init.arena.allocator(),
@@ -402,7 +388,7 @@ pub fn createCli(
         .console_log_path = spec.console_log_path,
         .initial_output = parsed.initial_output,
         .spore_executable = spore_executable,
-        .debug = try invokedWithDebug(init, allocator),
+        .debug = ctx.debug,
         .annotations = spec.annotations,
     }, .{
         .start_ms = start_ms,
@@ -473,26 +459,11 @@ pub fn createCli(
     }
 }
 
-pub fn logsCli(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (wantsHelp(args)) {
-        if (mode == .json) {
-            exitLifecycleCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageInvalidArgument("spore --json logs does not support help output", "logs"),
-                "spore --json logs does not support help output",
-            );
-        }
-        try stdout.writeAll(logs_usage);
-        return;
-    }
+pub fn logsCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const allocator = init.arena.allocator();
     if (args.len != 1) {
         exitLifecycleCliError(
@@ -536,11 +507,9 @@ pub fn logsCli(
     }
 }
 
-pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(exec_usage);
-        return;
-    }
+pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
     const allocator = init.arena.allocator();
     var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "exec");
     exec_cli_event_writer = if (requestsJsonl(args)) &events else null;
@@ -702,28 +671,17 @@ fn requestsJsonl(args: []const []const u8) bool {
     return false;
 }
 
-/// Whether this process was started as `spore --debug COMMAND ...`. Commands
-/// that start a monitor pass the flag on, so `monitor.log` gets debug detail.
-fn invokedWithDebug(init: std.process.Init, allocator: std.mem.Allocator) !bool {
-    const args = try init.minimal.args.toSlice(allocator);
-    for (args[@min(args.len, 1)..]) |arg| {
-        if (std.mem.eql(u8, arg, "--debug")) return true;
-        if (!std.mem.startsWith(u8, arg, "-")) return false;
-    }
-    return false;
-}
-
 /// Guest diagnostics during a copy go to stderr, escaped. With --json they
 /// are dropped so stderr carries at most the spore.error.v1 document.
 fn copyGuestStderrFd(mode: machine_output.Mode) std.c.fd_t {
     return if (mode == .json) -1 else 2;
 }
 
-pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(copy_in_usage);
-        return;
-    }
+pub fn copyInCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const allocator = init.arena.allocator();
     if (args.len != 3) exitLifecycleCliError(allocator, stderr, mode, machine_output.usageMissingArgument(copy_in_usage, "copy-in"), copy_in_usage);
     validateNameLifecycleCli(allocator, stderr, mode, "copy-in", args[0]);
@@ -798,11 +756,11 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     });
 }
 
-pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(copy_out_usage);
-        return;
-    }
+pub fn copyOutCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const allocator = init.arena.allocator();
     if (args.len != 3) exitLifecycleCliError(allocator, stderr, mode, machine_output.usageMissingArgument(copy_out_usage, "copy-out"), copy_out_usage);
     validateNameLifecycleCli(allocator, stderr, mode, "copy-out", args[0]);
@@ -891,26 +849,11 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
     });
 }
 
-pub fn rmCli(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (wantsHelp(args)) {
-        if (mode == .json) {
-            exitLifecycleCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageInvalidArgument("spore --json rm does not support help output", "rm"),
-                "spore --json rm does not support help output",
-            );
-        }
-        try stdout.writeAll(rm_usage);
-        return;
-    }
+pub fn rmCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const allocator = init.arena.allocator();
     if (args.len == 2 and std.mem.eql(u8, args[0], "--spore")) {
         // An empty path resolves to the working directory.
@@ -967,26 +910,11 @@ fn writeRemovedSavedSpore(writer: *Io.Writer, result: RemovedSavedSpore) !void {
     try writer.flush();
 }
 
-pub fn saveCli(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (wantsHelp(args)) {
-        if (mode == .json) {
-            exitLifecycleCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageInvalidArgument("spore --json save does not support help output", "save"),
-                "spore --json save does not support help output",
-            );
-        }
-        try stdout.writeAll(save_usage);
-        return;
-    }
+pub fn saveCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const allocator = init.arena.allocator();
     const parsed = parseSaveArgs(args, allocator, stderr, mode);
     const context = Context{ .io = init.io, .environ_map = init.environ_map };
@@ -1050,26 +978,11 @@ pub fn saveCli(
     }
 }
 
-pub fn forkCli(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (wantsHelp(args)) {
-        if (mode == .json) {
-            exitLifecycleCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageInvalidArgument("spore --json fork does not support help output", "fork"),
-                "spore --json fork does not support help output",
-            );
-        }
-        try stdout.writeAll(fork_usage);
-        return;
-    }
+pub fn forkCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
 
     const allocator = init.arena.allocator();
     const parsed = parseForkArgs(args, allocator, stderr, mode);
@@ -1080,7 +993,7 @@ pub fn forkCli(
         .name_pattern = parsed.name_pattern,
         .allow_slow_copy = parsed.allow_slow_copy,
         .spore_executable = spore_executable,
-        .debug = try invokedWithDebug(init, allocator),
+        .debug = ctx.debug,
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong, error.ControlSocketPathCollision => exitLifecycleRuntimePathError(allocator, stderr, mode, "fork", err),
         error.InvalidForkNamePattern => {
@@ -1153,26 +1066,11 @@ pub fn forkCli(
     }
 }
 
-pub fn restoreCli(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (wantsHelp(args)) {
-        if (mode == .json) {
-            exitLifecycleCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageInvalidArgument("spore --json restore does not support help output", "restore"),
-                "spore --json restore does not support help output",
-            );
-        }
-        try stdout.writeAll(restore_usage);
-        return;
-    }
+pub fn restoreCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const allocator = init.arena.allocator();
     var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
     restore_cli_event_writer = if (requestsJsonl(args)) &event_writer else null;
@@ -1186,7 +1084,7 @@ pub fn restoreCli(
         .backend = parsed.backend,
         .generation_path = parsed.generation_path,
         .spore_executable = spore_executable,
-        .debug = try invokedWithDebug(init, allocator),
+        .debug = ctx.debug,
         .bound_services = parsed.bound_services.slice(),
     }) catch |err| {
         emitRestoreFailureEvent(&event_writer, parsed.event_mode, err);
@@ -1302,26 +1200,11 @@ fn emitRestoreFailureEvent(event_writer: *events_mod.EventWriter, event_mode: ev
     if (event_mode == .jsonl) event_writer.emitFailure(events_mod.classifyFailure(err)) catch {};
 }
 
-pub fn lsCli(
-    init: std.process.Init,
-    args: []const []const u8,
-    stdout: *Io.Writer,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-) !void {
-    if (wantsHelp(args)) {
-        if (mode == .json) {
-            exitLifecycleCliError(
-                init.arena.allocator(),
-                stderr,
-                mode,
-                machine_output.usageInvalidArgument("spore --json ls does not support help output", "ls"),
-                "spore --json ls does not support help output",
-            );
-        }
-        try stdout.writeAll(ls_usage);
-        return;
-    }
+pub fn lsCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     if (args.len != 0) {
         if (args.len == 1 and std.mem.eql(u8, args[0], "--json")) {
             exitLifecycleCliError(
@@ -2485,19 +2368,6 @@ fn openHostFileRead(allocator: std.mem.Allocator, io: Io, path: []const u8) !std
     return fd;
 }
 
-fn wantsHelp(args: []const []const u8) bool {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, "-h") or
-            std.mem.eql(u8, arg, "--help"))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 fn usageExit(comptime text: []const u8) noreturn {
     if (exec_cli_event_writer) |events| {
         const classified = machine_output.usageInvalidArgument(text, "exec");
@@ -2676,20 +2546,10 @@ fn parseVcpuCountLifecycleCli(
 }
 
 pub fn wantsNamedFork(args: []const []const u8) bool {
-    if (wantsHelp(args)) return true;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--vm") or std.mem.eql(u8, arg, "--name")) return true;
     }
     return false;
-}
-
-test "lifecycle fork help routes through named fork cli" {
-    try std.testing.expect(wantsNamedFork(&.{"--help"}));
-    try std.testing.expect(wantsNamedFork(&.{"-h"}));
-    try std.testing.expect(wantsNamedFork(&.{"help"}));
-    try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
-    try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
-    try std.testing.expect(!wantsHelp(&.{ "bench-1", "--", "/bin/true", "--help" }));
 }
 
 test "create parser separates initial and maximum memory" {

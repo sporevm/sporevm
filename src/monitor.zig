@@ -1,6 +1,7 @@
 //! Per-VM monitor process and local control protocol.
 
 const std = @import("std");
+const Ctx = @import("cli.zig").Ctx;
 const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const local_paths = @import("local_paths.zig");
@@ -84,7 +85,7 @@ pub const testing = if (builtin.is_test) struct {
 const streaming_send_deadline_ms = 25;
 const disk_claim_timeout_ns = 5 * 60 * std.time.ns_per_s;
 
-const monitor_usage =
+pub const monitor_usage =
     \\Usage:
     \\  spore monitor NAME
     \\
@@ -205,13 +206,9 @@ fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: vm_registry
     return runtime_disk_claim.receiveHead(allocator, stream.socket.handle);
 }
 
-pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
+pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
     const start_ms = lifecycle.monotonicMs();
-    if (wantsHelp(args)) {
-        try stdout.writeAll(monitor_usage);
-        try stdout.flush();
-        return;
-    }
 
     const allocator = init.arena.allocator();
     const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
@@ -2224,28 +2221,9 @@ fn usageExit() noreturn {
     std.process.exit(2);
 }
 
-fn wantsHelp(args: []const []const u8) bool {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or
-            std.mem.eql(u8, arg, "--help"))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 fn currentPid() i64 {
     if (comptime @import("builtin").os.tag == .windows) return 1;
     return @intCast(std.c.getpid());
-}
-
-test "monitor cli help accepts help after name" {
-    try std.testing.expect(wantsHelp(&.{"--help"}));
-    try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
-    try std.testing.expect(!wantsHelp(&.{"bench-1"}));
-    try std.testing.expect(!wantsHelp(&.{ "help", "--backend", "auto" }));
 }
 
 test "named exec context applies image defaults and ephemeral overrides" {

@@ -4,11 +4,12 @@ const std = @import("std");
 const TestDir = @import("test_dir.zig").TestDir;
 const Io = std.Io;
 const api = @import("api.zig");
+const Ctx = @import("cli.zig").Ctx;
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_input = @import("rootfs_input.zig");
 
-const usage =
+pub const usage =
     \\Usage:
     \\  spore image push local/name:tag STORE/TAG [--platform os/arch]
     \\  spore image pack local/name:tag --platform os/arch --out image.tar.gz
@@ -28,48 +29,37 @@ const usage =
     \\
 ;
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
-    if (args.len == 0) {
-        if (mode == .json) return error.MissingImageCommand;
-        try stdout.writeAll(usage);
-        return;
-    }
-    if (wantsHelp(args)) {
-        try stdout.writeAll(usage);
-        return;
-    }
-    const allocator = init.arena.allocator();
-    if (std.mem.eql(u8, args[0], "push")) {
-        const options = try parsePushOptions(args[1..]);
-        const result = try api.imagePush(init, allocator, options);
-        if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
-        try stdout.print(
-            "ref: {s}\nimage_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
-            .{ result.ref, result.image_digest, result.objects_total, result.objects_written, result.bytes_written },
-        );
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "pack")) {
-        const options = try parsePackOptions(args[1..]);
-        const result = try api.imageArchivePack(init, allocator, options);
-        if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
-        try stdout.print(
-            "archive: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\nbytes: {d}\n",
-            .{ options.output_path, result.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count, result.archive_bytes },
-        );
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "unpack")) {
-        const options = try parseUnpackOptions(args[1..]);
-        const result = try api.imageArchiveUnpack(init, allocator, options);
-        if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
-        try stdout.print(
-            "ref: {s}\nresolved: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\n",
-            .{ options.ref, result.resolved_image_ref, options.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count },
-        );
-        return;
-    }
-    return error.UnknownImageCommand;
+pub fn push(ctx: *const Ctx, args: []const []const u8) !void {
+    const allocator = ctx.init.arena.allocator();
+    const options = try parsePushOptions(args);
+    const result = try api.imagePush(ctx.init, allocator, options);
+    if (ctx.mode == .json) return machine_output.writeJson(allocator, ctx.stdout, result);
+    try ctx.stdout.print(
+        "ref: {s}\nimage_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
+        .{ result.ref, result.image_digest, result.objects_total, result.objects_written, result.bytes_written },
+    );
+}
+
+pub fn pack(ctx: *const Ctx, args: []const []const u8) !void {
+    const allocator = ctx.init.arena.allocator();
+    const options = try parsePackOptions(args);
+    const result = try api.imageArchivePack(ctx.init, allocator, options);
+    if (ctx.mode == .json) return machine_output.writeJson(allocator, ctx.stdout, result);
+    try ctx.stdout.print(
+        "archive: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\nbytes: {d}\n",
+        .{ options.output_path, result.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count, result.archive_bytes },
+    );
+}
+
+pub fn unpack(ctx: *const Ctx, args: []const []const u8) !void {
+    const allocator = ctx.init.arena.allocator();
+    const options = try parseUnpackOptions(args);
+    const result = try api.imageArchiveUnpack(ctx.init, allocator, options);
+    if (ctx.mode == .json) return machine_output.writeJson(allocator, ctx.stdout, result);
+    try ctx.stdout.print(
+        "ref: {s}\nresolved: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\n",
+        .{ options.ref, result.resolved_image_ref, options.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count },
+    );
 }
 
 pub fn parsePushOptions(args: []const []const u8) !api.ImagePushOptions {
@@ -163,28 +153,23 @@ pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptio
     };
 }
 
-fn wantsHelp(args: []const []const u8) bool {
-    for (args) |arg| if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return true;
-    return false;
-}
-
 test "image archive options require immutable digest and explicit platform" {
-    const pack = try parsePackOptions(&.{
+    const pack_options = try parsePackOptions(&.{
         "local/app:ci",
         "--out",
         "app.spore-image.tar.gz",
         "--platform",
         "linux/arm64",
     });
-    try std.testing.expectEqualStrings("local/app:ci", pack.source);
-    try std.testing.expectEqual(.arm64, pack.platform.arch);
+    try std.testing.expectEqualStrings("local/app:ci", pack_options.source);
+    try std.testing.expectEqual(.arm64, pack_options.platform.arch);
     try std.testing.expectError(error.MissingPlatform, parsePackOptions(&.{
         "local/app:ci",
         "--out",
         "app.spore-image.tar.gz",
     }));
 
-    const unpack = try parseUnpackOptions(&.{
+    const unpack_options = try parseUnpackOptions(&.{
         "app.spore-image.tar.gz",
         "--archive-digest",
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -195,7 +180,7 @@ test "image archive options require immutable digest and explicit platform" {
         "--ref",
         "local/app:ci",
     });
-    try std.testing.expectEqual(.amd64, unpack.platform.arch);
+    try std.testing.expectEqual(.amd64, unpack_options.platform.arch);
     try std.testing.expectError(error.MissingImageArchiveDigest, parseUnpackOptions(&.{
         "app.spore-image.tar.gz",
         "--expected-image-digest",
@@ -270,23 +255,30 @@ test "json image pack and unpack print their documented result documents" {
     });
 
     var pack_out: Io.Writer.Allocating = .init(allocator);
-    try run(init, &.{ "pack", "local/cli-json:producer", "--platform", "linux/arm64", "--out", try tmp_dir.path("image.tar.gz") }, &pack_out.writer, .json);
-    const pack = try std.json.parseFromSliceLeaky(std.json.Value, allocator, pack_out.written(), .{});
-    try std.testing.expectEqualStrings("spore.image.archive.pack.result.v1", pack.object.get("schema").?.string);
-    try std.testing.expectEqualStrings("image", pack.object.get("resource_type").?.string);
-    const archive_digest = pack.object.get("archive_digest").?.string;
-    const image_digest = pack.object.get("image_digest").?.string;
+    var discard: Io.Writer = .failing;
+    const pack_ctx = Ctx{ .init = init, .stdout = &pack_out.writer, .stderr = &discard, .mode = .json };
+    try pack(&pack_ctx, &.{ "local/cli-json:producer", "--platform", "linux/arm64", "--out", try tmp_dir.path("image.tar.gz") });
+    const pack_doc = try std.json.parseFromSliceLeaky(std.json.Value, allocator, pack_out.written(), .{});
+    try std.testing.expectEqualStrings("spore.image.archive.pack.result.v1", pack_doc.object.get("schema").?.string);
+    try std.testing.expectEqualStrings("image", pack_doc.object.get("resource_type").?.string);
+    const archive_digest = pack_doc.object.get("archive_digest").?.string;
+    const image_digest = pack_doc.object.get("image_digest").?.string;
 
     try env.put(local_paths.rootfs_cache_env, try tmp_dir.path("consumer-cache"));
     var unpack_out: Io.Writer.Allocating = .init(allocator);
-    try run(init, &.{
-        "unpack",                  try tmp_dir.path("image.tar.gz"),
-        "--archive-digest",        archive_digest,
-        "--expected-image-digest", image_digest,
-        "--platform",              "linux/arm64",
-        "--ref",                   "local/cli-json:consumer",
-    }, &unpack_out.writer, .json);
-    const unpack = try std.json.parseFromSliceLeaky(std.json.Value, allocator, unpack_out.written(), .{});
-    try std.testing.expectEqualStrings("spore.image.archive.unpack.result.v1", unpack.object.get("schema").?.string);
-    try std.testing.expectEqualStrings(image_digest, unpack.object.get("image_digest").?.string);
+    const unpack_ctx = Ctx{ .init = init, .stdout = &unpack_out.writer, .stderr = &discard, .mode = .json };
+    try unpack(&unpack_ctx, &.{
+        try tmp_dir.path("image.tar.gz"),
+        "--archive-digest",
+        archive_digest,
+        "--expected-image-digest",
+        image_digest,
+        "--platform",
+        "linux/arm64",
+        "--ref",
+        "local/cli-json:consumer",
+    });
+    const unpack_doc = try std.json.parseFromSliceLeaky(std.json.Value, allocator, unpack_out.written(), .{});
+    try std.testing.expectEqualStrings("spore.image.archive.unpack.result.v1", unpack_doc.object.get("schema").?.string);
+    try std.testing.expectEqualStrings(image_digest, unpack_doc.object.get("image_digest").?.string);
 }
