@@ -492,23 +492,31 @@ test "run cmdline marks build mode and immutable input disks only when requested
 
 const FakeVm = struct {
     var seen: ?vmm.Config = null;
+    /// The backend that ran `seen`.
+    var ran: ?Backend = null;
     var exit: vmm.ExitCause = .probe_complete;
 
-    fn run(_: std.mem.Allocator, config: vmm.Config) !vmm.ExitCause {
-        seen = config;
-        return exit;
+    fn runAs(comptime backend: Backend) fn (std.mem.Allocator, vmm.Config) error{}!vmm.ExitCause {
+        return struct {
+            fn run(_: std.mem.Allocator, config: vmm.Config) error{}!vmm.ExitCause {
+                seen = config;
+                ran = backend;
+                return exit;
+            }
+        }.run;
     }
 
     fn reset(cause: vmm.ExitCause) void {
         seen = null;
+        ran = null;
         exit = cause;
     }
 };
 
 /// Both arm64 backends, whatever the host.
 const FakeArm = struct {
-    pub const hvf = FakeVm.run;
-    pub const kvm = FakeVm.run;
+    pub const hvf = FakeVm.runAs(.hvf);
+    pub const kvm = FakeVm.runAs(.kvm);
 };
 
 fn ignoreConsole(_: []const u8) void {}
@@ -570,15 +578,19 @@ test "a session runs only the backend it names, and a restore keeps the caller's
     var stream = try vsock_stream.HostStream.init(10700, "request\n");
 
     var session = testSession(&stream, .{ .restore = .{ .dir = "saved.spore", .ram = .eager_chunks } });
-    session.backend = .hvf;
-    FakeVm.reset(.probe_complete);
-    _ = try runOn(FakeArm, context, arena_state.allocator(), session);
-    const restore = FakeVm.seen.?.start.restore;
-    try std.testing.expectEqualStrings("saved.spore", restore.dir);
-    try std.testing.expect(restore.ram == .eager_chunks);
+    for ([_]Backend{ .hvf, .kvm }) |backend| {
+        session.backend = backend;
+        FakeVm.reset(.probe_complete);
+        _ = try runOn(FakeArm, context, arena_state.allocator(), session);
+        try std.testing.expectEqual(backend, FakeVm.ran.?);
+        const restore = FakeVm.seen.?.start.restore;
+        try std.testing.expectEqualStrings("saved.spore", restore.dir);
+        try std.testing.expect(restore.ram == .eager_chunks);
+    }
 
+    session.backend = .hvf;
     const KvmOnly = struct {
-        pub const kvm = FakeVm.run;
+        pub const kvm = FakeVm.runAs(.kvm);
     };
     FakeVm.reset(.probe_complete);
     try std.testing.expectError(error.UnsupportedBackend, runOn(KvmOnly, context, arena_state.allocator(), session));

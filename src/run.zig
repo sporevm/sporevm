@@ -720,7 +720,15 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
         // A store that cannot supply the image fails the save before it
         // publishes anything, so remove the directory this run created
         // (dirty-RAM tracking may already have written memory into it).
-        if (err == error.ImageStoreIncomplete and created_save_dir) Io.Dir.cwd().deleteTree(context.io, opts.save_path.?) catch {};
+        // Other failures remove it only while it is empty, as when the root
+        // disk does not open, so a published spore or an interrupted publish
+        // stays.
+        if (created_save_dir) {
+            if (err == error.ImageStoreIncomplete)
+                Io.Dir.cwd().deleteTree(context.io, opts.save_path.?) catch {}
+            else
+                Io.Dir.cwd().deleteDir(context.io, opts.save_path.?) catch {};
+        }
         events.emitFailure(err) catch {};
         return err;
     };
@@ -828,13 +836,13 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     });
     if (capture_plan.capture) |vm_capture| {
         try spore.createSnapshotRoot(allocator, vm_capture.dir);
+        created_save_dir.* = true;
         if (disks.hasRootfs()) {
             const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
             defer allocator.free(cache_root);
             try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, vm_capture.dir);
         }
     }
-    created_save_dir.* = capture_plan.capture != null;
     const saved_sessions = [_]spore.Session{spore.processSession(request.session_id, opts.interactive, opts.tty)};
     if (capture_plan.signal) |signal| {
         signal_registration = capture.SignalRegistration.install(signal, &capture_request);
@@ -1684,6 +1692,34 @@ test "run from carries writable disk manifests into runtime options" {
         std.testing.allocator.free(disk.object_namespace);
     }
     try std.testing.expectEqualStrings("blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", disk.base);
+}
+
+test "a run that fails before its VM starts leaves no save directory behind" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    try Io.Dir.cwd().createDirPath(io, cache_root);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    const save_path = try tmp_dir.path("out.spore");
+
+    // arm64 fails to open the root disk; x86 refuses the capture first. Both
+    // fail after the save directory exists.
+    const expected = if (builtin.cpu.arch == .x86_64) error.X86CaptureUnsupported else error.RootFSOpenFailed;
+    try std.testing.expectError(expected, execute(.{ .io = io, .environ_map = &env }, arena_state.allocator(), .{
+        .kernel_path = "",
+        .boot_artifacts = .{ .kernel = "kernel", .initrd = "initrd" },
+        .rootfs_path = try tmp_dir.path("missing.ext4"),
+        .command = &.{"true"},
+        .memory = memory_config.Config.fixed(vm_session.x86_experimental_memory_bytes),
+        .save_path = save_path,
+    }));
+    // A second `--save` to the same path would otherwise fail AlreadyExists.
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, save_path, .{}));
 }
 
 test "run cli parser accepts command after separator" {
