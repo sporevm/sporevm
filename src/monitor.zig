@@ -101,6 +101,7 @@ const Phase = enum { pending, active, done };
 /// The guest operation that holds the slot. Its slices are borrowed from the
 /// handler thread that submitted it, which waits until the operation is
 /// done; the VM thread stops using them before it marks the operation done.
+/// A finished suspend keeps the slot, so its handler clears `dir` first.
 const Op = union(enum) {
     idle,
     /// The readiness request, attached at startup. The run fails unless the
@@ -1123,7 +1124,9 @@ const ExecServer = struct {
         while (!self.op.done()) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        // The VM ends after a suspend, so the slot stays taken.
+        // The VM ends after a suspend, so the slot stays taken, but `out_dir`
+        // goes away with this handler.
+        self.op.@"suspend".dir = "";
         return self.takeResponseLocked();
     }
 
@@ -3257,8 +3260,6 @@ test "a streaming input wake finishes before the run replaces its wake" {
     try std.testing.expect(!target.woken_after_retire.load(.acquire));
 }
 
-/// A local control client with read deadlines, so a monitor that blocks
-/// fails the test instead of hanging it.
 fn expectErrorResponse(message: []const u8, line: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3266,6 +3267,8 @@ fn expectErrorResponse(message: []const u8, line: []const u8) !void {
     try std.testing.expectEqualStrings(message, response.err.message);
 }
 
+/// A local control client with read deadlines, so a monitor that blocks
+/// fails the test instead of hanging it.
 const TestControlClient = struct {
     stream: net.Stream,
     fd: std.c.fd_t,
@@ -3310,6 +3313,47 @@ const TestControlClient = struct {
         return client.readLine(buffer, timeout_ms);
     }
 };
+
+/// Test support: ends whatever operation holds the slot, so a failed test
+/// can stop the control plane instead of waiting forever for a handler
+/// whose operation nothing will finish.
+fn finishOpForTest(server: *ExecServer) void {
+    server.mutex.lockUncancelable(server.io);
+    defer server.mutex.unlock(server.io);
+    switch (server.op) {
+        .idle, .readiness => {},
+        .exec => |*exec| exec.phase = .done,
+        .@"suspend", .snapshot => |*capture| capture.phase = .done,
+        .disk_fork => |*fork| fork.phase = .done,
+    }
+    server.stream_input_stop.store(true, .release);
+    server.cond.broadcast(server.io);
+}
+
+/// Test support: plays the VM loop until the slot satisfies `reached`, for
+/// at most 5 s.
+fn pollVmUntil(server: *ExecServer, dev: *vsock.Vsock, comptime reached: fn (Op) bool) !void {
+    const started_ms = lifecycle.monotonicMs();
+    while (true) {
+        _ = try server.poll(dev);
+        {
+            server.mutex.lockUncancelable(server.io);
+            defer server.mutex.unlock(server.io);
+            if (reached(server.op)) return;
+        }
+        if (lifecycle.monotonicMs() - started_ms > 5_000) return error.Timeout;
+        var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
+fn opIdle(op: Op) bool {
+    return op == .idle;
+}
+
+fn execAttached(op: Op) bool {
+    return op == .exec and op.exec.phase == .active;
+}
 
 test "monitor records the fork baseline while it holds the guest" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
@@ -3585,6 +3629,7 @@ test "monitor answers hello and shutdown while a guest operation runs" {
     const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     var stopped = false;
     defer if (!stopped) server.stopControl(accept_thread, "test finished");
+    errdefer finishOpForTest(&server);
 
     // A streaming exec takes the guest. The test plays the VM loop, which
     // starts the exec and never finishes it.
@@ -3650,6 +3695,7 @@ test "shutdown fails an exec still waiting for the guest and refuses the rest" {
     defer server.disk_claims.deinit();
     const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     defer server.stopControl(accept_thread, "test finished");
+    errdefer finishOpForTest(&server);
 
     // No VM loop runs, so the exec takes the slot and never reaches the guest.
     const exec = try TestControlClient.connect(socket_path);
@@ -3673,6 +3719,78 @@ test "shutdown fails an exec still waiting for the guest and refuses the rest" {
     try expectErrorResponse(removal_message, try exec.readLine(&buffer, 1_000));
     const refused = try TestControlClient.call(socket_path, "{\"type\":\"suspend\",\"out_dir\":\"/tmp/save.spore\"}\n", &buffer, 1_000);
     try expectErrorResponse(if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) capture_unavailable_x86 else removal_message, refused);
+}
+
+test "a streamed exec whose client hangs up frees the guest for the next exec" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-hangup-{d}.sock", .{std.c.getpid()});
+    var entry_dir = try TestDir.init();
+    defer entry_dir.deinit();
+    // The VM timeout is far longer than the test, so only the hang-up can
+    // end the exec.
+    var server = try ExecServer.init(allocator, io, .{ .dir = entry_dir.dir }, entry_dir.root, "/nonexistent", socket_path, "/nonexistent", 10700, 60_000, null, .{});
+    defer server.disk_claims.deinit();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    defer server.stopControl(accept_thread, "test finished");
+    errdefer finishOpForTest(&server);
+    // The test plays the VM loop against a device with no guest behind it.
+    var dev = vsock.Vsock.init(.{ .guest_cid = 3 });
+
+    const exec = try TestControlClient.connect(socket_path);
+    try exec.send("{\"type\":\"exec-stream-v1\",\"argv\":[\"/bin/cat\"],\"stdio\":\"pipe\"}\n");
+    try pollVmUntil(&server, &dev, execAttached);
+    exec.close();
+    // The guest's next output has nowhere to go, which ends the exec.
+    server.streamOutput(.stdout, "after hang-up");
+    try pollVmUntil(&server, &dev, opIdle);
+
+    const next = try TestControlClient.connect(socket_path);
+    defer next.close();
+    try next.send("{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n");
+    try pollVmUntil(&server, &dev, execAttached);
+}
+
+test "the readiness probe frees the guest once the guest answers" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-readiness-{d}.sock", .{std.c.getpid()});
+    var entry_dir = try TestDir.init();
+    defer entry_dir.deinit();
+    var server = try ExecServer.init(allocator, io, .{ .dir = entry_dir.dir }, entry_dir.root, "/nonexistent", socket_path, "/nonexistent", 10700, 60_000, null, .{});
+    defer server.disk_claims.deinit();
+    server.startup = .{
+        .timing = .{ .parse_ms = 0, .paths_ms = 0, .asset_resolve_ms = 0, .metadata_ms = 0, .ready_after_start_ms = 0 },
+        .started_ms = lifecycle.monotonicMs(),
+        .ready = .{ .pid = std.c.getpid(), .control_socket_path = socket_path },
+    };
+    const probe = try server.startReadinessProbe();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    defer server.stopControl(accept_thread, "test finished");
+    errdefer finishOpForTest(&server);
+    var dev = vsock.Vsock.init(.{ .guest_cid = 3 });
+    try dev.attachHostStream(probe);
+
+    // The guest agent answers the readiness request.
+    {
+        server.mutex.lockUncancelable(io);
+        defer server.mutex.unlock(io);
+        probe.state = .complete;
+        probe.exit_code = 0;
+    }
+    try pollVmUntil(&server, &dev, opIdle);
+    const ready = try entry_dir.dir.readFileAlloc(io, "ready.json", allocator, .limited(4096));
+    defer allocator.free(ready);
+    try std.testing.expect(std.mem.indexOf(u8, ready, socket_path) != null);
+
+    const exec = try TestControlClient.connect(socket_path);
+    defer exec.close();
+    try exec.send("{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n");
+    try pollVmUntil(&server, &dev, execAttached);
 }
 
 test "monitor refuses a request with an unknown field before it takes the guest" {
