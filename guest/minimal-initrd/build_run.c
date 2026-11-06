@@ -414,10 +414,11 @@ static int cleanup_build_run_mounts(struct build_context_bind_mount_state *bind_
   return bind_rc != 0 || cache_rc != 0 ? -1 : 0;
 }
 
-void run_build_exec(struct client *client, const struct run_request *request, char *command, int use_rootfs,
-                           struct build_cache_mount_state *cache_state,
-                           struct build_context_bind_mount_state *bind_state,
-                           const char *root) {
+// Starts a build RUN step as the exec op, with its cache mounts and context
+// binds already set up in op. On failure, unmounts them, answers and closes
+// the client, and returns nonzero.
+int start_build_exec(struct exec_op *op, struct client *client, const struct run_request *request, char *command, int use_rootfs,
+                     const char *root) {
   char *argv[4];
   char *const *effective_argv = request->argv;
   if (!request->build_exec_form) {
@@ -428,7 +429,7 @@ void run_build_exec(struct client *client, const struct run_request *request, ch
     effective_argv = argv;
   }
 
-  struct session transient;
+  struct session *transient = &op->session;
   const struct session_start_options options = {
     .use_rootfs = use_rootfs,
     .build_run_isolation = 1,
@@ -438,93 +439,64 @@ void run_build_exec(struct client *client, const struct run_request *request, ch
     .terminal_rows = request->terminal_rows,
     .terminal_cols = request->terminal_cols,
   };
-  int rc = start_session(&transient, request->session_id, effective_argv, request->envp, request->working_dir, &options);
+  int rc = start_session(transient, request->session_id, effective_argv, request->envp, request->working_dir, &options);
   if (rc != 0) {
-    int mount_cleanup_rc = cleanup_build_run_mounts(bind_state, cache_state, root);
+    int mount_cleanup_rc = cleanup_build_run_mounts(&op->bind_state, &op->cache_state, root);
     if (mount_cleanup_rc != 0) {
       poison_build_run_mount_cleanup("RUN setup");
       (void)send_client_error_exit(client, 125, "spore build: RUN mount cleanup failed\n");
     } else {
       (void)send_client_error_exit(
-          client, rc, transient.setup_error[0] != '\0' ? transient.setup_error :
+          client, rc, transient->setup_error[0] != '\0' ? transient->setup_error :
           "spore build: RUN exec setup failed\n");
     }
     close_client(client);
-    return;
+    return -1;
   }
+  op->kind = EXEC_OP_BUILD_RUN;
+  op->descendants_cleaned = 0;
+  op->root = root;
+  return 0;
+}
 
-  int descendants_cleaned = 0;
-  while (client->fd >= 0 && (!transient.exited || transient.stdout_open || transient.stderr_open)) {
-    struct pollfd fds[4];
-    int roles[4];
-    nfds_t nfds = 0;
-    if (transient.stdout_open) {
-      fds[nfds].fd = transient.stdout_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 1;
+// Once the RUN command exits, kills its descendants and unmounts its cache
+// mounts and context binds before the exit status goes to the client.
+void step_build_exec(struct exec_op *op, struct client *client) {
+  struct session *transient = &op->session;
+  poll_session_exit(transient, client);
+  if (transient->exited && !op->descendants_cleaned) {
+    if (clean_build_run_processes(transient) != 0) {
+      (void)send_client_error_exit(client, 125, "spore build: RUN descendant cleanup failed\n");
+      close_client(client);
+      fail_closed_build_run_cleanup("command exit");
     }
-    if (transient.stderr_open) {
-      fds[nfds].fd = transient.stderr_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 2;
+    op->descendants_cleaned = 1;
+    if (cleanup_build_run_mounts(&op->bind_state, &op->cache_state, op->root) != 0) {
+      poison_build_run_mount_cleanup("command exit");
+      (void)send_client_error_exit(client, 125, "spore build: RUN mount cleanup failed\n");
+      close_client(client);
+      return;
     }
-    if (sigchld_pipe[0] >= 0) {
-      fds[nfds].fd = sigchld_pipe[0];
-      fds[nfds].events = POLLIN;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 4;
-    }
-    fds[nfds].fd = client->fd;
-    fds[nfds].events = POLLHUP | POLLERR;
-    fds[nfds].revents = 0;
-    roles[nfds++] = 3;
-
-    int pr = poll(fds, nfds, 100);
-    if (pr > 0) {
-      for (nfds_t i = 0; i < nfds; i++) {
-        if (fds[i].revents == 0) continue;
-        if (roles[i] == 1) {
-          pump_session_stream(&transient, client, 1);
-        } else if (roles[i] == 2) {
-          pump_session_stream(&transient, client, 0);
-        } else if (roles[i] == 3 && (fds[i].revents & (POLLHUP | POLLERR))) {
-          close_client(client);
-        } else if (roles[i] == 4) {
-          drain_sigchld_wakeup();
-        }
-      }
-    }
-    poll_session_exit(&transient, client);
-    if (transient.exited && !descendants_cleaned) {
-      if (clean_build_run_processes(&transient) != 0) {
-        (void)send_client_error_exit(client, 125, "spore build: RUN descendant cleanup failed\n");
-        close_client(client);
-        fail_closed_build_run_cleanup("command exit");
-      }
-      descendants_cleaned = 1;
-      if (cleanup_build_run_mounts(bind_state, cache_state, root) != 0) {
-        poison_build_run_mount_cleanup("command exit");
-        (void)send_client_error_exit(client, 125, "spore build: RUN mount cleanup failed\n");
-        close_client(client);
-        break;
-      }
-    }
-    if (descendants_cleaned) maybe_send_session_exit(&transient, client);
   }
+  if (op->descendants_cleaned) maybe_send_session_exit(transient, client);
+}
 
-  if (client->fd < 0 && transient.started && !descendants_cleaned) {
-    if (clean_build_run_processes(&transient) != 0) {
+// Ends the RUN step once its client has the exit status or is gone. If the
+// client went first, cleans up what the command left behind.
+void finish_build_exec(struct exec_op *op, struct client *client) {
+  struct session *transient = &op->session;
+  if (client->fd < 0 && transient->started && !op->descendants_cleaned) {
+    if (clean_build_run_processes(transient) != 0) {
       fail_closed_build_run_cleanup("control loss");
     }
   }
-  if (cache_state->count != 0 || cache_state->cache_mounted || bind_state->count != 0) {
-    if (cleanup_build_run_mounts(bind_state, cache_state, root) != 0) {
+  if (op->cache_state.count != 0 || op->cache_state.cache_mounted || op->bind_state.count != 0) {
+    if (cleanup_build_run_mounts(&op->bind_state, &op->cache_state, op->root) != 0) {
       poison_build_run_mount_cleanup("control loss");
     }
   }
-  reset_session(&transient);
+  reset_session(transient);
+  close_client(client);
 }
 
 #ifdef SPORE_AGENT_REQUEST_FUZZ

@@ -450,21 +450,22 @@ void maybe_send_memory_pressure(struct session *session, struct client *client) 
   }
 }
 
-// Runs an exec beside a captured session that is still running, such as a
-// named VM restored from a live capture. Named exec sends start-v1 with pipe
-// stdin, so forward its stdin frames; terminals and memory pressure need the
-// primary session slot. Until the exec finishes, the agent keeps draining the
-// captured session's output into its replay buffer, as the main loop does
-// with no client attached, so the captured workload never blocks on a full
-// pipe. Other execs and copies to the VM wait for this one to finish.
-void run_transient_exec(struct session *session, struct client *client, const struct run_request *request, int use_rootfs) {
+// Starts an exec beside a captured session that is still running, such as a
+// named VM restored from a live capture, as the exec op. Named exec sends
+// start-v1 with pipe stdin, so the event loop forwards its stdin frames;
+// terminals and memory pressure need the primary session slot. Until the
+// exec finishes, the loop keeps draining the captured session's output into
+// its replay buffer, as it does with no client attached, so the captured
+// workload never blocks on a full pipe. Other execs and copies to the VM wait
+// for this one to finish. On failure, answers and closes the client and
+// returns nonzero.
+int start_transient_exec(struct exec_op *op, struct client *client, const struct run_request *request, int use_rootfs) {
   if (request->tty || request->memory_pressure) {
     (void)send_client_error_exit(client, 2, "spore run: session already started\n");
     close_client(client);
-    return;
+    return -1;
   }
 
-  struct session transient;
   const struct session_start_options options = {
     .use_rootfs = use_rootfs,
     .exec_lookup = EXEC_LOOKUP_PATH,
@@ -472,71 +473,23 @@ void run_transient_exec(struct session *session, struct client *client, const st
     .terminal_rows = request->terminal_rows,
     .terminal_cols = request->terminal_cols,
   };
-  int rc = start_session(&transient, request->session_id, request->argv, request->envp, request->working_dir, &options);
+  int rc = start_session(&op->session, request->session_id, request->argv, request->envp, request->working_dir, &options);
   if (rc != 0) {
     (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
     close_client(client);
-    return;
+    return -1;
   }
+  op->kind = EXEC_OP_TRANSIENT;
+  return 0;
+}
 
-  // The agent has one client slot and this exec holds it, so the captured
-  // session's output goes only to its replay buffer and the console.
-  struct client no_client;
-  memset(&no_client, 0, sizeof(no_client));
-  no_client.fd = -1;
-  while (client->fd >= 0 && (!transient.exited || transient.stdout_open || transient.stderr_open)) {
-    struct pollfd fds[6];
-    int roles[6];
-    nfds_t nfds = 0;
-    if (transient.stdout_open) {
-      fds[nfds].fd = transient.stdout_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 1;
-    }
-    if (transient.stderr_open) {
-      fds[nfds].fd = transient.stderr_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 2;
-    }
-    fds[nfds].fd = client->fd;
-    fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-    fds[nfds].revents = 0;
-    roles[nfds++] = 3;
-    if (transient.stdin_open && transient.stdin_pending_len != 0) {
-      fds[nfds].fd = transient.stdin_fd;
-      fds[nfds].events = POLLOUT | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 4;
-    }
-    add_session_output_fds(session, fds, roles, &nfds, 5);
-
-    int pr = poll(fds, nfds, 100);
-    if (pr > 0) {
-      for (nfds_t i = 0; i < nfds; i++) {
-        if (fds[i].revents == 0) continue;
-        if (roles[i] == 5 || roles[i] == 6) {
-          pump_session_output(session, &no_client, roles[i] == 5, fds[i].revents);
-        } else if (roles[i] == 1) {
-          pump_session_stream(&transient, client, 1);
-        } else if (roles[i] == 2) {
-          pump_session_stream(&transient, client, 0);
-        } else if (roles[i] == 3) {
-          if (fds[i].revents & POLLIN) pump_client_v1(&transient, client);
-          if (fds[i].revents & (POLLHUP | POLLERR)) close_client(client);
-        } else if (roles[i] == 4) {
-          drain_session_stdin(&transient);
-        }
-      }
-    }
-    poll_session_exit(&transient, client);
-    maybe_send_session_exit(&transient, client);
+// Ends the transient exec once its client has the exit status or is gone,
+// killing the command if the client went first.
+void finish_transient_exec(struct exec_op *op, struct client *client) {
+  if (client->fd < 0 && op->session.started && !op->session.exited) {
+    (void)kill(op->session.pid, SIGKILL);
+    wait_child_blocking(op->session.pid);
   }
-
-  if (client->fd < 0 && transient.started && !transient.exited) {
-    (void)kill(transient.pid, SIGKILL);
-    wait_child_blocking(transient.pid);
-  }
-  reset_session(&transient);
+  reset_session(&op->session);
+  close_client(client);
 }

@@ -298,6 +298,24 @@ struct build_context_bind_mount_state {
   } mounts[MAX_BUILD_CONTEXT_BINDS];
 };
 
+enum exec_op_kind {
+  EXEC_OP_NONE,
+  EXEC_OP_TRANSIENT,
+  EXEC_OP_BUILD_RUN,
+};
+
+// An exec that holds the client until it finishes: a transient exec beside a
+// running captured session, or a build RUN step. The event loop runs it, and
+// the next request waits until it is done.
+struct exec_op {
+  enum exec_op_kind kind;
+  struct session session;
+  int descendants_cleaned;
+  struct build_cache_mount_state cache_state;
+  struct build_context_bind_mount_state bind_state;
+  const char *root;
+};
+
 extern int64_t t_init_start;
 extern int64_t t_listen_ready;
 extern int64_t t_request_accept;
@@ -402,12 +420,15 @@ void pump_client_v1(struct session *session, struct client *client);
 void poll_session_exit(struct session *session, struct client *client);
 void maybe_send_session_exit(struct session *session, struct client *client);
 void maybe_send_memory_pressure(struct session *session, struct client *client);
-void run_transient_exec(struct session *session, struct client *client, const struct run_request *request, int use_rootfs);
+int start_transient_exec(struct exec_op *op, struct client *client, const struct run_request *request, int use_rootfs);
+void finish_transient_exec(struct exec_op *op, struct client *client);
 void poison_build_run_mount_cleanup(const char *phase);
 int cleanup_build_cache_mounts(struct build_cache_mount_state *state, const char *root);
 int setup_build_cache_mounts(const struct run_request *request, const char *root, int has_context, int build_input_count, struct build_cache_mount_state *state, char *error, size_t error_cap);
 int setup_build_context_binds(const struct run_request *request, const char *root, int build_context_requested, int build_context_ready, struct build_context_bind_mount_state *state, char *error, size_t error_cap);
-void run_build_exec(struct client *client, const struct run_request *request, char *command, int use_rootfs, struct build_cache_mount_state *cache_state, struct build_context_bind_mount_state *bind_state, const char *root);
+int start_build_exec(struct exec_op *op, struct client *client, const struct run_request *request, char *command, int use_rootfs, const char *root);
+void step_build_exec(struct exec_op *op, struct client *client);
+void finish_build_exec(struct exec_op *op, struct client *client);
 const char *apply_request_generation(struct generation_monitor *generation, const char *root, const char *params);
 
 #endif

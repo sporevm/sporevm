@@ -30,6 +30,55 @@ int64_t t_command_system_us = -1;
 
 int proc_dir_fd = -1;
 
+// What the event loop works on: the listener, what boot set up, the captured
+// or current session and its client, detached children, the generation
+// device, and the exec op that holds the client while it runs.
+struct agent {
+  int listener;
+  int use_rootfs;
+  int rootfs_writable;
+  int rootfs_growth_session;
+  int rootfs_ready;
+  const char *rootfs_error;
+  int build_context_requested;
+  int build_context_ready;
+  const char *build_context_error;
+  int build_input_count;
+  int build_inputs_ready;
+  const char *build_inputs_error;
+  int network_requested;
+  int network_ready;
+  const char *network_error;
+  const char *generation_root;
+  struct session session;
+  struct client client;
+  struct detached_children detached;
+  struct generation_monitor generation;
+  struct exec_op op;
+  // Never connected: takes the session's output and exit while the exec op
+  // holds the client.
+  struct client no_client;
+};
+
+static struct client *session_client(struct agent *a) {
+  return a->op.kind == EXEC_OP_NONE ? &a->client : &a->no_client;
+}
+
+static void init_agent(struct agent *a) {
+  memset(a, 0, sizeof(*a));
+  a->session.stdin_fd = -1;
+  a->session.terminal_fd = -1;
+  a->session.stdout_fd = -1;
+  a->session.stderr_fd = -1;
+  a->session.memory_pressure_fd = -1;
+  a->client.fd = -1;
+  a->no_client.fd = -1;
+  a->detached.retained_pid = -1;
+  a->detached.retained_stdout_fd = -1;
+  a->detached.retained_stderr_fd = -1;
+  a->generation.last_generation = UINT64_MAX;
+}
+
 static int listen_vsock(uint32_t port) {
   int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) return -1;
@@ -49,8 +98,10 @@ static int listen_vsock(uint32_t port) {
   return fd;
 }
 
-static void accept_request(int listener, struct session *session, struct client *client, struct detached_children *detached, struct generation_monitor *generation, const char *generation_root, int use_rootfs, int rootfs_writable, int rootfs_growth_session, int rootfs_ready, const char *rootfs_error, int build_context_requested, int build_context_ready, const char *build_context_error, int build_input_count, int build_inputs_ready, const char *build_inputs_error, int network_requested, int network_ready, const char *network_error) {
-  int conn = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+static void accept_request(struct agent *a) {
+  struct session *session = &a->session;
+  struct client *client = &a->client;
+  int conn = accept4(a->listener, NULL, NULL, SOCK_CLOEXEC);
   if (conn < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
       dprintf(2, "accept failed: errno=%d\n", errno);
@@ -90,13 +141,13 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_READY) {
-    if (use_rootfs && !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+    if (a->use_rootfs && !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
-    if (network_requested && !network_ready) {
-      (void)send_client_error_exit(client, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
+    if (a->network_requested && !a->network_ready) {
+      (void)send_client_error_exit(client, 126, a->network_error[0] != '\0' ? a->network_error : "spore run: network unavailable\n");
       close_client(client);
       return;
     }
@@ -106,18 +157,18 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_INITIAL_OUTPUT) {
-    (void)send_retained_output(client, detached);
+    (void)send_retained_output(client, &a->detached);
     close_client(client);
     return;
   }
 
   if (request.kind == REQUEST_COPY_IN || request.kind == REQUEST_COPY_OUT) {
-    if (use_rootfs && !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+    if (a->use_rootfs && !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
-    const char *root = use_rootfs && rootfs_ready ? "/mnt/rootfs" : "";
+    const char *root = a->use_rootfs && a->rootfs_ready ? "/mnt/rootfs" : "";
     if (request.kind == REQUEST_COPY_IN) {
       (void)copy_in_file(client, root, request.copy_path);
     } else {
@@ -128,8 +179,8 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_BUILD_RUN) {
-    if (!use_rootfs || !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+    if (!a->use_rootfs || !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore build: rootfs unavailable\n");
       close_client(client);
       return;
     }
@@ -141,21 +192,21 @@ static void accept_request(int listener, struct session *session, struct client 
       close_client(client);
       return;
     }
-    struct build_cache_mount_state cache_state;
-    struct build_context_bind_mount_state bind_state;
+    struct build_cache_mount_state *cache_state = &a->op.cache_state;
+    struct build_context_bind_mount_state *bind_state = &a->op.bind_state;
     const char *root = "/mnt/rootfs";
-    int cache_setup_rc = setup_build_cache_mounts(&request, root, build_context_requested, build_input_count,
-                                                  &cache_state, error, sizeof(error));
+    int cache_setup_rc = setup_build_cache_mounts(&request, root, a->build_context_requested, a->build_input_count,
+                                                  cache_state, error, sizeof(error));
     if (cache_setup_rc != 0) {
       (void)send_client_error_exit(client, cache_setup_rc == -2 ? 125 : 126,
                                    error[0] != '\0' ? error : "spore build: cache mount setup failed\n");
       close_client(client);
       return;
     }
-    int bind_setup_rc = setup_build_context_binds(&request, root, build_context_requested, build_context_ready,
-                                                  &bind_state, error, sizeof(error));
+    int bind_setup_rc = setup_build_context_binds(&request, root, a->build_context_requested, a->build_context_ready,
+                                                  bind_state, error, sizeof(error));
     if (bind_setup_rc != 0) {
-      if (cleanup_build_cache_mounts(&cache_state, root) != 0) {
+      if (cleanup_build_cache_mounts(cache_state, root) != 0) {
         poison_build_run_mount_cleanup("context bind setup cache rollback");
         bind_setup_rc = -2;
         snprintf(error, sizeof(error), "spore build: RUN mount cleanup failed\n");
@@ -166,28 +217,27 @@ static void accept_request(int listener, struct session *session, struct client 
       return;
     }
     apply_resume_clock(request.resume_time_unix_ns);
-    run_build_exec(client, &request, command, use_rootfs, &cache_state, &bind_state, root);
-    close_client(client);
+    (void)start_build_exec(&a->op, client, &request, command, a->use_rootfs, root);
     return;
   }
 
   if (request.kind == REQUEST_BUILD_COPY) {
-    if (!use_rootfs || !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+    if (!a->use_rootfs || !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore build: rootfs unavailable\n");
       close_client(client);
       return;
     }
     char source_root[64];
     if (request.copy_source_disk == COPY_SOURCE_CONTEXT) {
-      if (!build_context_requested || !build_context_ready) {
-        (void)send_client_error_exit(client, 126, build_context_error[0] != '\0' ? build_context_error : "spore build: context disk unavailable\n");
+      if (!a->build_context_requested || !a->build_context_ready) {
+        (void)send_client_error_exit(client, 126, a->build_context_error[0] != '\0' ? a->build_context_error : "spore build: context disk unavailable\n");
         close_client(client);
         return;
       }
       snprintf(source_root, sizeof(source_root), "%s", BUILD_CONTEXT_ROOT);
     } else {
-      if (!build_inputs_ready || request.copy_input_index >= (uint64_t)build_input_count) {
-        (void)send_client_error_exit(client, 126, build_inputs_error[0] != '\0' ? build_inputs_error : "spore build: input disk unavailable\n");
+      if (!a->build_inputs_ready || request.copy_input_index >= (uint64_t)a->build_input_count) {
+        (void)send_client_error_exit(client, 126, a->build_inputs_error[0] != '\0' ? a->build_inputs_error : "spore build: input disk unavailable\n");
         close_client(client);
         return;
       }
@@ -217,8 +267,8 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_BUILD_WORKDIR) {
-    if (!use_rootfs || !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+    if (!a->use_rootfs || !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore build: rootfs unavailable\n");
       close_client(client);
       return;
     }
@@ -228,12 +278,12 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_ROOTFS_GROW) {
-    if (!use_rootfs || !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+    if (!a->use_rootfs || !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore build: rootfs unavailable\n");
       close_client(client);
       return;
     }
-    if (!rootfs_writable || !rootfs_growth_session) {
+    if (!a->rootfs_writable || !a->rootfs_growth_session) {
       (void)send_client_error_exit(client, 126, "spore build: rootfs growth is not enabled\n");
       close_client(client);
       return;
@@ -244,8 +294,8 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_FSFREEZE || request.kind == REQUEST_FSTHAW) {
-    if (!use_rootfs || !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore build: rootfs unavailable\n");
+    if (!a->use_rootfs || !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore build: rootfs unavailable\n");
       close_client(client);
       return;
     }
@@ -255,33 +305,33 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.kind == REQUEST_START) {
-    if (use_rootfs && !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+    if (a->use_rootfs && !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
-    if (network_requested && !network_ready) {
-      (void)send_client_error_exit(client, 126, network_error[0] != '\0' ? network_error : "spore run: network unavailable\n");
+    if (a->network_requested && !a->network_ready) {
+      (void)send_client_error_exit(client, 126, a->network_error[0] != '\0' ? a->network_error : "spore run: network unavailable\n");
       close_client(client);
       return;
     }
     if (request.generation_params[0] != '\0') {
-      const char *root = generation_root_path(use_rootfs, rootfs_ready);
-      const char *generation_error = apply_request_generation(generation, root, request.generation_params);
+      const char *root = generation_root_path(a->use_rootfs, a->rootfs_ready);
+      const char *generation_error = apply_request_generation(&a->generation, root, request.generation_params);
       if (generation_error != NULL) {
         (void)send_client_error_exit(client, 126, generation_error);
         close_client(client);
         return;
       }
-    } else if (request.require_generation_ready && ensure_generation_ready(generation, generation_root) != 0) {
+    } else if (request.require_generation_ready && ensure_generation_ready(&a->generation, a->generation_root) != 0) {
       (void)send_client_error_exit(client, 126, "spore run: generation metadata unavailable\n");
       close_client(client);
       return;
     }
     apply_resume_clock(request.resume_time_unix_ns);
     if (request.detached) {
-      int rc = start_detached(request.argv, request.envp, request.working_dir, use_rootfs,
-                              request.retain_output, detached);
+      int rc = start_detached(request.argv, request.envp, request.working_dir, a->use_rootfs,
+                              request.retain_output, &a->detached);
       if (rc != 0) {
         (void)send_client_error_exit(client, rc, "spore run: exec setup failed\n");
         close_client(client);
@@ -298,7 +348,7 @@ static void accept_request(int listener, struct session *session, struct client 
         return;
       }
       if (!session_finished(session)) {
-        run_transient_exec(session, client, &request, use_rootfs);
+        (void)start_transient_exec(&a->op, client, &request, a->use_rootfs);
         return;
       }
       // ponytail: completed-base resumes lose pipe wakeups under ReleaseSafe; keep the file fallback resumed-only.
@@ -306,7 +356,7 @@ static void accept_request(int listener, struct session *session, struct client 
       reset_session(session);
     }
     const struct session_start_options options = {
-      .use_rootfs = use_rootfs,
+      .use_rootfs = a->use_rootfs,
       .file_stdio = file_stdio,
       .memory_pressure = request.memory_pressure,
       .exec_lookup = EXEC_LOOKUP_PATH,
@@ -333,13 +383,13 @@ static void accept_request(int listener, struct session *session, struct client 
   }
 
   if (request.generation_params[0] != '\0') {
-    if (use_rootfs && !rootfs_ready) {
-      (void)send_client_error_exit(client, 126, rootfs_error[0] != '\0' ? rootfs_error : "spore run: rootfs unavailable\n");
+    if (a->use_rootfs && !a->rootfs_ready) {
+      (void)send_client_error_exit(client, 126, a->rootfs_error[0] != '\0' ? a->rootfs_error : "spore run: rootfs unavailable\n");
       close_client(client);
       return;
     }
-    const char *root = generation_root_path(use_rootfs, rootfs_ready);
-    const char *generation_error = apply_request_generation(generation, root, request.generation_params);
+    const char *root = generation_root_path(a->use_rootfs, a->rootfs_ready);
+    const char *generation_error = apply_request_generation(&a->generation, root, request.generation_params);
     if (generation_error != NULL) {
       (void)send_client_error_exit(client, 126, generation_error);
       close_client(client);
@@ -381,6 +431,143 @@ static void accept_request(int listener, struct session *session, struct client 
     return;
   }
   (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
+}
+
+// One pass of the event loop: waits up to 100 ms (10 ms while the session's
+// output goes through files) for the listener, the client, session
+// output, child exits, memory pressure, stdin space, and retained output, then
+// handles what is ready. While an exec op holds the client, the listener
+// waits, client frames go to the op, and the session's output goes only to
+// its replay buffer and the console.
+static void poll_agent(struct agent *a) {
+  struct session *session = &a->session;
+  struct exec_op *op = &a->op;
+
+  reap_detached_children(&a->detached);
+  drain_retained_output(&a->detached);
+  if (!a->use_rootfs || a->rootfs_ready) {
+    (void)poll_generation(&a->generation, a->generation_root);
+  }
+  if (session->file_stdio && !session->exited) {
+    pump_session_file(session, session_client(a), 1);
+    pump_session_file(session, session_client(a), 0);
+    poll_session_exit(session, session_client(a));
+    maybe_send_session_exit(session, session_client(a));
+  }
+
+  struct pollfd fds[13];
+  int roles[13];
+  nfds_t nfds = 0;
+  if (op->kind == EXEC_OP_NONE) {
+    fds[nfds].fd = a->listener;
+    fds[nfds].events = POLLIN;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 0;
+  }
+  if (a->client.fd >= 0) {
+    fds[nfds].fd = a->client.fd;
+    // A build RUN reads nothing more from its client; it only notices a hangup.
+    fds[nfds].events = op->kind == EXEC_OP_BUILD_RUN ? POLLHUP | POLLERR : POLLIN | POLLHUP | POLLERR;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 1;
+  }
+  add_session_output_fds(session, fds, roles, &nfds, 2);
+  fds[nfds].fd = sigchld_pipe[0];
+  fds[nfds].events = POLLIN;
+  fds[nfds].revents = 0;
+  roles[nfds++] = 4;
+  if (session->memory_pressure_fd >= 0) {
+    fds[nfds].fd = session->memory_pressure_fd;
+    fds[nfds].events = POLLPRI | POLLERR;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 5;
+  }
+  if (session->stdin_open && session->stdin_pending_len != 0) {
+    fds[nfds].fd = session->stdin_fd;
+    fds[nfds].events = POLLOUT | POLLERR;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 6;
+  }
+  if (a->detached.retained_stdout_fd >= 0) {
+    fds[nfds].fd = a->detached.retained_stdout_fd;
+    fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 7;
+  }
+  if (a->detached.retained_stderr_fd >= 0) {
+    fds[nfds].fd = a->detached.retained_stderr_fd;
+    fds[nfds].events = POLLIN | POLLHUP | POLLERR;
+    fds[nfds].revents = 0;
+    roles[nfds++] = 8;
+  }
+  if (op->kind != EXEC_OP_NONE) {
+    add_session_output_fds(&op->session, fds, roles, &nfds, 9);
+    if (op->session.stdin_open && op->session.stdin_pending_len != 0) {
+      fds[nfds].fd = op->session.stdin_fd;
+      fds[nfds].events = POLLOUT | POLLERR;
+      fds[nfds].revents = 0;
+      roles[nfds++] = 11;
+    }
+  }
+
+  int timeout_ms = session->file_stdio && session->started && !session->exited ? 10 : 100;
+  int pr = poll(fds, nfds, timeout_ms);
+  if (pr < 0 && errno != EINTR) return;
+  if (pr > 0) {
+    for (nfds_t i = 0; i < nfds; i++) {
+      if (fds[i].revents == 0) continue;
+      if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
+        accept_request(a);
+      } else if (roles[i] == 1 && fds[i].fd == a->client.fd) {
+        // accept_request may have replaced the client polled here; the
+        // replaced client's events, such as its hangup, are not the new one's.
+        if ((fds[i].revents & POLLIN) && op->kind != EXEC_OP_BUILD_RUN) {
+          pump_client_v1(op->kind == EXEC_OP_TRANSIENT ? &op->session : session, &a->client);
+        }
+        if (fds[i].revents & (POLLHUP | POLLERR)) {
+          close_client(&a->client);
+        }
+      } else if (roles[i] == 2 || roles[i] == 3) {
+        pump_session_output(session, session_client(a), roles[i] == 2, fds[i].revents);
+      } else if (roles[i] == 4) {
+        drain_sigchld_wakeup();
+        reap_detached_children(&a->detached);
+      } else if (roles[i] == 5 && (fds[i].revents & (POLLPRI | POLLERR))) {
+        maybe_send_memory_pressure(session, session_client(a));
+      } else if (roles[i] == 6) {
+        drain_session_stdin(session);
+      } else if (roles[i] == 7 || roles[i] == 8) {
+        drain_retained_output(&a->detached);
+      } else if (roles[i] == 9 || roles[i] == 10) {
+        pump_session_output(&op->session, &a->client, roles[i] == 9, fds[i].revents);
+      } else if (roles[i] == 11) {
+        drain_session_stdin(&op->session);
+      }
+    }
+  }
+  drain_session_stdin(session);
+  drain_session_terminal(session);
+  if (session->file_stdio && !session->exited) {
+    pump_session_file(session, session_client(a), 1);
+    pump_session_file(session, session_client(a), 0);
+  }
+  poll_session_exit(session, session_client(a));
+  maybe_send_session_exit(session, session_client(a));
+  if (op->kind == EXEC_OP_NONE) return;
+
+  if (op->kind == EXEC_OP_TRANSIENT) {
+    poll_session_exit(&op->session, &a->client);
+    maybe_send_session_exit(&op->session, &a->client);
+  } else {
+    step_build_exec(op, &a->client);
+  }
+  if (a->client.fd >= 0 && !session_finished(&op->session)) return;
+  if (op->kind == EXEC_OP_TRANSIENT) {
+    finish_transient_exec(op, &a->client);
+  } else {
+    finish_build_exec(op, &a->client);
+  }
+  op->kind = EXEC_OP_NONE;
 }
 
 #ifndef SPORE_AGENT_REQUEST_FUZZ
@@ -474,120 +661,25 @@ int main(void) {
     return 1;
   }
 
-  struct session session;
-  memset(&session, 0, sizeof(session));
-  session.stdin_fd = -1;
-  session.terminal_fd = -1;
-  session.stdout_fd = -1;
-  session.stderr_fd = -1;
-  session.memory_pressure_fd = -1;
-  struct client client;
-  memset(&client, 0, sizeof(client));
-  client.fd = -1;
-  struct detached_children detached;
-  memset(&detached, 0, sizeof(detached));
-  detached.retained_pid = -1;
-  detached.retained_stdout_fd = -1;
-  detached.retained_stderr_fd = -1;
-  struct generation_monitor generation;
-  memset(&generation, 0, sizeof(generation));
-  generation.last_generation = UINT64_MAX;
-  const char *generation_root = generation_root_path(use_rootfs, rootfs_ready);
-
-  for (;;) {
-    reap_detached_children(&detached);
-    drain_retained_output(&detached);
-    if (!use_rootfs || rootfs_ready) {
-      (void)poll_generation(&generation, generation_root);
-    }
-    if (session.file_stdio && !session.exited) {
-      pump_session_file(&session, &client, 1);
-      pump_session_file(&session, &client, 0);
-      poll_session_exit(&session, &client);
-      maybe_send_session_exit(&session, &client);
-    }
-
-    struct pollfd fds[10];
-    int roles[10];
-    nfds_t nfds = 0;
-    fds[nfds].fd = listener;
-    fds[nfds].events = POLLIN;
-    fds[nfds].revents = 0;
-    roles[nfds++] = 0;
-    if (client.fd >= 0) {
-      fds[nfds].fd = client.fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 1;
-    }
-    add_session_output_fds(&session, fds, roles, &nfds, 2);
-    fds[nfds].fd = sigchld_pipe[0];
-    fds[nfds].events = POLLIN;
-    fds[nfds].revents = 0;
-    roles[nfds++] = 4;
-    if (session.memory_pressure_fd >= 0) {
-      fds[nfds].fd = session.memory_pressure_fd;
-      fds[nfds].events = POLLPRI | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 5;
-    }
-    if (session.stdin_open && session.stdin_pending_len != 0) {
-      fds[nfds].fd = session.stdin_fd;
-      fds[nfds].events = POLLOUT | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 6;
-    }
-    if (detached.retained_stdout_fd >= 0) {
-      fds[nfds].fd = detached.retained_stdout_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 7;
-    }
-    if (detached.retained_stderr_fd >= 0) {
-      fds[nfds].fd = detached.retained_stderr_fd;
-      fds[nfds].events = POLLIN | POLLHUP | POLLERR;
-      fds[nfds].revents = 0;
-      roles[nfds++] = 8;
-    }
-
-    int poll_timeout_ms = session.file_stdio && session.started && !session.exited ? 10 : 100;
-    int pr = poll(fds, nfds, poll_timeout_ms);
-    if (pr < 0 && errno != EINTR) continue;
-    if (pr > 0) {
-      for (nfds_t i = 0; i < nfds; i++) {
-        if (fds[i].revents == 0) continue;
-        if (roles[i] == 0 && (fds[i].revents & POLLIN)) {
-          accept_request(listener, &session, &client, &detached, &generation, generation_root, use_rootfs, rootfs_writable, rootfs_growth_session, rootfs_ready, rootfs_error, use_build_context, build_context_ready, build_context_error, build_input_count, build_inputs_ready, build_inputs_error, use_network, network_ready, network_error);
-        } else if (roles[i] == 1) {
-          if (fds[i].revents & POLLIN) {
-            pump_client_v1(&session, &client);
-          }
-          if (fds[i].revents & (POLLHUP | POLLERR)) {
-            close_client(&client);
-          }
-        } else if (roles[i] == 2 || roles[i] == 3) {
-          pump_session_output(&session, &client, roles[i] == 2, fds[i].revents);
-        } else if (roles[i] == 4) {
-          drain_sigchld_wakeup();
-          reap_detached_children(&detached);
-        } else if (roles[i] == 5 && (fds[i].revents & (POLLPRI | POLLERR))) {
-          maybe_send_memory_pressure(&session, &client);
-        } else if (roles[i] == 6) {
-          drain_session_stdin(&session);
-        } else if (roles[i] == 7 || roles[i] == 8) {
-          drain_retained_output(&detached);
-        }
-      }
-    }
-    drain_session_stdin(&session);
-    drain_session_terminal(&session);
-    if (session.file_stdio && !session.exited) {
-      pump_session_file(&session, &client, 1);
-      pump_session_file(&session, &client, 0);
-    }
-    poll_session_exit(&session, &client);
-    maybe_send_session_exit(&session, &client);
-  }
+  static struct agent a;
+  init_agent(&a);
+  a.listener = listener;
+  a.use_rootfs = use_rootfs;
+  a.rootfs_writable = rootfs_writable;
+  a.rootfs_growth_session = rootfs_growth_session;
+  a.rootfs_ready = rootfs_ready;
+  a.rootfs_error = rootfs_error;
+  a.build_context_requested = use_build_context;
+  a.build_context_ready = build_context_ready;
+  a.build_context_error = build_context_error;
+  a.build_input_count = build_input_count;
+  a.build_inputs_ready = build_inputs_ready;
+  a.build_inputs_error = build_inputs_error;
+  a.network_requested = use_network;
+  a.network_ready = network_ready;
+  a.network_error = network_error;
+  a.generation_root = generation_root_path(use_rootfs, rootfs_ready);
+  for (;;) poll_agent(&a);
 }
 #endif
 
@@ -597,17 +689,32 @@ int main(void) {
 
 // Starts `/bin/sh -c captured_script` as a captured session, the state of a
 // named VM restored from a live capture, then sends request_bytes and
-// input_bytes as a second client while it runs. Copies the frames the agent
-// answers with into response and returns their length, or -1 when the harness
-// itself fails. *captured_stdout gets how many bytes of the captured
-// session's stdout the agent had read when the second client finished.
+// input_bytes as a second client while it runs. With attach_len nonzero, a
+// first client sends attach_bytes and stays attached until the second client
+// connects, then hangs up, so the agent sees both in the same poll. Copies the
+// frames the agent answers the second client with into response and returns
+// their length, or -1 when the harness itself fails. *captured_stdout gets
+// how many bytes of the captured session's stdout the agent had read when the
+// second client finished.
 __attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_running_session(
     const char *captured_script,
+    const unsigned char *attach_bytes, size_t attach_len,
     const unsigned char *request_bytes, size_t request_len,
     const unsigned char *input_bytes, size_t input_len,
     unsigned char *response, size_t response_cap, uint64_t *captured_stdout) {
-  static struct session session;
-  static struct detached_children detached;
+  static struct agent a;
+  init_agent(&a);
+  a.rootfs_ready = 1;
+  a.rootfs_error = "";
+  a.build_context_ready = 1;
+  a.build_context_error = "";
+  a.build_inputs_ready = 1;
+  a.build_inputs_error = "";
+  a.network_ready = 1;
+  a.network_error = "";
+  a.generation_root = "/run/sporevm";
+  a.generation.unavailable = 1;
+  struct session *session = &a.session;
   *captured_stdout = 0;
   char *captured_argv[] = { "/bin/sh", "-c", (char *)captured_script, NULL };
   char *empty_envp[] = { NULL };
@@ -615,44 +722,43 @@ __attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_runni
     .exec_lookup = EXEC_LOOKUP_PATH,
     .stdin_enabled = 1,
   };
-  if (start_session(&session, "captured", captured_argv, empty_envp, "", &captured_options) != 0) return -1;
+  if (start_session(session, "captured", captured_argv, empty_envp, "", &captured_options) != 0) return -1;
 
-  struct client client;
-  memset(&client, 0, sizeof(client));
-  client.fd = -1;
-  memset(&detached, 0, sizeof(detached));
-  detached.retained_pid = -1;
-  detached.retained_stdout_fd = -1;
-  detached.retained_stderr_fd = -1;
-  struct generation_monitor generation = { .base = NULL, .last_generation = UINT64_MAX, .unavailable = 1 };
   ssize_t total = -1;
+  int attached = -1;
   int peer = -1;
+  // The agent mirrors session output to its console; keep it off the test
+  // runner's stdout, which may carry the build protocol.
+  int saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
+  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
   int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (saved_stdout < 0 || null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0) goto done;
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   int name_len = snprintf(addr.sun_path + 1, sizeof(addr.sun_path) - 1, "spore-agent-test-%d", (int)getpid());
   socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + (size_t)name_len);
   if (listener < 0 || bind(listener, (struct sockaddr *)&addr, addr_len) != 0 || listen(listener, 1) != 0) goto done;
+  a.listener = listener;
+  if (attach_len > 0) {
+    attached = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (attached < 0 || connect(attached, (struct sockaddr *)&addr, addr_len) != 0 ||
+        write_all(attached, attach_bytes, attach_len) != 0) goto done;
+    accept_request(&a);
+    if (a.client.fd < 0) goto done;
+  }
   peer = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (peer < 0 || connect(peer, (struct sockaddr *)&addr, addr_len) != 0) goto done;
   if (write_all(peer, request_bytes, request_len) != 0 || write_all(peer, input_bytes, input_len) != 0) goto done;
-
-  // The agent mirrors session output to its console; keep it off the test
-  // runner's stdout, which may carry the build protocol.
-  int saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
-  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-  if (saved_stdout < 0 || null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0) {
-    if (saved_stdout >= 0) close(saved_stdout);
-    if (null_fd >= 0) close(null_fd);
-    goto done;
+  if (attached >= 0) {
+    close(attached);
+    attached = -1;
   }
-  accept_request(listener, &session, &client, &detached, &generation, "/run/sporevm", 0, 0, 0, 1, "", 0, 1, "", 0, 1, "", 0, 1, "");
-  close_client(&client);
-  *captured_stdout = session.stdout_offset;
-  (void)dup2(saved_stdout, STDOUT_FILENO);
-  close(saved_stdout);
-  close(null_fd);
+  // Accepts the request, and sees any attached client's hangup in the same poll.
+  poll_agent(&a);
+  while (a.op.kind != EXEC_OP_NONE) poll_agent(&a);
+  close_client(&a.client);
+  *captured_stdout = session->stdout_offset;
 
   total = 0;
   while ((size_t)total < response_cap) {
@@ -663,13 +769,19 @@ __attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_runni
   }
 
 done:
+  if (saved_stdout >= 0) {
+    (void)dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+  }
+  if (null_fd >= 0) close(null_fd);
+  if (attached >= 0) close(attached);
   if (peer >= 0) close(peer);
   if (listener >= 0) close(listener);
   // The captured script may still be running or blocked on a full pipe. A
   // child it started dies on EPIPE once reset_session closes the pipes.
-  (void)kill(session.pid, SIGKILL);
-  wait_child_blocking(session.pid);
-  reset_session(&session);
+  (void)kill(session->pid, SIGKILL);
+  wait_child_blocking(session->pid);
+  reset_session(session);
   return total;
 }
 #endif
