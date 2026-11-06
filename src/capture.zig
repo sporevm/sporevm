@@ -137,61 +137,6 @@ pub const Request = struct {
     }
 };
 
-/// Runs a capture wake on its own thread. A wake set with `Request.setWake`
-/// runs inside the signal handler, which may only make async-signal-safe
-/// calls; Hypervisor.framework's `hv_vcpus_exit` is not one. With this, the
-/// handler only writes a byte to a pipe and the thread makes the wake call.
-pub const WakeThread = struct {
-    pipe: [2]posix.fd_t = .{ -1, -1 },
-    thread: ?std.Thread = null,
-    wake_fn: WakeFn = undefined,
-    wake_context: ?*anyopaque = null,
-
-    pub fn start(self: *WakeThread, request: *Request, wake_fn: WakeFn, context: ?*anyopaque) !void {
-        self.* = .{ .wake_fn = wake_fn, .wake_context = context };
-        if (std.c.pipe(&self.pipe) != 0) return error.CaptureWakeStartFailed;
-        errdefer self.closePipe();
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
-        request.setWake(notify, self);
-    }
-
-    pub fn stop(self: *WakeThread, request: *Request) void {
-        request.clearWake();
-        // Closing the write end ends the thread's read after any pending
-        // wake byte.
-        _ = std.c.close(self.pipe[1]);
-        self.pipe[1] = -1;
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-        self.closePipe();
-    }
-
-    fn closePipe(self: *WakeThread) void {
-        for (&self.pipe) |*fd| {
-            if (fd.* >= 0) _ = std.c.close(fd.*);
-            fd.* = -1;
-        }
-    }
-
-    fn notify(context: ?*anyopaque) callconv(.c) void {
-        const self: *WakeThread = @ptrCast(@alignCast(context orelse return));
-        const byte = [_]u8{1};
-        _ = std.c.write(self.pipe[1], &byte, byte.len);
-    }
-
-    fn run(self: *WakeThread) void {
-        var byte: [1]u8 = undefined;
-        while (true) {
-            const n = std.c.read(self.pipe[0], &byte, byte.len);
-            if (n > 0) {
-                self.wake_fn(self.wake_context);
-            } else if (n == 0 or std.c.errno(n) != .INTR) {
-                return;
-            }
-        }
-    }
-};
-
 var active_request: ?*Request = null;
 
 pub const SignalRegistration = struct {
@@ -341,30 +286,4 @@ test "capture request invokes optional wake hook" {
     request_value.clearWake();
     request_value.notifySignal();
     try std.testing.expectEqual(@as(u32, 1), test_wake_count);
-}
-
-test "capture signal runs a thread wake outside the signal handler" {
-    const Probe = struct {
-        var woke = std.atomic.Value(bool).init(false);
-        var woke_on: std.Thread.Id = 0;
-
-        fn wake(_: ?*anyopaque) callconv(.c) void {
-            woke_on = std.Thread.getCurrentId();
-            woke.store(true, .release);
-        }
-    };
-    var request_value = Request{};
-    var wake_thread = WakeThread{};
-    try wake_thread.start(&request_value, Probe.wake, null);
-    var registration = SignalRegistration.install(.USR2, &request_value);
-    // raise() returns after the handler has run on this thread; stop() then
-    // joins the wake thread after it has handled any pending wake.
-    const raised = posix.raise(.USR2);
-    registration.deinit();
-    wake_thread.stop(&request_value);
-    try raised;
-
-    try std.testing.expect(request_value.isRequested());
-    try std.testing.expect(Probe.woke.load(.acquire));
-    try std.testing.expect(Probe.woke_on != std.Thread.getCurrentId());
 }
