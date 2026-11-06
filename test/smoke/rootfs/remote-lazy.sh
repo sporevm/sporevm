@@ -261,9 +261,10 @@ grep -Fq "nothing was saved" "${workdir}/lost-save.stderr" || {
 [[ ! -e "${workdir}/lost.spore" ]] || die "run --save left a save directory after the store failed"
 mv "${workdir}/unread.hidden" "${unread}"
 
-# A save from an empty cache fetches the rest of the image.
+# A save from an empty cache fetches the rest of the image. The save path
+# is relative, as users type it.
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/save-cache"
-run_image save "${store_ref}" --save "${workdir}/saved.spore" -- /hello ||
+(cd "${workdir}" && run_image save "${store_ref}" --save saved.spore -- /hello) ||
   require_success $? "run --save from the store" "${workdir}/save.stderr"
 expect_eq "remote-lazy-ok" "$(cat "${workdir}/save.stdout")" "run --save output"
 save_ms="$(cat "${workdir}/save.ms")"
@@ -289,6 +290,9 @@ run_capture "${workdir}/from.stdout" "${workdir}/from.stderr" \
   "${spore_bin}" run --backend "${backend}" --from "${workdir}/saved.spore" -- /hello ||
   require_success $? "run --from a spore saved from the store" "${workdir}/from.stderr"
 expect_eq "remote-lazy-ok" "$(cat "${workdir}/from.stdout")" "run --from output"
+(cd "${workdir}" && "${spore_bin}" fork saved.spore --count 1 --out children >fork.stdout 2>fork.stderr) ||
+  require_success $? "fork with a relative --out" "${workdir}/fork.stderr"
+[[ -f "${workdir}/children/000000/manifest.json" ]] || die "fork with a relative --out wrote no child"
 
 python3 - <<PY
 object_bytes = ${object_bytes}

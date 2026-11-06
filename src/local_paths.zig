@@ -131,6 +131,17 @@ fn accessPath(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !bool {
     return true;
 }
 
+/// `path` made absolute against the working directory and normalized, without
+/// `.`, `..` or a trailing separator. A save's pin records the save's absolute
+/// path, so commands that write a save resolve an output path once, where they
+/// take it from the command line.
+pub fn absolutePathAlloc(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    if (Io.Dir.path.isAbsolute(path)) return std.fs.path.resolve(allocator, &.{path});
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, path });
+}
+
 fn resolveRequiredAbsolute(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     try validateAbsoluteRuntimePath(path);
     return std.fs.path.resolve(allocator, &.{path});
@@ -174,6 +185,25 @@ test "cache roots prefer explicit and xdg paths" {
     const bundles = try bundleCacheRootPath(allocator, &env);
     defer allocator.free(bundles);
     try std.testing.expectEqualStrings("/tmp/xdg-cache/sporevm/bundles", bundles);
+}
+
+test "absolute paths resolve against the working directory and drop trailing separators" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const expected = try std.fs.path.join(allocator, &.{ cwd, "out.spore" });
+    defer allocator.free(expected);
+    for ([_][]const u8{ "out.spore", "./out.spore", "x/../out.spore", "out.spore/" }) |relative| {
+        const resolved = try absolutePathAlloc(io, allocator, relative);
+        defer allocator.free(resolved);
+        try std.testing.expectEqualStrings(expected, resolved);
+    }
+    for ([_][]const u8{ "/srv/out.spore", "/srv/out.spore/", "/srv/./x/../out.spore" }) |absolute| {
+        const resolved = try absolutePathAlloc(io, allocator, absolute);
+        defer allocator.free(resolved);
+        try std.testing.expectEqualStrings("/srv/out.spore", resolved);
+    }
 }
 
 test "cache roots ignore empty optional environment values" {
