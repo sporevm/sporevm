@@ -384,8 +384,8 @@ pub const StatCache = struct {
         });
         defer self.allocator.free(json);
         if (json.len > max_stat_cache_bytes) return error.StreamTooLong;
-        Io.Dir.cwd().deleteFile(self.io, self.path) catch {};
-        try chunk_sealer.writeFileAtomicDurable(self.allocator, self.path, json, 0o644);
+        // Concurrent builds may save at once; the last rename wins.
+        try chunk_sealer.replaceFileAtomicDurable(self.allocator, self.path, json, 0o644);
         diagnostic.stat_cache_entries_saved = keep;
         diagnostic.stat_cache_entries_evicted = records.len - keep;
     }

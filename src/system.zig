@@ -912,15 +912,16 @@ fn pruneRootfsCache(
     // objects that become part of newly completed storage before deletion.
     var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, cache_root);
     defer cache_lock.deinit();
-    var cache_mount_lock = try build_cache_mount.lockStoreExclusive(io, allocator, cache_root);
-    defer cache_mount_lock.deinit();
+    // A build holding the store has the cache disk mounted; leave it.
+    var cache_mount_lock = try build_cache_mount.tryLockStoreExclusive(io, allocator, cache_root);
+    defer if (cache_mount_lock) |*lock| lock.deinit();
 
     var protected_paths = std.StringHashMap(void).init(allocator);
     defer protected_paths.deinit();
     if (runtime_root) |root| try collectRuntimeLeaseProtectedPaths(allocator, io, cache_root, root, &protected_paths);
     const pins_conservative = collectPinnedProtectedPaths(allocator, io, cache_root, &protected_paths) catch true;
 
-    const plan = try collectPruneEntries(allocator, io, cache_root, opts.include_digest_artifacts, opts.include_rootfs_chunks);
+    const plan = try collectPruneEntries(allocator, io, cache_root, opts.include_digest_artifacts, opts.include_rootfs_chunks, cache_mount_lock != null);
     if (comptime builtin.is_test) if (testing.prune_mutation_barrier) |barrier| barrier.pause(io);
     if (pins_conservative) for (plan) |entry| {
         if (entry.kind == .cas_index or entry.kind == .cas_object) try protected_paths.put(entry.path, {});
@@ -1087,8 +1088,9 @@ fn gcRootfsCache(
 ) !RootfsGcResult {
     var cache_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, options.cache_root);
     defer cache_lock.deinit();
-    var cache_mount_lock = try build_cache_mount.lockStoreExclusive(io, allocator, options.cache_root);
-    defer cache_mount_lock.deinit();
+    // A build holding the store has the cache disk mounted; leave it.
+    var cache_mount_lock = try build_cache_mount.tryLockStoreExclusive(io, allocator, options.cache_root);
+    defer if (cache_mount_lock) |*lock| lock.deinit();
 
     var storage_roots = std.StringHashMap(spore.RootfsStorage).init(allocator);
     var rooted_indexes = std.StringHashMap(void).init(allocator);
@@ -1174,7 +1176,8 @@ fn gcRootfsCache(
     }
     if (comptime builtin.is_test) if (testing.gc_mutation_barrier) |barrier| barrier.pause(io);
 
-    for (try build_cache_mount.storageEntries(io, allocator, options.cache_root)) |entry| {
+    const cache_mount_entries = if (cache_mount_lock != null) try build_cache_mount.storageEntries(io, allocator, options.cache_root) else &.{};
+    for (cache_mount_entries) |entry| {
         cache_mount_candidate_count += 1;
         cache_mount_candidate_bytes += entry.allocated_bytes;
         candidate_bytes += entry.allocated_bytes;
@@ -1962,6 +1965,7 @@ fn collectPruneEntries(
     cache_root: []const u8,
     include_digest_artifacts: bool,
     include_rootfs_chunks: bool,
+    include_cache_mounts: bool,
 ) ![]PrunePlanEntry {
     var entries = std.array_list.Managed(PrunePlanEntry).init(allocator);
 
@@ -2007,7 +2011,7 @@ fn collectPruneEntries(
         try collectCasArtifacts(allocator, io, cache_root, "cas/rootfs/blake3/objects", ".chunk", .cas_object, &entries);
     }
 
-    for (try build_cache_mount.storageEntries(io, allocator, cache_root)) |entry| {
+    if (include_cache_mounts) for (try build_cache_mount.storageEntries(io, allocator, cache_root)) |entry| {
         try entries.append(.{
             .kind = switch (entry.kind) {
                 .aggregate => .build_cache_mount,
@@ -2019,7 +2023,7 @@ fn collectPruneEntries(
             .selection_bytes = entry.allocated_bytes,
             .mtime_ns = entry.mtime_ns,
         });
-    }
+    };
 
     return entries.toOwnedSlice();
 }
@@ -2721,54 +2725,29 @@ fn expectActiveBuildProtectsCacheMount(comptime operation: TestCacheCleanup) !vo
     Io.Dir.cwd().deleteTree(io, relative_root) catch {};
     const root = try std.fs.path.resolve(arena, &.{ try std.process.currentPathAlloc(io, arena), relative_root });
 
-    var build_lock = try rootfs.lockRootfsCacheExclusive(io, arena, root);
+    // A build session holds only the store lock while its VM mounts the disk.
     var store_lock = try build_cache_mount.lockStoreExclusive(io, arena, root);
     const cache_fd = try createCacheMountFixture(io, arena, root, 64 << 20);
-
-    const CleanupContext = struct {
-        allocator: std.mem.Allocator,
-        io: Io,
-        cache_root: []const u8,
-        attempting: *Io.Semaphore,
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.attempting.post(self.io);
+    const cleanup = struct {
+        fn run(cleanup_io: Io, cache_root: []const u8) !void {
             switch (operation) {
-                .prune => {
-                    const result = prune(self.allocator, self.io, .{ .cache_root = self.cache_root, .dry_run = false }, Io.Clock.real.now(self.io).nanoseconds) catch |err| {
-                        self.err = err;
-                        return;
-                    };
-                    deinitRootfsPruneResult(self.allocator, result);
-                },
-                .gc => {
-                    const result = gc(self.allocator, self.io, .{ .cache_root = self.cache_root, .dry_run = false }) catch |err| {
-                        self.err = err;
-                        return;
-                    };
-                    deinitRootfsGcResult(self.allocator, result);
-                },
+                .prune => deinitRootfsPruneResult(allocator, try prune(allocator, cleanup_io, .{ .cache_root = cache_root, .dry_run = false }, Io.Clock.real.now(cleanup_io).nanoseconds)),
+                .gc => deinitRootfsGcResult(allocator, try gc(allocator, cleanup_io, .{ .cache_root = cache_root, .dry_run = false })),
             }
         }
-    };
-    var attempting = Io.Semaphore{};
-    var context = CleanupContext{ .allocator = allocator, .io = io, .cache_root = root, .attempting = &attempting };
-    const thread = try std.Thread.spawn(.{}, CleanupContext.run, .{&context});
-    attempting.waitUncancelable(io);
+    }.run;
 
-    // Cleanup has started but cannot own the cache generation until the build
-    // closes its mounted disk and releases the process-bound flock.
+    // Cleanup neither waits for the build nor deletes the mounted disk.
+    try cleanup(io, root);
     try std.testing.expect((try build_cache_mount.diskStats(io, arena, root)) != null);
+
     _ = std.c.close(cache_fd);
     store_lock.deinit();
-    build_lock.deinit();
-    thread.join();
-    if (context.err) |err| return err;
+    try cleanup(io, root);
     try std.testing.expect((try build_cache_mount.diskStats(io, arena, root)) == null);
 }
 
-test "concurrent prune and gc wait for active build cache mounts" {
+test "prune and gc leave the cache mount of an active build" {
     try expectActiveBuildProtectsCacheMount(.prune);
     try expectActiveBuildProtectsCacheMount(.gc);
 }

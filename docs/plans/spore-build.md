@@ -297,7 +297,8 @@ golden invalidation test and at least one differential fixture.
   reachability and publication discipline as CAS collection.
 - Mutable cache-mount bytes are not step-record children. Keeping the existing
   aggregate as the cleanup unit avoids a second metadata graph, while the
-  build-wide process lock provides active-use safety without stale leases.
+  aggregate-store lock, which cleanup skips while a build holds it, provides
+  active-use safety without stale leases.
 - Mount and credential syntax can look like a small compatibility addition while
   changing host authority. Those features keep separate security and product
   decision gates.

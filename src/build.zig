@@ -279,13 +279,16 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         else => |e| return e,
     };
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    var cache_lock: ?rootfs_mod.RootfsCacheLock = null;
-    defer if (cache_lock) |*lock| lock.deinit();
+    // The build takes the rootfs cache lock only to look up, emit and publish
+    // storage, and leases each storage it will use so GC and prune leave it
+    // alone in between. Long RUN steps hold no lock.
+    var leases = try build_exec.StorageLeases.init(init.io, allocator, init.environ_map, cache_root);
+    defer leases.deinit();
 
-    // Resolve reachable external inputs before taking the coarse cache lock;
-    // imports may take the same lock internally. Base image config feeds the
-    // ARG/ENV state, so bases resolve before planning; COPY --from images
-    // only bind input disks, so they wait until the plan is valid.
+    // Resolve reachable external inputs first; imports take the cache lock
+    // internally. Base image config feeds the ARG/ENV state, so bases resolve
+    // before planning; COPY --from images only bind input disks, so they wait
+    // until the plan is valid.
     const resolved_bases = try allocator.alloc(?Base, plan.stages.len);
     @memset(resolved_bases, null);
     for (plan.order) |stage_index| switch (plan.stages[stage_index].base) {
@@ -333,23 +336,21 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         };
     };
 
-    cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
-    const build_cache_lock = if (cache_lock) |*lock| lock else unreachable;
-    // Register this defer after the lock defer: LIFO then guarantees every
-    // stat-cache save completes before the shared cache authority is released.
     var stat_cache = build_context.StatCache.load(allocator, init.io, cache_root, &diagnostic.context_hash);
     defer stat_cache.save(&diagnostic.context_hash);
 
-    // Imports and local-ref resolution happen before the coarse lock. Validate
-    // every resulting authority once inside the lock epoch so GC cannot remove
-    // an external base or COPY --from input before execution/publication.
-    for (plan.order) |stage_index| {
-        if (resolved_bases[stage_index]) |base| {
-            if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
+    // Imports and local-ref resolution ran unlocked. Check every resulting
+    // input is still complete and lease it, so GC cannot remove an external
+    // base or COPY --from input before execution or publication.
+    {
+        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
+        defer cache_lock.deinit();
+        for (plan.order) |stage_index| {
+            if (resolved_bases[stage_index]) |base| try leaseCompleteInput(init.io, allocator, &leases, &cache_lock, base);
+            for (resolved_copy_bases[stage_index]) |maybe_base| if (maybe_base) |base| {
+                try leaseCompleteInput(init.io, allocator, &leases, &cache_lock, base);
+            };
         }
-        for (resolved_copy_bases[stage_index]) |maybe_base| if (maybe_base) |base| {
-            if (!try rootfs_cas.storageCompleteWithStampRepair(init.io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
-        };
     }
 
     const storages = try allocator.alloc(?spore.RootfsStorage, plan.stages.len);
@@ -362,20 +363,18 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         const base_storage = switch (planned_stage.base) {
             .external => (resolved_bases[stage_index] orelse return error.BadManifest).storage,
             .stage => |dependency| storages[dependency] orelse return error.BadManifest,
-            .scratch => try scratchStorage(init, allocator, cache_root, options.platform, &diagnostic.scratch),
+            .scratch => try scratchStorage(init, allocator, cache_root, options.platform, &diagnostic.scratch, &leases),
         };
         const stage_inputs = try prepareStageInputs(allocator, diagnostic, planned_stage, storages, resolved_copy_bases[stage_index]);
-        const built = try buildStage(init, allocator, options, diagnostic, ctx, &stat_cache, stage_plan.steps, stage_inputs, if (remote_add_batch) |batch| batch.items else &.{}, base_storage, &producer, build_cache_lock);
+        const built = try buildStage(init, allocator, options, diagnostic, ctx, &stat_cache, stage_plan.steps, stage_inputs, if (remote_add_batch) |batch| batch.items else &.{}, base_storage, &producer, &leases);
         any_exec_step = any_exec_step or built.has_exec_step;
         storages[stage_index] = try spore.cloneRootfsStorage(allocator, built.storage);
     }
     const final_storage = storages[plan.target_index] orelse return error.BadManifest;
     const final_plan = stage_plans.stages[plan.target_index] orelse return error.BadManifest;
     if (comptime builtin.is_test) if (testing.before_final_publish_barrier) |barrier| barrier.pause(init.io);
-    // Keep the exclusive cache lock through local-ref publication so every
-    // PREPARE/step root and its destination ref become reachable in one GC
-    // exclusion window.
-    const publish = try local_image.publish(init.io, allocator, cache_root, build_cache_lock, .{
+    // The lease keeps the final storage complete until its record roots it.
+    const publish = try local_image.lockAndPublish(init.io, allocator, cache_root, .{
         .platform = options.platform,
         .config = final_plan.config,
         .storage = final_storage,
@@ -394,6 +393,11 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Opti
         .local_ref_path = publish.ref_path.?,
         .cache_hit = any_exec_step and diagnostic.executor.executed_steps == 0,
     };
+}
+
+fn leaseCompleteInput(io: Io, allocator: std.mem.Allocator, leases: *build_exec.StorageLeases, cache_lock: *const rootfs_mod.RootfsCacheLock, base: Base) !void {
+    if (!try rootfs_cas.storageCompleteWithStampRepair(io, allocator, base.cache_root, base.storage)) return error.RootFSDigestCacheMiss;
+    try leases.hold(cache_lock, base.storage);
 }
 
 const PlannedInputIdentity = union(enum) {
@@ -713,54 +717,83 @@ fn buildStage(
     prepared_remote_adds: []const remote_add.Prepared,
     base_storage: spore.RootfsStorage,
     producer: *?build_exec.Producer,
-    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
+    leases: *build_exec.StorageLeases,
 ) !BuiltStage {
     const disk_grow_target = try buildDiskGrowTarget(base_storage);
     if (steps.len == 0) return .{ .storage = base_storage, .has_exec_step = false };
     const transitions = try allocator.alloc(instruction_transition.InstructionTransition, steps.len);
     for (steps, transitions) |step, *transition| transition.* = try bindStep(allocator, step, stage_inputs, prepared_remote_adds);
 
-    var storage = base_storage;
+    if (producer.* == null) {
+        producer.* = try build_exec.resolveProducer(init, allocator);
+        diagnostic.executor.boot_artifact_file_reads += producer.*.?.eager_artifact_file_reads;
+        diagnostic.executor.boot_artifact_bytes_read += producer.*.?.eager_artifact_bytes_read;
+    }
+    const stage_producer = producer.*.?;
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    const pending_preparation = try ensurePrepared(init, allocator, options.platform, cache_root, &storage, disk_grow_target, producer, &diagnostic.executor);
-    const stage_producer = producer.* orelse return error.BadManifest;
     var transition_diagnostic = transitionDiagnostics(diagnostic);
-    const miss = if (pending_preparation != null)
-        instruction_transition.CacheWalkResult.Miss{ .transition_index = 0, .storage = storage }
-    else switch (try instruction_transition.walkCache(
-        init.io,
-        allocator,
-        cache_root,
-        options.platform,
-        stage_producer.identity,
-        runResources(options),
-        options.no_cache,
-        ctx,
-        stat_cache,
-        &transition_diagnostic,
-        storage,
-        transitions,
-    )) {
-        .complete => |complete| return .{ .storage = complete, .has_exec_step = true },
-        .miss => |value| value,
+    var step_slot: ?rootfs_mod.RootfsCacheLock = null;
+    defer if (step_slot) |*lock| lock.deinit();
+    var pending_preparation: ?build_exec.Preparation = null;
+    var lowered: instruction_transition.LoweredSuffix = undefined;
+    const miss = while (true) {
+        // Step-record lookups, the lease on their result and the context
+        // disk, whose emit dedupes against shared CAS objects, share one
+        // lock epoch.
+        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
+        defer cache_lock.deinit();
+        var storage = base_storage;
+        pending_preparation = try ensurePrepared(init.io, allocator, options.platform, cache_root, &storage, disk_grow_target, stage_producer.identity);
+        const miss = if (pending_preparation) |preparation|
+            instruction_transition.CacheWalkResult.Miss{ .transition_index = 0, .storage = storage, .key = preparation.step_key }
+        else switch (try instruction_transition.walkCache(
+            init.io,
+            allocator,
+            cache_root,
+            options.platform,
+            stage_producer.identity,
+            runResources(options),
+            options.no_cache,
+            ctx,
+            stat_cache,
+            &transition_diagnostic,
+            storage,
+            transitions,
+        )) {
+            .complete => |complete| {
+                try leases.hold(&cache_lock, complete);
+                return .{ .storage = complete, .has_exec_step = true };
+            },
+            .miss => |value| value,
+        };
+        if (miss.key) |key| {
+            step_slot = try step_cache.tryLockStepSlot(init.io, allocator, cache_root, key);
+            if (step_slot == null) {
+                // Another build is running this step; reuse its records.
+                cache_lock.deinit();
+                try step_cache.waitForStepSlot(init.io, allocator, cache_root, key);
+                continue;
+            }
+        }
+        try leases.hold(&cache_lock, miss.storage);
+        lowered = try instruction_transition.lowerMissSuffix(
+            init.io,
+            allocator,
+            cache_root,
+            ctx,
+            stat_cache,
+            &transition_diagnostic,
+            transitions[miss.transition_index..],
+        );
+        break miss;
     };
-
-    const lowered = try instruction_transition.lowerMissSuffix(
-        init.io,
-        allocator,
-        cache_root,
-        ctx,
-        stat_cache,
-        &transition_diagnostic,
-        transitions[miss.transition_index..],
-    );
     const previous_executor = diagnostic.executor;
-    storage = build_exec.runSession(init, allocator, .{
+    const storage = build_exec.runSession(init, allocator, .{
         .platform = options.platform,
         .cache_root = cache_root,
         .base_storage = miss.storage,
         .steps = lowered.steps,
-        .rootfs_cache_lock = rootfs_cache_lock,
+        .leases = leases,
         .preparation = pending_preparation,
         .producer = stage_producer,
         .context_disk_path = lowered.context_disk_path,
@@ -1014,13 +1047,19 @@ fn scratchStorage(
     cache_root: []const u8,
     platform: rootfs_mod.Platform,
     diagnostic: *ScratchDiagnostic,
+    leases: *build_exec.StorageLeases,
 ) !spore.RootfsStorage {
     const start_ns = monotonicNs() catch 0;
     defer diagnostic.resolve_ns +|= elapsedNs(start_ns);
     diagnostic.logical_size = automatic_build_capacity_bytes;
     const input = try step_cache.scratchInput(platform, automatic_build_capacity_bytes, scratch_format_identity);
     const key = try step_cache.stepKey(allocator, input);
+    // The emit below skips objects already in the cache, so it and the
+    // record that roots them share one lock epoch.
+    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
+    defer cache_lock.deinit();
     if (try step_cache.readHit(init.io, allocator, cache_root, input, key)) |storage| {
+        try leases.hold(&cache_lock, storage);
         diagnostic.reused += 1;
         return storage;
     }
@@ -1066,6 +1105,7 @@ fn scratchStorage(
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
     try rootfs_cas.markStorageComplete(init.io, allocator, cache_root, storage.index_digest);
     _ = try step_cache.writeRecord(init.io, allocator, cache_root, input, key, storage);
+    try leases.hold(&cache_lock, storage);
     diagnostic.created += 1;
     return storage;
 }
@@ -1264,29 +1304,23 @@ fn declareArg(
 }
 
 fn ensurePrepared(
-    init: std.process.Init,
+    io: Io,
     allocator: std.mem.Allocator,
     platform: rootfs_mod.Platform,
     cache_root: []const u8,
     storage: *spore.RootfsStorage,
     disk_grow_target: u64,
-    producer: *?build_exec.Producer,
-    diagnostic: *build_exec.Diagnostic,
+    producer_identity: []const u8,
 ) !?build_exec.Preparation {
-    if (producer.* == null) {
-        producer.* = try build_exec.resolveProducer(init, allocator);
-        diagnostic.boot_artifact_file_reads += producer.*.?.eager_artifact_file_reads;
-        diagnostic.boot_artifact_bytes_read += producer.*.?.eager_artifact_bytes_read;
-    }
     if (storage.logical_size >= disk_grow_target) return null;
     const input = try step_cache.prepareInput(
         platform,
         storage.index_digest,
         disk_grow_target,
-        producer.*.?.identity,
+        producer_identity,
     );
     const key = try step_cache.stepKey(allocator, input);
-    if (try step_cache.readHit(init.io, allocator, cache_root, input, key)) |prepared| {
+    if (try step_cache.readHit(io, allocator, cache_root, input, key)) |prepared| {
         try build_exec.validatePreparedStorage(storage.*, prepared, disk_grow_target);
         storage.* = prepared;
         return null;
@@ -3651,6 +3685,32 @@ test "unsupported reachable platform fails before context or base resolution" {
     try std.testing.expectEqualStrings("spore build FROM --platform must match linux/arm64", diagnostic.dockerfile.message);
 }
 
+test "an insecure runtime directory fails the build before it resolves a base" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const tmp = "zig-cache/test-spore-build-insecure-runtime";
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    try Io.Dir.cwd().createDirPath(io, tmp ++ "/runtime");
+    if (std.c.chmod(tmp ++ "/runtime", 0o755) != 0) return error.IoFailed;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/Dockerfile", .data = "FROM local/missing:base\nRUN true\n" });
+    const cwd = try std.process.currentPathAlloc(io, arena);
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, tmp ++ "/cache");
+    try env.put(local_paths.runtime_dir_env, try std.fs.path.resolve(arena, &.{ cwd, tmp, "runtime" }));
+    const init = testInit(allocator, io, &arena_state, &env);
+    try std.testing.expectError(error.InsecureRuntimeDir, build(init, arena, .{
+        .tag = "local/app:insecure-runtime",
+        .context_dir = tmp,
+        .dockerfile_path = tmp ++ "/Dockerfile",
+    }));
+}
+
 test "cross-architecture product platform fails before input IO" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3898,8 +3958,7 @@ test "scratch stage publishes an empty native rootfs without guest execution" {
     try std.testing.expectEqual(@as(usize, 0), warm_diagnostic.executor.resize_count);
 }
 
-test "metadata-only scratch publication serializes destructive GC until ref visibility" {
-    try skipNativeX86BuildIntegrationTest();
+test "GC while a build is unlocked keeps the storage the build later publishes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -3911,7 +3970,6 @@ test "metadata-only scratch publication serializes destructive GC until ref visi
     const runtime_dir = tmp ++ "/runtime";
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     try Io.Dir.cwd().createDirPath(io, context_dir);
-    try Io.Dir.cwd().createDirPath(io, runtime_dir);
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = context_dir ++ "/Dockerfile",
         .data = "FROM scratch\nENTRYPOINT [\"/app\"]\n",
@@ -3921,6 +3979,7 @@ test "metadata-only scratch publication serializes destructive GC until ref visi
     try env.put(local_paths.rootfs_cache_env, cache_dir);
     const cwd = try std.process.currentPathAlloc(io, arena);
     const absolute_runtime_dir = try std.fs.path.resolve(arena, &.{ cwd, runtime_dir });
+    try env.put(local_paths.runtime_dir_env, absolute_runtime_dir);
 
     const BuildContext = struct {
         allocator: std.mem.Allocator,
@@ -3964,52 +4023,34 @@ test "metadata-only scratch publication serializes destructive GC until ref visi
     defer build_thread.deinit();
     publish_boundary.waitReached(io);
     if (build_thread_context.err) |err| return err;
-    try std.testing.expectError(error.LockBusy, rootfs_mod.tryLockRootfsCacheExclusive(io, arena, cache_dir));
+    // Another cache user gets the lock while the build waits to publish.
+    var other_user = try rootfs_mod.tryLockRootfsCacheExclusive(io, arena, cache_dir);
+    other_user.deinit();
 
-    const GcContext = struct {
-        allocator: std.mem.Allocator,
-        io: Io,
-        cache_root: []const u8,
-        runtime_root: []const u8,
-        attempting: *Io.Semaphore,
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.attempting.post(self.io);
-            const result = system_mod.gc(self.allocator, self.io, .{
-                .cache_root = self.cache_root,
-                .runtime_root = self.runtime_root,
-                .dry_run = false,
-            }) catch |err| {
-                self.err = err;
-                return;
-            };
-            system_mod.deinitRootfsGcResult(self.allocator, result);
-        }
-    };
-    var gc_attempting = Io.Semaphore{};
-    var gc_context = GcContext{
-        .allocator = allocator,
-        .io = io,
+    // Drop the step record so only the build's lease roots its scratch
+    // storage, then let prune and GC take everything else.
+    try Io.Dir.cwd().deleteTree(io, cache_dir ++ "/build/steps");
+    const pruned = try system_mod.prune(allocator, io, .{
         .cache_root = cache_dir,
         .runtime_root = absolute_runtime_dir,
-        .attempting = &gc_attempting,
-    };
-    var gc_thread = test_barrier.ThreadGuard{
-        .io = io,
-        .thread = try std.Thread.spawn(.{}, GcContext.run, .{&gc_context}),
-        .barriers = &.{},
-    };
-    defer gc_thread.deinit();
-    gc_attempting.waitUncancelable(io);
+        .dry_run = false,
+        .include_rootfs_chunks = true,
+        .max_bytes = 0,
+    }, std.time.ns_per_s);
+    system_mod.deinitRootfsPruneResult(allocator, pruned);
+    const collected = try system_mod.gc(allocator, io, .{
+        .cache_root = cache_dir,
+        .runtime_root = absolute_runtime_dir,
+        .dry_run = false,
+    });
+    system_mod.deinitRootfsGcResult(allocator, collected);
+
     publish_boundary.release(io);
     build_thread.join();
     if (build_thread_context.err) |err| return err;
-    gc_thread.join();
-    if (gc_context.err) |err| return err;
 
     const result = build_thread_context.result orelse return error.BadManifest;
-    const local = (try local_image.find(io, arena, cache_dir, "local/app:scratch-gc", .{})) orelse return error.MissingLocalImage;
+    const local = (try local_image.find(io, arena, cache_dir, "local/app:scratch-gc", default_build_platform)) orelse return error.MissingLocalImage;
     try std.testing.expectEqualStrings(result.resolved_image_ref, try local_image.resolvedRefAlloc(arena, "local/app:scratch-gc", local.identity, local.oci));
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, cache_dir, local.storage));
 }

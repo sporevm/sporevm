@@ -3507,19 +3507,6 @@ pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Opti
     return executeMonitorWithBootArtifacts(context, allocator, opts, artifacts, control, startup_probe);
 }
 
-pub fn executeMonitorWithRootfsCacheLock(
-    context: Context,
-    allocator: std.mem.Allocator,
-    opts: Options,
-    control: vsock_control.Control,
-    startup_probe: ?*vsock_stream.HostStream,
-    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
-) !MonitorResult {
-    _ = try opts.backend.resolveForHost();
-    const artifacts = try loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
-    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
-}
-
 pub fn executeMonitorWithBootArtifacts(
     context: Context,
     allocator: std.mem.Allocator,
@@ -3527,30 +3514,6 @@ pub fn executeMonitorWithBootArtifacts(
     artifacts: MonitorBootArtifacts,
     control: vsock_control.Control,
     startup_probe: ?*vsock_stream.HostStream,
-) !MonitorResult {
-    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, null);
-}
-
-pub fn executeMonitorWithBootArtifactsAndRootfsCacheLock(
-    context: Context,
-    allocator: std.mem.Allocator,
-    opts: Options,
-    artifacts: MonitorBootArtifacts,
-    control: vsock_control.Control,
-    startup_probe: ?*vsock_stream.HostStream,
-    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
-) !MonitorResult {
-    return executeMonitorWithOptionalRootfsCacheLock(context, allocator, opts, artifacts, control, startup_probe, rootfs_cache_lock);
-}
-
-fn executeMonitorWithOptionalRootfsCacheLock(
-    context: Context,
-    allocator: std.mem.Allocator,
-    opts: Options,
-    artifacts: MonitorBootArtifacts,
-    control: vsock_control.Control,
-    startup_probe: ?*vsock_stream.HostStream,
-    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !MonitorResult {
     try topology.validateVcpuCount(opts.vcpus);
     try spore.validateAnnotations(opts.annotations);
@@ -3584,7 +3547,6 @@ fn executeMonitorWithOptionalRootfsCacheLock(
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
         .rootfs_grow_target = opts.rootfs_grow_target,
-        .rootfs_cache_lock = rootfs_cache_lock,
         .disk = opts.disk,
         .spore_dir = opts.resume_dir,
         .disk_root = opts.disk_root,
@@ -3603,7 +3565,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
         for (build_input_disks[0..build_input_count]) |*disk| disk.deinit();
     }
     for (opts.build_input_rootfs, 0..) |input_rootfs, index| {
-        build_input_disks[index] = try runtime_disk_mod.openReadOnlyRootfs(context, allocator, input_rootfs, opts.disk_root, rootfs_cache_lock);
+        build_input_disks[index] = try runtime_disk_mod.openReadOnlyRootfs(context, allocator, input_rootfs, opts.disk_root);
         build_input_count += 1;
     }
     const build_input_backends = try allocator.alloc(virtio_blk.Backend, build_input_disks.len);

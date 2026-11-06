@@ -68,6 +68,8 @@ pub const CacheWalkResult = union(enum) {
     pub const Miss = struct {
         transition_index: usize,
         storage: spore.RootfsStorage,
+        /// Step key of the missed transition; null under --no-cache.
+        key: ?[]const u8 = null,
     };
 };
 
@@ -106,7 +108,7 @@ pub fn walkCache(
         const input = build_exec.cacheInputForStep(platform, storage.index_digest, executor_identity, step, resources);
         const key = try step_cache.stepKey(allocator, input);
         storage = (try step_cache.readHit(io, allocator, cache_root, input, key)) orelse
-            return .{ .miss = .{ .transition_index = index, .storage = storage } };
+            return .{ .miss = .{ .transition_index = index, .storage = storage, .key = key } };
     }
     return .{ .complete = storage };
 }

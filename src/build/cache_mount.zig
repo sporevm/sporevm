@@ -84,6 +84,17 @@ pub fn lockStoreExclusive(io: Io, allocator: std.mem.Allocator, cache_root: []co
     return rootfs_mod.lockRootfsCacheExclusive(io, allocator, dir);
 }
 
+/// The store lock, or null while a build holds it. A build holds it for a
+/// whole VM session and takes the rootfs cache lock inside it, so cleanup
+/// that already holds the rootfs cache lock must not wait for it.
+pub fn tryLockStoreExclusive(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !?rootfs_mod.RootfsCacheLock {
+    const dir = try std.fs.path.join(allocator, &.{ cache_root, store_rel });
+    return rootfs_mod.tryLockRootfsCacheExclusive(io, allocator, dir) catch |err| switch (err) {
+        error.LockBusy => null,
+        else => |e| e,
+    };
+}
+
 pub fn resolve(
     allocator: std.mem.Allocator,
     workdir: []const u8,
@@ -207,12 +218,13 @@ pub const Store = struct {
     lock: rootfs_mod.RootfsCacheLock,
     fd: std.c.fd_t,
 
-    pub fn open(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, cache_lock: *const rootfs_mod.RootfsCacheLock) !Store {
-        return openSized(io, allocator, cache_root, cache_lock, default_disk_bytes, default_inode_count);
+    /// Opens the shared cache disk under the store lock, which cleanup also
+    /// needs before it deletes the disk.
+    pub fn open(io: Io, allocator: std.mem.Allocator, cache_root: []const u8) !Store {
+        return openSized(io, allocator, cache_root, default_disk_bytes, default_inode_count);
     }
 
-    fn openSized(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, cache_lock: *const rootfs_mod.RootfsCacheLock, image_size: u64, inode_count: u32) !Store {
-        if (!try cache_lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockRequired;
+    fn openSized(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, image_size: u64, inode_count: u32) !Store {
         const dir = try std.fs.path.join(allocator, &.{ cache_root, store_rel });
         var lock = try lockStoreExclusive(io, allocator, cache_root);
         errdefer lock.deinit();
@@ -493,10 +505,7 @@ test "cache store recreates a host-visible unclean aggregate" {
     const relative_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
     const root = try Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
     const image_size: u64 = 64 << 20;
-    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, root);
-    defer cache_lock.deinit();
-
-    var initial = try Store.openSized(io, allocator, root, &cache_lock, image_size, 4096);
+    var initial = try Store.openSized(io, allocator, root, image_size, 4096);
     initial.deinit();
     const path = try std.fs.path.join(allocator, &.{ root, store_rel, disk_name });
     const path_z = try allocator.dupeZ(u8, path);
@@ -512,7 +521,7 @@ test "cache store recreates a host-visible unclean aggregate" {
     const stale_path = try std.fs.path.join(allocator, &.{ root, store_rel, ".shared.ext4.123.abcd.tmp" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_path, .data = "stale" });
 
-    var reopened = try Store.openSized(io, allocator, root, &cache_lock, image_size, 4096);
+    var reopened = try Store.openSized(io, allocator, root, image_size, 4096);
     defer reopened.deinit();
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, stale_path, .{}));
     try std.testing.expect(try validOpenDisk(io, reopened.fd, image_size));

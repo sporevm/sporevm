@@ -7,9 +7,11 @@ const rootfs_cas = @import("../rootfs_cas.zig");
 const disk_layer = @import("../disk_layer.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const run_mod = @import("../run.zig");
+const local_paths = @import("../local_paths.zig");
 const memory_config = @import("../memory.zig");
 const topology = @import("../topology.zig");
 const runtime_disk = @import("../runtime_disk.zig");
+const runtime_disk_lease = @import("../runtime_disk_lease.zig");
 const cache_mount = @import("cache_mount.zig");
 const fuzz_support = @import("../fuzz_support.zig");
 const spore = @import("../spore.zig");
@@ -93,6 +95,55 @@ pub const Diagnostic = struct {
     snapshot_ms: u64 = 0,
     max_checkpoint_control_ms: u64 = 0,
     snapshot_metrics: disk_layer.SnapshotMetrics = std.mem.zeroes(disk_layer.SnapshotMetrics),
+};
+
+/// Process leases on every rootfs storage a build reads or publishes. A build
+/// holds the rootfs cache lock only to look up, emit and publish storage, so
+/// between those epochs these leases are what stop GC and prune from taking
+/// its bases, stage outputs and step snapshots; they end with the process.
+pub const StorageLeases = struct {
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    runtime_root: []const u8,
+    held: std.ArrayList(runtime_disk_lease.Active) = .empty,
+
+    /// Checks the runtime directory up front so a bad one fails the build
+    /// before it pulls anything.
+    pub fn init(io: Io, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, cache_root: []const u8) !StorageLeases {
+        const runtime_root = try local_paths.runtimeRootPath(allocator, environ);
+        errdefer allocator.free(runtime_root);
+        try runtime_disk_lease.ensurePrivateDir(io, runtime_root);
+        const cwd = try std.process.currentPathAlloc(io, allocator);
+        defer allocator.free(cwd);
+        return .{
+            .io = io,
+            .allocator = allocator,
+            .cache_root = try std.fs.path.resolve(allocator, &.{ cwd, cache_root }),
+            .runtime_root = runtime_root,
+        };
+    }
+
+    /// Leases `storage`, which the caller found complete in the epoch of
+    /// `lock`, so it stays rooted after the lock is released.
+    pub fn hold(self: *StorageLeases, lock: *const rootfs_mod.RootfsCacheLock, storage: spore.RootfsStorage) !void {
+        if (!try lock.ensureHeldFor(self.allocator, self.cache_root)) return error.RootfsCacheLockNotHeld;
+        try self.held.ensureUnusedCapacity(self.allocator, 1);
+        self.held.appendAssumeCapacity(try runtime_disk_lease.acquireActive(self.io, self.allocator, self.runtime_root, .{
+            .store = .rootfs_cache,
+            .root = self.cache_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = storage.index_digest,
+            .rootfs_storage = storage,
+        }));
+    }
+
+    pub fn deinit(self: *StorageLeases) void {
+        for (self.held.items) |*active| active.deinit();
+        self.held.deinit(self.allocator);
+        self.allocator.free(self.cache_root);
+        self.allocator.free(self.runtime_root);
+    }
 };
 
 pub const Producer = struct {
@@ -281,7 +332,7 @@ pub const Options = struct {
     cache_root: []const u8,
     base_storage: spore.RootfsStorage,
     steps: []const Step,
-    rootfs_cache_lock: *const rootfs_mod.RootfsCacheLock,
+    leases: *StorageLeases,
     preparation: ?Preparation = null,
     producer: Producer,
     context_disk_path: ?[]const u8 = null,
@@ -459,7 +510,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     }
 
     var cache_store: ?cache_mount.Store = if (cache_run != null)
-        try cache_mount.Store.open(init.io, allocator, options.cache_root, options.rootfs_cache_lock)
+        try cache_mount.Store.open(init.io, allocator, options.cache_root)
     else
         null;
     defer if (cache_store) |*store| store.deinit();
@@ -480,14 +531,13 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
             break :blk artifacts;
         },
     };
-    _ = try run_mod.executeMonitorWithBootArtifactsAndRootfsCacheLock(
+    _ = try run_mod.executeMonitorWithBootArtifacts(
         .{ .io = init.io, .environ_map = init.environ_map },
         allocator,
         monitor_options,
         boot,
         control.control(),
         null,
-        options.rootfs_cache_lock,
     );
     if (cache_store) |*store| try store.sync();
 
@@ -616,6 +666,9 @@ const BuildControl = struct {
     resources: RunResources,
     timeout_ms: u64,
     output: ?*Io.Writer,
+    leases: *StorageLeases,
+    /// Held from a checkpoint's snapshot until its output is leased.
+    cache_lock: ?rootfs_mod.RootfsCacheLock = null,
     current_storage: spore.RootfsStorage,
     preparation: ?Preparation = null,
     rootfs_grow_target: u64 = 0,
@@ -662,6 +715,7 @@ const BuildControl = struct {
             .resources = options.resources,
             .timeout_ms = options.timeout_ms,
             .output = options.output,
+            .leases = options.leases,
             .current_storage = try spore.cloneRootfsStorage(allocator, options.base_storage),
             .preparation = options.preparation,
             .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
@@ -676,6 +730,7 @@ const BuildControl = struct {
     }
 
     fn deinit(self: *BuildControl) void {
+        if (self.cache_lock) |*lock| lock.deinit();
         self.capture.deinit();
         self.resize_stdout.deinit();
     }
@@ -719,7 +774,13 @@ const BuildControl = struct {
                 return .keep_running;
             },
             .active_freeze => return try self.pollActiveStream(dev),
-            .snapshot => return .{ .rootfs_snapshot = .{ .dir = self.cache_root } },
+            .snapshot => {
+                // The snapshot seals objects into the shared cache and skips
+                // ones already there, so GC must not run until its output is
+                // leased. The guest is frozen while this waits.
+                if (self.cache_lock == null) self.cache_lock = try rootfs_mod.lockRootfsCacheExclusive(self.io, self.allocator, self.cache_root);
+                return .{ .rootfs_snapshot = .{ .dir = self.cache_root } };
+            },
             .start_thaw => {
                 try self.startSimpleControl(dev, .thaw);
                 return .keep_running;
@@ -980,6 +1041,10 @@ const BuildControl = struct {
         // A zero-dirty RUN/COPY/WORKDIR can intentionally yield child digest ==
         // parent digest; the step key still proves which instruction inputs ran.
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
+        const lock = if (self.cache_lock) |*lock| lock else return error.RootfsCacheLockNotHeld;
+        try self.leases.hold(lock, storage);
+        lock.deinit();
+        self.cache_lock = null;
         self.pending_storage = storage;
         self.phase = .start_thaw;
         self.requestPoll();
@@ -2126,6 +2191,7 @@ test "a build control phase change asks the VMM to poll again" {
         .platform = undefined,
         .executor_identity = "",
         .cache_root = "",
+        .leases = undefined,
         .steps = &.{},
         .resources = .{},
         .timeout_ms = std.time.ms_per_min,
@@ -2203,7 +2269,7 @@ test "build session forwards the selected spore executable to the monitor" {
         .cache_root = "/cache",
         .base_storage = undefined,
         .steps = &.{},
-        .rootfs_cache_lock = undefined,
+        .leases = undefined,
         .producer = undefined,
         .spore_executable = executable,
     };
