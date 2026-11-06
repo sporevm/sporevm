@@ -743,11 +743,23 @@ test "host stream resize does not wait for a full outbound ring and sends the la
         try std.testing.expectEqual(@as(usize, 1), try stream.enqueueStdinDataNonblocking("x"));
     }
     // Resizes are queued under the VMM device lock, which every ring drainer
-    // also needs, so a full ring must coalesce instead of waiting.
-    try std.testing.expect(stream.enqueueResize(.{ .rows = 30, .cols = 100 }));
-    try std.testing.expect(stream.enqueueResize(.{ .rows = 40, .cols = 120 }));
-
+    // also needs, so a full ring must coalesce instead of waiting. They run
+    // on another thread so a resize that waits fails here instead of hanging.
+    var done = std.atomic.Value(bool).init(false);
+    const resizer = try std.Thread.spawn(.{}, resizeTwice, .{ &stream, &done });
+    const one_ms = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+    var waited_ms: u32 = 0;
+    while (!done.load(.acquire) and waited_ms < 5000) : (waited_ms += 1) _ = std.c.nanosleep(&one_ms, null);
+    const waited = !done.load(.acquire);
     var payload_buf: [max_payload]u8 = undefined;
+    // Free ring space to release a resize that waits for it.
+    while (!done.load(.acquire)) {
+        _ = stream.dequeueOutboundWithin(&payload_buf, max_payload);
+        _ = std.c.nanosleep(&one_ms, null);
+    }
+    resizer.join();
+    try std.testing.expect(!waited);
+
     var header_buf: [spore_stream.header_len]u8 = undefined;
     for (0..max_outbound_frames) |_| {
         const frame = stream.dequeueOutboundWithin(&payload_buf, max_payload).?;
@@ -763,6 +775,12 @@ test "host stream resize does not wait for a full outbound ring and sends the la
     try std.testing.expectEqual(@as(u16, 40), resize.rows);
     try std.testing.expectEqual(@as(u16, 120), resize.cols);
     try std.testing.expect(stream.dequeueOutboundWithin(&payload_buf, max_payload) == null);
+}
+
+fn resizeTwice(stream: *HostStream, done: *std.atomic.Value(bool)) void {
+    _ = stream.enqueueResize(.{ .rows = 30, .cols = 100 });
+    _ = stream.enqueueResize(.{ .rows = 40, .cols = 120 });
+    done.store(true, .release);
 }
 
 test "request-derived host ports are stable dynamic ports" {
