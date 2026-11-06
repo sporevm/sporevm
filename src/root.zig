@@ -10,6 +10,7 @@ pub const architecture = @import("architecture.zig");
 pub const backend = @import("backend.zig");
 pub const board = @import("aarch64/board.zig");
 pub const block_source = @import("block_source.zig");
+const boot_assets = @import("boot_assets.zig");
 pub const boot = @import("aarch64/boot.zig");
 pub const build = @import("build.zig");
 pub const build_exec = @import("build/exec.zig");
@@ -103,6 +104,7 @@ test {
     testing.refAllDecls(@This());
     testing.refAllDecls(api);
     testing.refAllDecls(block_source);
+    testing.refAllDecls(boot_assets);
     testing.refAllDecls(build);
     testing.refAllDecls(build_exec);
     testing.refAllDecls(build_cli);

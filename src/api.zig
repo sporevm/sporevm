@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const aarch64_topology = @import("aarch64/topology.zig");
 const architecture = @import("architecture.zig");
 const backend_mod = @import("backend.zig");
+const boot_assets = @import("boot_assets.zig");
 const bundle = @import("bundle.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const contracts = @import("contracts.zig");
@@ -109,7 +110,7 @@ pub const Architecture = architecture.Architecture;
 pub const ResourceType = resource.Type;
 pub const Portability = resource.Portability;
 pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
-pub const InjectedFile = run_mod.InjectedFile;
+pub const InjectedFile = boot_assets.InjectedFile;
 pub const RunResult = run_mod.Result;
 pub const AttachResult = run_mod.Result;
 pub const RunEvent = run_mod.RunEvent;
@@ -628,18 +629,18 @@ pub fn runManaged(
     const default_kernel = options.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
     const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
     const managed_boot_descriptor = if (default_kernel and default_initrd)
-        try run_mod.resolveManagedMonitorBootDescriptor(init, arena)
+        try boot_assets.resolveManagedMonitorBootDescriptor(init, arena)
     else
         null;
     const boot_artifacts = if (managed_boot_descriptor) |descriptor|
-        try run_mod.materializeManagedMonitorBootArtifacts(init.io, arena, descriptor)
+        try boot_assets.materializeManagedMonitorBootArtifacts(init.io, arena, descriptor)
     else
         null;
     const kernel_path = if (managed_boot_descriptor) |descriptor|
         descriptor.kernel_path
     else
-        options.kernel_path orelse try run_mod.resolveDefaultKernelPath(init, arena);
-    const initrd_path = if (managed_boot_descriptor != null) null else try run_mod.resolveConfiguredInitrdPath(init, options.initrd_path);
+        options.kernel_path orelse try boot_assets.resolveDefaultKernelPath(init, arena);
+    const initrd_path = if (managed_boot_descriptor != null) null else try boot_assets.resolveConfiguredInitrdPath(init, options.initrd_path);
     const guest_env = try run_mod.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
     const rootfs_grow_target = if (options.disk_size) |target| blk: {
         const resolved_rootfs = rootfs.rootfs orelse return error.RunCommitRootfsNotSnapshotable;
