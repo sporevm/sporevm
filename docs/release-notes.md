@@ -126,6 +126,14 @@ same host; snapshot metrics report it as `finish_fsync_ms`. Proofs written by
 earlier builds fail to validate, so those spores restore from their verified
 chunks.
 
+### Faster chunk restores
+
+Restoring from memory chunks (pulled or unpacked spores, and any spore whose
+local RAM backing proof does not validate) no longer writes zeros over the
+guest's zero chunks, which committed all of guest RAM. In a 512 MiB VM with 32
+MiB of non-zero memory, loading memory now takes 55 ms instead of 324 ms with a
+cold page cache and leaves 32 MiB resident instead of 512 MiB.
+
 ### Embedding libraries removed
 
 The C ABI (`spore.h` and the `libspore` archives), the Go binding, and the Zig

@@ -162,6 +162,8 @@ before its proof is written.
   monitor-published nonzero and pending dirty chunk counters. Fields
   remain nullable when no cheap runtime source exists.
 - Resume from chunks is portable; local backing is same-host acceleration only.
+  Chunk resume writes only non-zero chunks into fresh anonymous RAM, so zero
+  chunks stay uncommitted until the guest touches them.
 - Virtio-mem is grow-only. Unplug and reclamation remain unsupported.
 
 ## Validation

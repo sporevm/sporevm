@@ -524,6 +524,7 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
             _ = std.c.close(fd);
         };
         const restored = try arena.alloc(u8, ram.len);
+        @memset(restored, 0);
         try spore.loadMemory(arena, child, parsed.value.memory, restored);
         try std.testing.expectEqualSlices(u8, ram, restored);
         var runtime_disk = try runtime_disk_mod.open(context, allocator, .{

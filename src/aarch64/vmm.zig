@@ -539,7 +539,9 @@ pub const RestoreStats = struct {
 };
 
 /// Fills guest RAM from the spore. Local backing is already mapped; verified
-/// chunks are loaded into anonymous RAM.
+/// chunks are loaded into anonymous RAM. Callers pass the mapping straight
+/// from `mapRam`, before anything writes guest RAM: chunk loading skips zero
+/// chunks because a fresh anonymous mapping already reads as zero.
 pub fn restoreMemory(
     allocator: std.mem.Allocator,
     restore: Start.Restore,
