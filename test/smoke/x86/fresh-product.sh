@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
 # shellcheck source=src/managed_kernel.env
 source "${repo_root}/src/managed_kernel.env"
 release="${SPOREVM_KERNEL_RELEASE:-${managed_kernel_release}}"
 asset="sporevm-x86_64-linux-${managed_kernel_linux_version}-bzImage"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
 [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 product smoke requires Linux/x86_64"
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
+require_spore_bin
 if [[ -n "${seed_dir}" ]]; then
   for suffix in "" .config .sha256; do
     [[ -f "${seed_dir}/${asset}${suffix}" ]] || die "missing managed seed asset: ${seed_dir}/${asset}${suffix}"
@@ -23,7 +17,7 @@ if [[ -n "${seed_dir}" ]]; then
 fi
 [[ -z "${SPOREVM_KERNEL_IMAGE:-}" && -z "${SPOREVM_RUN_INITRD:-}" ]] || die "boot artifact overrides must be unset"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-product.XXXXXX")"
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-x86-product"
 runtime_dir="${workdir}/runtime"
 kernel_cache="${workdir}/kernel-cache"
 vm_name="x86-product-$$"
@@ -33,9 +27,7 @@ cleanup() {
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" SPOREVM_KERNEL_CACHE_DIR="${kernel_cache}" \
       "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
   fi
-  rm -rf "${workdir}"
 }
-trap cleanup EXIT
 
 mkdir -p "${runtime_dir}"
 chmod 0700 "${runtime_dir}"

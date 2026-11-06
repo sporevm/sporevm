@@ -12,7 +12,8 @@ The task builds with the shipped `--release=safe` settings, then runs
 build; run directly, it measures the existing `zig-out/bin/spore` (or
 `--spore-bin PATH`), so build that with `--release=safe` first. Debug builds
 are much slower and their numbers are not comparable. Profiles are `smoke`,
-`ci` (the default), `comparison`, `nightly`, and `full` (100-way runs); see
+`ci` (the default), `comparison`, `sequential` (sequential runs only, plus the
+synthetic `cold_import`), and `full` (100-way runs); see
 `PROFILES` in the script for what each selects. `--benchmarks`, `--modes`, and
 `--iterations` narrow a run.
 

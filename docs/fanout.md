@@ -178,6 +178,11 @@ guest agent publishes it before the command or attached session starts at
 `/run/sporevm/env`. The payload must be a JSON object with
 `run_id`, `child_id`, `parallel_index`, `parallel_count`, `fork_index`,
 `fork_count`, `fork_batch_id`, and `vm_id`. Counts must be positive, and index
-values must be smaller than their matching counts. The interface is generic:
+values must be smaller than their matching counts. The guest agent's limits
+are checked before the VM starts: `fork_batch_id`, `vm_id`, and `hostname` or
+`resume_entropy_seed` if present must be strings of at most 127 bytes once
+unescaped, with no NUL, and the integer fields, plus `generation`,
+`parent_generation`, and `resume_time_unix_ns` if present, must be integers
+from 0 to 2^64-1. The interface is generic:
 SporeVM treats these as fan-out identity fields, not Rails, CI, or Kubernetes
 policy.

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-spore_bin="${SPORE_BIN:-${repo_root}/zig-out/bin/spore}"
+source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 board_smoke_bin="${SPOREVM_X86_BOARD_SMOKE_BIN:-${repo_root}/zig-out/bin/x86-board-smoke}"
 seed_dir="${SPOREVM_X86_MANAGED_KERNEL_SEED_DIR:-}"
 # shellcheck source=src/managed_kernel.env
@@ -10,18 +9,12 @@ source "${repo_root}/src/managed_kernel.env"
 release="${SPOREVM_KERNEL_RELEASE:-${managed_kernel_release}}"
 asset="sporevm-x86_64-linux-${managed_kernel_linux_version}-bzImage"
 
-die() {
-  echo "error: $*" >&2
-  exit 1
-}
-
 [[ "$(uname -s)-$(uname -m)" == "Linux-x86_64" ]] || die "x86 run smoke requires Linux/x86_64"
-[[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}"
+require_spore_bin
 [[ -x "${board_smoke_bin}" ]] || die "board smoke binary not executable: ${board_smoke_bin}"
 [[ -z "${SPOREVM_KERNEL_IMAGE:-}" && -z "${SPOREVM_RUN_INITRD:-}" ]] || die "boot artifact overrides must be unset"
 
-workdir="$(mktemp -d "${TMPDIR:-/tmp}/sporevm-x86-run.XXXXXX")"
-trap 'rm -rf "${workdir}"' EXIT
+smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-x86-run"
 if [[ -n "${seed_dir}" ]]; then
   kernel_path="${seed_dir}/${asset}"
   [[ -f "${kernel_path}" ]] || die "missing managed seed asset: ${kernel_path}"

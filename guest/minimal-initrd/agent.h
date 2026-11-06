@@ -18,6 +18,7 @@
 #include <linux/openat2.h>
 #include <poll.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -169,6 +170,40 @@ struct generation_monitor {
   volatile uint8_t *base;
   uint64_t last_generation;
   int unavailable;
+};
+
+#define GENERATION_TEXT_MAX 128
+
+enum generation_member {
+  GENERATION_FORK_INDEX,
+  GENERATION_FORK_COUNT,
+  GENERATION_PARALLEL_INDEX,
+  GENERATION_PARALLEL_COUNT,
+  GENERATION_PARENT_GENERATION,
+  GENERATION_GENERATION,
+  GENERATION_RESUME_TIME,
+  GENERATION_VM_ID,
+  GENERATION_FORK_BATCH_ID,
+  GENERATION_HOSTNAME,
+  GENERATION_RESUME_ENTROPY_SEED,
+  GENERATION_MEMBER_COUNT,
+};
+
+// The generation params members the agent reads. present has bit
+// (1 << GENERATION_*) set for each member the params carried.
+struct generation_params {
+  unsigned present;
+  uint64_t fork_index;
+  uint64_t fork_count;
+  uint64_t parallel_index;
+  uint64_t parallel_count;
+  uint64_t parent_generation;
+  uint64_t generation;
+  uint64_t resume_time_unix_ns;
+  char vm_id[GENERATION_TEXT_MAX];
+  char fork_batch_id[GENERATION_TEXT_MAX];
+  char hostname[GENERATION_TEXT_MAX];
+  char resume_entropy_seed[GENERATION_TEXT_MAX];
 };
 
 struct build_resolv_state {
@@ -379,8 +414,7 @@ void mirror_console(int is_stdout, const unsigned char *buf, size_t len);
 int wait_child(pid_t pid, int *status, struct rusage *usage);
 int setup_sigchld_wakeup(void);
 void drain_sigchld_wakeup(void);
-int parse_string_field(const char *req, const char *name, char *out, size_t cap);
-int parse_u64_field(const char *req, const char *name, uint64_t *out);
+int parse_generation_params(const char *params, struct generation_params *out);
 int parse_request(const char *req, size_t req_len, struct run_request *out);
 int send_client_error_exit(struct client *client, int code, const char *message);
 int send_client_stdout(struct client *client, const char *message);

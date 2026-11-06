@@ -157,19 +157,6 @@ static int parse_json_string(const char **cursor, char *out, size_t cap) {
   return 0;
 }
 
-static const char *find_field_value(const char *req, const char *name) {
-  char key[64];
-  snprintf(key, sizeof(key), "\"%s\"", name);
-  size_t key_len = strlen(key);
-  const char *p = req;
-  while ((p = strstr(p, key)) != NULL) {
-    const char *value = skip_ws(p + key_len);
-    if (*value == ':') return skip_ws(value + 1);
-    p += key_len;
-  }
-  return NULL;
-}
-
 enum request_stdio {
   REQUEST_STDIO_NULL,
   REQUEST_STDIO_PIPE,
@@ -493,25 +480,146 @@ static int parse_build_context_binds_value(const char **cursor, struct run_reque
   return 0;
 }
 
-int parse_string_field(const char *req, const char *name, char *out, size_t cap) {
-  const char *p = find_field_value(req, name);
-  if (p == NULL) return 0;
-  return parse_json_string(&p, out, cap) == 0 ? 1 : -1;
-}
-
-int parse_u64_field(const char *req, const char *name, uint64_t *out) {
-  const char *p = find_field_value(req, name);
-  if (p == NULL) return 0;
-  errno = 0;
-  char *end = NULL;
-  unsigned long long value = strtoull(p, &end, 10);
-  if (errno != 0 || end == p) return -1;
-  *out = (uint64_t)value;
-  return 1;
-}
-
 static int json_token_finished(char c) {
   return c == '\0' || c == ',' || c == '}' || c == ']' || c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+// Reads an object member's key and the colon, leaving the cursor at its value.
+static int parse_json_key(const char **cursor, char *key, size_t cap) {
+  if (parse_json_string(cursor, key, cap) != 0) return -1;
+  const char *p = skip_ws(*cursor);
+  if (*p != ':') return -1;
+  *cursor = skip_ws(p + 1);
+  return 0;
+}
+
+static int skip_json_number(const char **cursor) {
+  const char *p = *cursor;
+  if (*p == '-') p++;
+  if (*p == '0') {
+    p++;
+  } else if (*p >= '1' && *p <= '9') {
+    while (*p >= '0' && *p <= '9') p++;
+  } else {
+    return -1;
+  }
+  if (*p == '.') {
+    p++;
+    if (*p < '0' || *p > '9') return -1;
+    while (*p >= '0' && *p <= '9') p++;
+  }
+  if (*p == 'e' || *p == 'E') {
+    p++;
+    if (*p == '+' || *p == '-') p++;
+    if (*p < '0' || *p > '9') return -1;
+    while (*p >= '0' && *p <= '9') p++;
+  }
+  if (!json_token_finished(*p)) return -1;
+  *cursor = p;
+  return 0;
+}
+
+// Skips one JSON value of any type, validating it. Containers nest without
+// recursion, up to one level per byte of generation params. Strings decode
+// into scratch, which must hold any string in the input.
+static int skip_json_value(const char **cursor, char *scratch, size_t scratch_cap) {
+  char open[GEN_PARAMS_MAX];
+  size_t depth = 0;
+  const char *p = *cursor;
+  for (;;) {
+    if (*p == '{' || *p == '[') {
+      if (depth == sizeof(open)) return -1;
+      char kind = *p;
+      open[depth++] = kind;
+      p = skip_ws(p + 1);
+      if (*p != (kind == '{' ? '}' : ']')) {
+        if (kind == '{' && parse_json_key(&p, scratch, scratch_cap) != 0) return -1;
+        continue;
+      }
+      p++;
+      depth--;
+    } else if (*p == '"') {
+      if (parse_json_string(&p, scratch, scratch_cap) != 0) return -1;
+    } else if (*p == 't' || *p == 'f') {
+      int ignored = 0;
+      if (parse_json_bool(&p, &ignored) != 0) return -1;
+    } else if (strncmp(p, "null", 4) == 0 && json_token_finished(p[4])) {
+      p += 4;
+    } else if (skip_json_number(&p) != 0) {
+      return -1;
+    }
+    // After a value: close finished containers, or move to the next element.
+    for (;;) {
+      if (depth == 0) {
+        *cursor = p;
+        return 0;
+      }
+      p = skip_ws(p);
+      if (*p == (open[depth - 1] == '{' ? '}' : ']')) {
+        p++;
+        depth--;
+        continue;
+      }
+      if (*p != ',') return -1;
+      p = skip_ws(p + 1);
+      if (open[depth - 1] == '{' && parse_json_key(&p, scratch, scratch_cap) != 0) return -1;
+      break;
+    }
+  }
+}
+
+static const struct generation_member_spec {
+  const char *name;
+  size_t offset;
+  int text;
+} generation_members[GENERATION_MEMBER_COUNT] = {
+  [GENERATION_FORK_INDEX] = {"fork_index", offsetof(struct generation_params, fork_index), 0},
+  [GENERATION_FORK_COUNT] = {"fork_count", offsetof(struct generation_params, fork_count), 0},
+  [GENERATION_PARALLEL_INDEX] = {"parallel_index", offsetof(struct generation_params, parallel_index), 0},
+  [GENERATION_PARALLEL_COUNT] = {"parallel_count", offsetof(struct generation_params, parallel_count), 0},
+  [GENERATION_PARENT_GENERATION] = {"parent_generation", offsetof(struct generation_params, parent_generation), 0},
+  [GENERATION_GENERATION] = {"generation", offsetof(struct generation_params, generation), 0},
+  [GENERATION_RESUME_TIME] = {"resume_time_unix_ns", offsetof(struct generation_params, resume_time_unix_ns), 0},
+  [GENERATION_VM_ID] = {"vm_id", offsetof(struct generation_params, vm_id), 1},
+  [GENERATION_FORK_BATCH_ID] = {"fork_batch_id", offsetof(struct generation_params, fork_batch_id), 1},
+  [GENERATION_HOSTNAME] = {"hostname", offsetof(struct generation_params, hostname), 1},
+  [GENERATION_RESUME_ENTROPY_SEED] = {"resume_entropy_seed", offsetof(struct generation_params, resume_entropy_seed), 1},
+};
+
+// Generation params, from the generation device or a request's params_json,
+// are one JSON object. The members the agent reads must have their type and
+// appear at most once; other members, such as the host's run_id and
+// mac_address, may hold any JSON value and are skipped.
+int parse_generation_params(const char *params, struct generation_params *out) {
+  memset(out, 0, sizeof(*out));
+  if (strlen(params) >= GEN_PARAMS_MAX) return -1;
+  char scratch[GEN_PARAMS_MAX];
+  const char *p = skip_ws(params);
+  if (*p != '{') return -1;
+  p = skip_ws(p + 1);
+  if (*p == '}') return *skip_ws(p + 1) == '\0' ? 0 : -1;
+  for (;;) {
+    if (parse_json_key(&p, scratch, sizeof(scratch)) != 0) return -1;
+    int member = GENERATION_MEMBER_COUNT;
+    for (int i = 0; i < GENERATION_MEMBER_COUNT; i++) {
+      if (strcmp(scratch, generation_members[i].name) == 0) member = i;
+    }
+    if (member == GENERATION_MEMBER_COUNT) {
+      if (skip_json_value(&p, scratch, sizeof(scratch)) != 0) return -1;
+    } else {
+      const struct generation_member_spec *spec = &generation_members[member];
+      if ((out->present & (1u << member)) != 0) return -1;
+      void *field = (char *)out + spec->offset;
+      int rc = spec->text ? parse_json_string(&p, field, GENERATION_TEXT_MAX) : parse_json_u64(&p, field);
+      if (rc != 0) return -1;
+      out->present |= 1u << member;
+    }
+    p = skip_ws(p);
+    if (*p == '}') break;
+    if (*p != ',') return -1;
+    p = skip_ws(p + 1);
+  }
+  return *skip_ws(p + 1) == '\0' ? 0 : -1;
 }
 
 // Every request is one newline-terminated JSON object with a known type and
@@ -871,8 +979,13 @@ __attribute__((visibility("hidden"))) int spore_agent_fuzz_build_request(
   if (parsed.kind == REQUEST_BUILD_COPY) return SPORE_AGENT_FUZZ_COPY_REQUEST;
   if (parsed.kind == REQUEST_BUILD_WORKDIR) return SPORE_AGENT_FUZZ_WORKDIR_REQUEST;
   if (parsed.kind == REQUEST_ROOTFS_GROW) return SPORE_AGENT_FUZZ_GROW_REQUEST;
-  if (parsed.kind == REQUEST_START) return SPORE_AGENT_FUZZ_START_REQUEST;
-  if (parsed.kind == REQUEST_ATTACH) return SPORE_AGENT_FUZZ_ATTACH_REQUEST;
+  if (parsed.kind == REQUEST_START || parsed.kind == REQUEST_ATTACH) {
+    if (parsed.generation_params[0] != '\0') {
+      struct generation_params params;
+      (void)parse_generation_params(parsed.generation_params, &params);
+    }
+    return parsed.kind == REQUEST_START ? SPORE_AGENT_FUZZ_START_REQUEST : SPORE_AGENT_FUZZ_ATTACH_REQUEST;
+  }
   if (parsed.kind != REQUEST_BUILD_RUN) return SPORE_AGENT_FUZZ_OTHER_REQUEST;
   if (parsed.build_exec_form) return SPORE_AGENT_FUZZ_RUN_COMPLETE;
 
@@ -936,6 +1049,24 @@ __attribute__((visibility("hidden"))) void spore_agent_test_request_limits(struc
   out->generation_params_bytes = sizeof(((struct run_request *)0)->generation_params) - 1;
   out->frame_payload_bytes = MAX_FRAME_PAYLOAD;
   out->initial_output_bytes = INITIAL_OUTPUT_CAP;
+}
+
+// Returns -1 when the params are refused, 1 with *generation set when they
+// carry a generation, and 0 otherwise. Parsed params also set *fork_index and
+// vm_id (a GENERATION_TEXT_MAX buffer), to 0 and "" when absent.
+__attribute__((visibility("hidden"))) int spore_agent_test_generation_params(
+    const unsigned char *params_bytes, size_t params_len, uint64_t *generation, uint64_t *fork_index, char *vm_id) {
+  if (params_len >= GEN_PARAMS_MAX) return -1;
+  char params[GEN_PARAMS_MAX];
+  memcpy(params, params_bytes, params_len);
+  params[params_len] = '\0';
+  struct generation_params parsed;
+  if (parse_generation_params(params, &parsed) != 0) return -1;
+  *fork_index = parsed.fork_index;
+  memcpy(vm_id, parsed.vm_id, sizeof(parsed.vm_id));
+  if ((parsed.present & (1u << GENERATION_GENERATION)) == 0) return 0;
+  *generation = parsed.generation;
+  return 1;
 }
 
 __attribute__((visibility("hidden"))) int spore_agent_fuzz_exec_arg_equals(
