@@ -48,7 +48,9 @@
 #define INITIAL_OUTPUT_HEADER_LEN 3
 #define INITIAL_OUTPUT_CAP (16 * 1024 - INITIAL_OUTPUT_HEADER_LEN)
 #define REPLAY_CAP 65536
-#define GEN_PARAMS_MAX 4096
+// The generation device's params region, generation.zig params_size, plus
+// the NUL.
+#define GEN_PARAMS_MAX 3841
 #define SPIO_MAGIC "SPIO"
 #define SPIO_VERSION 1
 #define SPIO_HEADER_LEN 24
