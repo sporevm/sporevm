@@ -9,8 +9,8 @@ Bounded commands use global `spore --json <command> ...` and emit exactly one
 schema-versioned JSON result on stdout. SporeVM failures emit one
 `spore.error.v1` document on stderr and nothing on stdout. The bounded surface
 includes version and inspection, system and cache operations, rootfs and image
-operations, build, named lifecycle and copy operations, and bundle distribution
-operations.
+operations, build, named lifecycle and copy operations, and checkpoint push and
+pull.
 
 Runtime streams use command-local `--events=jsonl`. `run`, `attach`, `restore`,
 `exec`, and `fanout` emit `spore.automation.event.v1` records. Each completed stream ends
@@ -47,7 +47,7 @@ The bounded schema inventory is:
 | Operations | Result schemas |
 | --- | --- |
 | `version`, `host-info`, `inspect` | `spore.version.result.v1`, `spore.host-info.v3`, `spore.inspect.result.v1` |
-| checkpoint `fork`/`clone`/`push`/`pull`, bundle `pack`/`inspect-bundle`, checkpoint `unpack` | `spore.fork.result.v1`, `spore.clone.result.v1`, `spore.push.result.v2`, `spore.pull.result.v2`, `spore.pack.result.v1`, `spore.unpack.result.v1`, `spore.bundle.inspect.v1` |
+| checkpoint `fork`/`push`/`pull` | `spore.fork.result.v1`, `spore.push.result.v2`, `spore.pull.result.v2` |
 | `create`, `logs`, `save`, `restore`, `vm rm`, `vm fork`, `checkpoint rm`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v2`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
 | `build`, rootfs operations, image archive and push operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v2`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1`, `spore.image.push.result.v1` |
 | `system df`/`prune`, `cache gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v2`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
@@ -70,7 +70,7 @@ automatic-memory policy and is not compatible with the explicit two-size
 contract.
 
 Result schemas keep their existing names. Additive `resource_type` fields
-identify `live_vm`, `checkpoint`, `image`, or `bundle`, and checkpoint
+identify `live_vm`, `checkpoint`, or `image`, and checkpoint
 inspection also reports `can_attach`, `can_run_from`, `sessions` with
 per-session stream support, `portability`, and `ownership`. Existing consumers
 may ignore these fields under the v1 additive-field rule.

@@ -50,7 +50,7 @@ hypervisors.
 
 ## Design details
 
-- [docs/spore-format.md](docs/spore-format.md): manifest, bundle, and invariant
+- [docs/spore-format.md](docs/spore-format.md): manifest and invariant
   contract.
 - [docs/state-portability.md](docs/state-portability.md): KVM/HVF state mapping
   and fail-closed restore matrix.
@@ -366,23 +366,9 @@ spore fanout forks --for 20s
 See [docs/fanout.md](docs/fanout.md) for the child identity contract and
 [docs/memory.md](docs/memory.md) for the memory chunk/backing contract.
 
-## Pack and distribute
+## Distribute
 
-Pack a spore, optionally with forked children:
-
-```bash
-spore pack base.spore --children forks --out base.bundle
-```
-
-Unpack one selected child before attach:
-
-```bash
-spore unpack base.bundle --child 000042 --out child.spore
-spore attach child.spore
-```
-
-`spore pack` and `spore unpack` carry the manifest-selected memory, rootfs,
-and writable disk bytes. To move a saved spore between hosts, push it to an
+To move a saved spore between hosts, push it to an
 [image store](docs/image-format.md#spores) and pull it on the other host:
 
 ```bash
@@ -414,7 +400,7 @@ spore vm rm bench-2
 Use `spore checkpoint rm DIR` to delete saved state; `spore cache gc --force`
 then reclaims storage nothing else references.
 `spore vm rm NAME` stops the live monitor and deletes runtime state without
-touching checkpoints, images, or bundles. The older top-level `rm` and `fork`
+touching checkpoints or images. The older top-level `rm` and `fork`
 forms remain compatible throughout the 0.x release line.
 
 Create-time annotations and named lifecycle network policy can be passed as
@@ -437,7 +423,7 @@ restore, and fork operations in the example above remain unavailable.
 ## Current scope
 
 SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
-runs, local and remote bundle materialization, explicit guest networking, and
+runs, spore push and pull through image stores, explicit guest networking, and
 named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM is a
 frozen, fresh-only profile with one vCPU and fixed 512 MiB memory; native
 OCI/rootfs execution, image commit, networking, and build are available, while
@@ -512,8 +498,8 @@ can create duplicate tag builds.
 
 ## Security
 
-Read [SECURITY.md](SECURITY.md) before changing virtqueue parsing, manifest or
-bundle decoding, guest memory access, rootfs materialization, or monitor control
+Read [SECURITY.md](SECURITY.md) before changing virtqueue parsing, manifest
+decoding, guest memory access, rootfs materialization, or monitor control
 paths.
 
 ## License

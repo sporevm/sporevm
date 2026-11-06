@@ -30,8 +30,8 @@ Portable state is deliberately narrow:
 - Disk: a captured `spore run --image` workload may reference one verified
   immutable ext4 rootfs artifact and, for image-created spores, manifest-bound
   chunked rootfs storage. It may also reference an optional sealed writable
-  rootfs-bound disk index. Bundles can carry rootfs CAS bytes, exact
-  rootfs artifacts, disk indexes, and disk chunk objects. General block devices are
+  rootfs-bound disk index. `spore push` and `spore pull` carry the disk index
+  and disk chunk objects through an image store. General block devices are
   still outside the portable contract.
 
 Cross-ISA restore, portable HVF multi-vCPU GIC production, persisted access
@@ -94,7 +94,7 @@ block identical-host fork/fan-out.
 | Virtqueue descriptors and buffers | guest RAM | yes | yes | yes | yes | portable through RAM |
 | Generation device | counter, interrupt status, resume params | yes | yes | yes | yes | portable; fork path populates it |
 | Immutable rootfs base | optional exact artifact plus optional `chunked-ext4-rootfs-v0` storage descriptor | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | yes via `spore run --image` | trusted flat-artifact open; chunks fault in from CAS when the flat cache is missing | product resume base; cache contract is verify-at-install, trust-at-open |
-| Writable root disk index | optional `chunk-index-disk-v0` over the effective immutable rootfs base | yes for local CAS store | verifies disk index and chunk objects | yes for local CAS store | verifies disk index and chunk objects | product resume; bundle materialization unit-covered |
+| Writable root disk index | optional `chunk-index-disk-v0` over the effective immutable rootfs base | yes for local CAS store | verifies disk index and chunk objects | yes for local CAS store | verifies disk index and chunk objects | product resume; push and pull unit-covered |
 | Network capability and policy | optional `spore-net-v0` plus allow CIDRs/hosts, exact host-port rules, and bound-service requirements; no live flows, host socket material, or host port forwards | yes | fresh gateway | yes | fresh gateway | policy portable; flows and port forwards dropped; bound services fail closed unless restored |
 | Grow-only virtio-mem hotplug | `memory_state` normalized initial, maximum, requested, captured, and plugged block ranges | yes | yes | yes | yes | portable, one vCPU currently |
 | General writable disk contents | not represented | no | reject | no | reject | out of current format |
@@ -287,10 +287,9 @@ Current evidence:
 - Product smokes cover same-host diskless capture/resume, diskless fork/fan-out,
   and OCI-rootfs child execution through `mise run smoke core` and
   `test/smoke/fanout/rootfs.sh`.
-- Local writable rootfs persistence, fork divergence, and local
-  bundle-carried disk index replay are covered by `test/smoke/rootfs/writable.sh`.
-- Same-class KVM writable-rootfs bundle materialization previously passed on
-  two `a1.metal` hosts in run `writable-rootfs-20260619T212758Z`.
+- Local writable rootfs persistence, fork divergence, and disk index replay
+  after a push and a pull into an empty cache are covered by
+  `test/smoke/rootfs/writable.sh`.
 - KVM→HVF with an `m7g.metal` producer is a negative test: the spore records
   `counter_frequency_hz = 1_050_000_000` and HVF exposes 24MHz, so restore must
   reject it before running guest code.

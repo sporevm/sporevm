@@ -1,6 +1,6 @@
 # Lifecycle And Resource Model
 
-SporeVM keeps four public resources distinct because they have different
+SporeVM keeps three public resources distinct because they have different
 lifecycle and ownership rules:
 
 | Resource | Meaning | Primary operations |
@@ -8,7 +8,6 @@ lifecycle and ownership rules:
 | Live VM | A running, named VM behind a host-local monitor | `create`, `exec`, `save`, `restore`, `spore vm fork`, `spore vm rm` |
 | Checkpoint (spore) | Saved machine and session state in a directory | `inspect`, `attach`, `run --from`, `push`, `pull`, `spore checkpoint fork`, `spore checkpoint rm` |
 | Image | Application filesystem and OCI execution metadata, without machine state | `build`, `run --commit`, `image unpack` |
-| Bundle | Portable transport encoding for checkpoints and fork batches | `pack`, `unpack`, `inspect-bundle` |
 
 Named lifecycle keeps a live VM behind one local monitor process so callers can
 create a warmed guest, run repeated commands, save a checkpoint, restore it
@@ -316,7 +315,7 @@ starts. Named VM names remain lifecycle monitor handles.
 `spore save NAME --out DIR` writes a spore and leaves the named VM running.
 Image-created named saves record `exec_defaults` as optional manifest metadata:
 the OCI environment list and working directory are preserved by stop and
-non-destructive save, restore, offline fork, pack/unpack, and live named fork.
+non-destructive save, restore, offline fork, push and pull, and live named fork.
 The same defaults remain in host-private lifecycle metadata for compatibility
 with the named monitor. A missing field means no saved exec defaults, so older
 spores retain their existing root-directory and empty-environment behavior.
@@ -325,17 +324,16 @@ surface.
 Writable-disk saves are `machine-local-pinned` by default. The reference to
 their durable cache pin is hard-linked to one cache-side ownership anchor, so
 moving or renaming the directory is safe while ordinary and hard-link copies
-fail closed before restore, pack, or removal. Use `spore clone SOURCE --out
-DEST` to make a `portable-self-contained` artifact through the existing pack
-encoding, or `spore fork` for another machine-local lifetime.
-The ownership anchor is a hard link, so a machine-local pinned save must share
-a filesystem with the configured rootfs cache. To cross filesystems, save on
-the cache filesystem and clone the result to the final destination.
+fail closed before restore or removal. Use `spore fork` for another
+machine-local lifetime, or `spore push` and `spore pull` to copy a save to
+another host or rootfs cache.
+The ownership anchor is a hard link, so a machine-local pinned save must be on
+the configured rootfs cache's filesystem.
 Offline fork children report `batch-relative` because they share RAM through
 the batch-owned `shared-chunks` directory. A disk-backed child may also carry
 a machine-local pin, so this class describes the RAM ownership boundary rather
 than the absence of a disk pin. Move the complete batch, not an individual
-child; pack/unpack is the supported independently portable child boundary.
+child.
 Pin records stay pending until the final save or batch rename is durable.
 Cache GC distinguishes an abandoned staged reference after a crash from a
 committed artifact and reclaims the former. If ordinary save publication fails
@@ -381,12 +379,12 @@ checkpoint renamed within the same filesystem keeps its pin; `mv` to another
 filesystem copies it, which behaves like `cp -r` followed by `rm -rf`. After
 `cp -al`, neither copy restores until one is removed, and GC keeps the storage
 while either exists. A plain `cp -r` copy never owned the pin and cannot
-restore; use `spore clone` for an independent copy.
+restore; use `spore push` and `spore pull` for an independent copy.
 
 `spore cache pins` reports `index_valid` only after validating the record and
 canonical index, and `stale` for a record from an earlier build that
 `spore cache gc --force` deletes. It deliberately does not stat or hash every object; lazy reads
-and `spore pack` still verify object bytes and may fail closed on missing or
+and `spore push` still verify object bytes and may fail closed on missing or
 corrupt content. Inspect and save output name the ownership class.
 The hard-link anchor supplies local proof without a global save-path registry.
 

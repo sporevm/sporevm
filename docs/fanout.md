@@ -35,7 +35,7 @@ original command stream:
 | `spore save NAME --stop` | none | no | yes |
 | `spore run --save` | saved session | yes | yes |
 | `spore checkpoint fork base.spore` | inherits parent | if parent has one | yes |
-| `spore unpack bundle --child N` | inherits bundled child | if child has one | yes |
+| `spore pull STORE/TAG` | inherits the pushed spore | if it has one | yes |
 
 If the parent manifest declares bound services, fan-out supplies one fresh host
 socket binding per service and applies the same binding to every child:
@@ -63,14 +63,13 @@ chunks.
 The batch directory is the movement and ownership boundary. Child `chunks`
 links are batch-relative (`../shared-chunks`), so moving the complete batch
 preserves RAM authority. Moving or deleting one child does not transfer or
-clean up the shared store; use pack/unpack when a child must be independently
-portable.
+clean up the shared store. To run a child on another host, push the parent and
+pass the child's identity to `spore run --from` with `--generation`.
 
 Each disk-backed child gets its own durable disk pin, so removing the parent or
 a sibling cannot release that child's disk state. The child still reports
 `batch-relative` because its RAM chunks belong to the batch. Raw copies are not
-valid ownership transfers; use `spore clone` for an independently removable
-portable child or another fork for a machine-local lifetime.
+valid ownership transfers; use another fork for a machine-local lifetime.
 
 For pinned disk-backed batches, human and JSON fork results report cache-lock
 wait separately from the lock-held pin and batch publication interval. These

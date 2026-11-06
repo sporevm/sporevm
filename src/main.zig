@@ -23,7 +23,7 @@ const usage =
     \\
     \\Global options:
     \\  --debug             Show verbose VMM and restore logs
-    \\  --json              Emit one JSON result for supported state and bundle commands
+    \\  --json              Emit one JSON result for supported commands
     \\                      Use --events=jsonl for run/attach stream events
     \\
     \\Commands:
@@ -64,16 +64,8 @@ const usage =
     \\                        Mint child spores that share parent chunks
     \\    fanout <children-dir> [--for DURATION]
     \\                        Attach forked children concurrently with prefixed output
-    \\    pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
-    \\                        Pack portable spore chunks into a local bundle
-    \\    clone <spore-dir> --out DIR
-    \\                        Make an independently owned portable spore copy
-    \\    unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
-    \\                        Unpack a local spore bundle into a spore dir
     \\    push <spore-dir> STORE/TAG
     \\                        Push a saved spore to an image store
-    \\    inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
-    \\                        Inspect bundle metadata without materializing it
     \\    pull STORE/TAG --out DIR
     \\                        Pull a saved spore from an image store
     \\
@@ -89,40 +81,6 @@ const usage =
     \\
 ;
 
-const pack_usage =
-    \\Usage:
-    \\  spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR
-    \\
-    \\Options:
-    \\  --children DIR        Include forked child spores in the bundle
-    \\  --rootfs POLICY       Rootfs bundle policy: exact or metadata-only
-    \\                        metadata-only requires the same rootfs cache on unpack
-    \\  --out DIR             Write the local bundle to DIR
-    \\  -h, --help            Show this help
-    \\
-;
-
-const unpack_usage =
-    \\Usage:
-    \\  spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
-    \\
-    \\Options:
-    \\  --child ID                    Materialize one child from the bundle
-    \\  --allow-metadata-only-rootfs  Allow metadata-only rootfs descriptors
-    \\  --out DIR                     Write the unpacked spore to DIR
-    \\  -h, --help                    Show this help
-    \\
-;
-
-const clone_usage =
-    \\Usage:
-    \\  spore clone <spore-dir> --out DIR
-    \\
-    \\Makes a portable-self-contained copy through the pack transport encoding.
-    \\The output can be moved, copied, and removed independently.
-    \\
-;
-
 const push_usage =
     \\Usage:
     \\  spore push <spore-dir> STORE/TAG
@@ -133,17 +91,6 @@ const push_usage =
     \\
     \\Options:
     \\  -h, --help           Show this help
-    \\
-;
-
-const inspect_bundle_usage =
-    \\Usage:
-    \\  spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
-    \\
-    \\Options:
-    \\  --child ID               Inspect one child entry
-    \\  --child-range START..END Inspect an inclusive range of child entries
-    \\  -h, --help               Show this help
     \\
 ;
 
@@ -167,7 +114,7 @@ const vm_usage =
     \\  spore vm fork NAME --count N --name PATTERN [--allow-slow-copy]
     \\
     \\A live VM owns a running monitor and host-local runtime state. Removing it
-    \\does not remove checkpoints, images, or bundles.
+    \\does not remove checkpoints or images.
     \\
 ;
 
@@ -351,35 +298,6 @@ fn runCommand(
         }
     } else if (std.mem.eql(u8, command, "fanout")) {
         try spore_internal.fanout.cli(init, command_args, stdout);
-    } else if (std.mem.eql(u8, command, "pack")) {
-        if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll(pack_usage);
-            return;
-        }
-        const result = try packCommand(context, arena, stderr, mode, command_args);
-        if (mode == .json) {
-            try machine_output.writeJson(arena, stdout, result);
-        } else {
-            try writePackResult(stdout, result);
-        }
-    } else if (std.mem.eql(u8, command, "clone")) {
-        if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll(clone_usage);
-            return;
-        }
-        const result = try cloneCommand(context, arena, stderr, mode, command_args);
-        if (mode == .json) try machine_output.writeJson(arena, stdout, result) else try writeCloneResult(stdout, result);
-    } else if (std.mem.eql(u8, command, "unpack")) {
-        if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll(unpack_usage);
-            return;
-        }
-        const result = try unpackCommand(context, arena, stderr, mode, command_args);
-        if (mode == .json) {
-            try machine_output.writeJson(arena, stdout, result);
-        } else {
-            try writeUnpackResult(stdout, result);
-        }
     } else if (std.mem.eql(u8, command, "push")) {
         if (wantsCommandHelp(command_args)) {
             try stdout.writeAll(push_usage);
@@ -390,17 +308,6 @@ fn runCommand(
             try machine_output.writeJson(arena, stdout, result);
         } else {
             try writePushResult(stdout, result);
-        }
-    } else if (std.mem.eql(u8, command, "inspect-bundle")) {
-        if (wantsCommandHelp(command_args)) {
-            try stdout.writeAll(inspect_bundle_usage);
-            return;
-        }
-        const result = try inspectBundleCommand(arena, stderr, mode, command_args);
-        if (mode == .json) {
-            try machine_output.writeJson(arena, stdout, result);
-        } else {
-            try writeInspectBundleResult(stdout, result);
         }
     } else if (std.mem.eql(u8, command, "pull")) {
         if (wantsCommandHelp(command_args)) {
@@ -506,11 +413,7 @@ fn supportsJson(command: []const u8) bool {
         std.mem.eql(u8, command, "ls") or
         std.mem.eql(u8, command, "ps") or
         std.mem.eql(u8, command, "fork") or
-        std.mem.eql(u8, command, "pack") or
-        std.mem.eql(u8, command, "clone") or
-        std.mem.eql(u8, command, "unpack") or
         std.mem.eql(u8, command, "push") or
-        std.mem.eql(u8, command, "inspect-bundle") or
         std.mem.eql(u8, command, "pull");
 }
 
@@ -702,139 +605,11 @@ fn forkCommand(
         .count = count.?,
     }) catch |err| switch (err) {
         error.CrossDeviceOwnershipLink => {
-            const message = allocMessage(allocator, "spore {s}: machine-local pinned children must share a filesystem with the rootfs cache; use `spore clone` for a portable child on another filesystem", .{command_label});
+            const message = allocMessage(allocator, "spore {s}: {s} must be on the rootfs cache's filesystem", .{ command_label, out_dir.? });
             exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command_label), message);
         },
         else => |e| return e,
     };
-}
-
-fn packCommand(
-    context: spore_api.Context,
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    args: []const []const u8,
-) !spore_api.PackResult {
-    var spore_dir: ?[]const u8 = null;
-    var out_dir: ?[]const u8 = null;
-    var children_dir: ?[]const u8 = null;
-    var rootfs_policy: spore_api.RootfsBundlePolicy = .exact_bytes;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
-            i += 1;
-            out_dir = args[i];
-        } else if (std.mem.eql(u8, args[i], "--children") and i + 1 < args.len) {
-            i += 1;
-            children_dir = args[i];
-        } else if (std.mem.eql(u8, args[i], "--rootfs") and i + 1 < args.len) {
-            i += 1;
-            rootfs_policy = parseRootfsBundlePolicy(args[i]) orelse {
-                exitInvalidValue(allocator, stderr, mode, "pack", "--rootfs", args[i]);
-            };
-        } else if (std.mem.startsWith(u8, args[i], "--rootfs=")) {
-            const value = args[i]["--rootfs=".len..];
-            rootfs_policy = parseRootfsBundlePolicy(value) orelse {
-                exitInvalidValue(allocator, stderr, mode, "pack", "--rootfs", value);
-            };
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "pack", args[i]);
-        } else if (spore_dir == null) {
-            spore_dir = args[i];
-        } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "pack", args[i]);
-        }
-    }
-
-    if (spore_dir == null or out_dir == null) {
-        exitUsage(allocator, stderr, mode, "pack", "usage: spore pack <spore-dir> [--children DIR] [--rootfs=exact|metadata-only] --out DIR");
-    }
-
-    return spore_api.pack(context, allocator, .{
-        .spore_dir = spore_dir.?,
-        .out_dir = out_dir.?,
-        .children_dir = children_dir,
-        .rootfs_policy = rootfs_policy,
-    }) catch |err| switch (err) {
-        error.UnsupportedMetadataOnlyRootfsStorage => {
-            const message = "spore pack: --rootfs=metadata-only cannot pack chunked image/rootfs storage yet; use --rootfs=exact";
-            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "pack"), message);
-        },
-        else => |e| return e,
-    };
-}
-
-fn unpackCommand(
-    context: spore_api.Context,
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    args: []const []const u8,
-) !spore_api.UnpackResult {
-    var bundle_dir: ?[]const u8 = null;
-    var out_dir: ?[]const u8 = null;
-    var child_id: ?[]const u8 = null;
-    var allow_metadata_only_rootfs = false;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
-            i += 1;
-            out_dir = args[i];
-        } else if (std.mem.eql(u8, args[i], "--child") and i + 1 < args.len) {
-            i += 1;
-            child_id = args[i];
-        } else if (std.mem.eql(u8, args[i], "--allow-metadata-only-rootfs")) {
-            allow_metadata_only_rootfs = true;
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "unpack", args[i]);
-        } else if (bundle_dir == null) {
-            bundle_dir = args[i];
-        } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "unpack", args[i]);
-        }
-    }
-
-    if (bundle_dir == null or out_dir == null) {
-        exitUsage(allocator, stderr, mode, "unpack", "usage: spore unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR");
-    }
-
-    return spore_api.unpack(context, allocator, .{
-        .bundle_dir = bundle_dir.?,
-        .out_dir = out_dir.?,
-        .child_id = child_id,
-        .allow_metadata_only_rootfs = allow_metadata_only_rootfs,
-    });
-}
-
-fn cloneCommand(
-    context: spore_api.Context,
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    args: []const []const u8,
-) !spore_api.CloneResult {
-    var spore_dir: ?[]const u8 = null;
-    var out_dir: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
-            i += 1;
-            out_dir = args[i];
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "clone", args[i]);
-        } else if (spore_dir == null) {
-            spore_dir = args[i];
-        } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "clone", args[i]);
-        }
-    }
-    if (spore_dir == null or out_dir == null) {
-        exitUsage(allocator, stderr, mode, "clone", "usage: spore clone <spore-dir> --out DIR");
-    }
-    return spore_api.cloneSpore(context, allocator, .{ .spore_dir = spore_dir.?, .out_dir = out_dir.? });
 }
 
 fn pushCommand(
@@ -861,58 +636,6 @@ fn pushCommand(
         exitUsage(allocator, stderr, mode, "push", "usage: spore push <spore-dir> STORE/TAG");
     }
     return spore_api.push(context, allocator, .{ .spore_dir = spore_dir.?, .destination = destination.? });
-}
-
-fn inspectBundleCommand(
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    args: []const []const u8,
-) !spore_api.InspectBundleResult {
-    var source: ?[]const u8 = null;
-    var child_id: ?[]const u8 = null;
-    var child_range: ?spore_api.ChildRange = null;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--child")) {
-            if (i + 1 >= args.len or std.mem.startsWith(u8, args[i + 1], "--")) {
-                exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
-            }
-            i += 1;
-            if (child_range != null) {
-                exitWithInvalidCombination(allocator, stderr, mode, "inspect-bundle", "--child", "--child-range");
-            }
-            child_id = args[i];
-        } else if (std.mem.eql(u8, args[i], "--child-range")) {
-            if (i + 1 >= args.len or std.mem.startsWith(u8, args[i + 1], "--")) {
-                exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
-            }
-            i += 1;
-            if (child_id != null) {
-                exitWithInvalidCombination(allocator, stderr, mode, "inspect-bundle", "--child", "--child-range");
-            }
-            child_range = parseChildRange(args[i]) orelse {
-                exitInvalidValue(allocator, stderr, mode, "inspect-bundle", "--child-range", args[i]);
-            };
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "inspect-bundle", args[i]);
-        } else if (source == null) {
-            source = args[i];
-        } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "inspect-bundle", args[i]);
-        }
-    }
-
-    if (source == null) {
-        exitUsage(allocator, stderr, mode, "inspect-bundle", "usage: spore inspect-bundle <bundle-ref> [--child ID|--child-range START..END]");
-    }
-
-    return spore_api.inspectBundle(allocator, .{
-        .source = source.?,
-        .child_id = child_id,
-        .child_range = child_range,
-    });
 }
 
 fn pullCommand(
@@ -947,33 +670,6 @@ fn pullCommand(
         },
         else => |e| return e,
     };
-}
-
-fn exitWithInvalidCombination(
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    command: []const u8,
-    first: []const u8,
-    second: []const u8,
-) noreturn {
-    const message = allocMessage(allocator, "spore {s}: cannot combine {s} and {s}", .{ command, first, second });
-    exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
-}
-
-fn parseChildRange(value: []const u8) ?spore_api.ChildRange {
-    const sep = std.mem.indexOf(u8, value, "..") orelse return null;
-    if (sep == 0 or sep + 2 >= value.len) return null;
-    const start = std.fmt.parseInt(u32, value[0..sep], 10) catch return null;
-    const end = std.fmt.parseInt(u32, value[sep + 2 ..], 10) catch return null;
-    if (start > end) return null;
-    return .{ .start = start, .end = end };
-}
-
-fn parseRootfsBundlePolicy(value: []const u8) ?spore_api.RootfsBundlePolicy {
-    if (std.mem.eql(u8, value, "exact") or std.mem.eql(u8, value, "exact-bytes")) return .exact_bytes;
-    if (std.mem.eql(u8, value, "metadata-only")) return .metadata_only;
-    return null;
 }
 
 fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
@@ -1019,7 +715,6 @@ fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
     try writer.writeAll("  Cache roots:\n");
     try writePathFact(writer, "kernels", info.cache_roots.kernels);
     try writePathFact(writer, "rootfs", info.cache_roots.rootfs);
-    try writePathFact(writer, "bundles", info.cache_roots.bundles);
     try writePathFact(writer, "runtime", info.cache_roots.runtime);
 }
 
@@ -1099,61 +794,11 @@ fn writeForkResult(writer: *Io.Writer, result: spore_api.ForkResult) !void {
     if (result.pin_lock_wait_ms) |ms| try writer.print("  Pin lock wait: {d}ms\n", .{ms});
 }
 
-fn writePackResult(writer: *Io.Writer, result: spore_api.PackResult) !void {
-    try writer.writeAll("Bundle packed\n");
-    try writer.print("  Source: {s}\n", .{result.source});
-    try writer.print("  Output: {s}\n", .{result.out_dir});
-    try writer.print("  Bundle digest: sha256:{s}\n", .{result.bundle_digest});
-    try writer.print("  Chunks: {d} packed of {d}\n", .{ result.packed_chunk_count, result.chunk_count });
-    try writer.print("  Payload bytes: {d}\n", .{result.payload_bytes});
-    try writer.print("  Children: {d}\n", .{result.child_count});
-    if (result.rootfs_artifact_count > 0) {
-        try writer.print("  Rootfs artifacts: {d}, {d} bytes\n", .{ result.rootfs_artifact_count, result.rootfs_payload_bytes });
-    }
-}
-
-fn writeUnpackResult(writer: *Io.Writer, result: spore_api.UnpackResult) !void {
-    try writer.writeAll("Bundle unpacked\n");
-    try writer.print("  Bundle: {s}\n", .{result.bundle});
-    try writer.print("  Output: {s}\n", .{result.out_dir});
-    try writer.print("  Bundle digest: sha256:{s}\n", .{result.bundle_digest});
-    try writer.print("  Chunks: {d} unpacked of {d}\n", .{ result.unpacked_chunk_count, result.chunk_count });
-    try writer.print("  Payload bytes: {d}\n", .{result.payload_bytes});
-    try writer.print("  Children: {d}\n", .{result.child_count});
-    if (result.selected_child) |child| try writer.print("  Selected child: {s}\n", .{child});
-}
-
-fn writeCloneResult(writer: *Io.Writer, result: spore_api.CloneResult) !void {
-    try writer.writeAll("Checkpoint cloned\n");
-    try writer.print("  Source: {s}\n", .{result.source});
-    try writer.print("  Output: {s}\n", .{result.out_dir});
-    try writer.print("  Ownership: {s}\n", .{result.ownership});
-}
-
 fn writePushResult(writer: *Io.Writer, result: spore_api.PushResult) !void {
     try writer.print(
         "ref: {s}\nspore_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
         .{ result.ref, result.spore_digest, result.objects_total, result.objects_written, result.bytes_written },
     );
-}
-
-fn writeInspectBundleResult(writer: *Io.Writer, result: spore_api.InspectBundleResult) !void {
-    try writer.writeAll("Bundle\n");
-    try writer.print("  Resource type: {t}\n", .{result.resource_type});
-    try writer.print("  Source: {s}\n", .{result.source});
-    try writer.print("  Bundle: {s}\n", .{result.bundle_dir});
-    try writer.print("  Bundle digest: {s}:{s}\n", .{ result.bundle_digest.algorithm, result.bundle_digest.hex });
-    try writer.print("  Chunks: {d} chunks across {d} packs, {d} bytes\n", .{ result.chunkpack.chunk_count, result.chunkpack.pack_count, result.chunkpack.payload_bytes });
-    try writer.print("  Children: {d}\n", .{result.child_count});
-    if (result.selection.selected_count > 0) {
-        try writer.print("  Selection: {s}, {d} children\n", .{ result.selection.kind, result.selection.selected_count });
-        try writer.writeAll("  Selected children:");
-        for (result.selection.children) |child| try writer.print(" {s}", .{child.id});
-        try writer.writeByte('\n');
-    }
-    if (result.rootfs.artifact_count > 0) {
-        try writer.print("  Rootfs artifacts: {d}, {d} exact-byte artifacts, {d} metadata-only artifacts\n", .{ result.rootfs.artifact_count, result.rootfs.exact_bytes_count, result.rootfs.metadata_only_count });
-    }
 }
 
 fn writePullResult(writer: *Io.Writer, result: spore_api.PullResult) !void {
@@ -1185,11 +830,8 @@ test "usage names every command" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "version") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "host-info") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "inspect") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage, "inspect-bundle") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "fork") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "fanout") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage, "pack") != null);
-    try std.testing.expect(std.mem.indexOf(u8, usage, "unpack") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "push") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "pull") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "help") != null);
@@ -1207,45 +849,6 @@ test "version output distinguishes development and release builds" {
     try std.testing.expectEqualStrings("spore " ++ spore_internal.version ++ " (ReleaseSafe)\n", out.written());
 }
 
-test "parse inspect bundle child range" {
-    const range = parseChildRange("7..42") orelse return error.BadManifest;
-    try std.testing.expectEqual(@as(u32, 7), range.start);
-    try std.testing.expectEqual(@as(u32, 42), range.end);
-    try std.testing.expect(std.mem.indexOf(u8, inspect_bundle_usage, "inclusive range") != null);
-    try std.testing.expect(parseChildRange("42..7") == null);
-    try std.testing.expect(parseChildRange("7.") == null);
-    try std.testing.expect(parseChildRange("7..") == null);
-    try std.testing.expect(parseChildRange("..42") == null);
-}
-
-test "inspect bundle output lists selected child ids" {
-    const allocator = std.testing.allocator;
-    var out: Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-
-    const selected = [_]spore_api.BundleChildSummary{
-        .{ .id = "000001", .manifest = "manifests/children/000001.json" },
-    };
-    try writeInspectBundleResult(&out.writer, .{
-        .source = "bundle",
-        .bundle_dir = "/tmp/bundle",
-        .bundle_digest = .{ .hex = "abc" },
-        .parent_manifest = "manifests/parent.json",
-        .chunkpack_index = "chunkpack.index.json",
-        .chunkpack = .{ .chunk_count = 1, .pack_count = 1, .payload_bytes = 4096 },
-        .child_count = 2,
-        .selection = .{ .kind = "child_range", .selected_count = selected.len, .children = &selected },
-    });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Selected children: 000001") != null);
-}
-
-test "rootfs bundle policy parser accepts exact and metadata-only spellings" {
-    try std.testing.expectEqual(spore_api.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact").?);
-    try std.testing.expectEqual(spore_api.RootfsBundlePolicy.exact_bytes, parseRootfsBundlePolicy("exact-bytes").?);
-    try std.testing.expectEqual(spore_api.RootfsBundlePolicy.metadata_only, parseRootfsBundlePolicy("metadata-only").?);
-    try std.testing.expect(parseRootfsBundlePolicy("bad") == null);
-}
-
 test "removed commands map to rename hints" {
     try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore attach") != null);
     try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore restore") != null);
@@ -1260,7 +863,7 @@ test "command help accepts standard help spellings" {
     try std.testing.expect(wantsCommandHelp(&.{"help"}));
     try std.testing.expect(wantsCommandHelp(&.{ "base.spore", "--help" }));
     try std.testing.expect(!wantsCommandHelp(&.{}));
-    try std.testing.expect(!wantsCommandHelp(&.{ "help", "--out", "bundle" }));
+    try std.testing.expect(!wantsCommandHelp(&.{ "help", "--out", "base.spore" }));
     try std.testing.expect(!wantsCommandHelp(&.{ "--", "--help" }));
 }
 

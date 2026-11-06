@@ -7,7 +7,6 @@
 
 const std = @import("std");
 
-const bundle = @import("bundle.zig");
 const chunk = @import("chunk.zig");
 const Context = @import("context.zig").Context;
 const lifecycle = @import("lifecycle.zig");
@@ -20,6 +19,7 @@ const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const saved_spore_fork = @import("saved_spore_fork.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const spore = @import("spore.zig");
+const spore_store = @import("spore_store.zig");
 const system = @import("system.zig");
 const vm_registry = @import("vm_registry.zig");
 
@@ -165,35 +165,34 @@ fn recoverPinPublication(allocator: std.mem.Allocator, io: std.Io, mode: []const
             var record = try saved_spore_pin.loadForSporeLocked(io, allocator, registry, save_dir, manifest.value.disk.?);
             record.deinit();
         }
-        const bundle_dir = try std.fs.path.join(allocator, &.{ root_path, "visible.bundle" });
-        defer allocator.free(bundle_dir);
-        const unpacked_dir = try std.fs.path.join(allocator, &.{ root_path, "visible-unpacked.spore" });
-        defer allocator.free(unpacked_dir);
-        const unpack_cache = try std.fs.path.join(allocator, &.{ root_path, "unpack-cache" });
-        defer allocator.free(unpack_cache);
-        const pack_result = try bundle.pack(allocator, .{
-            .io = io,
-            .spore_dir = save_dir,
-            .out_dir = bundle_dir,
-            .rootfs_cache_dir = cache_root,
-            .runtime_root = runtime_root,
-        });
-        const unpack_result = try bundle.unpack(allocator, .{
-            .io = io,
-            .bundle_dir = bundle_dir,
-            .out_dir = unpacked_dir,
-            .rootfs_cache_dir = unpack_cache,
-        });
-        try std.testing.expectEqualStrings(pack_result.bundle_digest, unpack_result.bundle_digest);
-        const unpacked_object = try rootfs_cas.manifestObjectPath(allocator, unpacked_dir, object_digest);
-        defer allocator.free(unpacked_object);
-        const unpacked_bytes = try rootfs_cas.readVerifiedChunkPath(allocator, unpacked_object, object_digest, expected_bytes.len);
-        defer allocator.free(unpacked_bytes);
-        try std.testing.expectEqualSlices(u8, &expected_bytes, unpacked_bytes);
         var env = std.process.Environ.Map.init(allocator);
         defer env.deinit();
         try env.put(local_paths.rootfs_cache_env, cache_root);
         try env.put(local_paths.runtime_dir_env, runtime_root);
+        // The recovered save is complete: it pushes, and a pull into another
+        // cache gets its disk object back.
+        const store = try std.fs.path.join(allocator, &.{ root_path, "store" });
+        defer allocator.free(store);
+        const pushed = try spore_store.push(.{ .io = io, .environ_map = &env }, allocator, .{
+            .spore_dir = save_dir,
+            .destination = try std.fmt.allocPrint(allocator, "{s}/visible", .{store}),
+        });
+        const pull_cache = try std.fs.path.join(allocator, &.{ root_path, "pull-cache" });
+        defer allocator.free(pull_cache);
+        var pull_env = std.process.Environ.Map.init(allocator);
+        defer pull_env.deinit();
+        try pull_env.put(local_paths.rootfs_cache_env, pull_cache);
+        try pull_env.put(local_paths.runtime_dir_env, runtime_root);
+        const pulled = try spore_store.pull(.{ .io = io, .environ_map = &pull_env }, allocator, .{
+            .source = pushed.ref,
+            .out_dir = try std.fs.path.join(allocator, &.{ root_path, "visible-pulled.spore" }),
+        });
+        try std.testing.expectEqualStrings(pushed.spore_digest, pulled.spore_digest);
+        const pulled_object = try rootfs_cas.manifestObjectPath(allocator, pull_cache, object_digest);
+        defer allocator.free(pulled_object);
+        const pulled_bytes = try rootfs_cas.readVerifiedChunkPath(allocator, pulled_object, object_digest, expected_bytes.len);
+        defer allocator.free(pulled_bytes);
+        try std.testing.expectEqualSlices(u8, &expected_bytes, pulled_bytes);
         const removed = try lifecycle.removeSavedSpore(Context{ .io = io, .environ_map = &env }, allocator, save_dir);
         lifecycle.deinitRemovedSavedSpore(allocator, removed);
         const post_remove_gc = try system.gc(allocator, io, .{ .cache_root = cache_root, .runtime_root = runtime_root, .dry_run = false });

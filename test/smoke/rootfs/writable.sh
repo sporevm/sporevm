@@ -30,8 +30,9 @@ base_dir="${workdir}/base.spore"
 child_dir="${workdir}/child.spore"
 fork_dir="${workdir}/forks"
 fork_child0_capture_dir="${workdir}/fork-child0-capture.spore"
-bundle_dir="${workdir}/child.bundle"
-unpacked_dir="${workdir}/child-unpacked.spore"
+store_dir="${workdir}/store"
+pull_cache="${workdir}/pull-rootfs-cache"
+pulled_dir="${workdir}/child-pulled.spore"
 base_stdout="${workdir}/base.stdout"
 base_stderr="${workdir}/base.stderr"
 child_stdout="${workdir}/child.stdout"
@@ -42,8 +43,8 @@ fork_child0_verify_stdout="${workdir}/fork-child0-verify.stdout"
 fork_child0_verify_stderr="${workdir}/fork-child0-verify.stderr"
 verify_stdout="${workdir}/verify.stdout"
 verify_stderr="${workdir}/verify.stderr"
-unpacked_verify_stdout="${workdir}/unpacked-verify.stdout"
-unpacked_verify_stderr="${workdir}/unpacked-verify.stderr"
+pulled_verify_stdout="${workdir}/pulled-verify.stdout"
+pulled_verify_stderr="${workdir}/pulled-verify.stderr"
 
 if [[ "${image_ref}" == *@sha256:* ]]; then
   resolved_image_ref="${image_ref}"
@@ -189,41 +190,43 @@ grep -Fxq "child-layer-ok" "${verify_stdout}" || {
   die "verification run did not see child layer contents"
 }
 
-"${spore_bin}" pack "${child_dir}" --out "${bundle_dir}" >"${workdir}/pack.json" || {
-  cat "${workdir}/pack.json" >&2 || true
-  die "writable rootfs bundle pack failed"
+"${spore_bin}" --json push "${child_dir}" "${store_dir}/child" >"${workdir}/push.json" || {
+  cat "${workdir}/push.json" >&2 || true
+  die "writable rootfs push failed"
 }
 
-"${spore_bin}" unpack "${bundle_dir}" --out "${unpacked_dir}" >"${workdir}/unpack.json" || {
-  cat "${workdir}/unpack.json" >&2 || true
-  die "writable rootfs bundle unpack failed"
+# Into an empty rootfs cache, so the pull must fetch the child's disk.
+SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
+  "${spore_bin}" --json pull "file://${store_dir}/child" --out "${pulled_dir}" >"${workdir}/pull.json" || {
+  cat "${workdir}/pull.json" >&2 || true
+  die "writable rootfs pull failed"
 }
 
-[[ -f "${unpacked_dir}/manifest.json" ]] || die "unpacked writable rootfs bundle did not write manifest"
-[[ "$(disk_base "${unpacked_dir}/manifest.json")" == "${child_disk}" ]] || {
-  cat "${unpacked_dir}/manifest.json" >&2 || true
-  die "unpacked writable rootfs bundle did not preserve the child disk"
+[[ -f "${pulled_dir}/manifest.json" ]] || die "pulled writable rootfs spore did not write manifest"
+[[ "$(disk_base "${pulled_dir}/manifest.json")" == "${child_disk}" ]] || {
+  cat "${pulled_dir}/manifest.json" >&2 || true
+  die "pulled writable rootfs spore did not preserve the child disk"
 }
 
-"${spore_bin}" run \
+SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${unpacked_dir}" \
+  --from "${pulled_dir}" \
   -- /bin/sh -lc 'cat /var/sporevm-parent /var/sporevm-child' \
-  >"${unpacked_verify_stdout}" 2>"${unpacked_verify_stderr}" || {
-  cat "${unpacked_verify_stdout}" >&2 || true
-  cat "${unpacked_verify_stderr}" >&2 || true
-  die "unpacked writable rootfs verification run failed"
+  >"${pulled_verify_stdout}" 2>"${pulled_verify_stderr}" || {
+  cat "${pulled_verify_stdout}" >&2 || true
+  cat "${pulled_verify_stderr}" >&2 || true
+  die "pulled writable rootfs verification run failed"
 }
 
-grep -Fxq "parent-layer-ok" "${unpacked_verify_stdout}" || {
-  cat "${unpacked_verify_stdout}" >&2 || true
-  cat "${unpacked_verify_stderr}" >&2 || true
-  die "unpacked verification run did not see parent layer contents"
+grep -Fxq "parent-layer-ok" "${pulled_verify_stdout}" || {
+  cat "${pulled_verify_stdout}" >&2 || true
+  cat "${pulled_verify_stderr}" >&2 || true
+  die "pulled verification run did not see parent layer contents"
 }
-grep -Fxq "child-layer-ok" "${unpacked_verify_stdout}" || {
-  cat "${unpacked_verify_stdout}" >&2 || true
-  cat "${unpacked_verify_stderr}" >&2 || true
-  die "unpacked verification run did not see child layer contents"
+grep -Fxq "child-layer-ok" "${pulled_verify_stdout}" || {
+  cat "${pulled_verify_stdout}" >&2 || true
+  cat "${pulled_verify_stderr}" >&2 || true
+  die "pulled verification run did not see child layer contents"
 }
 
 echo "smoke:writable-rootfs ok backend=${backend} image=${resolved_image_ref}"

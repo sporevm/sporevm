@@ -18,6 +18,17 @@ one (`spore pull file://|s3://|http(s)://... [--child] [--region]
 elsewhere, push the parent, pull it there and pass the child's identity to
 `spore run --from DIR --generation FILE`.
 
+### Bundles and `spore clone` are gone
+
+`spore pack`, `spore unpack`, `spore inspect-bundle` and `spore clone` are
+removed, with their `spore.pack.result.v1`, `spore.unpack.result.v1`,
+`spore.bundle.inspect.v1` and `spore.clone.result.v1` results and the `bundle`
+resource type; use `spore push` and `spore pull`. A disk-backed save is always
+pinned in the rootfs cache and must be on its filesystem; nothing makes a
+self-contained copy of one any more. `SPOREVM_BUNDLE_CACHE_DIR` is no longer
+read and `spore host-info` no longer reports `cache_roots.bundles`; delete the
+`bundles` directory under the SporeVM cache.
+
 ### Performance
 
 - On aarch64 each virtio-blk disk serves its requests on a thread of its own

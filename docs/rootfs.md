@@ -1,6 +1,6 @@
 # Rootfs Images
 
-For the durable root disk, rootfs CAS, writable disk index, bundle, cache, and
+For the durable root disk, rootfs CAS, writable disk index, cache, and
 verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
 
 `spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
@@ -130,9 +130,8 @@ remain in the machine's rootfs CAS and are protected by a durable pin
 recorded only in host-private lifecycle metadata. The save directory can be
 renamed or moved on the same host. Its cache-side ownership anchor makes raw
 copies fail closed instead of silently sharing deletion authority. Use `spore
-fork` for another machine-local lifecycle or `spore clone` for an independently
-portable copy.
-`spore pack` copies and verifies all required disk storage. The no-copy save fast
+fork` for another machine-local lifecycle, or `spore push` and `spore pull` to
+move it to another host. The no-copy save fast
 path applies only after the machine-local parent already resides in the global
 CAS; the first save after portable/local-CAS restore performs a one-time
 verified migration into that cache.
@@ -259,7 +258,7 @@ tar like buildx writes. It verifies all `blobs/sha256/*` files against their
 filename digest, selects the requested platform from `index.json`, rejects
 unsupported manifest/config/layer media types, applies the verified layer tars,
 and publishes the deterministic ext4 output as a local image with chunked
-`rootfs.storage` for portable saved spores and bundles. Importing a layout the
+`rootfs.storage` for portable saved spores. Importing a layout the
 current builder already converted only repoints the name.
 
 For local BuildKit workflows that do not need OCI metadata, export the final
@@ -355,7 +354,7 @@ prune selectors:
   restored.
 - `--include-rootfs-chunks` prunes the canonical rootfs CAS index and chunk
   objects, including writable-disk state in the shared namespace. This can
-  break resume and pack even when the flat rootfs artifact remains. Use it only
+  break resume and push even when the flat rootfs artifact remains. Use it only
   for deliberate destructive reclamation; use the root-aware
   `spore cache gc --rootfs` command to preserve reachable state.
 
@@ -392,46 +391,15 @@ flat materialization cache, opened under the verify-at-install,
 trust-at-open cache contract (see SECURITY.md) without re-hashing it. Saved
 writable disks open from their verified disk index and fault referenced chunk
 objects into the sparse runtime base on first read; old `disk-layer-v0` chains
-are no longer opened by the runtime restore path. `spore unpack` assembles
-the immutable materialization from verified chunk
-objects at materialization time; if the flat entry is missing or corrupt at
-resume (for example after pruning), resume opens the local index and faults
+are no longer opened by the runtime restore path. If the flat entry is missing
+or corrupt at resume (for example after pruning), resume opens the local index and faults
 chunks on demand, failing closed before unverifiable bytes reach the guest.
 Spores without `rootfs.storage` use the same trusted
 fd-backed open.
 
-`spore pack` follows the manifest. Spores without `rootfs.storage` include exact
-rootfs bytes under `rootfs/blake3/<hex>.ext4`; spores with `rootfs.storage`
-include the descriptor-bound index and referenced chunk objects instead.
-Spores with a `chunk-index-disk-v0` writable disk include that disk index under
-`rootfs/blake3/indexes/<hex>.json` and its referenced nonzero disk chunks under
-`rootfs/blake3/objects/<hex>.chunk`.
-`spore unpack` verifies whichever form the manifest selected before writing a
-resumable spore.
-
-If a spore manifest has manifest-attached chunked rootfs storage under
-`rootfs.storage`, bundles carry the descriptor-bound
-versioned disk index under `rootfs/blake3/indexes/<hex>.json` and the
-referenced nonzero rootfs chunk objects under
-`rootfs/blake3/objects/<hex>.chunk`. `spore unpack` verifies the
-index against the manifest descriptor, verifies each chunk by BLAKE3, and installs
-those files into the destination host's rootfs CAS cache. It does not require
-the monolithic ext4 digest-cache artifact on the destination for a chunked
-rootfs child.
-
 `spore rootfs cas-preload <blake3:digest> --attach-spore DIR` remains available
 for repairing or upgrading an existing exact-rootfs spore. It is no longer the
 normal image-build or image-capture path.
-
-Bundles also support an explicit prepared-cache mode:
-`spore pack SPORE [--children CHILDREN] --rootfs=metadata-only --out BUNDLE`
-records the immutable rootfs identity and size without embedding the ext4 bytes.
-`spore unpack` rejects those bundles by default. Passing
-`--allow-metadata-only-rootfs` makes materialization require that the selected
-`SPOREVM_ROOTFS_CACHE_DIR` already contains a trusted rootfs materialization
-with the expected shape. It follows the local verify-at-install,
-trust-at-open cache contract, so it still fails before writing a resumable
-spore if the cache entry is missing, symlinked, non-regular, or size-mismatched.
 
 `spore pull STORE/TAG --out DIR` fetches a spore pushed to an
 [image store](image-format.md#spores) into DIR, and the disk index and objects

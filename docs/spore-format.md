@@ -13,10 +13,10 @@ interoperate through this document.
 Durable cache pins are deliberately outside this format. Machine-local saves
 carry a host-private reference hard-linked to one cache-side ownership anchor,
 and the cache owns the corresponding validated disk-index root. Neither pin ids
-nor host paths are serialized into `manifest.json` or portable bundles. Raw
+nor host paths are serialized into `manifest.json` or pushed spores. Raw
 moves preserve ownership, while raw copies are rejected because they cannot
-preserve the exclusive two-link identity. `spore clone` uses pack/unpack for an
-independent portable lifecycle. The cache has no global save-path registry.
+preserve the exclusive two-link identity. The cache has no global save-path
+registry.
 
 For the backend mapping rules, state classes, and current restore-direction
 matrix, see [Spore State Portability Contract](state-portability.md).
@@ -121,67 +121,7 @@ metadata's `rootfs_storage` descriptor remains keyed by the raw rootfs index
 digest used to boot the VM. `rootfs_storage` is the local rootfs metadata
 field; portable spore manifests continue to use `rootfs.storage`.
 
-A bundle is the distribution form. `bundle.json` names a parent manifest and
-zero or more child manifests, which share memory chunks without duplicating
-them; `spore pack` without `--children` writes a bundle with no children:
-
-```text
-<bundle>/
-├── bundle.json
-├── manifests/
-│   ├── parent.json         # portable manifest; local RAM backing stripped
-│   └── children/000042.json
-├── chunkpack.index.json    # blake3 chunk id -> pack/offset/length/sha256
-├── chunkpacks/000000.pack  # uncompressed logical chunks concatenated
-├── rootfs.index.json       # optional rootfs identity -> artifact policy
-├── rootfs/blake3/<hex>.ext4
-                            # optional exact immutable rootfs artifact
-├── rootfs/blake3/indexes/<hex>.json
-└── rootfs/blake3/objects/<hex>.chunk
-                            # optional writable disk/rootfs chunk CAS
-```
-
-Bundles are an implementation format for distribution, not a new machine-state
-contract. The BLAKE3 ids in the selected manifest remain the restore-time trust root;
-the SHA256 values in the chunkpack index make each packed segment compatible
-with blob-store and later OCI-style descriptor verification. `spore pack` and
-`spore unpack` also report a `bundle_digest`, a SHA256 digest over the exact
-bundle bytes that affect materialization, including bundle metadata, manifests,
-chunkpack metadata, pack blobs, rootfs metadata, included rootfs artifacts,
-chunked rootfs/disk indexes and objects. It is
-not a replacement for per-chunk, per-rootfs, or per-disk-object verification.
-
-If a bundled manifest records an immutable rootfs artifact, `spore pack` includes
-the exact ext4 bytes at `rootfs/blake3/<hex>.ext4` from a trusted local
-digest-cache entry, then verifies the bundled copy by BLAKE3 and size.
-`spore unpack` requires that bundled artifact, verifies it against the manifest,
-then installs it into the local rootfs materialization cache before writing the unpacked
-manifest. Bundles record that artifact in `rootfs.index.json` with an
-explicit `exact-bytes` policy by default. `spore pack
---rootfs=metadata-only` records the same digest and size with `metadata-only`
-policy and omits the ext4 file; materialized unpack accepts that policy
-only with `--allow-metadata-only-rootfs` and a trusted shape-compatible hit in
-the selected rootfs materialization cache.
-
-If a bundled manifest records `rootfs.storage.kind:
-"chunked-ext4-rootfs-v0"`, the bundle carries the exact
-versioned disk-index bytes named by `rootfs.storage.index_digest` under
-`rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero rootfs chunk
-object under `rootfs/blake3/objects/<hex>.chunk`. Unpack verifies the
-index against the manifest storage descriptor and verifies every chunk by BLAKE3
-before publishing the objects, index, and completeness stamp to both the
-portable output spore's local CAS and the selected host rootfs cache. It does
-not require the monolithic ext4 digest-cache artifact on the destination for a
-chunked rootfs child.
-
-If the selected manifest records a writable disk index, `spore pack` includes
-the exact versioned disk-index bytes named by `disk.base` under
-`rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero disk chunk
-object under `rootfs/blake3/objects/<hex>.chunk`. `spore unpack` copies
-those verified files into the materialized spore before writing the manifest,
-failing closed on missing or digest-mismatched index/object bytes.
-
-To move one saved spore between hosts without a bundle, `spore push` it to an
+To move one saved spore between hosts, `spore push` it to an
 [image store](image-format.md#spores) and `spore pull` it on the other host.
 
 ## x86-64 Board Profile v0
@@ -351,8 +291,8 @@ reset or poweroff.
 - `exec_defaults`: optional command context for image-created named VMs. `env`
   is the retained OCI `Config.Env` list, bounded to 64 entries of at most 255
   bytes each, and `working_dir` is an optional absolute path of at most 255
-  bytes. Named save and fork persist these defaults so restore, bundle
-  transport, and child VMs execute like the source image. Producers omit the
+  bytes. Named save and fork persist these defaults so restore, push and
+  pull, and child VMs execute like the source image. Producers omit the
   field when no defaults exist, and absence means no saved execution-context
   defaults. Per-exec environment and working-directory overrides are
   intentionally excluded.
@@ -540,20 +480,11 @@ before mutating VM state.
 
 - Chunk ids are BLAKE3-256 of chunk contents (`src/chunk.zig`); every chunk
   is verified against its id before use, from any source.
-- Chunkpack bundles are portable only after local RAM backing metadata has been
-  stripped. `spore unpack` reconstitutes normal `chunks/<blake3>` files and
-  fails closed when a pack segment's SHA256 or logical BLAKE3 id mismatches.
-- Bundles validate `bundle.json` child ids and relative manifest paths
-  before selecting a parent or child manifest. `spore unpack --child 000042`
-  writes a normal spore directory for the selected child.
-- Rootfs-backed bundles include exact immutable rootfs bytes by default for
-  fd-backed rootfs manifests. For manifest-attached chunked rootfs storage, they
-  include the descriptor-bound rootfs index and BLAKE3 chunk objects.
-  Bundle unpack refuses missing, symlinked, or digest-mismatched rootfs artifacts
-  and rootfs CAS files before writing a resumable spore.
-- Rootfs-backed bundles include referenced writable disk indexes and disk chunk
-  objects when present. Bundle materialization refuses corrupt or missing disk
-  index/object bytes before writing a resumable spore manifest.
+- Pushed spores carry no local RAM backing metadata: `spore push` strips it
+  and `spore pull` refuses a manifest that has it. Pull checks the manifest
+  against its ref, writes normal `chunks/<blake3>` files, and verifies every
+  RAM chunk, the disk index and every disk object before writing a resumable
+  spore manifest.
 - Immutable rootfs artifacts and chunked rootfs storage are portable by digest,
   not by local path. The fd-backed rootfs cache uses a verify-at-install,
   trust-at-open contract inside the host-local cache trust domain. User-supplied
@@ -563,23 +494,15 @@ before mutating VM state.
   bytes on every open. For chunked manifests, the flat ext4 file is a
   materialization cache keyed by the storage index digest.
 - Manifest-bound chunked rootfs storage descriptors are the authority for
-  bundle/pull CAS installation and for rebuilding a missing flat rootfs cache
+  pull CAS installation and for rebuilding a missing flat rootfs cache
   entry. Rebuild opens the exact local versioned disk index named by
   `rootfs.storage.index_digest`, validates the index against that descriptor,
   reads only BLAKE3-verified local chunk objects, then publishes the assembled
-  flat cache entry under the same index identity. Unpack publishes each unique
-  verified bundle object to both the portable spore-local CAS and the host
-  cache before publishing either index and completeness stamp. A later warm
-  runtime open may use an exact descriptor-bound host cache whose index and
-  completeness stamp validate, without rereading the local objects. When that
-  complete host authority is absent, the local index and stamp are the
-  reinstall source and any missing or corrupt local object fails closed.
-  `spore pack` always deep-verifies a present local index and its objects, so a
-  warm host cache cannot mask loss of the spore's claimed self-containment.
+  flat cache entry under the same index identity.
 - Local RAM backing files and `ram.backing.proof` are same-host acceleration
   hints, not portable trust roots. Product restore paths treat a valid proof as
   local provenance for opening a backing fd; invalid or absent proof uses the
-  chunk manifest path. Bundles and pulls remain chunk-authoritative, and proof
+  chunk manifest path. Pulls remain chunk-authoritative, and proof
   files must not be treated as distribution authority.
 - Writable disk indexes and disk chunk objects are portable by BLAKE3, not by
   local active-head paths. Resume validates the selected disk index and every

@@ -1019,7 +1019,7 @@ pub fn saveCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
         error.CrossDeviceOwnershipLink => {
-            const message = "spore save: a machine-local pinned save must be on the same filesystem as the rootfs cache; save there first, then use `spore clone SOURCE --out DEST` for a portable copy on another filesystem";
+            const message = "spore save: a machine-local pinned save must be on the rootfs cache's filesystem; choose --out DIR there";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
         },
         error.InvalidOutputDir => {
@@ -2098,7 +2098,7 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
             try writer.writeAll("checkpoint has no saved session; use `spore run --from <checkpoint> ...` to run new commands, or `spore run --save <checkpoint> --save-on TERM ...` if you want fanout to attach to the original command.\n");
         }
     } else if (std.mem.eql(u8, result.action, "removed")) {
-        try writer.print("removed live VM {s}; monitor stopped and runtime state deleted, checkpoints, images, and bundles unchanged\n", .{result.name});
+        try writer.print("removed live VM {s}; monitor stopped and runtime state deleted, checkpoints and images unchanged\n", .{result.name});
     } else {
         try writer.print("{s} vm {s}\n", .{ result.action, result.name });
     }

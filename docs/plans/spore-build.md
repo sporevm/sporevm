@@ -281,7 +281,7 @@ golden invalidation test and at least one differential fixture.
 - Add a credential broker only for a concrete workflow whose trust, revocation,
   audit, and guest-delivery requirements justify a separate product surface.
 - Consider OCI or registry output only if a real distribution workflow cannot
-  use local images plus SporeVM pack/push/pull.
+  use local images plus image stores and SporeVM push/pull.
 - Consider remote shared build cache only after the local cache's trust,
   retirement, and invalidation contracts are complete and measured transfer is
   the remaining limit.
