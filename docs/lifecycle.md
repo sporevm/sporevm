@@ -256,7 +256,9 @@ the name before it pulls the image but claims it only once the image is
 ready, so an interrupted pull leaves no entry behind. The claimer writes
 the complete spec, then starts `spore monitor NAME` with the lock as stdin.
 The monitor holds the lock until it exits and keeps it out of every helper it
-starts. `spore ls` reports `starting` while the lock is held before
+starts. From then on the monitor is the only writer of the spec, `pid`,
+`ready.json` and its timing and stats files, all through a directory fd it
+holds open. `spore ls` reports `starting` while the lock is held before
 `ready.json` exists, `ready` once it does, and `stale` when nobody holds the
 lock, for example after the monitor was killed. The `pid` file is used only to
 signal the monitor, never to decide whether it is alive. `spore rm` takes the
@@ -274,7 +276,9 @@ would need to select a new path. `spore --debug` on `create`, `restore`, or
 `fork` starts the monitor with `--debug`, so `monitor.log` includes its info
 and debug logs, such as save timing metrics. The monitor never creates its
 registry directory: once `rm` has deleted it, the monitor's writes fail
-instead of bringing the entry back.
+instead of bringing the entry back or landing in a new entry with the same
+name, and a monitor whose entry was deleted or replaced by hand stops within
+a second.
 
 ## Session Handles
 
@@ -423,7 +427,12 @@ factory root with each live writable disk and rejects a claimed child overlay
 from a different filesystem before publishing readiness.
 
 Each child receives a private one-use disk-head claim plus an independently
-rooted baseline lease. The child reopens that baseline and adopts the claimed
+rooted baseline lease. The source's monitor names that baseline and records
+it in its own spec while it holds the guest, so a save cannot replace the
+disk in between, and returns it with the claims; the fork command never
+writes the source's spec. While a build, pull or GC holds the rootfs cache,
+the fork waits for it without holding the guest, so the source keeps
+answering exec and save. The child reopens that baseline and adopts the claimed
 overlay before it writes `ready.json`, so a successful fork never reports a
 child whose disk handoff can still fail. The lease also means children remain
 readable, forkable, and saveable after the source is removed and rootfs cache

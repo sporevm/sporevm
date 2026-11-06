@@ -307,25 +307,96 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
     };
 }
 
+/// A registry entry directory, which the monitor holds open for its whole
+/// life. Writes go through the directory fd, so once `rm` deletes the entry
+/// they fail instead of landing in a new entry that reuses the name.
+pub const Entry = struct {
+    dir: Io.Dir,
+
+    pub fn open(io: Io, paths: Paths) !Entry {
+        // `iterate` opens a readable fd instead of an O_PATH one, so it can
+        // be fsynced.
+        return .{ .dir = try openDirPath(io, paths.vm_dir, .{ .follow_symlinks = false, .iterate = true }) };
+    }
+
+    pub fn close(self: *Entry, io: Io) void {
+        self.dir.close(io);
+        self.* = undefined;
+    }
+
+    /// Reports whether `vm_dir` no longer names this directory: the entry was
+    /// removed, and perhaps created again under the same name. While this fd
+    /// is open, its inode number cannot be reused on the same filesystem.
+    pub fn replaced(self: Entry, io: Io, vm_dir: []const u8) bool {
+        const held = self.dir.stat(io) catch return false;
+        const current = Io.Dir.cwd().statFile(io, vm_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return false,
+        };
+        return current.kind != .directory or current.inode != held.inode;
+    }
+
+    pub fn readSpec(self: Entry, allocator: std.mem.Allocator, io: Io) !std.json.Parsed(Spec) {
+        return readSpecIn(allocator, io, self.dir, spec_file);
+    }
+
+    /// Replaces the spec atomically and durably.
+    pub fn writeSpec(self: Entry, allocator: std.mem.Allocator, io: Io, spec: Spec) !void {
+        try validateSpec(spec);
+        const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .whitespace = .indent_2 });
+        defer allocator.free(json);
+        // readSpecIn must read back every spec written here, and readFileAlloc
+        // fails once its limit is reached.
+        if (json.len >= max_metadata_bytes) return error.SpecTooLarge;
+        var file = try self.dir.createFileAtomic(io, spec_file, .{ .permissions = @enumFromInt(0o600), .replace = true });
+        defer file.deinit(io);
+        try file.file.writeStreamingAll(io, json);
+        try file.file.sync(io);
+        try file.replace(io);
+        if (std.c.fsync(self.dir.handle) != 0) return error.IoFailed;
+    }
+
+    pub fn writePid(self: Entry, allocator: std.mem.Allocator, io: Io, pid: i64) !void {
+        if (pid <= 0) return error.InvalidPid;
+        const data = try std.fmt.allocPrint(allocator, "{d}\n", .{pid});
+        defer allocator.free(data);
+        try self.dir.writeFile(io, .{ .sub_path = pid_file, .data = data });
+    }
+
+    pub fn writeReady(self: Entry, allocator: std.mem.Allocator, io: Io, ready: Ready) !void {
+        try writeJson(allocator, io, self.dir, ready_file, ready);
+    }
+
+    pub fn writeMonitorTiming(self: Entry, allocator: std.mem.Allocator, io: Io, timing: MonitorTiming) !void {
+        try writeJson(allocator, io, self.dir, monitor_timing_file, timing);
+    }
+
+    pub fn writeMonitorStats(self: Entry, allocator: std.mem.Allocator, io: Io, stats: MonitorStats) !void {
+        try writeJson(allocator, io, self.dir, monitor_stats_file, stats);
+    }
+
+    /// Reads and deletes the entry's one-use fork claim. Returns null when
+    /// the entry has none.
+    pub fn takeDiskForkClaim(self: Entry, allocator: std.mem.Allocator, io: Io, spec: Spec) !?std.json.Parsed(DiskForkClaim) {
+        const data = self.dir.readFileAlloc(io, disk_claim_file, allocator, .limited(max_metadata_bytes)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => |e| return e,
+        };
+        defer allocator.free(data);
+        var parsed = try std.json.parseFromSlice(DiskForkClaim, allocator, data, .{ .allocate = .alloc_always });
+        errdefer parsed.deinit();
+        try validateDiskForkClaim(spec, parsed.value);
+        try self.dir.deleteFile(io, disk_claim_file);
+        return parsed;
+    }
+};
+
 /// Replaces the spec of an existing entry. It never creates the directory, so
 /// a writer racing `rm` fails instead of bringing the entry back.
 pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec) !void {
-    try validateSpec(spec);
-    const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    // readSpecFile must read back every spec written here, and readFileAlloc
-    // fails once its limit is reached.
-    if (json.len >= max_metadata_bytes) return error.SpecTooLarge;
-    // `iterate` opens a readable fd instead of an O_PATH one, so it can be
-    // fsynced.
-    var dir = try openDirPath(io, paths.vm_dir, .{ .follow_symlinks = false, .iterate = true });
-    defer dir.close(io);
-    var file = try dir.createFileAtomic(io, spec_file, .{ .permissions = @enumFromInt(0o600), .replace = true });
-    defer file.deinit(io);
-    try file.file.writeStreamingAll(io, json);
-    try file.file.sync(io);
-    try file.replace(io);
-    if (std.c.fsync(dir.handle) != 0) return error.IoFailed;
+    var entry = try Entry.open(io, paths);
+    defer entry.close(io);
+    try entry.writeSpec(allocator, io, spec);
 }
 
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
@@ -333,7 +404,11 @@ pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Pa
 }
 
 pub fn readSpecFile(allocator: std.mem.Allocator, io: Io, spec_path: []const u8) !std.json.Parsed(Spec) {
-    const data = try Io.Dir.cwd().readFileAlloc(io, spec_path, allocator, .limited(max_metadata_bytes));
+    return readSpecIn(allocator, io, Io.Dir.cwd(), spec_path);
+}
+
+fn readSpecIn(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) !std.json.Parsed(Spec) {
+    const data = try dir.readFileAlloc(io, sub_path, allocator, .limited(max_metadata_bytes));
     defer allocator.free(data);
     // An unknown field means an older spec shape, such as the removed memory
     // `policy`/`bytes` pair, and fails closed instead of silently defaulting.
@@ -357,21 +432,6 @@ pub fn writeDiskForkClaim(allocator: std.mem.Allocator, io: Io, paths: Paths, sp
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.disk_claim_path, .data = json, .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) } });
 }
 
-/// Reads and deletes the entry's one-use fork claim. Returns null when the
-/// entry has none.
-pub fn takeDiskForkClaim(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec) !?std.json.Parsed(DiskForkClaim) {
-    const data = Io.Dir.cwd().readFileAlloc(io, paths.disk_claim_path, allocator, .limited(max_metadata_bytes)) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => |e| return e,
-    };
-    defer allocator.free(data);
-    var parsed = try std.json.parseFromSlice(DiskForkClaim, allocator, data, .{ .allocate = .alloc_always });
-    errdefer parsed.deinit();
-    try validateDiskForkClaim(spec, parsed.value);
-    try Io.Dir.cwd().deleteFile(io, paths.disk_claim_path);
-    return parsed;
-}
-
 fn validateDiskForkClaim(spec: Spec, claim_value: DiskForkClaim) !void {
     if (!std.fs.path.isAbsolute(claim_value.source_socket_path)) return error.BadManifest;
     try validateControlSocketPath(claim_value.source_socket_path);
@@ -383,9 +443,9 @@ fn validateDiskForkClaim(spec: Spec, claim_value: DiskForkClaim) !void {
 }
 
 pub fn writeReady(allocator: std.mem.Allocator, io: Io, paths: Paths, ready: Ready) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, ready, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.ready_path, .data = json });
+    var entry = try Entry.open(io, paths);
+    defer entry.close(io);
+    try entry.writeReady(allocator, io, ready);
 }
 
 pub fn readReady(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Ready) {
@@ -401,31 +461,26 @@ pub fn writeCreateTiming(allocator: std.mem.Allocator, io: Io, paths: Paths, tim
     try writeTimingJson(allocator, io, paths.create_timing_path, timing);
 }
 
-pub fn writeMonitorTiming(allocator: std.mem.Allocator, io: Io, paths: Paths, timing: MonitorTiming) !void {
-    try writeTimingJson(allocator, io, paths.monitor_timing_path, timing);
-}
-
-pub fn writeMonitorStatsPath(allocator: std.mem.Allocator, io: Io, path: []const u8, stats: MonitorStats) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, stats, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
-}
-
 pub fn writeMonitorStats(allocator: std.mem.Allocator, io: Io, paths: Paths, stats: MonitorStats) !void {
-    try writeMonitorStatsPath(allocator, io, paths.monitor_stats_path, stats);
+    var entry = try Entry.open(io, paths);
+    defer entry.close(io);
+    try entry.writeMonitorStats(allocator, io, stats);
 }
 
 pub fn writeTimingJson(allocator: std.mem.Allocator, io: Io, path: []const u8, timing: anytype) !void {
-    const json = try std.json.Stringify.valueAlloc(allocator, timing, .{ .whitespace = .indent_2 });
+    try writeJson(allocator, io, Io.Dir.cwd(), path, timing);
+}
+
+fn writeJson(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, value: anytype) !void {
+    const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+    try dir.writeFile(io, .{ .sub_path = sub_path, .data = json });
 }
 
 pub fn writePid(allocator: std.mem.Allocator, io: Io, paths: Paths, pid: i64) !void {
-    if (pid <= 0) return error.InvalidPid;
-    const data = try std.fmt.allocPrint(allocator, "{d}\n", .{pid});
-    defer allocator.free(data);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.pid_path, .data = data });
+    var entry = try Entry.open(io, paths);
+    defer entry.close(io);
+    try entry.writePid(allocator, io, pid);
 }
 
 pub fn readPid(allocator: std.mem.Allocator, io: Io, paths: Paths) !i64 {
@@ -560,17 +615,17 @@ pub fn tryLockForRemoval(io: Io, paths: Paths) !?Io.File {
     }
 }
 
-/// Verifies that the monitor's stdin is its entry's lock and takes it over:
-/// the returned fd is close-on-exec, so no helper the monitor starts can keep
-/// a dead VM looking live, and fd 0 becomes `/dev/null`.
-pub fn adoptMonitorLock(io: Io, paths: Paths) !Io.File {
-    return adoptLockFd(io, paths, 0);
+/// Verifies that the monitor's stdin is the lock inside `entry` and takes it
+/// over: the returned fd is close-on-exec, so no helper the monitor starts
+/// can keep a dead VM looking live, and fd 0 becomes `/dev/null`.
+pub fn adoptMonitorLock(io: Io, entry: Entry) !Io.File {
+    return adoptLockFd(io, entry, 0);
 }
 
-fn adoptLockFd(io: Io, paths: Paths, inherited: std.c.fd_t) !Io.File {
+fn adoptLockFd(io: Io, entry: Entry, inherited: std.c.fd_t) !Io.File {
     const stdin = Io.File{ .handle = inherited, .flags = .{ .nonblocking = false } };
     const held = stdin.stat(io) catch return error.MonitorLockMissing;
-    const current = Io.Dir.cwd().statFile(io, paths.lock_path, .{ .follow_symlinks = false }) catch return error.MonitorLockMissing;
+    const current = entry.dir.statFile(io, lock_file, .{ .follow_symlinks = false }) catch return error.MonitorLockMissing;
     if (held.kind != .file or current.kind != .file or held.inode != current.inode) return error.MonitorLockMissing;
     // The claimer's lock is on the open file description this fd shares, so
     // this succeeds exactly when the monitor inherited it.
@@ -1072,11 +1127,28 @@ test "registry writers never recreate a removed entry" {
 
     // A monitor still running after `rm` deleted its entry.
     try ensureDirPath(io, paths.vm_dir);
+    var entry = try Entry.open(io, paths);
+    defer entry.close(io);
+    try std.testing.expect(!entry.replaced(io, paths.vm_dir));
     try Io.Dir.cwd().deleteTree(io, paths.vm_dir);
+    try std.testing.expect(entry.replaced(io, paths.vm_dir));
     try std.testing.expectError(error.FileNotFound, writePid(allocator, io, paths, 1));
     try std.testing.expectError(error.FileNotFound, writeReady(allocator, io, paths, .{ .pid = 1, .control_socket_path = paths.control_socket_path }));
     try std.testing.expectError(error.FileNotFound, writeSpec(allocator, io, paths, .{ .name = "bench-1" }));
     try std.testing.expect(!try pathExists(io, paths.vm_dir));
+
+    // Nor do they write into a new entry that reuses the name.
+    var reused = try claim(io, paths);
+    defer reused.abandon(io, paths);
+    try std.testing.expect(entry.replaced(io, paths.vm_dir));
+    try std.testing.expectError(error.FileNotFound, entry.writePid(allocator, io, 1));
+    try std.testing.expectError(error.FileNotFound, entry.writeReady(allocator, io, .{ .pid = 1, .control_socket_path = paths.control_socket_path }));
+    try std.testing.expectError(error.FileNotFound, entry.writeMonitorStats(allocator, io, .{}));
+    try std.testing.expectError(error.FileNotFound, entry.writeSpec(allocator, io, .{ .name = "bench-1" }));
+    var names = try openDirPath(io, paths.vm_dir, .{ .iterate = true });
+    defer names.close(io);
+    var it = names.iterate();
+    while (try it.next(io)) |file| try std.testing.expectEqualStrings(lock_file, file.name);
 }
 
 test "monitor lock adoption leaves no inheritable copy" {
@@ -1098,7 +1170,9 @@ test "monitor lock adoption leaves no inheritable copy" {
     const inherited = std.c.dup(held.lock.handle);
     try std.testing.expect(inherited >= 0);
     held.release(io);
-    var adopted = try adoptLockFd(io, paths, inherited);
+    var entry = try Entry.open(io, paths);
+    defer entry.close(io);
+    var adopted = try adoptLockFd(io, entry, inherited);
     defer _ = std.c.close(inherited);
     try std.testing.expect(std.c.fcntl(adopted.handle, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
     const replaced = try (Io.File{ .handle = inherited, .flags = .{ .nonblocking = false } }).stat(io);
@@ -1115,7 +1189,7 @@ test "monitor lock adoption leaves no inheritable copy" {
     // A stdin that is not the entry's lock is refused.
     const other = try Io.Dir.cwd().createFile(io, paths.spec_path, .{ .read = true });
     defer other.close(io);
-    try std.testing.expectError(error.MonitorLockMissing, adoptLockFd(io, paths, other.handle));
+    try std.testing.expectError(error.MonitorLockMissing, adoptLockFd(io, entry, other.handle));
 }
 
 test "fork disk claims are read once and must name the child" {
@@ -1150,10 +1224,12 @@ test "fork disk claims are read once and must name the child" {
     try std.testing.expectError(error.BadManifest, writeDiskForkClaim(allocator, io, paths, spec, fork_claim));
     fork_claim.request.child = "child";
     try writeDiskForkClaim(allocator, io, paths, spec, fork_claim);
-    var taken = (try takeDiskForkClaim(allocator, io, paths, spec)).?;
+    var entry = try Entry.open(io, paths);
+    defer entry.close(io);
+    var taken = (try entry.takeDiskForkClaim(allocator, io, spec)).?;
     defer taken.deinit();
     try std.testing.expectEqualStrings(fork_claim.request.token, taken.value.request.token);
-    try std.testing.expect((try takeDiskForkClaim(allocator, io, paths, spec)) == null);
+    try std.testing.expect((try entry.takeDiskForkClaim(allocator, io, spec)) == null);
 }
 
 test "lifecycle rejects insecure existing runtime directories" {

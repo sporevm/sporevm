@@ -46,6 +46,13 @@ checks every child name before it pauses the source. Stop named VMs before
 upgrading: a monitor from an earlier build does not take the lock, so its
 entry shows as stale, and `spore vm rm` removes it.
 
+### Forking a VM while it saves
+
+`spore vm fork` no longer writes the source VM's spec. A `spore save` of the
+source that finished while a fork was starting could be undone by the fork,
+after which every later fork of that VM failed. The source's monitor now
+records the fork's disk baseline itself, while no save can run.
+
 ### Lazy images from a store
 
 `spore image push local/app:1 /srv/images/app` writes a static image store

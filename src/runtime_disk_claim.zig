@@ -643,7 +643,8 @@ fn createUnlinkedSizedFd(allocator: std.mem.Allocator, logical_size: u64) Error!
     return fd;
 }
 
-fn makeSmokeHead(allocator: std.mem.Allocator) Error!runtime_disk_fork.Head {
+/// A two-chunk head over an unlinked overlay, for the jail smoke and tests.
+pub fn makeSmokeHead(allocator: std.mem.Allocator) Error!runtime_disk_fork.Head {
     const logical_size = 2 * spore.disk_chunk_size;
     const identity = try allocator.dupe(u8, "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     errdefer allocator.free(identity);
