@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage: scripts/kernel/make-minimal-exec-initrd.sh --arch aarch64|x86_64 \
-       --generation-base GPA --toybox-source DIR [--depfile PATH] <out.cpio>
+       --generation-base GPA --toybox-source DIR [--smoke-helpers] \
+       [--depfile PATH] <out.cpio>
 
 Build a tiny architecture-specific Linux initrd for the SporeVM minimal
 boot/run path. The generation GPA is supplied by build.zig from the selected
@@ -12,7 +13,8 @@ SporeVM board and is validated against that architecture here. The
 init process listens on AF_VSOCK, accepts one-line JSON run-session requests,
 runs the requested binary, streams stdout/stderr frames, and finishes with an
 exit-status frame. The initrd also includes a pinned Toybox build for /bin/sh
-and a small basic command set.
+and a small basic command set. --smoke-helpers adds the test-only helper
+binaries from guest/smoke-helpers that the VM smoke scripts run.
 
 Environment:
   CC   C compiler command. Defaults to `zig cc -target ARCH-linux-musl`
@@ -31,12 +33,17 @@ toybox_source=""
 target_arch=""
 generation_base=""
 depfile=""
+smoke_helpers=0
 out=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
       usage
       exit 0
+      ;;
+    --smoke-helpers)
+      smoke_helpers=1
+      shift
       ;;
     --toybox-source)
       if [[ $# -lt 2 ]]; then
@@ -173,13 +180,21 @@ trap 'rm -rf "${workdir}"' EXIT
 mkdir -p "${workdir}/root/bin" "${workdir}/root/dev" "${workdir}/root/proc" "${workdir}/root/run" "${workdir}/root/tmp" "${workdir}/root/usr/bin"
 
 source_dir="${REPO_ROOT}/guest/minimal-initrd"
+helper_dir="${REPO_ROOT}/guest/smoke-helpers"
 # The guest source list. Each NAME.c becomes /bin/NAME, except agent.c, which
 # links agent_sources into /init, and toybox-sh.c, which becomes /bin/sh.
-programs=(agent true false writeout sleeper finite counter nproc gencheck rngcheck blkcheck netcheck nslookup wget httpd flockcheck cgroupcheck toybox-sh)
+programs=(agent true false toybox-sh)
+helpers=()
+if ((smoke_helpers)); then
+  helpers=(writeout finite counter nproc gencheck rngcheck blkcheck netcheck nslookup wget httpd flockcheck cgroupcheck)
+fi
 agent_sources=("${source_dir}/build_copy.c" "${source_dir}/build_run_sandbox.c")
 inputs=("${agent_sources[@]}" "${source_dir}/build_copy.h" "${source_dir}/build_run_sandbox.h" "${source_dir}/toybox.config")
 for program in "${programs[@]}"; do
   inputs+=("${source_dir}/${program}.c")
+done
+for helper in ${helpers[@]+"${helpers[@]}"}; do
+  inputs+=("${helper_dir}/${helper}.c")
 done
 for input in "${inputs[@]}"; do
   if [[ ! -f "${input}" ]]; then
@@ -192,7 +207,7 @@ compile_static() {
   local src="$1"
   local dst="$2"
   shift 2
-  "${cc_cmd[@]}" -static -Os -s "-DSPORE_GENERATION_BASE=${generation_base}ULL" "${source_dir}/${src}.c" "$@" -o "${dst}"
+  "${cc_cmd[@]}" -static -Os -s "-DSPORE_GENERATION_BASE=${generation_base}ULL" "${src}" "$@" -o "${dst}"
 }
 
 build_toybox() {
@@ -349,10 +364,13 @@ build_toybox() {
 
 for program in "${programs[@]}"; do
   case "${program}" in
-    agent) compile_static agent "${workdir}/root/init" "${agent_sources[@]}" ;;
-    toybox-sh) compile_static toybox-sh "${workdir}/root/bin/sh" ;;
-    *) compile_static "${program}" "${workdir}/root/bin/${program}" ;;
+    agent) compile_static "${source_dir}/agent.c" "${workdir}/root/init" "${agent_sources[@]}" ;;
+    toybox-sh) compile_static "${source_dir}/toybox-sh.c" "${workdir}/root/bin/sh" ;;
+    *) compile_static "${source_dir}/${program}.c" "${workdir}/root/bin/${program}" ;;
   esac
+done
+for helper in ${helpers[@]+"${helpers[@]}"}; do
+  compile_static "${helper_dir}/${helper}.c" "${workdir}/root/bin/${helper}"
 done
 build_toybox "${toybox_source}" "${workdir}/root/bin/toybox"
 

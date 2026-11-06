@@ -135,9 +135,9 @@ one-shot image commit are available. `spore build` selects `linux/amd64`
 natively; saved-state options fail closed.
 
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
-initrd. The embedded initrd contains SporeVM helper binaries plus a small
-Toybox shell environment for basic commands such as `echo`, `cat`, `printf`,
-`pwd`, and `uname`. Use `--image` or `--rootfs` for distro behavior, package
+initrd. The embedded initrd contains the guest agent plus a small Toybox
+shell environment for basic commands such as `echo`, `cat`, `printf`, `pwd`,
+and `uname`. Use `--image` or `--rootfs` for distro behavior, package
 managers, or commands outside that bounded set.
 
 Exact argv after `--` still uses the path you provide without guest PATH
@@ -188,7 +188,7 @@ spore run -it --image docker.io/library/alpine:3.20 -- /bin/sh
 Override boot assets when needed:
 
 ```bash
-spore run --kernel Image --initrd root.cpio -- /bin/writeout
+spore run --kernel Image --initrd root.cpio -- /bin/true
 ```
 
 Use `spore --debug run ...` for verbose VMM setup and restore logs.
@@ -251,7 +251,7 @@ SporeVM-managed networking is explicit:
 ```bash
 spore run --net --allow-host example.com \
   --image docker.io/library/alpine:3.20 \
-  -- /bin/wget -qO- https://example.com
+  -- wget -qO- https://example.com
 ```
 
 Use `--allow-host` or `--allow-cidr` to open egress beyond the built-in deny
@@ -468,7 +468,8 @@ mise run check
 mise run smoke core
 ```
 
-`mise run smoke core` builds `spore`, then boots real VMs through run, signal
+`mise run smoke core` builds `spore` with `-Dsmoke-helpers`, which adds the
+guest helper binaries the scripts run, then boots real VMs through run, signal
 save, fork, named disk forks with save, restore, prune and GC, the named
 lifecycle, copy, the monitor jail, and networking. CI
 runs it on every commit on Linux ARM64 (KVM) and macOS (HVF). `mise run smoke
@@ -477,7 +478,7 @@ line per script and keeps each script's log under `zig-cache/smoke/`. `mise run
 smoke` also takes one script path without `.sh`, such as `mise run smoke
 run/tty`; on Linux x86-64 KVM hosts, `mise run smoke x86/run` and `mise run
 smoke x86/build` run the x86-64 smokes. Each script also runs on its own
-against `zig-out/bin/spore` (or `SPORE_BIN`), for example
+against such a build in `zig-out/bin/spore` (or `SPORE_BIN`), for example
 `test/smoke/run/tty.sh`.
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).

@@ -19,7 +19,7 @@ die() {
 }
 
 require_spore_bin() {
-  [[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run mise run build"
+  [[ -x "${spore_bin}" ]] || die "spore binary not executable: ${spore_bin}; run zig build -Dsmoke-helpers"
 }
 
 # Prints SPORE_BACKEND, or the backend for this aarch64 host.

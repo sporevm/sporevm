@@ -19,7 +19,7 @@ Options:
   --output PATH      Rootfs ext4 output path (default: <workdir>/rootfs.ext4)
   --metadata PATH    Metadata output path (default: <output>.json)
   --spore-bin PATH   Prebuilt spore CLI (default: SPORE_BIN or zig-out/bin/spore)
-  --no-build         Do not run `zig build`
+  --no-build         Do not run `zig build -Dsmoke-helpers`
   -h, --help         Show this help
 
 Example:
@@ -127,9 +127,9 @@ fi
 
 if [[ "${build}" == "1" ]]; then
   if command -v mise >/dev/null 2>&1; then
-    (cd "${repo_root}" && mise exec -- zig build)
+    (cd "${repo_root}" && mise exec -- zig build -Dsmoke-helpers)
   else
-    (cd "${repo_root}" && zig build)
+    (cd "${repo_root}" && zig build -Dsmoke-helpers)
   fi
 fi
 require_spore_bin

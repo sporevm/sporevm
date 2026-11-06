@@ -5,7 +5,9 @@
 # script. Each script's output goes to zig-cache/smoke/<script>.log; failing
 # scripts also copy their work logs to zig-cache/smoke/<script>/. With --build,
 # as `mise run smoke` passes, it builds first: Debug for aarch64, and the
-# shipped ReleaseSafe settings plus the board smoke binary for x86/ scripts.
+# shipped ReleaseSafe settings plus the board smoke binary for x86/ scripts,
+# both with -Dsmoke-helpers, which puts the helper binaries the scripts run in
+# the guest initrd.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -92,9 +94,9 @@ fi
 
 if ((build)); then
   if [[ "${suite}" == x86/* ]]; then
-    (cd "${repo_root}" && zig build install x86-board-smoke --release=safe)
+    (cd "${repo_root}" && zig build install x86-board-smoke --release=safe -Dsmoke-helpers)
   else
-    (cd "${repo_root}" && zig build)
+    (cd "${repo_root}" && zig build -Dsmoke-helpers)
   fi
 fi
 require_spore_bin

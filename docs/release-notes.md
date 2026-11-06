@@ -53,6 +53,15 @@ build's pin reference fails as too old even after GC, so as with manifests,
 saves from earlier builds must be re-created. Before, GC kept v1 pins and their
 storage even after the save was removed.
 
+### Smaller guest initrd
+
+The embedded initrd no longer carries the smoke-test helpers (`/bin/wget`,
+`/bin/httpd`, `/bin/writeout`, `/bin/counter`, `/bin/netcheck` and the rest);
+only `zig build -Dsmoke-helpers` test builds add them. Runs without `--image`
+keep the agent, the Toybox shell environment, `/bin/true` and `/bin/false`.
+The initrd digest is part of `spore build` cache keys, so the first build after
+upgrading misses the cache once.
+
 ### One ext4 writer
 
 The native ext4 writer now maps files through triple-indirect blocks, so image
