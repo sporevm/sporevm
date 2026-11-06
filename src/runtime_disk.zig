@@ -41,7 +41,6 @@ pub const Options = struct {
     spore_dir: ?[]const u8 = null,
     disk_root: ?[]const u8 = null,
     rootfs_grow_target: u64 = 0,
-    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock = null,
 };
 
 pub const RuntimeDisk = struct {
@@ -180,7 +179,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     if (options.rootfs) |rootfs| {
         if (rootfs.storage) |storage| {
             try validateRuntimeRootfsStorage(rootfs, storage);
-            try installLocalRootfsStorage(context, allocator, options.spore_dir, options.disk_root, storage, options.rootfs_cache_lock);
+            try installLocalRootfsStorage(context, allocator, options.spore_dir, options.disk_root, storage);
             // The flat digest-addressed ext4 artifact is the only runtime
             // base source on warm paths. When it is not materialized locally
             // (chunk-only pull caches, pruned entries), defer assembly and let
@@ -218,7 +217,7 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             defer allocator.free(cache_root);
             var origin: ?[]u8 = null;
             defer if (origin) |value| allocator.free(value);
-            runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, options.rootfs_cache_lock, .{ .rootfs = rootfs, .out = &origin });
+            runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, .{ .rootfs = rootfs, .out = &origin });
             runtime.rootfs_fd = try createSparseTempFd(context, allocator, grown_size);
             const base_source = try runtime.baseSource(grown_size);
             const writable = try openWritable(context, allocator, base_source, storage.logical_size, storage.chunk_size);
@@ -275,7 +274,6 @@ pub fn openReadOnlyRootfs(
     allocator: std.mem.Allocator,
     rootfs: spore.Rootfs,
     disk_root: ?[]const u8,
-    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !RuntimeDisk {
     var runtime = RuntimeDisk{ .allocator = allocator };
     errdefer runtime.deinit();
@@ -288,7 +286,7 @@ pub fn openReadOnlyRootfs(
         }
         const cache_root = try baselineRootPath(context, allocator, disk_root);
         defer allocator.free(cache_root);
-        runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, rootfs_cache_lock, null);
+        runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, null);
         runtime.rootfs_fd = try createSparseTempFd(context, allocator, storage.logical_size);
         const base_source = try runtime.baseSource(storage.logical_size);
         runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initReadOnly(allocator, base_source, storage.logical_size, storage.chunk_size);
@@ -492,7 +490,6 @@ fn installLocalRootfsStorage(
     spore_dir: ?[]const u8,
     root_override: ?[]const u8,
     storage: spore.RootfsStorage,
-    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
 ) !void {
     const local_root = spore_dir orelse return;
     const local_index_path = try rootfs_cas.manifestIndexPath(allocator, local_root, storage.index_digest);
@@ -505,13 +502,8 @@ fn installLocalRootfsStorage(
 
     const cache_root = try baselineRootPath(context, allocator, root_override);
     defer allocator.free(cache_root);
-    var cache_lock: ?rootfs_mod.RootfsCacheLock = null;
-    defer if (cache_lock) |*lock| lock.deinit();
-    if (rootfs_cache_lock) |lock| {
-        if (!try lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockNotHeld;
-    } else {
-        cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
-    }
+    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
+    defer cache_lock.deinit();
 
     // A prior verified install makes the host cache authoritative for warm
     // opens. Revalidate its exact descriptor-bound index under the lock, then
@@ -630,20 +622,14 @@ fn acquireLazyRootfsLease(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     storage: spore.RootfsStorage,
-    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
     store_origin: ?StoreOrigin,
 ) !?runtime_disk_lease.Active {
     const configured_cache_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(configured_cache_root);
     if (!std.mem.eql(u8, configured_cache_root, cache_root)) return null;
 
-    var cache_lock: ?rootfs_mod.RootfsCacheLock = null;
-    defer if (cache_lock) |*lock| lock.deinit();
-    if (rootfs_cache_lock) |lock| {
-        if (!try lock.ensureHeldFor(allocator, cache_root)) return error.RootfsCacheLockNotHeld;
-    } else {
-        cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
-    }
+    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
+    defer cache_lock.deinit();
     if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, cache_root, storage)) {
         // Objects still in the image's store are rooted by the lease below:
         // GC protects every object the leased index names.
@@ -1076,79 +1062,6 @@ test "runtime disk installs portable local rootfs storage and trusts complete wa
     try std.testing.expectError(error.MissingChunk, open(context, allocator, .{
         .rootfs = rootfs,
         .spore_dir = absolute_local_spore,
-    }));
-}
-
-test "build-owned cache lock permits lazy runtime disk open" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const tmp = "zig-cache/test-runtime-disk-build-cache-lock";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
-
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
-    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
-    const rootfs = spore.Rootfs{
-        .device = .{ .mmio_slot = 1 },
-        .artifact = .{ .digest = storage.index_digest, .size = artifact.size },
-        .storage = storage,
-    };
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const absolute_tmp = try std.fs.path.resolve(arena, &.{ cwd, tmp });
-    const absolute_cache_root = try std.fs.path.resolve(arena, &.{ cwd, cache_root });
-    const runtime_root = try std.fs.path.join(arena, &.{ absolute_tmp, "runtime" });
-    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
-    try env.put(local_paths.runtime_dir_env, runtime_root);
-    try env.put("TMPDIR", absolute_tmp);
-    const context = Context{ .io = io, .environ_map = &env };
-
-    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, absolute_cache_root);
-    defer cache_lock.deinit();
-    var runtime = try open(context, allocator, .{
-        .rootfs = rootfs,
-        .rootfs_grow_target = storage.logical_size + storage.chunk_size,
-        .rootfs_cache_lock = &cache_lock,
-    });
-    defer runtime.deinit();
-
-    try std.testing.expect(runtime.chunk_mapped != null);
-    try std.testing.expect(runtime.runtime_lease != null);
-    try std.testing.expectError(error.LockBusy, rootfs_mod.tryLockRootfsCacheExclusive(io, arena, absolute_cache_root));
-
-    const cache_alias = try std.fs.path.join(arena, &.{ absolute_tmp, "cache-alias" });
-    try Io.Dir.cwd().symLink(io, absolute_cache_root, cache_alias, .{});
-    try std.testing.expect(try cache_lock.ensureHeldFor(arena, cache_alias));
-
-    const wrong_cache_root = try std.fs.path.join(arena, &.{ absolute_tmp, "wrong-cache" });
-    try Io.Dir.cwd().createDirPath(io, wrong_cache_root);
-    try env.put(local_paths.rootfs_cache_env, wrong_cache_root);
-    try std.testing.expectError(error.RootfsCacheLockNotHeld, acquireLazyRootfsLease(context, allocator, wrong_cache_root, storage, &cache_lock, null));
-    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
-
-    var stale_cache_lock = cache_lock;
-    runtime.deinit();
-    cache_lock.deinit();
-    try std.testing.expectError(error.RootfsCacheLockNotHeld, open(context, allocator, .{
-        .rootfs = rootfs,
-        .rootfs_grow_target = storage.logical_size + storage.chunk_size,
-        .rootfs_cache_lock = &cache_lock,
-    }));
-    try std.testing.expectError(error.RootfsCacheLockNotHeld, open(context, allocator, .{
-        .rootfs = rootfs,
-        .rootfs_grow_target = storage.logical_size + storage.chunk_size,
-        .rootfs_cache_lock = &stale_cache_lock,
     }));
 }
 
