@@ -125,22 +125,6 @@ path, procfs can still address paths elsewhere in that VM, so this is not an
 image-root confinement boundary. An argv zero that already contains a slash is
 executed exactly as supplied.
 
-Pass `--timing-json PATH` before the VM name to retain one named-exec phase
-record without changing output streaming or exit propagation:
-
-```bash
-spore exec --timing-json run.json bench-1 -- /bin/true
-```
-
-The `spore.named-exec-timing.v1` artifact separates monitor dispatch, guest
-process start, guest execution wall time, guest user/system CPU in
-microseconds, post-exit output/result delivery, stream teardown, and total
-monitor request time. Dispatch is the residual host-side request/transport
-time after the independently measured guest and teardown phases are removed;
-the calculation does not compare unsynchronised host and guest clocks.
-Telemetry that is absent or malformed is emitted as `null` and never changes
-the guest result. The output path's parent must already exist.
-
 Named create accepts create-time annotations and networking options:
 
 ```bash

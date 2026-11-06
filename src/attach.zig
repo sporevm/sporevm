@@ -38,7 +38,6 @@ pub const Options = struct {
     spore_dir: []const u8,
     session_id: ?[]const u8 = null,
     generation_path: ?[]const u8 = null,
-    event_mode: events_mod.EventMode = .none,
     events: ?events_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,

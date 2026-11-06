@@ -9,7 +9,8 @@
 `--events=jsonl` is gone from every command. Argument errors in those
 commands now also end the stream with a failed `completion` instead of a
 message on stderr. `spore restore` no longer streams events; `spore --json
-restore` prints its `spore.lifecycle.v1` result as before.
+restore` prints its `spore.lifecycle.v1` result as before. `spore exec
+--timing-json` and its `spore.named-exec-timing.v1` file are gone.
 
 ### `spore push` and `spore pull` move spores through image stores
 
@@ -85,9 +86,9 @@ restored from the save runs; that VM's runtime lease keeps its storage.
 
 ### Other changes
 
-- `spore attach` without `--events=jsonl`, and so `spore fanout`, prints the
-  session's stdout and stderr, as `--events=jsonl` does, instead of the guest
-  console.
+- `spore attach` without `--json`, and so `spore fanout`, prints the
+  session's stdout and stderr, as its `--json` event stream does, instead of
+  the guest console.
 - The guest copies command output to the console, and so to a console log,
   only in VMs started with `--console-log`. A spore saved from a VM started
   without it does not gain it when restored with `--console-log`.

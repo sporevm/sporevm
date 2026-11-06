@@ -317,7 +317,6 @@ pub const NamedListResult = struct {
     entries: []const ListEntry,
 };
 
-pub const named_exec_timing_schema = "spore.named-exec-timing.v1";
 pub const named_exec_timing_schema_version: u32 = 1;
 
 pub const NamedExecTiming = struct {

@@ -216,7 +216,6 @@ pub const CliOptions = struct {
     continue_after_save: bool = false,
     network: spore_net_policy.Network = .disabled,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
-    event_mode: events_mod.EventMode = .none,
     interactive: bool = false,
     tty: bool = false,
     guest_env_specs: guest_request.GuestEnvSpecList = .{},
@@ -524,7 +523,12 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
     if (!network_requested and network_policy.hasBoundServices()) {
         failCliSetup("spore run: --bind-service requires --net", .{});
     }
-    memory_config.validateCliOrExit("spore run", shared.memory);
+    shared.memory.validate() catch |err| switch (err) {
+        error.MaximumBelowInitial => failCliSetup("spore run: --max-memory must be greater than or equal to --memory", .{}),
+        error.UnalignedElasticMemory => failCliSetup("spore run: elastic --memory and --max-memory values must be aligned to 2 MiB", .{}),
+        error.ElasticRegionTooLarge => failCliSetup("spore run: --max-memory may exceed --memory by at most 16 GiB", .{}),
+        else => failCliSetup("spore run: invalid memory configuration ({s})", .{memory_config.cliReason(err)}),
+    };
 
     return .{
         .backend = backend,
@@ -1519,6 +1523,13 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
     return parsed;
 }
 
+fn parseMemoryBytes(name: []const u8, raw: []const u8) u64 {
+    return memory_config.parseBytes(raw) catch |err| switch (err) {
+        error.RemovedAuto => failCliSetup("spore run: {s} auto was removed; use --memory 512mb for fixed memory, or --memory 512mb --max-memory 16gb for elastic memory", .{name}),
+        else => failCliSetup("spore run: {s} must be a positive page-aligned size like 512mb or 16gb ({s})", .{ name, memory_config.cliReason(err) }),
+    };
+}
+
 fn parseDurationMsOrExit(name: []const u8, raw: []const u8) u64 {
     return cli_args.parseDurationMs(raw) catch {
         failCliSetup("{s} expects a duration like 30s, 500ms, or 1m", .{name});
@@ -1548,14 +1559,14 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
     } else if (std.mem.eql(u8, name, "--initrd")) {
         shared.initrd_path = takeValue(args, i, name);
     } else if (std.mem.eql(u8, name, "--memory")) {
-        shared.memory.initial_bytes = memory_config.parseCliBytesOrExit("spore run", "--memory", takeValue(args, i, name));
+        shared.memory.initial_bytes = parseMemoryBytes(name, takeValue(args, i, name));
         if (!shared.max_memory_set) shared.memory.maximum_bytes = shared.memory.initial_bytes;
         shared.memory_set = true;
     } else if (std.mem.eql(u8, name, "--max-memory")) {
-        shared.memory.maximum_bytes = memory_config.parseCliBytesOrExit("spore run", "--max-memory", takeValue(args, i, name));
+        shared.memory.maximum_bytes = parseMemoryBytes(name, takeValue(args, i, name));
         shared.max_memory_set = true;
     } else if (std.mem.eql(u8, name, "--memory-mib")) {
-        memory_config.rejectMemoryMiBFlag("spore run");
+        failCliSetup("spore run: --memory-mib has been replaced by --memory", .{});
     } else if (std.mem.eql(u8, name, "--vcpus")) {
         shared.vcpus = parseVcpuCountOrExit(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {

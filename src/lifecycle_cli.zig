@@ -33,7 +33,6 @@ const version = @import("version.zig");
 const vm_registry = @import("vm_registry.zig");
 
 const max_metadata_bytes = vm_registry.max_metadata_bytes;
-const writeTimingJson = vm_registry.writeTimingJson;
 const runtime_dir_env = lifecycle.runtime_dir_env;
 const Spec = lifecycle.Spec;
 const validateName = lifecycle.validateName;
@@ -46,13 +45,10 @@ const InitialOutputDisposition = lifecycle.InitialOutputDisposition;
 const ListEntry = lifecycle.ListEntry;
 const ListMemory = lifecycle.ListMemory;
 const ListStats = lifecycle.ListStats;
-const NamedExecTiming = lifecycle.NamedExecTiming;
 const NamedForkResult = lifecycle.NamedForkResult;
 const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
 const NamedListResult = lifecycle.NamedListResult;
 const RemovedSavedSpore = lifecycle.RemovedSavedSpore;
-const named_exec_timing_schema = lifecycle.named_exec_timing_schema;
-const named_exec_timing_schema_version = lifecycle.named_exec_timing_schema_version;
 const initial_output_limit_bytes_per_stream = lifecycle.initial_output_limit_bytes_per_stream;
 const createNamedWithTiming = lifecycle.createNamedWithTiming;
 const restoreNamed = lifecycle.restoreNamed;
@@ -130,7 +126,6 @@ pub const exec_usage =
     \\  --workdir PATH          Override the image working directory
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
-    \\  --timing-json PATH      Write named-exec phase timing as JSON
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
@@ -301,8 +296,6 @@ const ExecOptions = struct {
     guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
-    timing_json_path: ?[]const u8 = null,
-    event_mode: events_mod.EventMode = .none,
 };
 
 var exec_cli_event_writer: ?*events_mod.EventWriter = null;
@@ -327,11 +320,6 @@ const RestoreOptions = struct {
     backend: ?backend_mod.Backend = null,
     generation_path: ?[]const u8 = null,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
-};
-
-const ExecNamedStreamingResult = struct {
-    exit_code: u8,
-    timing: ?NamedExecTiming,
 };
 
 pub fn createCli(ctx: *const Ctx, args: []const []const u8) !void {
@@ -509,9 +497,8 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
     var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "exec");
     exec_cli_event_writer = if (ctx.mode == .json) &events else null;
     defer exec_cli_event_writer = null;
-    var parsed = parseExecArgs(args);
-    parsed.event_mode = ctx.eventMode();
-    if (parsed.event_mode == .jsonl) return execCliEvents(init, allocator, parsed, &events, stdout);
+    const parsed = parseExecArgs(args);
+    if (ctx.mode == .json) return execCliEvents(init, allocator, parsed, &events, stdout);
     var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
     const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
         error.MissingHostEnvironment => {
@@ -535,7 +522,7 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
         },
         else => return err,
     };
-    const result = execNamedStreaming(.{
+    const exit_code = execNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
     }, allocator, .{
@@ -569,24 +556,7 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
         },
         else => |e| return e,
     };
-    if (parsed.timing_json_path) |path| {
-        const artifact = struct {
-            schema: []const u8 = named_exec_timing_schema,
-            schema_version: u32 = named_exec_timing_schema_version,
-            name: []const u8,
-            exit_code: u8,
-            timing: ?NamedExecTiming,
-        }{
-            .name = parsed.name,
-            .exit_code = result.exit_code,
-            .timing = result.timing,
-        };
-        writeTimingJson(allocator, init.io, path, artifact) catch |err| {
-            std.debug.print("spore exec: cannot write timing JSON to {s}: {s}\n", .{ path, @errorName(err) });
-            std.process.exit(1);
-        };
-    }
-    if (result.exit_code != 0) std.process.exit(result.exit_code);
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: ExecOptions, events: *events_mod.EventWriter, stdout: *Io.Writer) !void {
@@ -645,15 +615,6 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
                 std.process.exit(classified.exit_code);
             },
         }
-    }
-    if (parsed.timing_json_path) |path| {
-        try writeTimingJson(allocator, init.io, path, .{
-            .schema = named_exec_timing_schema,
-            .schema_version = named_exec_timing_schema_version,
-            .name = parsed.name,
-            .exit_code = exit_code,
-            .timing = stream.timing,
-        });
     }
     try stdout.flush();
     if (exit_code != 0) std.process.exit(exit_code);
@@ -1640,7 +1601,6 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var guest_working_dir: ?[]const u8 = null;
     var interactive = false;
     var tty = false;
-    var timing_json_path: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1667,14 +1627,6 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         } else if (std.mem.eql(u8, args[i], "-it") or std.mem.eql(u8, args[i], "-ti")) {
             interactive = true;
             tty = true;
-        } else if (std.mem.eql(u8, args[i], "--timing-json")) {
-            i += 1;
-            if (i >= args.len or args[i].len == 0) usageExit(exec_usage);
-            timing_json_path = args[i];
-        } else if (std.mem.startsWith(u8, args[i], "--timing-json=")) {
-            const value = args[i]["--timing-json=".len..];
-            if (value.len == 0) usageExit(exec_usage);
-            timing_json_path = value;
         } else if (std.mem.startsWith(u8, args[i], "-")) {
             usageExit(exec_usage);
         } else {
@@ -1692,7 +1644,6 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         .guest_working_dir = guest_working_dir,
         .interactive = interactive,
         .tty = tty,
-        .timing_json_path = timing_json_path,
     };
 }
 
@@ -1949,7 +1900,7 @@ fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !v
 /// Runs a named exec against this process's stdio: stdin is forwarded when
 /// interactive, an interactive TTY puts the terminal in raw mode, and window
 /// size changes reach the guest.
-fn execNamedStreaming(context: Context, allocator: std.mem.Allocator, options: ExecNamedStreamOptions) !ExecNamedStreamingResult {
+fn execNamedStreaming(context: Context, allocator: std.mem.Allocator, options: ExecNamedStreamOptions) !u8 {
     var stream = try openExecNamedStream(context, allocator, options);
     defer stream.deinit();
     var raw_terminal: ?attach_stream.RawTerminal = null;
@@ -1965,8 +1916,7 @@ fn execNamedStreaming(context: Context, allocator: std.mem.Allocator, options: E
         .interactive = options.interactive,
         .tty = options.tty,
     };
-    const exit_code = try pump.run();
-    return .{ .exit_code = exit_code, .timing = stream.timing };
+    return pump.run();
 }
 
 fn copyNamedStreaming(
@@ -2585,16 +2535,6 @@ test "exec parser accepts interactive and tty flags" {
     try std.testing.expect(long_opts.interactive);
     try std.testing.expect(long_opts.tty);
     try std.testing.expectEqualStrings("cat", long_opts.command[0]);
-}
-
-test "exec parser accepts timing JSON before the VM name" {
-    const separate = parseExecArgs(&.{ "--timing-json", "/tmp/run.json", "box", "true" });
-    try std.testing.expectEqualStrings("/tmp/run.json", separate.timing_json_path.?);
-    try std.testing.expectEqualStrings("box", separate.name);
-
-    const joined = parseExecArgs(&.{ "--timing-json=/tmp/joined.json", "box", "--", "/bin/true" });
-    try std.testing.expectEqualStrings("/tmp/joined.json", joined.timing_json_path.?);
-    try std.testing.expectEqual(cli_args.CommandMode.argv, joined.command_mode);
 }
 
 test "create parser accepts bounded vcpu count" {

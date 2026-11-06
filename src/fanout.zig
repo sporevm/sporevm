@@ -24,7 +24,6 @@ pub const Options = struct {
     duration_ms: ?u64 = null,
     timeout_ms: u64 = default_resume_timeout_ms,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
-    event_mode: events_mod.EventMode = .none,
 };
 
 pub const cli_usage =
@@ -89,18 +88,18 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "fanout");
     cli_event_writer = if (ctx.mode == .json) &events else null;
     defer cli_event_writer = null;
-    var opts = try parseCliArgs(args);
-    opts.event_mode = ctx.eventMode();
-    if (opts.event_mode == .jsonl) try events.emitStart(opts.backend);
-    const exit_code = execute(init, init.arena.allocator(), opts, stdout) catch |err| {
-        if (opts.event_mode == .jsonl) {
+    const event_mode = ctx.eventMode();
+    const opts = try parseCliArgs(args);
+    if (event_mode == .jsonl) try events.emitStart(opts.backend);
+    const exit_code = execute(init, init.arena.allocator(), opts, event_mode, stdout) catch |err| {
+        if (event_mode == .jsonl) {
             const classified = events_mod.classifyFailure(err);
             try events.emitFailure(classified);
             std.process.exit(classified.exit_code);
         }
         return err;
     };
-    if (opts.event_mode == .jsonl) try events.emitExecCompletion(exit_code);
+    if (event_mode == .jsonl) try events.emitExecCompletion(exit_code);
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
@@ -163,7 +162,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     };
 }
 
-fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, event_output: *Io.Writer) !u8 {
+fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, event_mode: events_mod.EventMode, event_output: *Io.Writer) !u8 {
     const children = try listChildren(allocator, init.io, opts.children_dir);
     if (children.len == 0) {
         var buf: [2048]u8 = undefined;
@@ -180,7 +179,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     errdefer cleanupRunning(init.io, running.items);
 
     for (children) |child| {
-        const run = try startRunningChild(init, allocator, spore_executable, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, opts.event_mode, event_output, &output_lock, &event_write_failed);
+        const run = try startRunningChild(init, allocator, spore_executable, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, event_mode, event_output, &output_lock, &event_write_failed);
         running.append(run) catch |err| {
             var single = [_]RunningChild{run};
             cleanupRunning(init.io, single[0..]);
@@ -206,19 +205,19 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     for (running.items) |*run| {
         const term = run.child.wait(init.io) catch |err| {
             writeStderr("spore fanout: child {s} wait failed: {s}\n", .{ run.name, @errorName(err) });
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
             failed = true;
             continue;
         };
         if (termExitCode(term)) |exit_code| {
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, exit_code, null);
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, exit_code, null);
             if (exit_code != 0 and aggregate_exit_code == 0) aggregate_exit_code = exit_code;
         } else if (termOk(term, opts.duration_ms != null)) {
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
         } else {
             writeStderr("spore fanout: child {s} exited {s}\n", .{ run.name, termName(term) });
             const classified = machine_output.fromZigError(error.FanoutChildFailed);
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
             failed = true;
         }
     }

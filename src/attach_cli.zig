@@ -22,9 +22,9 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "attach");
     if (ctx.mode == .json) attach_mod.cli_setup_events = event_writer.sink();
     defer attach_mod.cli_setup_events = null;
-    var opts = try attach_mod.parseCliArgs(args);
-    opts.event_mode = ctx.eventMode();
-    const events: ?api.EventSink = if (opts.event_mode == .jsonl) event_writer.sink() else null;
+    const opts = try attach_mod.parseCliArgs(args);
+    const json = ctx.mode == .json;
+    const events: ?api.EventSink = if (json) event_writer.sink() else null;
     const arena = init.arena.allocator();
     const result = api.attachSpore(.{
         .io = init.io,
@@ -42,7 +42,7 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
         .bound_services = opts.bound_services.slice(),
         .events = events,
     }) catch |err| {
-        if (opts.event_mode == .jsonl) {
+        if (json) {
             std.process.exit(api.classifyFailure(err).exit_code);
         }
         if (err == error.NoSavedSession) {
@@ -66,7 +66,7 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
         }
         return err;
     };
-    if (opts.event_mode == .jsonl) {
+    if (json) {
         try stdout.flush();
     }
     const code = result.processExitCode();

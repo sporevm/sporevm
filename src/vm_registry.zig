@@ -469,7 +469,7 @@ pub fn writeMonitorStats(allocator: std.mem.Allocator, io: Io, paths: Paths, sta
     try entry.writeMonitorStats(allocator, io, stats);
 }
 
-pub fn writeTimingJson(allocator: std.mem.Allocator, io: Io, path: []const u8, timing: anytype) !void {
+fn writeTimingJson(allocator: std.mem.Allocator, io: Io, path: []const u8, timing: anytype) !void {
     try writeJson(allocator, io, Io.Dir.cwd(), path, timing);
 }
 
