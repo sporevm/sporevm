@@ -30,6 +30,7 @@ const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const net_gateway = @import("net_gateway.zig");
 const boot_assets = @import("boot_assets.zig");
 const guest_request = @import("guest_request.zig");
+const backend_mod = @import("backend.zig");
 const run = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -246,7 +247,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     defer parsed_spec.deinit();
     const spec = parsed_spec.value;
     if (!std.mem.eql(u8, spec.name, name)) return error.BadManifest;
-    const requested_backend = run.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
+    const requested_backend = backend_mod.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
     // No host probe here: `create` probes before spawning its monitor, x86
     // rejects restore and fork monitors below, and opening the backend
     // reports an unusable arm64 KVM.

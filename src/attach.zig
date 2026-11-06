@@ -14,6 +14,10 @@ const kvm = kvm_native.binding;
 const net_gateway = @import("net_gateway.zig");
 const ram_restore = @import("ram_restore.zig");
 const generation = @import("generation.zig");
+const backend_mod = @import("backend.zig");
+const cli_args = @import("cli_args.zig");
+const events_mod = @import("events.zig");
+const machine_output = @import("machine_output.zig");
 const run_mod = @import("run.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const spore = @import("spore.zig");
@@ -24,18 +28,18 @@ const virtio_net = @import("virtio/net.zig");
 const vmm = @import("aarch64/vmm.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
 
-pub const Backend = run_mod.Backend;
+pub const Backend = backend_mod.Backend;
 const default_attach_guest_port: u32 = 10700;
 const default_attach_timeout_ms: u64 = 30_000;
-pub var cli_setup_events: ?run_mod.EventSink = null;
+pub var cli_setup_events: ?events_mod.EventSink = null;
 
 pub const Options = struct {
     backend: Backend = .auto,
     spore_dir: []const u8,
     session_id: ?[]const u8 = null,
     generation_path: ?[]const u8 = null,
-    event_mode: run_mod.EventMode = .none,
-    events: ?run_mod.EventSink = null,
+    event_mode: events_mod.EventMode = .none,
+    events: ?events_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     timeout_ms: u64 = default_attach_timeout_ms,
@@ -71,7 +75,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var spore_dir: ?[]const u8 = null;
     var session_id: ?[]const u8 = null;
     var generation_path: ?[]const u8 = null;
-    var event_mode: run_mod.EventMode = .none;
+    var event_mode: events_mod.EventMode = .none;
     var timeout_ms: u64 = default_attach_timeout_ms;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
     var interactive = false;
@@ -103,17 +107,17 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             };
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
-            event_mode = run_mod.EventMode.parse(args[i]) orelse {
+            event_mode = events_mod.EventMode.parse(args[i]) orelse {
                 failAttachSetup("--events must be jsonl", .{});
             };
         } else if (std.mem.startsWith(u8, args[i], "--events=")) {
             const raw = args[i]["--events=".len..];
-            event_mode = run_mod.EventMode.parse(raw) orelse {
+            event_mode = events_mod.EventMode.parse(raw) orelse {
                 failAttachSetup("--events must be jsonl", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
-            timeout_ms = run_mod.parseDurationMs(args[i]) catch {
+            timeout_ms = cli_args.parseDurationMs(args[i]) catch {
                 failAttachSetup("--timeout expects a duration like 30s, 500ms, or 1m", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
@@ -152,8 +156,8 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     };
 }
 
-pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !run_mod.Result {
-    var events = run_mod.EventEmitter.init(opts.events, "attach");
+pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !events_mod.Result {
+    var events = events_mod.EventEmitter.init(opts.events, "attach");
     try events.emitStart(opts.backend);
     errdefer |err| events.emitFailure(err) catch {};
 
@@ -286,12 +290,12 @@ fn consoleSink(bytes: []const u8) void {
 fn discardConsoleSink(_: []const u8) void {}
 
 fn attachEventOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
-    const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
+    const events: *events_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     events.emitOutputBestEffort(output, bytes);
 }
 
 fn attachEventLifecycleSink(context: ?*anyopaque, event: vsock_stream.HostStreamLifecycle) void {
-    const events: *run_mod.EventEmitter = @ptrCast(@alignCast(context.?));
+    const events: *events_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     switch (event) {
         .ready => events.emitReadyBestEffort(),
     }
@@ -312,7 +316,7 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     return parsed;
 }
 
-fn resultFromAttachStream(backend: Backend, memory_config: @import("memory.zig").Config, vcpu_count: u32, identity_stream: ?vsock_stream.HostStream) !run_mod.Result {
+fn resultFromAttachStream(backend: Backend, memory_config: @import("memory.zig").Config, vcpu_count: u32, identity_stream: ?vsock_stream.HostStream) !events_mod.Result {
     const stream = identity_stream orelse return error.UnexpectedAttachExit;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -404,7 +408,7 @@ fn failAttachSetup(comptime fmt: []const u8, args: anytype) noreturn {
         sink.emit(.{ .failure = .{
             .command = "attach",
             .backend = null,
-            .classified = run_mod.ClassifiedFailure.init(.usage_invalid_argument, message, "attach"),
+            .classified = machine_output.CliError.init(.usage_invalid_argument, message, "attach"),
         } }) catch {};
         std.process.exit(2);
     }
@@ -428,7 +432,7 @@ test "attach cli parser accepts hidden timeout-ms compatibility spelling" {
 test "attach cli parser accepts generation file" {
     const opts = try parseCliArgs(&.{ "--generation", "generation.json", "--events=jsonl", "child.spore" });
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
-    try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
+    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 

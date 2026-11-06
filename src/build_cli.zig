@@ -6,7 +6,7 @@ const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs_mod = @import("rootfs.zig");
-const run_mod = @import("run.zig");
+const cli_args = @import("cli_args.zig");
 const topology = @import("topology.zig");
 
 pub const usage =
@@ -231,9 +231,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
         } else if (std.mem.startsWith(u8, arg, "--vcpus=")) {
             parsed.vcpus = topology.parseVcpuCount(try nonEmptyValue(arg["--vcpus=".len..])) catch return error.BadVcpus;
         } else if (std.mem.eql(u8, arg, "--timeout")) {
-            parsed.timeout_ms = run_mod.parseDurationMs(try nextValue(args, &i, arg)) catch return error.BadTimeout;
+            parsed.timeout_ms = cli_args.parseDurationMs(try nextValue(args, &i, arg)) catch return error.BadTimeout;
         } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
-            parsed.timeout_ms = run_mod.parseDurationMs(try nonEmptyValue(arg["--timeout=".len..])) catch return error.BadTimeout;
+            parsed.timeout_ms = cli_args.parseDurationMs(try nonEmptyValue(arg["--timeout=".len..])) catch return error.BadTimeout;
         } else if (std.mem.eql(u8, arg, "--ulimit")) {
             parsed.nofile = try parseUlimit(try nextValue(args, &i, arg));
         } else if (std.mem.startsWith(u8, arg, "--ulimit=")) {

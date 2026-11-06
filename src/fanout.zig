@@ -7,11 +7,13 @@ const Io = std.Io;
 const deadline = @import("deadline.zig");
 const fd_util = @import("fd.zig");
 const machine_output = @import("machine_output.zig");
-const run_mod = @import("run.zig");
+const backend_mod = @import("backend.zig");
+const cli_args = @import("cli_args.zig");
+const events_mod = @import("events.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 
-pub const Backend = run_mod.Backend;
+pub const Backend = backend_mod.Backend;
 const max_pending_line_bytes = 64 * 1024;
 const default_resume_timeout_ms: u64 = 30_000;
 
@@ -21,7 +23,7 @@ pub const Options = struct {
     duration_ms: ?u64 = null,
     timeout_ms: u64 = default_resume_timeout_ms,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
-    event_mode: run_mod.EventMode = .none,
+    event_mode: events_mod.EventMode = .none,
 };
 
 const cli_usage =
@@ -60,7 +62,7 @@ const RunningChild = struct {
     stderr_thread: std.Thread,
 };
 
-var cli_event_writer: ?*run_mod.EventWriter = null;
+var cli_event_writer: ?*events_mod.EventWriter = null;
 
 const OutputLock = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -82,14 +84,14 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         return;
     }
 
-    var events = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "fanout");
+    var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "fanout");
     cli_event_writer = if (requestsJsonl(args)) &events else null;
     defer cli_event_writer = null;
     const opts = try parseCliArgs(args);
     if (opts.event_mode == .jsonl) try events.emitStart(opts.backend);
     const exit_code = execute(init, init.arena.allocator(), opts, stdout) catch |err| {
         if (opts.event_mode == .jsonl) {
-            const classified = run_mod.classifyFailure(err);
+            const classified = events_mod.classifyFailure(err);
             try events.emitFailure(classified);
             std.process.exit(classified.exit_code);
         }
@@ -113,7 +115,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var duration_ms: ?u64 = null;
     var timeout_ms: u64 = default_resume_timeout_ms;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
-    var event_mode: run_mod.EventMode = .none;
+    var event_mode: events_mod.EventMode = .none;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -127,12 +129,12 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             // the demo command self-describing without adding a second mode.
         } else if (std.mem.eql(u8, args[i], "--for") and i + 1 < args.len) {
             i += 1;
-            duration_ms = run_mod.parseDurationMs(args[i]) catch {
+            duration_ms = cli_args.parseDurationMs(args[i]) catch {
                 failCli("--for expects a duration like 10s, 500ms, or 1m", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
-            timeout_ms = run_mod.parseDurationMs(args[i]) catch {
+            timeout_ms = cli_args.parseDurationMs(args[i]) catch {
                 failCli("--timeout expects a duration like 30s, 500ms, or 1m", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
@@ -149,9 +151,9 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             };
         } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
             i += 1;
-            event_mode = run_mod.EventMode.parse(args[i]) orelse failCli("--events must be jsonl", .{});
+            event_mode = events_mod.EventMode.parse(args[i]) orelse failCli("--events must be jsonl", .{});
         } else if (std.mem.startsWith(u8, args[i], "--events=")) {
-            event_mode = run_mod.EventMode.parse(args[i]["--events=".len..]) orelse failCli("--events must be jsonl", .{});
+            event_mode = events_mod.EventMode.parse(args[i]["--events=".len..]) orelse failCli("--events must be jsonl", .{});
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failCli("unknown fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (children_dir == null) {
@@ -276,7 +278,7 @@ fn startRunningChild(
     timeout_ms: u64,
     bound_services: []const spore_net_policy.BoundServiceBinding,
     child: ChildSpec,
-    event_mode: run_mod.EventMode,
+    event_mode: events_mod.EventMode,
     event_output: *Io.Writer,
     output_lock: *OutputLock,
     event_write_failed: *std.atomic.Value(bool),
@@ -378,7 +380,7 @@ fn lessChildSpec(_: void, a: ChildSpec, b: ChildSpec) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_mode: run_mod.EventMode, event_output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool)) void {
+fn streamThread(fd: std.posix.fd_t, name: []const u8, stream: []const u8, event_mode: events_mod.EventMode, event_output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool)) void {
     defer _ = std.c.close(fd);
 
     var buf: [4096]u8 = undefined;
@@ -431,7 +433,7 @@ fn childEventJson(allocator: std.mem.Allocator, name: []const u8, stream: []cons
     }, .{});
 }
 
-fn writeChildCompletion(output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool), name: []const u8, outcome: run_mod.TerminalOutcome, exit_code: u8, failure: ?machine_output.CliError) void {
+fn writeChildCompletion(output: *Io.Writer, output_lock: *OutputLock, event_write_failed: *std.atomic.Value(bool), name: []const u8, outcome: events_mod.TerminalOutcome, exit_code: u8, failure: ?machine_output.CliError) void {
     const allocator = std.heap.page_allocator;
     const json = childCompletionJson(allocator, name, outcome, exit_code, failure) catch {
         event_write_failed.store(true, .release);
@@ -455,7 +457,7 @@ fn writeEventLine(output: *Io.Writer, output_lock: *OutputLock, event_write_fail
     output.flush() catch event_write_failed.store(true, .release);
 }
 
-fn childCompletionJson(allocator: std.mem.Allocator, name: []const u8, outcome: run_mod.TerminalOutcome, exit_code: u8, failure: ?machine_output.CliError) ![]u8 {
+fn childCompletionJson(allocator: std.mem.Allocator, name: []const u8, outcome: events_mod.TerminalOutcome, exit_code: u8, failure: ?machine_output.CliError) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, .{
         .schema = machine_output.automation_event_schema,
         .schema_version = machine_output.automation_event_schema_version,
@@ -619,7 +621,7 @@ test "fanout cli parser accepts hidden timeout-ms compatibility spelling" {
 
 test "fanout cli parser accepts shared automation event mode" {
     const opts = try parseCliArgs(&.{ "children", "--events=jsonl" });
-    try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
+    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expect(requestsJsonl(&.{ "children", "--events", "jsonl" }));
 }
 
