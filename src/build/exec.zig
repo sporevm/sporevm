@@ -11,6 +11,7 @@ const boot_assets = @import("../boot_assets.zig");
 const guest_request = @import("../guest_request.zig");
 const spore_net_policy = @import("../spore_net_policy.zig");
 const run_mod = @import("../run.zig");
+const vm_session = @import("../vm_session.zig");
 const local_paths = @import("../local_paths.zig");
 const memory_config = @import("../memory.zig");
 const topology = @import("../topology.zig");
@@ -161,7 +162,7 @@ pub const Producer = struct {
 };
 
 pub fn resolveProducer(init: std.process.Init, allocator: std.mem.Allocator) !Producer {
-    const noinit_itable = run_mod.rootfsGrowthNoInitItable(init.environ_map);
+    const noinit_itable = vm_session.rootfsGrowthNoInitItable(init.environ_map);
     if (init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null and
         init.environ_map.get("SPOREVM_RUN_INITRD") == null)
     {

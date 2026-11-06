@@ -32,6 +32,7 @@ const spore_fork = @import("spore_fork.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_store = @import("spore_store.zig");
 const topology = @import("topology.zig");
+const vm_session = @import("vm_session.zig");
 
 pub const ImageArchivePackOptions = image_archive.PackOptions;
 pub const ImageArchivePackResult = image_archive.PackResult;
@@ -469,12 +470,10 @@ pub fn runManaged(
         if (options.commit_ref == null or disk_size == 0 or disk_size % rootfs_cas.default_chunk_size != 0) return error.InvalidRunDiskSize;
     }
     const selected_backend = try backend_mod.select(options.backend, .probe());
-    try run_mod.validateFreshProductPolicy(selected_backend, .{
+    try vm_session.validateFreshProductPolicy(selected_backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
         .capture = options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save,
-        .rootfs = options.rootfs_path != null or options.image_ref != null or options.disk_size != null,
-        .network = options.network != .disabled,
     });
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -559,7 +558,7 @@ pub fn runFromSpore(
 ) !RunResult {
     if (options.command.len == 0) return error.InvalidGuestCommand;
     const selected_backend = try options.backend.resolveForHost();
-    try run_mod.validateFreshProductPolicy(selected_backend, .{
+    try vm_session.validateFreshProductPolicy(selected_backend, .{
         .memory = .{},
         .vcpus = options.vcpus,
         .resuming = true,

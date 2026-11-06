@@ -21,7 +21,6 @@ const hvf = @import("hvf/hvf.zig");
 const image = @import("image.zig");
 const kvm_native = @import("kvm/native.zig");
 const kvm = kvm_native.binding;
-const x86_board = @import("x86_64/board.zig");
 const x86_vm = if (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
     @import("x86_64/vm.zig")
 else
@@ -46,6 +45,7 @@ const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
+const vm_session = @import("vm_session.zig");
 const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
 const vmm = @import("aarch64/vmm.zig");
@@ -55,47 +55,12 @@ const vsock_stream = @import("virtio/vsock_stream.zig");
 const test_support = @import("test_support.zig");
 
 const max_guest_port = 65535;
-pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
-const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
-const force_write_zeroes_backend_failure_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_BACKEND_FAILURE_EXPERIMENT";
-const lazy_init_negative_control_experiment_env = "SPOREVM_ROOTFS_LAZY_INIT_NEGATIVE_CONTROL";
-pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
 
 pub const MemoryConfig = memory_config.Config;
 pub const SaveTrigger = capture.Trigger;
 pub const Rootfs = spore.Rootfs;
 pub const Disk = spore.Disk;
 const Backend = backend_mod.Backend;
-
-pub const FreshProductPolicy = struct {
-    memory: memory_config.Config,
-    vcpus: topology.VcpuCount,
-    resuming: bool = false,
-    capture: bool = false,
-    rootfs: bool = false,
-    network: bool = false,
-    disk_fork: bool = false,
-};
-
-/// The experimental x86 product profile remains fixed-memory, single-vCPU,
-/// and fresh-only. Keep this pure so API and lifecycle callers can reject
-/// unsupported work before downloads, rootfs resolution, gateway startup, or
-/// monitor state creation.
-pub fn validateFreshProductPolicy(selected_backend: Backend, policy: FreshProductPolicy) !void {
-    if (comptime builtin.os.tag != .linux) return;
-    return validateFreshProductPolicyFor(builtin.cpu.arch, selected_backend, policy);
-}
-
-fn validateFreshProductPolicyFor(zig_arch: std.Target.Cpu.Arch, selected_backend: Backend, policy: FreshProductPolicy) !void {
-    if (zig_arch != .x86_64) return;
-    if (selected_backend != .kvm) return error.UnsupportedBackend;
-    if (policy.resuming) return error.X86ResumeUnsupported;
-    if (policy.capture) return error.X86CaptureUnsupported;
-    if (policy.disk_fork) return error.X86DiskForkUnsupported;
-    if (policy.memory.isElastic()) return error.X86ElasticMemoryUnsupported;
-    if (policy.memory.initial_bytes != x86_experimental_memory_bytes) return error.X86ExperimentalMemorySizeUnsupported;
-    if (policy.vcpus != 1) return error.X86VcpuCountUnsupported;
-}
 
 pub const Options = struct {
     backend: Backend = .auto,
@@ -773,15 +738,6 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
-    try validateFreshProductPolicy(backend, .{
-        .memory = opts.memory,
-        .vcpus = opts.vcpus,
-        .resuming = opts.resume_dir != null,
-        .capture = opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save,
-        .rootfs = opts.rootfs_path != null or opts.rootfs != null or opts.disk != null or opts.rootfs_grow_target != 0,
-        .network = opts.network != .disabled or opts.network_runtime != null,
-        .disk_fork = opts.runtime_disk_head != null,
-    });
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (opts.network == .spore) {
@@ -791,7 +747,7 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     defer if (gateway_active) gateway.deinit();
     if (gateway_active) try events.emitPortForwards(&opts.network.spore);
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
-    errdefer finishGatewayNetworkEvents(&gateway, &gateway_active, events);
+    errdefer events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
     const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &opts.network);
 
     const resuming = opts.resume_dir != null;
@@ -819,20 +775,13 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     else
         try boot_assets.loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files);
     const initrd_ms = monotonicMs() -| initrd_start;
-    const disk_start = monotonicMs();
-    var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
+    const disks: runtime_disk_mod.Options = .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
         .rootfs_grow_target = opts.rootfs_grow_target,
         .disk = opts.disk,
         .spore_dir = opts.resume_dir,
-    });
-    const disk_ms = monotonicMs() -| disk_start;
-    defer runtime_disk.deinit();
-    const growth_session = opts.rootfs_grow_target != 0;
-    const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const base_boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, console_fd >= 0, false, false, 0);
-    const boot_args = if (resuming) "" else try productBootArgs(allocator, base_boot_args);
+    };
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, opts.memory.isElastic());
     var stream = try vsock_stream.HostStream.init(opts.guest_port, request.bytes);
@@ -861,16 +810,12 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
         .resize_stdout = std.array_list.Managed(u8).init(allocator),
     } else null;
     defer if (commit_control) |*control| control.deinit();
-    if (commit_control != null and runtime_disk.snapshot() == null) return error.RunCommitRootfsNotSnapshotable;
     const exec_control = if (commit_control) |*control|
         control.control()
     else if (stdin_control) |*control|
         control.control()
     else
         null;
-    var root_blk_stats: virtio_blk.Stats = .{};
-    const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
-    defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
@@ -883,7 +828,7 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     });
     if (capture_plan.capture) |vm_capture| {
         try spore.createSnapshotRoot(allocator, vm_capture.dir);
-        if (hasRootfs(opts)) {
+        if (disks.hasRootfs()) {
             const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
             defer allocator.free(cache_root);
             try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, vm_capture.dir);
@@ -895,114 +840,58 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
         signal_registration = capture.SignalRegistration.install(signal, &capture_request);
     }
     std.log.debug(
-        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} disk_ms={d} request_ms={d} ram_mib={d} virtio_mem_mib={d}",
+        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} request_ms={d} ram_mib={d} virtio_mem_mib={d}",
         .{
             monotonicMs() -| setup_start,
             local_backing_ms,
             kernel_ms,
             initrd_ms,
-            disk_ms,
             request_ms,
             opts.memory.initial_bytes / 1024 / 1024,
             (opts.memory.maximum_bytes - opts.memory.initial_bytes) / 1024 / 1024,
         },
     );
 
-    var vm_capture = capture_plan.capture;
-    // HVF tracks dirty RAM with one vCPU only, and neither backend tracks it
-    // with elastic memory.
-    if (vm_capture) |*value| value.dirty_tracking = value.dirty_tracking and !opts.memory.isElastic() and (backend == .kvm or opts.vcpus == 1);
-    const vm_config: vmm.Config = .{
-        .io = context.io,
-        .start = if (opts.resume_dir) |dir| .{ .restore = .{
+    const cause = vm_session.run(context, allocator, .{
+        .backend = backend,
+        .machine = if (opts.resume_dir) |dir| .{ .restore = .{
             .dir = dir,
             .ram = ram_plan.strategy,
             .generation = opts.resume_generation,
         } } else .{ .boot = .{
             .kernel = kernel,
-            .cmdline = boot_args,
             .initrd = initrd,
-            .ram_size = opts.memory.initial_bytes,
-            .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
+            .memory = opts.memory,
+            .guest_port = opts.guest_port,
+            .console_mirror = console_fd >= 0,
         } },
         .vcpus = opts.vcpus,
+        .disks = disks,
+        .network = .{ .runtime = network, .manifest = network_manifest },
+        .record = .{ .annotations = opts.annotations, .sessions = &saved_sessions },
         .console_sink = consoleSink,
-        .disk_backend = runtime_disk.backend(),
-        .root_blk_options = root_blk_options,
-        .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-        .rootfs = opts.rootfs,
-        .network_manifest = network_manifest,
-        .annotations = opts.annotations,
-        .sessions = &saved_sessions,
-        .environ_map = context.environ_map,
-        .probe = .{
-            .stream = &stream,
-            .timeout_ms = opts.timeout_ms,
-            .start = if (opts.rootfs_grow_target != 0) .control else .immediate,
-            .on_complete = if (opts.commit == null) .stop else .detach,
-            .session_output = true,
-        },
-        .capture = vm_capture,
-        .network = network,
-        .exec_control = exec_control,
-    };
-
-    const backend_run_start = monotonicMs();
-    const cause = (switch (backend) {
-        .auto => unreachable,
-        .hvf => blk: {
-            if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk hvf.vm.run(allocator, vm_config);
-        },
-        .kvm => blk: {
-            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
-                break :blk kvm.vm.run(allocator, vm_config);
-            }
-            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-                break :blk x86_vm.run(allocator, .{
-                    .kernel = kernel,
-                    .ram_size = opts.memory.initial_bytes,
-                    .vcpu_count = @intCast(opts.vcpus),
-                    .cmdline = boot_args,
-                    .initrd = initrd,
-                    .console_sink = consoleSink,
-                    .root_disk = runtime_disk.backend(),
-                    .root_blk_options = root_blk_options,
-                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                    .network = network,
-                    .exec_probe = &stream,
-                    .exec_probe_start = if (opts.rootfs_grow_target != 0) .control else .immediate,
-                    .exec_probe_completes_run = opts.commit == null,
-                    .exec_probe_watchdog_until_control = opts.commit != null,
-                    .exec_control = exec_control,
-                    .exec_probe_timeout_ms = opts.timeout_ms,
-                });
-            }
-            return error.UnsupportedBackend;
-        },
+        .mode = .{ .oneshot = .{
+            .probe = .{
+                .stream = &stream,
+                .timeout_ms = opts.timeout_ms,
+                .start = if (opts.rootfs_grow_target != 0) .control else .immediate,
+                .on_complete = if (opts.commit == null) .stop else .detach,
+                .session_output = true,
+            },
+            .capture = capture_plan.capture,
+            .control = exec_control,
+        } },
     }) catch |err| {
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
             var result = resultFromAbortedSignalCapture(backend, opts, &stream);
             if (resuming) result = result.withMemoryRestore(&ram_plan);
-            finishGatewayNetworkEvents(&gateway, &gateway_active, events);
+            events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
             return result;
         }
-        return @errorCast(err);
+        return err;
     };
-    const backend_run_ms = monotonicMs() -| backend_run_start;
-    const response_ms = stream.response_ms orelse stream.elapsedMs();
-    std.log.debug(
-        "run backend timing: elapsed_ms={d} stream_response_ms={d} tail_ms={d} cause={s}",
-        .{
-            backend_run_ms,
-            response_ms,
-            if (backend_run_ms >= response_ms) backend_run_ms - response_ms else 0,
-            @tagName(cause),
-        },
-    );
-    if (gateway_active and gateway.hasFailed()) return error.NetworkGatewayFailed;
     const signal_capture_observed = capture_plan.isSignalCapture() and capture_request.isCompleted();
     var result = try switch (cause) {
         .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
@@ -1038,19 +927,10 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
         }
     }
     if (resuming) result = result.withMemoryRestore(&ram_plan);
-    finishGatewayNetworkEvents(&gateway, &gateway_active, events);
+    events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
     return result;
-}
-
-pub fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active: *bool, events: *events_mod.EventEmitter) void {
-    if (!gateway_active.*) return;
-    gateway.deinit();
-    gateway_active.* = false;
-    while (gateway.popNetworkEvent()) |event| {
-        events.emitNetworkEventBestEffort(event);
-    }
 }
 
 pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock_control.Control, startup_probe: ?*vsock_stream.HostStream) !MonitorResult {
@@ -1071,12 +951,10 @@ pub fn executeMonitorWithBootArtifacts(
     try spore.validateAnnotations(opts.annotations);
 
     const backend = try opts.backend.resolveForHost();
-    try validateFreshProductPolicy(backend, .{
+    try vm_session.validateFreshProductPolicy(backend, .{
         .memory = opts.memory,
         .vcpus = opts.vcpus,
         .resuming = opts.resume_dir != null or opts.resume_generation != null or opts.resume_sessions.len != 0,
-        .rootfs = opts.rootfs_path != null or opts.rootfs != null or opts.disk != null or opts.rootfs_grow_target != 0,
-        .network = opts.network != .disabled or opts.network_runtime != null,
         .disk_fork = opts.runtime_disk_head != null,
     });
     var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.maximum_bytes);
@@ -1095,14 +973,15 @@ pub fn executeMonitorWithBootArtifacts(
     defer if (gateway_active) gateway.deinit();
     const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &opts.network);
     if (opts.injected_files.len != 0) return error.InjectedFileMonitorUnsupported;
-    var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
+    const disks: runtime_disk_mod.Options = .{
         .rootfs_path = opts.rootfs_path,
         .rootfs = opts.rootfs,
         .rootfs_grow_target = opts.rootfs_grow_target,
         .disk = opts.disk,
         .spore_dir = opts.resume_dir,
         .disk_root = opts.disk_root,
-    });
+    };
+    var runtime_disk = try runtime_disk_mod.open(context, allocator, disks);
     defer runtime_disk.deinit();
     if (opts.runtime_disk_head) |head| try runtime_disk.adoptForkHead(head);
     if (runtime_disk.fetcher) |fetcher| control.attachImageStore(fetcher);
@@ -1124,12 +1003,12 @@ pub fn executeMonitorWithBootArtifacts(
     defer allocator.free(build_input_backends);
     for (build_input_disks, 0..) |*disk, index| build_input_backends[index] = disk.backend() orelse return error.BadManifest;
     const growth_session = opts.rootfs_grow_target != 0;
-    const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const base_boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, console_fd >= 0, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
-    const boot_args = try productBootArgs(allocator, base_boot_args);
+    const noinit_itable = growth_session and vm_session.rootfsGrowthNoInitItable(context.environ_map);
+    const base_boot_args = try vm_session.cmdline(allocator, opts.guest_port, disks.hasRootfs(), disks.rootfsWritable(), growth_session, noinit_itable, opts.network, console_fd >= 0, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
+    const boot_args = try vm_session.productBootArgs(allocator, base_boot_args);
     var root_blk_stats: virtio_blk.Stats = .{};
-    const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
-    defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
+    const root_blk_options = vm_session.rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
+    defer if (opts.rootfs_grow_target != 0) vm_session.logRootBlkStats(&root_blk_stats);
 
     const vm_config: vmm.Config = .{
         .io = context.io,
@@ -1304,100 +1183,9 @@ fn randomRunSessionId(context: Context, allocator: std.mem.Allocator) ![]const u
     return std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
 }
 
-fn rootfsWritable(opts: Options) bool {
-    // Manifest-bound rootfs runs get a COW head; plain --rootfs stays local/read-only.
-    return opts.rootfs != null or opts.disk != null;
-}
-
-fn hasRootfs(opts: Options) bool {
-    return opts.rootfs_path != null or opts.rootfs != null;
-}
-
 pub fn rootfsGrowTarget(current_size: u64, requested_size: u64) !u64 {
     if (requested_size < current_size) return error.RunDiskSizeWouldShrink;
     return if (requested_size == current_size) 0 else requested_size;
-}
-
-fn rootBlkOptions(environ: *const std.process.Environ.Map, growth_session: bool, stats: *virtio_blk.Stats) virtio_blk.Options {
-    if (!growth_session) return .{};
-    const experiments_enabled = rootfsGrowthExperimentsEnabled(environ);
-    return .{
-        .write_zeroes = true,
-        .force_write_zeroes_unsupported = experiments_enabled and internalExperimentEnabled(environ.get(force_write_zeroes_unsupported_experiment_env)),
-        .force_write_zeroes_backend_failure = experiments_enabled and internalExperimentEnabled(environ.get(force_write_zeroes_backend_failure_experiment_env)),
-        .stats = stats,
-    };
-}
-
-pub fn rootfsGrowthExperimentsEnabled(environ: *const std.process.Environ.Map) bool {
-    return if (environ.get(rootfs_growth_experiments_env)) |value|
-        std.mem.eql(u8, value, "1")
-    else
-        false;
-}
-
-fn internalExperimentEnabled(value: ?[]const u8) bool {
-    const raw = value orelse return false;
-    if (raw.len == 0 or std.mem.eql(u8, raw, "0")) return false;
-    return !std.ascii.eqlIgnoreCase(raw, "false");
-}
-
-pub fn rootfsGrowthNoInitItable(environ: *const std.process.Environ.Map) bool {
-    return !rootfsGrowthExperimentsEnabled(environ) or
-        !internalExperimentEnabled(environ.get(lazy_init_negative_control_experiment_env));
-}
-
-fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
-    const snapshot = stats.snapshot();
-    std.log.info(
-        "rootfs growth blk metrics: accepted_features=0x{x} write_zeroes_requests={d} write_zeroes_bytes={d} write_zeroes_unmap={d} write_zeroes_ok={d} write_zeroes_errors={d} write_zeroes_backend_failures={d} write_zeroes_unsupported={d} out_requests={d} out_bytes={d} out_all_zero_requests={d} out_all_zero_bytes={d}",
-        .{
-            snapshot.accepted_features,
-            snapshot.write_zeroes_requests,
-            snapshot.write_zeroes_bytes,
-            snapshot.write_zeroes_unmap_requests,
-            snapshot.write_zeroes_ok,
-            snapshot.write_zeroes_errors,
-            snapshot.write_zeroes_backend_failures,
-            snapshot.write_zeroes_unsupported,
-            snapshot.out_requests,
-            snapshot.out_bytes,
-            snapshot.out_all_zero_requests,
-            snapshot.out_all_zero_bytes,
-        },
-    );
-}
-
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: spore_net_policy.NetworkMode, console_mirror: bool, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
-    const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
-    const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
-    const rootfs_growth_flag = if (rootfs and rootfs_writable and rootfs_growth) " spore_rootfs_growth=1" else "";
-    const noinit_itable_flag = if (rootfs and rootfs_writable and rootfs_growth and noinit_itable) " spore_rootfs_noinit_itable=1" else "";
-    const network_flag = if (network == .spore) " spore_net=1" else "";
-    // The agent copies command output to the console only when something
-    // logs it: each console write is a synchronous guest exit.
-    const console_mirror_flag = if (console_mirror) " spore_console_mirror=1" else "";
-    const build_context_flag = if (build_context) " spore_build_context=1" else "";
-    const build_mode_flag = if (build_mode) " spore_build=1" else "";
-    const build_inputs_flag = if (build_input_count != 0)
-        try std.fmt.allocPrint(allocator, " spore_build_inputs={d}", .{build_input_count})
-    else
-        null;
-    defer if (build_inputs_flag) |flag| allocator.free(flag);
-    return std.fmt.allocPrint(
-        allocator,
-        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}{s}{s}{s}{s}{s}",
-        .{ guest_port, rootfs_flag, rootfs_rw_flag, rootfs_growth_flag, noinit_itable_flag, network_flag, console_mirror_flag, build_context_flag, build_mode_flag, build_inputs_flag orelse "" },
-    );
-}
-
-fn productBootArgs(allocator: std.mem.Allocator, base: []const u8) ![]const u8 {
-    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-        var descriptors_buf: [x86_board.max_virtio_command_line_len]u8 = undefined;
-        const descriptors = try x86_board.formatVirtioCommandLine(&descriptors_buf);
-        return std.fmt.allocPrint(allocator, "{s} {s}", .{ base, descriptors });
-    }
-    return base;
 }
 
 fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream, saved: bool) !events_mod.Result {
@@ -1670,12 +1458,7 @@ test "local image supplies run env, working directory and rootfs identity" {
     try std.testing.expectEqualStrings(published.identity, rootfs.source.?.image_manifest_digest);
     try std.testing.expectEqualStrings(storage.index_digest, rootfs.artifact.digest);
     try std.testing.expectEqualStrings(storage.index_digest, rootfs.storage.?.index_digest);
-    try std.testing.expect(rootfsWritable(.{
-        .kernel_path = "",
-        .rootfs_path = input.path,
-        .rootfs = input.rootfs,
-        .command = &.{"/bin/true"},
-    }));
+    try std.testing.expect((runtime_disk_mod.Options{ .rootfs_path = input.path, .rootfs = input.rootfs }).rootfsWritable());
 }
 
 fn resolveStoreRefForTest(init: std.process.Init, allocator: std.mem.Allocator, options: rootfs_input.RootfsInputOptions) !rootfs_input.ResolvedRootfsInput {
@@ -2024,33 +1807,6 @@ test "run cli parser separates initial and maximum memory" {
     try std.testing.expectEqual(elastic.shared.memory.maximum_bytes, default_initial.shared.memory.maximum_bytes);
 }
 
-test "x86 fresh product policy is fixed and fail closed" {
-    const accepted = FreshProductPolicy{
-        .memory = memory_config.Config.fixed(x86_experimental_memory_bytes),
-        .vcpus = 1,
-    };
-    try validateFreshProductPolicyFor(.x86_64, .kvm, accepted);
-    try validateFreshProductPolicyFor(.aarch64, .kvm, .{ .memory = .{}, .vcpus = 8, .resuming = true, .capture = true });
-    try std.testing.expectError(error.UnsupportedBackend, validateFreshProductPolicyFor(.x86_64, .hvf, accepted));
-    try validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = .{}, .vcpus = 1 });
-    try std.testing.expectError(error.X86ExperimentalMemorySizeUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
-        .memory = memory_config.Config.fixed(1024 * 1024 * 1024),
-        .vcpus = 1,
-    }));
-    try std.testing.expectError(error.X86ElasticMemoryUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
-        .memory = .{ .initial_bytes = 512 * 1024 * 1024, .maximum_bytes = 1024 * 1024 * 1024 },
-        .vcpus = 1,
-    }));
-    try std.testing.expectError(error.X86VcpuCountUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{
-        .memory = accepted.memory,
-        .vcpus = 2,
-    }));
-    try std.testing.expectError(error.X86ResumeUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .resuming = true }));
-    try std.testing.expectError(error.X86CaptureUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .capture = true }));
-    try validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .rootfs = true, .network = true });
-    try std.testing.expectError(error.X86DiskForkUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .disk_fork = true }));
-}
-
 test "run cli parser accepts rootfs path" {
     const opts = try parseCliArgs(std.testing.allocator, &.{ "--rootfs", "rootfs.ext4", "--", "/bin/echo", "hi" });
     try std.testing.expectEqualStrings("rootfs.ext4", opts.rootfs_path.?);
@@ -2281,131 +2037,4 @@ test "run image cache creates absolute cache directories" {
     defer allocator.free(absolute_nested);
     try local_paths.ensureDirPath(io, absolute_nested);
     try Io.Dir.cwd().access(io, nested, .{});
-}
-
-test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, true, true, true, .disabled, false, false, false, 0);
-    defer std.testing.allocator.free(without_rootfs);
-    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_rw=1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_growth=1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_noinit_itable=1") == null);
-
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, true, true, .disabled, false, false, false, 0);
-    defer std.testing.allocator.free(with_rootfs);
-    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_rw=1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_growth=1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_noinit_itable=1") == null);
-
-    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, false, true, .disabled, false, false, false, 0);
-    defer std.testing.allocator.free(with_writable_rootfs);
-    try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_rw=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_growth=1") == null);
-
-    const with_growth = try cmdline(std.testing.allocator, 10700, true, true, true, true, .disabled, false, false, false, 0);
-    defer std.testing.allocator.free(with_growth);
-    try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_growth=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_noinit_itable=1") != null);
-
-    const lazy_init_control = try cmdline(std.testing.allocator, 10700, true, true, true, false, .disabled, false, false, false, 0);
-    defer std.testing.allocator.free(lazy_init_control);
-    try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_growth=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_noinit_itable=1") == null);
-}
-
-test "rootfs growth block profile is internal and opt in" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    var stats: virtio_blk.Stats = .{};
-
-    const ordinary = rootBlkOptions(&env, false, &stats);
-    try std.testing.expect(!ordinary.write_zeroes);
-    try std.testing.expect(ordinary.stats == null);
-
-    const growth = rootBlkOptions(&env, true, &stats);
-    try std.testing.expect(growth.write_zeroes);
-    try std.testing.expect(!growth.force_write_zeroes_unsupported);
-    try std.testing.expect(!growth.force_write_zeroes_backend_failure);
-    try std.testing.expect(growth.stats == &stats);
-
-    try env.put(force_write_zeroes_unsupported_experiment_env, "1");
-    try std.testing.expect(!rootBlkOptions(&env, true, &stats).force_write_zeroes_unsupported);
-    try env.put(force_write_zeroes_backend_failure_experiment_env, "1");
-    try std.testing.expect(!rootBlkOptions(&env, true, &stats).force_write_zeroes_backend_failure);
-    try env.put(lazy_init_negative_control_experiment_env, "1");
-    try std.testing.expect(rootfsGrowthNoInitItable(&env));
-
-    try env.put(rootfs_growth_experiments_env, "1");
-    try std.testing.expect(rootBlkOptions(&env, true, &stats).force_write_zeroes_unsupported);
-    try std.testing.expect(rootBlkOptions(&env, true, &stats).force_write_zeroes_backend_failure);
-    try std.testing.expect(!rootfsGrowthNoInitItable(&env));
-}
-
-test "run rootfs path stays read-only without manifest rootfs metadata" {
-    try std.testing.expect(!rootfsWritable(.{
-        .kernel_path = "",
-        .rootfs_path = "rootfs.ext4",
-        .command = &.{"/bin/true"},
-    }));
-}
-
-test "indexed rootfs input enables rootfs boot mode" {
-    try std.testing.expect(hasRootfs(.{
-        .kernel_path = "",
-        .rootfs = .{
-            .device = .{ .mmio_slot = 1 },
-            .artifact = .{
-                .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                .size = 4096,
-                .format = spore.rootfs_artifact_format_ext4,
-            },
-            .storage = .{
-                .kind = spore.rootfs_storage_kind_chunked_ext4,
-                .device = .{ .mmio_slot = 1 },
-                .logical_size = 4096,
-                .chunk_size = 4096,
-                .hash_algorithm = "blake3",
-                .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                .object_namespace = "rootfs/blake3",
-            },
-        },
-        .command = &.{"/bin/true"},
-    }));
-}
-
-test "run cmdline marks network mode" {
-    const without_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false, false, false, 0);
-    defer std.testing.allocator.free(without_network);
-    try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
-
-    const with_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .spore, false, false, false, 0);
-    defer std.testing.allocator.free(with_network);
-    try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
-}
-
-test "run cmdline asks for the console mirror only with a console log" {
-    const without_mirror = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false, false, false, 0);
-    defer std.testing.allocator.free(without_mirror);
-    try std.testing.expect(std.mem.indexOf(u8, without_mirror, "spore_console_mirror=1") == null);
-
-    const with_mirror = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, true, false, false, 0);
-    defer std.testing.allocator.free(with_mirror);
-    try std.testing.expect(std.mem.indexOf(u8, with_mirror, "spore_console_mirror=1") != null);
-}
-
-test "run cmdline marks build mode and immutable input disks only when requested" {
-    const without_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false, false, true, 0);
-    defer std.testing.allocator.free(without_context);
-    try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_context=1") == null);
-    try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_inputs=") == null);
-
-    const with_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false, true, true, 2);
-    defer std.testing.allocator.free(with_context);
-    try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build_context=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build_inputs=2") != null);
 }

@@ -303,6 +303,15 @@ pub const EventEmitter = struct {
     }
 };
 
+pub fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active: *bool, events: *EventEmitter) void {
+    if (!gateway_active.*) return;
+    gateway.deinit();
+    gateway_active.* = false;
+    while (gateway.popNetworkEvent()) |event| {
+        events.emitNetworkEventBestEffort(event);
+    }
+}
+
 fn networkAuditEvent(command: []const u8, backend: ?Backend, event: net_gateway.NetworkEvent) NetworkAuditEvent {
     return .{
         .command = command,

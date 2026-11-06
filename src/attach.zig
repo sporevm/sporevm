@@ -8,9 +8,6 @@ const Io = std.Io;
 const attach_stream = @import("attach_stream.zig");
 const Context = @import("context.zig").Context;
 const fd_util = @import("fd.zig");
-const hvf = @import("hvf/hvf.zig");
-const kvm_native = @import("kvm/native.zig");
-const kvm = kvm_native.binding;
 const net_gateway = @import("net_gateway.zig");
 const ram_restore = @import("ram_restore.zig");
 const generation = @import("generation.zig");
@@ -18,14 +15,12 @@ const backend_mod = @import("backend.zig");
 const cli_args = @import("cli_args.zig");
 const events_mod = @import("events.zig");
 const machine_output = @import("machine_output.zig");
-const run_mod = @import("run.zig");
-const runtime_disk = @import("runtime_disk.zig");
 const spore = @import("spore.zig");
 const spore_fork = @import("spore_fork.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const virtio_net = @import("virtio/net.zig");
-const vmm = @import("aarch64/vmm.zig");
+const vm_session = @import("vm_session.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
 
 pub const Backend = backend_mod.Backend;
@@ -154,7 +149,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
 fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Options, events: *events_mod.EventEmitter) !events_mod.Result {
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
-    try run_mod.validateFreshProductPolicy(backend, .{
+    // No caller checks the x86 profile before `attach`, so it refuses the
+    // restore here, before reading the spore or starting a gateway.
+    try vm_session.validateFreshProductPolicy(backend, .{
         .memory = .{},
         .vcpus = 1,
         .resuming = true,
@@ -180,15 +177,9 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     }
     defer if (gateway_active) gateway.deinit();
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
-    errdefer run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
+    errdefer events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
 
     try validateAttachDiskManifestParts(manifest.devices, manifest.rootfs, manifest.disk);
-    var runtime_disk_state = try runtime_disk.open(context, allocator, .{
-        .rootfs = manifest.rootfs,
-        .disk = manifest.disk,
-        .spore_dir = opts.spore_dir,
-    });
-    defer runtime_disk_state.deinit();
     const generation_params = if (opts.generation_path) |path|
         try loadGenerationParams(context.io, allocator, path)
     else
@@ -200,24 +191,18 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
         .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
     });
     defer attach.deinit(allocator);
-    var identity_stream: ?vsock_stream.HostStream = try vsock_stream.HostStream.init(default_attach_guest_port, attach.request);
-    if (identity_stream) |*stream| {
-        stream.host_port = vsock_stream.HostStream.deriveHostPort(attach.request);
-        // The output resumes where the saving run left off.
-        stream.stdout_offset = session.stdout_offset;
-        stream.stderr_offset = session.stderr_offset;
-        if (opts.events != null) {
-            stream.setLifecycleSink(events, attachEventLifecycleSink);
-            stream.setOutputSink(events, attachEventOutputSink);
-        } else {
-            stream.setOutputSink(null, rawOutputSink);
-        }
+    var stream = try vsock_stream.HostStream.init(default_attach_guest_port, attach.request);
+    stream.host_port = vsock_stream.HostStream.deriveHostPort(attach.request);
+    // The output resumes where the saving run left off.
+    stream.stdout_offset = session.stdout_offset;
+    stream.stderr_offset = session.stderr_offset;
+    if (opts.events != null) {
+        stream.setLifecycleSink(events, attachEventLifecycleSink);
+        stream.setOutputSink(events, attachEventOutputSink);
+    } else {
+        stream.setOutputSink(null, rawOutputSink);
     }
-    const identity_probe: ?*vsock_stream.HostStream = if (identity_stream) |*stream| stream else null;
-    var stdin_control = if (identity_stream) |*stream|
-        if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null
-    else
-        null;
+    var stdin_control = if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(&stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null;
     if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
     defer if (stdin_control) |*control| control.deinit();
     const exec_control = if (stdin_control) |*control| control.control() else null;
@@ -229,47 +214,37 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     var ram_plan = try ram_restore.Plan.fromMemory(allocator, context.environ_map, opts.spore_dir, manifest.memory, memory_config.maximum_bytes, vcpu_count);
     defer ram_plan.deinit();
     std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
-    const vm_config: vmm.Config = .{
-        .io = context.io,
-        .start = .{ .restore = .{
+    const cause = try vm_session.run(context, allocator, .{
+        .backend = backend,
+        .machine = .{ .restore = .{
             .dir = opts.spore_dir,
             .ram = ram_plan.strategy,
             .generation = attach.generation_state,
         } },
         .vcpus = vcpu_count,
+        .disks = .{
+            .rootfs = manifest.rootfs,
+            .disk = manifest.disk,
+            .spore_dir = opts.spore_dir,
+        },
+        .network = .{ .runtime = network },
         // Session output arrives on the attach stream; the guest copies it to
         // the console only for a VM that booted with a console log.
         .console_sink = discardConsoleSink,
-        .disk_backend = runtime_disk_state.backend(),
-        .probe = if (identity_probe) |stream| .{ .stream = stream, .timeout_ms = opts.timeout_ms } else null,
-        .network = network,
-        .exec_control = exec_control,
-    };
-    const cause = switch (backend) {
-        .auto => unreachable,
-        .hvf => blk: {
-            if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try hvf.vm.run(allocator, vm_config);
-        },
-        .kvm => blk: {
-            if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try kvm.vm.run(allocator, vm_config);
-        },
-    };
+        .mode = .{ .oneshot = .{
+            .probe = .{ .stream = &stream, .timeout_ms = opts.timeout_ms },
+            .control = exec_control,
+        } },
+    });
 
     switch (cause) {
-        .guest_off, .guest_reset => {
-            // The guest stopped before sending the session's exit frame, so
-            // its exit status is unknown; `spore run` reports the same.
-            const gateway_failed = gateway_active and gateway.hasFailed();
-            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
-            if (gateway_failed) return error.NetworkGatewayFailed;
-            return error.ProbeDidNotComplete;
-        },
+        // The guest stopped before sending the session's exit frame, so its
+        // exit status is unknown; `spore run` reports the same.
+        .guest_off, .guest_reset => return error.ProbeDidNotComplete,
         .probe_complete => {
-            var result = try resultFromAttachStream(backend, memory_config, vcpu_count, identity_stream);
+            var result = try resultFromAttachStream(backend, memory_config, vcpu_count, &stream);
             result = result.withMemoryRestore(&ram_plan);
-            run_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
+            events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
             return result;
@@ -310,8 +285,7 @@ fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
     return parsed;
 }
 
-fn resultFromAttachStream(backend: Backend, memory_config: @import("memory.zig").Config, vcpu_count: u32, identity_stream: ?vsock_stream.HostStream) !events_mod.Result {
-    const stream = identity_stream orelse return error.UnexpectedAttachExit;
+fn resultFromAttachStream(backend: Backend, memory_config: @import("memory.zig").Config, vcpu_count: u32, stream: *const vsock_stream.HostStream) !events_mod.Result {
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
     return .{

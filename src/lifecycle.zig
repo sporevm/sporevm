@@ -30,7 +30,6 @@ const saved_spore_remove = @import("saved_spore_remove.zig");
 const attach_mod = @import("attach.zig");
 const backend_mod = @import("backend.zig");
 const rootfs_input = @import("rootfs_input.zig");
-const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_fork = @import("spore_fork.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -40,6 +39,7 @@ const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
 const version = @import("version.zig");
 const vm_registry = @import("vm_registry.zig");
+const vm_session = @import("vm_session.zig");
 
 pub const runtime_dir_env = local_paths.runtime_dir_env;
 
@@ -383,11 +383,9 @@ pub fn createNamedWithTiming(
     clearLastError();
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
     const selected_backend = try backend_mod.select(options.backend, host);
-    try run_mod.validateFreshProductPolicy(selected_backend, .{
+    try vm_session.validateFreshProductPolicy(selected_backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
-        .rootfs = options.rootfs_path != null or options.image_ref != null,
-        .network = options.network != .disabled,
     });
     try topology.validateVcpuCount(options.vcpus);
     try spore.validateAnnotations(options.annotations);
@@ -542,7 +540,7 @@ pub fn restoreNamed(
     clearLastError();
     const requested_backend = options.backend orelse backend_mod.Backend.auto;
     const selected_backend = try requested_backend.resolveForHost();
-    try run_mod.validateFreshProductPolicy(selected_backend, .{
+    try vm_session.validateFreshProductPolicy(selected_backend, .{
         .memory = .{},
         .vcpus = 1,
         .resuming = true,
@@ -889,7 +887,7 @@ pub fn saveNamed(
 fn rejectX86NamedPersistence(spec: Spec) !void {
     const requested = backend_mod.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
     const selected = try requested.resolveForHost();
-    try run_mod.validateFreshProductPolicy(selected, .{
+    try vm_session.validateFreshProductPolicy(selected, .{
         .memory = spec.memory,
         .vcpus = spec.vcpus,
         .capture = true,
@@ -1999,7 +1997,7 @@ test "lifecycle named exists diagnostics include stale state and logs" {
         .preopens = .empty,
     }, allocator, .{}, .{
         .name = "bench-1",
-        .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
+        .memory = memory_config.Config.fixed(vm_session.x86_experimental_memory_bytes),
     }, .{ .start_ms = 0, .parsed_ms = 0 }));
 
     const detail = lastErrorMessage();
@@ -2054,7 +2052,7 @@ test "lifecycle create claims the name only once the image is ready" {
                 .preopens = .empty,
             }, std.testing.allocator, .{}, .{
                 .name = "bench-1",
-                .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
+                .memory = memory_config.Config.fixed(vm_session.x86_experimental_memory_bytes),
                 .spore_executable = "/nonexistent/spore",
             }, .{ .start_ms = 0, .parsed_ms = 0 }) catch |err| {
                 self.err = err;

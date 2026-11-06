@@ -37,6 +37,16 @@ pub const Options = struct {
     spore_dir: ?[]const u8 = null,
     disk_root: ?[]const u8 = null,
     rootfs_grow_target: u64 = 0,
+
+    pub fn hasRootfs(self: Options) bool {
+        return self.rootfs_path != null or self.rootfs != null;
+    }
+
+    /// Manifest-bound rootfs runs get a COW head; a plain rootfs path stays
+    /// local and read-only.
+    pub fn rootfsWritable(self: Options) bool {
+        return self.rootfs != null or self.disk != null;
+    }
 };
 
 pub const RuntimeDisk = struct {
@@ -1378,4 +1388,31 @@ test "runtime disk restores chunk-index disk manifests" {
     defer missing_runtime.deinit();
     var missing_byte: [1]u8 = undefined;
     try std.testing.expectError(error.MissingChunk, missing_runtime.chunk_mapped.?.readAt(&missing_byte, index.value.chunks[0].logical_chunk * storage.chunk_size));
+}
+
+test "run rootfs path stays read-only without manifest rootfs metadata" {
+    try std.testing.expect(!(Options{ .rootfs_path = "rootfs.ext4" }).rootfsWritable());
+}
+
+test "indexed rootfs input enables rootfs boot mode" {
+    try std.testing.expect((Options{
+        .rootfs = .{
+            .device = .{ .mmio_slot = 1 },
+            .artifact = .{
+                .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .size = 4096,
+                .format = spore.rootfs_artifact_format_ext4,
+            },
+            .storage = .{
+                .kind = spore.rootfs_storage_kind_chunked_ext4,
+                .device = .{ .mmio_slot = 1 },
+                .logical_size = 4096,
+                .chunk_size = 4096,
+                .hash_algorithm = "blake3",
+                .index_digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .base_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                .object_namespace = "rootfs/blake3",
+            },
+        },
+    }).hasRootfs());
 }
