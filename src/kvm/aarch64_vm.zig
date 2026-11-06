@@ -618,7 +618,7 @@ const DirtyLog = struct {
         ) catch "kvm snapshot metrics: formatting_failed=1";
         const metrics_tail = std.fmt.bufPrint(
             &metrics_tail_buf,
-            " get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
+            " get_dirty_log_ms={d} get_dirty_log_cpu_ms={d} seal_ms={d} seal_cpu_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} finish_fsync_ms={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_pages_per_sec={d} sealed_chunks_per_sec={d}",
             .{
                 stats.get_dirty_log_ms,
                 stats.get_dirty_log_cpu_ms,
@@ -630,6 +630,7 @@ const DirtyLog = struct {
                 ram_stats.sealBackingWriteMs(),
                 ram_stats.seal_parallel_flush_count,
                 ram_stats.seal_parallel_workers_max,
+                ram_stats.finish_fsync_ms,
                 ram_stats.finish_fchmod_ms,
                 ram_stats.finish_close_ms,
                 ram_stats.finish_close_deferred,

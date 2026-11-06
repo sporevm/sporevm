@@ -1,10 +1,14 @@
 //! Same-host RAM backing for local restores and forks.
 //!
 //! `ram.backing` is an optional sparse copy of guest RAM next to a spore's
-//! chunks. Restore and fork map it MAP_PRIVATE only when a v1 proof, MACed
+//! chunks. Restore and fork map it MAP_PRIVATE only when a v3 proof, MACed
 //! with a key under the user's runtime directory, binds it to the memory
 //! index and the file's identity. Anything else falls back to the chunks,
 //! which stay the portable, verified source of truth.
+//!
+//! The proof binds the file's identity, not its bytes, so it is written only
+//! after the backing is fsynced: a crash cannot leave a valid proof next to a
+//! backing that lost its pages.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,7 +25,9 @@ const ram_backing_proof_path = spore.ram_backing_proof_path;
 const validateMemoryBacking = spore.validateMemoryBacking;
 const validateMemoryForRam = spore.validateMemoryForRam;
 
-const local_backing_proof_version_v1: u32 = 1;
+/// v1 proofs could vouch for a backing that was never fsynced; v2 was the
+/// removed fs-verity schema.
+const local_backing_proof_version: u32 = 3;
 const local_backing_producer = "sporevm-local-ram-backing-v0";
 const local_backing_key_path = "local-ram-backing.key";
 const local_backing_key_len = HmacSha256.key_length;
@@ -121,8 +127,8 @@ fn proofMac(
     producer: []const u8,
 ) [HmacSha256.mac_length]u8 {
     var mac = HmacSha256.init(key);
-    mac.update("sporevm-local-ram-backing-proof-v1");
-    macU64(&mac, local_backing_proof_version_v1);
+    mac.update("sporevm-local-ram-backing-proof-v3");
+    macU64(&mac, local_backing_proof_version);
     macBytes(&mac, memory_fingerprint);
     macBytes(&mac, backing.kind);
     macBytes(&mac, backing.path);
@@ -294,7 +300,7 @@ fn proofFieldsMatch(
     backing: LocalBackingProofBacking,
     file: LocalBackingFileIdentity,
 ) bool {
-    return proof.schema_version == local_backing_proof_version_v1 and
+    return proof.schema_version == local_backing_proof_version and
         std.mem.eql(u8, proof.memory_fingerprint, memory_fingerprint) and
         std.mem.eql(u8, proof.backing.kind, backing.kind) and
         std.mem.eql(u8, proof.backing.path, backing.path) and
@@ -390,7 +396,7 @@ fn writeLocalMemoryBackingProofForFd(
     const mac_hex = std.fmt.allocPrint(allocator, "{x}", .{&mac}) catch return error.OutOfMemory;
     defer allocator.free(mac_hex);
     const proof = LocalBackingProof{
-        .schema_version = local_backing_proof_version_v1,
+        .schema_version = local_backing_proof_version,
         .memory_fingerprint = memory_fingerprint,
         .backing = proof_backing,
         .file = file,
@@ -1165,7 +1171,7 @@ test "local memory backing proof rejects foreign key and manifest mismatch" {
     try std.testing.expectEqual(LocalBackingRestoreReason.proof_mismatch, mismatch_plan.reason);
 }
 
-test "local memory backing proof written by the removed fs-verity schema falls back to chunks" {
+test "local memory backing proofs from earlier schemas fall back to chunks" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1183,11 +1189,13 @@ test "local memory backing proof written by the removed fs-verity schema falls b
     const mm = try saveMemoryWithBacking(arena, dir, ram);
     try writeLocalMemoryBackingProof(arena, &env, dir, mm, ram.len);
     const proof_path = try pathZ(arena, "{s}/{s}", .{ dir, ram_backing_proof_path });
-    const v1_proof = try readRegularFileAllNoFollow(arena, proof_path, local_backing_proof_max_bytes);
+    const v3_proof = try readRegularFileAllNoFollow(arena, proof_path, local_backing_proof_max_bytes);
 
+    // Schema v1 proofs had the same shape but unsynced backings.
+    const v1_proof = try std.mem.replaceOwned(u8, arena, v3_proof, "\"schema_version\": 3,", "\"schema_version\": 1,");
+    try std.testing.expect(!std.mem.eql(u8, v3_proof, v1_proof));
     // Schema v2 proofs carried a `verity` object next to the MAC.
-    const v2_schema = try std.mem.replaceOwned(u8, arena, v1_proof, "\"schema_version\": 1,", "\"schema_version\": 2,");
-    try std.testing.expect(!std.mem.eql(u8, v1_proof, v2_schema));
+    const v2_schema = try std.mem.replaceOwned(u8, arena, v3_proof, "\"schema_version\": 3,", "\"schema_version\": 2,");
     const v2_proof = try std.mem.replaceOwned(
         u8,
         arena,
@@ -1198,6 +1206,7 @@ test "local memory backing proof written by the removed fs-verity schema falls b
     try std.testing.expect(!std.mem.eql(u8, v2_schema, v2_proof));
 
     const cases = [_]struct { bytes: []const u8, reason: LocalBackingRestoreReason }{
+        .{ .bytes = v1_proof, .reason = .proof_mismatch },
         .{ .bytes = v2_proof, .reason = .proof_invalid },
         .{ .bytes = v2_schema, .reason = .proof_mismatch },
     };

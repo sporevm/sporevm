@@ -8,9 +8,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 
-const testing = if (builtin.is_test) struct {
-    var created_dir_syncs: ?*usize = null;
-    var dir_syncs: ?*usize = null;
+pub const testing = if (builtin.is_test) struct {
+    pub var created_dir_syncs: ?*usize = null;
+    pub var dir_syncs: ?*usize = null;
+    pub var file_syncs: ?*usize = null;
 } else struct {};
 
 pub const Error = error{
@@ -341,6 +342,15 @@ fn fsyncFd(fd: std.c.fd_t) Error!void {
     if (std.c.fsync(fd) != 0) return error.IoFailed;
 }
 
+/// Syncs a file the caller is about to vouch for, such as a RAM backing
+/// before its proof is written. Tests count these calls.
+pub fn fsyncFile(fd: std.c.fd_t) Error!void {
+    try fsyncFd(fd);
+    if (comptime builtin.is_test) {
+        if (testing.file_syncs) |count| count.* += 1;
+    }
+}
+
 fn verifyExistingFile(path: [:0]const u8, expected: []const u8) Error!void {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.BadChunk;
@@ -368,10 +378,12 @@ pub fn fsyncParentDirPath(allocator: std.mem.Allocator, path: []const u8) Error!
     try fsyncDirPath(allocator, parent);
 }
 
+/// Follows symlinks: callers pass user paths such as macOS's /tmp, and
+/// syncing a directory reached through one grants nothing.
 pub fn fsyncDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
     try fsyncFd(fd);

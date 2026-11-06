@@ -190,14 +190,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
     }
     if (disk_root != null) {
         // Phase two must leave complete durable child manifests before phase
-        // three can publish their pins.
+        // three can publish their pins; saveManifest already synced each one.
         for (0..options.count) |index| {
             const child = try std.fmt.allocPrint(arena, "{s}/{d:0>6}", .{ fork_out, index });
-            const manifest_path = try std.fs.path.join(arena, &.{ child, "manifest.json" });
-            const bytes = try std.Io.Dir.cwd().readFileAlloc(context.io, manifest_path, allocator, .limited(spore.max_manifest_bytes + 1));
-            defer allocator.free(bytes);
-            if (bytes.len > spore.max_manifest_bytes) return error.StreamTooLong;
-            try chunk_sealer.replaceFileAtomicDurable(arena, manifest_path, bytes, 0o644);
             const child_manifest = try spore.loadManifest(arena, child);
             defer child_manifest.deinit();
             const child_disk = child_manifest.value.disk orelse return error.BadManifest;

@@ -27,6 +27,7 @@ pub const Stats = struct {
     seal_parallel_flush_count: u64 = 0,
     seal_parallel_workers_max: u64 = 0,
     tail_flush_ms: u64 = 0,
+    finish_fsync_ms: u64 = 0,
     finish_fchmod_ms: u64 = 0,
     finish_close_ms: u64 = 0,
     finish_close_deferred: u64 = 0,
@@ -237,6 +238,7 @@ pub const Sealer = struct {
         self.stats.seal_parallel_flush_count = 0;
         self.stats.seal_parallel_workers_max = 0;
         self.stats.tail_flush_ms = 0;
+        self.stats.finish_fsync_ms = 0;
         self.stats.finish_fchmod_ms = 0;
         self.stats.finish_close_ms = 0;
         self.stats.finish_close_deferred = 0;
@@ -257,6 +259,12 @@ pub const Sealer = struct {
     }
 
     pub fn finishBacking(self: *Sealer) !spore.MemoryManifest {
+        // Its proof binds the file, not the bytes: sync them before one exists.
+        const fsync_start = try monotonicMs();
+        const fsync_result = chunk_sealer.fsyncFile(self.backing_fd);
+        self.stats.finish_fsync_ms = (try monotonicMs()) - fsync_start;
+        try fsync_result;
+
         const fchmod_start = try monotonicMs();
         const fchmod_rc = std.c.fchmod(self.backing_fd, 0o444);
         self.stats.finish_fchmod_ms = (try monotonicMs()) - fchmod_start;
@@ -614,7 +622,12 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
     try std.testing.expect(sealer.refs[2] != null);
     try std.testing.expectEqual(@as(u64, 0), sealer.stats.dirty_chunks_total);
 
+    // The backing is synced before its caller writes a proof for it.
+    var file_syncs: usize = 0;
+    chunk_sealer.testing.file_syncs = &file_syncs;
+    defer chunk_sealer.testing.file_syncs = null;
     const manifest = try sealer.finishBacking();
+    try std.testing.expectEqual(@as(usize, 1), file_syncs);
     const plan = try spore.validateMemoryForRam(manifest, ram.len);
     try std.testing.expectEqual(@as(usize, 3), plan.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), plan.nonzero_chunk_count);

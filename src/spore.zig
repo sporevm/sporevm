@@ -415,19 +415,13 @@ pub fn createSnapshotRoot(allocator: std.mem.Allocator, dir: []const u8) Error!v
     }
     const fd = try openDirectoryNoFollow(dir_z);
     defer _ = std.c.close(fd);
+    chunk_sealer.fsyncParentDirPath(allocator, dir) catch |err| return sealerError(err);
 }
 
 fn openDirectoryNoFollow(path: [:0]const u8) Error!std.c.fd_t {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
     return fd;
-}
-
-fn writeFileAll(path: [:0]const u8, data: []const u8) Error!void {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o644));
-    if (fd < 0) return error.IoFailed;
-    defer _ = std.c.close(fd);
-    try writeAllFd(fd, data);
 }
 
 fn createNewFile(path: [:0]const u8, mode: c_uint) Error!std.c.fd_t {
@@ -439,15 +433,6 @@ fn createNewFile(path: [:0]const u8, mode: c_uint) Error!std.c.fd_t {
         };
     }
     return fd;
-}
-
-fn writeAllFd(fd: std.c.fd_t, data: []const u8) Error!void {
-    var done: usize = 0;
-    while (done < data.len) {
-        const n = std.c.write(fd, data.ptr + done, data.len - done);
-        if (n <= 0) return error.IoFailed;
-        done += @intCast(n);
-    }
 }
 
 fn publishFileNoOverwrite(tmp_path: [:0]const u8, final_path: [:0]const u8) Error!void {
@@ -857,6 +842,8 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
     }
 
     const backing = if (with_backing) blk: {
+        // Its proof binds the file, not the bytes: sync them before one exists.
+        chunk_sealer.fsyncFile(backing_fd) catch |err| return sealerError(err);
         if (std.c.fchmod(backing_fd, 0o444) != 0) return error.IoFailed;
         _ = std.c.close(backing_fd);
         backing_fd = -1;
@@ -958,12 +945,12 @@ pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Man
     try saveManifestPath(allocator, path, manifest);
 }
 
+/// Replaces the manifest atomically and durably: a crash leaves the old or the
+/// new manifest, never a truncated one.
 pub fn saveManifestPath(allocator: std.mem.Allocator, path: []const u8, manifest: Manifest) Error!void {
     const json = try encodeManifestAlloc(allocator, manifest);
     defer allocator.free(json);
-    const path_z = try pathZ(allocator, "{s}", .{path});
-    defer allocator.free(path_z);
-    try writeFileAll(path_z, json);
+    chunk_sealer.replaceFileAtomicDurable(allocator, path, json, 0o644) catch |err| return sealerError(err);
 }
 
 /// Validates and encodes manifest bytes for every writer, including those
@@ -1282,6 +1269,22 @@ fn jsonStringLiteralSize(value: []const u8) Error!usize {
 
 extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
+fn writeFileAll(path: [:0]const u8, data: []const u8) Error!void {
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0o644));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    try writeAllFd(fd, data);
+}
+
+fn writeAllFd(fd: std.c.fd_t, data: []const u8) Error!void {
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = std.c.write(fd, data.ptr + done, data.len - done);
+        if (n <= 0) return error.IoFailed;
+        done += @intCast(n);
+    }
+}
+
 const manifest_test_support = @import("manifest_test_support.zig");
 const testDisk = manifest_test_support.testDisk;
 const testForkManifest = manifest_test_support.testForkManifest;
@@ -1316,6 +1319,29 @@ test "snapshot root creation rejects existing and symlink paths" {
     const link_dir = try pathZ(arena, "{s}/link.spore", .{root_dir});
     try std.Io.Dir.cwd().symLink(std.testing.io, target_dir, link_dir, .{});
     try std.testing.expectError(error.AlreadyExists, createSnapshotRoot(arena, link_dir));
+}
+
+test "snapshot root and manifest save follow a symlinked parent" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Like `run --save /tmp/out` on macOS, where /tmp links to private/tmp.
+    const root_dir = try testDir(arena);
+    const real_dir = try pathZ(arena, "{s}/real", .{root_dir});
+    try ensureDir(real_dir);
+    try std.Io.Dir.cwd().symLink(std.testing.io, real_dir, try pathZ(arena, "{s}/link", .{root_dir}), .{});
+    try createSnapshotRoot(arena, try pathZ(arena, "{s}/link/out.spore", .{root_dir}));
+    const spore_dir = try pathZ(arena, "{s}/out.spore", .{real_dir});
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(spore_dir, 0));
+
+    // Like `rootfs preload --attach-spore <link>`.
+    const spore_link = try pathZ(arena, "{s}/out-link.spore", .{root_dir});
+    try std.Io.Dir.cwd().symLink(std.testing.io, spore_dir, spore_link, .{});
+    try saveManifest(arena, spore_link, testForkManifest(testZeroMemoryManifest(chunk_size), chunk_size, 1));
+    const loaded = try loadManifest(arena, spore_dir);
+    loaded.deinit();
 }
 
 test "memory round-trips through the chunk store with zero elision" {
@@ -1412,7 +1438,7 @@ test "memory backing rejects preexisting symlink temp file" {
     try std.testing.expectEqualStrings("untouched", victim);
 }
 
-test "manifest save rejects symlink target" {
+test "manifest save replaces a symlink instead of writing through it" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1424,16 +1450,46 @@ test "manifest save rejects symlink target" {
     const manifest_path = try pathZ(arena, "{s}/manifest.json", .{dir});
     try std.Io.Dir.cwd().symLink(std.testing.io, victim_path, manifest_path, .{});
 
-    const manifest = testForkManifest(testZeroMemoryManifest(chunk_size), chunk_size, 1);
-    if (saveManifest(arena, dir, manifest)) |_| {
-        return error.TestUnexpectedResult;
-    } else |err| switch (err) {
-        error.IoFailed => {},
-        else => return err,
-    }
+    try saveManifest(arena, dir, testForkManifest(testZeroMemoryManifest(chunk_size), chunk_size, 1));
 
     const victim = try readFileAll(arena, victim_path, 1024);
     try std.testing.expectEqualStrings("untouched", victim);
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, manifest_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.file, stat.kind);
+    const loaded = try loadManifest(arena, dir);
+    loaded.deinit();
+}
+
+test "memory and manifest saves sync the backing and their directories" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, 4 * chunk_size);
+    @memset(ram, 0);
+    ram[0] = 1;
+    ram[2 * chunk_size] = 2;
+    ram[3 * chunk_size] = 3;
+
+    var dir_syncs: usize = 0;
+    chunk_sealer.testing.dir_syncs = &dir_syncs;
+    defer chunk_sealer.testing.dir_syncs = null;
+    var file_syncs: usize = 0;
+    chunk_sealer.testing.file_syncs = &file_syncs;
+    defer chunk_sealer.testing.file_syncs = null;
+
+    // `chunks/` is synced before a manifest names the chunks, and the backing
+    // before its caller writes a proof for it.
+    const memory = try saveMemoryWithBacking(arena, dir, ram);
+    try std.testing.expectEqual(@as(usize, 3), memory.chunks.len);
+    try std.testing.expect(dir_syncs >= 1);
+    try std.testing.expectEqual(@as(usize, 1), file_syncs);
+
+    const memory_dir_syncs = dir_syncs;
+    try saveManifest(arena, dir, testForkManifest(memory, ram.len, 1));
+    try std.testing.expect(dir_syncs > memory_dir_syncs);
 }
 
 test "memory backing rejects non-canonical paths" {
