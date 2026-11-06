@@ -1046,7 +1046,7 @@ fn writeLocalMemoryBackingProofForFd(
     defer allocator.free(memory_fingerprint);
     const proof_backing = proofBackingFromManifest(backing);
     const mac = proofMac(&key, memory_fingerprint, proof_backing, file, local_backing_producer);
-    const mac_hex = try hexAlloc(allocator, &mac);
+    const mac_hex = std.fmt.allocPrint(allocator, "{x}", .{&mac}) catch return error.OutOfMemory;
     defer allocator.free(mac_hex);
     const proof = LocalBackingProof{
         .schema_version = local_backing_proof_version_v1,
@@ -2080,10 +2080,9 @@ fn childIdentity(allocator: std.mem.Allocator, fork_batch_id: []const u8, fork_i
     var digest: [Blake3.digest_length]u8 = undefined;
     Blake3.hash(input, &digest, .{});
 
-    const vm_id_hex = try hexAlloc(allocator, digest[0..16]);
-    const vm_id = std.fmt.allocPrint(allocator, "spore-{s}", .{vm_id_hex}) catch return error.OutOfMemory;
+    const vm_id = std.fmt.allocPrint(allocator, "spore-{x}", .{digest[0..16]}) catch return error.OutOfMemory;
     const hostname = std.fmt.allocPrint(allocator, "spore-{s}-{d:0>6}", .{ fork_batch_id[0..8], fork_index }) catch return error.OutOfMemory;
-    const mac_seed = try hexAlloc(allocator, digest[16..32]);
+    const mac_seed = std.fmt.allocPrint(allocator, "{x}", .{digest[16..32]}) catch return error.OutOfMemory;
     var mac: [6]u8 = digest[0..6].*;
     mac[0] = (mac[0] | 0x02) & 0xfe; // locally administered, unicast
     const mac_address = try macString(allocator, mac);
@@ -2098,7 +2097,7 @@ fn childIdentity(allocator: std.mem.Allocator, fork_batch_id: []const u8, fork_i
 fn randomHex(allocator: std.mem.Allocator, comptime byte_count: usize) Error![]const u8 {
     var bytes: [byte_count]u8 = undefined;
     try fillRandom(&bytes);
-    return hexAlloc(allocator, &bytes);
+    return std.fmt.allocPrint(allocator, "{x}", .{&bytes}) catch error.OutOfMemory;
 }
 
 fn fillRandom(out: []u8) Error!void {
@@ -2121,18 +2120,8 @@ fn realtimeUnixNs() Error!u64 {
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
-fn hexAlloc(allocator: std.mem.Allocator, bytes: []const u8) Error![]const u8 {
-    const digits = "0123456789abcdef";
-    const out = allocator.alloc(u8, bytes.len * 2) catch return error.OutOfMemory;
-    for (bytes, 0..) |byte, i| {
-        out[i * 2] = digits[byte >> 4];
-        out[i * 2 + 1] = digits[byte & 0x0f];
-    }
-    return out;
-}
-
 fn macString(allocator: std.mem.Allocator, mac: [6]u8) Error![]const u8 {
-    const hex = try hexAlloc(allocator, &mac);
+    const hex = std.fmt.allocPrint(allocator, "{x}", .{&mac}) catch return error.OutOfMemory;
     return std.fmt.allocPrint(allocator, "{s}:{s}:{s}:{s}:{s}:{s}", .{
         hex[0..2],
         hex[2..4],
