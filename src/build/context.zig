@@ -173,7 +173,7 @@ pub const CopySnapshot = struct {
             const file = Io.Dir.cwd().createFile(io, path, .{
                 .read = true,
                 .exclusive = true,
-                .permissions = @enumFromInt(0o600),
+                .permissions = @fromBackingInt(@intCast(0o600)),
             }) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     allocator.free(path);
@@ -201,7 +201,7 @@ pub const CopySnapshot = struct {
         const file = self.file orelse return;
         file.close(io);
         self.file = null;
-        try Io.Dir.cwd().setFilePermissions(io, self.path, @enumFromInt(0o400), .{ .follow_symlinks = false });
+        try Io.Dir.cwd().setFilePermissions(io, self.path, @fromBackingInt(@intCast(0o400)), .{ .follow_symlinks = false });
     }
 
     fn captureFile(
@@ -685,7 +685,7 @@ fn resolveCopyEntries(
                 try out.append(.{
                     .rel = entry.rel,
                     .kind = entry.kind,
-                    .mode = @intCast(@intFromEnum(stat.permissions) & 0o7777),
+                    .mode = @intCast(@backingInt(stat.permissions) & 0o7777),
                     .size = stat.size,
                     .content_digest = digest,
                     .snapshot_path = if (captured != null) snapshot.?.path else "",
@@ -709,7 +709,7 @@ fn resolveCopyEntries(
                 try out.append(.{
                     .rel = entry.rel,
                     .kind = entry.kind,
-                    .mode = @intCast(@intFromEnum(stat.permissions) & 0o7777),
+                    .mode = @intCast(@backingInt(stat.permissions) & 0o7777),
                 });
             },
             .sym_link => {
@@ -730,7 +730,7 @@ fn resolveCopyEntries(
                 try out.append(.{
                     .rel = entry.rel,
                     .kind = entry.kind,
-                    .mode = @intCast(@intFromEnum(stat.permissions) & 0o7777),
+                    .mode = @intCast(@backingInt(stat.permissions) & 0o7777),
                     .symlink_target = try allocator.dupe(u8, target_buf[0..len]),
                 });
             },
@@ -1242,7 +1242,7 @@ test "COPY dereferences a selected symlink within the context" {
     const context_root = try root_dir.path("context");
     try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/files"));
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/files/plain.txt"), .data = "plain\n" });
-    try Io.Dir.cwd().setFilePermissions(io, try root_dir.path("context/files/plain.txt"), @enumFromInt(0o640), .{ .follow_symlinks = false });
+    try Io.Dir.cwd().setFilePermissions(io, try root_dir.path("context/files/plain.txt"), @fromBackingInt(@intCast(0o640)), .{ .follow_symlinks = false });
     try Io.Dir.cwd().symLink(io, "files/plain.txt", try root_dir.path("context/plain-link"), .{});
 
     var diag: IgnoreDiagnostic = .{};
@@ -1536,7 +1536,7 @@ test "context hashing frames fields so payload NULs cannot alias records" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("two/b"), .data = "right" });
     const b_stat = try Io.Dir.cwd().statFile(io, try root_dir.path("two/b"), .{ .follow_symlinks = false });
     var b_mode: [8]u8 = undefined;
-    std.mem.writeInt(u64, &b_mode, @intFromEnum(b_stat.permissions), .little);
+    std.mem.writeInt(u64, &b_mode, @backingInt(b_stat.permissions), .little);
 
     var payload = std.array_list.Managed(u8).init(arena);
     try payload.appendSlice("left");
@@ -1763,7 +1763,7 @@ fn oldUnframedHashCopySourcesForTest(
         const path = try std.fs.path.join(allocator, &.{ context.root, entry.rel });
         const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
         var mode_buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &mode_buf, @intFromEnum(stat.permissions), .little);
+        std.mem.writeInt(u64, &mode_buf, @backingInt(stat.permissions), .little);
         h.update(&mode_buf);
         h.update("\x00");
         switch (entry.kind) {

@@ -424,7 +424,7 @@ test "digest cache installs rootfs bytes atomically and verifies final content" 
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     try verifyPath(io, arena, digest_path, artifact, true);
     const stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@backingInt(stat.permissions) & 0o777)));
 
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
@@ -542,15 +542,15 @@ test "copy-only digest cache does not chmod source rootfs" {
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @fromBackingInt(@intCast(0o644)), .{});
 
     const artifact = try cacheByDigestPathCopy(io, arena, cache_root, rootfs_path);
     const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@backingInt(source_stat.permissions) & 0o777)));
 
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     const cache_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(cache_stat.permissions) & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@backingInt(cache_stat.permissions) & 0o777)));
 }
 
 test "digest cache default does not alias caller-owned source" {
@@ -565,17 +565,17 @@ test "digest cache default does not alias caller-owned source" {
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @fromBackingInt(@intCast(0o644)), .{});
 
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
 
-    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @fromBackingInt(@intCast(0o644)), .{});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "ROOTFS BYTES" });
 
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     try verifyPath(io, arena, digest_path, artifact, true);
     const cache_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(cache_stat.permissions) & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@backingInt(cache_stat.permissions) & 0o777)));
 }
 
 test "install after source verification cleans up bad installed bytes" {
@@ -633,7 +633,7 @@ test "preverified hardlink install skips second hash for regular source" {
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
     const digest_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(source.size, digest_stat.size);
-    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(digest_stat.permissions) & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@backingInt(digest_stat.permissions) & 0o777)));
     try std.testing.expectError(error.RootFSDigestMismatch, verifyPath(io, arena, digest_path, .{ .digest = source.digest, .size = source.size + 1 }, true));
 }
 

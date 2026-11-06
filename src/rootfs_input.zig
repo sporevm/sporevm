@@ -690,7 +690,7 @@ test "explicit rootfs input can record exact immutable identity" {
     const rootfs_path = try tmp_dir.path("source.ext4");
     const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
+    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @fromBackingInt(@intCast(0o644)), .{});
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -727,5 +727,5 @@ test "explicit rootfs input can record exact immutable identity" {
     const digest_path = try rootfs_cache.digestPath(arena, absolute_cache_root, resolved.rootfs.?.artifact.digest);
     try Io.Dir.cwd().access(io, digest_path, .{ .read = true });
     const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@backingInt(source_stat.permissions) & 0o777)));
 }

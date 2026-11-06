@@ -180,7 +180,8 @@ pub fn encode(allocator: std.mem.Allocator, message: anytype) error{OutOfMemory}
 /// fields need no defaults, else the default of its `type` field.
 fn wireType(comptime T: type) []const u8 {
     if (@hasDecl(T, "wire_type")) return T.wire_type;
-    return comptime std.meta.fieldInfo(T, .type).defaultValue().?;
+    const field = comptime std.meta.fieldInfo(T, .type);
+    return comptime field.attrs.defaultValue(field.type).?;
 }
 
 /// Reads the `type` field, then decodes the variant it names with unknown
@@ -191,13 +192,14 @@ fn decodeTagged(comptime U: type, arena: std.mem.Allocator, line: []const u8) er
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.BadMessage,
     };
-    inline for (@typeInfo(U).@"union".fields) |field| {
-        if (std.mem.eql(u8, probe.type, wireType(field.type))) {
-            const value = std.json.parseFromSliceLeaky(field.type, arena, line, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+    const info = @typeInfo(U).@"union";
+    inline for (info.field_names, info.field_types) |name, Field| {
+        if (std.mem.eql(u8, probe.type, wireType(Field))) {
+            const value = std.json.parseFromSliceLeaky(Field, arena, line, .{ .allocate = .alloc_always }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.BadMessage,
             };
-            return @unionInit(U, field.name, value);
+            return @unionInit(U, name, value);
         }
     }
     return error.BadMessage;

@@ -727,7 +727,7 @@ test "immediate exit requests use one atomic consume" {
 
 test "KVM_EXIT_IO decoder accepts one bounded envelope" {
     var run: [4096]u8 = undefined;
-    makeIoRun(&run, @intFromEnum(IoDirection.write), 4, 0x80, 2, 64);
+    makeIoRun(&run, @backingInt(IoDirection.write), 4, 0x80, 2, 64);
     const decoded = try decodeIoExit(&run);
     try std.testing.expectEqual(IoDirection.write, decoded.direction);
     try std.testing.expectEqual(@as(u8, 4), decoded.width);

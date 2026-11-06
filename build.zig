@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const host_is_kvm = builtin.os.tag == .linux and builtin.cpu.arch == .aarch64;
     const optimize = b.standardOptimizeOption(.{
         // Shipping builds are ReleaseSafe only; see SECURITY.md.
-        .preferred_optimize_mode = .ReleaseSafe,
+        .preferred_optimize_mode = .safe,
     });
     const macos_framework_path = macosFrameworkPath(b);
 
@@ -72,9 +72,9 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_exe.step);
 
     const spore_ready = if (target_is_hvf and host_is_hvf) blk: {
-        const sign_spore = b.addSystemCommand(&.{
-            "codesign",                      "--sign", "-", "--force", "--entitlements", "spore.entitlements",
-            b.getInstallPath(.bin, "spore"),
+        const sign_spore = addInstalledCommand(b, &.{
+            "codesign",  "--sign", "-", "--force", "--entitlements", "spore.entitlements",
+            "bin/spore",
         });
         sign_spore.step.dependOn(&install_exe.step);
         b.getInstallStep().dependOn(&sign_spore.step);
@@ -82,12 +82,10 @@ pub fn build(b: *std.Build) void {
     } else &install_exe.step;
 
     const run_step = b.step("run", "Run the spore CLI");
-    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "spore")});
+    const run_cmd = addInstalledCommand(b, &.{"bin/spore"});
     run_cmd.step.dependOn(b.getInstallStep());
     run_step.dependOn(&run_cmd.step);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const internal_test_mod = if (target_is_kvm) blk: {
         const mod = b.createModule(.{
@@ -158,6 +156,9 @@ pub fn build(b: *std.Build) void {
     const run_x86_64_tests = b.addRunArtifact(x86_64_tests);
 
     const test_step = b.step("test", "Run unit tests");
+    // One test binary, so `zig build fuzz --fuzz=N` runs each fuzz corpus once.
+    const fuzz_step = b.step("fuzz", "Run the internal unit tests; fuzz them with --fuzz");
+    fuzz_step.dependOn(&run_internal_tests.step);
     const minimal_exec_initrd_tests = b.addSystemCommand(&.{"bash"});
     minimal_exec_initrd_tests.addFileArg(b.path("scripts/kernel/test-minimal-exec-initrd.sh"));
     minimal_exec_initrd_tests.addDirectoryArg(toybox);
@@ -190,7 +191,7 @@ pub fn build(b: *std.Build) void {
         });
         const build_smoke_shell_mod = b.createModule(.{
             .target = linux_arm64_musl,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .link_libc = true,
         });
         build_smoke_shell_mod.addCSourceFile(.{
@@ -222,18 +223,18 @@ pub fn build(b: *std.Build) void {
         const install_build_run_smoke = b.addInstallArtifact(build_run_smoke, .{});
 
         const build_run_smoke_ready = if (target_is_hvf) blk: {
-            const sign_build_run_smoke = b.addSystemCommand(&.{
-                "codesign",                                      "--sign", "-", "--force", "--entitlements", "spore.entitlements",
-                b.getInstallPath(.bin, "spore-build-run-smoke"),
+            const sign_build_run_smoke = addInstalledCommand(b, &.{
+                "codesign",                  "--sign", "-", "--force", "--entitlements", "spore.entitlements",
+                "bin/spore-build-run-smoke",
             });
             sign_build_run_smoke.step.dependOn(&install_build_run_smoke.step);
             break :blk &sign_build_run_smoke.step;
         } else &install_build_run_smoke.step;
 
-        const run_build_smoke = b.addSystemCommand(&.{
-            b.getInstallPath(.bin, "spore-build-run-smoke"),
-            b.getInstallPath(.bin, "spore-build-smoke-sh"),
-            b.getInstallPath(.bin, "spore"),
+        const run_build_smoke = addInstalledCommand(b, &.{
+            "bin/spore-build-run-smoke",
+            "bin/spore-build-smoke-sh",
+            "bin/spore",
         });
         run_build_smoke.step.dependOn(build_run_smoke_ready);
         run_build_smoke.step.dependOn(&install_build_smoke_shell.step);
@@ -242,10 +243,10 @@ pub fn build(b: *std.Build) void {
         const build_run_smoke_step = b.step("spore-build-run-smoke", "Run the VM-backed spore build RUN executor smoke test");
         build_run_smoke_step.dependOn(&run_build_smoke.step);
 
-        const run_large_copy_smoke = b.addSystemCommand(&.{
-            b.getInstallPath(.bin, "spore-build-run-smoke"),
-            b.getInstallPath(.bin, "spore-build-smoke-sh"),
-            b.getInstallPath(.bin, "spore"),
+        const run_large_copy_smoke = addInstalledCommand(b, &.{
+            "bin/spore-build-run-smoke",
+            "bin/spore-build-smoke-sh",
+            "bin/spore",
             "--large-copy",
         });
         run_large_copy_smoke.step.dependOn(build_run_smoke_ready);
@@ -255,9 +256,9 @@ pub fn build(b: *std.Build) void {
         const build_large_copy_smoke_step = b.step("spore-build-large-copy-smoke", "Run the VM-backed multi-GiB spore build COPY smoke test");
         build_large_copy_smoke_step.dependOn(&run_large_copy_smoke.step);
 
-        const run_large_run_smoke = b.addSystemCommand(&.{
-            b.getInstallPath(.bin, "spore-build-run-smoke"),
-            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+        const run_large_run_smoke = addInstalledCommand(b, &.{
+            "bin/spore-build-run-smoke",
+            "bin/spore-build-smoke-sh",
             "--large-run",
         });
         run_large_run_smoke.step.dependOn(build_run_smoke_ready);
@@ -266,13 +267,13 @@ pub fn build(b: *std.Build) void {
         const build_large_run_smoke_step = b.step("spore-build-large-run-smoke", "Run the VM-backed 512 MiB nonzero spore build RUN smoke test");
         build_large_run_smoke_step.dependOn(&run_large_run_smoke.step);
 
-        const run_block_enospc_cli_smoke = b.addSystemCommand(&.{
+        const run_block_enospc_cli_smoke = addInstalledCommand(b, &.{
             "bash",
             "test/smoke/rootfs/build-enospc-cli.sh",
             "block",
-            b.getInstallPath(.bin, "spore"),
-            b.getInstallPath(.bin, "spore-build-run-smoke"),
-            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+            "bin/spore",
+            "bin/spore-build-run-smoke",
+            "bin/spore-build-smoke-sh",
         });
         run_block_enospc_cli_smoke.step.dependOn(build_run_smoke_ready);
         run_block_enospc_cli_smoke.step.dependOn(&install_build_smoke_shell.step);
@@ -281,13 +282,13 @@ pub fn build(b: *std.Build) void {
         const build_block_enospc_smoke_step = b.step("spore-build-block-enospc-smoke", "Run the VM-backed spore build block ENOSPC publication smoke test");
         build_block_enospc_smoke_step.dependOn(&run_block_enospc_cli_smoke.step);
 
-        const run_inode_enospc_cli_smoke = b.addSystemCommand(&.{
+        const run_inode_enospc_cli_smoke = addInstalledCommand(b, &.{
             "bash",
             "test/smoke/rootfs/build-enospc-cli.sh",
             "inode",
-            b.getInstallPath(.bin, "spore"),
-            b.getInstallPath(.bin, "spore-build-run-smoke"),
-            b.getInstallPath(.bin, "spore-build-smoke-sh"),
+            "bin/spore",
+            "bin/spore-build-run-smoke",
+            "bin/spore-build-smoke-sh",
         });
         run_inode_enospc_cli_smoke.step.dependOn(build_run_smoke_ready);
         run_inode_enospc_cli_smoke.step.dependOn(&install_build_smoke_shell.step);
@@ -303,7 +304,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/x86_64_board_smoke.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .link_libc = true,
         });
         // The board smoke runs /bin/blkcheck, so it always embeds the helpers.
@@ -418,4 +419,18 @@ fn linkHypervisor(mod: *std.Build.Module, framework_path: ?std.Build.LazyPath) v
         mod.addSystemFrameworkPath(path);
     }
     mod.linkFramework("Hypervisor", .{});
+}
+
+/// A Run step for `argv`, where each `bin/NAME` element is the installed
+/// `NAME`, passed as an absolute path.
+fn addInstalledCommand(b: *std.Build, argv: []const []const u8) *std.Build.Step.Run {
+    const run = std.Build.Step.Run.create(b, b.fmt("run {s}", .{argv[0]}));
+    for (argv) |arg| {
+        if (std.mem.startsWith(u8, arg, "bin/")) {
+            run.addFileArg2(.{ .relative = .{ .base = .install_bin, .sub_path = arg["bin/".len..] } }, .{ .make_absolute = true });
+        } else {
+            run.addArg(arg);
+        }
+    }
+    return run;
 }

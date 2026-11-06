@@ -56,9 +56,9 @@ pub const FrameError = error{
 pub fn writeHeader(buf: *[header_len]u8, header: Header) void {
     @memcpy(buf[0..4], magic);
     buf[4] = version;
-    buf[5] = @intFromEnum(header.frame_type);
+    buf[5] = @backingInt(header.frame_type);
     std.mem.writeInt(u16, buf[6..8], header.flags, .little);
-    std.mem.writeInt(u32, buf[8..12], @intFromEnum(header.stream_id), .little);
+    std.mem.writeInt(u32, buf[8..12], @backingInt(header.stream_id), .little);
     std.mem.writeInt(u64, buf[12..20], header.offset, .little);
     std.mem.writeInt(u32, buf[20..24], header.payload_len, .little);
 }
@@ -149,11 +149,11 @@ test "rejects malformed headers" {
     buf[5] = 99;
     try std.testing.expectError(error.UnknownFrameType, readHeader(&buf));
 
-    buf[5] = @intFromEnum(FrameType.data);
+    buf[5] = @backingInt(FrameType.data);
     std.mem.writeInt(u32, buf[8..12], 99, .little);
     try std.testing.expectError(error.UnknownStreamId, readHeader(&buf));
 
-    std.mem.writeInt(u32, buf[8..12], @intFromEnum(StreamId.stdout), .little);
+    std.mem.writeInt(u32, buf[8..12], @backingInt(StreamId.stdout), .little);
     std.mem.writeInt(u32, buf[20..24], max_payload_len + 1, .little);
     try std.testing.expectError(error.PayloadTooLarge, readHeader(&buf));
 }

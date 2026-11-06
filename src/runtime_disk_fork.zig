@@ -73,8 +73,8 @@ pub const Descriptor = struct {
         @memset(out, 0);
         @memcpy(out[0..magic.len], magic);
         std.mem.writeInt(u16, out[8..10], version, .little);
-        out[10] = @intFromEnum(self.baseline.kind);
-        out[11] = @intFromEnum(self.clone_method);
+        out[10] = @backingInt(self.baseline.kind);
+        out[11] = @backingInt(self.clone_method);
         std.mem.writeInt(u64, out[16..24], self.logical_size, .little);
         std.mem.writeInt(u64, out[24..32], self.chunk_size, .little);
         std.mem.writeInt(u64, out[32..40], self.chunk_count, .little);

@@ -329,19 +329,20 @@ pub fn hostCounterFrequencyHz() !u64 {
 /// virtio devices.
 pub fn checkManifest(manifest: spore.Manifest, expected: spore.Platform, device_count: usize) !void {
     const saved = manifest.platform;
-    inline for (std.meta.fields(spore.Platform)) |field| {
-        const saved_value = @field(saved, field.name);
-        const expected_value = @field(expected, field.name);
-        if (field.type == []const u8) {
+    const info = @typeInfo(spore.Platform).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        const saved_value = @field(saved, name);
+        const expected_value = @field(expected, name);
+        if (T == []const u8) {
             if (!std.mem.eql(u8, saved_value, expected_value)) {
-                std.log.warn("platform mismatch: {s}={s} expected={s}", .{ field.name, saved_value, expected_value });
+                std.log.warn("platform mismatch: {s}={s} expected={s}", .{ name, saved_value, expected_value });
                 return error.PlatformMismatch;
             }
         } else if (saved_value != expected_value) {
-            const address = comptime std.mem.endsWith(u8, field.name, "_base") or std.mem.endsWith(u8, field.name, "_stride");
+            const address = comptime std.mem.endsWith(u8, name, "_base") or std.mem.endsWith(u8, name, "_stride");
             const format = if (address) "platform mismatch: {s}=0x{x} expected=0x{x}{s}" else "platform mismatch: {s}={d} expected={d}{s}";
-            const note = if (comptime std.mem.eql(u8, field.name, "counter_frequency_hz")) "; cross-frequency architected timer restore unsupported" else "";
-            std.log.warn(format, .{ field.name, saved_value, expected_value, note });
+            const note = if (comptime std.mem.eql(u8, name, "counter_frequency_hz")) "; cross-frequency architected timer restore unsupported" else "";
+            std.log.warn(format, .{ name, saved_value, expected_value, note });
             return error.PlatformMismatch;
         }
     }
@@ -381,12 +382,13 @@ test "manifest platform check accepts its contract and rejects each differing fi
     try checkManifest(manifest, expected, 0);
     try std.testing.expectError(error.PlatformMismatch, checkManifest(manifest, expected, 1));
 
-    inline for (std.meta.fields(spore.Platform)) |field| {
+    const info = @typeInfo(spore.Platform).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
         manifest.platform = expected;
-        if (field.type == []const u8) {
-            @field(manifest.platform, field.name) = "other";
+        if (T == []const u8) {
+            @field(manifest.platform, name) = "other";
         } else {
-            @field(manifest.platform, field.name) += 1;
+            @field(manifest.platform, name) += 1;
         }
         try std.testing.expectError(error.PlatformMismatch, checkManifest(manifest, expected, 0));
     }

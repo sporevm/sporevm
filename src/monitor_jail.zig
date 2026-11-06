@@ -48,7 +48,7 @@ const SockFprog = extern struct {
     filter: [*]const SockFilter,
 };
 
-const exec_denied: u32 = linux.SECCOMP.RET.ERRNO | @as(u32, @intFromEnum(std.posix.E.ACCES));
+const exec_denied: u32 = linux.SECCOMP.RET.ERRNO | @as(u32, @backingInt(std.posix.E.ACCES));
 const audit_arch_current: u32 = switch (builtin.cpu.arch) {
     .aarch64 => 0xc00000b7,
     .x86_64 => 0xc000003e,
@@ -64,7 +64,7 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) SockFilter {
 }
 
 fn applyLinux() !void {
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS) return error.MonitorJailFailed;
+    if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS) return error.MonitorJailFailed;
 
     const filter = linuxExecDenyFilter();
     const program = SockFprog{ .len = filter.len, .filter = &filter };
@@ -97,9 +97,9 @@ fn linuxExecDenyFilter() [11]SockFilter {
         stmt(linux.BPF.LD | linux.BPF.W | linux.BPF.ABS, @offsetOf(linux.SECCOMP.data, "nr")),
         jump(linux.BPF.JMP | linux.BPF.JSET | linux.BPF.K, x32_syscall_bit, 0, 1),
         stmt(linux.BPF.RET | linux.BPF.K, linux.SECCOMP.RET.KILL_PROCESS),
-        jump(linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K, @intFromEnum(linux.SYS.execve), 0, 1),
+        jump(linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K, @backingInt(linux.SYS.execve), 0, 1),
         stmt(linux.BPF.RET | linux.BPF.K, exec_denied),
-        jump(linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K, @intFromEnum(linux.SYS.execveat), 0, 1),
+        jump(linux.BPF.JMP | linux.BPF.JEQ | linux.BPF.K, @backingInt(linux.SYS.execveat), 0, 1),
         stmt(linux.BPF.RET | linux.BPF.K, exec_denied),
         stmt(linux.BPF.RET | linux.BPF.K, linux.SECCOMP.RET.ALLOW),
     };
@@ -129,14 +129,14 @@ fn evalSeccompFilter(filter: []const SockFilter, arch: u32, nr: u32) !u32 {
 
 test "linux monitor jail denies native exec and kills x32 syscalls" {
     const filter = linuxExecDenyFilter();
-    const denied = linux.SECCOMP.RET.ERRNO | @as(u32, @intFromEnum(std.posix.E.ACCES));
+    const denied = linux.SECCOMP.RET.ERRNO | @as(u32, @backingInt(std.posix.E.ACCES));
     const killed = linux.SECCOMP.RET.KILL_PROCESS;
     const audit_arch_i386: u32 = 0x40000003;
 
-    try std.testing.expectEqual(denied, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.SYS.execve)));
-    try std.testing.expectEqual(denied, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.SYS.execveat)));
-    try std.testing.expectEqual(linux.SECCOMP.RET.ALLOW, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.SYS.getpid)));
-    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_i386, @intFromEnum(linux.SYS.getpid)));
-    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.syscalls.X32.execve)));
-    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_current, @intFromEnum(linux.syscalls.X32.execveat)));
+    try std.testing.expectEqual(denied, try evalSeccompFilter(&filter, audit_arch_current, @backingInt(linux.SYS.execve)));
+    try std.testing.expectEqual(denied, try evalSeccompFilter(&filter, audit_arch_current, @backingInt(linux.SYS.execveat)));
+    try std.testing.expectEqual(linux.SECCOMP.RET.ALLOW, try evalSeccompFilter(&filter, audit_arch_current, @backingInt(linux.SYS.getpid)));
+    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_i386, @backingInt(linux.SYS.getpid)));
+    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_current, @backingInt(linux.syscalls.X32.execve)));
+    try std.testing.expectEqual(killed, try evalSeccompFilter(&filter, audit_arch_current, @backingInt(linux.syscalls.X32.execveat)));
 }

@@ -203,7 +203,7 @@ fn openStagingSession(io: Io, allocator: std.mem.Allocator, cache_root: []const 
     const lock = try dir.createFile(io, ".lock", .{
         .read = true,
         .truncate = false,
-        .permissions = @enumFromInt(0o600),
+        .permissions = @fromBackingInt(@intCast(0o600)),
     });
     errdefer lock.close(io);
     if (try lock.tryLock(io, .exclusive)) {
@@ -284,7 +284,7 @@ pub fn fetch(
         };
         try writer.interface.flush();
         try file.sync(io);
-        try Io.Dir.cwd().setFilePermissions(io, path, @enumFromInt(0o400), .{ .follow_symlinks = false });
+        try Io.Dir.cwd().setFilePermissions(io, path, @fromBackingInt(@intCast(0o400)), .{ .follow_symlinks = false });
         return .{
             .path = path,
             .source_name = source_name,
@@ -478,7 +478,7 @@ fn createStagingFile(allocator: std.mem.Allocator, io: Io, dir: []const u8) !str
         const file = Io.Dir.cwd().createFile(io, path, .{
             .read = true,
             .exclusive = true,
-            .permissions = @enumFromInt(0o600),
+            .permissions = @fromBackingInt(@intCast(0o600)),
         }) catch |err| switch (err) {
             error.PathAlreadyExists => continue,
             else => |other| return other,
@@ -603,7 +603,7 @@ fn parsedDate(day: u64, month: u64, year: u64, hour: u64, minute: u64, second: u
     if (year > std.math.maxInt(std.time.epoch.Year) or month < 1 or month > 12 or day < 1 or
         hour > 23 or minute > 59 or second > 59) return null;
     const typed_year: std.time.epoch.Year = @intCast(year);
-    const typed_month: std.time.epoch.Month = @enumFromInt(month);
+    const typed_month: std.time.epoch.Month = @fromBackingInt(@intCast(month));
     if (day > std.time.epoch.getDaysInMonth(typed_year, typed_month)) return null;
     var y: i64 = @intCast(year);
     const m: i64 = @intCast(month);

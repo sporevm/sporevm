@@ -61,12 +61,13 @@ pub const Schema = struct {
             @setEvalBranchQuota(10_000);
             std.debug.assert(@FieldType(T, "schema_version") == u32);
             var fields: []const u8 = "";
-            for (std.meta.fieldNames(T)) |name| {
+            for (@typeInfo(T).@"struct".field_names) |name| {
                 if (std.mem.eql(u8, name, "schema") or std.mem.eql(u8, name, "schema_version")) continue;
                 const separator = if (fields.len == 0) "" else ", ";
                 fields = fields ++ separator ++ "`" ++ name ++ "`: " ++ jsonType(@FieldType(T, name));
             }
-            return .{ .name = std.meta.fieldInfo(T, .schema).defaultValue().?, .fields = fields };
+            const schema = std.meta.fieldInfo(T, .schema);
+            return .{ .name = schema.attrs.defaultValue(schema.type).?, .fields = fields };
         }
     }
 };
@@ -149,15 +150,26 @@ const VersionResult = struct {
 
 fn version(ctx: *const Ctx, _: []const []const u8) !void {
     if (ctx.mode == .json) {
-        try machine_output.writeJson(ctx.init.arena.allocator(), ctx.stdout, VersionResult{ .build_mode = @tagName(builtin.mode) });
+        try machine_output.writeJson(ctx.init.arena.allocator(), ctx.stdout, VersionResult{ .build_mode = buildModeName(builtin.mode) });
     } else {
         try writeVersion(ctx.stdout, builtin.mode);
     }
 }
 
 /// `spore --version` and `spore version`.
-pub fn writeVersion(writer: *Io.Writer, mode: std.builtin.OptimizeMode) !void {
-    try writer.print("spore {s} ({t})\n", .{ version_value, mode });
+pub fn writeVersion(writer: *Io.Writer, mode: std.lang.Optimize) !void {
+    try writer.print("spore {s} ({s})\n", .{ version_value, buildModeName(mode) });
+}
+
+/// The build mode names `spore version` has always printed, which predate
+/// Zig 0.17's `debug`/`safe`/`fast`/`small`.
+fn buildModeName(mode: std.lang.Optimize) []const u8 {
+    return switch (mode) {
+        .debug => "Debug",
+        .safe => "ReleaseSafe",
+        .fast => "ReleaseFast",
+        .small => "ReleaseSmall",
+    };
 }
 
 /// The flags before the command word.
@@ -497,11 +509,11 @@ test "version output distinguishes development and release builds" {
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
 
-    try writeVersion(&out.writer, .Debug);
+    try writeVersion(&out.writer, .debug);
     try std.testing.expectEqualStrings("spore " ++ version_value ++ " (Debug)\n", out.written());
 
     out.clearRetainingCapacity();
-    try writeVersion(&out.writer, .ReleaseSafe);
+    try writeVersion(&out.writer, .safe);
     try std.testing.expectEqualStrings("spore " ++ version_value ++ " (ReleaseSafe)\n", out.written());
 }
 

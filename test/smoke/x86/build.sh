@@ -46,15 +46,16 @@ pub fn main() u8 {
     if (fork_rc == 0) {
         const rc = asm volatile ("syscall"
             : [ret] "={rax}" (-> usize),
-            : [number] "{rax}" (0x40000000 | @intFromEnum(linux.SYS.socket)),
+            : [number] "{rax}" (0x40000000 | @backingInt(linux.SYS.socket)),
               [family] "{rdi}" (@as(usize, linux.AF.VSOCK)),
               [kind] "{rsi}" (@as(usize, linux.SOCK.STREAM)),
               [protocol] "{rdx}" (@as(usize, 0)),
             : .{ .rcx = true, .r11 = true, .memory = true });
-        linux.exit_group(@intFromEnum(linux.errno(rc)));
+        linux.exit_group(@backingInt(linux.errno(rc)));
     }
-    var status: u32 = 0;
-    if (linux.errno(linux.waitpid(@intCast(fork_rc), &status, 0)) != .SUCCESS) return 1;
+    var raw_status: i32 = 0;
+    if (linux.errno(linux.waitpid(@intCast(fork_rc), &raw_status, 0)) != .SUCCESS) return 1;
+    const status: u32 = @bitCast(raw_status);
     if (linux.W.IFSIGNALED(status) and linux.W.TERMSIG(status) == .SYS) return 0;
     var buf: [128]u8 = undefined;
     const message = std.fmt.bufPrint(&buf, "x32 socket(AF_VSOCK) survived the RUN seccomp filter: wait status {d}\n", .{status}) catch unreachable;

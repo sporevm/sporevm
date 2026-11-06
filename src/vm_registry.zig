@@ -42,7 +42,7 @@ const monitor_log_file = "monitor.log";
 const private_dir_permissions: Io.File.Permissions = if (builtin.os.tag == .windows)
     .default_dir
 else
-    @enumFromInt(0o700);
+    @fromBackingInt(@intCast(0o700));
 
 const last_lifecycle_error_max = 2048;
 threadlocal var last_lifecycle_error_buf: [last_lifecycle_error_max]u8 = undefined;
@@ -350,7 +350,7 @@ pub const Entry = struct {
         // readSpecIn must read back every spec written here, and readFileAlloc
         // fails once its limit is reached.
         if (json.len >= max_metadata_bytes) return error.SpecTooLarge;
-        var file = try self.dir.createFileAtomic(io, spec_file, .{ .permissions = @enumFromInt(0o600), .replace = true });
+        var file = try self.dir.createFileAtomic(io, spec_file, .{ .permissions = @fromBackingInt(@intCast(0o600)), .replace = true });
         defer file.deinit(io);
         try file.file.writeStreamingAll(io, json);
         try file.file.sync(io);
@@ -431,7 +431,7 @@ pub fn writeDiskForkClaim(allocator: std.mem.Allocator, io: Io, paths: Paths, sp
     try validateDiskForkClaim(spec, claim_value);
     const json = try std.json.Stringify.valueAlloc(allocator, claim_value, .{});
     defer allocator.free(json);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.disk_claim_path, .data = json, .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) } });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.disk_claim_path, .data = json, .flags = .{ .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) } });
 }
 
 fn validateDiskForkClaim(spec: Spec, claim_value: DiskForkClaim) !void {
@@ -564,7 +564,7 @@ pub fn claim(io: Io, paths: Paths) !Claim {
     const lock = Io.Dir.cwd().createFile(io, paths.lock_path, .{
         .exclusive = true,
         .read = true,
-        .permissions = @enumFromInt(0o600),
+        .permissions = @fromBackingInt(@intCast(0o600)),
     }) catch |err| switch (err) {
         // A racing `rm` saw the directory without a lock and removed it.
         error.FileNotFound, error.PathAlreadyExists => return claimLost(paths),
@@ -598,7 +598,7 @@ pub fn tryLockForRemoval(io: Io, paths: Paths) !?Io.File {
             error.FileNotFound => Io.Dir.cwd().createFile(io, paths.lock_path, .{
                 .exclusive = true,
                 .read = true,
-                .permissions = @enumFromInt(0o600),
+                .permissions = @fromBackingInt(@intCast(0o600)),
             }) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => continue,
                 error.FileNotFound => return error.NamedVmNotFound,
@@ -770,7 +770,7 @@ pub fn requirePrivateDir(io: Io, path: []const u8) !void {
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != Io.File.Kind.directory) return error.InvalidRuntimeDir;
     if (comptime builtin.os.tag != .windows) {
-        const mode = @intFromEnum(stat.permissions);
+        const mode = @backingInt(stat.permissions);
         if (mode & 0o077 != 0) return error.InsecureRuntimeDir;
     }
 }
@@ -1240,8 +1240,8 @@ test "lifecycle rejects insecure existing runtime directories" {
     var root_dir = try TestDir.init();
     defer root_dir.deinit();
     const root = root_dir.root;
-    _ = try Io.Dir.cwd().createDirPathStatus(io, root, @enumFromInt(0o755));
-    try Io.Dir.cwd().setFilePermissions(io, root, @enumFromInt(0o755), .{});
+    _ = try Io.Dir.cwd().createDirPathStatus(io, root, @fromBackingInt(@intCast(0o755)));
+    try Io.Dir.cwd().setFilePermissions(io, root, @fromBackingInt(@intCast(0o755)), .{});
 
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);

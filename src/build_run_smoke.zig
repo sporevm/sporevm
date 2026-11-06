@@ -352,7 +352,7 @@ fn validateProvidedSmokeRoot(allocator: std.mem.Allocator, io: Io, path: []const
 
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != .directory) return error.InvalidSmokeWorkspace;
-    if (@intFromEnum(stat.permissions) & 0o077 != 0) return error.InsecureSmokeWorkspace;
+    if (@backingInt(stat.permissions) & 0o077 != 0) return error.InsecureSmokeWorkspace;
 
     var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
     defer dir.close(io);

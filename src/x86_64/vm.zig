@@ -114,7 +114,7 @@ const WakeSet = struct {
         for (self.vcpus) |*vcpu| {
             requestWake(vcpu.run_bytes);
             const tid = vcpu.thread_id.load(.acquire);
-            if (tid != 0) _ = linux.tgkill(linux.getpid(), tid, @enumFromInt(@intFromEnum(wake_signal)));
+            if (tid != 0) _ = linux.tgkill(linux.getpid(), tid, @fromBackingInt(@intCast(@backingInt(wake_signal))));
         }
     }
 };
@@ -1116,11 +1116,11 @@ fn validateTransportSlots(
     try board.validateDeviceInventory();
     for (transports, board.virtio_inventory) |transport, attachment| {
         const expected = switch (attachment.role) {
-            .root => if (disk_backends[0] != null) @intFromEnum(attachment.device) else 0,
-            .context => if (disk_backends[1] != null) @intFromEnum(attachment.device) else 0,
-            .build => if (disk_backends[2] != null) @intFromEnum(attachment.device) else 0,
-            .cache => if (disk_backends[3] != null) @intFromEnum(attachment.device) else 0,
-            .console, .net, .vsock, .rng => @intFromEnum(attachment.device),
+            .root => if (disk_backends[0] != null) @backingInt(attachment.device) else 0,
+            .context => if (disk_backends[1] != null) @backingInt(attachment.device) else 0,
+            .build => if (disk_backends[2] != null) @backingInt(attachment.device) else 0,
+            .cache => if (disk_backends[3] != null) @backingInt(attachment.device) else 0,
+            .console, .net, .vsock, .rng => @backingInt(attachment.device),
         };
         if (transport.dev.device_id != expected) return error.InvalidDeviceInventory;
     }

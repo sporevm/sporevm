@@ -490,7 +490,7 @@ test "spore-net gateway spawns netd with policy arguments" {
     );
     defer allocator.free(script);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
-    try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
+    try Io.Dir.cwd().setFilePermissions(io, script_path, @fromBackingInt(@intCast(0o755)), .{});
 
     var process: Process = undefined;
     try process.start(io, allocator, script_path, false, .{ .egress = .deny_all });

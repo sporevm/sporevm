@@ -2,7 +2,7 @@
 aws-cli = "2.36.7"
 gh = "2.89.0"
 svu = "3.4.1"
-zig = "0.16.0"
+zig = "0.17.1"
 
 [tasks.build]
 run = "zig build"
