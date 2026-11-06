@@ -146,7 +146,9 @@ cost must stay visible in benchmark and runtime stats.
 Elastic capture currently uses the full-scan path so the maximum-sized portable
 memory index and optional local backing remain authoritative for every plugged
 range. Multi-vCPU HVF capture also uses the full scan. Fixed-memory KVM capture
-and single-vCPU HVF capture retain the dirty-tracking fast path.
+and single-vCPU HVF capture retain the dirty-tracking fast path. Both paths
+write chunks through `src/chunk_sealer.zig`, which fsyncs each chunk and its
+directory entry before the manifest names it.
 
 ## Current Limits
 

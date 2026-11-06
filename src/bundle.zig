@@ -26,6 +26,7 @@ const saved_spore_pin = @import("saved_spore_pin.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const disk_index = @import("disk_index.zig");
 const spore = @import("spore.zig");
+const spore_fork = @import("spore_fork.zig");
 const system = @import("system.zig");
 const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
@@ -4449,7 +4450,7 @@ test "pack children writes bundle index and unpacks selected child" {
     ram[spore.chunk_size + 2] = 0x91;
     const memory = try spore.saveMemory(arena, parent_dir, ram);
     try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 41));
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
 
     const pack_result = try pack(arena, .{
         .io = io,
@@ -4537,7 +4538,7 @@ test "pull file bundle materializes children through chunk cache" {
     try writeFileAll(rootfs_source_path, "pull rootfs artifact bytes");
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 71, artifact));
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
 
     const pack_result = try pack(arena, .{
         .io = io,
@@ -4627,7 +4628,7 @@ test "push and pull s3 indexed bundle through verified remote cache" {
     try writeFileAll(rootfs_source_path, "s3 pull rootfs artifact bytes");
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 101, artifact));
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
 
     const pack_result = try pack(arena, .{
         .io = io,
@@ -4752,7 +4753,7 @@ test "push and pull s3 indexed bundle carries disk indexes" {
     var manifest = testRootfsManifest(memory, ram.len, 121, artifact);
     try attachTestDiskIndex(arena, parent_dir, &manifest, rootfs_source_path, 4096, "remote disk bundle payload");
     try spore.saveManifest(arena, parent_dir, manifest);
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
 
     const pack_result = try pack(arena, .{
         .io = io,
@@ -5051,7 +5052,7 @@ test "pull fails closed on corrupt chunk cache entries" {
     @memset(ram, 0x62);
     const memory = try spore.saveMemory(arena, parent_dir, ram);
     try spore.saveManifest(arena, parent_dir, testManifest(memory, ram.len, 81));
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
     _ = try pack(arena, .{
         .io = io,
         .spore_dir = parent_dir,
@@ -5203,7 +5204,7 @@ test "pack children writes exact rootfs policy and unpacks selected rootfs child
     try writeFileAll(rootfs_source_path, "rootfs child bundle bytes");
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, pack_cache_root, rootfs_source_path);
     try spore.saveManifest(arena, parent_dir, testRootfsManifest(memory, ram.len, 51, artifact));
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 2 });
 
     _ = try pack(arena, .{
         .io = io,
@@ -5338,7 +5339,7 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     });
     try std.testing.expectEqualStrings(single_pack.bundle_digest, repacked.bundle_digest);
     try std.testing.expectEqual(single_pack.rootfs_payload_bytes, repacked.rootfs_payload_bytes);
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
 
     const pack_result = try pack(arena, .{
         .io = io,
@@ -5569,7 +5570,7 @@ test "metadata-only rootfs policy requires explicit prepared cache" {
     defer single_rootfs_index.deinit();
     try std.testing.expectEqualStrings(rootfs_policy_metadata_only, single_rootfs_index.value.artifacts[0].policy);
 
-    _ = try spore.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
+    _ = try spore_fork.fork(arena, .{ .parent_dir = parent_dir, .out_dir = children_dir, .count = 1 });
     _ = try pack(arena, .{
         .io = io,
         .spore_dir = parent_dir,

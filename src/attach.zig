@@ -16,6 +16,7 @@ const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const spore = @import("spore.zig");
+const spore_fork = @import("spore_fork.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const virtio_net = @import("virtio/net.zig");
@@ -363,7 +364,7 @@ fn prepareAttach(allocator: std.mem.Allocator, manifest_generation: spore.Genera
     if (generation_params) |params| {
         _ = try gen_dev.setResume(manifest_generation.generation, params);
     } else {
-        try spore.refreshResumeParams(allocator, &gen_dev);
+        try spore_fork.refreshResumeParams(allocator, &gen_dev);
     }
     const generation_state = try gen_dev.capture(allocator);
     errdefer allocator.free(generation_state.params_b64);

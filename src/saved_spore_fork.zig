@@ -7,6 +7,7 @@ const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const context_mod = @import("context.zig");
 const disk_index = @import("disk_index.zig");
+const local_backing = @import("local_backing.zig");
 const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -16,6 +17,7 @@ const runtime_disk_mod = @import("runtime_disk.zig");
 const runtime_disk_fork_capture = @import("runtime_disk_fork_capture.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const spore = @import("spore.zig");
+const spore_fork = @import("spore_fork.zig");
 const system = @import("system.zig");
 
 const Context = context_mod.Context;
@@ -169,7 +171,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
     const fork_out = try std.fmt.allocPrint(arena, "{s}.pin-stage-{x}", .{ options.out_dir, std.mem.readInt(u64, &nonce, .little) });
     var cleanup_stage = true;
     defer if (cleanup_stage) std.Io.Dir.cwd().deleteTree(context.io, fork_out) catch {};
-    const result = try spore.fork(arena, .{
+    const result = try spore_fork.fork(arena, .{
         .parent_dir = options.parent_dir,
         .out_dir = fork_out,
         .count = options.count,
@@ -403,7 +405,7 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     defer env.deinit();
     try env.put(local_paths.rootfs_cache_env, cache);
     try env.put(local_paths.runtime_dir_env, runtime_root);
-    try spore.writeLocalMemoryBackingProof(arena, &env, parent, memory, ram.len);
+    try local_backing.writeLocalMemoryBackingProof(arena, &env, parent, memory, ram.len);
     const context = Context{ .io = io, .environ_map = &env };
 
     // A portable/local-CAS fork stays hidden until every new CAS directory
@@ -520,9 +522,9 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
         var parsed = try spore.loadManifest(arena, child);
         defer parsed.deinit();
         try std.testing.expect(parsed.value.memory.backing != null);
-        const backing_plan = try spore.openProvenLocalMemoryBacking(arena, &env, child, parsed.value.memory, ram.len);
-        try std.testing.expectEqual(spore.LocalBackingRestoreSource.local_backing, backing_plan.source);
-        try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_valid, backing_plan.reason);
+        const backing_plan = try local_backing.openProvenLocalMemoryBacking(arena, &env, child, parsed.value.memory, ram.len);
+        try std.testing.expectEqual(local_backing.LocalBackingRestoreSource.local_backing, backing_plan.source);
+        try std.testing.expectEqual(local_backing.LocalBackingRestoreReason.proof_valid, backing_plan.reason);
         defer if (backing_plan.fd) |fd| {
             _ = std.c.close(fd);
         };

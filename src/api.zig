@@ -27,6 +27,7 @@ const saved_spore_pin = @import("saved_spore_pin.zig");
 const run_mod = @import("run.zig");
 const gicv3 = @import("aarch64/gicv3.zig");
 const spore = @import("spore.zig");
+const spore_fork = @import("spore_fork.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
 
@@ -773,7 +774,7 @@ fn prepareRunFromGenerationState(
 
     var gen_dev = generation.Device{};
     try gen_dev.restore(allocator, manifest_generation);
-    try spore.refreshResumeParams(allocator, &gen_dev);
+    try spore_fork.refreshResumeParams(allocator, &gen_dev);
     return .{
         .resume_generation = try gen_dev.capture(allocator),
         .start_generation_params = try allocator.dupe(u8, gen_dev.paramsPayload()),

@@ -16,6 +16,7 @@ const disk_layer = @import("../disk_layer.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const gicv3 = @import("gicv3.zig");
+const local_backing = @import("../local_backing.zig");
 const local_paths = @import("../local_paths.zig");
 const platform = @import("../platform.zig");
 const ram_restore = @import("../ram_restore.zig");
@@ -877,7 +878,7 @@ pub fn writeSnapshot(
     const memory_ms = clock.nowMs() - memory_start;
     const memory_state = if (source.memory_device) |device| try device.captureState(arena, source.ram_size) else null;
     if (config.environ_map) |environ| {
-        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, source.ram_bytes.len);
+        try local_backing.writeLocalMemoryBackingProof(arena, environ, dir, memory, source.ram_bytes.len);
     }
     const disk_snapshot = if (target.disk == .finish) config.disk_snapshot else null;
     var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;

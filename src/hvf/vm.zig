@@ -21,6 +21,7 @@ const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
 const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
+const spore_fork = @import("../spore_fork.zig");
 const topology = @import("../topology.zig");
 const vmm = @import("../aarch64/vmm.zig");
 const snapshot = @import("snapshot.zig");
@@ -206,7 +207,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         if (m.memory_state) |state| try mem_dev.restoreState(state);
         try vmm.applyTransports(transports, m.devices, ram);
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
-        if (restore.generation == null) try spore.refreshResumeParams(allocator, gen_dev);
+        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, gen_dev);
         try vmm.restoreMachine(allocator, &vm, vcpus, m.machine);
         try vmm.raiseGenerationIrqIfPending(&vm, gen_dev);
         if (restore_stats) |*stats| stats.state_ms = monotonicMs() - state_start;
@@ -937,7 +938,7 @@ fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !Exit
         const state_start = monotonicMs();
         try vmm.applyTransports(transports, manifest.devices, options.ram);
         try devices.gen.restore(allocator, restore.generation orelse manifest.generation);
-        if (restore.generation == null) try spore.refreshResumeParams(allocator, &devices.gen);
+        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, &devices.gen);
         try threaded.restore(allocator, manifest.machine);
         try vmm.raiseGenerationIrqIfPending(vm, &devices.gen);
         if (options.restore_stats.*) |*stats| stats.state_ms = monotonicMs() - state_start;
