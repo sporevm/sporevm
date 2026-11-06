@@ -4,6 +4,8 @@ const std = @import("std");
 
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
+const runtime_disk_lease = @import("runtime_disk_lease.zig");
+const spore = @import("spore.zig");
 
 pub const prepare_type = "disk-fork-prepare";
 pub const prepare_schema = "spore.disk-fork-prepare.v1";
@@ -44,6 +46,10 @@ pub const PreparedResponse = struct {
     batch: []const u8,
     capture_dir: []const u8,
     claims: []const PreparedClaim,
+    /// The baseline every claim shares, as the source recorded it in its
+    /// spec, and the source disk it belongs to. Children run on both.
+    lease: runtime_disk_lease.Lease,
+    disk: ?spore.Disk,
     ram_capture_ns: u64,
     disk_fork_ns: u64,
     source_pause_ns: u64,
@@ -95,6 +101,10 @@ pub fn validatePrepared(response: PreparedResponse) !void {
     if (!std.mem.eql(u8, response.type, prepared_type) or !std.mem.eql(u8, response.schema, prepared_schema)) return error.BadControlResponse;
     if (response.capture_dir.len == 0 or response.capture_dir.len > max_capture_dir_bytes) return error.BadControlResponse;
     if (response.claims.len == 0 or response.claims.len > runtime_disk_claim.max_children_per_batch) return error.BadControlResponse;
+    response.lease.validate() catch return error.BadControlResponse;
+    if (response.disk) |disk| {
+        if (response.lease.baseline_kind != .disk_index or !std.mem.eql(u8, disk.base, response.lease.baseline_identity)) return error.BadControlResponse;
+    }
     var child_names: [runtime_disk_claim.max_children_per_batch][]const u8 = undefined;
     for (response.claims, 0..) |claim, index| {
         if (claim.child_index != index) return error.BadControlResponse;
@@ -109,10 +119,7 @@ pub fn validatePrepared(response: PreparedResponse) !void {
             .baseline_kind = claim.baseline_kind,
             .baseline_identity = claim.baseline_identity,
         }) catch return error.BadControlResponse;
-        if (index > 0) {
-            const baseline = response.claims[0];
-            if (claim.baseline_kind != baseline.baseline_kind or !std.mem.eql(u8, claim.baseline_identity, baseline.baseline_identity)) return error.BadControlResponse;
-        }
+        if (claim.baseline_kind != response.lease.baseline_kind or !std.mem.eql(u8, claim.baseline_identity, response.lease.baseline_identity)) return error.BadControlResponse;
     }
     validateBindings(response.batch, child_names[0..response.claims.len], false, false) catch return error.BadControlResponse;
 }
@@ -148,15 +155,20 @@ test "prepare and cancel requests are strict and versioned" {
     defer cancel.deinit();
 
     const token = "abababababababababababababababababababababababababababababababab";
-    const prepared_json = try std.fmt.allocPrint(
-        allocator,
-        "{{\"type\":\"disk-fork-prepared\",\"schema\":\"spore.disk-fork-prepared.v1\",\"batch\":\"batch-1\",\"capture_dir\":\"/tmp/capture\",\"claims\":[{{\"child\":\"child-0\",\"child_index\":0,\"token\":\"{s}\",\"baseline_kind\":\"rootfs\",\"baseline_identity\":\"blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}],\"ram_capture_ns\":1,\"disk_fork_ns\":2,\"source_pause_ns\":3,\"copied_bytes\":0}}",
-        .{token},
-    );
+    const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const prepared_format = "{{\"type\":\"disk-fork-prepared\",\"schema\":\"spore.disk-fork-prepared.v1\",\"batch\":\"batch-1\",\"capture_dir\":\"/tmp/capture\",\"claims\":[{{\"child\":\"child-0\",\"child_index\":0,\"token\":\"{s}\",\"baseline_kind\":\"rootfs\",\"baseline_identity\":\"{s}\"}}],\"lease\":{{\"store\":\"rootfs_cache\",\"root\":\"/cache\",\"baseline_kind\":\"rootfs\",\"baseline_identity\":\"{s}\"}},\"disk\":null,\"ram_capture_ns\":1,\"disk_fork_ns\":2,\"source_pause_ns\":3,\"copied_bytes\":0}}";
+    const prepared_json = try std.fmt.allocPrint(allocator, prepared_format, .{ token, digest, digest });
     defer allocator.free(prepared_json);
     var prepared = try parsePreparedBytes(allocator, prepared_json);
     defer prepared.deinit();
     try std.testing.expectEqualStrings("child-0", prepared.value.claims[0].child);
+    try std.testing.expectEqualStrings(digest, prepared.value.lease.baseline_identity);
+
+    // Every claim must be for the baseline the lease names.
+    const other = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const mismatched_json = try std.fmt.allocPrint(allocator, prepared_format, .{ token, digest, other });
+    defer allocator.free(mismatched_json);
+    try std.testing.expectError(error.BadControlResponse, parsePreparedBytes(allocator, mismatched_json));
 }
 
 fn fuzzPrepare(_: void, smith: *std.testing.Smith) anyerror!void {

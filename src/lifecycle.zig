@@ -66,8 +66,6 @@ pub const writeSpec = vm_registry.writeSpec;
 pub const readReady = vm_registry.readReady;
 pub const writeReady = vm_registry.writeReady;
 pub const writeCreateTiming = vm_registry.writeCreateTiming;
-pub const writeMonitorTiming = vm_registry.writeMonitorTiming;
-pub const writeMonitorStatsPath = vm_registry.writeMonitorStatsPath;
 pub const writeMonitorStats = vm_registry.writeMonitorStats;
 pub const readPid = vm_registry.readPid;
 pub const writePid = vm_registry.writePid;
@@ -99,6 +97,7 @@ const monitor_reply_deadline_ms = 2_000;
 const testing = if (builtin.is_test) struct {
     var named_restore_authority_barrier: ?*test_barrier.Barrier = null;
     var create_rootfs_barrier: ?*test_barrier.Barrier = null;
+    var fork_source_read_barrier: ?*test_barrier.Barrier = null;
 } else struct {};
 
 const darwin_process = if (builtin.os.tag.isDarwin()) struct {
@@ -1557,9 +1556,9 @@ pub fn forkNamed(
     var disk_fork_ms: ?u64 = null;
     var source_pause_ms: ?u64 = null;
     var child_ready_ms: ?u64 = null;
+    if (comptime builtin.is_test) if (testing.fork_source_read_barrier) |barrier| barrier.pause(init.io);
 
     if (disk_backed) {
-        const lease = try ensureDiskBaselineLease(arena, context, source_paths, &source_spec.value);
         const batch_name = std.fs.path.basename(batch_dir);
         const prepare_request = runtime_disk_fork_control.PrepareRequest{
             .type = runtime_disk_fork_control.prepare_type,
@@ -1575,7 +1574,13 @@ pub fn forkNamed(
         const response = try sendDiskForkPrepareRequest(arena, init.io, ready.value.control_socket_path, prepare_request);
         var prepared = try parseDiskForkPreparedResponse(arena, response);
         defer prepared.deinit();
-        try validatePreparedDiskFork(prepared.value, prepare_request, lease);
+        try validatePreparedDiskFork(prepared.value, prepare_request);
+        // The source monitor names and records the baseline while it holds
+        // the guest, so a save that replaced the disk after this CLI read the
+        // spec is already reflected in the response. The CLI never writes
+        // the source's spec.
+        source_spec.value.disk = prepared.value.disk;
+        source_spec.value.disk_baseline_lease = prepared.value.lease;
         ram_capture_ms = prepared.value.ram_capture_ns / std.time.ns_per_ms;
         disk_fork_ms = prepared.value.disk_fork_ns / std.time.ns_per_ms;
         source_pause_ms = prepared.value.source_pause_ns / std.time.ns_per_ms;
@@ -3826,94 +3831,16 @@ fn hiddenForkBatchDir(allocator: std.mem.Allocator, runtime_root: []const u8) ![
     return std.fs.path.resolve(allocator, &.{ runtime_root, "forks", &leaf });
 }
 
-fn ensureDiskBaselineLease(
-    allocator: std.mem.Allocator,
-    context: Context,
-    paths: Paths,
-    spec: *Spec,
-) !runtime_disk_lease.Lease {
-    const rootfs = spec.rootfs orelse return error.UnsupportedNamedForkDisk;
-    const lease: runtime_disk_lease.Lease = spec.disk_baseline_lease orelse if (spec.disk) |disk| blk: {
-        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.UnsupportedNamedForkDisk;
-        try spore.validateDiskDigest(disk.base);
-        const resume_dir = spec.resume_dir orelse return error.UnsupportedNamedForkDisk;
-        const root = try std.fs.path.resolve(allocator, &.{resume_dir});
-        const forks_root = try std.fs.path.resolve(allocator, &.{ paths.runtime_root, "forks" });
-        if (pathWithin(forks_root, root)) return error.UnsupportedNamedForkDisk;
-        break :blk .{
-            .store = .saved_spore,
-            .root = root,
-            .baseline_kind = .disk_index,
-            .baseline_identity = disk.base,
-        };
-    } else if (rootfs.storage) |storage| blk: {
-        try spore.validateRootfsStorageDescriptor(storage);
-        const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
-        break :blk .{
-            .store = .rootfs_cache,
-            .root = cache_root,
-            .baseline_kind = .disk_index,
-            .baseline_identity = storage.index_digest,
-            .rootfs_storage = storage,
-        };
-    } else blk: {
-        try spore.validateRootfsDigest(rootfs.artifact.digest);
-        const cache_root = try local_paths.rootfsCacheRootPath(allocator, context.environ_map);
-        break :blk .{
-            .store = .rootfs_cache,
-            .root = cache_root,
-            .baseline_kind = .rootfs,
-            .baseline_identity = rootfs.artifact.digest,
-        };
-    };
-    try lease.validate();
-    spec.disk_baseline_lease = lease;
-    if (lease.store == .rootfs_cache) {
-        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, lease.root);
-        defer cache_lock.deinit();
-        switch (lease.baseline_kind) {
-            .rootfs => {
-                const fd = rootfs_cache.openTrustedFromCache(context.io, allocator, lease.root, rootfs) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.DiskForkBaselineUnavailable,
-                };
-                _ = std.c.close(fd);
-            },
-            .disk_index => {
-                const storage = lease.rootfs_storage orelse return error.BadManifest;
-                if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, lease.root, storage)) return error.DiskForkBaselineUnavailable;
-            },
-        }
-        // Publish the root while holding the same lock used by GC/prune. A
-        // collector that started first wins and is verified above; every
-        // collector that starts later observes the lease.
-        try writeSpec(allocator, context.io, paths, spec.*);
-    } else {
-        try writeSpec(allocator, context.io, paths, spec.*);
-    }
-    return lease;
-}
-
 fn validatePreparedDiskFork(
     response: runtime_disk_fork_control.PreparedResponse,
     request: runtime_disk_fork_control.PrepareRequest,
-    lease: runtime_disk_lease.Lease,
 ) !void {
     if (!std.mem.eql(u8, response.batch, request.batch) or
         !std.mem.eql(u8, response.capture_dir, request.out_dir) or
         response.claims.len != request.children.len) return error.BadMonitorResponse;
     for (response.claims, request.children) |claim, child| {
-        if (!std.mem.eql(u8, claim.child, child) or
-            claim.baseline_kind != lease.baseline_kind or
-            !std.mem.eql(u8, claim.baseline_identity, lease.baseline_identity)) return error.BadMonitorResponse;
+        if (!std.mem.eql(u8, claim.child, child)) return error.BadMonitorResponse;
     }
-}
-
-fn pathWithin(parent: []const u8, child: []const u8) bool {
-    if (!std.mem.startsWith(u8, child, parent)) return false;
-    if (child.len == parent.len) return true;
-    if (parent.len != 0 and parent[parent.len - 1] == std.fs.path.sep) return true;
-    return child[parent.len] == std.fs.path.sep;
 }
 
 fn childSporeDir(allocator: std.mem.Allocator, children_dir: []const u8, index: usize) ![]const u8 {
@@ -4816,6 +4743,8 @@ fn parseDiskForkPreparedResponse(
     if (std.mem.eql(u8, envelope.value.type, "error")) {
         const message = envelope.value.message orelse "monitor request failed";
         if (std.mem.endsWith(u8, message, "FastForkUnavailable")) return error.FastForkUnavailable;
+        if (std.mem.eql(u8, message, "UnsupportedNamedForkDisk")) return error.UnsupportedNamedForkDisk;
+        if (std.mem.eql(u8, message, "DiskForkBaselineUnavailable")) return error.DiskForkBaselineUnavailable;
         return monitorRequestFailed(message);
     }
     return runtime_disk_fork_control.parsePreparedBytes(allocator, response) catch return error.BadMonitorResponse;
@@ -6071,6 +6000,95 @@ test "lifecycle fork claims every child name before contacting the source and re
     const released = try pathsFromRoot(allocator, root, "worker-0");
     defer released.deinit(allocator);
     try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, released));
+}
+
+test "lifecycle fork leaves the source spec to its monitor" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const old_dir = try std.fs.path.join(allocator, &.{ tmp_root, "old.spore" });
+    defer allocator.free(old_dir);
+    const new_dir = try std.fs.path.join(allocator, &.{ tmp_root, "new.spore" });
+    defer allocator.free(new_dir);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, root);
+
+    const old_digest = "blake3:" ++ "a" ** 64;
+    const new_digest = "blake3:" ++ "b" ** 64;
+    const old_disk = spore.Disk{ .device = .{ .mmio_slot = 1 }, .size = spore.disk_chunk_size, .base = old_digest };
+    const source_spec = Spec{
+        .name = "source",
+        .backend = "auto",
+        .rootfs = .{ .device = .{ .mmio_slot = 1 }, .artifact = .{ .digest = old_digest, .size = spore.disk_chunk_size } },
+        .disk = old_disk,
+        .disk_baseline_lease = .{ .store = .saved_spore, .root = old_dir, .baseline_kind = .disk_index, .baseline_identity = old_digest },
+    };
+    rejectX86NamedPersistence(source_spec) catch return error.SkipZigTest;
+    // A live source whose control socket does not exist, so the fork fails
+    // at prepare.
+    const source = try pathsFromRoot(allocator, root, "source");
+    defer source.deinit(allocator);
+    var source_claim = try vm_registry.claim(io, source);
+    defer source_claim.abandon(io, source);
+    try writeSpec(allocator, io, source, source_spec);
+    try writeReady(allocator, io, source, .{ .pid = currentTestPid(), .control_socket_path = source.control_socket_path });
+
+    var read_boundary = test_barrier.Barrier{};
+    testing.fork_source_read_barrier = &read_boundary;
+    defer testing.fork_source_read_barrier = null;
+    const Fork = struct {
+        env: *std.process.Environ.Map,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const result = forkNamed(.{
+                .minimal = undefined,
+                .arena = undefined,
+                .gpa = std.testing.allocator,
+                .io = std.testing.io,
+                .environ_map = self.env,
+                .preopens = .empty,
+            }, std.testing.allocator, .{
+                .source_name = "source",
+                .count = 1,
+                .name_pattern = "child-%d",
+                .spore_executable = "/nonexistent/spore",
+            }) catch |err| {
+                self.err = err;
+                return;
+            };
+            deinitNamedForkResult(std.testing.allocator, result);
+        }
+    };
+    var fork = Fork{ .env = &env };
+    var fork_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, Fork.run, .{&fork}),
+        .barriers = &.{&read_boundary},
+    };
+    defer fork_thread.deinit();
+
+    // The source's monitor saves a newer disk after the fork read the spec.
+    read_boundary.waitReached(io);
+    var saved = source_spec;
+    saved.disk.?.base = new_digest;
+    saved.disk_baseline_lease = .{ .store = .saved_spore, .root = new_dir, .baseline_kind = .disk_index, .baseline_identity = new_digest };
+    try writeSpec(allocator, io, source, saved);
+    read_boundary.release(io);
+    fork_thread.join();
+    try std.testing.expectEqual(@as(?anyerror, error.MonitorUnavailable), fork.err);
+
+    var after = try readSpec(allocator, io, source);
+    defer after.deinit();
+    try std.testing.expectEqualStrings(new_digest, after.value.disk.?.base);
+    try std.testing.expectEqualStrings(new_digest, after.value.disk_baseline_lease.?.baseline_identity);
 }
 
 test "durable lifecycle metadata drops the live network policy" {

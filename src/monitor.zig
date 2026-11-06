@@ -6,6 +6,7 @@ const local_paths = @import("local_paths.zig");
 const Context = @import("context.zig").Context;
 const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
+const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const snapshot_publication = @import("snapshot_publication.zig");
@@ -67,7 +68,9 @@ pub const testing = if (builtin.is_test) struct {
         lease: runtime_disk_lease.Lease,
         active_slot: *?runtime_disk_lease.Active,
     ) !void {
-        try persistSourceDiskLeaseHandoff(io, allocator, runtime_root, source_paths, disk, lease, active_slot);
+        var entry = try vm_registry.Entry.open(io, source_paths);
+        defer entry.close(io);
+        try persistSourceDiskLeaseHandoff(io, allocator, runtime_root, entry, disk, lease, active_slot);
     }
 } else struct {};
 const streaming_send_deadline_ms = 25;
@@ -96,6 +99,9 @@ const RequestState = enum {
     active_suspend,
     pending_snapshot,
     active_snapshot,
+    /// A fork holds the slot while it names its baseline, before the VM
+    /// loop sees it.
+    preparing_disk_fork,
     pending_disk_fork,
     active_disk_fork,
     done,
@@ -130,18 +136,24 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const name = args[0];
     lifecycle.validateName(name) catch usageExit();
     const paths = try lifecycle.pathsFor(allocator, init.environ_map, name);
+    // Every monitor write goes through the entry it was started for.
+    var entry = vm_registry.Entry.open(init.io, paths) catch |err| {
+        std.debug.print("spore monitor: cannot open the registry entry of {s}: {s}\n", .{ name, @errorName(err) });
+        std.process.exit(2);
+    };
+    defer entry.close(init.io);
     // The claimer passes the entry's lock as stdin. Holding it for the
     // monitor's whole life is what makes the VM live.
-    var registry_lock = vm_registry.adoptMonitorLock(init.io, paths) catch |err| {
+    var registry_lock = vm_registry.adoptMonitorLock(init.io, entry) catch |err| {
         std.debug.print("spore monitor: stdin is not the registry lock of {s}: {s}\n", .{ name, @errorName(err) });
         std.process.exit(2);
     };
     defer registry_lock.close(init.io);
-    try lifecycle.writePid(allocator, init.io, paths, currentPid());
+    try entry.writePid(allocator, init.io, currentPid());
     try lifecycle.validateControlSocketOwner(init.io, paths);
     const paths_ms = lifecycle.monotonicMs();
 
-    var parsed_spec = try lifecycle.readSpec(allocator, init.io, paths);
+    var parsed_spec = try entry.readSpec(allocator, init.io);
     defer parsed_spec.deinit();
     const spec = parsed_spec.value;
     if (!std.mem.eql(u8, spec.name, name)) return error.BadManifest;
@@ -215,7 +227,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     };
     const assets_ms = lifecycle.monotonicMs();
 
-    var disk_claim = try vm_registry.takeDiskForkClaim(allocator, init.io, paths, spec);
+    var disk_claim = try entry.takeDiskForkClaim(allocator, init.io, spec);
     defer if (disk_claim) |*claim| claim.deinit();
     var runtime_disk_head: ?runtime_disk_fork.Head = if (disk_claim) |claim|
         try claimRuntimeDiskHead(init.io, allocator, claim.value)
@@ -224,7 +236,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     defer if (runtime_disk_head) |*head| head.deinit();
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, spec.guest_port, spec.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
+    var server = try ExecServer.init(allocator, init.io, entry, paths.vm_dir, paths.runtime_root, paths.control_socket_path, cache_root, spec.guest_port, spec.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
     if (spec.disk_baseline_lease) |lease| {
@@ -237,7 +249,6 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
     const metadata_ms = lifecycle.monotonicMs();
     server.startup = .{
-        .paths = paths,
         .timing = .{
             .parse_ms = parsed_ms - paths_ms,
             .paths_ms = paths_ms - start_ms,
@@ -344,7 +355,6 @@ fn monitorNetwork(allocator: std.mem.Allocator, spec: lifecycle.Spec) !MonitorNe
 }
 
 const StartupMetadata = struct {
-    paths: lifecycle.Paths,
     timing: lifecycle.MonitorTiming,
     started_ms: u64,
     ready: lifecycle.Ready,
@@ -370,10 +380,11 @@ fn effectiveExecContext(
 const ExecServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
+    /// The monitor's registry entry; its only writer while the VM runs.
+    entry: vm_registry.Entry,
     vm_dir: []const u8,
     runtime_root: []const u8,
     socket_path: []const u8,
-    stats_path: []const u8,
     cache_root: []const u8,
     guest_port: u32,
     timeout_ms: u64,
@@ -404,6 +415,8 @@ const ExecServer = struct {
     disk_fork_count: u8 = 0,
     disk_fork_allow_copy: bool = false,
     disk_fork_force_copy: bool = false,
+    /// Set while a fork is pending or active; owned by its handler thread.
+    disk_fork_baseline: ?DiskBaseline = null,
     disk_claims: runtime_disk_claim.Registry,
     active_stream: vsock_stream.HostStream = undefined,
     active_stream_valid: bool = false,
@@ -438,7 +451,7 @@ const ExecServer = struct {
     /// store: no snapshot can capture it, so save requests are refused.
     snapshots_refused: bool = false,
 
-    fn init(allocator: std.mem.Allocator, io: Io, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, stats_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
+    fn init(allocator: std.mem.Allocator, io: Io, entry: vm_registry.Entry, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
         // sun_path holds only 104; enforce the real platform limit before
         // listen so an oversized path fails with a clear log line instead
@@ -466,10 +479,10 @@ const ExecServer = struct {
         var server = ExecServer{
             .allocator = allocator,
             .io = io,
+            .entry = entry,
             .vm_dir = vm_dir,
             .runtime_root = runtime_root,
             .socket_path = socket_path,
-            .stats_path = stats_path,
             .cache_root = cache_root,
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
@@ -513,8 +526,8 @@ const ExecServer = struct {
         startup.timing.backend_restore_memory_ms = self.active_stream.backend_restore_memory_ms;
         startup.timing.backend_restore_state_ms = self.active_stream.backend_restore_state_ms;
         startup.timing.backend_restore_pre_run_ms = self.active_stream.backend_restore_pre_run_ms;
-        lifecycle.writeMonitorTiming(self.allocator, self.io, startup.paths, startup.timing) catch {};
-        try lifecycle.writeReady(self.allocator, self.io, startup.paths, startup.ready);
+        self.entry.writeMonitorTiming(self.allocator, self.io, startup.timing) catch {};
+        try self.entry.writeReady(self.allocator, self.io, startup.ready);
     }
 
     /// Runs after the VM loop returns: fails what is left, waits for the
@@ -609,7 +622,7 @@ const ExecServer = struct {
                     .force_copy = self.disk_fork_force_copy,
                 } };
             },
-            .active_disk_fork => return .keep_running,
+            .preparing_disk_fork, .active_disk_fork => return .keep_running,
             .pending_exec => {
                 self.active_stream = try vsock_stream.HostStream.init(self.guest_port, self.request[0..self.request_len]);
                 self.resetExecCapture();
@@ -1102,6 +1115,25 @@ const ExecServer = struct {
         defer self.mutex.unlock(self.io);
         try self.acquireOpLocked();
         if (self.disk_claims.hasBatch(batch)) return error.BatchAlreadyRegistered;
+        // Naming the baseline reads and writes the spec and can wait for the
+        // rootfs cache lock, so it runs unlocked. Holding the slot keeps a
+        // save from replacing the disk meanwhile.
+        self.state = .preparing_disk_fork;
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
+        self.mutex.unlock(self.io);
+        const named = ensureDiskBaselineLease(self.io, arena_state.allocator(), self.entry, self.runtime_root, self.cache_root);
+        self.mutex.lockUncancelable(self.io);
+        const baseline = named catch |err| {
+            self.state = .idle;
+            return err;
+        };
+        if (self.stopping != null) {
+            self.state = .idle;
+            return error.MonitorStopping;
+        }
+        self.disk_fork_baseline = baseline;
+        defer self.disk_fork_baseline = null;
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
         @memcpy(self.disk_fork_batch[0..batch.len], batch);
@@ -1198,14 +1230,12 @@ const ExecServer = struct {
         };
         var pin = try saved_spore_pin.loadForSporeLocked(self.io, self.allocator, registry, work_dir, disk);
         pin.deinit();
-        const source_paths = try lifecycle.pathsFromRoot(self.allocator, self.runtime_root, lifecycle_spec.value.name);
-        defer source_paths.deinit(self.allocator);
-        if (!std.mem.eql(u8, source_paths.vm_dir, self.vm_dir)) return error.BadManifest;
+        if (!std.mem.eql(u8, lifecycle_spec.value.name, std.fs.path.basename(self.vm_dir))) return error.BadManifest;
         try persistSourceDiskLeaseHandoff(
             self.io,
             self.allocator,
             self.runtime_root,
-            source_paths,
+            self.entry,
             disk,
             lease,
             &self.disk_baseline_active,
@@ -1220,6 +1250,7 @@ const ExecServer = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.state != .active_disk_fork or batch.heads.len != self.disk_fork_count) return error.ControlBusy;
+        const recorded = self.disk_fork_baseline orelse return error.ControlBusy;
 
         var pending: [runtime_disk_claim.max_children_per_batch]runtime_disk_claim.PendingClaim = undefined;
         for (batch.heads, 0..) |head, index| {
@@ -1255,6 +1286,8 @@ const ExecServer = struct {
             .batch = batch_name,
             .capture_dir = self.suspend_dir[0..self.suspend_dir_len],
             .claims = claims[0..registrations.len],
+            .lease = recorded.lease,
+            .disk = recorded.disk,
             .ram_capture_ns = batch.ram_capture_ns,
             .disk_fork_ns = batch.prepare_ns,
             .source_pause_ns = runtime_disk_fork_capture.elapsedSince(batch.pause_started_ns),
@@ -1297,7 +1330,7 @@ const ExecServer = struct {
         const first_write = self.stats_write_ms == 0;
         const clean_tail = (stats.dirty_chunks_pending orelse 0) == 0;
         if (!first_write and !clean_tail and now -| self.stats_write_ms < stats_write_interval_ms) return;
-        lifecycle.writeMonitorStatsPath(self.allocator, self.io, self.stats_path, .{
+        self.entry.writeMonitorStats(self.allocator, self.io, .{
             .chunks_nonzero = stats.chunks_nonzero,
             .dirty_chunks_pending = stats.dirty_chunks_pending,
         }) catch return;
@@ -1516,7 +1549,7 @@ fn persistSourceDiskLeaseHandoff(
     io: Io,
     allocator: std.mem.Allocator,
     runtime_root: []const u8,
-    source_paths: lifecycle.Paths,
+    entry: vm_registry.Entry,
     disk: spore.Disk,
     lease: runtime_disk_lease.Lease,
     active_slot: *?runtime_disk_lease.Active,
@@ -1527,7 +1560,7 @@ fn persistSourceDiskLeaseHandoff(
         !std.mem.eql(u8, lease.baseline_identity, disk.base) or
         !spore.rootfsStorageEql(lease.rootfs_storage orelse return error.BadManifest, try saved_spore_pin.storageForDisk(disk))) return error.BadManifest;
 
-    var source_spec = try lifecycle.readSpec(allocator, io, source_paths);
+    var source_spec = try entry.readSpec(allocator, io);
     defer source_spec.deinit();
     var next_active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, lease);
     var committed = false;
@@ -1540,12 +1573,97 @@ fn persistSourceDiskLeaseHandoff(
     source_spec.value.disk_baseline_lease = lease;
     // Atomic durable replacement is the commit point. Everything afterward is
     // infallible: swap the in-memory owner, then release the old active root.
-    try lifecycle.writeSpec(allocator, io, source_paths, source_spec.value);
+    try entry.writeSpec(allocator, io, source_spec.value);
     if (comptime builtin.is_test) if (testing.snapshot_lease_handoff_fault.crash_after == .source_spec) std.process.exit(88);
     var old_active = active_slot.*;
     active_slot.* = next_active;
     committed = true;
     if (old_active) |*old| old.deinit();
+}
+
+const DiskBaseline = struct {
+    lease: runtime_disk_lease.Lease,
+    disk: ?spore.Disk,
+};
+
+/// Names the baseline a disk fork's children share and records it in the
+/// spec, where GC finds it. The caller holds the operation slot, so no save
+/// replaces the disk between reading and writing the spec. The result lives
+/// in `arena`.
+fn ensureDiskBaselineLease(
+    io: Io,
+    arena: std.mem.Allocator,
+    entry: vm_registry.Entry,
+    runtime_root: []const u8,
+    cache_root: []const u8,
+) !DiskBaseline {
+    var spec = (try entry.readSpec(arena, io)).value;
+    const rootfs = spec.rootfs orelse return error.UnsupportedNamedForkDisk;
+    const recorded = spec.disk_baseline_lease;
+    const lease: runtime_disk_lease.Lease = recorded orelse if (spec.disk) |disk| blk: {
+        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.UnsupportedNamedForkDisk;
+        try spore.validateDiskDigest(disk.base);
+        const resume_dir = spec.resume_dir orelse return error.UnsupportedNamedForkDisk;
+        const root = try std.fs.path.resolve(arena, &.{resume_dir});
+        const forks_root = try std.fs.path.resolve(arena, &.{ runtime_root, "forks" });
+        if (pathWithin(forks_root, root)) return error.UnsupportedNamedForkDisk;
+        break :blk .{
+            .store = .saved_spore,
+            .root = root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = disk.base,
+        };
+    } else if (rootfs.storage) |storage| blk: {
+        try spore.validateRootfsStorageDescriptor(storage);
+        break :blk .{
+            .store = .rootfs_cache,
+            .root = cache_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = storage.index_digest,
+            .rootfs_storage = storage,
+        };
+    } else blk: {
+        try spore.validateRootfsDigest(rootfs.artifact.digest);
+        break :blk .{
+            .store = .rootfs_cache,
+            .root = cache_root,
+            .baseline_kind = .rootfs,
+            .baseline_identity = rootfs.artifact.digest,
+        };
+    };
+    try lease.validate();
+    spec.disk_baseline_lease = lease;
+    if (lease.store == .rootfs_cache) {
+        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, lease.root);
+        defer cache_lock.deinit();
+        switch (lease.baseline_kind) {
+            .rootfs => {
+                const fd = rootfs_cache.openTrustedFromCache(io, arena, lease.root, rootfs) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.DiskForkBaselineUnavailable,
+                };
+                _ = std.c.close(fd);
+            },
+            .disk_index => {
+                const storage = lease.rootfs_storage orelse return error.BadManifest;
+                if (!try rootfs_cas.storageMarkedComplete(io, arena, lease.root, storage)) return error.DiskForkBaselineUnavailable;
+            },
+        }
+        // Publish the root while holding the same lock used by GC/prune. A
+        // collector that started first wins and is verified above; every
+        // collector that starts later observes the lease.
+        if (recorded == null) try entry.writeSpec(arena, io, spec);
+    } else if (recorded == null) {
+        try entry.writeSpec(arena, io, spec);
+    }
+    return .{ .lease = lease, .disk = spec.disk };
+}
+
+fn pathWithin(parent: []const u8, child: []const u8) bool {
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    if (parent.len != 0 and parent[parent.len - 1] == std.fs.path.sep) return true;
+    return child[parent.len] == std.fs.path.sep;
 }
 
 fn formatSessionId(buffer: *[64]u8, nonce: u64, sequence: u64) ![]const u8 {
@@ -2457,7 +2575,9 @@ test "snapshot disk lease handoff preserves old authority on failure and commits
         .rootfs_storage = new_storage,
     };
     try vm_registry.ensureDirPath(io, paths.vm_dir);
-    try lifecycle.writeSpec(allocator, io, paths, .{
+    var entry = try vm_registry.Entry.open(io, paths);
+    defer entry.close(io);
+    try entry.writeSpec(allocator, io, .{
         .name = "source",
         .disk = old_disk,
         .disk_baseline_lease = old_lease,
@@ -2473,7 +2593,7 @@ test "snapshot disk lease handoff preserves old authority on failure and commits
         io,
         allocator,
         runtime_root,
-        paths,
+        entry,
         new_disk,
         new_lease,
         &active_slot,
@@ -2495,7 +2615,7 @@ test "snapshot disk lease handoff preserves old authority on failure and commits
     }
     try std.testing.expectEqual(@as(usize, 1), failed_active_count);
 
-    try persistSourceDiskLeaseHandoff(io, allocator, runtime_root, paths, new_disk, new_lease, &active_slot);
+    try persistSourceDiskLeaseHandoff(io, allocator, runtime_root, entry, new_disk, new_lease, &active_slot);
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, old_active_path, .{ .follow_symlinks = false }));
     var after_success = try lifecycle.readSpec(allocator, io, paths);
     defer after_success.deinit();
@@ -2651,6 +2771,8 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
     try env.put(local_paths.runtime_dir_env, runtime_root);
     const source_paths = try lifecycle.pathsFromRoot(arena, runtime_root, "source");
     try vm_registry.ensureDirPath(io, source_paths.vm_dir);
+    var source_entry = try vm_registry.Entry.open(io, source_paths);
+    defer source_entry.close(io);
     try lifecycle.writeSpec(arena, io, source_paths, .{
         .name = "source",
         .disk = old_fixture.disk,
@@ -2699,7 +2821,7 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
         io: Io,
         cache_root: []const u8,
         runtime_root: []const u8,
-        source_paths: lifecycle.Paths,
+        entry: vm_registry.Entry,
         disk: spore.Disk,
         lease: runtime_disk_lease.Lease,
         active_slot: *?runtime_disk_lease.Active,
@@ -2714,7 +2836,7 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
                 self.done.post(self.io);
                 return;
             };
-            persistSourceDiskLeaseHandoff(self.io, self.allocator, self.runtime_root, self.source_paths, self.disk, self.lease, self.active_slot) catch |err| {
+            persistSourceDiskLeaseHandoff(self.io, self.allocator, self.runtime_root, self.entry, self.disk, self.lease, self.active_slot) catch |err| {
                 lock.deinit();
                 self.err = err;
                 self.done.post(self.io);
@@ -2730,7 +2852,7 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
         .io = io,
         .cache_root = cache_root,
         .runtime_root = runtime_root,
-        .source_paths = source_paths,
+        .entry = source_entry,
         .disk = new_fixture.disk,
         .lease = new_lease,
         .active_slot = &active_slot,
@@ -2974,6 +3096,115 @@ const TestControlClient = struct {
     }
 };
 
+test "monitor records the fork baseline while it holds the guest" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const runtime_root = try std.fs.path.join(allocator, &.{ root, "runtime" });
+    defer allocator.free(runtime_root);
+    const saved_dir = try std.fs.path.join(allocator, &.{ root, "saved.spore" });
+    defer allocator.free(saved_dir);
+    const paths = try lifecycle.pathsFromRoot(allocator, runtime_root, "source");
+    defer paths.deinit(allocator);
+    try vm_registry.ensureDirPath(io, paths.vm_dir);
+    var entry = try vm_registry.Entry.open(io, paths);
+    defer entry.close(io);
+
+    // The capture the test hands back in place of the VM loop.
+    var batch = runtime_disk_fork_capture.Batch{
+        .allocator = allocator,
+        .heads = try allocator.alloc(?runtime_disk_fork.Head, 1),
+        .pause_started_ns = monotonicNs(),
+        .ram_capture_ns = 1,
+        .prepare_ns = 2,
+        .copied_bytes = 0,
+    };
+    batch.heads[0] = null;
+    defer batch.deinit();
+    batch.heads[0] = try runtime_disk_claim.makeSmokeHead(allocator);
+    batch.heads[0].?.descriptor.baseline.kind = .disk_index;
+    const digest = batch.heads[0].?.descriptor.baseline.identity;
+
+    // A source restored from a saved disk has no recorded baseline yet.
+    try entry.writeSpec(allocator, io, .{
+        .name = "source",
+        .rootfs = .{ .device = .{ .mmio_slot = 1 }, .artifact = .{ .digest = digest, .size = spore.disk_chunk_size } },
+        .disk = .{ .device = .{ .mmio_slot = 1 }, .size = spore.disk_chunk_size, .base = digest },
+        .resume_dir = saved_dir,
+    });
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-fork-{d}.sock", .{std.c.getpid()});
+    var server = try ExecServer.init(allocator, io, entry, paths.vm_dir, runtime_root, socket_path, "/nonexistent", 10700, 5_000, null, .{});
+    defer server.disk_claims.deinit();
+    defer {
+        server.server.deinit(io);
+        Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    }
+
+    const Prepare = struct {
+        server: *ExecServer,
+        response: ?[]const u8 = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.response = self.server.submitDiskFork("/tmp/capture", "batch-1", &.{"child-0"}, false, false) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var prepare = Prepare{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, Prepare.run, .{&prepare});
+    var joined = false;
+    defer if (!joined) {
+        server.failDiskFork(error.TestFailed);
+        thread.join();
+        if (prepare.response) |response| std.heap.page_allocator.free(response);
+    };
+
+    // The baseline is in the spec, where GC finds it, before the capture
+    // starts.
+    const started_ms = lifecycle.monotonicMs();
+    while (true) {
+        {
+            server.mutex.lockUncancelable(io);
+            defer server.mutex.unlock(io);
+            if (server.state == .pending_disk_fork) {
+                server.state = .active_disk_fork;
+                break;
+            }
+        }
+        if (prepare.err) |err| return err;
+        if (lifecycle.monotonicMs() - started_ms > 5_000) return error.Timeout;
+        var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    var recorded = try entry.readSpec(allocator, io);
+    defer recorded.deinit();
+    const lease = recorded.value.disk_baseline_lease.?;
+    try std.testing.expectEqual(runtime_disk_lease.Store.saved_spore, lease.store);
+    try std.testing.expectEqualStrings(saved_dir, lease.root);
+    try std.testing.expectEqualStrings(digest, lease.baseline_identity);
+
+    // The fork CLI gets the same baseline and disk in the response.
+    try server.completeDiskFork(&batch);
+    thread.join();
+    joined = true;
+    if (prepare.err) |err| return err;
+    const response = prepare.response.?;
+    defer std.heap.page_allocator.free(response);
+    var prepared = try runtime_disk_fork_control.parsePreparedBytes(allocator, response);
+    defer prepared.deinit();
+    try std.testing.expectEqualStrings(saved_dir, prepared.value.lease.root);
+    try std.testing.expectEqualStrings(lease.baseline_identity, prepared.value.lease.baseline_identity);
+    try std.testing.expectEqualStrings(lease.baseline_identity, prepared.value.disk.?.base);
+    try std.testing.expectEqual(RequestState.idle, server.state);
+}
+
 test "monitor answers hello and shutdown while a guest operation runs" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -2982,7 +3213,9 @@ test "monitor answers hello and shutdown while a guest operation runs" {
     const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-control-{d}.sock", .{std.c.getpid()});
     // Guest operations queue for at most the VM timeout.
     const timeout_ms = 300;
-    var server = try ExecServer.init(allocator, io, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", "/nonexistent", 10700, timeout_ms, null, .{});
+    var entry_dir = std.testing.tmpDir(.{});
+    defer entry_dir.cleanup();
+    var server = try ExecServer.init(allocator, io, .{ .dir = entry_dir.dir }, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", 10700, timeout_ms, null, .{});
     defer server.disk_claims.deinit();
     const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     var stopped = false;
@@ -3046,7 +3279,9 @@ test "monitor gives a slow client one deadline for its whole request line" {
     const io = std.testing.io;
     var path_buf: [64]u8 = undefined;
     const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-trickle-{d}.sock", .{std.c.getpid()});
-    var server = try ExecServer.init(allocator, io, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", "/nonexistent", 10700, 1_000, null, .{});
+    var entry_dir = std.testing.tmpDir(.{});
+    defer entry_dir.cleanup();
+    var server = try ExecServer.init(allocator, io, .{ .dir = entry_dir.dir }, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", 10700, 1_000, null, .{});
     defer server.disk_claims.deinit();
     const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
     defer server.stopControl(accept_thread, "test finished");
