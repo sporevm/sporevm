@@ -21,6 +21,7 @@ const spore_fork = @import("spore_fork.zig");
 const system = @import("system.zig");
 
 const Context = context_mod.Context;
+const TestDir = @import("test_dir.zig").TestDir;
 
 pub const Options = struct {
     parent_dir: []const u8,
@@ -88,6 +89,40 @@ test "diskless offline fork failure leaves no visible batch" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, children, .{ .follow_symlinks = false }));
 }
 
+test "fork of a pinned save pins its children given relative paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var test_dir = try TestDir.init();
+    defer test_dir.deinit();
+    const root = try test_dir.dir.realPathFileAlloc(io, ".", arena);
+    const cache = try std.fs.path.join(arena, &.{ root, "cache" });
+    const parent = try std.fs.path.join(arena, &.{ root, "parent.spore" });
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache, parent, 0x72, false);
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
+        defer lock.deinit();
+        try saved_spore_pin.publishManifest(io, arena, try saved_spore_pin.LockedRegistry.init(arena, cache, &lock), parent, fixture.disk, fixture.manifest);
+    }
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache);
+    try env.put(local_paths.runtime_dir_env, try std.fs.path.join(arena, &.{ root, "runtime" }));
+
+    // Relative to the working directory, as `spore fork` passes them.
+    _ = try execute(.{ .io = io, .environ_map = &env }, allocator, .{
+        .parent_dir = try test_dir.path("parent.spore"),
+        .out_dir = try test_dir.path("children"),
+        .count = 1,
+    });
+    var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
+    defer lock.deinit();
+    var pin = try saved_spore_pin.loadForSporeLocked(io, arena, try saved_spore_pin.LockedRegistry.init(arena, cache, &lock), try std.fs.path.join(arena, &.{ root, "children", "000000" }), fixture.disk);
+    pin.deinit();
+}
+
 test "a save pinned by an earlier build fails as too old after GC" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -140,10 +175,12 @@ test "a save pinned by an earlier build fails as too old after GC" {
     }));
 }
 
-pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options) !Result {
+pub fn execute(context: Context, allocator: std.mem.Allocator, options_in: Options) !Result {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var options = options_in;
+    options.out_dir = try local_paths.absolutePathAlloc(context.io, arena, options_in.out_dir);
     const parent_manifest = try spore.loadManifest(arena, options.parent_dir);
     defer parent_manifest.deinit();
     const disk = parent_manifest.value.disk;

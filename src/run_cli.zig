@@ -10,6 +10,7 @@ const api = @import("api.zig");
 const boot_assets = @import("boot_assets.zig");
 const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
+const local_paths = @import("local_paths.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
@@ -111,6 +112,7 @@ fn runParsed(
         error.InjectedFileTooLarge => failRunSetup("spore run: injected files exceed 16MiB total", .{}),
         else => return err,
     };
+    const save_path = if (parsed.save_path) |path| try local_paths.absolutePathAlloc(init.io, allocator, path) else null;
     var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
     const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
         error.MissingHostEnvironment => failRunSetup("spore run: --env {s} is not set in the host environment", .{env_diagnostic.missing_key orelse "unknown"}),
@@ -147,7 +149,7 @@ fn runParsed(
             .vcpus = parsed.shared.vcpus,
             .guest_port = parsed.shared.guest_port,
             .timeout_ms = parsed.shared.timeout_ms,
-            .save_path = parsed.save_path,
+            .save_path = save_path,
             .save_trigger = parsed.save_trigger,
             .continue_after_save = parsed.continue_after_save,
             .generation_path = parsed.generation_path,
@@ -198,7 +200,7 @@ fn runParsed(
         .vcpus = parsed.shared.vcpus,
         .guest_port = parsed.shared.guest_port,
         .timeout_ms = parsed.shared.timeout_ms,
-        .save_path = parsed.save_path,
+        .save_path = save_path,
         .save_trigger = parsed.save_trigger,
         .continue_after_save = parsed.continue_after_save,
         .commit_ref = parsed.commit_ref,
