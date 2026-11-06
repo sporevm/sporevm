@@ -42,8 +42,10 @@ CDN-backed hosts whose A records are owned by the CNAME target still resolve
 into allowed IPs; records not chained from the queried name are ignored:
 
 ```bash
-spore run --net --allow-host example.com -- /bin/wget -qO- https://example.com
-spore run --net --allow-cidr 93.184.216.34/32 -- /bin/wget -qO- http://93.184.216.34/
+spore run --net --allow-host example.com --image docker.io/library/alpine:3.20 \
+  -- wget -qO- https://example.com
+spore run --net --allow-cidr 93.184.216.34/32 --image docker.io/library/alpine:3.20 \
+  -- wget -qO- http://93.184.216.34/
 ```
 
 ## Bound Services
@@ -54,7 +56,8 @@ One-shot runs can expose declared host Unix sockets to the guest:
 spore run --net \
   --bind-service metadata=unix:/tmp/metadata.sock \
   --bind-service cache:8080=unix:/tmp/cache.sock \
-  -- /bin/wget -qO- http://metadata.spore.internal/
+  --image docker.io/library/alpine:3.20 \
+  -- wget -qO- http://metadata.spore.internal/
 ```
 
 The CLI shape is deliberately small: up to 16 named Unix stream socket targets.
@@ -85,7 +88,9 @@ One live guest TCP port can be forwarded to host loopback for the lifetime of a
 `spore run` or named VM monitor:
 
 ```bash
-spore run --net --forward 127.0.0.1:18080:8080 -- /bin/httpd 8080
+spore run --net --forward 127.0.0.1:18080:8080 \
+  --image docker.io/library/python:3.12-alpine \
+  -- python3 -m http.server 8080
 ```
 
 This maps `127.0.0.1:18080` on the host to `100.96.0.2:8080` in the guest. The
@@ -105,7 +110,7 @@ bindings are allowed because they satisfy already-saved policy; they do not
 change the manifest:
 
 ```bash
-spore run --from net-enabled.spore -- /bin/wget -qO- https://example.com
+spore run --from net-enabled.spore -- wget -qO- https://example.com
 ```
 
 ## Events And Limits

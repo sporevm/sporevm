@@ -27,10 +27,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
+    const smoke_helpers = b.option(bool, "smoke-helpers", "Embed the test-only helper binaries the VM smoke scripts run in the guest initrd") orelse false;
     const toybox = b.dependency("toybox", .{}).path("");
-    const aarch64_initrd = addMinimalExecInitrd(b, toybox, .aarch64);
-    const x86_64_initrd = addMinimalExecInitrd(b, toybox, .x86_64);
-    const minimal_exec_initrd_module = switch (target_arch) {
+    const aarch64_initrd = addMinimalExecInitrd(b, toybox, .aarch64, false);
+    const x86_64_initrd = addMinimalExecInitrd(b, toybox, .x86_64, false);
+    const minimal_exec_initrd_module = if (smoke_helpers)
+        addMinimalExecInitrd(b, toybox, target_arch, true).module
+    else switch (target_arch) {
         .aarch64 => aarch64_initrd.module,
         .x86_64 => x86_64_initrd.module,
         else => std.debug.panic("unsupported embedded guest architecture: {s}", .{@tagName(target_arch)}),
@@ -307,8 +310,9 @@ pub fn build(b: *std.Build) void {
             .strip = optimize != .Debug,
             .link_libc = true,
         });
+        // The board smoke runs /bin/blkcheck, so it always embeds the helpers.
         board_smoke_mod.addAnonymousImport("run_assets", .{
-            .root_source_file = minimal_exec_initrd_module,
+            .root_source_file = if (smoke_helpers) minimal_exec_initrd_module else addMinimalExecInitrd(b, toybox, .x86_64, true).module,
         });
         board_smoke_mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
         const board_smoke_exe = b.addExecutable(.{
@@ -326,15 +330,17 @@ const MinimalExecInitrd = struct {
     module: std.Build.LazyPath,
 };
 
-/// Build the embedded guest initrd for one architecture. The generator owns
-/// the guest source list and reports it in a depfile, so the cached result is
-/// rebuilt only when a guest source, the generator, or Toybox changes.
-fn addMinimalExecInitrd(b: *std.Build, toybox: std.Build.LazyPath, arch: std.Target.Cpu.Arch) MinimalExecInitrd {
+/// Build the embedded guest initrd for one architecture, with the smoke
+/// helpers for test builds. The generator owns the guest source list and
+/// reports it in a depfile, so the cached result is rebuilt only when a guest
+/// source, the generator, or Toybox changes.
+fn addMinimalExecInitrd(b: *std.Build, toybox: std.Build.LazyPath, arch: std.Target.Cpu.Arch, smoke_helpers: bool) MinimalExecInitrd {
     const run = b.addSystemCommand(&.{
         "bash",
         "-c",
         \\set -euo pipefail
-        \\"$1" --arch "$2" --generation-base "$3" --toybox-source "$4" --depfile "$5" "$6"
+        \\# Arguments after the two outputs are generator flags (--smoke-helpers).
+        \\"$1" --arch "$2" --generation-base "$3" --toybox-source "$4" --depfile "$5" "${@:8}" "$6"
         \\if command -v sha256sum >/dev/null 2>&1; then
         \\  initrd_sha256="$(sha256sum "$6" | awk '{print $1}')"
         \\else
@@ -347,16 +353,18 @@ fn addMinimalExecInitrd(b: *std.Build, toybox: std.Build.LazyPath, arch: std.Tar
         ,
         "sporevm-initrd-assets",
     });
-    run.setName(b.fmt("minimal exec initrd {s}", .{@tagName(arch)}));
+    run.setName(b.fmt("minimal exec initrd {s}{s}", .{ @tagName(arch), if (smoke_helpers) " with smoke helpers" else "" }));
     run.addFileArg(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
     run.addArg(@tagName(arch));
     run.addArg(b.fmt("0x{x}", .{generationBase(arch).?}));
     run.addDirectoryArg(toybox);
     _ = run.addDepFileOutputArg("minimal-exec-initrd.d");
-    return .{
+    const initrd: MinimalExecInitrd = .{
         .cpio = run.addOutputFileArg("minimal-exec-initrd.cpio"),
         .module = run.addOutputFileArg("minimal-exec-initrd.zig"),
     };
+    if (smoke_helpers) run.addArg("--smoke-helpers");
+    return initrd;
 }
 
 /// Keep the guest agent's MMIO definition tied to the selected, validated

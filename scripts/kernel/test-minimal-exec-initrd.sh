@@ -93,10 +93,15 @@ for name, (mode, payload) in entries.items():
     else:
         raise SystemExit(f"error: unsupported newc entry type: {name}")
 
-required = {".", "bin", "dev", "proc", "run", "tmp", "usr", "usr/bin", "init", "bin/toybox"}
-missing = required.difference(entries)
-if missing:
-    raise SystemExit(f"error: missing newc entries: {sorted(missing)}")
+# The shipped initrd holds the agent, the Toybox shell environment, true and
+# false. Smoke helpers belong only in -Dsmoke-helpers test builds.
+expected = {".", "bin", "dev", "proc", "run", "tmp", "usr", "usr/bin", "usr/bin/env", "init",
+            "bin/sh", "bin/toybox", "bin/true", "bin/false"}
+expected.update(f"bin/{applet}" for applet in
+                ("echo", "cat", "env", "ls", "mkdir", "printf", "pwd", "rm", "sleep", "test", "touch", "uname"))
+if set(entries) != expected:
+    raise SystemExit(f"error: initrd entries differ: missing {sorted(expected - set(entries))}, "
+                     f"unexpected {sorted(set(entries) - expected)}")
 PY
 }
 
