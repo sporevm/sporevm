@@ -45,7 +45,8 @@ pub const Device = struct {
     /// Called once the driver feature selection is accepted, and with zero
     /// when transport reset clears that selection.
     featuresAcceptedFn: ?*const fn (context: *anyopaque, accepted_features: u64) void = null,
-    /// Optional device reset hook called after transport-owned state is reset.
+    /// Optional device reset hook, called before the transport resets its
+    /// own state, so a device can first finish requests it took off a queue.
     resetFn: ?*const fn (context: *anyopaque) void = null,
 };
 
@@ -156,6 +157,7 @@ pub const Transport = struct {
     }
 
     pub fn reset(self: *Transport) void {
+        if (self.dev.resetFn) |f| f(self.dev.context);
         for (&self.queues) |*q| q.reset();
         self.status = 0;
         self.interrupt_status = 0;
@@ -168,7 +170,6 @@ pub const Transport = struct {
         self.driver_features_sel = 0;
         self.queue_sel = 0;
         self.config_generation = 0;
-        if (self.dev.resetFn) |f| f(self.dev.context);
     }
 
     /// MMIO read at `offset` within the register window.

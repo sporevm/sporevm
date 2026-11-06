@@ -510,9 +510,9 @@ pub const Budget = struct {
 
 /// Image metadata is read before boot, where only the caller waits.
 pub const metadata_budget = Budget{ .attempts = 3, .attempt_ms = 60_000, .total_ms = 120_000 };
-/// An object read holds the VMM device lock, so every vCPU may wait for it.
-/// Stay well under the guest's 20 s soft-lockup watchdog; a failed read
-/// poisons the disk, which then fetches nothing more.
+/// A guest disk read waits for an object, and on x86_64 so does the vCPU
+/// that issued it. Stay well under the guest's 20 s soft-lockup watchdog; a
+/// failed read poisons the disk, which then fetches nothing more.
 pub const object_budget = Budget{ .attempts = 3, .attempt_ms = 5_000, .total_ms = 10_000 };
 
 pub const Limit = struct {
@@ -876,7 +876,7 @@ pub const Fetcher = struct {
     /// A window fetch failed, so faults fetch only what the guest reads.
     window_failed: std.atomic.Value(bool) = .init(false),
     /// Window fetches, which outlive the fault that started them. Faults
-    /// add to it one at a time, under the VMM's device lock.
+    /// add to it one at a time: one thread serves each disk's reads.
     windows: Io.Group = .init,
     /// Window fetches still running.
     windows_running: std.atomic.Value(u32) = .init(0),
@@ -894,8 +894,8 @@ pub const Fetcher = struct {
 
     const Purpose = enum { read, window, fill };
 
-    /// `allocator` must be thread-safe: faults run on vCPU threads and
-    /// requests on `Io` workers. An S3 store takes its credentials from `env`
+    /// `allocator` must be thread-safe: faults run on disk worker or vCPU
+    /// threads and requests on `Io` workers. An S3 store takes its credentials from `env`
     /// now and keeps them for the Fetcher's life.
     pub fn create(allocator: std.mem.Allocator, io: Io, cache_root: []const u8, origin: []const u8, storage: spore.RootfsStorage, env: *const std.process.Environ.Map) !*Fetcher {
         const self = try allocator.create(Fetcher);

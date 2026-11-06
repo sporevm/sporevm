@@ -219,8 +219,8 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             runtime.chunk_mapped = writable.disk;
             try runtime.chunk_mapped.?.attachCasIndexTraced(cache_root, parsed.value, runtime.trace_fd);
             if (origin) |store| {
-                // Faults run on vCPU threads and fetches on Io workers, so the
-                // fetcher needs a thread-safe allocator.
+                // Faults run on disk worker or vCPU threads and fetches on Io
+                // workers, so the fetcher needs a thread-safe allocator.
                 runtime.fetcher = try image_store.Fetcher.create(std.heap.c_allocator, context.io, cache_root, store, storage, context.environ_map);
                 runtime.chunk_mapped.?.attachRemote(runtime.fetcher.?);
             }
