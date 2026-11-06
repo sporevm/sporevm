@@ -91,6 +91,9 @@ pub const Request = struct {
     completed: std.atomic.Value(bool) = .init(false),
     wake_fn_addr: std.atomic.Value(usize) = .init(0),
     wake_context_addr: std.atomic.Value(usize) = .init(0),
+    /// Wakes under way in the signal handler. `setWake` and `clearWake`
+    /// wait for them, so no wake reaches a target they replaced.
+    wakes_in_flight: std.atomic.Value(u32) = .init(0),
 
     pub fn request(self: *Request) void {
         self.signal_count.store(1, .release);
@@ -119,16 +122,26 @@ pub const Request = struct {
 
     pub fn setWake(self: *Request, wake_fn: WakeFn, context: ?*anyopaque) void {
         self.wake_context_addr.store(if (context) |ptr| @intFromPtr(ptr) else 0, .release);
-        self.wake_fn_addr.store(@intFromPtr(wake_fn), .release);
+        self.wake_fn_addr.store(@intFromPtr(wake_fn), .seq_cst);
+        self.waitForWakes();
     }
 
     pub fn clearWake(self: *Request) void {
-        self.wake_fn_addr.store(0, .release);
+        self.wake_fn_addr.store(0, .seq_cst);
         self.wake_context_addr.store(0, .release);
+        self.waitForWakes();
+    }
+
+    /// A signal handler cannot take a lock, so wakes count themselves and a
+    /// new target waits until none of them can still call the old one.
+    fn waitForWakes(self: *Request) void {
+        while (self.wakes_in_flight.load(.seq_cst) != 0) std.atomic.spinLoopHint();
     }
 
     fn wake(self: *Request) void {
-        const wake_fn_addr = self.wake_fn_addr.load(.acquire);
+        _ = self.wakes_in_flight.fetchAdd(1, .seq_cst);
+        defer _ = self.wakes_in_flight.fetchSub(1, .release);
+        const wake_fn_addr = self.wake_fn_addr.load(.seq_cst);
         if (wake_fn_addr == 0) return;
         const wake_fn: WakeFn = @ptrFromInt(wake_fn_addr);
         const context_addr = self.wake_context_addr.load(.acquire);
@@ -286,4 +299,33 @@ test "capture request invokes optional wake hook" {
     request_value.clearWake();
     request_value.notifySignal();
     try std.testing.expectEqual(@as(u32, 1), test_wake_count);
+}
+
+test "capture wake finishes before clearWake returns" {
+    const Run = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        woken_after_retire: std.atomic.Value(bool) = .init(false),
+
+        fn wake(context: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.started.store(true, .release);
+            // Leave the run time to clear the wake while this call is in
+            // flight.
+            const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            if (self.retired.load(.acquire)) self.woken_after_retire.store(true, .release);
+        }
+    };
+
+    var request_value = Request{};
+    var target: Run = .{};
+    request_value.setWake(Run.wake, &target);
+    const thread = try std.Thread.spawn(.{}, Request.notifySignal, .{&request_value});
+    while (!target.started.load(.acquire)) std.Thread.yield() catch {};
+    request_value.clearWake();
+    target.retired.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(!target.woken_after_retire.load(.acquire));
 }

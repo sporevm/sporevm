@@ -1079,7 +1079,7 @@ const ExecServer = struct {
             else => return error.InvalidControlStream,
         };
         if (!queued) return error.ControlStreamClosed;
-        if (self.wake) |wake| wake.wake();
+        self.wakeRun();
     }
 
     fn enqueueStreamingClose(self: *ExecServer, stream_id: spore_stream.StreamId) !void {
@@ -1094,7 +1094,7 @@ const ExecServer = struct {
             else => return error.InvalidControlStream,
         };
         if (!queued) return error.ControlStreamClosed;
-        if (self.wake) |wake| wake.wake();
+        self.wakeRun();
     }
 
     fn enqueueStreamingResize(self: *ExecServer, resize: spore_stream.Resize) !void {
@@ -1104,6 +1104,15 @@ const ExecServer = struct {
             if (self.activeStreamedLocked() == null) return error.ControlStreamClosed;
         }
         if (!self.active_stream.enqueueResize(resize)) return error.ControlStreamClosed;
+        self.wakeRun();
+    }
+
+    /// Wakes the VM run from a thread that does not hold `mutex`. The wake
+    /// runs under `mutex`, which `setWake` also takes, so once the run has
+    /// replaced its wake no call into it is still in flight.
+    fn wakeRun(self: *ExecServer) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.wake) |wake| wake.wake();
     }
 
@@ -3203,6 +3212,57 @@ const StoreSaveClient = struct {
         if (self.client_end >= 0) _ = std.c.close(self.client_end);
     }
 };
+
+test "a streaming input wake finishes before the run replaces its wake" {
+    const Run = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        woken_after_retire: std.atomic.Value(bool) = .init(false),
+
+        fn wake(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.started.store(true, .release);
+            // Leave the run time to retire the wake while this call is in
+            // flight.
+            const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            if (self.retired.load(.acquire)) self.woken_after_retire.store(true, .release);
+        }
+
+        fn ignore(_: *anyopaque) void {}
+
+        fn resize(server: *ExecServer, result: *?anyerror) void {
+            server.enqueueStreamingResize(.{ .rows = 24, .cols = 80 }) catch |err| {
+                result.* = err;
+            };
+        }
+    };
+
+    var server: ExecServer = undefined;
+    server.io = std.testing.io;
+    server.mutex = .init;
+    server.op = .{ .exec = .{
+        .phase = .active,
+        .request = "{}\n",
+        .session_sequence = 1,
+        .submitted_ms = 0,
+        .output = .{ .streamed = .{ .client_fd = -1, .timing = false } },
+    } };
+    server.active_stream = try vsock_stream.HostStream.init(10700, "{}\n");
+    var target: Run = .{};
+    server.wake = .{ .context = &target, .wakeFn = Run.wake };
+
+    var result: ?anyerror = null;
+    const thread = try std.Thread.spawn(.{}, Run.resize, .{ &server, &result });
+    while (!target.started.load(.acquire)) std.Thread.yield() catch {};
+    // A finished run replaces its wake before its frame goes away.
+    server.setWake(.{ .context = &target, .wakeFn = Run.ignore });
+    target.retired.store(true, .release);
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), result);
+    try std.testing.expect(!target.woken_after_retire.load(.acquire));
+}
 
 /// A local control client with read deadlines, so a monitor that blocks
 /// fails the test instead of hanging it.

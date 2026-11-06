@@ -202,11 +202,12 @@ pub const Process = struct {
         self.wakeGuest();
     }
 
+    /// Wakes under `wake_lock`, so once `clearWake` returns no wake into
+    /// the finished run is still in flight.
     fn wakeGuest(self: *Process) void {
         self.wake_lock.lock();
-        const wake = self.wake;
-        self.wake_lock.unlock();
-        wake.wake();
+        defer self.wake_lock.unlock();
+        self.wake.wake();
     }
 
     fn transmit(ctx: ?*anyopaque, frame: []const u8) void {
@@ -519,6 +520,35 @@ test "spore-net gateway buffers multiple rx frames" {
     try std.testing.expectEqualStrings("dns-reply", backend.peekRx().?);
     backend.consumeRx();
     try std.testing.expect(backend.peekRx() == null);
+}
+
+test "spore-net gateway wake finishes before clearWake returns" {
+    const Run = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        woken_after_retire: std.atomic.Value(bool) = .init(false),
+
+        fn wake(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.started.store(true, .release);
+            // Leave the run time to clear the wake while this call is in
+            // flight.
+            const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            if (self.retired.load(.acquire)) self.woken_after_retire.store(true, .release);
+        }
+    };
+
+    var process = Process{};
+    var target: Run = .{};
+    process.runtime().setWake(.{ .context = &target, .wakeFn = Run.wake });
+    const thread = try std.Thread.spawn(.{}, Process.wakeGuest, .{&process});
+    while (!target.started.load(.acquire)) std.Thread.yield() catch {};
+    process.runtime().clearWake();
+    target.retired.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(!target.woken_after_retire.load(.acquire));
 }
 
 test "spore-net gateway drops rx frames only after queue capacity" {
