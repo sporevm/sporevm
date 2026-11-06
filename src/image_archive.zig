@@ -10,6 +10,7 @@ const std = @import("std");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
+const fuzz_support = @import("fuzz_support.zig");
 const image = @import("image.zig");
 const image_manifest = @import("image_manifest.zig");
 const local_image = @import("local_image.zig");
@@ -18,6 +19,7 @@ const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
+const tar = @import("rootfs/tar.zig");
 
 const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
@@ -313,12 +315,13 @@ fn extractArchive(
     var hashed = file_reader.interface.hashed(Sha256.init(.{}), &hash_buf);
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&hashed.reader, .gzip, &decompress_buf);
+    var records: tar.RecordIterator = .{ .reader = &decompress.reader };
 
-    const manifest_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, manifest_entry, image_manifest.max_image_manifest_bytes);
+    const manifest_bytes = try readNamedEntryAlloc(allocator, &records, manifest_entry, image_manifest.max_image_manifest_bytes);
     defer allocator.free(manifest_bytes);
-    const config_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, config_entry, image_manifest.max_config_blob_bytes);
+    const config_bytes = try readNamedEntryAlloc(allocator, &records, config_entry, image_manifest.max_config_blob_bytes);
     defer allocator.free(config_bytes);
-    const index_bytes = try readNamedEntryAlloc(allocator, &decompress.reader, index_entry, disk_index.max_index_bytes);
+    const index_bytes = try readNamedEntryAlloc(allocator, &records, index_entry, disk_index.max_index_bytes);
     errdefer allocator.free(index_bytes);
 
     const manifest_digest = try image_manifest.transportDigestAlloc(allocator, manifest_bytes);
@@ -352,9 +355,9 @@ fn extractArchive(
         defer allocator.free(expected_name);
         const staged_path = try std.fs.path.join(allocator, &.{ stage_dir, object.digest["blake3:".len..] });
         defer allocator.free(staged_path);
-        try readObjectEntry(io, &decompress.reader, expected_name, object, staged_path);
+        try readObjectEntry(io, &records, expected_name, object, staged_path);
     }
-    try readArchiveEnd(&decompress.reader);
+    try readArchiveEnd(&records);
     _ = try hashed.reader.discardRemaining();
     var archive_digest: [Sha256.digest_length]u8 = undefined;
     hashed.hasher.final(&archive_digest);
@@ -437,66 +440,39 @@ fn validateArchiveBounds(logical_bytes: u64, objects: []const ObjectDescriptor) 
     return object_bytes;
 }
 
-fn readNamedEntryAlloc(allocator: std.mem.Allocator, reader: *Io.Reader, expected_name: []const u8, max_bytes: usize) ![]u8 {
-    var header: [512]u8 = undefined;
-    if (!try readTarHeader(reader, &header) or isZeroBlock(&header)) return error.BadImageArchive;
-    const size = try tarSize(&header);
-    if (size == 0 or size > max_bytes) return error.BadImageArchive;
-    try verifyTarHeader(&header, expected_name, size);
-    const bytes = try allocator.alloc(u8, @intCast(size));
-    errdefer allocator.free(bytes);
-    try reader.readSliceAll(bytes);
-    try discardTarPadding(reader, size);
-    return bytes;
+fn readNamedEntryAlloc(allocator: std.mem.Allocator, records: *tar.RecordIterator, expected_name: []const u8, max_bytes: usize) ![]u8 {
+    const record = try records.next() orelse return error.BadImageArchive;
+    if (record.size == 0 or record.size > max_bytes) return error.BadImageArchive;
+    try verifyTarHeader(&record.header, expected_name, record.size);
+    return records.readPayloadAlloc(allocator, max_bytes);
 }
 
-fn readObjectEntry(io: Io, reader: *Io.Reader, expected_name: []const u8, object: ObjectDescriptor, path: []const u8) !void {
-    var header: [512]u8 = undefined;
-    if (!try readTarHeader(reader, &header) or isZeroBlock(&header)) return error.BadImageArchive;
-    try verifyTarHeader(&header, expected_name, object.size);
+fn readObjectEntry(io: Io, records: *tar.RecordIterator, expected_name: []const u8, object: ObjectDescriptor, path: []const u8) !void {
+    const record = try records.next() orelse return error.BadImageArchive;
+    try verifyTarHeader(&record.header, expected_name, object.size);
     var file = try Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
     defer file.close(io);
     var file_buf: [64 * 1024]u8 = undefined;
     var writer: Io.File.Writer = .initStreaming(file, io, &file_buf);
-    var hasher = Blake3.init(.{});
-    var remaining: usize = object.size;
-    var buffer: [64 * 1024]u8 = undefined;
-    while (remaining > 0) {
-        const want = @min(remaining, buffer.len);
-        const n = try reader.readSliceShort(buffer[0..want]);
-        if (n == 0) return error.BadImageArchive;
-        hasher.update(buffer[0..n]);
-        try writer.interface.writeAll(buffer[0..n]);
-        remaining -= n;
-    }
+    var hash_buf: [64 * 1024]u8 = undefined;
+    var hashed = writer.interface.hashed(Blake3.init(.{}), &hash_buf);
+    try records.streamPayload(&hashed.writer);
+    try hashed.writer.flush();
     try writer.interface.flush();
     var digest: [Blake3.digest_length]u8 = undefined;
-    hasher.final(&digest);
+    hashed.hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
     if (!std.mem.eql(u8, object.digest["blake3:".len..], &hex)) return error.BadImageArchiveObject;
-    try discardTarPadding(reader, object.size);
 }
 
-fn readArchiveEnd(reader: *Io.Reader) !void {
-    var first: [512]u8 = undefined;
+fn readArchiveEnd(records: *tar.RecordIterator) !void {
+    // `next` returns null at the first zero block and at the end of the
+    // stream; only after a zero block can a second one follow.
+    if (try records.next() != null) return error.BadImageArchive;
     var second: [512]u8 = undefined;
-    if (!try readTarHeader(reader, &first) or !isZeroBlock(&first) or
-        !try readTarHeader(reader, &second) or !isZeroBlock(&second)) return error.BadImageArchive;
     var trailing: [1]u8 = undefined;
-    if (try reader.readSliceShort(&trailing) != 0) return error.BadImageArchive;
-}
-
-fn readTarHeader(reader: *Io.Reader, header: *[512]u8) !bool {
-    var filled: usize = 0;
-    while (filled < header.len) {
-        const n = try reader.readSliceShort(header[filled..]);
-        if (n == 0) {
-            if (filled == 0) return false;
-            return error.BadImageArchive;
-        }
-        filled += n;
-    }
-    return true;
+    if (try records.reader.readSliceShort(&second) != second.len or !allZero(&second) or
+        try records.reader.readSliceShort(&trailing) != 0) return error.BadImageArchive;
 }
 
 fn verifyTarHeader(header: *const [512]u8, expected_name: []const u8, expected_size: u64) !void {
@@ -520,10 +496,8 @@ fn verifyTarHeader(header: *const [512]u8, expected_name: []const u8, expected_s
         value /= 8;
     }
     if (!std.mem.eql(u8, header[124..136], &canonical_size)) return error.BadImageArchive;
-    const stored = try parseTarNumber(header[148..156]);
     var sum: u64 = 0;
     for (header, 0..) |byte, index| sum += if (index >= 148 and index < 156) ' ' else byte;
-    if (stored != sum) return error.BadImageArchive;
     var canonical_checksum = [_]u8{' '} ** 8;
     canonical_checksum[7] = 0;
     value = sum;
@@ -540,26 +514,6 @@ fn verifyTarHeader(header: *const [512]u8, expected_name: []const u8, expected_s
 fn allZero(bytes: []const u8) bool {
     for (bytes) |byte| if (byte != 0) return false;
     return true;
-}
-
-fn tarSize(header: *const [512]u8) !u64 {
-    return parseTarNumber(header[124..136]);
-}
-
-fn parseTarNumber(raw: []const u8) !u64 {
-    const trimmed = std.mem.trim(u8, raw, " \x00");
-    if (trimmed.len == 0) return 0;
-    return std.fmt.parseInt(u64, trimmed, 8) catch return error.BadImageArchive;
-}
-
-fn isZeroBlock(block: *const [512]u8) bool {
-    for (block) |byte| if (byte != 0) return false;
-    return true;
-}
-
-fn discardTarPadding(reader: *Io.Reader, size: u64) !void {
-    const padding = (512 - (size % 512)) % 512;
-    if (padding != 0) try reader.discardAll(@intCast(padding));
 }
 
 fn validateOutputPath(io: Io, path: []const u8) !void {
@@ -611,57 +565,133 @@ fn chmodPath(allocator: std.mem.Allocator, path: []const u8, mode: std.c.mode_t)
     if (std.c.chmod(path_z.ptr, mode) != 0) return error.ImageArchiveStagingUnavailable;
 }
 
-fn fuzzTarHeader(_: void, smith: *std.testing.Smith) !void {
-    var header: [512]u8 = undefined;
-    _ = smith.slice(&header);
-    verifyTarHeader(&header, manifest_entry, 1) catch {};
-    _ = tarSize(&header) catch {};
+const fuzz_archive_bytes = 16 * 1024;
+
+fn fuzzArchiveExtraction(_: void, smith: *std.testing.Smith) !void {
+    // Archives come from CI or object stores, and unpack parses every entry
+    // before it can compare the archive digest. The input is the tar stream
+    // inside the gzip layer, so mutations reach the tar, manifest, index and
+    // object checks instead of failing in the decompressor.
+    var buf: [fuzz_archive_bytes]u8 = undefined;
+    const len = smith.slice(&buf);
+
+    // The checking allocator, so leaks and double frees on error paths fail
+    // the run.
+    const allocator = std.testing.allocator;
+    var tmp = fuzz_support.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    defer allocator.free(dir);
+    extractTestTar(allocator, dir, buf[0..len]) catch {};
 }
 
-test "image archive tar header parser is fuzzed" {
-    try std.testing.fuzz({}, fuzzTarHeader, .{});
-}
-
-test "native image archive import enforces aggregate bounds" {
-    try std.testing.expectError(
-        error.ImageArchiveTooLarge,
-        validateArchiveBounds(max_rootfs_logical_bytes + 1, &.{}),
-    );
-
-    const half = max_object_bytes / 2 + 1;
-    const large = [_]ObjectDescriptor{ .{ .digest = "", .size = half }, .{ .digest = "", .size = half } };
-    try std.testing.expectError(error.ImageArchiveTooLarge, validateArchiveBounds(1, &large));
-
-    const many = try std.testing.allocator.alloc(ObjectDescriptor, max_object_count + 1);
-    defer std.testing.allocator.free(many);
-    @memset(many, .{ .digest = "", .size = 0 });
-    try std.testing.expectError(error.ImageArchiveTooLarge, validateArchiveBounds(1, many));
-}
-
-test "image pack rejects an image record that does not match its identity" {
+test "image archive extraction is fuzzed from a packed archive" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    var tmp = fuzz_support.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    const seed_tar = try testArchiveTarAlloc(&arena, dir);
+    try std.testing.expect(seed_tar.len <= fuzz_archive_bytes);
+    // The seed passes every check before the archive digest comparison.
+    try std.testing.expectError(error.ImageArchiveDigestMismatch, extractTestTar(allocator, dir, seed_tar));
+    // Smith reads a little-endian u32 length before the slice bytes.
+    const seed = try allocator.alloc(u8, 4 + seed_tar.len);
+    std.mem.writeInt(u32, seed[0..4], @intCast(seed_tar.len), .little);
+    @memcpy(seed[4..], seed_tar);
+    try std.testing.fuzz({}, fuzzArchiveExtraction, .{ .corpus = &.{seed} });
+}
+
+test "image archive must end with exactly two zero blocks after its last object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+
+    const seed_tar = try testArchiveTarAlloc(&arena, dir);
+    const end = seed_tar.len - 1024;
+    try std.testing.expect(allZero(seed_tar[end..]));
+    try std.testing.expectError(error.ImageArchiveDigestMismatch, extractTestTar(allocator, dir, seed_tar));
+
+    const zero_blocks = [_]u8{0} ** 1024;
+    const cases = [_][]const u8{
+        seed_tar[0..end],
+        seed_tar[0 .. end + 512],
+        try std.mem.concat(allocator, u8, &.{ seed_tar, "\x00" }),
+        try std.mem.concat(allocator, u8, &.{ seed_tar[0..end], seed_tar[0..512], &zero_blocks }),
+    };
+    for (cases) |case| try std.testing.expectError(error.BadImageArchive, extractTestTar(allocator, dir, case));
+}
+
+/// Gzips `tar_bytes` into `dir` and extracts them as `spore image unpack`
+/// does. No archive matches the all-zero digest, so a well-formed archive
+/// fails with ImageArchiveDigestMismatch only after every entry has been
+/// parsed and every object verified.
+fn extractTestTar(allocator: std.mem.Allocator, dir: []const u8, tar_bytes: []const u8) !void {
     const io = std.testing.io;
-    const tmp = "zig-cache/test-image-archive-local-digests";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    const cache = tmp ++ "/cache";
-    try Io.Dir.cwd().createDirPath(io, cache);
+    const archive_path = try std.fs.path.join(allocator, &.{ dir, "archive.tar.gz" });
+    defer allocator.free(archive_path);
+    {
+        var file = try Io.Dir.cwd().createFile(io, archive_path, .{});
+        defer file.close(io);
+        var file_buf: [4096]u8 = undefined;
+        var writer: Io.File.Writer = .initStreaming(file, io, &file_buf);
+        const compress_buf = try allocator.alloc(u8, std.compress.flate.max_window_len * 2);
+        defer allocator.free(compress_buf);
+        var compressor = try std.compress.flate.Compress.init(&writer.interface, compress_buf, .gzip, .fastest);
+        try compressor.writer.writeAll(tar_bytes);
+        try compressor.finish();
+        try writer.interface.flush();
+    }
+    const stage_dir = try std.fs.path.join(allocator, &.{ dir, "stage" });
+    defer allocator.free(stage_dir);
+    Io.Dir.cwd().deleteTree(io, stage_dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, stage_dir);
+    var extracted = try extractArchive(io, allocator, archive_path, "sha256:" ++ "0" ** 64, stage_dir, .{ .os = "linux", .arch = .arm64 });
+    extracted.deinit(allocator);
+}
+
+/// Packs a one-object image under `dir` and returns the archive's
+/// decompressed tar stream, allocated in `arena`.
+fn testArchiveTarAlloc(arena: *std.heap.ArenaAllocator, dir: []const u8) ![]u8 {
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const cache = try std.fs.path.join(allocator, &.{ dir, "cache" });
+    _ = try publishTestImage(allocator, io, cache, "local/archive:seed", "image archive seed object");
 
     var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
     try env.put(local_paths.rootfs_cache_env, cache);
     const init = std.process.Init{
         .minimal = undefined,
-        .arena = &arena,
+        .arena = arena,
         .gpa = allocator,
         .io = io,
         .environ_map = &env,
         .preopens = .empty,
     };
+    const archive_path = try std.fs.path.join(allocator, &.{ dir, "image.tar.gz" });
+    _ = try pack(init, allocator, .{ .source = "local/archive:seed", .output_path = archive_path, .platform = .{ .os = "linux", .arch = .arm64 } });
+    const archive = try Io.Dir.cwd().readFileAlloc(io, archive_path, allocator, .limited(1 << 20));
+    var input: Io.Reader = .fixed(archive);
+    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&input, .gzip, &decompress_buf);
+    return decompress.reader.allocRemaining(allocator, .limited(1 << 20));
+}
 
-    const object_bytes = "local digest archive object";
+const TestImage = struct {
+    storage: spore.RootfsStorage,
+    object_path: []const u8,
+    published: local_image.Published,
+};
+
+/// Installs `object_bytes` as the only chunk of an arm64 image in `cache`
+/// and publishes it as `name`. `allocator` must be an arena.
+fn publishTestImage(allocator: std.mem.Allocator, io: Io, cache: []const u8, name: []const u8, object_bytes: []const u8) !TestImage {
+    try Io.Dir.cwd().createDirPath(io, cache);
     const object_id = chunk.ChunkId.fromContents(object_bytes);
     const object_digest_buf = object_id.toDigest();
     const object_digest: []const u8 = &object_digest_buf;
@@ -693,8 +723,50 @@ test "image pack rejects an image record that does not match its identity" {
         .platform = .{},
         .config = .{ .architecture = .arm64, .os = "linux" },
         .storage = storage,
-        .name = "local/archive:native",
+        .name = name,
     });
+    return .{ .storage = storage, .object_path = object_path, .published = published };
+}
+
+test "native image archive import enforces aggregate bounds" {
+    try std.testing.expectError(
+        error.ImageArchiveTooLarge,
+        validateArchiveBounds(max_rootfs_logical_bytes + 1, &.{}),
+    );
+
+    const half = max_object_bytes / 2 + 1;
+    const large = [_]ObjectDescriptor{ .{ .digest = "", .size = half }, .{ .digest = "", .size = half } };
+    try std.testing.expectError(error.ImageArchiveTooLarge, validateArchiveBounds(1, &large));
+
+    const many = try std.testing.allocator.alloc(ObjectDescriptor, max_object_count + 1);
+    defer std.testing.allocator.free(many);
+    @memset(many, .{ .digest = "", .size = 0 });
+    try std.testing.expectError(error.ImageArchiveTooLarge, validateArchiveBounds(1, many));
+}
+
+test "image pack rejects an image record that does not match its identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const tmp = "zig-cache/test-image-archive-local-digests";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    const cache = tmp ++ "/cache";
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache);
+    const init = std.process.Init{
+        .minimal = undefined,
+        .arena = &arena,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    };
+
+    const published = (try publishTestImage(allocator, io, cache, "local/archive:native", "local digest archive object")).published;
     const arm64 = rootfs.Platform{ .os = "linux", .arch = .arm64 };
     const native = try pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/native.tar.gz", .platform = arm64 });
     try std.testing.expectEqualStrings(published.identity, native.image_digest);
@@ -730,44 +802,10 @@ test "native image archive round-trips into a clean cache and rejects substituti
     };
 
     const object_bytes = "native image archive object";
-    const object_id = chunk.ChunkId.fromContents(object_bytes);
-    const object_digest_buf = object_id.toDigest();
-    const object_digest: []const u8 = &object_digest_buf;
-    const entries = [_]disk_index.DiskIndexChunk{.{ .logical_chunk = 0, .id = object_id }};
-    const encoded_index = try disk_index.encodeCanonicalAlloc(allocator, .{
-        .kind = disk_index.disk_index_kind,
-        .logical_size = object_bytes.len,
-        .chunk_size = image_manifest.rootfs_chunk_size,
-        .hash_algorithm = image_manifest.rootfs_hash_algorithm,
-        .object_namespace = image_manifest.rootfs_object_namespace,
-        .chunks = &entries,
-    });
-    defer encoded_index.deinit(allocator);
-    const storage = spore.RootfsStorage{
-        .kind = image_manifest.rootfs_storage_kind,
-        .device = .{ .mmio_slot = image_manifest.rootfs_mmio_slot },
-        .logical_size = object_bytes.len,
-        .chunk_size = image_manifest.rootfs_chunk_size,
-        .hash_algorithm = image_manifest.rootfs_hash_algorithm,
-        .index_digest = encoded_index.digest,
-        .base_identity = encoded_index.digest,
-        .object_namespace = image_manifest.rootfs_object_namespace,
-    };
-    const producer_cache = tmp ++ "/producer-cache";
-    const installed_index = try rootfs_cas.manifestIndexPath(allocator, producer_cache, storage.index_digest);
-    defer allocator.free(installed_index);
-    _ = try rootfs_cas.installStorageIndexPath(allocator, io, installed_index, encoded_index.bytes, storage);
-    const installed_object = try rootfs_cas.manifestObjectPath(allocator, producer_cache, object_digest);
-    defer allocator.free(installed_object);
-    _ = try rootfs_cas.installChunkPath(allocator, io, installed_object, object_bytes, object_digest, object_bytes.len);
-    try rootfs_cas.markStorageComplete(io, allocator, producer_cache, storage.index_digest);
-    const published = try local_image.lockAndPublish(io, allocator, producer_cache, .{
-        .platform = .{},
-        .config = .{ .architecture = .arm64, .os = "linux" },
-        .storage = storage,
-        .name = "local/archive:producer",
-    });
-    defer published.deinit(allocator);
+    const producer = try publishTestImage(allocator, io, tmp ++ "/producer-cache", "local/archive:producer", object_bytes);
+    const published = producer.published;
+    const storage = producer.storage;
+    const installed_object = producer.object_path;
 
     const archive_path = tmp ++ "/image.tar.gz";
     const pack_result = try pack(init, allocator, .{
