@@ -25,7 +25,6 @@ pub const BackendAvailability = struct {
 pub const CacheRoots = struct {
     kernels: PathFact,
     rootfs: PathFact,
-    bundles: PathFact,
     runtime: PathFact,
 };
 
@@ -175,8 +174,6 @@ pub fn hostInfoFromSnapshot(
     errdefer freePathFact(allocator, kernels);
     const rootfs = try cacheRootFact(allocator, environ, .rootfs);
     errdefer freePathFact(allocator, rootfs);
-    const bundles = try cacheRootFact(allocator, environ, .bundles);
-    errdefer freePathFact(allocator, bundles);
     const runtime = try runtimeRootFact(allocator, environ);
     errdefer freePathFact(allocator, runtime);
 
@@ -188,7 +185,6 @@ pub fn hostInfoFromSnapshot(
         .cache_roots = .{
             .kernels = kernels,
             .rootfs = rootfs,
-            .bundles = bundles,
             .runtime = runtime,
         },
     };
@@ -218,7 +214,6 @@ fn platformFacts(snapshot: HostInfoSnapshot, arch: architecture.Architecture) Pl
 pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
     freePathFact(allocator, info.cache_roots.kernels);
     freePathFact(allocator, info.cache_roots.rootfs);
-    freePathFact(allocator, info.cache_roots.bundles);
     freePathFact(allocator, info.cache_roots.runtime);
 }
 
@@ -424,7 +419,6 @@ test "host info exposes schema and cache roots" {
     try std.testing.expect(info.backends.len >= 2);
     try std.testing.expectEqualStrings("/tmp/sporevm-cache/sporevm/kernels", info.cache_roots.kernels.path.?);
     try std.testing.expectEqualStrings("/tmp/sporevm-cache/sporevm/rootfs", info.cache_roots.rootfs.path.?);
-    try std.testing.expectEqualStrings("/tmp/sporevm-cache/sporevm/bundles", info.cache_roots.bundles.path.?);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/sporevm", info.cache_roots.runtime.path.?);
 }
 
@@ -494,7 +488,7 @@ test "host info offline renderer discriminates ARM and x86 without host probing"
     try std.testing.expectEqualStrings(
         "{\"schema\":\"spore.host-info.v3\",\"schema_version\":3,\"host_class\":\"macos-arm64-hvf\",\"architecture\":\"arm64\",\"platform\":{\"arm64\":{\"os\":\"macos\",\"cpu_profile\":\"sporevm-aarch64-v0\",\"device_model_version\":4,\"ram_base\":2147483648,\"interrupt_controller\":{\"kind\":\"gicv3\",\"distributor_base\":134217728,\"redistributor_base\":134348800},\"counter\":{\"source\":\"cntfrq_el0\",\"frequency_hz\":24000000}}}," ++
             "\"backends\":[{\"name\":\"hvf\",\"supported\":true,\"available\":true,\"reason\":\"supported_host\"},{\"name\":\"kvm\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"}]," ++
-            "\"cache_roots\":{\"kernels\":{\"path\":\"/tmp/sporevm-cache/sporevm/kernels\",\"resolved\":true,\"source\":\"environment\"},\"rootfs\":{\"path\":\"/tmp/sporevm-cache/sporevm/rootfs\",\"resolved\":true,\"source\":\"environment\"},\"bundles\":{\"path\":\"/tmp/sporevm-cache/sporevm/bundles\",\"resolved\":true,\"source\":\"environment\"},\"runtime\":{\"path\":\"/tmp/sporevm-runtime/sporevm\",\"resolved\":true,\"source\":\"environment\"}}}",
+            "\"cache_roots\":{\"kernels\":{\"path\":\"/tmp/sporevm-cache/sporevm/kernels\",\"resolved\":true,\"source\":\"environment\"},\"rootfs\":{\"path\":\"/tmp/sporevm-cache/sporevm/rootfs\",\"resolved\":true,\"source\":\"environment\"},\"runtime\":{\"path\":\"/tmp/sporevm-runtime/sporevm\",\"resolved\":true,\"source\":\"environment\"}}}",
         arm_json,
     );
     try std.testing.expectEqualStrings(
@@ -504,7 +498,7 @@ test "host info offline renderer discriminates ARM and x86 without host probing"
             "\"virtio_mmio\":{\"base\":3489660928,\"window_size\":512,\"slot_count\":8,\"first_gsi\":5},\"generation\":{\"base\":3489665024,\"size\":4096,\"gsi\":13,\"poweroff_doorbell_offset\":32,\"poweroff_command\":1179012944}," ++
             "\"kvm_capabilities\":[{\"name\":\"irqchip\",\"id\":0,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"user_memory\",\"id\":3,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"set_tss_addr\",\"id\":4,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"ext_cpuid\",\"id\":7,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"mp_state\",\"id\":14,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"pit2\",\"id\":33,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"pit_state2\",\"id\":35,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"set_identity_map_addr\",\"id\":37,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"adjust_clock\",\"id\":39,\"minimum\":1,\"required_bits\":14,\"value\":14,\"satisfied\":true},{\"name\":\"vcpu_events\",\"id\":41,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"debugregs\",\"id\":50,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"enable_cap_vm\",\"id\":98,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"xsave\",\"id\":55,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"xcrs\",\"id\":56,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"tsc_control\",\"id\":60,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"get_tsc_khz\",\"id\":61,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"kvmclock_ctrl\",\"id\":76,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"immediate_exit\",\"id\":136,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"exception_payload\",\"id\":164,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"enforce_pv_feature_cpuid\",\"id\":190,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true},{\"name\":\"vm_tsc_control\",\"id\":214,\"minimum\":1,\"required_bits\":0,\"value\":1,\"satisfied\":true}]}}" ++
             ",\"backends\":[{\"name\":\"hvf\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"},{\"name\":\"kvm\",\"supported\":true,\"available\":true,\"reason\":\"available\"}]," ++
-            "\"cache_roots\":{\"kernels\":{\"path\":\"/tmp/sporevm-cache/sporevm/kernels\",\"resolved\":true,\"source\":\"environment\"},\"rootfs\":{\"path\":\"/tmp/sporevm-cache/sporevm/rootfs\",\"resolved\":true,\"source\":\"environment\"},\"bundles\":{\"path\":\"/tmp/sporevm-cache/sporevm/bundles\",\"resolved\":true,\"source\":\"environment\"},\"runtime\":{\"path\":\"/tmp/sporevm-runtime/sporevm\",\"resolved\":true,\"source\":\"environment\"}}}",
+            "\"cache_roots\":{\"kernels\":{\"path\":\"/tmp/sporevm-cache/sporevm/kernels\",\"resolved\":true,\"source\":\"environment\"},\"rootfs\":{\"path\":\"/tmp/sporevm-cache/sporevm/rootfs\",\"resolved\":true,\"source\":\"environment\"},\"runtime\":{\"path\":\"/tmp/sporevm-runtime/sporevm\",\"resolved\":true,\"source\":\"environment\"}}}",
         x86_json,
     );
 }

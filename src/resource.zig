@@ -6,7 +6,6 @@ pub const Type = enum {
     live_vm,
     checkpoint,
     image,
-    bundle,
 };
 
 pub const Portability = enum {

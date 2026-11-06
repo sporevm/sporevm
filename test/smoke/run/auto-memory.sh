@@ -16,8 +16,7 @@ require_spore_bin
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-auto-memory"
 export SPOREVM_ROOTFS_CACHE_DIR="${SPOREVM_ROOTFS_CACHE_DIR:-${workdir}/rootfs-cache}"
-export SPOREVM_BUNDLE_CACHE_DIR="${SPOREVM_BUNDLE_CACHE_DIR:-${workdir}/bundle-cache}"
-mkdir -p "${SPOREVM_ROOTFS_CACHE_DIR}" "${SPOREVM_BUNDLE_CACHE_DIR}"
+mkdir -p "${SPOREVM_ROOTFS_CACHE_DIR}"
 
 process_rss_kb() {
   local pid="$1"

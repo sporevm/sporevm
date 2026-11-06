@@ -287,8 +287,7 @@ deliberately making them persistent.
 
 ## Manifest Authority
 
-The manifest, not a path, tag, cache entry, or bundle index, is the restore
-authority.
+The manifest, not a path, tag, or cache entry, is the restore authority.
 
 - `rootfs.artifact` records the ext4 materialization identity, size, format,
   device binding, and OCI provenance. For spores with `rootfs.storage`, the
@@ -335,9 +334,8 @@ closed, so destructive prune or GC cannot remove a still-unread CAS object.
 
 Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
 and now also the local cold-start fallback when a flat materialization is not
-available. `spore unpack` can still assemble flat
-materializations from verified chunk objects, but `spore run` and restore do
-not need to publish a flat by-digest cache entry before boot. An inconsistent
+available: `spore run` and restore do not need to publish a flat by-digest
+cache entry before boot. An inconsistent
 artifact/index pairing fails closed when the index is opened; missing or
 corrupt chunk objects fail a lazy multi-chunk, multi-descriptor read before any
 disk payload bytes are copied; virtio still writes the request's I/O-error
@@ -371,44 +369,13 @@ first read and then use the same hot `.base` path as a materialized image.
 
 ## Distribution
 
-`spore pack` follows the selected manifest. Machine-local saves may keep
-writable-disk indexes and objects only in the global rootfs CAS. A validated
-host-private durable pin keeps that storage reachable across save moves and
-cache GC/prune. Its hard-linked ownership anchor makes raw copies fail closed.
-Pack resolves saved-local storage first and then
-the pinned global CAS, verifies the canonical index and every object while
-copying, and emits a self-contained bundle that still restores after the source
-CAS and pin are removed. `spore clone` uses this same transport encoding to
-create an independent portable lifecycle.
-
-- spores without `rootfs.storage` include exact rootfs bytes under
-  `rootfs/blake3/<hex>.ext4`;
-- spores with `rootfs.storage` include the descriptor-bound index under
-  `rootfs/blake3/indexes/<hex>.json` and referenced chunks under
-  `rootfs/blake3/objects/<hex>.chunk`;
-- spores with writable disk indexes include the versioned index named by
-  `disk.base` and referenced nonzero disk chunk objects under the same
-  `rootfs/blake3` index/object paths.
-
-For chunked rootfs storage, pack reads the canonical index and its verified CAS
-objects directly while holding the rootfs cache lock. The manifest already
-binds `rootfs.artifact.digest` to that index identity, so packing neither needs
-nor recreates the derived flat ext4 materialization.
-
-`spore unpack` fully materializes one selected child before resume. It
-verifies bundle identity, selected manifests, RAM chunks, rootfs
-artifacts or CAS bytes, and disk index/object bytes before writing a resumable
-checkpoint. The resulting disk-backed checkpoint owns a descriptor-bound
-complete CAS locally, so `spore checkpoint rm DIR` removes and syncs the self-contained directory
-without requiring or unregistering a host-private durable pin. Removal fails
-closed while a live runtime owns that directory as its lazy disk baseline.
-`spore pull` from an [image store](image-format.md#spores) instead writes a
-save pinned in the rootfs cache.
-
-Metadata-only exact-rootfs bundles are an explicit prepared-cache opt-out:
-`--rootfs=metadata-only` on pack and `--allow-metadata-only-rootfs` on
-unpack. Chunked rootfs storage is bundled by default for new image-created
-spores.
+`spore push` copies a save's manifest, RAM chunks, disk index, and disk objects
+to an [image store](image-format.md#spores), verifying each against its BLAKE3
+digest, and `spore pull` writes them back as a save pinned in the receiving
+host's rootfs cache. Machine-local saves keep writable-disk indexes and objects
+only in the global rootfs CAS. A validated host-private durable pin keeps that
+storage reachable across save moves and cache GC/prune. Its hard-linked
+ownership anchor makes raw copies fail closed.
 
 ## Cache Inspection And Pruning
 
@@ -432,7 +399,7 @@ skipped unless `--include-digest-artifacts`
 is passed with an age or size bound. Canonical rootfs CAS chunks are skipped
 unless `--include-rootfs-chunks` is passed.
 That shared namespace also holds writable-disk state: pruning it can break
-resume and pack even when a flat rootfs artifact remains. Use root-aware
+resume and push even when a flat rootfs artifact remains. Use root-aware
 `spore cache gc --rootfs` to preserve reachable state.
 
 ## Evidence

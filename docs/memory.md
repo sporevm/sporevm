@@ -48,8 +48,8 @@ the requested amount is satisfied.
 `spore-disk-index-v2` encoding used for disk data. Each `chunk_ranges` entry
 packs the digests of a run of contiguous nonzero chunks; `zero_ranges` counts
 runs of all-zero chunks. RAM uses 2MiB chunks and the `memory/blake3`
-namespace. Every nonzero chunk loaded from disk, a bundle, a cache, S3, or
-HTTP(S) is verified against its digest before guest use.
+namespace. Every nonzero chunk loaded from disk, a cache, or an image store is
+verified against its digest before guest use.
 
 `manifest.memory.backing` may name a local `ram.backing` file:
 
@@ -125,8 +125,8 @@ hard-link capability, or a conflicting optional child proof produces chunk-only
 children. Malformed parent metadata, allocation failure, identity races, and
 unexpected hard-link or proof-write I/O abort the fork instead of being hidden.
 
-`spore pack`, `spore unpack`, and `spore pull` remain chunk-authoritative.
-Bundles must not treat proof files as distribution authority.
+`spore push` and `spore pull` remain chunk-authoritative and do not treat
+proof files as distribution authority.
 
 ## Dirty Tracking
 

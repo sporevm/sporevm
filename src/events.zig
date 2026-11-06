@@ -814,7 +814,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.CrossDeviceOwnershipLink) {
         return machine_output.CliError.init(
             .object_invalid,
-            "spore run: a machine-local pinned save must share a filesystem with the rootfs cache; save there first, then use `spore clone SOURCE --out DEST` for a portable copy",
+            "spore run: a machine-local pinned save must be on the rootfs cache's filesystem; choose --save DIR there",
             @errorName(err),
         );
     }

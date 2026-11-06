@@ -8,13 +8,11 @@
 //!
 //! The cache contract is verify-at-install, trust-at-open: exact writes verify
 //! flat bytes against the expected digest before publishing them
-//! (`installExpectedPath*`, `cacheByDigestPath*`, `copyVerifiedPath`), chunked
+//! (`installExpectedPathAfterSourceVerified*`, `cacheByDigestPath*`), chunked
 //! writes verify the index and chunks before publishing a materialization under
 //! the index identity, entries are installed read-only, and product open paths
 //! (`openTrustedFromCache`) do not re-hash them. The cache lives in the same
 //! host trust domain as the spore binary and kernel cache; see SECURITY.md.
-//! `openVerifiedFromCache` remains for boundaries that must prove cache
-//! contents to a third party, such as metadata-only bundle materialization.
 
 const std = @import("std");
 const TestDir = @import("test_dir.zig").TestDir;
@@ -66,29 +64,6 @@ pub fn openTrustedFromCache(
     return fd;
 }
 
-pub fn openVerifiedFromCache(
-    io: Io,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    rootfs: spore.Rootfs,
-) !std.c.fd_t {
-    const path = try digestPath(allocator, cache_root, rootfs.artifact.digest);
-    defer allocator.free(path);
-    if (!try regularFileNoSymlink(io, path)) return error.RootFSDigestCacheMiss;
-    const pathz = try allocator.dupeSentinel(u8, path, 0);
-    defer allocator.free(pathz);
-    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
-    if (fd < 0) return error.RootFSDigestCacheMiss;
-    errdefer _ = std.c.close(fd);
-    if (!try fdIsRegularFile(io, fd)) return error.RootFSDigestCacheMiss;
-
-    const actual = try hashFd(io, allocator, fd);
-    if (actual.size != rootfs.artifact.size) return error.RootFSDigestMismatch;
-    if (!std.mem.eql(u8, actual.digest, rootfs.artifact.digest)) return error.RootFSDigestMismatch;
-    if (std.c.lseek(fd, 0, std.c.SEEK.SET) < 0) return error.RootFSOpenFailed;
-    return fd;
-}
-
 /// Installs a caller-owned rootfs path into the digest cache by copying it.
 ///
 /// Product opens trust install-time verification, so the digest cache must not
@@ -130,29 +105,6 @@ fn cacheByDigestPathWithOptions(
     };
     _ = try installExpectedPathAfterSourceVerified(io, allocator, cache_root, rootfs_path, artifact, copy_options);
     return artifact;
-}
-
-pub fn installExpectedPath(
-    io: Io,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    source_path: []const u8,
-    artifact: spore.RootfsArtifactRef,
-    copy_options: CopyOptions,
-) !void {
-    _ = try installExpectedPathWithResult(io, allocator, cache_root, source_path, artifact, copy_options);
-}
-
-pub fn installExpectedPathWithResult(
-    io: Io,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    source_path: []const u8,
-    artifact: spore.RootfsArtifactRef,
-    copy_options: CopyOptions,
-) !InstallResult {
-    try verifyPath(io, allocator, source_path, artifact, copy_options.source_must_not_be_symlink);
-    return installExpectedPathAfterSourceVerified(io, allocator, cache_root, source_path, artifact, copy_options);
 }
 
 pub fn installExpectedPathAfterSourceVerified(
@@ -247,37 +199,6 @@ pub fn installTrustedMaterializationByHardlink(
 
     if (!try hardlinkTrustedPath(io, allocator, source_path, digest_path, expected_size)) return null;
     return .{ .cache_hit = false, .bytes_fetched = expected_size };
-}
-
-pub fn copyVerifiedPath(
-    io: Io,
-    allocator: std.mem.Allocator,
-    source_path: []const u8,
-    dest_path: []const u8,
-    artifact: spore.RootfsArtifactRef,
-    options: CopyOptions,
-) !void {
-    try verifyPath(io, allocator, source_path, artifact, options.source_must_not_be_symlink);
-    try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, dest_path, artifact, options);
-}
-
-/// Copy from a source that is already in the local cache trust domain.
-///
-/// This skips the source BLAKE3 pass but still verifies the published
-/// destination bytes against `artifact`. Use this only for cache-internal
-/// immutable sources, not for caller-owned paths or peer/bundle inputs.
-pub fn copyTrustedPath(
-    io: Io,
-    allocator: std.mem.Allocator,
-    source_path: []const u8,
-    dest_path: []const u8,
-    artifact: spore.RootfsArtifactRef,
-) !void {
-    if (!try regularFileNoSymlink(io, source_path)) return error.RootFSOpenFailed;
-    try copyVerifiedPathAfterSourceVerified(io, allocator, source_path, dest_path, artifact, .{
-        .source_must_not_be_symlink = true,
-        .allow_hardlink = false,
-    });
 }
 
 fn copyVerifiedPathAfterSourceVerified(
@@ -500,17 +421,14 @@ test "digest cache installs rootfs bytes atomically and verifies final content" 
     try std.testing.expect(std.mem.startsWith(u8, artifact.digest, spore.rootfs_digest_prefix));
     try std.testing.expectEqual(@as(u64, "rootfs bytes".len), artifact.size);
 
-    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
-    const fd = try openVerifiedFromCache(io, arena, cache_root, rootfs);
-    _ = std.c.close(fd);
-
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    try verifyPath(io, arena, digest_path, artifact, true);
     const stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
 
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "tampered" });
-    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
+    try std.testing.expectError(error.RootFSDigestMismatch, verifyPath(io, arena, digest_path, artifact, true));
 }
 
 test "trusted open accepts installed entry and fails closed on size and shape" {
@@ -578,7 +496,7 @@ test "trusted open trusts install-time verification for same-size entries" {
 
     const fd = try openTrustedFromCache(io, arena, cache_root, rootfs);
     _ = std.c.close(fd);
-    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
+    try std.testing.expectError(error.RootFSDigestMismatch, verifyPath(io, arena, digest_path, artifact, true));
 }
 
 test "install trusts existing same-size digest cache hits" {
@@ -600,7 +518,7 @@ test "install trusts existing same-size digest cache hits" {
     try Io.Dir.cwd().deleteFile(io, digest_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = digest_path, .data = "ROOTFS BYTES" });
 
-    const result = try installExpectedPathWithResult(io, arena, cache_root, rootfs_path, artifact, .{
+    const result = try installExpectedPathAfterSourceVerified(io, arena, cache_root, rootfs_path, artifact, .{
         .source_must_not_be_symlink = false,
         .allow_hardlink = false,
     });
@@ -609,7 +527,7 @@ test "install trusts existing same-size digest cache hits" {
 
     const fd = try openTrustedFromCache(io, arena, cache_root, rootfs);
     _ = std.c.close(fd);
-    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, rootfs));
+    try std.testing.expectError(error.RootFSDigestMismatch, verifyPath(io, arena, digest_path, artifact, true));
 }
 
 test "copy-only digest cache does not chmod source rootfs" {
@@ -650,45 +568,14 @@ test "digest cache default does not alias caller-owned source" {
     try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
 
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const rootfs = spore.Rootfs{ .device = .{ .mmio_slot = 1 }, .artifact = artifact };
 
     try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "ROOTFS BYTES" });
 
-    const fd = try openVerifiedFromCache(io, arena, cache_root, rootfs);
-    _ = std.c.close(fd);
-
     const digest_path = try digestPath(arena, cache_root, artifact.digest);
+    try verifyPath(io, arena, digest_path, artifact, true);
     const cache_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(cache_stat.permissions) & 0o777)));
-}
-
-test "trusted rootfs copy verifies destination bytes" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp_dir = try TestDir.init();
-    defer tmp_dir.deinit();
-    const expected_path = try tmp_dir.path("expected.ext4");
-    const source_path = try tmp_dir.path("source.ext4");
-    const dest_path = try tmp_dir.path("dest.ext4");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = "expected rootfs bytes" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "tampered rootfs bytes" });
-
-    const expected = try hashPath(io, arena, expected_path);
-    const artifact = spore.RootfsArtifactRef{
-        .digest = expected.digest,
-        .size = expected.size,
-    };
-    try std.testing.expectError(error.RootFSDigestMismatch, copyTrustedPath(io, arena, source_path, dest_path, artifact));
-    try std.testing.expect(!try pathExistsNoSymlink(io, dest_path));
-
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "expected rootfs bytes" });
-    try copyTrustedPath(io, arena, source_path, dest_path, artifact);
-    try verifyPath(io, arena, dest_path, artifact, true);
 }
 
 test "install after source verification cleans up bad installed bytes" {
@@ -747,10 +634,7 @@ test "preverified hardlink install skips second hash for regular source" {
     const digest_stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(source.size, digest_stat.size);
     try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(digest_stat.permissions) & 0o777)));
-    try std.testing.expectError(error.RootFSDigestMismatch, openVerifiedFromCache(io, arena, cache_root, .{
-        .device = .{ .mmio_slot = 1 },
-        .artifact = .{ .digest = source.digest, .size = source.size + 1 },
-    }));
+    try std.testing.expectError(error.RootFSDigestMismatch, verifyPath(io, arena, digest_path, .{ .digest = source.digest, .size = source.size + 1 }, true));
 }
 
 test "digest cache rejects unsafe existing paths" {
@@ -773,7 +657,7 @@ test "digest cache rejects unsafe existing paths" {
     const rootfs_z = try arena.dupeSentinel(u8, rootfs_path, 0);
     if (std.c.symlink(rootfs_z, digest_z) != 0) return error.SkipZigTest;
 
-    try std.testing.expectError(error.RootFSDigestMismatch, installExpectedPath(io, arena, cache_root, rootfs_path, artifact, .{}));
+    try std.testing.expectError(error.RootFSDigestMismatch, installExpectedPathAfterSourceVerified(io, arena, cache_root, rootfs_path, artifact, .{}));
 }
 
 test "rootfs hashing rejects non-file descriptors" {

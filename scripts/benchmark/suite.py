@@ -689,7 +689,6 @@ class BenchmarkRunner:
         self.raw_path = self.run_dir / "results.jsonl"
         self.summary_path = self.run_dir / "summary.json"
         self.rootfs_cache_dir = Path(args.rootfs_cache_dir).resolve() if args.rootfs_cache_dir else self.scratch_run_dir / "rootfs-cache"
-        self.bundle_cache_dir = self.scratch_run_dir / "bundle-cache"
         self.spore_bin = Path(args.spore_bin).resolve()
         self.backend = args.backend
         self.command = parse_shell_words(args.command)
@@ -698,7 +697,6 @@ class BenchmarkRunner:
         self.env = os.environ.copy()
         self.env.pop(EAGER_ROOTFS_ENV, None)
         self.env["SPOREVM_ROOTFS_CACHE_DIR"] = str(self.rootfs_cache_dir)
-        self.env["SPOREVM_BUNDLE_CACHE_DIR"] = str(self.bundle_cache_dir)
         self.effective_image = args.image
         self.expectations = load_benchmark_expectations(self.root)
 
@@ -707,7 +705,6 @@ class BenchmarkRunner:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.rootfs_cache_dir.mkdir(parents=True, exist_ok=True)
-        self.bundle_cache_dir.mkdir(parents=True, exist_ok=True)
         if not self.spore_bin.is_file() or not os.access(self.spore_bin, os.X_OK):
             die(f"spore binary not executable: {self.spore_bin}")
         if self.needs_image_setup():
@@ -826,7 +823,6 @@ class BenchmarkRunner:
             "output_dir": str(self.run_dir),
             "scratch_dir": str(self.scratch_run_dir),
             "rootfs_cache_dir": str(self.rootfs_cache_dir),
-            "bundle_cache_dir": str(self.bundle_cache_dir),
             "benchmark_expectations": self.expectations,
         }
 

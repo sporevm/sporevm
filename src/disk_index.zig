@@ -821,7 +821,7 @@ test "chunk range digests must be lowercase hex" {
 }
 
 fn fuzzDiskIndexParse(_: void, s: *std.testing.Smith) !void {
-    // Disk indexes may arrive from registries, bundles, or peers. They
+    // Disk indexes may arrive from registries, image stores, or peers. They
     // must either fail closed or validate to a descriptor-bound, canonical map.
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);

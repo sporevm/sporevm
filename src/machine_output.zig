@@ -305,7 +305,6 @@ pub fn fromZigError(err: anyerror) CliError {
         error.MissingHome,
         => CliError.init(.cache_unavailable, ErrorCode.cache_unavailable.defaultMessage(), @errorName(err)),
         error.BadChunk,
-        error.BadBundleDigest,
         error.BadRootfsDigest,
         error.BadManagedKernelChecksum,
         error.ManagedKernelChecksumMismatch,

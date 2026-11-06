@@ -52,7 +52,7 @@ check_materialized_ext4() {
     return
   fi
   local image="${cache_root}/by-digest/blake3/${index_digest#blake3:}.ext4"
-  [[ -f "${image}" ]] || die "unpack did not materialize ${image}"
+  [[ -f "${image}" ]] || die "run did not materialize ${image}"
   "${e2fsck_bin}" -fn "${image}" >"${workdir}/e2fsck.stdout" 2>"${workdir}/e2fsck.stderr" || {
     cat "${workdir}/e2fsck.stdout" >&2 || true
     cat "${workdir}/e2fsck.stderr" >&2 || true
@@ -97,9 +97,8 @@ smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-build-capacity"
 
 primary_cache="${workdir}/rootfs-cache"
 runtime_dir="${workdir}/runtime"
-unpack_cache="${workdir}/unpack-rootfs-cache"
 pull_cache="${workdir}/pull-rootfs-cache"
-mkdir -p "${primary_cache}" "${unpack_cache}" "${pull_cache}"
+mkdir -p "${primary_cache}" "${pull_cache}"
 export SPOREVM_ROOTFS_CACHE_DIR="${primary_cache}"
 export SPOREVM_RUNTIME_DIR="${runtime_dir}"
 
@@ -153,19 +152,7 @@ assert_manifest_rootfs "${capture_dir}/manifest.json" "${built_index}" "${capaci
   --from "${capture_dir}" \
   -- /bin/sh -lc "grep -Fxq prepared-build /prepared-build-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_16} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 15000000"
 
-bundle_dir="${workdir}/built.bundle"
-unpacked_dir="${workdir}/unpacked.spore"
 pulled_dir="${workdir}/pulled.spore"
-"${spore_bin}" --json pack "${capture_dir}" --out "${bundle_dir}" >"${workdir}/pack.json"
-
-SPOREVM_ROOTFS_CACHE_DIR="${unpack_cache}" \
-  "${spore_bin}" --json unpack "${bundle_dir}" --out "${unpacked_dir}" >"${workdir}/unpack.json"
-assert_manifest_rootfs "${unpacked_dir}/manifest.json" "${built_index}" "${capacity_16}"
-check_materialized_ext4 "${unpack_cache}" "${built_index}"
-SPOREVM_ROOTFS_CACHE_DIR="${unpack_cache}" \
-  "${spore_bin}" run --backend "${backend}" --from "${unpacked_dir}" -- \
-    /bin/sh -lc "grep -Fxq prepared-build /prepared-build-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_16} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 15000000"
-
 "${spore_bin}" --json push "${capture_dir}" "${workdir}/store/built" >"${workdir}/push.json"
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
   "${spore_bin}" --json pull "file://${workdir}/store/built" --out "${pulled_dir}" >"${workdir}/pull.json"
@@ -238,5 +225,15 @@ assert_manifest_rootfs "${above_capture}/manifest.json" "${above_built_index}" "
   --backend "${backend}" \
   --from "${above_capture}" \
   -- /bin/sh -lc "grep -Fxq above-cap-built /above-cap-built-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_20} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 19000000"
+
+# Last, so the runs above start from the lazy chunked base: materialize the
+# flat ext4 so the host can fsck the prepared build output.
+SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK=1 "${spore_bin}" run \
+  --backend "${backend}" \
+  --memory "${smoke_memory}" \
+  --image "${built_ref}" \
+  --pull=never \
+  -- /bin/sh -lc 'grep -Fxq prepared-build /prepared-build-marker'
+check_materialized_ext4 "${primary_cache}" "${built_index}"
 
 echo "smoke:build-rootfs-capacity ok backend=${backend} image=${image_ref} index=${built_index}"

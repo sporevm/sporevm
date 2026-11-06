@@ -8,14 +8,10 @@ const aarch64_topology = @import("aarch64/topology.zig");
 const architecture = @import("architecture.zig");
 const backend_mod = @import("backend.zig");
 const boot_assets = @import("boot_assets.zig");
-const bundle = @import("bundle.zig");
-const chunk_sealer = @import("chunk_sealer.zig");
-const contracts = @import("contracts.zig");
 const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
 const image_archive = @import("image_archive.zig");
 const image_store = @import("image_store.zig");
-const local_paths = @import("local_paths.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const memory_config = @import("memory.zig");
 const platform = @import("platform.zig");
@@ -25,7 +21,6 @@ const rootfs_cas = @import("rootfs_cas.zig");
 const resource = @import("resource.zig");
 const saved_spore_fork = @import("saved_spore_fork.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
-const saved_spore_pin = @import("saved_spore_pin.zig");
 const guest_request = @import("guest_request.zig");
 const rootfs_input = @import("rootfs_input.zig");
 const events_mod = @import("events.zig");
@@ -48,46 +43,10 @@ pub const ImagePushResult = image_store.PushResult;
 /// Process IO and environment access shared by product operations.
 pub const Context = context_mod.Context;
 
-/// Cache root selection for operations that materialize or read cached bytes.
-///
-/// `.env` uses the same environment-derived defaults as the CLI, `.none`
-/// disables the optional cache, and `.path` uses an explicit caller path.
-pub const CacheRoot = union(enum) {
-    env,
-    none,
-    path: []const u8,
-};
-
 /// Architecture-discriminated `spore.host-info.v3` host facts.
 pub const HostInfo = platform.HostInfo;
 
-/// Rootfs storage policy used when packing a spore into a bundle.
-pub const RootfsBundlePolicy = enum {
-    /// Include rootfs bytes so the bundle can be unpacked without the original cache.
-    exact_bytes,
-    /// Include only rootfs metadata; unpacking requires an already-populated cache.
-    metadata_only,
-};
-
-/// Inclusive bundle child range.
-pub const ChildRange = struct {
-    start: u32,
-    end: u32,
-};
-
-/// Options for read-only bundle inspection.
-pub const InspectBundleOptions = struct {
-    /// Local path or remote reference understood by SporeVM's bundle resolver.
-    source: []const u8,
-    /// Optional child id to summarize.
-    child_id: ?[]const u8 = null,
-    /// Optional child range to summarize.
-    child_range: ?ChildRange = null,
-};
-
 pub const PullResult = spore_store.PullResult;
-pub const BundleChildSummary = contracts.BundleChildSummary;
-pub const InspectBundleResult = contracts.InspectBundleResult;
 
 pub const Backend = backend_mod.Backend;
 pub const MemoryConfig = run_mod.MemoryConfig;
@@ -236,75 +195,6 @@ pub const ForkResult = struct {
     last_child: []const u8,
     pin_publish_ms: ?u64 = null,
     pin_lock_wait_ms: ?u64 = null,
-};
-
-/// Options for packing a spore directory into a portable bundle.
-pub const PackOptions = struct {
-    spore_dir: []const u8,
-    out_dir: []const u8,
-    rootfs_cache: CacheRoot = .env,
-    children_dir: ?[]const u8 = null,
-    rootfs_policy: RootfsBundlePolicy = .exact_bytes,
-};
-
-/// Result returned by `pack`.
-pub const PackResult = struct {
-    schema: []const u8 = "spore.pack.result.v1",
-    schema_version: u32 = 1,
-    resource_type: ResourceType = .bundle,
-    source: []const u8,
-    out_dir: []const u8,
-    bundle_digest: []const u8,
-    chunk_count: usize,
-    packed_chunk_count: usize,
-    pack_count: usize,
-    payload_bytes: u64,
-    rootfs_artifact_count: usize = 0,
-    rootfs_payload_bytes: u64 = 0,
-    child_count: usize = 0,
-};
-
-/// Options for unpacking a bundle into a spore directory.
-pub const UnpackOptions = struct {
-    bundle_dir: []const u8,
-    out_dir: []const u8,
-    rootfs_cache: CacheRoot = .env,
-    child_id: ?[]const u8 = null,
-    allow_metadata_only_rootfs: bool = false,
-};
-
-/// Result returned by `unpack`.
-pub const UnpackResult = struct {
-    schema: []const u8 = "spore.unpack.result.v1",
-    schema_version: u32 = 1,
-    resource_type: ResourceType = .checkpoint,
-    bundle: []const u8,
-    out_dir: []const u8,
-    bundle_digest: []const u8,
-    chunk_count: usize,
-    unpacked_chunk_count: usize,
-    payload_bytes: u64,
-    rootfs_artifact_count: usize = 0,
-    rootfs_payload_bytes: u64 = 0,
-    child_count: usize = 0,
-    selected_child: ?[]const u8 = null,
-};
-
-/// Options for making an independently owned portable copy of one spore.
-pub const CloneOptions = struct {
-    spore_dir: []const u8,
-    out_dir: []const u8,
-    rootfs_cache: CacheRoot = .env,
-};
-
-pub const CloneResult = struct {
-    schema: []const u8 = "spore.clone.result.v1",
-    schema_version: u32 = 1,
-    resource_type: ResourceType = .checkpoint,
-    portability: Portability = .portable,
-    source: []const u8,
-    out_dir: []const u8,
-    ownership: []const u8 = saved_spore_ownership.portable_self_contained,
 };
 
 /// Options for pushing a saved spore to an image store.
@@ -863,188 +753,6 @@ test "fork validates count and returns owned child paths" {
     try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ children, "000001" }), result.last_child);
 }
 
-/// Pack a spore directory into a portable bundle.
-pub fn pack(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: PackOptions,
-) !PackResult {
-    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map);
-    defer rootfs_cache.deinit(allocator);
-    const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
-    defer allocator.free(runtime_root);
-
-    const result = try bundle.pack(allocator, .{
-        .io = context.io,
-        .spore_dir = options.spore_dir,
-        .out_dir = options.out_dir,
-        .rootfs_cache_dir = rootfs_cache.path,
-        .runtime_root = runtime_root,
-        .children_dir = options.children_dir,
-        .rootfs_policy = rootfsBundlePolicy(options.rootfs_policy),
-    });
-    return .{
-        .source = result.source,
-        .out_dir = result.out_dir,
-        .bundle_digest = result.bundle_digest,
-        .chunk_count = result.chunk_count,
-        .packed_chunk_count = result.packed_chunk_count,
-        .pack_count = result.pack_count,
-        .payload_bytes = result.payload_bytes,
-        .rootfs_artifact_count = result.rootfs_artifact_count,
-        .rootfs_payload_bytes = result.rootfs_payload_bytes,
-        .child_count = result.child_count,
-    };
-}
-
-/// Unpack a bundle into a spore directory.
-pub fn unpack(
-    context: Context,
-    allocator: std.mem.Allocator,
-    options: UnpackOptions,
-) !UnpackResult {
-    const rootfs_cache = resolveCacheRoot(options.rootfs_cache, allocator, context.environ_map);
-    defer rootfs_cache.deinit(allocator);
-
-    const result = try bundle.unpack(allocator, .{
-        .io = context.io,
-        .bundle_dir = options.bundle_dir,
-        .out_dir = options.out_dir,
-        .rootfs_cache_dir = rootfs_cache.path,
-        .child_id = options.child_id,
-        .allow_metadata_only_rootfs = options.allow_metadata_only_rootfs,
-    });
-    return .{
-        .bundle = result.bundle,
-        .out_dir = result.out_dir,
-        .bundle_digest = result.bundle_digest,
-        .chunk_count = result.chunk_count,
-        .unpacked_chunk_count = result.unpacked_chunk_count,
-        .payload_bytes = result.payload_bytes,
-        .rootfs_artifact_count = result.rootfs_artifact_count,
-        .rootfs_payload_bytes = result.rootfs_payload_bytes,
-        .child_count = result.child_count,
-        .selected_child = result.selected_child,
-    };
-}
-
-/// Clone one spore through the existing pack/unpack transport encoding so the
-/// output owns all RAM and disk content it needs.
-pub fn cloneSpore(context: Context, allocator: std.mem.Allocator, options: CloneOptions) !CloneResult {
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var stage_root: ?[]const u8 = null;
-    if (std.Io.Dir.cwd().statFile(context.io, options.out_dir, .{ .follow_symlinks = false })) |_| {
-        return error.AlreadyExists;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    }
-    for (0..16) |_| {
-        var nonce: [8]u8 = undefined;
-        context.io.random(&nonce);
-        const candidate = try std.fmt.allocPrint(arena, "{s}.clone-stage-{x}", .{ options.out_dir, std.mem.readInt(u64, &nonce, .little) });
-        std.Io.Dir.cwd().createDir(context.io, candidate, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => continue,
-            else => |e| return e,
-        };
-        stage_root = candidate;
-        break;
-    }
-    const owned_stage_root = stage_root orelse return error.PathAlreadyExists;
-    defer std.Io.Dir.cwd().deleteTree(context.io, owned_stage_root) catch {};
-    const bundle_dir = try std.fs.path.join(arena, &.{ owned_stage_root, "bundle" });
-    const staged_output = try std.fs.path.join(arena, &.{ owned_stage_root, "output" });
-
-    _ = try pack(context, arena, .{
-        .spore_dir = options.spore_dir,
-        .out_dir = bundle_dir,
-        .rootfs_cache = options.rootfs_cache,
-    });
-    _ = try unpack(context, arena, .{
-        .bundle_dir = bundle_dir,
-        .out_dir = staged_output,
-        .rootfs_cache = options.rootfs_cache,
-    });
-    try chunk_sealer.fsyncDirPath(arena, staged_output);
-    try renameDirectoryNoReplace(arena, staged_output, options.out_dir);
-    try chunk_sealer.fsyncDirPath(arena, std.fs.path.dirname(options.out_dir) orelse ".");
-    return .{ .source = options.spore_dir, .out_dir = options.out_dir };
-}
-
-fn renameDirectoryNoReplace(allocator: std.mem.Allocator, source: []const u8, destination: []const u8) !void {
-    const source_z = try allocator.dupeSentinel(u8, source, 0);
-    defer allocator.free(source_z);
-    const destination_z = try allocator.dupeSentinel(u8, destination, 0);
-    defer allocator.free(destination_z);
-    if (comptime builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        const rc = linux.renameat2(std.c.AT.FDCWD, source_z.ptr, std.c.AT.FDCWD, destination_z.ptr, .{ .NOREPLACE = true });
-        return switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .EXIST => error.AlreadyExists,
-            .NOENT => error.FileNotFound,
-            .XDEV => error.CrossDevice,
-            else => error.IoFailed,
-        };
-    } else {
-        const Darwin = struct {
-            extern "c" fn renamex_np(old: [*:0]const u8, new: [*:0]const u8, flags: c_uint) c_int;
-        };
-        if (Darwin.renamex_np(source_z.ptr, destination_z.ptr, 0x00000004) == 0) return;
-        return switch (std.c.errno(-1)) {
-            .EXIST => error.AlreadyExists,
-            .NOENT => error.FileNotFound,
-            .XDEV => error.CrossDevice,
-            else => error.IoFailed,
-        };
-    }
-}
-
-test "clone spore makes a pinned save independently portable" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
-    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
-    const source = try std.fs.path.join(arena, &.{ root, "source.spore" });
-    const output = try std.fs.path.join(arena, &.{ root, "portable.spore" });
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, cache_root);
-    try env.put(local_paths.runtime_dir_env, runtime_root);
-    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, source, 0x71, false);
-    {
-        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
-        defer lock.deinit();
-        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &lock);
-        try saved_spore_pin.publishManifest(io, arena, registry, source, fixture.disk, fixture.manifest);
-    }
-    const source_inspected = try inspectSpore(allocator, source);
-    defer deinitSporeInspectResult(allocator, source_inspected);
-    try std.testing.expectEqualStrings(saved_spore_ownership.machine_local_pinned, source_inspected.ownership);
-    const result = try cloneSpore(.{ .io = io, .environ_map = &env }, allocator, .{ .spore_dir = source, .out_dir = output });
-    try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, result.ownership);
-    const inspected = try inspectSpore(allocator, output);
-    defer deinitSporeInspectResult(allocator, inspected);
-    try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, inspected.ownership);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, try std.fs.path.join(arena, &.{ output, saved_spore_pin.reference_file }), .{ .follow_symlinks = false }));
-
-    const occupied = try std.fs.path.join(arena, &.{ root, "occupied.spore" });
-    try std.Io.Dir.cwd().createDirPath(io, occupied);
-    const sentinel = try std.fs.path.join(arena, &.{ occupied, "keep" });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sentinel, .data = "owned elsewhere" });
-    try std.testing.expectError(error.AlreadyExists, cloneSpore(.{ .io = io, .environ_map = &env }, allocator, .{ .spore_dir = source, .out_dir = occupied }));
-    try std.testing.expectEqualStrings("owned elsewhere", try std.Io.Dir.cwd().readFileAlloc(io, sentinel, arena, .limited(64)));
-}
-
 /// Push a saved spore to a directory or S3 image store.
 pub fn push(
     context: Context,
@@ -1052,18 +760,6 @@ pub fn push(
     options: PushOptions,
 ) !PushResult {
     return spore_store.push(context, allocator, options);
-}
-
-/// Inspect bundle metadata without materializing a child spore.
-pub fn inspectBundle(
-    allocator: std.mem.Allocator,
-    options: InspectBundleOptions,
-) !InspectBundleResult {
-    return bundle.inspectBundle(allocator, .{
-        .source = options.source,
-        .child_id = options.child_id,
-        .child_range = if (options.child_range) |range| .{ .start = range.start, .end = range.end } else null,
-    });
 }
 
 /// Pull a saved spore from a directory, HTTP(S) or S3 image store.
@@ -1444,33 +1140,5 @@ fn testVcpuState(index: u32) spore.VcpuState {
         .sys_regs = &.{},
         .icc_regs = &.{},
         .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
-    };
-}
-
-const ResolvedCacheRoot = struct {
-    path: ?[]const u8 = null,
-    owned: bool = false,
-
-    fn deinit(self: ResolvedCacheRoot, allocator: std.mem.Allocator) void {
-        if (self.owned) allocator.free(self.path.?);
-    }
-};
-
-fn resolveCacheRoot(
-    requested: CacheRoot,
-    allocator: std.mem.Allocator,
-    environ_map: *const std.process.Environ.Map,
-) ResolvedCacheRoot {
-    return switch (requested) {
-        .none => .{},
-        .path => |path| .{ .path = path },
-        .env => if (local_paths.rootfsCacheRootPath(allocator, environ_map) catch null) |path| .{ .path = path, .owned = true } else .{},
-    };
-}
-
-fn rootfsBundlePolicy(policy: RootfsBundlePolicy) bundle.RootfsBundlePolicy {
-    return switch (policy) {
-        .exact_bytes => .exact_bytes,
-        .metadata_only => .metadata_only,
     };
 }

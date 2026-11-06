@@ -1629,7 +1629,7 @@ test "fuzz elastic memory state validation" {
 }
 
 fn fuzzMemoryManifestParse(_: void, s: *std.testing.Smith) !void {
-    // Memory indexes arrive in manifests from bundles and peers. Start near
+    // Memory indexes arrive in manifests from image stores and peers. Start near
     // a valid object so mutations reach range decoding and validation
     // instead of stopping at the JSON tokenizer.
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

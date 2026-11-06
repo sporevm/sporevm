@@ -103,8 +103,7 @@ local ref last.
 Archives are bounded to 16 GiB logical rootfs size, 65,536 distinct nonzero
 objects, 4 GiB object payload, and 4 GiB compressed archive bytes. The
 unpacker uses private disk staging and never creates, captures, restores, or
-carries RAM, vCPU, device, session, or suspended machine state. `spore pack`
-and `unpack` remain the separate saved-machine bundle protocol; `spore push`
+carries RAM, vCPU, device, session, or suspended machine state; `spore push`
 and `pull` move a saved spore through an [image store](#spores).
 
 ## Image stores
