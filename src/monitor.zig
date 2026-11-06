@@ -289,7 +289,6 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .vcpus = spec.vcpus,
         .guest_port = spec.guest_port,
         .timeout_ms = spec.timeout_ms,
-        .console_log_path = spec.console_log_path,
         .network = network.mode,
         .network_policy = network.policy,
         .network_runtime = if (gateway_active) gateway.runtime() else null,
