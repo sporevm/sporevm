@@ -74,14 +74,14 @@ static int connect_timeout(const struct addrinfo *ai) {
       close(fd);
       return -1;
     }
-    if (wait_fd(fd, POLLOUT) != 0) {
-      close(fd);
-      return -1;
-    }
+    int waited = wait_fd(fd, POLLOUT);
     int err = 0;
     socklen_t len = sizeof(err);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) err = errno;
+    if (err == 0 && waited != 0) err = ETIMEDOUT;
+    if (err != 0) {
       close(fd);
+      errno = err;
       return -1;
     }
   }
@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
   }
   freeaddrinfo(res);
   if (fd < 0) {
-    dprintf(2, "wget: connect failed for %s:%s errno=%d\n", parts.host, parts.port, errno);
+    dprintf(2, "wget: connect failed for %s:%s: %s\n", parts.host, parts.port, strerror(errno));
     return 1;
   }
 
