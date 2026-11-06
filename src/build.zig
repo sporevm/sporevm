@@ -24,6 +24,7 @@ const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
 const ext4 = @import("rootfs/ext4.zig");
 const ext4_writer = @import("rootfs/ext4_writer.zig");
+const rootfs_input = @import("rootfs_input.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const system_mod = @import("system.zig");
@@ -1160,7 +1161,7 @@ fn resolveBase(init: std.process.Init, allocator: std.mem.Allocator, options: Op
         return .{ .cache_root = cache_root, .storage = local.storage, .config = local.config };
     }
     const image_ref = try normalizeBuildImageRef(allocator, source);
-    const resolved = try run_mod.resolveRootfsInputDetailed(init, allocator, .{
+    const resolved = try rootfs_input.resolveRootfsInputDetailed(init, allocator, .{
         .rootfs_path = null,
         .image_ref = image_ref,
         .command_name = "build",

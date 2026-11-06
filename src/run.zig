@@ -14,6 +14,7 @@ const Context = @import("context.zig").Context;
 const disk_layer = @import("disk_layer.zig");
 const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
+const guest_request = @import("guest_request.zig");
 const hvf = @import("hvf/hvf.zig");
 const image = @import("image.zig");
 const kvm_native = @import("kvm/native.zig");
@@ -30,6 +31,7 @@ const machine_output = @import("machine_output.zig");
 const memory_config = @import("memory.zig");
 const net_gateway = @import("net_gateway.zig");
 const ram_restore = @import("ram_restore.zig");
+const rootfs_input = @import("rootfs_input.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const rootfs_mod = @import("rootfs.zig");
@@ -49,26 +51,12 @@ const vsock = @import("virtio/vsock.zig");
 const vsock_control = @import("virtio/vsock_control.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
 
-pub const max_guest_argc = run_contract.max_exec_args;
-pub const max_guest_request_len = 8191;
-const max_guest_arg_len = max_guest_request_len;
-pub const max_guest_envc = 64;
-pub const max_guest_env_len = 255;
-pub const max_guest_working_dir_len = 255;
 const max_guest_port = 65535;
 pub const rootfs_growth_experiments_env = "SPOREVM_ROOTFS_GROWTH_EXPERIMENTS";
 const force_write_zeroes_unsupported_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_UNSUPPORTED_EXPERIMENT";
 const force_write_zeroes_backend_failure_experiment_env = "SPOREVM_WRITE_ZEROES_FORCE_BACKEND_FAILURE_EXPERIMENT";
 const lazy_init_negative_control_experiment_env = "SPOREVM_ROOTFS_LAZY_INIT_NEGATIVE_CONTROL";
-pub const direct_image_platform = directImagePlatformFor(builtin.cpu.arch) catch
-    @compileError("SporeVM product execution requires an arm64 or amd64 host architecture");
 pub const x86_experimental_memory_bytes: u64 = 512 * 1024 * 1024;
-
-fn directImagePlatformFor(zig_arch: std.Target.Cpu.Arch) !rootfs_mod.Platform {
-    return .{
-        .arch = architecture.fromTarget(zig_arch) orelse return error.UnsupportedArchitecture,
-    };
-}
 
 pub const MemoryConfig = memory_config.Config;
 pub const SaveTrigger = capture.Trigger;
@@ -161,7 +149,7 @@ pub const Options = struct {
     continue_after_save: bool = false,
     commit: ?CommitOptions = null,
     annotations: spore.Annotations = .{},
-    network: Network = .disabled,
+    network: spore_net_policy.Network = .disabled,
     network_runtime: ?virtio_net.Runtime = null,
     events: ?EventSink = null,
     spore_executable: []const u8 = "spore",
@@ -171,27 +159,7 @@ pub const Options = struct {
 pub const CommitOptions = struct {
     ref: []const u8,
     config: rootfs_mod.ImageConfig,
-    platform: rootfs_mod.Platform = direct_image_platform,
-};
-
-pub const GuestEnvSpec = union(enum) {
-    literal: []const u8,
-    copy: []const u8,
-};
-
-pub const GuestEnvSpecList = struct {
-    items: [max_guest_envc]GuestEnvSpec = undefined,
-    len: usize = 0,
-
-    pub fn append(self: *GuestEnvSpecList, spec: GuestEnvSpec) !void {
-        if (self.len >= max_guest_envc) return error.TooManyRunEnv;
-        self.items[self.len] = spec;
-        self.len += 1;
-    }
-
-    pub fn slice(self: *const GuestEnvSpecList) []const GuestEnvSpec {
-        return self.items[0..self.len];
-    }
+    platform: rootfs_mod.Platform = rootfs_input.direct_image_platform,
 };
 
 pub const BoundServiceArgList = struct {
@@ -209,52 +177,12 @@ pub const BoundServiceArgList = struct {
     }
 };
 
-pub const BoundServiceBindingList = struct {
-    items: [spore_net_policy.max_bound_services]spore_net_policy.BoundServiceBinding = undefined,
-    len: usize = 0,
-
-    pub fn append(self: *BoundServiceBindingList, binding: spore_net_policy.BoundServiceBinding) !void {
-        if (self.len >= spore_net_policy.max_bound_services) return error.TooManyBoundServices;
-        self.items[self.len] = binding;
-        self.len += 1;
-    }
-
-    pub fn slice(self: *const BoundServiceBindingList) []const spore_net_policy.BoundServiceBinding {
-        return self.items[0..self.len];
-    }
-};
-
-pub const BoundServiceBindingDiagnostic = spore_net_policy.BoundServiceBindingDiagnostic;
-
-/// Guest networking. Spore networking always carries its policy, and the
-/// policy has no default egress, so enabling the network means choosing
-/// between unrestricted egress and an allowlist.
-pub const Network = union(enum) {
-    disabled,
-    spore: spore_net_policy.Config,
-};
-
-pub const NetworkMode = std.meta.Tag(Network);
-
 pub const EventMode = enum {
     none,
     jsonl,
 
     pub fn parse(raw: []const u8) ?EventMode {
         if (std.mem.eql(u8, raw, "jsonl")) return .jsonl;
-        return null;
-    }
-};
-
-pub const PullPolicy = enum {
-    missing,
-    always,
-    never,
-
-    pub fn parse(raw: []const u8) ?PullPolicy {
-        if (std.mem.eql(u8, raw, "missing")) return .missing;
-        if (std.mem.eql(u8, raw, "always")) return .always;
-        if (std.mem.eql(u8, raw, "never")) return .never;
         return null;
     }
 };
@@ -1131,18 +1059,18 @@ pub const CliOptions = struct {
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
     image_entrypoint: ?[]const u8 = null,
-    pull_policy: PullPolicy = .missing,
+    pull_policy: rootfs_input.PullPolicy = .missing,
     commit_ref: ?[]const u8 = null,
     disk_size: ?u64 = null,
     save_path: ?[]const u8 = null,
     save_trigger: capture.Trigger = .exit,
     continue_after_save: bool = false,
-    network: Network = .disabled,
-    bound_services: BoundServiceBindingList = .{},
+    network: spore_net_policy.Network = .disabled,
+    bound_services: spore_net_policy.BoundServiceBindingList = .{},
     event_mode: EventMode = .none,
     interactive: bool = false,
     tty: bool = false,
-    guest_env_specs: GuestEnvSpecList = .{},
+    guest_env_specs: guest_request.GuestEnvSpecList = .{},
     injected_file_sources: boot_assets.InjectedFileSourceList = .{},
     command_mode: CommandMode = .argv,
     command: []const []const u8,
@@ -1224,7 +1152,7 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
     var rootfs_path: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
     var image_entrypoint: ?[]const u8 = null;
-    var pull_policy: PullPolicy = .missing;
+    var pull_policy: rootfs_input.PullPolicy = .missing;
     var commit_ref: ?[]const u8 = null;
     var disk_size: ?u64 = null;
     var save_path: ?[]const u8 = null;
@@ -1235,11 +1163,11 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
     // Plain `--net` leaves egress unrestricted; allow flags narrow it.
     var network_policy = spore_net_policy.Config{ .egress = .unrestricted };
     var bind_service_args = BoundServiceArgList{};
-    var bound_services = BoundServiceBindingList{};
+    var bound_services = spore_net_policy.BoundServiceBindingList{};
     var event_mode: EventMode = .none;
     var interactive = false;
     var tty = false;
-    var guest_env_specs = GuestEnvSpecList{};
+    var guest_env_specs = guest_request.GuestEnvSpecList{};
     var injected_file_sources = boot_assets.InjectedFileSourceList{};
     var command_mode: CommandMode = .shell;
     var command_had_delimiter = false;
@@ -1279,13 +1207,13 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
             disk_size = bytes;
         } else if (std.mem.eql(u8, args[i], "--pull")) {
             const raw = takeValue(args, &i, args[i]);
-            pull_policy = PullPolicy.parse(raw) orelse {
+            pull_policy = rootfs_input.PullPolicy.parse(raw) orelse {
                 std.debug.print("--pull must be missing, always, or never\n", .{});
                 std.process.exit(2);
             };
         } else if (std.mem.startsWith(u8, args[i], "--pull=")) {
             const raw = args[i]["--pull=".len..];
-            pull_policy = PullPolicy.parse(raw) orelse {
+            pull_policy = rootfs_input.PullPolicy.parse(raw) orelse {
                 std.debug.print("--pull must be missing, always, or never\n", .{});
                 std.process.exit(2);
             };
@@ -1320,7 +1248,7 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
             };
         } else if (std.mem.eql(u8, args[i], "--env")) {
             const raw = takeValue(args, &i, args[i]);
-            guest_env_specs.append(parseGuestEnvSpec(raw) catch |err| {
+            guest_env_specs.append(guest_request.parseGuestEnvSpec(raw) catch |err| {
                 std.debug.print("spore run: invalid --env {s}: {s}\n", .{ raw, @errorName(err) });
                 std.process.exit(2);
             }) catch |err| {
@@ -1516,116 +1444,6 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
     };
 }
 
-pub fn parseGuestEnvSpec(raw: []const u8) !GuestEnvSpec {
-    if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
-        const key = raw[0..eq];
-        try validateGuestEnvKey(key);
-        return .{ .literal = raw };
-    }
-    try validateGuestEnvKey(raw);
-    return .{ .copy = raw };
-}
-
-pub const GuestEnvResolveDiagnostic = struct {
-    missing_key: ?[]const u8 = null,
-};
-
-pub fn resolveCliGuestEnv(
-    allocator: std.mem.Allocator,
-    specs: []const GuestEnvSpec,
-    environ: *const std.process.Environ.Map,
-    diagnostic: ?*GuestEnvResolveDiagnostic,
-) ![]const []const u8 {
-    if (diagnostic) |diag| diag.* = .{};
-    var out = std.array_list.Managed([]const u8).init(allocator);
-    for (specs) |spec| {
-        const entry = switch (spec) {
-            .literal => |entry| entry,
-            .copy => |key| blk: {
-                const value = environ.get(key) orelse {
-                    if (diagnostic) |diag| diag.missing_key = key;
-                    return error.MissingHostEnvironment;
-                };
-                break :blk try std.fmt.allocPrint(allocator, "{s}={s}", .{ key, value });
-            },
-        };
-        if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
-        try upsertGuestEnvEntry(&out, entry);
-    }
-    return out.toOwnedSlice();
-}
-
-pub fn mergeGuestEnv(allocator: std.mem.Allocator, base: []const []const u8, overrides: []const []const u8) ![]const []const u8 {
-    if (base.len == 0) return overrides;
-    if (overrides.len == 0) return base;
-    var out = std.array_list.Managed([]const u8).init(allocator);
-    for (base) |entry| {
-        if (!guestEnvHasKey(overrides, inheritedGuestEnvEntryKey(entry))) try out.append(entry);
-    }
-    for (overrides) |entry| try out.append(entry);
-    if (out.items.len > max_guest_envc) return error.RunEnvCountUnsupported;
-    return out.toOwnedSlice();
-}
-
-pub fn mergeGuestEnvInto(out: [][]const u8, base: []const []const u8, overrides: []const []const u8) ![]const []const u8 {
-    var len: usize = 0;
-    for (base) |entry| {
-        if (!guestEnvHasKey(overrides, inheritedGuestEnvEntryKey(entry))) {
-            if (len >= out.len or len >= max_guest_envc) return error.RunEnvCountUnsupported;
-            out[len] = entry;
-            len += 1;
-        }
-    }
-    for (overrides) |entry| {
-        if (len >= out.len or len >= max_guest_envc) return error.RunEnvCountUnsupported;
-        out[len] = entry;
-        len += 1;
-    }
-    return out[0..len];
-}
-
-fn upsertGuestEnvEntry(entries: *std.array_list.Managed([]const u8), entry: []const u8) !void {
-    const key = guestEnvEntryKey(entry) orelse return error.BadGuestEnvKey;
-    for (entries.items, 0..) |existing, i| {
-        if (guestEnvKeyEql(guestEnvEntryKey(existing), key)) {
-            entries.items[i] = entry;
-            return;
-        }
-    }
-    if (entries.items.len >= max_guest_envc) return error.RunEnvCountUnsupported;
-    try entries.append(entry);
-}
-
-fn guestEnvHasKey(entries: []const []const u8, key: ?[]const u8) bool {
-    for (entries) |entry| {
-        if (guestEnvKeyEql(guestEnvEntryKey(entry), key)) return true;
-    }
-    return false;
-}
-
-fn guestEnvKeyEql(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
-}
-
-fn guestEnvEntryKey(entry: []const u8) ?[]const u8 {
-    const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return null;
-    if (eq == 0) return null;
-    return entry[0..eq];
-}
-
-fn inheritedGuestEnvEntryKey(entry: []const u8) ?[]const u8 {
-    return guestEnvEntryKey(entry) orelse if (entry.len != 0) entry else null;
-}
-
-fn validateGuestEnvKey(key: []const u8) !void {
-    if (key.len == 0) return error.BadGuestEnvKey;
-    for (key, 0..) |c, i| {
-        if (std.ascii.isAlphabetic(c) or c == '_' or (i != 0 and std.ascii.isDigit(c))) continue;
-        return error.BadGuestEnvKey;
-    }
-}
-
 pub fn cliGuestCommand(allocator: std.mem.Allocator, opts: CliOptions) ![]const []const u8 {
     return cliGuestCommandFromMode(allocator, opts.command_mode, opts.command);
 }
@@ -1637,426 +1455,6 @@ pub fn cliGuestCommandFromMode(allocator: std.mem.Allocator, mode: CommandMode, 
             if (command.len != 1) return error.ShellCommandArgumentCountUnsupported;
             return allocator.dupe([]const u8, &.{ "/bin/sh", "-lc", command[0] });
         },
-    };
-}
-
-pub fn networkFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !Network {
-    return networkFromManifestWithBindings(allocator, manifest_network, &.{});
-}
-
-pub fn networkFromManifestWithBindings(
-    allocator: std.mem.Allocator,
-    manifest_network: ?spore.Network,
-    bound_services: []const spore_net_policy.BoundServiceBinding,
-) !Network {
-    return networkFromManifestWithBindingDiagnostic(allocator, manifest_network, bound_services, null);
-}
-
-pub fn networkFromManifestWithBindingDiagnostic(
-    allocator: std.mem.Allocator,
-    manifest_network: ?spore.Network,
-    bound_services: []const spore_net_policy.BoundServiceBinding,
-    diagnostic: ?*BoundServiceBindingDiagnostic,
-) !Network {
-    if (diagnostic) |diag| diag.* = .{};
-    const network = manifest_network orelse {
-        if (bound_services.len != 0) {
-            if (diagnostic) |diag| diag.unexpected_name = bound_services[0].name;
-            return error.UnexpectedBoundServiceBinding;
-        }
-        return .disabled;
-    };
-    return .{ .spore = try spore_net_policy.configFromManifestNetworkWithBindingDiagnostic(allocator, network, bound_services, diagnostic) };
-}
-
-pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: *const Network) !?spore.Network {
-    return switch (network.*) {
-        .disabled => null,
-        .spore => |*policy| try spore_net_policy.manifestNetworkFromConfig(allocator, policy),
-    };
-}
-
-pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
-    const disk_count = spore.countBlockDevices(manifest.devices);
-    if (disk_count == 0) return null;
-    if (disk_count != 1) return error.UnsupportedRootfsDeviceCount;
-    const rootfs = manifest.rootfs orelse return error.MissingRootfsArtifact;
-    try spore.validateRootfs(rootfs, manifest.devices);
-    return try cloneRootfs(allocator, rootfs);
-}
-
-pub fn resumeDiskForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Disk {
-    const disk = manifest.disk orelse return null;
-    return try disk_layer.cloneDisk(allocator, disk);
-}
-
-fn cloneRootfs(allocator: std.mem.Allocator, rootfs: spore.Rootfs) !spore.Rootfs {
-    return .{
-        .kind = try allocator.dupe(u8, rootfs.kind),
-        .mode = try allocator.dupe(u8, rootfs.mode),
-        .device = try spore.cloneRootfsDevice(allocator, rootfs.device),
-        .artifact = .{
-            .digest = try allocator.dupe(u8, rootfs.artifact.digest),
-            .size = rootfs.artifact.size,
-            .format = try allocator.dupe(u8, rootfs.artifact.format),
-        },
-        .storage = if (rootfs.storage) |storage| try spore.cloneRootfsStorage(allocator, storage) else null,
-        .source = if (rootfs.source) |source| .{
-            .kind = try allocator.dupe(u8, source.kind),
-            .requested_ref = try allocator.dupe(u8, source.requested_ref),
-            .resolved_image_ref = try allocator.dupe(u8, source.resolved_image_ref),
-            .image_manifest_digest = try allocator.dupe(u8, source.image_manifest_digest),
-            .platform = try allocator.dupe(u8, source.platform),
-            .builder_version = try allocator.dupe(u8, source.builder_version),
-        } else null,
-    };
-}
-
-pub const RootfsInputOptions = struct {
-    rootfs_path: ?[]const u8,
-    image_ref: ?[]const u8,
-    pull_policy: PullPolicy = .missing,
-    command_name: []const u8,
-    record_artifact: bool = false,
-};
-
-pub const ResolvedRootfsInput = struct {
-    path: ?[]const u8,
-    rootfs: ?spore.Rootfs = null,
-    image_config: ?rootfs_mod.ImageConfig = null,
-    guest_env: []const []const u8 = &.{},
-    guest_working_dir: ?[]const u8 = null,
-};
-
-/// Resolve OCI process metadata for a fresh image-backed invocation. The
-/// returned argv borrows strings from the image config and caller command;
-/// only the slice itself is allocated. OCI User is deliberately root-only
-/// until the guest can switch credentials.
-pub fn resolveImageRuntimeCommand(
-    allocator: std.mem.Allocator,
-    image_config: ?rootfs_mod.ImageConfig,
-    caller_command: []const []const u8,
-) ![]const []const u8 {
-    return resolveImageRuntimeCommandWithEntrypoint(allocator, image_config, caller_command, null);
-}
-
-/// Resolve OCI process metadata while replacing the image Entrypoint when an
-/// override is provided. An empty override explicitly clears the Entrypoint.
-pub fn resolveImageRuntimeCommandWithEntrypoint(
-    allocator: std.mem.Allocator,
-    image_config: ?rootfs_mod.ImageConfig,
-    caller_command: []const []const u8,
-    entrypoint_override: ?[]const []const u8,
-) ![]const []const u8 {
-    const runtime = if (image_config) |config| config.config else null;
-    const entrypoint = entrypoint_override orelse if (runtime) |config| config.Entrypoint orelse &.{} else &.{};
-    const command = if (caller_command.len != 0)
-        caller_command
-    else if (runtime) |config|
-        config.Cmd orelse &.{}
-    else
-        &.{};
-
-    if (runtime) |config| {
-        if (!image.isRootUser(config.User)) return error.UnsupportedImageUser;
-    }
-    if (entrypoint.len == 0 and command.len == 0) return error.ImageCommandMissing;
-    if (entrypoint.len > max_guest_argc or command.len > max_guest_argc - entrypoint.len) return error.RunArgCountUnsupported;
-    const len = entrypoint.len + command.len;
-    const argv = try allocator.alloc([]const u8, len);
-    errdefer allocator.free(argv);
-    @memcpy(argv[0..entrypoint.len], entrypoint);
-    @memcpy(argv[entrypoint.len..], command);
-    try validateGuestArgv(argv);
-    return argv;
-}
-
-pub const RootfsInputResolution = union(enum) {
-    resolved: ResolvedRootfsInput,
-    failure: machine_output.CliError,
-};
-
-pub fn resolveRootfsInputDetailed(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: RootfsInputOptions,
-) !ResolvedRootfsInput {
-    const resolution = try resolveRootfsInputDetailedResult(init, allocator, options);
-    switch (resolution) {
-        .resolved => |resolved| return resolved,
-        .failure => |failure| return rootfsInputError(failure.code),
-    }
-}
-
-pub fn resolveRootfsInputDetailedResult(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: RootfsInputOptions,
-) !RootfsInputResolution {
-    if (options.rootfs_path != null and options.image_ref != null) {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            .usage_invalid_argument,
-            options.command_name,
-            "spore {s}: --rootfs and --image are mutually exclusive",
-            .{options.command_name},
-        ) };
-    }
-    const resolved = if (options.rootfs_path) |path|
-        try resolvePathRootfs(init, allocator, path, options.command_name, options.record_artifact)
-    else if (options.image_ref) |ref|
-        try resolveImageRootfs(init, allocator, ref, options.command_name, options.pull_policy)
-    else
-        RootfsInputResolution{ .resolved = .{ .path = null } };
-    switch (resolved) {
-        .failure => return resolved,
-        .resolved => |rootfs| {
-            return .{ .resolved = rootfs };
-        },
-    }
-}
-
-fn resolvePathRootfs(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    rootfs_path: []const u8,
-    command_name: []const u8,
-    record_artifact: bool,
-) !RootfsInputResolution {
-    if (!try local_paths.readablePath(init.io, rootfs_path)) {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            .object_not_found,
-            command_name,
-            "spore {s}: rootfs not found: {s}",
-            .{ command_name, rootfs_path },
-        ) };
-    }
-    if (!record_artifact) return .{ .resolved = .{ .path = rootfs_path } };
-
-    const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
-        error.MissingHome => return .{ .failure = rootfsInputFailure(
-            allocator,
-            .cache_unavailable,
-            command_name,
-            "spore {s}: cannot resolve rootfs cache directory; set {s} or HOME",
-            .{ command_name, local_paths.rootfs_cache_env },
-        ) },
-        else => |e| return e,
-    };
-    try local_paths.ensureDirPath(init.io, cache_root);
-    const artifact = resolvePathRootfsArtifact(init.io, allocator, cache_root, rootfs_path) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            machine_output.fromZigError(err).code,
-            command_name,
-            "spore {s}: rootfs artifact setup failed for {s}: {s}",
-            .{ command_name, rootfs_path, @errorName(err) },
-        ) };
-    };
-    return .{ .resolved = .{
-        .path = rootfs_path,
-        .rootfs = .{
-            .device = .{ .mmio_slot = 1 },
-            .artifact = artifact,
-        },
-    } };
-}
-
-fn resolvePathRootfsArtifact(
-    io: Io,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    rootfs_path: []const u8,
-) !spore.RootfsArtifactRef {
-    return rootfs_cache.cacheByDigestPathCopy(io, allocator, cache_root, rootfs_path);
-}
-
-fn resolveImageRootfs(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    image_ref: []const u8,
-    command_name: []const u8,
-    pull_policy: PullPolicy,
-) !RootfsInputResolution {
-    const cache_root = local_paths.rootfsCacheRootPath(allocator, init.environ_map) catch |err| switch (err) {
-        error.MissingHome => return .{ .failure = rootfsInputFailure(
-            allocator,
-            .cache_unavailable,
-            command_name,
-            "spore {s}: cannot resolve rootfs cache directory; set {s} or HOME",
-            .{ command_name, local_paths.rootfs_cache_env },
-        ) },
-        else => |e| return e,
-    };
-    try local_paths.ensureDirPath(init.io, cache_root);
-
-    if (image_store.isStoreRef(image_ref)) {
-        const local = image_store.resolve(init.io, allocator, cache_root, image_ref, direct_image_platform, init.environ_map) catch |err| {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                machine_output.fromZigError(err).code,
-                command_name,
-                "spore {s}: image store fetch failed for {s}: {s}",
-                .{ command_name, image_ref, @errorName(err) },
-            ) };
-        };
-        return .{ .resolved = try imageRootfsInput(allocator, image_ref, local) };
-    }
-
-    const local_ref = rootfs_mod.isLocalImageRef(image_ref);
-    const digest_pinned = if (local_ref) null else try rootfs_mod.digestPinnedImageIdentity(allocator, image_ref, direct_image_platform);
-    if (!local_ref and digest_pinned == null) rootfs_mod.validateTaggedImageRef(image_ref) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            .usage_invalid_argument,
-            command_name,
-            "spore {s}: image resolve failed for {s}: {s}",
-            .{ command_name, image_ref, @errorName(err) },
-        ) };
-    };
-    // Local names and digests are immutable or never pulled; a registry tag
-    // follows its ref record unless --pull=always asks the registry again,
-    // or --pull=missing finds a conversion by an older rootfs builder.
-    if (local_ref or digest_pinned != null or pull_policy != .always) {
-        const found = local_image.find(init.io, allocator, cache_root, image_ref, direct_image_platform) catch |err| {
-            return .{ .failure = rootfsInputFailure(
-                allocator,
-                .cache_integrity_failed,
-                command_name,
-                "spore {s}: local image check failed for {s}: {s}",
-                .{ command_name, image_ref, @errorName(err) },
-            ) };
-        };
-        if (found) |local| {
-            const stale = !local_ref and digest_pinned == null and pull_policy == .missing and
-                if (local.oci) |source| !std.mem.eql(u8, source.builder_version, rootfs_mod.builder_version) else false;
-            if (!stale) return .{ .resolved = try imageRootfsInput(allocator, image_ref, local) };
-        }
-    }
-    if (local_ref) return .{ .failure = rootfsInputFailure(
-        allocator,
-        .object_not_found,
-        command_name,
-        "spore {s}: local image not found: {s}; build, import or unpack it first",
-        .{ command_name, image_ref },
-    ) };
-    if (digest_pinned == null and pull_policy == .never) return .{ .failure = rootfsInputFailure(
-        allocator,
-        .object_not_found,
-        command_name,
-        "spore {s}: image ref cache miss for {s} with --pull=never",
-        .{ command_name, image_ref },
-    ) };
-
-    const resolved = digest_pinned orelse rootfs_mod.resolveImageRef(init, allocator, image_ref, direct_image_platform) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            machine_output.fromZigError(err).code,
-            command_name,
-            "spore {s}: image resolve failed for {s}: {s}",
-            .{ command_name, image_ref, @errorName(err) },
-        ) };
-    };
-    const name = if (digest_pinned == null) image_ref else null;
-    const local = pulledImage(init, allocator, cache_root, resolved, name) catch |err| {
-        return .{ .failure = rootfsInputFailure(
-            allocator,
-            machine_output.fromZigError(err).code,
-            command_name,
-            "spore {s}: image rootfs build failed for {s}: {s}",
-            .{ command_name, resolved.ref, @errorName(err) },
-        ) };
-    };
-    return .{ .resolved = try imageRootfsInput(allocator, image_ref, local) };
-}
-
-/// The image the current builder converted from `resolved`, pulling it if
-/// this host has none. Points `name` at it.
-fn pulledImage(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    cache_root: []const u8,
-    resolved: rootfs_mod.ResolvedImage,
-    name: ?[]const u8,
-) !local_image.LocalImage {
-    if (try local_image.find(init.io, allocator, cache_root, resolved.ref, resolved.platform)) |local| {
-        if (name) |tag| {
-            var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, cache_root);
-            defer cache_lock.deinit();
-            _ = try local_image.tag(allocator, cache_root, &cache_lock, tag, local);
-        }
-        return local;
-    }
-    const published = try rootfs_mod.pullImage(init, allocator, cache_root, resolved, name);
-    return (try local_image.load(init.io, allocator, cache_root, published.identity)) orelse error.RootFSDigestCacheMiss;
-}
-
-fn rootfsInputFailure(
-    allocator: std.mem.Allocator,
-    code: machine_output.ErrorCode,
-    source: []const u8,
-    comptime fmt: []const u8,
-    args: anytype,
-) machine_output.CliError {
-    const message = std.fmt.allocPrint(allocator, fmt, args) catch code.defaultMessage();
-    return machine_output.CliError.init(code, message, source);
-}
-
-fn rootfsInputError(code: machine_output.ErrorCode) anyerror {
-    return switch (code) {
-        .usage_invalid_argument,
-        .usage_missing_argument,
-        => error.InvalidRootfsInput,
-        .object_not_found => error.FileNotFound,
-        .object_invalid => error.BadManifest,
-        .cache_unavailable => error.RootfsCacheUnavailable,
-        .cache_integrity_failed => error.BadRootfsDigest,
-        .host_unsupported,
-        .host_unavailable,
-        => error.UnsupportedHost,
-        .runtime_start_failed,
-        .runtime_execution_failed,
-        => error.RuntimeFailed,
-        .operation_canceled => error.OperationCanceled,
-        .stream_interrupted => error.EventSinkFailed,
-    };
-}
-
-fn imageRootfsInput(allocator: std.mem.Allocator, requested_ref: []const u8, local: local_image.LocalImage) !ResolvedRootfsInput {
-    const rootfs_device = spore.RootfsDevice{ .mmio_slot = 1 };
-    var storage = local.storage;
-    storage.device = rootfs_device;
-    const resolved_ref = if (image_store.isStoreRef(requested_ref))
-        try image_store.resolvedRefAlloc(allocator, requested_ref, local.identity)
-    else
-        try local_image.resolvedRefAlloc(allocator, requested_ref, local.identity, local.oci);
-    // `repo@digest`, or `<store>/blake3:<hex>` for a store image.
-    const digest_start = std.mem.lastIndexOfAny(u8, resolved_ref, "@/").? + 1;
-    const runtime = local.config.config;
-    const working_dir = if (runtime) |config| config.WorkingDir else null;
-    return .{
-        .path = null,
-        .rootfs = .{
-            .device = rootfs_device,
-            .artifact = .{
-                .digest = storage.index_digest,
-                .size = storage.logical_size,
-                .format = spore.rootfs_artifact_format_ext4,
-            },
-            .storage = storage,
-            .source = .{
-                // A local tag is mutable, so saves record what it resolved to.
-                .requested_ref = if (rootfs_mod.isLocalImageRef(requested_ref)) resolved_ref else requested_ref,
-                .resolved_image_ref = resolved_ref,
-                .image_manifest_digest = resolved_ref[digest_start..],
-                .platform = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ local.platform.os, local.platform.arch.name() }),
-                .builder_version = if (local.oci) |source| source.builder_version else rootfs_mod.builder_version,
-            },
-        },
-        .guest_env = if (runtime) |config| config.Env orelse &.{} else &.{},
-        .guest_working_dir = if (working_dir) |dir| if (dir.len == 0) null else dir else null,
-        .image_config = local.config,
     };
 }
 
@@ -2170,7 +1568,7 @@ const CommitControl = struct {
     fn poll(self: *CommitControl, dev: *vsock.Vsock) !vsock_control.ControlAction {
         switch (self.phase) {
             .start_resize => {
-                const request = try simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-run-commit-resize");
+                const request = try guest_request.simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-run-commit-resize");
                 self.resize_stream = try vsock_stream.HostStream.init(self.guest_port, request);
                 self.resize_stream.host_port = vsock_stream.HostStream.deriveHostPort(request);
                 self.resize_stream.setOutputSink(self, resizeOutputSink);
@@ -2186,7 +1584,7 @@ const CommitControl = struct {
                         dev.resetHostStream();
                         if (exit_code != 0) return error.RunCommitGuestResizeFailed;
                         if (self.resize_stdout_overflow) return error.RunCommitGuestResizeFailed;
-                        const result = parseRootfsGrowResponse(self.resize_stdout.items) catch return error.RunCommitGuestResizeFailed;
+                        const result = guest_request.parseRootfsGrowResponse(self.resize_stdout.items) catch return error.RunCommitGuestResizeFailed;
                         if (result.device_bytes != self.rootfs_grow_target) return error.RunCommitGuestResizeFailed;
                         self.phase = .start_command;
                         self.requestPoll();
@@ -2219,7 +1617,7 @@ const CommitControl = struct {
                 return .keep_running;
             },
             .start_freeze => {
-                const request = try simpleControlRequest(self.allocator, "fsfreeze-v1", "spore-run-commit-freeze");
+                const request = try guest_request.simpleControlRequest(self.allocator, "fsfreeze-v1", "spore-run-commit-freeze");
                 self.freeze_stream = try vsock_stream.HostStream.init(self.guest_port, request);
                 self.freeze_stream.host_port = vsock_stream.HostStream.deriveHostPort(request);
                 try dev.attachHostStream(&self.freeze_stream);
@@ -2268,7 +1666,7 @@ const CommitControl = struct {
     fn resizeOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         if (output != .stdout) return;
         const self: *CommitControl = @ptrCast(@alignCast(context.?));
-        const remaining = max_rootfs_grow_response -| self.resize_stdout.items.len;
+        const remaining = guest_request.max_rootfs_grow_response -| self.resize_stdout.items.len;
         if (bytes.len > remaining) self.resize_stdout_overflow = true;
         const take = @min(remaining, bytes.len);
         if (take != 0) self.resize_stdout.appendSlice(bytes[0..take]) catch {
@@ -2305,16 +1703,6 @@ const CommitControl = struct {
     fn reportStatsThunk(_: *anyopaque, _: vsock_control.ControlStats) void {}
 };
 
-pub fn simpleControlRequest(allocator: std.mem.Allocator, request_type: []const u8, session_id: []const u8) ![]const u8 {
-    const json = try std.json.Stringify.valueAlloc(allocator, .{
-        .type = request_type,
-        .session_id = session_id,
-    }, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
-}
-
 pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !Result {
     var events = EventEmitter.init(opts.events, "run");
     try events.emitStart(opts.backend);
@@ -2348,7 +1736,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     if (gateway_active) try events.emitPortForwards(&opts.network.spore);
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
     errdefer finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
-    const network_manifest = try manifestNetworkFromOptions(allocator, &opts.network);
+    const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &opts.network);
 
     const resuming = opts.resume_dir != null;
     if (opts.memory.isElastic() and ((!resuming and !opts.auto_memory_hotplug_capable) or opts.vcpus != 1)) return error.ElasticMemoryUnsupported;
@@ -2651,7 +2039,7 @@ pub fn executeMonitorWithBootArtifacts(
         break :blk .{};
     };
     defer if (gateway_active) gateway.deinit();
-    const network_manifest = try manifestNetworkFromOptions(allocator, &opts.network);
+    const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &opts.network);
     if (opts.injected_files.len != 0) return error.InjectedFileMonitorUnsupported;
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
@@ -2817,10 +2205,6 @@ pub fn closeConsoleLog() void {
     }
 }
 
-pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
-    return execRequestWithSession(allocator, argv, "default", 0);
-}
-
 const RunRequestInfo = struct {
     bytes: []const u8,
     session_id: []const u8,
@@ -2829,7 +2213,7 @@ const RunRequestInfo = struct {
 fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) !RunRequestInfo {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
     if (opts.resume_dir == null) return .{
-        .bytes = try execRequestWithSessionOptions(allocator, opts.command, spore.default_session_id, .{
+        .bytes = try guest_request.execRequestWithSessionOptions(allocator, opts.command, spore.default_session_id, .{
             .env = opts.guest_env,
             .working_dir = opts.guest_working_dir,
             .resume_time_unix_ns = resume_time_unix_ns,
@@ -2842,7 +2226,7 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
 
     const session_id = try randomRunSessionId(context, allocator);
     return .{
-        .bytes = try execRequestWithSessionOptions(allocator, opts.command, session_id, .{
+        .bytes = try guest_request.execRequestWithSessionOptions(allocator, opts.command, session_id, .{
             .env = opts.guest_env,
             .resume_time_unix_ns = resume_time_unix_ns,
             .memory_pressure = memory_pressure,
@@ -2857,7 +2241,7 @@ fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Optio
 
 // `spore run` forwards host stdin only with -i; without it the command
 // reads /dev/null, as it did before the guest agent spoke only SPIO.
-fn runStdio(opts: Options) GuestStdio {
+fn runStdio(opts: Options) guest_request.GuestStdio {
     if (opts.tty) return .tty;
     if (opts.interactive) return .pipe;
     return .null;
@@ -2869,110 +2253,6 @@ fn randomRunSessionId(context: Context, allocator: std.mem.Allocator) ![]const u
     context.io.random(&nonce_bytes);
     const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     return std.fmt.allocPrint(allocator, "run-{x}-{x}", .{ now, nonce });
-}
-
-pub fn execRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, resume_time_unix_ns: u64) ![]const u8 {
-    return execRequestWithSessionOptions(allocator, argv, session_id, .{
-        .resume_time_unix_ns = resume_time_unix_ns,
-    });
-}
-
-pub const ExecRequestContextOptions = struct {
-    env: []const []const u8 = &.{},
-    working_dir: ?[]const u8 = null,
-    resume_time_unix_ns: u64 = 0,
-    retain_output: bool = false,
-};
-
-pub const InteractiveExecRequestOptions = struct {
-    env: []const []const u8 = &.{},
-    working_dir: ?[]const u8 = null,
-    tty: bool = false,
-    terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
-    resume_time_unix_ns: u64 = 0,
-    generation_params: ?[]const u8 = null,
-};
-
-/// Encodes a streamed exec. Stdin is always a pipe (or the terminal): the
-/// caller forwards input and closes the stream when it has none.
-pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: InteractiveExecRequestOptions) ![]const u8 {
-    return execRequestWithSessionOptions(allocator, argv, session_id, .{
-        .env = options.env,
-        .working_dir = options.working_dir,
-        .stdio = if (options.tty) .tty else .pipe,
-        .terminal_size = options.terminal_size,
-        .resume_time_unix_ns = options.resume_time_unix_ns,
-        .generation_params = options.generation_params,
-    });
-}
-
-pub fn detachedExecRequestWithSessionContext(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: ExecRequestContextOptions) ![]const u8 {
-    return execRequestWithSessionOptions(allocator, argv, session_id, .{
-        .env = options.env,
-        .working_dir = options.working_dir,
-        .resume_time_unix_ns = options.resume_time_unix_ns,
-        .detached = true,
-        .retain_output = options.retain_output,
-    });
-}
-
-/// The guest command's stdio: `null` gives it /dev/null stdin and piped
-/// output, `pipe` also pipes stdin, and `tty` gives it a terminal.
-const GuestStdio = enum { null, pipe, tty };
-
-const GuestExecOptions = struct {
-    env: []const []const u8 = &.{},
-    working_dir: ?[]const u8 = null,
-    resume_time_unix_ns: u64 = 0,
-    memory_pressure: bool = false,
-    stdio: GuestStdio = .null,
-    terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
-    generation_params: ?[]const u8 = null,
-    require_generation_ready: bool = false,
-    detached: bool = false,
-    retain_output: bool = false,
-};
-
-/// Encodes the guest agent's `start-v1` request. Every member is always
-/// present; detached commands require `null` stdio.
-fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const []const u8, session_id: []const u8, options: GuestExecOptions) ![]const u8 {
-    try validateGuestArgv(argv);
-    try validateGuestExecOptions(options);
-    const payload = struct {
-        type: []const u8 = "start-v1",
-        session_id: []const u8,
-        resume_time_unix_ns: u64,
-        argv: []const []const u8,
-        env: []const []const u8,
-        working_dir: []const u8,
-        stdio: []const u8,
-        terminal_rows: u16,
-        terminal_cols: u16,
-        memory_pressure: bool,
-        params_json: []const u8,
-        require_generation_ready: bool,
-        detached: bool,
-        retain_output: bool,
-        closed_env: bool = true,
-    }{
-        .session_id = session_id,
-        .resume_time_unix_ns = options.resume_time_unix_ns,
-        .argv = argv,
-        .env = options.env,
-        .working_dir = options.working_dir orelse "",
-        .stdio = @tagName(options.stdio),
-        .terminal_rows = options.terminal_size.rows,
-        .terminal_cols = options.terminal_size.cols,
-        .memory_pressure = options.memory_pressure,
-        .params_json = options.generation_params orelse "",
-        .require_generation_ready = options.require_generation_ready,
-        .detached = options.detached,
-        .retain_output = options.retain_output,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > max_guest_request_len) return error.RunRequestTooLarge;
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
 }
 
 fn rootfsWritable(opts: Options) bool {
@@ -2987,71 +2267,6 @@ fn hasRootfs(opts: Options) bool {
 pub fn rootfsGrowTarget(current_size: u64, requested_size: u64) !u64 {
     if (requested_size < current_size) return error.RunDiskSizeWouldShrink;
     return if (requested_size == current_size) 0 else requested_size;
-}
-
-pub const max_rootfs_grow_response: usize = 1024;
-
-pub const RootfsGrowResult = struct {
-    device_bytes: u64,
-    block_size: u64,
-    target_blocks: u64,
-    before_blocks: u64,
-    filesystem_blocks: u64,
-    blocks_per_group: u32,
-    usable_blocks: u64,
-    free_bytes: u64,
-    inodes: u64,
-    free_inodes: u64,
-};
-
-pub fn parseRootfsGrowResponse(bytes: []const u8) !RootfsGrowResult {
-    if (bytes.len == 0 or bytes.len > max_rootfs_grow_response) return error.BadRootfsGrowResponse;
-    if (!std.mem.endsWith(u8, bytes, "\n") or std.mem.count(u8, bytes, "\n") != 1) return error.BadRootfsGrowResponse;
-    const line = bytes[0 .. bytes.len - 1];
-    if (std.mem.indexOfScalar(u8, line, '\r') != null) return error.BadRootfsGrowResponse;
-
-    var tokens = std.mem.splitScalar(u8, line, ' ');
-    if (!std.mem.eql(u8, tokens.next() orelse return error.BadRootfsGrowResponse, "spore-rootfs-grow-v1")) return error.BadRootfsGrowResponse;
-    const device_bytes = try parseRootfsGrowField(tokens.next(), "device_bytes");
-    const block_size = try parseRootfsGrowField(tokens.next(), "block_size");
-    const target_blocks = try parseRootfsGrowField(tokens.next(), "target_blocks");
-    const before_blocks = try parseRootfsGrowField(tokens.next(), "before_blocks");
-    const filesystem_blocks = try parseRootfsGrowField(tokens.next(), "filesystem_blocks");
-    const blocks_per_group_raw = try parseRootfsGrowField(tokens.next(), "blocks_per_group");
-    const usable_blocks = try parseRootfsGrowField(tokens.next(), "usable_blocks");
-    const free_bytes = try parseRootfsGrowField(tokens.next(), "free_bytes");
-    const inodes = try parseRootfsGrowField(tokens.next(), "inodes");
-    const free_inodes = try parseRootfsGrowField(tokens.next(), "free_inodes");
-    if (tokens.next() != null) return error.BadRootfsGrowResponse;
-
-    if (device_bytes == 0 or block_size == 0 or device_bytes % block_size != 0) return error.BadRootfsGrowResponse;
-    if (target_blocks != device_bytes / block_size) return error.BadRootfsGrowResponse;
-    const blocks_per_group = std.math.cast(u32, blocks_per_group_raw) orelse return error.BadRootfsGrowResponse;
-    if (before_blocks == 0 or before_blocks >= filesystem_blocks or filesystem_blocks > target_blocks or blocks_per_group == 0) return error.BadRootfsGrowResponse;
-    if (target_blocks - filesystem_blocks >= blocks_per_group) return error.BadRootfsGrowResponse;
-    if (usable_blocks == 0 or usable_blocks > filesystem_blocks or inodes == 0) return error.BadRootfsGrowResponse;
-    const usable_bytes = std.math.mul(u64, usable_blocks, block_size) catch return error.BadRootfsGrowResponse;
-    if (free_bytes > usable_bytes or free_bytes % block_size != 0 or free_inodes > inodes) return error.BadRootfsGrowResponse;
-    return .{
-        .device_bytes = device_bytes,
-        .block_size = block_size,
-        .target_blocks = target_blocks,
-        .before_blocks = before_blocks,
-        .filesystem_blocks = filesystem_blocks,
-        .blocks_per_group = blocks_per_group,
-        .usable_blocks = usable_blocks,
-        .free_bytes = free_bytes,
-        .inodes = inodes,
-        .free_inodes = free_inodes,
-    };
-}
-
-fn parseRootfsGrowField(maybe_token: ?[]const u8, expected_name: []const u8) !u64 {
-    const token = maybe_token orelse return error.BadRootfsGrowResponse;
-    if (token.len <= expected_name.len + 1 or !std.mem.startsWith(u8, token, expected_name) or token[expected_name.len] != '=') {
-        return error.BadRootfsGrowResponse;
-    }
-    return std.fmt.parseUnsigned(u64, token[expected_name.len + 1 ..], 10) catch error.BadRootfsGrowResponse;
 }
 
 fn rootBlkOptions(environ: *const std.process.Environ.Map, growth_session: bool, stats: *virtio_blk.Stats) virtio_blk.Options {
@@ -3104,7 +2319,7 @@ fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
     );
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: NetworkMode, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: spore_net_policy.NetworkMode, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
     const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
     const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
     const rootfs_growth_flag = if (rootfs and rootfs_writable and rootfs_growth) " spore_rootfs_growth=1" else "";
@@ -3310,28 +2525,6 @@ fn parseGuestPort(name: []const u8, raw: []const u8) !u32 {
     return parsed;
 }
 
-fn validateGuestArgv(argv: []const []const u8) !void {
-    if (argv.len == 0 or argv.len > max_guest_argc) return error.RunArgCountUnsupported;
-    if (argv[0].len == 0) return error.RunProgramEmpty;
-    for (argv) |arg| {
-        if (arg.len > max_guest_arg_len) return error.RunArgTooLong;
-    }
-}
-
-fn validateGuestExecOptions(options: GuestExecOptions) !void {
-    try validateGuestExecContext(options.env, options.working_dir);
-}
-
-pub fn validateGuestExecContext(env: []const []const u8, working_dir: ?[]const u8) !void {
-    if (env.len > max_guest_envc) return error.RunEnvCountUnsupported;
-    for (env) |entry| {
-        if (entry.len > max_guest_env_len) return error.RunEnvTooLong;
-    }
-    if (working_dir) |dir| {
-        if (dir.len == 0 or dir.len > max_guest_working_dir_len or !std.fs.path.isAbsolute(dir)) return error.RunWorkingDirUnsupported;
-    }
-}
-
 fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize) !bool {
     const name = args[i.*];
     if (std.mem.eql(u8, name, "--kernel")) {
@@ -3372,42 +2565,6 @@ fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
     return args[i.*];
 }
 
-test "run request encodes argv" {
-    const request = try execRequest(std.testing.allocator, &.{ "/bin/echo", "hello world" });
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"default\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/echo\",\"hello world\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true}\n", request);
-}
-
-test "run request can encode explicit session id" {
-    const request = try execRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "lifecycle-42", 1_700_000_000_000_000_000);
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"lifecycle-42\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true}\n", request);
-}
-
-test "run detached exec request asks guest to start without waiting" {
-    const request = try detachedExecRequestWithSessionContext(std.testing.allocator, &.{"/bin/true"}, "lifecycle-1", .{
-        .env = &.{"SPORE_CONTEXT=detached"},
-        .working_dir = "/work",
-        .resume_time_unix_ns = 1_700_000_000_000_000_000,
-        .retain_output = true,
-    });
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1700000000000000000,\"argv\":[\"/bin/true\"],\"env\":[\"SPORE_CONTEXT=detached\"],\"working_dir\":\"/work\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":true,\"retain_output\":true,\"closed_env\":true}\n", request);
-}
-
-test "run request encodes image env and working directory" {
-    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{ "/bin/sh", "-lc", "env && pwd" }, "default", .{
-        .env = &.{ "GEM_HOME=/usr/local/bundle", "RUBYOPT=--yjit" },
-        .working_dir = "/app",
-        .resume_time_unix_ns = 123,
-        .memory_pressure = true,
-        .generation_params = "{\"resume_entropy_seed\":\"abcd\"}",
-        .require_generation_ready = true,
-    });
-    defer std.testing.allocator.free(request);
-    try std.testing.expectEqualStrings("{\"type\":\"start-v1\",\"session_id\":\"default\",\"resume_time_unix_ns\":123,\"argv\":[\"/bin/sh\",\"-lc\",\"env && pwd\"],\"env\":[\"GEM_HOME=/usr/local/bundle\",\"RUBYOPT=--yjit\"],\"working_dir\":\"/app\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":true,\"params_json\":\"{\\\"resume_entropy_seed\\\":\\\"abcd\\\"}\",\"require_generation_ready\":true,\"detached\":false,\"retain_output\":false,\"closed_env\":true}\n", request);
-}
-
 test "run request encodes env for run from spore command" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
@@ -3420,51 +2577,6 @@ test "run request encodes env for run from spore command" {
     defer std.testing.allocator.free(request.bytes);
     defer std.testing.allocator.free(request.session_id);
     try std.testing.expect(std.mem.indexOf(u8, request.bytes, "\"env\":[\"SPORE_TEST_ENV=ok\"]") != null);
-}
-
-test "cli env specs resolve host copies and last override wins" {
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("SPORE_TEST_ENV", "from-host");
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const literal = try parseGuestEnvSpec("SPORE_TEST_ENV=literal=with-equals");
-    const copy = try parseGuestEnvSpec("SPORE_TEST_ENV");
-    const resolved = try resolveCliGuestEnv(arena, &.{ literal, copy }, &env, null);
-
-    try std.testing.expectEqual(@as(usize, 1), resolved.len);
-    try std.testing.expectEqualStrings("SPORE_TEST_ENV=from-host", resolved[0]);
-}
-
-test "cli env specs reject empty keys and missing host values" {
-    try std.testing.expectError(error.BadGuestEnvKey, parseGuestEnvSpec("=bad"));
-    try std.testing.expectError(error.BadGuestEnvKey, parseGuestEnvSpec("1BAD=value"));
-    try std.testing.expectError(error.BadGuestEnvKey, parseGuestEnvSpec("BAD-KEY=value"));
-
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    var diagnostic = GuestEnvResolveDiagnostic{};
-    const spec = try parseGuestEnvSpec("MISSING_ENV");
-    try std.testing.expectError(error.MissingHostEnvironment, resolveCliGuestEnv(std.testing.allocator, &.{spec}, &env, &diagnostic));
-    try std.testing.expectEqualStrings("MISSING_ENV", diagnostic.missing_key.?);
-}
-
-test "cli env overrides image env by key" {
-    const merged = try mergeGuestEnv(std.testing.allocator, &.{ "PATH", "KEEP=1" }, &.{ "PATH=/usr/bin", "NEW=2" });
-    defer std.testing.allocator.free(merged);
-
-    try std.testing.expectEqual(@as(usize, 3), merged.len);
-    try std.testing.expectEqualStrings("KEEP=1", merged[0]);
-    try std.testing.expectEqualStrings("PATH=/usr/bin", merged[1]);
-    try std.testing.expectEqualStrings("NEW=2", merged[2]);
-
-    var buffer: [max_guest_envc][]const u8 = undefined;
-    const cleared = try mergeGuestEnvInto(&buffer, &.{ "CLEAR_ME", "KEEP=1" }, &.{"CLEAR_ME="});
-    try std.testing.expectEqual(@as(usize, 2), cleared.len);
-    try std.testing.expectEqualStrings("KEEP=1", cleared[0]);
-    try std.testing.expectEqualStrings("CLEAR_ME=", cleared[1]);
 }
 
 test "local image supplies run env, working directory and rootfs identity" {
@@ -3487,7 +2599,7 @@ test "local image supplies run env, working directory and rootfs identity" {
     var entrypoint = [_][]const u8{"/usr/bin/env"};
     var cmd = [_][]const u8{ "bundle", "exec" };
     const published = try local_image.lockAndPublish(io, arena, cache_root, .{
-        .platform = direct_image_platform,
+        .platform = rootfs_input.direct_image_platform,
         .config = .{ .config = .{ .Env = &image_env, .Entrypoint = &entrypoint, .Cmd = &cmd, .WorkingDir = "/app", .User = "1000:1000" } },
         .storage = storage,
         .name = "local/buildkite-spore:ci",
@@ -3507,7 +2619,7 @@ test "local image supplies run env, working directory and rootfs identity" {
         .preopens = .empty,
     };
 
-    const result = try resolveRootfsInputDetailedResult(init, arena, .{
+    const result = try rootfs_input.resolveRootfsInputDetailedResult(init, arena, .{
         .rootfs_path = null,
         .image_ref = "local/buildkite-spore:ci",
         .command_name = "run",
@@ -3521,7 +2633,7 @@ test "local image supplies run env, working directory and rootfs identity" {
     try std.testing.expectEqualStrings("GEM_HOME=/usr/local/bundle", input.guest_env[0]);
     try std.testing.expectEqualStrings("BUNDLE_APP_CONFIG=/usr/local/bundle", input.guest_env[1]);
     try std.testing.expectEqualStrings("/app", input.guest_working_dir.?);
-    try std.testing.expectEqual(direct_image_platform.arch, input.image_config.?.architecture.?);
+    try std.testing.expectEqual(rootfs_input.direct_image_platform.arch, input.image_config.?.architecture.?);
     try std.testing.expectEqualStrings("/usr/bin/env", input.image_config.?.config.?.Entrypoint.?[0]);
     try std.testing.expectEqualStrings("1000:1000", input.image_config.?.config.?.User.?);
 
@@ -3540,8 +2652,8 @@ test "local image supplies run env, working directory and rootfs identity" {
     }));
 }
 
-fn resolveStoreRefForTest(init: std.process.Init, allocator: std.mem.Allocator, options: RootfsInputOptions) !ResolvedRootfsInput {
-    return switch (try resolveRootfsInputDetailedResult(init, allocator, options)) {
+fn resolveStoreRefForTest(init: std.process.Init, allocator: std.mem.Allocator, options: rootfs_input.RootfsInputOptions) !rootfs_input.ResolvedRootfsInput {
+    return switch (try rootfs_input.resolveRootfsInputDetailedResult(init, allocator, options)) {
         .resolved => |resolved| resolved,
         .failure => |failure| {
             std.debug.print("store ref failed: {s}\n", .{failure.message});
@@ -3552,7 +2664,7 @@ fn resolveStoreRefForTest(init: std.process.Init, allocator: std.mem.Allocator, 
 
 test "a store image runs lazily from an empty cache and fails closed without its objects" {
     var fixture: image_store.TestImage = undefined;
-    try fixture.init(direct_image_platform);
+    try fixture.init(rootfs_input.direct_image_platform);
     defer fixture.deinit();
     const allocator = fixture.arena.allocator();
     const io = std.testing.io;
@@ -3644,7 +2756,7 @@ test "a store image runs lazily from an empty cache and fails closed without its
 
 test "a snapshot of a store image's disk first fetches every missing object, and fails cleanly without one" {
     var fixture: image_store.TestImage = undefined;
-    try fixture.init(direct_image_platform);
+    try fixture.init(rootfs_input.direct_image_platform);
     defer fixture.deinit();
     const allocator = fixture.arena.allocator();
     const io = std.testing.io;
@@ -3697,72 +2809,13 @@ test "a snapshot of a store image's disk first fetches every missing object, and
     try std.testing.expectEqualSlices(u8, fixture.rootfs_bytes, readback);
 }
 
-test "image runtime command composes entrypoint defaults and caller override" {
-    const allocator = std.testing.allocator;
-    var entrypoint = [_][]const u8{ "/entry", "fixed" };
-    var cmd = [_][]const u8{ "default", "arg" };
-    const config = rootfs_mod.ImageConfig{ .config = .{ .Entrypoint = &entrypoint, .Cmd = &cmd } };
-
-    const defaults = try resolveImageRuntimeCommand(allocator, config, &.{});
-    defer allocator.free(defaults);
-    try std.testing.expectEqualSlices([]const u8, &.{ "/entry", "fixed", "default", "arg" }, defaults);
-
-    const override = try resolveImageRuntimeCommand(allocator, config, &.{ "/bin/sh", "-lc", "echo hi" });
-    defer allocator.free(override);
-    try std.testing.expectEqualSlices([]const u8, &.{ "/entry", "fixed", "/bin/sh", "-lc", "echo hi" }, override);
-}
-
-test "image runtime command permits an explicit entrypoint override" {
-    const allocator = std.testing.allocator;
-    var entrypoint = [_][]const u8{"/image-entry"};
-    var cmd = [_][]const u8{"default"};
-    var entrypoint_override = [_][]const u8{"/scanner"};
-    const config = rootfs_mod.ImageConfig{ .config = .{ .Entrypoint = &entrypoint, .Cmd = &cmd } };
-
-    const default_command = try resolveImageRuntimeCommandWithEntrypoint(allocator, config, &.{}, &entrypoint_override);
-    defer allocator.free(default_command);
-    try std.testing.expectEqualSlices([]const u8, &.{ "/scanner", "default" }, default_command);
-
-    const resolved = try resolveImageRuntimeCommandWithEntrypoint(allocator, config, &.{"/runtime"}, &entrypoint_override);
-    defer allocator.free(resolved);
-    try std.testing.expectEqualSlices([]const u8, &.{ "/scanner", "/runtime" }, resolved);
-}
-
-test "image runtime command handles absent and empty defaults" {
-    const allocator = std.testing.allocator;
-    try std.testing.expectError(error.ImageCommandMissing, resolveImageRuntimeCommand(allocator, null, &.{}));
-    try std.testing.expectError(error.ImageCommandMissing, resolveImageRuntimeCommand(allocator, .{ .config = .{} }, &.{}));
-    var empty = [_][]const u8{};
-    try std.testing.expectError(error.ImageCommandMissing, resolveImageRuntimeCommand(allocator, .{ .config = .{ .Entrypoint = &empty, .Cmd = &empty } }, &.{}));
-
-    var cmd = [_][]const u8{"/default"};
-    const command = try resolveImageRuntimeCommand(allocator, .{ .config = .{ .Entrypoint = &empty, .Cmd = &cmd } }, &.{});
-    defer allocator.free(command);
-    try std.testing.expectEqualStrings("/default", command[0]);
-}
-
-test "image runtime command rejects a non-root image user" {
-    try std.testing.expectError(
-        error.UnsupportedImageUser,
-        resolveImageRuntimeCommand(std.testing.allocator, .{ .config = .{ .User = "1000:1000" } }, &.{"/bin/true"}),
-    );
-}
-
-test "image runtime command enforces guest argv bounds" {
-    const allocator = std.testing.allocator;
-    var too_many: [max_guest_argc + 1][]const u8 = @splat("x");
-    try std.testing.expectError(error.RunArgCountUnsupported, resolveImageRuntimeCommand(allocator, null, &too_many));
-    var too_long: [max_guest_arg_len + 1]u8 = @splat('x');
-    try std.testing.expectError(error.RunArgTooLong, resolveImageRuntimeCommand(allocator, null, &.{&too_long}));
-}
-
 test "guest requests reject an empty program name before the guest sees them" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(error.RunProgramEmpty, resolveImageRuntimeCommand(allocator, null, &.{ "", "arg" }));
-    try std.testing.expectError(error.RunProgramEmpty, execRequestWithSession(allocator, &.{""}, "default", 0));
-    try std.testing.expectError(error.RunProgramEmpty, interactiveExecRequestWithSession(allocator, &.{""}, "lifecycle-1", .{}));
-    try std.testing.expectError(error.RunProgramEmpty, detachedExecRequestWithSessionContext(allocator, &.{""}, "lifecycle-1", .{}));
-    const later_empty = try execRequestWithSession(allocator, &.{ "/bin/echo", "" }, "default", 0);
+    try std.testing.expectError(error.RunProgramEmpty, rootfs_input.resolveImageRuntimeCommand(allocator, null, &.{ "", "arg" }));
+    try std.testing.expectError(error.RunProgramEmpty, guest_request.execRequestWithSession(allocator, &.{""}, "default", 0));
+    try std.testing.expectError(error.RunProgramEmpty, guest_request.interactiveExecRequestWithSession(allocator, &.{""}, "lifecycle-1", .{}));
+    try std.testing.expectError(error.RunProgramEmpty, guest_request.detachedExecRequestWithSessionContext(allocator, &.{""}, "lifecycle-1", .{}));
+    const later_empty = try guest_request.execRequestWithSession(allocator, &.{ "/bin/echo", "" }, "default", 0);
     allocator.free(later_empty);
     try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classifyFailure(error.RunProgramEmpty).code);
 }
@@ -4020,68 +3073,6 @@ test "event emitter records best-effort sink failures" {
     try std.testing.expect(events.write_failed);
 }
 
-test "run request rejects guest argv count overflow" {
-    const argv = [_][]const u8{
-        "/bin/true", "1",  "2",  "3",
-        "4",         "5",  "6",  "7",
-        "8",         "9",  "10", "11",
-        "12",        "13", "14", "15",
-        "16",
-    };
-    try std.testing.expectError(error.RunArgCountUnsupported, execRequest(std.testing.allocator, &argv));
-}
-
-test "run request rejects guest argv length overflow" {
-    var arg = [_]u8{'a'} ** (max_guest_arg_len + 1);
-    try std.testing.expectError(error.RunArgTooLong, execRequest(std.testing.allocator, &.{arg[0..]}));
-}
-
-test "run request accepts 4096 byte argv within total request limit" {
-    var arg = [_]u8{'a'} ** 4096;
-    const request = try execRequest(std.testing.allocator, &.{arg[0..]});
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(request.len > arg.len);
-}
-
-test "run request rejects encoded line overflow" {
-    var env_entry = [_]u8{'A'} ** max_guest_env_len;
-    var env: [max_guest_envc][]const u8 = undefined;
-    for (&env) |*slot| slot.* = env_entry[0..];
-    try std.testing.expectError(error.RunRequestTooLarge, execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/true"}, "default", .{ .env = &env }));
-}
-
-test "interactive run request uses start v1 pipe stdio" {
-    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/cat"}, "default", .{ .stdio = .pipe });
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"argv\":[\"/bin/cat\"]") != null);
-}
-
-test "streaming exec request uses start v1 with closed pipe stdin" {
-    const request = try interactiveExecRequestWithSession(std.testing.allocator, &.{"/bin/true"}, "default", .{
-        .env = &.{"SPORE_CONTEXT=stream"},
-        .working_dir = "/workspace",
-    });
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"pipe\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"env\":[\"SPORE_CONTEXT=stream\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"working_dir\":\"/workspace\"") != null);
-}
-
-test "tty run request uses start v1 terminal metadata" {
-    const request = try execRequestWithSessionOptions(std.testing.allocator, &.{"/bin/sh"}, "default", .{
-        .stdio = .tty,
-        .terminal_size = .{ .rows = 40, .cols = 120 },
-    });
-    defer std.testing.allocator.free(request);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"type\":\"start-v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"tty\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_rows\":40") != null);
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_cols\":120") != null);
-}
-
 fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
     return .{
         .platform = .{
@@ -4126,8 +3117,8 @@ fn testDiskGuardManifest(with_disk: bool) spore.Manifest {
 }
 
 test "run from carries writable disk manifests into runtime options" {
-    try std.testing.expect((try resumeDiskForRun(std.testing.allocator, testDiskGuardManifest(false))) == null);
-    const disk = (try resumeDiskForRun(std.testing.allocator, testDiskGuardManifest(true))).?;
+    try std.testing.expect((try rootfs_input.resumeDiskForRun(std.testing.allocator, testDiskGuardManifest(false))) == null);
+    const disk = (try rootfs_input.resumeDiskForRun(std.testing.allocator, testDiskGuardManifest(true))).?;
     defer {
         std.testing.allocator.free(disk.kind);
         std.testing.allocator.free(disk.device.kind);
@@ -4295,12 +3286,6 @@ test "x86 fresh product policy is fixed and fail closed" {
     try std.testing.expectError(error.X86DiskForkUnsupported, validateFreshProductPolicyFor(.x86_64, .kvm, .{ .memory = accepted.memory, .vcpus = 1, .disk_fork = true }));
 }
 
-test "direct image product platform follows the native architecture" {
-    try std.testing.expectEqual(architecture.Architecture.arm64, (try directImagePlatformFor(.aarch64)).arch);
-    try std.testing.expectEqual(architecture.Architecture.amd64, (try directImagePlatformFor(.x86_64)).arch);
-    try std.testing.expectError(error.UnsupportedArchitecture, directImagePlatformFor(.wasm32));
-}
-
 test "run cli parser accepts rootfs path" {
     const opts = try parseCliArgs(std.testing.allocator, &.{ "--rootfs", "rootfs.ext4", "--", "/bin/echo", "hi" });
     try std.testing.expectEqualStrings("rootfs.ext4", opts.rootfs_path.?);
@@ -4313,7 +3298,7 @@ test "run cli parser accepts image ref" {
     const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "--", "/bin/echo", "hi" });
     try std.testing.expect(opts.rootfs_path == null);
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", opts.image_ref.?);
-    try std.testing.expectEqual(PullPolicy.missing, opts.pull_policy);
+    try std.testing.expectEqual(rootfs_input.PullPolicy.missing, opts.pull_policy);
     try std.testing.expectEqual(CommandMode.argv, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 2), opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", opts.command[0]);
@@ -4370,197 +3355,10 @@ test "run disk size is absolute and cannot shrink" {
 
 test "run cli parser accepts image pull policy" {
     const equals_opts = try parseCliArgs(std.testing.allocator, &.{ "--pull=always", "--image", "docker.io/library/alpine:3.20", "--", "/bin/true" });
-    try std.testing.expectEqual(PullPolicy.always, equals_opts.pull_policy);
+    try std.testing.expectEqual(rootfs_input.PullPolicy.always, equals_opts.pull_policy);
 
     const value_opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "--pull", "never", "--", "/bin/true" });
-    try std.testing.expectEqual(PullPolicy.never, value_opts.pull_policy);
-}
-
-test "run pull never fails closed on mutable image ref cache miss" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp_dir = try TestDir.init();
-    defer tmp_dir.deinit();
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, try tmp_dir.path("cache"));
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
-
-    const result = try resolveRootfsInputDetailedResult(init, arena, .{
-        .rootfs_path = null,
-        .image_ref = "docker.io/library/alpine:3.20",
-        .pull_policy = .never,
-        .command_name = "run",
-    });
-    switch (result) {
-        .resolved => return error.ExpectedPullNeverCacheMiss,
-        .failure => |failure| {
-            try std.testing.expectEqual(machine_output.ErrorCode.object_not_found, failure.code);
-            try std.testing.expect(std.mem.indexOf(u8, failure.message, "--pull=never") != null);
-        },
-    }
-}
-
-test "run points a registry tag at the image imported from the same OCI manifest" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
-    const layout = try std.fs.path.join(arena, &.{ root, "layout" });
-    const blobs = try std.fs.path.join(arena, &.{ layout, "blobs", "sha256" });
-    try Io.Dir.cwd().createDirPath(io, blobs);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ layout, "oci-layout" }), .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
-    const Blob = struct {
-        fn write(a: std.mem.Allocator, dir: []const u8, bytes: []const u8) ![]const u8 {
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-            const hex = std.fmt.bytesToHex(digest, .lower);
-            try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = try std.fs.path.join(a, &.{ dir, &hex }), .data = bytes });
-            return std.fmt.allocPrint(a, "sha256:{s}", .{&hex});
-        }
-    };
-    var layer: Io.Writer.Allocating = .init(arena);
-    var layer_writer = std.tar.Writer{ .underlying_writer = &layer.writer };
-    try layer_writer.writeFileBytes("etc/hello", "hello\n", .{ .mode = 0o644 });
-    try layer_writer.finishPedantically();
-    const arch = direct_image_platform.arch.name();
-    const config = try std.fmt.allocPrint(arena, "{{\"architecture\":\"{s}\",\"os\":\"linux\"}}", .{arch});
-    const manifest = try std.fmt.allocPrint(
-        arena,
-        "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
-        .{ try Blob.write(arena, blobs, config), config.len, try Blob.write(arena, blobs, layer.written()), layer.written().len },
-    );
-    const manifest_digest = try Blob.write(arena, blobs, manifest);
-    try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = try std.fs.path.join(arena, &.{ layout, "index.json" }),
-        .data = try std.fmt.allocPrint(
-            arena,
-            "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"{s}\"}}}}]}}",
-            .{ manifest_digest, manifest.len, arch },
-        ),
-    });
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, cache_root);
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
-
-    // `spore build --build-context` imports its base like this.
-    const imported = try rootfs_mod.importOciLayout(init, arena, .{ .input = layout, .ref = "local/app:dev", .platform = direct_image_platform });
-    // `spore run registry.example.test/app:1` after the registry resolved the
-    // tag to the same manifest.
-    const resolved_ref = try std.fmt.allocPrint(arena, "registry.example.test/app@{s}", .{manifest_digest});
-    const pulled = try pulledImage(init, arena, cache_root, .{ .ref = resolved_ref, .manifest_digest = manifest_digest, .platform = direct_image_platform }, "registry.example.test/app:1");
-    try std.testing.expectEqualStrings(imported.image_manifest_digest, pulled.identity);
-
-    const result = try resolveRootfsInputDetailedResult(init, arena, .{
-        .rootfs_path = null,
-        .image_ref = "registry.example.test/app:1",
-        .pull_policy = .never,
-        .command_name = "run",
-    });
-    const input = switch (result) {
-        .resolved => |input| input,
-        .failure => return error.ExpectedLocalImage,
-    };
-    try std.testing.expectEqualStrings(resolved_ref, input.rootfs.?.source.?.resolved_image_ref);
-}
-
-test "run --pull=missing converts a registry tag again after a rootfs builder change, but keeps a local name" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp_dir = try TestDir.init();
-    defer tmp_dir.deinit();
-    const cache_root = try tmp_dir.path("cache");
-    try Io.Dir.cwd().createDirPath(io, cache_root);
-    const rootfs_path = try tmp_dir.path("rootfs.ext4");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
-    const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
-    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
-
-    // The loopback registry fails every registry request before connecting.
-    const manifest = "sha256:" ++ "a" ** 64;
-    for ([_]struct { name: []const u8, source: []const u8, builder: []const u8, workdir: []const u8 }{
-        .{ .name = "127.0.0.1:1/app:old", .source = "127.0.0.1:1/app@" ++ manifest, .builder = "sporevm-rootfs-previous", .workdir = "/old" },
-        .{ .name = "127.0.0.1:1/app:current", .source = "127.0.0.1:1/app@" ++ manifest, .builder = rootfs_mod.builder_version, .workdir = "/current" },
-        .{ .name = "local/app:old", .source = "local/app@" ++ manifest, .builder = "sporevm-rootfs-previous", .workdir = "/local-old" },
-    }) |published| {
-        _ = try local_image.lockAndPublish(io, arena, cache_root, .{
-            .platform = direct_image_platform,
-            .config = .{ .config = .{ .WorkingDir = published.workdir } },
-            .storage = storage,
-            .oci = .{ .ref = published.source, .manifest_digest = manifest, .builder_version = published.builder },
-            .name = published.name,
-        });
-    }
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, cache_root);
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
-    const Case = struct { ref: []const u8, pull: PullPolicy, workdir: ?[]const u8 };
-    for ([_]Case{
-        .{ .ref = "127.0.0.1:1/app:current", .pull = .missing, .workdir = "/current" },
-        .{ .ref = "127.0.0.1:1/app:old", .pull = .never, .workdir = "/old" },
-        .{ .ref = "127.0.0.1:1/app:old", .pull = .missing, .workdir = null },
-        // A local name has no registry to convert from again.
-        .{ .ref = "local/app:old", .pull = .missing, .workdir = "/local-old" },
-    }) |case| {
-        const result = try resolveRootfsInputDetailedResult(init, arena, .{
-            .rootfs_path = null,
-            .image_ref = case.ref,
-            .pull_policy = case.pull,
-            .command_name = "run",
-        });
-        switch (result) {
-            .resolved => |input| try std.testing.expectEqualStrings(case.workdir orelse return error.ExpectedRegistryResolve, input.guest_working_dir.?),
-            .failure => |failure| {
-                if (case.workdir != null) return error.ExpectedLocalImage;
-                try std.testing.expect(std.mem.indexOf(u8, failure.message, "image resolve failed") != null);
-            },
-        }
-    }
+    try std.testing.expectEqual(rootfs_input.PullPolicy.never, value_opts.pull_policy);
 }
 
 test "run cli parser accepts source spore generation file" {
@@ -4585,7 +3383,7 @@ test "run cli parser accepts source spore bound service bindings" {
     try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
     try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
-    try std.testing.expectEqual(NetworkMode.disabled, opts.network);
+    try std.testing.expectEqual(spore_net_policy.NetworkMode.disabled, opts.network);
 }
 
 test "run cli parser keeps plain --net unrestricted and allow rules restrict it" {
@@ -4598,7 +3396,7 @@ test "run cli parser keeps plain --net unrestricted and allow rules restrict it"
     try std.testing.expectEqualStrings("93.184.216.34/32", restricted.network.spore.allowCidrSlice()[0]);
 
     const disabled = try parseCliArgs(std.testing.allocator, &.{ "--", "/bin/true" });
-    try std.testing.expectEqual(NetworkMode.disabled, disabled.network);
+    try std.testing.expectEqual(spore_net_policy.NetworkMode.disabled, disabled.network);
 }
 
 test "run cli parser accepts network allow rules" {
@@ -4656,167 +3454,6 @@ test "run cli parser accepts network port forwards" {
     try std.testing.expectEqual(@as(usize, 1), forwards.len);
     try std.testing.expectEqual(@as(u16, 8080), forwards[0].host_port);
     try std.testing.expectEqual(@as(u16, 80), forwards[0].guest_port);
-}
-
-test "run restores network options from manifest policy" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const manifest_network = spore.Network{
-        .default_action = spore.network_default_deny,
-        .allow_cidrs = &.{"93.184.216.34/32"},
-        .allow_hosts = &.{"example.com"},
-        .allow_host_ports = &.{.{
-            .host = "github.com",
-            .ports = &.{443},
-        }},
-    };
-
-    const network = try networkFromManifest(arena, manifest_network);
-    const policy = &network.spore;
-    try std.testing.expect(policy.egress == .allowlist);
-    try std.testing.expectEqual(@as(usize, 1), policy.allowCidrSlice().len);
-    try std.testing.expectEqualStrings("93.184.216.34/32", policy.allowCidrSlice()[0]);
-    try std.testing.expectEqual(@as(usize, 1), policy.allowHostSlice().len);
-    try std.testing.expectEqualStrings("example.com", policy.allowHostSlice()[0]);
-    try std.testing.expectEqual(@as(usize, 1), policy.exactRuleSlice().len);
-    try std.testing.expectEqualStrings("github.com", policy.exactRuleSlice()[0].host);
-    try std.testing.expectEqual(@as(u16, 443), policy.exactRuleSlice()[0].ports[0]);
-
-    try std.testing.expectEqual(NetworkMode.disabled, try networkFromManifest(arena, null));
-}
-
-test "run manifest network keeps every egress variant" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var hosts_only = spore_net_policy.Config{ .egress = .deny_all };
-    try hosts_only.addAllowHost("example.com");
-    const cases = [_]struct { policy: spore_net_policy.Config, public: spore_net_policy.Decision }{
-        .{ .policy = .{ .egress = .unrestricted }, .public = .allow },
-        .{ .policy = .{ .egress = .deny_all }, .public = .deny_not_allowed },
-        .{ .policy = hosts_only, .public = .deny_not_allowed },
-    };
-    for (cases) |case| {
-        const network: Network = .{ .spore = case.policy };
-        const manifest_network = (try manifestNetworkFromOptions(arena, &network)).?;
-        // A restricted policy always records its default, so the manifest
-        // states the egress instead of implying it from its lists.
-        if (case.policy.egress == .allowlist) {
-            try std.testing.expectEqualStrings(spore.network_default_deny, manifest_network.default_action orelse "");
-        } else {
-            try std.testing.expect(manifest_network.default_action == null);
-        }
-        const restored = try networkFromManifest(arena, manifest_network);
-        try std.testing.expectEqual(std.meta.activeTag(case.policy.egress), std.meta.activeTag(restored.spore.egress));
-        const runtime = try spore_net_policy.Runtime.init(restored.spore);
-        try std.testing.expectEqual(case.public, runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
-    }
-
-    // Allow entries without `default_action` still restrict egress.
-    const implied = try networkFromManifest(arena, .{ .default_action = null, .allow_hosts = &.{"example.com"} });
-    try std.testing.expect(implied.spore.egress == .allowlist);
-    const implied_runtime = try spore_net_policy.Runtime.init(implied.spore);
-    try std.testing.expectEqual(spore_net_policy.Decision.deny_not_allowed, implied_runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
-}
-
-test "run builds manifest network from active policy" {
-    var policy = spore_net_policy.Config{ .egress = .deny_all };
-    try policy.addAllowCidr("93.184.216.34/32");
-    try policy.addAllowHost("example.com");
-    try policy.addExactHostPorts("github.com", &.{443});
-
-    const network = (try manifestNetworkFromOptions(std.testing.allocator, &.{ .spore = policy })) orelse return error.TestUnexpectedResult;
-    defer std.testing.allocator.free(network.allow_host_ports);
-    defer std.testing.allocator.free(network.bound_services);
-    try std.testing.expectEqualStrings(spore.network_kind_spore, network.kind);
-    try std.testing.expectEqualStrings(spore.network_default_deny, network.default_action.?);
-    try std.testing.expectEqualStrings("93.184.216.34/32", network.allow_cidrs[0]);
-    try std.testing.expectEqualStrings("example.com", network.allow_hosts[0]);
-    try std.testing.expectEqualStrings("github.com", network.allow_host_ports[0].host);
-    try std.testing.expectEqual(@as(u16, 443), network.allow_host_ports[0].ports[0]);
-    try std.testing.expect(network.requirements.exact_host_port);
-
-    try std.testing.expect((try manifestNetworkFromOptions(std.testing.allocator, &.disabled)) == null);
-}
-
-test "run binding diagnostics name missing saved bound service" {
-    var diagnostic = BoundServiceBindingDiagnostic{};
-    {
-        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const service_name = try arena.dupe(u8, "cleanroom-gateway");
-        const manifest_network = spore.Network{
-            .bound_services = &.{.{
-                .name = service_name,
-                .guest_host = "gateway.cleanroom.internal",
-                .guest_port = 8170,
-            }},
-            .requirements = .{ .bound_services = true },
-        };
-
-        try std.testing.expectError(
-            error.MissingBoundServiceBinding,
-            networkFromManifestWithBindingDiagnostic(arena, manifest_network, &.{}, &diagnostic),
-        );
-    }
-    try std.testing.expectEqualStrings("cleanroom-gateway", diagnostic.missing_name.?);
-}
-
-test "run restores saved bound services with live bindings" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const manifest_network = spore.Network{
-        .bound_services = &.{.{
-            .name = "cleanroom-gateway",
-            .guest_host = "gateway.cleanroom.internal",
-            .guest_port = 8170,
-        }},
-        .requirements = .{ .bound_services = true },
-    };
-
-    const network = try networkFromManifestWithBindings(arena, manifest_network, &.{.{
-        .name = "cleanroom-gateway",
-        .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
-    }});
-    try std.testing.expect(network.spore.egress == .unrestricted);
-    const services = network.spore.boundServiceSlice();
-    try std.testing.expectEqual(@as(usize, 1), services.len);
-    try std.testing.expectEqualStrings("cleanroom-gateway", services[0].name);
-    try std.testing.expectEqualStrings("gateway.cleanroom.internal", services[0].guest_host);
-    try std.testing.expectEqual(@as(u16, 8170), services[0].guest_port);
-    try std.testing.expectEqualStrings("/tmp/fresh-cleanroom-gateway.sock", services[0].unix_path);
-}
-
-test "run rejects live bound service bindings that do not match manifest" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const manifest_network = spore.Network{
-        .bound_services = &.{.{
-            .name = "cleanroom-gateway",
-            .guest_host = "gateway.cleanroom.internal",
-            .guest_port = 8170,
-        }},
-        .requirements = .{ .bound_services = true },
-    };
-
-    try std.testing.expectError(error.MissingBoundServiceBinding, networkFromManifestWithBindings(arena, manifest_network, &.{.{
-        .name = "wrong-service",
-        .target = .{ .unix = "/tmp/wrong.sock" },
-    }}));
-
-    try std.testing.expectError(error.UnexpectedBoundServiceBinding, networkFromManifestWithBindings(arena, null, &.{.{
-        .name = "cleanroom-gateway",
-        .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
-    }}));
 }
 
 test "run network gateway errors are reported clearly" {
@@ -4890,58 +3527,6 @@ test "saved run result preserves stored exit code" {
         .save_path = "out.spore",
     };
     try std.testing.expectEqual(@as(u8, 7), result.processExitCode());
-}
-
-test "explicit rootfs input can record exact immutable identity" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp_dir = try TestDir.init();
-    defer tmp_dir.deinit();
-    const rootfs_path = try tmp_dir.path("source.ext4");
-    const cache_root = try tmp_dir.path("cache");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-    try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
-    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
-    var process_arena = std.heap.ArenaAllocator.init(allocator);
-    defer process_arena.deinit();
-    const init = std.process.Init{
-        .minimal = undefined,
-        .arena = &process_arena,
-        .gpa = allocator,
-        .io = io,
-        .environ_map = &env,
-        .preopens = .empty,
-    };
-
-    const result = try resolveRootfsInputDetailedResult(init, arena, .{
-        .rootfs_path = rootfs_path,
-        .image_ref = null,
-        .command_name = "create",
-        .record_artifact = true,
-    });
-    const resolved = switch (result) {
-        .resolved => |resolved| resolved,
-        .failure => return error.ExpectedRootfsRecord,
-    };
-    try std.testing.expectEqualStrings(rootfs_path, resolved.path.?);
-    try std.testing.expect(resolved.rootfs != null);
-    try std.testing.expect(resolved.rootfs.?.storage == null);
-    try std.testing.expect(resolved.rootfs.?.source == null);
-    try std.testing.expectEqual(@as(u32, 1), resolved.rootfs.?.device.mmio_slot);
-    try std.testing.expectEqual(@as(u64, "rootfs bytes".len), resolved.rootfs.?.artifact.size);
-
-    const digest_path = try rootfs_cache.digestPath(arena, absolute_cache_root, resolved.rootfs.?.artifact.digest);
-    try Io.Dir.cwd().access(io, digest_path, .{ .read = true });
-    const source_stat = try Io.Dir.cwd().statFile(io, rootfs_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o644), @as(u32, @intCast(@intFromEnum(source_stat.permissions) & 0o777)));
 }
 
 test "run image cache creates absolute cache directories" {

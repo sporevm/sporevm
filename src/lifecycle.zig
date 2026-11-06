@@ -28,6 +28,7 @@ const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const saved_spore_remove = @import("saved_spore_remove.zig");
 const attach_mod = @import("attach.zig");
 const backend_mod = @import("backend.zig");
+const rootfs_input = @import("rootfs_input.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_fork = @import("spore_fork.zig");
@@ -222,11 +223,11 @@ pub const CreateNamedOptions = struct {
     initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
     image_ref: ?[]const u8 = null,
-    image_pull_policy: run_mod.PullPolicy = .missing,
+    image_pull_policy: rootfs_input.PullPolicy = .missing,
     /// Optional caller command. Image-backed creates prepend OCI Entrypoint;
     /// when omitted they use OCI Entrypoint and Cmd. Non-image creates remain idle.
     initial_command: []const []const u8 = &.{},
-    network: run_mod.Network = .disabled,
+    network: spore_net_policy.Network = .disabled,
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
@@ -360,7 +361,7 @@ pub const ExecNamedStreamOptions = struct {
 
 /// The live policy a monitor reads, encoded next to the manifest form that a
 /// save records.
-fn specNetworkPolicy(arena: std.mem.Allocator, network: *const run_mod.Network) !?[]const u8 {
+fn specNetworkPolicy(arena: std.mem.Allocator, network: *const spore_net_policy.Network) !?[]const u8 {
     return switch (network.*) {
         .disabled => null,
         .spore => |*policy| try spore_net_policy.encodeArgAlloc(arena, policy),
@@ -402,7 +403,7 @@ pub fn createNamedWithTiming(
         .initrd_path = options.initrd_path,
         .rootfs_path = options.rootfs_path,
         .image_ref = options.image_ref,
-        .network = try run_mod.manifestNetworkFromOptions(arena, &options.network),
+        .network = try spore_net_policy.manifestNetworkFromOptions(arena, &options.network),
         .network_policy = try specNetworkPolicy(arena, &options.network),
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -420,7 +421,7 @@ pub fn createNamedWithTiming(
     const state_checked_ms = monotonicMs();
 
     if (comptime builtin.is_test) if (testing.create_rootfs_barrier) |barrier| barrier.pause(init.io);
-    const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
+    const rootfs = try rootfs_input.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
         .pull_policy = options.image_pull_policy,
@@ -433,7 +434,7 @@ pub fn createNamedWithTiming(
         if (!managed_kernel or !managed_initrd) return error.ElasticMemoryUnsupported;
     }
     const initial_command: ?[]const []const u8 = if (options.image_ref != null)
-        try run_mod.resolveImageRuntimeCommand(arena, rootfs.image_config, options.initial_command)
+        try rootfs_input.resolveImageRuntimeCommand(arena, rootfs.image_config, options.initial_command)
     else if (options.initial_command.len != 0)
         options.initial_command
     else
@@ -557,7 +558,7 @@ pub fn restoreNamed(
     };
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    const network = run_mod.networkFromManifestWithBindings(arena, manifest.network, options.bound_services) catch |err| switch (err) {
+    const network = spore_net_policy.networkFromManifestWithBindings(arena, manifest.network, options.bound_services) catch |err| switch (err) {
         error.MissingBoundServiceBinding,
         error.UnexpectedBoundServiceBinding,
         error.DuplicateBoundServiceBinding,
@@ -567,8 +568,8 @@ pub fn restoreNamed(
         => return err,
         else => return error.InvalidNetworkPolicy,
     };
-    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest);
-    const disk = try run_mod.resumeDiskForRun(arena, manifest);
+    const rootfs = try rootfs_input.resumeRootfsForRun(arena, manifest);
+    const disk = try rootfs_input.resumeDiskForRun(arena, manifest);
     if (rootfs == null and manifest.devices.len != diskless_resume_device_count) return error.UnsupportedLifecycleDeviceModel;
     const resume_generation = if (options.generation_path) |path| blk: {
         const params = attach_mod.loadGenerationParams(init.io, arena, path) catch |err| switch (err) {
@@ -603,7 +604,7 @@ pub fn restoreNamed(
         .rootfs = rootfs,
         .disk = disk,
         .disk_baseline_lease = if (disk_handoff) |handoff| handoff.lease else base.disk_baseline_lease,
-        .network = try run_mod.manifestNetworkFromOptions(arena, &network),
+        .network = try spore_net_policy.manifestNetworkFromOptions(arena, &network),
         .network_policy = try specNetworkPolicy(arena, &network),
         .annotations = manifest.annotations,
         .sessions = manifest.sessions,
@@ -2809,11 +2810,11 @@ test "named create hands an explicit deny-all policy to the monitor" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const network: run_mod.Network = .{ .spore = .{ .egress = .deny_all } };
+    const network: spore_net_policy.Network = .{ .spore = .{ .egress = .deny_all } };
     const encoded = (try specNetworkPolicy(arena, &network)).?;
     const runtime = try spore_net_policy.Runtime.init(try spore_net_policy.parseArg(arena, encoded));
     try std.testing.expectEqual(spore_net_policy.Decision.deny_not_allowed, runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
-    const manifest_network = (try run_mod.manifestNetworkFromOptions(arena, &network)).?;
+    const manifest_network = (try spore_net_policy.manifestNetworkFromOptions(arena, &network)).?;
     try std.testing.expectEqualStrings(spore.network_default_deny, manifest_network.default_action orelse "");
 
     try std.testing.expect((try specNetworkPolicy(arena, &.disabled)) == null);

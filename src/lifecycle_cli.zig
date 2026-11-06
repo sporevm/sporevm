@@ -17,6 +17,8 @@ const memory_config = @import("memory.zig");
 const monitor_protocol = @import("monitor_protocol.zig");
 const ExecNamedStream = monitor_protocol.ExecNamedStream;
 const named_copy_archive = @import("named_copy_archive.zig");
+const guest_request = @import("guest_request.zig");
+const rootfs_input = @import("rootfs_input.zig");
 const run_mod = @import("run.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
@@ -242,9 +244,9 @@ const ls_usage =
 const CreateOptions = struct {
     spec: Spec,
     options_path: ?[]const u8 = null,
-    image_pull_policy: run_mod.PullPolicy = .missing,
+    image_pull_policy: rootfs_input.PullPolicy = .missing,
     initial_output: InitialOutputDisposition = .retain,
-    network: run_mod.Network = .disabled,
+    network: spore_net_policy.Network = .disabled,
     command_mode: run_mod.CommandMode = .shell,
     command: []const []const u8 = &.{},
 };
@@ -294,7 +296,7 @@ const ExecOptions = struct {
     name: []const u8,
     command_mode: run_mod.CommandMode = .shell,
     command: []const []const u8,
-    guest_env_specs: run_mod.GuestEnvSpecList = .{},
+    guest_env_specs: guest_request.GuestEnvSpecList = .{},
     guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
@@ -326,7 +328,7 @@ const RestoreOptions = struct {
     backend: ?run_mod.Backend = null,
     generation_path: ?[]const u8 = null,
     event_mode: run_mod.EventMode = .none,
-    bound_services: run_mod.BoundServiceBindingList = .{},
+    bound_services: spore_net_policy.BoundServiceBindingList = .{},
 };
 
 const ExecNamedStreamingResult = struct {
@@ -543,8 +545,8 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     defer exec_cli_event_writer = null;
     const parsed = parseExecArgs(args);
     if (parsed.event_mode == .jsonl) return execCliEvents(init, allocator, parsed, &events, stdout);
-    var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
-    const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
+    var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
+    const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
         error.MissingHostEnvironment => {
             std.debug.print("spore exec: --env {s} is not set in the host environment\n", .{env_diagnostic.missing_key orelse "unknown"});
             std.process.exit(2);
@@ -628,8 +630,8 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
         std.process.exit(classified.exit_code);
     }
 
-    var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
-    const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| {
+    var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
+    const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| {
         const classified = run_mod.classifyFailure(err);
         try events.emitFailure(classified);
         std.process.exit(classified.exit_code);
@@ -1522,7 +1524,7 @@ fn parseCreateOptionsFile(
     out.spec.rootfs_path = file.rootfs;
     out.spec.image_ref = file.image;
     if (file.pull) |pull| {
-        out.image_pull_policy = run_mod.PullPolicy.parse(pull) orelse return error.InvalidPullPolicy;
+        out.image_pull_policy = rootfs_input.PullPolicy.parse(pull) orelse return error.InvalidPullPolicy;
     }
     if (file.memory) |memory| {
         out.spec.memory = try memory_config.parse(memory);
@@ -1577,7 +1579,7 @@ fn parseCreateArgs(
     var options_path: ?[]const u8 = null;
     var field_flag_seen = false;
     var max_memory_set = false;
-    var image_pull_policy: run_mod.PullPolicy = .missing;
+    var image_pull_policy: rootfs_input.PullPolicy = .missing;
     var initial_output: InitialOutputDisposition = .retain;
     var network_requested = false;
     // Plain `--net` leaves egress unrestricted; allow flags narrow it.
@@ -1619,14 +1621,14 @@ fn parseCreateArgs(
         } else if (std.mem.eql(u8, args[i], "--pull")) {
             field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
-            image_pull_policy = run_mod.PullPolicy.parse(raw) orelse {
+            image_pull_policy = rootfs_input.PullPolicy.parse(raw) orelse {
                 const message = "spore create: --pull must be missing, always, or never";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
         } else if (std.mem.startsWith(u8, args[i], "--pull=")) {
             field_flag_seen = true;
             const raw = args[i]["--pull=".len..];
-            image_pull_policy = run_mod.PullPolicy.parse(raw) orelse {
+            image_pull_policy = rootfs_input.PullPolicy.parse(raw) orelse {
                 const message = "spore create: --pull must be missing, always, or never";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             };
@@ -1792,7 +1794,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var name: ?[]const u8 = null;
     var command_mode: run_mod.CommandMode = .shell;
     var command: []const []const u8 = &.{};
-    var guest_env_specs = run_mod.GuestEnvSpecList{};
+    var guest_env_specs = guest_request.GuestEnvSpecList{};
     var guest_working_dir: ?[]const u8 = null;
     var interactive = false;
     var tty = false;
@@ -1811,11 +1813,11 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         } else if (std.mem.eql(u8, args[i], "--env")) {
             if (i + 1 >= args.len) usageExit(exec_usage);
             i += 1;
-            guest_env_specs.append(run_mod.parseGuestEnvSpec(args[i]) catch usageExit(exec_usage)) catch usageExit(exec_usage);
+            guest_env_specs.append(guest_request.parseGuestEnvSpec(args[i]) catch usageExit(exec_usage)) catch usageExit(exec_usage);
         } else if (std.mem.eql(u8, args[i], "--workdir")) {
             if (i + 1 >= args.len) usageExit(exec_usage);
             i += 1;
-            run_mod.validateGuestExecContext(&.{}, args[i]) catch usageExit(exec_usage);
+            guest_request.validateGuestExecContext(&.{}, args[i]) catch usageExit(exec_usage);
             guest_working_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
             interactive = true;
@@ -1985,7 +1987,7 @@ fn parseRestoreArgs(
     var backend: ?run_mod.Backend = null;
     var generation_path: ?[]const u8 = null;
     var event_mode: run_mod.EventMode = .none;
-    var bound_services = run_mod.BoundServiceBindingList{};
+    var bound_services = spore_net_policy.BoundServiceBindingList{};
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -2833,13 +2835,13 @@ test "create parser accepts image pull policy" {
     defer stderr.deinit();
 
     const default_opts = try parseCreateArgs(&.{ "bench-1", "--image", "docker.io/library/alpine:3.20" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(run_mod.PullPolicy.missing, default_opts.image_pull_policy);
+    try std.testing.expectEqual(rootfs_input.PullPolicy.missing, default_opts.image_pull_policy);
 
     const equals_opts = try parseCreateArgs(&.{ "bench-1", "--pull=always", "--image", "docker.io/library/alpine:3.20" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(run_mod.PullPolicy.always, equals_opts.image_pull_policy);
+    try std.testing.expectEqual(rootfs_input.PullPolicy.always, equals_opts.image_pull_policy);
 
     const value_opts = try parseCreateArgs(&.{ "bench-1", "--image", "docker.io/library/alpine:3.20", "--pull", "never" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(run_mod.PullPolicy.never, value_opts.image_pull_policy);
+    try std.testing.expectEqual(rootfs_input.PullPolicy.never, value_opts.image_pull_policy);
 }
 
 test "create parser accepts network allow policy" {
@@ -2984,7 +2986,7 @@ test "create cli keeps plain --net unrestricted and allow rules restrict egress"
     try std.testing.expectEqualStrings("github.com", exact.network.spore.exactRuleSlice()[0].host);
 
     const disabled = try parseCreateArgs(&.{"bench-1"}, arena, &stderr.writer, .human);
-    try std.testing.expectEqual(run_mod.NetworkMode.disabled, disabled.network);
+    try std.testing.expectEqual(spore_net_policy.NetworkMode.disabled, disabled.network);
 }
 
 test "save parser accepts annotations and stop" {

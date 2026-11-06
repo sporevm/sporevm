@@ -18,7 +18,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const generation = @import("generation.zig");
 const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
-const run_mod = @import("run.zig");
+const guest_request = @import("guest_request.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
@@ -422,7 +422,7 @@ fn readSpecIn(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, sub_path: []con
 }
 
 pub fn validateSpec(spec: Spec) !void {
-    if (spec.exec_defaults) |defaults| try run_mod.validateGuestExecContext(defaults.env, defaults.working_dir);
+    if (spec.exec_defaults) |defaults| try guest_request.validateGuestExecContext(defaults.env, defaults.working_dir);
     if (spec.disk_baseline_lease) |lease| try lease.validate();
 }
 
