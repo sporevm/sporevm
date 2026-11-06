@@ -48,10 +48,13 @@ pub const ChunkId = struct {
         return digest;
     }
 
-    /// Parse the `blake3:<hex>` digest form.
+    /// Parse the `blake3:<lowercase hex>` digest form, which is the only form
+    /// indexes and stores write.
     pub fn fromDigest(digest: []const u8) error{InvalidChunkId}!ChunkId {
         if (!std.mem.startsWith(u8, digest, digest_prefix)) return error.InvalidChunkId;
-        return fromHex(digest[digest_prefix.len..]);
+        const hex = digest[digest_prefix.len..];
+        for (hex) |c| if (std.ascii.isUpper(c)) return error.InvalidChunkId;
+        return fromHex(hex);
     }
 
     /// Parse a lowercase or uppercase hex id, as found in manifests.
@@ -71,6 +74,16 @@ test "fromHex rejects malformed input" {
     try std.testing.expectError(error.InvalidChunkId, ChunkId.fromHex("abc"));
     const not_hex = "zz" ** 32;
     try std.testing.expectError(error.InvalidChunkId, ChunkId.fromHex(not_hex));
+}
+
+test "fromDigest accepts only the lowercase digest form" {
+    const id = ChunkId.fromContents("digest form");
+    const digest = id.toDigest();
+    try std.testing.expect((try ChunkId.fromDigest(&digest)).eql(id));
+    var upper = digest;
+    _ = std.ascii.upperString(upper[ChunkId.digest_prefix.len..], digest[ChunkId.digest_prefix.len..]);
+    try std.testing.expectError(error.InvalidChunkId, ChunkId.fromDigest(&upper));
+    try std.testing.expectError(error.InvalidChunkId, ChunkId.fromDigest(digest[ChunkId.digest_prefix.len..]));
 }
 
 test "verification detects corruption" {

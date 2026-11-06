@@ -921,15 +921,6 @@ fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, id: chunklib.C
     @memcpy(target, data);
 }
 
-pub fn memoryChunkDigestHex(digest: []const u8) Error![]const u8 {
-    return diskDigestHex(digest);
-}
-
-pub fn memoryDigestFromHex(allocator: std.mem.Allocator, hex: []const u8) Error![]const u8 {
-    _ = chunklib.ChunkId.fromHex(hex) catch return error.BadManifest;
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ disk_index.digest_prefix, hex }) catch return error.OutOfMemory;
-}
-
 pub fn saveManifest(allocator: std.mem.Allocator, dir: []const u8, manifest: Manifest) Error!void {
     const path = try pathZ(allocator, "{s}/manifest.json", .{dir});
     defer allocator.free(path);
