@@ -112,6 +112,16 @@ removed. `spore cache gc --force` releases the pin and storage. The removal
 journal is gone, and JSON output advances to `spore.saved.remove.result.v2`
 without `ownership`, `pin_id`, or `pin_removed`.
 
+### One host probe per command
+
+`spore run`, `create` and `build` check the hypervisor once, before any
+download or disk work, and `spore host-info` renders the same check. On Linux
+arm64 the check now opens `/dev/kvm`, so a host without a usable device fails
+with `MissingKvmDevice` or `KvmOpenFailed` before pulling an image, and
+`host-info` reports `kvm_open_failed` when the device exists but cannot be
+opened. A named VM's monitor no longer repeats the check, so `spore create` on
+Linux/AMD64 no longer builds an extra throwaway VM to probe the CPU profile.
+
 ### Bundles are always indexed
 
 `spore pack` without `--children` now always writes `bundle.json` with no

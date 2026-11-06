@@ -129,16 +129,13 @@ pub const KvmCapabilityFact = struct {
     satisfied: bool,
 };
 
-/// Pure input to the host-info renderer. Offline tools and tests can render
-/// either architecture without executing an architecture-specific instruction
-/// or opening `/dev/kvm`.
+/// Pure input to the host-info renderer: the same probed host that commands
+/// select a backend from. Tests can render either architecture without
+/// executing an architecture-specific instruction or opening `/dev/kvm`.
 pub const HostInfoSnapshot = struct {
-    os: []const u8,
-    architecture: architecture.Architecture,
-    host_class: []const u8,
+    host: backend_mod.Host,
     aarch64_counter_frequency_hz: u64 = 0,
     x86_kvm_capabilities: [x86_cpu_profile.required_capabilities.len]KvmCapabilityFact = emptyX86KvmCapabilities(),
-    backends: [2]BackendAvailability,
 };
 
 pub const Expected = struct {
@@ -171,6 +168,8 @@ pub fn hostInfoFromSnapshot(
     environ: *const std.process.Environ.Map,
     snapshot: HostInfoSnapshot,
 ) !HostInfo {
+    const host = snapshot.host;
+    const arch = architecture.fromTarget(host.arch) orelse return error.UnsupportedArchitecture;
     const kernels = try cacheRootFact(allocator, environ, .kernels);
     errdefer freePathFact(allocator, kernels);
     const rootfs = try cacheRootFact(allocator, environ, .rootfs);
@@ -181,10 +180,10 @@ pub fn hostInfoFromSnapshot(
     errdefer freePathFact(allocator, runtime);
 
     return .{
-        .host_class = snapshot.host_class,
-        .architecture = @tagName(snapshot.architecture),
-        .platform = platformFacts(snapshot),
-        .backends = snapshot.backends,
+        .host_class = hostClass(host),
+        .architecture = @tagName(arch),
+        .platform = platformFacts(snapshot, arch),
+        .backends = .{ backendAvailability(.hvf, host), backendAvailability(.kvm, host) },
         .cache_roots = .{
             .kernels = kernels,
             .rootfs = rootfs,
@@ -194,10 +193,11 @@ pub fn hostInfoFromSnapshot(
     };
 }
 
-fn platformFacts(snapshot: HostInfoSnapshot) PlatformFacts {
-    return switch (snapshot.architecture) {
+fn platformFacts(snapshot: HostInfoSnapshot, arch: architecture.Architecture) PlatformFacts {
+    const os = @tagName(snapshot.host.os);
+    return switch (arch) {
         .arm64 => .{ .arm64 = .{
-            .os = snapshot.os,
+            .os = os,
             .cpu_profile = board.cpu_profile,
             .device_model_version = board.device_model_version,
             .ram_base = board.ram_base,
@@ -208,7 +208,7 @@ fn platformFacts(snapshot: HostInfoSnapshot) PlatformFacts {
             .counter = .{ .frequency_hz = snapshot.aarch64_counter_frequency_hz },
         } },
         .amd64 => .{ .amd64 = .{
-            .os = snapshot.os,
+            .os = os,
             .kvm_capabilities = snapshot.x86_kvm_capabilities,
         } },
     };
@@ -223,23 +223,10 @@ pub fn deinitHostInfo(allocator: std.mem.Allocator, info: HostInfo) void {
 
 fn currentHostInfoSnapshot() !HostInfoSnapshot {
     if (comptime builtin.cpu.arch == .aarch64) {
-        return .{
-            .os = @tagName(builtin.os.tag),
-            .architecture = .arm64,
-            .host_class = hostClass(),
-            .aarch64_counter_frequency_hz = try hostCounterFrequencyHz(),
-            .backends = .{ hvfAvailability(), kvmAvailability() },
-        };
+        return .{ .host = .probe(), .aarch64_counter_frequency_hz = try hostCounterFrequencyHz() };
     }
     if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-        const capabilities = collectX86KvmCapabilities();
-        return .{
-            .os = @tagName(builtin.os.tag),
-            .architecture = .amd64,
-            .host_class = "linux-amd64-kvm",
-            .x86_kvm_capabilities = capabilities,
-            .backends = .{ unsupportedBackend("hvf"), x86KvmAvailability(capabilities) },
-        };
+        return .{ .host = .probe(), .x86_kvm_capabilities = collectX86KvmCapabilities() };
     }
     return error.UnsupportedArchitecture;
 }
@@ -273,20 +260,19 @@ fn collectX86KvmCapabilities() [x86_cpu_profile.required_capabilities.len]KvmCap
     return facts;
 }
 
-fn unsupportedBackend(name: []const u8) BackendAvailability {
-    return .{ .name = name, .supported = false, .available = false, .reason = "unsupported_os_or_arch" };
-}
-
-fn x86KvmAvailability(capabilities: [x86_cpu_profile.required_capabilities.len]KvmCapabilityFact) BackendAvailability {
-    _ = capabilities;
-    const availability = backend_mod.availability(.kvm, .probe());
-    return switch (availability) {
-        .available => .{ .name = "kvm", .supported = true, .available = true, .reason = "available" },
-        .unavailable => |result| .{
-            .name = "kvm",
-            .supported = result.reason != .unsupported_host,
+fn backendAvailability(backend: backend_mod.Backend, host: backend_mod.Host) BackendAvailability {
+    return switch (backend_mod.availability(backend, host)) {
+        .available => .{
+            .name = backend.name(),
+            .supported = true,
+            .available = true,
+            .reason = if (backend == .hvf) "supported_host" else "available",
+        },
+        .unavailable => |reason| .{
+            .name = backend.name(),
+            .supported = reason != .unsupported_host,
             .available = false,
-            .reason = unavailableReasonName(result.reason),
+            .reason = unavailableReasonName(reason),
         },
     };
 }
@@ -305,45 +291,11 @@ fn freePathFact(allocator: std.mem.Allocator, fact: PathFact) void {
     if (fact.path) |path| allocator.free(path);
 }
 
-fn hostClass() []const u8 {
-    if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) return "macos-arm64-hvf";
-    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) return "linux-arm64-kvm";
+fn hostClass(host: backend_mod.Host) []const u8 {
+    if (host.os == .macos and host.arch == .aarch64) return "macos-arm64-hvf";
+    if (host.os == .linux and host.arch == .aarch64) return "linux-arm64-kvm";
+    if (host.os == .linux and host.arch == .x86_64) return "linux-amd64-kvm";
     return "unsupported";
-}
-
-fn hvfAvailability() BackendAvailability {
-    if (comptime builtin.os.tag == .macos and builtin.cpu.arch == .aarch64) {
-        return .{
-            .name = "hvf",
-            .supported = true,
-            .available = true,
-            .reason = "supported_host",
-        };
-    }
-    return .{
-        .name = "hvf",
-        .supported = false,
-        .available = false,
-        .reason = "unsupported_os_or_arch",
-    };
-}
-
-fn kvmAvailability() BackendAvailability {
-    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
-        const available = std.c.access("/dev/kvm", 0) == 0;
-        return .{
-            .name = "kvm",
-            .supported = true,
-            .available = available,
-            .reason = if (available) "available" else "missing_dev_kvm",
-        };
-    }
-    return .{
-        .name = "kvm",
-        .supported = false,
-        .available = false,
-        .reason = "unsupported_os_or_arch",
-    };
 }
 
 fn cacheRootFact(
@@ -499,6 +451,32 @@ test "host info exposes schema and cache roots" {
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/sporevm", info.cache_roots.runtime.path.?);
 }
 
+test "host info reports each backend from the probed host" {
+    const allocator = std.testing.allocator;
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_CACHE_HOME", "/tmp/sporevm-cache");
+    try env.put("XDG_RUNTIME_DIR", "/tmp/sporevm-runtime");
+
+    const hvf_unsupported = "{\"name\":\"hvf\",\"supported\":false,\"available\":false,\"reason\":\"unsupported_os_or_arch\"}";
+    const Case = struct { backend_mod.Host, []const u8 };
+    const cases = [_]Case{
+        .{ .{ .os = .linux, .arch = .aarch64 }, "[" ++ hvf_unsupported ++ ",{\"name\":\"kvm\",\"supported\":true,\"available\":true,\"reason\":\"available\"}]" },
+        .{ .{ .os = .linux, .arch = .aarch64, .kvm_unavailable = .missing_dev_kvm }, "[" ++ hvf_unsupported ++ ",{\"name\":\"kvm\",\"supported\":true,\"available\":false,\"reason\":\"missing_dev_kvm\"}]" },
+        .{ .{ .os = .linux, .arch = .x86_64, .kvm_unavailable = .kvm_open_failed }, "[" ++ hvf_unsupported ++ ",{\"name\":\"kvm\",\"supported\":true,\"available\":false,\"reason\":\"kvm_open_failed\"}]" },
+        .{ .{ .os = .linux, .arch = .x86_64, .kvm_unavailable = .incompatible_cpu_profile }, "[" ++ hvf_unsupported ++ ",{\"name\":\"kvm\",\"supported\":true,\"available\":false,\"reason\":\"cpu_profile_incompatible\"}]" },
+        .{ .{ .os = .linux, .arch = .x86_64, .kvm_unavailable = .kvm_probe_failed }, "[" ++ hvf_unsupported ++ ",{\"name\":\"kvm\",\"supported\":true,\"available\":false,\"reason\":\"kvm_probe_failed\"}]" },
+    };
+    for (cases) |case| {
+        const host, const expected = case;
+        const info = try hostInfoFromSnapshot(allocator, &env, .{ .host = host });
+        defer deinitHostInfo(allocator, info);
+        const json = try std.json.Stringify.valueAlloc(allocator, info.backends, .{});
+        defer allocator.free(json);
+        try std.testing.expectEqualStrings(expected, json);
+    }
+}
+
 test "host info offline renderer discriminates ARM and x86 without host probing" {
     const allocator = std.testing.allocator;
     var env = std.process.Environ.Map.init(allocator);
@@ -506,17 +484,9 @@ test "host info offline renderer discriminates ARM and x86 without host probing"
     try env.put("XDG_CACHE_HOME", "/tmp/sporevm-cache");
     try env.put("XDG_RUNTIME_DIR", "/tmp/sporevm-runtime");
 
-    const unavailable_hvf = unsupportedBackend("hvf");
-    const available_hvf = BackendAvailability{ .name = "hvf", .supported = true, .available = true, .reason = "supported_host" };
-    const unavailable_kvm = unsupportedBackend("kvm");
-    const available_kvm = BackendAvailability{ .name = "kvm", .supported = true, .available = true, .reason = "available" };
-
     const arm = try hostInfoFromSnapshot(allocator, &env, .{
-        .os = "macos",
-        .architecture = .arm64,
-        .host_class = "macos-arm64-hvf",
+        .host = .{ .os = .macos, .arch = .aarch64 },
         .aarch64_counter_frequency_hz = 24_000_000,
-        .backends = .{ available_hvf, unavailable_kvm },
     });
     defer deinitHostInfo(allocator, arm);
     try std.testing.expectEqualStrings(host_info_schema, arm.schema);
@@ -529,11 +499,8 @@ test "host info offline renderer discriminates ARM and x86 without host probing"
         capability.satisfied = true;
     }
     const x86 = try hostInfoFromSnapshot(allocator, &env, .{
-        .os = "linux",
-        .architecture = .amd64,
-        .host_class = "linux-amd64-kvm",
+        .host = .{ .os = .linux, .arch = .x86_64 },
         .x86_kvm_capabilities = capabilities,
-        .backends = .{ unavailable_hvf, available_kvm },
     });
     defer deinitHostInfo(allocator, x86);
     try std.testing.expectEqualStrings("amd64", x86.architecture);

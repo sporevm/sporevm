@@ -200,7 +200,7 @@ const ArgValue = step_cache.ArgInput;
 const automatic_build_capacity_bytes: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Result {
-    const backend = try backend_mod.requireProductRunner(.auto, options.host);
+    const backend = try backend_mod.select(.auto, options.host);
     try run_mod.validateFreshProductPolicy(backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -483,7 +483,7 @@ test "build requires a product runner before reading inputs" {
         .context_dir = "zig-cache/test-spore-build-runner-gate/missing-context",
         .dockerfile_path = "zig-cache/test-spore-build-runner-gate/missing-Dockerfile",
         .diagnostic = &diagnostic,
-        .host = .{ .os = .linux, .arch = .x86_64, .x86_kvm_unavailable = .missing_dev_kvm },
+        .host = .{ .os = .linux, .arch = .x86_64, .kvm_unavailable = .missing_dev_kvm },
     }));
     try std.testing.expect(diagnostic.missing_input == null);
 }

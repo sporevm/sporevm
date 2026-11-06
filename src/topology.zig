@@ -8,16 +8,11 @@ const std = @import("std");
 pub const VcpuCount = u32;
 pub const VcpuIndex = u32;
 
-/// First product ceiling while backend and manifest support lands in slices.
+/// The most vCPUs a guest may have.
 pub const max_vcpus: VcpuCount = 8;
 
 pub fn validateVcpuCount(count: VcpuCount) !void {
     if (count == 0 or count > max_vcpus) return error.UnsupportedVcpuCount;
-}
-
-pub fn requireSingleVcpu(count: VcpuCount) !void {
-    try validateVcpuCount(count);
-    if (count != 1) return error.UnsupportedVcpuCount;
 }
 
 pub fn parseVcpuCount(raw: []const u8) !VcpuCount {
@@ -32,7 +27,6 @@ test "validates vcpu count cap" {
     try validateVcpuCount(max_vcpus);
     try std.testing.expectError(error.UnsupportedVcpuCount, validateVcpuCount(0));
     try std.testing.expectError(error.UnsupportedVcpuCount, validateVcpuCount(max_vcpus + 1));
-    try std.testing.expectError(error.UnsupportedVcpuCount, requireSingleVcpu(2));
 }
 
 test "parses vcpu counts" {

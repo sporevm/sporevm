@@ -15,7 +15,6 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const lifecycle = @import("lifecycle.zig");
-const backend_mod = @import("backend.zig");
 const memory_config = @import("memory.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
@@ -156,7 +155,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const opts = try parseMonitorArgs(allocator, args);
     const parsed_ms = lifecycle.monotonicMs();
-    const selected_backend = backend_mod.requireProductRunner(opts.backend, .probe()) catch |err| {
+    // No host probe here: `create` probes before spawning its monitor, x86
+    // rejects restore and fork monitors below, and opening the backend
+    // reports an unusable arm64 KVM.
+    const selected_backend = opts.backend.resolveForHost() catch |err| {
         std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };

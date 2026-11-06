@@ -1,7 +1,7 @@
-//! Product and backend architecture vocabulary.
+//! Product architecture vocabulary.
 //!
-//! Product-facing values use OCI names. Backend names stay confined to the
-//! runtime-selection boundary where they describe machine implementations.
+//! Product-facing values use OCI names; `fromTarget` translates Zig's
+//! toolchain spelling at the host/build boundary.
 
 const std = @import("std");
 
@@ -19,20 +19,6 @@ pub const Architecture = enum {
         return @tagName(self);
     }
 };
-
-pub const BackendArchitecture = enum {
-    aarch64,
-    x86_64,
-};
-
-/// Select the machine/backend architecture for one OCI architecture.
-/// Keep this switch exhaustive so product callers never translate aliases.
-pub fn selectBackend(product: Architecture) BackendArchitecture {
-    return switch (product) {
-        .arm64 => .aarch64,
-        .amd64 => .x86_64,
-    };
-}
 
 /// Translate Zig's toolchain spelling at the host/build boundary.
 pub fn fromTarget(target: std.Target.Cpu.Arch) ?Architecture {
@@ -52,9 +38,7 @@ test "product architectures use only OCI names" {
     try std.testing.expectError(error.UnsupportedArchitecture, Architecture.parse("x86_64"));
 }
 
-test "backend selection maps both OCI architectures exhaustively" {
-    try std.testing.expectEqual(BackendArchitecture.aarch64, selectBackend(.arm64));
-    try std.testing.expectEqual(BackendArchitecture.x86_64, selectBackend(.amd64));
+test "toolchain architectures translate to OCI names" {
     try std.testing.expectEqual(Architecture.arm64, fromTarget(.aarch64).?);
     try std.testing.expectEqual(Architecture.amd64, fromTarget(.x86_64).?);
 }

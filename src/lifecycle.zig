@@ -865,7 +865,7 @@ fn createNamedWithTiming(
 ) !NamedLifecycleResult {
     clearLastError();
     if (options.rootfs_path != null and options.image_ref != null) return error.InvalidRootfsInput;
-    const selected_backend = try backend_mod.requireProductRunner(options.backend, host);
+    const selected_backend = try backend_mod.select(options.backend, host);
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -5760,7 +5760,8 @@ fn parseVcpuCountLifecycleCli(
 }
 
 pub fn monitorBackendSupported(raw: []const u8) bool {
-    return (run_mod.Backend.parse(raw) orelse return false).supportedOnHost();
+    _ = (run_mod.Backend.parse(raw) orelse return false).resolveForHost() catch return false;
+    return true;
 }
 
 pub fn wantsNamedFork(args: []const []const u8) bool {
