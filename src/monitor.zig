@@ -28,6 +28,7 @@ const runtime_disk_fork_capture = @import("runtime_disk_fork_capture.zig");
 const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const net_gateway = @import("net_gateway.zig");
+const boot_assets = @import("boot_assets.zig");
 const run = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -287,14 +288,14 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const spec_exec_defaults = spec.exec_defaults orelse lifecycle.ExecDefaults{};
     const managed_boot_descriptor = if (spec.kernel_path == null and spec.initrd_path == null and
         init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null)
-        run.resolveManagedMonitorBootDescriptor(init, allocator) catch |err| {
+        boot_assets.resolveManagedMonitorBootDescriptor(init, allocator) catch |err| {
             std.debug.print("spore monitor: managed boot setup failed: {s}\n", .{@errorName(err)});
             std.process.exit(2);
         }
     else
         null;
     const managed_boot_artifacts = if (managed_boot_descriptor) |descriptor|
-        run.materializeManagedMonitorBootArtifacts(init.io, allocator, descriptor) catch |err| {
+        boot_assets.materializeManagedMonitorBootArtifacts(init.io, allocator, descriptor) catch |err| {
             std.debug.print("spore monitor: managed boot verification failed: {s}\n", .{@errorName(err)});
             std.process.exit(2);
         }
@@ -303,11 +304,11 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const kernel_path = if (managed_boot_descriptor) |descriptor|
         descriptor.kernel_path
     else
-        spec.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
+        spec.kernel_path orelse boot_assets.resolveDefaultKernelPath(init, allocator) catch |err| {
             std.debug.print("spore monitor: kernel setup failed: {s}\n", .{@errorName(err)});
             std.process.exit(2);
         };
-    const initrd_path = if (managed_boot_descriptor != null) null else run.resolveConfiguredInitrdPath(init, spec.initrd_path) catch |err| {
+    const initrd_path = if (managed_boot_descriptor != null) null else boot_assets.resolveConfiguredInitrdPath(init, spec.initrd_path) catch |err| {
         std.debug.print("spore monitor: initrd setup failed: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };

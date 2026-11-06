@@ -91,6 +91,46 @@ pub fn runtimeOverlayRootPath(allocator: std.mem.Allocator, environ: *const std.
     return resolveRequiredAbsolute(allocator, environ.get("TMPDIR") orelse "/tmp");
 }
 
+pub fn ensureDirPath(io: Io, path: []const u8) !void {
+    if (!Io.Dir.path.isAbsolute(path)) {
+        try Io.Dir.cwd().createDirPath(io, path);
+        return;
+    }
+    var existing = Io.Dir.openDirAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (std.fs.path.dirname(path)) |parent| {
+                if (parent.len > 0 and !std.mem.eql(u8, parent, path)) try ensureDirPath(io, parent);
+            }
+            Io.Dir.createDirAbsolute(io, path, .default_dir) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => {},
+                else => |e| return e,
+            };
+            return;
+        },
+        else => |e| return e,
+    };
+    existing.close(io);
+}
+
+pub fn readablePath(io: Io, path: []const u8) !bool {
+    return accessPath(io, path, .{ .read = true });
+}
+
+fn accessPath(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !bool {
+    if (Io.Dir.path.isAbsolute(path)) {
+        Io.Dir.accessAbsolute(io, path, options) catch |err| switch (err) {
+            error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+            else => |e| return e,
+        };
+        return true;
+    }
+    Io.Dir.cwd().access(io, path, options) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
 fn resolveRequiredAbsolute(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     try validateAbsoluteRuntimePath(path);
     return std.fs.path.resolve(allocator, &.{path});

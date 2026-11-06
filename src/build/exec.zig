@@ -7,6 +7,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const rootfs_cas = @import("../rootfs_cas.zig");
 const disk_layer = @import("../disk_layer.zig");
 const rootfs_mod = @import("../rootfs.zig");
+const boot_assets = @import("../boot_assets.zig");
 const run_mod = @import("../run.zig");
 const local_paths = @import("../local_paths.zig");
 const memory_config = @import("../memory.zig");
@@ -150,8 +151,8 @@ pub const StorageLeases = struct {
 pub const Producer = struct {
     identity: []const u8,
     boot_source: union(enum) {
-        retained: run_mod.MonitorBootArtifacts,
-        managed: run_mod.ManagedMonitorBootDescriptor,
+        retained: boot_assets.MonitorBootArtifacts,
+        managed: boot_assets.ManagedMonitorBootDescriptor,
     },
     eager_artifact_file_reads: usize = 0,
     eager_artifact_bytes_read: usize = 0,
@@ -162,13 +163,13 @@ pub fn resolveProducer(init: std.process.Init, allocator: std.mem.Allocator) !Pr
     if (init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null and
         init.environ_map.get("SPOREVM_RUN_INITRD") == null)
     {
-        const managed = try run_mod.resolveManagedMonitorBootDescriptor(init, allocator);
+        const managed = try boot_assets.resolveManagedMonitorBootDescriptor(init, allocator);
         return managedProducer(allocator, managed, noinit_itable);
     }
 
-    const kernel_path = try run_mod.resolveDefaultKernelPath(init, allocator);
-    const initrd_path = try run_mod.resolveConfiguredInitrdPath(init, null);
-    const boot = try run_mod.loadMonitorBootArtifacts(init.io, allocator, kernel_path, initrd_path);
+    const kernel_path = try boot_assets.resolveDefaultKernelPath(init, allocator);
+    const initrd_path = try boot_assets.resolveConfiguredInitrdPath(init, null);
+    const boot = try boot_assets.loadMonitorBootArtifacts(init.io, allocator, kernel_path, initrd_path);
     const kernel_sha256 = sha256Bytes(boot.kernel);
     const initrd_sha256 = sha256Bytes(boot.initrd);
     return .{
@@ -181,7 +182,7 @@ pub fn resolveProducer(init: std.process.Init, allocator: std.mem.Allocator) !Pr
 
 fn managedProducer(
     allocator: std.mem.Allocator,
-    managed: run_mod.ManagedMonitorBootDescriptor,
+    managed: boot_assets.ManagedMonitorBootDescriptor,
     noinit_itable: bool,
 ) !Producer {
     return .{
@@ -524,7 +525,7 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     const boot = switch (options.producer.boot_source) {
         .retained => |retained| retained,
         .managed => |managed| blk: {
-            const artifacts = try run_mod.materializeManagedMonitorBootArtifacts(init.io, allocator, managed);
+            const artifacts = try boot_assets.materializeManagedMonitorBootArtifacts(init.io, allocator, managed);
             if (options.diagnostic) |diag| {
                 diag.boot_artifact_file_reads += 1;
                 diag.boot_artifact_bytes_read += artifacts.kernel.len;

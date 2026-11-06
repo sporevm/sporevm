@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const api = @import("api.zig");
+const boot_assets = @import("boot_assets.zig");
 const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
 const run_mod = @import("run.zig");
@@ -105,7 +106,7 @@ fn runParsed(
     spore_executable: []const u8,
     debug: bool,
 ) !api.RunResult {
-    const injected_files = run_mod.readInjectedFileSources(init.io, allocator, parsed.injected_file_sources.slice()) catch |err| switch (err) {
+    const injected_files = boot_assets.readInjectedFileSources(init.io, allocator, parsed.injected_file_sources.slice()) catch |err| switch (err) {
         error.InjectedFileOpenFailed => failRunSetup("spore run: injected file setup failed", .{}),
         error.InjectedFileTooLarge => failRunSetup("spore run: injected files exceed 16MiB total", .{}),
         else => return err,
