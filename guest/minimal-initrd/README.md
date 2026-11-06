@@ -16,13 +16,17 @@ SPIO frames: a 24-byte little-endian header (`SPIO`, version 1, frame type,
 zero flags, stream id, byte offset, payload length of at most 4096) and the
 payload. The streams are control (0), stdin (1), stdout (2), stderr (3), and
 terminal (4). Every reply ends with an exit frame; a failed request first
-writes its error to stderr.
+writes its error to stderr. The agent packs up to 15 output frames into one
+write, which the guest kernel sends as one vsock packet of at most 64 KiB.
+With `spore_console_mirror=1` on the kernel command line, which the host
+passes only when it logs the console (`--console-log`), the agent also copies
+command output to the console.
 
 | Request | Does |
 | --- | --- |
 | `ready` | exits 0 if the rootfs and network the VM asked for are usable |
 | `start-v1` | starts a command as the VM's session, or in the background with `detached`; `stdio` is `null`, `pipe` (stdin frames), or `tty` (a PTY on the terminal stream, resized by resize frames); `params_json` applies new generation identity first |
-| `attach-v1` | reattaches to a session, replaying output from the given offsets if they are within the last 64 KiB of each stream; `params_json` as for `start-v1` |
+| `attach-v1` | reattaches to a session, replaying output from the given offsets if they are within the last 256 KiB of each stream; `params_json` as for `start-v1` |
 | `initial-output` | returns the retained output of a named VM's create command |
 | `copy-in-v1`, `copy-out-v1` | `spore cp`: an `SPCP1` archive on the stdin or stdout stream |
 | `spore-build-run-v4`, `spore-build-copy-v5`, `spore-build-workdir-v1` | `spore build` RUN, COPY, and WORKDIR steps |

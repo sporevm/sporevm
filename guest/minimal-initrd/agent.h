@@ -48,13 +48,22 @@
 #define MAX_DETACHED_CHILDREN 32
 #define INITIAL_OUTPUT_HEADER_LEN 3
 #define INITIAL_OUTPUT_CAP (16 * 1024 - INITIAL_OUTPUT_HEADER_LEN)
-#define REPLAY_CAP 65536
+// Each output stream keeps its last REPLAY_CAP bytes for an attach to resume
+// from. A `spore run` save records how much output its host had received,
+// which trails what the agent had read by at most the read the agent was still
+// sending (SPIO_BATCH_FRAMES * MAX_FRAME_PAYLOAD, 60 KiB) plus the 64 KiB of
+// vsock credit the host grants (host_stream_credit in src/virtio/vsock.zig):
+// 124 KiB. The rest holds what the agent reads after a restore, before the
+// attach arrives.
+#define REPLAY_CAP (256 * 1024)
 // The generation device's params region, generation.zig params_size, plus
 // the NUL.
 #define GEN_PARAMS_MAX 3841
 #define SPIO_MAGIC "SPIO"
 #define SPIO_VERSION 1
 #define SPIO_HEADER_LEN 24
+// Frames the agent packs into one vsock write; see spio.c.
+#define SPIO_BATCH_FRAMES 15
 #define SPIO_DATA 1
 #define SPIO_CLOSE 2
 #define SPIO_STDIN_STREAM 1
@@ -89,6 +98,7 @@
 #endif
 #define MAX_SYMLINK_DEPTH 40
 
+// A ring: the byte at stream offset o is at data[o % REPLAY_CAP].
 struct replay_buffer {
   unsigned char data[REPLAY_CAP];
   uint64_t base_offset;
@@ -360,6 +370,7 @@ extern int64_t t_command_user_us;
 extern int64_t t_command_system_us;
 extern int sigchld_pipe[2];
 extern int proc_dir_fd;
+extern int console_mirror;
 extern struct build_resolv_state build_resolv;
 extern int build_run_mount_cleanup_poisoned;
 

@@ -28,9 +28,19 @@ elsewhere, push the parent, pull it there and pass the child's identity to
 - Restores from memory chunks read each chunk straight into guest RAM instead
   of through a heap buffer, taking another 28 to 43 percent off loads with a
   warm page cache and 10 to 35 percent with a cold one.
+- Guest command output reaches `spore run` and `spore exec` at 350 to 700
+  MiB/s, up from 14 MiB/s on KVM and 30 MiB/s on Hypervisor.framework. The
+  guest agent no longer copies it to the console unless the console is
+  logged, and sends it in 64 KiB vsock packets instead of two packets per
+  4 KiB.
 
 ### Fixes
 
+- `spore attach` and `spore fanout` resume a saved session's output where the
+  `spore run` that saved it left off. `spore attach --events=jsonl` replayed
+  it from the start and the others printed the console instead, and all of
+  them asked the guest for the output from the start, so they failed once the
+  session had written more than 64 KiB.
 - Single-vCPU saves also wait until the vCPU is not in an interrupt handler,
   or fail with `InterruptStillActive`, as multi-vCPU saves do.
 
@@ -48,6 +58,12 @@ elsewhere, push the parent, pull it there and pass the child's identity to
 
 ### Other changes
 
+- `spore attach` without `--events=jsonl`, and so `spore fanout`, prints the
+  session's stdout and stderr, as `--events=jsonl` does, instead of the guest
+  console.
+- The guest copies command output to the console, and so to a console log,
+  only in VMs started with `--console-log`. A spore saved from a VM started
+  without it does not gain it when restored with `--console-log`.
 - Saved network spores record `default_action: "deny"` for every restricted
   egress policy, including `--allow-cidr` and `--allow-host` alone; a policy
   with allow entries but no `default_action` still restores as restricted.

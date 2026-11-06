@@ -1515,6 +1515,8 @@ const GuestRequestLimits = extern struct {
     generation_params_bytes: u64,
     frame_payload_bytes: u64,
     initial_output_bytes: u64,
+    output_read_bytes: u64,
+    replay_bytes: u64,
 };
 extern fn spore_agent_test_request_limits(out: *GuestRequestLimits) void;
 extern fn spore_agent_test_serve_requests(captured_script: [*:0]const u8, captured_finishes: c_int, attach: [*]const u8, attach_len: usize, requests: [*]const u8, request_lens: [*]const usize, request_count: usize, response: [*]u8, response_cap: usize, captured_stdout: *u64) isize;
@@ -1688,6 +1690,10 @@ test "host request limits match the guest agent" {
     try std.testing.expectEqual(@as(u64, @import("../generation.zig").params_size), guest.generation_params_bytes);
     try std.testing.expectEqual(@as(u64, @import("../spore_stream.zig").max_payload_len), guest.frame_payload_bytes);
     try std.testing.expectEqual(@as(u64, @import("../lifecycle.zig").initial_output_limit_bytes_per_stream), guest.initial_output_bytes);
+    // A `spore run` save trails the agent by at most a read it is still
+    // sending plus the vsock credit the host grants, and an attach must be
+    // able to resume from there.
+    try std.testing.expect(guest.replay_bytes >= guest.output_read_bytes + @import("../virtio/vsock.zig").host_stream_credit);
 }
 
 test "build agent fd budget covers every bounded hardlink authority" {
@@ -2850,6 +2856,9 @@ test "builder and runtime share bounded guest PATH resolution" {
 const AgentResult = struct {
     stdout: []u8,
     stderr: []u8,
+    /// The offsets of the first stdout and stderr frames.
+    stdout_offset: ?u64,
+    stderr_offset: ?u64,
     exit_code: ?u32,
     captured_stdout: u64,
 
@@ -2897,28 +2906,39 @@ fn agentServeRequests(scenario: AgentScenario, requests: []const []const u8) !Ag
     const lens = try allocator.alloc(usize, requests.len);
     defer allocator.free(lens);
     for (requests, lens) |request, *len| len.* = request.len;
-    var response: [8192]u8 = undefined;
+    const response = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(response);
     var captured_stdout: u64 = 0;
-    const response_len = spore_agent_test_serve_requests(scenario.captured_script, @intFromBool(scenario.captured_finishes), scenario.attach.ptr, scenario.attach.len, joined.ptr, lens.ptr, requests.len, &response, response.len, &captured_stdout);
+    const response_len = spore_agent_test_serve_requests(scenario.captured_script, @intFromBool(scenario.captured_finishes), scenario.attach.ptr, scenario.attach.len, joined.ptr, lens.ptr, requests.len, response.ptr, response.len, &captured_stdout);
     if (response_len < 0) return error.AgentHarnessFailed;
 
     var stdout: std.ArrayList(u8) = .empty;
     errdefer stdout.deinit(allocator);
     var stderr: std.ArrayList(u8) = .empty;
     errdefer stderr.deinit(allocator);
+    var stdout_offset: ?u64 = null;
+    var stderr_offset: ?u64 = null;
     var exit_code: ?u32 = null;
     var rest = response[0..@intCast(response_len)];
     while (rest.len >= spore_stream.header_len) {
         const header = try spore_stream.readHeader(rest[0..spore_stream.header_len]);
         const payload = rest[spore_stream.header_len..][0..header.payload_len];
-        if (header.frame_type == .data and header.stream_id == .stdout) try stdout.appendSlice(allocator, payload);
-        if (header.frame_type == .data and header.stream_id == .stderr) try stderr.appendSlice(allocator, payload);
+        if (header.frame_type == .data and header.stream_id == .stdout) {
+            if (stdout_offset == null) stdout_offset = header.offset;
+            try stdout.appendSlice(allocator, payload);
+        }
+        if (header.frame_type == .data and header.stream_id == .stderr) {
+            if (stderr_offset == null) stderr_offset = header.offset;
+            try stderr.appendSlice(allocator, payload);
+        }
         if (header.frame_type == .exit) exit_code = try spore_stream.readExitPayload(payload);
         rest = rest[spore_stream.header_len + payload.len ..];
     }
     return .{
         .stdout = try stdout.toOwnedSlice(allocator),
         .stderr = try stderr.toOwnedSlice(allocator),
+        .stdout_offset = stdout_offset,
+        .stderr_offset = stderr_offset,
         .exit_code = exit_code,
         .captured_stdout = captured_stdout,
     };
@@ -3023,6 +3043,63 @@ test "guest agent replays an exec that followed the captured session" {
     try std.testing.expectEqualStrings("out\n", result.stdout);
     try std.testing.expectEqualStrings("err\n", result.stderr);
     try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
+}
+
+test "guest agent refuses an attach at the offsets it was asked to resume from" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // The host's stream expects the refusal's stderr where the saved
+    // session's stderr left off, not at zero.
+    const attach = try @import("../attach_stream.zig").attachV1Request(allocator, .{ .session_id = "other", .stdout_offset = 3, .stderr_offset = 5 });
+    defer allocator.free(attach);
+    const result = try agentServeRequests(.{}, &.{attach});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("spore run: no session\n", result.stderr);
+    try std.testing.expectEqual(@as(?u64, 5), result.stderr_offset);
+    try std.testing.expectEqual(@as(?u32, 2), result.exit_code);
+}
+
+test "guest agent resumes a session's output from as far back as a save leaves the host" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const attach_stream = @import("../attach_stream.zig");
+
+    // More output than the agent keeps, so its replay buffer has wrapped.
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    for (1..60_001) |i| try expected.print(allocator, "{d}\n", .{i});
+    const total = expected.items.len;
+    var limits: GuestRequestLimits = undefined;
+    spore_agent_test_request_limits(&limits);
+    try std.testing.expect(total > limits.replay_bytes);
+    const scenario: AgentScenario = .{ .captured_script = "seq 1 60000", .captured_finishes = true };
+
+    // The furthest a `spore run` save can trail the agent.
+    const lag: usize = @intCast(limits.output_read_bytes + @import("../virtio/vsock.zig").host_stream_credit);
+    const behind = try attach_stream.attachV1Request(allocator, .{ .session_id = "captured", .stdout_offset = total - lag });
+    defer allocator.free(behind);
+    const resumed = try agentServeRequests(scenario, &.{behind});
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(?u64, total - lag), resumed.stdout_offset);
+    try std.testing.expectEqualSlices(u8, expected.items[total - lag ..], resumed.stdout);
+    try std.testing.expectEqual(@as(?u32, 0), resumed.exit_code);
+
+    // An attach where the output ends gets only the exit.
+    const at_end = try attach_stream.attachV1Request(allocator, .{ .session_id = "captured", .stdout_offset = total });
+    defer allocator.free(at_end);
+    const caught_up = try agentServeRequests(scenario, &.{at_end});
+    defer caught_up.deinit();
+    try std.testing.expectEqualStrings("", caught_up.stdout);
+    try std.testing.expectEqual(@as(?u32, 0), caught_up.exit_code);
+
+    // Output older than the agent keeps is gone.
+    const too_far = try attach_stream.attachV1Request(allocator, .{ .session_id = "captured", .stdout_offset = total - @as(usize, @intCast(limits.replay_bytes)) - 1 });
+    defer allocator.free(too_far);
+    const refused = try agentServeRequests(scenario, &.{too_far});
+    defer refused.deinit();
+    try std.testing.expectEqualStrings("spore run: requested replay offset is unavailable\n", refused.stderr);
+    try std.testing.expectEqual(@as(?u32, 125), refused.exit_code);
 }
 
 test "build nofile limit is bounded" {

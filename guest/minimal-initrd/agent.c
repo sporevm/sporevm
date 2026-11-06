@@ -131,6 +131,12 @@ static void accept_request(struct agent *a) {
 
   close_client(client);
   client->fd = conn;
+  if (request.kind == REQUEST_ATTACH) {
+    // The host expects every frame, a refusal's stderr included, at the
+    // offsets it asked to resume from.
+    client->stdout_offset = request.stdout_offset;
+    client->stderr_offset = request.stderr_offset;
+  }
   client->stdin_input_owner = request.stdin_enabled;
   client->terminal_input_owner = request.tty && (request.kind == REQUEST_START || request.interactive);
 
@@ -582,6 +588,7 @@ int main(void) {
     return 1;
   }
   int use_network = cmdline_has_flag_in(cmdline, "spore_net=1");
+  console_mirror = cmdline_has_flag_in(cmdline, "spore_console_mirror=1");
   int listener = listen_vsock(resolve_port_from_cmdline(cmdline));
   if (listener < 0) {
     dprintf(2, "listen vsock failed: errno=%d\n", errno);
@@ -704,8 +711,8 @@ __attribute__((visibility("hidden"))) ssize_t spore_agent_test_serve_requests(
   struct session *session = &a.session;
   *captured_stdout = 0;
 
-  // The agent mirrors session output to its console; keep it off the test
-  // runner's stdout, which may carry the build protocol, and stderr.
+  // Keep what the agent writes to its console off the test runner's stdout,
+  // which may carry the build protocol, and stderr.
   int saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
   int saved_stderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0);
   int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);

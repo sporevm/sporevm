@@ -100,7 +100,7 @@ const create_usage =
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
-    \\  --console-log PATH      Write guest console output to PATH
+    \\  --console-log PATH      Write guest console output, and, in a VM this command boots, a copy of command output, to PATH
     \\  --initial-output MODE   retain or discard initial-command output (default: retain)
     \\  -- <argv...>            Start exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help

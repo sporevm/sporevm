@@ -6,28 +6,39 @@
 #define SPIO_EVENT 7
 #define SPIO_CONTROL_STREAM 0
 
+// One write's worth of frames. Each write leaves as at least one vsock packet
+// and guest exit, so whole reads go out together: 15 full frames fit in one
+// 64 KiB virtio-vsock packet. The agent is single-threaded.
+static unsigned char spio_out[SPIO_BATCH_FRAMES * (SPIO_HEADER_LEN + MAX_FRAME_PAYLOAD)];
+
+static size_t put_spio_frame(unsigned char *out, uint8_t type, uint32_t stream_id, uint64_t offset, const unsigned char *payload, size_t len) {
+  memcpy(out, SPIO_MAGIC, 4);
+  out[4] = SPIO_VERSION;
+  out[5] = type;
+  write_le16(out + 6, 0);
+  write_le32(out + 8, stream_id);
+  write_le64(out + 12, offset);
+  write_le32(out + 20, (uint32_t)len);
+  if (len > 0) memcpy(out + SPIO_HEADER_LEN, payload, len);
+  return SPIO_HEADER_LEN + len;
+}
+
 static int send_spio_frame(int fd, uint8_t type, uint32_t stream_id, uint64_t offset, const unsigned char *payload, size_t len) {
   if (len > MAX_FRAME_PAYLOAD) return -1;
-  unsigned char header[SPIO_HEADER_LEN];
-  memcpy(header, SPIO_MAGIC, 4);
-  header[4] = SPIO_VERSION;
-  header[5] = type;
-  write_le16(header + 6, 0);
-  write_le32(header + 8, stream_id);
-  write_le64(header + 12, offset);
-  write_le32(header + 20, (uint32_t)len);
-  if (write_all(fd, header, sizeof(header)) != 0) return -1;
-  if (len > 0 && write_all(fd, payload, len) != 0) return -1;
-  return 0;
+  return write_all(fd, spio_out, put_spio_frame(spio_out, type, stream_id, offset, payload, len));
 }
 
 int send_spio_data(int fd, uint32_t stream_id, uint64_t offset, const unsigned char *buf, size_t len) {
   size_t sent = 0;
   while (sent < len) {
-    size_t chunk = len - sent;
-    if (chunk > MAX_FRAME_PAYLOAD) chunk = MAX_FRAME_PAYLOAD;
-    if (send_spio_frame(fd, SPIO_DATA, stream_id, offset + sent, buf + sent, chunk) != 0) return -1;
-    sent += chunk;
+    size_t used = 0;
+    while (sent < len && used + SPIO_HEADER_LEN + MAX_FRAME_PAYLOAD <= sizeof(spio_out)) {
+      size_t chunk = len - sent;
+      if (chunk > MAX_FRAME_PAYLOAD) chunk = MAX_FRAME_PAYLOAD;
+      used += put_spio_frame(spio_out + used, SPIO_DATA, stream_id, offset + sent, buf + sent, chunk);
+      sent += chunk;
+    }
+    if (write_all(fd, spio_out, used) != 0) return -1;
   }
   return 0;
 }
@@ -109,7 +120,12 @@ int send_client_terminal_output(struct session *session, struct client *client, 
   return 0;
 }
 
+// Set by spore_console_mirror=1, which the host passes only when it logs the
+// console. Every write here is a synchronous virtio-console transfer.
+int console_mirror = 0;
+
 void mirror_console(int is_stdout, const unsigned char *buf, size_t len) {
+  if (!console_mirror) return;
   int fd = is_stdout ? STDOUT_FILENO : STDERR_FILENO;
   (void)write_all(fd, buf, len);
 }

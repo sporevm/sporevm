@@ -181,6 +181,10 @@ pub const Probe = struct {
     timeout_ms: u64 = 30_000,
     start: vsock_stream.HostStreamStart = .immediate,
     on_complete: OnComplete = .stop,
+    /// Whether the stream carries the output of the one entry in
+    /// `Config.sessions`. A snapshot then records how much of it the host
+    /// has delivered, where an attach resumes the output.
+    session_output: bool = false,
 
     pub const OnComplete = enum {
         /// The run ends when the command completes.
@@ -912,7 +916,7 @@ pub fn writeSnapshot(
         .rootfs = config.rootfs,
         .disk = disk_manifest,
         .network = config.network_manifest,
-        .sessions = config.sessions,
+        .sessions = try savedSessions(arena, config.*),
         .memory_state = memory_state,
         .memory = memory,
     };
@@ -976,6 +980,18 @@ pub fn writeSnapshot(
         );
     }
     std.log.info("spore written to {s}", .{dir});
+}
+
+/// `config.sessions`, with the output the probe stream has delivered when it
+/// carries the session's output.
+fn savedSessions(arena: std.mem.Allocator, config: Config) ![]const spore.Session {
+    const probe = config.probe orelse return config.sessions;
+    if (!probe.session_output) return config.sessions;
+    std.debug.assert(config.sessions.len == 1);
+    const sessions = try arena.dupe(spore.Session, config.sessions);
+    sessions[0].stdout_offset = probe.stream.stdout_offset;
+    sessions[0].stderr_offset = probe.stream.stderr_offset;
+    return sessions;
 }
 
 /// Writes the RAM half of a disk fork with `writeSnapshot`, then hands the
@@ -2290,6 +2306,45 @@ test "snapshots refuse queued host vsock packets before writing anything" {
         .{ .dir = dir },
     ));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "spore", .{}));
+}
+
+test "a snapshot records how much of the session's output the probe stream delivered" {
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = try tmp.path("spore");
+
+    var stream = try vsock_stream.HostStream.init(10700, "{}\n");
+    stream.stdout_offset = 4096;
+    stream.stderr_offset = 12;
+    const sessions = [_]spore.Session{spore.processSession(spore.default_session_id, false, false)};
+    var config = testBoot(.{});
+    config.sessions = &sessions;
+    config.probe = .{ .stream = &stream, .session_output = true };
+    const vsock_dev = vsock.Vsock.init(.{});
+    const gen_dev = generation.Device{};
+    var vm = TestVm{};
+    var one = [_]TestVcpu{.{ .live = testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 0, .cntv_cval = 0 }) }};
+    const ram = try std.testing.allocator.alloc(u8, spore.chunk_size);
+    defer std.testing.allocator.free(ram);
+    @memset(ram, 0);
+    writeSnapshot(
+        std.testing.allocator,
+        "test",
+        &vm,
+        @as([]TestVcpu, &one),
+        @as(?*DirtyTracker(TestDirtyBackend), null),
+        .{ .config = &config, .transports = &.{}, .gen_dev = &gen_dev, .vsock_dev = &vsock_dev, .ram_bytes = ram, .ram_size = ram.len },
+        .{ .dir = dir },
+    ) catch |err| switch (err) {
+        // The manifest records the host's counter frequency.
+        error.UnsupportedHost => return error.SkipZigTest,
+        else => |e| return e,
+    };
+
+    const parsed = try spore.loadManifest(std.testing.allocator, dir);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 4096), parsed.value.sessions[0].stdout_offset);
+    try std.testing.expectEqual(@as(u64, 12), parsed.value.sessions[0].stderr_offset);
 }
 
 test "one vCPU captures the single shape and more share vCPU 0's counter" {

@@ -1215,6 +1215,8 @@ fn ownSessions(allocator: std.mem.Allocator, sessions: []const spore.Session) ![
             .id = id,
             .kind = kind,
             .streams = session.streams,
+            .stdout_offset = session.stdout_offset,
+            .stderr_offset = session.stderr_offset,
         };
         initialized += 1;
     }

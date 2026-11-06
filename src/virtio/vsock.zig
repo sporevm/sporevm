@@ -37,9 +37,12 @@ const op_credit_update: u16 = 6;
 const op_credit_request: u16 = 7;
 
 const max_pending = 16;
-/// Largest packet payload the device accepts or queues.
+/// Largest packet payload the device queues for the guest.
 pub const max_payload = 8192;
-const host_stream_credit = 64 * 1024;
+/// Largest guest packet payload the device accepts: Linux's
+/// VIRTIO_VSOCK_MAX_PKT_BUF_SIZE, so one large guest write is one packet.
+const max_tx_payload = 64 * 1024;
+pub const host_stream_credit = 64 * 1024;
 
 pub const Header = struct {
     src_cid: u64,
@@ -183,9 +186,7 @@ pub const Vsock = struct {
             const maybe_chain = tx.popAvail(ram) catch return did_work;
             const chain = maybe_chain orelse break;
             budget.consume();
-            if (parsePacketFromChain(&chain)) |packet| {
-                self.handleGuestPacket(packet.header, packet.data[0..packet.data_len]);
-            }
+            if (parseTxHeader(&chain)) |header| self.handleGuestPacket(header, &chain);
             tx.pushUsed(ram, chain.head, 0) catch return did_work;
             did_work = true;
         }
@@ -197,7 +198,7 @@ pub const Vsock = struct {
         return self.flushRx(&queues[rx_queue], ram, budget) or did_work;
     }
 
-    fn handleGuestPacket(self: *Vsock, h: Header, payload: []const u8) void {
+    fn handleGuestPacket(self: *Vsock, h: Header, chain: *const queue.Chain) void {
         if (h.packet_type != packet_type_stream) return;
 
         if (self.host_stream) |stream| {
@@ -207,7 +208,7 @@ pub const Vsock = struct {
                 h.src_port == stream.guest_port and
                 h.dst_port == stream.host_port;
             if (matches_host_stream) {
-                self.handleHostStreamPacket(stream, h, payload);
+                self.handleHostStreamPacket(stream, h, chain);
                 return;
             }
         }
@@ -229,7 +230,7 @@ pub const Vsock = struct {
         }, "") catch {};
     }
 
-    fn handleHostStreamPacket(self: *Vsock, stream: *HostStream, h: Header, payload: []const u8) void {
+    fn handleHostStreamPacket(self: *Vsock, stream: *HostStream, h: Header, chain: *const queue.Chain) void {
         // Every guest packet carries the guest's current receive window.
         stream.peer_buf_alloc = h.buf_alloc;
         stream.peer_fwd_cnt = h.fwd_cnt;
@@ -241,7 +242,16 @@ pub const Vsock = struct {
                 }
             },
             op_rw => {
-                stream.appendOutput(payload);
+                // Copy the payload out of guest memory a piece at a time;
+                // parseTxHeader checked the chain holds all of it.
+                var piece: [max_payload]u8 = undefined;
+                var done: usize = 0;
+                while (done < h.len) {
+                    const n = @min(piece.len, h.len - done);
+                    if (!chain.copyReadableRange(header_len + done, piece[0..n])) break;
+                    stream.appendOutput(piece[0..n]);
+                    done += n;
+                }
             },
             op_credit_request => self.enqueueHostPacket(stream, op_credit_update, "") catch stream.fail(),
             op_credit_update => {},
@@ -403,15 +413,13 @@ fn chainWritableCapacity(chain: *const queue.Chain) usize {
     return n;
 }
 
-fn parsePacketFromChain(chain: *const queue.Chain) ?Packet {
+/// The header of a guest packet whose chain holds its whole payload.
+fn parseTxHeader(chain: *const queue.Chain) ?Header {
     var buf: [header_len]u8 = undefined;
     if (!chain.copyReadableRange(0, &buf)) return null;
     const header = parseHeader(&buf);
-    if (header.len > max_payload) return null;
-    const data_len: usize = @intCast(header.len);
-    var packet = Packet{ .header = header, .data_len = data_len };
-    if (data_len > 0 and !chain.copyReadableRange(header_len, packet.data[0..data_len])) return null;
-    return packet;
+    if (header.len > max_tx_payload or chain.readableLen() - header_len < header.len) return null;
+    return header;
 }
 
 fn writePacketToChain(chain: *const queue.Chain, h: Header, payload: []const u8) ?u32 {
@@ -907,6 +915,72 @@ test "host proactively updates credit while consuming guest stream data" {
     try std.testing.expectEqual(@as(u32, host_stream_credit / 2), update.fwd_cnt);
 }
 
+test "a guest packet reaches the host stream only when its chain holds its whole payload of at most 64 KiB" {
+    // Linux puts the header and the payload in separate descriptors.
+    const cases = [_]struct { len: u32, payload_desc_len: u32, delivered: bool }{
+        .{ .len = max_tx_payload, .payload_desc_len = max_tx_payload, .delivered = true },
+        .{ .len = max_tx_payload + 1, .payload_desc_len = max_tx_payload + 1, .delivered = false },
+        .{ .len = max_tx_payload, .payload_desc_len = max_tx_payload - 1, .delivered = false },
+    };
+    const buf = try std.testing.allocator.alloc(u8, 160 * 1024);
+    defer std.testing.allocator.free(buf);
+    const ram = guestmem.GuestRam{ .bytes = buf, .base = 0 };
+    const tx_desc = 0x1000;
+    const tx_avail = 0x1400;
+    const tx_used = 0x1800;
+    const header_buf = 0x2000;
+    const payload_buf = 0x3000;
+
+    for (cases) |case| {
+        @memset(buf, 0);
+        var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
+        var t = mmio.Transport.init(dev.device());
+        configureQueue(&t, rx_queue, 0x000, 0x400, 0x800, ram);
+        configureQueue(&t, tx_queue, tx_desc, tx_avail, tx_used, ram);
+        var stream = try HostStream.init(10700, "{}\n");
+        stream.state = .connected;
+        dev.host_stream = &stream;
+
+        // 64 KiB of stdout frames, as the guest agent writes them at once.
+        const payload = buf[payload_buf..][0..max_tx_payload];
+        var frame_start: usize = 0;
+        var data_len: u64 = 0;
+        while (frame_start < payload.len) {
+            const len = @min(spore_stream.max_payload_len, payload.len - frame_start - spore_stream.header_len);
+            spore_stream.writeHeader(payload[frame_start..][0..spore_stream.header_len], .{
+                .frame_type = .data,
+                .stream_id = .stdout,
+                .offset = data_len,
+                .payload_len = @intCast(len),
+            });
+            @memset(payload[frame_start + spore_stream.header_len ..][0..len], 'x');
+            frame_start += spore_stream.header_len + len;
+            data_len += len;
+        }
+        writeHeader(buf[header_buf..][0..header_len], .{
+            .src_cid = default_guest_cid,
+            .dst_cid = host_cid,
+            .src_port = 10700,
+            .dst_port = vsock_stream.default_host_port,
+            .len = case.len,
+            .packet_type = packet_type_stream,
+            .op = op_rw,
+        });
+        try setDesc(ram, tx_desc, 0, header_buf, header_len, 1); // VIRTQ_DESC_F_NEXT
+        try ram.write(u16, tx_desc + 14, 1);
+        try setDesc(ram, tx_desc, 1, payload_buf, case.payload_desc_len, 0);
+        try pushAvail(ram, tx_avail, 8, 0);
+        try std.testing.expect(t.write(0x050, tx_queue, ram));
+
+        // The device returns the chain either way, and never delivers part
+        // of a packet.
+        try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, tx_used + 2));
+        try std.testing.expectEqual(vsock_stream.HostStreamState.connected, stream.state);
+        try std.testing.expectEqual(if (case.delivered) data_len else 0, stream.stdout_offset);
+        try std.testing.expectEqual(if (case.delivered) case.len else 0, stream.received_bytes);
+    }
+}
+
 test "host defers stream data until the guest advertises credit" {
     var dev = Vsock.init(.{ .guest_cid = default_guest_cid });
     var t = mmio.Transport.init(dev.device());
@@ -1003,6 +1077,11 @@ fn fuzzVsockTx(_: void, s: *std.testing.Smith) !void {
     const ram = guestmem.GuestRam{ .bytes = &buf, .base = 0 };
     t.queues[rx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x1000, .avail_addr = 0x1200, .used_addr = 0x1400 };
     t.queues[tx_queue] = .{ .size = 8, .ready = true, .desc_addr = 0x0000, .avail_addr = 0x0400, .used_addr = 0x0800 };
+
+    // Packets addressed to the host stream feed its frame parser.
+    var stream = HostStream.init(10700, "{}\n") catch return;
+    stream.state = .connected;
+    dev.host_stream = &stream;
     _ = t.write(0x050, tx_queue, ram);
 }
 

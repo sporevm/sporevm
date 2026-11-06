@@ -328,11 +328,13 @@ pub const HostStream = struct {
         if (data.len == 0) return;
         if (self.first_output_ms == null) self.first_output_ms = self.elapsedMs();
         if (self.output_sink) |sink| sink(self.output_sink_context, output, data);
+        // Saturates: an attach starts at the offsets a saved manifest
+        // supplies, which may be anything.
         const len: u64 = @intCast(data.len);
         switch (output) {
-            .stdout => self.stdout_offset += len,
-            .stderr => self.stderr_offset += len,
-            .terminal => self.terminal_offset += len,
+            .stdout => self.stdout_offset +|= len,
+            .stderr => self.stderr_offset +|= len,
+            .terminal => self.terminal_offset +|= len,
         }
     }
 

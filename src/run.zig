@@ -263,7 +263,7 @@ pub const cli_usage =
     \\  --vcpus N               Guest vCPU count (1-8; save/restore backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
-    \\  --console-log PATH      Write guest console output to PATH
+    \\  --console-log PATH      Write guest console output, and, in a VM this command boots, a copy of command output, to PATH
     \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  --env KEY[=VALUE]       Set or copy a host env var for the guest command
     \\  --inject ID=PATH        Inject PATH as /run/sporevm/injected/ID for this run
@@ -851,7 +851,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     defer runtime_disk.deinit();
     const growth_session = opts.rootfs_grow_target != 0;
     const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const base_boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, false, false, 0);
+    const base_boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, console_fd >= 0, false, false, 0);
     const boot_args = if (resuming) "" else try productBootArgs(allocator, base_boot_args);
     const request_start = monotonicMs();
     const request = try execRequestForRun(context, allocator, opts, opts.memory.isElastic());
@@ -963,6 +963,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
             .timeout_ms = opts.timeout_ms,
             .start = if (opts.rootfs_grow_target != 0) .control else .immediate,
             .on_complete = if (opts.commit == null) .stop else .detach,
+            .session_output = true,
         },
         .capture = vm_capture,
         .network = network,
@@ -1147,7 +1148,7 @@ pub fn executeMonitorWithBootArtifacts(
     for (build_input_disks, 0..) |*disk, index| build_input_backends[index] = disk.backend() orelse return error.BadManifest;
     const growth_session = opts.rootfs_grow_target != 0;
     const noinit_itable = growth_session and rootfsGrowthNoInitItable(context.environ_map);
-    const base_boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
+    const base_boot_args = try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, console_fd >= 0, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
     const boot_args = try productBootArgs(allocator, base_boot_args);
     var root_blk_stats: virtio_blk.Stats = .{};
     const root_blk_options = rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
@@ -1239,6 +1240,8 @@ fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !s
     return fd;
 }
 
+/// The console log, when there is one. A VM booted while it is open has the
+/// guest agent copy command output to the console too.
 pub var console_fd: std.c.fd_t = -1;
 
 fn runEventOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
@@ -1388,12 +1391,15 @@ fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
     );
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: spore_net_policy.NetworkMode, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
+pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: spore_net_policy.NetworkMode, console_mirror: bool, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
     const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
     const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
     const rootfs_growth_flag = if (rootfs and rootfs_writable and rootfs_growth) " spore_rootfs_growth=1" else "";
     const noinit_itable_flag = if (rootfs and rootfs_writable and rootfs_growth and noinit_itable) " spore_rootfs_noinit_itable=1" else "";
     const network_flag = if (network == .spore) " spore_net=1" else "";
+    // The agent copies command output to the console only when something
+    // logs it: each console write is a synchronous guest exit.
+    const console_mirror_flag = if (console_mirror) " spore_console_mirror=1" else "";
     const build_context_flag = if (build_context) " spore_build_context=1" else "";
     const build_mode_flag = if (build_mode) " spore_build=1" else "";
     const build_inputs_flag = if (build_input_count != 0)
@@ -1403,8 +1409,8 @@ pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, root
     defer if (build_inputs_flag) |flag| allocator.free(flag);
     return std.fmt.allocPrint(
         allocator,
-        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}{s}{s}{s}{s}",
-        .{ guest_port, rootfs_flag, rootfs_rw_flag, rootfs_growth_flag, noinit_itable_flag, network_flag, build_context_flag, build_mode_flag, build_inputs_flag orelse "" },
+        "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1{s}{s}{s}{s}{s}{s}{s}{s}{s}",
+        .{ guest_port, rootfs_flag, rootfs_rw_flag, rootfs_growth_flag, noinit_itable_flag, network_flag, console_mirror_flag, build_context_flag, build_mode_flag, build_inputs_flag orelse "" },
     );
 }
 
@@ -2308,32 +2314,32 @@ test "run image cache creates absolute cache directories" {
 }
 
 test "run cmdline marks rootfs mode" {
-    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, true, true, true, .disabled, false, false, 0);
+    const without_rootfs = try cmdline(std.testing.allocator, 10700, false, true, true, true, .disabled, false, false, false, 0);
     defer std.testing.allocator.free(without_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_rw=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_growth=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_rootfs, "spore_rootfs_noinit_itable=1") == null);
 
-    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, true, true, .disabled, false, false, 0);
+    const with_rootfs = try cmdline(std.testing.allocator, 10700, true, false, true, true, .disabled, false, false, false, 0);
     defer std.testing.allocator.free(with_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_rw=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_growth=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, with_rootfs, "spore_rootfs_noinit_itable=1") == null);
 
-    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, false, true, .disabled, false, false, 0);
+    const with_writable_rootfs = try cmdline(std.testing.allocator, 10700, true, true, false, true, .disabled, false, false, false, 0);
     defer std.testing.allocator.free(with_writable_rootfs);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_rw=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_writable_rootfs, "spore_rootfs_growth=1") == null);
 
-    const with_growth = try cmdline(std.testing.allocator, 10700, true, true, true, true, .disabled, false, false, 0);
+    const with_growth = try cmdline(std.testing.allocator, 10700, true, true, true, true, .disabled, false, false, false, 0);
     defer std.testing.allocator.free(with_growth);
     try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_growth=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_growth, "spore_rootfs_noinit_itable=1") != null);
 
-    const lazy_init_control = try cmdline(std.testing.allocator, 10700, true, true, true, false, .disabled, false, false, 0);
+    const lazy_init_control = try cmdline(std.testing.allocator, 10700, true, true, true, false, .disabled, false, false, false, 0);
     defer std.testing.allocator.free(lazy_init_control);
     try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_growth=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, lazy_init_control, "spore_rootfs_noinit_itable=1") == null);
@@ -2401,23 +2407,33 @@ test "indexed rootfs input enables rootfs boot mode" {
 }
 
 test "run cmdline marks network mode" {
-    const without_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false, false, 0);
+    const without_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false, false, false, 0);
     defer std.testing.allocator.free(without_network);
     try std.testing.expect(std.mem.indexOf(u8, without_network, "spore_net=1") == null);
 
-    const with_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .spore, false, false, 0);
+    const with_network = try cmdline(std.testing.allocator, 10700, false, false, false, false, .spore, false, false, false, 0);
     defer std.testing.allocator.free(with_network);
     try std.testing.expect(std.mem.indexOf(u8, with_network, "spore_net=1") != null);
 }
 
+test "run cmdline asks for the console mirror only with a console log" {
+    const without_mirror = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, false, false, false, 0);
+    defer std.testing.allocator.free(without_mirror);
+    try std.testing.expect(std.mem.indexOf(u8, without_mirror, "spore_console_mirror=1") == null);
+
+    const with_mirror = try cmdline(std.testing.allocator, 10700, false, false, false, false, .disabled, true, false, false, 0);
+    defer std.testing.allocator.free(with_mirror);
+    try std.testing.expect(std.mem.indexOf(u8, with_mirror, "spore_console_mirror=1") != null);
+}
+
 test "run cmdline marks build mode and immutable input disks only when requested" {
-    const without_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false, true, 0);
+    const without_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false, false, true, 0);
     defer std.testing.allocator.free(without_context);
     try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_context=1") == null);
     try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, without_context, "spore_build_inputs=") == null);
 
-    const with_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, true, true, 2);
+    const with_context = try cmdline(std.testing.allocator, 10700, true, true, false, false, .disabled, false, true, true, 2);
     defer std.testing.allocator.free(with_context);
     try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build_context=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_context, "spore_build=1") != null);
