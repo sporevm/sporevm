@@ -324,6 +324,18 @@ pub const Entry = struct {
         self.* = undefined;
     }
 
+    /// Reports whether `vm_dir` no longer names this directory: the entry was
+    /// removed, and perhaps created again under the same name. While this fd
+    /// is open, its inode number cannot be reused on the same filesystem.
+    pub fn replaced(self: Entry, io: Io, vm_dir: []const u8) bool {
+        const held = self.dir.stat(io) catch return false;
+        const current = Io.Dir.cwd().statFile(io, vm_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return false,
+        };
+        return current.kind != .directory or current.inode != held.inode;
+    }
+
     pub fn readSpec(self: Entry, allocator: std.mem.Allocator, io: Io) !std.json.Parsed(Spec) {
         return readSpecIn(allocator, io, self.dir, spec_file);
     }
@@ -1117,7 +1129,9 @@ test "registry writers never recreate a removed entry" {
     try ensureDirPath(io, paths.vm_dir);
     var entry = try Entry.open(io, paths);
     defer entry.close(io);
+    try std.testing.expect(!entry.replaced(io, paths.vm_dir));
     try Io.Dir.cwd().deleteTree(io, paths.vm_dir);
+    try std.testing.expect(entry.replaced(io, paths.vm_dir));
     try std.testing.expectError(error.FileNotFound, writePid(allocator, io, paths, 1));
     try std.testing.expectError(error.FileNotFound, writeReady(allocator, io, paths, .{ .pid = 1, .control_socket_path = paths.control_socket_path }));
     try std.testing.expectError(error.FileNotFound, writeSpec(allocator, io, paths, .{ .name = "bench-1" }));
@@ -1126,6 +1140,7 @@ test "registry writers never recreate a removed entry" {
     // Nor do they write into a new entry that reuses the name.
     var reused = try claim(io, paths);
     defer reused.abandon(io, paths);
+    try std.testing.expect(entry.replaced(io, paths.vm_dir));
     try std.testing.expectError(error.FileNotFound, entry.writePid(allocator, io, 1));
     try std.testing.expectError(error.FileNotFound, entry.writeReady(allocator, io, .{ .pid = 1, .control_socket_path = paths.control_socket_path }));
     try std.testing.expectError(error.FileNotFound, entry.writeMonitorStats(allocator, io, .{}));

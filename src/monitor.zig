@@ -58,6 +58,7 @@ const SnapshotLeaseHandoffTestFault = struct {
 pub const testing = if (builtin.is_test) struct {
     pub var snapshot_lease_handoff_fault: SnapshotLeaseHandoffTestFault = .{};
     var snapshot_lease_handoff_barrier: ?*test_barrier.Barrier = null;
+    var disk_fork_cache_waits: std.atomic.Value(u32) = .init(0);
 
     pub fn persistSourceDiskLeaseHandoffForCrashProof(
         io: Io,
@@ -737,7 +738,7 @@ const ExecServer = struct {
         if (now - self.last_registry_check_ms < registry_check_interval_ms) return false;
         self.last_registry_check_ms = now;
         // ponytail: one stat per second, kqueue/inotify only if cleanup latency matters.
-        return registryDirMissing(self.io, self.vm_dir);
+        return self.entry.replaced(self.io, self.vm_dir);
     }
 
     /// Waits for the guest operation slot. A request queues behind the
@@ -1113,25 +1114,38 @@ const ExecServer = struct {
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        try self.acquireOpLocked();
-        if (self.disk_claims.hasBatch(batch)) return error.BatchAlreadyRegistered;
-        // Naming the baseline reads and writes the spec and can wait for the
-        // rootfs cache lock, so it runs unlocked. Holding the slot keeps a
-        // save from replacing the disk meanwhile.
-        self.state = .preparing_disk_fork;
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
-        self.mutex.unlock(self.io);
-        const named = ensureDiskBaselineLease(self.io, arena_state.allocator(), self.entry, self.runtime_root, self.cache_root);
-        self.mutex.lockUncancelable(self.io);
-        const baseline = named catch |err| {
+        const baseline = while (true) {
+            try self.acquireOpLocked();
+            if (self.disk_claims.hasBatch(batch)) return error.BatchAlreadyRegistered;
+            // Naming the baseline reads and writes the spec, so it runs
+            // unlocked. Holding the slot keeps a save from replacing the disk
+            // meanwhile.
+            self.state = .preparing_disk_fork;
+            self.mutex.unlock(self.io);
+            const step = ensureDiskBaselineLease(self.io, arena_state.allocator(), self.entry, self.runtime_root, self.cache_root);
+            self.mutex.lockUncancelable(self.io);
+            const busy_root = switch (step catch |err| {
+                self.state = .idle;
+                return err;
+            }) {
+                .named => |named| {
+                    if (self.stopping == null) break named;
+                    self.state = .idle;
+                    return error.MonitorStopping;
+                },
+                .cache_busy => |root| root,
+            };
+            // A build, pull or GC holds the rootfs cache lock. Wait for it
+            // without the slot, so the guest stays usable meanwhile, then
+            // name the baseline again.
             self.state = .idle;
-            return err;
+            self.mutex.unlock(self.io);
+            const waited = self.awaitRootfsCacheLock(busy_root);
+            self.mutex.lockUncancelable(self.io);
+            try waited;
         };
-        if (self.stopping != null) {
-            self.state = .idle;
-            return error.MonitorStopping;
-        }
         self.disk_fork_baseline = baseline;
         defer self.disk_fork_baseline = null;
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
@@ -1154,6 +1168,29 @@ const ExecServer = struct {
         }
         defer self.state = .idle;
         return self.takeResponseLocked();
+    }
+
+    /// Polls until the rootfs cache lock at `root` is free, or the monitor
+    /// is stopping.
+    fn awaitRootfsCacheLock(self: *ExecServer, root: []const u8) !void {
+        if (comptime builtin.is_test) _ = testing.disk_fork_cache_waits.fetchAdd(1, .monotonic);
+        while (true) {
+            {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                if (self.stopping != null) return error.MonitorStopping;
+            }
+            var lock = rootfs_mod.tryLockRootfsCacheExclusive(self.io, self.allocator, root) catch |err| switch (err) {
+                error.LockBusy => {
+                    var ts = std.c.timespec{ .sec = 0, .nsec = control_queue_poll_ms * std.time.ns_per_ms };
+                    _ = std.c.nanosleep(&ts, null);
+                    continue;
+                },
+                else => |e| return e,
+            };
+            lock.deinit();
+            return;
+        }
     }
 
     fn completeSuspend(self: *ExecServer) !void {
@@ -1586,17 +1623,23 @@ const DiskBaseline = struct {
     disk: ?spore.Disk,
 };
 
+const BaselineStep = union(enum) {
+    named: DiskBaseline,
+    /// Another process holds the rootfs cache lock at this root.
+    cache_busy: []const u8,
+};
+
 /// Names the baseline a disk fork's children share and records it in the
 /// spec, where GC finds it. The caller holds the operation slot, so no save
-/// replaces the disk between reading and writing the spec. The result lives
-/// in `arena`.
+/// replaces the disk between reading and writing the spec, and so it never
+/// waits for the rootfs cache lock. The result lives in `arena`.
 fn ensureDiskBaselineLease(
     io: Io,
     arena: std.mem.Allocator,
     entry: vm_registry.Entry,
     runtime_root: []const u8,
     cache_root: []const u8,
-) !DiskBaseline {
+) !BaselineStep {
     var spec = (try entry.readSpec(arena, io)).value;
     const rootfs = spec.rootfs orelse return error.UnsupportedNamedForkDisk;
     const recorded = spec.disk_baseline_lease;
@@ -1634,7 +1677,10 @@ fn ensureDiskBaselineLease(
     try lease.validate();
     spec.disk_baseline_lease = lease;
     if (lease.store == .rootfs_cache) {
-        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, lease.root);
+        var cache_lock = rootfs_mod.tryLockRootfsCacheExclusive(io, arena, lease.root) catch |err| switch (err) {
+            error.LockBusy => return .{ .cache_busy = lease.root },
+            else => |e| return e,
+        };
         defer cache_lock.deinit();
         switch (lease.baseline_kind) {
             .rootfs => {
@@ -1656,7 +1702,7 @@ fn ensureDiskBaselineLease(
     } else if (recorded == null) {
         try entry.writeSpec(arena, io, spec);
     }
-    return .{ .lease = lease, .disk = spec.disk };
+    return .{ .named = .{ .lease = lease, .disk = spec.disk } };
 }
 
 fn pathWithin(parent: []const u8, child: []const u8) bool {
@@ -1676,14 +1722,6 @@ fn formatExecHostStreamStart(buffer: *[160]u8, nonce: u64, sequence: u64, host_p
         "monitor vsock stream start: kind=exec session_id=lifecycle-{x}-{d} host_port={d}",
         .{ nonce, sequence, host_port },
     ) catch unreachable;
-}
-
-fn registryDirMissing(io: Io, vm_dir: []const u8) bool {
-    const stat = Io.Dir.cwd().statFile(io, vm_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return true,
-        else => return false,
-    };
-    return stat.kind != .directory;
 }
 
 fn base64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -2962,19 +3000,6 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
     handoff_thread.join();
 }
 
-test "monitor registry detector notices deleted vm dir" {
-    const io = std.testing.io;
-    const root = "zig-cache/test-monitor-registry-gone";
-    const vm_dir = root ++ "/vms/bench-1";
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-
-    _ = try Io.Dir.cwd().createDirPathStatus(io, vm_dir, .default_dir);
-    try std.testing.expect(!registryDirMissing(io, vm_dir));
-    try Io.Dir.cwd().deleteTree(io, vm_dir);
-    try std.testing.expect(registryDirMissing(io, vm_dir));
-}
-
 test "monitor reports actionable guest command request errors" {
     try std.testing.expectEqualStrings(
         "guest command must contain between 1 and 16 arguments",
@@ -3203,6 +3228,142 @@ test "monitor records the fork baseline while it holds the guest" {
     try std.testing.expectEqualStrings(lease.baseline_identity, prepared.value.lease.baseline_identity);
     try std.testing.expectEqualStrings(lease.baseline_identity, prepared.value.disk.?.base);
     try std.testing.expectEqual(RequestState.idle, server.state);
+}
+
+test "a fork waiting for the rootfs cache lock leaves the guest free" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const image = try manifest_test_support.diskFixture(arena, io, cache_root, try std.fs.path.join(arena, &.{ root, "image.spore" }), 0x75, false);
+    try rootfs_cas.markStorageComplete(io, arena, cache_root, image.storage.index_digest);
+    const paths = try lifecycle.pathsFromRoot(arena, runtime_root, "source");
+    try vm_registry.ensureDirPath(io, paths.vm_dir);
+    var entry = try vm_registry.Entry.open(io, paths);
+    defer entry.close(io);
+    // A VM created from an image, whose baseline is the image's cached index.
+    try entry.writeSpec(arena, io, .{
+        .name = "source",
+        .rootfs = .{
+            .device = .{ .mmio_slot = 1 },
+            .artifact = .{ .digest = image.storage.index_digest, .size = image.storage.logical_size },
+            .storage = image.storage,
+        },
+    });
+
+    // The capture the test hands back in place of the VM loop.
+    var batch = runtime_disk_fork_capture.Batch{
+        .allocator = allocator,
+        .heads = try allocator.alloc(?runtime_disk_fork.Head, 1),
+        .pause_started_ns = monotonicNs(),
+        .ram_capture_ns = 1,
+        .prepare_ns = 2,
+        .copied_bytes = 0,
+    };
+    batch.heads[0] = null;
+    defer batch.deinit();
+    batch.heads[0] = try runtime_disk_claim.makeSmokeHead(allocator);
+    const identity = try allocator.dupe(u8, image.storage.index_digest);
+    allocator.free(batch.heads[0].?.descriptor.baseline.identity);
+    batch.heads[0].?.descriptor.baseline = .{ .kind = .disk_index, .identity = identity };
+
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-fork-wait-{d}.sock", .{std.c.getpid()});
+    // A guest operation gives up on a held slot after this long.
+    const timeout_ms = 300;
+    var server = try ExecServer.init(allocator, io, entry, paths.vm_dir, runtime_root, socket_path, cache_root, 10700, timeout_ms, null, .{});
+    defer server.disk_claims.deinit();
+    defer {
+        server.server.deinit(io);
+        Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    }
+
+    // A build holds the cache lock while the fork starts.
+    var build_lock: ?rootfs_mod.RootfsCacheLock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache_root);
+    defer if (build_lock) |*lock| lock.deinit();
+    const waits_before = testing.disk_fork_cache_waits.load(.monotonic);
+    const Prepare = struct {
+        server: *ExecServer,
+        response: ?[]const u8 = null,
+        err: ?anyerror = null,
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            defer self.finished.store(true, .release);
+            self.response = self.server.submitDiskFork("/tmp/capture", "batch-1", &.{"child-0"}, false, false) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+    var prepare = Prepare{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, Prepare.run, .{&prepare});
+    var joined = false;
+    defer if (!joined) {
+        if (build_lock) |*lock| lock.deinit();
+        build_lock = null;
+        while (!prepare.finished.load(.acquire)) {
+            server.failDiskFork(error.TestFailed);
+            var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+        }
+        thread.join();
+        if (prepare.response) |response| std.heap.page_allocator.free(response);
+    };
+
+    // The fork finds the lock held and waits for it without the guest slot,
+    // so a guest operation still gets the slot at once.
+    const started_ms = lifecycle.monotonicMs();
+    while (testing.disk_fork_cache_waits.load(.monotonic) == waits_before) {
+        if (prepare.finished.load(.acquire)) return prepare.err orelse error.TestUnexpectedResult;
+        if (lifecycle.monotonicMs() - started_ms > 5_000) return error.Timeout;
+        var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    {
+        server.mutex.lockUncancelable(io);
+        defer server.mutex.unlock(io);
+        try server.acquireOpLocked();
+    }
+
+    // Once the build finishes, the fork records the baseline and goes on.
+    build_lock.?.deinit();
+    build_lock = null;
+    while (true) {
+        {
+            server.mutex.lockUncancelable(io);
+            defer server.mutex.unlock(io);
+            if (server.state == .pending_disk_fork) {
+                server.state = .active_disk_fork;
+                break;
+            }
+        }
+        if (prepare.finished.load(.acquire)) return prepare.err orelse error.TestUnexpectedResult;
+        if (lifecycle.monotonicMs() - started_ms > 10_000) return error.Timeout;
+        var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    var recorded = try entry.readSpec(allocator, io);
+    defer recorded.deinit();
+    try std.testing.expectEqual(runtime_disk_lease.Store.rootfs_cache, recorded.value.disk_baseline_lease.?.store);
+    try std.testing.expectEqualStrings(image.storage.index_digest, recorded.value.disk_baseline_lease.?.baseline_identity);
+    try server.completeDiskFork(&batch);
+    thread.join();
+    joined = true;
+    if (prepare.err) |err| return err;
+    const response = prepare.response.?;
+    defer std.heap.page_allocator.free(response);
+    var prepared = try runtime_disk_fork_control.parsePreparedBytes(allocator, response);
+    defer prepared.deinit();
+    try std.testing.expectEqualStrings(cache_root, prepared.value.lease.root);
+    try std.testing.expect(prepared.value.disk == null);
 }
 
 test "monitor answers hello and shutdown while a guest operation runs" {

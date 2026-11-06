@@ -277,7 +277,8 @@ would need to select a new path. `spore --debug` on `create`, `restore`, or
 and debug logs, such as save timing metrics. The monitor never creates its
 registry directory: once `rm` has deleted it, the monitor's writes fail
 instead of bringing the entry back or landing in a new entry with the same
-name.
+name, and a monitor whose entry was deleted or replaced by hand stops within
+a second.
 
 ## Session Handles
 
@@ -429,7 +430,9 @@ Each child receives a private one-use disk-head claim plus an independently
 rooted baseline lease. The source's monitor names that baseline and records
 it in its own spec while it holds the guest, so a save cannot replace the
 disk in between, and returns it with the claims; the fork command never
-writes the source's spec. The child reopens that baseline and adopts the claimed
+writes the source's spec. While a build, pull or GC holds the rootfs cache,
+the fork waits for it without holding the guest, so the source keeps
+answering exec and save. The child reopens that baseline and adopts the claimed
 overlay before it writes `ready.json`, so a successful fork never reports a
 child whose disk handoff can still fail. The lease also means children remain
 readable, forkable, and saveable after the source is removed and rootfs cache

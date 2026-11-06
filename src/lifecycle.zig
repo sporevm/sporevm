@@ -2500,7 +2500,10 @@ pub fn forkCli(
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "fork"), message);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
-            const message = allocLifecycleMessage(allocator, "spore fork: monitor request failed for VM {s}: {s}", .{ parsed.source_name, @errorName(err) });
+            // A refused request carries the monitor's reason.
+            const detail = lastErrorMessage();
+            const reason = if (err == error.MonitorRequestFailed and detail.len != 0) detail else @errorName(err);
+            const message = allocLifecycleMessage(allocator, "spore fork: monitor request failed for VM {s}: {s}", .{ parsed.source_name, reason });
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "fork"), message);
         },
         error.FastForkUnavailable => {
