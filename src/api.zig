@@ -597,7 +597,7 @@ pub fn runManaged(
     if (options.disk_size) |disk_size| {
         if (options.commit_ref == null or disk_size == 0 or disk_size % rootfs_cas.default_chunk_size != 0) return error.InvalidRunDiskSize;
     }
-    const selected_backend = try backend_mod.requireProductRunner(options.backend, .probe());
+    const selected_backend = try backend_mod.select(options.backend, .probe());
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
@@ -648,7 +648,7 @@ pub fn runManaged(
     } else 0;
 
     return run_mod.execute(.{ .io = init.io, .environ_map = init.environ_map }, arena, .{
-        .backend = options.backend,
+        .backend = selected_backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .boot_artifacts = boot_artifacts,
