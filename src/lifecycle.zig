@@ -98,6 +98,7 @@ const monitor_reply_deadline_ms = 2_000;
 
 const testing = if (builtin.is_test) struct {
     var named_restore_authority_barrier: ?*test_barrier.Barrier = null;
+    var create_rootfs_barrier: ?*test_barrier.Barrier = null;
 } else struct {};
 
 const darwin_process = if (builtin.os.tag.isDarwin()) struct {
@@ -895,11 +896,13 @@ fn createNamedWithTiming(
     spec.network_policy = if (named_network.mode == .spore) try spore_net_policy.encodeArgAlloc(arena, &named_network.policy) else null;
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const paths_ms = monotonicMs();
-    var claim = try claimName(arena, init.io, paths, "create");
-    var claimed = true;
-    defer if (claimed) claim.abandon(init.io, paths);
+    // Fail fast on a taken name, but claim it only once the image is ready,
+    // so a pull that is interrupted leaves no entry behind.
+    const prior = try vm_registry.probe(init.io, paths);
+    if (prior != .absent) return namedVmExists(arena, init.io, paths, "create", spec.name, prior);
     const state_checked_ms = monotonicMs();
 
+    if (comptime builtin.is_test) if (testing.create_rootfs_barrier) |barrier| barrier.pause(init.io);
     const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
@@ -927,6 +930,9 @@ fn createNamedWithTiming(
     } else null;
     const rootfs_abspath_ms = monotonicMs();
 
+    var claim = try claimName(arena, init.io, paths, "create");
+    var claimed = true;
+    defer if (claimed) claim.abandon(init.io, paths);
     try spawnMonitorExecutable(init, arena, paths, &claim, spec, options.spore_executable, options.debug);
     claimed = false;
     const monitor_spawned_ms = monotonicMs();
@@ -4542,6 +4548,74 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     try std.testing.expectEqualStrings(spec_bytes, after);
 }
 
+test "lifecycle create claims the name only once the image is ready" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, root);
+
+    var rootfs_boundary = test_barrier.Barrier{};
+    testing.create_rootfs_barrier = &rootfs_boundary;
+    defer testing.create_rootfs_barrier = null;
+    const Create = struct {
+        env: *std.process.Environ.Map,
+        boundary: *test_barrier.Barrier,
+        err: ?anyerror = null,
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            // A create that fails before the barrier must not leave the test
+            // waiting for it.
+            defer {
+                self.finished.store(true, .release);
+                self.boundary.reached.post(std.testing.io);
+            }
+            const result = createNamedWithTiming(.{
+                .minimal = undefined,
+                .arena = undefined,
+                .gpa = std.testing.allocator,
+                .io = std.testing.io,
+                .environ_map = self.env,
+                .preopens = .empty,
+            }, std.testing.allocator, .{}, .{
+                .name = "bench-1",
+                .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
+                .spore_executable = "/nonexistent/spore",
+            }, .{ .start_ms = 0, .parsed_ms = 0 }) catch |err| {
+                self.err = err;
+                return;
+            };
+            deinitNamedLifecycleResult(std.testing.allocator, result);
+        }
+    };
+    var create = Create{ .env = &env, .boundary = &rootfs_boundary };
+    var create_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, Create.run, .{&create}),
+        .barriers = &.{&rootfs_boundary},
+    };
+    defer create_thread.deinit();
+
+    // A create killed while it pulls its image leaves nothing to remove.
+    rootfs_boundary.waitReached(io);
+    if (create.finished.load(.acquire)) return create.err orelse error.TestUnexpectedResult;
+    try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, paths));
+    rootfs_boundary.release(io);
+    create_thread.join();
+    try std.testing.expect(create.err != null);
+    try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, paths));
+}
+
 fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !ExecNamedStream {
     const payload = struct {
         type: []const u8 = "exec-stream-v1",
@@ -5945,7 +6019,7 @@ test "lifecycle rm of a starting VM is busy" {
     try std.testing.expectEqual(VmState.starting, try vm_registry.probe(io, paths));
 }
 
-test "lifecycle fork claims every child name before contacting the source" {
+test "lifecycle fork claims every child name before contacting the source and releases them on failure" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;

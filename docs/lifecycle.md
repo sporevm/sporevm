@@ -251,7 +251,9 @@ user.
 `create`, `restore --name` and each `vm fork` child claim the name by creating
 `vms/<name>/` and its `lock` file and taking an exclusive `flock` on the lock.
 A name that already has an entry, in any state, fails with "already exists";
-fork claims every child name before it pauses the source. The claimer writes
+fork claims every child name before it pauses the source, and `create` checks
+the name before it pulls the image but claims it only once the image is
+ready, so an interrupted pull leaves no entry behind. The claimer writes
 the complete spec, then starts `spore monitor NAME` with the lock as stdin.
 The monitor holds the lock until it exits and keeps it out of every helper it
 starts. `spore ls` reports `starting` while the lock is held before

@@ -32,9 +32,9 @@ recorded pid is no longer consulted, so a reused pid cannot keep a dead VM
 `ready`, and `spore ls` shows `starting` where it showed `incomplete`.
 `create`, `restore --name` and `vm fork` claim the name atomically, so a
 racing create or fork can no longer overwrite a live VM's state, and fork
-checks every child name before it pauses the source. Entries from earlier
-builds have no lock and show as stale; `spore vm rm` removes them, and their
-monitors stop once their entry is gone.
+checks every child name before it pauses the source. Stop named VMs before
+upgrading: a monitor from an earlier build does not take the lock, so its
+entry shows as stale, and `spore vm rm` removes it.
 
 ### Lazy images from a store
 
