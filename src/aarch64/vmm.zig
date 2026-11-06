@@ -353,6 +353,115 @@ pub const Devices = struct {
     }
 };
 
+/// virtio-mem's region: guest RAM past the initial size that the guest sees
+/// only once the driver plugs it. `vm` provides
+/// `mapHotplug(bytes, guest_addr, mapped_bytes, new_bytes)`, which maps the
+/// first `new_bytes` of `bytes` when the first `mapped_bytes` already are,
+/// and `unmapHotplug(guest_addr, mapped_bytes)`.
+pub fn Hotplug(comptime Vm: type) type {
+    return struct {
+        const Self = @This();
+
+        vm: *const Vm,
+        bytes: []align(std.heap.page_size_min) u8,
+        guest_addr: u64,
+        mapped_bytes: u64 = 0,
+
+        pub fn deinit(self: *Self) void {
+            if (self.mapped_bytes != 0) self.vm.unmapHotplug(self.guest_addr, self.mapped_bytes);
+        }
+
+        /// The virtio-mem device configuration that plugs into this region.
+        pub fn memConfig(self: *Self) virtio_mem.Config {
+            return .{
+                .addr = self.guest_addr,
+                .region_size = @intCast(self.bytes.len),
+                .requested_size = 0,
+                .plug_context = self,
+                .plugFn = plug,
+            };
+        }
+
+        fn plug(ctx: *anyopaque, requested_size: u64) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.mapForGuest(requested_size) catch return false;
+            return true;
+        }
+
+        fn mapForGuest(self: *Self, bytes: u64) !void {
+            if (bytes > self.bytes.len) return error.InvalidVirtioMemRequest;
+            if (bytes <= self.mapped_bytes) return;
+            try self.vm.mapHotplug(self.bytes, self.guest_addr, self.mapped_bytes, bytes);
+            self.mapped_bytes = bytes;
+            std.log.debug("virtio-mem mapped hotplug region: addr=0x{x} bytes={d}", .{ self.guest_addr, bytes });
+        }
+    };
+}
+
+/// Emulates a guest access to the generation device or a virtio-mmio
+/// transport and returns the value a read sees. Device interrupt lines go
+/// through `vm.setSpi(intid, level)`. Accesses outside every device read as
+/// zero and drop writes.
+pub fn dispatchMmio(
+    vm: anytype,
+    access: Mmio,
+    transports: []mmio.Transport,
+    gen_dev: *generation.Device,
+    ram: guestmem.GuestRam,
+) !u64 {
+    const ipa = access.addr;
+
+    if (ipa >= board.generation_base and ipa < board.generation_base + board.generation_size) {
+        const offset = ipa - board.generation_base;
+        if (access.write) |value| {
+            if (gen_dev.write(offset, value, access.size_log2)) {
+                try vm.setSpi(board.generationIntid(), false);
+            }
+            return 0;
+        }
+        return gen_dev.read(offset, access.size_log2);
+    }
+
+    const dev_index = blk: {
+        if (ipa < board.virtio_base) break :blk null;
+        const idx = (ipa - board.virtio_base) / board.virtio_stride;
+        if (idx >= transports.len) break :blk null;
+        break :blk idx;
+    };
+    if (dev_index) |idx| {
+        const t = &transports[@intCast(idx)];
+        const intid = board.virtioDeviceIntid(@intCast(idx));
+        const offset = ipa - board.virtioDeviceBase(@intCast(idx));
+        if (access.write) |value| {
+            if (t.write(offset, @truncate(value), ram)) try vm.setSpi(intid, true);
+            // Interrupt ack lowers the line (covers level semantics too).
+            if (offset == 0x064) try vm.setSpi(intid, false);
+            return 0;
+        }
+        return t.read(offset);
+    }
+
+    std.log.debug("stray mmio {s} at ipa=0x{x}", .{ if (access.write != null) "write" else "read", ipa });
+    return 0;
+}
+
+/// Delivers the host-to-guest packets `device` (vsock or net) has queued for
+/// the transport at `index` and raises its interrupt if any went in.
+/// Returns whether any did.
+pub fn flushRx(vm: anytype, device: anytype, transports: []mmio.Transport, index: usize, ram: guestmem.GuestRam) !bool {
+    if (!device.flushPendingRx(&transports[index], ram)) return false;
+    try vm.setSpi(board.virtioDeviceIntid(@intCast(index)), true);
+    return true;
+}
+
+/// Raises the generation interrupt a restored generation change left
+/// unacknowledged.
+pub fn raiseGenerationIrqIfPending(vm: anytype, gen_dev: *const generation.Device) !void {
+    if (gen_dev.interrupt_status & generation.irq_generation_changed != 0) {
+        try vm.setSpi(board.generationIntid(), true);
+    }
+}
+
 pub const RamMapping = struct {
     bytes: []align(std.heap.page_size_min) u8,
     file_backed: bool,
@@ -565,6 +674,81 @@ pub fn takeRootfsSnapshot(
         return error.DeviceStatePending;
     }
     return try disk_state.finish(allocator, dir, true);
+}
+
+/// Tracks the guest RAM chunks written since tracking started, so a snapshot
+/// seals only those. Host writes into guest RAM (device DMA) arrive through
+/// `markGuestWriteCallback`; `Backend` finds the guest's own writes. It holds
+/// the backend's state and provides, each taking the tracker:
+/// - `start(tracker, allocator)`, once the boot image is in RAM;
+/// - `flush(tracker)`, which seals every chunk written since the last flush
+///   and runs with `mutex` held;
+/// - `stop(tracker)`, on teardown;
+/// - `metrics_mode` and `logSnapshotMetrics(tracker, SnapshotMetrics)`.
+pub fn DirtyTracker(comptime Backend: type) type {
+    return struct {
+        const Self = @This();
+
+        sealer: dirty_ram.Sealer,
+        backend: Backend,
+        tracking_start_ms: u64 = 0,
+        mutex: SpinLock = .{},
+
+        pub const metrics_mode = Backend.metrics_mode;
+
+        pub fn start(allocator: std.mem.Allocator, options: dirty_ram.Options, backend: Backend) !Self {
+            var tracker = Self{ .sealer = try dirty_ram.Sealer.start(allocator, options), .backend = backend };
+            errdefer tracker.sealer.deinit();
+            try Backend.start(&tracker, allocator);
+            tracker.tracking_start_ms = deadline.system_clock.nowMs();
+            return tracker;
+        }
+
+        pub fn deinit(self: *Self) void {
+            Backend.stop(self);
+            self.sealer.deinit();
+        }
+
+        /// Seals the last dirty chunks and completes the RAM backing file.
+        pub fn finish(self: *Self) !spore.MemoryManifest {
+            const clock = deadline.system_clock;
+            const tail_start = clock.nowMs();
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                try Backend.flush(self);
+            }
+            self.sealer.stats.tail_flush_ms = clock.nowMs() - tail_start;
+            self.sealer.finishRates(self.tracking_start_ms, clock.nowMs());
+            return try self.sealer.finishBacking();
+        }
+
+        /// Logs a single-vCPU snapshot's metrics with the backend's counters.
+        pub fn logSnapshotMetrics(self: *const Self, m: SnapshotMetrics) void {
+            Backend.logSnapshotMetrics(self, m);
+        }
+
+        /// `guestmem.GuestRam.dirty_fn`: the host wrote `len` bytes at `gpa`.
+        pub fn markGuestWriteCallback(ctx: *anyopaque, gpa: u64, len: u64) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.markGuestWrite(gpa, len);
+        }
+
+        fn markGuestWrite(self: *Self, gpa: u64, len: u64) void {
+            if (len == 0) return;
+            if (gpa < board.ram_base) return;
+            const guest_offset = gpa - board.ram_base;
+            if (guest_offset >= self.sealer.ram.len) return;
+            const start_offset: usize = @intCast(guest_offset);
+            const remaining: u64 = @intCast(self.sealer.ram.len - start_offset);
+            const capped_len: usize = @intCast(@min(len, remaining));
+            if (capped_len == 0) return;
+
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.sealer.markHostDirtyRange(start_offset, capped_len);
+        }
+    };
 }
 
 pub fn monitorStats(sealer: ?*const dirty_ram.Sealer) vsock_control.ControlStats {
@@ -1118,6 +1302,84 @@ test "devices take virtio slots in the order the guest enumerates them" {
     try std.testing.expectEqual(@as(?usize, 5), devices.mem_index);
 }
 
+const TestSpi = struct {
+    intid: ?u32 = null,
+    level: bool = false,
+
+    pub fn setSpi(self: *TestSpi, intid: u32, level: bool) !void {
+        self.intid = intid;
+        self.level = level;
+    }
+};
+
+test "device MMIO reaches each virtio window and its interrupt line" {
+    var con = console.Console{ .sink = testConsoleSink };
+    var rng_dev = rng.Rng{};
+    var transports = [_]mmio.Transport{ mmio.Transport.init(con.device()), mmio.Transport.init(rng_dev.device()) };
+    var gen_dev = generation.Device{};
+    const ram = guestmem.GuestRam{ .bytes = &.{}, .base = board.ram_base };
+    var spi = TestSpi{};
+
+    const rng_base = board.virtioDeviceBase(1);
+    try std.testing.expectEqual(@as(u64, rng.device_id), try dispatchMmio(&spi, .{ .addr = rng_base + 0x008, .size_log2 = 2, .write = null }, &transports, &gen_dev, ram));
+    try std.testing.expectEqual(@as(?u32, null), spi.intid);
+    // The interrupt ack lowers that device's line.
+    _ = try dispatchMmio(&spi, .{ .addr = rng_base + 0x064, .size_log2 = 2, .write = 1 }, &transports, &gen_dev, ram);
+    try std.testing.expectEqual(@as(?u32, board.virtioDeviceIntid(1)), spi.intid);
+    try std.testing.expect(!spi.level);
+
+    // Slots past the last device read as zero and raise nothing.
+    spi = .{};
+    try std.testing.expectEqual(@as(u64, 0), try dispatchMmio(&spi, .{ .addr = board.virtioDeviceBase(2), .size_log2 = 2, .write = null }, &transports, &gen_dev, ram));
+    _ = try dispatchMmio(&spi, .{ .addr = board.virtioDeviceBase(2) + 0x064, .size_log2 = 2, .write = 1 }, &transports, &gen_dev, ram);
+    try std.testing.expectEqual(@as(?u32, null), spi.intid);
+}
+
+const TestDirtyBackend = struct {
+    flushes: u32 = 0,
+
+    pub const metrics_mode = "test";
+
+    pub fn start(_: *DirtyTracker(TestDirtyBackend), _: std.mem.Allocator) !void {}
+
+    pub fn stop(_: *DirtyTracker(TestDirtyBackend)) void {}
+
+    pub fn flush(tracker: *DirtyTracker(TestDirtyBackend)) !void {
+        tracker.backend.flushes += 1;
+        _ = try tracker.sealer.flushMarked(.{});
+    }
+
+    pub fn logSnapshotMetrics(_: *const DirtyTracker(TestDirtyBackend), _: SnapshotMetrics) void {}
+};
+
+test "dirty tracker marks host writes inside guest RAM and seals them at finish" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const ram = try arena.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 2 * spore.chunk_size);
+    @memset(ram, 0);
+
+    const Tracker = DirtyTracker(TestDirtyBackend);
+    var tracker = try Tracker.start(arena, .{ .dir = dir, .ram = ram, .seed_ranges = &.{} }, .{});
+    defer tracker.deinit();
+    Tracker.markGuestWriteCallback(&tracker, board.ram_base - 1, 1);
+    Tracker.markGuestWriteCallback(&tracker, board.ram_base + ram.len, 1);
+    try std.testing.expectEqual(@as(usize, 0), tracker.sealer.dirtyChunksPending());
+    // A write that runs past the end of RAM marks only what is inside.
+    Tracker.markGuestWriteCallback(&tracker, board.ram_base + spore.chunk_size, 4 * spore.chunk_size);
+    try std.testing.expectEqual(@as(usize, 1), tracker.sealer.dirtyChunksPending());
+    Tracker.markGuestWriteCallback(&tracker, board.ram_base + spore.chunk_size - 1, 2);
+    try std.testing.expectEqual(@as(usize, 2), tracker.sealer.dirtyChunksPending());
+
+    const memory = try tracker.finish();
+    try std.testing.expectEqual(@as(u32, 1), tracker.backend.flushes);
+    try std.testing.expectEqual(@as(usize, 0), tracker.sealer.dirtyChunksPending());
+    try std.testing.expectEqual(@as(usize, 2), (try spore.validateMemoryForRam(memory, ram.len)).chunk_count);
+}
+
 test "restore metrics include source, RAM size, and backend timings" {
     var stats = RestoreStats{
         .start_ms = 100,
@@ -1304,6 +1566,34 @@ const TestVcpu = struct {
         self.applied = state;
     }
 };
+
+test "snapshots refuse queued host vsock packets before writing anything" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
+
+    const config = testBoot(.{});
+    var vsock_dev = vsock.Vsock.init(.{});
+    var gen_dev = generation.Device{};
+    var stream = try vsock_stream.HostStream.init(10700, "{}\n");
+    try vsock_dev.attachHostStream(&stream);
+    try std.testing.expect(vsock_dev.pending_len != 0);
+
+    var vm = TestVm{};
+    var one = [_]TestVcpu{.{ .live = testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 0, .cntv_cval = 0 }) }};
+    const ram: [std.heap.page_size_min]u8 = @splat(0);
+    try std.testing.expectError(error.DeviceStatePending, writeSnapshot(
+        std.testing.allocator,
+        "test",
+        &vm,
+        @as([]TestVcpu, &one),
+        @as(?*DirtyTracker(TestDirtyBackend), null),
+        .{ .config = &config, .transports = &.{}, .gen_dev = &gen_dev, .vsock_dev = &vsock_dev, .ram_bytes = &ram, .ram_size = ram.len },
+        .{ .dir = dir },
+    ));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "spore", .{}));
+}
 
 test "one vCPU captures the single shape and more share vCPU 0's counter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
