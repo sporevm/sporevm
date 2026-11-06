@@ -369,10 +369,11 @@ GC collects its storage. An image record or live runtime manifest whose index
 record GC cannot parse keeps every CAS entry. It is the preferred command when the
 goal is to clean chunk garbage without discarding reachable chunked storage.
 The mutable cache-mount aggregate is not a step-record or image root and is
-therefore collectable as a unit. A build holds the rootfs-cache `flock` from
-cache validation through final publication and the store lock while its disk is
-open; prune and GC acquire both in the same order. Process exit releases those
-locks even after a crash, and a leftover lock file has no lease lifetime.
+therefore collectable as a unit. A build holds the store lock while its disk is
+open. Prune and GC take the rootfs-cache `flock` and then try the store lock;
+while a build holds it they skip the aggregate rather than wait. Process exit
+releases those locks even after a crash, and a leftover lock file has no lease
+lifetime.
 Abandoned regular emit temps are reported and reclaimed by maintenance, and the
 next cache-store open scavenges them before reuse.
 

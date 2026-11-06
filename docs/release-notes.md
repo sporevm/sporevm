@@ -39,8 +39,10 @@ from a store. See `docs/image-format.md`.
 `spore build` holds the rootfs cache lock only to look up step records, seal
 each step, and publish the image, and leases the storage it uses in between,
 so `run --image`, saves and `cache gc` no longer wait for a long build.
-Concurrent builds of the same step still run it once. `cache gc` and `prune`
-skip the build cache-mount disk while a build is using it.
+Builds that miss the same first step still run that stage once; a build that
+starts while another is mid-build may rerun steps the other has not recorded
+yet. `cache gc` and `prune` skip the build cache-mount disk while a build is
+using it.
 
 ### Format reset
 
