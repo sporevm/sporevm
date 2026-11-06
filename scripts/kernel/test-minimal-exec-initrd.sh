@@ -28,8 +28,8 @@ help="$(${generator} --help)"
 
 grep -Fq 'const aarch64_board = @import("src/aarch64/board.zig");' "${repo_root}/build.zig" || fail "build does not source the ARM generation GPA from its board"
 grep -Fq 'const x86_64_board = @import("src/x86_64/board.zig");' "${repo_root}/build.zig" || fail "build does not source the x86 generation GPA from its board"
-grep -Fq '#error "SPORE_GENERATION_BASE must come from the selected SporeVM board"' "${repo_root}/guest/minimal-initrd/agent.c" || fail "agent permits an implicit generation GPA"
-if grep -Fq '#define GEN_BASE 0x0c001000ULL' "${repo_root}/guest/minimal-initrd/agent.c"; then
+grep -Fq '#error "SPORE_GENERATION_BASE must come from the selected SporeVM board"' "${repo_root}/guest/minimal-initrd/generation.c" || fail "agent permits an implicit generation GPA"
+if grep -Fq '#define GEN_BASE 0x0c001000ULL' "${repo_root}/guest/minimal-initrd/generation.c"; then
   fail "agent still hardcodes the ARM generation GPA"
 fi
 
