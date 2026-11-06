@@ -73,6 +73,7 @@ pub const spore_netd_tcp = @import("spore_netd_tcp.zig");
 pub const spore_stream = @import("spore_stream.zig");
 pub const spore = @import("spore.zig");
 pub const system = @import("system.zig");
+pub const vm_registry = @import("vm_registry.zig");
 pub const vmm = @import("aarch64/vmm.zig");
 pub const kvm_native = @import("kvm/native.zig");
 pub const kvm = kvm_native.binding;
@@ -154,6 +155,7 @@ test {
     testing.refAllDecls(spore_netd_tcp);
     testing.refAllDecls(spore_stream);
     testing.refAllDecls(system);
+    testing.refAllDecls(vm_registry);
     testing.refAllDecls(vmm);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);
