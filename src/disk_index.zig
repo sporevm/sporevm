@@ -169,7 +169,7 @@ fn parseV2(allocator: std.mem.Allocator, bytes: []const u8) Error!ParsedDiskInde
 }
 
 /// Validates the encoded ranges and expands the packed digests into one
-/// chunk id per nonzero chunk.
+/// chunk id per nonzero chunk. Digests must be lowercase hex.
 pub fn decodeChunkRanges(allocator: std.mem.Allocator, index: DiskIndexV2) Error![]DiskIndexChunk {
     try validateV2Shape(index);
 
@@ -187,7 +187,7 @@ pub fn decodeChunkRanges(allocator: std.mem.Allocator, index: DiskIndexV2) Error
         for (0..count) |offset| {
             chunks[entry_index] = .{
                 .logical_chunk = std.math.add(u64, range.start, offset) catch return error.BadManifest,
-                .id = chunk.ChunkId.fromHex(range.digests[offset * chunk.ChunkId.hex_len ..][0..chunk.ChunkId.hex_len]) catch return error.BadManifest,
+                .id = idFromLowerHex(range.digests[offset * chunk.ChunkId.hex_len ..][0..chunk.ChunkId.hex_len]) orelse return error.BadManifest,
             };
             entry_index += 1;
         }
@@ -268,7 +268,6 @@ fn validateV2Shape(index: DiskIndexV2) Error!void {
         const end = std.math.add(u64, range.start, count) catch return error.BadManifest;
         if (range.start >= chunk_count or end > chunk_count) return error.BadManifest;
         if (previous_nonzero_end) |previous| if (range.start <= previous) return error.BadManifest;
-        for (range.digests) |byte| if (!isLowerHex(byte)) return error.BadManifest;
         previous_nonzero_end = end;
     }
 
@@ -323,9 +322,27 @@ pub fn appendZeroChunk(allocator: std.mem.Allocator, ranges: *std.ArrayList(Disk
     try ranges.append(allocator, .{ .start = logical_chunk, .count = 1 });
 }
 
-fn isLowerHex(byte: u8) bool {
-    return (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f');
+/// Decodes one packed digest in a single pass, so a dense index costs one
+/// table lookup per hex digit rather than a separate check and parse.
+fn idFromLowerHex(hex: *const [chunk.ChunkId.hex_len]u8) ?chunk.ChunkId {
+    var id: chunk.ChunkId = undefined;
+    var invalid: u8 = 0;
+    for (&id.bytes, 0..) |*byte, i| {
+        const high = lower_hex_values[hex[2 * i]];
+        const low = lower_hex_values[hex[2 * i + 1]];
+        invalid |= high | low;
+        byte.* = (high << 4) | (low & 0x0f);
+    }
+    if (invalid > 0x0f) return null;
+    return id;
 }
+
+/// Maps each lowercase hex digit to its value and every other byte to 0xff.
+const lower_hex_values: [256]u8 = values: {
+    var values = [_]u8{0xff} ** 256;
+    for ("0123456789abcdef", 0..) |digit, value| values[digit] = value;
+    break :values values;
+};
 
 fn validateIndexDigest(bytes: []const u8, digest: []const u8) Error!void {
     if (!std.mem.startsWith(u8, digest, digest_prefix)) return error.BadManifest;
@@ -772,6 +789,35 @@ test "v2 disk index rejects malformed and out-of-bounds ranges" {
         .chunk_ranges = &.{.{ .start = std.math.maxInt(u64), .digests = &id_b.toHex() }},
         .zero_ranges = &one_zero,
     }));
+}
+
+test "chunk range digests must be lowercase hex" {
+    // Memory manifests decode their index through decodeChunkRanges alone,
+    // without the canonical re-encoding check, so the decoder enforces case.
+    const allocator = std.testing.allocator;
+    const lower = id_b.toHex() ++ id_c.toHex();
+    var encoded: DiskIndexV2 = .{
+        .kind = disk_index_kind,
+        .logical_size = 8192,
+        .chunk_size = 4096,
+        .hash_algorithm = "blake3",
+        .object_namespace = "rootfs/blake3",
+        .chunk_ranges = &.{.{ .start = 0, .digests = &lower }},
+    };
+    const chunks = try decodeChunkRanges(allocator, encoded);
+    defer allocator.free(chunks);
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expect(chunks[0].id.eql(id_b) and chunks[1].id.eql(id_c));
+    try std.testing.expectEqual(@as(u64, 1), chunks[1].logical_chunk);
+
+    for ([_]u8{ 'B', 'g', '/', ':', '`', 0, 0xff }) |bad| {
+        for ([_]usize{ 0, 63, 64, 127 }) |position| {
+            var digests = lower;
+            digests[position] = bad;
+            encoded.chunk_ranges = &.{.{ .start = 0, .digests = &digests }};
+            try std.testing.expectError(error.BadManifest, decodeChunkRanges(allocator, encoded));
+        }
+    }
 }
 
 fn fuzzDiskIndexParse(_: void, s: *std.testing.Smith) !void {
