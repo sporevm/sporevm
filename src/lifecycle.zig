@@ -7075,7 +7075,7 @@ test "named restore lease planning prefers local CAS over stale pin reference" {
     const stale_ref = try std.fs.path.join(allocator, &.{ spore_dir, saved_spore_pin.reference_file });
     defer allocator.free(stale_ref);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_ref, .data =
-        \\{"schema":"spore.saved-disk-pin-ref.v1","id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+        \\{"schema":"spore.saved-disk-pin-ref.v2","id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
     });
 
     const missing_cache = try std.fs.path.join(allocator, &.{ root, "missing-cache" });

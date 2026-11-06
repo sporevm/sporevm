@@ -1303,12 +1303,20 @@ fn collectOrphanPinGcCandidates(
     // Snapshot the registry before replay or orphan cleanup mutates it. Some
     // filesystems can otherwise skip the directory entry following a delete.
     for (ids.items) |id| {
-        var record = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch continue;
-        defer record.deinit();
-        const pending_state = try saved_spore_pin.pendingPublicationState(io, allocator, cache_root, id, record.value);
-        const abandoned_publication = pending_state == .abandoned;
-        if (pending_state == .committed and !dry_run) try saved_spore_pin.clearPendingPublication(io, allocator, registry, id);
-        if (!abandoned_publication and try saved_spore_pin.ownerState(allocator, cache_root, id, record.value) != .orphaned) continue;
+        // A v1 pin can only protect a save whose manifest predates v6 and no
+        // longer loads, so it is deleted like an orphaned pin.
+        var record: ?std.json.Parsed(saved_spore_pin.Record) = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch |err| switch (err) {
+            error.FormatTooOld => null,
+            else => continue,
+        };
+        defer if (record) |*value| value.deinit();
+        var abandoned_publication = false;
+        if (record) |value| {
+            const pending_state = try saved_spore_pin.pendingPublicationState(io, allocator, cache_root, id, value.value);
+            abandoned_publication = pending_state == .abandoned;
+            if (pending_state == .committed and !dry_run) try saved_spore_pin.clearPendingPublication(io, allocator, registry, id);
+            if (!abandoned_publication and try saved_spore_pin.ownerState(allocator, cache_root, id, value.value) != .orphaned) continue;
+        }
 
         const owned_id = try allocator.dupe(u8, id);
         const inserted = try orphan_ids.getOrPut(owned_id);
@@ -1323,10 +1331,13 @@ fn collectOrphanPinGcCandidates(
             else => |e| return e,
         };
         const bytes = record_stat.size + owner_bytes;
-        try entries.append(.{ .kind = if (abandoned_publication) "saved-spore-abandoned-pin" else "saved-spore-orphan-pin", .path = owner_path, .bytes = bytes });
+        try entries.append(if (record == null)
+            .{ .kind = "saved-spore-stale-pin", .path = record_path, .bytes = bytes }
+        else
+            .{ .kind = if (abandoned_publication) "saved-spore-abandoned-pin" else "saved-spore-orphan-pin", .path = owner_path, .bytes = bytes });
         candidate_bytes.* += bytes;
         if (!dry_run) {
-            if (abandoned_publication) try saved_spore_pin.abandonPendingPublication(io, allocator, cache_root, id, record.value);
+            if (abandoned_publication) try saved_spore_pin.abandonPendingPublication(io, allocator, cache_root, id, record.?.value);
             try saved_spore_pin.remove(io, allocator, registry, id);
             deleted_count.* += 1;
             deleted_bytes.* += bytes;
@@ -1394,9 +1405,13 @@ fn collectStorageRootsFromPins(
         try chunk_sealer.fsyncDirPath(allocator, pins_path);
     }
     for (ids.items) |id| {
-        var record = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch {
-            conservative_roots.pin_count += 1;
-            continue;
+        var record = saved_spore_pin.loadRecord(io, allocator, cache_root, id) catch |err| switch (err) {
+            // A v1 pin roots nothing: its save no longer loads.
+            error.FormatTooOld => continue,
+            else => {
+                conservative_roots.pin_count += 1;
+                continue;
+            },
         };
         defer record.deinit();
         if (unique.get(record.value.storage.index_digest)) |prior| {
@@ -2555,7 +2570,7 @@ test "cache pins renders exact text and JSON health states" {
     const entries = [_]saved_spore_pin.Listing{
         .{ .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .state = .index_valid, .owner_state = .exclusive, .index_digest = "blake3:1111" },
         .{ .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", .state = .missing, .owner_state = .orphaned },
-        .{ .id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", .state = .corrupt, .owner_state = .legacy, .index_digest = "blake3:3333" },
+        .{ .id = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", .state = .corrupt, .owner_state = .duplicated, .index_digest = "blake3:3333" },
     };
     var text_out: Io.Writer.Allocating = .init(allocator);
     defer text_out.deinit();
@@ -2563,7 +2578,7 @@ test "cache pins renders exact text and JSON health states" {
     try std.testing.expectEqualStrings(
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\texclusive\tindex_valid\tblake3:1111\n" ++
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\torphaned\tmissing\t-\n" ++
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\tlegacy\tcorrupt\tblake3:3333\n",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\tduplicated\tcorrupt\tblake3:3333\n",
         text_out.written(),
     );
     var json_out: Io.Writer.Allocating = .init(allocator);
@@ -3774,10 +3789,13 @@ test "durable save pin roots GC until explicit unpin" {
     pin_lock.deinit();
     var original_pin = try saved_spore_pin.loadRecord(io, allocator, root, pin_id);
     defer original_pin.deinit();
+    // Each extra pin is owned by its own save reference, so none is orphaned.
+    // The references live outside the image catalog, which GC also reads.
+    try Io.Dir.cwd().createDirPath(io, root ++ "/saves");
     for (1..1000) |index| {
         const id = try std.fmt.allocPrint(allocator, "{x:0>64}", .{index});
         const record = saved_spore_pin.Record{
-            .schema = saved_spore_pin.legacy_schema,
+            .schema = saved_spore_pin.schema,
             .id = id,
             .manifest_sha256 = original_pin.value.manifest_sha256,
             .storage = original_pin.value.storage,
@@ -3785,6 +3803,10 @@ test "durable save pin roots GC until explicit unpin" {
         const json = try std.json.Stringify.valueAlloc(allocator, record, .{});
         const path = try std.fmt.allocPrint(allocator, "{s}/pins/{s}.json", .{ root, id });
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
+        const owner = try saved_spore_pin.ownerPath(allocator, root, id);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = owner, .data = "{}" });
+        const ref = try std.fmt.allocPrint(allocator, "{s}/saves/{s}", .{ root, id });
+        try Io.Dir.cwd().hardLink(owner, Io.Dir.cwd(), ref, io, .{});
     }
     const temp_name = try std.fmt.allocPrint(allocator, "{s}/pins/{s}.json.1.tmp", .{ root, pin_id });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = temp_name, .data = "crash-left-temp" });
@@ -3795,6 +3817,10 @@ test "durable save pin roots GC until explicit unpin" {
     const index_path = try rootfs_cas.manifestIndexPath(allocator, root, fixture.storage.index_digest);
     const object_path = try rootfs_cas.manifestObjectPath(allocator, root, fixture.object_digest);
     const kept = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    // Nothing unreadable, so only the pins keep the storage.
+    try std.testing.expectEqual(@as(usize, 0), kept.unparseable_metadata_count);
+    try std.testing.expectEqual(@as(usize, 0), kept.unparseable_step_record_count);
+    try std.testing.expectEqual(@as(usize, 0), kept.unparseable_pin_count);
     try std.testing.expectEqual(@as(usize, 0), kept.deleted_count);
     try std.testing.expectEqual(@as(usize, 1), kept.pin_index_validation_count);
     try std.testing.expect(try fileExists(io, index_path));
@@ -3802,9 +3828,10 @@ test "durable save pin roots GC until explicit unpin" {
     try std.testing.expect(!try fileExists(io, temp_name));
     for (1..1000) |index| {
         const id = try std.fmt.allocPrint(allocator, "{x:0>64}", .{index});
-        const path = try std.fmt.allocPrint(allocator, "{s}/pins/{s}.json", .{ root, id });
-        try Io.Dir.cwd().deleteFile(io, path);
+        try Io.Dir.cwd().deleteFile(io, try saved_spore_pin.recordPath(allocator, root, id));
+        try Io.Dir.cwd().deleteFile(io, try saved_spore_pin.ownerPath(allocator, root, id));
     }
+    try Io.Dir.cwd().deleteTree(io, root ++ "/saves");
     var remove_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     defer remove_lock.deinit();
     const remove_registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &remove_lock);
@@ -3887,6 +3914,57 @@ test "corrupt save pin makes destructive prune retain all CAS" {
     const object_path = try rootfs_cas.manifestObjectPath(allocator, root, fixture.object_digest);
     try std.testing.expect(try fileExists(io, index_path));
     try std.testing.expect(try fileExists(io, object_path));
+}
+
+test "cache GC deletes v1 pins and the storage only they rooted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    const root = "zig-cache/test-system-cache-gc-v1-pin";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    try Io.Dir.cwd().createDirPath(io, root ++ "/pins");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/save");
+    const fixture = try writeGcStorageFixture(allocator, io, root, false, 0x68);
+    // A v1 save: an old manifest, a copied reference and no ownership anchor.
+    const id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save/manifest.json", .data = "{\"version\":2}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save/" ++ saved_spore_pin.reference_file, .data = "{\"schema\":\"spore.saved-disk-pin-ref.v1\",\"id\":\"" ++ id ++ "\"}" });
+    const record_json = try std.json.Stringify.valueAlloc(allocator, .{
+        .schema = "spore.saved-disk-pin.v1",
+        .id = id,
+        .manifest_sha256 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        .storage = fixture.storage,
+    }, .{});
+    const record_path = try saved_spore_pin.recordPath(allocator, root, id);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = record_json });
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, root, fixture.storage.index_digest);
+    const object_path = try rootfs_cas.manifestObjectPath(allocator, root, fixture.object_digest);
+
+    const prune_plan = try pruneRootfsCache(allocator, io, root, null, .{
+        .dry_run = true,
+        .include_rootfs_chunks = true,
+        .max_bytes = 0,
+    }, Io.Clock.real.now(io).nanoseconds);
+    try std.testing.expectEqual(@as(usize, 2), prune_plan.candidate_count);
+
+    const planned = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = true });
+    try std.testing.expectEqual(@as(usize, 0), planned.unparseable_pin_count);
+    try std.testing.expectEqual(@as(usize, 0), planned.rooted_indexes);
+    try std.testing.expectEqual(@as(usize, 3), planned.candidate_count);
+    var stale_pin_count: usize = 0;
+    for (planned.entries) |entry| {
+        if (std.mem.eql(u8, entry.kind, "saved-spore-stale-pin")) stale_pin_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), stale_pin_count);
+    try std.testing.expect(try fileExists(io, record_path));
+
+    const forced = try gcRootfsCache(allocator, io, .{ .cache_root = root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 3), forced.deleted_count);
+    try std.testing.expect(!try fileExists(io, record_path));
+    try std.testing.expect(!try fileExists(io, index_path));
+    try std.testing.expect(!try fileExists(io, object_path));
 }
 
 fn writeGcStorageFixture(
