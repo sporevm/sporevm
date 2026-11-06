@@ -52,7 +52,6 @@ pub const CreateTiming = vm_registry.CreateTiming;
 pub const MonitorTiming = vm_registry.MonitorTiming;
 pub const MonitorStats = vm_registry.MonitorStats;
 pub const VmState = vm_registry.VmState;
-pub const PidAliveFn = vm_registry.PidAliveFn;
 pub const max_control_socket_path_len = vm_registry.max_control_socket_path_len;
 pub const clearLastError = vm_registry.clearLastError;
 pub const lastErrorMessage = vm_registry.lastErrorMessage;
@@ -72,8 +71,6 @@ pub const writeMonitorStatsPath = vm_registry.writeMonitorStatsPath;
 pub const writeMonitorStats = vm_registry.writeMonitorStats;
 pub const readPid = vm_registry.readPid;
 pub const writePid = vm_registry.writePid;
-pub const classifyVmState = vm_registry.classifyVmState;
-pub const pidAlive = vm_registry.pidAlive;
 const max_metadata_bytes = vm_registry.max_metadata_bytes;
 const setLastError = vm_registry.setLastError;
 const writeTimingJson = vm_registry.writeTimingJson;
@@ -82,7 +79,6 @@ const controlSocketAddress = vm_registry.controlSocketAddress;
 const readMonitorStats = vm_registry.readMonitorStats;
 const pathExists = vm_registry.pathExists;
 const openDirPath = vm_registry.openDirPath;
-const ensureVmDir = vm_registry.ensureVmDir;
 const ensureDirPath = vm_registry.ensureDirPath;
 const requirePrivateDir = vm_registry.requirePrivateDir;
 const validateExistingRuntimeDirs = vm_registry.validateExistingRuntimeDirs;
@@ -102,6 +98,7 @@ const monitor_reply_deadline_ms = 2_000;
 
 const testing = if (builtin.is_test) struct {
     var named_restore_authority_barrier: ?*test_barrier.Barrier = null;
+    var create_rootfs_barrier: ?*test_barrier.Barrier = null;
 } else struct {};
 
 const darwin_process = if (builtin.os.tag.isDarwin()) struct {
@@ -896,12 +893,16 @@ fn createNamedWithTiming(
         .console_log_path = options.console_log_path,
         .annotations = options.annotations,
     };
+    spec.network_policy = if (named_network.mode == .spore) try spore_net_policy.encodeArgAlloc(arena, &named_network.policy) else null;
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const paths_ms = monotonicMs();
-    const state = try classifyVmState(arena, init.io, paths, pidAlive);
-    if (state != .absent) return namedVmExists(arena, init.io, paths, "create", spec.name, state);
+    // Fail fast on a taken name, but claim it only once the image is ready,
+    // so a pull that is interrupted leaves no entry behind.
+    const prior = try vm_registry.probe(init.io, paths);
+    if (prior != .absent) return namedVmExists(arena, init.io, paths, "create", spec.name, prior);
     const state_checked_ms = monotonicMs();
 
+    if (comptime builtin.is_test) if (testing.create_rootfs_barrier) |barrier| barrier.pause(init.io);
     const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = spec.rootfs_path,
         .image_ref = spec.image_ref,
@@ -928,10 +929,12 @@ fn createNamedWithTiming(
         .working_dir = rootfs.guest_working_dir,
     } else null;
     const rootfs_abspath_ms = monotonicMs();
-    if (spec.rootfs != null or spec.exec_defaults != null or !spore.annotationsEmpty(spec.annotations)) try writeSpec(arena, init.io, paths, spec);
 
-    const spawn_policy: ?*const run_mod.NetworkPolicy = if (named_network.mode == .spore) &named_network.policy else null;
-    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, options.debug, spawn_policy);
+    var claim = try claimName(arena, init.io, paths, "create");
+    var claimed = true;
+    defer if (claimed) claim.abandon(init.io, paths);
+    try spawnMonitorExecutable(init, arena, paths, &claim, spec, options.spore_executable, options.debug);
+    claimed = false;
     const monitor_spawned_ms = monotonicMs();
     try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
@@ -1084,6 +1087,7 @@ pub fn restoreNamed(
         .disk = disk,
         .disk_baseline_lease = if (disk_handoff) |handoff| handoff.lease else base.disk_baseline_lease,
         .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
+        .network_policy = if (network_options.network == .spore) try spore_net_policy.encodeArgAlloc(arena, &network_options.policy) else null,
         .annotations = manifest.annotations,
         .sessions = manifest.sessions,
         .exec_defaults = manifest.exec_defaults orelse base.exec_defaults,
@@ -1098,13 +1102,13 @@ pub fn restoreNamed(
     if (!monitorBackendSupported(spec.backend)) return error.HostUnsupported;
 
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
-    const state = try classifyVmState(arena, init.io, paths, pidAlive);
-    if (state != .absent) return namedVmExists(arena, init.io, paths, "restore", spec.name, state);
-    if (spec.rootfs != null or spec.disk != null or spec.resume_generation != null or !spore.annotationsEmpty(spec.annotations) or spec.sessions.len != 0 or spec.exec_defaults != null) try writeSpec(arena, init.io, paths, spec);
+    var claim = try claimName(arena, init.io, paths, "restore");
+    var claimed = true;
+    defer if (claimed) claim.abandon(init.io, paths);
 
     const prepared_ms = monotonicMs();
-    const spawn_policy: ?*const run_mod.NetworkPolicy = if (network_options.network == .spore) &network_options.policy else null;
-    try spawnMonitorExecutable(init, arena, paths, spec, options.spore_executable, options.debug, spawn_policy);
+    try spawnMonitorExecutable(init, arena, paths, &claim, spec, options.spore_executable, options.debug);
+    claimed = false;
     const monitor_spawned_ms = monotonicMs();
     try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
@@ -1187,7 +1191,7 @@ pub fn openExecNamedStream(
     const arena = arena_state.allocator();
 
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    const state = try vm_registry.probe(context.io, paths);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "exec-stream", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
@@ -1219,7 +1223,7 @@ fn execNamedStreaming(
     const arena = arena_state.allocator();
 
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    const state = try vm_registry.probe(context.io, paths);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "exec-stream", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
@@ -1248,7 +1252,7 @@ fn copyNamedStreaming(
     const arena = arena_state.allocator();
 
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    const state = try vm_registry.probe(context.io, paths);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "copy", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
@@ -1271,7 +1275,7 @@ fn startNamed(
     const arena = arena_state.allocator();
 
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    const state = try vm_registry.probe(context.io, paths);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "start", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
@@ -1290,7 +1294,7 @@ pub fn initialOutputNamed(
     const arena = arena_state.allocator();
 
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    const state = try vm_registry.probe(context.io, paths);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "logs", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
@@ -1354,7 +1358,7 @@ fn saveContinueNamed(
     var cleanup_temp = true;
     defer if (cleanup_temp) Io.Dir.cwd().deleteTree(context.io, temp_dir) catch {};
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    const state = try vm_registry.probe(context.io, paths);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
@@ -1435,7 +1439,7 @@ fn saveStopNamed(
 
     const out_dir = try resolveNewOutputDirApi(arena, context.io, options.out_dir);
     const paths = try apiPaths(context, arena, options.name);
-    const state = try classifyVmState(arena, context.io, paths, pidAlive);
+    const state = try vm_registry.probe(context.io, paths);
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "save", options.name, state);
     var spec = try readSpec(arena, context.io, paths);
     defer spec.deinit();
@@ -1457,8 +1461,8 @@ fn saveStopNamed(
 
     var cleanup_after_suspend = true;
     defer if (cleanup_after_suspend) {
-        if (finishAcceptedMonitorStop(context.io, paths, ready.value.pid)) {
-            deleteVmState(context.io, paths) catch {};
+        if (awaitMonitorExit(context.io, paths, ready.value.pid)) |lock| {
+            deleteLocked(context.io, paths, lock) catch {};
         } else |_| {}
     };
     var suspend_spec = spec.value;
@@ -1487,8 +1491,7 @@ fn saveStopNamed(
     try writeSporeLifecycleSpec(arena, context.io, out_dir, suspend_spec);
     const saved_sessions = manifest.value.sessions.len;
     cleanup_after_suspend = false;
-    try finishAcceptedMonitorStop(context.io, paths, ready.value.pid);
-    try deleteVmState(context.io, paths);
+    try deleteLocked(context.io, paths, try awaitMonitorExit(context.io, paths, ready.value.pid));
     return ownedNamedLifecycleResult(allocator, .{
         .action = "saved_stopped",
         .name = options.name,
@@ -1515,23 +1518,28 @@ pub fn forkNamed(
 
     const child_names = try renderForkNames(arena, options.name_pattern, options.count);
     const source_paths = try apiPaths(context, arena, options.source_name);
-    const state = try classifyVmState(arena, init.io, source_paths, pidAlive);
+    const state = try vm_registry.probe(init.io, source_paths);
     if (state != .ready) return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, state);
 
-    var source_spec = readSpec(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, .incomplete);
+    var source_spec = try readSpec(arena, init.io, source_paths);
     defer source_spec.deinit();
     try rejectX86NamedPersistence(source_spec.value);
     const disk_backed = source_spec.value.rootfs != null or source_spec.value.rootfs_path != null or source_spec.value.image_ref != null or source_spec.value.disk != null;
     if (disk_backed and source_spec.value.rootfs == null) return error.UnsupportedNamedForkDisk;
     if (source_spec.value.network != null) return error.UnsupportedNamedForkNetwork;
 
-    for (child_names) |child_name| {
+    // Every child name is claimed before the source pauses. A claim is
+    // abandoned, deleting its entry, until its monitor has started.
+    const children = try arena.alloc(ForkChild, child_names.len);
+    var claimed: usize = 0;
+    defer for (children[0..claimed]) |*child| if (child.claim) |*claim| claim.abandon(init.io, child.paths);
+    for (child_names, children) |child_name, *child| {
         const child_paths = try apiPaths(context, arena, child_name);
-        const child_state = try classifyVmState(arena, init.io, child_paths, pidAlive);
-        if (child_state != .absent) return namedVmExists(arena, init.io, child_paths, "fork", child_name, child_state);
+        child.* = .{ .paths = child_paths, .claim = try claimName(arena, init.io, child_paths, "fork") };
+        claimed += 1;
     }
 
-    var ready = readReady(arena, init.io, source_paths) catch return namedVmNotReady(arena, init.io, source_paths, "fork", options.source_name, .incomplete);
+    var ready = try readReady(arena, init.io, source_paths);
     defer ready.deinit();
 
     const batch_dir = try hiddenForkBatchDir(arena, source_paths.runtime_root);
@@ -1549,8 +1557,6 @@ pub fn forkNamed(
     var disk_fork_ms: ?u64 = null;
     var source_pause_ms: ?u64 = null;
     var child_ready_ms: ?u64 = null;
-    var started = std.array_list.Managed([]const u8).init(arena);
-    try started.ensureTotalCapacity(child_names.len);
 
     if (disk_backed) {
         const lease = try ensureDiskBaselineLease(arena, context, source_paths, &source_spec.value);
@@ -1583,18 +1589,16 @@ pub fn forkNamed(
             .count = options.count,
             .environ_map = init.environ_map,
         });
-        for (child_names, prepared.value.claims, 0..) |child_name, claim, index| {
+        for (children, prepared.value.claims, 0..) |*child, claim, index| {
             const spore_dir = try childSporeDir(arena, children_dir, index);
-            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, options.debug, .{
+            startForkChildExecutable(init, arena, child, spore_dir, source_spec.value, options.spore_executable, options.debug, .{
                 .source_socket_path = ready.value.control_socket_path,
                 .batch_name = batch_name,
                 .prepared_claim = claim,
             }) catch |err| {
-                if (err != error.ControlSocketPathCollision) started.appendAssumeCapacity(child_name);
-                cleanupStartedChildren(init, arena, started.items);
+                cleanupStartedChildren(context, arena, children);
                 return err;
             };
-            started.appendAssumeCapacity(child_name);
         }
         child_ready_ms = monotonicMs() -| children_start_ms;
     } else {
@@ -1609,14 +1613,12 @@ pub fn forkNamed(
             .count = options.count,
             .environ_map = init.environ_map,
         });
-        for (child_names, 0..) |child_name, index| {
+        for (children, 0..) |*child, index| {
             const spore_dir = try childSporeDir(arena, children_dir, index);
-            startForkChildExecutable(init, arena, child_name, spore_dir, source_spec.value, options.spore_executable, options.debug, null) catch |err| {
-                if (err != error.ControlSocketPathCollision) started.appendAssumeCapacity(child_name);
-                cleanupStartedChildren(init, arena, started.items);
+            startForkChildExecutable(init, arena, child, spore_dir, source_spec.value, options.spore_executable, options.debug, null) catch |err| {
+                cleanupStartedChildren(context, arena, children);
                 return err;
             };
-            started.appendAssumeCapacity(child_name);
         }
     }
 
@@ -1653,36 +1655,10 @@ pub fn removeNamed(
 }
 
 fn removeNamedAtPaths(context: Context, allocator: std.mem.Allocator, paths: Paths) !?i64 {
-    const state = try classifyVmState(allocator, context.io, paths, pidAlive);
-    var removed_pid: ?i64 = null;
-    switch (state) {
-        .absent => return error.NamedVmNotFound,
-        .ready => {
-            var ready = try readReady(allocator, context.io, paths);
-            defer ready.deinit();
-            removed_pid = ready.value.pid;
-            try stopReadyMonitor(allocator, context.io, paths, ready.value);
-            try deleteVmState(context.io, paths);
-        },
-        .incomplete => {
-            removed_pid = readPid(allocator, context.io, paths) catch null;
-            try deleteVmState(context.io, paths);
-        },
-        .stale => {
-            removed_pid = readPid(allocator, context.io, paths) catch null;
-            // An unreadable spec, such as one from an older binary, is stale
-            // even while its monitor still runs. Stop that monitor first so it
-            // is not left running with no state to find it by.
-            if (readReady(allocator, context.io, paths)) |parsed| {
-                var ready = parsed;
-                defer ready.deinit();
-                if (removed_pid) |pid| {
-                    if (pid == ready.value.pid and pidAlive(pid)) try stopReadyMonitor(allocator, context.io, paths, ready.value);
-                }
-            } else |_| {}
-            try deleteVmState(context.io, paths);
-        },
-    }
+    if (try vm_registry.probe(context.io, paths) == .absent) return error.NamedVmNotFound;
+    const lock = (try vm_registry.tryLockForRemoval(context.io, paths)) orelse try stopLockHolder(allocator, context.io, paths);
+    const removed_pid = readPid(allocator, context.io, paths) catch null;
+    try deleteLocked(context.io, paths, lock);
     return removed_pid;
 }
 
@@ -1695,7 +1671,7 @@ pub fn listNamed(
     _ = options;
     const root = try runtimeRootPath(allocator, context.environ_map);
     defer allocator.free(root);
-    return listEntries(allocator, context.io, root, pidAlive);
+    return listEntries(allocator, context.io, root);
 }
 
 pub fn deinitNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycleResult) void {
@@ -1827,7 +1803,7 @@ pub fn createCli(
             const message = "spore create: required rootfs object was not found";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "create"), message);
         },
-        error.MonitorReadyTimeout => {
+        error.MonitorReadyTimeout, error.MonitorExited => {
             const message = allocLifecycleLastErrorMessage(allocator, "create", "spore create: timed out waiting for monitor readiness");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "create"), message);
         },
@@ -2327,6 +2303,11 @@ pub fn rmCli(
             const message = allocLifecycleMessage(allocator, "spore vm rm: live VM not found: {s}", .{name});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "rm"), message);
         },
+        error.NamedVmBusy => {
+            const fallback = allocLifecycleMessage(allocator, "spore vm rm: live VM is still starting: {s}", .{name});
+            const message = allocLifecycleLastErrorMessage(allocator, "rm", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "rm"), message);
+        },
         error.MonitorShutdownTimedOut => {
             const fallback = allocLifecycleMessage(allocator, "spore vm rm: timed out stopping live VM monitor before deleting runtime state: {s}", .{name});
             const message = allocLifecycleLastErrorMessage(allocator, "rm", fallback);
@@ -2525,7 +2506,7 @@ pub fn forkCli(
             const message = "spore fork: the source disk baseline is no longer complete in its bound store";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "fork"), message);
         },
-        error.MonitorReadyTimeout, error.MonitorVersionMismatch => {
+        error.MonitorReadyTimeout, error.MonitorExited, error.MonitorVersionMismatch => {
             const message = allocLifecycleLastErrorMessage(allocator, "fork", "spore fork: timed out waiting for monitor readiness");
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "fork"), message);
         },
@@ -2651,7 +2632,7 @@ pub fn restoreCli(
                 const message = allocLifecycleLastErrorMessage(allocator, "restore", fallback);
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             },
-            error.MonitorReadyTimeout, error.MonitorVersionMismatch => {
+            error.MonitorReadyTimeout, error.MonitorExited, error.MonitorVersionMismatch => {
                 const message = allocLifecycleLastErrorMessage(allocator, "restore", "spore restore: timed out waiting for monitor readiness");
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_start_failed, message, "restore"), message);
             },
@@ -2776,7 +2757,7 @@ fn writeListEntries(writer: *Io.Writer, entries: []const ListEntry) !void {
     }
 }
 
-pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u8, pid_alive: PidAliveFn) ![]ListEntry {
+pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u8) ![]ListEntry {
     requirePrivateDir(io, runtime_root) catch |err| switch (err) {
         error.FileNotFound => return emptyListEntries(allocator),
         else => |e| return e,
@@ -2800,9 +2781,9 @@ pub fn listEntries(allocator: std.mem.Allocator, io: Io, runtime_root: []const u
         validateName(entry.name) catch continue;
         const paths = try pathsFromRoot(allocator, runtime_root, entry.name);
         defer paths.deinit(allocator);
-        const state = try classifyVmState(allocator, io, paths, pid_alive);
+        const state = try vm_registry.probe(io, paths);
         if (state == .absent) continue;
-        const pid = if (state == .ready or state == .stale) readPid(allocator, io, paths) catch null else null;
+        const pid = readPid(allocator, io, paths) catch null;
         const metadata = readListMetadata(allocator, io, paths) catch null;
         var stats = if (metadata) |value| value.stats else ListStats{};
         if (state == .ready) {
@@ -3728,7 +3709,7 @@ pub fn writeSporeLifecycleSpec(allocator: std.mem.Allocator, io: Io, dir: []cons
     var metadata = spec;
     metadata.resume_dir = null;
     metadata.resume_generation = null;
-    metadata.disk_fork_claim = null;
+    metadata.network_policy = null;
     const json = try std.json.Stringify.valueAlloc(allocator, metadata, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
@@ -3945,10 +3926,17 @@ const ForkChildDiskClaim = struct {
     prepared_claim: runtime_disk_fork_control.PreparedClaim,
 };
 
+/// A fork child's registry entry. `claim` is null once the child's monitor
+/// holds the lock.
+const ForkChild = struct {
+    paths: Paths,
+    claim: ?vm_registry.Claim,
+};
+
 fn startForkChildExecutable(
     init: std.process.Init,
     allocator: std.mem.Allocator,
-    child_name: []const u8,
+    child: *ForkChild,
     spore_dir: []const u8,
     base: Spec,
     spore_executable: []const u8,
@@ -3965,7 +3953,25 @@ fn startForkChildExecutable(
     if (manifest.devices.len != expected_devices) return error.UnsupportedNamedForkDisk;
     if (manifest.disk != null) return error.UnsupportedNamedForkDisk;
     const memory = try spore.memoryConfig(manifest.platform.ram_size, manifest.memory_state);
-    const fork_claim: ?DiskForkClaim = if (disk_claim) |claim| .{
+    const spec = Spec{
+        .name = std.fs.path.basename(child.paths.vm_dir),
+        .backend = base.backend,
+        .kernel_path = base.kernel_path,
+        .initrd_path = base.initrd_path,
+        .resume_dir = spore_dir,
+        .rootfs = base.rootfs,
+        .disk = base.disk,
+        .disk_baseline_lease = base.disk_baseline_lease,
+        .annotations = manifest.annotations,
+        .sessions = manifest.sessions,
+        .exec_defaults = base.exec_defaults,
+        .memory = memory,
+        .vcpus = manifest.platform.vcpu_count,
+        .guest_port = base.guest_port,
+        .timeout_ms = base.timeout_ms,
+        .console_log_path = null,
+    };
+    if (disk_claim) |claim| try vm_registry.writeDiskForkClaim(allocator, init.io, child.paths, spec, .{
         .source_socket_path = claim.source_socket_path,
         .request = .{
             .type = runtime_disk_claim.claim_type,
@@ -3977,48 +3983,17 @@ fn startForkChildExecutable(
             .baseline_kind = claim.prepared_claim.baseline_kind,
             .baseline_identity = claim.prepared_claim.baseline_identity,
         },
-    } else null;
-    const spec = Spec{
-        .name = child_name,
-        .backend = base.backend,
-        .kernel_path = base.kernel_path,
-        .initrd_path = base.initrd_path,
-        .resume_dir = spore_dir,
-        .rootfs = base.rootfs,
-        .disk = base.disk,
-        .disk_baseline_lease = base.disk_baseline_lease,
-        .disk_fork_claim = fork_claim,
-        .annotations = manifest.annotations,
-        .sessions = manifest.sessions,
-        .exec_defaults = base.exec_defaults,
-        .memory = memory,
-        .vcpus = manifest.platform.vcpu_count,
-        .guest_port = base.guest_port,
-        .timeout_ms = base.timeout_ms,
-        .console_log_path = null,
-    };
-    const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, allocator, child_name);
-    try writeSpec(allocator, init.io, paths, spec);
-    try spawnMonitorExecutable(init, allocator, paths, spec, spore_executable, debug, null);
-    try waitForReadyResult(allocator, init.io, paths, spec.timeout_ms, spore_executable);
+    });
+    try spawnMonitorExecutable(init, allocator, child.paths, &child.claim.?, spec, spore_executable, debug);
+    child.claim = null;
+    try waitForReadyResult(allocator, init.io, child.paths, spec.timeout_ms, spore_executable);
 }
 
-fn cleanupStartedChildren(init: std.process.Init, allocator: std.mem.Allocator, names: []const []const u8) void {
-    for (names) |name| {
-        const paths = pathsFor(allocator, init.environ_map, name) catch continue;
-        var ready = readReady(allocator, init.io, paths) catch {
-            if (readPid(allocator, init.io, paths)) |pid| {
-                finishMonitorPidExit(paths, pid) catch {};
-            } else |_| {}
-            deleteVmState(init.io, paths) catch {};
-            continue;
-        };
-        stopReadyMonitor(allocator, init.io, paths, ready.value) catch {
-            ready.deinit();
-            continue;
-        };
-        ready.deinit();
-        deleteVmState(init.io, paths) catch {};
+/// Stops and removes every child whose monitor started. Children still
+/// holding a claim are left to the caller.
+fn cleanupStartedChildren(context: Context, allocator: std.mem.Allocator, children: []const ForkChild) void {
+    for (children) |child| {
+        if (child.claim == null) _ = removeNamedAtPaths(context, allocator, child.paths) catch {};
     }
 }
 
@@ -4083,73 +4058,35 @@ fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !v
     }
 }
 
-/// Starts `exe [--debug] monitor ...`. CLI callers pass the running
-/// executable's path so the monitor is always this exact build.
-fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, spec: Spec, exe: []const u8, debug: bool, network_policy: ?*const run_mod.NetworkPolicy) !void {
+/// Writes the complete spec and starts `exe [--debug] monitor NAME` with the
+/// claim's lock as its stdin. CLI callers pass the running executable's path
+/// so the monitor is always this exact build. Once the monitor is started it
+/// holds the lock and the claimer's copy is closed; on an earlier failure the
+/// caller still holds the claim.
+fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, paths: Paths, claim: *vm_registry.Claim, spec: Spec, exe: []const u8, debug: bool) !void {
     try validateControlSocketPath(paths.control_socket_path);
-    try ensureVmDir(init.io, paths);
-
+    try claimControlSocketPath(init.io, paths);
     var monitor_log = try createFileAtPath(init.io, paths.monitor_log_path);
     defer monitor_log.close(init.io);
+    try writeSpec(allocator, init.io, paths, spec);
 
     var argv = std.array_list.Managed([]const u8).init(allocator);
     try argv.append(exe);
     if (debug) try argv.append("--debug");
     try argv.append("monitor");
     try argv.append(spec.name);
-    try argv.append("--backend");
-    try argv.append(spec.backend);
-    if (spec.kernel_path) |path| {
-        try argv.append("--kernel");
-        try argv.append(path);
-    }
-    if (spec.initrd_path) |path| {
-        try argv.append("--initrd");
-        try argv.append(path);
-    }
-    if (spec.rootfs_path) |path| {
-        try argv.append("--rootfs");
-        try argv.append(path);
-    }
-    if (spec.image_ref) |image| {
-        try argv.append("--image");
-        try argv.append(image);
-    }
-    if (spec.resume_dir) |path| {
-        try argv.append("--resume");
-        try argv.append(path);
-    }
-    if (spec.network) |network| {
-        const policy = try monitorNetworkPolicy(allocator, network, network_policy);
-        try argv.append("--net-policy");
-        try argv.append(try spore_net_policy.encodeArgAlloc(allocator, &policy));
-    }
-    try appendMemoryArg(allocator, &argv, spec.memory);
-    try appendIntArg(allocator, &argv, "--vcpus", spec.vcpus);
-    try appendIntArg(allocator, &argv, "--guest-port", spec.guest_port);
-    try argv.append("--timeout");
-    try argv.append(try std.fmt.allocPrint(allocator, "{d}ms", .{spec.timeout_ms}));
-    if (spec.console_log_path) |path| {
-        try argv.append("--console-log");
-        try argv.append(path);
-    }
-    try claimControlSocketPath(init.io, paths);
-    var release_socket_claim = true;
-    errdefer {
-        if (release_socket_claim) releaseControlSocketPath(init.io, paths) catch {};
-    }
     _ = try std.process.spawn(init.io, .{
         .argv = argv.items,
         .environ_map = init.environ_map,
-        .stdin = .ignore,
+        .stdin = .{ .file = claim.lock },
         .stdout = .{ .file = monitor_log },
         .stderr = .{ .file = monitor_log },
         .pgid = if (builtin.os.tag == .windows) null else 0,
     });
-    release_socket_claim = false;
+    claim.release(init.io);
 }
 
-test "lifecycle monitor spawn receives context environment and debug flag" {
+test "lifecycle monitor spawn receives context environment, debug flag and only the name" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -4165,7 +4102,7 @@ test "lifecycle monitor spawn receives context environment and debug flag" {
     defer allocator.free(out_path);
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = script_path,
-        .data = "#!/bin/sh\nprintf '%s\\n%s %s\\n' \"$HOME\" \"$1\" \"$2\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
+        .data = "#!/bin/sh\nprintf '%s\\n%s\\n' \"$HOME\" \"$*\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
     });
     try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
 
@@ -4181,6 +4118,7 @@ test "lifecycle monitor spawn receives context environment and debug flag" {
     releaseControlSocketPath(io, paths) catch {};
     defer releaseControlSocketPath(io, paths) catch {};
 
+    var claim = try vm_registry.claim(io, paths);
     try spawnMonitorExecutable(.{
         .minimal = undefined,
         .arena = undefined,
@@ -4188,10 +4126,11 @@ test "lifecycle monitor spawn receives context environment and debug flag" {
         .io = io,
         .environ_map = &env,
         .preopens = .empty,
-    }, spawn_arena, paths, .{
+    }, spawn_arena, paths, &claim, .{
         .name = "env-probe",
         .backend = "auto",
-    }, script_path, true, null);
+        .memory = memory_config.Config.fixed(1024 * 1024 * 1024),
+    }, script_path, true);
 
     var observed: ?[]u8 = null;
     defer if (observed) |bytes| allocator.free(bytes);
@@ -4207,29 +4146,11 @@ test "lifecycle monitor spawn receives context environment and debug flag" {
         break;
     }
     try std.testing.expect(observed != null);
-    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\n--debug monitor\n", observed.?);
-}
-
-/// The policy a monitor enforces: the caller's live policy when it has one,
-/// otherwise the policy recorded with the VM.
-fn monitorNetworkPolicy(allocator: std.mem.Allocator, network: spore.Network, live: ?*const run_mod.NetworkPolicy) !run_mod.NetworkPolicy {
-    if (live) |policy| return policy.*;
-    if (network.bound_services.len != 0) return error.UnsupportedBoundServiceRestore;
-    return spore_net_policy.configFromManifestNetwork(allocator, network);
-}
-
-fn appendIntArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), flag: []const u8, value: anytype) !void {
-    try argv.append(flag);
-    try argv.append(try std.fmt.allocPrint(allocator, "{d}", .{value}));
-}
-
-fn appendMemoryArg(allocator: std.mem.Allocator, argv: *std.array_list.Managed([]const u8), memory: memory_config.Config) !void {
-    try argv.append("--memory");
-    try argv.append(try memory.initialCliValueAlloc(allocator));
-    if (try memory.maximumCliValueAlloc(allocator)) |maximum| {
-        try argv.append("--max-memory");
-        try argv.append(maximum);
-    }
+    // The spec reaches the monitor only through spec.json.
+    try std.testing.expectEqualStrings("/tmp/sporevm-context-home\n--debug monitor env-probe\n", observed.?);
+    var spec = try readSpec(allocator, io, paths);
+    defer spec.deinit();
+    try std.testing.expectEqual(@as(u64, 1024 * 1024 * 1024), spec.value.memory.initial_bytes);
 }
 
 const FakeHelloServer = struct {
@@ -4376,15 +4297,18 @@ fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeou
     const start = monotonicMs();
     var sleep_attempt: u32 = 0;
     while (monotonicMs() - start < timeout_ms) {
+        switch (try vm_registry.probe(io, paths)) {
+            .starting, .ready => {},
+            // The monitor held the lock from its spawn, so it has exited.
+            .stale, .absent => {
+                setStartupError(allocator, io, paths, std.fs.path.basename(paths.vm_dir), spore_executable_path, "monitor exited before it was ready");
+                return error.MonitorExited;
+            },
+        }
         var ready = readReady(allocator, io, paths) catch {
             readyPollSleep(&sleep_attempt);
             continue;
         };
-        if (!pidAlive(ready.value.pid)) {
-            ready.deinit();
-            readyPollSleep(&sleep_attempt);
-            continue;
-        }
         verifyMonitorHelloWithPath(allocator, io, ready.value.control_socket_path, spore_executable_path) catch |err| switch (err) {
             error.MonitorVersionMismatch => {
                 ready.deinit();
@@ -4411,7 +4335,7 @@ fn createFileAtPath(io: Io, path: []const u8) !Io.File {
 }
 
 fn setStartupError(allocator: std.mem.Allocator, io: Io, paths: Paths, name: []const u8, spore_executable_path: []const u8, reason: []const u8) void {
-    const state = classifyVmState(allocator, io, paths, pidAlive) catch VmState.incomplete;
+    const state = vm_registry.probe(io, paths) catch VmState.stale;
     const pid = readPid(allocator, io, paths) catch null;
     const console_log_path = configuredConsoleLogPath(allocator, io, paths);
     defer if (console_log_path) |path| allocator.free(path);
@@ -4430,6 +4354,15 @@ fn namedVmNotReady(allocator: std.mem.Allocator, io: Io, paths: Paths, operation
         .{ name, operation, state.name(), pid, console_log_path orelse "none", paths.monitor_log_path, paths.control_socket_path },
     );
     return error.NamedVmNotReady;
+}
+
+/// Claims a name for create, restore or a fork child, reporting an existing
+/// entry with the same diagnostics as other lifecycle failures.
+fn claimName(allocator: std.mem.Allocator, io: Io, paths: Paths, operation: []const u8) !vm_registry.Claim {
+    return vm_registry.claim(io, paths) catch |err| switch (err) {
+        error.NamedVmExists => namedVmExists(allocator, io, paths, operation, std.fs.path.basename(paths.vm_dir), vm_registry.probe(io, paths) catch .stale),
+        else => |e| e,
+    };
 }
 
 fn namedVmExists(allocator: std.mem.Allocator, io: Io, paths: Paths, operation: []const u8, name: []const u8, state: VmState) anyerror {
@@ -4461,6 +4394,8 @@ test "lifecycle readiness requires monitor control socket hello" {
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
+    var claim = try vm_registry.claim(io, paths);
+    defer claim.release(io);
     const pid = currentTestPid();
     try writeSpec(allocator, io, paths, .{ .name = "bench-1", .timeout_ms = 40 });
     try writeReady(allocator, io, paths, .{
@@ -4490,6 +4425,8 @@ test "lifecycle readiness fails on monitor version mismatch" {
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
+    var claim = try vm_registry.claim(io, paths);
+    defer claim.release(io);
     const pid = currentTestPid();
     try writeSpec(allocator, io, paths, .{ .name = "bench-1", .console_log_path = paths.console_log_path });
     try writeReady(allocator, io, paths, .{
@@ -4530,6 +4467,8 @@ test "lifecycle named not ready diagnostics include state pid and logs" {
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
+    var claim = try vm_registry.claim(io, paths);
+    claim.release(io);
     const dead_pid: i64 = 999_999_999;
     try writeSpec(allocator, io, paths, .{ .name = "bench-1", .console_log_path = paths.console_log_path });
     try writeReady(allocator, io, paths, .{
@@ -4569,8 +4508,11 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
+    var claim = try vm_registry.claim(io, paths);
+    claim.release(io);
     const dead_pid: i64 = 999_999_998;
-    try writeSpec(allocator, io, paths, .{ .name = "bench-1" });
+    const spec_bytes = "{\"name\":\"bench-1\"}";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.spec_path, .data = spec_bytes });
     try writeReady(allocator, io, paths, .{
         .pid = dead_pid,
         .control_socket_path = paths.control_socket_path,
@@ -4601,6 +4543,77 @@ test "lifecycle named exists diagnostics include stale state and logs" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "console_log=none") != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.monitor_log_path) != null);
     try std.testing.expect(std.mem.indexOf(u8, detail, paths.control_socket_path) != null);
+    const after = try Io.Dir.cwd().readFileAlloc(io, paths.spec_path, allocator, .limited(4096));
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(spec_bytes, after);
+}
+
+test "lifecycle create claims the name only once the image is ready" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, root);
+
+    var rootfs_boundary = test_barrier.Barrier{};
+    testing.create_rootfs_barrier = &rootfs_boundary;
+    defer testing.create_rootfs_barrier = null;
+    const Create = struct {
+        env: *std.process.Environ.Map,
+        boundary: *test_barrier.Barrier,
+        err: ?anyerror = null,
+        finished: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            // A create that fails before the barrier must not leave the test
+            // waiting for it.
+            defer {
+                self.finished.store(true, .release);
+                self.boundary.reached.post(std.testing.io);
+            }
+            const result = createNamedWithTiming(.{
+                .minimal = undefined,
+                .arena = undefined,
+                .gpa = std.testing.allocator,
+                .io = std.testing.io,
+                .environ_map = self.env,
+                .preopens = .empty,
+            }, std.testing.allocator, .{}, .{
+                .name = "bench-1",
+                .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
+                .spore_executable = "/nonexistent/spore",
+            }, .{ .start_ms = 0, .parsed_ms = 0 }) catch |err| {
+                self.err = err;
+                return;
+            };
+            deinitNamedLifecycleResult(std.testing.allocator, result);
+        }
+    };
+    var create = Create{ .env = &env, .boundary = &rootfs_boundary };
+    var create_thread = test_barrier.ThreadGuard{
+        .io = io,
+        .thread = try std.Thread.spawn(.{}, Create.run, .{&create}),
+        .barriers = &.{&rootfs_boundary},
+    };
+    defer create_thread.deinit();
+
+    // A create killed while it pulls its image leaves nothing to remove.
+    rootfs_boundary.waitReached(io);
+    if (create.finished.load(.acquire)) return create.err orelse error.TestUnexpectedResult;
+    try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, paths));
+    rootfs_boundary.release(io);
+    create_thread.join();
+    try std.testing.expect(create.err != null);
+    try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, paths));
 }
 
 fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !ExecNamedStream {
@@ -5463,78 +5476,54 @@ fn writeRawStderr(bytes: []const u8) !void {
     }
 }
 
-const MonitorStopResult = enum {
-    stopped,
-    timed_out,
-};
-
-fn stopReadyMonitor(allocator: std.mem.Allocator, io: Io, paths: Paths, ready: Ready) !void {
-    const shutdown_requested = if (sendShutdownRequest(allocator, io, ready.control_socket_path)) |_| true else |_| false;
-    if (shutdown_requested) return finishAcceptedMonitorStop(io, paths, ready.pid);
-    return finishMonitorPidExit(paths, ready.pid);
+/// Stops whoever holds a live entry's lock and returns the lock. With no
+/// `pid` file the claimer has not started the monitor yet, so after a short
+/// wait the entry is busy.
+fn stopLockHolder(allocator: std.mem.Allocator, io: Io, paths: Paths) !Io.File {
+    const start = monotonicMs();
+    const pid = while (true) {
+        if (readPid(allocator, io, paths)) |value| break value else |_| {}
+        if (try vm_registry.tryLockForRemoval(io, paths)) |lock| return lock;
+        if (monotonicMs() -| start >= monitor_shutdown_grace_ms) {
+            setLastError("named VM {s} is still starting; retry once it is ready", .{std.fs.path.basename(paths.vm_dir)});
+            return error.NamedVmBusy;
+        }
+        sleepMs(20);
+    };
+    // The monitor answers `shutdown` as it accepts it and then exits.
+    _ = sendShutdownRequest(allocator, io, paths.control_socket_path) catch {};
+    return awaitMonitorExit(io, paths, pid);
 }
 
-fn finishAcceptedMonitorStop(io: Io, paths: Paths, pid: i64) !void {
-    if (waitForAcceptedMonitorStop(io, paths, pid, monitor_shutdown_grace_ms, pidAlive) == .stopped) return;
-
+/// Waits for the monitor to exit, which frees the entry's lock, signalling
+/// its process group after each grace period, and returns the lock.
+fn awaitMonitorExit(io: Io, paths: Paths, pid: i64) !Io.File {
+    if (try waitForLock(io, paths, monitor_shutdown_grace_ms)) |lock| return lock;
     signalMonitorProcessGroup(pid, .TERM);
-    if (waitForAcceptedMonitorStop(io, paths, pid, monitor_shutdown_term_ms, pidAlive) == .stopped) return;
-
+    if (try waitForLock(io, paths, monitor_shutdown_term_ms)) |lock| return lock;
     signalMonitorProcessGroup(pid, .KILL);
-    if (waitForAcceptedMonitorStop(io, paths, pid, monitor_shutdown_kill_ms, pidAlive) == .stopped) return;
-
-    setMonitorShutdownError(paths, pid);
-    return error.MonitorShutdownTimedOut;
-}
-
-fn finishMonitorPidExit(paths: Paths, pid: i64) !void {
-    if (waitForPidExit(pid, monitor_shutdown_grace_ms, pidAlive) == .stopped) return;
-
-    signalMonitorProcessGroup(pid, .TERM);
-    if (waitForPidExit(pid, monitor_shutdown_term_ms, pidAlive) == .stopped) return;
-
-    signalMonitorProcessGroup(pid, .KILL);
-    if (waitForPidExit(pid, monitor_shutdown_kill_ms, pidAlive) == .stopped) return;
-
-    setMonitorShutdownError(paths, pid);
-    return error.MonitorShutdownTimedOut;
-}
-
-fn setMonitorShutdownError(paths: Paths, pid: i64) void {
+    if (try waitForLock(io, paths, monitor_shutdown_kill_ms)) |lock| return lock;
     setLastError(
         "timed out waiting for named VM monitor shutdown: name={s} pid={d} monitor_log={s} control_socket={s}",
         .{ std.fs.path.basename(paths.vm_dir), pid, paths.monitor_log_path, paths.control_socket_path },
     );
+    return error.MonitorShutdownTimedOut;
 }
 
-fn waitForAcceptedMonitorStop(io: Io, paths: Paths, pid: i64, timeout_ms: u64, pid_alive: PidAliveFn) MonitorStopResult {
+fn waitForLock(io: Io, paths: Paths, timeout_ms: u64) !?Io.File {
     const start = monotonicMs();
-    while (monotonicMs() - start < timeout_ms) {
-        if (!pid_alive(pid)) return .stopped;
-        if (!controlSocketExists(io, paths.control_socket_path)) return .stopped;
+    while (true) {
+        if (try vm_registry.tryLockForRemoval(io, paths)) |lock| return lock;
+        if (monotonicMs() -| start >= timeout_ms) return null;
         sleepMs(20);
     }
-    if (!pid_alive(pid)) return .stopped;
-    if (!controlSocketExists(io, paths.control_socket_path)) return .stopped;
-    return .timed_out;
 }
 
-fn waitForPidExit(pid: i64, timeout_ms: u64, pid_alive: PidAliveFn) MonitorStopResult {
-    const start = monotonicMs();
-    while (monotonicMs() - start < timeout_ms) {
-        if (!pid_alive(pid)) return .stopped;
-        sleepMs(20);
-    }
-    if (!pid_alive(pid)) return .stopped;
-    return .timed_out;
-}
-
-fn controlSocketExists(io: Io, path: []const u8) bool {
-    _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return true,
-    };
-    return true;
+/// Deletes an entry while holding its lock, so no prober or claimer sees a
+/// half-deleted entry as live.
+fn deleteLocked(io: Io, paths: Paths, lock: Io.File) !void {
+    defer lock.close(io);
+    try deleteVmState(io, paths);
 }
 
 fn signalMonitorProcessGroup(pid: i64, signal: std.posix.SIG) void {
@@ -5914,107 +5903,193 @@ test "save validates annotations before touching runtime state" {
     }));
 }
 
-test "lifecycle specs with the removed memory policy are stale and removable" {
+test "lifecycle liveness follows the lock holder, not its spec or pid" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"/tmp/sporevm-test-lifecycle-old-memory-policy"});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
     defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
     const paths = try pathsFromRoot(allocator, root, "old-1");
     defer paths.deinit(allocator);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, root);
+    const context = Context{ .io = io, .environ_map = &env };
 
-    try writeSpec(allocator, io, paths, .{ .name = "old-1" });
+    // A sleeper holding the lock on stdin stands in for the monitor.
+    var claim = try vm_registry.claim(io, paths);
+    var monitor = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .{ .file = claim.lock }, .pgid = 0 });
+    defer if (monitor.id != null) monitor.kill(io);
+    claim.release(io);
+    const monitor_pid: i64 = monitor.id.?;
+    try std.testing.expectEqual(VmState.starting, try vm_registry.probe(io, paths));
+    try std.testing.expectError(error.NamedVmExists, vm_registry.claim(io, paths));
+
+    // A spec this build cannot read does not make a live VM stale.
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = paths.spec_path,
         .data = "{\"name\":\"old-1\",\"memory\":{\"policy\":\"auto\",\"bytes\":17179869184}}",
     });
     try std.testing.expectError(error.UnknownField, readSpec(allocator, io, paths));
-
-    // The monitor that wrote this spec may still be running. A sleeper in its
-    // own process group stands in for it; a thread reaps it once it exits.
-    const Reaper = struct {
-        fn run(child: *std.process.Child, child_io: Io, term: *?std.process.Child.Term) void {
-            term.* = child.wait(child_io) catch null;
-        }
-    };
-    var monitor = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .ignore, .pgid = 0 });
-    const monitor_pid: i64 = monitor.id.?;
-    var monitor_term: ?std.process.Child.Term = null;
-    const reaper = std.Thread.spawn(.{}, Reaper.run, .{ &monitor, io, &monitor_term }) catch |err| {
-        monitor.kill(io);
-        return err;
-    };
-    var reaped = false;
-    defer if (!reaped) {
-        signalMonitorProcessGroup(monitor_pid, .KILL);
-        reaper.join();
-    };
-    try writeReady(allocator, io, paths, .{
-        .pid = monitor_pid,
-        .control_socket_path = paths.control_socket_path,
-        .console_log_path = paths.console_log_path,
-    });
     try writePid(allocator, io, paths, monitor_pid);
-    try std.testing.expectEqual(VmState.stale, try classifyVmState(allocator, io, paths, pidAlive));
+    try writeReady(allocator, io, paths, .{ .pid = monitor_pid, .control_socket_path = paths.control_socket_path });
+    try std.testing.expectEqual(VmState.ready, try vm_registry.probe(io, paths));
 
+    // `rm` stops a live holder with no control socket by signal.
+    const removed = try removeNamed(context, allocator, .{ .name = "old-1" });
+    defer deinitNamedLifecycleResult(allocator, removed);
+    try std.testing.expectEqual(monitor_pid, removed.pid.?);
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, try monitor.wait(io));
+    try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, paths));
+
+    // A holder killed outright leaves a stale entry that `rm` deletes and
+    // the name can be claimed again.
+    var second_claim = try vm_registry.claim(io, paths);
+    var second = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "30" }, .stdin = .{ .file = second_claim.lock }, .pgid = 0 });
+    defer if (second.id != null) second.kill(io);
+    second_claim.release(io);
+    try writePid(allocator, io, paths, second.id.?);
+    try writeReady(allocator, io, paths, .{ .pid = second.id.?, .control_socket_path = paths.control_socket_path });
+    try std.testing.expectEqual(VmState.ready, try vm_registry.probe(io, paths));
+    try std.posix.kill(second.id.?, .KILL);
+    _ = try second.wait(io);
+    try std.testing.expectEqual(VmState.stale, try vm_registry.probe(io, paths));
+    const stale_removed = try removeNamed(context, allocator, .{ .name = "old-1" });
+    defer deinitNamedLifecycleResult(allocator, stale_removed);
+    try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, paths));
+    var reclaimed = try vm_registry.claim(io, paths);
+    reclaimed.abandon(io, paths);
+}
+
+test "lifecycle lists a VM nobody holds as stale even when its pid is alive" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "reused-pid");
+    defer paths.deinit(allocator);
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put(runtime_dir_env, root);
-    const removed = try removeNamed(.{ .io = io, .environ_map = &env }, allocator, .{ .name = "old-1" });
-    defer deinitNamedLifecycleResult(allocator, removed);
-    try std.testing.expectEqual(monitor_pid, removed.pid.?);
-    try std.testing.expect(!pidAlive(monitor_pid));
-    reaper.join();
-    reaped = true;
-    try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, monitor_term.?);
-    try std.testing.expectEqual(VmState.absent, try classifyVmState(allocator, io, paths, alwaysAlive));
+
+    // The dead monitor's pid now names a live process of another user, so
+    // kill(pid, 0) fails with EPERM.
+    try ensureDirPath(io, paths.vm_dir);
+    try writeSpec(allocator, io, paths, .{ .name = "reused-pid" });
+    try writeReady(allocator, io, paths, .{ .pid = 1, .control_socket_path = paths.control_socket_path });
+    try writePid(allocator, io, paths, 1);
+    const entries = try listNamed(.{ .io = io, .environ_map = &env }, allocator, .{});
+    defer freeListEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("stale", entries[0].state);
 }
 
-test "durable lifecycle metadata drops transient disk fork claims" {
+test "lifecycle rm of a starting VM is busy" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "zig-cache/test-lifecycle-transient-disk-fork-claim";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "starting-1");
+    defer paths.deinit(allocator);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, root);
+
+    // The claimer holds the lock and has not started a monitor, so there is
+    // no pid to stop.
+    var claim = try vm_registry.claim(io, paths);
+    defer claim.abandon(io, paths);
+    clearLastError();
+    try std.testing.expectError(error.NamedVmBusy, removeNamed(.{ .io = io, .environ_map = &env }, allocator, .{ .name = "starting-1" }));
+    try std.testing.expect(std.mem.indexOf(u8, lastErrorMessage(), "still starting") != null);
+    try std.testing.expectEqual(VmState.starting, try vm_registry.probe(io, paths));
+}
+
+test "lifecycle fork claims every child name before contacting the source and releases them on failure" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(runtime_dir_env, root);
+
+    const source_spec = Spec{ .name = "source", .backend = "auto" };
+    rejectX86NamedPersistence(source_spec) catch return error.SkipZigTest;
+    // A live source whose control socket does not exist: any request to it
+    // would fail the fork with a different error.
+    const source = try pathsFromRoot(allocator, root, "source");
+    defer source.deinit(allocator);
+    var source_claim = try vm_registry.claim(io, source);
+    defer source_claim.abandon(io, source);
+    try writeSpec(allocator, io, source, source_spec);
+    try writeReady(allocator, io, source, .{ .pid = currentTestPid(), .control_socket_path = source.control_socket_path });
+
+    const taken = try pathsFromRoot(allocator, root, "worker-1");
+    defer taken.deinit(allocator);
+    var taken_claim = try vm_registry.claim(io, taken);
+    defer taken_claim.abandon(io, taken);
+    const taken_spec = "{\"name\":\"worker-1\",\"timeout_ms\":1234}";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = taken.spec_path, .data = taken_spec });
+    try writeReady(allocator, io, taken, .{ .pid = currentTestPid(), .control_socket_path = taken.control_socket_path });
+
+    try std.testing.expectError(error.NamedVmExists, forkNamed(.{
+        .minimal = undefined,
+        .arena = undefined,
+        .gpa = allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    }, allocator, .{
+        .source_name = "source",
+        .count = 2,
+        .name_pattern = "worker-%d",
+        .spore_executable = "/nonexistent/spore",
+    }));
+    const after = try Io.Dir.cwd().readFileAlloc(io, taken.spec_path, allocator, .limited(4096));
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(taken_spec, after);
+    const released = try pathsFromRoot(allocator, root, "worker-0");
+    defer released.deinit(allocator);
+    try std.testing.expectEqual(VmState.absent, try vm_registry.probe(io, released));
+}
+
+test "durable lifecycle metadata drops the live network policy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/test-lifecycle-live-network-policy";
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     try Io.Dir.cwd().createDirPath(io, dir);
     try std.testing.expect((try readSporeLifecycleSpec(allocator, io, dir)) == null);
 
-    const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     try writeSporeLifecycleSpec(allocator, io, dir, .{
         .name = "child",
-        .disk_baseline_lease = .{
-            .store = .rootfs_cache,
-            .root = "/cache",
-            .baseline_kind = .rootfs,
-            .baseline_identity = digest,
-        },
-        .disk_fork_claim = .{
-            .source_socket_path = "/tmp/source.sock",
-            .request = .{
-                .type = runtime_disk_claim.claim_type,
-                .schema = runtime_disk_claim.claim_schema,
-                .token = token,
-                .batch = "batch",
-                .child = "child",
-                .child_index = 0,
-                .baseline_kind = .rootfs,
-                .baseline_identity = digest,
-            },
-        },
+        .network = .{ .default_action = spore.network_default_deny },
+        .network_policy = "{\"default_deny\":true}",
     });
-
-    const bytes = try Io.Dir.cwd().readFileAlloc(
-        io,
-        dir ++ "/" ++ lifecycle_spore_metadata_file,
-        allocator,
-        .limited(max_metadata_bytes),
-    );
-    defer allocator.free(bytes);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, token) == null);
     var parsed = (try readSporeLifecycleSpec(allocator, io, dir)).?;
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.disk_fork_claim == null);
+    try std.testing.expect(parsed.value.network != null);
+    try std.testing.expect(parsed.value.network_policy == null);
 }
 
 test "named exec defaults are additive portable manifest metadata" {
@@ -6050,43 +6125,6 @@ test "named restore rejects every saved console host path authority" {
     for (saved_paths) |saved_path| {
         try std.testing.expectEqual(@as(?[]const u8, null), restoreConsoleLogPath(saved_path));
     }
-}
-
-test "lifecycle monitor stop distinguishes accepted socket close from pid exit" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-monitor-stop"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    const paths = try pathsFromRoot(allocator, root, "bench-1");
-    defer paths.deinit(allocator);
-
-    releaseControlSocketPath(io, paths) catch {};
-    Io.Dir.cwd().deleteFile(io, paths.control_socket_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    };
-    try ensureVmDir(io, paths);
-    try claimControlSocketPath(io, paths);
-    defer releaseControlSocketPath(io, paths) catch {};
-    const start = monotonicMs();
-    try std.testing.expectEqual(
-        MonitorStopResult.stopped,
-        waitForAcceptedMonitorStop(io, paths, 1234, 5_000, alwaysAlive),
-    );
-    try std.testing.expect(monotonicMs() -| start < 100);
-    try std.testing.expectEqual(
-        MonitorStopResult.timed_out,
-        waitForPidExit(1234, 15, alwaysAlive),
-    );
-
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.control_socket_path, .data = "" });
-    try std.testing.expectEqual(
-        MonitorStopResult.timed_out,
-        waitForAcceptedMonitorStop(io, paths, 1234, 15, alwaysAlive),
-    );
 }
 
 test "create parser separates initial and maximum memory" {
@@ -6503,19 +6541,6 @@ test "create cli keeps plain --net unrestricted and exact rules deny by default"
     try std.testing.expectEqualStrings("github.com", exact_config.policy.exact_rules[0].host);
 }
 
-test "lifecycle monitor policy from a recorded network keeps default deny" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const policy = try monitorNetworkPolicy(arena, .{ .default_action = spore.network_default_deny }, null);
-    try std.testing.expect(policy.default_deny);
-    try std.testing.expect(!policy.hasBoundServices());
-    try std.testing.expectError(error.UnsupportedBoundServiceRestore, monitorNetworkPolicy(arena, .{
-        .bound_services = &.{.{ .name = "metadata", .guest_host = "metadata.spore.internal", .guest_port = 80 }},
-    }, null));
-}
-
 test "new output dirs resolve to absolute paths" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -6913,7 +6938,7 @@ test "lifecycle list entries sorts and classifies VM directories" {
     defer allocator.free(root);
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
 
-    const empty = try listEntries(allocator, io, root, alwaysDead);
+    const empty = try listEntries(allocator, io, root);
     defer freeListEntries(allocator, empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
@@ -6925,6 +6950,8 @@ test "lifecycle list entries sorts and classifies VM directories" {
     const stale_backing_path = try std.fs.path.resolve(allocator, &.{ stale_spore_dir, spore.ram_backing_path });
     defer allocator.free(stale_backing_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_backing_path, .data = "backing-bytes" });
+    var stale_claim = try vm_registry.claim(io, stale);
+    stale_claim.release(io);
     try writeSpec(allocator, io, stale, .{
         .name = "b-stale",
         .resume_dir = stale_spore_dir,
@@ -6940,6 +6967,8 @@ test "lifecycle list entries sorts and classifies VM directories" {
     const ready = try pathsFromRoot(allocator, root, "a-ready");
     defer ready.deinit(allocator);
     const ready_pid = currentTestPid();
+    var ready_claim = try vm_registry.claim(io, ready);
+    defer ready_claim.release(io);
     try writeSpec(allocator, io, ready, .{
         .name = "a-ready",
         .memory = .{ .initial_bytes = 512 * 1024 * 1024, .maximum_bytes = 16 * 1024 * 1024 * 1024 },
@@ -6955,7 +6984,7 @@ test "lifecycle list entries sorts and classifies VM directories" {
         .dirty_chunks_pending = 2,
     });
 
-    const entries = try listEntries(allocator, io, root, aliveOnlyCurrentProcess);
+    const entries = try listEntries(allocator, io, root);
     defer freeListEntries(allocator, entries);
     try std.testing.expectEqual(@as(usize, 2), entries.len);
     try std.testing.expectEqualStrings("a-ready", entries[0].name);
@@ -7171,20 +7200,8 @@ test "linux statm resident parser reads resident pages" {
     try std.testing.expectError(error.InvalidProcessStat, linuxStatmResidentBytes("99\n", 4096));
 }
 
-fn alwaysDead(_: i64) bool {
-    return false;
-}
-
-fn alwaysAlive(_: i64) bool {
-    return true;
-}
-
 fn currentTestPid() i64 {
     return if (comptime builtin.os.tag == .windows) 1 else @intCast(std.c.getpid());
-}
-
-fn aliveOnlyCurrentProcess(pid: i64) bool {
-    return pid == currentTestPid();
 }
 
 test "save recognizes the monitor's refusal of a store-backed root disk" {

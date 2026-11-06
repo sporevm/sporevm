@@ -25,6 +25,17 @@ command's output through files in `/tmp` and kept none of it for replay, is
 gone: `spore attach` of a spore saved while that command ran replays its
 output from the start.
 
+### Named VM liveness
+
+A named VM is live exactly while its monitor holds `vms/<name>/lock`. The
+recorded pid is no longer consulted, so a reused pid cannot keep a dead VM
+`ready`, and `spore ls` shows `starting` where it showed `incomplete`.
+`create`, `restore --name` and `vm fork` claim the name atomically, so a
+racing create or fork can no longer overwrite a live VM's state, and fork
+checks every child name before it pauses the source. Stop named VMs before
+upgrading: a monitor from an earlier build does not take the lock, so its
+entry shows as stale, and `spore vm rm` removes it.
+
 ### Lazy images from a store
 
 `spore image push local/app:1 /srv/images/app` writes a static image store
@@ -50,8 +61,7 @@ private to the current user and fails early if `SPOREVM_RUNTIME_DIR` is not.
 Old local formats have no readers. `spore host-info` reports only
 `spore.host-info.v3`, including on arm64. A named VM whose spec still has the
 removed memory `policy`, or a writable disk with the removed `layers` field
-from an earlier build, is stale; `spore vm rm` stops its monitor if it is still
-running and removes it. `cache gc` deletes step records from every older
+from an earlier build, is stale; `spore vm rm` removes it. `cache gc` deletes step records from every older
 builder version (`sporevm-build-v0` to `v8`) instead of keeping them as roots.
 GC treated v0 to v5 records as unknown and kept every CAS entry, so on a cache
 that holds them the first GC now runs a real sweep. JSON output advances to

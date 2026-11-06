@@ -264,6 +264,28 @@ fi
   die "source exec after fork wrote unexpected stdout"
 }
 
+# A live name cannot be claimed again: create fails, and fork fails before it
+# pauses the source, leaving the existing VM's spec untouched.
+worker0_spec="${runtime_dir}/vms/${worker0}/spec.json"
+worker0_spec_before="$(cksum <"${worker0_spec}")"
+if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${vm_name}" \
+  --backend "${backend}" --memory "${smoke_memory}" >/dev/null 2>"${workdir}/create-existing.stderr"; then
+  die "spore create of an existing name unexpectedly succeeded"
+fi
+grep -Fq "already exists" "${workdir}/create-existing.stderr" || {
+  cat "${workdir}/create-existing.stderr" >&2 || true
+  die "spore create of an existing name did not report it"
+}
+if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" fork --vm "${vm_name}" --count 1 --name "${worker0}" \
+  >/dev/null 2>"${workdir}/fork-existing.stderr"; then
+  die "spore fork onto an existing name unexpectedly succeeded"
+fi
+grep -Fq "already exists" "${workdir}/fork-existing.stderr" || {
+  cat "${workdir}/fork-existing.stderr" >&2 || true
+  die "spore fork onto an existing name did not report it"
+}
+[[ "$(cksum <"${worker0_spec}")" == "${worker0_spec_before}" ]] || die "spore fork rewrote the existing VM's spec"
+
 if run_capture "${worker0_stdout}" "${worker0_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
   "${spore_bin}" exec "${worker0}" -- /bin/writeout; then
