@@ -74,16 +74,6 @@ pub const RuntimeDisk = struct {
         return null;
     }
 
-    /// Clones the live writable head without sealing a durable disk index.
-    /// The VMM remains responsible for pausing vCPUs and draining virtio-blk.
-    pub fn exportForkHead(
-        self: *RuntimeDisk,
-        options: chunk_mapped_disk.ExportForkOptions,
-    ) !runtime_disk_fork.Head {
-        const disk = if (self.chunk_mapped) |*value| value else return error.ReadOnly;
-        return disk.exportForkHead(try self.forkBaseline(), options);
-    }
-
     /// Adopts a claimed head only after this runtime has independently opened
     /// the exact immutable baseline named by the descriptor.
     pub fn adoptForkHead(self: *RuntimeDisk, head: *runtime_disk_fork.Head) !void {
@@ -870,7 +860,7 @@ test "runtime disk exports and adopts a portable fork head" {
     const parent_patch = [_]u8{0xA5} ** 97;
     try parent.chunk_mapped.?.writeAt(&parent_patch, spore.disk_chunk_size - 17);
     try parent.chunk_mapped.?.markZeroChunk(2);
-    var head = try parent.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    var head = try parent.snapshot().?.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
     defer head.deinit();
     const parent_overlay_fd = parent.overlay.?.fd;
     const replaced_child_fd = child.overlay.?.fd;
@@ -896,7 +886,7 @@ test "runtime disk exports and adopts a portable fork head" {
     try parent.chunk_mapped.?.readAt(readback[0..5], spore.disk_chunk_size + 1024);
     try std.testing.expectEqualSlices(u8, rootfs_bytes[spore.disk_chunk_size + 1024 ..][0..5], readback[0..5]);
 
-    var mismatched = try parent.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    var mismatched = try parent.snapshot().?.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
     defer mismatched.deinit();
     const mutable_identity = @constCast(mismatched.descriptor.baseline.identity);
     mutable_identity[mutable_identity.len - 1] = if (mutable_identity[mutable_identity.len - 1] == 'a') 'b' else 'a';
