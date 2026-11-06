@@ -2093,6 +2093,12 @@ fn invokedWithDebug(init: std.process.Init, allocator: std.mem.Allocator) !bool 
     return false;
 }
 
+/// Guest diagnostics during a copy go to stderr, escaped. With --json they
+/// are dropped so stderr carries at most the spore.error.v1 document.
+fn copyGuestStderrFd(mode: machine_output.Mode) std.c.fd_t {
+    return if (mode == .json) -1 else 2;
+}
+
 pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
     if (wantsHelp(args)) {
         try stdout.writeAll(copy_in_usage);
@@ -2121,7 +2127,12 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     const exit_code = copyNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
-    }, allocator, parsed, "copy-in-v1", .{ .input_fd = source_fd }) catch |err| switch (err) {
+    }, allocator, parsed, "copy-in-v1", .{
+        .input_fd = source_fd,
+        // Guest stdout is dropped during copy-in, so there is no archive to cap.
+        .archive_limit = std.math.maxInt(u64),
+        .stderr_fd = copyGuestStderrFd(mode),
+    }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
             if (mode == .json) return err;
             archive.deinit(init.io);
@@ -2198,7 +2209,10 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
     const exit_code = copyNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
-    }, allocator, parsed, "copy-out-v1", .{ .stdout_fd = archive_fd }) catch |err| switch (err) {
+    }, allocator, parsed, "copy-out-v1", .{
+        .archive_fd = archive_fd,
+        .stderr_fd = copyGuestStderrFd(mode),
+    }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
             if (mode == .json) return err;
             archive.deinit(init.io);
@@ -2222,6 +2236,11 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
             } else {
                 std.debug.print("spore copy-out: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
             }
+            exitAfterCopyArchiveCleanup(&archive, init.io, 1);
+        },
+        error.CopyArchiveTooLarge => {
+            if (mode == .json) return err;
+            std.debug.print("spore copy-out: guest archive exceeds the {d} GiB copy-out limit\n", .{named_copy_archive.max_archive_bytes >> 30});
             exitAfterCopyArchiveCleanup(&archive, init.io, 1);
         },
         else => |e| return e,
@@ -4659,8 +4678,10 @@ fn copyStreamControl(
         .interactive = std.mem.eql(u8, request_type, "copy-in-v1"),
         .tty = false,
         .input_fd = fds.input_fd,
-        .stdout_fd = fds.stdout_fd,
+        .stdout_fd = fds.archive_fd,
+        .stdout_limit = fds.archive_limit,
         .stderr_fd = fds.stderr_fd,
+        .escape_stderr = true,
     };
     return pump.run();
 }
@@ -4870,10 +4891,16 @@ fn monitorHelloMismatch(hello: MonitorHelloResponse, spore_executable_path: ?[]c
     return error.MonitorVersionMismatch;
 }
 
+/// Where a copy stream's bytes go. Guest stdout is the copy-out archive and
+/// is dropped during copy-in, so guest bytes never reach the CLI's stdout.
 const CopyStreamFds = struct {
-    input_fd: std.c.fd_t = 0,
-    stdout_fd: std.c.fd_t = 1,
-    stderr_fd: std.c.fd_t = 2,
+    /// The copy-in archive sent to the guest.
+    input_fd: std.c.fd_t = -1,
+    /// Receives the copy-out archive.
+    archive_fd: std.c.fd_t = -1,
+    archive_limit: u64 = named_copy_archive.max_archive_bytes,
+    /// Receives guest diagnostics with control bytes escaped; -1 drops them.
+    stderr_fd: std.c.fd_t = -1,
 };
 
 const ExecStreamPump = struct {
@@ -4883,6 +4910,9 @@ const ExecStreamPump = struct {
     input_fd: std.c.fd_t = 0,
     stdout_fd: std.c.fd_t = 1,
     stderr_fd: std.c.fd_t = 2,
+    stdout_limit: u64 = std.math.maxInt(u64),
+    stdout_bytes: u64 = 0,
+    escape_stderr: bool = false,
     stdin_closed: bool = false,
     resize_seen: u32 = 0,
 
@@ -4920,11 +4950,18 @@ const ExecStreamPump = struct {
     fn readOutputFrame(self: *ExecStreamPump) !?u8 {
         switch (try self.stream.next()) {
             .stdout, .terminal => |bytes| {
+                self.stdout_bytes += bytes.len;
+                if (self.stdout_bytes > self.stdout_limit) return error.CopyArchiveTooLarge;
                 if (self.stdout_fd >= 0) try writeFdAll(self.stdout_fd, bytes);
                 return null;
             },
             .stderr => |bytes| {
-                if (self.stderr_fd >= 0) try writeFdAll(self.stderr_fd, bytes);
+                if (self.stderr_fd < 0) return null;
+                if (self.escape_stderr) {
+                    try writeEscapedFd(self.stderr_fd, bytes);
+                } else {
+                    try writeFdAll(self.stderr_fd, bytes);
+                }
                 return null;
             },
             .exit => |code| return code,
@@ -4974,6 +5011,136 @@ const ExecStreamPump = struct {
         try self.stream.resizeTerminal(terminalSizeOrDefault(terminalSizeFd()));
     }
 };
+
+/// Answers one hello, then one copy request with `frames`, then drains the
+/// client until it hangs up.
+const FakeCopyMonitor = struct {
+    io: Io,
+    server: net.Server,
+    frames: []const u8,
+
+    fn main(fake: *FakeCopyMonitor) void {
+        fake.serve() catch {};
+    }
+
+    fn serve(fake: *FakeCopyMonitor) !void {
+        const io = fake.io;
+        var line_buffer: [512]u8 = undefined;
+        {
+            var hello = try fake.server.accept(io);
+            defer hello.close(io);
+            var reader = hello.reader(io, &line_buffer);
+            _ = try reader.interface.takeDelimiterExclusive('\n');
+            try writeAll(io, hello, std.fmt.comptimePrint(
+                "{{\"type\":\"hello\",\"schema\":\"{s}\",\"spore_version\":\"{s}\",\"helper_contract\":{d}}}\n",
+                .{ monitor_hello_schema, version.value, monitor_helper_contract },
+            ));
+        }
+        var copy = try fake.server.accept(io);
+        defer copy.close(io);
+        var reader = copy.reader(io, &line_buffer);
+        _ = try reader.interface.takeDelimiterExclusive('\n');
+        try writeAll(io, copy, fake.frames);
+        _ = reader.interface.discardRemaining() catch {};
+    }
+};
+
+fn appendTestFrame(w: *Io.Writer, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, offset: u64, payload: []const u8) !void {
+    var buf: [spore_stream.max_frame_len]u8 = undefined;
+    try w.writeAll(try spore_stream.writeFrame(&buf, .{ .frame_type = frame_type, .stream_id = stream_id, .offset = offset }, payload));
+}
+
+/// Runs one copy stream against a fake monitor that sends `frames`.
+fn copyStreamAgainstFrames(request_type: []const u8, frames: []const u8, fds: CopyStreamFds) !u8 {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const socket_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/m.sock", .{tmp.sub_path});
+    defer allocator.free(socket_path);
+    const address = try net.UnixAddress.init(socket_path);
+    var fake = FakeCopyMonitor{ .io = io, .server = try address.listen(io, .{ .kernel_backlog = 2 }), .frames = frames };
+    defer fake.server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, FakeCopyMonitor.main, .{&fake});
+    defer thread.join();
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    return copyStreamControl(.{ .io = io, .environ_map = &env }, allocator, socket_path, request_type, "/tmp/guest", fds);
+}
+
+fn readPipeToEnd(fd: std.c.fd_t, buf: []u8) ![]const u8 {
+    var len: usize = 0;
+    while (true) {
+        if (len == buf.len) return error.NoSpaceLeft;
+        const n = std.c.read(fd, buf[len..].ptr, buf.len - len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) return buf[0..len];
+        len += @intCast(n);
+    }
+}
+
+test "copy-in drops guest stdout and escapes guest stderr" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var frames_buf: [256]u8 = undefined;
+    var frames: Io.Writer = .fixed(&frames_buf);
+    // A hostile guest tries to print a result before the CLI's own JSON and
+    // to retitle the terminal.
+    try appendTestFrame(&frames, .data, .stdout, 0, "{\"schema\":\"spore.copy.result.v1\"}\n");
+    try appendTestFrame(&frames, .data, .stderr, 0, "\x1b]0;owned\x07denied\r\n");
+    try appendTestFrame(&frames, .exit, .control, 0, &.{ 0, 0, 0, 0 });
+
+    var input: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&input));
+    defer _ = std.c.close(input[0]);
+    _ = std.c.close(input[1]);
+    var stdout_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&stdout_pipe));
+    defer _ = std.c.close(stdout_pipe[0]);
+    var stderr_pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&stderr_pipe));
+    defer _ = std.c.close(stderr_pipe[0]);
+
+    // Capture this process's stdout for the length of the copy.
+    const saved_stdout = std.c.dup(1);
+    try std.testing.expect(saved_stdout >= 0);
+    try std.testing.expect(std.c.dup2(stdout_pipe[1], 1) == 1);
+    const result = copyStreamAgainstFrames("copy-in-v1", frames.buffered(), .{
+        .input_fd = input[0],
+        .stderr_fd = stderr_pipe[1],
+    });
+    _ = std.c.dup2(saved_stdout, 1);
+    _ = std.c.close(saved_stdout);
+    _ = std.c.close(stdout_pipe[1]);
+    _ = std.c.close(stderr_pipe[1]);
+    try std.testing.expectEqual(0, try result);
+
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("", try readPipeToEnd(stdout_pipe[0], &buf));
+    try std.testing.expectEqualStrings("\\x1b]0;owned\\x07denied\\x0d\n", try readPipeToEnd(stderr_pipe[0], &buf));
+}
+
+test "copy-out refuses an archive over its limit" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var frames_buf: [256]u8 = undefined;
+    var frames: Io.Writer = .fixed(&frames_buf);
+    try appendTestFrame(&frames, .data, .stdout, 0, "12345678");
+    try appendTestFrame(&frames, .data, .stdout, 8, "9");
+    try appendTestFrame(&frames, .exit, .control, 0, &.{ 0, 0, 0, 0 });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var archive = try tmp.dir.createFile(io, "payload.spcp", .{});
+    defer archive.close(io);
+    try std.testing.expectError(error.CopyArchiveTooLarge, copyStreamAgainstFrames("copy-out-v1", frames.buffered(), .{
+        .archive_fd = archive.handle,
+        .archive_limit = 8,
+    }));
+    try std.testing.expectEqual(8, (try archive.stat(io)).size);
+}
 
 const ExecRawTerminal = struct {
     saved: std.c.termios,
@@ -5223,6 +5390,27 @@ fn readFdExact(fd: std.c.fd_t, buf: []u8) !void {
         if (n == 0) return error.MonitorUnavailable;
         remaining = remaining[@intCast(n)..];
     }
+}
+
+/// Writes guest text with every byte other than printable ASCII, tab, and
+/// newline shown as `\xNN`, so the guest cannot send terminal escapes.
+fn writeEscapedFd(fd: std.c.fd_t, bytes: []const u8) !void {
+    var buf: [1024]u8 = undefined;
+    var len: usize = 0;
+    for (bytes) |byte| {
+        if (len + 4 > buf.len) {
+            try writeFdAll(fd, buf[0..len]);
+            len = 0;
+        }
+        if ((byte >= 0x20 and byte < 0x7f) or byte == '\n' or byte == '\t') {
+            buf[len] = byte;
+            len += 1;
+        } else {
+            _ = std.fmt.bufPrint(buf[len..][0..4], "\\x{x:0>2}", .{byte}) catch unreachable;
+            len += 4;
+        }
+    }
+    try writeFdAll(fd, buf[0..len]);
 }
 
 fn writeFdAll(fd: std.c.fd_t, bytes: []const u8) !void {

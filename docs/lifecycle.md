@@ -502,7 +502,8 @@ spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
   with process status, optional exit code, bytes, and truncation flags.
 - `spore copy-in` and `spore copy-out` transfer explicit regular files or
   directory trees. Symlinks, special files, overwrite, and workspace sync are
-  intentionally outside this primitive.
+  intentionally outside this primitive. `copy-out` accepts at most 4 GiB of
+  archive from the guest, and extracted modes pass through the host umask.
 - `spore attach` connects to saved sessions in spores. Attaching to an
   already-running named VM remains outside the public CLI surface.
 - Named live fork accepts at most 32 children and one writable rootfs disk.
