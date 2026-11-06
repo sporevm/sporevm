@@ -44,7 +44,7 @@ const stats_write_interval_ms = 250;
 const registry_check_interval_ms = 1_000;
 /// Guest operations run on handler threads, at most the listen backlog.
 const max_control_handlers = 8;
-/// A client must send its request line this soon after connecting.
+/// A client must send its whole request line this soon after connecting.
 const control_request_timeout_ms = 1_000;
 const control_accept_poll_ms = 100;
 const control_queue_poll_ms = 10;
@@ -629,11 +629,9 @@ const ExecServer = struct {
             return .stop;
         }
         if (self.stopping) |message| {
+            // A capture runs inside the VM loop, so none is under way here.
             self.stopLocked(message);
-            switch (self.state) {
-                .active_suspend, .active_snapshot, .active_disk_fork => {},
-                else => return .stop,
-            }
+            return .stop;
         }
         _ = self.disk_claims.expire(monotonicNs());
 
@@ -801,11 +799,12 @@ const ExecServer = struct {
         return std.heap.page_allocator.dupe(u8, self.response[0..self.response_len]);
     }
 
-    fn submitExec(self: *ExecServer, request: []const u8) ![]const u8 {
+    fn submitExec(self: *ExecServer, request: []const u8, session_sequence: u64) ![]const u8 {
         if (request.len > self.request.len) return error.ControlRequestTooLarge;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.acquireOpLocked();
+        self.active_session_sequence = session_sequence;
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
         self.response_len = 0;
@@ -824,12 +823,13 @@ const ExecServer = struct {
         return self.takeResponseLocked();
     }
 
-    fn submitStreamingExec(self: *ExecServer, request: []const u8, client_fd: std.c.fd_t, timing_enabled: bool) !void {
+    fn submitStreamingExec(self: *ExecServer, request: []const u8, session_sequence: u64, client_fd: std.c.fd_t, timing_enabled: bool) !void {
         if (request.len > self.request.len) return error.ControlRequestTooLarge;
         try setStreamingSendDeadline(client_fd);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.acquireOpLocked();
+        self.active_session_sequence = session_sequence;
         self.stream_input_stop.store(false, .release);
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
@@ -877,9 +877,9 @@ const ExecServer = struct {
         return @intCast(ns);
     }
 
-    fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, tty: bool, terminal_size: spore_stream.Resize) ![]const u8 {
+    fn interactiveExecRequest(self: *ExecServer, session_sequence: *u64, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, tty: bool, terminal_size: spore_stream.Resize) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try self.nextSessionId(&id_buf);
+        const session_id = try self.nextSessionId(&id_buf, session_sequence);
         var merged_env: [run.max_guest_envc][]const u8 = undefined;
         const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
         return run.interactiveExecRequestWithSession(self.allocator, argv, session_id, .{
@@ -892,9 +892,9 @@ const ExecServer = struct {
         });
     }
 
-    fn detachedExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
+    fn detachedExecRequest(self: *ExecServer, session_sequence: *u64, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try self.nextSessionId(&id_buf);
+        const session_id = try self.nextSessionId(&id_buf, session_sequence);
         var merged_env: [run.max_guest_envc][]const u8 = undefined;
         const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
         return run.detachedExecRequestWithSessionContext(self.allocator, argv, session_id, .{
@@ -905,9 +905,9 @@ const ExecServer = struct {
         });
     }
 
-    fn copyRequest(self: *ExecServer, request_type: []const u8, path: []const u8) ![]const u8 {
+    fn copyRequest(self: *ExecServer, session_sequence: *u64, request_type: []const u8, path: []const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try self.nextSessionId(&id_buf);
+        const session_id = try self.nextSessionId(&id_buf, session_sequence);
         const payload = struct {
             type: []const u8,
             session_id: []const u8,
@@ -922,11 +922,13 @@ const ExecServer = struct {
         return std.fmt.allocPrint(self.allocator, "{s}\n", .{json});
     }
 
-    fn nextSessionId(self: *ExecServer, buffer: *[64]u8) ![]const u8 {
+    /// Reserves the next session id. The submit functions record its
+    /// sequence for stream logging once the request takes the guest.
+    fn nextSessionId(self: *ExecServer, buffer: *[64]u8, sequence: *u64) ![]const u8 {
         // Handler threads build requests concurrently.
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.active_session_sequence = self.next_session_id;
+        sequence.* = self.next_session_id;
         const session_id = try formatSessionId(buffer, self.session_nonce, self.next_session_id);
         self.next_session_id +%= 1;
         if (self.next_session_id == 0) self.next_session_id = 1;
@@ -1670,18 +1672,6 @@ fn setStreamingSendDeadline(fd: std.c.fd_t) !void {
     }
 }
 
-/// Zero clears the timeout. Only reads through `std.c.read` may run on a
-/// socket with a timeout: std.Io treats EAGAIN as a bug.
-fn setReceiveTimeout(fd: std.c.fd_t, timeout_ms: u32) !void {
-    const timeout = std.c.timeval{
-        .sec = @intCast(timeout_ms / std.time.ms_per_s),
-        .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
-    };
-    if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &timeout, @sizeOf(std.c.timeval)) != 0) {
-        return error.MonitorUnavailable;
-    }
-}
-
 fn writeSpioFrameFd(fd: std.c.fd_t, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, offset: u64, payload: []const u8) c_int {
     var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
     const frame = encodeSpioFrame(&frame_buf, frame_type, stream_id, offset, payload) orelse return -1;
@@ -1731,13 +1721,14 @@ fn controlThreadMain(server: *ExecServer) void {
 }
 
 /// Answers the requests that need no guest as soon as the connection is
-/// accepted, so `hello`, `shutdown` and disk-fork claims never wait behind a
-/// guest operation. Returns true when a handler thread took the stream.
+/// accepted, so `hello`, `shutdown`, and disk-fork claims and cancels never
+/// wait behind a guest operation. Returns true when a handler thread took the
+/// stream.
 fn acceptControlClient(server: *ExecServer, stream: net.Stream) !bool {
     const fd = stream.socket.handle;
-    try setReceiveTimeout(fd, control_request_timeout_ms);
     var read_buffer: [max_control_request]u8 = undefined;
-    const line = readControlLineFd(fd, &read_buffer) catch |err| {
+    const deadline_ms = lifecycle.monotonicMs() +| control_request_timeout_ms;
+    const line = readControlLineFd(fd, &read_buffer, deadline_ms) catch |err| {
         const message = if (err == error.ControlRequestTooLarge)
             "control request exceeds 8191 bytes; shorten the guest command"
         else
@@ -1745,8 +1736,6 @@ fn acceptControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlError(server.io, stream, message);
         return false;
     };
-    // Handlers read exec and copy input for as long as the operation runs.
-    try setReceiveTimeout(fd, 0);
     var parsed = std.json.parseFromSlice(ControlRequest, server.allocator, line, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
@@ -1930,12 +1919,13 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json
             .rows = parsed.value.terminal_rows orelse 24,
             .cols = parsed.value.terminal_cols orelse 80,
         };
-        const request = server.interactiveExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, tty, terminal_size) catch |err| {
+        var session_sequence: u64 = 0;
+        const request = server.interactiveExecRequest(&session_sequence, argv, parsed.value.env orelse &.{}, parsed.value.working_dir, tty, terminal_size) catch |err| {
             try writeStreamingControlError(stream.socket.handle, guestCommandErrorMessage(err));
             return;
         };
         defer server.allocator.free(request);
-        server.submitStreamingExec(request, stream.socket.handle, true) catch |err| {
+        server.submitStreamingExec(request, session_sequence, stream.socket.handle, true) catch |err| {
             try writeStreamingControlError(stream.socket.handle, server.refusalMessage(err));
             return;
         };
@@ -1948,12 +1938,13 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json
             try writeStreamingControlError(stream.socket.handle, "copy request missing path");
             return;
         };
-        const request = server.copyRequest(parsed.value.type, path) catch {
+        var session_sequence: u64 = 0;
+        const request = server.copyRequest(&session_sequence, parsed.value.type, path) catch {
             try writeStreamingControlError(stream.socket.handle, "invalid copy request");
             return;
         };
         defer server.allocator.free(request);
-        server.submitStreamingExec(request, stream.socket.handle, false) catch |err| {
+        server.submitStreamingExec(request, session_sequence, stream.socket.handle, false) catch |err| {
             try writeStreamingControlError(stream.socket.handle, server.refusalMessage(err));
             return;
         };
@@ -1964,7 +1955,8 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json
         return;
     }
     if (std.mem.eql(u8, parsed.value.type, "initial-output")) {
-        const response = server.submitExec("{\"type\":\"initial-output\"}\n") catch |err| {
+        // The initial-output request carries no session id.
+        const response = server.submitExec("{\"type\":\"initial-output\"}\n", 0) catch |err| {
             try writeControlError(server.io, stream, server.refusalMessage(err));
             return;
         };
@@ -1980,12 +1972,13 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json
         try writeControlError(server.io, stream, "command request missing argv");
         return;
     };
-    const request = server.detachedExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
+    var session_sequence: u64 = 0;
+    const request = server.detachedExecRequest(&session_sequence, argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
         try writeControlError(server.io, stream, guestCommandErrorMessage(err));
         return;
     };
     defer server.allocator.free(request);
-    const response = server.submitExec(request) catch |err| {
+    const response = server.submitExec(request, session_sequence) catch |err| {
         try writeControlError(server.io, stream, server.refusalMessage(err));
         return;
     };
@@ -2006,9 +1999,16 @@ fn guestCommandErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-fn readControlLineFd(fd: std.c.fd_t, buffer: []u8) ![]const u8 {
+/// Reads one request line a byte at a time, so the stream frames that follow
+/// it stay unread. The whole line must arrive by `deadline_ms`.
+fn readControlLineFd(fd: std.c.fd_t, buffer: []u8, deadline_ms: u64) ![]const u8 {
     var len: usize = 0;
     while (len < buffer.len) {
+        const now = lifecycle.monotonicMs();
+        if (now >= deadline_ms) return error.ControlRequestTimedOut;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        const wait_ms: i32 = @intCast(@min(deadline_ms - now, std.math.maxInt(i32)));
+        if (try std.posix.poll(&fds, wait_ms) == 0) return error.ControlRequestTimedOut;
         var byte: [1]u8 = undefined;
         const n = std.c.read(fd, &byte, 1);
         if (n < 0) {
@@ -2399,18 +2399,18 @@ test "monitor records the exact generated request sequence for stream logging" {
     server.mutex = .init;
     server.session_nonce = 0x0123_4567_89ab_cdef;
     server.next_session_id = 41;
-    server.active_session_sequence = 0;
     var buffer: [64]u8 = undefined;
+    var sequence: u64 = 0;
 
-    const session_id = try server.nextSessionId(&buffer);
+    const session_id = try server.nextSessionId(&buffer, &sequence);
 
     try std.testing.expectEqualStrings("lifecycle-123456789abcdef-41", session_id);
-    try std.testing.expectEqual(@as(u64, 41), server.active_session_sequence);
+    try std.testing.expectEqual(@as(u64, 41), sequence);
     try std.testing.expectEqual(@as(u64, 42), server.next_session_id);
     var log_buffer: [160]u8 = undefined;
     try std.testing.expectEqualStrings(
         "monitor vsock stream start: kind=exec session_id=lifecycle-123456789abcdef-41 host_port=54321",
-        formatExecHostStreamStart(&log_buffer, server.session_nonce, server.active_session_sequence, 54321),
+        formatExecHostStreamStart(&log_buffer, server.session_nonce, sequence, 54321),
     );
 }
 
@@ -2424,7 +2424,8 @@ test "streaming named exec carries the restored generation" {
     server.session_nonce = 1;
     server.next_session_id = 1;
 
-    const request = try server.interactiveExecRequest(&.{"/bin/gencheck"}, &.{}, null, false, .{ .rows = 24, .cols = 80 });
+    var sequence: u64 = 0;
+    const request = try server.interactiveExecRequest(&sequence, &.{"/bin/gencheck"}, &.{}, null, false, .{ .rows = 24, .cols = 80 });
     defer std.testing.allocator.free(request);
     const parsed = try std.json.parseFromSlice(struct { params_json: []const u8 }, std.testing.allocator, request, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -3184,4 +3185,44 @@ test "monitor answers hello and shutdown while a guest operation runs" {
     stopped = true;
     server.stopControl(accept_thread, "test finished");
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, socket_path, .{}));
+}
+
+test "monitor gives a slow client one deadline for its whole request line" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-trickle-{d}.sock", .{std.c.getpid()});
+    var server = try ExecServer.init(allocator, io, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", "/nonexistent", 10700, 1_000, null, .{});
+    defer server.disk_claims.deinit();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    defer server.stopControl(accept_thread, "test finished");
+
+    // The client sends one byte of its request line every 200 ms, so each
+    // read is quick but the line would take seconds.
+    const Trickler = struct {
+        fn run(fd: std.c.fd_t) void {
+            for (0..25) |_| {
+                if (std.c.send(fd, "{", 1, std.c.MSG.NOSIGNAL) != 1) return;
+                var ts = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+    };
+    const slow = try TestControlClient.connect(socket_path);
+    defer slow.close();
+    const trickler = try std.Thread.spawn(.{}, Trickler.run, .{slow.fd});
+    defer trickler.join();
+    // Let the accept thread take the slow client first.
+    var ts = std.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ts, null);
+
+    const started_ms = lifecycle.monotonicMs();
+    var buffer: [512]u8 = undefined;
+    const hello = try TestControlClient.call(socket_path, "{\"type\":\"hello\"}\n", &buffer, 3_000);
+    try std.testing.expect(std.mem.startsWith(u8, hello, "{\"type\":\"hello\""));
+    try std.testing.expect(lifecycle.monotonicMs() - started_ms < 2 * control_request_timeout_ms);
+
+    const refused = try slow.readLine(&buffer, 1_000);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"bad control request\"}", refused);
 }

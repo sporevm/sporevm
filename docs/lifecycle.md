@@ -432,7 +432,8 @@ Networked named live fork remains unsupported.
 The monitor protocol is local-only and protected by private runtime-directory
 permissions. There is no TCP control socket and no central `spore daemon`.
 Unknown monitor request types fail closed. The monitor answers `hello`,
-`shutdown`, and disk-fork claims as soon as it accepts the connection. Guest
+`shutdown`, and disk-fork claims and cancels as soon as it accepts the
+connection. Guest
 operations (exec, copy, logs, save, fork) take turns: each waits for the
 running one for up to the VM timeout and then fails as busy, and at most eight
 run or wait at once. `spore rm` stops a VM even while an exec runs; that exec
