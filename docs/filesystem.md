@@ -270,7 +270,7 @@ rootfs descriptor and disk index use the grown logical size; the immutable
 source index remains unchanged.
 
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
-`spore create --rootfs PATH` records exact immutable rootfs identity in the
+`spore vm create --rootfs PATH` records exact immutable rootfs identity in the
 digest cache, so lifecycle saves can restore through the fd-backed rootfs
 path. Combining one-shot `spore run --rootfs PATH` with `--save` is rejected
 until an import path can record chunked portable rootfs identity for arbitrary
@@ -369,9 +369,9 @@ first read and then use the same hot `.base` path as a materialized image.
 
 ## Distribution
 
-`spore push` copies a save's manifest, RAM chunks, disk index, and disk objects
+`spore checkpoint push` copies a save's manifest, RAM chunks, disk index, and disk objects
 to an [image store](image-format.md#spores), verifying each against its BLAKE3
-digest, and `spore pull` writes them back as a save pinned in the receiving
+digest, and `spore checkpoint pull` writes them back as a save pinned in the receiving
 host's rootfs cache. Machine-local saves keep writable-disk indexes and objects
 only in the global rootfs CAS. A validated host-private durable pin keeps that
 storage reachable across save moves and cache GC/prune. Its hard-linked

@@ -20,7 +20,7 @@ run_pid=""
 resume_pid=""
 watchdog_pid=""
 cleanup() {
-  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${named_vm}" >/dev/null 2>&1 || true
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${named_vm}" >/dev/null 2>&1 || true
   if [[ -n "${run_pid}" ]]; then
     kill -TERM "${run_pid}" >/dev/null 2>&1 || true
     wait "${run_pid}" >/dev/null 2>&1 || true
@@ -96,7 +96,7 @@ if [[ "${run_rc}" != "0" ]]; then
 fi
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
 
-"${spore_bin}" fork "${capture_dir}" --count 1 --out "${generation_fork_dir}" >"${workdir}/generation-fork.stdout" 2>"${workdir}/generation-fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count 1 --out "${generation_fork_dir}" >"${workdir}/generation-fork.stdout" 2>"${workdir}/generation-fork.stderr"
 cat >"${generation_json}" <<'JSON'
 {"run_id":"counter-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"counter-smoke-batch","vm_id":"spore-counter-smoke-7","generation":7,"resume_entropy_seed":"0123456789abcdef0123456789abcdef"}
 JSON
@@ -128,15 +128,15 @@ fi
 grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore --json attach --generation did not emit ready"
 grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore --json attach --generation did not emit stdout"
 
-if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json restore --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
+if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json vm restore --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
   >"${named_resume_stdout}" 2>"${named_resume_stderr}"; then
   cat "${named_resume_stdout}" >&2 || true
   cat "${named_resume_stderr}" >&2 || true
-  die "named spore restore --generation failed"
+  die "named spore vm restore --generation failed"
 fi
 [[ "$(json_field "${named_resume_stdout}" schema)" == "spore.lifecycle.v1" && "$(json_field "${named_resume_stdout}" state)" == "ready" ]] ||
-  die "named spore --json restore --generation did not report a ready VM"
-if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${named_vm}" -- /bin/gencheck \
+  die "named spore --json vm restore --generation did not report a ready VM"
+if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${named_vm}" -- /bin/gencheck \
   >"${named_exec_stdout}" 2>"${named_exec_stderr}"; then
   cat "${named_exec_stdout}" >&2 || true
   cat "${named_exec_stderr}" >&2 || true
@@ -147,9 +147,9 @@ grep -Fq "spore generation ready " "${named_exec_stdout}" || {
   cat "${named_exec_stderr}" >&2 || true
   die "named resumed child exec did not observe generation metadata"
 }
-env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${named_vm}" >/dev/null
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${named_vm}" >/dev/null
 
-"${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
 children=()
 while IFS= read -r child; do

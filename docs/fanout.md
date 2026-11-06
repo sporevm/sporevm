@@ -32,10 +32,10 @@ original command stream:
 
 | Spore source | Sessions | Good for fanout | Good for `run --from <cmd>` |
 | --- | --- | --- | --- |
-| `spore save NAME --stop` | none | no | yes |
+| `spore vm save NAME --stop` | none | no | yes |
 | `spore run --save` | saved session | yes | yes |
 | `spore checkpoint fork base.spore` | inherits parent | if parent has one | yes |
-| `spore pull STORE/TAG` | inherits the pushed spore | if it has one | yes |
+| `spore checkpoint pull STORE/TAG` | inherits the pushed spore | if it has one | yes |
 
 If the parent manifest declares bound services, fan-out supplies one fresh host
 socket binding per service and applies the same binding to every child:
@@ -119,7 +119,7 @@ state, not rootfs image content; a live save can contain older files until the
 guest agent refreshes them from the generation device. Workloads that need
 shard identity must read `/run/sporevm/env` or `/run/sporevm/generation.json`
 after fan-out and wait for child generation metadata before starting sharded
-work. For a parent saved before `spore fork`, a practical barrier is to
+work. For a parent saved before `spore checkpoint fork`, a practical barrier is to
 require `SPORE_FORK_BATCH_ID`, `SPORE_PARALLEL_JOB`,
 `SPORE_PARALLEL_JOB_COUNT`, and `SPORE_GENERATION >
 SPORE_PARENT_GENERATION`. Harnesses that can read the child manifest can compare

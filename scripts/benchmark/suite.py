@@ -1245,7 +1245,7 @@ class BenchmarkRunner:
         out_dir.parent.mkdir(parents=True, exist_ok=True)
         stdout = self.log_dir / benchmark / mode / "fork.stdout"
         stderr = self.log_dir / benchmark / mode / "fork.stderr"
-        argv = [str(self.spore_bin), "fork", str(base_dir), "--count", str(count), "--out", str(out_dir)]
+        argv = [str(self.spore_bin), "checkpoint", "fork", str(base_dir), "--count", str(count), "--out", str(out_dir)]
         status, elapsed_ms, error = run_command(argv, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
         success = status == 0 and out_dir.exists()
         self.emit({
@@ -1316,7 +1316,7 @@ class BenchmarkRunner:
         store_dir.parent.mkdir(parents=True, exist_ok=True)
         push_stdout = self.log_dir / "distribution_tti" / mode / "push.stdout"
         push_stderr = self.log_dir / "distribution_tti" / mode / "push.stderr"
-        push_argv = [str(self.spore_bin), "--json", "push", str(base_dir), f"{store_dir}/base"]
+        push_argv = [str(self.spore_bin), "--json", "checkpoint", "push", str(base_dir), f"{store_dir}/base"]
         push_status, push_ms, push_error = run_command(push_argv, env=self.env, stdout_path=push_stdout, stderr_path=push_stderr, timeout_s=self.args.timeout_s)
         push_result = parse_json_file(push_stdout)
         push_success = push_status == 0 and store_dir.exists()
@@ -1345,7 +1345,7 @@ class BenchmarkRunner:
             pull_prefix = self.log_dir / "distribution_tti" / mode / f"pull-{child_name}"
             pull_stdout = pull_prefix.with_suffix(".stdout")
             pull_stderr = pull_prefix.with_suffix(".stderr")
-            pull_argv = [str(self.spore_bin), "--json", "pull", source, "--out", str(pulled_dir)]
+            pull_argv = [str(self.spore_bin), "--json", "checkpoint", "pull", source, "--out", str(pulled_dir)]
             pull_status, pull_ms, pull_error = run_command(pull_argv, env=self.env, stdout_path=pull_stdout, stderr_path=pull_stderr, timeout_s=self.args.timeout_s)
             pull_result = parse_json_file(pull_stdout)
             if pull_status != 0:

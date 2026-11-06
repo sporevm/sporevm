@@ -153,9 +153,9 @@ assert_manifest_rootfs "${capture_dir}/manifest.json" "${built_index}" "${capaci
   -- /bin/sh -lc "grep -Fxq prepared-build /prepared-build-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_16} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 15000000"
 
 pulled_dir="${workdir}/pulled.spore"
-"${spore_bin}" --json push "${capture_dir}" "${workdir}/store/built" >"${workdir}/push.json"
+"${spore_bin}" --json checkpoint push "${capture_dir}" "${workdir}/store/built" >"${workdir}/push.json"
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
-  "${spore_bin}" --json pull "file://${workdir}/store/built" --out "${pulled_dir}" >"${workdir}/pull.json"
+  "${spore_bin}" --json checkpoint pull "file://${workdir}/store/built" --out "${pulled_dir}" >"${workdir}/pull.json"
 assert_manifest_rootfs "${pulled_dir}/manifest.json" "${built_index}" "${capacity_16}"
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
   "${spore_bin}" run --backend "${backend}" --from "${pulled_dir}" -- \

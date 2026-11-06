@@ -121,8 +121,8 @@ metadata's `rootfs_storage` descriptor remains keyed by the raw rootfs index
 digest used to boot the VM. `rootfs_storage` is the local rootfs metadata
 field; portable spore manifests continue to use `rootfs.storage`.
 
-To move one saved spore between hosts, `spore push` it to an
-[image store](image-format.md#spores) and `spore pull` it on the other host.
+To move one saved spore between hosts, `spore checkpoint push` it to an
+[image store](image-format.md#spores) and `spore checkpoint pull` it on the other host.
 
 ## x86-64 Board Profile v0
 
@@ -220,7 +220,7 @@ reset or poweroff.
   such as `dev.buildkite.cleanroom.policy_hash`. Keys and values are UTF-8
   strings, values are not interpreted by SporeVM, and the serialized annotation
   object is capped at 64 KiB. Restore ignores annotations it does not know.
-  `spore --json inspect` returns these key/value pairs from local `.spore`
+  `spore --json checkpoint inspect` returns these key/value pairs from local `.spore`
   artifacts after the same manifest validation, so callers can recover opaque
   metadata without sidecar files.
 - `platform`: contract the restoring host must satisfy exactly — `arch`
@@ -262,7 +262,7 @@ reset or poweroff.
   and no flag other than `UNMAP`.
 - `generation`: non-virtio generation MMIO device state — `generation`
   counter, `interrupt_status`, and `params_b64` (base64-encoded
-  resume-parameter bytes with trailing zeroes elided). `spore fork` increments
+  resume-parameter bytes with trailing zeroes elided). `spore checkpoint fork` increments
   the counter per child, sets `interrupt_status` to
   `irq_generation_changed`, and writes a JSON resume-parameter payload with
   stable child identity fields: `schema_version`, `parent_generation`,
@@ -411,7 +411,7 @@ representation.
   live gateway state, TCP flows, DNS response caches, host socket paths,
   host port forwards, credential material, or helper process state. Resume and
   `spore run --from` must attach a fresh gateway that satisfies the recorded
-  `requirements` and policy or fail closed. `spore --json inspect` exposes the
+  `requirements` and policy or fail closed. `spore --json checkpoint inspect` exposes the
   network kind, requirements, and bound-service requirements so callers can
   preflight restore-time bindings without parsing `manifest.json` directly.
 
@@ -480,8 +480,8 @@ before mutating VM state.
 
 - Chunk ids are BLAKE3-256 of chunk contents (`src/chunk.zig`); every chunk
   is verified against its id before use, from any source.
-- Pushed spores carry no local RAM backing metadata: `spore push` strips it
-  and `spore pull` refuses a manifest that has it. Pull checks the manifest
+- Pushed spores carry no local RAM backing metadata: `spore checkpoint push` strips it
+  and `spore checkpoint pull` refuses a manifest that has it. Pull checks the manifest
   against its ref, writes normal `chunks/<blake3>` files, and verifies every
   RAM chunk, the disk index and every disk object before writing a resumable
   spore manifest.

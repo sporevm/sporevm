@@ -103,7 +103,7 @@ local ref last.
 Archives are bounded to 16 GiB logical rootfs size, 65,536 distinct nonzero
 objects, 4 GiB object payload, and 4 GiB compressed archive bytes. The
 unpacker uses private disk staging and never creates, captures, restores, or
-carries RAM, vCPU, device, session, or suspended machine state; `spore push`
+carries RAM, vCPU, device, session, or suspended machine state; `spore checkpoint push`
 and `pull` move a saved spore through an [image store](#spores).
 
 ## Image stores
@@ -126,7 +126,7 @@ right bytes are kept, so pushing again or under another tag writes nothing
 else. A destination of `blake3:<hex>` writes no tag and must name the image.
 Tags match `[a-z0-9][a-z0-9._-]{0,127}`.
 
-`spore run --image` and `spore create --image` treat any ref with `://` as a
+`spore run --image` and `spore vm create --image` treat any ref with `://` as a
 store ref: `file:///srv/images/app`, `https://images.example/app`,
 `s3://bucket/images/app` (see [S3 stores](#s3-stores)), or
 `.../blake3:<hex>`. Tags over plain `http://` are accepted only on 127.0.0.1
@@ -154,9 +154,9 @@ local fail at once, so a failing HTTP(S) store stalls the disk for at most
 one 10-second fetch.
 
 Saving or committing a disk run from a store (`run --save`, `--save-on`,
-`--commit`, `spore save`) first fetches every object of the image that is not
+`--commit`, `spore vm save`) first fetches every object of the image that is not
 yet local, up to 16 at a time, so the result needs nothing from the store.
-`spore save` fetches before it pauses the guest; if the store cannot supply an
+`spore vm save` fetches before it pauses the guest; if the store cannot supply an
 object, or a guest read from it fails before the save, the save fails and the
 VM keeps running. `spore vm rm` and a client that quits also stop that fetch.
 `run --save` and `--save-on` fetch while the guest is paused for the capture,
@@ -191,7 +191,7 @@ and the catalog's origin show only the `s3://` URL.
 
 ### Spores
 
-`spore push base.spore /srv/images/base` writes a saved spore into the same
+`spore checkpoint push base.spore /srv/images/base` writes a saved spore into the same
 store:
 
 ```text
@@ -210,13 +210,13 @@ not the hash of the local `manifest.json`. The disk must be complete in the
 rootfs cache. Spore tags are separate from image tags. An `s3://` destination is uploaded as
 `spore image push` uploads one, with `spores/` in place of `images/`.
 
-`spore pull STORE/<tag|blake3:hex> --out DIR` reads a pushed spore back. It
+`spore checkpoint pull STORE/<tag|blake3:hex> --out DIR` reads a pushed spore back. It
 fetches `spores/<hex>` and checks its BLAKE3 digest against the tag or ref,
 refuses a manifest that names `memory.backing` or more than 128 GiB of nonzero
 RAM, then fetches every RAM chunk into `DIR/chunks`, and the disk index and
 every disk object the rootfs cache lacks into the cache, verifying each against
 its digest and size. DIR is then a save pinned in the rootfs cache, as
-`spore save` writes them, so it must be on the cache's filesystem, and
+`spore vm save` writes them, so it must be on the cache's filesystem, and
 `spore checkpoint rm` and `spore cache gc` treat it like any other save. Reads
 follow the store rules above, so a tag over plain HTTP is read only from
 loopback. The pull is eager, so `spore run --from DIR` needs no store; give

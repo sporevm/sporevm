@@ -162,8 +162,8 @@ const help_header =
     \\
     \\Global options:
     \\  --debug   Show verbose VMM and restore logs
-    \\  --json    Print one JSON result document, or for run, attach, exec and
-    \\            fanout a stream of JSON events
+    \\  --json    Print one JSON result document, or for run, attach, fanout and
+    \\            vm exec a stream of JSON events
     \\
     \\Commands:
     \\

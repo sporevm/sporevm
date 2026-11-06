@@ -16,6 +16,7 @@ pub const build = @import("build.zig");
 pub const build_exec = @import("build/exec.zig");
 pub const build_cli = @import("build_cli.zig");
 pub const capture = @import("capture.zig");
+pub const checkpoint_cli = @import("checkpoint_cli.zig");
 pub const chunk = @import("chunk.zig");
 pub const cli = @import("cli.zig");
 pub const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
@@ -114,6 +115,7 @@ test {
     testing.refAllDecls(build_exec);
     testing.refAllDecls(build_cli);
     testing.refAllDecls(capture);
+    testing.refAllDecls(checkpoint_cli);
     testing.refAllDecls(cli);
     testing.refAllDecls(chunk_mapped_disk);
     testing.refAllDecls(chunk_sealer);

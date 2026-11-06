@@ -71,7 +71,7 @@ int send_retained_output(struct client *client, struct detached_children *childr
   reap_detached_children(children);
   drain_retained_output(children);
   if (children->retained_pid <= 0) {
-    return send_client_error_exit(client, 2, "spore create: initial output was not retained\n");
+    return send_client_error_exit(client, 2, "spore vm create: initial output was not retained\n");
   }
   /* status (running/exited), exit code, then stdout/stderr truncation bits. */
   unsigned char header[INITIAL_OUTPUT_HEADER_LEN] = {

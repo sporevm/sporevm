@@ -18,33 +18,6 @@ pub const std_options: std.Options = .{
 
 var runtime_log_level: std.log.Level = .warn;
 
-const push_usage =
-    \\Usage:
-    \\  spore push <spore-dir> STORE/TAG
-    \\
-    \\STORE is a directory, a file:// URL or s3://bucket/prefix (uploaded with
-    \\the aws CLI); TAG may be blake3:<digest>. The spore's RAM chunks and disk
-    \\objects share the store's objects with images.
-    \\
-    \\Options:
-    \\  -h, --help           Show this help
-    \\
-;
-
-const pull_usage =
-    \\Usage:
-    \\  spore pull STORE/TAG --out DIR
-    \\
-    \\STORE is a directory, a file://, http(s):// or s3://bucket/prefix URL; TAG
-    \\may be blake3:<digest>. DIR must not exist and must be on the rootfs cache's
-    \\filesystem. Run the pulled spore with `spore run --from DIR`.
-    \\
-    \\Options:
-    \\  --out DIR            Write the pulled spore to DIR
-    \\  -h, --help           Show this help
-    \\
-;
-
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
@@ -80,11 +53,6 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(if (parsed.help) 0 else 2);
     }
 
-    if (renamedCommandHint(parsed.argv[0])) |hint| {
-        const message = cli.allocMessage(arena, "spore {s} was renamed; {s}", .{ parsed.argv[0], hint });
-        exitWithCliError(arena, stderr, parsed.mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), message);
-    }
-
     const ctx = cli.Ctx{
         .init = init,
         .stdout = stdout,
@@ -103,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout.flush();
 }
 
+const checkpoint_cli = spore_internal.checkpoint_cli;
 const lifecycle_cli = spore_internal.lifecycle_cli;
 const rootfs_cli = spore_internal.rootfs_cli;
 const image_cli = spore_internal.image_cli;
@@ -111,27 +80,24 @@ const system = spore_internal.system;
 /// Every `spore` command. `spore --help` lists them in this order.
 const commands = [_]cli.Command{
     .{ .name = "run", .summary = "Boot a throwaway VM and run one command", .usage = spore_internal.run.cli_usage, .output = .events, .run = spore_internal.run_cli.cli },
-    .{ .name = "attach", .summary = "Restore a spore and attach to a saved session", .usage = spore_internal.attach_cmd.cli_usage, .output = .events, .run = spore_internal.attach_cli.cli },
-    .{ .name = "vm rm", .summary = "Remove a live VM and its runtime state", .usage = lifecycle_cli.rm_usage, .output = .result, .run = vmRm },
-    .{ .name = "vm fork", .summary = "Fork a live VM into live VM children", .usage = lifecycle_cli.fork_usage, .output = .result, .run = vmFork },
-    .{ .name = "create", .summary = "Create a named VM lifecycle target", .usage = lifecycle_cli.create_usage, .output = .result, .run = lifecycle_cli.createCli },
-    .{ .name = "exec", .summary = "Execute a command in a named VM", .usage = lifecycle_cli.exec_usage, .output = .events, .run = lifecycle_cli.execCli },
-    .{ .name = "logs", .summary = "Show retained initial-command stdout and stderr", .usage = lifecycle_cli.logs_usage, .output = .result, .run = lifecycle_cli.logsCli },
-    .{ .name = "copy-in", .summary = "Copy one host file or directory into a named VM", .usage = lifecycle_cli.copy_in_usage, .output = .result, .run = lifecycle_cli.copyInCli },
-    .{ .name = "copy-out", .summary = "Copy one guest file or directory out of a named VM", .usage = lifecycle_cli.copy_out_usage, .output = .result, .run = lifecycle_cli.copyOutCli },
-    .{ .name = "save", .summary = "Save a named VM into a spore; --stop removes the VM", .usage = lifecycle_cli.save_usage, .output = .result, .run = lifecycle_cli.saveCli },
-    .{ .name = "restore", .summary = "Restore a spore as a named VM", .usage = lifecycle_cli.restore_usage, .output = .result, .run = lifecycle_cli.restoreCli },
-    .{ .name = "fork", .summary = "Fork a spore into child spores, or a named VM with --vm", .usage = lifecycle_cli.fork_usage, .output = .result, .run = fork },
-    .{ .name = "ls", .summary = "List named VMs in the local runtime registry", .usage = lifecycle_cli.ls_usage, .output = .result, .run = lifecycle_cli.lsCli },
-    .{ .name = "ps", .summary = null, .usage = lifecycle_cli.ls_usage, .output = .result, .run = lifecycle_cli.lsCli },
-    .{ .name = "rm", .summary = "Remove a named VM, or a spore with --spore", .usage = lifecycle_cli.rm_usage, .output = .result, .run = lifecycle_cli.rmCli },
-    .{ .name = "checkpoint rm", .summary = "Remove a checkpoint directory", .usage = lifecycle_cli.rm_usage, .output = .result, .run = checkpointRm },
-    .{ .name = "checkpoint fork", .summary = "Fork a checkpoint into checkpoint children", .usage = lifecycle_cli.fork_usage, .output = .result, .run = checkpointFork },
-    .{ .name = "inspect", .summary = "Print a spore manifest summary", .usage = inspect_usage, .output = .result, .run = inspect },
+    .{ .name = "attach", .summary = "Restore a checkpoint and attach to its saved session", .usage = spore_internal.attach_cmd.cli_usage, .output = .events, .run = spore_internal.attach_cli.cli },
     .{ .name = "fanout", .summary = "Attach forked children concurrently with prefixed output", .usage = spore_internal.fanout.cli_usage, .output = .events, .run = spore_internal.fanout.cli },
-    .{ .name = "push", .summary = "Push a saved spore to an image store", .usage = push_usage, .output = .result, .run = push },
-    .{ .name = "pull", .summary = "Pull a saved spore from an image store", .usage = pull_usage, .output = .result, .run = pull },
     .{ .name = "build", .summary = "Build a Spore image from a Dockerfile subset", .usage = spore_internal.build_cli.usage, .output = .result, .run = spore_internal.build_cli.run },
+    .{ .name = "vm create", .summary = "Create a named VM", .usage = lifecycle_cli.create_usage, .output = .result, .run = lifecycle_cli.createCli },
+    .{ .name = "vm exec", .summary = "Execute a command in a named VM", .usage = lifecycle_cli.exec_usage, .output = .events, .run = lifecycle_cli.execCli },
+    .{ .name = "vm logs", .summary = "Show retained initial-command stdout and stderr", .usage = lifecycle_cli.logs_usage, .output = .result, .run = lifecycle_cli.logsCli },
+    .{ .name = "vm copy-in", .summary = "Copy one host file or directory into a named VM", .usage = lifecycle_cli.copy_in_usage, .output = .result, .run = lifecycle_cli.copyInCli },
+    .{ .name = "vm copy-out", .summary = "Copy one guest file or directory out of a named VM", .usage = lifecycle_cli.copy_out_usage, .output = .result, .run = lifecycle_cli.copyOutCli },
+    .{ .name = "vm save", .summary = "Save a named VM as a checkpoint; --stop removes the VM", .usage = lifecycle_cli.save_usage, .output = .result, .run = lifecycle_cli.saveCli },
+    .{ .name = "vm restore", .summary = "Restore a checkpoint as a named VM", .usage = lifecycle_cli.restore_usage, .output = .result, .run = lifecycle_cli.restoreCli },
+    .{ .name = "vm fork", .summary = "Fork a named VM into named VM children", .usage = lifecycle_cli.fork_usage, .output = .result, .run = lifecycle_cli.forkCli },
+    .{ .name = "vm rm", .summary = "Stop a named VM and delete its runtime state", .usage = lifecycle_cli.rm_usage, .output = .result, .run = lifecycle_cli.rmCli },
+    .{ .name = "vm ls", .summary = "List named VMs", .usage = lifecycle_cli.ls_usage, .output = .result, .run = lifecycle_cli.lsCli },
+    .{ .name = "checkpoint inspect", .summary = "Print a checkpoint manifest summary", .usage = checkpoint_cli.inspect_usage, .output = .result, .run = checkpoint_cli.inspect },
+    .{ .name = "checkpoint fork", .summary = "Fork a checkpoint into child checkpoints", .usage = checkpoint_cli.fork_usage, .output = .result, .run = checkpoint_cli.fork },
+    .{ .name = "checkpoint rm", .summary = "Remove a checkpoint directory", .usage = checkpoint_cli.rm_usage, .output = .result, .run = checkpoint_cli.rm },
+    .{ .name = "checkpoint push", .summary = "Push a checkpoint to an image store", .usage = checkpoint_cli.push_usage, .output = .result, .run = checkpoint_cli.push },
+    .{ .name = "checkpoint pull", .summary = "Pull a checkpoint from an image store", .usage = checkpoint_cli.pull_usage, .output = .result, .run = checkpoint_cli.pull },
     .{ .name = "rootfs build", .summary = "Build an ext4 rootfs from an OCI image", .usage = rootfs_cli.build_usage, .output = .result, .run = rootfs_cli.build },
     .{ .name = "rootfs import-oci", .summary = "Import an OCI image layout as a local image", .usage = rootfs_cli.import_oci_usage, .output = .result, .run = rootfs_cli.importOci },
     .{ .name = "rootfs import-tar", .summary = "Import a rootfs tar as a local image", .usage = rootfs_cli.import_tar_usage, .output = .result, .run = rootfs_cli.importTar },
@@ -147,19 +113,12 @@ const commands = [_]cli.Command{
     .{ .name = "system prune", .summary = "Prune local caches and old runtime fork batches", .usage = system.usage, .output = .result, .run = system.pruneCli },
     .{ .name = "host-info", .summary = "Print this host's platform facts", .usage = "usage: spore host-info\n", .output = .result, .run = hostInfo },
     .{ .name = "version", .summary = "Print the spore version", .usage = "usage: spore version\n", .output = .result, .run = version },
-    .{ .name = "help", .summary = "Show this help", .usage = "usage: spore help\n", .output = .text, .run = help },
     .{ .name = "monitor", .summary = null, .usage = spore_internal.monitor.monitor_usage, .output = .text, .run = spore_internal.monitor.cli },
     .{ .name = "netd", .summary = null, .usage = spore_internal.spore_netd.netd_usage, .output = .text, .run = spore_internal.spore_netd.cli },
 };
 
-const inspect_usage = "usage: spore inspect <spore-dir>\n";
-
 fn apiContext(ctx: *const cli.Ctx) spore_api.Context {
     return .{ .io = ctx.init.io, .environ_map = ctx.init.environ_map };
-}
-
-fn help(ctx: *const cli.Ctx, _: []const []const u8) !void {
-    try cli.writeHelp(&commands, null, ctx.stdout);
 }
 
 fn version(ctx: *const cli.Ctx, _: []const []const u8) !void {
@@ -189,82 +148,6 @@ fn hostInfo(ctx: *const cli.Ctx, args: []const []const u8) !void {
     } else {
         try writeHostInfo(ctx.stdout, info);
     }
-}
-
-fn inspect(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    const arena = ctx.init.arena.allocator();
-    if (args.len != 1) exitUsage(arena, ctx.stderr, ctx.mode, "inspect", "usage: spore inspect <spore-dir>");
-    const summary = try spore_api.inspectSpore(arena, args[0]);
-    if (ctx.mode == .json) {
-        try machine_output.writeJson(arena, ctx.stdout, summary);
-    } else {
-        try writeInspectSummary(ctx.stdout, summary);
-    }
-}
-
-fn fork(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    if (lifecycle_cli.wantsNamedFork(args)) return lifecycle_cli.forkCli(ctx, args);
-    return forkSpore(ctx, "fork", args);
-}
-
-fn forkSpore(ctx: *const cli.Ctx, command_label: []const u8, args: []const []const u8) !void {
-    const arena = ctx.init.arena.allocator();
-    const result = try forkCommand(apiContext(ctx), arena, ctx.stderr, ctx.mode, command_label, args);
-    if (ctx.mode == .json) {
-        try machine_output.writeJson(arena, ctx.stdout, result);
-    } else {
-        try writeForkResult(ctx.stdout, result);
-    }
-}
-
-fn vmRm(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    if (args.len != 1) exitUsage(ctx.init.arena.allocator(), ctx.stderr, ctx.mode, "vm rm", "usage: spore vm rm NAME");
-    return lifecycle_cli.rmCli(ctx, args);
-}
-
-fn vmFork(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    const arena = ctx.init.arena.allocator();
-    if (args.len == 0 or std.mem.startsWith(u8, args[0], "--")) exitUsage(arena, ctx.stderr, ctx.mode, "vm fork", "usage: spore vm fork NAME --count N --name PATTERN");
-    const legacy_args = try arena.alloc([]const u8, args.len + 1);
-    legacy_args[0] = "--vm";
-    @memcpy(legacy_args[1..], args);
-    return lifecycle_cli.forkCli(ctx, legacy_args);
-}
-
-fn checkpointRm(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    if (args.len != 1) exitUsage(ctx.init.arena.allocator(), ctx.stderr, ctx.mode, "checkpoint rm", "usage: spore checkpoint rm DIR");
-    return lifecycle_cli.rmCli(ctx, &.{ "--spore", args[0] });
-}
-
-fn checkpointFork(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    if (args.len == 0) exitUsage(ctx.init.arena.allocator(), ctx.stderr, ctx.mode, "checkpoint fork", "usage: spore checkpoint fork DIR --count N --out DIR");
-    return forkSpore(ctx, "checkpoint fork", args);
-}
-
-fn push(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    const arena = ctx.init.arena.allocator();
-    const result = try pushCommand(apiContext(ctx), arena, ctx.stderr, ctx.mode, args);
-    if (ctx.mode == .json) try machine_output.writeJson(arena, ctx.stdout, result) else try writePushResult(ctx.stdout, result);
-}
-
-fn pull(ctx: *const cli.Ctx, args: []const []const u8) !void {
-    const arena = ctx.init.arena.allocator();
-    const result = try pullCommand(apiContext(ctx), arena, ctx.stderr, ctx.mode, args);
-    if (ctx.mode == .json) try machine_output.writeJson(arena, ctx.stdout, result) else try writePullResult(ctx.stdout, result);
-}
-
-/// Redirect hints for command spellings removed in the spore/saved-session
-/// rename. The old commands stay non-functional so the new vocabulary is
-/// unambiguous, but users get pointed at the replacement instead of a
-/// generic unknown-command error.
-fn renamedCommandHint(command: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, command, "resume")) {
-        return "use `spore attach <spore-dir>` to attach a saved session, or `spore restore <spore-dir> --name NAME` to restore a named VM";
-    }
-    if (std.mem.eql(u8, command, "suspend")) {
-        return "use `spore save NAME --out DIR --stop`";
-    }
-    return null;
 }
 
 fn logFn(
@@ -322,118 +205,6 @@ const allocMessage = cli.allocMessage;
 
 fn writeVersion(writer: *Io.Writer, mode: std.builtin.OptimizeMode) !void {
     try writer.print("spore {s} ({t})\n", .{ spore_internal.version, mode });
-}
-
-fn forkCommand(
-    context: spore_api.Context,
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    command_label: []const u8,
-    args: []const []const u8,
-) !spore_api.ForkResult {
-    var parent_dir: ?[]const u8 = null;
-    var out_dir: ?[]const u8 = null;
-    var count: ?usize = null;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--count") and i + 1 < args.len) {
-            i += 1;
-            count = std.fmt.parseInt(usize, args[i], 10) catch {
-                exitInvalidValue(allocator, stderr, mode, command_label, "--count", args[i]);
-            };
-        } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
-            i += 1;
-            out_dir = args[i];
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, command_label, args[i]);
-        } else if (parent_dir == null) {
-            parent_dir = args[i];
-        } else {
-            exitUnexpectedArgument(allocator, stderr, mode, command_label, args[i]);
-        }
-    }
-
-    if (parent_dir == null or out_dir == null or count == null) {
-        const usage_line = if (std.mem.eql(u8, command_label, "checkpoint fork"))
-            "usage: spore checkpoint fork DIR --count N --out DIR"
-        else
-            "usage: spore fork <spore-dir> --count N --out DIR";
-        exitUsage(allocator, stderr, mode, command_label, usage_line);
-    }
-
-    return spore_api.fork(context, allocator, .{
-        .parent_dir = parent_dir.?,
-        .out_dir = out_dir.?,
-        .count = count.?,
-    }) catch |err| switch (err) {
-        error.CrossDeviceOwnershipLink => {
-            const message = allocMessage(allocator, "spore {s}: {s} must be on the rootfs cache's filesystem", .{ command_label, out_dir.? });
-            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command_label), message);
-        },
-        else => |e| return e,
-    };
-}
-
-fn pushCommand(
-    context: spore_api.Context,
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    args: []const []const u8,
-) !spore_api.PushResult {
-    var spore_dir: ?[]const u8 = null;
-    var destination: ?[]const u8 = null;
-    for (args) |arg| {
-        if (std.mem.startsWith(u8, arg, "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "push", arg);
-        } else if (spore_dir == null) {
-            spore_dir = arg;
-        } else if (destination == null) {
-            destination = arg;
-        } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "push", arg);
-        }
-    }
-    if (spore_dir == null or destination == null) {
-        exitUsage(allocator, stderr, mode, "push", "usage: spore push <spore-dir> STORE/TAG");
-    }
-    return spore_api.push(context, allocator, .{ .spore_dir = spore_dir.?, .destination = destination.? });
-}
-
-fn pullCommand(
-    context: spore_api.Context,
-    allocator: std.mem.Allocator,
-    stderr: *Io.Writer,
-    mode: machine_output.Mode,
-    args: []const []const u8,
-) !spore_api.PullResult {
-    var source: ?[]const u8 = null;
-    var out_dir: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
-            i += 1;
-            out_dir = args[i];
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "pull", args[i]);
-        } else if (source == null) {
-            source = args[i];
-        } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "pull", args[i]);
-        }
-    }
-    if (source == null or out_dir == null) {
-        exitUsage(allocator, stderr, mode, "pull", "usage: spore pull STORE/TAG --out DIR");
-    }
-    return spore_api.pull(context, allocator, .{ .source = source.?, .out_dir = out_dir.? }) catch |err| switch (err) {
-        error.CrossDeviceOwnershipLink => {
-            const message = allocMessage(allocator, "spore pull: {s} must be on the rootfs cache's filesystem", .{out_dir.?});
-            exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "pull"), message);
-        },
-        else => |e| return e,
-    };
 }
 
 fn writeHostInfo(writer: *Io.Writer, info: spore_api.HostInfo) !void {
@@ -494,88 +265,6 @@ fn yesNo(value: bool) []const u8 {
     return if (value) "yes" else "no";
 }
 
-fn writeInspectSummary(writer: *Io.Writer, summary: spore_api.SporeInspectResult) !void {
-    try writer.writeAll("Checkpoint manifest\n");
-    try writer.print("  Resource type: {t}\n", .{summary.resource_type});
-    try writer.print("  Portability: {t}\n", .{summary.portability});
-    try writer.print("  Can attach: {s}\n", .{yesNo(summary.can_attach)});
-    try writer.print("  Can run from: {s}\n", .{yesNo(summary.can_run_from)});
-    try writer.print("  Version: {d}\n", .{summary.version});
-    try writer.print("  Platform: {s}/{s}\n", .{ summary.platform.arch, summary.platform.cpu_profile });
-    try writer.print("  vCPUs: {d}\n", .{summary.vcpu_count});
-    try writer.print("  Devices: {d}\n", .{summary.device_count});
-    try writer.print("  Ownership: {s}\n", .{summary.ownership});
-    try writer.print(
-        "  Memory: initial={d}, maximum={d}, requested={d}, captured={d} bytes\n",
-        .{
-            summary.initial_memory_bytes,
-            summary.max_memory_bytes,
-            summary.requested_memory_bytes,
-            summary.captured_memory_bytes,
-        },
-    );
-    try writer.print("  Memory chunks: {d} present of {d}\n", .{ summary.present_memory_chunk_count, summary.memory_chunk_count });
-    if (summary.memory_backing_kind) |kind| {
-        try writer.print("  Memory backing: {s}", .{kind});
-        if (summary.memory_backing_size) |size| try writer.print(", {d} bytes", .{size});
-        try writer.writeByte('\n');
-    } else {
-        try writer.writeAll("  Memory backing: none\n");
-    }
-    try writer.print("  GIC: {s}\n", .{summary.gic_kind});
-    if (summary.sessions.len == 0) {
-        try writer.writeAll("  Sessions: none\n");
-    } else {
-        try writer.print("  Sessions: {d}\n", .{summary.sessions.len});
-        for (summary.sessions) |session| {
-            try writer.print("    - {s}: stdin={s} stdout={s} stderr={s} terminal={s}\n", .{
-                session.id,
-                yesNo(session.streams.stdin),
-                yesNo(session.streams.stdout),
-                yesNo(session.streams.stderr),
-                yesNo(session.streams.terminal),
-            });
-        }
-    }
-    if (summary.annotations.map.count() == 0) {
-        try writer.writeAll("  Annotations: none\n");
-    } else {
-        try writer.print("  Annotations: {d}\n", .{summary.annotations.map.count()});
-        var annotation_it = summary.annotations.map.iterator();
-        while (annotation_it.next()) |entry| {
-            try writer.print("    - {s}={s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
-        }
-    }
-}
-
-fn writeForkResult(writer: *Io.Writer, result: spore_api.ForkResult) !void {
-    try writer.writeAll("Checkpoint fork complete\n");
-    try writer.print("  Parent: {s}\n", .{result.parent});
-    try writer.print("  Children: {d}\n", .{result.count});
-    try writer.print("  Output: {s}\n", .{result.out_dir});
-    try writer.print("  Generation range: {d}..{d}\n", .{ result.first_generation, result.last_generation });
-    if (result.pin_publish_ms) |ms| try writer.print("  Pin publish: {d}ms\n", .{ms});
-    if (result.pin_lock_wait_ms) |ms| try writer.print("  Pin lock wait: {d}ms\n", .{ms});
-}
-
-fn writePushResult(writer: *Io.Writer, result: spore_api.PushResult) !void {
-    try writer.print(
-        "ref: {s}\nspore_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
-        .{ result.ref, result.spore_digest, result.objects_total, result.objects_written, result.bytes_written },
-    );
-}
-
-fn writePullResult(writer: *Io.Writer, result: spore_api.PullResult) !void {
-    try writer.print(
-        "ref: {s}\nspore_digest: {s}\nout_dir: {s}\nram: {d} objects, {d} fetched, {d} bytes\ndisk: {d} objects, {d} fetched, {d} bytes\n",
-        .{
-            result.ref,          result.spore_digest,         result.out_dir,
-            result.ram.objects,  result.ram.objects_fetched,  result.ram.bytes_fetched,
-            result.disk.objects, result.disk.objects_fetched, result.disk.bytes_fetched,
-        },
-    );
-}
-
 test "version output distinguishes development and release builds" {
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -586,14 +275,6 @@ test "version output distinguishes development and release builds" {
     out.clearRetainingCapacity();
     try writeVersion(&out.writer, .ReleaseSafe);
     try std.testing.expectEqualStrings("spore " ++ spore_internal.version ++ " (ReleaseSafe)\n", out.written());
-}
-
-test "removed commands map to rename hints" {
-    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore attach") != null);
-    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("resume").?, "spore restore") != null);
-    try std.testing.expect(std.mem.indexOf(u8, renamedCommandHint("suspend").?, "spore save NAME --out DIR --stop") != null);
-    try std.testing.expect(renamedCommandHint("attach") == null);
-    try std.testing.expect(renamedCommandHint("bogus") == null);
 }
 
 test "command table names each command once and fits the dispatcher" {
@@ -612,9 +293,8 @@ test "command table names each command once and fits the dispatcher" {
 test "only internal commands refuse global json, and only four commands stream" {
     for (commands) |command| {
         const streams = std.mem.eql(u8, command.name, "run") or std.mem.eql(u8, command.name, "attach") or
-            std.mem.eql(u8, command.name, "exec") or std.mem.eql(u8, command.name, "fanout");
-        const text = std.mem.eql(u8, command.name, "monitor") or std.mem.eql(u8, command.name, "netd") or
-            std.mem.eql(u8, command.name, "help");
+            std.mem.eql(u8, command.name, "vm exec") or std.mem.eql(u8, command.name, "fanout");
+        const text = std.mem.eql(u8, command.name, "monitor") or std.mem.eql(u8, command.name, "netd");
         const expected: cli.Output = if (streams) .events else if (text) .text else .result;
         try std.testing.expectEqual(expected, command.output);
     }

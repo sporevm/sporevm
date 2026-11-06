@@ -39,7 +39,7 @@ pub const cli_usage =
     \\  -h, --help              Show this help
     \\
     \\Requires child spores with saved sessions. Verify one with:
-    \\  spore inspect children/000000
+    \\  spore checkpoint inspect children/000000
     \\  # Sessions: 1
     \\
     \\Workflow:

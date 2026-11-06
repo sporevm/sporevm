@@ -75,7 +75,7 @@ grep -Fxq "rootfs-base-err" "${base_from_stderr}" || {
   die "rootfs base run-from did not stream stderr"
 }
 
-"${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
 children=()
 while IFS= read -r child; do

@@ -221,7 +221,7 @@ spore run \
 
 Commit is disk-only and leaves the destination ref unchanged unless the guest
 command and publication both succeed. Save one warm machine from the resulting
-image, then use offline `spore fork` for low-latency fan-out.
+image, then use offline `spore checkpoint fork` for low-latency fan-out.
 Add `--disk-size 20gb` when preparation needs a larger root disk; commit grows
 the private sparse head with known-zero chunks and asks the managed initrd to
 grow ext4 directly. The selected image needs no `resize2fs` or e2fsprogs for
@@ -270,7 +270,7 @@ port-forward, and restore or attach limits.
 Start a named VM with a running process:
 
 ```bash
-spore create counter --image docker.io/library/alpine:3.20 \
+spore vm create counter --image docker.io/library/alpine:3.20 \
   'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done'
 ```
 
@@ -283,27 +283,27 @@ spore vm fork counter --count 2 --name child-%d
 Both children keep running from the fork point:
 
 ```bash
-spore exec child-0 'cat /tick; sleep 1; cat /tick'
-spore exec child-1 'cat /tick; sleep 1; cat /tick'
+spore vm exec child-0 'cat /tick; sleep 1; cat /tick'
+spore vm exec child-1 'cat /tick; sleep 1; cat /tick'
 ```
 
 Named exec can also be interactive when you opt in to input or a terminal:
 
 ```bash
-printf 'hello\n' | spore exec -i child-0 -- /bin/cat
-spore exec -it child-0 -- /bin/sh
+printf 'hello\n' | spore vm exec -i child-0 -- /bin/cat
+spore vm exec -it child-0 -- /bin/sh
 ```
 
 Copy explicit files or directories into or out of a named VM:
 
 ```bash
-spore copy-in child-0 ./local.txt /tmp/local.txt
-spore copy-out child-0 /tmp/local.txt ./roundtrip.txt
-spore copy-in child-0 ./src /tmp/src
-spore copy-out child-0 /tmp/src ./src-roundtrip
+spore vm copy-in child-0 ./local.txt /tmp/local.txt
+spore vm copy-out child-0 /tmp/local.txt ./roundtrip.txt
+spore vm copy-in child-0 ./src /tmp/src
+spore vm copy-out child-0 /tmp/src ./src-roundtrip
 ```
 
-`spore create`, `spore run`, and `spore exec` run shell commands as
+`spore vm create`, `spore run`, and `spore vm exec` run shell commands as
 `/bin/sh -lc`. Use `-- <argv...>` when you need exact argv.
 
 ## Save and attach
@@ -372,8 +372,8 @@ To move a saved spore between hosts, push it to an
 [image store](docs/image-format.md#spores) and pull it on the other host:
 
 ```bash
-spore push base.spore s3://bucket/spores/base
-spore pull s3://bucket/spores/base --out base.spore
+spore checkpoint push base.spore s3://bucket/spores/base
+spore checkpoint pull s3://bucket/spores/base --out base.spore
 spore run --from base.spore -- ./bin/test
 ```
 
@@ -388,31 +388,30 @@ The complete named VM lifecycle is stable on ARM64 HVF/KVM hosts:
 ```bash
 export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
-spore create bench-1 --image docker.io/library/alpine:3.20
-spore logs bench-1
-spore exec bench-1 'echo hi'
-spore save bench-1 --out bench-1.spore --stop --annotation saved=true
-spore restore bench-1.spore --name bench-2
-spore ps
+spore vm create bench-1 --image docker.io/library/alpine:3.20
+spore vm logs bench-1
+spore vm exec bench-1 'echo hi'
+spore vm save bench-1 --out bench-1.spore --stop --annotation saved=true
+spore vm restore bench-1.spore --name bench-2
+spore vm ls
 spore vm rm bench-2
 ```
 
 Use `spore checkpoint rm DIR` to delete saved state; `spore cache gc --force`
 then reclaims storage nothing else references.
 `spore vm rm NAME` stops the live monitor and deletes runtime state without
-touching checkpoints or images. The older top-level `rm` and `fork`
-forms remain compatible throughout the 0.x release line.
+touching checkpoints or images.
 
 Create-time annotations and named lifecycle network policy can be passed as
 flags or through a JSON options file:
 
 ```bash
-spore create bench-net \
+spore vm create bench-net \
   --options @create-options.json
 ```
 
-Create retains bounded initial-command output by default; use `spore logs NAME`
-to retrieve it after create returns. Machine callers can use global `--json`
+Create retains bounded initial-command output by default; use
+`spore vm logs NAME` to retrieve it after create returns. Machine callers can use global `--json`
 for structured lifecycle state. See [docs/lifecycle.md](docs/lifecycle.md) for
 runtime layout, monitor jailing, named live fork, and limits.
 
@@ -423,9 +422,9 @@ restore, and fork operations in the example above remain unavailable.
 ## Current scope
 
 SporeVM supports one-shot runs, save/attach, local fork/fan-out, rootfs-backed
-runs, spore push and pull through image stores, explicit guest networking, and
-named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64 KVM is a
-frozen, fresh-only profile with one vCPU and fixed 512 MiB memory; native
+runs, checkpoint push and pull through image stores, explicit guest
+networking, and named lifecycle on supported arm64 HVF/KVM hosts. Linux/x86-64
+KVM is a frozen, fresh-only profile with one vCPU and fixed 512 MiB memory; native
 OCI/rootfs execution, image commit, networking, and build are available, while
 capture, saved-state restore/resume, disk fork, multi-vCPU, and elastic memory
 are not. It needs an Intel host whose KVM provides the `sporevm-x86_64-v0` CPU

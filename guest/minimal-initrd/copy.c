@@ -372,39 +372,39 @@ static int emit_copy_entry(struct client *client, const char *path, const char *
 }
 
 int copy_in_file(struct client *client, const char *root, const char *guest_path) {
-  if (validate_copy_path(guest_path) != 0) return send_client_error_exit(client, 2, "spore copy-in: invalid guest path\n");
+  if (validate_copy_path(guest_path) != 0) return send_client_error_exit(client, 2, "spore vm copy-in: invalid guest path\n");
 
   char path[MAX_COPY_FULL_PATH_LEN];
   char tmp_dir[MAX_COPY_FULL_PATH_LEN + 96];
   char tmp[MAX_COPY_FULL_PATH_LEN + 112];
   if (build_copy_path(path, sizeof(path), root, guest_path) != 0) {
-    return send_client_error_exit(client, 2, "spore copy-in: guest path is too long\n");
+    return send_client_error_exit(client, 2, "spore vm copy-in: guest path is too long\n");
   }
   if (reserve_copy_tmp_dir(tmp_dir, sizeof(tmp_dir), path) != 0) {
-    return send_client_error_exit(client, 1, "spore copy-in: cannot create guest transfer temp\n");
+    return send_client_error_exit(client, 1, "spore vm copy-in: cannot create guest transfer temp\n");
   }
   int tmp_n = snprintf(tmp, sizeof(tmp), "%s/payload", tmp_dir);
   if (tmp_n <= 0 || (size_t)tmp_n >= sizeof(tmp)) {
     remove_tree(tmp_dir);
-    return send_client_error_exit(client, 2, "spore copy-in: guest path is too long\n");
+    return send_client_error_exit(client, 2, "spore vm copy-in: guest path is too long\n");
   }
 
   char archive_tmp[MAX_COPY_FULL_PATH_LEN + 112];
   int archive_n = snprintf(archive_tmp, sizeof(archive_tmp), "%s/archive", tmp_dir);
   if (archive_n <= 0 || (size_t)archive_n >= sizeof(archive_tmp)) {
     remove_tree(tmp_dir);
-    return send_client_error_exit(client, 1, "spore copy-in: cannot create guest transfer archive\n");
+    return send_client_error_exit(client, 1, "spore vm copy-in: cannot create guest transfer archive\n");
   }
 
   if (receive_lifecycle_copy_archive_from_spio(client, archive_tmp) != 0) {
     remove_tree(tmp_dir);
-    return send_client_error_exit(client, 1, "spore copy-in: transfer failed\n");
+    return send_client_error_exit(client, 1, "spore vm copy-in: transfer failed\n");
   }
 
   int root_kind = 0;
   if (extract_copy_archive(archive_tmp, tmp, &root_kind) != 0) {
     remove_tree(tmp_dir);
-    return send_client_error_exit(client, 1, "spore copy-in: cannot write guest path\n");
+    return send_client_error_exit(client, 1, "spore vm copy-in: cannot write guest path\n");
   }
   unlink(archive_tmp);
 
@@ -412,25 +412,25 @@ int copy_in_file(struct client *client, const char *root, const char *guest_path
   if (publish_rc != 0) {
     int exists = errno == EEXIST;
     remove_tree(tmp_dir);
-    if (exists) return send_client_error_exit(client, 1, "spore copy-in: guest path already exists\n");
-    return send_client_error_exit(client, 1, "spore copy-in: cannot publish guest path\n");
+    if (exists) return send_client_error_exit(client, 1, "spore vm copy-in: guest path already exists\n");
+    return send_client_error_exit(client, 1, "spore vm copy-in: cannot publish guest path\n");
   }
   remove_tree(tmp_dir);
   return send_client_exit(client, 0);
 }
 
 int copy_out_file(struct client *client, const char *root, const char *guest_path) {
-  if (validate_copy_path(guest_path) != 0) return send_client_error_exit(client, 2, "spore copy-out: invalid guest path\n");
+  if (validate_copy_path(guest_path) != 0) return send_client_error_exit(client, 2, "spore vm copy-out: invalid guest path\n");
 
   char path[MAX_COPY_FULL_PATH_LEN];
   if (build_copy_path(path, sizeof(path), root, guest_path) != 0) {
-    return send_client_error_exit(client, 2, "spore copy-out: guest path is too long\n");
+    return send_client_error_exit(client, 2, "spore vm copy-out: guest path is too long\n");
   }
 
   if (send_copy_stdout(client, copy_archive_magic, sizeof(copy_archive_magic)) != 0 ||
       emit_copy_entry(client, path, "") != 0 ||
       send_copy_record(client, COPY_KIND_END, "", 0, 0) != 0) {
-    return send_client_error_exit(client, 1, "spore copy-out: cannot read guest path\n");
+    return send_client_error_exit(client, 1, "spore vm copy-out: cannot read guest path\n");
   }
   return send_client_exit(client, 0);
 }

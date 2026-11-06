@@ -74,12 +74,12 @@ base_disk="$(disk_base "${base_dir}/manifest.json")"
 
 # Anything resume can restore must also pass inspect; disk-backed captures
 # once tripped BadManifest in the inspect parser.
-"${spore_bin}" --json inspect "${base_dir}" >"${workdir}/inspect.json" || {
+"${spore_bin}" --json checkpoint inspect "${base_dir}" >"${workdir}/inspect.json" || {
   cat "${workdir}/inspect.json" >&2 || true
-  die "spore inspect rejected a disk-backed capture that resume accepts"
+  die "spore checkpoint inspect rejected a disk-backed capture that resume accepts"
 }
 
-"${spore_bin}" fork "${base_dir}" --count 4 --out "${fork_dir}" >"${workdir}/fork.json" || {
+"${spore_bin}" checkpoint fork "${base_dir}" --count 4 --out "${fork_dir}" >"${workdir}/fork.json" || {
   cat "${workdir}/fork.json" >&2 || true
   die "writable rootfs fork failed"
 }
@@ -190,14 +190,14 @@ grep -Fxq "child-layer-ok" "${verify_stdout}" || {
   die "verification run did not see child layer contents"
 }
 
-"${spore_bin}" --json push "${child_dir}" "${store_dir}/child" >"${workdir}/push.json" || {
+"${spore_bin}" --json checkpoint push "${child_dir}" "${store_dir}/child" >"${workdir}/push.json" || {
   cat "${workdir}/push.json" >&2 || true
   die "writable rootfs push failed"
 }
 
 # Into an empty rootfs cache, so the pull must fetch the child's disk.
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
-  "${spore_bin}" --json pull "file://${store_dir}/child" --out "${pulled_dir}" >"${workdir}/pull.json" || {
+  "${spore_bin}" --json checkpoint pull "file://${store_dir}/child" --out "${pulled_dir}" >"${workdir}/pull.json" || {
   cat "${workdir}/pull.json" >&2 || true
   die "writable rootfs pull failed"
 }

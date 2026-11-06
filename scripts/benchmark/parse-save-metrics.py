@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse the backend snapshot and named publication timing records emitted by `spore save`."""
+"""Parse the backend snapshot and named publication timing records emitted by `spore vm save`."""
 
 from __future__ import annotations
 

@@ -34,10 +34,10 @@ run_spore() {
 
 cleanup() {
   if [[ "${rootfs_created}" == "1" ]]; then
-    run_spore rm "${rootfs_vm}" >/dev/null 2>&1 || true
+    run_spore vm rm "${rootfs_vm}" >/dev/null 2>&1 || true
   fi
   if [[ "${dead_created}" == "1" ]]; then
-    run_spore rm "${dead_vm}" >/dev/null 2>&1 || true
+    run_spore vm rm "${dead_vm}" >/dev/null 2>&1 || true
   fi
 }
 
@@ -48,7 +48,7 @@ image="${SPORE_MONITOR_FAILURE_IMAGE:-docker.io/library/node@sha256:d51cff3fa44a
 console_log="${workdir}/rootfs-console.log"
 
 if run_capture "${workdir}/create.out" "${workdir}/create.err" \
-  run_spore create "${rootfs_vm}" \
+  run_spore vm create "${rootfs_vm}" \
     --backend "${backend}" \
     --memory "${memory}" \
     --timeout "${timeout_ms}ms" \
@@ -57,11 +57,11 @@ if run_capture "${workdir}/create.out" "${workdir}/create.err" \
   rootfs_created=1
 else
   cat "${workdir}/create.err" >&2 || true
-  die "spore create rootfs VM failed"
+  die "spore vm create rootfs VM failed"
 fi
 
 if run_capture "${workdir}/sigterm.out" "${workdir}/sigterm.err" \
-  run_spore exec "${rootfs_vm}" -- /bin/sh -lc 'kill -TERM $$'; then
+  run_spore vm exec "${rootfs_vm}" -- /bin/sh -lc 'kill -TERM $$'; then
   die "guest SIGTERM command unexpectedly exited 0"
 else
   sigterm_status=$?
@@ -72,7 +72,7 @@ fi
 }
 
 if run_capture "${workdir}/sigkill.out" "${workdir}/sigkill.err" \
-  run_spore exec "${rootfs_vm}" -- /bin/sh -lc 'kill -KILL $$'; then
+  run_spore vm exec "${rootfs_vm}" -- /bin/sh -lc 'kill -KILL $$'; then
   die "guest SIGKILL command unexpectedly exited 0"
 else
   sigkill_status=$?
@@ -84,7 +84,7 @@ fi
 
 oom_js='const chunks=[]; let i=0; for (;;) { chunks.push(Buffer.alloc(64*1024*1024, 1)); console.error("allocated_64mib_chunks=" + (++i)); }'
 if run_capture "${workdir}/oom.out" "${workdir}/oom.err" \
-  run_spore exec "${rootfs_vm}" -- /bin/sh -lc "node -e '${oom_js}'"; then
+  run_spore vm exec "${rootfs_vm}" -- /bin/sh -lc "node -e '${oom_js}'"; then
   die "guest OOM command unexpectedly exited 0"
 else
   oom_status=$?
@@ -99,22 +99,22 @@ grep -Eiq 'out of memory|oom-kill|killed process' "${console_log}" || {
   die "guest console did not include OOM evidence"
 }
 
-if ! run_spore exec "${rootfs_vm}" -- /bin/true; then
+if ! run_spore vm exec "${rootfs_vm}" -- /bin/true; then
   die "rootfs VM did not remain usable after guest OOM"
 fi
-if ! run_spore rm "${rootfs_vm}"; then
-  die "spore rm rootfs VM failed after guest OOM"
+if ! run_spore vm rm "${rootfs_vm}"; then
+  die "spore vm rm rootfs VM failed after guest OOM"
 fi
 rootfs_created=0
 
 # The killed VM has a network gateway, the helper most likely to outlive its
 # monitor and keep a dead VM looking live.
 if run_capture "${workdir}/dead-create.out" "${workdir}/dead-create.err" \
-  run_spore create "${dead_vm}" --backend "${backend}" --memory "${dead_memory}" --timeout 60s --net; then
+  run_spore vm create "${dead_vm}" --backend "${backend}" --memory "${dead_memory}" --timeout 60s --net; then
   dead_created=1
 else
   cat "${workdir}/dead-create.err" >&2 || true
-  die "spore create diskless VM failed"
+  die "spore vm create diskless VM failed"
 fi
 
 pid_path="${runtime_dir}/vms/${dead_vm}/pid"
@@ -131,14 +131,14 @@ wait_dead "${monitor_pid}" || die "monitor pid did not exit after SIGKILL: ${mon
 
 dead_state=""
 for _ in $(seq 1 20); do
-  dead_state="$(run_spore --json ls | python3 -c 'import json, sys; print(next((e["state"] for e in json.load(sys.stdin)["entries"] if e["name"] == sys.argv[1]), "missing"))' "${dead_vm}")"
+  dead_state="$(run_spore --json vm ls | python3 -c 'import json, sys; print(next((e["state"] for e in json.load(sys.stdin)["entries"] if e["name"] == sys.argv[1]), "missing"))' "${dead_vm}")"
   [[ "${dead_state}" == "stale" ]] && break
   sleep 0.1
 done
-[[ "${dead_state}" == "stale" ]] || die "spore ls reported ${dead_state} for a VM whose monitor was killed, expected stale"
+[[ "${dead_state}" == "stale" ]] || die "spore vm ls reported ${dead_state} for a VM whose monitor was killed, expected stale"
 
 if run_capture "${workdir}/dead-exec.out" "${workdir}/dead-exec.err" \
-  run_spore exec "${dead_vm}" -- /bin/true; then
+  run_spore vm exec "${dead_vm}" -- /bin/true; then
   die "exec against killed monitor unexpectedly exited 0"
 else
   dead_exec_status=$?
@@ -160,12 +160,12 @@ grep -q "monitor_log=" "${workdir}/dead-exec.err" || {
   die "exec against killed monitor did not report monitor log path"
 }
 
-if ! run_spore rm "${dead_vm}"; then
-  die "spore rm killed monitor VM failed"
+if ! run_spore vm rm "${dead_vm}"; then
+  die "spore vm rm killed monitor VM failed"
 fi
 dead_created=0
 [[ ! -e "${runtime_dir}/vms/${dead_vm}" ]] || {
-  die "spore rm did not clean killed monitor state"
+  die "spore vm rm did not clean killed monitor state"
 }
 for _ in $(seq 1 50); do
   pgrep -g "${monitor_pid}" >/dev/null || break

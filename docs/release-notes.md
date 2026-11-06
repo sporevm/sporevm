@@ -2,26 +2,46 @@
 
 ## Unreleased
 
+### One spelling per command: `spore vm` and `spore checkpoint`
+
+Commands on named VMs live under `spore vm` and commands on saved state under
+`spore checkpoint`, and the top-level spellings are gone, with no aliases or
+hints:
+
+| Old | New |
+| --- | --- |
+| `spore create`, `exec`, `logs`, `copy-in`, `copy-out`, `save`, `restore`, `ls` | `spore vm create`, `vm exec`, `vm logs`, `vm copy-in`, `vm copy-out`, `vm save`, `vm restore`, `vm ls` |
+| `spore ps` | `spore vm ls` |
+| `spore rm NAME` | `spore vm rm NAME` |
+| `spore fork --vm NAME` | `spore vm fork NAME` |
+| `spore rm --spore DIR` | `spore checkpoint rm DIR` |
+| `spore fork DIR` | `spore checkpoint fork DIR` |
+| `spore inspect`, `push`, `pull` | `spore checkpoint inspect`, `checkpoint push`, `checkpoint pull` |
+
+`spore help` is gone (use `spore --help`), and `spore resume` and `spore
+suspend` no longer print a hint. JSON results and their schemas are
+unchanged. The CLI no longer promises to keep 0.x spellings compatible.
+
 ### Global `--json` replaces `--events=jsonl`
 
-`spore --json run|attach|exec|fanout` now prints the
+`spore --json run|attach|fanout|vm exec` now prints the
 `spore.automation.event.v1` stream that `--events=jsonl` printed, and
 `--events=jsonl` is gone from every command. Argument errors in those
 commands now also end the stream with a failed `completion` instead of a
-message on stderr. `spore restore` no longer streams events; `spore --json
-restore` prints its `spore.lifecycle.v1` result as before. `spore exec
+message on stderr. `spore vm restore` no longer streams events; `spore --json
+vm restore` prints its `spore.lifecycle.v1` result as before. `spore exec
 --timing-json` and its `spore.named-exec-timing.v1` file are gone.
 
-### `spore push` and `spore pull` move spores through image stores
+### `spore checkpoint push` and `spore checkpoint pull` move spores through image stores
 
-`spore push SPORE STORE/TAG` now writes a saved spore to a directory or S3
-image store: its RAM chunks and disk objects go in the store's shared
-`objects/`, so a spore pushed to a store holding its image uploads only its
-RAM, changed disk chunks, disk index and manifest. It prints the
+`spore checkpoint push SPORE STORE/TAG` now writes a saved spore to a
+directory or S3 image store: its RAM chunks and disk objects go in the store's
+shared `objects/`, so a spore pushed to a store holding its image uploads only
+its RAM, changed disk chunks, disk index and manifest. It prints the
 digest-pinned ref, and `--json` prints `spore.push.result.v2`.
-`spore pull STORE/TAG --out DIR` fetches it back from a directory, HTTP(S) or
-S3 store, verifying every object, and writes a save pinned in the rootfs
-cache; `--json` prints `spore.pull.result.v2`. Bundles no longer travel:
+`spore checkpoint pull STORE/TAG --out DIR` fetches it back from a directory,
+HTTP(S) or S3 store, verifying every object, and writes a save pinned in the
+rootfs cache; `--json` prints `spore.pull.result.v2`. Bundles no longer travel:
 pushing a bundle to S3 (`spore push BUNDLE s3://... [--region]`) and pulling
 one (`spore pull file://|s3://|http(s)://... [--child] [--region]
 [--allow-metadata-only-rootfs]`) are gone. To run one child of a fork batch
@@ -33,11 +53,12 @@ elsewhere, push the parent, pull it there and pass the child's identity to
 `spore pack`, `spore unpack`, `spore inspect-bundle` and `spore clone` are
 removed, with their `spore.pack.result.v1`, `spore.unpack.result.v1`,
 `spore.bundle.inspect.v1` and `spore.clone.result.v1` results and the `bundle`
-resource type; use `spore push` and `spore pull`. A disk-backed save is always
-pinned in the rootfs cache and must be on its filesystem; nothing makes a
-self-contained copy of one any more. `SPOREVM_BUNDLE_CACHE_DIR` is no longer
-read and `spore host-info` no longer reports `cache_roots.bundles`; delete the
-`bundles` directory under the SporeVM cache.
+resource type; use `spore checkpoint push` and `spore checkpoint pull`. A
+disk-backed save is always pinned in the rootfs cache and must be on its
+filesystem; nothing makes a self-contained copy of one any more.
+`SPOREVM_BUNDLE_CACHE_DIR` is no longer read and `spore host-info` no longer
+reports `cache_roots.bundles`; delete the `bundles` directory under the SporeVM
+cache.
 
 A disk-backed save that carries its own disk index and objects, as
 `spore clone` and `spore unpack` wrote, no longer restores, forks or pushes;
@@ -51,12 +72,12 @@ restored from the save runs; that VM's runtime lease keeps its storage.
 - On aarch64 each virtio-blk disk serves its requests on a thread of its own
   instead of on the vCPU that issued them. A slow read, such as the first read
   of an object fetched from an image store, now stalls only that disk: the
-  vCPUs keep running, and the console, network, other disks and `spore exec`
+  vCPUs keep running, and the console, network, other disks and `spore vm exec`
   keep working.
 - Restores from memory chunks read each chunk straight into guest RAM instead
   of through a heap buffer, taking another 28 to 43 percent off loads with a
   warm page cache and 10 to 35 percent with a cold one.
-- Guest command output reaches `spore run` and `spore exec` at 350 to 700
+- Guest command output reaches `spore run` and `spore vm exec` at 350 to 700
   MiB/s, up from 14 MiB/s on KVM and 30 MiB/s on Hypervisor.framework. The
   guest agent no longer copies it to the console unless the console is
   logged, and sends it in 64 KiB vsock packets instead of two packets per
@@ -81,7 +102,7 @@ restored from the save runs; that VM's runtime lease keeps its storage.
   agent reads, give it the wrong type, or set a VM id, fork batch id,
   hostname or entropy seed over 127 bytes or containing NUL, now fail instead
   of being partly applied. `spore run --from`, `spore attach` and
-  `spore restore` check a `--generation` file against the same rules before
+  `spore vm restore` check a `--generation` file against the same rules before
   the VM starts.
 
 ### Other changes

@@ -27,7 +27,7 @@ smoke_tempdir runtime_dir "${SPORE_SMOKE_RUNTIME_ROOT:-/tmp}/svm-egress"
 vm_name=""
 cleanup() {
   if [[ -n "${vm_name}" ]]; then
-    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${vm_name}" >/dev/null 2>&1 || true
   fi
 }
 
@@ -36,7 +36,7 @@ fetch_and_assert() {
   local label="$2"
   local fetched
   fetched="$(env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-    "${spore_bin}" exec "${name}" -- /bin/sh -c "wget -q -T 20 -O - '${fetch_url}' | wc -c")" || {
+    "${spore_bin}" vm exec "${name}" -- /bin/sh -c "wget -q -T 20 -O - '${fetch_url}' | wc -c")" || {
     die "${label}: HTTPS fetch failed"
   }
   fetched="$(echo "${fetched}" | tr -d '[:space:]')"
@@ -47,7 +47,7 @@ assert_denied() {
   local name="$1"
   local label="$2"
   if env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-    "${spore_bin}" exec "${name}" -- /bin/sh -c "nc -z -w 4 '${denied_host}' 443" \
+    "${spore_bin}" vm exec "${name}" -- /bin/sh -c "nc -z -w 4 '${denied_host}' 443" \
     >"${workdir}/denied.out" 2>"${workdir}/denied.err"; then
     cat "${workdir}/denied.out" >&2 || true
     cat "${workdir}/denied.err" >&2 || true
@@ -58,24 +58,24 @@ assert_denied() {
 # Exact host-port allow rule.
 vm_name="egress-port-$$"
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-  "${spore_bin}" create "${vm_name}" \
+  "${spore_bin}" vm create "${vm_name}" \
     --image "${image}" \
     --net --allow-host-port "${allow_host}:443" \
     --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}ms" >/dev/null
 fetch_and_assert "${vm_name}" "allow-host-port"
 assert_denied "${vm_name}" "allow-host-port"
-env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${vm_name}" >/dev/null
 
 # Host-only allow rule.
 vm_name="egress-host-$$"
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-  "${spore_bin}" create "${vm_name}" \
+  "${spore_bin}" vm create "${vm_name}" \
     --image "${image}" \
     --net --allow-host "${allow_host}" \
     --timeout "${SPORE_SMOKE_LIFECYCLE_TIMEOUT_MS:-60000}ms" >/dev/null
 fetch_and_assert "${vm_name}" "allow-host"
 assert_denied "${vm_name}" "allow-host"
-env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${vm_name}" >/dev/null
 vm_name=""
 
 echo "smoke:net-egress ok host=${allow_host}"

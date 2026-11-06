@@ -33,13 +33,13 @@ spore_bin=""
 cleanup() {
   if [[ -n "${spore_bin}" && -x "${spore_bin}" ]]; then
     SPOREVM_RUNTIME_DIR="${workdir}/runtime" SPOREVM_ROOTFS_CACHE_DIR="${workdir}/cache" \
-      "${spore_bin}" rm diskless-rm-1 >/dev/null 2>&1 || true
+      "${spore_bin}" vm rm diskless-rm-1 >/dev/null 2>&1 || true
     SPOREVM_RUNTIME_DIR="${workdir}/runtime" SPOREVM_ROOTFS_CACHE_DIR="${workdir}/cache" \
-      "${spore_bin}" rm diskless-rm-2 >/dev/null 2>&1 || true
+      "${spore_bin}" vm rm diskless-rm-2 >/dev/null 2>&1 || true
     for saved in stopped-1.spore stopped-2.spore; do
       if [[ -d "${workdir}/run/${saved}" ]]; then
         SPOREVM_RUNTIME_DIR="${workdir}/runtime" SPOREVM_ROOTFS_CACHE_DIR="${workdir}/cache" \
-          "${spore_bin}" rm --spore "${workdir}/run/${saved}" >/dev/null 2>&1 || true
+          "${spore_bin}" checkpoint rm "${workdir}/run/${saved}" >/dev/null 2>&1 || true
       fi
     done
   fi
@@ -63,35 +63,32 @@ export SPOREVM_RUNTIME_DIR="${workdir}/runtime"
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/cache"
 cd "${workdir}/run"
 
-"${spore_bin}" create diskless-rm-1 --backend "${backend}" --memory 256mb --vcpus 1
-"${spore_bin}" save diskless-rm-1 --out stopped-1.spore --stop
-"${spore_bin}" inspect stopped-1.spore > inspect-1.txt
+"${spore_bin}" vm create diskless-rm-1 --backend "${backend}" --memory 256mb --vcpus 1
+"${spore_bin}" vm save diskless-rm-1 --out stopped-1.spore --stop
+"${spore_bin}" checkpoint inspect stopped-1.spore > inspect-1.txt
 grep -Fq "vCPUs: 1" inspect-1.txt
 saved_1="$(cd stopped-1.spore && pwd -P)"
 # An empty DIR would resolve to the working directory, here a real save.
-for form in "checkpoint rm" "rm --spore"; do
-  status=0
-  # shellcheck disable=SC2086 # split the subcommand words
-  (cd stopped-1.spore && "${spore_bin}" ${form} "") >/dev/null 2>&1 || status=$?
-  [[ "${status}" == 2 && -f stopped-1.spore/manifest.json ]] || {
-    echo "spore ${form} \"\" exited ${status} or removed the working directory" >&2
-    exit 1
-  }
-done
-"${spore_bin}" rm --spore stopped-1.spore > removed-1.txt
+status=0
+(cd stopped-1.spore && "${spore_bin}" checkpoint rm "") >/dev/null 2>&1 || status=$?
+[[ "${status}" == 2 && -f stopped-1.spore/manifest.json ]] || {
+  echo "spore checkpoint rm \"\" exited ${status} or removed the working directory" >&2
+  exit 1
+}
+"${spore_bin}" checkpoint rm stopped-1.spore > removed-1.txt
 grep -Fq "removed checkpoint ${saved_1};" removed-1.txt
 [[ ! -e stopped-1.spore ]]
-if "${spore_bin}" rm --spore stopped-1.spore >/dev/null 2>&1; then
+if "${spore_bin}" checkpoint rm stopped-1.spore >/dev/null 2>&1; then
   echo "repeated diskless saved-spore removal unexpectedly succeeded" >&2
   exit 1
 fi
 
-"${spore_bin}" create diskless-rm-2 --backend "${backend}" --memory 256mb --vcpus 2
-"${spore_bin}" save diskless-rm-2 --out stopped-2.spore --stop
-"${spore_bin}" inspect stopped-2.spore > inspect-2.txt
+"${spore_bin}" vm create diskless-rm-2 --backend "${backend}" --memory 256mb --vcpus 2
+"${spore_bin}" vm save diskless-rm-2 --out stopped-2.spore --stop
+"${spore_bin}" checkpoint inspect stopped-2.spore > inspect-2.txt
 grep -Fq "vCPUs: 2" inspect-2.txt
 saved_2="$(cd stopped-2.spore && pwd -P)"
-"${spore_bin}" --json rm --spore stopped-2.spore > removed-2.json
+"${spore_bin}" --json checkpoint rm stopped-2.spore > removed-2.json
 python3 - "${workdir}/run/removed-2.json" "${saved_2}" <<'PY'
 import json
 import pathlib

@@ -116,7 +116,7 @@ KVM and HVF map a validated `ram.backing` fd with private mappings. Clean pages
 can be shared by the host; guest writes fault into private CoW pages. This is
 the same-host fork/fan-out fast path.
 
-`spore fork` hard-links a proof-valid parent backing file into each child and
+`spore checkpoint fork` hard-links a proof-valid parent backing file into each child and
 writes child-local proofs. The proven parent fd stays open across the batch; each
 new child link is opened without following symlinks and must match every
 proof-bound parent file-identity field before its proof is written. An
@@ -125,7 +125,7 @@ hard-link capability, or a conflicting optional child proof produces chunk-only
 children. Malformed parent metadata, allocation failure, identity races, and
 unexpected hard-link or proof-write I/O abort the fork instead of being hidden.
 
-`spore push` and `spore pull` remain chunk-authoritative and do not treat
+`spore checkpoint push` and `spore checkpoint pull` remain chunk-authoritative and do not treat
 proof files as distribution authority.
 
 ## Dirty Tracking
@@ -155,7 +155,7 @@ before its proof is written.
 
 ## Current Limits
 
-- `spore ls` reports initial and maximum memory, monitor process
+- `spore vm ls` reports initial and maximum memory, monitor process
   resident bytes on Linux/macOS, chunk size and total chunks, and local
   `ram.backing` logical/allocated bytes when a listed VM points at a local spore
   directory with a backing file. Ready dirty-tracked monitor VMs also report

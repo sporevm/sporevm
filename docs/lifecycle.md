@@ -5,8 +5,8 @@ lifecycle and ownership rules:
 
 | Resource | Meaning | Primary operations |
 | --- | --- | --- |
-| Live VM | A running, named VM behind a host-local monitor | `create`, `exec`, `save`, `restore`, `spore vm fork`, `spore vm rm` |
-| Checkpoint (spore) | Saved machine and session state in a directory | `inspect`, `attach`, `run --from`, `push`, `pull`, `spore checkpoint fork`, `spore checkpoint rm` |
+| Live VM | A running, named VM behind a host-local monitor | `spore vm create`, `exec`, `save`, `restore`, `fork`, `rm` |
+| Checkpoint (spore) | Saved machine and session state in a directory | `spore checkpoint inspect`, `fork`, `rm`, `push`, `pull`; `spore attach`, `spore run --from` |
 | Image | Application filesystem and OCI execution metadata, without machine state | `build`, `run --commit`, `image unpack` |
 
 Named lifecycle keeps a live VM behind one local monitor process so callers can
@@ -18,22 +18,17 @@ directories; public capability and result fields use `checkpoint`.
 ## User Contract
 
 ```bash
-spore create bench-1 --image docker.io/library/alpine:3.20 'sleep 30'
-spore exec bench-1 'echo hi'
-spore save bench-1 --out bench-1.spore --stop
-spore restore bench-1.spore --name bench-2
-spore ps
+spore vm create bench-1 --image docker.io/library/alpine:3.20 'sleep 30'
+spore vm exec bench-1 'echo hi'
+spore vm save bench-1 --out bench-1.spore --stop
+spore vm restore bench-1.spore --name bench-2
+spore vm ls
 spore vm rm bench-2
 ```
 
 `spore run` remains the one-shot command. On ARM64 HVF/KVM hosts, the stable
-named surface is `create`, `exec`, `copy-in`, `copy-out`, `save`, `restore`,
-`vm fork`, `ls`/`ps`, and `vm rm`.
-
-The older `spore rm NAME`, `spore rm --spore DIR`, `spore fork DIR`, and
-`spore fork --vm NAME` forms remain compatible throughout the 0.x release
-line. New scripts should use the resource namespaces because they make the
-destructive target visible without interpreting a selector flag.
+named surface is `spore vm create`, `exec`, `copy-in`, `copy-out`, `save`,
+`restore`, `fork`, `ls` and `rm`.
 
 VM names are 1-128 ASCII bytes. The first byte must be alphanumeric; remaining
 bytes may also use `.`, `_`, and `-`. This public limit is identical on macOS
@@ -53,16 +48,16 @@ interactive lifecycle operations.
 Machine callers use global `--json` for single-result lifecycle commands:
 
 ```bash
-spore --json create bench-1 --image docker.io/library/alpine:3.20
-spore --json ls
+spore --json vm create bench-1 --image docker.io/library/alpine:3.20
+spore --json vm ls
 ```
 
-`spore create`, `spore exec`, and `spore run` accept a shell command by default
+`spore vm create`, `spore vm exec`, and `spore run` accept a shell command by default
 and `-- <argv...>` for exact argv. Shell-form commands require a guest
 environment with `/bin/sh`; the managed default initrd provides a small Toybox
 shell environment, while image, rootfs, and custom-initrd guests provide their
 own command environment. Use `--image` or `--rootfs` for general distro
-commands. A command passed to `spore create` is started in the guest and
+commands. A command passed to `spore vm create` is started in the guest and
 detached. By default the guest continuously drains and retains up to 16,381
 bytes from each of stdout and stderr, so an unattended process cannot block on
 a full pipe or grow host storage. Create reports the `named_logs` destination
@@ -70,25 +65,25 @@ and `started` status; retrieve the current bounded snapshot, process status,
 exit code, and truncation flags later with:
 
 ```bash
-spore logs bench-1
-spore --json logs bench-1
+spore vm logs bench-1
+spore --json vm logs bench-1
 ```
 
 Pass `--initial-output discard` when the output is intentionally disposable;
 `retain` is the default and is also accepted explicitly. Retained bytes live
 with the guest agent, are copied with a live fork or saved-memory restore, and
 disappear when the VM is removed. Retrieval takes its turn on the guest like
-any other operation, so `spore logs` waits behind a running exec, copy, save,
+any other operation, so `spore vm logs` waits behind a running exec, copy, save,
 or fork for up to the VM timeout and then reports the monitor as busy. Create removes the new
 VM if the process cannot be started, while a non-zero exit after a successful
-start is reported by `spore logs` and does not affect VM readiness.
-`spore exec` always
+start is reported by `spore vm logs` and does not affect VM readiness.
+`spore vm exec` always
 streams guest stdout and stderr live as independent ordered streams. Stdin is
 closed by default. Pass `-i` to forward host stdin, and pass `-t` to request a
 guest terminal for the exec. The usual shell spelling is:
 
 ```bash
-spore exec -it bench-1 -- /bin/sh
+spore vm exec -it bench-1 -- /bin/sh
 ```
 
 `-i` and `-t` are independent: neither flag selects output attachment, and a
@@ -96,7 +91,7 @@ host terminal is not required when PTY output or input is redirected.
 
 Named VMs created with `--image` apply the image's OCI `Config.Env` and
 `WorkingDir` to every command, including the detached command passed to
-`spore create`, plain exec, interactive exec, and TTY exec. When create has no
+`spore vm create`, plain exec, interactive exec, and TTY exec. When create has no
 command, its detached initial process uses `Entrypoint` plus `Cmd`; an explicit
 create command replaces `Cmd` but still follows `Entrypoint`. `User` must select
 root until guest credential switching is implemented. Later execs do not
@@ -104,7 +99,7 @@ reapply `Entrypoint` or `Cmd`, and each can override the environment and working
 directory before the VM name:
 
 ```bash
-spore exec --env RACK_ENV=test --env BUNDLE_GEMFILE --workdir /app bench-1 \
+spore vm exec --env RACK_ENV=test --env BUNDLE_GEMFILE --workdir /app bench-1 \
   -- bundle exec rspec
 ```
 
@@ -128,7 +123,7 @@ executed exactly as supplied.
 Named create accepts create-time annotations and networking options:
 
 ```bash
-spore create bench-1 \
+spore vm create bench-1 \
   --image docker.io/library/alpine:3.20 \
   --annotation cleanroom.stage=compile \
   --net \
@@ -146,7 +141,7 @@ guest host, and guest port as restore-time requirements.
 Tooling can provide the same create options as JSON:
 
 ```bash
-spore create bench-1 --options @create-options.json
+spore vm create bench-1 --options @create-options.json
 ```
 
 ```json
@@ -190,10 +185,10 @@ Named VMs also support explicit path transfer through the same local
 monitor boundary:
 
 ```bash
-spore copy-in bench-1 ./local.txt /tmp/local.txt
-spore copy-out bench-1 /tmp/local.txt ./roundtrip.txt
-spore copy-in bench-1 ./src /tmp/src
-spore copy-out bench-1 /tmp/src ./src-roundtrip
+spore vm copy-in bench-1 ./local.txt /tmp/local.txt
+spore vm copy-out bench-1 /tmp/local.txt ./roundtrip.txt
+spore vm copy-in bench-1 ./src /tmp/src
+spore vm copy-out bench-1 /tmp/src ./src-roundtrip
 ```
 
 Copy paths are explicit on both sides. Guest paths must be absolute, `.` and
@@ -241,10 +236,10 @@ the complete spec, then starts `spore monitor NAME` with the lock as stdin.
 The monitor holds the lock until it exits and keeps it out of every helper it
 starts. From then on the monitor is the only writer of the spec, `pid`,
 `ready.json` and its timing and stats files, all through a directory fd it
-holds open. `spore ls` reports `starting` while the lock is held before
+holds open. `spore vm ls` reports `starting` while the lock is held before
 `ready.json` exists, `ready` once it does, and `stale` when nobody holds the
 lock, for example after the monitor was killed. The `pid` file is used only to
-signal the monitor, never to decide whether it is alive. `spore rm` takes the
+signal the monitor, never to decide whether it is alive. `spore vm rm` takes the
 lock before it deletes the entry: a stale entry is deleted at once, a live one
 is asked to shut down and then signalled, and an entry whose claimer has not
 started its monitor yet is reported as still starting.
@@ -280,7 +275,7 @@ restored command can be reattached without pretending it is the original default
 process.
 
 `spore attach DIR` attaches to the `default` handle when present, or to the sole
-recorded handle when a spore only has one non-default session. `spore fork`
+recorded handle when a spore only has one non-default session. `spore checkpoint fork`
 preserves the recorded handles in each child. The handle
 records guest-side capability only: host stdin, the host-side PTY owner, raw
 terminal mode, window ownership, and any currently attached client are not part
@@ -296,7 +291,7 @@ starts. Named VM names remain lifecycle monitor handles.
 
 ## Saves And Forks
 
-`spore save NAME --out DIR` writes a spore and leaves the named VM running.
+`spore vm save NAME --out DIR` writes a spore and leaves the named VM running.
 Image-created named saves record `exec_defaults` as optional manifest metadata:
 the OCI environment list and working directory are preserved by stop and
 non-destructive save, restore, offline fork, push and pull, and live named fork.
@@ -308,8 +303,8 @@ surface.
 Writable-disk saves are `machine-local-pinned`. The reference to
 their durable cache pin is hard-linked to one cache-side ownership anchor, so
 moving or renaming the directory is safe while ordinary and hard-link copies
-fail closed before restore or removal. Use `spore fork` for another
-machine-local lifetime, or `spore push` and `spore pull` to copy a save to
+fail closed before restore or removal. Use `spore checkpoint fork` for another
+machine-local lifetime, or `spore checkpoint push` and `spore checkpoint pull` to copy a save to
 another host or rootfs cache.
 The ownership anchor is a hard link, so a machine-local pinned save must be on
 the configured rootfs cache's filesystem.
@@ -328,7 +323,7 @@ supported backend (KVM and HVF), for diskless, image-created writable rootfs, an
 explicit `--rootfs PATH` VMs: the monitor quiesces every vCPU at one barrier,
 captures manifest-v1 machine state, and resumes the guest. As with `--stop` and
 live fork, KVM writes a portable multi-vCPU spore while HVF writes a
-same-backend spore that restores only on HVF. `spore save NAME --out DIR --stop`
+same-backend spore that restores only on HVF. `spore vm save NAME --out DIR --stop`
 writes a spore and removes the named VM from the runtime registry. A failed save
 leaves no partial spore at `--out`; if the capture itself fails, the monitor
 stops the VM and the command reports the error (parity with single-vCPU save).
@@ -344,7 +339,7 @@ Repeated `--annotation KEY=VALUE` flags merge save-time annotations into the
 manifest without dropping create-time annotations:
 
 ```bash
-spore save bench-1 --out bench-1.spore --stop --annotation saved=true
+spore vm save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
 Delete a checkpoint with `spore checkpoint rm DIR`. It requires a directory
@@ -363,12 +358,12 @@ checkpoint renamed within the same filesystem keeps its pin; `mv` to another
 filesystem copies it, which behaves like `cp -r` followed by `rm -rf`. After
 `cp -al`, neither copy restores until one is removed, and GC keeps the storage
 while either exists. A plain `cp -r` copy never owned the pin and cannot
-restore; use `spore push` and `spore pull` for an independent copy.
+restore; use `spore checkpoint push` and `spore checkpoint pull` for an independent copy.
 
 `spore cache pins` reports `index_valid` only after validating the record and
 canonical index, and `stale` for a record from an earlier build that
 `spore cache gc --force` deletes. It deliberately does not stat or hash every object; lazy reads
-and `spore push` still verify object bytes and may fail closed on missing or
+and `spore checkpoint push` still verify object bytes and may fail closed on missing or
 corrupt content. Inspect and save output name the ownership class.
 The hard-link anchor supplies local proof without a global save-path registry.
 
@@ -376,7 +371,7 @@ If a saved manifest declares bound services, named restore requires fresh host
 socket bindings:
 
 ```bash
-spore restore bench-1.spore --name bench-2 \
+spore vm restore bench-1.spore --name bench-2 \
   --bind-service metadata=unix:/tmp/fresh-metadata.sock
 ```
 
@@ -385,10 +380,10 @@ machine state once while the source VM is paused, then keeps the source VM
 running:
 
 ```bash
-spore create counter --image docker.io/library/alpine:3.20 \
+spore vm create counter --image docker.io/library/alpine:3.20 \
   'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done'
 spore vm fork counter --count 2 --name worker-%d
-spore exec worker-0 'cat /tick; sleep 1; cat /tick'
+spore vm exec worker-0 'cat /tick; sleep 1; cat /tick'
 ```
 
 `--name` is required for live VM fork. For `--count > 1`, it must contain exactly one
@@ -452,20 +447,20 @@ a duplicate field fails the request. The monitor answers `hello`,
 connection. Guest
 operations (exec, copy, logs, save, fork) take turns: each waits for the
 running one for up to the VM timeout and then fails as busy, and at most eight
-run or wait at once. `spore rm` stops a VM even while an exec runs; that exec
+run or wait at once. `spore vm rm` stops a VM even while an exec runs; that exec
 fails with `named VM is being removed`. A save or fork capture already under
 way may finish, but `rm` still signals the monitor if it has not exited within
-a second. `spore ls` reads monitor-published
+a second. `spore vm ls` reads monitor-published
 metadata such as `monitor-stats.json`; unavailable stats render as unknown
 instead of forcing an expensive VM memory scan.
 
-`spore create`, `spore restore --name`, and `spore vm fork` report success
+`spore vm create`, `spore vm restore --name`, and `spore vm fork` report success
 only after the restored guest agent has answered a dedicated readiness request,
 the monitor has written `ready.json` while holding the entry's lock, and the
 local `control.sock` answers a `hello` request with the same SporeVM version as
 the calling `spore`. A monitor that exits first is reported as a startup error
 at once instead of after the readiness timeout. This means a successful named restore is immediately ready for
-`spore exec`; callers do not need to poll with a no-op command. For disk-backed
+`spore vm exec`; callers do not need to poll with a no-op command. For disk-backed
 fork children, the baseline and one-shot `SCM_RIGHTS` overlay claim are validated
 and adopted before that guest readiness probe succeeds. The monitor's only
 argument is the VM name; it reads everything else from `spec.json`. The spec
@@ -476,9 +471,9 @@ both versions and the resolved executable path.
 Named lifecycle failures include the last known lifecycle state, recorded PID
 when present, the configured console path when one exists, `monitor.log`, and
 the control socket path where useful. This is the same diagnostic state visible
-through `spore ls`, carried back to the caller that hit the lifecycle error.
+through `spore vm ls`, carried back to the caller that hit the lifecycle error.
 
-`spore --json restore` includes `timing.prepare_ms`,
+`spore --json vm restore` includes `timing.prepare_ms`,
 `timing.spawn_monitor_ms`, `timing.wait_exec_ready_ms`, and `timing.total_ms`.
 The command returns after the exec-ready point, so `timing.total_ms` is the
 in-process restore-to-readiness measurement; external callers can separately
@@ -503,13 +498,13 @@ spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
   `spore run --from <spore-dir> <command>` starts a new command from saved VM
   state. `--generation FILE` is accepted only with `--from`. `spore run -t
   --from <spore-dir> <command>` is not implemented yet.
-- Every attached `spore exec` uses the streaming monitor request with separate
+- Every attached `spore vm exec` uses the streaming monitor request with separate
   stdout/stderr, optional stdin, terminal, resize, exit, and monitor-error
   frames. The monitor uses fail-fast backpressure: a disconnected consumer or
   local socket that cannot accept a complete frame within the 25 ms send
   deadline aborts that exec so it cannot block the VM control loop
   indefinitely.
-- `spore --json exec` uses the same `spore.automation.event.v1` envelope as
+- `spore --json vm exec` uses the same `spore.automation.event.v1` envelope as
   run, attach, and fanout. It emits base64 output records
   followed by exactly one completed, failed, or canceled completion; EOF before
   completion is `stream.interrupted`.
@@ -517,7 +512,7 @@ spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
   populates `initial_command` with its disposition, optional destination,
   per-stream limit, and startup status; `logs` returns the same nested object
   with process status, optional exit code, bytes, and truncation flags.
-- `spore copy-in` and `spore copy-out` transfer explicit regular files or
+- `spore vm copy-in` and `spore vm copy-out` transfer explicit regular files or
   directory trees. Symlinks, special files, overwrite, and workspace sync are
   intentionally outside this primitive. `copy-out` accepts at most 4 GiB of
   archive from the guest, and extracted modes pass through the host umask.
@@ -526,8 +521,8 @@ spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
 - Named live fork accepts at most 32 children and one writable rootfs disk.
   Networked and additional-device layouts remain unsupported.
 - No live network-flow save/restore.
-- `spore create --image` applies OCI Entrypoint and Cmd to its optional initial
-  command and requires a root `User`. Later `spore exec`, attach, restore, and
+- `spore vm create --image` applies OCI Entrypoint and Cmd to its optional initial
+  command and requires a root `User`. Later `spore vm exec`, attach, restore, and
   saved-spore paths do not reapply OCI command defaults.
 
 ## Validation

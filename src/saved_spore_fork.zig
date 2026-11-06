@@ -110,7 +110,7 @@ test "fork of a pinned save pins its children given relative paths" {
     try env.put(local_paths.rootfs_cache_env, cache);
     try env.put(local_paths.runtime_dir_env, try std.fs.path.join(arena, &.{ root, "runtime" }));
 
-    // Relative to the working directory, as `spore fork` passes them.
+    // Relative to the working directory, as `spore checkpoint fork` passes them.
     _ = try execute(.{ .io = io, .environ_map = &env }, allocator, .{
         .parent_dir = try test_dir.path("parent.spore"),
         .out_dir = try test_dir.path("children"),
