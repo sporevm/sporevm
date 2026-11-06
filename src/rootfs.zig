@@ -86,7 +86,6 @@ pub const BuildRequest = struct {
     output: []const u8,
     metadata: []const u8,
     platform: Platform = .{},
-    temp_dir_root: ?[]const u8 = null,
 };
 
 pub const ImportOciRequest = struct {
@@ -131,7 +130,7 @@ pub const RootfsStoragePolicy = enum {
 const BuildOptions = struct {
     ref: []const u8,
     platform: Platform = .{},
-    temp_dir_root: ?[]const u8 = null,
+    temp_dir_root: []const u8,
     target: Target,
 };
 
@@ -774,10 +773,11 @@ fn validateManifestConfigPlatform(
 }
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: BuildRequest) !BuildResult {
+    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     const result = try buildRootFS(init, allocator, .{
         .ref = request.ref,
         .platform = request.platform,
-        .temp_dir_root = request.temp_dir_root,
+        .temp_dir_root = try std.fs.path.join(allocator, &.{ cache_root, "tmp" }),
         .target = .{ .file = .{ .output = request.output, .metadata = request.metadata } },
     });
     return .{ .rootfs_storage = result.rootfs_storage };
@@ -1010,13 +1010,12 @@ fn buildRootFS(init: std.process.Init, allocator: std.mem.Allocator, opts: Build
     defer client.deinit();
     var session = try registry.Session.init(&client, init.environ_map);
 
-    const temp_dir_root = opts.temp_dir_root orelse ".zig-cache";
-    try Io.Dir.cwd().createDirPath(init.io, temp_dir_root);
+    try Io.Dir.cwd().createDirPath(init.io, opts.temp_dir_root);
     const temp_id = Io.Clock.real.now(init.io).nanoseconds;
     var temp_nonce_bytes: [8]u8 = undefined;
     init.io.random(&temp_nonce_bytes);
     const temp_nonce = std.mem.readInt(u64, &temp_nonce_bytes, .little);
-    const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ temp_dir_root, temp_id, temp_nonce });
+    const temp_dir = try std.fmt.allocPrint(allocator, "{s}/spore-rootfs-{d}-{x}", .{ opts.temp_dir_root, temp_id, temp_nonce });
     errdefer Io.Dir.cwd().deleteTree(init.io, temp_dir) catch {};
     try Io.Dir.cwd().createDirPath(init.io, temp_dir);
     const profile = RootfsBuildProfile.init(init.environ_map);
@@ -1500,6 +1499,36 @@ test "build options accept tag image refs" {
     defer allocator.free(parsed.metadata);
     try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
     try std.testing.expectEqualStrings("rootfs.ext4.json", parsed.metadata);
+}
+
+test "rootfs build keeps its temp dir in the rootfs cache and removes it on failure" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    var env = std.process.Environ.Map.init(arena);
+    try env.put(local_paths.rootfs_cache_env, try std.fs.path.join(arena, &.{ root, "cache" }));
+
+    // The untagged ref fails only after the build has made its temp dir.
+    try std.testing.expectError(error.ImageTagRequired, build(.{
+        .minimal = undefined,
+        .arena = &arena_state,
+        .gpa = std.testing.allocator,
+        .io = io,
+        .environ_map = &env,
+        .preopens = .empty,
+    }, arena, .{
+        .ref = "registry.example/repo",
+        .output = try std.fs.path.join(arena, &.{ root, "rootfs.ext4" }),
+        .metadata = try std.fs.path.join(arena, &.{ root, "rootfs.ext4.json" }),
+    }));
+    var temp_root = try tmp.dir.openDir(io, "cache/tmp", .{ .iterate = true });
+    defer temp_root.close(io);
+    var entries = temp_root.iterate();
+    try std.testing.expect(try entries.next(io) == null);
 }
 
 test "resolve options parse image tag and platform" {
