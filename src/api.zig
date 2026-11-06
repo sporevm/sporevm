@@ -648,7 +648,7 @@ pub fn runManaged(
     } else 0;
 
     return run_mod.execute(.{ .io = init.io, .environ_map = init.environ_map }, arena, .{
-        .backend = selected_backend,
+        .backend = options.backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
         .boot_artifacts = boot_artifacts,

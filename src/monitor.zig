@@ -155,7 +155,9 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
 
     const opts = try parseMonitorArgs(allocator, args);
     const parsed_ms = lifecycle.monotonicMs();
-    // The command that spawned this monitor already probed the host.
+    // No host probe here: `create` probes before spawning its monitor, x86
+    // rejects restore and fork monitors below, and opening the backend
+    // reports an unusable arm64 KVM.
     const selected_backend = opts.backend.resolveForHost() catch |err| {
         std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
         std.process.exit(2);
