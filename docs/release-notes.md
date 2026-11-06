@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Multi-vCPU saves wait out interrupt handlers
+
+A save could stop a vCPU after the guest acknowledged an interrupt and before
+it completed it. Hypervisor.framework does not restore that state, so
+restoring such a spore on macOS aborted with `FIXME: "Handle no active
+virtual interrupt, EOIR1 0x32"` once the guest completed the interrupt. Saves
+of multi-vCPU VMs on either backend now let the guest run on until no vCPU is
+inside an interrupt handler, and fail with `InterruptStillActive` if that
+takes more than a second. Re-save spores that hit the abort.
+
 ### x32 syscalls in build RUN
 
 On an x86_64 kernel built with x32 support (the managed kernel has none), a
