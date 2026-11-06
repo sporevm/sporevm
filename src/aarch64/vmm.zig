@@ -109,7 +109,9 @@ pub const Config = struct {
     annotations: spore.Annotations = .{},
     sessions: []const spore.Session = &.{},
     /// Product callers provide their environment so snapshot code can write
-    /// local-only RAM backing proofs under the configured runtime root.
+    /// local-only RAM backing proofs under the configured runtime root and
+    /// seal a writable disk into the configured rootfs cache. Saving a
+    /// writable disk requires it.
     environ_map: ?*const std.process.Environ.Map = null,
     /// Host-initiated vsock stream that runs the guest command.
     probe: ?Probe = null,
@@ -879,10 +881,14 @@ pub fn writeSnapshot(
     const generation_start = clock.nowMs();
     const gen_state = try source.gen_dev.capture(arena);
     const generation_ms = clock.nowMs() - generation_start;
+    // A disk fork keeps the layer live; a save seals it into the rootfs
+    // cache that the environment names, and pins it there.
+    const disk_snapshot = if (target.disk == .finish) config.disk_snapshot else null;
+    const disk_environ = if (disk_snapshot != null) config.environ_map orelse return error.RootfsCacheUnavailable else null;
     // Fetch a store image's missing objects before sealing the disk, so a
     // failed download leaves nothing written and does not hold the cache
-    // lock. A disk fork keeps the layer live, so it fetches nothing.
-    if (target.disk == .finish) if (config.disk_snapshot) |disk_state| try disk_state.fetchFromStore();
+    // lock. A disk fork fetches nothing.
+    if (disk_snapshot) |disk_state| try disk_state.fetchFromStore();
     const memory_start = clock.nowMs();
     const memory = if (dirty_tracker) |tracker|
         try tracker.finish()
@@ -893,18 +899,17 @@ pub fn writeSnapshot(
     if (config.environ_map) |environ| {
         try local_backing.writeLocalMemoryBackingProof(arena, environ, dir, memory, source.ram_bytes.len);
     }
-    const disk_snapshot = if (target.disk == .finish) config.disk_snapshot else null;
     var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
     defer if (owned_cache_lock) |*lock| lock.deinit();
-    const disk_root = if (disk_snapshot != null and config.environ_map != null) blk: {
-        const cache_root = try local_paths.rootfsCacheRootPath(arena, config.environ_map.?);
+    const cache_root = if (disk_environ) |environ| blk: {
+        const root = try local_paths.rootfsCacheRootPath(arena, environ);
         if (target.rootfs_cache_lock) |lock| {
-            if (!try lock.ensureHeldFor(arena, cache_root)) return error.RootfsCacheLockNotHeld;
-        } else owned_cache_lock = try rootfs_mod.lockRootfsCacheExclusive(pin_io, arena, cache_root);
-        break :blk cache_root;
-    } else dir;
+            if (!try lock.ensureHeldFor(arena, root)) return error.RootfsCacheLockNotHeld;
+        } else owned_cache_lock = try rootfs_mod.lockRootfsCacheExclusive(pin_io, arena, root);
+        break :blk root;
+    } else null;
     const disk_start = clock.nowMs();
-    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
+    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, cache_root.?, disk_quiesced) else null;
     const disk_ms = clock.nowMs() - disk_start;
     const manifest_start = clock.nowMs();
     const saved_manifest = spore.Manifest{
@@ -921,10 +926,8 @@ pub fn writeSnapshot(
         .memory = memory,
     };
     if (disk_manifest) |disk| {
-        if (config.environ_map != null) {
-            const registry = try saved_spore_pin.LockedRegistry.init(arena, disk_root, target.rootfs_cache_lock orelse &owned_cache_lock.?);
-            try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
-        } else try spore.saveManifest(arena, dir, saved_manifest);
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root.?, target.rootfs_cache_lock orelse &owned_cache_lock.?);
+        try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
     } else try spore.saveManifest(arena, dir, saved_manifest);
     const manifest_ms = clock.nowMs() - manifest_start;
     const total_ms = clock.nowMs() - total_start;
@@ -1758,11 +1761,6 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             else
                 null;
             defer if (preparation) |*owned| owned.deinit();
-            var prepared_root = if (request.publish_dir) |publish_dir|
-                if (config.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
-            else
-                null;
-            defer if (prepared_root) |*root| root.deinit();
             try self.pauseAll(.capture);
             const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
             try self.writeSpore(allocator, source, .{
@@ -1771,7 +1769,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             });
             const completed_dir = if (request.publish_dir) |publish_dir| blk: {
                 const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
-                if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (config.environ_map != null) .shared_no_rebind else .local_rebind);
+                if (config.disk_snapshot) |disk_state| disk_state.commitSnapshot();
                 logNamedSnapshotPublication(Vm.name, publish_metrics, source_pause_started_ns);
                 break :blk publish_dir;
             } else request.dir;
@@ -2742,8 +2740,15 @@ test "a snapshot fetches a store image's missing objects first, and a disk fork 
     try std.testing.expectEqual(@as(u64, 0), fetcher.stats.fetches);
     try std.testing.expectEqual(@as(u64, 0), fetcher.stats.errors);
 
-    // A snapshot fetches first and fails before it writes anything.
+    // A save seals the disk into the rootfs cache, which only the
+    // environment names, so without one it fails before it writes anything.
     const save_dir = try fixture.path("save");
+    try std.testing.expectError(error.RootfsCacheUnavailable, writeSnapshot(std.testing.allocator, "test", &vm, @as([]TestVcpu, &vcpus), @as(?*NoTracker, null), source, .{ .dir = save_dir }));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, save_dir, .{}));
+    try std.testing.expectEqual(@as(u64, 0), fetcher.stats.fetches);
+
+    // A snapshot fetches first and fails before it writes anything.
+    config.environ_map = &fixture.env;
     try std.testing.expectError(error.ImageStoreIncomplete, writeSnapshot(std.testing.allocator, "test", &vm, @as([]TestVcpu, &vcpus), @as(?*NoTracker, null), source, .{ .dir = save_dir }));
     try std.testing.expect(fetcher.stats.errors != 0);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, save_dir, .{}));

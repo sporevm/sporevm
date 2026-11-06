@@ -231,18 +231,6 @@ const LazyCasTrace = struct {
     stats: LazyCasTraceStats,
 };
 
-pub const PreparedSnapshotRoot = struct {
-    allocator: std.mem.Allocator,
-    root: ?[]const u8,
-
-    pub fn deinit(self: *PreparedSnapshotRoot) void {
-        if (self.root) |root| self.allocator.free(root);
-        self.* = undefined;
-    }
-};
-
-pub const SnapshotRootCommit = enum { local_rebind, shared_no_rebind };
-
 pub const ChunkMappedDisk = struct {
     allocator: std.mem.Allocator,
     base: block_source.FileBlockSource,
@@ -253,7 +241,7 @@ pub const ChunkMappedDisk = struct {
     sources: []Source,
     index: Index = .none,
     /// A newly installed snapshot is not fork authority until
-    /// `commitSnapshotRoot` runs after durable save publication and the source
+    /// `commitSnapshot` runs after durable save publication and the source
     /// runtime lease handoff. Either being set means a snapshot was published.
     pending_snapshot_identity: ?[]const u8 = null,
     committed_snapshot_identity: ?[]const u8 = null,
@@ -884,33 +872,6 @@ pub const ChunkMappedDisk = struct {
         self.index = .{ .parent = parent };
     }
 
-    /// Preallocates a stable snapshot authority before an atomic directory
-    /// rename. `commitSnapshotRoot` transfers this allocation without a
-    /// fallible operation after the rename succeeds.
-    pub fn prepareSnapshotRoot(self: *ChunkMappedDisk, root: []const u8) Error!PreparedSnapshotRoot {
-        return .{ .allocator = self.allocator, .root = try self.allocator.dupe(u8, root) };
-    }
-
-    /// Rebinds a just-published snapshot from its temporary directory to the
-    /// final atomic-publish path. A fresh clean rootfs may not publish a disk
-    /// index; in that case there is no baseline to rebind.
-    pub fn commitSnapshotRoot(self: *ChunkMappedDisk, expected_root: []const u8, prepared: *PreparedSnapshotRoot, intent: SnapshotRootCommit) Error!void {
-        if (!self.hasPublishedSnapshot()) return;
-        const parent = self.currentBaselinePtr() orelse return error.BadManifest;
-        const current = parent.root;
-        if (intent == .shared_no_rebind) {
-            if (std.mem.eql(u8, current, expected_root)) return error.BadManifest;
-            self.commitSnapshotIdentity();
-            return;
-        }
-        if (!std.mem.eql(u8, current, expected_root)) return error.BadManifest;
-        const next = prepared.root orelse return error.BadManifest;
-        prepared.root = null;
-        parent.root = next;
-        self.allocator.free(current);
-        self.commitSnapshotIdentity();
-    }
-
     fn indexStateFrom(self: *ChunkMappedDisk, cache_root: []const u8, index: disk_index.DiskIndex) Error!IndexState {
         const next_sources = try self.allocator.alloc(Source, self.sources.len);
         errdefer self.allocator.free(next_sources);
@@ -1222,7 +1183,10 @@ pub const ChunkMappedDisk = struct {
         }
     }
 
-    fn commitSnapshotIdentity(self: *ChunkMappedDisk) void {
+    /// Makes a just-published snapshot the disk's fork authority. A fresh
+    /// clean rootfs may not publish a disk index; then there is nothing to
+    /// commit.
+    pub fn commitSnapshot(self: *ChunkMappedDisk) void {
         const next = self.pending_snapshot_identity orelse return;
         self.pending_snapshot_identity = null;
         if (self.committed_snapshot_identity) |identity| self.allocator.free(identity);
@@ -2432,10 +2396,8 @@ test "snapshot output does not become live disk storage" {
     var tmp = try TestDir.init();
     defer tmp.deinit();
 
-    const temp_dir = try tmp.path("temp.spore");
-    const final_dir = try tmp.path("final.spore");
-    const second_dir = try tmp.path("second.spore");
-    try std.Io.Dir.cwd().createDirPath(io, temp_dir);
+    const cache_root = try tmp.path("cache");
+    try std.Io.Dir.cwd().createDirPath(io, cache_root);
 
     const chunk_size: usize = 512;
     const base_bytes = try allocator.alloc(u8, chunk_size * 2);
@@ -2462,31 +2424,22 @@ test "snapshot output does not become live disk storage" {
     try disk.writeAt(&first_patch, 17);
     @memcpy(model[17..][0..first_patch.len], &first_patch);
 
-    var prepared_root = try disk.prepareSnapshotRoot(final_dir);
-    defer prepared_root.deinit();
-    const saved = try disk.snapshotIndex(temp_dir, .{ .mmio_slot = 1 }, true);
+    const saved = try disk.snapshotIndex(cache_root, .{ .mmio_slot = 1 }, true);
     defer freeTestDisk(allocator, saved);
     try std.testing.expectEqual(@as(usize, 0), disk.dirtyChunkCount());
     const readback = try allocator.alloc(u8, model.len);
     defer allocator.free(readback);
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), temp_dir, std.Io.Dir.cwd(), final_dir, io);
-    try disk.commitSnapshotRoot(temp_dir, &prepared_root, .local_rebind);
-    var wrong_local = try disk.prepareSnapshotRoot(second_dir);
-    defer wrong_local.deinit();
-    try std.testing.expectError(error.BadManifest, disk.commitSnapshotRoot(temp_dir, &wrong_local, .local_rebind));
-    try disk.commitSnapshotRoot(temp_dir, &wrong_local, .shared_no_rebind);
-    try std.testing.expect(wrong_local.root != null);
+    disk.commitSnapshot();
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, model, readback);
 
     const overlay_patch = @as([47]u8, @splat(0xB2));
     try disk.writeAt(&overlay_patch, 101);
     @memcpy(model[101..][0..overlay_patch.len], &overlay_patch);
-    try std.Io.Dir.cwd().createDirPath(io, second_dir);
     var stats: SnapshotStats = .{};
-    const second = try disk.snapshotIndexWithStats(second_dir, .{ .mmio_slot = 1 }, true, &stats);
+    const second = try disk.snapshotIndexWithStats(cache_root, .{ .mmio_slot = 1 }, true, &stats);
     defer freeTestDisk(allocator, second);
     try std.testing.expect(!stats.full_scan);
     try std.testing.expectEqual(@as(usize, 1), stats.parent_chunks_reused);
@@ -2907,10 +2860,6 @@ test "post-snapshot fast fork uses sealed baseline without native overlay clone"
     const parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
     defer parsed.deinit();
 
-    var rejected_root = try parent.prepareSnapshotRoot("unused-rejected-save");
-    defer rejected_root.deinit();
-    try std.testing.expectError(error.BadManifest, parent.commitSnapshotRoot(snapshot_dir, &rejected_root, .shared_no_rebind));
-
     var precommit_head = try parent.exportForkHead(.{
         .kind = .rootfs,
         .identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -2919,9 +2868,7 @@ test "post-snapshot fast fork uses sealed baseline without native overlay clone"
     try std.testing.expectEqual(runtime_disk_fork.CloneMethod.copy, precommit_head.descriptor.clone_method);
     try std.testing.expect(precommit_head.descriptor.overlay(0));
 
-    var prepared_root = try parent.prepareSnapshotRoot("unused-published-save");
-    defer prepared_root.deinit();
-    try parent.commitSnapshotRoot("snapshot-staging-root", &prepared_root, .shared_no_rebind);
+    parent.commitSnapshot();
 
     var head = try parent.exportForkHead(.{
         .kind = .rootfs,
