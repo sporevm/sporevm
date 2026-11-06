@@ -9,7 +9,6 @@ const build_step_cache = @import("build/step_cache.zig");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
-const lifecycle = @import("lifecycle.zig");
 const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
@@ -21,6 +20,7 @@ const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const spore = @import("spore.zig");
 const test_barrier = @import("test_barrier.zig");
+const vm_registry = @import("vm_registry.zig");
 const default_prune_max_bytes = 0;
 const max_root_record_bytes = 1024 * 1024;
 
@@ -1595,17 +1595,10 @@ fn collectStorageRootsFromRuntimeLeases(
         try addStorageRootFromRuntimeLease(allocator, io, cache_root, parsed.value, storage_roots);
     }
 
-    const vms_dir_path = try std.fs.path.join(allocator, &.{ runtime_root, "vms" });
-    var vms_dir = openDirPath(io, vms_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => |e| return e,
-    };
-    defer vms_dir.close(io);
-
-    var it = vms_dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        var spec = try readRuntimeVmSpec(allocator, io, vms_dir_path, entry.name) orelse continue;
+    var vms = try vm_registry.Iterator.init(allocator, io, runtime_root);
+    defer vms.deinit();
+    while (try vms.next()) |parsed_spec| {
+        var spec = parsed_spec;
         defer spec.deinit();
         const lease = spec.value.disk_baseline_lease orelse continue;
         try addStorageRootFromRuntimeLease(allocator, io, cache_root, lease, storage_roots);
@@ -1643,17 +1636,10 @@ fn collectRuntimeLeaseProtectedPaths(
         try addProtectedPathsFromRuntimeLease(allocator, io, cache_root, parsed.value, protected_paths);
     }
 
-    const vms_dir_path = try std.fs.path.join(allocator, &.{ runtime_root, "vms" });
-    var vms_dir = openDirPath(io, vms_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => |e| return e,
-    };
-    defer vms_dir.close(io);
-
-    var it = vms_dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        var spec = try readRuntimeVmSpec(allocator, io, vms_dir_path, entry.name) orelse continue;
+    var vms = try vm_registry.Iterator.init(allocator, io, runtime_root);
+    defer vms.deinit();
+    while (try vms.next()) |parsed_spec| {
+        var spec = parsed_spec;
         defer spec.deinit();
         const lease = spec.value.disk_baseline_lease orelse continue;
         try addProtectedPathsFromRuntimeLease(allocator, io, cache_root, lease, protected_paths);
@@ -1944,35 +1930,16 @@ fn collectRuntimeForkEntries(
 
 fn collectRuntimeForkRefs(allocator: std.mem.Allocator, io: Io, runtime_root: []const u8) ![]const []const u8 {
     var refs = std.array_list.Managed([]const u8).init(allocator);
-    const vms_dir_path = try std.fs.path.join(allocator, &.{ runtime_root, "vms" });
-    var vms_dir = openDirPath(io, vms_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return refs.toOwnedSlice(),
-        else => |e| return e,
-    };
-    defer vms_dir.close(io);
-
-    var it = vms_dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        var spec = try readRuntimeVmSpec(allocator, io, vms_dir_path, entry.name) orelse continue;
+    var vms = try vm_registry.Iterator.init(allocator, io, runtime_root);
+    defer vms.deinit();
+    while (try vms.next()) |parsed_spec| {
+        var spec = parsed_spec;
         defer spec.deinit();
         const resume_dir = spec.value.resume_dir orelse continue;
         try refs.append(try std.fs.path.resolve(allocator, &.{resume_dir}));
     }
 
     return refs.toOwnedSlice();
-}
-
-/// Reads a named VM spec with the lifecycle reader. Null means the VM has no
-/// spec; a spec lifecycle cannot read fails closed.
-fn readRuntimeVmSpec(allocator: std.mem.Allocator, io: Io, vms_dir_path: []const u8, name: []const u8) !?std.json.Parsed(lifecycle.Spec) {
-    const spec_path = try std.fs.path.join(allocator, &.{ vms_dir_path, name, "spec.json" });
-    defer allocator.free(spec_path);
-    return lifecycle.readSpecFile(allocator, io, spec_path) catch |err| switch (err) {
-        error.FileNotFound => null,
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.BadManifest,
-    };
 }
 
 fn pathReferenced(path: []const u8, refs: []const []const u8) bool {
@@ -3356,7 +3323,7 @@ test "runtime disk lease protects its cache baseline from prune and gc" {
         .sub_path = try std.fs.path.join(allocator, &.{ resume_dir, "manifest.json" }),
         .data = manifest_json,
     });
-    const spec_json = try std.json.Stringify.valueAlloc(allocator, lifecycle.Spec{
+    const spec_json = try std.json.Stringify.valueAlloc(allocator, vm_registry.Spec{
         .name = "child",
         .resume_dir = resume_dir,
         .disk_baseline_lease = .{
@@ -3422,8 +3389,8 @@ test "system prune and gc read named VM specs larger than 64 KiB" {
     @memset(value, 'a');
     var annotations = spore.Annotations{};
     try annotations.map.put(allocator, key, value);
-    const paths = try lifecycle.pathsFromRoot(allocator, runtime_root, "large");
-    try lifecycle.writeSpec(allocator, io, paths, .{
+    const paths = try vm_registry.pathsFromRoot(allocator, runtime_root, "large");
+    try vm_registry.writeSpec(allocator, io, paths, .{
         .name = "large",
         .annotations = annotations,
         .disk_baseline_lease = .{
@@ -3548,7 +3515,7 @@ test "cache gc runs after destructive prune deleted storage a VM manifest or ima
     });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = try std.fs.path.join(allocator, &.{ vm_dir, "spec.json" }),
-        .data = try std.json.Stringify.valueAlloc(allocator, lifecycle.Spec{
+        .data = try std.json.Stringify.valueAlloc(allocator, vm_registry.Spec{
             .name = "child",
             .resume_dir = resume_dir,
             .disk_baseline_lease = .{
