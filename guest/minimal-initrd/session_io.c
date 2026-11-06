@@ -437,8 +437,12 @@ void maybe_send_session_exit(struct session *session, struct client *client) {
 }
 
 void maybe_send_memory_pressure(struct session *session, struct client *client) {
-  if (client->fd < 0 || !session->started || session->exited || session->memory_pressure_fd < 0) return;
+  if (session->memory_pressure_fd < 0) return;
+  // Read the event even with no client to tell, or it stays pending and the
+  // event loop wakes on it forever. A workload still over memory.high raises
+  // another event, which a client attached by then hears.
   drain_memory_pressure_events(session);
+  if (client->fd < 0 || !session->started || session->exited) return;
   if (send_spio_event(client->fd, "memory-pressure") != 0) {
     close_client(client);
     return;
