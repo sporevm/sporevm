@@ -175,14 +175,14 @@ void drain_session_terminal(struct session *session) {
 // Adds the session's stdout and stderr pipes to a poll set, as roles
 // stdout_role and stdout_role + 1. pump_session_output handles their events.
 void add_session_output_fds(const struct session *session, struct pollfd *fds, int *roles, nfds_t *nfds, int stdout_role) {
-  if (session->stdout_open && !session->file_stdio) {
+  if (session->stdout_open) {
     fds[*nfds].fd = session->stdout_fd;
     fds[*nfds].events = POLLIN | POLLHUP | POLLERR;
     if (session->tty && session->terminal_pending_len != 0) fds[*nfds].events |= POLLOUT;
     fds[*nfds].revents = 0;
     roles[(*nfds)++] = stdout_role;
   }
-  if (session->stderr_open && !session->file_stdio) {
+  if (session->stderr_open) {
     fds[*nfds].fd = session->stderr_fd;
     fds[*nfds].events = POLLIN | POLLHUP | POLLERR;
     fds[*nfds].revents = 0;
@@ -400,11 +400,7 @@ void poll_session_exit(struct session *session, struct client *client) {
    * Do not wait indefinitely for pipe EOF after the direct command exits;
    * inherited fds from daemonized children must not block the run result.
    */
-  if (session->file_stdio) {
-    pump_session_file(session, client, 1);
-    pump_session_file(session, client, 0);
-    close_file_stdio(session);
-  } else if (session->tty) {
+  if (session->tty) {
     pump_session_terminal(session, client);
     if (session->terminal_fd >= 0) {
       close(session->terminal_fd);

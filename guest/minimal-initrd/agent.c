@@ -341,7 +341,6 @@ static void accept_request(struct agent *a) {
       close_client(client);
       return;
     }
-    int file_stdio = 0;
     if (session->started) {
       if (strcmp(request.session_id, session->session_id) == 0) {
         (void)attach_client(session, client, request.stdout_offset, request.stderr_offset);
@@ -351,13 +350,10 @@ static void accept_request(struct agent *a) {
         (void)start_transient_exec(&a->op, client, &request, a->use_rootfs);
         return;
       }
-      // ponytail: completed-base resumes lose pipe wakeups under ReleaseSafe; keep the file fallback resumed-only.
-      file_stdio = request.tty ? 0 : 1;
       reset_session(session);
     }
     const struct session_start_options options = {
       .use_rootfs = a->use_rootfs,
-      .file_stdio = file_stdio,
       .memory_pressure = request.memory_pressure,
       .exec_lookup = EXEC_LOOKUP_PATH,
       .stdin_enabled = request.stdin_enabled,
@@ -448,12 +444,6 @@ static void poll_agent(struct agent *a) {
   if (!a->use_rootfs || a->rootfs_ready) {
     (void)poll_generation(&a->generation, a->generation_root);
   }
-  if (session->file_stdio && !session->exited) {
-    pump_session_file(session, session_client(a), 1);
-    pump_session_file(session, session_client(a), 0);
-    poll_session_exit(session, session_client(a));
-    maybe_send_session_exit(session, session_client(a));
-  }
 
   struct pollfd fds[13];
   int roles[13];
@@ -510,8 +500,7 @@ static void poll_agent(struct agent *a) {
     }
   }
 
-  int timeout_ms = session->file_stdio && session->started && !session->exited ? 10 : 100;
-  int pr = poll(fds, nfds, timeout_ms);
+  int pr = poll(fds, nfds, 100);
   if (pr < 0 && errno != EINTR) return;
   if (pr > 0) {
     for (nfds_t i = 0; i < nfds; i++) {
@@ -547,10 +536,6 @@ static void poll_agent(struct agent *a) {
   }
   drain_session_stdin(session);
   drain_session_terminal(session);
-  if (session->file_stdio && !session->exited) {
-    pump_session_file(session, session_client(a), 1);
-    pump_session_file(session, session_client(a), 0);
-  }
   poll_session_exit(session, session_client(a));
   maybe_send_session_exit(session, session_client(a));
   if (op->kind == EXEC_OP_NONE) return;
@@ -687,20 +672,22 @@ int main(void) {
 #include <stddef.h>
 #include <sys/un.h>
 
-// Starts `/bin/sh -c captured_script` as a captured session, the state of a
-// named VM restored from a live capture, then sends request_bytes and
-// input_bytes as a second client while it runs. With attach_len nonzero, a
-// first client sends attach_bytes and stays attached until the second client
-// connects, then hangs up, so the agent sees both in the same poll. Copies the
-// frames the agent answers the second client with into response and returns
-// their length, or -1 when the harness itself fails. *captured_stdout gets
-// how many bytes of the captured session's stdout the agent had read when the
-// second client finished.
-__attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_running_session(
-    const char *captured_script,
+// Starts `/bin/sh -c captured_script` as the captured session, the state of
+// a named VM restored from a capture. With captured_finishes set, waits for
+// the script to exit, as in a VM captured after its command finished. With
+// attach_len nonzero, a client then sends attach_bytes and stays attached
+// until the first request's client connects, then hangs up, so the agent sees
+// both in the same poll. Serves request_count requests, each a request line
+// and its input frames back to back in requests with its length in
+// request_lens, as one client after another, waiting for each to be answered.
+// Copies the frames the agent answers the last request with into response and
+// returns their length, or -1 when the harness itself fails. *captured_stdout
+// gets how many bytes of the captured session's stdout the agent had read when
+// the last client finished.
+__attribute__((visibility("hidden"))) ssize_t spore_agent_test_serve_requests(
+    const char *captured_script, int captured_finishes,
     const unsigned char *attach_bytes, size_t attach_len,
-    const unsigned char *request_bytes, size_t request_len,
-    const unsigned char *input_bytes, size_t input_len,
+    const unsigned char *requests, const size_t *request_lens, size_t request_count,
     unsigned char *response, size_t response_cap, uint64_t *captured_stdout) {
   static struct agent a;
   init_agent(&a);
@@ -716,23 +703,34 @@ __attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_runni
   a.generation.unavailable = 1;
   struct session *session = &a.session;
   *captured_stdout = 0;
+
+  // The agent mirrors session output to its console; keep it off the test
+  // runner's stdout, which may carry the build protocol, and stderr.
+  int saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
+  int saved_stderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0);
+  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+  if (saved_stdout < 0 || saved_stderr < 0 || null_fd < 0 ||
+      dup2(null_fd, STDOUT_FILENO) < 0 || dup2(null_fd, STDERR_FILENO) < 0) {
+    if (saved_stdout >= 0) {
+      (void)dup2(saved_stdout, STDOUT_FILENO);
+      close(saved_stdout);
+    }
+    if (saved_stderr >= 0) close(saved_stderr);
+    if (null_fd >= 0) close(null_fd);
+    return -1;
+  }
+
+  ssize_t total = -1;
+  int attached = -1;
+  int peer = -1;
+  int listener = -1;
   char *captured_argv[] = { "/bin/sh", "-c", (char *)captured_script, NULL };
   char *empty_envp[] = { NULL };
   const struct session_start_options captured_options = {
     .exec_lookup = EXEC_LOOKUP_PATH,
     .stdin_enabled = 1,
   };
-  if (start_session(session, "captured", captured_argv, empty_envp, "", &captured_options) != 0) return -1;
-
-  ssize_t total = -1;
-  int attached = -1;
-  int peer = -1;
-  // The agent mirrors session output to its console; keep it off the test
-  // runner's stdout, which may carry the build protocol.
-  int saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
-  int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-  int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (saved_stdout < 0 || null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0) goto done;
+  listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
@@ -740,6 +738,8 @@ __attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_runni
   socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + (size_t)name_len);
   if (listener < 0 || bind(listener, (struct sockaddr *)&addr, addr_len) != 0 || listen(listener, 1) != 0) goto done;
   a.listener = listener;
+  if (start_session(session, "captured", captured_argv, empty_envp, "", &captured_options) != 0) goto done;
+  while (captured_finishes && !session_finished(session)) poll_agent(&a);
   if (attach_len > 0) {
     attached = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (attached < 0 || connect(attached, (struct sockaddr *)&addr, addr_len) != 0 ||
@@ -747,40 +747,50 @@ __attribute__((visibility("hidden"))) ssize_t spore_agent_test_exec_beside_runni
     accept_request(&a);
     if (a.client.fd < 0) goto done;
   }
-  peer = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (peer < 0 || connect(peer, (struct sockaddr *)&addr, addr_len) != 0) goto done;
-  if (write_all(peer, request_bytes, request_len) != 0 || write_all(peer, input_bytes, input_len) != 0) goto done;
-  if (attached >= 0) {
-    close(attached);
-    attached = -1;
+
+  for (size_t i = 0; i < request_count; i++) {
+    if (peer >= 0) close(peer);
+    peer = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (peer < 0 || connect(peer, (struct sockaddr *)&addr, addr_len) != 0) goto done;
+    if (write_all(peer, requests, request_lens[i]) != 0) goto done;
+    requests += request_lens[i];
+    if (attached >= 0) {
+      close(attached);
+      attached = -1;
+    }
+    // Accept the request through the event loop, which sees an attached
+    // client's hangup in the same poll.
+    struct pollfd pending = { .fd = listener, .events = POLLIN };
+    do {
+      poll_agent(&a);
+    } while (poll(&pending, 1, 0) > 0);
+    while (a.op.kind != EXEC_OP_NONE || a.client.fd >= 0) poll_agent(&a);
+
+    total = 0;
+    while ((size_t)total < response_cap) {
+      ssize_t n = read(peer, response + total, response_cap - (size_t)total);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) break;
+      total += n;
+    }
   }
-  // Accepts the request, and sees any attached client's hangup in the same poll.
-  poll_agent(&a);
-  while (a.op.kind != EXEC_OP_NONE) poll_agent(&a);
-  close_client(&a.client);
   *captured_stdout = session->stdout_offset;
 
-  total = 0;
-  while ((size_t)total < response_cap) {
-    ssize_t n = read(peer, response + total, response_cap - (size_t)total);
-    if (n < 0 && errno == EINTR) continue;
-    if (n <= 0) break;
-    total += n;
-  }
-
 done:
-  if (saved_stdout >= 0) {
-    (void)dup2(saved_stdout, STDOUT_FILENO);
-    close(saved_stdout);
-  }
-  if (null_fd >= 0) close(null_fd);
+  (void)dup2(saved_stdout, STDOUT_FILENO);
+  (void)dup2(saved_stderr, STDERR_FILENO);
+  close(saved_stdout);
+  close(saved_stderr);
+  close(null_fd);
   if (attached >= 0) close(attached);
   if (peer >= 0) close(peer);
   if (listener >= 0) close(listener);
   // The captured script may still be running or blocked on a full pipe. A
   // child it started dies on EPIPE once reset_session closes the pipes.
-  (void)kill(session->pid, SIGKILL);
-  wait_child_blocking(session->pid);
+  if (session->started && !session->exited) {
+    (void)kill(session->pid, SIGKILL);
+    wait_child_blocking(session->pid);
+  }
   reset_session(session);
   return total;
 }

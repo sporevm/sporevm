@@ -1422,7 +1422,7 @@ const GuestRequestLimits = extern struct {
     nofile: u64,
 };
 extern fn spore_agent_test_request_limits(out: *GuestRequestLimits) void;
-extern fn spore_agent_test_exec_beside_running_session(captured_script: [*:0]const u8, attach: [*]const u8, attach_len: usize, request: [*]const u8, request_len: usize, input: [*]const u8, input_len: usize, response: [*]u8, response_cap: usize, captured_stdout: *u64) isize;
+extern fn spore_agent_test_serve_requests(captured_script: [*:0]const u8, captured_finishes: c_int, attach: [*]const u8, attach_len: usize, requests: [*]const u8, request_lens: [*]const usize, request_count: usize, response: [*]u8, response_cap: usize, captured_stdout: *u64) isize;
 extern fn spore_build_copy_test_confined_source_parent(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
 extern fn spore_build_copy_test_confined_mtime(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize, unix_seconds: i64) c_int;
 extern fn spore_build_copy_test_context_bind_source(root: [*]const u8, root_len: usize, path: [*]const u8, path_len: usize) c_int;
@@ -2702,13 +2702,13 @@ test "builder and runtime share bounded guest PATH resolution" {
     );
 }
 
-const BesideCapturedResult = struct {
+const AgentResult = struct {
     stdout: []u8,
     stderr: []u8,
     exit_code: ?u32,
     captured_stdout: u64,
 
-    fn deinit(self: BesideCapturedResult) void {
+    fn deinit(self: AgentResult) void {
         std.testing.allocator.free(self.stdout);
         std.testing.allocator.free(self.stderr);
     }
@@ -2716,7 +2716,7 @@ const BesideCapturedResult = struct {
 
 // Runs `argv` the way `spore exec` does, with `stdin` streamed and closed,
 // while the guest agent's captured session runs `/bin/sh -c captured_script`.
-fn execBesideCapturedSession(captured_script: [*:0]const u8, argv: []const []const u8, stdin: []const u8) !BesideCapturedResult {
+fn execBesideCapturedSession(captured_script: [*:0]const u8, argv: []const []const u8, stdin: []const u8) !AgentResult {
     const spore_stream = @import("../spore_stream.zig");
     const allocator = std.testing.allocator;
 
@@ -2725,19 +2725,36 @@ fn execBesideCapturedSession(captured_script: [*:0]const u8, argv: []const []con
     var input: [2 * spore_stream.header_len + 64]u8 = undefined;
     const data = if (stdin.len == 0) input[0..0] else try spore_stream.writeFrame(input[0..], .{ .frame_type = .data, .stream_id = .stdin }, stdin);
     const close = try spore_stream.writeFrame(input[data.len..], .{ .frame_type = .close, .stream_id = .stdin, .offset = stdin.len }, "");
-    return agentRequestBesideCapturedSession(captured_script, "", request, input[0 .. data.len + close.len]);
+    const with_input = try std.mem.concat(allocator, u8, &.{ request, input[0 .. data.len + close.len] });
+    defer allocator.free(with_input);
+    return agentServeRequests(.{ .captured_script = captured_script }, &.{with_input});
 }
 
-// Sends one request and its input frames to the guest agent while its
-// captured session runs, and decodes the SPIO reply. A nonempty `attach` is
-// sent first by another client, which hangs up as the request arrives.
-fn agentRequestBesideCapturedSession(captured_script: [*:0]const u8, attach: []const u8, request: []const u8, input: []const u8) !BesideCapturedResult {
+// What the guest agent is doing when agentServeRequests sends its requests.
+const AgentScenario = struct {
+    /// Runs as the captured session, through `/bin/sh -c`.
+    captured_script: [*:0]const u8 = "read line",
+    /// Waits for the captured session to finish first.
+    captured_finishes: bool = false,
+    /// When nonempty, another client sends this first and stays attached
+    /// until the first request arrives, then hangs up.
+    attach: []const u8 = "",
+};
+
+// Sends each request, with any input frames appended, to the guest agent as
+// one client after another, and decodes the SPIO reply to the last request.
+fn agentServeRequests(scenario: AgentScenario, requests: []const []const u8) !AgentResult {
     const spore_stream = @import("../spore_stream.zig");
     const allocator = std.testing.allocator;
 
+    const joined = try std.mem.concat(allocator, u8, requests);
+    defer allocator.free(joined);
+    const lens = try allocator.alloc(usize, requests.len);
+    defer allocator.free(lens);
+    for (requests, lens) |request, *len| len.* = request.len;
     var response: [8192]u8 = undefined;
     var captured_stdout: u64 = 0;
-    const response_len = spore_agent_test_exec_beside_running_session(captured_script, attach.ptr, attach.len, request.ptr, request.len, input.ptr, input.len, &response, response.len, &captured_stdout);
+    const response_len = spore_agent_test_serve_requests(scenario.captured_script, @intFromBool(scenario.captured_finishes), scenario.attach.ptr, scenario.attach.len, joined.ptr, lens.ptr, requests.len, &response, response.len, &captured_stdout);
     if (response_len < 0) return error.AgentHarnessFailed;
 
     var stdout: std.ArrayList(u8) = .empty;
@@ -2778,7 +2795,7 @@ test "guest agent gives a null-stdio exec /dev/null stdin" {
     const request = try run_mod.execRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", "cat; echo stdin-closed" }, "exec-1", 0);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"null\"") != null);
-    const result = try agentRequestBesideCapturedSession("read line", "", request, "");
+    const result = try agentServeRequests(.{}, &.{request});
     defer result.deinit();
     try std.testing.expectEqualStrings("", result.stderr);
     try std.testing.expectEqualStrings("stdin-closed\n", result.stdout);
@@ -2789,7 +2806,7 @@ test "guest agent answers a legacy start request with an SPIO bad request" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
     const legacy = "{\"type\":\"start\",\"session_id\":\"exec-1\",\"resume_time_unix_ns\":0,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"closed_env\":true}\n";
-    const result = try agentRequestBesideCapturedSession("read line", "", legacy, "");
+    const result = try agentServeRequests(.{}, &.{legacy});
     defer result.deinit();
     try std.testing.expectEqualStrings("spore run: bad request\n", result.stderr);
     try std.testing.expectEqualStrings("", result.stdout);
@@ -2807,7 +2824,7 @@ test "guest agent keeps a named exec whose request arrives as the attached clien
     defer allocator.free(attach);
     const request = try run_mod.execRequestWithSession(allocator, &.{ "/bin/sh", "-c", "echo beside" }, "exec-1", 0);
     defer allocator.free(request);
-    const result = try agentRequestBesideCapturedSession("read line", attach, request, "");
+    const result = try agentServeRequests(.{ .attach = attach }, &.{request});
     defer result.deinit();
     try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
     try std.testing.expectEqualStrings("beside\n", result.stdout);
@@ -2843,6 +2860,24 @@ test "guest agent drains the captured session while a named exec runs" {
     try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
     // At most one pipe of output can still be unread when the marker appears.
     try std.testing.expect(result.captured_stdout >= captured_bytes - max_pipe_bytes);
+}
+
+test "guest agent replays an exec that followed the captured session" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // In a VM captured after its command exited, the next exec becomes the
+    // session. Its output must be retained like the first command's, so an
+    // attach from offset zero replays all of it.
+    const start = try run_mod.execRequestWithSession(allocator, &.{ "/bin/sh", "-c", "echo out; echo err >&2" }, "exec-1", 0);
+    defer allocator.free(start);
+    const attach = try @import("../attach_stream.zig").attachV1Request(allocator, .{ .session_id = "exec-1" });
+    defer allocator.free(attach);
+    const result = try agentServeRequests(.{ .captured_script = "true", .captured_finishes = true }, &.{ start, attach });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("out\n", result.stdout);
+    try std.testing.expectEqualStrings("err\n", result.stderr);
+    try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
 }
 
 test "build nofile limit is bounded" {

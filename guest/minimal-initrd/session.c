@@ -3,13 +3,9 @@
 
 #include "agent.h"
 
-#define FILE_STDOUT_PATH "/tmp/spore-run.stdout"
-#define FILE_STDERR_PATH "/tmp/spore-run.stderr"
 #define MAX_EXEC_PATH_LEN (MAX_ENV_LEN - sizeof("PATH="))
 #define MAX_EXEC_PATH_ENTRIES 64
 #define MAX_EXEC_CANDIDATE_LEN 512
-
-static void pin_to_current_cpu(pid_t pid);
 
 int sigchld_pipe[2] = { -1, -1 };
 
@@ -151,43 +147,6 @@ void drain_sigchld_wakeup(void) {
   char buf[32];
   while (read(sigchld_pipe[0], buf, sizeof(buf)) > 0) {
   }
-}
-
-void pump_session_file(struct session *session, struct client *client, int is_stdout) {
-  int fd = is_stdout ? session->stdout_fd : session->stderr_fd;
-  if (fd < 0) return;
-  unsigned char buf[MAX_FRAME_PAYLOAD];
-  const char *name = is_stdout ? "stdout" : "stderr";
-  uint64_t *offset = is_stdout ? &session->stdout_offset : &session->stderr_offset;
-  uint64_t *client_offset = is_stdout ? &client->stdout_offset : &client->stderr_offset;
-  for (;;) {
-    ssize_t n = read(fd, buf, sizeof(buf));
-    if (n > 0) {
-      uint64_t frame_offset = *offset;
-      mirror_console(is_stdout, buf, (size_t)n);
-      *offset += (uint64_t)n;
-      if (client->fd >= 0) (void)send_client_output(session, client, name, client_offset, frame_offset, buf, (size_t)n);
-      continue;
-    }
-    if (n == 0) return;
-    if (errno == EINTR) continue;
-    return;
-  }
-}
-
-void close_file_stdio(struct session *session) {
-  if (session->stdout_fd >= 0) {
-    close(session->stdout_fd);
-    session->stdout_fd = -1;
-  }
-  if (session->stderr_fd >= 0) {
-    close(session->stderr_fd);
-    session->stderr_fd = -1;
-  }
-  session->stdout_open = 0;
-  session->stderr_open = 0;
-  unlink(FILE_STDOUT_PATH);
-  unlink(FILE_STDERR_PATH);
 }
 
 int apply_terminal_size(int fd, uint16_t rows, uint16_t cols) {
@@ -339,7 +298,6 @@ int start_session(struct session *session, const char *session_id, char *const a
   memset(session, 0, sizeof(*session));
   session->memory_pressure_fd = -1;
   int use_rootfs = options->use_rootfs;
-  int file_stdio = options->file_stdio;
   int memory_pressure = options->memory_pressure;
   int build_run_isolation = options->build_run_isolation;
   uint64_t nofile_soft = options->nofile_soft;
@@ -361,19 +319,6 @@ int start_session(struct session *session, const char *session_id, char *const a
   int ready_pipe[2] = { -1, -1 };
   if (tty) {
     if (open_session_pty(&pty_master, &pty_slave, terminal_rows, terminal_cols) != 0) {
-      t_command_exit = now_ms();
-      return 127;
-    }
-  } else if (file_stdio) {
-    stdout_pipe[1] = open(FILE_STDOUT_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
-    stderr_pipe[1] = open(FILE_STDERR_PATH, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
-    stdout_pipe[0] = open(FILE_STDOUT_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    stderr_pipe[0] = open(FILE_STDERR_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (stdout_pipe[0] < 0 || stderr_pipe[0] < 0 || stdout_pipe[1] < 0 || stderr_pipe[1] < 0) {
-      if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
-      if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
-      if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
-      if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
       t_command_exit = now_ms();
       return 127;
     }
@@ -523,13 +468,6 @@ int start_session(struct session *session, const char *session_id, char *const a
     t_command_exit = now_ms();
     return 127;
   }
-  /*
-   * Completed-session resumes use file-backed stdio after restoring an already
-   * booted guest. Keep that start-gate handoff on the agent's current CPU so a
-   * restored multi-vCPU guest cannot strand the new child behind a lost wakeup.
-   */
-  if (file_stdio) pin_to_current_cpu(pid);
-
   session->build_run_isolation = build_run_isolation;
   if (((memory_pressure || build_run_isolation) && setup_session_cgroup(session, pid, memory_pressure) != 0) || write_all(start_pipe[1], "\1", 1) != 0) {
     close(start_pipe[1]);
@@ -607,7 +545,6 @@ int start_session(struct session *session, const char *session_id, char *const a
   session->tty = tty;
   session->stdout_open = tty ? pty_master >= 0 : 1;
   session->stderr_open = tty ? 0 : 1;
-  session->file_stdio = file_stdio;
   return 0;
 }
 
@@ -640,15 +577,6 @@ void reap_exited_children(void) {
     if (rc < 0 && errno == EINTR) continue;
     return;
   }
-}
-
-static void pin_to_current_cpu(pid_t pid) {
-  int cpu = sched_getcpu();
-  if (cpu < 0 || cpu >= CPU_SETSIZE) return;
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
-  (void)sched_setaffinity(pid, sizeof(set), &set);
 }
 
 #ifdef SPORE_AGENT_REQUEST_FUZZ
