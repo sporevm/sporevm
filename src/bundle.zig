@@ -3730,7 +3730,7 @@ test "pack and unpack chunkpack bundle strips local backing" {
     try std.testing.expectEqualStrings("IMAGE_VALUE=default", restored_manifest.value.exec_defaults.?.env[0]);
     try std.testing.expectEqualStrings("/workspace", restored_manifest.value.exec_defaults.?.working_dir.?);
     const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
+    @memset(out, 0);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 }
@@ -3779,7 +3779,7 @@ test "pack and unpack preserves multi-vCPU manifests" {
     try std.testing.expectEqualStrings("IMAGE_VALUE=default", restored_manifest.value.exec_defaults.?.env[0]);
     try std.testing.expectEqualStrings("/workspace", restored_manifest.value.exec_defaults.?.working_dir.?);
     const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
+    @memset(out, 0);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 
@@ -3820,7 +3820,7 @@ test "indexed bundle pull preserves multi-vCPU manifests" {
     defer restored_manifest.deinit();
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), restored_manifest.value.platform.vcpu_count);
     const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
+    @memset(out, 0);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 }
@@ -4506,7 +4506,7 @@ test "pack children writes bundle index and unpacks selected child" {
     defer restored_manifest.deinit();
     try std.testing.expectEqual(@as(u64, 43), restored_manifest.value.generation.generation);
     const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
+    @memset(out, 0);
     try spore.loadMemory(arena, out_dir, restored_manifest.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 }
@@ -4591,7 +4591,7 @@ test "pull file bundle materializes children through chunk cache" {
     const fd = try rootfs_cache.openVerifiedFromCache(io, arena, pull_rootfs_cache, restored_rootfs);
     _ = std.c.close(fd);
     const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
+    @memset(out, 0);
     try spore.loadMemory(arena, out1_dir, restored_manifest.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 }
@@ -4695,7 +4695,7 @@ test "push and pull s3 indexed bundle through verified remote cache" {
     const fd = try rootfs_cache.openVerifiedFromCache(io, arena, pull_rootfs_cache, restored_rootfs);
     _ = std.c.close(fd);
     const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xCC);
+    @memset(out, 0);
     try spore.loadMemory(arena, out1_dir, restored_manifest.value.memory, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 

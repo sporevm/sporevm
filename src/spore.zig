@@ -873,21 +873,16 @@ fn sealerError(err: chunk_sealer.Error) Error {
     };
 }
 
-/// Materialize guest memory from the chunk store. Verifies every chunk
-/// against its id; fails closed on mismatch.
+/// Materializes guest memory from the chunk store into `ram`, which must
+/// already be all zero, such as a fresh anonymous mapping. Only non-zero
+/// chunks are written, so zero chunks commit no host memory. Verifies every
+/// chunk against its id; fails closed on mismatch.
 pub fn loadMemory(allocator: std.mem.Allocator, dir: []const u8, manifest: MemoryManifest, ram: []u8) Error!void {
     const plan = try validateMemoryForRam(manifest, ram.len);
-
-    var nonzero_index: usize = 0;
-    var i: usize = 0;
-    while (i < plan.chunk_count) : (i += 1) {
-        const range = memoryChunkRangeFromPlan(plan, ram.len, i) catch return error.BadManifest;
-        const id: ?chunklib.ChunkId = if (nonzero_index < manifest.chunks.len and manifest.chunks[nonzero_index].logical_chunk == i) blk: {
-            const value = manifest.chunks[nonzero_index].id;
-            nonzero_index += 1;
-            break :blk value;
-        } else null;
-        try loadMemoryChunk(allocator, dir, id, ram[range.start..range.end]);
+    for (manifest.chunks) |entry| {
+        const index = std.math.cast(usize, entry.logical_chunk) orelse return error.BadManifest;
+        const range = memoryChunkRangeFromPlan(plan, ram.len, index) catch return error.BadManifest;
+        try loadMemoryChunk(allocator, dir, entry.id, ram[range.start..range.end]);
     }
 }
 
@@ -916,18 +911,14 @@ fn memoryChunkRangeFromPlan(plan: MemoryPlan, ram_len: usize, index: usize) !Mem
     return .{ .start = start, .end = end };
 }
 
-fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, maybe_id: ?chunklib.ChunkId, target: []u8) Error!void {
-    if (maybe_id) |id| {
-        const hex = id.toHex();
-        const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, &hex });
-        const data = try readFileAll(allocator, chunk_path, target.len);
-        defer allocator.free(data);
-        if (data.len != target.len) return error.BadChunk;
-        if (!id.matches(data)) return error.BadChunk;
-        @memcpy(target, data);
-    } else {
-        @memset(target, 0);
-    }
+fn loadMemoryChunk(allocator: std.mem.Allocator, dir: []const u8, id: chunklib.ChunkId, target: []u8) Error!void {
+    const hex = id.toHex();
+    const chunk_path = try pathZ(allocator, "{s}/chunks/{s}", .{ dir, &hex });
+    const data = try readFileAll(allocator, chunk_path, target.len);
+    defer allocator.free(data);
+    if (data.len != target.len) return error.BadChunk;
+    if (!id.matches(data)) return error.BadChunk;
+    @memcpy(target, data);
 }
 
 pub fn memoryChunkDigestHex(digest: []const u8) Error![]const u8 {
@@ -1374,9 +1365,16 @@ test "memory round-trips through the chunk store with zero elision" {
     try std.testing.expectEqual(@as(usize, 6), plan.chunk_count);
     try std.testing.expectEqual(@as(usize, 3), plan.nonzero_chunk_count);
 
+    // Restore loads into fresh zero pages, so zero chunks are left unwritten
+    // rather than committed.
     const out = try arena.alloc(u8, ram.len);
     @memset(out, 0xAA);
     try loadMemory(arena, dir, mm, out);
+    for ([_]usize{ 1, 2, 4 }) |index| {
+        const zero_chunk = out[index * chunk_size ..][0..chunk_size];
+        try std.testing.expect(std.mem.allEqual(u8, zero_chunk, 0xAA));
+        @memset(zero_chunk, 0);
+    }
     try std.testing.expectEqualSlices(u8, ram, out);
 }
 
@@ -1405,7 +1403,7 @@ test "memory backing is sparse local acceleration metadata" {
     try std.testing.expectEqualSlices(u8, ram, backing_bytes);
 
     const out = try arena.alloc(u8, ram.len);
-    @memset(out, 0xAA);
+    @memset(out, 0);
     try loadMemory(arena, dir, mm, out);
     try std.testing.expectEqualSlices(u8, ram, out);
 }
