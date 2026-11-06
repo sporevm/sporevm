@@ -43,7 +43,7 @@ expect_named_online_cpus() {
   local prefix="$2"
   local stdout="${workdir}/${prefix}.stdout"
   local stderr="${workdir}/${prefix}.stderr"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${name}" -- "${online_cpu_command[@]}" >"${stdout}" 2>"${stderr}"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${name}" -- "${online_cpu_command[@]}" >"${stdout}" 2>"${stderr}"; then
     cat "${stdout}" >&2 || true
     cat "${stderr}" >&2 || true
     die "multi-vCPU online CPU check failed for ${name}"
@@ -52,7 +52,7 @@ expect_named_online_cpus() {
 }
 
 # The metrics are info logs, so NAME must have been created with
-# `spore --debug create` for its monitor to write them.
+# `spore --debug vm create` for its monitor to write them.
 save_named_with_metrics() {
   local name="$1"
   local out_dir="$2"
@@ -62,7 +62,7 @@ save_named_with_metrics() {
 
   snapshot_before="$(grep -c "${backend} snapshot metrics:" "${monitor_log}" 2>/dev/null || true)"
   publication_before="$(grep -c "${backend} named snapshot publication metrics:" "${monitor_log}" 2>/dev/null || true)"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${name}" --out "${out_dir}" \
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm save "${name}" --out "${out_dir}" \
     >"${workdir}/${label}-save.stdout" 2>"${workdir}/${label}-save.stderr"; then
     cat "${workdir}/${label}-save.stdout" >&2 || true
     cat "${workdir}/${label}-save.stderr" >&2 || true
@@ -112,7 +112,7 @@ run_disk_point_in_time_case() {
   local restored_name="${source_name}-restored"
   local saved_dir="${workdir}/${kind}.spore"
 
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --debug create "${source_name}" \
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --debug vm create "${source_name}" \
     --backend "${backend}" \
     --vcpus "${vcpus}" \
     --memory "${memory}" \
@@ -124,20 +124,20 @@ run_disk_point_in_time_case() {
     die "${kind} multi-vCPU named create failed"
   fi
   expect_named_online_cpus "${source_name}" "${kind}-source-cpus-online"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- \
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${source_name}" -- \
     /bin/sh -lc 'printf captured > /var/sporevm-save-point; sync'
   save_named_with_metrics "${source_name}" "${saved_dir}" "${kind}"
   expect_multi_vcpu_manifest "${saved_dir}"
   [[ "$(json_field "${saved_dir}/manifest.json" disk.kind)" == "chunk-index-disk-v0" ]] || \
     die "${kind} save did not record a writable disk index"
 
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- \
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${source_name}" -- \
     /bin/sh -lc 'printf continued > /var/sporevm-save-point; sync'
-  [[ "$(SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${source_name}" -- /bin/cat /var/sporevm-save-point)" == "continued" ]] || \
+  [[ "$(SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${source_name}" -- /bin/cat /var/sporevm-save-point)" == "continued" ]] || \
     die "${kind} source did not observe its post-save disk mutation"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${source_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${source_name}" >/dev/null
 
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${saved_dir}" \
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm restore "${saved_dir}" \
     --name "${restored_name}" --backend "${backend}" \
     >"${workdir}/${kind}-restore.stdout" 2>"${workdir}/${kind}-restore.stderr"; then
     cat "${workdir}/${kind}-restore.stdout" >&2 || true
@@ -145,10 +145,10 @@ run_disk_point_in_time_case() {
     die "${kind} point-in-time restore failed"
   fi
   expect_named_online_cpus "${restored_name}" "${kind}-restored-cpus-online"
-  [[ "$(SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${restored_name}" -- /bin/cat /var/sporevm-save-point)" == "captured" ]] || \
+  [[ "$(SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${restored_name}" -- /bin/cat /var/sporevm-save-point)" == "captured" ]] || \
     die "${kind} restore did not preserve the saved point-in-time disk state"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${restored_name}" >/dev/null
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${saved_dir}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${restored_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" checkpoint rm "${saved_dir}" >/dev/null
 }
 
 # expect_still_ticking NAME PREFIX -> assert the guest counter advances, proving
@@ -158,7 +158,7 @@ expect_still_ticking() {
   local prefix="$2"
   local out="${workdir}/${prefix}-tick"
   local before after numbers
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${name}" -- /bin/sh -c 'before="$(cat /tick)"; sleep 3; after="$(cat /tick)"; echo "$before $after"' \
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${name}" -- /bin/sh -c 'before="$(cat /tick)"; sleep 3; after="$(cat /tick)"; echo "$before $after"' \
     >"${out}" 2>"${out}.err" || {
     cat "${out}" >&2 || true
     cat "${out}.err" >&2 || true
@@ -191,11 +191,11 @@ cleanup() {
   for name in "${forked_name}" "${resumed_name}" "${vm_name}-saved" "${vm_name}-live" "${vm_name}-live-restored" \
     "${vm_name}-image" "${vm_name}-image-restored" "${vm_name}-explicit-rootfs" "${vm_name}-explicit-rootfs-restored" \
     "${vm_name}-auto" "${vm_name}"; do
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${name}" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${name}" >/dev/null 2>&1 || true
   done
   for saved_dir in "${workdir}/image.spore" "${workdir}/explicit-rootfs.spore" "${workdir}/auto.spore"; do
     [[ -d "${saved_dir}" ]] || continue
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${saved_dir}" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" checkpoint rm "${saved_dir}" >/dev/null 2>&1 || true
   done
 }
 
@@ -232,7 +232,7 @@ expect_multi_vcpu_manifest "${from_base_dir}"
 fork_dir="${workdir}/multi-children"
 fork_child_stdout="${workdir}/fork-child.stdout"
 fork_child_stderr="${workdir}/fork-child.stderr"
-if ! "${spore_bin}" fork "${from_base_dir}" --count 2 --out "${fork_dir}" \
+if ! "${spore_bin}" checkpoint fork "${from_base_dir}" --count 2 --out "${fork_dir}" \
   >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"; then
   cat "${workdir}/fork.stdout" >&2 || true
   cat "${workdir}/fork.stderr" >&2 || true
@@ -318,47 +318,47 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   # filesystem, and the saves below go to the work directory.
   export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/rootfs-cache"
   named_dir="${workdir}/named.spore"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${vm_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm create "${vm_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"; then
     cat "${workdir}/create.stdout" >&2 || true
     cat "${workdir}/create.stderr" >&2 || true
     die "multi-vCPU named create failed"
   fi
   expect_named_online_cpus "${vm_name}" "exec-cpus-online"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" fork --vm "${vm_name}" --count 1 --name "${forked_name}" >"${workdir}/named-fork.stdout" 2>"${workdir}/named-fork.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm fork "${vm_name}" --count 1 --name "${forked_name}" >"${workdir}/named-fork.stdout" 2>"${workdir}/named-fork.stderr"; then
     cat "${workdir}/named-fork.stdout" >&2 || true
     cat "${workdir}/named-fork.stderr" >&2 || true
     die "multi-vCPU named fork failed"
   fi
   expect_named_online_cpus "${forked_name}" "forked-cpus-online"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${forked_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${forked_name}" >/dev/null
 
   # Non-destructive multi-vCPU save for an exec-ready VM: save it WITHOUT
   # --stop, confirm the source VM remains registered, then restore the saved
   # spore under a second name while the source is still alive.
   concurrent_name="${vm_name}-saved"
   concurrent_dir="${workdir}/named-live.spore"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${concurrent_dir}" >"${workdir}/named-live-save.stdout" 2>"${workdir}/named-live-save.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm save "${vm_name}" --out "${concurrent_dir}" >"${workdir}/named-live-save.stdout" 2>"${workdir}/named-live-save.stderr"; then
     cat "${workdir}/named-live-save.stdout" >&2 || true
     cat "${workdir}/named-live-save.stderr" >&2 || true
     die "multi-vCPU named non-destructive save failed"
   fi
   expect_multi_vcpu_manifest "${concurrent_dir}"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/named-live-ls.stdout" 2>"${workdir}/named-live-ls.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm ls >"${workdir}/named-live-ls.stdout" 2>"${workdir}/named-live-ls.stderr"; then
     cat "${workdir}/named-live-ls.stdout" >&2 || true
     cat "${workdir}/named-live-ls.stderr" >&2 || true
-    die "spore ls failed after multi-vCPU named non-destructive save"
+    die "spore vm ls failed after multi-vCPU named non-destructive save"
   fi
   grep -Fq "${vm_name}" "${workdir}/named-live-ls.stdout" || {
     cat "${workdir}/named-live-ls.stdout" >&2 || true
     die "non-destructive save removed ${vm_name} from the registry"
   }
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${concurrent_dir}" --name "${concurrent_name}" >"${workdir}/named-live-restore.stdout" 2>"${workdir}/named-live-restore.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm restore "${concurrent_dir}" --name "${concurrent_name}" >"${workdir}/named-live-restore.stdout" 2>"${workdir}/named-live-restore.stderr"; then
     cat "${workdir}/named-live-restore.stdout" >&2 || true
     cat "${workdir}/named-live-restore.stderr" >&2 || true
     die "multi-vCPU restore of non-destructive save failed"
   fi
   expect_named_online_cpus "${concurrent_name}" "named-live-cpus-online"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${concurrent_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${concurrent_name}" >/dev/null
 
   # Prove a disk-backed non-destructive save is a point-in-time boundary for
   # both public named-rootfs sources. The continuing VM mutates the same file
@@ -383,7 +383,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   # with rootfs publication work.
   auto_name="${vm_name}-auto"
   auto_dir="${workdir}/auto.spore"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --debug create "${auto_name}" \
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --debug vm create "${auto_name}" \
     --backend "${backend}" \
     --vcpus "${vcpus}" \
     --timeout "${create_timeout_ms}ms" \
@@ -396,8 +396,8 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   save_named_with_metrics "${auto_name}" "${auto_dir}" "default-auto-memory"
   [[ "$(json_field "${auto_dir}/manifest.json" platform.ram_size)" == "536870912" ]] || \
     die "default-memory save did not keep the 512 MiB default"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${auto_name}" >/dev/null
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm --spore "${auto_dir}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${auto_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" checkpoint rm "${auto_dir}" >/dev/null
 
   # Non-destructive multi-vCPU save of an active workload: prove the source VM
   # stays registered and keeps ticking after save, then remove the source and
@@ -406,24 +406,24 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   live_name="${vm_name}-live"
   live_restored_name="${vm_name}-live-restored"
   live_dir="${workdir}/live.spore"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" create "${live_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" 'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done' >"${workdir}/live-create.stdout" 2>"${workdir}/live-create.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm create "${live_name}" --backend "${backend}" --vcpus "${vcpus}" --memory "${memory}" --timeout "${create_timeout_ms}ms" 'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done' >"${workdir}/live-create.stdout" 2>"${workdir}/live-create.stderr"; then
     cat "${workdir}/live-create.stdout" >&2 || true
     cat "${workdir}/live-create.stderr" >&2 || true
     die "multi-vCPU live create failed"
   fi
   # The workload must be ticking before the save so the save captures a running guest.
   expect_still_ticking "${live_name}" "live-pre-save"
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${live_name}" --out "${live_dir}" >"${workdir}/live-save.stdout" 2>"${workdir}/live-save.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm save "${live_name}" --out "${live_dir}" >"${workdir}/live-save.stdout" 2>"${workdir}/live-save.stderr"; then
     cat "${workdir}/live-save.stdout" >&2 || true
     cat "${workdir}/live-save.stderr" >&2 || true
     die "multi-vCPU non-destructive save failed"
   fi
   expect_multi_vcpu_manifest "${live_dir}"
   # The source VM must still be registered as ready after a non-destructive save.
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" ls >"${workdir}/live-ls.stdout" 2>"${workdir}/live-ls.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm ls >"${workdir}/live-ls.stdout" 2>"${workdir}/live-ls.stderr"; then
     cat "${workdir}/live-ls.stdout" >&2 || true
     cat "${workdir}/live-ls.stderr" >&2 || true
-    die "spore ls failed after non-destructive save"
+    die "spore vm ls failed after non-destructive save"
   fi
   grep -Fq "${live_name}" "${workdir}/live-ls.stdout" || {
     cat "${workdir}/live-ls.stdout" >&2 || true
@@ -431,40 +431,40 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   }
   # The source VM must still be running the workload after the save.
   expect_still_ticking "${live_name}" "live-post-save"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${live_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${live_name}" >/dev/null
   # The saved spore must restore and keep ticking (the running workload was
   # captured in the spore's memory state).
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${live_dir}" --name "${live_restored_name}" >"${workdir}/live-restore.stdout" 2>"${workdir}/live-restore.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm restore "${live_dir}" --name "${live_restored_name}" >"${workdir}/live-restore.stdout" 2>"${workdir}/live-restore.stderr"; then
     cat "${workdir}/live-restore.stdout" >&2 || true
     cat "${workdir}/live-restore.stderr" >&2 || true
     die "multi-vCPU restore of non-destructive save failed"
   fi
   expect_still_ticking "${live_restored_name}" "live-restored"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${live_restored_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${live_restored_name}" >/dev/null
 
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${named_dir}" --stop >"${workdir}/suspend.stdout" 2>"${workdir}/suspend.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm save "${vm_name}" --out "${named_dir}" --stop >"${workdir}/suspend.stdout" 2>"${workdir}/suspend.stderr"; then
     cat "${workdir}/suspend.stdout" >&2 || true
     cat "${workdir}/suspend.stderr" >&2 || true
     die "multi-vCPU named save --stop failed"
   fi
   expect_multi_vcpu_manifest "${named_dir}"
   # Inspect must accept everything restore accepts.
-  if ! "${spore_bin}" --json inspect "${named_dir}" >"${workdir}/inspect.json" 2>"${workdir}/inspect.stderr"; then
+  if ! "${spore_bin}" --json checkpoint inspect "${named_dir}" >"${workdir}/inspect.json" 2>"${workdir}/inspect.stderr"; then
     cat "${workdir}/inspect.json" >&2 || true
     cat "${workdir}/inspect.stderr" >&2 || true
-    die "spore inspect rejected a multi-vCPU save that restore accepts"
+    die "spore checkpoint inspect rejected a multi-vCPU save that restore accepts"
   fi
   grep -Eq '"vcpu_count": *'"${vcpus}" "${workdir}/inspect.json" || {
     cat "${workdir}/inspect.json" >&2 || true
-    die "spore inspect did not report the saved vCPU count"
+    die "spore checkpoint inspect did not report the saved vCPU count"
   }
-  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore "${named_dir}" --name "${resumed_name}" >"${workdir}/named-resume.stdout" 2>"${workdir}/named-resume.stderr"; then
+  if ! SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm restore "${named_dir}" --name "${resumed_name}" >"${workdir}/named-resume.stdout" 2>"${workdir}/named-resume.stderr"; then
     cat "${workdir}/named-resume.stdout" >&2 || true
     cat "${workdir}/named-resume.stderr" >&2 || true
     die "multi-vCPU named restore failed"
   fi
   expect_named_online_cpus "${resumed_name}" "named-cpus-online"
-  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${resumed_name}" >/dev/null
+  SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${resumed_name}" >/dev/null
 fi
 
 echo "smoke:multi-vcpu ok backend=${backend} vcpus=${vcpus}"

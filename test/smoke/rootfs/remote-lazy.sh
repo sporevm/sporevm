@@ -2,7 +2,7 @@
 # Pushes a local image holding a large random file to a directory store, serves
 # the store over loopback HTTP, and runs the image with an empty rootfs cache.
 # The run must fetch only the objects the guest reads, and a warm rerun fetches
-# nothing. A named VM boots the same way; `spore save` fails and leaves it
+# nothing. A named VM boots the same way; `spore vm save` fails and leaves it
 # running while the store lacks an object, then succeeds. `run --save` fails
 # without leaving a save directory while the store lacks an object; from an
 # empty cache it fetches the rest of the image, so the saved spore runs after
@@ -27,7 +27,7 @@ vm_created=0
 
 cleanup() {
   if ((vm_created)); then
-    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+    SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${vm_name}" >/dev/null 2>&1 || true
   fi
   if [[ -n "${server_pid}" ]]; then
     kill "${server_pid}" 2>/dev/null || true
@@ -209,12 +209,12 @@ named() {
   SPOREVM_ROOTFS_CACHE_DIR="${workdir}/named-cache" SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" "$@"
 }
 named_exec() {
-  run_capture "${workdir}/$1.stdout" "${workdir}/$1.stderr" named exec "${vm_name}" -- /hello ||
+  run_capture "${workdir}/$1.stdout" "${workdir}/$1.stderr" named vm exec "${vm_name}" -- /hello ||
     require_success $? "$1" "${workdir}/$1.stderr"
   expect_eq "remote-lazy-ok" "$(cat "${workdir}/$1.stdout")" "$1 output"
 }
 run_capture "${workdir}/create.stdout" "${workdir}/create.stderr" \
-  named create "${vm_name}" --backend "${backend}" --image "${store_ref}" -- /hello ||
+  named vm create "${vm_name}" --backend "${backend}" --image "${store_ref}" -- /hello ||
   require_success $? "create from the store" "${workdir}/create.stderr"
 vm_created=1
 named_exec exec
@@ -230,23 +230,23 @@ done
 [[ -n "${unread}" ]] || die "the named VM read every object of the image"
 mv "${unread}" "${workdir}/unread.hidden"
 if run_capture "${workdir}/named-save-lost.stdout" "${workdir}/named-save-lost.stderr" \
-  named save "${vm_name}" --out "${workdir}/named-lost.spore"; then
-  die "spore save succeeded while the store lacked an object"
+  named vm save "${vm_name}" --out "${workdir}/named-lost.spore"; then
+  die "spore vm save succeeded while the store lacked an object"
 fi
 grep -Fq "was not saved" "${workdir}/named-save-lost.stderr" || {
   cat "${workdir}/named-save-lost.stderr" >&2
-  die "spore save without a store object did not explain the failure"
+  die "spore vm save without a store object did not explain the failure"
 }
 named_exec exec-after-failed-save
 mv "${workdir}/unread.hidden" "${unread}"
 # With the object back, both kinds of save fetch the rest and succeed.
 run_capture "${workdir}/named-save.stdout" "${workdir}/named-save.stderr" \
-  named save "${vm_name}" --out "${workdir}/named.spore" ||
-  require_success $? "spore save of a VM created from the store" "${workdir}/named-save.stderr"
+  named vm save "${vm_name}" --out "${workdir}/named.spore" ||
+  require_success $? "spore vm save of a VM created from the store" "${workdir}/named-save.stderr"
 named_exec exec-after-save
 run_capture "${workdir}/named-save-stop.stdout" "${workdir}/named-save-stop.stderr" \
-  named save "${vm_name}" --out "${workdir}/named-stop.spore" --stop ||
-  require_success $? "spore save --stop of a VM created from the store" "${workdir}/named-save-stop.stderr"
+  named vm save "${vm_name}" --out "${workdir}/named-stop.spore" --stop ||
+  require_success $? "spore vm save --stop of a VM created from the store" "${workdir}/named-save-stop.stderr"
 vm_created=0
 
 # A save the store cannot complete fails and leaves no save directory.
@@ -291,7 +291,7 @@ run_capture "${workdir}/from.stdout" "${workdir}/from.stderr" \
   "${spore_bin}" run --backend "${backend}" --from "${workdir}/saved.spore" -- /hello ||
   require_success $? "run --from a spore saved from the store" "${workdir}/from.stderr"
 expect_eq "remote-lazy-ok" "$(cat "${workdir}/from.stdout")" "run --from output"
-(cd "${workdir}" && "${spore_bin}" fork saved.spore --count 1 --out children >fork.stdout 2>fork.stderr) ||
+(cd "${workdir}" && "${spore_bin}" checkpoint fork saved.spore --count 1 --out children >fork.stdout 2>fork.stderr) ||
   require_success $? "fork with a relative --out" "${workdir}/fork.stderr"
 [[ -f "${workdir}/children/000000/manifest.json" ]] || die "fork with a relative --out wrote no child"
 
@@ -299,15 +299,15 @@ expect_eq "remote-lazy-ok" "$(cat "${workdir}/from.stdout")" "run --from output"
 # image lacks: its RAM, changed disk chunks, disk index and manifest.
 mv "${workdir}/objects.hidden" "${workdir}/store/objects"
 store_objects="$(find "${workdir}/store/objects" -type f | wc -l | tr -d ' ')"
-"${spore_bin}" --json push "${workdir}/saved.spore" "${workdir}/store/saved" >"${workdir}/spore-push.json"
+"${spore_bin}" --json checkpoint push "${workdir}/saved.spore" "${workdir}/store/saved" >"${workdir}/spore-push.json"
 spore_objects="$(json_field "${workdir}/spore-push.json" objects_total)"
 spore_written="$(json_field "${workdir}/spore-push.json" objects_written)"
 spore_bytes="$(json_field "${workdir}/spore-push.json" bytes_written)"
 spore_digest="$(json_field "${workdir}/spore-push.json" spore_digest)"
-expect_eq "$((store_objects + spore_written))" "$(find "${workdir}/store/objects" -type f | wc -l | tr -d ' ')" "store objects after spore push"
-((spore_written < spore_objects)) || die "spore push wrote all ${spore_objects} objects; none deduplicated against the image"
+expect_eq "$((store_objects + spore_written))" "$(find "${workdir}/store/objects" -type f | wc -l | tr -d ' ')" "store objects after spore checkpoint push"
+((spore_written < spore_objects)) || die "spore checkpoint push wrote all ${spore_objects} objects; none deduplicated against the image"
 expect_eq "${spore_digest}" "$(cat "${workdir}/store/spore-tags/saved")" "spore tag"
-[[ -f "${workdir}/store/spores/${spore_digest#blake3:}" ]] || die "spore push wrote no manifest"
+[[ -f "${workdir}/store/spores/${spore_digest#blake3:}" ]] || die "spore checkpoint push wrote no manifest"
 
 python3 - <<PY
 object_bytes = ${object_bytes}
@@ -318,6 +318,6 @@ print(f"remote-lazy: cold run windows fetched ${cold_window_fetches} objects, ${
 print(f"remote-lazy: warm run ${warm_ms} ms; fully local run $(cat "${workdir}/local.ms") ms")
 print(f"remote-lazy: cold ${seq_mib} MiB sequential read ${seq_ms} ms, fetched ${seq_fetches} objects; windows fetched ${seq_window_fetches}, ${seq_window_unused} never read")
 print(f"remote-lazy: run --save from an empty cache ${save_ms} ms, fetching all ${objects_total} objects")
-print(f"remote-lazy: spore push to the image's store wrote ${spore_written} of ${spore_objects} objects, ${spore_bytes} bytes")
+print(f"remote-lazy: spore checkpoint push to the image's store wrote ${spore_written} of ${spore_objects} objects, ${spore_bytes} bytes")
 PY
 echo "smoke:remote-lazy ok"

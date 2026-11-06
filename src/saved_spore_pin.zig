@@ -732,7 +732,7 @@ test "the same-filesystem check follows a symlinked parent of a new save" {
     const cache = try std.fs.path.join(allocator, &.{ root, "cache" });
     try Io.Dir.cwd().createDirPath(io, cache);
     try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ root, "real" }));
-    // As /tmp is on macOS, where `spore save NAME --out /tmp/x.spore` passes
+    // As /tmp is on macOS, where `spore vm save NAME --out /tmp/x.spore` passes
     // the absolute path through unchanged.
     const link = try std.fs.path.join(allocator, &.{ root, "link" });
     try Io.Dir.cwd().symLink(io, try std.fs.path.join(allocator, &.{ root, "real" }), link, .{});

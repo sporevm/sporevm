@@ -25,7 +25,7 @@ created=0
 cleanup() {
   if ((created)); then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" SPOREVM_KERNEL_CACHE_DIR="${kernel_cache}" \
-      "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+      "${spore_bin}" vm rm "${vm_name}" >/dev/null 2>&1 || true
   fi
 }
 
@@ -51,7 +51,7 @@ grep -Fxq "spore stdout" "${workdir}/run.stdout" || die "one-shot stdout was not
 grep -Fxq "spore stderr" "${workdir}/run.stderr" || die "one-shot stderr was not delivered"
 grep -Fxq "rng ok" "${workdir}/run.stdout" || die "virtio RNG was not functional"
 
-"${run_env[@]}" "${spore_bin}" create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 \
+"${run_env[@]}" "${spore_bin}" vm create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 \
   >"${workdir}/create.stdout" 2>"${workdir}/create.stderr"
 created=1
 # The monitor runs the VM. Booting must not commit all 512 MiB of guest RAM.
@@ -60,23 +60,23 @@ monitor_rss_kib="$(awk '$1 == "VmRSS:" { print $2 }' "/proc/${monitor_pid}/statu
 echo "x86 named VM monitor VmRSS after boot: ${monitor_rss_kib} KiB"
 ((monitor_rss_kib < 256 * 1024)) || die "monitor committed ${monitor_rss_kib} KiB for a 512 MiB guest"
 
-"${run_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/writeout \
+"${run_env[@]}" "${spore_bin}" vm exec "${vm_name}" -- /bin/writeout \
   >"${workdir}/exec.stdout" 2>"${workdir}/exec.stderr"
 grep -Fxq "spore stdout" "${workdir}/exec.stdout" || die "named exec stdout was not delivered"
 grep -Fxq "spore stderr" "${workdir}/exec.stderr" || die "named exec stderr was not delivered"
 
-printf 'stdin-ok' | "${run_env[@]}" "${spore_bin}" exec -i "${vm_name}" -- /bin/cat \
+printf 'stdin-ok' | "${run_env[@]}" "${spore_bin}" vm exec -i "${vm_name}" -- /bin/cat \
   >"${workdir}/stdin.stdout" 2>"${workdir}/stdin.stderr"
 [[ "$(cat "${workdir}/stdin.stdout")" == "stdin-ok" ]] || die "named interactive stdin did not round trip"
 [[ ! -s "${workdir}/stdin.stderr" ]] || die "named interactive stdin wrote unexpected stderr"
 
-"${run_env[@]}" "${spore_bin}" exec -t "${vm_name}" -- /bin/sh -lc \
+"${run_env[@]}" "${spore_bin}" vm exec -t "${vm_name}" -- /bin/sh -lc \
   'printf tty-out; printf tty-err >&2' >"${workdir}/tty.stdout" 2>"${workdir}/tty.stderr"
 grep -Fq "tty-out" "${workdir}/tty.stdout" || die "TTY stdout was not delivered"
 grep -Fq "tty-err" "${workdir}/tty.stdout" || die "TTY stderr was not merged"
 [[ ! -s "${workdir}/tty.stderr" ]] || die "TTY wrote separate stderr"
 
-"${run_env[@]}" "${spore_bin}" rm "${vm_name}" >/dev/null
+"${run_env[@]}" "${spore_bin}" vm rm "${vm_name}" >/dev/null
 created=0
 if find "${runtime_dir}" -mindepth 2 -print -quit | grep -q .; then
   find "${runtime_dir}" -mindepth 2 -maxdepth 3 -print >&2

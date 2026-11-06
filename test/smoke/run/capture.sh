@@ -78,7 +78,7 @@ grep -Fq "saved spore at ${capture_dir}" "${run_stderr}" || {
   die "spore run save did not report the save path"
 }
 
-"${spore_bin}" fork "${capture_dir}" --count 1 --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count 1 --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 children=()
 while IFS= read -r child; do
   children+=("${child}")
@@ -175,7 +175,7 @@ expect_probe_incomplete "spore attach" "${poweroff_rc}" "${workdir}/poweroff-att
   >"${from_base_stdout}" 2>"${from_base_stderr}"
 [[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base save did not write ${from_base_dir}/manifest.json"
 
-"${spore_bin}" fork "${from_base_dir}" --count 1 --out "${from_base_fork_dir}" >"${workdir}/from-base-fork.stdout" 2>"${workdir}/from-base-fork.stderr"
+"${spore_bin}" checkpoint fork "${from_base_dir}" --count 1 --out "${from_base_fork_dir}" >"${workdir}/from-base-fork.stdout" 2>"${workdir}/from-base-fork.stderr"
 from_child_dir="$(fork_children "${from_base_fork_dir}" | head -n 1)"
 [[ -n "${from_child_dir}" ]] || die "forked run --from base did not create a child spore"
 

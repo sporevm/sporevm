@@ -148,7 +148,7 @@ with_timeout() {
   python3 -c 'import os, signal, sys; signal.alarm(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])' "$@"
 }
 
-# fork_children DIR prints the child spores of a `spore fork --out DIR` batch.
+# fork_children DIR prints the child spores of a `spore checkpoint fork --out DIR` batch.
 # The batch also holds shared stores such as shared-chunks.
 fork_children() {
   find "$1" -mindepth 1 -maxdepth 1 -type d -name '[0-9][0-9][0-9][0-9][0-9][0-9]' | sort

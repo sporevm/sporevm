@@ -47,7 +47,7 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
         }
         if (err == error.NoSavedSession) {
             std.debug.print(
-                "spore attach: spore has no saved session; run new commands with `spore run --from {s} ...`, or create one with `spore run --save <spore> --save-on TERM ...`; verify with `spore inspect {s}` and `Sessions: 1`\n",
+                "spore attach: spore has no saved session; run new commands with `spore run --from {s} ...`, or create one with `spore run --save <spore> --save-on TERM ...`; verify with `spore checkpoint inspect {s}` and `Sessions: 1`\n",
                 .{ opts.spore_dir, opts.spore_dir },
             );
             std.process.exit(api.classifyFailure(err).exit_code);

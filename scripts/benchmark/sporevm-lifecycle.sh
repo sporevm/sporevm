@@ -9,7 +9,7 @@ Usage:
   scripts/benchmark/sporevm-lifecycle.sh --image REF [options]
 
 Options:
-  --image REF              OCI image to use for spore create.
+  --image REF              OCI image to use for spore vm create.
                            Mutable tags are pinned once before timing by default.
   --pin-image-once         Resolve mutable image tags before the timed loop (default).
   --measure-tag-resolution Do not pre-resolve image tags; include tag lookup in create time.
@@ -18,19 +18,19 @@ Options:
   --runtime-dir DIR        Runtime directory to reuse (default: <output-dir>/runtime).
   --rootfs-cache-dir DIR   Rootfs cache directory to pass as SPOREVM_ROOTFS_CACHE_DIR.
   --spore-bin PATH         Spore binary path (default: zig-out/bin/spore).
-  --backend NAME           Backend for spore create (default: auto).
+  --backend NAME           Backend for spore vm create (default: auto).
   --kernel PATH            Kernel Image path to pass through to create.
   --initrd PATH            Initrd path to pass through to create.
   --memory VALUE           Guest memory: auto, 512mb, 2gb, ... (default: auto).
   --timeout DURATION       Exec/create timeout (default: 60s).
   --identity-command CMD   First command run in the VM (default: boot_id probe).
   --workload-command CMD   Second command run in the VM (default: node -v).
-  --max-cleanup-ms N       Fail if any spore rm cleanup exceeds N milliseconds.
+  --max-cleanup-ms N       Fail if any spore vm rm cleanup exceeds N milliseconds.
   --no-build               Do not run mise/zig build before benchmarking.
   -h, --help               Show this help.
 
-The timed section starts immediately before `spore create`, runs the identity
-probe and workload command with `spore exec`, then stops before `spore rm`.
+The timed section starts immediately before `spore vm create`, runs the identity
+probe and workload command with `spore vm exec`, then stops before `spore vm rm`.
 Cleanup is recorded separately and is not included in create_to_node_ms.
 When available, create and monitor phase timings are flattened into each JSONL row.
 EOF
@@ -364,7 +364,7 @@ elif [[ "${pin_image_once}" == "0" ]]; then
   image_resolution_timed="true"
 fi
 
-create_base=("${spore_bin}" create)
+create_base=("${spore_bin}" vm create)
 if [[ -n "${backend}" ]]; then
   create_base+=(--backend "${backend}")
 fi
@@ -406,7 +406,7 @@ for i in $(seq 1 "${iterations}"); do
   identity_start_ms="${create_end_ms}"
   if [[ "${create_status}" == "0" ]]; then
     if run_capture "${identity_stdout}" "${identity_stderr}" \
-      env "${spore_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/sh -lc "${identity_command}"; then
+      env "${spore_env[@]}" "${spore_bin}" vm exec "${vm_name}" -- /bin/sh -lc "${identity_command}"; then
       identity_status=0
     else
       identity_status=$?
@@ -417,7 +417,7 @@ for i in $(seq 1 "${iterations}"); do
   workload_start_ms="${identity_end_ms}"
   if [[ "${identity_status}" == "0" ]]; then
     if run_capture "${workload_stdout}" "${workload_stderr}" \
-      env "${spore_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/sh -lc "${workload_command}"; then
+      env "${spore_env[@]}" "${spore_bin}" vm exec "${vm_name}" -- /bin/sh -lc "${workload_command}"; then
       workload_status=0
     else
       workload_status=$?
@@ -444,7 +444,7 @@ for i in $(seq 1 "${iterations}"); do
   monitor_ready_after_start_ms="$(json_number_field "${monitor_timing_path}" "ready_after_start_ms")"
 
   rm_start_ms="$(now_ms)"
-  if run_capture "${rm_stdout}" "${rm_stderr}" env "${spore_env[@]}" "${spore_bin}" rm "${vm_name}"; then
+  if run_capture "${rm_stdout}" "${rm_stderr}" env "${spore_env[@]}" "${spore_bin}" vm rm "${vm_name}"; then
     rm_status=0
   else
     rm_status=$?

@@ -137,7 +137,7 @@ children_dir="${workdir}/children"
   --pull=never \
   --save "${warm_spore}" \
   -- /bin/sh -lc 'test ! -e /failed.txt && grep -Fxq copied-from-transient-injection /committed.txt'
-"${spore_bin}" fork "${warm_spore}" --count 2 --out "${children_dir}"
+"${spore_bin}" checkpoint fork "${warm_spore}" --count 2 --out "${children_dir}"
 
 children=("${children_dir}"/[0-9][0-9][0-9][0-9][0-9][0-9])
 [[ "${#children[@]}" -eq 2 ]] || die "fork did not create two children"

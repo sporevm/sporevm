@@ -101,7 +101,7 @@ if [[ "${run_rc}" != "0" ]]; then
 fi
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
 
-"${spore_bin}" fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
 children=()
 while IFS= read -r child; do

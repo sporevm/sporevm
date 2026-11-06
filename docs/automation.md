@@ -13,10 +13,10 @@ The bounded surface includes version and inspection, system and cache
 operations, rootfs and image operations, build, named lifecycle and copy
 operations, and checkpoint push and pull.
 
-Under the same global `--json`, the streaming commands `run`, `attach`, `exec`
-and `fanout` print `spore.automation.event.v1` records on stdout, one per line,
-instead of the guest's raw output. Every stream, including one that fails on
-its arguments, ends with exactly one `completion` record:
+Under the same global `--json`, the streaming commands `run`, `attach`,
+`fanout` and `vm exec` print `spore.automation.event.v1` records on stdout,
+one per line, instead of the guest's raw output. Every stream, including one
+that fails on its arguments, ends with exactly one `completion` record:
 
 ```json
 {"schema":"spore.automation.event.v1","schema_version":1,"event":"completion","outcome":"completed","command":"exec","backend":null,"exit_code":0}
@@ -47,9 +47,9 @@ The bounded schema inventory is:
 
 | Operations | Result schemas |
 | --- | --- |
-| `version`, `host-info`, `inspect` | `spore.version.result.v1`, `spore.host-info.v3`, `spore.inspect.result.v1` |
-| checkpoint `fork`/`push`/`pull` | `spore.fork.result.v1`, `spore.push.result.v2`, `spore.pull.result.v2` |
-| `create`, `logs`, `save`, `restore`, `vm rm`, `vm fork`, `checkpoint rm`, `ls`/`ps`, `copy-in`/`copy-out` | `spore.lifecycle.v1`, `spore.saved.remove.result.v2`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
+| `version`, `host-info`, `checkpoint inspect` | `spore.version.result.v1`, `spore.host-info.v3`, `spore.inspect.result.v1` |
+| `checkpoint fork`/`push`/`pull` | `spore.fork.result.v1`, `spore.push.result.v2`, `spore.pull.result.v2` |
+| `vm create`, `logs`, `save`, `restore`, `rm`, `fork`, `ls`, `copy-in`/`copy-out`; `checkpoint rm` | `spore.lifecycle.v1`, `spore.saved.remove.result.v2`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
 | `build`, rootfs operations, image archive and push operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v2`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1`, `spore.image.push.result.v1` |
 | `system df`/`prune`, `cache gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v2`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
 
@@ -60,12 +60,12 @@ fixed memory. Checkpoint inspection adds `initial_memory_bytes`,
 `plugged_memory_ranges`. Fixed-memory manifests report the same value for all
 four sizes and an empty range list.
 
-Named create and `logs` share `spore.lifecycle.v1`. Its optional
+`vm create` and `vm logs` share `spore.lifecycle.v1`. Its optional
 `initial_command` object first reports output disposition, destination, bound,
 and startup status, then the logs result adds process status, optional exit
 code, retained bytes, and per-stream truncation flags.
 
-Named `ls`/`ps` uses `spore.lifecycle.list.result.v2`; its `memory` object
+`vm ls` uses `spore.lifecycle.list.result.v2`; its `memory` object
 contains `initial_bytes` and `maximum_bytes`. Version 1 exposed the removed
 automatic-memory policy and is not compatible with the explicit two-size
 contract.

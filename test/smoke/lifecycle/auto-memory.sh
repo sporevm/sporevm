@@ -22,7 +22,7 @@ created=0
 
 cleanup() {
   if [[ "${created}" == "1" ]]; then
-    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+    env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${vm_name}" >/dev/null 2>&1 || true
   fi
 }
 
@@ -40,7 +40,7 @@ suspend_stderr="${workdir}/suspend.stderr"
 create_start_ms="$(now_ms)"
 if run_capture "${create_stdout}" "${create_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-  "${spore_bin}" create "${vm_name}" \
+  "${spore_bin}" vm create "${vm_name}" \
     --backend "${backend}" \
     --memory 512mb \
     --max-memory 16gb \
@@ -49,35 +49,35 @@ if run_capture "${create_stdout}" "${create_stderr}" \
   created=1
 else
   status=$?
-  require_success "${status}" "spore create --memory 512mb --max-memory 16gb" "${create_stderr}"
+  require_success "${status}" "spore vm create --memory 512mb --max-memory 16gb" "${create_stderr}"
 fi
 create_ms="$(( $(now_ms) - create_start_ms ))"
 
 if run_capture "${exec1_stdout}" "${exec1_stderr}" \
-  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${vm_name}" -- /bin/writeout; then
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${vm_name}" -- /bin/writeout; then
   :
 else
   status=$?
-  require_success "${status}" "first spore exec" "${exec1_stderr}"
+  require_success "${status}" "first spore vm exec" "${exec1_stderr}"
 fi
-grep -Fxq "spore stdout" "${exec1_stdout}" || die "first spore exec did not forward guest stdout"
-grep -Fq "spore stderr" "${exec1_stderr}" || die "first spore exec did not forward guest stderr"
+grep -Fxq "spore stdout" "${exec1_stdout}" || die "first spore vm exec did not forward guest stdout"
+grep -Fq "spore stderr" "${exec1_stderr}" || die "first spore vm exec did not forward guest stderr"
 
 if run_capture "${exec2_stdout}" "${exec2_stderr}" \
-  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${vm_name}" -- /bin/true; then
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm exec "${vm_name}" -- /bin/true; then
   :
 else
   status=$?
-  require_success "${status}" "second spore exec" "${exec2_stderr}"
+  require_success "${status}" "second spore vm exec" "${exec2_stderr}"
 fi
-[[ ! -s "${exec2_stdout}" ]] || die "second spore exec wrote unexpected stdout"
+[[ ! -s "${exec2_stdout}" ]] || die "second spore vm exec wrote unexpected stdout"
 
 if run_capture "${ls_stdout}" "${ls_stderr}" \
-  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json ls; then
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json vm ls; then
   :
 else
   status=$?
-  require_success "${status}" "spore --json ls" "${ls_stderr}"
+  require_success "${status}" "spore --json vm ls" "${ls_stderr}"
 fi
 
 if ! ls_metrics="$(
@@ -91,7 +91,7 @@ with open(path, "r", encoding="utf-8") as fh:
 
 entry = next((e for e in entries if e.get("name") == name), None)
 if entry is None:
-    raise SystemExit(f"{name} missing from spore --json ls")
+    raise SystemExit(f"{name} missing from spore --json vm ls")
 if entry.get("state") != "ready":
     raise SystemExit(f"{name} state was {entry.get('state')!r}, expected ready")
 
@@ -107,7 +107,7 @@ for key, value in {
     "chunks_total": stats.get("chunks_total"),
 }.items():
     if value is None:
-        raise SystemExit(f"{key} missing from spore --json ls")
+        raise SystemExit(f"{key} missing from spore --json vm ls")
 
 print(
     f"initial_memory_bytes={memory['initial_bytes']} "
@@ -125,11 +125,11 @@ fi
 
 suspend_start_ms="$(now_ms)"
 if run_capture "${suspend_stdout}" "${suspend_stderr}" \
-  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" save "${vm_name}" --out "${spore_dir}" --stop; then
+  env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm save "${vm_name}" --out "${spore_dir}" --stop; then
   created=0
 else
   status=$?
-  require_success "${status}" "spore save --stop" "${suspend_stderr}"
+  require_success "${status}" "spore vm save --stop" "${suspend_stderr}"
 fi
 suspend_ms="$(( $(now_ms) - suspend_start_ms ))"
 

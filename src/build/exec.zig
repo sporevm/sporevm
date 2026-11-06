@@ -2868,7 +2868,7 @@ const AgentResult = struct {
     }
 };
 
-// Runs `argv` the way `spore exec` does, with `stdin` streamed and closed,
+// Runs `argv` the way `spore vm exec` does, with `stdin` streamed and closed,
 // while the guest agent's captured session runs `/bin/sh -c captured_script`.
 fn execBesideCapturedSession(captured_script: [*:0]const u8, argv: []const []const u8, stdin: []const u8) !AgentResult {
     const spore_stream = @import("../spore_stream.zig");
@@ -2982,7 +2982,7 @@ test "guest agent keeps a named exec whose request arrives as the attached clien
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    // `spore attach` to the captured session ends just as `spore exec`
+    // `spore attach` to the captured session ends just as `spore vm exec`
     // connects. The agent sees both in one poll and must not take the
     // attached client's hangup for the exec's.
     const attach = try @import("../attach_stream.zig").attachV1Request(allocator, .{ .session_id = "captured" });

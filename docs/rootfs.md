@@ -50,7 +50,7 @@ and uses OCI Cmd when no caller command is supplied. A caller command replaces
 Cmd but keeps Entrypoint. `--entrypoint PATH` replaces the image Entrypoint;
 the caller command still replaces Cmd, or the image Cmd is used when no command
 is supplied. Empty or absent arrays contribute no arguments, and an image with
-no effective command is rejected before boot. `spore create --image` applies
+no effective command is rejected before boot. `spore vm create --image` applies
 the same default rules to its optional initial command; plain create without an
 image remains an idle VM.
 
@@ -62,7 +62,7 @@ argument remains byte-for-byte unchanged and no shell is involved.
 Image `Env` and `WorkingDir` are also applied. `User` currently fails closed:
 only empty, `root`, `0`, and those users with an empty, `root`, or `0` group are
 accepted because guest credential switching is not implemented. Later named
-`spore exec` commands use the saved environment and working directory, but do
+`spore vm exec` commands use the saved environment and working directory, but do
 not reapply Entrypoint or Cmd.
 
 `spore build` prepares capacity automatically before the first executor-backed
@@ -129,9 +129,9 @@ itself before writing memory, disk, and manifest files. Writable-disk bytes
 remain in the machine's rootfs CAS and are protected by a durable pin
 recorded only in host-private lifecycle metadata. The save directory can be
 renamed or moved on the same host. Its cache-side ownership anchor makes raw
-copies fail closed instead of silently sharing deletion authority. Use `spore
-fork` for another machine-local lifecycle, or `spore push` and `spore pull` to
-move it to another host.
+copies fail closed instead of silently sharing deletion authority. Use
+`spore checkpoint fork` for another machine-local lifecycle, or
+`spore checkpoint push` and `spore checkpoint pull` to move it to another host.
 
 Use `--commit local/<name>:<tag>` when the command should produce another
 image instead of a resumable machine:
@@ -202,7 +202,7 @@ response-validation failure aborts before the command and publishes nothing.
 Commit is the storage-preparation layer for fan-out, not the warm-machine
 layer. Prepare stable dependencies or Docker data into an image, put frequently
 changing code above it with `spore build FROM local/...`, then capture one warm
-spore and use `spore fork` plus `spore run --from` for children.
+spore and use `spore checkpoint fork` plus `spore run --from` for children.
 
 Pulled, imported, and built images live in a host-local catalog in the rootfs
 cache, each identified by its native BLAKE3 image identity over the rootfs
@@ -211,7 +211,7 @@ index, or tar digest the current rootfs builder converted into that image, so a
 digest-pinned ref converts once and then resolves without the registry. Names
 such as `local/app:dev` or `docker.io/library/alpine:3.20` are per-platform ref
 records pointing at an image, so a warm `spore run --image
-docker.io/library/alpine:3.20` or `spore create --image
+docker.io/library/alpine:3.20` or `spore vm create --image
 docker.io/library/alpine:3.20` goes straight to the previously converted image
 instead of re-resolving the tag on every invocation.
 `--pull=missing|always|never` controls whether mutable refs may use that
@@ -398,12 +398,12 @@ fd-backed open.
 for repairing or upgrading an existing exact-rootfs spore. It is no longer the
 normal image-build or image-capture path.
 
-`spore pull STORE/TAG --out DIR` fetches a spore pushed to an
+`spore checkpoint pull STORE/TAG --out DIR` fetches a spore pushed to an
 [image store](image-format.md#spores) into DIR, and the disk index and objects
 the cache lacks into the rootfs cache `SPOREVM_ROOTFS_CACHE_DIR` selects.
 
 Plain `spore run --rootfs PATH` remains a local read-only run escape hatch.
-Named `spore create --rootfs PATH` records exact immutable rootfs identity in
+Named `spore vm create --rootfs PATH` records exact immutable rootfs identity in
 the digest cache for lifecycle saves. Combining one-shot `spore run
 --rootfs PATH` with `--save` is rejected until an import/preload command can
 record chunked portable rootfs identity for arbitrary local images.

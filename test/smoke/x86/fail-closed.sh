@@ -38,7 +38,7 @@ created=0
 cleanup() {
   if ((created)); then
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" SPOREVM_KERNEL_CACHE_DIR="${kernel_cache}" \
-      "${spore_bin}" rm "${vm_name}" >/dev/null 2>&1 || true
+      "${spore_bin}" vm rm "${vm_name}" >/dev/null 2>&1 || true
   fi
 }
 mkdir -p "${runtime_dir}"
@@ -50,13 +50,13 @@ expect_failure run-auto-memory "--memory auto was removed" \
 expect_failure run-vcpus "requires --vcpus 1" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --memory 512mib --vcpus 2 -- /bin/true
 expect_failure create-auto-memory "--memory auto was removed" \
-  "${run_env[@]}" "${spore_bin}" create rejected-auto-$$ --backend kvm --memory auto
+  "${run_env[@]}" "${spore_bin}" vm create rejected-auto-$$ --backend kvm --memory auto
 expect_failure run-save "fresh execution only" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --memory 512mib --save "${workdir}/saved.spore" -- /bin/true
 expect_failure run-resume "fresh execution only" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --from "${workdir}/missing.spore" -- /bin/true
 expect_failure restore "resume is unavailable" \
-  "${run_env[@]}" "${spore_bin}" restore "${workdir}/missing.spore" --name restored-$$ --backend kvm
+  "${run_env[@]}" "${spore_bin}" vm restore "${workdir}/missing.spore" --name restored-$$ --backend kvm
 expect_failure attach "X86ResumeUnsupported" \
   "${run_env[@]}" "${spore_bin}" attach "${workdir}/missing.spore"
 expect_failure checkpoint-fork "X86ForkUnsupported" \
@@ -77,24 +77,24 @@ if [[ -n "${seed_dir}" ]]; then
     chmod 0444 "${managed_dir}/${asset}${suffix}"
   done
 fi
-"${run_env[@]}" "${spore_bin}" create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 >/dev/null
+"${run_env[@]}" "${spore_bin}" vm create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 >/dev/null
 created=1
 expect_failure named-copy-in "X86NamedCopyUnsupported" \
-  "${run_env[@]}" "${spore_bin}" copy-in "${vm_name}" "${workdir}/missing-host-input" /tmp/input
+  "${run_env[@]}" "${spore_bin}" vm copy-in "${vm_name}" "${workdir}/missing-host-input" /tmp/input
 expect_failure named-copy-out "X86NamedCopyUnsupported" \
-  "${run_env[@]}" "${spore_bin}" copy-out "${vm_name}" /tmp/output "${workdir}/host-output"
+  "${run_env[@]}" "${spore_bin}" vm copy-out "${vm_name}" /tmp/output "${workdir}/host-output"
 [[ ! -e "${workdir}/host-output" ]] || die "rejected named copy-out created output"
 expect_failure named-save "capture is unavailable" \
-  "${run_env[@]}" "${spore_bin}" save "${vm_name}" --out "${workdir}/named.spore"
-"${run_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/true
+  "${run_env[@]}" "${spore_bin}" vm save "${vm_name}" --out "${workdir}/named.spore"
+"${run_env[@]}" "${spore_bin}" vm exec "${vm_name}" -- /bin/true
 [[ ! -e "${workdir}/named.spore" ]] || die "rejected named save created output"
 expect_failure named-fork "capture is unavailable" \
-  "${run_env[@]}" "${spore_bin}" fork --vm "${vm_name}" --count 1 --name "${fork_name}"
-"${run_env[@]}" "${spore_bin}" exec "${vm_name}" -- /bin/true
+  "${run_env[@]}" "${spore_bin}" vm fork "${vm_name}" --count 1 --name "${fork_name}"
+"${run_env[@]}" "${spore_bin}" vm exec "${vm_name}" -- /bin/true
 if [[ -e "${runtime_dir}/vms/${fork_name}" ]]; then
   die "rejected named fork created child state"
 fi
-"${run_env[@]}" "${spore_bin}" rm "${vm_name}" >/dev/null
+"${run_env[@]}" "${spore_bin}" vm rm "${vm_name}" >/dev/null
 created=0
 if find "${runtime_dir}" -mindepth 2 -print -quit | grep -q .; then
   find "${runtime_dir}" -mindepth 2 -maxdepth 3 -print >&2

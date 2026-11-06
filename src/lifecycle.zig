@@ -837,7 +837,7 @@ fn saveContinueNamed(
     // Non-destructive save supports multi-vCPU VMs: both KVM and HVF quiesce
     // every vCPU at one barrier, capture manifest-v1 state, and resume the
     // guest through the monitor snapshot-and-continue path (the same path
-    // `spore fork --vm` uses). No vCPU-count gate is needed here.
+    // `spore vm fork` uses). No vCPU-count gate is needed here.
     if ((spec.value.rootfs_path != null or spec.value.image_ref != null) and spec.value.rootfs == null) {
         return error.MissingRootfsIdentity;
     }

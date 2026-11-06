@@ -31,25 +31,25 @@ cleanup() {
     wait "${lock_pid}" 2>/dev/null || true
   fi
   for name in repeated-nested repeated-restored postrestore postprune restored grandchild child-1 child-0 source; do
-    "${spore_bin}" rm "${name}" >/dev/null 2>&1 || true
+    "${spore_bin}" vm rm "${name}" >/dev/null 2>&1 || true
   done
 }
 
 # --debug reaches the source monitor, whose log carries the publication metrics
 # read below.
-"${spore_bin}" --debug create source \
+"${spore_bin}" --debug vm create source \
   --backend "${backend}" \
   --memory "${memory}" \
   --image "${image_ref}" \
   --console-log "${source_console_log}" \
   -- /bin/sh -lc 'while true; do sleep 3600; done'
-"${spore_bin}" exec source -- /bin/sh -lc 'printf inherited > /fork-marker; sync'
+"${spore_bin}" vm exec source -- /bin/sh -lc 'printf inherited > /fork-marker; sync'
 
 # Cache contention must be resolved before the source pause begins. Keep a
 # guest-side counter moving while an external process owns the exact cache
 # lock, then require the pending save to report the accumulated wait.
 monitor_log="${SPOREVM_RUNTIME_DIR}/vms/source/monitor.log"
-"${spore_bin}" exec source -- /bin/sh -lc 'nohup sh -c '\''i=0; while :; do i=$((i + 1)); printf "snapshot-lock-counter:%s\n" "$i" >/dev/console; sleep 0.05; done'\'' </dev/null >/dev/null 2>&1 &'
+"${spore_bin}" vm exec source -- /bin/sh -lc 'nohup sh -c '\''i=0; while :; do i=$((i + 1)); printf "snapshot-lock-counter:%s\n" "$i" >/dev/console; sleep 0.05; done'\'' </dev/null >/dev/null 2>&1 &'
 deadline=$((SECONDS + 10))
 while ! grep -q 'snapshot-lock-counter:' "${source_console_log}"; do
   if (( SECONDS >= deadline )); then
@@ -87,7 +87,7 @@ while [[ ! -f "${lock_ready}" ]]; do
   sleep 0.01
 done
 contention_save="${workdir}/contention.spore"
-"${spore_bin}" save source --out "${contention_save}" >"${workdir}/contention-save.stdout" 2>"${workdir}/contention-save.stderr" &
+"${spore_bin}" vm save source --out "${contention_save}" >"${workdir}/contention-save.stdout" 2>"${workdir}/contention-save.stderr" &
 save_pid="$!"
 sleep 1
 kill -0 "${save_pid}" 2>/dev/null || {
@@ -115,10 +115,10 @@ wait_ms, pause_ms = map(int, match.groups())
 assert wait_ms > 0, lines[-1]
 print(f"named snapshot contention cache_lock_wait_ms={wait_ms} source_pause_ms={pause_ms}")
 PY
-"${spore_bin}" rm --spore "${contention_save}"
+"${spore_bin}" checkpoint rm "${contention_save}"
 
 fork_json="${workdir}/fork.json"
-"${spore_bin}" --json fork --vm source --count 2 --name 'child-%d' >"${fork_json}"
+"${spore_bin}" --json vm fork source --count 2 --name 'child-%d' >"${fork_json}"
 python3 - "${fork_json}" "${SPOREVM_RUNTIME_DIR}" <<'PY'
 import base64
 import json
@@ -158,24 +158,24 @@ PY
 
 # The first request after resume must observe inherited disk state. This also
 # prevents guest session replay from hiding the child's actual response.
-expect_eq inherited "$("${spore_bin}" exec child-0 -- /bin/cat /fork-marker)" "child-0 inherited marker"
-expect_eq inherited "$("${spore_bin}" exec child-1 -- /bin/cat /fork-marker)" "child-1 inherited marker"
+expect_eq inherited "$("${spore_bin}" vm exec child-0 -- /bin/cat /fork-marker)" "child-0 inherited marker"
+expect_eq inherited "$("${spore_bin}" vm exec child-1 -- /bin/cat /fork-marker)" "child-1 inherited marker"
 
-"${spore_bin}" exec source -- /bin/sh -lc 'printf parent > /fork-marker; sync'
-"${spore_bin}" exec child-0 -- /bin/sh -lc 'printf child0 > /fork-marker; sync'
-expect_eq parent "$("${spore_bin}" exec source -- /bin/cat /fork-marker)" "parent divergent marker"
-expect_eq child0 "$("${spore_bin}" exec child-0 -- /bin/cat /fork-marker)" "child-0 divergent marker"
-expect_eq inherited "$("${spore_bin}" exec child-1 -- /bin/cat /fork-marker)" "child-1 isolated marker"
+"${spore_bin}" vm exec source -- /bin/sh -lc 'printf parent > /fork-marker; sync'
+"${spore_bin}" vm exec child-0 -- /bin/sh -lc 'printf child0 > /fork-marker; sync'
+expect_eq parent "$("${spore_bin}" vm exec source -- /bin/cat /fork-marker)" "parent divergent marker"
+expect_eq child0 "$("${spore_bin}" vm exec child-0 -- /bin/cat /fork-marker)" "child-0 divergent marker"
+expect_eq inherited "$("${spore_bin}" vm exec child-1 -- /bin/cat /fork-marker)" "child-1 isolated marker"
 
-"${spore_bin}" fork --vm child-1 --count 1 --name grandchild
-expect_eq inherited "$("${spore_bin}" exec grandchild -- /bin/cat /fork-marker)" "nested child marker"
-"${spore_bin}" save grandchild --out "${workdir}/grandchild.spore"
-"${spore_bin}" restore "${workdir}/grandchild.spore" --name restored --backend "${backend}"
-expect_eq inherited "$("${spore_bin}" exec restored -- /bin/cat /fork-marker)" "restored nested child marker"
+"${spore_bin}" vm fork child-1 --count 1 --name grandchild
+expect_eq inherited "$("${spore_bin}" vm exec grandchild -- /bin/cat /fork-marker)" "nested child marker"
+"${spore_bin}" vm save grandchild --out "${workdir}/grandchild.spore"
+"${spore_bin}" vm restore "${workdir}/grandchild.spore" --name restored --backend "${backend}"
+expect_eq inherited "$("${spore_bin}" vm exec restored -- /bin/cat /fork-marker)" "restored nested child marker"
 
 # Once the source is gone, live children and durable saves must remain the
 # roots of their own immutable baselines.
-"${spore_bin}" rm source
+"${spore_bin}" vm rm source
 "${spore_bin}" --json cache gc --rootfs --force >"${workdir}/gc.json"
 "${spore_bin}" --json system prune \
   --rootfs \
@@ -184,19 +184,19 @@ expect_eq inherited "$("${spore_bin}" exec restored -- /bin/cat /fork-marker)" "
   --include-digest-artifacts \
   --include-rootfs-chunks \
   >"${workdir}/prune.json"
-expect_eq child0 "$("${spore_bin}" exec child-0 -- /bin/cat /fork-marker)" "post-prune child-0 marker"
-expect_eq inherited "$("${spore_bin}" exec child-1 -- /bin/cat /fork-marker)" "post-prune child-1 marker"
-expect_eq inherited "$("${spore_bin}" exec grandchild -- /bin/cat /fork-marker)" "post-prune nested child marker"
-expect_eq inherited "$("${spore_bin}" exec restored -- /bin/cat /fork-marker)" "post-prune restored marker"
+expect_eq child0 "$("${spore_bin}" vm exec child-0 -- /bin/cat /fork-marker)" "post-prune child-0 marker"
+expect_eq inherited "$("${spore_bin}" vm exec child-1 -- /bin/cat /fork-marker)" "post-prune child-1 marker"
+expect_eq inherited "$("${spore_bin}" vm exec grandchild -- /bin/cat /fork-marker)" "post-prune nested child marker"
+expect_eq inherited "$("${spore_bin}" vm exec restored -- /bin/cat /fork-marker)" "post-prune restored marker"
 
-"${spore_bin}" rm grandchild
-"${spore_bin}" rm restored
-"${spore_bin}" fork --vm child-1 --count 1 --name postprune
-expect_eq inherited "$("${spore_bin}" exec postprune -- /bin/cat /fork-marker)" "post-prune nested fork marker"
-"${spore_bin}" save child-1 --out "${workdir}/after-prune.spore"
+"${spore_bin}" vm rm grandchild
+"${spore_bin}" vm rm restored
+"${spore_bin}" vm fork child-1 --count 1 --name postprune
+expect_eq inherited "$("${spore_bin}" vm exec postprune -- /bin/cat /fork-marker)" "post-prune nested fork marker"
+"${spore_bin}" vm save child-1 --out "${workdir}/after-prune.spore"
 mv "${workdir}/after-prune.spore" "${workdir}/relocated-after-prune.spore"
-"${spore_bin}" restore "${workdir}/relocated-after-prune.spore" --name postrestore --backend "${backend}"
-expect_eq inherited "$("${spore_bin}" exec postrestore -- /bin/cat /fork-marker)" "post-prune save/restore marker"
+"${spore_bin}" vm restore "${workdir}/relocated-after-prune.spore" --name postrestore --backend "${backend}"
+expect_eq inherited "$("${spore_bin}" vm exec postrestore -- /bin/cat /fork-marker)" "post-prune save/restore marker"
 
 # A repeated non-destructive save must publish a complete new global-CAS
 # baseline before its pin becomes visible. Removing the first save and forcing
@@ -205,8 +205,8 @@ expect_eq inherited "$("${spore_bin}" exec postrestore -- /bin/cat /fork-marker)
 # fast fork.
 first_repeat_dir="${workdir}/repeat-first.spore"
 second_repeat_dir="${workdir}/repeat-second.spore"
-"${spore_bin}" save child-1 --out "${first_repeat_dir}"
-"${spore_bin}" rm --spore "${first_repeat_dir}"
+"${spore_bin}" vm save child-1 --out "${first_repeat_dir}"
+"${spore_bin}" checkpoint rm "${first_repeat_dir}"
 "${spore_bin}" --json cache gc --rootfs --force >"${workdir}/repeat-gc.json"
 "${spore_bin}" --json system prune \
   --rootfs \
@@ -215,9 +215,9 @@ second_repeat_dir="${workdir}/repeat-second.spore"
   --include-digest-artifacts \
   --include-rootfs-chunks \
   >"${workdir}/repeat-prune.json"
-expect_eq inherited "$("${spore_bin}" exec child-1 -- /bin/cat /fork-marker)" "continued source after first save removal"
-"${spore_bin}" exec child-1 -- /bin/sh -lc 'printf repeated > /fork-marker; sync'
-"${spore_bin}" save child-1 --out "${second_repeat_dir}"
+expect_eq inherited "$("${spore_bin}" vm exec child-1 -- /bin/cat /fork-marker)" "continued source after first save removal"
+"${spore_bin}" vm exec child-1 -- /bin/sh -lc 'printf repeated > /fork-marker; sync'
+"${spore_bin}" vm save child-1 --out "${second_repeat_dir}"
 
 assert_pinned_runtime_authority() {
   local save_dir="$1"
@@ -267,9 +267,9 @@ PY
 }
 
 assert_pinned_runtime_authority "${second_repeat_dir}" child-1
-"${spore_bin}" restore "${second_repeat_dir}" --name repeated-restored --backend "${backend}"
+"${spore_bin}" vm restore "${second_repeat_dir}" --name repeated-restored --backend "${backend}"
 assert_pinned_runtime_authority "${second_repeat_dir}" repeated-restored
-"${spore_bin}" fork --vm repeated-restored --count 1 --name repeated-nested
-expect_eq repeated "$("${spore_bin}" exec repeated-nested -- /bin/cat /fork-marker)" "repeated-save nested restore marker"
+"${spore_bin}" vm fork repeated-restored --count 1 --name repeated-nested
+expect_eq repeated "$("${spore_bin}" vm exec repeated-nested -- /bin/cat /fork-marker)" "repeated-save nested restore marker"
 
 echo "smoke:named-disk-fork ok backend=${backend} image=${image_ref}"

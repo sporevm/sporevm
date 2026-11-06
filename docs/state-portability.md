@@ -30,7 +30,7 @@ Portable state is deliberately narrow:
 - Disk: a captured `spore run --image` workload may reference one verified
   immutable ext4 rootfs artifact and, for image-created spores, manifest-bound
   chunked rootfs storage. It may also reference an optional sealed writable
-  rootfs-bound disk index. `spore push` and `spore pull` carry the disk index
+  rootfs-bound disk index. `spore checkpoint push` and `spore checkpoint pull` carry the disk index
   and disk chunk objects through an image store. General block devices are
   still outside the portable contract.
 
@@ -279,7 +279,7 @@ State portability checks should use product-created spores wherever possible:
 - `spore run --save ...` to create diskless, immutable-rootfs, or locally
   layered writable-rootfs spores;
 - `spore attach` to validate session restore;
-- `spore fork` and `spore fanout` to validate child identity and parallel
+- `spore checkpoint fork` and `spore fanout` to validate child identity and parallel
   resume behavior.
 
 Current evidence:

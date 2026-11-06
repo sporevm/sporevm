@@ -1,7 +1,7 @@
-//! Saved spores in an image store. `spore push` writes the manifest to
+//! Saved spores in an image store. `spore checkpoint push` writes the manifest to
 //! `spores/<hex>`, where `hex` is its BLAKE3, and the RAM chunks, the disk
 //! index and the disk objects to the store's shared `objects/blake3/`, so a
-//! spore's unchanged disk chunks dedupe against its image. `spore pull`
+//! spore's unchanged disk chunks dedupe against its image. `spore checkpoint pull`
 //! fetches them back into a pinned save.
 
 const std = @import("std");
@@ -379,7 +379,7 @@ fn testPush(fixture: *image_store.TestImage, spore_dir: []const u8, destination:
     });
 }
 
-test "spore push writes a spore once, without its RAM backing, and dedupes against its image" {
+test "spore checkpoint push writes a spore once, without its RAM backing, and dedupes against its image" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -414,7 +414,7 @@ test "spore push writes a spore once, without its RAM backing, and dedupes again
     try std.testing.expectError(error.ImageStorePushUnsupportedScheme, testPush(&fixture, saved.dir, "https://images.example.test/warm", "aws"));
 }
 
-test "spore push sends a spore without a rootfs and refuses an incomplete or missing disk" {
+test "spore checkpoint push sends a spore without a rootfs and refuses an incomplete or missing disk" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -441,7 +441,7 @@ test "spore push sends a spore without a rootfs and refuses an incomplete or mis
     try std.testing.expectEqual(@as(usize, 2), pushed.objects_written);
 }
 
-test "spore push to S3 uploads objects, then the manifest, then the tag" {
+test "spore checkpoint push to S3 uploads objects, then the manifest, then the tag" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -487,7 +487,7 @@ test "spore push to S3 uploads objects, then the manifest, then the tag" {
     try std.testing.expectEqual(null, try entries.next(io));
 }
 
-test "spore pull fetches a pushed spore into a pinned save" {
+test "spore checkpoint pull fetches a pushed spore into a pinned save" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -531,7 +531,7 @@ test "spore pull fetches a pushed spore into a pinned save" {
     try std.testing.expectError(error.AlreadyExists, testPull(&fixture, env, pushed.ref, out));
 }
 
-test "spore pull writes to a relative --out and one under a symlinked directory" {
+test "spore checkpoint pull writes to a relative --out and one under a symlinked directory" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -554,7 +554,7 @@ test "spore pull writes to a relative --out and one under a symlinked directory"
     try std.testing.expectEqualStrings(saved_spore_ownership.machine_local_pinned, try saved_spore_ownership.classify(allocator, try fixture.path("real/linked.spore"), saved.disk));
 }
 
-test "spore pull refuses a spore with more RAM than it writes before creating --out" {
+test "spore checkpoint pull refuses a spore with more RAM than it writes before creating --out" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -577,7 +577,7 @@ test "spore pull refuses a spore with more RAM than it writes before creating --
     try std.testing.expect(!try exists(out));
 }
 
-test "spore pull fails closed on bad store data and leaves no save or pin" {
+test "spore checkpoint pull fails closed on bad store data and leaves no save or pin" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();
@@ -691,7 +691,7 @@ test "a cache gc during a pull keeps what the pull fetched" {
     try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, cache, storage));
 }
 
-test "spore pull over HTTP fetches a spore without a rootfs and refuses a rootfs without a disk" {
+test "spore checkpoint pull over HTTP fetches a spore without a rootfs and refuses a rootfs without a disk" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
     defer fixture.deinit();

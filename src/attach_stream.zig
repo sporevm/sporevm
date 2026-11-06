@@ -1,5 +1,5 @@
 //! Shared host-side stream and terminal helpers for `spore run --from`,
-//! `spore attach` and `spore exec`.
+//! `spore attach` and `spore vm exec`.
 
 const std = @import("std");
 

@@ -89,8 +89,8 @@ pub const monitor_usage =
     \\Usage:
     \\  spore monitor NAME
     \\
-    \\Internal helper for named VM lifecycle monitors. `spore create`,
-    \\`spore restore --name` and `spore vm fork` start it after claiming NAME:
+    \\Internal helper for named VM lifecycle monitors. `spore vm create`,
+    \\`spore vm restore --name` and `spore vm fork` start it after claiming NAME:
     \\the VM's spec is read from its registry entry, and stdin must be the
     \\entry's lock.
     \\

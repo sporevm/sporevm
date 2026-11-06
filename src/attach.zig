@@ -63,7 +63,7 @@ pub const cli_usage =
     \\  -h, --help              Show this help
     \\
     \\Requires a spore with saved sessions. Verify with:
-    \\  spore inspect <spore-dir>
+    \\  spore checkpoint inspect <spore-dir>
     \\  # Sessions: 1
     \\
 ;
