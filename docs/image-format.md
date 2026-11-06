@@ -104,7 +104,8 @@ Archives are bounded to 16 GiB logical rootfs size, 65,536 distinct nonzero
 objects, 4 GiB object payload, and 4 GiB compressed archive bytes. The
 unpacker uses private disk staging and never creates, captures, restores, or
 carries RAM, vCPU, device, session, or suspended machine state. `spore pack`,
-`push`, `pull`, and `unpack` remain the separate saved-machine bundle protocol.
+`pull`, and `unpack` remain the separate saved-machine bundle protocol;
+`spore push` writes a saved spore to an [image store](#spores).
 
 ## Image stores
 
@@ -188,6 +189,28 @@ so a reader never sees a tag before its image. An object's key is its digest,
 so a size match means the bucket already has it. Credentials appear only in
 the request signature and the session token header; refs, log lines, errors
 and the catalog's origin show only the `s3://` URL.
+
+### Spores
+
+`spore push base.spore /srv/images/base` writes a saved spore into the same
+store:
+
+```text
+objects/blake3/<hex>    RAM chunk, disk index or disk object
+spores/<hex>            spore manifest, named by its BLAKE3 digest
+spore-tags/<name>       "blake3:<spore hex>\n"
+```
+
+It writes the RAM chunks, disk index and disk objects the store lacks, then
+the manifest, then the tag, and prints the digest-pinned ref,
+`file:///srv/images/base/blake3:<hex>`. A spore's unchanged disk chunks are
+its image's objects, so pushing it to a store that holds the image writes only
+the RAM chunks, the changed disk chunks, the index and the manifest. The pushed
+manifest drops `memory.backing`, a path on the saving host, so its digest is
+not the hash of the local `manifest.json`. The disk must be complete in the
+rootfs cache or, for a portable spore, in the spore directory. Spore tags are
+separate from image tags. An `s3://` destination is uploaded as
+`spore image push` uploads one, with `spores/` in place of `images/`.
 
 ## Converter-worker conformance
 

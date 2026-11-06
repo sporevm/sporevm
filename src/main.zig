@@ -70,8 +70,8 @@ const usage =
     \\                        Make an independently owned portable spore copy
     \\    unpack <bundle-dir> [--child ID] [--allow-metadata-only-rootfs] --out DIR
     \\                        Unpack a local spore bundle into a spore dir
-    \\    push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
-    \\                        Push a bundle to an object store
+    \\    push <spore-dir> STORE/TAG
+    \\                        Push a saved spore to an image store
     \\    inspect-bundle <bundle-ref> [--child ID|--child-range START..END]
     \\                        Inspect bundle metadata without materializing it
     \\    pull file://BUNDLE|s3://BUNDLE@sha256:DIGEST|http(s)://BUNDLE@sha256:DIGEST [--child ID] [--allow-metadata-only-rootfs] --out DIR [--region REGION]
@@ -125,10 +125,13 @@ const clone_usage =
 
 const push_usage =
     \\Usage:
-    \\  spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]
+    \\  spore push <spore-dir> STORE/TAG
+    \\
+    \\STORE is a directory, a file:// URL or s3://bucket/prefix (uploaded with
+    \\the aws CLI); TAG may be blake3:<digest>. The spore's RAM chunks and disk
+    \\objects share the store's objects with images.
     \\
     \\Options:
-    \\  --region REGION      AWS region for S3 destinations
     \\  -h, --help           Show this help
     \\
 ;
@@ -840,35 +843,23 @@ fn pushCommand(
     mode: machine_output.Mode,
     args: []const []const u8,
 ) !spore_api.PushResult {
-    var bundle_dir: ?[]const u8 = null;
+    var spore_dir: ?[]const u8 = null;
     var destination: ?[]const u8 = null;
-    var aws_region: ?[]const u8 = null;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--region") and i + 1 < args.len) {
-            i += 1;
-            aws_region = args[i];
-        } else if (std.mem.startsWith(u8, args[i], "--")) {
-            exitUnknownArgument(allocator, stderr, mode, "push", args[i]);
-        } else if (bundle_dir == null) {
-            bundle_dir = args[i];
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--")) {
+            exitUnknownArgument(allocator, stderr, mode, "push", arg);
+        } else if (spore_dir == null) {
+            spore_dir = arg;
         } else if (destination == null) {
-            destination = args[i];
+            destination = arg;
         } else {
-            exitUnexpectedArgument(allocator, stderr, mode, "push", args[i]);
+            exitUnexpectedArgument(allocator, stderr, mode, "push", arg);
         }
     }
-
-    if (bundle_dir == null or destination == null) {
-        exitUsage(allocator, stderr, mode, "push", "usage: spore push <bundle-dir> s3://BUCKET/PREFIX [--region REGION]");
+    if (spore_dir == null or destination == null) {
+        exitUsage(allocator, stderr, mode, "push", "usage: spore push <spore-dir> STORE/TAG");
     }
-
-    return spore_api.push(context, allocator, .{
-        .bundle_dir = bundle_dir.?,
-        .destination = destination.?,
-        .aws_region = aws_region,
-    });
+    return spore_api.push(context, allocator, .{ .spore_dir = spore_dir.?, .destination = destination.? });
 }
 
 fn inspectBundleCommand(
@@ -1153,12 +1144,10 @@ fn writeCloneResult(writer: *Io.Writer, result: spore_api.CloneResult) !void {
 }
 
 fn writePushResult(writer: *Io.Writer, result: spore_api.PushResult) !void {
-    try writer.writeAll("Bundle pushed\n");
-    try writer.print("  Source: {s}\n", .{result.source});
-    try writer.print("  Destination: {s}\n", .{result.destination});
-    try writer.print("  Store: {s}\n", .{result.store});
-    try writer.print("  Bundle digest: sha256:{s}\n", .{result.bundle_digest});
-    try writer.print("  Uploaded: {d} files, {d} bytes\n", .{ result.uploaded_file_count, result.uploaded_bytes });
+    try writer.print(
+        "ref: {s}\nspore_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
+        .{ result.ref, result.spore_digest, result.objects_total, result.objects_written, result.bytes_written },
+    );
 }
 
 fn writeInspectBundleResult(writer: *Io.Writer, result: spore_api.InspectBundleResult) !void {

@@ -223,8 +223,7 @@ pub const PushResult = struct {
 /// pushing another tag writes only that tag.
 pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushOptions) !PushResult {
     try rootfs.validateLocalTagRef(options.source);
-    const destination = try parseStoreRef(options.destination);
-    if (destination.base.scheme == .http or destination.base.scheme == .https) return error.ImageStorePushUnsupportedScheme;
+    const destination = try parsePushDestination(options.destination);
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     defer allocator.free(cache_root);
@@ -236,14 +235,110 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
         .digest => |digest| if (!std.mem.eql(u8, digest, closure.image_digest)) return error.ImageIdentityMismatch,
         .tag => {},
     }
-    if (destination.base.scheme == .s3) return pushS3(init.io, allocator, options.aws_executable, destination, cache_root, &cache_lock, &closure);
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const objects = try arena.alloc(PushObject, closure.objects.len);
+    for (objects, closure.objects) |*object, descriptor| object.* = .{
+        .digest = descriptor.digest,
+        .size = descriptor.size,
+        .path = try rootfs_cas.manifestObjectPath(arena, cache_root, descriptor.digest),
+    };
+    const hex = closure.image_digest[digest_prefix.len..];
+    const files = [_]PushFile{
+        .{ .path = try std.fmt.allocPrint(arena, "{s}/manifest", .{hex}), .bytes = closure.manifest.bytes },
+        .{ .path = try std.fmt.allocPrint(arena, "{s}/config", .{hex}), .bytes = closure.config_bytes },
+        .{ .path = try std.fmt.allocPrint(arena, "{s}/index", .{hex}), .bytes = closure.index_bytes },
+    };
+    const written = try pushClosure(init.io, allocator, options.aws_executable, destination, cache_root, &cache_lock, .{
+        .digest = closure.image_digest,
+        .objects = objects,
+        .files_dir = "images",
+        .files = &files,
+        .tags_dir = "tags",
+    });
+    const ref = try pushedRefAlloc(allocator, destination.base, switch (destination.target) {
+        .tag => |name| name,
+        .digest => |digest| digest,
+    });
+    errdefer allocator.free(ref);
+    return .{
+        .ref = ref,
+        .image_digest = try allocator.dupe(u8, closure.image_digest),
+        .objects_total = closure.objects.len,
+        .objects_written = written.objects,
+        .bytes_written = written.bytes,
+    };
+}
+
+/// A push destination: a directory or S3 store ref.
+pub fn parsePushDestination(raw: []const u8) !StoreRef {
+    const destination = try parseStoreRef(raw);
+    if (destination.base.scheme == .http or destination.base.scheme == .https) return error.ImageStorePushUnsupportedScheme;
+    return destination;
+}
+
+/// `name` in the store `base`, in the `file://` form for a directory store,
+/// which `spore run --image` takes as a store ref.
+pub fn pushedRefAlloc(allocator: std.mem.Allocator, base: Base, name: []const u8) ![]u8 {
+    if (base.scheme == .file) return std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ base.dir, name });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base.url, name });
+}
+
+/// One object a push writes, read from `path` and verified against its
+/// digest and size first.
+pub const PushObject = struct {
+    digest: []const u8,
+    size: usize,
+    path: []const u8,
+};
+
+/// One file a push writes after its objects, at `path` under the closure's
+/// `files_dir`.
+pub const PushFile = struct {
+    path: []const u8,
+    bytes: []const u8,
+};
+
+/// What one push writes, in order: objects, then files named by `digest`,
+/// then a tag naming `digest` if the destination is a tag. A reader that
+/// finds the tag finds everything it names.
+pub const PushClosure = struct {
+    digest: []const u8,
+    objects: []const PushObject,
+    /// `images` or `spores`.
+    files_dir: []const u8,
+    files: []const PushFile,
+    /// `tags` or `spore-tags`.
+    tags_dir: []const u8,
+};
+
+pub const PushWritten = struct {
+    objects: usize = 0,
+    bytes: u64 = 0,
+};
+
+/// Write `closure` into a directory or S3 store. Objects the store already
+/// has intact are kept, so pushing again writes nothing. The caller holds
+/// `cache_lock` exclusively; an S3 push releases it once its objects are
+/// staged.
+pub fn pushClosure(
+    io: Io,
+    allocator: std.mem.Allocator,
+    aws: []const u8,
+    destination: StoreRef,
+    cache_root: []const u8,
+    cache_lock: *rootfs.RootfsCacheLock,
+    closure: PushClosure,
+) !PushWritten {
+    if (destination.base.scheme == .s3) return pushS3(io, allocator, aws, destination, cache_root, cache_lock, closure);
 
     const dir = destination.base.dir;
     const objects_dir = try std.fs.path.join(allocator, &.{ dir, "objects", "blake3" });
     defer allocator.free(objects_dir);
     try chunk_sealer.ensureDirPath(allocator, objects_dir);
-    var written: usize = 0;
-    var bytes_written: u64 = 0;
+    var written: PushWritten = .{};
     var work_stats: chunk_sealer.WorkStats = .{};
     for (closure.objects) |object| {
         const path = try std.fs.path.join(allocator, &.{ objects_dir, object.digest[digest_prefix.len..] });
@@ -254,66 +349,46 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
         } else |err| switch (err) {
             error.MissingChunk => {},
             // Replace a damaged object rather than keep serving it.
-            error.BadChunk, error.ShortRead => try Io.Dir.cwd().deleteFile(init.io, path),
+            error.BadChunk, error.ShortRead => try Io.Dir.cwd().deleteFile(io, path),
             else => |e| return e,
         }
-        const bytes = try rootfs_cas.readVerifiedManifestObject(allocator, cache_root, object.digest, object.size);
+        const bytes = try rootfs_cas.readVerifiedChunkPath(allocator, object.path, object.digest, object.size);
         defer allocator.free(bytes);
         _ = try chunk_sealer.writePathAllIfMissingTimedForBatch(allocator, path, bytes, &work_stats);
-        written += 1;
-        bytes_written += object.size;
+        written.objects += 1;
+        written.bytes += object.size;
     }
-    if (written != 0) try chunk_sealer.fsyncDirPath(allocator, objects_dir);
+    if (written.objects != 0) try chunk_sealer.fsyncDirPath(allocator, objects_dir);
 
-    const image_files = [_]struct { name: []const u8, bytes: []const u8 }{
-        .{ .name = "manifest", .bytes = closure.manifest.bytes },
-        .{ .name = "config", .bytes = closure.config_bytes },
-        .{ .name = "index", .bytes = closure.index_bytes },
-    };
-    for (image_files) |file| {
-        const relative = try imagePathAlloc(allocator, closure.image_digest, file.name);
-        defer allocator.free(relative);
-        const path = try std.fs.path.join(allocator, &.{ dir, relative });
+    for (closure.files) |file| {
+        const path = try std.fs.path.join(allocator, &.{ dir, closure.files_dir, file.path });
         defer allocator.free(path);
         chunk_sealer.writeFileAtomicDurable(allocator, path, file.bytes, 0o444) catch |err| switch (err) {
-            // Metadata is named by the image digest; different bytes mean
-            // a damaged store file, so replace it.
+            // Files are named by the pushed digest; different bytes mean a
+            // damaged store file, so replace it.
             error.BadChunk => try chunk_sealer.replaceFileAtomicDurable(allocator, path, file.bytes, 0o444),
             else => |e| return e,
         };
     }
     switch (destination.target) {
         .tag => |name| {
-            const path = try std.fs.path.join(allocator, &.{ dir, "tags", name });
+            const path = try std.fs.path.join(allocator, &.{ dir, closure.tags_dir, name });
             defer allocator.free(path);
-            const tag_bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{closure.image_digest});
+            const tag_bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{closure.digest});
             defer allocator.free(tag_bytes);
             try chunk_sealer.replaceFileAtomicDurable(allocator, path, tag_bytes, 0o644);
         },
         .digest => {},
     }
-
-    // The `file://` form, which `spore run --image` takes as a store ref.
-    const ref = try std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ dir, switch (destination.target) {
-        .tag => |name| name,
-        .digest => |digest| digest,
-    } });
-    errdefer allocator.free(ref);
-    return .{
-        .ref = ref,
-        .image_digest = try allocator.dupe(u8, closure.image_digest),
-        .objects_total = closure.objects.len,
-        .objects_written = written,
-        .bytes_written = bytes_written,
-    };
+    return written;
 }
 
-/// Stage the image as a directory store under the cache's `tmp` directory,
-/// with its objects hardlinked from the cache and verified, then upload it
-/// with the aws CLI: objects, then the image's files, then the tag. The
-/// links keep the objects, so the upload does not hold the cache lock.
-/// `--size-only` skips objects the store already has: an object's key is
-/// its digest, so its size only differs when the store copy is damaged.
+/// Stage the closure as a directory store under the cache's `tmp` directory,
+/// with its objects hardlinked and verified, then upload it with the aws
+/// CLI: objects, then the files, then the tag. The links keep the objects,
+/// so the upload does not hold the cache lock. `--size-only` skips objects
+/// the store already has: an object's key is its digest, so its size only
+/// differs when the store copy is damaged.
 fn pushS3(
     io: Io,
     allocator: std.mem.Allocator,
@@ -321,14 +396,14 @@ fn pushS3(
     destination: StoreRef,
     cache_root: []const u8,
     cache_lock: *rootfs.RootfsCacheLock,
-    closure: *const image_archive.LocalClosure,
-) !PushResult {
+    closure: PushClosure,
+) !PushWritten {
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var nonce: [8]u8 = undefined;
     io.random(&nonce);
-    const stage = try std.fmt.allocPrint(arena, "{s}/tmp/image-push-{x}", .{ cache_root, std.mem.readInt(u64, &nonce, .little) });
+    const stage = try std.fmt.allocPrint(arena, "{s}/tmp/store-push-{x}", .{ cache_root, std.mem.readInt(u64, &nonce, .little) });
     defer Io.Dir.cwd().deleteTree(io, stage) catch {};
     const objects_dir = try std.fs.path.join(arena, &.{ stage, "objects", "blake3" });
     try Io.Dir.cwd().createDirPath(io, objects_dir);
@@ -336,27 +411,21 @@ fn pushS3(
     var uploads: Uploads = .{};
     // Linked objects, verified once the lock is released: a link pins the
     // inode, so GC cannot change what it holds.
-    var linked: std.ArrayList(struct { path: []const u8, digest: []const u8, size: u64 }) = .empty;
+    var linked: std.ArrayList(PushObject) = .empty;
     for (closure.objects) |object| {
         const hex = object.digest[digest_prefix.len..];
         const staged = try std.fs.path.join(arena, &.{ objects_dir, hex });
-        const cached = try rootfs_cas.manifestObjectPath(arena, cache_root, object.digest);
-        if (Io.Dir.cwd().hardLink(cached, Io.Dir.cwd(), staged, io, .{})) {
-            try linked.append(arena, .{ .path = staged, .digest = object.digest, .size = object.size });
+        if (Io.Dir.cwd().hardLink(object.path, Io.Dir.cwd(), staged, io, .{})) {
+            try linked.append(arena, .{ .digest = object.digest, .size = object.size, .path = staged });
         } else |_| {
-            const bytes = try rootfs_cas.readVerifiedManifestObject(allocator, cache_root, object.digest, object.size);
+            const bytes = try rootfs_cas.readVerifiedChunkPath(allocator, object.path, object.digest, object.size);
             defer allocator.free(bytes);
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = staged, .data = bytes });
         }
         try uploads.sizes.put(arena, hex, object.size);
     }
-    const image_files = [_]struct { name: []const u8, bytes: []const u8 }{
-        .{ .name = "manifest", .bytes = closure.manifest.bytes },
-        .{ .name = "config", .bytes = closure.config_bytes },
-        .{ .name = "index", .bytes = closure.index_bytes },
-    };
-    for (image_files) |file| {
-        const path = try std.fs.path.join(arena, &.{ stage, try imagePathAlloc(arena, closure.image_digest, file.name) });
+    for (closure.files) |file| {
+        const path = try std.fs.path.join(arena, &.{ stage, closure.files_dir, file.path });
         try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = file.bytes });
     }
@@ -365,26 +434,16 @@ fn pushS3(
 
     const base = destination.base.url;
     try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--no-progress", try std.fs.path.join(arena, &.{ stage, "objects" }), try std.fmt.allocPrint(arena, "{s}/objects", .{base}) }, &uploads);
-    try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--only-show-errors", try std.fs.path.join(arena, &.{ stage, "images" }), try std.fmt.allocPrint(arena, "{s}/images", .{base}) }, null);
-    const name = switch (destination.target) {
-        .tag => |tag| blk: {
+    try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--only-show-errors", try std.fs.path.join(arena, &.{ stage, closure.files_dir }), try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, closure.files_dir }) }, null);
+    switch (destination.target) {
+        .tag => |name| {
             const path = try std.fs.path.join(arena, &.{ stage, "tag" });
-            try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try std.fmt.allocPrint(arena, "{s}\n", .{closure.image_digest}) });
-            try runAws(io, arena, aws, &.{ "s3", "cp", "--only-show-errors", path, try std.fmt.allocPrint(arena, "{s}/tags/{s}", .{ base, tag }) }, null);
-            break :blk tag;
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try std.fmt.allocPrint(arena, "{s}\n", .{closure.digest}) });
+            try runAws(io, arena, aws, &.{ "s3", "cp", "--only-show-errors", path, try std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ base, closure.tags_dir, name }) }, null);
         },
-        .digest => |digest| digest,
-    };
-
-    const ref = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, name });
-    errdefer allocator.free(ref);
-    return .{
-        .ref = ref,
-        .image_digest = try allocator.dupe(u8, closure.image_digest),
-        .objects_total = closure.objects.len,
-        .objects_written = uploads.count,
-        .bytes_written = uploads.bytes,
-    };
+        .digest => {},
+    }
+    return .{ .objects = uploads.count, .bytes = uploads.bytes };
 }
 
 /// Counts the objects `aws s3 sync` uploads from the lines it prints:
@@ -1366,6 +1425,42 @@ pub const TestImage = struct {
         return push(self.processInit(), self.arena.allocator(), .{ .source = "local/app:1", .destination = destination, .platform = self.platform });
     }
 
+    /// A fake aws CLI that keeps S3 in the fixture's `bucket` directory, with
+    /// `sync --size-only` semantics. It logs each command to `aws.log`, and a
+    /// sync to `.../<dir>` fails while `bucket/fail-<dir>` exists.
+    pub fn fakeAws(self: *TestImage) ![]const u8 {
+        const allocator = self.arena.allocator();
+        const io = std.testing.io;
+        const bucket = try self.path("bucket");
+        const aws = try self.path("aws");
+        try Io.Dir.cwd().createDirPath(io, bucket);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = aws, .data = try std.fmt.allocPrint(allocator,
+            \\#!/usr/bin/env bash
+            \\set -euo pipefail
+            \\root="{s}"
+            \\printf '%s\n' "$*" >> "{s}"
+            \\args=("$@")
+            \\src="${{args[$# - 2]}}"
+            \\url="${{args[$# - 1]}}"
+            \\dst="$root/${{url#s3://}}"
+            \\case "$1 $2" in
+            \\  "s3 sync")
+            \\    if [[ -e "$root/fail-${{url##*/}}" ]]; then exit 1; fi
+            \\    (cd "$src" && find . -type f | sort) | while read -r file; do
+            \\      file="${{file#./}}"
+            \\      if [[ -f "$dst/$file" && $(wc -c < "$dst/$file") == $(wc -c < "$src/$file") ]]; then continue; fi
+            \\      mkdir -p "$(dirname "$dst/$file")"
+            \\      cp "$src/$file" "$dst/$file"
+            \\      [[ " $* " == *" --only-show-errors "* ]] || echo "upload: $src/$file to $url/$file"
+            \\    done ;;
+            \\  "s3 cp") mkdir -p "$(dirname "$dst")"; cp "$src" "$dst" ;;
+            \\  *) exit 2 ;;
+            \\esac
+            \\
+        , .{ bucket, try self.path("aws.log") }), .flags = .{ .permissions = .fromMode(0o755) } });
+        return aws;
+    }
+
     pub fn listStore(self: *TestImage, store: []const u8) ![]const []const u8 {
         const allocator = self.arena.allocator();
         var dir = try Io.Dir.cwd().openDir(std.testing.io, store, .{ .iterate = true });
@@ -1443,36 +1538,9 @@ test "image push to S3 uploads objects, then the image, then the tag, with the a
     defer fixture.deinit();
     const allocator = fixture.arena.allocator();
     const io = std.testing.io;
-    // A fake aws CLI over a local bucket directory, with `sync --size-only`
-    // semantics, that fails while `fail-images` exists.
+    const aws = try fixture.fakeAws();
     const bucket = try fixture.path("bucket");
     const log = try fixture.path("aws.log");
-    const aws = try fixture.path("aws");
-    try Io.Dir.cwd().createDirPath(io, bucket);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = aws, .data = try std.fmt.allocPrint(allocator,
-        \\#!/usr/bin/env bash
-        \\set -euo pipefail
-        \\root="{s}"
-        \\printf '%s\n' "$*" >> "{s}"
-        \\args=("$@")
-        \\src="${{args[$# - 2]}}"
-        \\url="${{args[$# - 1]}}"
-        \\dst="$root/${{url#s3://}}"
-        \\case "$1 $2" in
-        \\  "s3 sync")
-        \\    if [[ -e "$root/fail-images" && "$url" == */images ]]; then exit 1; fi
-        \\    (cd "$src" && find . -type f | sort) | while read -r file; do
-        \\      file="${{file#./}}"
-        \\      if [[ -f "$dst/$file" && $(wc -c < "$dst/$file") == $(wc -c < "$src/$file") ]]; then continue; fi
-        \\      mkdir -p "$(dirname "$dst/$file")"
-        \\      cp "$src/$file" "$dst/$file"
-        \\      [[ " $* " == *" --only-show-errors "* ]] || echo "upload: $src/$file to $url/$file"
-        \\    done ;;
-        \\  "s3 cp") mkdir -p "$(dirname "$dst")"; cp "$src" "$dst" ;;
-        \\  *) exit 2 ;;
-        \\esac
-        \\
-    , .{ bucket, log }), .flags = .{ .permissions = .fromMode(0o755) } });
     const options = PushOptions{ .source = "local/app:1", .destination = "s3://bucket-1/team/1", .platform = fixture.platform, .aws_executable = aws };
 
     // The image's files reach the bucket before its tag, so a reader never

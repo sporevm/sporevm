@@ -115,23 +115,6 @@ pub const UnpackResult = struct {
     selected_child: ?[]const u8 = null,
 };
 
-pub const PushOptions = struct {
-    io: Io,
-    bundle_dir: []const u8,
-    destination: []const u8,
-    aws_region: ?[]const u8 = null,
-    aws_executable: []const u8 = "aws",
-};
-
-pub const PushResult = struct {
-    source: []const u8,
-    destination: []const u8,
-    store: []const u8 = "s3",
-    bundle_digest: []const u8,
-    uploaded_file_count: usize,
-    uploaded_bytes: u64,
-};
-
 pub const PullOptions = struct {
     io: Io,
     source: []const u8,
@@ -742,31 +725,6 @@ fn materialize(
         .rootfs = rootfs_result,
         .child_count = bundle_index.children.len,
         .selected_child = child_id,
-    };
-}
-
-pub fn push(allocator: std.mem.Allocator, options: PushOptions) Error!PushResult {
-    const destination = try parseS3Destination(allocator, options.destination);
-    const files = try indexedBundleFiles(allocator, options.bundle_dir);
-    const bundle_digest = try digestHex(allocator, options.bundle_dir);
-
-    var uploaded_bytes: u64 = 0;
-    for (files) |rel_path| {
-        const local_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, rel_path });
-        uploaded_bytes += try fileSizeNoSymlink(options.io, local_path);
-        const object_uri = try destination.objectUri(allocator, rel_path);
-        try runAwsS3Cp(allocator, options.io, options.aws_executable, local_path, object_uri, options.aws_region);
-    }
-
-    const final_digest = try digestHex(allocator, options.bundle_dir);
-    if (!std.mem.eql(u8, bundle_digest, final_digest)) return error.BadChunk;
-
-    return .{
-        .source = options.bundle_dir,
-        .destination = options.destination,
-        .bundle_digest = bundle_digest,
-        .uploaded_file_count = files.len,
-        .uploaded_bytes = uploaded_bytes,
     };
 }
 
@@ -1899,11 +1857,6 @@ const S3Location = struct {
         try validateBundleRelPath(rel_path);
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.prefix, rel_path }) catch return error.OutOfMemory;
     }
-
-    fn objectUri(self: S3Location, allocator: std.mem.Allocator, rel_path: []const u8) Error![]const u8 {
-        try validateBundleRelPath(rel_path);
-        return std.fmt.allocPrint(allocator, "s3://{s}/{s}/{s}", .{ self.bucket, self.prefix, rel_path }) catch return error.OutOfMemory;
-    }
 };
 
 const S3Source = struct {
@@ -1930,11 +1883,6 @@ const RemoteBundleMaterialization = struct {
     origin_bytes_read: u64,
     cache_hit: bool,
 };
-
-fn parseS3Destination(allocator: std.mem.Allocator, uri: []const u8) Error!S3Location {
-    if (std.mem.indexOf(u8, uri, "@sha256:") != null) return error.BadManifest;
-    return parseS3Location(allocator, uri);
-}
 
 fn parseS3Source(allocator: std.mem.Allocator, uri: []const u8) Error!S3Source {
     const marker = "@sha256:";
@@ -2801,37 +2749,6 @@ fn runAwsS3GetObject(
     return error.IoFailed;
 }
 
-fn runAwsS3Cp(
-    allocator: std.mem.Allocator,
-    io: Io,
-    aws_executable: []const u8,
-    source: []const u8,
-    destination: []const u8,
-    region: ?[]const u8,
-) Error!void {
-    var argv = std.array_list.Managed([]const u8).init(allocator);
-    argv.append(aws_executable) catch return error.OutOfMemory;
-    argv.append("s3") catch return error.OutOfMemory;
-    argv.append("cp") catch return error.OutOfMemory;
-    argv.append(source) catch return error.OutOfMemory;
-    argv.append(destination) catch return error.OutOfMemory;
-    try appendAwsRegion(&argv, region);
-    argv.append("--only-show-errors") catch return error.OutOfMemory;
-
-    const result = std.process.run(allocator, io, .{
-        .argv = argv.items,
-        .stdout_limit = .limited(256 * 1024),
-        .stderr_limit = .limited(256 * 1024),
-    }) catch return error.IoFailed;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code == 0) return,
-        else => {},
-    }
-    return error.IoFailed;
-}
-
 fn fileSizeNoSymlink(io: Io, path: []const u8) Error!u64 {
     const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return error.BadChunk,
@@ -3370,6 +3287,20 @@ const TestHttpBodyServer = struct {
         try writer.interface.flush();
     }
 };
+
+/// Copies a bundle's files under a fake S3 prefix directory, as the bundle
+/// push did with `aws s3 cp`. Returns the bytes copied.
+fn copyBundleToFakeS3(allocator: std.mem.Allocator, io: Io, bundle_dir: []const u8, prefix_dir: []const u8) !u64 {
+    var bytes: u64 = 0;
+    for (try indexedBundleFiles(allocator, bundle_dir)) |rel_path| {
+        const data = try readFileAll(allocator, try pathZ(allocator, "{s}/{s}", .{ bundle_dir, rel_path }), 64 * 1024 * 1024);
+        const dest = try pathZ(allocator, "{s}/{s}", .{ prefix_dir, rel_path });
+        try ensureDirPath(io, std.fs.path.dirname(dest).?);
+        try writeFileAll(dest, data);
+        bytes += data.len;
+    }
+    return bytes;
+}
 
 fn writeFakeAwsScript(allocator: std.mem.Allocator, script_path: [:0]const u8, fake_s3_root: []const u8) !void {
     try writeFakeAwsScriptWithLog(allocator, script_path, fake_s3_root, null);
@@ -4638,18 +4569,8 @@ test "push and pull s3 indexed bundle through verified remote cache" {
         .children_dir = children_dir,
     });
 
-    const push_result = try push(arena, .{
-        .io = io,
-        .bundle_dir = bundle_dir,
-        .destination = "s3://bucket/runs/demo.bundle/",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    });
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, push_result.bundle_digest);
-    try std.testing.expectEqual(@as(usize, 8), push_result.uploaded_file_count);
-    try std.testing.expect(push_result.uploaded_bytes > 0);
-
-    const source_uri = try std.fmt.allocPrint(arena, "s3://bucket/runs/demo.bundle@sha256:{s}", .{push_result.bundle_digest});
+    const uploaded_bytes = try copyBundleToFakeS3(arena, io, bundle_dir, try pathZ(arena, "{s}/bucket/runs/demo.bundle", .{fake_s3_root}));
+    const source_uri = try std.fmt.allocPrint(arena, "s3://bucket/runs/demo.bundle@sha256:{s}", .{pack_result.bundle_digest});
     const pulled0 = try pull(arena, .{
         .io = io,
         .source = source_uri,
@@ -4661,9 +4582,9 @@ test "push and pull s3 indexed bundle through verified remote cache" {
         .aws_executable = fake_aws,
     });
     try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
-    try std.testing.expectEqualStrings(push_result.bundle_digest, pulled0.bundle_digest.hex);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
     try std.testing.expect(!pulled0.remote.cache_hit);
-    try std.testing.expectEqual(push_result.uploaded_bytes, pulled0.remote.origin_bytes_read);
+    try std.testing.expectEqual(uploaded_bytes, pulled0.remote.origin_bytes_read);
     try std.testing.expectEqual(@as(usize, 2), pulled0.materialization.cache.miss_count);
     try std.testing.expectEqual(@as(u64, @intCast(ram.len)), pulled0.materialization.cache.bytes_fetched);
     try std.testing.expectEqual(@as(usize, 0), pulled0.rootfs.cache.hit_count);
@@ -4765,17 +4686,8 @@ test "push and pull s3 indexed bundle carries disk indexes" {
     const files = try indexedBundleFiles(arena, bundle_dir);
     try std.testing.expectEqual(@as(usize, 10), files.len);
 
-    const push_result = try push(arena, .{
-        .io = io,
-        .bundle_dir = bundle_dir,
-        .destination = "s3://bucket/runs/disk-demo.bundle/",
-        .aws_region = "ap-southeast-2",
-        .aws_executable = fake_aws,
-    });
-    try std.testing.expectEqualStrings(pack_result.bundle_digest, push_result.bundle_digest);
-    try std.testing.expectEqual(@as(usize, 10), push_result.uploaded_file_count);
-
-    const source_uri = try std.fmt.allocPrint(arena, "s3://bucket/runs/disk-demo.bundle@sha256:{s}", .{push_result.bundle_digest});
+    const uploaded_bytes = try copyBundleToFakeS3(arena, io, bundle_dir, try pathZ(arena, "{s}/bucket/runs/disk-demo.bundle", .{fake_s3_root}));
+    const source_uri = try std.fmt.allocPrint(arena, "s3://bucket/runs/disk-demo.bundle@sha256:{s}", .{pack_result.bundle_digest});
     const pulled0 = try pull(arena, .{
         .io = io,
         .source = source_uri,
@@ -4787,9 +4699,9 @@ test "push and pull s3 indexed bundle carries disk indexes" {
         .aws_executable = fake_aws,
     });
     try std.testing.expectEqualStrings("000000", pulled0.children.selected_child.?);
-    try std.testing.expectEqualStrings(push_result.bundle_digest, pulled0.bundle_digest.hex);
+    try std.testing.expectEqualStrings(pack_result.bundle_digest, pulled0.bundle_digest.hex);
     try std.testing.expect(!pulled0.remote.cache_hit);
-    try std.testing.expectEqual(push_result.uploaded_bytes, pulled0.remote.origin_bytes_read);
+    try std.testing.expectEqual(uploaded_bytes, pulled0.remote.origin_bytes_read);
     const restored0 = try spore.loadManifest(arena, out0_dir);
     defer restored0.deinit();
     const restored0_disk = restored0.value.disk orelse return error.BadManifest;
@@ -5139,7 +5051,6 @@ test "s3 uri parser requires immutable digest for sources" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.BadManifest, parseS3Source(allocator, "s3://bucket/runs/demo.bundle"));
     try std.testing.expectError(error.BadManifest, parseS3Source(allocator, "s3://bucket/runs/demo.bundle@sha256:not-hex"));
-    try std.testing.expectError(error.BadManifest, parseS3Destination(allocator, "s3://bucket/runs/demo.bundle@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 
     const parsed = try parseS3Source(allocator, "s3://bucket/runs/demo.bundle/@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     defer allocator.free(parsed.location.bucket);

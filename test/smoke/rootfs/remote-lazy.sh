@@ -6,9 +6,10 @@
 # running while the store lacks an object, then succeeds. `run --save` fails
 # without leaving a save directory while the store lacks an object; from an
 # empty cache it fetches the rest of the image, so the saved spore runs after
-# the store is gone, and a store without its objects fails the run. Prints run
-# times and the bytes fetched against the image's object bytes. Needs zig (to
-# build the guest program) and python3, but no registry.
+# the store is gone, and a store without its objects fails the run. Pushing
+# the saved spore to the store writes none of the image's objects again. Prints
+# run times and the bytes fetched against the image's object bytes. Needs zig
+# (to build the guest program) and python3, but no registry.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
@@ -294,6 +295,20 @@ expect_eq "remote-lazy-ok" "$(cat "${workdir}/from.stdout")" "run --from output"
   require_success $? "fork with a relative --out" "${workdir}/fork.stderr"
 [[ -f "${workdir}/children/000000/manifest.json" ]] || die "fork with a relative --out wrote no child"
 
+# Pushing the spore to the store that holds its image writes only what the
+# image lacks: its RAM, changed disk chunks, disk index and manifest.
+mv "${workdir}/objects.hidden" "${workdir}/store/objects"
+store_objects="$(find "${workdir}/store/objects" -type f | wc -l | tr -d ' ')"
+"${spore_bin}" --json push "${workdir}/saved.spore" "${workdir}/store/saved" >"${workdir}/spore-push.json"
+spore_objects="$(json_field "${workdir}/spore-push.json" objects_total)"
+spore_written="$(json_field "${workdir}/spore-push.json" objects_written)"
+spore_bytes="$(json_field "${workdir}/spore-push.json" bytes_written)"
+spore_digest="$(json_field "${workdir}/spore-push.json" spore_digest)"
+expect_eq "$((store_objects + spore_written))" "$(find "${workdir}/store/objects" -type f | wc -l | tr -d ' ')" "store objects after spore push"
+((spore_written < spore_objects)) || die "spore push wrote all ${spore_objects} objects; none deduplicated against the image"
+expect_eq "${spore_digest}" "$(cat "${workdir}/store/spore-tags/saved")" "spore tag"
+[[ -f "${workdir}/store/spores/${spore_digest#blake3:}" ]] || die "spore push wrote no manifest"
+
 python3 - <<PY
 object_bytes = ${object_bytes}
 cold_bytes = ${cold_bytes}
@@ -303,5 +318,6 @@ print(f"remote-lazy: cold run windows fetched ${cold_window_fetches} objects, ${
 print(f"remote-lazy: warm run ${warm_ms} ms; fully local run $(cat "${workdir}/local.ms") ms")
 print(f"remote-lazy: cold ${seq_mib} MiB sequential read ${seq_ms} ms, fetched ${seq_fetches} objects; windows fetched ${seq_window_fetches}, ${seq_window_unused} never read")
 print(f"remote-lazy: run --save from an empty cache ${save_ms} ms, fetching all ${objects_total} objects")
+print(f"remote-lazy: spore push to the image's store wrote ${spore_written} of ${spore_objects} objects, ${spore_bytes} bytes")
 PY
 echo "smoke:remote-lazy ok"

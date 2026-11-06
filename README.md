@@ -389,8 +389,10 @@ spore pull s3://bucket/path/base.bundle@sha256:<bundle-digest> \
   --out child.spore
 ```
 
-`spore pack`, `spore unpack`, `spore push`, and `spore pull` carry the
-manifest-selected memory, rootfs, and writable disk bytes. See
+`spore pack`, `spore unpack`, and `spore pull` carry the
+manifest-selected memory, rootfs, and writable disk bytes. `spore push
+base.spore /srv/images/base` writes a saved spore to an
+[image store](docs/image-format.md#spores) instead. See
 [docs/spore-format.md](docs/spore-format.md) and
 [docs/filesystem.md](docs/filesystem.md) for the artifact contract.
 
