@@ -469,7 +469,8 @@ mise run smoke core
 ```
 
 `mise run smoke core` builds `spore`, then boots real VMs through run, signal
-save, fork, the named lifecycle, copy, the monitor jail, and networking. CI
+save, fork, named disk forks with save, restore, prune and GC, the named
+lifecycle, copy, the monitor jail, and networking. CI
 runs it on every commit on Linux ARM64 (KVM) and macOS (HVF). `mise run smoke
 full` adds the other aarch64 scripts in `test/smoke/`. The suite prints one
 line per script and keeps each script's log under `zig-cache/smoke/`. `mise run

@@ -10,12 +10,14 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-# The per-commit gate: one-shot run, signal save, fork, named lifecycle, copy,
-# the monitor jail, networking, and lazy runs from an image store.
+# The per-commit gate: one-shot run, signal save, fork, named disk forks with
+# save, restore, prune and GC, named lifecycle, copy, the monitor jail,
+# networking, and lazy runs from an image store.
 core=(
   run/basic.sh
   run/capture.sh
   fanout/counter.sh
+  fanout/named-disk-fork.sh
   lifecycle/basic.sh
   lifecycle/copy.sh
   monitor/jail.sh
@@ -39,7 +41,6 @@ full=(
   fanout/live-rootfs.sh
   fanout/local-pull.sh
   fanout/multi-vcpu.sh
-  fanout/named-disk-fork.sh
   fanout/rootfs.sh
   lifecycle/auto-memory.sh
   lifecycle/image-context.sh
