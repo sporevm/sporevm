@@ -4,59 +4,11 @@ const std = @import("std");
 const resource = @import("resource.zig");
 
 pub const inspect_bundle_schema = "spore.bundle.inspect.v1";
-pub const pull_result_schema = "spore.pull.result.v1";
 pub const bundle_schema_version: u32 = 1;
 
 pub const DigestRef = struct {
     algorithm: []const u8 = "sha256",
     hex: []const u8,
-};
-
-pub const CacheState = struct {
-    hit_count: usize = 0,
-    miss_count: usize = 0,
-    bytes_fetched: u64 = 0,
-    bytes_reused: u64 = 0,
-};
-
-pub const ChunkMaterializationSummary = struct {
-    chunk_count: usize,
-    materialized_chunk_count: usize,
-    payload_bytes: u64,
-    linked_chunk_count: usize = 0,
-    copied_chunk_count: usize = 0,
-    cache: CacheState = .{},
-};
-
-pub const RootfsMaterializationSummary = struct {
-    artifact_count: usize = 0,
-    payload_bytes: u64 = 0,
-    cache: CacheState = .{},
-};
-
-pub const RemoteBundleCache = struct {
-    cache_hit: bool = false,
-    origin_bytes_read: u64 = 0,
-    peer_bytes_read: u64 = 0,
-};
-
-pub const BundleChildrenSummary = struct {
-    count: usize = 0,
-    selected_child: ?[]const u8 = null,
-};
-
-pub const PullResult = struct {
-    schema: []const u8 = pull_result_schema,
-    schema_version: u32 = bundle_schema_version,
-    resource_type: resource.Type = .checkpoint,
-    source: []const u8,
-    bundle_dir: []const u8,
-    out_dir: []const u8,
-    bundle_digest: DigestRef,
-    materialization: ChunkMaterializationSummary,
-    rootfs: RootfsMaterializationSummary = .{},
-    remote: RemoteBundleCache = .{},
-    children: BundleChildrenSummary = .{},
 };
 
 pub const BundleChildSummary = struct {
@@ -103,12 +55,6 @@ pub const InspectBundleResult = struct {
 
 pub fn digestRef(hex: []const u8) DigestRef {
     return .{ .hex = hex };
-}
-
-pub fn deinitPullResult(allocator: std.mem.Allocator, result: PullResult) void {
-    allocator.free(result.bundle_dir);
-    allocator.free(result.bundle_digest.hex);
-    if (result.children.selected_child) |child| allocator.free(child);
 }
 
 pub fn deinitBundleSelectionSummary(allocator: std.mem.Allocator, selection: BundleSelectionSummary) void {

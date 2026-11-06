@@ -335,7 +335,7 @@ closed, so destructive prune or GC cannot remove a still-unread CAS object.
 
 Chunked rootfs storage (`rootfs.storage`) is a distribution and dedupe format,
 and now also the local cold-start fallback when a flat materialization is not
-available. `spore pull` and `spore unpack` can still assemble flat
+available. `spore unpack` can still assemble flat
 materializations from verified chunk objects, but `spore run` and restore do
 not need to publish a flat by-digest cache entry before boot. An inconsistent
 artifact/index pairing fails closed when the index is opened; missing or
@@ -395,21 +395,19 @@ objects directly while holding the rootfs cache lock. The manifest already
 binds `rootfs.artifact.digest` to that index identity, so packing neither needs
 nor recreates the derived flat ext4 materialization.
 
-`spore unpack` and `spore pull` fully materialize one selected child before
-resume. They verify bundle identity, selected manifests, RAM chunks, rootfs
+`spore unpack` fully materializes one selected child before resume. It
+verifies bundle identity, selected manifests, RAM chunks, rootfs
 artifacts or CAS bytes, and disk index/object bytes before writing a resumable
 checkpoint. The resulting disk-backed checkpoint owns a descriptor-bound
 complete CAS locally, so `spore checkpoint rm DIR` removes and syncs the self-contained directory
 without requiring or unregistering a host-private durable pin. Removal fails
 closed while a live runtime owns that directory as its lazy disk baseline.
-Direct S3 and digest-pinned HTTP peer pulls are byte sources only; they never
-become restore authority. HTTP peer hosts must resolve only to public IP
-addresses; loopback, link-local, private, multicast, and reserved targets are
-rejected before a GET is issued.
+`spore pull` from an [image store](image-format.md#spores) instead writes a
+save pinned in the rootfs cache.
 
 Metadata-only exact-rootfs bundles are an explicit prepared-cache opt-out:
 `--rootfs=metadata-only` on pack and `--allow-metadata-only-rootfs` on
-unpack/pull. Chunked rootfs storage is bundled by default for new image-created
+unpack. Chunked rootfs storage is bundled by default for new image-created
 spores.
 
 ## Cache Inspection And Pruning

@@ -190,7 +190,7 @@ pub fn resolvedRefAlloc(allocator: std.mem.Allocator, raw: []const u8, identity:
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.base.url, identity });
 }
 
-fn objectPathAlloc(allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
+pub fn objectPathAlloc(allocator: std.mem.Allocator, digest: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "objects/blake3/{s}", .{digest[digest_prefix.len..]});
 }
 
@@ -1163,43 +1163,14 @@ pub const Fetcher = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
         const missing = try self.missingObjects(arena_state.allocator());
-        var fill = Fill{ .fetcher = self, .objects = missing };
-        var group: Io.Group = .init;
-        // This thread is one of the workers.
-        for (0..@min(fill_concurrency, missing.len) -| 1) |_| {
-            group.concurrent(self.io, Fill.run, .{&fill}) catch break;
-        }
-        Fill.run(&fill) catch {};
-        group.await(self.io) catch {};
-        if (fill.err) |err| return err;
+        try fillEach(self.io, missing, &self.canceled, self, fillOne);
         self.complete.store(true, .release);
         std.log.info("image store {s}: fetched the root disk's {d} missing objects in {d} ms", .{ self.client.base.url, missing.len, (monotonicNs() -| start_ns) / std.time.ns_per_ms });
     }
 
-    const Fill = struct {
-        fetcher: *Fetcher,
-        objects: []const Object,
-        next: std.atomic.Value(usize) = .init(0),
-        failed: std.atomic.Value(bool) = .init(false),
-        /// The first failure; guarded by `fetcher.mutex`.
-        err: ?anyerror = null,
-
-        fn run(fill: *Fill) Io.Cancelable!void {
-            while (!fill.failed.load(.acquire)) {
-                if (fill.fetcher.canceled.load(.acquire)) return fill.fail(error.ImageStoreFetchCanceled);
-                const i = fill.next.fetchAdd(1, .monotonic);
-                if (i >= fill.objects.len) return;
-                _ = fill.fetcher.fetchOnce(fill.objects[i], .fill) catch |err| return fill.fail(err);
-            }
-        }
-
-        fn fail(fill: *Fill, err: anyerror) void {
-            fill.fetcher.mutex.lockUncancelable(fill.fetcher.io);
-            defer fill.fetcher.mutex.unlock(fill.fetcher.io);
-            if (fill.err == null) fill.err = err;
-            fill.failed.store(true, .release);
-        }
-    };
+    fn fillOne(self: *Fetcher, object: Object) !void {
+        _ = try self.fetchOnce(object, .fill);
+    }
 
     /// The distinct objects of the storage's index that are not in the local
     /// CAS at their indexed length.
@@ -1253,6 +1224,55 @@ pub const Fetcher = struct {
         self.stats.install_errors += delta.install_errors;
     }
 };
+
+/// Run `work(context, object)` for each of `objects`, up to `fill_concurrency`
+/// at once with this thread among the workers, and return the first failure.
+/// Workers stop at a failure, or with `ImageStoreFetchCanceled` once
+/// `canceled` is set.
+pub fn fillEach(
+    io: Io,
+    objects: []const Object,
+    canceled: ?*const std.atomic.Value(bool),
+    context: anytype,
+    comptime work: anytype,
+) !void {
+    const Fill = struct {
+        io: Io,
+        objects: []const Object,
+        canceled: ?*const std.atomic.Value(bool),
+        context: @TypeOf(context),
+        next: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        /// Guards `err`.
+        mutex: Io.Mutex = .init,
+        /// The first failure.
+        err: ?anyerror = null,
+
+        fn run(fill: *@This()) Io.Cancelable!void {
+            while (!fill.failed.load(.acquire)) {
+                if (fill.canceled) |flag| if (flag.load(.acquire)) return fill.fail(error.ImageStoreFetchCanceled);
+                const i = fill.next.fetchAdd(1, .monotonic);
+                if (i >= fill.objects.len) return;
+                work(fill.context, fill.objects[i]) catch |err| return fill.fail(err);
+            }
+        }
+
+        fn fail(fill: *@This(), err: anyerror) void {
+            fill.mutex.lockUncancelable(fill.io);
+            defer fill.mutex.unlock(fill.io);
+            if (fill.err == null) fill.err = err;
+            fill.failed.store(true, .release);
+        }
+    };
+    var fill: Fill = .{ .io = io, .objects = objects, .canceled = canceled, .context = context };
+    var group: Io.Group = .init;
+    for (0..@min(fill_concurrency, objects.len) -| 1) |_| {
+        group.concurrent(io, Fill.run, .{&fill}) catch break;
+    }
+    Fill.run(&fill) catch {};
+    group.await(io) catch {};
+    if (fill.err) |err| return err;
+}
 
 fn monotonicMs() u64 {
     return monotonicNs() / std.time.ns_per_ms;

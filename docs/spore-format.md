@@ -159,7 +159,7 @@ then installs it into the local rootfs materialization cache before writing the 
 manifest. Bundles record that artifact in `rootfs.index.json` with an
 explicit `exact-bytes` policy by default. `spore pack
 --rootfs=metadata-only` records the same digest and size with `metadata-only`
-policy and omits the ext4 file; materialized unpack and pull accept that policy
+policy and omits the ext4 file; materialized unpack accepts that policy
 only with `--allow-metadata-only-rootfs` and a trusted shape-compatible hit in
 the selected rootfs materialization cache.
 
@@ -167,48 +167,22 @@ If a bundled manifest records `rootfs.storage.kind:
 "chunked-ext4-rootfs-v0"`, the bundle carries the exact
 versioned disk-index bytes named by `rootfs.storage.index_digest` under
 `rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero rootfs chunk
-object under `rootfs/blake3/objects/<hex>.chunk`. Unpack and pull verify the
-index against the manifest storage descriptor and verify every chunk by BLAKE3
+object under `rootfs/blake3/objects/<hex>.chunk`. Unpack verifies the
+index against the manifest storage descriptor and verifies every chunk by BLAKE3
 before publishing the objects, index, and completeness stamp to both the
-portable output spore's local CAS and the selected host rootfs cache. They do
+portable output spore's local CAS and the selected host rootfs cache. It does
 not require the monolithic ext4 digest-cache artifact on the destination for a
 chunked rootfs child.
 
 If the selected manifest records a writable disk index, `spore pack` includes
 the exact versioned disk-index bytes named by `disk.base` under
 `rootfs/blake3/indexes/<hex>.json`, plus each referenced nonzero disk chunk
-object under `rootfs/blake3/objects/<hex>.chunk`. `spore unpack` and
-`spore pull` copy those verified files into the materialized spore before
-writing the manifest, failing closed on missing or digest-mismatched
-index/object bytes.
+object under `rootfs/blake3/objects/<hex>.chunk`. `spore unpack` copies
+those verified files into the materialized spore before writing the manifest,
+failing closed on missing or digest-mismatched index/object bytes.
 
-`spore pull file:///path/to/bundle --child 42 --out child.spore` is the first
-pull materialization policy. It accepts local bundles, canonicalizes the
-child id to the six-digit child manifest id, verifies the selected chunks through
-the bundle index, and writes a normal spore directory. When
-`SPOREVM_BUNDLE_CACHE_DIR` is set, or the platform cache root is available, pull
-installs verified memory chunks into a node-local BLAKE3 chunk cache and hard
-links them into the output spore where the filesystem allows it.
-
-`spore pull s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out
-child.spore` downloads the canonical files of a bundle copied under that
-prefix into the node-local bundle cache,
-checks the canonical `bundle_digest`, then uses the same chunk and rootfs
-verification path as local pull, including writable disk index/object
-verification when present. Bare S3 URLs are rejected for pull because the remote
-URL is not restore authority.
-
-`spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42
---out child.spore` uses the same verified materialization path for a static
-HTTP(S) peer source. The peer URL is only a byte source: it must be digest
-pinned, its host must resolve only to public IP addresses, redirects and mutable
-URL components are rejected, and corrupt peer bytes fail before the local cache
-is marked complete. Pull results report cache accounting for the materialization
-path: `remote.origin_bytes_read` for
-object-store sources, `remote.peer_bytes_read` for HTTP(S) peer sources,
-`remote.cache_hit`, `materialization.cache.bytes_fetched`,
-`materialization.cache.bytes_reused`, and rootfs cache hit/fetch/reuse counters
-under `rootfs.cache`.
+To move one saved spore between hosts without a bundle, `spore push` it to an
+[image store](image-format.md#spores) and `spore pull` it on the other host.
 
 ## x86-64 Board Profile v0
 
@@ -572,12 +546,6 @@ before mutating VM state.
 - Bundles validate `bundle.json` child ids and relative manifest paths
   before selecting a parent or child manifest. `spore unpack --child 000042`
   writes a normal spore directory for the selected child.
-- Local `spore pull file://... --child 42` and remote digest-pinned
-  `s3://...@sha256:<bundle>` / `http(s)://...@sha256:<bundle>` pulls use the
-  same manifest authority but read chunks through a verified content-source
-  boundary and fail closed on unsupported URI schemes, non-canonical bundle
-  metadata, corrupt chunkpacks, corrupt remote bytes, or corrupt node-local
-  chunk cache entries.
 - Rootfs-backed bundles include exact immutable rootfs bytes by default for
   fd-backed rootfs manifests. For manifest-attached chunked rootfs storage, they
   include the descriptor-bound rootfs index and BLAKE3 chunk objects.

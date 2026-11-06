@@ -103,9 +103,9 @@ local ref last.
 Archives are bounded to 16 GiB logical rootfs size, 65,536 distinct nonzero
 objects, 4 GiB object payload, and 4 GiB compressed archive bytes. The
 unpacker uses private disk staging and never creates, captures, restores, or
-carries RAM, vCPU, device, session, or suspended machine state. `spore pack`,
-`pull`, and `unpack` remain the separate saved-machine bundle protocol;
-`spore push` writes a saved spore to an [image store](#spores).
+carries RAM, vCPU, device, session, or suspended machine state. `spore pack`
+and `unpack` remain the separate saved-machine bundle protocol; `spore push`
+and `pull` move a saved spore through an [image store](#spores).
 
 ## Image stores
 
@@ -211,6 +211,20 @@ not the hash of the local `manifest.json`. The disk must be complete in the
 rootfs cache or, for a portable spore, in the spore directory. Spore tags are
 separate from image tags. An `s3://` destination is uploaded as
 `spore image push` uploads one, with `spores/` in place of `images/`.
+
+`spore pull STORE/<tag|blake3:hex> --out DIR` reads a pushed spore back. It
+fetches `spores/<hex>` and checks its BLAKE3 digest against the tag or ref,
+refuses a manifest that names `memory.backing` or more than 128 GiB of nonzero
+RAM, then fetches every RAM chunk into `DIR/chunks`, and the disk index and
+every disk object the rootfs cache lacks into the cache, verifying each against
+its digest and size. DIR is then a save pinned in the rootfs cache, as
+`spore save` writes them, so it must be on the cache's filesystem, and
+`spore checkpoint rm` and `spore cache gc` treat it like any other save. Reads
+follow the store rules above, so a tag over plain HTTP is read only from
+loopback. The pull is eager, so `spore run --from DIR` needs no store; give
+each copy its own identity with `--generation` (see
+[fanout.md](fanout.md#single-child-resume-identity)). `--json` prints
+`spore.pull.result.v2` with the objects and bytes fetched.
 
 ## Converter-worker conformance
 

@@ -392,8 +392,8 @@ flat materialization cache, opened under the verify-at-install,
 trust-at-open cache contract (see SECURITY.md) without re-hashing it. Saved
 writable disks open from their verified disk index and fault referenced chunk
 objects into the sparse runtime base on first read; old `disk-layer-v0` chains
-are no longer opened by the runtime restore path. `spore pull` and
-`spore unpack` assemble the immutable materialization from verified chunk
+are no longer opened by the runtime restore path. `spore unpack` assembles
+the immutable materialization from verified chunk
 objects at materialization time; if the flat entry is missing or corrupt at
 resume (for example after pruning), resume opens the local index and faults
 chunks on demand, failing closed before unverifiable bytes reach the guest.
@@ -413,9 +413,9 @@ If a spore manifest has manifest-attached chunked rootfs storage under
 `rootfs.storage`, bundles carry the descriptor-bound
 versioned disk index under `rootfs/blake3/indexes/<hex>.json` and the
 referenced nonzero rootfs chunk objects under
-`rootfs/blake3/objects/<hex>.chunk`. `spore unpack` and `spore pull` verify the
-index against the manifest descriptor, verify each chunk by BLAKE3, and install
-those files into the destination host's rootfs CAS cache. They do not require
+`rootfs/blake3/objects/<hex>.chunk`. `spore unpack` verifies the
+index against the manifest descriptor, verifies each chunk by BLAKE3, and installs
+those files into the destination host's rootfs CAS cache. It does not require
 the monolithic ext4 digest-cache artifact on the destination for a chunked
 rootfs child.
 
@@ -426,28 +426,16 @@ normal image-build or image-capture path.
 Bundles also support an explicit prepared-cache mode:
 `spore pack SPORE [--children CHILDREN] --rootfs=metadata-only --out BUNDLE`
 records the immutable rootfs identity and size without embedding the ext4 bytes.
-`spore unpack` and `spore pull` reject those bundles by default. Passing
+`spore unpack` rejects those bundles by default. Passing
 `--allow-metadata-only-rootfs` makes materialization require that the selected
 `SPOREVM_ROOTFS_CACHE_DIR` already contains a trusted rootfs materialization
 with the expected shape. It follows the local verify-at-install,
 trust-at-open cache contract, so it still fails before writing a resumable
 spore if the cache entry is missing, symlinked, non-regular, or size-mismatched.
 
-`spore pull file:///path/to/bundle --child 42 --out child.spore` does the same
-rootfs installation for local bundles while materializing one selected
-child. Digest-pinned remote pulls, such as `spore pull
-s3://bucket/prefix@sha256:<bundle_digest> --child 42 --out child.spore` and
-`spore pull http://peer:20000/spore.bundle@sha256:<bundle_digest> --child 42
---out child.spore`, first verify the remote bundle identity, then install any
-bundled exact rootfs bytes or chunked rootfs CAS bytes through the same verified
-materialization boundary. HTTP peer hosts must resolve only to public IP
-addresses before fetch. Use
-`SPOREVM_ROOTFS_CACHE_DIR` to choose the destination rootfs cache and
-`SPOREVM_BUNDLE_CACHE_DIR` to choose the node-local bundle and memory chunk
-caches used by pull. Pull JSON reports `rootfs.cache.hit_count`,
-`rootfs.cache.miss_count`, `rootfs.cache.bytes_fetched`, and
-`rootfs.cache.bytes_reused` so repeated pulls can prove a warm digest or CAS
-cache is not refetching or reinstalling rootfs bytes.
+`spore pull STORE/TAG --out DIR` fetches a spore pushed to an
+[image store](image-format.md#spores) into DIR, and the disk index and objects
+the cache lacks into the rootfs cache `SPOREVM_ROOTFS_CACHE_DIR` selects.
 
 Plain `spore run --rootfs PATH` remains a local read-only run escape hatch.
 Named `spore create --rootfs PATH` records exact immutable rootfs identity in
