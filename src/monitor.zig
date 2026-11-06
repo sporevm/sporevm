@@ -95,22 +95,103 @@ const monitor_usage =
     \\
 ;
 
-const RequestState = enum {
-    active_ready,
+const Phase = enum { pending, active, done };
+
+/// The guest operation that holds the slot. Its slices are borrowed from the
+/// handler thread that submitted it, which waits until the operation is
+/// done; the VM thread stops using them before it marks the operation done.
+const Op = union(enum) {
     idle,
-    pending_exec,
-    active_exec,
-    pending_suspend,
-    active_suspend,
-    pending_snapshot,
-    active_snapshot,
-    /// A fork holds the slot while it names its baseline, before the VM
-    /// loop sees it.
-    preparing_disk_fork,
-    pending_disk_fork,
-    active_disk_fork,
-    done,
+    /// The readiness request, attached at startup. The run fails unless the
+    /// guest answers it.
+    readiness,
+    exec: Exec,
+    /// Captures the VM, which then ends; the slot stays taken.
+    @"suspend": Capture,
+    snapshot: Capture,
+    disk_fork: DiskFork,
+
+    /// Whether the operation finished and left its response.
+    fn done(op: Op) bool {
+        return switch (op) {
+            .idle, .readiness => false,
+            .exec => |exec| exec.phase == .done,
+            .@"suspend", .snapshot => |capture| capture.phase == .done,
+            .disk_fork => |fork| fork.phase == .done,
+        };
+    }
 };
+
+const Exec = struct {
+    phase: Phase = .pending,
+    /// The guest request; attaching the stream copies it.
+    request: []const u8,
+    session_sequence: u64,
+    submitted_ms: u64,
+    output: union(enum) {
+        /// Kept in `ExecServer.capture` and returned in the response.
+        captured,
+        streamed: Streamed,
+    },
+};
+
+/// Output written to the client as SPIO frames while the guest runs.
+const Streamed = struct {
+    client_fd: std.c.fd_t,
+    /// Whether a timing event precedes the exit frame.
+    timing: bool,
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
+    terminal_offset: u64 = 0,
+    /// Set once a frame could not be written; nothing more is sent.
+    write_failed: bool = false,
+};
+
+const Capture = struct {
+    phase: Phase = .pending,
+    dir: []const u8,
+    publish_dir: ?[]const u8 = null,
+};
+
+const DiskFork = struct {
+    /// `preparing` holds the slot while the handler names the baseline,
+    /// before the VM loop sees the fork.
+    phase: enum { preparing, pending, active, done } = .preparing,
+    request: runtime_disk_fork_control.PrepareRequest,
+    baseline: ?DiskBaseline = null,
+};
+
+/// The output of the readiness request or a captured exec. Only the VM
+/// thread writes and reads it.
+const OutputCapture = struct {
+    stdout: [lifecycle.exec_named_capture_limit]u8 = undefined,
+    stdout_len: usize = 0,
+    stdout_truncated: bool = false,
+    stderr: [lifecycle.exec_named_capture_limit]u8 = undefined,
+    stderr_len: usize = 0,
+    stderr_truncated: bool = false,
+
+    fn reset(self: *OutputCapture) void {
+        self.stdout_len = 0;
+        self.stdout_truncated = false;
+        self.stderr_len = 0;
+        self.stderr_truncated = false;
+    }
+
+    fn append(self: *OutputCapture, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
+        const stderr = output == .stderr;
+        const buffer: []u8 = if (stderr) &self.stderr else &self.stdout;
+        const len = if (stderr) &self.stderr_len else &self.stdout_len;
+        const n = @min(bytes.len, buffer.len - len.*);
+        @memcpy(buffer[len.*..][0..n], bytes[0..n]);
+        len.* += n;
+        if (n < bytes.len) {
+            if (stderr) self.stderr_truncated = true else self.stdout_truncated = true;
+        }
+    }
+};
+
+const readiness_request = "{\"type\":\"ready\"}\n";
 
 fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: vm_registry.DiskForkClaim) !runtime_disk_fork.Head {
     const address = try net.UnixAddress.init(claim.source_socket_path);
@@ -402,50 +483,24 @@ const ExecServer = struct {
     exec_defaults: lifecycle.ExecDefaults,
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
-    state: RequestState = .idle,
+    op: Op = .idle,
     /// Set once the monitor is stopping; queued and new guest operations fail
     /// with this message.
     stopping: ?[]const u8 = null,
     /// Ends blocking stdin delivery to an exec that was failed.
     stream_input_stop: std.atomic.Value(bool) = .init(false),
     handlers: [max_control_handlers]ControlHandler = @splat(.{}),
-    request: [monitor_protocol.max_request_bytes]u8 = undefined,
-    request_len: usize = 0,
+    /// The finished operation's response, which its submitter copies out
+    /// before it frees the slot.
     response: [max_control_response]u8 = undefined,
     response_len: usize = 0,
-    suspend_dir: [max_suspend_path]u8 = undefined,
-    suspend_dir_len: usize = 0,
-    publish_dir: [max_suspend_path]u8 = undefined,
-    publish_dir_len: usize = 0,
-    disk_fork_batch: [runtime_disk_claim.max_batch_name_bytes]u8 = undefined,
-    disk_fork_batch_len: usize = 0,
-    disk_fork_children: [runtime_disk_claim.max_children_per_batch][runtime_disk_claim.max_child_name_bytes]u8 = undefined,
-    disk_fork_child_lens: [runtime_disk_claim.max_children_per_batch]u8 = [_]u8{0} ** runtime_disk_claim.max_children_per_batch,
-    disk_fork_count: u8 = 0,
-    disk_fork_allow_copy: bool = false,
-    disk_fork_force_copy: bool = false,
-    /// Set while a fork is pending or active; owned by its handler thread.
-    disk_fork_baseline: ?DiskBaseline = null,
     disk_claims: runtime_disk_claim.Registry,
+    /// The stream of the readiness request or an exec. The vsock device
+    /// holds it by pointer while it is attached.
     active_stream: vsock_stream.HostStream = undefined,
-    active_stream_valid: bool = false,
-    active_streaming_exec: bool = false,
-    active_stream_timing_enabled: bool = false,
-    active_exec_submitted_ms: u64 = 0,
-    streaming_client_fd: std.c.fd_t = -1,
-    streaming_stdout_offset: u64 = 0,
-    streaming_stderr_offset: u64 = 0,
-    streaming_terminal_offset: u64 = 0,
-    streaming_write_failed: bool = false,
-    stdout_capture: [lifecycle.exec_named_capture_limit]u8 = undefined,
-    stdout_capture_len: usize = 0,
-    stdout_truncated: bool = false,
-    stderr_capture: [lifecycle.exec_named_capture_limit]u8 = undefined,
-    stderr_capture_len: usize = 0,
-    stderr_truncated: bool = false,
+    capture: OutputCapture = .{},
     session_nonce: u64,
     next_session_id: u64 = 1,
-    active_session_sequence: u64 = 0,
     next_host_stream_sequence: u64,
     wake: ?vsock_control.Wake = null,
     stats_written: bool = false,
@@ -485,7 +540,7 @@ const ExecServer = struct {
         var session_nonce_bytes: [8]u8 = undefined;
         io.random(&session_nonce_bytes);
         const session_nonce = std.mem.readInt(u64, &session_nonce_bytes, .little);
-        var server = ExecServer{
+        return .{
             .allocator = allocator,
             .io = io,
             .entry = entry,
@@ -502,24 +557,19 @@ const ExecServer = struct {
             .session_nonce = session_nonce,
             .next_host_stream_sequence = session_nonce,
         };
-        const request = "{\"type\":\"ready\"}\n";
-        @memcpy(server.request[0..request.len], request);
-        server.request_len = request.len;
-        return server;
     }
 
     fn startReadinessProbe(self: *ExecServer) !*vsock_stream.HostStream {
-        if (self.state != .idle) return error.ControlBusy;
-        self.active_stream = try vsock_stream.HostStream.init(self.guest_port, self.request[0..self.request_len]);
-        self.resetExecCapture();
+        if (self.op != .idle) return error.ControlBusy;
+        self.active_stream = try vsock_stream.HostStream.init(self.guest_port, readiness_request);
+        self.capture.reset();
         self.active_stream.setOutputSink(self, captureOutputThunk);
         self.active_stream.host_port = self.nextHostStreamPort();
         std.log.debug(
             "monitor vsock stream start: kind=readiness session_id=ready host_port={d}",
             .{self.active_stream.host_port},
         );
-        self.active_stream_valid = true;
-        self.state = .active_ready;
+        self.op = .readiness;
         return &self.active_stream;
     }
 
@@ -630,9 +680,13 @@ const ExecServer = struct {
     fn prepareSnapshot(self: *ExecServer) !?snapshot_publication.SnapshotPreparation {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.state != .active_snapshot) return error.ControlBusy;
+        const snapshot = switch (self.op) {
+            .snapshot => |*snapshot| snapshot,
+            else => return error.ControlBusy,
+        };
+        if (snapshot.phase != .active) return error.ControlBusy;
         const preparation = try self.snapshot_publication_wait.tryPrepare(self.io, self.allocator, self.cache_root);
-        if (preparation == null) self.state = .pending_snapshot;
+        if (preparation == null) snapshot.phase = .pending;
         return preparation;
     }
 
@@ -652,139 +706,139 @@ const ExecServer = struct {
         }
         _ = self.disk_claims.expire(monotonicNs());
 
-        switch (self.state) {
-            .idle, .done => return .keep_running,
-            .pending_suspend => {
-                self.state = .active_suspend;
-                return .{ .snapshot = .{ .dir = self.suspend_dir[0..self.suspend_dir_len] } };
+        switch (self.op) {
+            .idle => return .keep_running,
+            .@"suspend" => |*capture| {
+                if (capture.phase != .pending) return .keep_running;
+                capture.phase = .active;
+                return .{ .snapshot = .{ .dir = capture.dir } };
             },
-            .active_suspend => return .keep_running,
-            .pending_snapshot => {
-                self.state = .active_snapshot;
-                return .{ .snapshot = .{
-                    .dir = self.suspend_dir[0..self.suspend_dir_len],
-                    .publish_dir = if (self.publish_dir_len == 0) null else self.publish_dir[0..self.publish_dir_len],
-                    .continue_after = true,
-                } };
+            .snapshot => |*capture| {
+                if (capture.phase != .pending) return .keep_running;
+                capture.phase = .active;
+                return .{ .snapshot = .{ .dir = capture.dir, .publish_dir = capture.publish_dir, .continue_after = true } };
             },
-            .active_snapshot => return .keep_running,
-            .pending_disk_fork => {
-                self.state = .active_disk_fork;
+            .disk_fork => |*fork| {
+                if (fork.phase != .pending) return .keep_running;
+                fork.phase = .active;
                 return .{ .disk_fork = .{
-                    .dir = self.suspend_dir[0..self.suspend_dir_len],
-                    .count = self.disk_fork_count,
-                    .allow_copy = self.disk_fork_allow_copy,
-                    .force_copy = self.disk_fork_force_copy,
+                    .dir = fork.request.out_dir,
+                    .count = @intCast(fork.request.children.len),
+                    .allow_copy = fork.request.allow_copy,
+                    .force_copy = fork.request.force_copy,
                 } };
             },
-            .preparing_disk_fork, .active_disk_fork => return .keep_running,
-            .pending_exec => {
-                self.active_stream = try vsock_stream.HostStream.init(self.guest_port, self.request[0..self.request_len]);
-                self.resetExecCapture();
-                if (self.active_streaming_exec) {
-                    self.resetStreamingOffsets();
-                    self.active_stream.setOutputSink(self, streamOutputThunk);
+            .readiness => return self.pollStreamLocked(dev, null),
+            .exec => |*exec| switch (exec.phase) {
+                .done => return .keep_running,
+                .pending => {
+                    try self.attachExecLocked(dev, exec);
+                    return self.pollStreamLocked(dev, exec);
+                },
+                .active => return self.pollStreamLocked(dev, exec),
+            },
+        }
+    }
+
+    fn attachExecLocked(self: *ExecServer, dev: *vsock.Vsock, exec: *Exec) !void {
+        self.active_stream = try vsock_stream.HostStream.init(self.guest_port, exec.request);
+        switch (exec.output) {
+            .captured => {
+                self.capture.reset();
+                self.active_stream.setOutputSink(self, captureOutputThunk);
+            },
+            .streamed => self.active_stream.setOutputSink(self, streamOutputThunk),
+        }
+        // Restored guests can carry the original default host port in
+        // serialized vsock state. Start from a random dynamic offset,
+        // then advance for readiness and every request so neither the
+        // restored tuple nor an earlier monitor stream is reused.
+        self.active_stream.host_port = self.nextHostStreamPort();
+        var stream_log: [160]u8 = undefined;
+        std.log.debug("{s}", .{formatExecHostStreamStart(
+            &stream_log,
+            self.session_nonce,
+            exec.session_sequence,
+            self.active_stream.host_port,
+        )});
+        try dev.attachHostStream(&self.active_stream);
+        self.active_stream.markStarted();
+        exec.phase = .active;
+        self.cond.broadcast(self.io);
+    }
+
+    /// Advances the attached stream of `exec`, or of the readiness request
+    /// when `exec` is null.
+    fn pollStreamLocked(self: *ExecServer, dev: *vsock.Vsock, exec: ?*Exec) !vsock_control.ControlAction {
+        const streamed: ?*Streamed = if (exec) |active| switch (active.output) {
+            .streamed => |*streamed| streamed,
+            .captured => null,
+        } else null;
+        if (streamed) |output| {
+            if (output.write_failed) self.active_stream.fail();
+        }
+        _ = try dev.flushHostStreamOutbound();
+        switch (self.active_stream.state) {
+            .failed => {
+                try self.failExecLocked(exec orelse return error.GuestReadinessProbeFailed, "guest vsock stream failed");
+                dev.resetHostStream();
+            },
+            .complete => {
+                const exit_code = self.active_stream.exit_code orelse {
+                    try self.failExecLocked(exec orelse return error.GuestReadinessProbeFailed, "guest exec missing exit code");
+                    dev.resetHostStream();
+                    return .keep_running;
+                };
+                const active = exec orelse {
+                    if (exit_code != 0) return error.GuestReadinessProbeFailed;
+                    std.log.info(
+                        "monitor readiness metrics: attach_ms={?d} connect_request_delivered_ms={?d} connect_ms={?d} request_delivered_ms={?d} guest_timing_ms={?d} response_ms={?d} ready_ms={d}",
+                        .{
+                            self.active_stream.attach_ms,
+                            self.active_stream.connect_request_delivered_ms,
+                            self.active_stream.connect_ms,
+                            self.active_stream.request_delivered_ms,
+                            self.active_stream.guest_timing_ms,
+                            self.active_stream.response_ms,
+                            self.active_stream.elapsedMs(),
+                        },
+                    );
+                    dev.resetHostStream();
+                    try self.publishReady();
+                    self.op = .idle;
+                    self.cond.broadcast(self.io);
+                    return .keep_running;
+                };
+                dev.resetHostStream();
+                const timing = namedExecTiming(&self.active_stream, active.submitted_ms, lifecycle.monotonicMs());
+                if (streamed) |output| {
+                    if (output.timing) self.sendStreamingTimingLocked(output, timing);
+                    self.sendStreamingExitLocked(output, exit_code);
                 } else {
-                    self.active_stream.setOutputSink(self, captureOutputThunk);
+                    try self.storeExecResultLocked(exit_code, timing);
                 }
-                // Restored guests can carry the original default host port in
-                // serialized vsock state. Start from a random dynamic offset,
-                // then advance for readiness and every request so neither the
-                // restored tuple nor an earlier monitor stream is reused.
-                self.active_stream.host_port = self.nextHostStreamPort();
-                var stream_log: [160]u8 = undefined;
-                std.log.debug("{s}", .{formatExecHostStreamStart(
-                    &stream_log,
-                    self.session_nonce,
-                    self.active_session_sequence,
-                    self.active_stream.host_port,
-                )});
-                try dev.attachHostStream(&self.active_stream);
-                self.active_stream.markStarted();
-                self.active_stream_valid = true;
-                self.state = .active_exec;
+                active.phase = .done;
                 self.cond.broadcast(self.io);
             },
-            .active_ready, .active_exec => {},
-        }
-
-        if ((self.state == .active_ready or self.state == .active_exec) and self.active_stream_valid) {
-            const readiness_probe = self.state == .active_ready;
-            if (self.streaming_write_failed) self.active_stream.fail();
-            _ = try dev.flushHostStreamOutbound();
-            switch (self.active_stream.state) {
-                .failed => {
-                    if (readiness_probe) return error.GuestReadinessProbeFailed;
-                    if (self.active_streaming_exec) {
-                        self.sendStreamingErrorLocked("guest vsock stream failed");
-                    } else {
-                        try self.storeErrorLocked("guest vsock stream failed");
-                    }
+            else => {
+                if (self.active_stream.elapsedMs() > self.timeout_ms) {
+                    try self.failExecLocked(exec orelse return error.GuestReadinessProbeFailed, "guest exec timed out");
                     dev.resetHostStream();
-                    self.state = .done;
-                    self.cond.broadcast(self.io);
-                },
-                .complete => {
-                    const exit_code = self.active_stream.exit_code orelse {
-                        if (readiness_probe) return error.GuestReadinessProbeFailed;
-                        if (self.active_streaming_exec) {
-                            self.sendStreamingErrorLocked("guest exec missing exit code");
-                        } else {
-                            try self.storeErrorLocked("guest exec missing exit code");
-                        }
-                        dev.resetHostStream();
-                        self.state = .done;
-                        self.cond.broadcast(self.io);
-                        return .keep_running;
-                    };
-                    if (readiness_probe) {
-                        if (exit_code != 0) return error.GuestReadinessProbeFailed;
-                        std.log.info(
-                            "monitor readiness metrics: attach_ms={?d} connect_request_delivered_ms={?d} connect_ms={?d} request_delivered_ms={?d} guest_timing_ms={?d} response_ms={?d} ready_ms={d}",
-                            .{
-                                self.active_stream.attach_ms,
-                                self.active_stream.connect_request_delivered_ms,
-                                self.active_stream.connect_ms,
-                                self.active_stream.request_delivered_ms,
-                                self.active_stream.guest_timing_ms,
-                                self.active_stream.response_ms,
-                                self.active_stream.elapsedMs(),
-                            },
-                        );
-                        dev.resetHostStream();
-                        self.active_stream_valid = false;
-                        try self.publishReady();
-                        self.state = .idle;
-                        self.cond.broadcast(self.io);
-                        return .keep_running;
-                    }
-                    dev.resetHostStream();
-                    const timing = namedExecTiming(&self.active_stream, self.active_exec_submitted_ms, lifecycle.monotonicMs());
-                    if (self.active_streaming_exec) {
-                        if (self.active_stream_timing_enabled) self.sendStreamingTimingLocked(timing);
-                        self.sendStreamingExitLocked(exit_code);
-                    } else {
-                        try self.storeExecResultLocked(exit_code, timing);
-                    }
-                    self.state = .done;
-                    self.cond.broadcast(self.io);
-                },
-                else => {
-                    if (self.active_stream.elapsedMs() > self.timeout_ms) {
-                        if (readiness_probe) return error.GuestReadinessProbeFailed;
-                        if (self.active_streaming_exec) {
-                            self.sendStreamingErrorLocked("guest exec timed out");
-                        } else {
-                            try self.storeErrorLocked("guest exec timed out");
-                        }
-                        dev.resetHostStream();
-                        self.state = .done;
-                        self.cond.broadcast(self.io);
-                    }
-                },
-            }
+                }
+            },
         }
         return .keep_running;
+    }
+
+    /// Ends `exec` with `message`: an error frame for a streamed exec, the
+    /// response for a captured one.
+    fn failExecLocked(self: *ExecServer, exec: *Exec, message: []const u8) !void {
+        switch (exec.output) {
+            .streamed => |*streamed| self.sendStreamingErrorLocked(streamed, message),
+            .captured => try self.storeErrorLocked(message),
+        }
+        exec.phase = .done;
+        self.cond.broadcast(self.io);
     }
 
     fn registryDirGone(self: *ExecServer) bool {
@@ -801,7 +855,7 @@ const ExecServer = struct {
         const deadline = lifecycle.monotonicMs() +| self.timeout_ms;
         while (true) {
             if (self.stopping != null) return error.MonitorStopping;
-            if (self.state == .idle) return;
+            if (self.op == .idle) return;
             if (lifecycle.monotonicMs() >= deadline) return error.ControlBusy;
             self.mutex.unlock(self.io);
             var ts = std.c.timespec{ .sec = 0, .nsec = control_queue_poll_ms * std.time.ns_per_ms };
@@ -817,72 +871,75 @@ const ExecServer = struct {
     }
 
     fn submitExec(self: *ExecServer, request: []const u8, session_sequence: u64) ![]const u8 {
-        if (request.len > self.request.len) return error.ControlRequestTooLarge;
+        if (request.len > vsock.max_payload) return error.ControlRequestTooLarge;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.acquireOpLocked();
-        self.active_session_sequence = session_sequence;
-        @memcpy(self.request[0..request.len], request);
-        self.request_len = request.len;
         self.response_len = 0;
-        self.active_streaming_exec = false;
-        self.active_stream_timing_enabled = false;
-        self.streaming_client_fd = -1;
-        self.streaming_write_failed = false;
-        self.active_exec_submitted_ms = lifecycle.monotonicMs();
-        self.state = .pending_exec;
+        self.op = .{ .exec = .{
+            .request = request,
+            .session_sequence = session_sequence,
+            .submitted_ms = lifecycle.monotonicMs(),
+            .output = .captured,
+        } };
         if (self.wake) |wake| wake.wake();
         self.cond.broadcast(self.io);
-        while (self.state != .done) {
+        while (!self.op.done()) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        defer self.state = .idle;
+        defer self.op = .idle;
         return self.takeResponseLocked();
     }
 
     fn submitStreamingExec(self: *ExecServer, request: []const u8, session_sequence: u64, client_fd: std.c.fd_t, timing_enabled: bool) !void {
-        if (request.len > self.request.len) return error.ControlRequestTooLarge;
+        if (request.len > vsock.max_payload) return error.ControlRequestTooLarge;
         try setStreamingSendDeadline(client_fd);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.acquireOpLocked();
-        self.active_session_sequence = session_sequence;
         self.stream_input_stop.store(false, .release);
-        @memcpy(self.request[0..request.len], request);
-        self.request_len = request.len;
         self.response_len = 0;
-        self.active_streaming_exec = true;
-        self.active_stream_timing_enabled = timing_enabled;
-        self.streaming_client_fd = client_fd;
-        self.streaming_write_failed = false;
-        self.active_exec_submitted_ms = lifecycle.monotonicMs();
-        self.state = .pending_exec;
+        self.op = .{ .exec = .{
+            .request = request,
+            .session_sequence = session_sequence,
+            .submitted_ms = lifecycle.monotonicMs(),
+            .output = .{ .streamed = .{ .client_fd = client_fd, .timing = timing_enabled } },
+        } };
         if (self.wake) |wake| wake.wake();
         self.cond.broadcast(self.io);
-        while (self.state == .pending_exec) {
+        while (self.op.exec.phase == .pending) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
     }
 
+    /// Waits for the submitted streaming exec to end, then frees the slot.
     fn finishStreamingExec(self: *ExecServer) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        while (self.state != .done and self.state != .idle) {
+        while (!self.op.done()) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        self.active_streaming_exec = false;
-        self.active_stream_timing_enabled = false;
-        self.streaming_client_fd = -1;
-        if (self.state == .done) {
-            self.state = .idle;
-            self.cond.broadcast(self.io);
-        }
+        self.op = .idle;
+        self.cond.broadcast(self.io);
     }
 
     fn streamingDone(self: *ExecServer) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.state == .done or self.state == .idle;
+        return self.op.done();
+    }
+
+    /// The streamed exec whose stream is attached, if one is.
+    fn activeStreamedLocked(self: *ExecServer) ?*Streamed {
+        const exec = switch (self.op) {
+            .exec => |*exec| exec,
+            else => return null,
+        };
+        if (exec.phase != .active) return null;
+        return switch (exec.output) {
+            .streamed => |*streamed| streamed,
+            .captured => null,
+        };
     }
 
     /// Host wall clock carried on session starts so the guest agent can set
@@ -958,100 +1015,56 @@ const ExecServer = struct {
         return port;
     }
 
-    fn resetExecCapture(self: *ExecServer) void {
-        self.stdout_capture_len = 0;
-        self.stdout_truncated = false;
-        self.stderr_capture_len = 0;
-        self.stderr_truncated = false;
-    }
-
-    fn resetStreamingOffsets(self: *ExecServer) void {
-        self.streaming_stdout_offset = 0;
-        self.streaming_stderr_offset = 0;
-        self.streaming_terminal_offset = 0;
-        self.streaming_write_failed = false;
-    }
-
-    fn captureOutput(self: *ExecServer, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
-        const capture = switch (output) {
-            .stdout => &self.stdout_capture,
-            .stderr => &self.stderr_capture,
-            .terminal => &self.stdout_capture,
-        };
-        const len = switch (output) {
-            .stdout => &self.stdout_capture_len,
-            .stderr => &self.stderr_capture_len,
-            .terminal => &self.stdout_capture_len,
-        };
-        const truncated = switch (output) {
-            .stdout => &self.stdout_truncated,
-            .stderr => &self.stderr_truncated,
-            .terminal => &self.stdout_truncated,
-        };
-        const available = capture.len - len.*;
-        const n = @min(bytes.len, available);
-        if (n > 0) {
-            @memcpy(capture[len.*..][0..n], bytes[0..n]);
-            len.* += n;
-        }
-        if (n < bytes.len) truncated.* = true;
-    }
-
     fn streamOutput(self: *ExecServer, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         if (bytes.len == 0) return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const fd = self.streaming_client_fd;
-        if (fd < 0 or self.streaming_write_failed) return;
+        const streamed = self.activeStreamedLocked() orelse return;
+        if (streamed.write_failed) return;
         const stream_id: spore_stream.StreamId = switch (output) {
             .stdout => .stdout,
             .stderr => .stderr,
             .terminal => .terminal,
         };
         const offset = switch (output) {
-            .stdout => self.streaming_stdout_offset,
-            .stderr => self.streaming_stderr_offset,
-            .terminal => self.streaming_terminal_offset,
+            .stdout => &streamed.stdout_offset,
+            .stderr => &streamed.stderr_offset,
+            .terminal => &streamed.terminal_offset,
         };
-        if (writeSpioDataFdBounded(fd, stream_id, offset, bytes) != 0) {
-            self.streaming_write_failed = true;
+        if (writeSpioDataFdBounded(streamed.client_fd, stream_id, offset.*, bytes) != 0) {
+            streamed.write_failed = true;
             if (self.wake) |wake| wake.wake();
             return;
         }
-        const len: u64 = @intCast(bytes.len);
-        switch (output) {
-            .stdout => self.streaming_stdout_offset += len,
-            .stderr => self.streaming_stderr_offset += len,
-            .terminal => self.streaming_terminal_offset += len,
-        }
+        offset.* += bytes.len;
     }
 
-    fn sendStreamingExitLocked(self: *ExecServer, exit_code: i32) void {
-        if (self.streaming_client_fd < 0 or self.streaming_write_failed) return;
+    fn sendStreamingExitLocked(_: *ExecServer, streamed: *Streamed, exit_code: i32) void {
+        if (streamed.write_failed) return;
         const code: u32 = if (exit_code < 0) 1 else @intCast(@min(exit_code, 255));
         var payload: [4]u8 = undefined;
         spore_stream.writeExitPayload(&payload, code);
-        if (writeSpioFrameFdBounded(self.streaming_client_fd, .exit, .control, 0, &payload) != 0) {
-            self.streaming_write_failed = true;
+        if (writeSpioFrameFdBounded(streamed.client_fd, .exit, .control, 0, &payload) != 0) {
+            streamed.write_failed = true;
         }
     }
 
-    fn sendStreamingTimingLocked(self: *ExecServer, timing: lifecycle.NamedExecTiming) void {
-        if (self.streaming_client_fd < 0 or self.streaming_write_failed) return;
+    fn sendStreamingTimingLocked(self: *ExecServer, streamed: *Streamed, timing: lifecycle.NamedExecTiming) void {
+        if (streamed.write_failed) return;
         const json = std.json.Stringify.valueAlloc(self.allocator, monitor_protocol.TimingEvent{ .timing = timing }, .{}) catch return;
         defer self.allocator.free(json);
         if (json.len > spore_stream.max_payload_len or
-            writeSpioFrameFdBounded(self.streaming_client_fd, .event, .control, 0, json) != 0)
+            writeSpioFrameFdBounded(streamed.client_fd, .event, .control, 0, json) != 0)
         {
-            self.streaming_write_failed = true;
+            streamed.write_failed = true;
         }
     }
 
-    fn sendStreamingErrorLocked(self: *ExecServer, message: []const u8) void {
-        if (self.streaming_client_fd < 0 or self.streaming_write_failed) return;
+    fn sendStreamingErrorLocked(_: *ExecServer, streamed: *Streamed, message: []const u8) void {
+        if (streamed.write_failed) return;
         const payload = if (message.len > spore_stream.max_payload_len) message[0..spore_stream.max_payload_len] else message;
-        if (writeSpioFrameFdBounded(self.streaming_client_fd, .err, .control, 0, payload) != 0) {
-            self.streaming_write_failed = true;
+        if (writeSpioFrameFdBounded(streamed.client_fd, .err, .control, 0, payload) != 0) {
+            streamed.write_failed = true;
         }
     }
 
@@ -1059,7 +1072,7 @@ const ExecServer = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.state != .active_exec or !self.active_streaming_exec or !self.active_stream_valid) return error.ControlStreamClosed;
+            if (self.activeStreamedLocked() == null) return error.ControlStreamClosed;
         }
         const queued = switch (stream_id) {
             .stdin => try self.active_stream.enqueueStdinDataBlocking(bytes, &self.stream_input_stop),
@@ -1074,7 +1087,7 @@ const ExecServer = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.state != .active_exec or !self.active_streaming_exec or !self.active_stream_valid) return error.ControlStreamClosed;
+            if (self.activeStreamedLocked() == null) return error.ControlStreamClosed;
         }
         const queued = switch (stream_id) {
             .stdin => try self.active_stream.enqueueStdinCloseBlocking(&self.stream_input_stop),
@@ -1089,24 +1102,22 @@ const ExecServer = struct {
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.state != .active_exec or !self.active_streaming_exec or !self.active_stream_valid) return error.ControlStreamClosed;
+            if (self.activeStreamedLocked() == null) return error.ControlStreamClosed;
         }
         if (!self.active_stream.enqueueResize(resize)) return error.ControlStreamClosed;
         if (self.wake) |wake| wake.wake();
     }
 
     fn submitSuspend(self: *ExecServer, out_dir: []const u8) ![]const u8 {
-        if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
+        if (out_dir.len == 0 or out_dir.len > max_suspend_path) return error.InvalidSuspendDir;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.acquireOpLocked();
-        @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
-        self.suspend_dir_len = out_dir.len;
         self.response_len = 0;
-        self.state = .pending_suspend;
+        self.op = .{ .@"suspend" = .{ .dir = out_dir } };
         if (self.wake) |wake| wake.wake();
         self.cond.broadcast(self.io);
-        while (self.state != .done) {
+        while (!self.op.done()) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
         // The VM ends after a suspend, so the slot stays taken.
@@ -1114,37 +1125,26 @@ const ExecServer = struct {
     }
 
     fn submitSnapshot(self: *ExecServer, out_dir: []const u8, publish_dir: ?[]const u8) ![]const u8 {
-        if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
+        if (out_dir.len == 0 or out_dir.len > max_suspend_path) return error.InvalidSuspendDir;
         if (publish_dir) |dir| {
-            if (dir.len == 0 or dir.len > self.publish_dir.len) return error.InvalidSuspendDir;
+            if (dir.len == 0 or dir.len > max_suspend_path) return error.InvalidSuspendDir;
         }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.acquireOpLocked();
-        @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
-        self.suspend_dir_len = out_dir.len;
-        self.publish_dir_len = 0;
-        if (publish_dir) |dir| {
-            @memcpy(self.publish_dir[0..dir.len], dir);
-            self.publish_dir_len = dir.len;
-        }
         self.response_len = 0;
-        self.state = .pending_snapshot;
+        self.op = .{ .snapshot = .{ .dir = out_dir, .publish_dir = publish_dir } };
         if (self.wake) |wake| wake.wake();
         self.cond.broadcast(self.io);
-        while (self.state != .done) {
+        while (!self.op.done()) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        defer self.state = .idle;
+        defer self.op = .idle;
         return self.takeResponseLocked();
     }
 
     fn submitDiskFork(self: *ExecServer, request: runtime_disk_fork_control.PrepareRequest) ![]const u8 {
         try runtime_disk_fork_control.validatePrepare(request);
-        const out_dir = request.out_dir;
-        const batch = request.batch;
-        const children = request.children;
-        if (out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -1152,21 +1152,21 @@ const ExecServer = struct {
         defer arena_state.deinit();
         const baseline = while (true) {
             try self.acquireOpLocked();
-            if (self.disk_claims.hasBatch(batch)) return error.BatchAlreadyRegistered;
+            if (self.disk_claims.hasBatch(request.batch)) return error.BatchAlreadyRegistered;
             // Naming the baseline reads and writes the spec, so it runs
             // unlocked. Holding the slot keeps a save from replacing the disk
             // meanwhile.
-            self.state = .preparing_disk_fork;
+            self.op = .{ .disk_fork = .{ .request = request } };
             self.mutex.unlock(self.io);
             const step = ensureDiskBaselineLease(self.io, arena_state.allocator(), self.entry, self.runtime_root, self.cache_root);
             self.mutex.lockUncancelable(self.io);
             const busy_root = switch (step catch |err| {
-                self.state = .idle;
+                self.op = .idle;
                 return err;
             }) {
                 .named => |named| {
                     if (self.stopping == null) break named;
-                    self.state = .idle;
+                    self.op = .idle;
                     return error.MonitorStopping;
                 },
                 .cache_busy => |root| root,
@@ -1174,33 +1174,21 @@ const ExecServer = struct {
             // A build, pull or GC holds the rootfs cache lock. Wait for it
             // without the slot, so the guest stays usable meanwhile, then
             // name the baseline again.
-            self.state = .idle;
+            self.op = .idle;
             self.mutex.unlock(self.io);
             const waited = self.awaitRootfsCacheLock(busy_root);
             self.mutex.lockUncancelable(self.io);
             try waited;
         };
-        self.disk_fork_baseline = baseline;
-        defer self.disk_fork_baseline = null;
-        @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
-        self.suspend_dir_len = out_dir.len;
-        @memcpy(self.disk_fork_batch[0..batch.len], batch);
-        self.disk_fork_batch_len = batch.len;
-        for (children, 0..) |child, index| {
-            @memcpy(self.disk_fork_children[index][0..child.len], child);
-            self.disk_fork_child_lens[index] = @intCast(child.len);
-        }
-        self.disk_fork_count = @intCast(children.len);
-        self.disk_fork_allow_copy = request.allow_copy;
-        self.disk_fork_force_copy = request.force_copy;
+        self.op.disk_fork.baseline = baseline;
+        self.op.disk_fork.phase = .pending;
         self.response_len = 0;
-        self.state = .pending_disk_fork;
         if (self.wake) |wake| wake.wake();
         self.cond.broadcast(self.io);
-        while (self.state != .done) {
+        while (!self.op.done()) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        defer self.state = .idle;
+        defer self.op = .idle;
         return self.takeResponseLocked();
     }
 
@@ -1230,27 +1218,27 @@ const ExecServer = struct {
     fn completeSuspend(self: *ExecServer) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        switch (self.state) {
-            .pending_suspend, .active_suspend => {
-                try self.storeJsonLocked(monitor_protocol.Suspended{ .out_dir = self.suspend_dir[0..self.suspend_dir_len] });
-                self.state = .done;
-                self.cond.broadcast(self.io);
-            },
-            else => {},
-        }
+        const capture = switch (self.op) {
+            .@"suspend" => |*capture| capture,
+            else => return,
+        };
+        if (capture.phase == .done) return;
+        try self.storeJsonLocked(monitor_protocol.Suspended{ .out_dir = capture.dir });
+        capture.phase = .done;
+        self.cond.broadcast(self.io);
     }
 
     fn completeSnapshot(self: *ExecServer, dir: []const u8) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        switch (self.state) {
-            .pending_snapshot, .active_snapshot => {
-                try self.storeJsonLocked(monitor_protocol.Snapshotted{ .out_dir = dir });
-                self.state = .done;
-                self.cond.broadcast(self.io);
-            },
-            else => {},
-        }
+        const capture = switch (self.op) {
+            .snapshot => |*capture| capture,
+            else => return,
+        };
+        if (capture.phase == .done) return;
+        try self.storeJsonLocked(monitor_protocol.Snapshotted{ .out_dir = dir });
+        capture.phase = .done;
+        self.cond.broadcast(self.io);
     }
 
     fn publishSnapshot(self: *ExecServer, preparation: *const snapshot_publication.SnapshotPreparation, work_dir: []const u8, publish_dir: []const u8) !vsock_control.SnapshotPublishMetrics {
@@ -1320,20 +1308,25 @@ const ExecServer = struct {
     fn completeDiskFork(self: *ExecServer, batch: *runtime_disk_fork_capture.Batch) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.state != .active_disk_fork or batch.heads.len != self.disk_fork_count) return error.ControlBusy;
-        const recorded = self.disk_fork_baseline orelse return error.ControlBusy;
+        const fork = switch (self.op) {
+            .disk_fork => |*fork| fork,
+            else => return error.ControlBusy,
+        };
+        const children = fork.request.children;
+        if (fork.phase != .active or batch.heads.len != children.len) return error.ControlBusy;
+        const recorded = fork.baseline orelse return error.ControlBusy;
 
         var pending: [runtime_disk_claim.max_children_per_batch]runtime_disk_claim.PendingClaim = undefined;
         for (batch.heads, 0..) |head, index| {
             pending[index] = .{
-                .child_name = self.disk_fork_children[index][0..self.disk_fork_child_lens[index]],
+                .child_name = children[index],
                 .child_index = @intCast(index),
                 .head = head,
             };
         }
         const now_ns = monotonicNs();
         const expires_at_ns = std.math.add(u64, now_ns, disk_claim_timeout_ns) catch std.math.maxInt(u64);
-        const batch_name = self.disk_fork_batch[0..self.disk_fork_batch_len];
+        const batch_name = fork.request.batch;
         const baseline = (batch.heads[0] orelse return error.BadBatch).descriptor.baseline;
         const registrations = try self.disk_claims.registerBatch(batch_name, pending[0..batch.heads.len], now_ns, expires_at_ns);
         defer self.allocator.free(registrations);
@@ -1344,7 +1337,7 @@ const ExecServer = struct {
         var claims: [runtime_disk_claim.max_children_per_batch]runtime_disk_fork_control.PreparedClaim = undefined;
         for (claims[0..registrations.len], registrations, 0..) |*claim, registration, index| {
             claim.* = .{
-                .child = self.disk_fork_children[index][0..self.disk_fork_child_lens[index]],
+                .child = children[index],
                 .child_index = @intCast(index),
                 .token = runtime_disk_claim.formatTokenHex(registration.token, &token_buffers[index]),
                 .baseline_kind = baseline.kind,
@@ -1355,7 +1348,7 @@ const ExecServer = struct {
             .type = runtime_disk_fork_control.prepared_type,
             .schema = runtime_disk_fork_control.prepared_schema,
             .batch = batch_name,
-            .capture_dir = self.suspend_dir[0..self.suspend_dir_len],
+            .capture_dir = fork.request.out_dir,
             .claims = claims[0..registrations.len],
             .lease = recorded.lease,
             .disk = recorded.disk,
@@ -1364,20 +1357,24 @@ const ExecServer = struct {
             .source_pause_ns = runtime_disk_fork_capture.elapsedSince(batch.pause_started_ns),
             .copied_bytes = batch.copied_bytes,
         });
-        self.state = .done;
+        fork.phase = .done;
         self.cond.broadcast(self.io);
     }
 
     fn failDiskFork(self: *ExecServer, err: anyerror) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.state != .pending_disk_fork and self.state != .active_disk_fork) return;
+        const fork = switch (self.op) {
+            .disk_fork => |*fork| fork,
+            else => return,
+        };
+        if (fork.phase != .pending and fork.phase != .active) return;
         var message_buf: [192]u8 = undefined;
         const message = std.fmt.bufPrint(&message_buf, "disk fork capture failed: {s}", .{@errorName(err)}) catch "disk fork capture failed";
         self.storeJsonLocked(monitor_protocol.Error{ .message = message, .code = .of(err) }) catch {
             self.response_len = 0;
         };
-        self.state = .done;
+        fork.phase = .done;
         self.cond.broadcast(self.io);
     }
 
@@ -1421,10 +1418,12 @@ const ExecServer = struct {
     /// active one, except a capture already under way, which finishes first.
     fn stopLocked(self: *ExecServer, message: []const u8) void {
         self.stopping = self.stopping orelse message;
-        switch (self.state) {
-            .active_suspend, .active_snapshot, .active_disk_fork => {},
-            else => self.failOutstandingLocked(message),
-        }
+        const capturing = switch (self.op) {
+            .@"suspend", .snapshot => |capture| capture.phase == .active,
+            .disk_fork => |fork| fork.phase == .active,
+            else => false,
+        };
+        if (!capturing) self.failOutstandingLocked(message);
     }
 
     fn failOutstanding(self: *ExecServer, message: []const u8) void {
@@ -1442,37 +1441,56 @@ const ExecServer = struct {
         return self.stopping orelse removal_message;
     }
 
+    /// Fails the operation holding the slot unless it is done or still
+    /// preparing, which checks `stopping` itself.
     fn failOutstandingLocked(self: *ExecServer, message: []const u8) void {
-        switch (self.state) {
-            .active_ready, .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot, .pending_disk_fork, .active_disk_fork => {
-                self.stream_input_stop.store(true, .release);
-                if (self.active_streaming_exec) {
-                    self.sendStreamingErrorLocked(message);
-                    // Nothing follows the error frame.
-                    self.streaming_write_failed = true;
-                } else {
-                    self.storeErrorLocked(message) catch {
+        switch (self.op) {
+            .idle => return,
+            .readiness => {},
+            .exec => |*exec| {
+                if (exec.phase == .done) return;
+                switch (exec.output) {
+                    .streamed => |*streamed| {
+                        self.sendStreamingErrorLocked(streamed, message);
+                        // Nothing follows the error frame.
+                        streamed.write_failed = true;
+                    },
+                    .captured => self.storeErrorLocked(message) catch {
                         self.response_len = 0;
-                    };
+                    },
                 }
-                self.state = .done;
-                self.cond.broadcast(self.io);
+                exec.phase = .done;
             },
-            else => {},
+            .@"suspend", .snapshot => |*capture| {
+                if (capture.phase == .done) return;
+                self.storeErrorLocked(message) catch {
+                    self.response_len = 0;
+                };
+                capture.phase = .done;
+            },
+            .disk_fork => |*fork| {
+                if (fork.phase == .done or fork.phase == .preparing) return;
+                self.storeErrorLocked(message) catch {
+                    self.response_len = 0;
+                };
+                fork.phase = .done;
+            },
         }
+        self.stream_input_stop.store(true, .release);
+        self.cond.broadcast(self.io);
     }
 
     fn storeExecResultLocked(self: *ExecServer, exit_code: i32, timing: lifecycle.NamedExecTiming) !void {
-        const stdout_b64 = try base64Alloc(self.allocator, self.stdout_capture[0..self.stdout_capture_len]);
+        const stdout_b64 = try base64Alloc(self.allocator, self.capture.stdout[0..self.capture.stdout_len]);
         defer self.allocator.free(stdout_b64);
-        const stderr_b64 = try base64Alloc(self.allocator, self.stderr_capture[0..self.stderr_capture_len]);
+        const stderr_b64 = try base64Alloc(self.allocator, self.capture.stderr[0..self.capture.stderr_len]);
         defer self.allocator.free(stderr_b64);
         try self.storeJsonLocked(monitor_protocol.ExecResult{
             .exit_code = exit_code,
             .stdout_b64 = stdout_b64,
             .stderr_b64 = stderr_b64,
-            .stdout_truncated = self.stdout_truncated,
-            .stderr_truncated = self.stderr_truncated,
+            .stdout_truncated = self.capture.stdout_truncated,
+            .stderr_truncated = self.capture.stderr_truncated,
             .timing = timing,
         });
     }
@@ -1542,7 +1560,7 @@ const ExecServer = struct {
 
     fn captureOutputThunk(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
         const self: *ExecServer = @ptrCast(@alignCast(context.?));
-        self.captureOutput(output, bytes);
+        self.capture.append(output, bytes);
     }
 
     fn streamOutputThunk(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
@@ -2370,17 +2388,17 @@ test "named snapshot cache contention returns pending before the pause authority
     server.io = io;
     server.cache_root = cache_root;
     server.mutex = .init;
-    server.state = .active_snapshot;
+    server.op = .{ .snapshot = .{ .phase = .active, .dir = "/tmp/save.tmp", .publish_dir = "/tmp/save.spore" } };
     server.snapshot_publication_wait = .{};
     var held = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache_root);
     defer held.deinit();
     try std.testing.expect(try server.prepareSnapshot() == null);
-    try std.testing.expectEqual(RequestState.pending_snapshot, server.state);
+    try std.testing.expectEqual(Phase.pending, server.op.snapshot.phase);
     try std.testing.expect(server.snapshot_publication_wait.started_ns != null);
 
     // This is the state in which each backend falls through to one normal
     // guest-run opportunity instead of retrying the lock in a tight loop.
-    server.state = .active_snapshot;
+    server.op.snapshot.phase = .active;
     held.deinit();
     var preparation = (try server.prepareSnapshot()) orelse return error.TestUnexpectedResult;
     const borrowed = preparation.cacheLock();
@@ -2985,7 +3003,7 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     const refusal = monitor.server.imageStoreRefusal(client.monitor_end, &buf) orelse return error.TestExpectedRefusal;
     try std.testing.expectEqualStrings(save_refused_image_store ++ ": ImageStoreNotFound", refusal.message);
     try std.testing.expectEqual(monitor_protocol.ErrorCode.image_store_incomplete, refusal.code.?);
-    try std.testing.expectEqual(RequestState.idle, monitor.server.state);
+    try std.testing.expectEqual(Op.idle, monitor.server.op);
     // Once the store has it again, the save goes ahead with every object local.
     try std.Io.Dir.renameAbsolute(hidden, object.?, io);
     try std.testing.expectEqual(null, monitor.server.imageStoreRefusal(client.monitor_end, &buf));
@@ -3074,7 +3092,7 @@ test "a save is refused when a guest read fails while the monitor fetches the im
 
     try std.testing.expect(monitor.fetcher.complete.load(.acquire));
     try std.testing.expectEqualStrings(save_refused_image_store ++ ": a guest read from it failed earlier", (save.refusal orelse return error.TestExpectedRefusal).message);
-    try std.testing.expectEqual(RequestState.idle, monitor.server.state);
+    try std.testing.expectEqual(Op.idle, monitor.server.op);
 }
 
 test "stopping the control plane cancels a save's pending image fetch" {
@@ -3152,7 +3170,7 @@ const StoreMonitor = struct {
         self.server = undefined;
         self.server.io = std.testing.io;
         self.server.mutex = .init;
-        self.server.state = .idle;
+        self.server.op = .idle;
         self.server.stopping = null;
         self.server.image_store = null;
         // The run loop hands over the fetcher of the disk it opened.
@@ -3324,8 +3342,8 @@ test "monitor records the fork baseline while it holds the guest" {
         {
             server.mutex.lockUncancelable(io);
             defer server.mutex.unlock(io);
-            if (server.state == .pending_disk_fork) {
-                server.state = .active_disk_fork;
+            if (server.op == .disk_fork and server.op.disk_fork.phase == .pending) {
+                server.op.disk_fork.phase = .active;
                 break;
             }
         }
@@ -3354,7 +3372,7 @@ test "monitor records the fork baseline while it holds the guest" {
     try std.testing.expectEqualStrings(saved_dir, prepared.lease.root);
     try std.testing.expectEqualStrings(lease.baseline_identity, prepared.lease.baseline_identity);
     try std.testing.expectEqualStrings(lease.baseline_identity, prepared.disk.?.base);
-    try std.testing.expectEqual(RequestState.idle, server.state);
+    try std.testing.expectEqual(Op.idle, server.op);
 }
 
 test "a fork waiting for the rootfs cache lock leaves the guest free" {
@@ -3473,8 +3491,8 @@ test "a fork waiting for the rootfs cache lock leaves the guest free" {
         {
             server.mutex.lockUncancelable(io);
             defer server.mutex.unlock(io);
-            if (server.state == .pending_disk_fork) {
-                server.state = .active_disk_fork;
+            if (server.op == .disk_fork and server.op.disk_fork.phase == .pending) {
+                server.op.disk_fork.phase = .active;
                 break;
             }
         }
@@ -3526,8 +3544,8 @@ test "monitor answers hello and shutdown while a guest operation runs" {
         {
             server.mutex.lockUncancelable(io);
             defer server.mutex.unlock(io);
-            if (server.state == .pending_exec) {
-                server.state = .active_exec;
+            if (server.op == .exec and server.op.exec.phase == .pending) {
+                server.op.exec.phase = .active;
                 server.cond.broadcast(io);
                 break;
             }
@@ -3568,6 +3586,43 @@ test "monitor answers hello and shutdown while a guest operation runs" {
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, socket_path, .{}));
 }
 
+test "shutdown fails an exec still waiting for the guest and refuses the rest" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-pending-{d}.sock", .{std.c.getpid()});
+    var entry_dir = std.testing.tmpDir(.{});
+    defer entry_dir.cleanup();
+    var server = try ExecServer.init(allocator, io, .{ .dir = entry_dir.dir }, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", 10700, 1_000, null, .{});
+    defer server.disk_claims.deinit();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    defer server.stopControl(accept_thread, "test finished");
+
+    // No VM loop runs, so the exec takes the slot and never reaches the guest.
+    const exec = try TestControlClient.connect(socket_path);
+    defer exec.close();
+    try exec.send("{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n");
+    const started_ms = lifecycle.monotonicMs();
+    while (true) {
+        {
+            server.mutex.lockUncancelable(io);
+            defer server.mutex.unlock(io);
+            if (server.op == .exec) break;
+        }
+        if (lifecycle.monotonicMs() - started_ms > 5_000) return error.Timeout;
+        var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+
+    var buffer: [512]u8 = undefined;
+    const ok = try TestControlClient.call(socket_path, "{\"type\":\"shutdown\"}\n", &buffer, 1_000);
+    try std.testing.expect(std.mem.startsWith(u8, ok, "{\"type\":\"ok\""));
+    try expectErrorResponse(removal_message, try exec.readLine(&buffer, 1_000));
+    const refused = try TestControlClient.call(socket_path, "{\"type\":\"suspend\",\"out_dir\":\"/tmp/save.spore\"}\n", &buffer, 1_000);
+    try expectErrorResponse(if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) capture_unavailable_x86 else removal_message, refused);
+}
+
 test "monitor refuses a request with an unknown field before it takes the guest" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -3586,7 +3641,7 @@ test "monitor refuses a request with an unknown field before it takes the guest"
     try expectErrorResponse("bad control request", refused);
     server.mutex.lockUncancelable(io);
     defer server.mutex.unlock(io);
-    try std.testing.expectEqual(RequestState.idle, server.state);
+    try std.testing.expectEqual(Op.idle, server.op);
 }
 
 test "monitor gives a slow client one deadline for its whole request line" {
