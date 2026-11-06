@@ -47,9 +47,11 @@ Saved-spore pins are `spore.saved-disk-pin.v3`: the pin id, the disk storage
 it roots and, until the save is durable, its pending publication. A pin no
 longer records the manifest hash, so editing a pinned save's manifest no longer
 stops it restoring. Pin records from earlier builds (v1 and v2) fail as too
-old, root nothing, and `cache gc` deletes them as `saved-spore-stale-pin`
-entries; as with manifests, saves from earlier builds must be re-created.
-Before, GC kept v1 pins and their storage even after the save was removed.
+old, root nothing, `cache pins` lists them as `stale`, and `cache gc` deletes
+them as `saved-spore-stale-pin` entries. A save still holding an earlier
+build's pin reference fails as too old even after GC, so as with manifests,
+saves from earlier builds must be re-created. Before, GC kept v1 pins and their
+storage even after the save was removed.
 
 ### One ext4 writer
 

@@ -14,7 +14,10 @@ pub const schema = "spore.saved-disk-pin.v3";
 /// Pins written by earlier builds. Their saves no longer restore, so GC
 /// deletes them.
 const old_schemas = [_][]const u8{ "spore.saved-disk-pin.v1", "spore.saved-disk-pin.v2" };
-pub const reference_schema = "spore.saved-disk-pin-ref.v2";
+pub const reference_schema = "spore.saved-disk-pin-ref.v3";
+/// A save keeps its reference after GC deletes the old record it named, so
+/// the reference alone shows that the save is too old.
+const old_reference_schemas = [_][]const u8{ "spore.saved-disk-pin-ref.v1", "spore.saved-disk-pin-ref.v2" };
 pub const dir_name = "pins";
 pub const reference_file = "sporevm-disk-pin.json";
 pub const owner_suffix = ".owner";
@@ -59,7 +62,7 @@ pub const Reference = struct {
     }
 };
 
-pub const ListingState = enum { index_valid, corrupt, missing };
+pub const ListingState = enum { index_valid, corrupt, missing, stale };
 pub const Listing = struct { id: []const u8, state: ListingState, owner_state: OwnerState = .invalid, index_digest: ?[]const u8 = null };
 pub const ListStats = struct { index_validation_count: usize = 0 };
 
@@ -175,6 +178,7 @@ pub fn listWithStats(io: Io, allocator: std.mem.Allocator, cache_root: []const u
                 listing.index_digest = try allocator.dupe(u8, parsed.value.storage.index_digest);
             } else |err| switch (err) {
                 error.FileNotFound => listing.state = .missing,
+                error.FormatTooOld => listing.state = .stale,
                 else => {},
             }
         }
@@ -402,6 +406,7 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
     defer allocator.free(ref_bytes);
     var ref = std.json.parseFromSlice(Reference, allocator, ref_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadManifest;
     defer ref.deinit();
+    if (isOneOf(&old_reference_schemas, ref.value.schema)) return error.FormatTooOld;
     try ref.value.validate();
     var record = try loadRecord(io, allocator, registry.cache_root, ref.value.id);
     errdefer record.deinit();
@@ -611,9 +616,7 @@ pub fn loadRecord(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, 
 fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8, id: []const u8) !std.json.Parsed(Record) {
     const SchemaProbe = struct { schema: []const u8 };
     const probe = std.json.parseFromSlice(SchemaProbe, allocator, bytes, .{ .ignore_unknown_fields = true }) catch return error.BadManifest;
-    const too_old = for (old_schemas) |old| {
-        if (std.mem.eql(u8, probe.value.schema, old)) break true;
-    } else false;
+    const too_old = isOneOf(&old_schemas, probe.value.schema);
     probe.deinit();
     if (too_old) return error.FormatTooOld;
     var parsed = std.json.parseFromSlice(Record, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadManifest;
@@ -687,6 +690,11 @@ pub fn validOwnerName(name: []const u8) bool {
     return name.len == id_bytes * 2 + owner_suffix.len and
         std.mem.endsWith(u8, name, owner_suffix) and
         validId(name[0 .. id_bytes * 2]);
+}
+
+fn isOneOf(values: []const []const u8, value: []const u8) bool {
+    for (values) |candidate| if (std.mem.eql(u8, candidate, value)) return true;
+    return false;
 }
 
 fn encodeRecord(allocator: std.mem.Allocator, record: Record) ![]u8 {

@@ -55,7 +55,8 @@ pin, index, and object shape; lazy restore and pack keep content verification at
 their existing boundaries. Unknown or corrupt pin records make GC and
 destructive prune retain all CAS. A pin record from an earlier build (v1 or
 v2) fails as too old, roots nothing, and GC deletes it: its save no longer
-restores. Pin
+restores, and the save's earlier-build reference keeps failing as too old
+after GC. Pin
 references are hard-linked to one cache-side ownership anchor: the anchor and
 artifact must be the only two links. Ordinary copies have the wrong inode,
 hard-link duplicates raise the link count, and both fail closed before restore

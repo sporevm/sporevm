@@ -1703,7 +1703,10 @@ fn packDiskIndexForManifest(
         var cache_lock = rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache_root) catch return error.BadManifest;
         defer cache_lock.deinit();
         const registry = saved_spore_pin.LockedRegistry.init(allocator, cache_root, &cache_lock) catch return error.BadManifest;
-        var pin = saved_spore_pin.loadForSporeLocked(io, allocator, registry, source_dir, disk) catch return error.BadManifest;
+        var pin = saved_spore_pin.loadForSporeLocked(io, allocator, registry, source_dir, disk) catch |err| return switch (err) {
+            error.FormatTooOld => error.FormatTooOld,
+            else => error.BadManifest,
+        };
         defer pin.deinit();
         active_lease = runtime_disk_lease.acquireActive(io, allocator, runtime_root, .{
             .store = .rootfs_cache,

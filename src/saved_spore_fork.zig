@@ -86,6 +86,58 @@ test "diskless offline fork failure leaves no visible batch" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, children, .{ .follow_symlinks = false }));
 }
 
+test "a save pinned by an earlier build fails as too old after GC" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache = try std.fs.path.join(arena, &.{ root, "cache" });
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const save = try std.fs.path.join(arena, &.{ root, "save.spore" });
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache, save, 0x5a, false);
+    try spore.saveManifest(arena, save, fixture.manifest);
+    // An earlier build's pin: a v2 record and a v2 reference that is the
+    // second link of its ownership anchor.
+    const id = "c" ** 64;
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ cache, saved_spore_pin.dir_name }));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try saved_spore_pin.recordPath(arena, cache, id), .data = try std.json.Stringify.valueAlloc(arena, .{
+        .schema = "spore.saved-disk-pin.v2",
+        .id = id,
+        .manifest_sha256 = "e" ** 64,
+        .storage = fixture.storage,
+    }, .{}) });
+    const owner = try saved_spore_pin.ownerPath(arena, cache, id);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = owner, .data = "{\"schema\":\"spore.saved-disk-pin-ref.v2\",\"id\":\"" ++ id ++ "\"}" });
+    try std.Io.Dir.cwd().hardLink(owner, std.Io.Dir.cwd(), try std.fs.path.join(arena, &.{ save, saved_spore_pin.reference_file }), io, .{});
+
+    const listed = try saved_spore_pin.list(io, arena, cache);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqual(saved_spore_pin.ListingState.stale, listed[0].state);
+    const gc_result = try system.gc(allocator, io, .{ .cache_root = cache, .runtime_root = runtime_root, .dry_run = false });
+    system.deinitRootfsGcResult(allocator, gc_result);
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, arena, cache, id));
+
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache, &lock);
+        try std.testing.expectError(error.FormatTooOld, saved_spore_pin.loadForSporeLocked(io, arena, registry, save, fixture.disk));
+    }
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache);
+    try env.put(local_paths.runtime_dir_env, runtime_root);
+    try std.testing.expectError(error.FormatTooOld, execute(.{ .io = io, .environ_map = &env }, allocator, .{
+        .parent_dir = save,
+        .out_dir = try std.fs.path.join(arena, &.{ root, "children" }),
+        .count = 1,
+    }));
+}
+
 pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options) !Result {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();

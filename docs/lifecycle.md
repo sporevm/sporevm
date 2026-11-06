@@ -356,7 +356,8 @@ while either exists. A plain `cp -r` copy never owned the pin and cannot
 restore; use `spore clone` for an independent copy.
 
 `spore cache pins` reports `index_valid` only after validating the record and
-canonical index. It deliberately does not stat or hash every object; lazy reads
+canonical index, and `stale` for a record from an earlier build that
+`spore cache gc --force` deletes. It deliberately does not stat or hash every object; lazy reads
 and `spore pack` still verify object bytes and may fail closed on missing or
 corrupt content. Inspect and save output name the ownership class.
 The hard-link anchor supplies local proof without a global save-path registry.
