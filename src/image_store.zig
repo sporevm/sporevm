@@ -814,15 +814,18 @@ pub const Client = struct {
             headers.host = .{ .override = s3.host };
             headers.authorization = .{ .override = signed.authorization() };
         }
-        var request = try self.http.request(.GET, uri, .{
+        // The user named the store, so loopback and private addresses are
+        // fine. Connecting to the resolved address keeps IPv6-literal hosts
+        // such as `[::1]` working; `std.http.Client.request` rejects them.
+        const addresses = try host_fetch_policy.resolveUriAddresses(self.io, uri, .{ .allow_private = true });
+        var request: std.http.Client.Request = undefined;
+        var no_redirects: [0]u8 = undefined;
+        var response = try host_fetch_policy.getHead(&self.http, uri, addresses.slice(), .{
             .redirect_behavior = .unhandled,
             .headers = headers,
             .extra_headers = extra_headers,
-        });
+        }, &request, &no_redirects);
         defer request.deinit();
-        try request.sendBodiless();
-        var no_redirects: [0]u8 = undefined;
-        var response = try request.receiveHead(&no_redirects);
         switch (response.head.status) {
             .ok => {},
             .not_found => return error.ImageStoreNotFound,
@@ -1652,12 +1655,12 @@ test "a store image resolves into an empty cache with only its metadata" {
     try std.testing.expectError(error.ImageStoreNotFound, resolve(io, allocator, missing_cache, try std.fmt.allocPrint(allocator, "{s}/2", .{store}), platform, &fixture.env));
 }
 
-/// Test support: serves files from `root` over HTTP/1.1 on loopback, each
-/// connection on its own thread. `failures` answers that many requests with
-/// 500 first; `hang` holds every request open until `deinit`; `delay_ms`
-/// delays every answer, reading the file after the delay; requests for
-/// `held` wait until `releaseHeld`; with `s3` set, a request without a valid
-/// SigV4 signature by those credentials gets 403, as S3 answers.
+/// Test support: serves files from `root` over HTTP/1.1 on loopback address
+/// `ip`, each connection on its own thread. `failures` answers that many
+/// requests with 500 first; `hang` holds every request open until `deinit`;
+/// `delay_ms` delays every answer, reading the file after the delay; requests
+/// for `held` wait until `releaseHeld`; with `s3` set, a request without a
+/// valid SigV4 signature by those credentials gets 403, as S3 answers.
 pub const TestServer = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -1682,8 +1685,8 @@ pub const TestServer = struct {
     /// Requests that carried the secret key anywhere in their head.
     leaked: std.atomic.Value(u32) = .init(0),
 
-    pub fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
-        var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    pub fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8, ip: []const u8) !void {
+        var address = try Io.net.IpAddress.parse(ip, 0);
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -1710,7 +1713,7 @@ pub const TestServer = struct {
     }
 
     pub fn url(self: *TestServer, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+        return std.fmt.allocPrint(allocator, "http://{f}", .{self.server.socket.address});
     }
 
     fn serve(self: *TestServer) void {
@@ -1836,7 +1839,7 @@ test "HTTP store reads retry transient failures and fail closed on the rest" {
     const tag = try Io.Dir.cwd().readFileAlloc(io, tag_path, allocator, .limited(tag_file_len + 1));
 
     var server: TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
+    try server.start(std.testing.allocator, io, store, "127.0.0.1");
     defer server.stop();
     var client = try Client.init(std.testing.allocator, io, try server.url(allocator), &fixture.env);
     defer client.deinit();
@@ -1865,6 +1868,30 @@ test "HTTP store reads retry transient failures and fail closed on the rest" {
     try std.testing.expect(monotonicMs() - start_ms < 2_000);
 }
 
+test "HTTP stores at loopback IP literals resolve images" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+
+    for ([_][]const u8{ "127.0.0.1", "::1" }, 0..) |ip, i| {
+        var server: TestServer = undefined;
+        server.start(std.testing.allocator, io, store, ip) catch |err| switch (err) {
+            // The host has no IPv6 loopback.
+            error.AddressUnavailable, error.AddressFamilyUnsupported => continue,
+            else => return err,
+        };
+        defer server.stop();
+        const cache = try fixture.path(try std.fmt.allocPrint(allocator, "cache-{d}", .{i}));
+        const ref = try std.fmt.allocPrint(allocator, "{s}/1", .{try server.url(allocator)});
+        const local = try resolve(io, allocator, cache, ref, .{}, &fixture.env);
+        try std.testing.expectEqualStrings(fixture.identity, local.identity);
+    }
+}
+
 test "S3 store reads are signed with the environment's credentials, which only the signature carries" {
     var fixture: TestImage = undefined;
     try fixture.init(.{});
@@ -1886,7 +1913,7 @@ test "S3 store reads are signed with the environment's credentials, which only t
     try env.put("AWS_REGION", "eu-west-2");
 
     var server: TestServer = undefined;
-    try server.start(std.testing.allocator, io, bucket);
+    try server.start(std.testing.allocator, io, bucket, "127.0.0.1");
     defer server.stop();
     server.s3 = .{ .credentials = .{ .access_key_id = "AKIDEXAMPLE", .secret_access_key = secret, .session_token = token }, .region = "eu-west-2" };
     const endpoint = try server.url(allocator);
@@ -1979,7 +2006,7 @@ test "a guest read fetches its window with it, with one GET per object" {
     const read, const next, const after = .{ objects[0], objects[1], objects[2] };
 
     var server: TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
+    try server.start(std.testing.allocator, io, store, "127.0.0.1");
     defer server.stop();
     // Every GET is slow, so the window's two requests for `next` overlap.
     server.delay_ms.store(100, .monotonic);
@@ -2031,7 +2058,7 @@ test "a guest read returns before its window, which finishes into the cache" {
     const read, const next = .{ objects[0], objects[1] };
 
     var server: TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
+    try server.start(std.testing.allocator, io, store, "127.0.0.1");
     defer server.stop();
     server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
     const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage, &fixture.env);
@@ -2068,7 +2095,7 @@ test "releasing a fetcher cancels a window fetch the store never answers" {
     const read, const next = .{ objects[0], objects[1] };
 
     var server: TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
+    try server.start(std.testing.allocator, io, store, "127.0.0.1");
     defer server.stop();
     server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
     const fetcher = try Fetcher.create(std.testing.allocator, io, try fixture.path("cache"), try server.url(allocator), local.storage, &fixture.env);
@@ -2096,7 +2123,7 @@ test "a read that shares a request that could not install its object fetches it 
     const read, const next = .{ objects[0], objects[1] };
 
     var server: TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
+    try server.start(std.testing.allocator, io, store, "127.0.0.1");
     defer server.stop();
     server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{next.digest[digest_prefix.len..]});
     // Nothing can be installed into this cache.

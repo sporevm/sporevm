@@ -642,7 +642,7 @@ test "a cache gc during a pull keeps what the pull fetched" {
 
     // The store holds back the changed disk object until the GC has run.
     var server: image_store.TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
+    try server.start(std.testing.allocator, io, store, "127.0.0.1");
     defer server.stop();
     const changed_hex = std.fs.path.basename(saved.disk_object)[0..chunk.ChunkId.hex_len];
     server.held = try std.fmt.allocPrint(allocator, "/objects/blake3/{s}", .{changed_hex});
@@ -706,7 +706,7 @@ test "spore checkpoint pull over HTTP fetches a spore without a rootfs and refus
     try spore.saveManifest(allocator, saved.dir, parsed.value);
     _ = try testPush(&fixture, saved.dir, try std.fmt.allocPrint(allocator, "{s}/ram", .{store}), "aws");
     var server: image_store.TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
+    try server.start(std.testing.allocator, io, store, "127.0.0.1");
     defer server.stop();
     const base = try server.url(allocator);
     const env = try testEnv(&fixture, "consumer");
