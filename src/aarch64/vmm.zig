@@ -1147,6 +1147,9 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         /// GIC and CPU_ON requests from other vCPUs and interrupts for an
         /// idle HVF vCPU only kick, which does not end the wait.
         const vcpu_wait_ms = 1;
+        /// How long a capture lets the guest run on for every vCPU to leave
+        /// its interrupt handler before it gives up.
+        const capture_settle_ms = 1000;
 
         const Result = union(enum) { exit: ExitCause, err: anyerror };
 
@@ -1312,6 +1315,24 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         fn pauseAll(self: *Self, action: Action) !void {
             try self.pauseFor(.none);
             if (action != .none) try self.pauseFor(action);
+            if (action == .capture) try self.settleInterrupts();
+        }
+
+        /// Captures again, letting the guest run in between, until no vCPU
+        /// stopped inside an interrupt handler. Hypervisor.framework does
+        /// not restore an interrupt the guest acknowledged but has not
+        /// completed: the restored guest's EOI aborts the process with
+        /// "Handle no active virtual interrupt". KVM would restore it, but
+        /// both backends save by the same rule.
+        fn settleInterrupts(self: *Self) !void {
+            const give_up_ms = deadline.system_clock.nowMs() + capture_settle_ms;
+            while (anyInInterruptHandler(self.states)) {
+                if (deadline.system_clock.nowMs() >= give_up_ms) return error.InterruptStillActive;
+                self.resumeAll();
+                try self.waitMain(self.events.load(.acquire));
+                try self.pauseFor(.none);
+                try self.pauseFor(.capture);
+            }
         }
 
         fn pauseFor(self: *Self, action: Action) !void {
@@ -1571,6 +1592,18 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             try captureDiskFork(allocator, Vm.name, self.vm, self.states, self.dirty_tracker, source, fork, control, pause_started_ns);
         }
     };
+}
+
+/// Whether any captured vCPU stopped between acknowledging an interrupt and
+/// completing it: its CPU interface still holds an active priority.
+fn anyInInterruptHandler(states: []const Captured) bool {
+    for (states) |captured| {
+        for (captured.state.icc_regs) |reg| {
+            const active_priority = std.mem.eql(u8, reg.name, "ap0r0_el1") or std.mem.eql(u8, reg.name, "ap1r0_el1");
+            if (active_priority and reg.value != 0) return true;
+        }
+    }
+    return false;
 }
 
 /// A vCPU state its own thread captured, in the shape `writeSnapshot` reads
@@ -2182,6 +2215,11 @@ const ThreadTestVcpu = struct {
     on_owner: bool = true,
     applied: ?spore.VcpuState = null,
     kicks: std.atomic.Value(u32) = .init(0),
+    /// Guest runs left before this vCPU completes the interrupt it is
+    /// handling; until then its CPU interface holds an active priority.
+    handler_runs: std.atomic.Value(u32) = .init(0),
+
+    var in_handler_icc = [_]spore.SysRegEntry{.{ .name = "ap1r0_el1", .value = 0x10_0000 }};
 
     pub fn threadStart(self: *ThreadTestVcpu) !void {
         self.owner = std.Thread.getCurrentId();
@@ -2194,6 +2232,7 @@ const ThreadTestVcpu = struct {
     }
 
     pub fn run(self: *ThreadTestVcpu, vm: *const ThreadTestVm, _: []ThreadTestVcpu) !Exit {
+        if (self.handler_runs.load(.acquire) > 0) _ = self.handler_runs.fetchSub(1, .acq_rel);
         if (self.index == 1 and vm.shutdown.load(.acquire)) return .{ .shutdown = .off };
         return .wfi;
     }
@@ -2202,7 +2241,9 @@ const ThreadTestVcpu = struct {
 
     pub fn capture(self: *ThreadTestVcpu, _: *const ThreadTestVm, _: std.mem.Allocator) !spore.VcpuState {
         self.checkOwner();
-        return self.live;
+        var state = self.live;
+        if (self.handler_runs.load(.acquire) > 0) state.icc_regs = &in_handler_icc;
+        return state;
     }
 
     pub fn apply(self: *ThreadTestVcpu, _: *const ThreadTestVm, state: spore.VcpuState) !void {
@@ -2263,6 +2304,34 @@ test "threaded vCPUs restore and capture themselves on their own threads" {
         .ram_bytes = &.{},
         .ram_size = 0,
     }));
+}
+
+test "a threaded capture lets a vCPU finish the interrupt it is handling" {
+    const allocator = std.testing.allocator;
+    var config = testBoot(.{ .vcpus = 2 });
+    var devices: Devices = undefined;
+    devices.init(&config, null);
+    defer devices.net.shutdown();
+    var vm = ThreadTestVm{};
+    var vcpus = [_]ThreadTestVcpu{
+        .{ .index = 0, .live = testVcpuState(0, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 530 }), .handler_runs = .init(3) },
+        .{ .index = 1, .live = testVcpuState(1, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 540 }) },
+    };
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = .{ .bytes = &.{}, .base = board.ram_base },
+        .config = &config,
+    };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
+
+    // vCPU 0 stopped mid-handler; the capture resumes the guest until it
+    // completes the interrupt, then keeps that later state.
+    try threaded.pauseAll(.capture);
+    try std.testing.expectEqual(@as(u32, 0), vcpus[0].handler_runs.load(.acquire));
+    for (threaded.states) |captured| try std.testing.expectEqual(@as(usize, 0), captured.state.icc_regs.len);
 }
 
 /// Attaches a host stream when asked to, as a monitor does to start an exec,
