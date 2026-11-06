@@ -1567,16 +1567,8 @@ fn saveStopNamed(
             manifest.value.annotations = try spore.mergeAnnotations(arena, manifest.value.annotations, options.annotations);
         }
         manifest.value.exec_defaults = suspend_spec.exec_defaults;
-        if (manifest.value.disk) |disk| {
-            const bytes = try spore.encodeManifestAlloc(arena, manifest.value);
-            const cache_root = try local_paths.rootfsCacheRootPath(arena, context.environ_map);
-            var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
-            defer cache_lock.deinit();
-            const registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &cache_lock);
-            try saved_spore_pin.replaceAuthorizedManifest(context.io, arena, registry, out_dir, disk, bytes);
-        } else {
-            try spore.saveManifest(arena, out_dir, manifest.value);
-        }
+        const bytes = try spore.encodeManifestAlloc(arena, manifest.value);
+        try chunk_sealer.replaceFileAtomicDurable(arena, try std.fs.path.join(arena, &.{ out_dir, "manifest.json" }), bytes, 0o644);
         suspend_spec.annotations = manifest.value.annotations;
     }
     if (manifest.value.disk) |disk| {

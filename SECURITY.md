@@ -43,8 +43,8 @@ Every path that parses attacker-influenced data is enumerated here and carries
 fuzz targets from the slice that introduces it:
 
 Saved-spore durable pin records are host-private, strict versioned JSON bounded
-to 64KiB and fuzzed. A pin binds the staged manifest hash and exact validated
-disk storage descriptor. Publication is serialized with GC/prune: objects and
+to 64KiB and fuzzed. A pin binds the exact validated disk storage descriptor,
+not the manifest bytes. Publication is serialized with GC/prune: objects and
 the canonical index are durable before the derived completeness stamp, the
 stamp is durable before the pin, and the pin is durable before final save
 publication. A continuing named monitor acquires the exact new active lease,
@@ -53,8 +53,10 @@ lease; a failed handoff leaves the old spec and lease intact. Restore and pack
 fail closed on missing or mismatched
 pin, index, and object shape; lazy restore and pack keep content verification at
 their existing boundaries. Unknown or corrupt pin records make GC and
-destructive prune retain all CAS. A v1 pin record fails as too old, roots
-nothing, and GC deletes it: its save's manifest no longer loads. Pin
+destructive prune retain all CAS. A pin record from an earlier build (v1 or
+v2) fails as too old, roots nothing, and GC deletes it: its save no longer
+restores, and the save's earlier-build reference keeps failing as too old
+after GC. Pin
 references are hard-linked to one cache-side ownership anchor: the anchor and
 artifact must be the only two links. Ordinary copies have the wrong inode,
 hard-link duplicates raise the link count, and both fail closed before restore

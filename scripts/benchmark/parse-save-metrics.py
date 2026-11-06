@@ -12,7 +12,7 @@ SNAPSHOT_PREFIXES = {"kvm": "kvm snapshot metrics: ", "hvf": "hvf snapshot metri
 SNAPSHOT_FIELDS = ("machine_ms", "devices_ms", "generation_ms", "memory_ms", "disk_ms", "manifest_ms", "snapshot_total_ms")
 NAMED_PREFIXES = {"kvm": "kvm named snapshot publication metrics: ", "hvf": "hvf named snapshot publication metrics: "}
 NAMED_FIELDS = (
-    "cache_lock_wait_ms", "manifest_pin_authorization_ms", "active_lease_handoff_ms",
+    "cache_lock_wait_ms", "manifest_write_ms", "active_lease_handoff_ms",
     "lifecycle_spec_ms", "final_publication_ms", "source_pause_ms",
 )
 
@@ -81,7 +81,7 @@ def parse_named_publication_metric(line: str) -> dict[str, int | str]:
             raise ValueError(f"invalid named publication metric field: {key}")
         result[key] = int(value)
     publication_sum = sum(int(result[key]) for key in (
-        "manifest_pin_authorization_ms", "active_lease_handoff_ms",
+        "manifest_write_ms", "active_lease_handoff_ms",
         "lifecycle_spec_ms", "final_publication_ms",
     ))
     if result["source_pause_ms"] < publication_sum:
@@ -100,11 +100,11 @@ def self_test() -> None:
                         "disk_ms": 5, "manifest_ms": 6, "snapshot_total_ms": 21}
     named = parse_named_publication_metric(
         "info: hvf named snapshot publication metrics: cache_lock_wait_ms=1 "
-        "manifest_pin_authorization_ms=2 active_lease_handoff_ms=3 lifecycle_spec_ms=4 "
+        "manifest_write_ms=2 active_lease_handoff_ms=3 lifecycle_spec_ms=4 "
         "final_publication_ms=5 source_pause_ms=15"
     )
     assert named == {"schema": 1, "backend": "hvf", "cache_lock_wait_ms": 1,
-                     "manifest_pin_authorization_ms": 2, "active_lease_handoff_ms": 3,
+                     "manifest_write_ms": 2, "active_lease_handoff_ms": 3,
                      "lifecycle_spec_ms": 4, "final_publication_ms": 5,
                      "source_pause_ms": 15}
 

@@ -10,13 +10,18 @@ const spore = @import("spore.zig");
 const test_barrier = @import("test_barrier.zig");
 
 const Io = std.Io;
-pub const schema = "spore.saved-disk-pin.v2";
-pub const reference_schema = "spore.saved-disk-pin-ref.v2";
+pub const schema = "spore.saved-disk-pin.v3";
+/// Pins written by earlier builds. Their saves no longer restore, so GC
+/// deletes them.
+const old_schemas = [_][]const u8{ "spore.saved-disk-pin.v1", "spore.saved-disk-pin.v2" };
+pub const reference_schema = "spore.saved-disk-pin-ref.v3";
+/// A save keeps its reference after GC deletes the old record it named, so
+/// the reference alone shows that the save is too old.
+const old_reference_schemas = [_][]const u8{ "spore.saved-disk-pin-ref.v1", "spore.saved-disk-pin-ref.v2" };
 pub const dir_name = "pins";
 pub const reference_file = "sporevm-disk-pin.json";
 pub const owner_suffix = ".owner";
 pub const max_record_bytes = 64 * 1024;
-pub const max_manifest_bytes = spore.max_manifest_bytes;
 pub const id_bytes = 32;
 
 pub const PendingPublication = struct {
@@ -37,15 +42,13 @@ pub const PendingPublication = struct {
 pub const Record = struct {
     schema: []const u8,
     id: []const u8,
-    manifest_sha256: []const u8,
-    pending_manifest_sha256: ?[]const u8 = null,
-    pending_publication: ?PendingPublication = null,
     storage: spore.RootfsStorage,
+    /// Set until the save holding the reference is durably visible.
+    pending: ?PendingPublication = null,
 
     pub fn validate(self: Record) !void {
-        if (!std.mem.eql(u8, self.schema, schema) or !validId(self.id) or !validId(self.manifest_sha256)) return error.BadManifest;
-        if (self.pending_manifest_sha256) |digest| if (!validId(digest)) return error.BadManifest;
-        if (self.pending_publication) |pending| try pending.validate();
+        if (!std.mem.eql(u8, self.schema, schema) or !validId(self.id)) return error.BadManifest;
+        if (self.pending) |pending| try pending.validate();
         try spore.validateRootfsStorageDescriptor(self.storage);
     }
 };
@@ -59,7 +62,7 @@ pub const Reference = struct {
     }
 };
 
-pub const ListingState = enum { index_valid, corrupt, missing };
+pub const ListingState = enum { index_valid, corrupt, missing, stale };
 pub const Listing = struct { id: []const u8, state: ListingState, owner_state: OwnerState = .invalid, index_digest: ?[]const u8 = null };
 pub const ListStats = struct { index_validation_count: usize = 0 };
 
@@ -81,6 +84,21 @@ pub const testing = if (builtin.is_test) struct {
     pub var publish_fault: PublishTestFault = .{};
     pub var remove_mutation_barrier: ?*test_barrier.Barrier = null;
     pub var publish_authority_barrier: ?*test_barrier.Barrier = null;
+
+    /// Pins an existing save directory as a committed save would be.
+    pub fn pinSave(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk) ![]const u8 {
+        const storage = try storageForDisk(disk);
+        try validateRoot(allocator, registry.cache_root, storage);
+        const dir = try Io.Dir.cwd().realPathFileAlloc(io, spore_dir, allocator);
+        defer allocator.free(dir);
+        const reference_path = try std.fs.path.join(allocator, &.{ dir, reference_file });
+        defer allocator.free(reference_path);
+        const id = try acquire(io, allocator, registry, storage, .{ .spore_dir = dir, .reference_path = reference_path });
+        errdefer allocator.free(id);
+        try syncRegistry(allocator, registry);
+        try clearPendingPublication(io, allocator, registry, id);
+        return id;
+    }
 } else struct {};
 
 fn crashAfterPublishBoundary(boundary: PublishCrashBoundary) void {
@@ -160,6 +178,7 @@ pub fn listWithStats(io: Io, allocator: std.mem.Allocator, cache_root: []const u
                 listing.index_digest = try allocator.dupe(u8, parsed.value.storage.index_digest);
             } else |err| switch (err) {
                 error.FileNotFound => listing.state = .missing,
+                error.FormatTooOld => listing.state = .stale,
                 else => {},
             }
         }
@@ -271,12 +290,11 @@ pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedReg
     // From this point a failed publication leaves recovery material in the
     // stage directory. The preflight above cleans its empty stage on refusal.
     cleanup_stage = false;
-    try spore.saveManifest(allocator, stage, manifest);
+    const manifest_bytes = try spore.encodeManifestAlloc(allocator, manifest);
+    defer allocator.free(manifest_bytes);
+    if (manifest_bytes.len > spore.max_manifest_bytes) return error.StreamTooLong;
     const staged_manifest = try std.fs.path.join(allocator, &.{ stage, "manifest.json" });
     defer allocator.free(staged_manifest);
-    const manifest_bytes = try Io.Dir.cwd().readFileAlloc(io, staged_manifest, allocator, .limited(max_manifest_bytes + 1));
-    defer allocator.free(manifest_bytes);
-    if (manifest_bytes.len > max_manifest_bytes) return error.StreamTooLong;
     try chunk_sealer.replaceFileAtomicDurable(allocator, staged_manifest, manifest_bytes, 0o644);
     crashAfterPublishBoundary(.staged_manifest);
     const storage = try storageForDisk(disk);
@@ -289,11 +307,12 @@ pub fn publishManifest(io: Io, allocator: std.mem.Allocator, registry: LockedReg
     if (comptime builtin.is_test) if (testing.publish_fault.fail_before_complete_stamp) return error.InjectedFailure;
     try rootfs_cas.markStorageComplete(io, allocator, registry.cache_root, storage.index_digest);
     crashAfterPublishBoundary(.complete_stamp);
-    const id = try createPendingValidated(io, allocator, registry, stage, spore_dir, disk, storage);
-    defer allocator.free(id);
-    crashAfterPublishBoundary(.pin_record);
     const staged_ref = try std.fs.path.join(allocator, &.{ stage, reference_file });
     defer allocator.free(staged_ref);
+    const id = try acquire(io, allocator, registry, storage, .{ .spore_dir = spore_dir, .reference_path = staged_ref });
+    defer allocator.free(id);
+    try syncRegistry(allocator, registry);
+    crashAfterPublishBoundary(.pin_record);
     try Io.Dir.renameAbsolute(staged_ref, final_ref, io);
     crashAfterPublishBoundary(.reference_rename);
     try Io.Dir.renameAbsolute(staged_manifest, final_manifest, io);
@@ -312,78 +331,46 @@ fn requireAbsent(io: Io, path: []const u8) !void {
     return error.SavedSporeOwnershipConflict;
 }
 
-/// The caller holds the rootfs cache lock. The manifest and every CAS value
-/// it names must already be durable; the final save path is not visible yet.
-pub fn create(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk) ![]const u8 {
-    const storage = try storageForDisk(disk);
-    try validateRoot(allocator, registry.cache_root, storage);
-    return createValidated(io, allocator, registry, spore_dir, disk, storage);
-}
-
-/// Publish a pin after the caller validated this exact storage descriptor and
-/// canonical index under the same cache lock. Batch fork uses this to avoid N
-/// repeated index parses while minting child-manifest bindings.
-pub fn createValidated(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk, storage: spore.RootfsStorage) ![]const u8 {
-    return createValidatedInternal(io, allocator, registry, spore_dir, disk, storage, null);
-}
-
-fn createPendingValidated(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, staged_spore_dir: []const u8, final_spore_dir: []const u8, disk: spore.Disk, storage: spore.RootfsStorage) ![]const u8 {
-    const reference_path = try std.fs.path.join(allocator, &.{ staged_spore_dir, reference_file });
-    defer allocator.free(reference_path);
-    return createValidatedInternal(io, allocator, registry, staged_spore_dir, disk, storage, .{
-        .spore_dir = final_spore_dir,
-        .reference_path = reference_path,
-    });
-}
-
-fn createValidatedInternal(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk, storage: spore.RootfsStorage, pending: ?PendingPublication) ![]const u8 {
-    if (!spore.rootfsStorageEql(storage, try storageForDisk(disk))) return error.BadManifest;
-    const manifest_path = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
-    defer allocator.free(manifest_path);
-    const manifest_sha256 = try sha256File(io, allocator, manifest_path);
-    defer allocator.free(manifest_sha256);
-    var attempt: usize = 0;
-    while (attempt < 16) : (attempt += 1) {
-        var random: [id_bytes]u8 = undefined;
-        io.random(&random);
-        const id_array = std.fmt.bytesToHex(random, .lower);
-        const id = try allocator.dupe(u8, &id_array);
-        if (createWithId(allocator, registry, spore_dir, storage, manifest_sha256, id, pending)) |_| return id else |err| {
-            allocator.free(id);
-            if (err != error.PathAlreadyExists) return err;
-        }
-    }
-    return error.PathAlreadyExists;
-}
-
-pub const PreparedPin = struct {
-    id: []const u8,
-    manifest_sha256: []const u8,
-    spore_dir: []const u8,
-    final_spore_dir: []const u8,
-};
-
-/// Prepare a hidden child's manifest binding without holding the cache lock.
-/// The owner anchor and reference are published together under the lock.
-pub fn prepareValidatedReference(io: Io, allocator: std.mem.Allocator, spore_dir: []const u8, final_spore_dir: []const u8, disk: spore.Disk, storage: spore.RootfsStorage) !PreparedPin {
-    if (!spore.rootfsStorageEql(storage, try storageForDisk(disk))) return error.BadManifest;
-    const manifest_path = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
-    defer allocator.free(manifest_path);
-    const manifest_sha256 = try sha256File(io, allocator, manifest_path);
-    errdefer allocator.free(manifest_sha256);
+/// Creates a pending pin rooting `storage` and hard-links its reference at
+/// `pending.reference_path`, in a save that is not visible yet. The caller
+/// holds the cache lock and has validated the storage root. It calls
+/// `syncRegistry` before making the save visible and
+/// `clearPendingPublication` once the save is durable.
+pub fn acquire(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, storage: spore.RootfsStorage, pending: PendingPublication) ![]const u8 {
     var random: [id_bytes]u8 = undefined;
     io.random(&random);
     const id_array = std.fmt.bytesToHex(random, .lower);
     const id = try allocator.dupe(u8, &id_array);
     errdefer allocator.free(id);
-    const owned_spore_dir = try allocator.dupe(u8, spore_dir);
-    errdefer allocator.free(owned_spore_dir);
-    const owned_final_spore_dir = try allocator.dupe(u8, final_spore_dir);
-    return .{ .id = id, .manifest_sha256 = manifest_sha256, .spore_dir = owned_spore_dir, .final_spore_dir = owned_final_spore_dir };
+    const record_json = try encodeRecord(allocator, .{ .schema = schema, .id = id, .storage = storage, .pending = pending });
+    defer allocator.free(record_json);
+    try ensureRegistryDurable(allocator, registry);
+    const record_path = try recordPath(allocator, registry.cache_root, id);
+    defer allocator.free(record_path);
+    try createFileExclusiveDurable(allocator, record_path, record_json, 0o600);
+    errdefer unlinkPath(allocator, record_path);
+    const owner_path = try ownerPath(allocator, registry.cache_root, id);
+    defer allocator.free(owner_path);
+    const ref_json = try std.json.Stringify.valueAlloc(allocator, Reference{ .schema = reference_schema, .id = id }, .{ .whitespace = .indent_2 });
+    defer allocator.free(ref_json);
+    try createFileExclusiveDurable(allocator, owner_path, ref_json, 0o600);
+    errdefer unlinkPath(allocator, owner_path);
+    hardLink(allocator, owner_path, pending.reference_path) catch |err| return switch (err) {
+        error.PathAlreadyExists => error.SavedSporeOwnershipConflict,
+        else => |e| e,
+    };
+    try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(pending.reference_path).?);
+    return id;
 }
 
-/// Ensure the registry directory itself is durable. Call once before a batch.
-pub fn ensureRegistryDurable(allocator: std.mem.Allocator, registry: LockedRegistry) !void {
+/// Makes the records created by `acquire` durable. Call once per batch.
+pub fn syncRegistry(allocator: std.mem.Allocator, registry: LockedRegistry) !void {
+    const pins_dir = try std.fs.path.join(allocator, &.{ registry.cache_root, dir_name });
+    defer allocator.free(pins_dir);
+    try chunk_sealer.fsyncDirPath(allocator, pins_dir);
+}
+
+fn ensureRegistryDurable(allocator: std.mem.Allocator, registry: LockedRegistry) !void {
     const pins_dir = try std.fs.path.join(allocator, &.{ registry.cache_root, dir_name });
     defer allocator.free(pins_dir);
     const pins_dir_z = try allocator.dupeZ(u8, pins_dir);
@@ -400,153 +387,18 @@ pub fn ensureRegistryDurable(allocator: std.mem.Allocator, registry: LockedRegis
     if (created_registry) try chunk_sealer.fsyncDirPath(allocator, registry.cache_root);
 }
 
-/// Publish one already-prepared record. The caller holds the cache lock and
-/// syncs the registry once after the complete batch.
-pub fn publishPreparedRecord(allocator: std.mem.Allocator, registry: LockedRegistry, storage: spore.RootfsStorage, prepared: PreparedPin) !void {
-    const pending_reference_path = try std.fs.path.join(allocator, &.{ prepared.spore_dir, reference_file });
-    defer allocator.free(pending_reference_path);
-    const record = Record{
-        .schema = schema,
-        .id = prepared.id,
-        .manifest_sha256 = prepared.manifest_sha256,
-        .pending_publication = .{
-            .spore_dir = prepared.final_spore_dir,
-            .reference_path = pending_reference_path,
-            .cleanup_root = std.fs.path.dirname(prepared.spore_dir) orelse return error.BadManifest,
-        },
-        .storage = storage,
-    };
-    try record.validate();
-    const record_path = try recordPath(allocator, registry.cache_root, prepared.id);
-    defer allocator.free(record_path);
-    const record_json = try std.json.Stringify.valueAlloc(allocator, record, .{ .whitespace = .indent_2 });
-    defer allocator.free(record_json);
-    try createFileExclusiveDurable(allocator, record_path, record_json, 0o600, false);
-    errdefer unlinkPath(allocator, record_path);
-    const owner_path = try ownerPath(allocator, registry.cache_root, prepared.id);
-    defer allocator.free(owner_path);
-    const ref_json = try std.json.Stringify.valueAlloc(allocator, Reference{ .schema = reference_schema, .id = prepared.id }, .{ .whitespace = .indent_2 });
-    defer allocator.free(ref_json);
-    try createFileExclusiveDurable(allocator, owner_path, ref_json, 0o600, false);
-    errdefer unlinkPath(allocator, owner_path);
-    const ref_path = try std.fs.path.join(allocator, &.{ prepared.spore_dir, reference_file });
-    defer allocator.free(ref_path);
-    hardLink(allocator, owner_path, ref_path) catch |err| return switch (err) {
-        error.PathAlreadyExists => error.SavedSporeOwnershipConflict,
-        else => |e| e,
-    };
-    try chunk_sealer.fsyncDirPath(allocator, prepared.spore_dir);
-}
-
-pub fn syncPreparedRecords(allocator: std.mem.Allocator, registry: LockedRegistry) !void {
-    const pins_dir = try std.fs.path.join(allocator, &.{ registry.cache_root, dir_name });
-    defer allocator.free(pins_dir);
-    try chunk_sealer.fsyncDirPath(allocator, pins_dir);
-}
-
 /// Mark a staged pin publication committed after the final artifact path and
 /// its parent-directory entry are durable.
 pub fn clearPendingPublication(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, id: []const u8) !void {
     var record = try loadRecord(io, allocator, registry.cache_root, id);
     defer record.deinit();
-    if (record.value.pending_publication == null) return;
-    const path = try recordPath(allocator, registry.cache_root, id);
-    defer allocator.free(path);
-    const json = try std.json.Stringify.valueAlloc(allocator, Record{
-        .schema = record.value.schema,
-        .id = record.value.id,
-        .manifest_sha256 = record.value.manifest_sha256,
-        .pending_manifest_sha256 = record.value.pending_manifest_sha256,
-        .storage = record.value.storage,
-    }, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    try replaceRecord(allocator, path, json);
+    if (record.value.pending == null) return;
+    record.value.pending = null;
+    try replaceRecord(allocator, registry, record.value);
 }
 
-fn createWithId(allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, storage: spore.RootfsStorage, manifest_sha256: []const u8, id: []const u8, pending: ?PendingPublication) !void {
-    try ensureRegistryDurable(allocator, registry);
-    const record_path = try recordPath(allocator, registry.cache_root, id);
-    defer allocator.free(record_path);
-    const record_json = try std.json.Stringify.valueAlloc(allocator, Record{
-        .schema = schema,
-        .id = id,
-        .manifest_sha256 = manifest_sha256,
-        .pending_publication = pending,
-        .storage = storage,
-    }, .{ .whitespace = .indent_2 });
-    defer allocator.free(record_json);
-    try createFileExclusiveDurable(allocator, record_path, record_json, 0o600, true);
-    errdefer unlinkPath(allocator, record_path);
-    const owner_path = try ownerPath(allocator, registry.cache_root, id);
-    defer allocator.free(owner_path);
-    const ref_json = try std.json.Stringify.valueAlloc(allocator, Reference{ .schema = reference_schema, .id = id }, .{ .whitespace = .indent_2 });
-    defer allocator.free(ref_json);
-    try createFileExclusiveDurable(allocator, owner_path, ref_json, 0o600, true);
-    errdefer unlinkPath(allocator, owner_path);
-    const ref_path = try std.fs.path.join(allocator, &.{ spore_dir, reference_file });
-    defer allocator.free(ref_path);
-    hardLink(allocator, owner_path, ref_path) catch |err| return switch (err) {
-        error.PathAlreadyExists => error.SavedSporeOwnershipConflict,
-        else => |e| e,
-    };
-    try chunk_sealer.fsyncDirPath(allocator, spore_dir);
-}
-
-fn authorizeManifestBytes(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk, manifest_bytes: []const u8) !void {
-    // Establish existing authority before mutating anything. This rejects a
-    // copied/dangling reference, a changed disk descriptor, and a manifest
-    // whose current bytes are not already authorized by this exact pin.
-    var authority = try loadForSporeLocked(io, allocator, registry, spore_dir, disk);
-    defer authority.deinit();
-    const manifest_path = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
-    defer allocator.free(manifest_path);
-    const current_digest = try sha256File(io, allocator, manifest_path);
-    defer allocator.free(current_digest);
-    const next_digest = try sha256Bytes(allocator, manifest_bytes);
-    defer allocator.free(next_digest);
-    const path = try recordPath(allocator, registry.cache_root, authority.value.id);
-    defer allocator.free(path);
-    const json = try std.json.Stringify.valueAlloc(allocator, Record{ .schema = authority.value.schema, .id = authority.value.id, .manifest_sha256 = current_digest, .pending_manifest_sha256 = next_digest, .storage = authority.value.storage }, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    try replaceRecord(allocator, path, json);
-}
-
-/// Atomically replace an already-pinned manifest after first extending its pin
-/// authorization to cover both the old and new durable bytes. The caller holds
-/// the rootfs cache lock for the full operation.
-pub fn replaceAuthorizedManifest(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk, manifest_bytes: []const u8) !void {
-    var existing = try loadForSporeLocked(io, allocator, registry, spore_dir, disk);
-    defer existing.deinit();
-    const manifest_path = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
-    defer allocator.free(manifest_path);
-    const requested_digest = try sha256Bytes(allocator, manifest_bytes);
-    defer allocator.free(requested_digest);
-    if (std.mem.eql(u8, existing.value.manifest_sha256, requested_digest)) return;
-    const record_path = try recordPath(allocator, registry.cache_root, existing.value.id);
-    defer allocator.free(record_path);
-    const pending = try std.json.Stringify.valueAlloc(allocator, Record{
-        .schema = existing.value.schema,
-        .id = existing.value.id,
-        .manifest_sha256 = existing.value.manifest_sha256,
-        .pending_manifest_sha256 = requested_digest,
-        .storage = existing.value.storage,
-    }, .{ .whitespace = .indent_2 });
-    defer allocator.free(pending);
-    try replaceRecord(allocator, record_path, pending);
-    try chunk_sealer.replaceFileAtomicDurable(allocator, manifest_path, manifest_bytes, 0o644);
-    const json = try std.json.Stringify.valueAlloc(allocator, Record{
-        .schema = existing.value.schema,
-        .id = existing.value.id,
-        .manifest_sha256 = requested_digest,
-        .pending_manifest_sha256 = null,
-        .storage = existing.value.storage,
-    }, .{ .whitespace = .indent_2 });
-    defer allocator.free(json);
-    try replaceRecord(allocator, record_path, json);
-}
-
-/// Validate and reconcile a saved-spore pin. The caller must hold the rootfs
-/// cache lock because crash recovery may durably rewrite the pin record.
+/// Validate a saved-spore pin. The caller must hold the rootfs cache lock
+/// because a load commits a pin left pending by a crash.
 pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: LockedRegistry, spore_dir: []const u8, disk: spore.Disk) !std.json.Parsed(Record) {
     const ref_path = try std.fs.path.join(allocator, &.{ spore_dir, reference_file });
     defer allocator.free(ref_path);
@@ -554,42 +406,19 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
     defer allocator.free(ref_bytes);
     var ref = std.json.parseFromSlice(Reference, allocator, ref_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadManifest;
     defer ref.deinit();
+    if (isOneOf(&old_reference_schemas, ref.value.schema)) return error.FormatTooOld;
     try ref.value.validate();
     var record = try loadRecord(io, allocator, registry.cache_root, ref.value.id);
     errdefer record.deinit();
     try validateExclusiveOwner(allocator, registry.cache_root, spore_dir, ref.value.id);
     const expected = try storageForDisk(disk);
     if (!spore.rootfsStorageEql(record.value.storage, expected)) return error.BadManifest;
-    // Never change authorization state before proving the canonical root is
-    // intact. Missing/corrupt roots leave the record byte-for-byte unchanged.
+    // Never change the record before proving the canonical root is intact.
+    // Missing/corrupt roots leave the record byte-for-byte unchanged.
     try validateRoot(allocator, registry.cache_root, record.value.storage);
-    const manifest_path = try std.fs.path.join(allocator, &.{ spore_dir, "manifest.json" });
-    defer allocator.free(manifest_path);
-    const digest = try sha256File(io, allocator, manifest_path);
-    defer allocator.free(digest);
-    var reconciled_digest = record.value.manifest_sha256;
-    var rewrite_record = record.value.pending_publication != null;
-    if (record.value.pending_manifest_sha256) |pending| {
-        const actual_is_current = std.mem.eql(u8, digest, record.value.manifest_sha256);
-        const actual_is_pending = std.mem.eql(u8, digest, pending);
-        if (!actual_is_current and !actual_is_pending) return error.BadManifest;
-        reconciled_digest = if (actual_is_pending) pending else record.value.manifest_sha256;
-        rewrite_record = true;
-    } else if (!std.mem.eql(u8, digest, record.value.manifest_sha256)) return error.BadManifest;
-    if (rewrite_record) {
-        const path = try recordPath(allocator, registry.cache_root, record.value.id);
-        defer allocator.free(path);
-        const json = try std.json.Stringify.valueAlloc(allocator, Record{
-            .schema = record.value.schema,
-            .id = record.value.id,
-            .manifest_sha256 = reconciled_digest,
-            .storage = record.value.storage,
-        }, .{ .whitespace = .indent_2 });
-        defer allocator.free(json);
-        try replaceRecord(allocator, path, json);
-        record.value.manifest_sha256 = reconciled_digest;
-        record.value.pending_manifest_sha256 = null;
-        record.value.pending_publication = null;
+    if (record.value.pending != null) {
+        record.value.pending = null;
+        try replaceRecord(allocator, registry, record.value);
     }
     return record;
 }
@@ -597,7 +426,7 @@ pub fn loadForSporeLocked(io: Io, allocator: std.mem.Allocator, registry: Locked
 pub const OwnerState = enum { exclusive, pending, orphaned, duplicated, invalid };
 
 pub fn ownerState(allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8, record: Record) !OwnerState {
-    if (record.pending_publication != null) return .pending;
+    if (record.pending != null) return .pending;
     const owner = try ownerPath(allocator, cache_root, id);
     defer allocator.free(owner);
     const stat = statRegularNoFollow(allocator, owner) catch |err| return switch (err) {
@@ -617,7 +446,7 @@ pub const PendingPublicationState = enum { none, committed, abandoned, unresolve
 /// directory rename. The cache lock makes a still-pending record evidence of
 /// a crashed publisher rather than an in-flight one.
 pub fn pendingPublicationState(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8, record: Record) !PendingPublicationState {
-    const pending = record.pending_publication orelse return .none;
+    const pending = record.pending orelse return .none;
     const final_dir = pending.spore_dir;
     const pending_ref = pending.reference_path;
     const owner = try ownerPath(allocator, cache_root, id);
@@ -632,12 +461,13 @@ pub fn pendingPublicationState(io: Io, allocator: std.mem.Allocator, cache_root:
         .matches => {
             const manifest_path = try std.fs.path.join(allocator, &.{ final_dir, "manifest.json" });
             defer allocator.free(manifest_path);
-            const digest = sha256File(io, allocator, manifest_path) catch |err| return switch (err) {
+            // The manifest rename follows the reference rename, and
+            // publication refuses to start over an existing manifest.
+            const stat = Io.Dir.cwd().statFile(io, manifest_path, .{ .follow_symlinks = false }) catch |err| return switch (err) {
                 error.FileNotFound => .abandoned,
                 else => .unresolved,
             };
-            defer allocator.free(digest);
-            return if (std.mem.eql(u8, digest, record.manifest_sha256)) .committed else .unresolved;
+            return if (stat.kind == .file) .committed else .unresolved;
         },
         .other => return .unresolved,
         .missing => {},
@@ -653,7 +483,7 @@ pub fn pendingPublicationState(io: Io, allocator: std.mem.Allocator, cache_root:
 /// caller may then remove the owner and record with `remove`.
 pub fn abandonPendingPublication(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8, record: Record) !void {
     if (try pendingPublicationState(io, allocator, cache_root, id, record) != .abandoned) return error.SavedSporeOwnershipConflict;
-    const pending = record.pending_publication orelse return error.BadManifest;
+    const pending = record.pending orelse return error.BadManifest;
     if (pending.cleanup_root) |cleanup_root| {
         try Io.Dir.cwd().deleteTree(io, cleanup_root);
         try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(cleanup_root) orelse ".");
@@ -781,12 +611,12 @@ pub fn loadRecord(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, 
     return parseRecord(allocator, bytes, id);
 }
 
-/// Checks the schema before the shape, so a v1 record fails as too old
+/// Checks the schema before the shape, so an older record fails as too old
 /// whatever fields it carries.
 fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8, id: []const u8) !std.json.Parsed(Record) {
     const SchemaProbe = struct { schema: []const u8 };
     const probe = std.json.parseFromSlice(SchemaProbe, allocator, bytes, .{ .ignore_unknown_fields = true }) catch return error.BadManifest;
-    const too_old = std.mem.eql(u8, probe.value.schema, "spore.saved-disk-pin.v1");
+    const too_old = isOneOf(&old_schemas, probe.value.schema);
     probe.deinit();
     if (too_old) return error.FormatTooOld;
     var parsed = std.json.parseFromSlice(Record, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch return error.BadManifest;
@@ -862,18 +692,26 @@ pub fn validOwnerName(name: []const u8) bool {
         validId(name[0 .. id_bytes * 2]);
 }
 
-fn sha256File(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_manifest_bytes + 1));
-    defer allocator.free(bytes);
-    if (bytes.len > max_manifest_bytes) return error.StreamTooLong;
-    return sha256Bytes(allocator, bytes);
+fn isOneOf(values: []const []const u8, value: []const u8) bool {
+    for (values) |candidate| if (std.mem.eql(u8, candidate, value)) return true;
+    return false;
 }
 
-fn replaceRecord(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
-    try chunk_sealer.replaceFileAtomicDurable(allocator, path, bytes, 0o600);
+fn encodeRecord(allocator: std.mem.Allocator, record: Record) ![]u8 {
+    try record.validate();
+    return std.json.Stringify.valueAlloc(allocator, record, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
 }
 
-fn createFileExclusiveDurable(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: c_uint, sync_parent: bool) !void {
+fn replaceRecord(allocator: std.mem.Allocator, registry: LockedRegistry, record: Record) !void {
+    const json = try encodeRecord(allocator, record);
+    defer allocator.free(json);
+    const path = try recordPath(allocator, registry.cache_root, record.id);
+    defer allocator.free(path);
+    try chunk_sealer.replaceFileAtomicDurable(allocator, path, json, 0o600);
+}
+
+/// Creates and fsyncs `path`; the caller syncs its directory.
+fn createFileExclusiveDurable(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8, mode: c_uint) !void {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true, .NOFOLLOW = true }, mode);
@@ -890,7 +728,6 @@ fn createFileExclusiveDurable(allocator: std.mem.Allocator, path: []const u8, by
         offset += @intCast(wrote);
     }
     if (std.c.fsync(fd) != 0) return error.IoFailed;
-    if (sync_parent) try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(path) orelse ".");
 }
 
 fn createDirectoryExclusive(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -901,13 +738,6 @@ fn createDirectoryExclusive(allocator: std.mem.Allocator, path: []const u8) !voi
         .EXIST => error.SavedSporePublicationRecoveryRequired,
         else => error.IoFailed,
     };
-}
-
-fn sha256Bytes(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-    const hex = std.fmt.bytesToHex(digest, .lower);
-    return allocator.dupe(u8, &hex);
 }
 
 test "locked pin registry binds the exact held cache lock" {
@@ -936,43 +766,42 @@ test "saved spore pin ids are strict lowercase hex" {
     try std.testing.expect(!validRecordTempName("../../pin.json.1.tmp"));
 }
 
+const test_record =
+    \\{"schema":"spore.saved-disk-pin.v3","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","storage":{"kind":"chunked-ext4-rootfs-v0","device":{"kind":"virtio-mmio","role":"rootfs","virtio_device_id":2,"mmio_slot":1},"logical_size":65536,"chunk_size":65536,"hash_algorithm":"blake3","index_digest":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base_identity":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","object_namespace":"rootfs/blake3"}}
+;
+const test_pending_record =
+    \\{"schema":"spore.saved-disk-pin.v3","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","storage":{"kind":"chunked-ext4-rootfs-v0","device":{"kind":"virtio-mmio","role":"rootfs","virtio_device_id":2,"mmio_slot":1},"logical_size":65536,"chunk_size":65536,"hash_algorithm":"blake3","index_digest":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","base_identity":"blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","object_namespace":"rootfs/blake3"},"pending":{"spore_dir":"/saves/a.spore","reference_path":"/saves/a.spore.pin-stage-1f/000000/sporevm-disk-pin.json","cleanup_root":"/saves/a.spore.pin-stage-1f"}}
+;
+
 test "saved spore pin schemas are required and exact" {
     const allocator = std.testing.allocator;
+    const id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Reference, allocator,
         \\{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-    , .{ .allocate = .alloc_always, .ignore_unknown_fields = false }));
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Record, allocator,
-        \\{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = false }));
     var unknown = try std.json.parseFromSlice(Reference, allocator,
         \\{"schema":"future","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     defer unknown.deinit();
     try std.testing.expectError(error.BadManifest, unknown.value.validate());
-}
 
-test "saved spore manifest hashing preserves the 64 MiB loader contract" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(io, "manifest.json", .{});
-    file.close(io);
-    const path = try tmp.dir.realPathFileAlloc(io, "manifest.json", allocator);
-    defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, @as(c_uint, 0));
-    if (fd < 0) return error.IoFailed;
-    defer _ = std.c.close(fd);
-    if (std.c.ftruncate(fd, max_manifest_bytes - 1) != 0) return error.IoFailed;
-    const below_digest = try sha256File(io, allocator, path);
-    allocator.free(below_digest);
-    if (std.c.ftruncate(fd, max_manifest_bytes) != 0) return error.IoFailed;
-    const digest = try sha256File(io, allocator, path);
-    allocator.free(digest);
-    if (std.c.ftruncate(fd, max_manifest_bytes + 1) != 0) return error.IoFailed;
-    try std.testing.expectError(error.StreamTooLong, sha256File(io, allocator, path));
+    inline for (.{ test_record, test_pending_record }) |bytes| {
+        var parsed = try parseRecord(allocator, bytes, id);
+        parsed.deinit();
+    }
+    try std.testing.expectError(error.BadManifest, parseRecord(allocator, "{\"id\":\"" ++ id ++ "\"}", id));
+    try std.testing.expectError(error.BadManifest, parseRecord(allocator, test_record, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"));
+    // Older pins fail as too old so GC can delete them; other schemas, and a
+    // current schema carrying the removed manifest hash, are corrupt.
+    for (old_schemas ++ [_][]const u8{"spore.saved-disk-pin.v4"}, 0..) |other, index| {
+        const bytes = try std.mem.replaceOwned(u8, allocator, test_record, schema, other);
+        defer allocator.free(bytes);
+        const expected: anyerror = if (index < old_schemas.len) error.FormatTooOld else error.BadManifest;
+        try std.testing.expectError(expected, parseRecord(allocator, bytes, id));
+    }
+    const with_hash = try std.mem.replaceOwned(u8, allocator, test_record, "\"storage\"", "\"manifest_sha256\":\"" ++ id ++ "\",\"storage\"");
+    defer allocator.free(with_hash);
+    try std.testing.expectError(error.BadManifest, parseRecord(allocator, with_hash, id));
 }
 
 test "exclusive pin survives moves and rejects copied or duplicate references" {
@@ -1006,7 +835,7 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
     try chunk_sealer.writeFileAtomicDurable(allocator, index_path, encoded.bytes, 0o444);
     const manifest_path = try std.fs.path.join(allocator, &.{ save, "manifest.json" });
     defer allocator.free(manifest_path);
-    try chunk_sealer.writeFileAtomicDurable(allocator, manifest_path, "old", 0o644);
+    try chunk_sealer.writeFileAtomicDurable(allocator, manifest_path, "manifest", 0o644);
     const disk = spore.Disk{
         .kind = spore.disk_kind_chunk_index,
         .device = .{ .mmio_slot = 1 },
@@ -1019,24 +848,19 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
     var lock = try rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache);
     defer lock.deinit();
     const registry = try LockedRegistry.init(allocator, cache, &lock);
-    const id = try create(io, allocator, registry, save, disk);
+    // Leave the pin pending, as a crash before the save's commit would.
+    const save_ref = try std.fs.path.join(allocator, &.{ save, reference_file });
+    defer allocator.free(save_ref);
+    const id = try acquire(io, allocator, registry, try storageForDisk(disk), .{ .spore_dir = save, .reference_path = save_ref });
     defer allocator.free(id);
-    const manifest_digest = try sha256File(io, allocator, manifest_path);
-    defer allocator.free(manifest_digest);
-    try std.testing.expectError(error.PathAlreadyExists, createWithId(allocator, registry, save, try storageForDisk(disk), manifest_digest, id, null));
-    try std.testing.expectError(error.SavedSporeOwnershipConflict, create(io, allocator, registry, save, disk));
-    var loaded = try loadForSporeLocked(io, allocator, registry, save, disk);
-    loaded.deinit();
+    try syncRegistry(allocator, registry);
+    try std.testing.expectError(error.SavedSporeOwnershipConflict, testing.pinSave(io, allocator, registry, save, disk));
     // The parsed record owns independently allocated descriptor strings, but
     // byte-identical values remain authoritative. Any field mutation fails.
     var wrong_disk = disk;
     wrong_disk.device.mmio_slot += 1;
     try std.testing.expectError(error.BadManifest, loadForSporeLocked(io, allocator, registry, save, wrong_disk));
-    var wrong_storage = try storageForDisk(disk);
-    wrong_storage.logical_size += spore.disk_chunk_size;
-    try std.testing.expectError(error.BadManifest, createValidated(io, allocator, registry, save, disk, wrong_storage));
 
-    try authorizeManifestBytes(io, allocator, registry, save, disk, "new");
     const record_path = try recordPath(allocator, cache, id);
     defer allocator.free(record_path);
     const pending_record = try Io.Dir.cwd().readFileAlloc(io, record_path, allocator, .limited(max_record_bytes));
@@ -1056,28 +880,19 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
     defer allocator.free(after_corrupt);
     try std.testing.expectEqualSlices(u8, pending_record, after_corrupt);
     try chunk_sealer.replaceFileAtomicDurable(allocator, index_path, encoded.bytes, 0o444);
-    // A crash on either side of the manifest rewrite remains valid.
-    loaded = try loadForSporeLocked(io, allocator, registry, save, disk);
+    // Loading through the save's own reference commits the pending pin.
+    var loaded = try loadForSporeLocked(io, allocator, registry, save, disk);
+    try std.testing.expect(loaded.value.pending == null);
     loaded.deinit();
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = "new" });
-    try std.testing.expectError(error.BadManifest, loadForSporeLocked(io, allocator, registry, save, disk));
-    try chunk_sealer.replaceFileAtomicDurable(allocator, manifest_path, "old", 0o644);
-    try authorizeManifestBytes(io, allocator, registry, save, disk, "new");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = "new" });
-    loaded = try loadForSporeLocked(io, allocator, registry, save, disk);
-    loaded.deinit();
-    try replaceAuthorizedManifest(io, allocator, registry, save, disk, "new");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = "old" });
-    try std.testing.expectError(error.BadManifest, loadForSporeLocked(io, allocator, registry, save, disk));
-    try chunk_sealer.replaceFileAtomicDurable(allocator, manifest_path, "new", 0o644);
+    var committed = try loadRecord(io, allocator, cache, id);
+    try std.testing.expect(committed.value.pending == null);
+    committed.deinit();
 
     const moved = try std.fs.path.join(allocator, &.{ root, "renamed.spore" });
     defer allocator.free(moved);
     try Io.Dir.renameAbsolute(save, moved, io);
     loaded = try loadForSporeLocked(io, allocator, registry, moved, disk);
     loaded.deinit();
-    const moved_manifest = try std.fs.path.join(allocator, &.{ moved, "manifest.json" });
-    defer allocator.free(moved_manifest);
 
     const copied = try std.fs.path.join(allocator, &.{ root, "copied.spore" });
     defer allocator.free(copied);
@@ -1087,7 +902,7 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
         defer allocator.free(source);
         const destination = try std.fs.path.join(allocator, &.{ copied, name });
         defer allocator.free(destination);
-        const bytes = try Io.Dir.cwd().readFileAlloc(io, source, allocator, .limited(max_manifest_bytes + 1));
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, source, allocator, .limited(max_record_bytes));
         defer allocator.free(bytes);
         try chunk_sealer.writeFileAtomicDurable(allocator, destination, bytes, 0o600);
     }
@@ -1102,10 +917,6 @@ test "exclusive pin survives moves and rejects copied or duplicate references" {
     try Io.Dir.cwd().deleteFile(io, duplicate_ref);
     loaded = try loadForSporeLocked(io, allocator, registry, moved, disk);
     loaded.deinit();
-
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = moved_manifest, .data = "tampered" });
-    try std.testing.expectError(error.BadManifest, loadForSporeLocked(io, allocator, registry, moved, disk));
-    try std.testing.expectError(error.BadManifest, authorizeManifestBytes(io, allocator, registry, moved, disk, "attacker-authorized"));
 
     // Raw deletion leaves the cache-side anchor with one link, which makes
     // the orphan diagnosable without scanning arbitrary filesystem paths.
@@ -1150,5 +961,5 @@ test "fuzz saved spore pin parsers" {
             } else |_| {}
         }
     };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    try std.testing.fuzz(Context{}, Context.testOne, .{ .corpus = &.{ test_record, test_pending_record } });
 }

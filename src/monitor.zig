@@ -1180,17 +1180,17 @@ const ExecServer = struct {
         defer manifest.deinit();
         manifest.value.annotations = lifecycle_spec.value.annotations;
         manifest.value.exec_defaults = lifecycle_spec.value.exec_defaults;
+        const manifest_started = runtime_disk_fork_capture.monotonicNs();
+        const bytes = try spore.encodeManifestAlloc(self.allocator, manifest.value);
+        defer self.allocator.free(bytes);
+        const manifest_path = try std.fs.path.join(self.allocator, &.{ work_dir, "manifest.json" });
+        defer self.allocator.free(manifest_path);
+        try chunk_sealer.replaceFileAtomicDurable(self.allocator, manifest_path, bytes, 0o644);
+        metrics.manifest_write_ns = runtime_disk_fork_capture.elapsedSince(manifest_started);
         if (manifest.value.disk) |disk| {
-            const bytes = try spore.encodeManifestAlloc(self.allocator, manifest.value);
-            defer self.allocator.free(bytes);
-            const authorization_started = runtime_disk_fork_capture.monotonicNs();
-            try saved_spore_pin.replaceAuthorizedManifest(self.io, self.allocator, registry, work_dir, disk, bytes);
-            metrics.manifest_pin_authorization_ns = runtime_disk_fork_capture.elapsedSince(authorization_started);
             const lease_started = runtime_disk_fork_capture.monotonicNs();
             try self.handoffSnapshotDiskLease(registry, work_dir, disk, &lifecycle_spec);
             metrics.active_lease_handoff_ns = runtime_disk_fork_capture.elapsedSince(lease_started);
-        } else {
-            try spore.saveManifest(self.allocator, work_dir, manifest.value);
         }
         const lifecycle_started = runtime_disk_fork_capture.monotonicNs();
         try lifecycle.writeSporeLifecycleSpec(self.allocator, self.io, work_dir, lifecycle_spec.value);

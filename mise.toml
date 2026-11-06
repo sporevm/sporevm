@@ -51,7 +51,7 @@ description = "Build local release archives without publishing"
 
 [tasks."benchmark:disk-fork"]
 run = "SPOREVM_DISK_FORK_BENCHMARK=1 zig test src/chunk_mapped_disk.zig -O ReleaseFast -lc --test-filter 'disk fork benchmark'"
-description = "Benchmark native disk-head cloning, 32-child preparation, and generation-32 reads"
+description = "Benchmark native disk-head cloning and 32-child preparation"
 
 [tasks.smoke]
 run = "test/smoke/suite.sh --build"

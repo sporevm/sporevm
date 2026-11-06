@@ -325,9 +325,9 @@ stops the VM and the command reports the error (parity with single-vCPU save).
 Named saves try the global cache lock before pausing any vCPU. While the lock
 is contended, the request stays pending and the guest continues running; the
 same acquired lock then spans capture and durable publication. Named saves
-report the complete source-pause time through manifest/pin
-authorization, active baseline-lease handoff, lifecycle metadata, final rename,
-and destination-parent sync. Cache-lock wait and each publication phase are
+report the complete source-pause time through the manifest write, active
+baseline-lease handoff, lifecycle metadata, final rename, and
+destination-parent sync. Cache-lock wait and each publication phase are
 logged separately, so backend RAM/disk capture time is not mistaken for the
 full pause experienced by the guest.
 Repeated `--annotation KEY=VALUE` flags merge save-time annotations into the
@@ -356,7 +356,8 @@ while either exists. A plain `cp -r` copy never owned the pin and cannot
 restore; use `spore clone` for an independent copy.
 
 `spore cache pins` reports `index_valid` only after validating the record and
-canonical index. It deliberately does not stat or hash every object; lazy reads
+canonical index, and `stale` for a record from an earlier build that
+`spore cache gc --force` deletes. It deliberately does not stat or hash every object; lazy reads
 and `spore pack` still verify object bytes and may fail closed on missing or
 corrupt content. Inspect and save output name the ownership class.
 The hard-link anchor supplies local proof without a global save-path registry.

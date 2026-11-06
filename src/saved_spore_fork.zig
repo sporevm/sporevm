@@ -86,6 +86,58 @@ test "diskless offline fork failure leaves no visible batch" {
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, children, .{ .follow_symlinks = false }));
 }
 
+test "a save pinned by an earlier build fails as too old after GC" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const cache = try std.fs.path.join(arena, &.{ root, "cache" });
+    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
+    const save = try std.fs.path.join(arena, &.{ root, "save.spore" });
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache, save, 0x5a, false);
+    try spore.saveManifest(arena, save, fixture.manifest);
+    // An earlier build's pin: a v2 record and a v2 reference that is the
+    // second link of its ownership anchor.
+    const id = "c" ** 64;
+    try std.Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ cache, saved_spore_pin.dir_name }));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try saved_spore_pin.recordPath(arena, cache, id), .data = try std.json.Stringify.valueAlloc(arena, .{
+        .schema = "spore.saved-disk-pin.v2",
+        .id = id,
+        .manifest_sha256 = "e" ** 64,
+        .storage = fixture.storage,
+    }, .{}) });
+    const owner = try saved_spore_pin.ownerPath(arena, cache, id);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = owner, .data = "{\"schema\":\"spore.saved-disk-pin-ref.v2\",\"id\":\"" ++ id ++ "\"}" });
+    try std.Io.Dir.cwd().hardLink(owner, std.Io.Dir.cwd(), try std.fs.path.join(arena, &.{ save, saved_spore_pin.reference_file }), io, .{});
+
+    const listed = try saved_spore_pin.list(io, arena, cache);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqual(saved_spore_pin.ListingState.stale, listed[0].state);
+    const gc_result = try system.gc(allocator, io, .{ .cache_root = cache, .runtime_root = runtime_root, .dry_run = false });
+    system.deinitRootfsGcResult(allocator, gc_result);
+    try std.testing.expectError(error.FileNotFound, saved_spore_pin.loadRecord(io, arena, cache, id));
+
+    {
+        var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
+        defer lock.deinit();
+        const registry = try saved_spore_pin.LockedRegistry.init(arena, cache, &lock);
+        try std.testing.expectError(error.FormatTooOld, saved_spore_pin.loadForSporeLocked(io, arena, registry, save, fixture.disk));
+    }
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache);
+    try env.put(local_paths.runtime_dir_env, runtime_root);
+    try std.testing.expectError(error.FormatTooOld, execute(.{ .io = io, .environ_map = &env }, allocator, .{
+        .parent_dir = save,
+        .out_dir = try std.fs.path.join(arena, &.{ root, "children" }),
+        .count = 1,
+    }));
+}
+
 pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options) !Result {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -134,31 +186,20 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
         crashAfterBoundary(.parent_sync);
         cleanup_stage = false;
     }
-    var prepared_pins: ?[]saved_spore_pin.PreparedPin = null;
     if (disk_root != null) {
-        prepared_pins = try arena.alloc(saved_spore_pin.PreparedPin, options.count);
         // Phase two must leave complete durable child manifests before phase
-        // three can publish their pins. References are synced while the batch
-        // is hidden, outside the short global-cache critical section.
+        // three can publish their pins.
         for (0..options.count) |index| {
             const child = try std.fmt.allocPrint(arena, "{s}/{d:0>6}", .{ fork_out, index });
-            const final_child = try std.fmt.allocPrint(arena, "{s}/{d:0>6}", .{ options.out_dir, index });
             const manifest_path = try std.fs.path.join(arena, &.{ child, "manifest.json" });
-            const bytes = try std.Io.Dir.cwd().readFileAlloc(context.io, manifest_path, allocator, .limited(saved_spore_pin.max_manifest_bytes + 1));
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(context.io, manifest_path, allocator, .limited(spore.max_manifest_bytes + 1));
             defer allocator.free(bytes);
-            if (bytes.len > saved_spore_pin.max_manifest_bytes) return error.StreamTooLong;
+            if (bytes.len > spore.max_manifest_bytes) return error.StreamTooLong;
             try chunk_sealer.replaceFileAtomicDurable(arena, manifest_path, bytes, 0o644);
             const child_manifest = try spore.loadManifest(arena, child);
             defer child_manifest.deinit();
             const child_disk = child_manifest.value.disk orelse return error.BadManifest;
-            prepared_pins.?[index] = try saved_spore_pin.prepareValidatedReference(
-                context.io,
-                arena,
-                child,
-                final_child,
-                child_disk,
-                validated_storage.?,
-            );
+            if (!spore.rootfsStorageEql(validated_storage.?, try saved_spore_pin.storageForDisk(child_disk))) return error.BadManifest;
         }
         try chunk_sealer.fsyncDirPath(arena, fork_out);
     }
@@ -174,20 +215,25 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options: Options)
         var current = try saved_spore_pin.loadForSporeLocked(context.io, arena, publish_registry, options.parent_dir, disk.?);
         defer current.deinit();
         if (!std.mem.eql(u8, current.value.id, parent_pin_id.?)) return error.BadManifest;
-        try saved_spore_pin.ensureRegistryDurable(arena, publish_registry);
-        for (0..options.count) |index| {
+        const child_pins = try arena.alloc([]const u8, options.count);
+        for (child_pins, 0..) |*id, index| {
             if (comptime builtin.is_test) if (testing.fault.fail_before_child == index) return error.InjectedFailure;
-            try saved_spore_pin.publishPreparedRecord(arena, publish_registry, validated_storage.?, prepared_pins.?[index]);
+            const child = try std.fmt.allocPrint(arena, "{s}/{d:0>6}", .{ fork_out, index });
+            id.* = try saved_spore_pin.acquire(context.io, arena, publish_registry, validated_storage.?, .{
+                .spore_dir = try std.fmt.allocPrint(arena, "{s}/{d:0>6}", .{ options.out_dir, index }),
+                .reference_path = try std.fs.path.join(arena, &.{ child, saved_spore_pin.reference_file }),
+                .cleanup_root = fork_out,
+            });
         }
         if (comptime builtin.is_test) if (testing.fault.fail_before_registry_sync) return error.InjectedFailure;
-        try saved_spore_pin.syncPreparedRecords(arena, publish_registry);
+        try saved_spore_pin.syncRegistry(arena, publish_registry);
         if (comptime builtin.is_test) if (testing.fault.fail_before_batch_rename) return error.InjectedFailure;
         crashAfterBoundary(.before_batch_rename);
         try std.Io.Dir.rename(std.Io.Dir.cwd(), fork_out, std.Io.Dir.cwd(), options.out_dir, context.io);
         crashAfterBoundary(.batch_rename);
         try chunk_sealer.fsyncDirPath(arena, std.fs.path.dirname(options.out_dir) orelse ".");
         crashAfterBoundary(.parent_sync);
-        for (prepared_pins.?) |prepared| try saved_spore_pin.clearPendingPublication(context.io, arena, publish_registry, prepared.id);
+        for (child_pins) |id| try saved_spore_pin.clearPendingPublication(context.io, arena, publish_registry, id);
         cleanup_stage = false;
         const lock_finished = runtime_disk_fork_capture.monotonicNs();
         pin_publish_ms = (lock_finished -| lock_started) / std.time.ns_per_ms;
@@ -389,11 +435,11 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     var parent_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
     defer parent_lock.deinit();
     const parent_registry = try saved_spore_pin.LockedRegistry.init(arena, cache, &parent_lock);
-    const parent_pin = try saved_spore_pin.create(io, arena, parent_registry, parent, disk);
+    const parent_pin = try saved_spore_pin.testing.pinSave(io, arena, parent_registry, parent, disk);
     const parent_manifest_path = try std.fs.path.join(arena, &.{ parent, "manifest.json" });
     const parent_ref_path = try std.fs.path.join(arena, &.{ parent, saved_spore_pin.reference_file });
     const parent_record_path = try std.fmt.allocPrint(arena, "{s}/{s}/{s}.json", .{ cache, saved_spore_pin.dir_name, parent_pin });
-    const manifest_before_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_manifest_path, allocator, .limited(saved_spore_pin.max_manifest_bytes));
+    const manifest_before_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_manifest_path, allocator, .limited(spore.max_manifest_bytes));
     defer allocator.free(manifest_before_fault);
     const ref_before_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_ref_path, allocator, .limited(saved_spore_pin.max_record_bytes));
     defer allocator.free(ref_before_fault);
@@ -402,7 +448,7 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     var replacement_manifest = manifest;
     replacement_manifest.generation.generation += 1;
     try std.testing.expectError(error.SavedSporeOwnershipConflict, saved_spore_pin.publishManifest(io, arena, parent_registry, parent, disk, replacement_manifest));
-    const manifest_after_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_manifest_path, allocator, .limited(saved_spore_pin.max_manifest_bytes));
+    const manifest_after_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_manifest_path, allocator, .limited(spore.max_manifest_bytes));
     defer allocator.free(manifest_after_fault);
     const ref_after_fault = try std.Io.Dir.cwd().readFileAlloc(io, parent_ref_path, allocator, .limited(saved_spore_pin.max_record_bytes));
     defer allocator.free(ref_after_fault);

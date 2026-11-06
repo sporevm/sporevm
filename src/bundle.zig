@@ -1703,7 +1703,10 @@ fn packDiskIndexForManifest(
         var cache_lock = rootfs_mod.lockRootfsCacheExclusive(io, allocator, cache_root) catch return error.BadManifest;
         defer cache_lock.deinit();
         const registry = saved_spore_pin.LockedRegistry.init(allocator, cache_root, &cache_lock) catch return error.BadManifest;
-        var pin = saved_spore_pin.loadForSporeLocked(io, allocator, registry, source_dir, disk) catch return error.BadManifest;
+        var pin = saved_spore_pin.loadForSporeLocked(io, allocator, registry, source_dir, disk) catch |err| return switch (err) {
+            error.FormatTooOld => error.FormatTooOld,
+            else => error.BadManifest,
+        };
         defer pin.deinit();
         active_lease = runtime_disk_lease.acquireActive(io, allocator, runtime_root, .{
             .store = .rootfs_cache,
@@ -4005,7 +4008,7 @@ test "pack and unpack disk indexes" {
         var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, pack_cache_root);
         defer pin_lock.deinit();
         const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, pack_cache_root, &pin_lock);
-        break :blk try saved_spore_pin.create(io, arena, pin_registry, parent_dir, disk);
+        break :blk try saved_spore_pin.testing.pinSave(io, arena, pin_registry, parent_dir, disk);
     };
     const source_index = try rootfs_cas.manifestIndexPath(arena, pack_cache_root, storage.index_digest);
     const index_bytes = try readFileAllNoSymlink(arena, source_index, disk_index.max_index_bytes);

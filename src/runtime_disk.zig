@@ -1567,7 +1567,7 @@ test "runtime disk restores chunk-index disk manifests" {
     var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, absolute_cache_root);
     defer pin_lock.deinit();
     const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, absolute_cache_root, &pin_lock);
-    const pin_id = try saved_spore_pin.create(io, arena, pin_registry, spore_dir, saved_disk);
+    const pin_id = try saved_spore_pin.testing.pinSave(io, arena, pin_registry, spore_dir, saved_disk);
     pin_lock.deinit();
     const storage = try saved_spore_pin.storageForDisk(saved_disk);
     const global_index_path = try rootfs_cas.manifestIndexPath(arena, absolute_cache_root, storage.index_digest);
