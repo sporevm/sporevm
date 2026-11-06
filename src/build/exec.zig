@@ -2850,6 +2850,9 @@ test "builder and runtime share bounded guest PATH resolution" {
 const AgentResult = struct {
     stdout: []u8,
     stderr: []u8,
+    /// The offsets of the first stdout and stderr frames.
+    stdout_offset: ?u64,
+    stderr_offset: ?u64,
     exit_code: ?u32,
     captured_stdout: u64,
 
@@ -2897,28 +2900,39 @@ fn agentServeRequests(scenario: AgentScenario, requests: []const []const u8) !Ag
     const lens = try allocator.alloc(usize, requests.len);
     defer allocator.free(lens);
     for (requests, lens) |request, *len| len.* = request.len;
-    var response: [8192]u8 = undefined;
+    const response = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(response);
     var captured_stdout: u64 = 0;
-    const response_len = spore_agent_test_serve_requests(scenario.captured_script, @intFromBool(scenario.captured_finishes), scenario.attach.ptr, scenario.attach.len, joined.ptr, lens.ptr, requests.len, &response, response.len, &captured_stdout);
+    const response_len = spore_agent_test_serve_requests(scenario.captured_script, @intFromBool(scenario.captured_finishes), scenario.attach.ptr, scenario.attach.len, joined.ptr, lens.ptr, requests.len, response.ptr, response.len, &captured_stdout);
     if (response_len < 0) return error.AgentHarnessFailed;
 
     var stdout: std.ArrayList(u8) = .empty;
     errdefer stdout.deinit(allocator);
     var stderr: std.ArrayList(u8) = .empty;
     errdefer stderr.deinit(allocator);
+    var stdout_offset: ?u64 = null;
+    var stderr_offset: ?u64 = null;
     var exit_code: ?u32 = null;
     var rest = response[0..@intCast(response_len)];
     while (rest.len >= spore_stream.header_len) {
         const header = try spore_stream.readHeader(rest[0..spore_stream.header_len]);
         const payload = rest[spore_stream.header_len..][0..header.payload_len];
-        if (header.frame_type == .data and header.stream_id == .stdout) try stdout.appendSlice(allocator, payload);
-        if (header.frame_type == .data and header.stream_id == .stderr) try stderr.appendSlice(allocator, payload);
+        if (header.frame_type == .data and header.stream_id == .stdout) {
+            if (stdout_offset == null) stdout_offset = header.offset;
+            try stdout.appendSlice(allocator, payload);
+        }
+        if (header.frame_type == .data and header.stream_id == .stderr) {
+            if (stderr_offset == null) stderr_offset = header.offset;
+            try stderr.appendSlice(allocator, payload);
+        }
         if (header.frame_type == .exit) exit_code = try spore_stream.readExitPayload(payload);
         rest = rest[spore_stream.header_len + payload.len ..];
     }
     return .{
         .stdout = try stdout.toOwnedSlice(allocator),
         .stderr = try stderr.toOwnedSlice(allocator),
+        .stdout_offset = stdout_offset,
+        .stderr_offset = stderr_offset,
         .exit_code = exit_code,
         .captured_stdout = captured_stdout,
     };
@@ -3023,6 +3037,21 @@ test "guest agent replays an exec that followed the captured session" {
     try std.testing.expectEqualStrings("out\n", result.stdout);
     try std.testing.expectEqualStrings("err\n", result.stderr);
     try std.testing.expectEqual(@as(?u32, 0), result.exit_code);
+}
+
+test "guest agent refuses an attach at the offsets it was asked to resume from" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // The host's stream expects the refusal's stderr where the saved
+    // session's stderr left off, not at zero.
+    const attach = try @import("../attach_stream.zig").attachV1Request(allocator, .{ .session_id = "other", .stdout_offset = 3, .stderr_offset = 5 });
+    defer allocator.free(attach);
+    const result = try agentServeRequests(.{}, &.{attach});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("spore run: no session\n", result.stderr);
+    try std.testing.expectEqual(@as(?u64, 5), result.stderr_offset);
+    try std.testing.expectEqual(@as(?u32, 2), result.exit_code);
 }
 
 test "build nofile limit is bounded" {

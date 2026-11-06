@@ -174,9 +174,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     const manifest = parsed.value;
 
     const sessions = manifest.sessions;
-    const session_id = opts.session_id orelse spore.defaultAttachSessionId(sessions);
-    try spore.validateSessionAttach(sessions, .{
-        .id = session_id,
+    const session = try spore.validateSessionAttach(sessions, .{
+        .id = opts.session_id orelse spore.defaultAttachSessionId(sessions),
         .stdin = opts.interactive and !opts.tty,
         .terminal = opts.tty,
     });
@@ -204,7 +203,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     else
         null;
     const attach = try prepareAttach(allocator, manifest.generation, generation_params, .{
-        .session_id = session_id,
+        .session = session,
         .interactive = opts.interactive,
         .tty = opts.tty,
         .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
@@ -213,11 +212,14 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     var identity_stream: ?vsock_stream.HostStream = try vsock_stream.HostStream.init(default_attach_guest_port, attach.request);
     if (identity_stream) |*stream| {
         stream.host_port = vsock_stream.HostStream.deriveHostPort(attach.request);
+        // The output resumes where the saving run left off.
+        stream.stdout_offset = session.stdout_offset;
+        stream.stderr_offset = session.stderr_offset;
         if (opts.events != null) {
             stream.setLifecycleSink(&events, attachEventLifecycleSink);
             stream.setOutputSink(&events, attachEventOutputSink);
         } else {
-            stream.setOutputSink(null, identityProbeOutputSink);
+            stream.setOutputSink(null, rawOutputSink);
         }
     }
     const identity_probe: ?*vsock_stream.HostStream = if (identity_stream) |*stream| stream else null;
@@ -244,7 +246,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
             .generation = attach.generation_state,
         } },
         .vcpus = vcpu_count,
-        .console_sink = if (opts.events == null) consoleSink else discardConsoleSink,
+        // Session output arrives on the attach stream; the guest copies it to
+        // the console only for a VM that booted with a console log.
+        .console_sink = discardConsoleSink,
         .disk_backend = runtime_disk_state.backend(),
         .probe = if (identity_probe) |stream| .{ .stream = stream, .timeout_ms = opts.timeout_ms } else null,
         .network = network,
@@ -283,10 +287,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
     }
 }
 
-fn consoleSink(bytes: []const u8) void {
-    fd_util.writeAllBestEffort(1, bytes);
-}
-
 fn discardConsoleSink(_: []const u8) void {}
 
 fn attachEventOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
@@ -301,9 +301,12 @@ fn attachEventLifecycleSink(context: ?*anyopaque, event: vsock_stream.HostStream
     }
 }
 
-fn identityProbeOutputSink(_: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
-    if (output != .stderr) return;
-    fd_util.writeAllBestEffort(2, bytes);
+fn rawOutputSink(_: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
+    const fd: std.c.fd_t = switch (output) {
+        .stdout, .terminal => 1,
+        .stderr => 2,
+    };
+    fd_util.writeAllBestEffort(fd, bytes);
 }
 
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) T {
@@ -344,7 +347,7 @@ const PreparedAttach = struct {
 };
 
 const AttachRequestOptions = struct {
-    session_id: []const u8,
+    session: spore.Session,
     interactive: bool = false,
     tty: bool = false,
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
@@ -377,7 +380,9 @@ fn prepareAttach(allocator: std.mem.Allocator, manifest_generation: spore.Genera
     const params_payload = gen_dev.paramsPayload();
     return .{
         .request = try attach_stream.attachV1Request(allocator, .{
-            .session_id = options.session_id,
+            .session_id = options.session.id,
+            .stdout_offset = options.session.stdout_offset,
+            .stderr_offset = options.session.stderr_offset,
             .interactive = options.interactive,
             .tty = options.tty,
             .terminal_size = options.terminal_size,
@@ -505,10 +510,18 @@ test "attach validates saved sessions before bound service bindings" {
 test "attach request omits empty generation params" {
     const allocator = std.testing.allocator;
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
+    const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session = .{} });
     defer attach.deinit(allocator);
     try std.testing.expectEqualStrings("{\"type\":\"attach-v1\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0,\"stdio\":\"null\",\"interactive\":false,\"terminal_rows\":24,\"terminal_cols\":80,\"params_json\":\"\"}\n", attach.request);
     try std.testing.expectEqualStrings("", attach.generation_state.params_b64);
+}
+
+test "attach request resumes a saved session's output where the saving run left off" {
+    const allocator = std.testing.allocator;
+    const manifest = testDiskGuardManifest(&.{}, false);
+    const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session = .{ .stdout_offset = 4096, .stderr_offset = 12 } });
+    defer attach.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"stdout_offset\":4096,\"stderr_offset\":12,") != null);
 }
 
 test "attach request carries refreshed generation params" {
@@ -522,7 +535,7 @@ test "attach request carries refreshed generation params" {
     manifest.generation = try gen_dev.capture(allocator);
     defer allocator.free(manifest.generation.params_b64);
 
-    const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session_id = spore.default_session_id });
+    const attach = try prepareAttach(allocator, manifest.generation, null, .{ .session = .{} });
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"type\":\"attach-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\"stdio\":\"null\"") != null);
@@ -556,7 +569,7 @@ test "attach request accepts explicit generation params" {
     try generation.validateFanoutParams(allocator, params);
 
     const manifest = testDiskGuardManifest(&.{}, false);
-    const attach = try prepareAttach(allocator, manifest.generation, params, .{ .session_id = spore.default_session_id });
+    const attach = try prepareAttach(allocator, manifest.generation, params, .{ .session = .{} });
     defer attach.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"run_id\\\":\\\"rails-rspec-1\\\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach.request, "\\\"parallel_index\\\":7") != null);

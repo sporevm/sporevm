@@ -360,6 +360,7 @@ extern int64_t t_command_user_us;
 extern int64_t t_command_system_us;
 extern int sigchld_pipe[2];
 extern int proc_dir_fd;
+extern int console_mirror;
 extern struct build_resolv_state build_resolv;
 extern int build_run_mount_cleanup_poisoned;
 

@@ -31,6 +31,11 @@ elsewhere, push the parent, pull it there and pass the child's identity to
 
 ### Fixes
 
+- `spore attach` and `spore fanout` resume a saved session's output where the
+  `spore run` that saved it left off. `spore attach --events=jsonl` replayed
+  it from the start and the others printed the console instead, and all of
+  them asked the guest for the output from the start, so they failed once the
+  session had written more than 64 KiB.
 - Single-vCPU saves also wait until the vCPU is not in an interrupt handler,
   or fail with `InterruptStillActive`, as multi-vCPU saves do.
 
@@ -48,6 +53,12 @@ elsewhere, push the parent, pull it there and pass the child's identity to
 
 ### Other changes
 
+- `spore attach` without `--events=jsonl`, and so `spore fanout`, prints the
+  session's stdout and stderr, as `--events=jsonl` does, instead of the guest
+  console.
+- The guest copies command output to the console, and so to a console log,
+  only in VMs started with `--console-log`. A spore saved from a VM started
+  without it does not gain it when restored with `--console-log`.
 - Saved network spores record `default_action: "deny"` for every restricted
   egress policy, including `--allow-cidr` and `--allow-host` alone; a policy
   with allow entries but no `default_action` still restores as restricted.

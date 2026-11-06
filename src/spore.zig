@@ -334,6 +334,10 @@ pub const Session = struct {
     id: []const u8 = default_session_id,
     kind: []const u8 = session_kind_process,
     streams: SessionStreams = .{},
+    /// Bytes of each output stream the saving run had already delivered.
+    /// An attach resumes the output there.
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
 };
 
 pub const max_exec_default_env = 64;
@@ -1101,11 +1105,13 @@ pub fn defaultAttachSessionId(sessions: []const Session) []const u8 {
     return if (sessions.len == 1) sessions[0].id else default_session_id;
 }
 
-pub fn validateSessionAttach(sessions: []const Session, request: SessionAttachRequest) !void {
+/// The session `request` attaches to, if it can.
+pub fn validateSessionAttach(sessions: []const Session, request: SessionAttachRequest) !Session {
     if (sessions.len == 0) return error.NoSavedSession;
     const session = findSession(sessions, request.id) orelse return error.SavedSessionUnavailable;
     if (request.stdin and !session.streams.stdin) return error.SavedSessionHasNoInteractiveStdin;
     if (request.terminal and !session.streams.terminal) return error.SavedSessionHasNoTerminal;
+    return session;
 }
 
 fn findSession(sessions: []const Session, id: []const u8) ?Session {
@@ -1970,7 +1976,7 @@ test "session attach validation rejects unavailable input streams" {
     const sessions = [_]Session{processSession(default_session_id, false, false)};
 
     try std.testing.expectError(error.NoSavedSession, validateSessionAttach(&.{}, .{ .id = default_session_id }));
-    try validateSessionAttach(&sessions, .{ .id = default_session_id });
+    _ = try validateSessionAttach(&sessions, .{ .id = default_session_id });
     try std.testing.expectError(error.SavedSessionHasNoInteractiveStdin, validateSessionAttach(&sessions, .{
         .id = default_session_id,
         .stdin = true,

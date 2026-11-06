@@ -284,7 +284,11 @@ a second.
 
 Spore session handles are low-level process/session handles, not workflow
 state. Saved manifests can record `sessions`: an `id`, `kind: "process"`,
-and stream capabilities for `stdin`, `stdout`, `stderr`, and `terminal`.
+stream capabilities for `stdin`, `stdout`, `stderr`, and `terminal`, and the
+`stdout_offset` and `stderr_offset` the saving run had printed up to. `spore
+attach` resumes the output there, so it prints only output that run did not.
+The guest keeps the last 64 KiB of each stream, so the attach fails if the run
+had fallen further behind.
 Fresh `spore run --save` calls create a new output directory and record the
 `default` session. Commands started from an existing spore record a generated
 `run-*` session id, so a save of that

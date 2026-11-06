@@ -109,7 +109,12 @@ int send_client_terminal_output(struct session *session, struct client *client, 
   return 0;
 }
 
+// Set by spore_console_mirror=1, which the host passes only when it logs the
+// console. Every write here is a synchronous virtio-console transfer.
+int console_mirror = 0;
+
 void mirror_console(int is_stdout, const unsigned char *buf, size_t len) {
+  if (!console_mirror) return;
   int fd = is_stdout ? STDOUT_FILENO : STDERR_FILENO;
   (void)write_all(fd, buf, len);
 }

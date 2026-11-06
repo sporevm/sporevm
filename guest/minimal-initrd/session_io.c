@@ -112,7 +112,7 @@ static void pump_session_terminal(struct session *session, struct client *client
   for (;;) {
     ssize_t n = read(session->terminal_fd, buf, sizeof(buf));
     if (n > 0) {
-      (void)write_all(STDOUT_FILENO, buf, (size_t)n);
+      mirror_console(1, buf, (size_t)n);
       session->terminal_offset += (uint64_t)n;
       if (client->fd >= 0) {
         (void)send_client_terminal_output(session, client, client->terminal_offset, buf, (size_t)n);

@@ -311,6 +311,9 @@ pub fn terminalSizeFd() std.c.fd_t {
 
 pub const AttachV1Options = struct {
     session_id: []const u8 = spore.default_session_id,
+    /// Where the session's output resumes.
+    stdout_offset: u64 = 0,
+    stderr_offset: u64 = 0,
     interactive: bool = false,
     tty: bool = false,
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
@@ -324,8 +327,8 @@ pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) !
     const payload = struct {
         type: []const u8 = "attach-v1",
         session_id: []const u8,
-        stdout_offset: u64 = 0,
-        stderr_offset: u64 = 0,
+        stdout_offset: u64,
+        stderr_offset: u64,
         stdio: []const u8,
         interactive: bool,
         terminal_rows: u16,
@@ -333,6 +336,8 @@ pub fn attachV1Request(allocator: std.mem.Allocator, options: AttachV1Options) !
         params_json: []const u8,
     }{
         .session_id = options.session_id,
+        .stdout_offset = options.stdout_offset,
+        .stderr_offset = options.stderr_offset,
         .stdio = if (options.tty) "tty" else if (options.interactive) "pipe" else "null",
         .interactive = options.interactive,
         .terminal_rows = options.terminal_size.rows,

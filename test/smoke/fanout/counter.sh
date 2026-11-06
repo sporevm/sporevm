@@ -169,6 +169,9 @@ if [[ "${fanout_rc}" != "0" ]]; then
   die "spore fanout exited ${fanout_rc}, expected 0"
 fi
 
+# Each child resumes the saved process: its first counter line is the one after
+# the last the saving run printed, with nothing replayed or lost.
+saved_counter="$(grep -Eao 'spore counter [0-9]+' "${run_stdout}" | tail -n 1 | awk '{print $NF}')"
 for child in "${children[@]}"; do
   child_name="$(basename "${child}")"
   child_index="$((10#${child_name}))"
@@ -177,10 +180,11 @@ for child in "${children[@]}"; do
     cat "${fanout_stderr}" >&2 || true
     die "child ${child_name} did not report SPORE_PARALLEL_JOB=${child_index} SPORE_PARALLEL_JOB_COUNT=${count}"
   fi
-  if ! grep -Eaq "^\[${child_name}\] .*spore counter [0-9]+" "${fanout_stdout}"; then
+  first_counter="$(grep -Ea "^\[${child_name}\] " "${fanout_stdout}" | grep -Eao 'spore counter [0-9]+' | head -n 1 | awk '{print $NF}')"
+  if [[ -z "${first_counter}" || "${first_counter}" != "$((saved_counter + 1))" ]]; then
     tail -120 "${fanout_stdout}" >&2 || true
     cat "${fanout_stderr}" >&2 || true
-    die "child ${child_name} did not stream a prefixed resumed counter line"
+    die "child ${child_name} did not continue the counter from the saved run's last line"
   fi
 done
 

@@ -16,7 +16,9 @@ SPIO frames: a 24-byte little-endian header (`SPIO`, version 1, frame type,
 zero flags, stream id, byte offset, payload length of at most 4096) and the
 payload. The streams are control (0), stdin (1), stdout (2), stderr (3), and
 terminal (4). Every reply ends with an exit frame; a failed request first
-writes its error to stderr.
+writes its error to stderr. With `spore_console_mirror=1` on the kernel
+command line, which the host passes only when it logs the console
+(`--console-log`), the agent also copies command output to the console.
 
 | Request | Does |
 | --- | --- |
