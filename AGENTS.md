@@ -29,6 +29,8 @@
 - Prefer small, fast, reliable tests whose failures identify the broken
   behavior. Use integration/E2E tests for interactions isolated tests cannot
   establish.
+- Test runs may share a checkout, so tests never write to fixed paths. Use
+  `std.testing.tmpDir`, or `TestDir` (`src/test_dir.zig`) for path strings.
 - Do not reproduce implementation logic in assertions or mocks. Protect
   contracts, not incidental internal structure.
 - Distinguish temporary development scaffolding from checks worth maintaining.
