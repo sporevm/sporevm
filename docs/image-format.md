@@ -140,8 +140,18 @@ at most three attempts within 10 seconds; a `file://` store has no deadline, so
 a hung mount blocks the VM. A missing or corrupt object, or an unreachable
 store, fails that guest read with an I/O error, and the disk then fetches
 nothing more: later reads of objects not yet local fail at once, so a failing
-HTTP(S) store stalls the VM for at most one 10-second fetch. `run --save`,
-`run --commit` and `spore save` are refused for images run from a store.
+HTTP(S) store stalls the VM for at most one 10-second fetch.
+
+Saving or committing a disk run from a store (`run --save`, `--save-on`,
+`--commit`, `spore save`) first fetches every object of the image that is not
+yet local, up to 16 at a time, so the result needs nothing from the store.
+`spore save` fetches before it pauses the guest; if the store cannot supply an
+object, or a guest read from it fails before the save, the save fails and the
+VM keeps running. `spore vm rm` and a client that quits also stop that fetch.
+`run --save` and `--save-on` fetch while the guest is paused for the capture,
+before they write the spore or take the rootfs cache lock; a failure fails the
+run and removes the save directory. `--commit` takes the cache lock once the
+guest is frozen, so its fetch runs under it.
 
 ## Converter-worker conformance
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Pushes a local image holding a large random file to a directory store, serves
 # the store over loopback HTTP, and runs the image with an empty rootfs cache.
-# The run must fetch only the objects the guest reads; a warm rerun fetches
-# nothing, --save is refused, a named VM boots the same way and survives a
-# refused `spore save`, and a store without its objects fails the run. Prints
-# run times and the bytes fetched against the image's object bytes. Needs zig
-# (to build the guest program) and python3, but no registry.
+# The run must fetch only the objects the guest reads, and a warm rerun fetches
+# nothing. A named VM boots the same way; `spore save` fails and leaves it
+# running while the store lacks an object, then succeeds. `run --save` fails
+# without leaving a save directory while the store lacks an object; from an
+# empty cache it fetches the rest of the image, so the saved spore runs after
+# the store is gone, and a store without its objects fails the run. Prints run
+# times and the bytes fetched against the image's object bytes. Needs zig (to
+# build the guest program) and python3, but no registry.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
@@ -154,42 +157,71 @@ warm_ms="$(cat "${workdir}/warm.ms")"
 expect_eq "remote-lazy-ok" "$(cat "${workdir}/warm.stdout")" "warm remote run output"
 expect_eq 0 "$(trace_field "${workdir}/warm.trace.jsonl" remote_fetches)" "warm remote fetches"
 
-if run_image save "${store_ref}" --save "${workdir}/saved.spore"; then
-  die "--save from a partially local image succeeded"
-fi
-grep -Fq "refused for images run from a store" "${workdir}/save.stderr" || {
-  cat "${workdir}/save.stderr" >&2
-  die "--save from a partially local image did not explain the failure"
-}
-
 # A named VM boots from the store the same way.
 named() {
   SPOREVM_ROOTFS_CACHE_DIR="${workdir}/named-cache" SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" "$@"
+}
+named_exec() {
+  run_capture "${workdir}/$1.stdout" "${workdir}/$1.stderr" named exec "${vm_name}" -- /hello ||
+    require_success $? "$1" "${workdir}/$1.stderr"
+  expect_eq "remote-lazy-ok" "$(cat "${workdir}/$1.stdout")" "$1 output"
 }
 run_capture "${workdir}/create.stdout" "${workdir}/create.stderr" \
   named create "${vm_name}" --backend "${backend}" --image "${store_ref}" -- /hello ||
   require_success $? "create from the store" "${workdir}/create.stderr"
 vm_created=1
-run_capture "${workdir}/exec.stdout" "${workdir}/exec.stderr" named exec "${vm_name}" -- /hello ||
-  require_success $? "exec in a VM created from the store" "${workdir}/exec.stderr"
-expect_eq "remote-lazy-ok" "$(cat "${workdir}/exec.stdout")" "named exec output"
-# Saving it, with or without --stop, is refused and the VM keeps running.
-for stop in "" --stop; do
-  if run_capture "${workdir}/named-save${stop}.stdout" "${workdir}/named-save${stop}.stderr" \
-    named save "${vm_name}" --out "${workdir}/named${stop}.spore" ${stop}; then
-    die "spore save ${stop} of a VM created from the store succeeded"
+named_exec exec
+# While the store lacks an object the guest has not read, the save fails
+# before the guest pauses and the VM keeps running.
+unread=""
+for object in "${workdir}"/store/objects/blake3/*; do
+  if [[ ! -e "${workdir}/named-cache/cas/rootfs/blake3/objects/$(basename "${object}").chunk" ]]; then
+    unread="${object}"
+    break
   fi
-  grep -Fq "runs an image from a store" "${workdir}/named-save${stop}.stderr" || {
-    cat "${workdir}/named-save${stop}.stderr" >&2
-    die "spore save ${stop} of a VM created from the store did not explain the failure"
-  }
-  run_capture "${workdir}/exec-after-save${stop}.stdout" "${workdir}/exec-after-save${stop}.stderr" named exec "${vm_name}" -- /hello ||
-    require_success $? "exec after a refused spore save ${stop}" "${workdir}/exec-after-save${stop}.stderr"
-  expect_eq "remote-lazy-ok" "$(cat "${workdir}/exec-after-save${stop}.stdout")" "exec after a refused spore save ${stop}"
 done
-run_capture "${workdir}/rm.stdout" "${workdir}/rm.stderr" named rm "${vm_name}" ||
-  require_success $? "rm of a VM created from the store" "${workdir}/rm.stderr"
+[[ -n "${unread}" ]] || die "the named VM read every object of the image"
+mv "${unread}" "${workdir}/unread.hidden"
+if run_capture "${workdir}/named-save-lost.stdout" "${workdir}/named-save-lost.stderr" \
+  named save "${vm_name}" --out "${workdir}/named-lost.spore"; then
+  die "spore save succeeded while the store lacked an object"
+fi
+grep -Fq "was not saved" "${workdir}/named-save-lost.stderr" || {
+  cat "${workdir}/named-save-lost.stderr" >&2
+  die "spore save without a store object did not explain the failure"
+}
+named_exec exec-after-failed-save
+mv "${workdir}/unread.hidden" "${unread}"
+# With the object back, both kinds of save fetch the rest and succeed.
+run_capture "${workdir}/named-save.stdout" "${workdir}/named-save.stderr" \
+  named save "${vm_name}" --out "${workdir}/named.spore" ||
+  require_success $? "spore save of a VM created from the store" "${workdir}/named-save.stderr"
+named_exec exec-after-save
+run_capture "${workdir}/named-save-stop.stdout" "${workdir}/named-save-stop.stderr" \
+  named save "${vm_name}" --out "${workdir}/named-stop.spore" --stop ||
+  require_success $? "spore save --stop of a VM created from the store" "${workdir}/named-save-stop.stderr"
 vm_created=0
+
+# A save the store cannot complete fails and leaves no save directory.
+mv "${unread}" "${workdir}/unread.hidden"
+export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/lost-save-cache"
+if run_image lost-save "${store_ref}" --save "${workdir}/lost.spore"; then
+  die "run --save succeeded while the store lacked an object"
+fi
+grep -Fq "nothing was saved" "${workdir}/lost-save.stderr" || {
+  cat "${workdir}/lost-save.stderr" >&2
+  die "run --save without a store object did not explain the failure"
+}
+[[ ! -e "${workdir}/lost.spore" ]] || die "run --save left a save directory after the store failed"
+mv "${workdir}/unread.hidden" "${unread}"
+
+# A save from an empty cache fetches the rest of the image.
+export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/save-cache"
+run_image save "${store_ref}" --save "${workdir}/saved.spore" ||
+  require_success $? "run --save from the store" "${workdir}/save.stderr"
+expect_eq "remote-lazy-ok" "$(cat "${workdir}/save.stdout")" "run --save output"
+save_ms="$(cat "${workdir}/save.ms")"
+expect_eq "${objects_total}" "$(trace_field "${workdir}/save.trace.jsonl" remote_fetches)" "objects fetched by run --save"
 
 # Without its objects the image cannot boot, and the run fails instead of hanging.
 mv "${workdir}/store/objects" "${workdir}/objects.hidden"
@@ -203,11 +235,21 @@ set -e
 ((missing_status != 142)) || die "run without store objects hung"
 [[ ! -s "${workdir}/missing.stdout" ]] || die "run without store objects printed guest output"
 
+# The saved spore needs nothing from the store.
+kill "${server_pid}"
+wait "${server_pid}" 2>/dev/null || true
+server_pid=""
+run_capture "${workdir}/from.stdout" "${workdir}/from.stderr" \
+  "${spore_bin}" run --backend "${backend}" --from "${workdir}/saved.spore" -- /hello ||
+  require_success $? "run --from a spore saved from the store" "${workdir}/from.stderr"
+expect_eq "remote-lazy-ok" "$(cat "${workdir}/from.stdout")" "run --from output"
+
 python3 - <<PY
 object_bytes = ${object_bytes}
 cold_bytes = ${cold_bytes}
 print(f"remote-lazy: image ${image_digest}: ${objects_total} objects, {object_bytes} object bytes, ${index_bytes} index bytes")
 print(f"remote-lazy: cold run ${cold_ms} ms, fetched ${cold_fetches} objects, {cold_bytes} bytes ({100 * cold_bytes / object_bytes:.2f}% of object bytes)")
 print(f"remote-lazy: warm run ${warm_ms} ms; fully local run $(cat "${workdir}/local.ms") ms")
+print(f"remote-lazy: run --save from an empty cache ${save_ms} ms, fetching all ${objects_total} objects")
 PY
 echo "smoke:remote-lazy ok"

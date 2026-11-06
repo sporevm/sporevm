@@ -618,8 +618,6 @@ pub fn runManaged(
         .command_name = "run",
         .record_artifact = options.save_path != null or options.image_ref != null,
     });
-    const snapshots = options.save_path != null or !options.save_trigger.isExit() or options.continue_after_save or options.commit_ref != null;
-    if (snapshots and rootfs.remote) return error.RemoteImageNotSnapshotable;
     const command = if (options.image_ref != null)
         try run_mod.resolveImageRuntimeCommandWithEntrypoint(arena, rootfs.image_config, options.command, options.image_entrypoint)
     else blk: {

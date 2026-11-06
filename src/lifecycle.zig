@@ -1383,7 +1383,7 @@ fn saveContinueNamed(
     defer ready.deinit();
     const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, temp_dir, out_dir);
     if (!try snapshotResponseOk(arena, response)) {
-        if (try snapshotRefused(arena, response)) return error.RemoteImageNotSnapshotable;
+        try checkImageStoreRefusal(arena, options.name, response);
         return error.MonitorRequestFailed;
     }
     cleanup_temp = false;
@@ -1454,7 +1454,7 @@ fn saveStopNamed(
     defer ready.deinit();
     const response = try sendSuspendRequest(arena, context.io, ready.value.control_socket_path, out_dir);
     if (try suspendResponseFailureMessage(arena, response) != null) {
-        if (try snapshotRefused(arena, response)) return error.RemoteImageNotSnapshotable;
+        try checkImageStoreRefusal(arena, options.name, response);
         return error.MonitorRequestFailed;
     }
 
@@ -2402,9 +2402,10 @@ pub fn saveCli(
             const message = "spore save: disk-backed lifecycle save requires recorded immutable rootfs identity";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "save"), message);
         },
-        error.RemoteImageNotSnapshotable => {
-            const message = allocLifecycleMessage(allocator, "spore save: VM {s} runs an image from a store, and saving it is not supported; the VM keeps running", .{parsed.name});
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
+        error.ImageStoreIncomplete => {
+            const fallback = allocLifecycleMessage(allocator, "spore save: VM {s} was not saved: its image store could not supply every object; the VM keeps running", .{parsed.name});
+            const message = allocLifecycleLastErrorMessage(allocator, "save", fallback);
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, @errorName(err)), message);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.MonitorVersionMismatch, error.MonitorShutdownTimedOut => {
             const fallback = switch (err) {
@@ -4016,6 +4017,111 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
     claim.release(init.io);
 }
 
+test "a control request with a deadline gives up when the monitor's backlog is full" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-busy-{d}.sock", .{currentTestPid()});
+    defer allocator.free(socket_path);
+    Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    // A listener that never accepts stands in for a monitor whose accept
+    // thread is stuck; clients queued behind it fill the backlog, and a
+    // blocking connect would then wait for an accept that never comes.
+    const address = try net.UnixAddress.init(socket_path);
+    var server = try address.listen(io, .{ .kernel_backlog = 1 });
+    defer server.deinit(io);
+    var queued: [64]std.c.fd_t = undefined;
+    var count: usize = 0;
+    defer for (queued[0..count]) |fd| {
+        _ = std.c.close(fd);
+    };
+    while (count < queued.len) : (count += 1) {
+        queued[count] = connectControlSocketBefore(socket_path, monotonicMs() + 100) catch break;
+    }
+    try std.testing.expect(count < queued.len);
+
+    const start = monotonicMs();
+    try std.testing.expectError(error.MonitorUnavailable, sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}", 100));
+    try std.testing.expect(monotonicMs() - start < 2_000);
+}
+
+test "a control request to a monitor that closed its socket fails instead of raising SIGPIPE" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-closed-{d}.sock", .{currentTestPid()});
+    defer allocator.free(socket_path);
+    Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    // A client queued on the monitor's socket, which the monitor then closes
+    // as it exits, so the connection is reset before the request is written.
+    const address = try net.UnixAddress.init(socket_path);
+    var server = try address.listen(io, .{});
+    const fd = connectControlSocketBefore(socket_path, monotonicMs() + 1_000) catch |err| {
+        server.deinit(io);
+        return err;
+    };
+    defer _ = std.c.close(fd);
+    server.deinit(io);
+    // The test runtime catches SIGPIPE and the spore CLI does not, so restore
+    // the default: a write that raises it ends the test process.
+    var old_action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.PIPE, &.{ .handler = .{ .handler = std.c.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 }, &old_action);
+    defer std.posix.sigaction(.PIPE, &old_action, null);
+    try std.testing.expectError(error.MonitorUnavailable, writeControlRequest(fd, "{\"type\":\"shutdown\"}"));
+}
+
+test "a control request with a deadline waits for the monitor's backlog to drain" {
+    // macOS refuses a connect to a full backlog at once instead of waiting.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-drain-{d}.sock", .{currentTestPid()});
+    defer allocator.free(socket_path);
+    Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    const address = try net.UnixAddress.init(socket_path);
+    var server = try address.listen(io, .{ .kernel_backlog = 1 });
+    defer server.deinit(io);
+    var queued: [64]std.c.fd_t = undefined;
+    var count: usize = 0;
+    defer for (queued[0..count]) |fd| {
+        _ = std.c.close(fd);
+    };
+    while (count < queued.len) : (count += 1) {
+        queued[count] = connectControlSocketBefore(socket_path, monotonicMs() + 100) catch break;
+    }
+    try std.testing.expect(count < queued.len);
+
+    // The monitor's accept thread comes back partway through the deadline,
+    // takes the queued clients, then answers the request.
+    const Monitor = struct {
+        fn run(listener: std.c.fd_t, backlog: usize) void {
+            sleepMs(300);
+            for (0..backlog) |_| _ = std.c.close(std.c.accept(listener, null, null));
+            // Bounded, so a request that gave up fails the test instead of
+            // hanging it.
+            var fds = [_]std.posix.pollfd{.{ .fd = listener, .events = std.c.POLL.IN, .revents = 0 }};
+            if ((std.posix.poll(&fds, 3_000) catch 0) == 0) return;
+            const client = std.c.accept(listener, null, null);
+            if (client < 0) return;
+            defer _ = std.c.close(client);
+            var buf: [64]u8 = undefined;
+            _ = std.c.read(client, &buf, buf.len);
+            const reply = "{\"type\":\"ok\"}\n";
+            _ = std.c.write(client, reply, reply.len);
+        }
+    };
+    const monitor = try std.Thread.spawn(.{}, Monitor.run, .{ server.socket.handle, count });
+    defer monitor.join();
+    const start = monotonicMs();
+    const response = try sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"hello\"}", 2_000);
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("{\"type\":\"ok\"}", response);
+    try std.testing.expect(monotonicMs() - start >= 250);
+}
+
 test "lifecycle monitor spawn receives context environment, debug flag and only the name" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -4677,6 +4783,57 @@ fn sendShutdownRequest(allocator: std.mem.Allocator, io: Io, socket_path: []cons
     return sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}", monitor_reply_deadline_ms);
 }
 
+/// Connect to a control socket by `deadline`. While the monitor's listen
+/// backlog is full (its accept thread is waiting out a slow client and
+/// others queue behind it), Linux makes a blocking AF_UNIX connect wait for
+/// room for up to the send timeout, then fail with EAGAIN. macOS refuses a
+/// full backlog at once with ECONNREFUSED, which is not retried: it also
+/// means a dead monitor's socket, and `spore vm rm` should not wait on that.
+fn connectControlSocketBefore(socket_path: []const u8, deadline: u64) !std.c.fd_t {
+    try validateControlSocketPath(socket_path);
+    var address = std.mem.zeroes(std.c.sockaddr.un);
+    address.family = std.c.AF.UNIX;
+    if (@hasField(std.c.sockaddr.un, "len")) address.len = @sizeOf(std.c.sockaddr.un);
+    if (socket_path.len >= address.path.len) return error.NameTooLong;
+    @memcpy(address.path[0..socket_path.len], socket_path);
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return error.MonitorUnavailable;
+    errdefer _ = std.c.close(fd);
+    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+    while (true) {
+        try setControlSendDeadline(fd, deadline);
+        const rc = std.c.connect(fd, @ptrCast(&address), @sizeOf(std.c.sockaddr.un));
+        if (rc == 0) return fd;
+        if (std.c.errno(rc) != .INTR) return error.MonitorUnavailable;
+    }
+}
+
+/// Bounds blocking connects and writes on `fd` by `deadline`.
+fn setControlSendDeadline(fd: std.c.fd_t, deadline: u64) !void {
+    const now = monotonicMs();
+    if (now >= deadline) return error.MonitorUnavailable;
+    const ms = deadline - now;
+    const timeout = std.c.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * std.time.us_per_ms) };
+    if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, &timeout, @sizeOf(std.c.timeval)) != 0) return error.MonitorUnavailable;
+}
+
+/// Write `json` and a newline to the control socket `fd`, whose send
+/// timeout bounds a write the monitor does not take. A monitor that closed
+/// its socket fails the write instead of raising SIGPIPE.
+fn writeControlRequest(fd: std.c.fd_t, json: []const u8) !void {
+    for ([_][]const u8{ json, "\n" }) |part| {
+        var remaining = part;
+        while (remaining.len != 0) {
+            const n = std.c.send(fd, remaining.ptr, remaining.len, std.c.MSG.NOSIGNAL);
+            if (n >= 0) {
+                remaining = remaining[@intCast(n)..];
+            } else if (std.c.errno(n) != .INTR) {
+                return error.MonitorUnavailable;
+            }
+        }
+    }
+}
+
 fn sendSuspendRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, out_dir: []const u8) ![]const u8 {
     const payload = struct {
         type: []const u8 = "suspend",
@@ -4759,18 +4916,29 @@ fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8
 }
 
 /// Sends one request line and reads one response line. With a deadline, a
-/// monitor that has not answered in time is treated as unavailable.
+/// monitor that has not taken the request and answered in time is treated
+/// as unavailable.
 fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8, deadline_ms: ?u64) ![]const u8 {
-    const address = try controlSocketAddress(socket_path);
-    const stream = address.connect(io) catch return error.MonitorUnavailable;
-    defer stream.close(io);
     // Callers commonly use arenas that cannot reclaim scratch beneath the response.
     const read_buffer = try std.heap.page_allocator.alloc(u8, max_control_response);
     defer std.heap.page_allocator.free(read_buffer);
+    if (deadline_ms) |ms| {
+        // Connecting shares the deadline: an unbounded connect waits as long
+        // as the monitor's listen backlog stays full.
+        const deadline = monotonicMs() +| ms;
+        const fd = try connectControlSocketBefore(socket_path, deadline);
+        defer _ = std.c.close(fd);
+        try setControlSendDeadline(fd, deadline);
+        try writeControlRequest(fd, json);
+        return allocator.dupe(u8, try readControlLine(fd, read_buffer, deadline -| monotonicMs()));
+    }
+    const address = try controlSocketAddress(socket_path);
+    const stream = address.connect(io) catch return error.MonitorUnavailable;
+    defer stream.close(io);
     writeAll(io, stream, json) catch return error.MonitorUnavailable;
     writeAll(io, stream, "\n") catch return error.MonitorUnavailable;
 
-    const line = try readControlLine(stream.socket.handle, read_buffer, deadline_ms);
+    const line = try readControlLine(stream.socket.handle, read_buffer, null);
     return allocator.dupe(u8, line);
 }
 
@@ -5242,19 +5410,23 @@ fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const
     return try allocator.dupe(u8, message);
 }
 
-/// The monitor's answer to a save of a VM whose root disk reads objects from
-/// an image store. It refuses before pausing the guest, so the VM keeps
-/// running.
-pub const snapshot_refused_store_rootfs = "the root disk reads objects from an image store and cannot be saved";
+/// How the monitor's refusal of a save begins when the root disk's image
+/// store cannot supply every object. It refuses before pausing the guest, so
+/// the VM keeps running.
+pub const save_refused_image_store = "the image store of the root disk could not supply every object";
 
-fn snapshotRefused(allocator: std.mem.Allocator, response: []const u8) !bool {
+/// Fails with `error.ImageStoreIncomplete`, and the refusal as last error,
+/// when the monitor refused the save for the root disk's image store.
+fn checkImageStoreRefusal(allocator: std.mem.Allocator, name: []const u8, response: []const u8) !void {
     var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
     defer parsed.deinit();
-    return std.mem.eql(u8, parsed.value.type, "error") and
-        std.mem.eql(u8, parsed.value.message orelse "", snapshot_refused_store_rootfs);
+    const message = parsed.value.message orelse return;
+    if (!std.mem.eql(u8, parsed.value.type, "error") or !std.mem.startsWith(u8, message, save_refused_image_store)) return;
+    setLastError("VM {s} was not saved: {s}; the VM keeps running", .{ name, message });
+    return error.ImageStoreIncomplete;
 }
 
 fn snapshotResponseOk(allocator: std.mem.Allocator, response: []const u8) !bool {
@@ -7225,11 +7397,13 @@ fn currentTestPid() i64 {
     return if (comptime builtin.os.tag == .windows) 1 else @intCast(std.c.getpid());
 }
 
-test "save recognizes the monitor's refusal of a store-backed root disk" {
+test "save reports the monitor's refusal for a root disk's image store" {
     const allocator = std.testing.allocator;
-    const refused = try std.json.Stringify.valueAlloc(allocator, .{ .type = "error", .message = snapshot_refused_store_rootfs }, .{});
+    const refused = try std.json.Stringify.valueAlloc(allocator, .{ .type = "error", .message = save_refused_image_store ++ ": ImageStoreNotFound" }, .{});
     defer allocator.free(refused);
-    try std.testing.expect(try snapshotRefused(allocator, refused));
-    try std.testing.expect(!try snapshotRefused(allocator, "{\"type\":\"error\",\"message\":\"monitor busy\"}"));
-    try std.testing.expect(!try snapshotRefused(allocator, "{\"type\":\"snapshotted\",\"out_dir\":\"/tmp/a\"}"));
+    clearLastError();
+    try std.testing.expectError(error.ImageStoreIncomplete, checkImageStoreRefusal(allocator, "app", refused));
+    try std.testing.expectEqualStrings("VM app was not saved: " ++ save_refused_image_store ++ ": ImageStoreNotFound; the VM keeps running", lastErrorMessage());
+    try checkImageStoreRefusal(allocator, "app", "{\"type\":\"error\",\"message\":\"monitor busy\"}");
+    try checkImageStoreRefusal(allocator, "app", "{\"type\":\"snapshotted\",\"out_dir\":\"/tmp/a\"}");
 }

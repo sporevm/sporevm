@@ -119,6 +119,15 @@ pub const SnapshotState = struct {
     active: ActiveHead,
     metrics: ?*SnapshotMetrics = null,
 
+    /// Fetch the objects of a store image that are not local yet. The VMM
+    /// calls this before it writes anything for a snapshot or takes the
+    /// cache lock.
+    pub fn fetchFromStore(self: SnapshotState) Error!void {
+        switch (self.active) {
+            .chunk_mapped => |disk| try disk.fetchFromStore(),
+        }
+    }
+
     /// Finish a writable disk snapshot after the VMM has paused the guest and
     /// verified the matching virtio-blk queues have no pending requests.
     /// A clean head over an exact rootfs baseline needs no disk state, so it

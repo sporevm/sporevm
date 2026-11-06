@@ -12,6 +12,7 @@ const saved_spore_pin = @import("saved_spore_pin.zig");
 const snapshot_publication = @import("snapshot_publication.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const generation = @import("generation.zig");
+const image_store_mod = @import("image_store.zig");
 const Io = std.Io;
 const net = std.Io.net;
 
@@ -240,6 +241,9 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     var server = try ExecServer.init(allocator, init.io, entry, paths.vm_dir, paths.runtime_root, paths.control_socket_path, cache_root, spec.guest_port, spec.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
+    // Runs after the accept thread has joined every handler, any of which
+    // may have been fetching for a save.
+    defer if (server.image_store) |fetcher| fetcher.release();
     if (spec.disk_baseline_lease) |lease| {
         var cache_lock: ?rootfs_mod.RootfsCacheLock = if (lease.store == .rootfs_cache)
             try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, lease.root)
@@ -449,8 +453,8 @@ const ExecServer = struct {
     disk_baseline_active: ?runtime_disk_lease.Active = null,
     snapshot_publication_wait: snapshot_publication.Wait = .{},
     /// Set once the root disk is open when it reads objects from an image
-    /// store: no snapshot can capture it, so save requests are refused.
-    snapshots_refused: bool = false,
+    /// store. Retained; released after every control handler has joined.
+    image_store: ?*image_store_mod.Fetcher = null,
 
     fn init(allocator: std.mem.Allocator, io: Io, entry: vm_registry.Entry, vm_dir: []const u8, runtime_root: []const u8, socket_path: []const u8, cache_root: []const u8, guest_port: u32, timeout_ms: u64, generation_params: ?[]const u8, exec_defaults: lifecycle.ExecDefaults) !ExecServer {
         // Zig's UnixAddress accepts 108-byte paths everywhere, but macOS
@@ -536,6 +540,9 @@ const ExecServer = struct {
     fn stopControl(self: *ExecServer, accept_thread: std.Thread, message: []const u8) void {
         self.failOutstanding(message);
         self.closed.store(true, .release);
+        // A handler may be fetching a store image for a save; stop it so the
+        // join does not wait for the download.
+        self.cancelImageStoreFetch();
         accept_thread.join();
         self.server.deinit(self.io);
         Io.Dir.cwd().deleteFile(self.io, self.socket_path) catch {};
@@ -556,15 +563,55 @@ const ExecServer = struct {
             .completeRootfsSnapshotFn = completeRootfsSnapshotThunk,
             .completeDiskForkFn = completeDiskForkThunk,
             .failDiskForkFn = failDiskForkThunk,
-            .refuseSnapshotsFn = refuseSnapshotsThunk,
+            .attachImageStoreFn = attachImageStoreThunk,
             .reportStatsFn = reportStatsThunk,
         };
     }
 
-    fn refuseSnapshots(self: *ExecServer) void {
+    fn attachImageStore(self: *ExecServer, fetcher: *image_store_mod.Fetcher) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.snapshots_refused = true;
+        if (self.image_store == null) self.image_store = fetcher.retain();
+    }
+
+    /// Before a save pauses the guest, fetch the root disk's objects that are
+    /// only in its image store. Returns why the save is refused, or null.
+    /// Refusing here keeps the VM running; a capture that fails while the
+    /// guest is paused ends the run.
+    fn imageStoreRefusal(self: *ExecServer, client: std.c.fd_t, buf: []u8) ?[]const u8 {
+        const fetcher = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            break :blk self.image_store orelse return null;
+        };
+        // A failed read poisoned the disk, and no snapshot can capture it.
+        // A read can also fail while the fill runs, so check again after it.
+        const read_failed = "a guest read from it failed earlier";
+        const cause = if (fetcher.readFailed())
+            read_failed
+        else if (fetcher.fetchAll()) |_|
+            if (fetcher.readFailed())
+                read_failed
+            else if (clientGone(client))
+                // The client gave up while the image downloaded.
+                "the client went away"
+            else
+                return null
+        else |err| switch (err) {
+            // The monitor is stopping, so the store is not to blame and the
+            // VM does not keep running.
+            error.ImageStoreFetchCanceled => return self.refusalMessage(error.MonitorStopping),
+            else => @errorName(err),
+        };
+        return std.fmt.bufPrint(buf, "{s}: {s}", .{ lifecycle.save_refused_image_store, cause }) catch lifecycle.save_refused_image_store;
+    }
+
+    /// Stop a save's fetch on a control handler thread, so the handlers can
+    /// be joined without waiting for the image to download.
+    fn cancelImageStoreFetch(self: *ExecServer) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.image_store) |fetcher| fetcher.cancel();
     }
 
     fn setWake(self: *ExecServer, wake: vsock_control.Wake) void {
@@ -1050,8 +1097,6 @@ const ExecServer = struct {
         if (out_dir.len == 0 or out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        // Refuse before the guest pauses: a failed capture ends the VM.
-        if (self.snapshots_refused) return error.RemoteImageNotSnapshotable;
         try self.acquireOpLocked();
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
@@ -1073,7 +1118,6 @@ const ExecServer = struct {
         }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        if (self.snapshots_refused) return error.RemoteImageNotSnapshotable;
         try self.acquireOpLocked();
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
@@ -1402,7 +1446,7 @@ const ExecServer = struct {
 
     /// The message for a guest operation the monitor did not run.
     fn refusalMessage(self: *ExecServer, err: anyerror) []const u8 {
-        if (err != error.MonitorStopping) return snapshotSubmitErrorMessage(err);
+        if (err != error.MonitorStopping) return "monitor busy";
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.stopping orelse removal_message;
@@ -1525,9 +1569,9 @@ const ExecServer = struct {
         self.failDiskFork(err);
     }
 
-    fn refuseSnapshotsThunk(context: *anyopaque) void {
+    fn attachImageStoreThunk(context: *anyopaque, fetcher: *image_store_mod.Fetcher) void {
         const self: *ExecServer = @ptrCast(@alignCast(context));
-        self.refuseSnapshots();
+        self.attachImageStore(fetcher);
     }
 
     fn reportStatsThunk(context: *anyopaque, stats: vsock_control.ControlStats) void {
@@ -1810,6 +1854,19 @@ const ControlHandler = struct {
     line_len: usize = 0,
 };
 
+/// Whether the client of a control connection closed it. It has sent its
+/// whole request, so any readable byte is an end of stream.
+fn clientGone(fd: std.c.fd_t) bool {
+    var byte: [1]u8 = undefined;
+    const n = std.c.recv(fd, &byte, byte.len, std.c.MSG.PEEK | std.c.MSG.DONTWAIT);
+    if (n == 0) return true;
+    if (n > 0) return false;
+    return switch (std.c.errno(n)) {
+        .AGAIN, .INTR => false,
+        else => true,
+    };
+}
+
 fn controlThreadMain(server: *ExecServer) void {
     while (!server.isClosed()) {
         var fds = [_]std.posix.pollfd{.{ .fd = server.server.socket.handle, .events = std.c.POLL.IN, .revents = 0 }};
@@ -1976,6 +2033,11 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json
             try writeControlError(server.io, stream, "suspend request missing out_dir");
             return;
         };
+        var refusal_buf: [256]u8 = undefined;
+        if (server.imageStoreRefusal(stream.socket.handle, &refusal_buf)) |message| {
+            try writeControlError(server.io, stream, message);
+            return;
+        }
         const response = server.submitSuspend(out_dir) catch |err| {
             try writeControlError(server.io, stream, server.refusalMessage(err));
             return;
@@ -1996,6 +2058,11 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json
         const continue_after = parsed.value.@"continue" orelse false;
         if (!continue_after) {
             try writeControlError(server.io, stream, "snapshot request must set continue=true");
+            return;
+        }
+        var refusal_buf: [256]u8 = undefined;
+        if (server.imageStoreRefusal(stream.socket.handle, &refusal_buf)) |message| {
+            try writeControlError(server.io, stream, message);
             return;
         }
         const response = server.submitSnapshot(out_dir, parsed.value.publish_dir) catch |err| {
@@ -2297,10 +2364,6 @@ fn writeControlHello(io: Io, stream: net.Stream) !void {
     const json = try std.json.Stringify.valueAlloc(fixed.allocator(), payload, .{});
     try writeAll(io, stream, json);
     try writeAll(io, stream, "\n");
-}
-
-fn snapshotSubmitErrorMessage(err: anyerror) []const u8 {
-    return if (err == error.RemoteImageNotSnapshotable) lifecycle.snapshot_refused_store_rootfs else "monitor busy";
 }
 
 fn writeControlError(io: Io, stream: net.Stream, message: []const u8) !void {
@@ -3054,25 +3117,220 @@ test "named exec timing partitions monitor and guest phases" {
     try std.testing.expectEqual(@as(u64, 100), timing.total_ms);
 }
 
-test "a monitor whose root disk reads from an image store refuses saves before pausing" {
-    var server: ExecServer = undefined;
-    server.allocator = std.testing.allocator;
-    server.io = std.testing.io;
-    server.mutex = .init;
-    server.cond = .init;
-    server.state = .idle;
-    server.wake = null;
-    server.snapshots_refused = false;
+test "a monitor fetches a store-backed root disk before a save pauses the guest, or refuses the save" {
+    var fixture: image_store_mod.TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
+    var object: ?[]const u8 = null;
+    for (try fixture.listStore(store)) |file| {
+        if (std.mem.startsWith(u8, file, "objects/")) object = try std.fs.path.join(allocator, &.{ store, file });
+    }
+    const hidden = try fixture.path("hidden");
+    const digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{std.fs.path.basename(object.?)});
+    const len: usize = @intCast((try std.Io.Dir.cwd().statFile(io, object.?, .{})).size);
+    var buf: [256]u8 = undefined;
+    // The save request's client end, which stays connected.
+    var client: StoreSaveClient = try .init();
+    defer client.deinit();
 
-    // The run loop reports the disk it opened through the control interface.
-    server.control().refuseSnapshots();
-    try std.testing.expectError(error.RemoteImageNotSnapshotable, server.submitSuspend("/tmp/save.spore"));
-    try std.testing.expectError(error.RemoteImageNotSnapshotable, server.submitSnapshot("/tmp/save.tmp", "/tmp/save.spore"));
-    // Nothing reaches the run loop, so the guest never pauses.
-    try std.testing.expectEqual(RequestState.idle, server.state);
-    try std.testing.expectEqualStrings(lifecycle.snapshot_refused_store_rootfs, snapshotSubmitErrorMessage(error.RemoteImageNotSnapshotable));
-    try std.testing.expectEqualStrings("monitor busy", snapshotSubmitErrorMessage(error.ControlBusy));
+    // The store lost an object: the save is refused and nothing paused.
+    var monitor: StoreMonitor = undefined;
+    try monitor.init(try fixture.path("cache"), ref, allocator);
+    defer monitor.deinit();
+    try std.Io.Dir.renameAbsolute(object.?, hidden, io);
+    const refusal = monitor.server.imageStoreRefusal(client.monitor_end, &buf) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": ImageStoreNotFound", refusal);
+    try std.testing.expectEqual(RequestState.idle, monitor.server.state);
+    // Once the store has it again, the save goes ahead with every object local.
+    try std.Io.Dir.renameAbsolute(hidden, object.?, io);
+    try std.testing.expectEqual(null, monitor.server.imageStoreRefusal(client.monitor_end, &buf));
+    try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, try fixture.path("cache"), monitor.storage));
+
+    // A guest read that could not fetch its object poisoned the disk, so its
+    // saves stay refused even when the store recovers.
+    var poisoned: StoreMonitor = undefined;
+    try poisoned.init(try fixture.path("poisoned-cache"), ref, allocator);
+    defer poisoned.deinit();
+    try std.Io.Dir.renameAbsolute(object.?, hidden, io);
+    try std.testing.expectError(error.ImageStoreNotFound, poisoned.fetcher.fetchObject(digest, try allocator.alloc(u8, len)));
+    try std.Io.Dir.renameAbsolute(hidden, object.?, io);
+    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": a guest read from it failed earlier", poisoned.server.imageStoreRefusal(client.monitor_end, &buf).?);
+
+    // A stopping monitor cancels the fetch and says it is stopping, not that
+    // the store failed; a client that left during the fetch gets no save.
+    var canceled: StoreMonitor = undefined;
+    try canceled.init(try fixture.path("canceled-cache"), ref, allocator);
+    defer canceled.deinit();
+    canceled.server.cancelImageStoreFetch();
+    try std.testing.expectEqualStrings(removal_message, canceled.server.imageStoreRefusal(client.monitor_end, &buf).?);
+    var gone: StoreMonitor = undefined;
+    try gone.init(try fixture.path("gone-cache"), ref, allocator);
+    defer gone.deinit();
+    var left: StoreSaveClient = try .init();
+    defer left.deinit();
+    left.hangUp();
+    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": the client went away", gone.server.imageStoreRefusal(left.monitor_end, &buf).?);
 }
+
+test "a save is refused when a guest read fails while the monitor fetches the image" {
+    var fixture: image_store_mod.TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    var object: ?[]const u8 = null;
+    for (try fixture.listStore(store)) |file| {
+        if (std.mem.startsWith(u8, file, "objects/")) object = try std.fs.path.join(allocator, &.{ store, file });
+    }
+    const digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{std.fs.path.basename(object.?)});
+    const len: usize = @intCast((try std.Io.Dir.cwd().statFile(io, object.?, .{})).size);
+    var server: image_store_mod.TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    var monitor: StoreMonitor = undefined;
+    try monitor.init(try fixture.path("cache"), try std.fmt.allocPrint(allocator, "{s}/1", .{try server.url(allocator)}), allocator);
+    defer monitor.deinit();
+    var client: StoreSaveClient = try .init();
+    defer client.deinit();
+
+    // A guest read finds the object missing from the store, which gets it
+    // back before the save's own fetch of it is answered.
+    try std.Io.Dir.renameAbsolute(object.?, try fixture.path("hidden"), io);
+    server.delay_ms.store(200, .monotonic);
+    const before = server.requests.load(.monotonic);
+    const Reader = struct {
+        fn run(fetcher: *image_store_mod.Fetcher, object_digest: []const u8, buf: []u8, hidden: []const u8, path: []const u8) void {
+            fetcher.fetchObject(object_digest, buf) catch {};
+            std.Io.Dir.renameAbsolute(hidden, path, std.testing.io) catch {};
+        }
+    };
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ monitor.fetcher, digest, try allocator.alloc(u8, len), try fixture.path("hidden"), object.? });
+    defer reader.join();
+    while (server.requests.load(.monotonic) == before) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+
+    var buf: [256]u8 = undefined;
+    const refusal = monitor.server.imageStoreRefusal(client.monitor_end, &buf) orelse return error.TestExpectedRefusal;
+    try std.testing.expect(std.mem.startsWith(u8, refusal, lifecycle.save_refused_image_store));
+    try std.testing.expect(monitor.fetcher.readFailed());
+    try std.testing.expectEqual(RequestState.idle, monitor.server.state);
+}
+
+test "stopping the control plane cancels a save's pending image fetch" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var fixture: image_store_mod.TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const cache = try fixture.path("cache");
+    const local = try image_store_mod.resolve(io, allocator, cache, try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{});
+    const fetcher = try image_store_mod.Fetcher.create(std.testing.allocator, io, cache, local.origin.?, local.storage);
+    defer fetcher.release();
+
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-fetch-stop-{d}.sock", .{std.c.getpid()});
+    var entry_dir = std.testing.tmpDir(.{});
+    defer entry_dir.cleanup();
+    var server = try ExecServer.init(std.testing.allocator, io, .{ .dir = entry_dir.dir }, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", 10700, 1_000, null, .{});
+    defer server.disk_claims.deinit();
+    server.control().attachImageStore(fetcher);
+    defer server.image_store.?.release();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    var stopped = false;
+    defer if (!stopped) server.stopControl(accept_thread, "test finished");
+
+    // A handler's save waits to start its fetch.
+    const fill_mutex = &fetcher.fill_mutex;
+    try std.testing.expect(fill_mutex.tryLock());
+    var client: StoreSaveClient = try .init();
+    defer client.deinit();
+    var refusal_buf: [256]u8 = undefined;
+    const Save = struct {
+        refusal: ?[]const u8 = null,
+        fn run(save: *@This(), exec_server: *ExecServer, fd: std.c.fd_t, buf: []u8) void {
+            save.refusal = exec_server.imageStoreRefusal(fd, buf);
+        }
+    };
+    var save: Save = .{};
+    const thread = std.Thread.spawn(.{}, Save.run, .{ &save, &server, client.monitor_end, &refusal_buf }) catch |err| {
+        fill_mutex.unlock(io);
+        return err;
+    };
+    var waiting = true;
+    errdefer if (waiting) {
+        fill_mutex.unlock(io);
+        thread.join();
+    };
+    while (fill_mutex.state.load(.monotonic) != .contended) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+
+    // The VM loop has returned; stopping the control plane cancels the
+    // fetch, which then downloads nothing. (That stopControl cancels before
+    // it joins the handlers is not checked here: this save is not on one.)
+    stopped = true;
+    server.stopControl(accept_thread, "monitor stopped");
+    waiting = false;
+    fill_mutex.unlock(io);
+    thread.join();
+    try std.testing.expectEqualStrings("monitor stopped", save.refusal orelse return error.TestExpectedRefusal);
+    try std.testing.expectEqual(@as(u64, 0), fetcher.currentStats().fetches);
+}
+
+/// Test support: an ExecServer whose root disk runs a store image.
+const StoreMonitor = struct {
+    server: ExecServer,
+    fetcher: *image_store_mod.Fetcher,
+    storage: spore.RootfsStorage,
+
+    fn init(self: *StoreMonitor, cache: []const u8, image_ref: []const u8, arena: std.mem.Allocator) !void {
+        const local = try image_store_mod.resolve(std.testing.io, arena, cache, image_ref, .{});
+        self.storage = local.storage;
+        self.fetcher = try image_store_mod.Fetcher.create(std.testing.allocator, std.testing.io, cache, local.origin.?, local.storage);
+        self.server = undefined;
+        self.server.io = std.testing.io;
+        self.server.mutex = .init;
+        self.server.state = .idle;
+        self.server.stopping = null;
+        self.server.image_store = null;
+        // The run loop hands over the fetcher of the disk it opened.
+        self.server.control().attachImageStore(self.fetcher);
+    }
+
+    fn deinit(self: *StoreMonitor) void {
+        self.server.image_store.?.release();
+        self.fetcher.release();
+    }
+};
+
+/// Test support: both ends of a control connection.
+const StoreSaveClient = struct {
+    monitor_end: std.c.fd_t,
+    client_end: std.c.fd_t,
+
+    fn init() !StoreSaveClient {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPairFailed;
+        return .{ .monitor_end = fds[0], .client_end = fds[1] };
+    }
+
+    fn hangUp(self: *StoreSaveClient) void {
+        _ = std.c.close(self.client_end);
+        self.client_end = -1;
+    }
+
+    fn deinit(self: *StoreSaveClient) void {
+        _ = std.c.close(self.monitor_end);
+        if (self.client_end >= 0) _ = std.c.close(self.client_end);
+    }
+};
 
 /// A local control client with read deadlines, so a monitor that blocks
 /// fails the test instead of hanging it.
