@@ -91,7 +91,7 @@ pub const RuntimeDisk = struct {
         const overlay = if (self.overlay) |*value| value else return error.ReadOnly;
         const expected = try self.forkBaseline();
         if (expected.kind != head.descriptor.baseline.kind or !std.mem.eql(u8, expected.identity, head.descriptor.baseline.identity)) return error.BadDescriptor;
-        if (disk.overlay_fd != overlay.fd) return error.BadManifest;
+        if ((disk.overlay orelse return error.ReadOnly).fd != overlay.fd) return error.BadManifest;
 
         const claimed_fd = head.overlay_fd;
         if (!try sameFilesystem(overlay.fd, claimed_fd)) return error.BadOverlay;
@@ -823,8 +823,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
 
     try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.chunk_mapped != null);
-    try std.testing.expect(runtime.chunk_mapped.?.cas_root == null);
-    try std.testing.expect(runtime.chunk_mapped.?.parent_root != null);
+    try std.testing.expect(runtime.chunk_mapped.?.index == .parent);
     try std.testing.expectEqual(@as(usize, @intCast(preload_result.nonzero_chunks)), runtime.chunk_mapped.?.indexDigestCount());
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
@@ -865,8 +864,8 @@ test "runtime disk exports and adopts a portable fork head" {
     defer parent.deinit();
     var child = try open(context, allocator, .{ .rootfs = rootfs });
     defer child.deinit();
-    try std.testing.expectEqualStrings(absolute_tmp_root, parent.chunk_mapped.?.overlay_dir.?);
-    try std.testing.expectEqualStrings(absolute_tmp_root, child.chunk_mapped.?.overlay_dir.?);
+    try std.testing.expectEqualStrings(absolute_tmp_root, parent.chunk_mapped.?.overlay.?.dir);
+    try std.testing.expectEqualStrings(absolute_tmp_root, child.chunk_mapped.?.overlay.?.dir);
 
     const parent_patch = [_]u8{0xA5} ** 97;
     try parent.chunk_mapped.?.writeAt(&parent_patch, spore.disk_chunk_size - 17);
@@ -1196,7 +1195,7 @@ test "runtime disk benchmark env eagerly materializes missing flat rootfs from c
 
     try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.chunk_mapped != null);
-    try std.testing.expect(runtime.chunk_mapped.?.cas_root == null);
+    try std.testing.expect(runtime.chunk_mapped.?.index != .cas);
     try std.testing.expect(try rootfs_cache.regularFileNoSymlink(io, digest_path));
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, spore.disk_chunk_size);
