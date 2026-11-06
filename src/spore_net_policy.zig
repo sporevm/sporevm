@@ -1084,6 +1084,67 @@ fn dnsTestNameLen(name: []const u8) usize {
     return name.len + 2;
 }
 
+pub const BoundServiceBindingList = struct {
+    items: [max_bound_services]BoundServiceBinding = undefined,
+    len: usize = 0,
+
+    pub fn append(self: *BoundServiceBindingList, binding: BoundServiceBinding) !void {
+        if (self.len >= max_bound_services) return error.TooManyBoundServices;
+        self.items[self.len] = binding;
+        self.len += 1;
+    }
+
+    pub fn slice(self: *const BoundServiceBindingList) []const BoundServiceBinding {
+        return self.items[0..self.len];
+    }
+};
+
+/// Guest networking. Spore networking always carries its policy, and the
+/// policy has no default egress, so enabling the network means choosing
+/// between unrestricted egress and an allowlist.
+pub const Network = union(enum) {
+    disabled,
+    spore: Config,
+};
+
+pub const NetworkMode = std.meta.Tag(Network);
+
+pub fn networkFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !Network {
+    return networkFromManifestWithBindings(allocator, manifest_network, &.{});
+}
+
+pub fn networkFromManifestWithBindings(
+    allocator: std.mem.Allocator,
+    manifest_network: ?spore.Network,
+    bound_services: []const BoundServiceBinding,
+) !Network {
+    return networkFromManifestWithBindingDiagnostic(allocator, manifest_network, bound_services, null);
+}
+
+pub fn networkFromManifestWithBindingDiagnostic(
+    allocator: std.mem.Allocator,
+    manifest_network: ?spore.Network,
+    bound_services: []const BoundServiceBinding,
+    diagnostic: ?*BoundServiceBindingDiagnostic,
+) !Network {
+    if (diagnostic) |diag| diag.* = .{};
+    const network = manifest_network orelse {
+        if (bound_services.len != 0) {
+            if (diagnostic) |diag| diag.unexpected_name = bound_services[0].name;
+            return error.UnexpectedBoundServiceBinding;
+        }
+        return .disabled;
+    };
+    return .{ .spore = try configFromManifestNetworkWithBindingDiagnostic(allocator, network, bound_services, diagnostic) };
+}
+
+pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: *const Network) !?spore.Network {
+    return switch (network.*) {
+        .disabled => null,
+        .spore => |*policy| try manifestNetworkFromConfig(allocator, policy),
+    };
+}
+
 test "spore-net policy allow host learns A records behind a CNAME chain" {
     var config = Config{ .egress = .deny_all };
     try config.addAllowHost("dl-cdn.alpinelinux.org");
@@ -1544,4 +1605,165 @@ test "spore-net bound Unix services validate and lookup by DNS name and guest po
     const by_port = policy.boundServiceForPort(8170) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("/tmp/cleanroom-gateway.sock", by_port.unix_path);
     try std.testing.expect(policy.boundServiceForPort(8171) == null);
+}
+
+test "run restores network options from manifest policy" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_network = spore.Network{
+        .default_action = spore.network_default_deny,
+        .allow_cidrs = &.{"93.184.216.34/32"},
+        .allow_hosts = &.{"example.com"},
+        .allow_host_ports = &.{.{
+            .host = "github.com",
+            .ports = &.{443},
+        }},
+    };
+
+    const network = try networkFromManifest(arena, manifest_network);
+    const policy = &network.spore;
+    try std.testing.expect(policy.egress == .allowlist);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowCidrSlice().len);
+    try std.testing.expectEqualStrings("93.184.216.34/32", policy.allowCidrSlice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowHostSlice().len);
+    try std.testing.expectEqualStrings("example.com", policy.allowHostSlice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), policy.exactRuleSlice().len);
+    try std.testing.expectEqualStrings("github.com", policy.exactRuleSlice()[0].host);
+    try std.testing.expectEqual(@as(u16, 443), policy.exactRuleSlice()[0].ports[0]);
+
+    try std.testing.expectEqual(NetworkMode.disabled, try networkFromManifest(arena, null));
+}
+
+test "run manifest network keeps every egress variant" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hosts_only = Config{ .egress = .deny_all };
+    try hosts_only.addAllowHost("example.com");
+    const cases = [_]struct { policy: Config, public: Decision }{
+        .{ .policy = .{ .egress = .unrestricted }, .public = .allow },
+        .{ .policy = .{ .egress = .deny_all }, .public = .deny_not_allowed },
+        .{ .policy = hosts_only, .public = .deny_not_allowed },
+    };
+    for (cases) |case| {
+        const network: Network = .{ .spore = case.policy };
+        const manifest_network = (try manifestNetworkFromOptions(arena, &network)).?;
+        // A restricted policy always records its default, so the manifest
+        // states the egress instead of implying it from its lists.
+        if (case.policy.egress == .allowlist) {
+            try std.testing.expectEqualStrings(spore.network_default_deny, manifest_network.default_action orelse "");
+        } else {
+            try std.testing.expect(manifest_network.default_action == null);
+        }
+        const restored = try networkFromManifest(arena, manifest_network);
+        try std.testing.expectEqual(std.meta.activeTag(case.policy.egress), std.meta.activeTag(restored.spore.egress));
+        const runtime = try Runtime.init(restored.spore);
+        try std.testing.expectEqual(case.public, runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+    }
+
+    // Allow entries without `default_action` still restrict egress.
+    const implied = try networkFromManifest(arena, .{ .default_action = null, .allow_hosts = &.{"example.com"} });
+    try std.testing.expect(implied.spore.egress == .allowlist);
+    const implied_runtime = try Runtime.init(implied.spore);
+    try std.testing.expectEqual(Decision.deny_not_allowed, implied_runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+}
+
+test "run builds manifest network from active policy" {
+    var policy = Config{ .egress = .deny_all };
+    try policy.addAllowCidr("93.184.216.34/32");
+    try policy.addAllowHost("example.com");
+    try policy.addExactHostPorts("github.com", &.{443});
+
+    const network = (try manifestNetworkFromOptions(std.testing.allocator, &.{ .spore = policy })) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(network.allow_host_ports);
+    defer std.testing.allocator.free(network.bound_services);
+    try std.testing.expectEqualStrings(spore.network_kind_spore, network.kind);
+    try std.testing.expectEqualStrings(spore.network_default_deny, network.default_action.?);
+    try std.testing.expectEqualStrings("93.184.216.34/32", network.allow_cidrs[0]);
+    try std.testing.expectEqualStrings("example.com", network.allow_hosts[0]);
+    try std.testing.expectEqualStrings("github.com", network.allow_host_ports[0].host);
+    try std.testing.expectEqual(@as(u16, 443), network.allow_host_ports[0].ports[0]);
+    try std.testing.expect(network.requirements.exact_host_port);
+
+    try std.testing.expect((try manifestNetworkFromOptions(std.testing.allocator, &.disabled)) == null);
+}
+
+test "run binding diagnostics name missing saved bound service" {
+    var diagnostic = BoundServiceBindingDiagnostic{};
+    {
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const service_name = try arena.dupe(u8, "cleanroom-gateway");
+        const manifest_network = spore.Network{
+            .bound_services = &.{.{
+                .name = service_name,
+                .guest_host = "gateway.cleanroom.internal",
+                .guest_port = 8170,
+            }},
+            .requirements = .{ .bound_services = true },
+        };
+
+        try std.testing.expectError(
+            error.MissingBoundServiceBinding,
+            networkFromManifestWithBindingDiagnostic(arena, manifest_network, &.{}, &diagnostic),
+        );
+    }
+    try std.testing.expectEqualStrings("cleanroom-gateway", diagnostic.missing_name.?);
+}
+
+test "run restores saved bound services with live bindings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_network = spore.Network{
+        .bound_services = &.{.{
+            .name = "cleanroom-gateway",
+            .guest_host = "gateway.cleanroom.internal",
+            .guest_port = 8170,
+        }},
+        .requirements = .{ .bound_services = true },
+    };
+
+    const network = try networkFromManifestWithBindings(arena, manifest_network, &.{.{
+        .name = "cleanroom-gateway",
+        .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
+    }});
+    try std.testing.expect(network.spore.egress == .unrestricted);
+    const services = network.spore.boundServiceSlice();
+    try std.testing.expectEqual(@as(usize, 1), services.len);
+    try std.testing.expectEqualStrings("cleanroom-gateway", services[0].name);
+    try std.testing.expectEqualStrings("gateway.cleanroom.internal", services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/fresh-cleanroom-gateway.sock", services[0].unix_path);
+}
+
+test "run rejects live bound service bindings that do not match manifest" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const manifest_network = spore.Network{
+        .bound_services = &.{.{
+            .name = "cleanroom-gateway",
+            .guest_host = "gateway.cleanroom.internal",
+            .guest_port = 8170,
+        }},
+        .requirements = .{ .bound_services = true },
+    };
+
+    try std.testing.expectError(error.MissingBoundServiceBinding, networkFromManifestWithBindings(arena, manifest_network, &.{.{
+        .name = "wrong-service",
+        .target = .{ .unix = "/tmp/wrong.sock" },
+    }}));
+
+    try std.testing.expectError(error.UnexpectedBoundServiceBinding, networkFromManifestWithBindings(arena, null, &.{.{
+        .name = "cleanroom-gateway",
+        .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
+    }}));
 }

@@ -6,7 +6,7 @@ const Io = std.Io;
 const api = @import("api.zig");
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
-const run_mod = @import("run.zig");
+const rootfs_input = @import("rootfs_input.zig");
 
 const usage =
     \\Usage:
@@ -75,7 +75,7 @@ pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
 pub fn parsePushOptions(args: []const []const u8) !api.ImagePushOptions {
     var positional: [2][]const u8 = undefined;
     var count: usize = 0;
-    var platform: rootfs.Platform = run_mod.direct_image_platform;
+    var platform: rootfs.Platform = rootfs_input.direct_image_platform;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];

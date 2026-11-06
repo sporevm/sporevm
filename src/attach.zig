@@ -39,7 +39,7 @@ pub const Options = struct {
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     timeout_ms: u64 = default_attach_timeout_ms,
-    bound_services: run_mod.BoundServiceBindingList = .{},
+    bound_services: spore_net_policy.BoundServiceBindingList = .{},
     interactive: bool = false,
     tty: bool = false,
 };
@@ -73,7 +73,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var generation_path: ?[]const u8 = null;
     var event_mode: run_mod.EventMode = .none;
     var timeout_ms: u64 = default_attach_timeout_ms;
-    var bound_services = run_mod.BoundServiceBindingList{};
+    var bound_services = spore_net_policy.BoundServiceBindingList{};
     var interactive = false;
     var tty = false;
 
@@ -177,7 +177,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .terminal = opts.tty,
     });
 
-    const saved_network = try run_mod.networkFromManifestWithBindings(allocator, manifest.network, opts.bound_services.slice());
+    const saved_network = try spore_net_policy.networkFromManifestWithBindings(allocator, manifest.network, opts.bound_services.slice());
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (saved_network == .spore) {

@@ -11,6 +11,7 @@ const boot_assets = @import("boot_assets.zig");
 const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
 const local_paths = @import("local_paths.zig");
+const guest_request = @import("guest_request.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
@@ -113,8 +114,8 @@ fn runParsed(
         else => return err,
     };
     const save_path = if (parsed.save_path) |path| try local_paths.absolutePathAlloc(init.io, allocator, path) else null;
-    var env_diagnostic = run_mod.GuestEnvResolveDiagnostic{};
-    const guest_env = run_mod.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
+    var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
+    const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
         error.MissingHostEnvironment => failRunSetup("spore run: --env {s} is not set in the host environment", .{env_diagnostic.missing_key orelse "unknown"}),
         error.RunEnvTooLong => failRunSetup("spore run: --env entry exceeds 255 bytes", .{}),
         error.RunEnvCountUnsupported => failRunSetup("spore run: too many --env entries", .{}),

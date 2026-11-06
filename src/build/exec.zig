@@ -8,6 +8,8 @@ const rootfs_cas = @import("../rootfs_cas.zig");
 const disk_layer = @import("../disk_layer.zig");
 const rootfs_mod = @import("../rootfs.zig");
 const boot_assets = @import("../boot_assets.zig");
+const guest_request = @import("../guest_request.zig");
+const spore_net_policy = @import("../spore_net_policy.zig");
 const run_mod = @import("../run.zig");
 const local_paths = @import("../local_paths.zig");
 const memory_config = @import("../memory.zig");
@@ -31,7 +33,7 @@ const max_virtio_devices = switch (builtin.cpu.arch) {
 };
 pub const default_step_timeout_ms: u64 = 30 * 60 * 1000;
 const max_captured_output = 64 * 1024;
-const max_rootfs_grow_response = run_mod.max_rootfs_grow_response;
+const max_rootfs_grow_response = guest_request.max_rootfs_grow_response;
 const build_producer_domain = "sporevm-build-producer-v2";
 const prepare_host_contract = "grow-v1-strict-request-v2;ext4-source-preflight-v2;ext4-superblock-postcondition-v1;ext4-ioctl-v1;noinit-itable-v1;virtio-write-zeroes-1x4m-v1;chunk-zero-map-v1";
 // The x86 product profile is intentionally fixed at 512 MiB. AArch64 keeps
@@ -41,13 +43,13 @@ pub const default_build_memory = memory_config.Config.fixed(build_vm_memory_byte
 pub const default_build_vcpus: topology.VcpuCount = 1;
 pub const max_build_nofile: u64 = 1_048_576;
 pub const default_build_nofile = NofileLimit{ .soft = 65_536, .hard = 65_536 };
-const max_guest_request_len = run_mod.max_guest_request_len;
+const max_guest_request_len = guest_request.max_guest_request_len;
 pub const max_run_command_len = run_contract.max_shell_command_bytes;
 pub const max_run_exec_args = run_contract.max_exec_args;
 pub const max_run_exec_args_bytes = run_contract.max_exec_args_bytes;
-pub const max_guest_envc = run_mod.max_guest_envc;
-pub const max_guest_env_len = run_mod.max_guest_env_len;
-pub const max_guest_working_dir_len = run_mod.max_guest_working_dir_len;
+pub const max_guest_envc = guest_request.max_guest_envc;
+pub const max_guest_env_len = guest_request.max_guest_env_len;
+pub const max_guest_working_dir_len = guest_request.max_guest_working_dir_len;
 pub const max_copy_entries = 65536;
 pub const max_copy_entry_path_len = 512;
 pub const max_context_bind_mounts = 8;
@@ -800,7 +802,7 @@ const BuildControl = struct {
     fn startResize(self: *BuildControl, dev: *vsock.Vsock) !void {
         if (self.preparation_start_ns != null) return error.BadManifest;
         self.preparation_start_ns = try monotonicNs();
-        const request = try run_mod.simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
+        const request = try guest_request.simpleControlRequest(self.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
         try self.startStream(dev, request, .resize, "");
         self.phase = .active_resize;
     }
@@ -858,8 +860,8 @@ const BuildControl = struct {
     fn startSimpleControl(self: *BuildControl, dev: *vsock.Vsock, kind: ActiveStream) !void {
         const session_id = try checkpointSessionId(self.allocator, kind, self.checkpoint_kind, self.step_index);
         const request = switch (kind) {
-            .freeze => try run_mod.simpleControlRequest(self.allocator, "fsfreeze-v1", session_id),
-            .thaw => try run_mod.simpleControlRequest(self.allocator, "fsthaw-v1", session_id),
+            .freeze => try guest_request.simpleControlRequest(self.allocator, "fsfreeze-v1", session_id),
+            .thaw => try guest_request.simpleControlRequest(self.allocator, "fsthaw-v1", session_id),
             .resize, .run, .copy, .workdir => unreachable,
         };
         try self.startStream(dev, request, kind, "");
@@ -1154,8 +1156,8 @@ fn preparationMetricsLine(buf: []u8, publish_ms: u64, resume_ms: u64, target_mib
     );
 }
 
-fn parseRootfsGrowResponse(bytes: []const u8) !run_mod.RootfsGrowResult {
-    return run_mod.parseRootfsGrowResponse(bytes);
+fn parseRootfsGrowResponse(bytes: []const u8) !guest_request.RootfsGrowResult {
+    return guest_request.parseRootfsGrowResponse(bytes);
 }
 
 fn monotonicNs() !u64 {
@@ -1441,7 +1443,7 @@ pub fn rootfsFromStorage(allocator: std.mem.Allocator, storage: spore.RootfsStor
 fn fuzzSimpleRequest(_: void, s: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
     const len = s.slice(&buf);
-    const request = run_mod.simpleControlRequest(std.testing.allocator, buf[0..len], "session") catch return;
+    const request = guest_request.simpleControlRequest(std.testing.allocator, buf[0..len], "session") catch return;
     defer std.testing.allocator.free(request);
     try std.testing.expect(request.len <= max_guest_request_len);
 }
@@ -1641,7 +1643,7 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
 
         if (mode == 9) {
             const tty = fuzz_len > 1 and (fuzz_bytes[1] & 1) != 0;
-            const request = run_mod.interactiveExecRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", command }, "spore-exec-fuzz", .{ .tty = tty }) catch return;
+            const request = guest_request.interactiveExecRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", command }, "spore-exec-fuzz", .{ .tty = tty }) catch return;
             defer std.testing.allocator.free(request);
             _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
             return;
@@ -1666,9 +1668,9 @@ test "host request limits match the guest agent" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
     var guest: GuestRequestLimits = undefined;
     spore_agent_test_request_limits(&guest);
-    try std.testing.expectEqual(@as(u64, run_mod.max_guest_request_len), guest.request_bytes);
+    try std.testing.expectEqual(@as(u64, guest_request.max_guest_request_len), guest.request_bytes);
     try std.testing.expectEqual(@as(u64, max_run_exec_args), guest.argc);
-    try std.testing.expectEqual(@as(u64, run_mod.max_guest_argc), guest.argc);
+    try std.testing.expectEqual(@as(u64, guest_request.max_guest_argc), guest.argc);
     try std.testing.expectEqual(@as(u64, max_run_exec_args_bytes), guest.exec_args_bytes);
     try std.testing.expectEqual(@as(u64, max_run_command_len), guest.shell_command_bytes);
     try std.testing.expectEqual(@as(u64, max_guest_envc), guest.envc);
@@ -1967,7 +1969,7 @@ fn appendTestSpioFrame(out: []u8, cursor: *usize, frame_type: u8, offset: u64, p
 }
 
 test "build rootfs grow request stays bounded" {
-    const request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
+    const request = try guest_request.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.endsWith(u8, request, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, request, "\"spore-rootfs-grow-v1\"") != null);
@@ -2293,7 +2295,7 @@ test "build session forwards the selected spore executable to the monitor" {
     const monitor_options = monitorOptionsForSession(options, rootfs, .spore, null);
     try std.testing.expectEqualStrings(executable, monitor_options.spore_executable);
     try std.testing.expect(monitor_options.network.spore.egress == .unrestricted);
-    try std.testing.expectEqual(run_mod.NetworkMode.disabled, monitorOptionsForSession(options, rootfs, .none, null).network);
+    try std.testing.expectEqual(spore_net_policy.NetworkMode.disabled, monitorOptionsForSession(options, rootfs, .none, null).network);
 }
 
 test "build copy request names context disk source" {
@@ -2863,7 +2865,7 @@ fn execBesideCapturedSession(captured_script: [*:0]const u8, argv: []const []con
     const spore_stream = @import("../spore_stream.zig");
     const allocator = std.testing.allocator;
 
-    const request = try run_mod.interactiveExecRequestWithSession(allocator, argv, "exec-1", .{});
+    const request = try guest_request.interactiveExecRequestWithSession(allocator, argv, "exec-1", .{});
     defer allocator.free(request);
     var input: [2 * spore_stream.header_len + 64]u8 = undefined;
     const data = if (stdin.len == 0) input[0..0] else try spore_stream.writeFrame(input[0..], .{ .frame_type = .data, .stream_id = .stdin }, stdin);
@@ -2935,7 +2937,7 @@ test "guest agent runs named exec beside a running captured session" {
 test "guest agent gives a null-stdio exec /dev/null stdin" {
     if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
 
-    const request = try run_mod.execRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", "cat; echo stdin-closed" }, "exec-1", 0);
+    const request = try guest_request.execRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", "cat; echo stdin-closed" }, "exec-1", 0);
     defer std.testing.allocator.free(request);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"null\"") != null);
     const result = try agentServeRequests(.{}, &.{request});
@@ -2965,7 +2967,7 @@ test "guest agent keeps a named exec whose request arrives as the attached clien
     // attached client's hangup for the exec's.
     const attach = try @import("../attach_stream.zig").attachV1Request(allocator, .{ .session_id = "captured" });
     defer allocator.free(attach);
-    const request = try run_mod.execRequestWithSession(allocator, &.{ "/bin/sh", "-c", "echo beside" }, "exec-1", 0);
+    const request = try guest_request.execRequestWithSession(allocator, &.{ "/bin/sh", "-c", "echo beside" }, "exec-1", 0);
     defer allocator.free(request);
     const result = try agentServeRequests(.{ .attach = attach }, &.{request});
     defer result.deinit();
@@ -3012,7 +3014,7 @@ test "guest agent replays an exec that followed the captured session" {
     // In a VM captured after its command exited, the next exec becomes the
     // session. Its output must be retained like the first command's, so an
     // attach from offset zero replays all of it.
-    const start = try run_mod.execRequestWithSession(allocator, &.{ "/bin/sh", "-c", "echo out; echo err >&2" }, "exec-1", 0);
+    const start = try guest_request.execRequestWithSession(allocator, &.{ "/bin/sh", "-c", "echo out; echo err >&2" }, "exec-1", 0);
     defer allocator.free(start);
     const attach = try @import("../attach_stream.zig").attachV1Request(allocator, .{ .session_id = "exec-1" });
     defer allocator.free(attach);
@@ -3151,7 +3153,7 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     defer std.testing.allocator.free(workdir_request);
     try std.testing.expectEqual(guest_agent_fuzz_workdir_request, spore_agent_fuzz_build_request(workdir_request.ptr, workdir_request.len, stream[0..0].ptr, 0));
 
-    const stale_resize_request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-build-resize-v1", "spore-build-resize");
+    const stale_resize_request = try guest_request.simpleControlRequest(std.testing.allocator, "spore-build-resize-v1", "spore-build-resize");
     defer std.testing.allocator.free(stale_resize_request);
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(stale_resize_request.ptr, stale_resize_request.len, stream[0..0].ptr, 0));
 
@@ -3160,7 +3162,7 @@ test "guest build request parser rejects malformed RUN framing and accepts build
     const ready_with_nonce = "{\"type\":\"ready\",\"nonce\":\"1234\"}\n";
     try std.testing.expectEqual(guest_agent_fuzz_invalid, spore_agent_fuzz_build_request(ready_with_nonce.ptr, ready_with_nonce.len, stream[0..0].ptr, 0));
 
-    const grow_request = try run_mod.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
+    const grow_request = try guest_request.simpleControlRequest(std.testing.allocator, "spore-rootfs-grow-v1", "spore-build-resize");
     defer std.testing.allocator.free(grow_request);
     try std.testing.expectEqual(guest_agent_fuzz_grow_request, spore_agent_fuzz_build_request(grow_request.ptr, grow_request.len, stream[0..0].ptr, 0));
 }
@@ -3194,16 +3196,16 @@ test "guest agent parses exec and control requests strictly" {
     const other = guest_agent_fuzz_other_request;
     const invalid = guest_agent_fuzz_invalid;
 
-    const null_start = try run_mod.execRequestWithSession(allocator, &.{"/bin/true"}, "s", 1);
+    const null_start = try guest_request.execRequestWithSession(allocator, &.{"/bin/true"}, "s", 1);
     defer allocator.free(null_start);
     try expectGuestRequestKind(start, null_start);
-    const pipe_start = try run_mod.interactiveExecRequestWithSession(allocator, &.{"/bin/cat"}, "s", .{ .working_dir = "/work" });
+    const pipe_start = try guest_request.interactiveExecRequestWithSession(allocator, &.{"/bin/cat"}, "s", .{ .working_dir = "/work" });
     defer allocator.free(pipe_start);
     try expectGuestRequestKind(start, pipe_start);
-    const tty_start = try run_mod.interactiveExecRequestWithSession(allocator, &.{"/bin/sh"}, "s", .{ .tty = true, .terminal_size = .{ .rows = 65535, .cols = 1 } });
+    const tty_start = try guest_request.interactiveExecRequestWithSession(allocator, &.{"/bin/sh"}, "s", .{ .tty = true, .terminal_size = .{ .rows = 65535, .cols = 1 } });
     defer allocator.free(tty_start);
     try expectGuestRequestKind(start, tty_start);
-    const detached_start = try run_mod.detachedExecRequestWithSessionContext(allocator, &.{"/bin/true"}, "s", .{ .retain_output = true });
+    const detached_start = try guest_request.detachedExecRequestWithSessionContext(allocator, &.{"/bin/true"}, "s", .{ .retain_output = true });
     defer allocator.free(detached_start);
     try expectGuestRequestKind(start, detached_start);
 
@@ -3251,10 +3253,10 @@ test "guest agent parses exec and control requests strictly" {
     };
     for (attach_rejects) |edits| try expectGuestRequestEdit(invalid, null_attach, edits);
 
-    const freeze = try run_mod.simpleControlRequest(allocator, "fsfreeze-v1", "spore-run-commit-freeze");
+    const freeze = try guest_request.simpleControlRequest(allocator, "fsfreeze-v1", "spore-run-commit-freeze");
     defer allocator.free(freeze);
     try expectGuestRequestKind(other, freeze);
-    const thaw = try run_mod.simpleControlRequest(allocator, "fsthaw-v1", "spore-run-commit-thaw");
+    const thaw = try guest_request.simpleControlRequest(allocator, "fsthaw-v1", "spore-run-commit-thaw");
     defer allocator.free(thaw);
     try expectGuestRequestKind(other, thaw);
     try expectGuestRequestKind(other, "{\"type\":\"initial-output\"}\n");

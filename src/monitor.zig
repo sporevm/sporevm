@@ -29,6 +29,7 @@ const runtime_disk_fork_control = @import("runtime_disk_fork_control.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const net_gateway = @import("net_gateway.zig");
 const boot_assets = @import("boot_assets.zig");
+const guest_request = @import("guest_request.zig");
 const run = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
@@ -430,7 +431,7 @@ test "monitor console configuration matches opened and advertised path" {
 
 /// The network the monitor runs, from the live policy the claimer encoded in
 /// the spec next to its manifest form.
-fn monitorNetwork(allocator: std.mem.Allocator, spec: lifecycle.Spec) !run.Network {
+fn monitorNetwork(allocator: std.mem.Allocator, spec: lifecycle.Spec) !spore_net_policy.Network {
     const raw = spec.network_policy orelse {
         if (spec.network != null) return error.InvalidNetworkPolicy;
         return .disabled;
@@ -451,14 +452,14 @@ const EffectiveExecContext = struct {
 };
 
 fn effectiveExecContext(
-    env_buffer: *[run.max_guest_envc][]const u8,
+    env_buffer: *[guest_request.max_guest_envc][]const u8,
     defaults: lifecycle.ExecDefaults,
     env_overrides: []const []const u8,
     working_dir_override: ?[]const u8,
 ) !EffectiveExecContext {
-    const env = try run.mergeGuestEnvInto(env_buffer, defaults.env, env_overrides);
+    const env = try guest_request.mergeGuestEnvInto(env_buffer, defaults.env, env_overrides);
     const working_dir = working_dir_override orelse defaults.working_dir;
-    try run.validateGuestExecContext(env, working_dir);
+    try guest_request.validateGuestExecContext(env, working_dir);
     return .{ .env = env, .working_dir = working_dir };
 }
 
@@ -949,9 +950,9 @@ const ExecServer = struct {
     fn interactiveExecRequest(self: *ExecServer, session_sequence: *u64, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, tty: bool, terminal_size: spore_stream.Resize) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try self.nextSessionId(&id_buf, session_sequence);
-        var merged_env: [run.max_guest_envc][]const u8 = undefined;
+        var merged_env: [guest_request.max_guest_envc][]const u8 = undefined;
         const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
-        return run.interactiveExecRequestWithSession(self.allocator, argv, session_id, .{
+        return guest_request.interactiveExecRequestWithSession(self.allocator, argv, session_id, .{
             .env = exec_context.env,
             .working_dir = exec_context.working_dir,
             .tty = tty,
@@ -964,9 +965,9 @@ const ExecServer = struct {
     fn detachedExecRequest(self: *ExecServer, session_sequence: *u64, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
         var id_buf: [64]u8 = undefined;
         const session_id = try self.nextSessionId(&id_buf, session_sequence);
-        var merged_env: [run.max_guest_envc][]const u8 = undefined;
+        var merged_env: [guest_request.max_guest_envc][]const u8 = undefined;
         const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
-        return run.detachedExecRequestWithSessionContext(self.allocator, argv, session_id, .{
+        return guest_request.detachedExecRequestWithSessionContext(self.allocator, argv, session_id, .{
             .env = exec_context.env,
             .working_dir = exec_context.working_dir,
             .resume_time_unix_ns = self.wallClockUnixNs(),
@@ -2006,11 +2007,11 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor
             const tty = exec.stdio == .tty;
             const terminal_size = spore_stream.Resize{ .rows = exec.terminal_rows, .cols = exec.terminal_cols };
             var session_sequence: u64 = 0;
-            const guest_request = server.interactiveExecRequest(&session_sequence, exec.argv, exec.env, exec.working_dir, tty, terminal_size) catch |err| {
+            const exec_request = server.interactiveExecRequest(&session_sequence, exec.argv, exec.env, exec.working_dir, tty, terminal_size) catch |err| {
                 return writeStreamingControlError(fd, guestCommandErrorMessage(err));
             };
-            defer server.allocator.free(guest_request);
-            server.submitStreamingExec(guest_request, session_sequence, fd, true) catch |err| {
+            defer server.allocator.free(exec_request);
+            server.submitStreamingExec(exec_request, session_sequence, fd, true) catch |err| {
                 return writeStreamingControlError(fd, server.refusalMessage(err));
             };
             defer server.finishStreamingExec();
@@ -2020,11 +2021,11 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor
             const copy_in = request == .copy_in;
             const path = if (copy_in) request.copy_in.path else request.copy_out.path;
             var session_sequence: u64 = 0;
-            const guest_request = server.copyRequest(&session_sequence, if (copy_in) "copy-in-v1" else "copy-out-v1", path) catch {
+            const exec_request = server.copyRequest(&session_sequence, if (copy_in) "copy-in-v1" else "copy-out-v1", path) catch {
                 return writeStreamingControlError(fd, "invalid copy request");
             };
-            defer server.allocator.free(guest_request);
-            server.submitStreamingExec(guest_request, session_sequence, fd, false) catch |err| {
+            defer server.allocator.free(exec_request);
+            server.submitStreamingExec(exec_request, session_sequence, fd, false) catch |err| {
                 return writeStreamingControlError(fd, server.refusalMessage(err));
             };
             defer server.finishStreamingExec();
@@ -2040,11 +2041,11 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor
         },
         .start => |start| {
             var session_sequence: u64 = 0;
-            const guest_request = server.detachedExecRequest(&session_sequence, start.argv, start.env, start.working_dir, start.retain_output) catch |err| {
+            const exec_request = server.detachedExecRequest(&session_sequence, start.argv, start.env, start.working_dir, start.retain_output) catch |err| {
                 return writeControlError(server.io, stream, guestCommandErrorMessage(err));
             };
-            defer server.allocator.free(guest_request);
-            const response = server.submitExec(guest_request, session_sequence) catch |err| {
+            defer server.allocator.free(exec_request);
+            const response = server.submitExec(exec_request, session_sequence) catch |err| {
                 return writeControlError(server.io, stream, server.refusalMessage(err));
             };
             defer std.heap.page_allocator.free(response);
@@ -2278,7 +2279,7 @@ test "monitor cli help accepts help after name" {
 }
 
 test "named exec context applies image defaults and ephemeral overrides" {
-    var env_buffer: [run.max_guest_envc][]const u8 = undefined;
+    var env_buffer: [guest_request.max_guest_envc][]const u8 = undefined;
     const context = try effectiveExecContext(&env_buffer, .{
         .env = &.{ "IMAGE_VALUE=default", "CLEAR_ME", "KEEP=1" },
         .working_dir = "/app",
@@ -2305,12 +2306,12 @@ test "monitor network comes from the spec's encoded live policy" {
     var policy = spore_net_policy.Config{ .egress = .deny_all };
     try policy.addAllowCidr("93.184.216.34/32");
     try policy.addPortForward("127.0.0.1:8080:80");
-    const network = (try run.manifestNetworkFromOptions(allocator, &.{ .spore = policy })).?;
+    const network = (try spore_net_policy.manifestNetworkFromOptions(allocator, &.{ .spore = policy })).?;
     const encoded = try spore_net_policy.encodeArgAlloc(allocator, &policy);
 
     const enabled = try monitorNetwork(allocator, .{ .name = "bench-1", .network = network, .network_policy = encoded });
     try std.testing.expectEqualStrings(encoded, try spore_net_policy.encodeArgAlloc(allocator, &enabled.spore));
-    try std.testing.expectEqual(run.NetworkMode.disabled, try monitorNetwork(allocator, .{ .name = "bench-1" }));
+    try std.testing.expectEqual(spore_net_policy.NetworkMode.disabled, try monitorNetwork(allocator, .{ .name = "bench-1" }));
     try std.testing.expectError(error.InvalidNetworkPolicy, monitorNetwork(allocator, .{ .name = "bench-1", .network = network }));
     try std.testing.expectError(error.InvalidNetworkPolicy, monitorNetwork(allocator, .{ .name = "bench-1", .network_policy = encoded }));
 }

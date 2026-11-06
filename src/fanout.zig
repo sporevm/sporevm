@@ -20,7 +20,7 @@ pub const Options = struct {
     children_dir: []const u8,
     duration_ms: ?u64 = null,
     timeout_ms: u64 = default_resume_timeout_ms,
-    bound_services: run_mod.BoundServiceBindingList = .{},
+    bound_services: spore_net_policy.BoundServiceBindingList = .{},
     event_mode: run_mod.EventMode = .none,
 };
 
@@ -112,7 +112,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var children_dir: ?[]const u8 = null;
     var duration_ms: ?u64 = null;
     var timeout_ms: u64 = default_resume_timeout_ms;
-    var bound_services = run_mod.BoundServiceBindingList{};
+    var bound_services = spore_net_policy.BoundServiceBindingList{};
     var event_mode: run_mod.EventMode = .none;
 
     var i: usize = 0;

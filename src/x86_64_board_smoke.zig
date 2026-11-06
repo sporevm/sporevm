@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const run = @import("run.zig");
+const guest_request = @import("guest_request.zig");
 const assets = @import("run_assets");
 const board = @import("x86_64/board.zig");
 const vm = @import("x86_64/vm.zig");
@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
         "console=hvc0 rdinit=/init cleanroom_guest_port={d} cleanroom_guest_boot_timing=1 {s}",
         .{ guest_port, descriptors },
     );
-    const request = try run.execRequest(allocator, &.{ "/bin/sh", "-lc", guest_command });
+    const request = try guest_request.execRequest(allocator, &.{ "/bin/sh", "-lc", guest_command });
     var stream = try vsock_stream.HostStream.init(guest_port, request);
     var capture = Capture{};
     stream.setOutputSink(&capture, Capture.sink);

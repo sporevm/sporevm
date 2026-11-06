@@ -26,6 +26,8 @@ const resource = @import("resource.zig");
 const saved_spore_fork = @import("saved_spore_fork.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
+const guest_request = @import("guest_request.zig");
+const rootfs_input = @import("rootfs_input.zig");
 const run_mod = @import("run.zig");
 const gicv3 = @import("aarch64/gicv3.zig");
 const spore = @import("spore.zig");
@@ -88,8 +90,8 @@ pub const InspectBundleResult = contracts.InspectBundleResult;
 pub const Backend = run_mod.Backend;
 pub const MemoryConfig = run_mod.MemoryConfig;
 pub const SaveTrigger = run_mod.SaveTrigger;
-pub const ImagePullPolicy = run_mod.PullPolicy;
-pub const Network = run_mod.Network;
+pub const ImagePullPolicy = rootfs_input.PullPolicy;
+pub const Network = spore_net_policy.Network;
 pub const BoundServiceBinding = spore_net_policy.BoundServiceBinding;
 pub const BoundServiceBindingDiagnostic = spore_net_policy.BoundServiceBindingDiagnostic;
 pub const Rootfs = run_mod.Rootfs;
@@ -587,7 +589,7 @@ pub fn runManaged(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const rootfs = try run_mod.resolveRootfsInputDetailed(init, arena, .{
+    const rootfs = try rootfs_input.resolveRootfsInputDetailed(init, arena, .{
         .rootfs_path = options.rootfs_path,
         .image_ref = options.image_ref,
         .pull_policy = options.image_pull_policy,
@@ -595,7 +597,7 @@ pub fn runManaged(
         .record_artifact = options.save_path != null or options.image_ref != null,
     });
     const command = if (options.image_ref != null)
-        try run_mod.resolveImageRuntimeCommandWithEntrypoint(arena, rootfs.image_config, options.command, options.image_entrypoint)
+        try rootfs_input.resolveImageRuntimeCommandWithEntrypoint(arena, rootfs.image_config, options.command, options.image_entrypoint)
     else blk: {
         if (options.command.len == 0) return error.RunArgCountUnsupported;
         break :blk options.command;
@@ -615,7 +617,7 @@ pub fn runManaged(
     else
         options.kernel_path orelse try boot_assets.resolveDefaultKernelPath(init, arena);
     const initrd_path = if (managed_boot_descriptor != null) null else try boot_assets.resolveConfiguredInitrdPath(init, options.initrd_path);
-    const guest_env = try run_mod.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
+    const guest_env = try guest_request.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
     const rootfs_grow_target = if (options.disk_size) |target| blk: {
         const resolved_rootfs = rootfs.rootfs orelse return error.RunCommitRootfsNotSnapshotable;
         const storage = resolved_rootfs.storage orelse return error.RunCommitRootfsNotSnapshotable;
@@ -679,9 +681,9 @@ pub fn runFromSpore(
     defer parsed.deinit();
     const manifest = parsed.value;
 
-    const rootfs = try run_mod.resumeRootfsForRun(arena, manifest);
-    const disk = try run_mod.resumeDiskForRun(arena, manifest);
-    const network = try run_mod.networkFromManifestWithBindingDiagnostic(arena, manifest.network, options.bound_services, options.bound_service_diagnostic);
+    const rootfs = try rootfs_input.resumeRootfsForRun(arena, manifest);
+    const disk = try rootfs_input.resumeDiskForRun(arena, manifest);
+    const network = try spore_net_policy.networkFromManifestWithBindingDiagnostic(arena, manifest.network, options.bound_services, options.bound_service_diagnostic);
     if (options.vcpus != 1 and options.vcpus != manifest.platform.vcpu_count) return error.PlatformMismatch;
     const explicit_generation_params = if (options.generation_path) |path|
         attach_mod.loadGenerationParams(context.io, arena, path) catch |err| switch (err) {
@@ -755,7 +757,7 @@ pub fn attachSpore(
     allocator: std.mem.Allocator,
     options: AttachOptions,
 ) !AttachResult {
-    var bound_services = run_mod.BoundServiceBindingList{};
+    var bound_services = spore_net_policy.BoundServiceBindingList{};
     for (options.bound_services) |binding| try bound_services.append(binding);
     return attach_mod.execute(context, allocator, .{
         .backend = options.backend,
