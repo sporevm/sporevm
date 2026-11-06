@@ -267,23 +267,23 @@ fn runCommand(
     } else if (std.mem.eql(u8, command, "attach")) {
         try spore_internal.attach_cli.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "create")) {
-        try spore_internal.lifecycle.createCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.createCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "logs")) {
-        try spore_internal.lifecycle.logsCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.logsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "exec")) {
-        try spore_internal.lifecycle.execCli(init, command_args, stdout);
+        try spore_internal.lifecycle_cli.execCli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "copy-in")) {
-        try spore_internal.lifecycle.copyInCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.copyInCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "copy-out")) {
-        try spore_internal.lifecycle.copyOutCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.copyOutCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "rm")) {
-        try spore_internal.lifecycle.rmCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.rmCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "save")) {
-        try spore_internal.lifecycle.saveCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.saveCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "restore")) {
-        try spore_internal.lifecycle.restoreCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.restoreCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "ls") or std.mem.eql(u8, command, "ps")) {
-        try spore_internal.lifecycle.lsCli(init, command_args, stdout, stderr, mode);
+        try spore_internal.lifecycle_cli.lsCli(init, command_args, stdout, stderr, mode);
     } else if (std.mem.eql(u8, command, "monitor")) {
         try spore_internal.monitor.cli(init, command_args, stdout);
     } else if (std.mem.eql(u8, command, "netd")) {
@@ -335,8 +335,8 @@ fn runCommand(
             try writeInspectSummary(stdout, summary);
         }
     } else if (std.mem.eql(u8, command, "fork")) {
-        if (spore_internal.lifecycle.wantsNamedFork(command_args)) {
-            try spore_internal.lifecycle.forkCli(init, command_args, stdout, stderr, mode);
+        if (spore_internal.lifecycle_cli.wantsNamedFork(command_args)) {
+            try spore_internal.lifecycle_cli.forkCli(init, command_args, stdout, stderr, mode);
         } else {
             const result = try forkCommand(context, arena, stderr, mode, "fork", command_args);
             if (mode == .json) {
@@ -524,14 +524,14 @@ fn vmCommand(
     if (args.len == 0) exitUsage(init.arena.allocator(), stderr, mode, "vm", "usage: spore vm rm NAME | spore vm fork NAME --count N --name PATTERN");
     if (std.mem.eql(u8, args[0], "rm")) {
         if (args.len != 2) exitUsage(init.arena.allocator(), stderr, mode, "vm rm", "usage: spore vm rm NAME");
-        return spore_internal.lifecycle.rmCli(init, args[1..], stdout, stderr, mode);
+        return spore_internal.lifecycle_cli.rmCli(init, args[1..], stdout, stderr, mode);
     }
     if (std.mem.eql(u8, args[0], "fork")) {
         if (args.len < 2 or std.mem.startsWith(u8, args[1], "--")) exitUsage(init.arena.allocator(), stderr, mode, "vm fork", "usage: spore vm fork NAME --count N --name PATTERN");
         const legacy_args = try init.arena.allocator().alloc([]const u8, args.len);
         legacy_args[0] = "--vm";
         @memcpy(legacy_args[1..], args[1..]);
-        return spore_internal.lifecycle.forkCli(init, legacy_args, stdout, stderr, mode);
+        return spore_internal.lifecycle_cli.forkCli(init, legacy_args, stdout, stderr, mode);
     }
     exitUnknownArgument(init.arena.allocator(), stderr, mode, "vm", args[0]);
 }
@@ -551,7 +551,7 @@ fn checkpointCommand(
     if (args.len == 0) exitUsage(init.arena.allocator(), stderr, mode, "checkpoint", "usage: spore checkpoint rm DIR | spore checkpoint fork DIR --count N --out DIR");
     if (std.mem.eql(u8, args[0], "rm")) {
         if (args.len != 2) exitUsage(init.arena.allocator(), stderr, mode, "checkpoint rm", "usage: spore checkpoint rm DIR");
-        return spore_internal.lifecycle.rmCli(init, &.{ "--spore", args[1] }, stdout, stderr, mode);
+        return spore_internal.lifecycle_cli.rmCli(init, &.{ "--spore", args[1] }, stdout, stderr, mode);
     }
     if (std.mem.eql(u8, args[0], "fork")) {
         if (args.len < 2) exitUsage(init.arena.allocator(), stderr, mode, "checkpoint fork", "usage: spore checkpoint fork DIR --count N --out DIR");
