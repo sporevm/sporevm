@@ -2918,6 +2918,14 @@ const BlkTestRig = struct {
         rig.mmioWrite(0x070, 0);
     }
 
+    /// Selects VERSION_1 and sets ACKNOWLEDGE | DRIVER | FEATURES_OK, as a
+    /// driver does.
+    fn acceptFeatures(rig: *BlkTestRig) void {
+        rig.mmioWrite(0x024, 1);
+        rig.mmioWrite(0x020, 1);
+        rig.mmioWrite(0x070, 0xb);
+    }
+
     fn pause(rig: *BlkTestRig) void {
         rig.threaded.pauseAll(.none) catch unreachable;
     }
@@ -3004,6 +3012,39 @@ test "a pause and a queue reset wait for the virtio-blk request in flight" {
     // The request finished before the reset cleared the queue.
     try TestBlkRead.expectDone(rig.ram(), &rig.disk);
     try std.testing.expect(!rig.devices.transports()[BlkTestRig.index].queues[0].ready);
+}
+
+test "accepting virtio-blk features keeps the device lock while a request is in flight" {
+    const io = std.testing.io;
+    var rig: BlkTestRig = undefined;
+    defer rig.deinit();
+    try rig.start();
+    const transport = &rig.devices.transports()[BlkTestRig.index];
+
+    var notify: TestCall = .{};
+    var notifier = try rig.spawn(&notify, BlkTestRig.notify);
+    defer notifier.deinit();
+    rig.read_barrier.waitReached(io);
+
+    // The write returns while the read is still held.
+    var accept: TestCall = .{};
+    var accepter = try rig.spawn(&accept, BlkTestRig.acceptFeatures);
+    defer accepter.deinit();
+    try std.testing.expect(accept.returnedSoon());
+    accepter.join();
+    try std.testing.expectEqual(mmio.f_version_1, transport.accepted_features.?);
+    try std.testing.expectEqual(mmio.f_version_1, rig.devices.blk.accepted_features.load(.monotonic));
+
+    // A reset from another vCPU waits for the read, and leaves the device
+    // and its transport agreeing that no features are accepted.
+    var reset: TestCall = .{};
+    var resetter = try rig.spawn(&reset, BlkTestRig.reset);
+    defer resetter.deinit();
+    rig.read_barrier.release(io);
+    notifier.join();
+    resetter.join();
+    try std.testing.expectEqual(@as(?u64, null), transport.accepted_features);
+    try std.testing.expectEqual(@as(u64, 0), rig.devices.blk.accepted_features.load(.monotonic));
 }
 
 test "a capture that waits out an interrupt handler also waits for the disk request the guest makes meanwhile" {
