@@ -21,7 +21,6 @@ const gicv3 = @import("../aarch64/gicv3.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const mmio = @import("../virtio/mmio.zig");
-const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const platform = @import("../platform.zig");
@@ -53,60 +52,6 @@ const gic_dist_size: u64 = 0x0001_0000;
 const gic_redist_base: u64 = 0x0802_0000;
 const gic_redist_size: u64 = 0x0002_0000;
 
-const HotplugMapping = struct {
-    bytes: []align(std.heap.page_size_min) u8,
-    guest_addr: u64,
-    vm_fd: std.c.fd_t,
-    mapped_bytes: u64 = 0,
-
-    fn init(bytes: []align(std.heap.page_size_min) u8, guest_addr: u64, vm_fd: std.c.fd_t) HotplugMapping {
-        return .{
-            .bytes = bytes,
-            .guest_addr = guest_addr,
-            .vm_fd = vm_fd,
-        };
-    }
-
-    fn deinit(self: *HotplugMapping) void {
-        self.unmapFromGuest() catch |err| std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
-    }
-
-    fn unmapFromGuest(self: *HotplugMapping) !void {
-        if (self.mapped_bytes == 0) return;
-        var region = kvm.UserspaceMemoryRegion{
-            .slot = 1,
-            .flags = 0,
-            .guest_phys_addr = self.guest_addr,
-            .memory_size = 0,
-            .userspace_addr = 0,
-        };
-        _ = try kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
-        self.mapped_bytes = 0;
-    }
-
-    fn mapForGuest(self: *HotplugMapping, bytes: u64) !void {
-        if (bytes > self.bytes.len) return error.InvalidVirtioMemRequest;
-        if (bytes <= self.mapped_bytes) return;
-        try self.unmapFromGuest();
-        var region = kvm.UserspaceMemoryRegion{
-            .slot = 1,
-            .flags = 0,
-            .guest_phys_addr = self.guest_addr,
-            .memory_size = bytes,
-            .userspace_addr = @intFromPtr(self.bytes.ptr),
-        };
-        _ = try kvm.ioctl(self.vm_fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
-        self.mapped_bytes = bytes;
-        std.log.debug("virtio-mem mapped hotplug region: addr=0x{x} bytes={d}", .{ self.guest_addr, bytes });
-    }
-
-    fn plug(ctx: *anyopaque, requested_size: u64) bool {
-        const self: *HotplugMapping = @ptrCast(@alignCast(ctx));
-        self.mapForGuest(requested_size) catch return false;
-        return true;
-    }
-};
-
 pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const manifest_start = try monotonicMs();
     var prepared = try vmm.prepare(allocator, input, .{ .multi_vcpu_dirty_tracking = true });
@@ -135,25 +80,18 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         .counter_offset = prepared.restoring() or config.capture != null,
     });
     defer vm.deinit();
-    const vm_fd = vm.fd;
 
-    var hotplug_mapping: ?HotplugMapping = if (prepared.virtio_mem_region_size > 0)
-        HotplugMapping.init(@alignCast(ram_bytes[initial_ram_len..]), board.ram_base + prepared.ram_size, vm_fd)
-    else
-        null;
-    defer if (hotplug_mapping) |*mapping| mapping.deinit();
+    var hotplug: ?vmm.Hotplug(Vm) = if (prepared.virtio_mem_region_size > 0) .{
+        .vm = &vm,
+        .bytes = @alignCast(ram_bytes[initial_ram_len..]),
+        .guest_addr = board.ram_base + prepared.ram_size,
+    } else null;
+    defer if (hotplug) |*region| region.deinit();
 
     var devices: vmm.Devices = undefined;
-    devices.init(config, if (hotplug_mapping) |*mapping| .{
-        .addr = mapping.guest_addr,
-        .region_size = @intCast(mapping.bytes.len),
-        .requested_size = 0,
-        .plug_context = mapping,
-        .plugFn = HotplugMapping.plug,
-    } else null);
+    devices.init(config, if (hotplug) |*region| region.memConfig() else null);
     defer devices.net.shutdown();
     const transports = devices.transports();
-    const transports_buf = &devices.transports_buf;
     const net_dev = &devices.net;
     const vsock_dev = &devices.vsock;
     const mem_dev = &devices.mem;
@@ -195,7 +133,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, gen_dev);
         try vmm.restoreMachine(allocator, &vm, vcpus, m.machine);
-        try raiseGenerationIrqIfPending(vm_fd, gen_dev);
+        try vmm.raiseGenerationIrqIfPending(&vm, gen_dev);
         if (restore_stats) |*stats| stats.state_ms = (try monotonicMs()) - state_start;
     } else {
         const fresh = config.start.boot;
@@ -228,12 +166,10 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
 
     if (config.dirtyTrackingDir()) |dir| {
         dirty_tracker = try DirtyTracker.start(allocator, .{
-            .vm_fd = vm_fd,
-            .slot = 0,
             .dir = dir,
             .ram = ram_bytes,
             .seed_ranges = boot_seed_ranges,
-        });
+        }, .{ .vm_fd = vm.fd, .slot = 0 });
         if (dirty_tracker) |*tracker| {
             ram.dirty_context = tracker;
             ram.dirty_fn = DirtyTracker.markGuestWriteCallback;
@@ -268,13 +204,12 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         if (probe.start == .immediate) {
             probe.stream.markStarted();
             try vsock_dev.attachHostStream(probe.stream);
-            try flushVsockRxKvm(vm_fd, vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
+            _ = try vmm.flushRx(&vm, vsock_dev, transports, vsock_transport_index, ram);
         }
     }
     if (prepared.vcpus != 1) {
         return runFreshMultiVcpu(allocator, .{
             .vm = &vm,
-            .vm_fd = vm_fd,
             .vcpus = vcpus,
             .wake_set = &multi_wake,
             .config = config,
@@ -312,12 +247,11 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 const new_pressure_events = probe.memory_pressure_count -| handled_memory_pressure_count;
                 if (new_pressure_events > 0 and probe.state == .connected) {
                     const idx = mem_transport_index.?;
-                    const mapping = if (hotplug_mapping) |*m| m else unreachable;
-                    requested_hotplug_size = virtio_mem.requestedSizeAfterPressure(requested_hotplug_size, @intCast(mapping.bytes.len), new_pressure_events);
+                    requested_hotplug_size = virtio_mem.requestedSizeAfterPressure(requested_hotplug_size, @intCast(hotplug.?.bytes.len), new_pressure_events);
                     handled_memory_pressure_count = probe.memory_pressure_count;
                     try mem_dev.setRequestedSize(@intCast(requested_hotplug_size));
-                    _ = transports_buf[idx].raiseConfigChange();
-                    try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), true);
+                    _ = transports[idx].raiseConfigChange();
+                    try vm.setSpi(board.virtioDeviceIntid(@intCast(idx)), true);
                     std.log.debug("virtio-mem requested hotplug size: bytes={d} pressure_count={d}", .{ requested_hotplug_size, handled_memory_pressure_count });
                 }
             }
@@ -362,7 +296,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                     vmm.captureDiskFork(allocator, "kvm", &vm, vcpus, tracker_ref, snapshot_source, request, control, pause_started_ns) catch |err| control.failDiskFork(err);
                 },
             }
-            try flushVsockRxKvm(vm_fd, vsock_dev, &transports_buf[vsock_transport_index], ram, vsock_transport_index);
+            _ = try vmm.flushRx(&vm, vsock_dev, transports, vsock_transport_index, ram);
         }
         if (config.captureRequest()) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
@@ -402,7 +336,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         }
 
         switch (try primary_vcpu.run()) {
-            .mmio => |access| primary_vcpu.completeMmio(try handleDeviceMmio(vm_fd, access, transports, gen_dev, ram)),
+            .mmio => |access| primary_vcpu.completeMmio(try vmm.dispatchMmio(&vm, access, transports, gen_dev, ram)),
             .shutdown => |kind| return kind.cause(),
             .kicked => {
                 if (config.captureRequest()) |request_capture| {
@@ -410,7 +344,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 }
                 if (config.network.failed()) continue;
                 if (config.network.consumeWake()) {
-                    try flushNetworkRxKvm(vm_fd, net_dev, &transports_buf[net_transport_index], ram, net_transport_index);
+                    _ = try vmm.flushRx(&vm, net_dev, transports, net_transport_index, ram);
                 }
             },
             .wfi, .handled => unreachable,
@@ -657,7 +591,6 @@ const MultiKvmRunState = struct {
 
 const MultiKvmRunOptions = struct {
     vm: *const Vm,
-    vm_fd: std.c.fd_t,
     vcpus: []Vcpu,
     wake_set: *KvmRunWakeSet,
     config: *const vmm.Config,
@@ -687,7 +620,7 @@ const MultiKvmRunOptions = struct {
 };
 
 const MultiKvmThreadContext = struct {
-    vm_fd: std.c.fd_t,
+    vm: *const Vm,
     vcpu: *Vcpu,
     state: *MultiKvmRunState,
     device_lock: *vmm.SpinLock,
@@ -712,7 +645,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
 
     for (options.vcpus, contexts) |*vcpu, *ctx| {
         ctx.* = .{
-            .vm_fd = options.vm_fd,
+            .vm = options.vm,
             .vcpu = vcpu,
             .state = &state,
             .device_lock = &device_lock,
@@ -756,12 +689,12 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiKvmRunOptions) 
                 continue;
             };
             switch (action) {
-                .keep_running => flushVsockRxKvm(
-                    options.vm_fd,
+                .keep_running => _ = vmm.flushRx(
+                    options.vm,
                     options.vsock_dev,
-                    &options.transports[options.vsock_transport_index],
-                    options.ram,
+                    options.transports,
                     options.vsock_transport_index,
+                    options.ram,
                 ) catch |err| {
                     device_lock.unlock();
                     state.finish(.{ .err = err });
@@ -961,7 +894,7 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
                 }
                 ctx.device_lock.lock();
                 if (ctx.network.consumeWake()) {
-                    flushNetworkRxKvm(ctx.vm_fd, ctx.net_dev, &ctx.transports[ctx.net_transport_index], ctx.ram, ctx.net_transport_index) catch |err| {
+                    _ = vmm.flushRx(ctx.vm, ctx.net_dev, ctx.transports, ctx.net_transport_index, ctx.ram) catch |err| {
                         ctx.device_lock.unlock();
                         ctx.state.finish(.{ .err = err });
                         return;
@@ -971,7 +904,7 @@ fn kvmVcpuThreadMain(ctx: *MultiKvmThreadContext) void {
             },
             .mmio => |access| {
                 ctx.device_lock.lock();
-                const value = handleDeviceMmio(ctx.vm_fd, access, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
+                const value = vmm.dispatchMmio(ctx.vm, access, ctx.transports, ctx.gen_dev, ctx.ram) catch |err| {
                     ctx.device_lock.unlock();
                     ctx.state.finish(.{ .err = err });
                     return;
@@ -1012,30 +945,6 @@ fn pauseKvmVcpusForSnapshot(vcpus: []Vcpu, state: *MultiKvmRunState, wake_set: *
         }
         if (paused_count == vcpus.len) return;
         sleepMs(1);
-    }
-}
-
-fn flushVsockRxKvm(
-    vm_fd: std.c.fd_t,
-    vsock_dev: *vsock.Vsock,
-    transport: *mmio.Transport,
-    ram: guestmem.GuestRam,
-    transport_index: usize,
-) !void {
-    if (vsock_dev.flushPendingRx(transport, ram)) {
-        try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(transport_index)), true);
-    }
-}
-
-fn flushNetworkRxKvm(
-    vm_fd: std.c.fd_t,
-    net_dev: *net.Net,
-    transport: *mmio.Transport,
-    ram: guestmem.GuestRam,
-    transport_index: usize,
-) !void {
-    if (net_dev.flushPendingRx(transport, ram)) {
-        try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(transport_index)), true);
     }
 }
 
@@ -1091,85 +1000,54 @@ fn ratePerSec(count: u64, elapsed_ms: u64) u64 {
     return count * std.time.ms_per_s / elapsed_ms;
 }
 
-const DirtyTracker = struct {
-    sealer: dirty_ram.Sealer,
+const DirtyTracker = vmm.DirtyTracker(DirtyLog);
+
+/// KVM finds guest writes in the RAM memslot's dirty-page log, read once at
+/// start to drop the baseline and again at every flush.
+const DirtyLog = struct {
     vm_fd: std.c.fd_t,
     slot: u32,
-    bitmap: []usize,
-    tracking_start_ms: u64 = 0,
-    mutex: vmm.SpinLock = .{},
-    stats: DirtyStats = .{},
+    bitmap: []usize = &.{},
+    stats: Stats = .{},
 
-    const Options = struct {
-        vm_fd: std.c.fd_t,
-        slot: u32,
-        dir: []const u8,
-        ram: []const u8,
-        seed_ranges: ?[]const dirty_ram.ChunkRange = null,
-    };
-
-    const DirtyStats = struct {
+    const Stats = struct {
         dirty_pages_total: u64 = 0,
         get_dirty_log_ms: u64 = 0,
         get_dirty_log_cpu_ms: u64 = 0,
-        dirty_pages_per_sec: u64 = 0,
     };
 
-    fn start(allocator: std.mem.Allocator, options: Options) !DirtyTracker {
-        if (options.ram.len == 0) return error.BadManifest;
-        if (options.ram.len % std.heap.page_size_min != 0) return error.BadManifest;
-        if (spore.chunk_size % std.heap.page_size_min != 0) return error.BadManifest;
+    pub const metrics_mode = "dirty-log";
 
-        const page_count = (options.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
+    pub fn start(tracker: *DirtyTracker, allocator: std.mem.Allocator) !void {
+        const page_count = (tracker.sealer.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
         const bitmap_word_count = (page_count + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
-        var sealer = try dirty_ram.Sealer.start(allocator, .{
-            .dir = options.dir,
-            .ram = options.ram,
-            .seed_ranges = options.seed_ranges,
-        });
-        errdefer sealer.deinit();
-
-        var tracker = DirtyTracker{
-            .sealer = sealer,
-            .vm_fd = options.vm_fd,
-            .slot = options.slot,
-            .bitmap = try allocator.alloc(usize, bitmap_word_count),
-        };
+        tracker.backend.bitmap = try allocator.alloc(usize, bitmap_word_count);
 
         // Some kernels conservatively mark a logging memslot dirty at
         // creation. Drop that baseline after the host has loaded the kernel,
         // initrd, and DTB so the capture-time flush covers guest writes only.
-        _ = try tracker.collectDirtyLog();
-        tracker.resetDirtyStatsAfterBaseline();
-        tracker.tracking_start_ms = try monotonicMs();
+        _ = try collect(tracker);
+        tracker.backend.stats = .{};
+        tracker.sealer.resetStatsAfterBaseline();
 
         std.log.info(
             "kvm dirty tracking started: mode=dirty-log ram_mib={d} chunks={d} seed_nonzero_chunks={d} seed_ms={d}",
-            .{ options.ram.len / 1024 / 1024, tracker.sealer.chunkCount(), tracker.sealer.stats.seed_nonzero_chunks, tracker.sealer.stats.seed_ms },
+            .{ tracker.sealer.ram.len / 1024 / 1024, tracker.sealer.chunkCount(), tracker.sealer.stats.seed_nonzero_chunks, tracker.sealer.stats.seed_ms },
         );
-        return tracker;
     }
 
-    fn deinit(self: *DirtyTracker) void {
-        self.sealer.deinit();
-    }
+    pub fn stop(_: *DirtyTracker) void {}
 
-    pub const metrics_mode = "dirty-log";
-
-    pub fn finish(self: *DirtyTracker) !spore.MemoryManifest {
-        const tail_start = try monotonicMs();
-        try self.flushDirty();
-        self.sealer.stats.tail_flush_ms = (try monotonicMs()) - tail_start;
-        const now_ms = try monotonicMs();
-        self.sealer.finishRates(self.tracking_start_ms, now_ms);
-        self.stats.dirty_pages_per_sec = ratePerSec(self.stats.dirty_pages_total, self.sealer.stats.tracking_ms);
-        return try self.sealer.finishBacking();
+    pub fn flush(tracker: *DirtyTracker) !void {
+        const dirty_pages = try collect(tracker);
+        if (dirty_pages == 0 and !tracker.sealer.hasDirtyChunks()) return;
+        _ = try tracker.sealer.flushMarked(.{ .record_cpu = true });
     }
 
     /// Logs a single-vCPU snapshot's metrics with the dirty-log counters.
-    pub fn logSnapshotMetrics(self: *const DirtyTracker, m: vmm.SnapshotMetrics) void {
-        const stats = self.stats;
-        const ram_stats = self.sealer.stats;
+    pub fn logSnapshotMetrics(tracker: *const DirtyTracker, m: vmm.SnapshotMetrics) void {
+        const stats = tracker.backend.stats;
+        const ram_stats = tracker.sealer.stats;
         var metrics_head_buf: [2048]u8 = undefined;
         var metrics_tail_buf: [3072]u8 = undefined;
         const metrics_head = std.fmt.bufPrint(
@@ -1217,22 +1095,15 @@ const DirtyTracker = struct {
                 ram_stats.finish_close_deferred,
                 ram_stats.finish_rename_ms,
                 ram_stats.tracking_ms,
-                stats.dirty_pages_per_sec,
+                ratePerSec(stats.dirty_pages_total, ram_stats.tracking_ms),
                 ram_stats.sealed_chunks_per_sec,
             },
         ) catch "";
         std.log.info("{s}{s}", .{ metrics_head, metrics_tail });
     }
 
-    fn flushDirty(self: *DirtyTracker) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const dirty_pages = try self.collectDirtyLog();
-        if (dirty_pages == 0 and !self.sealer.hasDirtyChunks()) return;
-        _ = try self.sealer.flushMarked(.{ .record_cpu = true });
-    }
-
-    fn collectDirtyLog(self: *DirtyTracker) !u64 {
+    fn collect(tracker: *DirtyTracker) !u64 {
+        const self = &tracker.backend;
         @memset(self.bitmap, 0);
         var log = kvm.DirtyLog{
             .slot = self.slot,
@@ -1245,7 +1116,7 @@ const DirtyTracker = struct {
         self.stats.get_dirty_log_cpu_ms += elapsedCpuMs(log_cpu_start);
 
         var dirty_pages: u64 = 0;
-        const page_count = (self.sealer.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
+        const page_count = (tracker.sealer.ram.len + std.heap.page_size_min - 1) / std.heap.page_size_min;
         for (self.bitmap, 0..) |word, word_index| {
             var bits = word;
             while (bits != 0) {
@@ -1253,42 +1124,13 @@ const DirtyTracker = struct {
                 const page_index = word_index * @bitSizeOf(usize) + bit_index;
                 if (page_index >= page_count) break;
                 const chunk_index = (page_index * std.heap.page_size_min) / spore.chunk_size;
-                self.sealer.markCollectedChunkDirty(chunk_index);
+                tracker.sealer.markCollectedChunkDirty(chunk_index);
                 dirty_pages += 1;
                 bits &= bits - 1;
             }
         }
         self.stats.dirty_pages_total += dirty_pages;
         return dirty_pages;
-    }
-
-    fn markGuestWriteCallback(ctx: *anyopaque, gpa: u64, len: u64) void {
-        const self: *DirtyTracker = @ptrCast(@alignCast(ctx));
-        self.markGuestWrite(gpa, len);
-    }
-
-    fn markGuestWrite(self: *DirtyTracker, gpa: u64, len: u64) void {
-        if (len == 0) return;
-        if (gpa < board.ram_base) return;
-        const guest_offset = gpa - board.ram_base;
-        if (guest_offset >= self.sealer.ram.len) return;
-        const start_offset: usize = @intCast(guest_offset);
-        const remaining: u64 = @intCast(self.sealer.ram.len - start_offset);
-        const capped_len: usize = @intCast(@min(len, remaining));
-        if (capped_len == 0) return;
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.sealer.markHostDirtyRange(start_offset, capped_len);
-    }
-
-    fn resetDirtyStatsAfterBaseline(self: *DirtyTracker) void {
-        self.stats.dirty_pages_total = 0;
-        self.stats.get_dirty_log_ms = 0;
-        self.stats.get_dirty_log_cpu_ms = 0;
-        self.stats.dirty_pages_per_sec = 0;
-        self.sealer.resetStatsAfterBaseline();
-        @memset(self.bitmap, 0);
     }
 };
 
@@ -1303,12 +1145,6 @@ fn captureMultiKvmDiskFork(
     try pauseKvmVcpusForSnapshot(options.vcpus, state, options.wake_set);
     defer state.clearSnapshot();
     try vmm.captureDiskFork(allocator, "kvm", options.vm, options.vcpus, options.dirty_tracker, options.snapshotSource(), request, control, pause_started_ns);
-}
-
-fn raiseGenerationIrqIfPending(vm_fd: std.c.fd_t, gen_dev: *const generation.Device) !void {
-    if (gen_dev.interrupt_status & generation.irq_generation_changed != 0) {
-        try kvm.setIrq(vm_fd, board.generationIntid(), true);
-    }
 }
 
 fn closeFd(fd: std.c.fd_t) void {
@@ -1393,6 +1229,36 @@ const Vm = struct {
     pub fn setCounter(self: *const Vm, guest_cntvct: u64) !void {
         try kvm.setCounterOffset(self.fd, snapshot.hostCounter() -% guest_cntvct);
     }
+
+    pub fn setSpi(self: *const Vm, intid: u32, level: bool) !void {
+        try kvm.setIrq(self.fd, intid, level);
+    }
+
+    /// A memslot cannot grow, so the virtio-mem slot is deleted and added
+    /// back at the new size. If that fails, the old size goes back so the
+    /// memory the guest already plugged stays mapped.
+    pub fn mapHotplug(self: *const Vm, bytes: []u8, guest_addr: u64, mapped_bytes: u64, new_bytes: u64) !void {
+        if (mapped_bytes != 0) try self.setHotplugSlot(guest_addr, 0, 0);
+        self.setHotplugSlot(guest_addr, new_bytes, @intFromPtr(bytes.ptr)) catch |err| {
+            if (mapped_bytes != 0) self.setHotplugSlot(guest_addr, mapped_bytes, @intFromPtr(bytes.ptr)) catch {};
+            return err;
+        };
+    }
+
+    pub fn unmapHotplug(self: *const Vm, guest_addr: u64, _: u64) void {
+        self.setHotplugSlot(guest_addr, 0, 0) catch |err| std.log.warn("failed to unmap virtio-mem hotplug region: {}", .{err});
+    }
+
+    fn setHotplugSlot(self: *const Vm, guest_addr: u64, size: u64, userspace_addr: u64) !void {
+        var region = kvm.UserspaceMemoryRegion{
+            .slot = 1,
+            .flags = 0,
+            .guest_phys_addr = guest_addr,
+            .memory_size = size,
+            .userspace_addr = userspace_addr,
+        };
+        _ = try kvm.ioctl(self.fd, kvm.KVM_SET_USER_MEMORY_REGION, @intFromPtr(&region), "KVM_SET_USER_MEMORY_REGION");
+    }
 };
 
 fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {
@@ -1431,50 +1297,6 @@ fn maskPortableCpuFeatures(vcpu_fd: std.c.fd_t) !void {
         std.log.debug("masking KVM ID_AA64ISAR0_EL1.RNDR for portability: 0x{x} -> 0x{x}", .{ isar0, masked });
         try kvm.setOneRegU64(vcpu_fd, id_aa64isar0_el1, masked);
     }
-}
-
-/// Handles a guest access to the generation device or a virtio transport and
-/// returns the value a read sees. Stray accesses read as zero.
-fn handleDeviceMmio(
-    vm_fd: std.c.fd_t,
-    access: vmm.Mmio,
-    transports: []mmio.Transport,
-    gen_dev: *generation.Device,
-    ram: guestmem.GuestRam,
-) !u64 {
-    const ipa = access.addr;
-
-    if (ipa >= board.generation_base and ipa < board.generation_base + board.generation_size) {
-        const offset = ipa - board.generation_base;
-        if (access.write) |value| {
-            if (gen_dev.write(offset, value, access.size_log2)) {
-                try kvm.setIrq(vm_fd, board.generationIntid(), false);
-            }
-            return 0;
-        }
-        return gen_dev.read(offset, access.size_log2);
-    }
-
-    const dev_index = blk: {
-        if (ipa < board.virtio_base) break :blk null;
-        const idx = (ipa - board.virtio_base) / board.virtio_stride;
-        if (idx >= transports.len) break :blk null;
-        break :blk idx;
-    };
-    if (dev_index) |idx| {
-        const t = &transports[@intCast(idx)];
-        const offset = ipa - board.virtioDeviceBase(@intCast(idx));
-        if (access.write) |value| {
-            const raised = t.write(offset, @truncate(value), ram);
-            if (raised) try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), true);
-            if (offset == 0x064) try kvm.setIrq(vm_fd, board.virtioDeviceIntid(@intCast(idx)), false);
-            return 0;
-        }
-        return t.read(offset);
-    }
-
-    std.log.debug("stray KVM MMIO {s} at ipa=0x{x}", .{ if (access.write != null) "write" else "read", ipa });
-    return 0;
 }
 
 fn sizeLog2(len: u32) ?u2 {
