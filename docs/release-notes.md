@@ -122,6 +122,13 @@ with `MissingKvmDevice` or `KvmOpenFailed` before pulling an image, and
 opened. A named VM's monitor no longer repeats the check, so `spore create` on
 Linux/AMD64 no longer builds an extra throwaway VM to probe the CPU profile.
 
+### One GIC layout on every backend
+
+HVF now places the GICv3 redistributors at `0x08020000`, where KVM and
+`spore host-info` already had them, instead of directly after the
+distributor at `0x08010000`. HVF spores saved by earlier builds fail restore
+with `PlatformMismatch` on `gic_redist_base`; re-create them.
+
 ### Bundles are always indexed
 
 `spore pack` without `--children` now always writes `bundle.json` with no

@@ -313,7 +313,9 @@ reset or poweroff.
   the shared SporeVM topology cap), `ram_base`, `ram_size`, `gic_dist_base`,
   `gic_redist_base`, `gic_redist_stride` (the redistributor frame stride used
   to validate the exposed GIC layout), and `counter_frequency_hz`. Restore
-  fails closed on any mismatch. CPU profile `sporevm-aarch64-v0` is the
+  fails closed on any mismatch. Every backend uses the board's GICv3 layout:
+  the distributor at `0x08000000` (64 KiB) and one `0x20000` redistributor
+  frame per vCPU from `0x08020000`. CPU profile `sporevm-aarch64-v0` is the
   current Apple-M/Graviton common denominator; KVM enforces it by masking RNDR
   before guest boot. Device model version 4 includes the fixed virtio-mmio
   range plus the generation MMIO device at `0x0c001000`, size `0x1000`, SPI 24
