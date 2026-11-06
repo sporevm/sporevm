@@ -1321,6 +1321,29 @@ test "snapshot root creation rejects existing and symlink paths" {
     try std.testing.expectError(error.AlreadyExists, createSnapshotRoot(arena, link_dir));
 }
 
+test "snapshot root and manifest save follow a symlinked parent" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Like `run --save /tmp/out` on macOS, where /tmp links to private/tmp.
+    const root_dir = try testDir(arena);
+    const real_dir = try pathZ(arena, "{s}/real", .{root_dir});
+    try ensureDir(real_dir);
+    try std.Io.Dir.cwd().symLink(std.testing.io, real_dir, try pathZ(arena, "{s}/link", .{root_dir}), .{});
+    try createSnapshotRoot(arena, try pathZ(arena, "{s}/link/out.spore", .{root_dir}));
+    const spore_dir = try pathZ(arena, "{s}/out.spore", .{real_dir});
+    try std.testing.expectEqual(@as(c_int, 0), std.c.access(spore_dir, 0));
+
+    // Like `rootfs preload --attach-spore <link>`.
+    const spore_link = try pathZ(arena, "{s}/out-link.spore", .{root_dir});
+    try std.Io.Dir.cwd().symLink(std.testing.io, spore_dir, spore_link, .{});
+    try saveManifest(arena, spore_link, testForkManifest(testZeroMemoryManifest(chunk_size), chunk_size, 1));
+    const loaded = try loadManifest(arena, spore_dir);
+    loaded.deinit();
+}
+
 test "memory round-trips through the chunk store with zero elision" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);

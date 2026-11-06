@@ -368,10 +368,12 @@ pub fn fsyncParentDirPath(allocator: std.mem.Allocator, path: []const u8) Error!
     try fsyncDirPath(allocator, parent);
 }
 
+/// Follows symlinks: callers pass user paths such as macOS's /tmp, and
+/// syncing a directory reached through one grants nothing.
 pub fn fsyncDirPath(allocator: std.mem.Allocator, path: []const u8) Error!void {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, @as(c_uint, 0));
     if (fd < 0) return error.IoFailed;
     defer _ = std.c.close(fd);
     try fsyncFd(fd);
