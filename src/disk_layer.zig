@@ -132,8 +132,9 @@ pub const SnapshotState = struct {
     /// Finish a writable disk snapshot after the VMM has paused the guest and
     /// verified the matching virtio-blk queues have no pending requests.
     /// A clean head over an exact rootfs baseline needs no disk state, so it
-    /// returns null until the head publishes its first index.
-    pub fn finish(self: SnapshotState, _: std.mem.Allocator, dir: []const u8, quiesced: bool) Error!?spore.Disk {
+    /// returns null until the head publishes its first index, which goes
+    /// into the CAS under `cache_root`.
+    pub fn finish(self: SnapshotState, _: std.mem.Allocator, cache_root: []const u8, quiesced: bool) Error!?spore.Disk {
         std.debug.assert(quiesced);
         try self.active.ensurePublishable();
         if (self.active.dirtyClusterCount() == 0 and self.base.baseline.kind == .rootfs and !self.active.hasPublishedSnapshot()) return null;
@@ -141,7 +142,7 @@ pub const SnapshotState = struct {
         const dirty_chunks = self.active.dirtyClusterCount();
         var stats: chunk_mapped_disk.SnapshotStats = .{};
         const result = switch (self.active) {
-            .chunk_mapped => |disk| try disk.snapshotIndexWithStats(dir, self.base.device, quiesced, &stats),
+            .chunk_mapped => |disk| try disk.snapshotIndexWithStats(cache_root, self.base.device, quiesced, &stats),
         };
         const chunks = std.math.divCeil(u64, result.size, result.chunk_size) catch 0;
         var metrics_buf: [2048]u8 = undefined;
@@ -171,21 +172,12 @@ pub const SnapshotState = struct {
         return result;
     }
 
-    pub fn prepareSnapshotRoot(self: SnapshotState, root: []const u8) Error!chunk_mapped_disk.PreparedSnapshotRoot {
-        return switch (self.active) {
-            .chunk_mapped => |disk| disk.prepareSnapshotRoot(root),
-        };
-    }
-
-    pub fn commitSnapshotRoot(
-        self: SnapshotState,
-        expected_root: []const u8,
-        prepared: *chunk_mapped_disk.PreparedSnapshotRoot,
-        intent: chunk_mapped_disk.SnapshotRootCommit,
-    ) Error!void {
-        return switch (self.active) {
-            .chunk_mapped => |disk| disk.commitSnapshotRoot(expected_root, prepared, intent),
-        };
+    /// Makes a just-published save the disk's fork authority, after its
+    /// directory is durably published.
+    pub fn commitSnapshot(self: SnapshotState) void {
+        switch (self.active) {
+            .chunk_mapped => |disk| disk.commitSnapshot(),
+        }
     }
 
     /// Clones the live writable head without sealing a durable disk index.
