@@ -507,6 +507,25 @@ test "local image names resolve through refs, identities and derivations across 
     try std.testing.expectError(error.LocalRefMustUseLocalRegistry, tag(allocator, cache.root, &cache_lock, "registry.example.test/app:native", native_image));
 }
 
+test "a local name's ref does not depend on the rootfs builder" {
+    // Refs used to be keyed by the rootfs builder version, so a builder bump
+    // orphaned every `local/...` name. This is the ref the current format
+    // writes for `local/app:dev` on linux/arm64; with no builder in its path
+    // or record, the name keeps resolving whatever the builder.
+    const io = std.testing.io;
+    var cache = try TestCache.init();
+    defer cache.deinit();
+    const allocator = cache.arena.allocator();
+    const ref_path = try std.fs.path.join(allocator, &.{ cache.root, refs_dir, "dbe40c92415cf6b6180e7c570afc0b17c0d8e936177fc21041afddf9def8ae63.json" });
+
+    const published = try lockAndPublish(io, allocator, cache.root, .{ .platform = .{}, .storage = try cache.storage(1), .name = "local/app:dev" });
+    try std.testing.expectEqualStrings(ref_path, published.ref_path.?);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = ref_path, .data = try std.fmt.allocPrint(allocator,
+        \\{{"kind":"spore-image-ref-v1","name":"local/app:dev","platform":{{"os":"linux","arch":"arm64"}},"image":"{s}"}}
+    , .{published.identity}) });
+    try std.testing.expectEqualStrings(published.identity, (try find(io, allocator, cache.root, "local/app:dev", .{})).?.identity);
+}
+
 test "only the origin-aware load returns an image with objects missing locally" {
     const io = std.testing.io;
     var cache = try TestCache.init();
