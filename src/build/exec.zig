@@ -1486,6 +1486,7 @@ const guest_agent_fuzz_attach_request: c_int = 9;
 
 extern fn spore_agent_fuzz_build_request(request: [*]const u8, request_len: usize, stream: [*]const u8, stream_len: usize) c_int;
 extern fn spore_agent_fuzz_exec_arg_equals(request: [*]const u8, request_len: usize, arg_index: usize, expected: [*]const u8, expected_len: usize) c_int;
+extern fn spore_agent_test_generation_params(params: [*]const u8, params_len: usize, generation: *u64, fork_index: *u64, vm_id: *[128]u8) c_int;
 extern fn spore_agent_test_resolve_exec_path(command: [*]const u8, command_len: usize, path: [*]const u8, path_len: usize, path_present: c_int, resolved: [*]u8, resolved_cap: usize) c_int;
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 extern fn spore_agent_fuzz_ext4_geometry(super: [*]const u8, super_len: usize, blocks_count: *u64, blocks_per_group: *u32, block_size: *u32) c_int;
@@ -1538,16 +1539,23 @@ extern fn spore_build_copy_apply(
     error_cap: usize,
 ) c_int;
 
+// Fork generation params as a JSON string value, with an extra member holding
+// the kinds of value the agent must skip.
+const guest_fork_params_json_string =
+    \\{\"schema_version\":0,\"parent_generation\":1,\"generation\":2,\"fork_index\":0,\"fork_count\":2,\"parallel_index\":0,\"parallel_count\":2,\"fork_batch_id\":\"0123456789abcdef0123456789abcdef\",\"vm_id\":\"spore-0123456789abcdef0123456789abcdef\",\"hostname\":\"spore-01234567-000000\",\"mac_seed\":\"0123456789abcdef0123456789abcdef\",\"mac_address\":\"02:00:00:00:00:01\",\"resume_time_unix_ns\":1,\"resume_entropy_seed\":\"0123456789abcdef0123456789abcdef\",\"labels\":{\"generation\":[1,null,true,-1.5e3]}}
+;
+
 // start-v1 and attach-v1 requests as the host encodes them, without the
 // closing "}\n". They seed the guest request fuzz target, each with a
 // duplicate-key and an unknown-key variant, so mutations start from requests
-// that reach every member parser.
+// that reach every member parser, including the generation params parser.
 const guest_exec_request_seeds = [_]struct { body: []const u8, kind: c_int, last_member: []const u8 }{
     .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"run-1\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
     .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/sh\",\"-c\",\"cat\"],\"env\":[\"A=1\"],\"working_dir\":\"/work\",\"stdio\":\"pipe\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":true,\"params_json\":\"{\\\"generation\\\":2}\",\"require_generation_ready\":true,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
     .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-2\",\"resume_time_unix_ns\":1,\"argv\":[\"sh\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"tty\",\"terminal_rows\":40,\"terminal_cols\":120,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
     .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-3\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/sleep\",\"60\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":true,\"retain_output\":true,\"closed_env\":true" },
     .{ .kind = guest_agent_fuzz_attach_request, .last_member = ",\"params_json\":\"\"", .body = "{\"type\":\"attach-v1\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0,\"stdio\":\"null\",\"interactive\":false,\"terminal_rows\":24,\"terminal_cols\":80,\"params_json\":\"\"" },
+    .{ .kind = guest_agent_fuzz_attach_request, .last_member = ",\"params_json\":\"\"", .body = "{\"type\":\"attach-v1\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0,\"stdio\":\"null\",\"interactive\":false,\"terminal_rows\":24,\"terminal_cols\":80,\"params_json\":\"" ++ guest_fork_params_json_string ++ "\"" },
 };
 
 // The removed term member doubles as the unknown key.
@@ -3280,6 +3288,60 @@ test "guest agent parses exec and control requests strictly" {
         try expectGuestRequestKind(invalid, seed.body ++ seed.last_member ++ "}\n");
         try expectGuestRequestKind(invalid, seed.body ++ guest_exec_request_unknown_member ++ "}\n");
     }
+}
+
+test "guest generation params are read only from their top-level members" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const cases = [_]struct { params: []const u8, result: c_int, generation: u64 = 0, fork_index: u64 = 0, vm_id: []const u8 = "" }{
+        .{ .params = "{\"generation\":7}", .result = 1, .generation = 7 },
+        // A substring search for "generation": finds a nested key, or a key
+        // that only ends in that text, before the real member.
+        .{ .params = "{\"labels\":{\"generation\":5},\"generation\":7}", .result = 1, .generation = 7 },
+        .{ .params = "{\"\\\"generation\":5,\"generation\":7}", .result = 1, .generation = 7 },
+        .{ .params = "{\"labels\":{\"generation\":5}}", .result = 0 },
+        .{ .params = "{\"vm_id\":\"\\\"generation\\\":5\",\"generation\":7}", .result = 1, .generation = 7, .vm_id = "\"generation\":5" },
+        // Fork params as the host writes them, with members the agent skips.
+        // The members the agent reads have distinct values, so reading the
+        // generation, fork index or VM id from another member fails.
+        .{ .params = "{\"schema_version\":0,\"parent_generation\":1,\"generation\":2,\"fork_index\":3,\"fork_count\":4,\"parallel_index\":5,\"parallel_count\":6,\"fork_batch_id\":\"0123456789abcdef0123456789abcdef\",\"vm_id\":\"spore-0123456789abcdef0123456789abcdef\",\"hostname\":\"spore-01234567-000000\",\"mac_seed\":\"0123456789abcdef0123456789abcdef\",\"mac_address\":\"02:00:00:00:00:01\"}", .result = 1, .generation = 2, .fork_index = 3, .vm_id = "spore-0123456789abcdef0123456789abcdef" },
+        .{ .params = "{\"run_id\":\"r\",\"child_id\":7,\"note\":null,\"ok\":true,\"ratio\":-1.5e+3,\"tree\":[[{\"a\":[]}],{}],\"generation\":3}", .result = 1, .generation = 3 },
+        .{ .params = " { } ", .result = 0 },
+        .{ .params = "{\"tree\":" ++ "[" ** 1900 ++ "]" ** 1900 ++ ",\"generation\":4}", .result = 1, .generation = 4 },
+        .{ .params = "{\"generation\":1,\"generation\":2}", .result = -1 },
+        .{ .params = "{\"generation\":\"7\"}", .result = -1 },
+        .{ .params = "{\"generation\":-1}", .result = -1 },
+        .{ .params = "{\"generation\":1.5}", .result = -1 },
+        .{ .params = "{\"generation\":07}", .result = -1 },
+        .{ .params = "{\"hostname\":7}", .result = -1 },
+        .{ .params = "{\"hostname\":\"" ++ "h" ** 128 ++ "\"}", .result = -1 },
+        .{ .params = "{\"generation\":7", .result = -1 },
+        .{ .params = "{\"generation\":7}x", .result = -1 },
+        .{ .params = "{\"generation\":7,}", .result = -1 },
+        .{ .params = "{\"tree\":[1,]}", .result = -1 },
+        .{ .params = "{\"tree\":{\"a\"}}", .result = -1 },
+        .{ .params = "{\"ratio\":1.}", .result = -1 },
+        .{ .params = "[]", .result = -1 },
+        .{ .params = "", .result = -1 },
+    };
+    for (cases) |case| {
+        var generation: u64 = 0;
+        var fork_index: u64 = 0;
+        var vm_id: [128]u8 = undefined;
+        const result = spore_agent_test_generation_params(case.params.ptr, case.params.len, &generation, &fork_index, &vm_id);
+        std.testing.expectEqual(case.result, result) catch |err| {
+            std.debug.print("generation params: {s}\n", .{case.params});
+            return err;
+        };
+        if (result == -1) continue;
+        if (result == 1) try std.testing.expectEqual(case.generation, generation);
+        try std.testing.expectEqual(case.fork_index, fork_index);
+        try std.testing.expectEqualStrings(case.vm_id, std.mem.sliceTo(&vm_id, 0));
+    }
+    var generation: u64 = 0;
+    var fork_index: u64 = 0;
+    var vm_id: [128]u8 = undefined;
+    const longest_hostname = "{\"hostname\":\"" ++ "h" ** 127 ++ "\"}";
+    try std.testing.expectEqual(@as(c_int, 0), spore_agent_test_generation_params(longest_hostname.ptr, longest_hostname.len, &generation, &fork_index, &vm_id));
 }
 
 test "guest proc stat parser identifies kernel threads with adversarial task names" {

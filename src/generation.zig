@@ -145,15 +145,39 @@ pub fn validateFanoutParams(allocator: std.mem.Allocator, params: []const u8) !v
     const parallel_count = try requiredJsonU64(object, "parallel_count");
     const fork_index = try requiredJsonU64(object, "fork_index");
     const fork_count = try requiredJsonU64(object, "fork_count");
-    _ = try requiredJsonString(object, "fork_batch_id");
-    _ = try requiredJsonString(object, "vm_id");
+    // The guest agent refuses params when a member it reads has the wrong
+    // type, a number that is not a plain u64, or a string that holds a NUL
+    // or is longer than guest_text_max bytes (parse_generation_params in
+    // guest/minimal-initrd/request.c). Refuse them here, before the VM starts.
+    try checkGuestText(try requiredJsonString(object, "fork_batch_id"));
+    try checkGuestText(try requiredJsonString(object, "vm_id"));
+    inline for (.{ "hostname", "resume_entropy_seed" }) |field| {
+        if (object.get(field)) |value| switch (value) {
+            .string => |string| try checkGuestText(string),
+            else => return error.BadGenerationPayload,
+        };
+    }
+    inline for (.{ "parent_generation", "generation", "resume_time_unix_ns" }) |field| {
+        if (object.get(field)) |value| _ = try jsonU64(value);
+    }
 
     if (parallel_count == 0 or fork_count == 0) return error.BadGenerationPayload;
     if (parallel_index >= parallel_count or fork_index >= fork_count) return error.BadGenerationPayload;
 }
 
+/// The guest agent holds each string member it reads in 128 bytes with a
+/// terminating NUL (agent.h GENERATION_TEXT_MAX).
+const guest_text_max = 127;
+
+fn checkGuestText(string: []const u8) !void {
+    if (string.len > guest_text_max or std.mem.indexOfScalar(u8, string, 0) != null) return error.BadGenerationPayload;
+}
+
 fn requiredJsonU64(object: std.json.ObjectMap, field: []const u8) !u64 {
-    const value = object.get(field) orelse return error.BadGenerationPayload;
+    return jsonU64(object.get(field) orelse return error.BadGenerationPayload);
+}
+
+fn jsonU64(value: std.json.Value) !u64 {
     return switch (value) {
         .integer => |integer| if (integer >= 0) @intCast(integer) else error.BadGenerationPayload,
         .number_string => |string| std.fmt.parseInt(u64, string, 10) catch return error.BadGenerationPayload,
@@ -248,6 +272,48 @@ test "fanout params require shard identity fields" {
     try std.testing.expectError(error.BadGenerationPayload, validateFanoutParams(allocator,
         \\{"run_id":"rails-rspec-1","child_id":1,"parallel_index":2,"parallel_count":2,"fork_index":0,"fork_count":1,"fork_batch_id":"batch-1","vm_id":"spore-child-1"}
     ));
+}
+
+test "fanout params follow the guest agent's rules for the members it reads" {
+    const allocator = std.testing.allocator;
+    const head = "{\"run_id\":\"r\",\"child_id\":0,\"parallel_index\":0,\"parallel_count\":1,\"fork_index\":0,\"fork_count\":1";
+    const ids = ",\"fork_batch_id\":\"b\",\"vm_id\":\"v\"";
+    const cases = [_]struct { tail: []const u8, accepted: bool }{
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "v" ** 127 ++ "\"}", .accepted = true },
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "v" ** 128 ++ "\"}", .accepted = false },
+        // Strings are measured decoded: each \u00e9 is two bytes.
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "\\u00e9" ** 63 ++ "v\"}", .accepted = true },
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"" ++ "\\u00e9" ** 64 ++ "\"}", .accepted = false },
+        .{ .tail = ",\"fork_batch_id\":\"b\",\"vm_id\":\"v\\u0000\"}", .accepted = false },
+        .{ .tail = ",\"fork_batch_id\":\"" ++ "b" ** 128 ++ "\",\"vm_id\":\"v\"}", .accepted = false },
+        .{ .tail = ids ++ ",\"hostname\":\"spore-child-7\",\"resume_entropy_seed\":\"\"}", .accepted = true },
+        .{ .tail = ids ++ ",\"hostname\":\"" ++ "h" ** 128 ++ "\"}", .accepted = false },
+        .{ .tail = ids ++ ",\"hostname\":7}", .accepted = false },
+        .{ .tail = ids ++ ",\"resume_entropy_seed\":null}", .accepted = false },
+        .{ .tail = ids ++ ",\"resume_entropy_seed\":\"s\\u0000\"}", .accepted = false },
+        .{ .tail = ids ++ ",\"generation\":18446744073709551615,\"parent_generation\":0,\"resume_time_unix_ns\":1}", .accepted = true },
+        .{ .tail = ids ++ ",\"generation\":18446744073709551616}", .accepted = false },
+        .{ .tail = ids ++ ",\"generation\":-0}", .accepted = false },
+        .{ .tail = ids ++ ",\"generation\":1.0}", .accepted = false },
+        .{ .tail = ids ++ ",\"generation\":1e2}", .accepted = false },
+        .{ .tail = ids ++ ",\"parent_generation\":\"1\"}", .accepted = false },
+        .{ .tail = ids ++ ",\"resume_time_unix_ns\":-1}", .accepted = false },
+    };
+    inline for (cases) |case| {
+        const params = head ++ case.tail;
+        const result = validateFanoutParams(allocator, params);
+        if (case.accepted) {
+            result catch |err| {
+                std.debug.print("refused: {s}\n", .{params});
+                return err;
+            };
+        } else {
+            std.testing.expectError(error.BadGenerationPayload, result) catch |err| {
+                std.debug.print("accepted: {s}\n", .{params});
+                return err;
+            };
+        }
+    }
 }
 
 fn fuzzMmio(_: void, s: *std.testing.Smith) !void {

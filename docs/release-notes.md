@@ -18,6 +18,18 @@
 - Single-vCPU saves also wait until the vCPU is not in an interrupt handler,
   or fail with `InterruptStillActive`, as multi-vCPU saves do.
 
+### Security
+
+- The guest agent reads generation params (from `--generation` files, forks
+  and restores) in one pass over the JSON object instead of searching the
+  text for each key, so a nested object or a look-alike key can't supply a
+  member's value. Params that aren't valid JSON, or that repeat a member the
+  agent reads, give it the wrong type, or set a VM id, fork batch id,
+  hostname or entropy seed over 127 bytes or containing NUL, now fail instead
+  of being partly applied. `spore run --from`, `spore attach` and
+  `spore restore` check a `--generation` file against the same rules before
+  the VM starts.
+
 ### Other changes
 
 - Saved network spores record `default_action: "deny"` for every restricted
