@@ -41,11 +41,6 @@ test "completed KVM exit wins a racing network wake" {
     try std.testing.expectEqual(KvmPostRunAction.handle_async_wake, kvmPostRunAction(.interrupted, true));
 }
 
-const gic_dist_base: u64 = 0x0800_0000;
-const gic_dist_size: u64 = 0x0001_0000;
-const gic_redist_base: u64 = 0x0802_0000;
-const gic_redist_size: u64 = 0x0002_0000;
-
 pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const manifest_start = try monotonicMs();
     var prepared = try vmm.prepare(allocator, input, .{ .multi_vcpu_dirty_tracking = true });
@@ -111,15 +106,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     if (prepared.manifest) |parsed| {
         const restore = config.start.restore;
         const m = parsed.value;
-        try platform.checkManifest(m, .{
-            .vcpu_count = prepared.vcpus,
-            .ram_size = prepared.ram_size,
-            .gic_dist_base = gic_dist_base,
-            .gic_redist_base = gic_redist_base,
-            .gic_redist_stride = gic_redist_size,
-            .counter_frequency_hz = snapshot.hostCounterFreq(),
-            .device_count = transports.len,
-        });
+        try platform.checkManifest(m, platform.contract(prepared.vcpus, prepared.ram_size, snapshot.hostCounterFreq()), transports.len);
         try vmm.restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = try monotonicMs();
         if (m.memory_state) |state| try mem_dev.restoreState(state);
@@ -136,12 +123,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = prepared.ram_size,
             .cpu_count = prepared.vcpus,
-            .gic = .{
-                .distributor_base = gic_dist_base,
-                .distributor_size = gic_dist_size,
-                .redistributor_base = gic_redist_base,
-                .redistributor_size = try board.redistributorRegionSize(gic_redist_size, prepared.vcpus),
-            },
+            .gic = try board.gicLayout(prepared.vcpus),
             .virtio_count = @intCast(transports.len),
             .bootargs = fresh.cmdline,
             .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
@@ -709,7 +691,6 @@ const Vm = struct {
     kvm_fd: std.c.fd_t,
     fd: std.c.fd_t,
     gic: kvm.CreateDevice,
-    gic_layout: vmm.GicLayout = .{ .dist_base = gic_dist_base, .redist_base = gic_redist_base, .redist_stride = gic_redist_size },
     run_size: usize,
     wake_signal: KvmRunWakeSignal,
 
@@ -820,8 +801,8 @@ const Vm = struct {
 fn createGic(vm_fd: std.c.fd_t) !kvm.CreateDevice {
     var dev = kvm.CreateDevice{ .type = kvm.KVM_DEV_TYPE_ARM_VGIC_V3, .fd = 0, .flags = 0 };
     _ = try kvm.ioctl(vm_fd, kvm.KVM_CREATE_DEVICE, @intFromPtr(&dev), "KVM_CREATE_DEVICE vgicv3");
-    var dist = gic_dist_base;
-    var redist = gic_redist_base;
+    var dist = board.gic_dist_base;
+    var redist = board.gic_redist_base;
     try kvm.setDeviceAttr(@intCast(dev.fd), kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_DIST, &dist, "vgic dist addr");
     try kvm.setDeviceAttr(@intCast(dev.fd), kvm.KVM_DEV_ARM_VGIC_GRP_ADDR, kvm.KVM_VGIC_V3_ADDR_TYPE_REDIST, &redist, "vgic redist addr");
     return dev;

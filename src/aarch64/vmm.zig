@@ -775,13 +775,6 @@ pub fn logNamedSnapshotPublication(comptime backend: []const u8, metrics: vsock_
     );
 }
 
-/// Where a backend placed the interrupt controller; manifests record it.
-pub const GicLayout = struct {
-    dist_base: u64,
-    redist_base: u64,
-    redist_stride: u64,
-};
-
 /// The parts of a run a snapshot captures besides machine state. They stay
 /// the same for the whole run.
 pub const SnapshotSource = struct {
@@ -826,7 +819,7 @@ pub const SnapshotMetrics = struct {
 /// would race a reset or DRIVER_FEATURES write.
 ///
 /// Machine state comes from each `vcpu.capture(vm, arena)` and
-/// `vm.captureGic(arena, vcpus)`; `vm.gic_layout` goes in the manifest.
+/// `vm.captureGic(arena, vcpus)`; the platform block is the board contract.
 /// `dirty_tracker` is an optional pointer to the backend's tracker, which
 /// provides `finish()`, `metrics_mode` and `logSnapshotMetrics(SnapshotMetrics)`;
 /// without one, RAM is scanned in full.
@@ -897,19 +890,8 @@ pub fn writeSnapshot(
     const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
     const disk_ms = clock.nowMs() - disk_start;
     const manifest_start = clock.nowMs();
-    const gic_layout: GicLayout = vm.gic_layout;
     const saved_manifest = spore.Manifest{
-        .platform = .{
-            .cpu_profile = board.cpu_profile,
-            .device_model_version = board.device_model_version,
-            .vcpu_count = @intCast(vcpus.len),
-            .ram_base = board.ram_base,
-            .ram_size = source.ram_size,
-            .gic_dist_base = gic_layout.dist_base,
-            .gic_redist_base = gic_layout.redist_base,
-            .gic_redist_stride = gic_layout.redist_stride,
-            .counter_frequency_hz = try platform.hostCounterFrequencyHz(),
-        },
+        .platform = platform.contract(@intCast(vcpus.len), source.ram_size, try platform.hostCounterFrequencyHz()),
         .machine = machine,
         .devices = devices,
         .generation = gen_state,
@@ -1954,7 +1936,6 @@ fn testVcpuState(index: topology.VcpuIndex, vtimer: spore.VtimerState) spore.Vcp
 
 /// Records the order `restoreMachine` drives a backend in.
 const TestVm = struct {
-    gic_layout: GicLayout = .{ .dist_base = 0, .redist_base = 0, .redist_stride = 0 },
     gic_applied: bool = false,
     counter: ?u64 = null,
 
@@ -2096,7 +2077,6 @@ const ThreadTestVm = struct {
     pub const name = "test";
     pub const spi_needs_kick = true;
 
-    gic_layout: GicLayout = .{ .dist_base = 0, .redist_base = 0, .redist_stride = 0 },
     counter: ?u64 = null,
     /// vCPU 1 shuts the guest down once this is set.
     shutdown: std.atomic.Value(bool) = .init(false),

@@ -136,7 +136,8 @@ by the suspended workload.
   stable `index`/`mpidr` topology while each backend sets MPIDR during vCPU
   bring-up.
 - GIC base addresses are not translated. They are platform fields and must
-  match because the guest has already observed and mapped them.
+  match because the guest has already observed and mapped them; HVF and KVM
+  both place the GIC where the board says.
 
 ### Profiled or masked
 

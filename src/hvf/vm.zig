@@ -68,7 +68,8 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     // HVF restore metrics have always excluded hv_vm_create from pre_run_ms.
     if (restore_stats) |*stats| stats.start_ms += hv_vm_create_ms;
 
-    // GIC layout from runtime parameters; created before any vCPU.
+    // The board fixes the GIC layout; the framework sizes and aligns it.
+    // Created before any vCPU.
     const gic_start = monotonicMs();
     var dist_size: usize = 0;
     var dist_align: usize = 0;
@@ -79,13 +80,15 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     try hvf.check(hvf.hv_gic_get_redistributor_region_size(&redist_size), "gic redist size");
     try hvf.check(hvf.hv_gic_get_redistributor_base_alignment(&redist_align), "gic redist align");
 
-    const default_dist_base: u64 = std.mem.alignForward(u64, 0x0800_0000, dist_align);
-    const default_redist_base: u64 = std.mem.alignForward(u64, default_dist_base + dist_size, redist_align);
-    const dist_base: u64, const redist_base: u64 = if (prepared.manifest) |parsed|
-        .{ parsed.value.platform.gic_dist_base, parsed.value.platform.gic_redist_base }
-    else
-        .{ default_dist_base, default_redist_base };
-    if (dist_base % dist_align != 0 or redist_base % redist_align != 0) return error.PlatformMismatch;
+    const dist_base = board.gic_dist_base;
+    const redist_base = board.gic_redist_base;
+    // The redistributor region covers every vCPU the VM supports.
+    if (dist_size != board.gic_dist_size or dist_base % dist_align != 0 or redist_base % redist_align != 0 or
+        redist_size > board.virtio_base - redist_base)
+    {
+        std.log.err("HVF GIC cannot use the board layout: distributor size=0x{x} align=0x{x} redistributor size=0x{x} align=0x{x}", .{ dist_size, dist_align, redist_size, redist_align });
+        return error.UnsupportedHost;
+    }
 
     const gic_config = hvf.hv_gic_config_create();
     defer hvf.os_release(gic_config);
@@ -177,13 +180,13 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     const vcpu_redist_base = primary.redist_base;
     var redist_stride: usize = 0;
     try hvf.check(hvf.hv_gic_get_redistributor_size(&redist_stride), "gic redist stride");
+    try requireBoardRedistributors(.{ .base = vcpu_redist_base, .size = redist_stride }, redist_stride, 1);
 
     std.log.debug(
         "gic: dist=0x{x}+0x{x} redist(vcpu0)=0x{x}+0x{x} (region 0x{x}+0x{x})",
         .{ dist_base, dist_size, vcpu_redist_base, redist_stride, redist_base, redist_size },
     );
     const vcpu_ms = monotonicMs() - vcpu_start;
-    vm.gic_layout = .{ .dist_base = dist_base, .redist_base = vcpu_redist_base, .redist_stride = redist_stride };
     vm.gic_windows = .{
         .dist_base = dist_base,
         .dist_size = dist_size,
@@ -197,15 +200,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         const restore = config.start.restore;
         // Restore: memory, device, GIC, and vCPU state from the spore.
         const m = parsed.value;
-        try platform_contract.checkManifest(m, .{
-            .vcpu_count = 1,
-            .ram_size = prepared.ram_size,
-            .gic_dist_base = dist_base,
-            .gic_redist_base = vcpu_redist_base,
-            .gic_redist_stride = redist_stride,
-            .counter_frequency_hz = snapshot.hostCounterFreq(),
-            .device_count = transports.len,
-        });
+        try platform_contract.checkManifest(m, platform_contract.contract(1, prepared.ram_size, snapshot.hostCounterFreq()), transports.len);
         try vmm.restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = monotonicMs();
         if (m.memory_state) |state| try mem_dev.restoreState(state);
@@ -225,12 +220,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = prepared.ram_size,
             .cpu_count = prepared.vcpus,
-            .gic = .{
-                .distributor_base = dist_base,
-                .distributor_size = dist_size,
-                .redistributor_base = vcpu_redist_base,
-                .redistributor_size = try board.redistributorRegionSize(@intCast(redist_stride), prepared.vcpus),
-            },
+            .gic = try board.gicLayout(prepared.vcpus),
             .virtio_count = @intCast(transports.len),
             .bootargs = fresh.cmdline,
             .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
@@ -537,14 +527,12 @@ const HvfVcpuCommandSlot = struct {
     }
 };
 
-/// What the shared core needs from the HVF VM: where the GIC sits, the guest
-/// counter offset every vCPU shares, interrupt lines and the virtio-mem
-/// mapping. HVF has one VM per process, so most calls need no handle.
+/// What the shared core needs from the HVF VM: the GIC windows a vCPU
+/// emulates, the guest counter offset every vCPU shares, interrupt lines and
+/// the virtio-mem mapping. HVF has one VM per process, so most calls need no
+/// handle.
 const Vm = struct {
-    /// Set once the vCPUs exist: HVF places each redistributor frame by the
-    /// vCPU's MPIDR.
-    gic_layout: vmm.GicLayout = undefined,
-    /// The GIC windows a vCPU emulates; set with `gic_layout`.
+    /// Set once the vCPUs exist.
     gic_windows: GicWindows = undefined,
     /// Host counter minus guest counter; a restore sets it on every vCPU.
     vtimer_offset: u64 = 0,
@@ -829,6 +817,18 @@ const HvfRedistributorWindow = struct {
     size: u64,
 };
 
+/// The framework assigns each vCPU's redistributor frames from its MPIDR;
+/// they must land where the board says they are.
+fn requireBoardRedistributors(window: HvfRedistributorWindow, stride: u64, vcpu_count: topology.VcpuCount) !void {
+    const board_size = try board.redistributorRegionSize(board.gic_redist_stride, vcpu_count);
+    if (window.base == board.gic_redist_base and window.size == board_size and stride == board.gic_redist_stride) return;
+    std.log.err(
+        "HVF placed the GIC redistributors at 0x{x}+0x{x} stride=0x{x}; the board needs 0x{x}+0x{x} stride=0x{x}",
+        .{ window.base, window.size, stride, board.gic_redist_base, board_size, board.gic_redist_stride },
+    );
+    return error.UnsupportedHost;
+}
+
 fn hvfRedistributorWindow(vcpus: []const Vcpu, stride: u64) !HvfRedistributorWindow {
     if (vcpus.len == 0 or stride == 0) return error.UnsupportedVcpuCount;
     var base = vcpus[0].redist_base;
@@ -900,6 +900,7 @@ fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !Exit
     try hvf.check(hvf.hv_gic_get_redistributor_size(&redist_stride), "gic redist stride");
     const redist_window = try hvfRedistributorWindow(vcpus, @intCast(redist_stride));
     if (redist_window.size > options.redist_region_size) return error.UnsupportedVcpuCount;
+    try requireBoardRedistributors(redist_window, redist_stride, @intCast(vcpus.len));
     const vcpu_ms = monotonicMs() - vcpu_start;
     vm.gic_windows = .{
         .dist_base = options.dist_base,
@@ -909,7 +910,6 @@ fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !Exit
         .redist_stride = @intCast(redist_stride),
         .redist_vcpus = vcpus,
     };
-    vm.gic_layout = .{ .dist_base = options.dist_base, .redist_base = redist_window.base, .redist_stride = @intCast(redist_stride) };
     std.log.debug(
         "gic: dist=0x{x}+0x{x} redist=0x{x}+0x{x} stride=0x{x} count={d} (region 0x{x}+0x{x})",
         .{ options.dist_base, options.dist_size, redist_window.base, redist_window.size, redist_stride, vcpus.len, options.redist_region_base, options.redist_region_size },
@@ -924,15 +924,7 @@ fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !Exit
             .multi => |multi| multi,
             .single => return error.PlatformMismatch,
         };
-        try platform_contract.checkManifest(manifest.*, .{
-            .vcpu_count = options.prepared.vcpus,
-            .ram_size = options.prepared.ram_size,
-            .gic_dist_base = options.dist_base,
-            .gic_redist_base = redist_window.base,
-            .gic_redist_stride = @intCast(redist_stride),
-            .counter_frequency_hz = snapshot.hostCounterFreq(),
-            .device_count = transports.len,
-        });
+        try platform_contract.checkManifest(manifest.*, platform_contract.contract(options.prepared.vcpus, options.prepared.ram_size, snapshot.hostCounterFreq()), transports.len);
         // HVF restores only its own private GIC blob.
         if (machine.gic.kind != .backend_private) return error.PlatformMismatch;
         try vmm.restoreMemory(allocator, restore, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
@@ -951,12 +943,7 @@ fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !Exit
         const dtb = try board.buildDtb(allocator, .{
             .ram_size = options.prepared.ram_size,
             .cpu_count = options.prepared.vcpus,
-            .gic = .{
-                .distributor_base = options.dist_base,
-                .distributor_size = options.dist_size,
-                .redistributor_base = redist_window.base,
-                .redistributor_size = redist_window.size,
-            },
+            .gic = try board.gicLayout(options.prepared.vcpus),
             .virtio_count = @intCast(transports.len),
             .bootargs = fresh.cmdline,
             .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,

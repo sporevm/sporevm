@@ -19,6 +19,15 @@ pub const device_model_version = 4;
 pub const cpu_profile = "sporevm-aarch64-v0";
 
 pub const ram_base: u64 = 0x8000_0000;
+
+/// GICv3 layout. Every backend places the interrupt controller here and
+/// manifests record it, so restore can require an exact match.
+pub const gic_dist_base: u64 = 0x0800_0000;
+pub const gic_dist_size: u64 = 0x1_0000;
+pub const gic_redist_base: u64 = 0x0802_0000;
+/// One vCPU's redistributor frames (RD_base and SGI_base).
+pub const gic_redist_stride: u64 = 0x2_0000;
+
 /// Outside the GIC's reserved redistributor region (which can span tens of
 /// MB above the distributor at 0x0800_0000 on HVF).
 pub const virtio_base: u64 = 0x0c00_0000;
@@ -75,6 +84,16 @@ pub fn generationIntid() u32 {
 pub fn redistributorRegionSize(stride: u64, cpu_count: topology.VcpuCount) !u64 {
     try topology.validateVcpuCount(cpu_count);
     return std.math.mul(u64, stride, cpu_count);
+}
+
+/// The GIC windows a guest with `cpu_count` vCPUs sees.
+pub fn gicLayout(cpu_count: topology.VcpuCount) !GicLayout {
+    return .{
+        .distributor_base = gic_dist_base,
+        .distributor_size = gic_dist_size,
+        .redistributor_base = gic_redist_base,
+        .redistributor_size = try redistributorRegionSize(gic_redist_stride, cpu_count),
+    };
 }
 
 /// Build the boot DTB. Caller owns the returned blob.
@@ -261,4 +280,13 @@ test "virtio addressing helpers" {
     try std.testing.expectEqual(@as(u32, 48), virtioDeviceIntid(0));
     try std.testing.expectEqual(virtio_base + virtio_stride * max_virtio_devices, generation_base);
     try std.testing.expectEqual(@as(u32, 56), generationIntid());
+}
+
+test "the GIC layout fits below the virtio window for every vCPU count" {
+    for (1..topology.max_vcpus + 1) |count| {
+        const gic = try gicLayout(@intCast(count));
+        try std.testing.expect(gic.distributor_base + gic.distributor_size <= gic.redistributor_base);
+        try std.testing.expect(gic.redistributor_base + gic.redistributor_size <= virtio_base);
+    }
+    try std.testing.expectError(error.UnsupportedVcpuCount, gicLayout(topology.max_vcpus + 1));
 }

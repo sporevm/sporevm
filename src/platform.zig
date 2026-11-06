@@ -12,11 +12,8 @@ const x86_board = @import("x86_64/board.zig");
 const x86_cpu_profile = @import("x86_64/cpu_profile.zig");
 const x86_kvm = @import("kvm/x86_64.zig");
 
-pub const machine_arch = "aarch64";
 pub const host_info_schema = "spore.host-info.v3";
 pub const host_info_schema_version: u32 = 3;
-pub const default_gic_dist_base: u64 = 0x0800_0000;
-pub const default_gic_redist_base: u64 = 0x0802_0000;
 
 pub const BackendAvailability = struct {
     name: []const u8,
@@ -138,19 +135,23 @@ pub const HostInfoSnapshot = struct {
     x86_kvm_capabilities: [x86_cpu_profile.required_capabilities.len]KvmCapabilityFact = emptyX86KvmCapabilities(),
 };
 
-pub const Expected = struct {
-    arch: []const u8 = machine_arch,
-    cpu_profile: []const u8 = board.cpu_profile,
-    device_model_version: u32 = board.device_model_version,
-    vcpu_count: topology.VcpuCount,
-    ram_base: u64 = board.ram_base,
-    ram_size: u64,
-    gic_dist_base: u64,
-    gic_redist_base: u64,
-    gic_redist_stride: u64,
-    counter_frequency_hz: u64,
-    device_count: usize,
-};
+/// The guest platform of a VM with `vcpu_count` vCPUs and `ram_size` bytes
+/// of initial RAM on a host whose counter runs at `counter_frequency_hz`.
+/// Snapshots record it, restore requires a manifest to match it exactly, and
+/// host-info reports its fixed part.
+pub fn contract(vcpu_count: topology.VcpuCount, ram_size: u64, counter_frequency_hz: u64) spore.Platform {
+    return .{
+        .cpu_profile = board.cpu_profile,
+        .device_model_version = board.device_model_version,
+        .vcpu_count = vcpu_count,
+        .ram_base = board.ram_base,
+        .ram_size = ram_size,
+        .gic_dist_base = board.gic_dist_base,
+        .gic_redist_base = board.gic_redist_base,
+        .gic_redist_stride = board.gic_redist_stride,
+        .counter_frequency_hz = counter_frequency_hz,
+    };
+}
 
 /// Return the versioned host-info contract on either supported architecture.
 /// Architecture-specific probing is confined to snapshot construction; JSON
@@ -202,8 +203,8 @@ fn platformFacts(snapshot: HostInfoSnapshot, arch: architecture.Architecture) Pl
             .device_model_version = board.device_model_version,
             .ram_base = board.ram_base,
             .interrupt_controller = .{
-                .distributor_base = default_gic_dist_base,
-                .redistributor_base = default_gic_redist_base,
+                .distributor_base = board.gic_dist_base,
+                .redistributor_base = board.gic_redist_base,
             },
             .counter = .{ .frequency_hz = snapshot.aarch64_counter_frequency_hz },
         } },
@@ -328,69 +329,36 @@ pub fn hostCounterFrequencyHz() !u64 {
     );
 }
 
-pub fn checkManifest(manifest: spore.Manifest, expected: Expected) !void {
-    if (!std.mem.eql(u8, manifest.platform.arch, expected.arch)) {
-        std.log.err("platform mismatch: arch={s} expected={s}", .{ manifest.platform.arch, expected.arch });
-        return error.PlatformMismatch;
+/// Fails with `error.PlatformMismatch`, logging the first field that
+/// differs, unless `manifest` was saved on `expected` with `device_count`
+/// virtio devices.
+pub fn checkManifest(manifest: spore.Manifest, expected: spore.Platform, device_count: usize) !void {
+    const saved = manifest.platform;
+    inline for (std.meta.fields(spore.Platform)) |field| {
+        const saved_value = @field(saved, field.name);
+        const expected_value = @field(expected, field.name);
+        if (field.type == []const u8) {
+            if (!std.mem.eql(u8, saved_value, expected_value)) {
+                std.log.warn("platform mismatch: {s}={s} expected={s}", .{ field.name, saved_value, expected_value });
+                return error.PlatformMismatch;
+            }
+        } else if (saved_value != expected_value) {
+            const address = comptime std.mem.endsWith(u8, field.name, "_base") or std.mem.endsWith(u8, field.name, "_stride");
+            const format = if (address) "platform mismatch: {s}=0x{x} expected=0x{x}{s}" else "platform mismatch: {s}={d} expected={d}{s}";
+            const note = if (comptime std.mem.eql(u8, field.name, "counter_frequency_hz")) "; cross-frequency architected timer restore unsupported" else "";
+            std.log.warn(format, .{ field.name, saved_value, expected_value, note });
+            return error.PlatformMismatch;
+        }
     }
-    if (!std.mem.eql(u8, manifest.platform.cpu_profile, expected.cpu_profile)) {
-        std.log.err("platform mismatch: cpu_profile={s} expected={s}", .{ manifest.platform.cpu_profile, expected.cpu_profile });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.device_model_version != expected.device_model_version) {
-        std.log.err("platform mismatch: device_model_version={d} expected={d}", .{ manifest.platform.device_model_version, expected.device_model_version });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.vcpu_count != expected.vcpu_count) {
-        std.log.err("platform mismatch: vcpu_count={d} expected={d}", .{ manifest.platform.vcpu_count, expected.vcpu_count });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.ram_base != expected.ram_base) {
-        std.log.err("platform mismatch: ram_base=0x{x} expected=0x{x}", .{ manifest.platform.ram_base, expected.ram_base });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.ram_size != expected.ram_size) {
-        std.log.err("platform mismatch: ram_size={d} expected={d}", .{ manifest.platform.ram_size, expected.ram_size });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.gic_dist_base != expected.gic_dist_base) {
-        std.log.err("platform mismatch: gic_dist_base=0x{x} expected=0x{x}", .{ manifest.platform.gic_dist_base, expected.gic_dist_base });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.gic_redist_base != expected.gic_redist_base) {
-        std.log.err("platform mismatch: gic_redist_base=0x{x} expected=0x{x}", .{ manifest.platform.gic_redist_base, expected.gic_redist_base });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.gic_redist_stride != expected.gic_redist_stride) {
-        std.log.err("platform mismatch: gic_redist_stride=0x{x} expected=0x{x}", .{ manifest.platform.gic_redist_stride, expected.gic_redist_stride });
-        return error.PlatformMismatch;
-    }
-    if (manifest.platform.counter_frequency_hz != expected.counter_frequency_hz) {
-        std.log.err(
-            "platform mismatch: counter_frequency_hz={d} expected={d}; cross-frequency architected timer restore unsupported",
-            .{ manifest.platform.counter_frequency_hz, expected.counter_frequency_hz },
-        );
-        return error.PlatformMismatch;
-    }
-    if (manifest.devices.len != expected.device_count) {
-        std.log.err("platform mismatch: device_count={d} expected={d}", .{ manifest.devices.len, expected.device_count });
+    if (manifest.devices.len != device_count) {
+        std.log.warn("platform mismatch: device_count={d} expected={d}", .{ manifest.devices.len, device_count });
         return error.PlatformMismatch;
     }
 }
 
-test "manifest platform check accepts exact match" {
-    const manifest = spore.Manifest{
-        .platform = .{
-            .cpu_profile = board.cpu_profile,
-            .device_model_version = board.device_model_version,
-            .vcpu_count = 1,
-            .ram_base = board.ram_base,
-            .ram_size = 512 * 1024 * 1024,
-            .gic_dist_base = 0x0800_0000,
-            .gic_redist_base = 0x0802_0000,
-            .gic_redist_stride = 0x2_0000,
-            .counter_frequency_hz = 24_000_000,
-        },
+test "manifest platform check accepts its contract and rejects each differing field" {
+    var manifest = spore.Manifest{
+        .platform = contract(1, 512 * 1024 * 1024, 24_000_000),
         .machine = .{ .single = .{
             .gprs = [_]u64{0} ** 31,
             .pc = 0,
@@ -414,16 +382,25 @@ test "manifest platform check accepts exact match" {
         .generation = .{ .generation = 0, .interrupt_status = 0, .params_b64 = "" },
         .memory = .{ .logical_size = 1, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
     };
-    const expected = Expected{
-        .vcpu_count = 1,
-        .ram_size = manifest.platform.ram_size,
-        .gic_dist_base = manifest.platform.gic_dist_base,
-        .gic_redist_base = manifest.platform.gic_redist_base,
-        .gic_redist_stride = manifest.platform.gic_redist_stride,
-        .counter_frequency_hz = manifest.platform.counter_frequency_hz,
-        .device_count = 0,
-    };
-    try checkManifest(manifest, expected);
+    const expected = manifest.platform;
+    try checkManifest(manifest, expected, 0);
+    try std.testing.expectError(error.PlatformMismatch, checkManifest(manifest, expected, 1));
+
+    inline for (std.meta.fields(spore.Platform)) |field| {
+        manifest.platform = expected;
+        if (field.type == []const u8) {
+            @field(manifest.platform, field.name) = "other";
+        } else {
+            @field(manifest.platform, field.name) += 1;
+        }
+        try std.testing.expectError(error.PlatformMismatch, checkManifest(manifest, expected, 0));
+    }
+
+    // HVF spores saved before the board owned the GIC layout put the
+    // redistributor right after the distributor.
+    manifest.platform = expected;
+    manifest.platform.gic_redist_base = 0x0801_0000;
+    try std.testing.expectError(error.PlatformMismatch, checkManifest(manifest, expected, 0));
 }
 
 test "host info exposes schema and cache roots" {
