@@ -135,12 +135,20 @@ on every run. SporeVM fetches and verifies the manifest, config and index as
 platform, installs the index, and records the image in the local catalog with
 the store as its origin. It then boots without any objects: the first guest
 read of a chunk fetches its object, verifies its BLAKE3 digest, and installs it
-in the local cache. Every vCPU waits for a fetch. Over HTTP(S) a fetch makes
-at most three attempts within 10 seconds; a `file://` store has no deadline, so
-a hung mount blocks the VM. A missing or corrupt object, or an unreachable
-store, fails that guest read with an I/O error, and the disk then fetches
-nothing more: later reads of objects not yet local fail at once, so a failing
-HTTP(S) store stalls the VM for at most one 10-second fetch.
+in the local cache. Every vCPU waits for that fetch. The same fault starts
+fetches of the missing objects of the next 7 chunks into the cache and does
+not wait for them; a later read of one of those objects waits only for the
+fetch already under way, with one request per object however many readers want
+it. If a window fetch fails, later faults fetch only what the guest reads. Up
+to 8 fault and window requests and 16 save requests can be open at once, so
+serve a store with a listen backlog of at least 32: `python3 -m http.server`
+uses 5, and a Linux host retries connections past the backlog a second later.
+Over HTTP(S) a fetch makes at most three attempts within 10 seconds; a
+`file://` store has no deadline, so a hung mount blocks the VM. A missing or
+corrupt object, or an unreachable store, fails that guest read with an I/O
+error, and the disk then fetches nothing more: later reads of objects not yet
+local fail at once, so a failing HTTP(S) store stalls the VM for at most one
+10-second fetch.
 
 Saving or committing a disk run from a store (`run --save`, `--save-on`,
 `--commit`, `spore save`) first fetches every object of the image that is not

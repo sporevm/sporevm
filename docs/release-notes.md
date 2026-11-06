@@ -59,9 +59,9 @@ records the fork's disk baseline itself, while no save can run.
 that any file server can publish, and `spore run --image
 https://images.example/app` (or `create`) boots it with only the image's
 manifest, config and index local, fetching each rootfs object the guest reads
-on first use. `--save`, `--commit` and `spore save` first fetch the rest of
-the image, so the result needs nothing from the store. See
-`docs/image-format.md`.
+on first use, along with the objects of the next 7 chunks. `--save`,
+`--commit` and `spore save` first fetch the rest of the image, so the result
+needs nothing from the store. See `docs/image-format.md`.
 
 ### Builds no longer block the cache
 

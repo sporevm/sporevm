@@ -3157,7 +3157,7 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     try poisoned.init(try fixture.path("poisoned-cache"), ref, allocator);
     defer poisoned.deinit();
     try std.Io.Dir.renameAbsolute(object.?, hidden, io);
-    try std.testing.expectError(error.ImageStoreNotFound, poisoned.fetcher.fetchObject(digest, try allocator.alloc(u8, len)));
+    try std.testing.expectError(error.ImageStoreNotFound, poisoned.fetcher.fetchObject(digest, try allocator.alloc(u8, len), &.{}));
     try std.Io.Dir.renameAbsolute(hidden, object.?, io);
     try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": a guest read from it failed earlier", poisoned.server.imageStoreRefusal(client.monitor_end, &buf).?);
 
@@ -3191,34 +3191,47 @@ test "a save is refused when a guest read fails while the monitor fetches the im
     }
     const digest = try std.fmt.allocPrint(allocator, "blake3:{s}", .{std.fs.path.basename(object.?)});
     const len: usize = @intCast((try std.Io.Dir.cwd().statFile(io, object.?, .{})).size);
-    var server: image_store_mod.TestServer = undefined;
-    try server.start(std.testing.allocator, io, store);
-    defer server.stop();
     var monitor: StoreMonitor = undefined;
-    try monitor.init(try fixture.path("cache"), try std.fmt.allocPrint(allocator, "{s}/1", .{try server.url(allocator)}), allocator);
+    try monitor.init(try fixture.path("cache"), try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), allocator);
     defer monitor.deinit();
     var client: StoreSaveClient = try .init();
     defer client.deinit();
 
-    // A guest read finds the object missing from the store, which gets it
-    // back before the save's own fetch of it is answered.
-    try std.Io.Dir.renameAbsolute(object.?, try fixture.path("hidden"), io);
-    server.delay_ms.store(200, .monotonic);
-    const before = server.requests.load(.monotonic);
-    const Reader = struct {
-        fn run(fetcher: *image_store_mod.Fetcher, object_digest: []const u8, buf: []u8, hidden: []const u8, path: []const u8) void {
-            fetcher.fetchObject(object_digest, buf) catch {};
-            std.Io.Dir.renameAbsolute(hidden, path, std.testing.io) catch {};
+    // The save checks for failed reads, then waits to start its fetch.
+    const fill_mutex = &monitor.fetcher.fill_mutex;
+    try std.testing.expect(fill_mutex.tryLock());
+    var refusal_buf: [256]u8 = undefined;
+    const Save = struct {
+        refusal: ?[]const u8 = null,
+        fn run(save: *@This(), server: *ExecServer, fd: std.c.fd_t, buf: []u8) void {
+            save.refusal = server.imageStoreRefusal(fd, buf);
         }
     };
-    const reader = try std.Thread.spawn(.{}, Reader.run, .{ monitor.fetcher, digest, try allocator.alloc(u8, len), try fixture.path("hidden"), object.? });
-    defer reader.join();
-    while (server.requests.load(.monotonic) == before) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    var save: Save = .{};
+    const thread = std.Thread.spawn(.{}, Save.run, .{ &save, &monitor.server, client.monitor_end, &refusal_buf }) catch |err| {
+        fill_mutex.unlock(io);
+        return err;
+    };
+    var waiting = true;
+    errdefer if (waiting) {
+        fill_mutex.unlock(io);
+        thread.join();
+    };
+    while (fill_mutex.state.load(.monotonic) != .contended) try std.Io.sleep(io, .fromMilliseconds(1), .awake);
 
-    var buf: [256]u8 = undefined;
-    const refusal = monitor.server.imageStoreRefusal(client.monitor_end, &buf) orelse return error.TestExpectedRefusal;
-    try std.testing.expect(std.mem.startsWith(u8, refusal, lifecycle.save_refused_image_store));
-    try std.testing.expect(monitor.fetcher.readFailed());
+    // Meanwhile a guest read finds the object missing from the store, which
+    // has it again by the time the fetch asks for it, so only the check
+    // after the fetch can refuse the save.
+    const hidden = try fixture.path("hidden");
+    try std.Io.Dir.renameAbsolute(object.?, hidden, io);
+    try std.testing.expectError(error.ImageStoreNotFound, monitor.fetcher.fetchObject(digest, try allocator.alloc(u8, len), &.{}));
+    try std.Io.Dir.renameAbsolute(hidden, object.?, io);
+    waiting = false;
+    fill_mutex.unlock(io);
+    thread.join();
+
+    try std.testing.expect(monitor.fetcher.complete.load(.acquire));
+    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": a guest read from it failed earlier", save.refusal orelse return error.TestExpectedRefusal);
     try std.testing.expectEqual(RequestState.idle, monitor.server.state);
 }
 
