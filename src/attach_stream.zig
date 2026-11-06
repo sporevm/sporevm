@@ -1,4 +1,5 @@
-//! Shared host-side stream helpers for `spore run --from` and `spore attach`.
+//! Shared host-side stream and terminal helpers for `spore run --from`,
+//! `spore attach` and `spore exec`.
 
 const std = @import("std");
 
@@ -224,11 +225,12 @@ pub const RunStdinControl = struct {
     }
 };
 
-const RawTerminal = struct {
+/// Puts stdin's terminal in raw mode until `deinit` restores it.
+pub const RawTerminal = struct {
     saved: std.c.termios,
     active: bool = true,
 
-    fn enable() !RawTerminal {
+    pub fn enable() !RawTerminal {
         var current: std.c.termios = undefined;
         if (std.c.tcgetattr(0, &current) != 0) return error.TerminalRawModeFailed;
         var raw = current;
@@ -242,7 +244,7 @@ const RawTerminal = struct {
         return .{ .saved = current };
     }
 
-    fn deinit(self: *RawTerminal) void {
+    pub fn deinit(self: *RawTerminal) void {
         if (!self.active) return;
         var saved = self.saved;
         _ = std.c.tcsetattr(0, .NOW, &saved);
@@ -250,13 +252,17 @@ const RawTerminal = struct {
     }
 };
 
+/// Counts SIGWINCH deliveries while a `TerminalResizeRegistration` is installed.
+pub var terminal_resizes: std.atomic.Value(u32) = .init(0);
 var active_terminal_resize: ?*RunStdinControl = null;
 
-const TerminalResizeRegistration = struct {
+pub const TerminalResizeRegistration = struct {
     old_action: std.posix.Sigaction,
     active: bool = true,
 
-    fn install(control: *RunStdinControl) TerminalResizeRegistration {
+    /// Counts each SIGWINCH in `terminal_resizes` and, when `control` is set,
+    /// wakes it to send the new size.
+    pub fn install(control: ?*RunStdinControl) TerminalResizeRegistration {
         active_terminal_resize = control;
         var old_action: std.posix.Sigaction = undefined;
         const action = std.posix.Sigaction{
@@ -268,7 +274,7 @@ const TerminalResizeRegistration = struct {
         return .{ .old_action = old_action };
     }
 
-    fn deinit(self: *TerminalResizeRegistration) void {
+    pub fn deinit(self: *TerminalResizeRegistration) void {
         if (!self.active) return;
         std.posix.sigaction(.WINCH, &self.old_action, null);
         if (active_terminal_resize != null) active_terminal_resize = null;
@@ -277,6 +283,7 @@ const TerminalResizeRegistration = struct {
 };
 
 fn handleTerminalResize(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    _ = terminal_resizes.fetchAdd(1, .acq_rel);
     if (active_terminal_resize) |control| control.notifyResize();
 }
 

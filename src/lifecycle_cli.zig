@@ -9,6 +9,7 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const Context = @import("context.zig").Context;
+const attach_stream = @import("attach_stream.zig");
 const generation = @import("generation.zig");
 const lifecycle = @import("lifecycle.zig");
 const machine_output = @import("machine_output.zig");
@@ -575,7 +576,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         .guest_working_dir = parsed.guest_working_dir,
         .interactive = parsed.interactive,
         .tty = parsed.tty,
-        .terminal_size = terminalSizeOrDefault(terminalSizeFd()),
+        .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
     }) catch |err| switch (err) {
         error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => cliRuntimePathExit("exec", err),
         error.NamedVmNotReady => {
@@ -2129,15 +2130,12 @@ fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !v
 fn execNamedStreaming(context: Context, allocator: std.mem.Allocator, options: ExecNamedStreamOptions) !ExecNamedStreamingResult {
     var stream = try openExecNamedStream(context, allocator, options);
     defer stream.deinit();
-    var raw_terminal: ?ExecRawTerminal = null;
-    if (options.tty and options.interactive and std.c.isatty(0) != 0) raw_terminal = try ExecRawTerminal.enable();
+    var raw_terminal: ?attach_stream.RawTerminal = null;
+    if (options.tty and options.interactive and std.c.isatty(0) != 0) raw_terminal = try attach_stream.RawTerminal.enable();
     defer if (raw_terminal) |*raw| raw.deinit();
 
-    var resize_registration: ?ExecResizeRegistration = null;
-    if (options.tty) {
-        resize_registration = ExecResizeRegistration.install();
-        execResizeNotify();
-    }
+    var resize_registration: ?attach_stream.TerminalResizeRegistration = null;
+    if (options.tty) resize_registration = attach_stream.TerminalResizeRegistration.install(null);
     defer if (resize_registration) |*registration| registration.deinit();
 
     var pump = ExecStreamPump{
@@ -2198,7 +2196,8 @@ const ExecStreamPump = struct {
     stdout_bytes: u64 = 0,
     escape_stderr: bool = false,
     stdin_closed: bool = false,
-    resize_seen: u32 = 0,
+    /// The resize count last sent; null sends the size on the first poll.
+    resize_seen: ?u32 = null,
 
     fn run(self: *ExecStreamPump) !u8 {
         while (true) {
@@ -2289,10 +2288,10 @@ const ExecStreamPump = struct {
 
     fn maybeSendResize(self: *ExecStreamPump) !void {
         if (!self.tty) return;
-        const count = exec_resize_count.load(.acquire);
+        const count = attach_stream.terminal_resizes.load(.acquire);
         if (count == self.resize_seen) return;
         self.resize_seen = count;
-        try self.stream.resizeTerminal(terminalSizeOrDefault(terminalSizeFd()));
+        try self.stream.resizeTerminal(attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()));
     }
 };
 
@@ -2433,86 +2432,6 @@ test "copy-out refuses an archive over its limit" {
         .archive_limit = 8,
     }));
     try std.testing.expectEqual(8, (try archive.stat(io)).size);
-}
-
-const ExecRawTerminal = struct {
-    saved: std.c.termios,
-    active: bool = true,
-
-    fn enable() !ExecRawTerminal {
-        var current: std.c.termios = undefined;
-        if (std.c.tcgetattr(0, &current) != 0) return error.TerminalRawModeFailed;
-        var raw = current;
-        raw.iflag.ICRNL = false;
-        raw.iflag.IXON = false;
-        raw.lflag.ICANON = false;
-        raw.lflag.ECHO = false;
-        raw.lflag.ISIG = false;
-        raw.oflag.OPOST = false;
-        if (std.c.tcsetattr(0, .NOW, &raw) != 0) return error.TerminalRawModeFailed;
-        return .{ .saved = current };
-    }
-
-    fn deinit(self: *ExecRawTerminal) void {
-        if (!self.active) return;
-        var saved = self.saved;
-        _ = std.c.tcsetattr(0, .NOW, &saved);
-        self.active = false;
-    }
-};
-
-var exec_resize_count: std.atomic.Value(u32) = .init(0);
-
-const ExecResizeRegistration = struct {
-    old_action: std.posix.Sigaction,
-    active: bool = true,
-
-    fn install() ExecResizeRegistration {
-        var old_action: std.posix.Sigaction = undefined;
-        const action = std.posix.Sigaction{
-            .handler = .{ .sigaction = handleExecResize },
-            .mask = std.posix.sigemptyset(),
-            .flags = std.posix.SA.SIGINFO,
-        };
-        std.posix.sigaction(.WINCH, &action, &old_action);
-        return .{ .old_action = old_action };
-    }
-
-    fn deinit(self: *ExecResizeRegistration) void {
-        if (!self.active) return;
-        std.posix.sigaction(.WINCH, &self.old_action, null);
-        self.active = false;
-    }
-};
-
-fn handleExecResize(_: std.posix.SIG, _: *const std.posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
-    execResizeNotify();
-}
-
-fn execResizeNotify() void {
-    _ = exec_resize_count.fetchAdd(1, .acq_rel);
-}
-
-fn ioctlRequest(comptime request: anytype) c_int {
-    const raw: u32 = @truncate(@as(usize, request));
-    return @bitCast(raw);
-}
-
-fn terminalSizeOrDefault(fd: std.c.fd_t) spore_stream.Resize {
-    var size: std.posix.winsize = .{
-        .row = 0,
-        .col = 0,
-        .xpixel = 0,
-        .ypixel = 0,
-    };
-    if (std.c.ioctl(fd, ioctlRequest(std.posix.T.IOCGWINSZ), &size) == 0 and size.row > 0 and size.col > 0) {
-        return .{ .rows = size.row, .cols = size.col };
-    }
-    return .{ .rows = 24, .cols = 80 };
-}
-
-fn terminalSizeFd() std.c.fd_t {
-    return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
 }
 
 /// Writes guest text with every byte other than printable ASCII, tab, and
