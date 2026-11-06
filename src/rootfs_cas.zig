@@ -408,7 +408,45 @@ pub fn storageCompleteWithStampRepair(
     return storageComplete(io, allocator, cache_root, storage);
 }
 
+/// Whether `storage` carries a completeness stamp and its index file still
+/// holds the exact bytes the descriptor names. The index is hashed, not
+/// decoded: every install decodes those bytes before publishing them under
+/// their digest. A caller that uses the index reads it with
+/// `loadCompleteStorageIndex` instead, which decodes the bytes it hashed.
 pub fn storageMarkedComplete(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !bool {
+    if (!try storageStamped(io, allocator, cache_root, storage)) return false;
+    const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
+    defer allocator.free(index_path);
+    verifyStorageIndexPath(allocator, index_path, storage) catch |err| switch (err) {
+        error.MissingChunk, error.BadChunk, error.ShortRead, error.BadManifest => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
+/// `storageMarkedComplete`, returning the index decoded from the one read
+/// that was checked against the descriptor digest. Null when incomplete.
+pub fn loadCompleteStorageIndex(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    storage: spore.RootfsStorage,
+) !?StorageIndex {
+    if (!try storageStamped(io, allocator, cache_root, storage)) return null;
+    const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
+    defer allocator.free(index_path);
+    return readStorageIndexPath(allocator, index_path, storage) catch |err| switch (err) {
+        error.MissingChunk, error.BadChunk, error.ShortRead, error.BadManifest, error.FormatTooOld => return null,
+        else => |e| return e,
+    };
+}
+
+fn storageStamped(
     io: Io,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
@@ -422,16 +460,7 @@ pub fn storageMarkedComplete(
         else => |e| return e,
     };
     defer allocator.free(stamp_bytes);
-    if (!std.mem.eql(u8, stamp_bytes, complete_stamp_contents)) return false;
-
-    const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
-    defer allocator.free(index_path);
-    const index_bytes = readVerifiedStorageIndexPath(allocator, index_path, storage) catch |err| switch (err) {
-        error.MissingChunk, error.BadChunk, error.ShortRead, error.BadManifest, error.FormatTooOld => return false,
-        else => |e| return e,
-    };
-    allocator.free(index_bytes);
-    return true;
+    return std.mem.eql(u8, stamp_bytes, complete_stamp_contents);
 }
 
 pub fn markStorageComplete(
@@ -517,16 +546,58 @@ pub fn removeStorageCompleteStampsReferencingObjects(
     }
 }
 
-pub fn readVerifiedStorageIndexPath(
+/// An index read once: `parsed` is decoded from exactly the `bytes` that were
+/// checked against the storage descriptor's digest.
+pub const StorageIndex = struct {
+    bytes: []u8,
+    parsed: disk_index.ParsedDiskIndex,
+
+    pub fn deinit(self: StorageIndex) void {
+        self.parsed.allocator.free(self.bytes);
+        self.parsed.deinit();
+    }
+};
+
+/// Reads the index at `path` once, hashes those bytes against the storage
+/// digest and decodes them.
+pub fn readStorageIndexPath(
     allocator: std.mem.Allocator,
     path: []const u8,
     storage: spore.RootfsStorage,
-) ![]u8 {
+) !StorageIndex {
     const bytes = try readFileAll(allocator, path, disk_index.max_index_bytes);
     errdefer allocator.free(bytes);
-    var parsed = try parseStorageDiskIndex(allocator, bytes, storage);
-    parsed.deinit();
-    return bytes;
+    return .{ .bytes = bytes, .parsed = try parseStorageDiskIndex(allocator, bytes, storage) };
+}
+
+/// Checks that `path` is a regular file holding exactly the index bytes the
+/// storage descriptor names, hashing them in fixed blocks without decoding.
+pub fn verifyStorageIndexPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    storage: spore.RootfsStorage,
+) !void {
+    const digest = (try spore.diskIndexDescriptorForStorage(storage)).index_digest.?;
+    if (!std.mem.startsWith(u8, digest, disk_index.digest_prefix)) return error.BadManifest;
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.MissingChunk;
+    defer _ = std.c.close(fd);
+    const size = try fstatRegularSize(fd);
+    if (size > disk_index.max_index_bytes) return error.BadChunk;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < size) {
+        const block = buf[0..@min(buf.len, size - offset)];
+        try preadExact(fd, block, offset);
+        hasher.update(block);
+        offset += block.len;
+    }
+    var id: chunk.ChunkId = undefined;
+    hasher.final(&id.bytes);
+    if (!std.mem.eql(u8, digest[disk_index.digest_prefix.len..], &id.toHex())) return error.BadManifest;
 }
 
 pub fn readVerifiedChunkPath(
@@ -548,19 +619,9 @@ pub fn installStorageIndexPath(
     data: []const u8,
     storage: spore.RootfsStorage,
 ) !InstallResult {
-    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
-    try ensureDirPath(io, cache_parent);
-    if (try pathExistsNoSymlink(io, cache_path)) {
-        const existing = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
-        allocator.free(existing);
-        return .{ .cache_hit = true, .bytes_fetched = 0 };
-    }
     var parsed = try parseStorageDiskIndex(allocator, data, storage);
     parsed.deinit();
-    try writeFileAtomic(io, allocator, cache_path, data);
-    const installed = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
-    defer allocator.free(installed);
-    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+    return installCheckedIndex(allocator, io, cache_path, data);
 }
 
 /// Installs a verified storage index, atomically replacing an invalid entry.
@@ -574,17 +635,49 @@ pub fn installStorageIndexPathRepairingInvalid(
     data: []const u8,
     storage: spore.RootfsStorage,
 ) !InstallResult {
-    return installStorageIndexPath(allocator, io, cache_path, data, storage) catch |err| switch (err) {
-        error.MissingChunk, error.BadChunk, error.ShortRead, error.BadManifest, error.FormatTooOld => {
-            var parsed = try parseStorageDiskIndex(allocator, data, storage);
-            parsed.deinit();
+    var parsed = try parseStorageDiskIndex(allocator, data, storage);
+    parsed.deinit();
+    return installCheckedIndex(allocator, io, cache_path, data) catch |err| switch (err) {
+        error.MissingChunk, error.ShortRead, error.BadManifest => {
             try chunk_sealer.replaceFileAtomicDurable(allocator, cache_path, data, 0o444);
-            const installed = try readVerifiedStorageIndexPath(allocator, cache_path, storage);
-            defer allocator.free(installed);
+            try expectFileBytes(allocator, cache_path, data);
             return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
         },
         else => |e| return e,
     };
+}
+
+/// Installs `data`, already decoded and checked against its digest. An entry
+/// holding other bytes fails as `BadManifest`: only the checked bytes have
+/// that digest.
+fn installCheckedIndex(allocator: std.mem.Allocator, io: Io, cache_path: []const u8, data: []const u8) !InstallResult {
+    const cache_parent = std.fs.path.dirname(cache_path) orelse return error.IoFailed;
+    try ensureDirPath(io, cache_parent);
+    if (try pathExistsNoSymlink(io, cache_path)) {
+        try expectFileBytes(allocator, cache_path, data);
+        return .{ .cache_hit = true, .bytes_fetched = 0 };
+    }
+    try writeFileAtomic(io, allocator, cache_path, data);
+    try expectFileBytes(allocator, cache_path, data);
+    return .{ .cache_hit = false, .bytes_fetched = @intCast(data.len) };
+}
+
+/// Fails unless `path` is a regular file holding exactly `expected`.
+fn expectFileBytes(allocator: std.mem.Allocator, path: []const u8, expected: []const u8) !void {
+    const pathz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.MissingChunk;
+    defer _ = std.c.close(fd);
+    if (try fstatRegularSize(fd) != expected.len) return error.BadManifest;
+    var buf: [64 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < expected.len) {
+        const block = buf[0..@min(buf.len, expected.len - offset)];
+        try preadExact(fd, block, offset);
+        if (!std.mem.eql(u8, block, expected[offset..][0..block.len])) return error.BadManifest;
+        offset += block.len;
+    }
 }
 
 /// Installs a verified chunk unless a valid one is already there. Callers
@@ -1209,4 +1302,46 @@ test "preload repairs corrupt existing chunk objects" {
     try materializeFlatFromChunks(io, allocator, cache_root, rootfs);
     const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(spore.disk_chunk_size));
     try std.testing.expectEqualStrings("abcd", assembled);
+}
+
+test "a stamped index swapped for another valid index is incomplete until repaired" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    var indexes: [2][]const u8 = undefined;
+    var storages: [2]spore.RootfsStorage = undefined;
+    for (&indexes, &storages, [_][]const u8{ "abcd", "wxyz" }) |*index, *storage, contents| {
+        const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ tmp_dir.root, contents });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = try std.mem.concat(arena, u8, &(.{contents} ** 16384)) });
+        const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+        const result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+        storage.* = storageDescriptor(.{ .mmio_slot = 1 }, result);
+        index.* = try Io.Dir.cwd().readFileAlloc(io, result.index_path, arena, .limited(max_index_bytes));
+    }
+    const storage = storages[0];
+    // The other index has the same shape, so only its digest gives it away.
+    var other_descriptor = try spore.diskIndexDescriptorForStorage(storage);
+    other_descriptor.index_digest = null;
+    (try disk_index.parseDiskIndex(arena, indexes[1], other_descriptor)).deinit();
+
+    const index_path = try manifestIndexPath(arena, cache_root, storage.index_digest);
+    try std.testing.expect(try storageMarkedComplete(io, arena, cache_root, storage));
+    try chunk_sealer.replaceFileAtomicDurable(arena, index_path, indexes[1], 0o444);
+    try std.testing.expect(!try storageMarkedComplete(io, arena, cache_root, storage));
+    try std.testing.expectEqual(null, try loadCompleteStorageIndex(io, arena, cache_root, storage));
+    try std.testing.expectError(error.BadManifest, installStorageIndexPath(arena, io, index_path, indexes[0], storage));
+
+    _ = try installStorageIndexPathRepairingInvalid(arena, io, index_path, indexes[0], storage);
+    try std.testing.expect(try storageMarkedComplete(io, arena, cache_root, storage));
+    const loaded = (try loadCompleteStorageIndex(io, arena, cache_root, storage)).?;
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings(indexes[0], loaded.bytes);
+    try std.testing.expectEqual(1, loaded.parsed.value.chunks.len);
+    try std.testing.expectEqual(chunk.ChunkId.fromContents(try std.mem.concat(arena, u8, &(.{"abcd"} ** 16384))), loaded.parsed.value.chunks[0].id);
 }

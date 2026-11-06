@@ -1385,10 +1385,10 @@ fn packRootfsStorageIndexed(
     defer if (cache_lock) |*lock| lock.deinit();
 
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, source_root, storage.index_digest) catch |err| return rootfsError(err);
-    const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
-    defer allocator.free(index_bytes);
-    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
-    defer parsed_index.deinit();
+    const storage_index = rootfs_cas.readStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
+    defer storage_index.deinit();
+    const index_bytes = storage_index.bytes;
+    const parsed_index = storage_index.parsed;
 
     const index_rel_path = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
     const dest_index_path = try pathZ(allocator, "{s}/{s}", .{ options.out_dir, index_rel_path });
@@ -1502,10 +1502,10 @@ fn unpackRootfsStorageIndexed(
     if (!rootfsStorageEntryMatches(entry, storage)) return error.BadManifest;
 
     const source_index_path = try pathZ(allocator, "{s}/{s}", .{ options.bundle_dir, entry.index_path });
-    const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
-    defer allocator.free(index_bytes);
-    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
-    defer parsed_index.deinit();
+    const storage_index = rootfs_cas.readStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
+    defer storage_index.deinit();
+    const index_bytes = storage_index.bytes;
+    const parsed_index = storage_index.parsed;
     if (entry.index_bytes != @as(u64, @intCast(index_bytes.len))) return error.BadManifest;
     try validateRootfsStoragePayloadStats(entry, storage, parsed_index.value);
 
@@ -1569,8 +1569,8 @@ fn unpackRootfsStorageIndexed(
 
     const local_index_parent = std.fs.path.dirname(local_index_path) orelse return error.BadManifest;
     chunk_sealer.ensureDirPath(allocator, local_index_parent) catch |err| return rootfsError(err);
-    // readVerifiedStorageIndexPath and parseRootfsDiskIndexForStorage already
-    // authenticated and validated these exact bytes before object publication.
+    // readStorageIndexPath already authenticated and validated these exact
+    // bytes before object publication.
     chunk_sealer.writeFileAtomicDurable(allocator, local_index_path, index_bytes, 0o444) catch |err| return rootfsError(err);
     if (cache_storage_complete) {
         result.cache_hit_count += 1;
@@ -1720,10 +1720,10 @@ fn packDiskIndexForManifest(
     };
     if (comptime builtin.is_test) if (testing.pack_authority_barrier) |barrier| barrier.pause(io);
     const source_index_path = rootfs_cas.manifestIndexPath(allocator, source_root, storage.index_digest) catch |err| return rootfsError(err);
-    const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
-    defer allocator.free(index_bytes);
-    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
-    defer parsed_index.deinit();
+    const storage_index = rootfs_cas.readStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
+    defer storage_index.deinit();
+    const index_bytes = storage_index.bytes;
+    const parsed_index = storage_index.parsed;
 
     const index_rel_path = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
     const dest_index_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, index_rel_path });
@@ -1766,10 +1766,10 @@ fn unpackDiskIndexForManifest(
     const storage = try diskStorageDescriptor(disk);
     const index_rel_path = try rootfsStorageIndexRelPath(allocator, storage.index_digest);
     const source_index_path = try pathZ(allocator, "{s}/{s}", .{ bundle_dir, index_rel_path });
-    const index_bytes = rootfs_cas.readVerifiedStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
-    defer allocator.free(index_bytes);
-    const parsed_index = try parseRootfsDiskIndexForStorage(allocator, index_bytes, storage);
-    defer parsed_index.deinit();
+    const storage_index = rootfs_cas.readStorageIndexPath(allocator, source_index_path, storage) catch |err| return rootfsError(err);
+    defer storage_index.deinit();
+    const index_bytes = storage_index.bytes;
+    const parsed_index = storage_index.parsed;
 
     for (parsed_index.value.chunks) |chunk_entry| {
         const expected_size = rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk) catch |err| return rootfsError(err);
@@ -1792,8 +1792,8 @@ fn unpackDiskIndexForManifest(
     const dest_index_path = rootfs_cas.manifestIndexPath(allocator, out_dir, storage.index_digest) catch |err| return rootfsError(err);
     const dest_index_parent = std.fs.path.dirname(dest_index_path) orelse return error.BadManifest;
     chunk_sealer.ensureDirPath(allocator, dest_index_parent) catch |err| return rootfsError(err);
-    // readVerifiedStorageIndexPath and parseRootfsDiskIndexForStorage already
-    // authenticated and validated these exact bytes after all objects.
+    // readStorageIndexPath already authenticated and validated these exact
+    // bytes after all objects.
     chunk_sealer.writeFileAtomicDurable(allocator, dest_index_path, index_bytes, 0o444) catch |err| return rootfsError(err);
 }
 
@@ -5311,11 +5311,9 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try std.testing.expectEqual(@as(usize, 1), single_pack.rootfs_artifact_count);
     try std.testing.expect(!try pathExistsNoSymlink(io, pack_flat_path));
     try std.testing.expect(!try rootfs_cas.storageMarkedComplete(io, arena, pack_cache_root, manifest_storage));
-    const source_index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(arena, preload_result.index_path, manifest_storage);
-    const source_index = try disk_index.parseDiskIndex(arena, source_index_bytes, try spore.diskIndexDescriptorForStorage(manifest_storage));
-    defer source_index.deinit();
+    const source_index = try rootfs_cas.readStorageIndexPath(arena, preload_result.index_path, manifest_storage);
     var unique_source_objects = std.AutoHashMap(chunklib.ChunkId, void).init(arena);
-    for (source_index.value.chunks) |entry| try unique_source_objects.put(entry.id, {});
+    for (source_index.parsed.value.chunks) |entry| try unique_source_objects.put(entry.id, {});
     try std.testing.expect(unique_source_objects.count() < preload_result.nonzero_chunks);
     var source_object_reads: usize = 0;
     testing.rootfs_unpack_source_object_reads = &source_object_reads;
@@ -5384,7 +5382,7 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try std.testing.expectEqual(@as(u64, 0), pulled.rootfs.cache.bytes_reused);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
 
-    const repair_entry = source_index.value.chunks[0];
+    const repair_entry = source_index.parsed.value.chunks[0];
     const missing_cached_object = try rootfs_cas.objectPath(arena, pull_rootfs_cache, repair_entry.id);
     try Io.Dir.cwd().deleteFile(io, missing_cached_object);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
@@ -5428,8 +5426,8 @@ test "pack reads chunked rootfs directly from CAS and pull materializes it" {
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, pull_rootfs_cache, storage));
     const repaired_truncated_object = try rootfs_cas.readVerifiedChunkPath(arena, missing_cached_object, &repair_entry.id.toDigest(), spore.disk_chunk_size);
     try std.testing.expectEqual(@as(usize, spore.disk_chunk_size), repaired_truncated_object.len);
-    const repaired_index = try rootfs_cas.readVerifiedStorageIndexPath(arena, cached_index_path, storage);
-    try std.testing.expectEqualStrings(source_index_bytes, repaired_index);
+    const repaired_index = try rootfs_cas.readStorageIndexPath(arena, cached_index_path, storage);
+    try std.testing.expectEqualStrings(source_index.bytes, repaired_index.bytes);
 
     // Chunked pulls eagerly assemble the flat digest-addressed artifact from
     // the installed verified chunks; it is the only runtime base source.

@@ -158,15 +158,10 @@ pub fn loadLocalClosure(
     const storage = local.storage;
     const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);
-    const index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(allocator, index_path, storage);
+    const index = try rootfs_cas.readStorageIndexPath(allocator, index_path, storage);
+    const index_bytes = index.bytes;
     errdefer allocator.free(index_bytes);
-    var parsed_index = try disk_index.parseDiskIndex(allocator, index_bytes, .{
-        .logical_size = storage.logical_size,
-        .chunk_size = storage.chunk_size,
-        .hash_algorithm = storage.hash_algorithm,
-        .object_namespace = storage.object_namespace,
-        .index_digest = storage.index_digest,
-    });
+    const parsed_index = index.parsed;
     defer parsed_index.deinit();
 
     const objects = try uniqueSortedObjects(allocator, storage, parsed_index.value.chunks);

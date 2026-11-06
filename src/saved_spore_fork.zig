@@ -256,10 +256,10 @@ fn materializeForkDiskStore(
 ) !void {
     const storage = try saved_spore_pin.storageForDisk(disk);
     const source_index = try rootfs_cas.manifestIndexPath(path_allocator, parent_dir, storage.index_digest);
-    const index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(scratch_allocator, source_index, storage);
-    defer scratch_allocator.free(index_bytes);
-    var parsed = try disk_index.parseDiskIndex(scratch_allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
-    defer parsed.deinit();
+    const storage_index = try rootfs_cas.readStorageIndexPath(scratch_allocator, source_index, storage);
+    defer storage_index.deinit();
+    const index_bytes = storage_index.bytes;
+    const parsed = storage_index.parsed;
 
     const shared_root = try std.fs.path.join(path_allocator, &.{ batch_dir, "shared-disk" });
     const dest_index = try rootfs_cas.manifestIndexPath(path_allocator, shared_root, storage.index_digest);
