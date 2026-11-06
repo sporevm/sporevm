@@ -20,6 +20,7 @@ const net = std.Io.net;
 const lifecycle = @import("lifecycle.zig");
 const vm_registry = @import("vm_registry.zig");
 const monitor_jail = @import("monitor_jail.zig");
+const monitor_protocol = @import("monitor_protocol.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
@@ -39,8 +40,7 @@ const vsock = @import("virtio/vsock.zig");
 const vsock_control = @import("virtio/vsock_control.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
 
-const max_control_request = run.max_guest_request_len + 1;
-const max_control_response = 128 * 1024;
+const max_control_response = monitor_protocol.max_response_bytes;
 const max_suspend_path = 4096;
 const stats_write_interval_ms = 250;
 const registry_check_interval_ms = 1_000;
@@ -51,6 +51,8 @@ const control_request_timeout_ms = 1_000;
 const control_accept_poll_ms = 100;
 const control_queue_poll_ms = 10;
 const removal_message = "named VM is being removed";
+/// How a save refused for the root disk's image store is explained.
+const save_refused_image_store = "the image store of the root disk could not supply every object";
 
 const SnapshotLeaseHandoffTestFault = struct {
     fail_before_source_spec: bool = false,
@@ -407,7 +409,7 @@ const ExecServer = struct {
     /// Ends blocking stdin delivery to an exec that was failed.
     stream_input_stop: std.atomic.Value(bool) = .init(false),
     handlers: [max_control_handlers]ControlHandler = @splat(.{}),
-    request: [max_control_request]u8 = undefined,
+    request: [monitor_protocol.max_request_bytes]u8 = undefined,
     request_len: usize = 0,
     response: [max_control_response]u8 = undefined,
     response_len: usize = 0,
@@ -577,10 +579,10 @@ const ExecServer = struct {
     }
 
     /// Before a save pauses the guest, fetch the root disk's objects that are
-    /// only in its image store. Returns why the save is refused, or null.
+    /// only in its image store. Returns the refusal of the save, or null.
     /// Refusing here keeps the VM running; a capture that fails while the
     /// guest is paused ends the run.
-    fn imageStoreRefusal(self: *ExecServer, client: std.c.fd_t, buf: []u8) ?[]const u8 {
+    fn imageStoreRefusal(self: *ExecServer, client: std.c.fd_t, buf: []u8) ?monitor_protocol.Error {
         const fetcher = blk: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -602,10 +604,13 @@ const ExecServer = struct {
         else |err| switch (err) {
             // The monitor is stopping, so the store is not to blame and the
             // VM does not keep running.
-            error.ImageStoreFetchCanceled => return self.refusalMessage(error.MonitorStopping),
+            error.ImageStoreFetchCanceled => return .{ .message = self.refusalMessage(error.MonitorStopping) },
             else => @errorName(err),
         };
-        return std.fmt.bufPrint(buf, "{s}: {s}", .{ lifecycle.save_refused_image_store, cause }) catch lifecycle.save_refused_image_store;
+        return .{
+            .message = std.fmt.bufPrint(buf, "{s}: {s}", .{ save_refused_image_store, cause }) catch save_refused_image_store,
+            .code = .image_store_incomplete,
+        };
     }
 
     /// Stop a save's fetch on a control handler thread, so the handlers can
@@ -1033,12 +1038,7 @@ const ExecServer = struct {
 
     fn sendStreamingTimingLocked(self: *ExecServer, timing: lifecycle.NamedExecTiming) void {
         if (self.streaming_client_fd < 0 or self.streaming_write_failed) return;
-        const payload = struct {
-            type: []const u8 = "named_exec_timing",
-            schema_version: u32 = lifecycle.named_exec_timing_schema_version,
-            timing: lifecycle.NamedExecTiming,
-        }{ .timing = timing };
-        const json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch return;
+        const json = std.json.Stringify.valueAlloc(self.allocator, monitor_protocol.TimingEvent{ .timing = timing }, .{}) catch return;
         defer self.allocator.free(json);
         if (json.len > spore_stream.max_payload_len or
             writeSpioFrameFdBounded(self.streaming_client_fd, .event, .control, 0, json) != 0)
@@ -1139,23 +1139,11 @@ const ExecServer = struct {
         return self.takeResponseLocked();
     }
 
-    fn submitDiskFork(
-        self: *ExecServer,
-        out_dir: []const u8,
-        batch: []const u8,
-        children: []const []const u8,
-        allow_copy: bool,
-        force_copy: bool,
-    ) ![]const u8 {
-        try runtime_disk_fork_control.validatePrepare(.{
-            .type = runtime_disk_fork_control.prepare_type,
-            .schema = runtime_disk_fork_control.prepare_schema,
-            .out_dir = out_dir,
-            .batch = batch,
-            .children = children,
-            .allow_copy = allow_copy,
-            .force_copy = force_copy,
-        });
+    fn submitDiskFork(self: *ExecServer, request: runtime_disk_fork_control.PrepareRequest) ![]const u8 {
+        try runtime_disk_fork_control.validatePrepare(request);
+        const out_dir = request.out_dir;
+        const batch = request.batch;
+        const children = request.children;
         if (out_dir.len > self.suspend_dir.len) return error.InvalidSuspendDir;
 
         self.mutex.lockUncancelable(self.io);
@@ -1203,8 +1191,8 @@ const ExecServer = struct {
             self.disk_fork_child_lens[index] = @intCast(child.len);
         }
         self.disk_fork_count = @intCast(children.len);
-        self.disk_fork_allow_copy = allow_copy;
-        self.disk_fork_force_copy = force_copy;
+        self.disk_fork_allow_copy = request.allow_copy;
+        self.disk_fork_force_copy = request.force_copy;
         self.response_len = 0;
         self.state = .pending_disk_fork;
         if (self.wake) |wake| wake.wake();
@@ -1244,7 +1232,7 @@ const ExecServer = struct {
         defer self.mutex.unlock(self.io);
         switch (self.state) {
             .pending_suspend, .active_suspend => {
-                try self.storeSuspendResultLocked(self.suspend_dir[0..self.suspend_dir_len]);
+                try self.storeJsonLocked(monitor_protocol.Suspended{ .out_dir = self.suspend_dir[0..self.suspend_dir_len] });
                 self.state = .done;
                 self.cond.broadcast(self.io);
             },
@@ -1257,7 +1245,7 @@ const ExecServer = struct {
         defer self.mutex.unlock(self.io);
         switch (self.state) {
             .pending_snapshot, .active_snapshot => {
-                try self.storeSnapshotResultLocked(dir);
+                try self.storeJsonLocked(monitor_protocol.Snapshotted{ .out_dir = dir });
                 self.state = .done;
                 self.cond.broadcast(self.io);
             },
@@ -1386,7 +1374,7 @@ const ExecServer = struct {
         if (self.state != .pending_disk_fork and self.state != .active_disk_fork) return;
         var message_buf: [192]u8 = undefined;
         const message = std.fmt.bufPrint(&message_buf, "disk fork capture failed: {s}", .{@errorName(err)}) catch "disk fork capture failed";
-        self.storeErrorLocked(message) catch {
+        self.storeJsonLocked(monitor_protocol.Error{ .message = message, .code = .of(err) }) catch {
             self.response_len = 0;
         };
         self.state = .done;
@@ -1479,47 +1467,18 @@ const ExecServer = struct {
         defer self.allocator.free(stdout_b64);
         const stderr_b64 = try base64Alloc(self.allocator, self.stderr_capture[0..self.stderr_capture_len]);
         defer self.allocator.free(stderr_b64);
-        const payload = struct {
-            type: []const u8 = "exec_result",
-            exit_code: i32,
-            stdout_b64: []const u8,
-            stderr_b64: []const u8,
-            stdout_truncated: bool,
-            stderr_truncated: bool,
-            timing: lifecycle.NamedExecTiming,
-        }{
+        try self.storeJsonLocked(monitor_protocol.ExecResult{
             .exit_code = exit_code,
             .stdout_b64 = stdout_b64,
             .stderr_b64 = stderr_b64,
             .stdout_truncated = self.stdout_truncated,
             .stderr_truncated = self.stderr_truncated,
             .timing = timing,
-        };
-        try self.storeJsonLocked(payload);
-    }
-
-    fn storeSuspendResultLocked(self: *ExecServer, out_dir: []const u8) !void {
-        const payload = struct {
-            type: []const u8 = "suspended",
-            out_dir: []const u8,
-        }{ .out_dir = out_dir };
-        try self.storeJsonLocked(payload);
-    }
-
-    fn storeSnapshotResultLocked(self: *ExecServer, out_dir: []const u8) !void {
-        const payload = struct {
-            type: []const u8 = "snapshotted",
-            out_dir: []const u8,
-        }{ .out_dir = out_dir };
-        try self.storeJsonLocked(payload);
+        });
     }
 
     fn storeErrorLocked(self: *ExecServer, message: []const u8) !void {
-        const payload = struct {
-            type: []const u8 = "error",
-            message: []const u8,
-        }{ .message = message };
-        try self.storeJsonLocked(payload);
+        try self.storeJsonLocked(monitor_protocol.Error{ .message = message });
     }
 
     fn storeJsonLocked(self: *ExecServer, payload: anytype) !void {
@@ -1851,9 +1810,9 @@ const ControlHandler = struct {
     /// Set by the handler, under the server mutex, as it exits.
     finished: bool = false,
     stream: net.Stream = undefined,
-    request: std.json.Parsed(ControlRequest) = undefined,
-    line: [max_control_request]u8 = undefined,
-    line_len: usize = 0,
+    /// Holds `request`.
+    arena: std.heap.ArenaAllocator = undefined,
+    request: monitor_protocol.Request = undefined,
 };
 
 /// Whether the client of a control connection closed it. It has sent its
@@ -1890,7 +1849,7 @@ fn controlThreadMain(server: *ExecServer) void {
 /// stream.
 fn acceptControlClient(server: *ExecServer, stream: net.Stream) !bool {
     const fd = stream.socket.handle;
-    var read_buffer: [max_control_request]u8 = undefined;
+    var read_buffer: [monitor_protocol.max_request_bytes]u8 = undefined;
     const deadline_ms = lifecycle.monotonicMs() +| control_request_timeout_ms;
     const line = readControlLineFd(fd, &read_buffer, deadline_ms) catch |err| {
         const message = if (err == error.ControlRequestTooLarge)
@@ -1900,56 +1859,39 @@ fn acceptControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlError(server.io, stream, message);
         return false;
     };
-    var parsed = std.json.parseFromSlice(ControlRequest, server.allocator, line, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    }) catch {
+    var arena = std.heap.ArenaAllocator.init(server.allocator);
+    var handed_off = false;
+    defer if (!handed_off) arena.deinit();
+    const request = monitor_protocol.decodeRequest(arena.allocator(), line) catch {
         try writeControlError(server.io, stream, "bad control request");
         return false;
     };
-    var handed_off = false;
-    defer if (!handed_off) parsed.deinit();
-
-    if (std.mem.eql(u8, parsed.value.type, "hello")) {
-        try writeControlHello(server.io, stream);
-        return false;
+    switch (request) {
+        .hello => try writeResponse(server.io, stream, monitor_protocol.HelloReply{}),
+        .shutdown => {
+            server.requestStop();
+            try writeResponse(server.io, stream, monitor_protocol.Ok{});
+        },
+        .disk_claim => |claim| {
+            var head = server.claimDiskHead(claim) catch |err| {
+                try writeControlError(server.io, stream, @errorName(err));
+                return false;
+            };
+            defer head.deinit();
+            runtime_disk_claim.sendHead(fd, server.allocator, &head) catch {};
+        },
+        .disk_fork_cancel => |cancel| {
+            _ = server.cancelDiskFork(cancel.batch);
+            try writeResponse(server.io, stream, monitor_protocol.Ok{});
+        },
+        else => handed_off = try startControlHandler(server, stream, arena, request),
     }
-    if (std.mem.eql(u8, parsed.value.type, "shutdown")) {
-        server.requestStop();
-        try writeControlOk(server.io, stream);
-        return false;
-    }
-    if (std.mem.eql(u8, parsed.value.type, runtime_disk_claim.claim_type)) {
-        var claim = runtime_disk_claim.parseClaimBytes(server.allocator, line) catch {
-            try writeControlError(server.io, stream, "bad disk fork claim");
-            return false;
-        };
-        defer claim.deinit();
-        var head = server.claimDiskHead(claim.value) catch |err| {
-            try writeControlError(server.io, stream, @errorName(err));
-            return false;
-        };
-        defer head.deinit();
-        runtime_disk_claim.sendHead(fd, server.allocator, &head) catch return false;
-        return false;
-    }
-    if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.cancel_type)) {
-        var request = runtime_disk_fork_control.parseCancelBytes(server.allocator, line) catch {
-            try writeControlError(server.io, stream, "bad disk fork cancel request");
-            return false;
-        };
-        defer request.deinit();
-        _ = server.cancelDiskFork(request.value.batch);
-        try writeControlOk(server.io, stream);
-        return false;
-    }
-    handed_off = try startControlHandler(server, stream, line, parsed);
     return handed_off;
 }
 
 /// Hands a guest operation to a handler thread, or tells the client the
 /// monitor is busy when every handler is taken.
-fn startControlHandler(server: *ExecServer, stream: net.Stream, line: []const u8, parsed: std.json.Parsed(ControlRequest)) !bool {
+fn startControlHandler(server: *ExecServer, stream: net.Stream, arena: std.heap.ArenaAllocator, request: monitor_protocol.Request) !bool {
     var finished: [max_control_handlers]?std.Thread = @splat(null);
     var free: ?*ControlHandler = null;
     {
@@ -1966,199 +1908,125 @@ fn startControlHandler(server: *ExecServer, stream: net.Stream, line: []const u8
     for (finished) |thread| if (thread) |value| value.join();
 
     const handler = free orelse {
-        try writeRequestError(server, stream, parsed.value.type, "monitor busy");
+        try writeRequestError(server, stream, request, "monitor busy");
         return false;
     };
     handler.stream = stream;
-    handler.request = parsed;
-    @memcpy(handler.line[0..line.len], line);
-    handler.line_len = line.len;
+    handler.arena = arena;
+    handler.request = request;
     handler.thread = std.Thread.spawn(.{}, controlHandlerMain, .{ server, handler }) catch {
-        try writeRequestError(server, stream, parsed.value.type, "monitor busy");
+        try writeRequestError(server, stream, request, "monitor busy");
         return false;
     };
     return true;
 }
 
 fn controlHandlerMain(server: *ExecServer, handler: *ControlHandler) void {
-    handleControlClient(server, handler.stream, handler.request, handler.line[0..handler.line_len]) catch {};
-    handler.request.deinit();
+    handleControlClient(server, handler.stream, handler.request) catch {};
+    handler.arena.deinit();
     handler.stream.close(server.io);
     server.mutex.lockUncancelable(server.io);
     defer server.mutex.unlock(server.io);
     handler.finished = true;
 }
 
-fn writeRequestError(server: *ExecServer, stream: net.Stream, request_type: []const u8, message: []const u8) !void {
-    if (std.mem.eql(u8, request_type, "exec-stream-v1") or
-        std.mem.eql(u8, request_type, "copy-in-v1") or
-        std.mem.eql(u8, request_type, "copy-out-v1"))
-    {
-        return writeStreamingControlError(stream.socket.handle, message);
-    }
+fn writeRequestError(server: *ExecServer, stream: net.Stream, request: monitor_protocol.Request, message: []const u8) !void {
+    if (request.streams()) return writeStreamingControlError(stream.socket.handle, message);
     return writeControlError(server.io, stream, message);
 }
 
+const capture_unavailable_x86 = "capture is unavailable for the experimental x86-64 KVM fresh profile";
+
 /// Runs one guest operation on a handler thread. Operations take turns on
 /// the guest; each waits for the slot up to the VM's timeout.
-fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json.Parsed(ControlRequest), line: []const u8) !void {
-    if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.prepare_type)) {
-        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
-            return;
-        }
-        var request = runtime_disk_fork_control.parsePrepareBytes(server.allocator, line) catch {
-            try writeControlError(server.io, stream, "bad disk fork prepare request");
-            return;
-        };
-        defer request.deinit();
-        const response = server.submitDiskFork(
-            request.value.out_dir,
-            request.value.batch,
-            request.value.children,
-            request.value.allow_copy,
-            request.value.force_copy,
-        ) catch |err| {
-            try writeControlError(server.io, stream, if (err == error.MonitorStopping) server.refusalMessage(err) else @errorName(err));
-            return;
-        };
-        defer std.heap.page_allocator.free(response);
-        try writeAll(server.io, stream, response);
-        return;
+fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor_protocol.Request) !void {
+    const fd = stream.socket.handle;
+    switch (request) {
+        .hello, .shutdown, .disk_claim, .disk_fork_cancel => unreachable,
+        .disk_fork_prepare => |prepare| {
+            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+                return writeControlError(server.io, stream, capture_unavailable_x86);
+            }
+            const response = server.submitDiskFork(prepare) catch |err| {
+                if (err == error.MonitorStopping) return writeControlError(server.io, stream, server.refusalMessage(err));
+                return writeResponse(server.io, stream, monitor_protocol.Error{ .message = @errorName(err), .code = .of(err) });
+            };
+            defer std.heap.page_allocator.free(response);
+            try writeAll(server.io, stream, response);
+        },
+        .@"suspend" => |capture| {
+            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+                return writeControlError(server.io, stream, capture_unavailable_x86);
+            }
+            var refusal_buf: [256]u8 = undefined;
+            if (server.imageStoreRefusal(fd, &refusal_buf)) |refusal| return writeResponse(server.io, stream, refusal);
+            const response = server.submitSuspend(capture.out_dir) catch |err| {
+                return writeControlError(server.io, stream, server.refusalMessage(err));
+            };
+            defer std.heap.page_allocator.free(response);
+            try writeAll(server.io, stream, response);
+        },
+        .snapshot => |snapshot| {
+            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+                return writeControlError(server.io, stream, capture_unavailable_x86);
+            }
+            var refusal_buf: [256]u8 = undefined;
+            if (server.imageStoreRefusal(fd, &refusal_buf)) |refusal| return writeResponse(server.io, stream, refusal);
+            const response = server.submitSnapshot(snapshot.out_dir, snapshot.publish_dir) catch |err| {
+                return writeControlError(server.io, stream, server.refusalMessage(err));
+            };
+            defer std.heap.page_allocator.free(response);
+            try writeAll(server.io, stream, response);
+        },
+        .exec_stream => |exec| {
+            const tty = exec.stdio == .tty;
+            const terminal_size = spore_stream.Resize{ .rows = exec.terminal_rows, .cols = exec.terminal_cols };
+            var session_sequence: u64 = 0;
+            const guest_request = server.interactiveExecRequest(&session_sequence, exec.argv, exec.env, exec.working_dir, tty, terminal_size) catch |err| {
+                return writeStreamingControlError(fd, guestCommandErrorMessage(err));
+            };
+            defer server.allocator.free(guest_request);
+            server.submitStreamingExec(guest_request, session_sequence, fd, true) catch |err| {
+                return writeStreamingControlError(fd, server.refusalMessage(err));
+            };
+            defer server.finishStreamingExec();
+            proxyStreamingInput(server, fd, if (tty) .terminal else .stdin) catch {};
+        },
+        .copy_in, .copy_out => {
+            const copy_in = request == .copy_in;
+            const path = if (copy_in) request.copy_in.path else request.copy_out.path;
+            var session_sequence: u64 = 0;
+            const guest_request = server.copyRequest(&session_sequence, if (copy_in) "copy-in-v1" else "copy-out-v1", path) catch {
+                return writeStreamingControlError(fd, "invalid copy request");
+            };
+            defer server.allocator.free(guest_request);
+            server.submitStreamingExec(guest_request, session_sequence, fd, false) catch |err| {
+                return writeStreamingControlError(fd, server.refusalMessage(err));
+            };
+            defer server.finishStreamingExec();
+            if (copy_in) proxyStreamingInput(server, fd, .stdin) catch {};
+        },
+        .initial_output => {
+            // The initial-output request carries no session id.
+            const response = server.submitExec("{\"type\":\"initial-output\"}\n", 0) catch |err| {
+                return writeControlError(server.io, stream, server.refusalMessage(err));
+            };
+            defer std.heap.page_allocator.free(response);
+            try writeAll(server.io, stream, response);
+        },
+        .start => |start| {
+            var session_sequence: u64 = 0;
+            const guest_request = server.detachedExecRequest(&session_sequence, start.argv, start.env, start.working_dir, start.retain_output) catch |err| {
+                return writeControlError(server.io, stream, guestCommandErrorMessage(err));
+            };
+            defer server.allocator.free(guest_request);
+            const response = server.submitExec(guest_request, session_sequence) catch |err| {
+                return writeControlError(server.io, stream, server.refusalMessage(err));
+            };
+            defer std.heap.page_allocator.free(response);
+            try writeAll(server.io, stream, response);
+        },
     }
-    if (std.mem.eql(u8, parsed.value.type, "suspend")) {
-        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
-            return;
-        }
-        const out_dir = parsed.value.out_dir orelse {
-            try writeControlError(server.io, stream, "suspend request missing out_dir");
-            return;
-        };
-        var refusal_buf: [256]u8 = undefined;
-        if (server.imageStoreRefusal(stream.socket.handle, &refusal_buf)) |message| {
-            try writeControlError(server.io, stream, message);
-            return;
-        }
-        const response = server.submitSuspend(out_dir) catch |err| {
-            try writeControlError(server.io, stream, server.refusalMessage(err));
-            return;
-        };
-        defer std.heap.page_allocator.free(response);
-        try writeAll(server.io, stream, response);
-        return;
-    }
-    if (std.mem.eql(u8, parsed.value.type, "snapshot")) {
-        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
-            return;
-        }
-        const out_dir = parsed.value.out_dir orelse {
-            try writeControlError(server.io, stream, "snapshot request missing out_dir");
-            return;
-        };
-        const continue_after = parsed.value.@"continue" orelse false;
-        if (!continue_after) {
-            try writeControlError(server.io, stream, "snapshot request must set continue=true");
-            return;
-        }
-        var refusal_buf: [256]u8 = undefined;
-        if (server.imageStoreRefusal(stream.socket.handle, &refusal_buf)) |message| {
-            try writeControlError(server.io, stream, message);
-            return;
-        }
-        const response = server.submitSnapshot(out_dir, parsed.value.publish_dir) catch |err| {
-            try writeControlError(server.io, stream, server.refusalMessage(err));
-            return;
-        };
-        defer std.heap.page_allocator.free(response);
-        try writeAll(server.io, stream, response);
-        return;
-    }
-    if (std.mem.eql(u8, parsed.value.type, "exec-stream-v1")) {
-        const argv = parsed.value.argv orelse {
-            try writeStreamingControlError(stream.socket.handle, "command request missing argv");
-            return;
-        };
-        const stdio = parsed.value.stdio orelse {
-            try writeStreamingControlError(stream.socket.handle, "stream request missing stdio");
-            return;
-        };
-        const tty = std.mem.eql(u8, stdio, "tty");
-        if (!tty and !std.mem.eql(u8, stdio, "pipe")) {
-            try writeStreamingControlError(stream.socket.handle, "unsupported stream stdio");
-            return;
-        }
-        const terminal_size = spore_stream.Resize{
-            .rows = parsed.value.terminal_rows orelse 24,
-            .cols = parsed.value.terminal_cols orelse 80,
-        };
-        var session_sequence: u64 = 0;
-        const request = server.interactiveExecRequest(&session_sequence, argv, parsed.value.env orelse &.{}, parsed.value.working_dir, tty, terminal_size) catch |err| {
-            try writeStreamingControlError(stream.socket.handle, guestCommandErrorMessage(err));
-            return;
-        };
-        defer server.allocator.free(request);
-        server.submitStreamingExec(request, session_sequence, stream.socket.handle, true) catch |err| {
-            try writeStreamingControlError(stream.socket.handle, server.refusalMessage(err));
-            return;
-        };
-        defer server.finishStreamingExec();
-        proxyStreamingInput(server, stream.socket.handle, if (tty) .terminal else .stdin) catch {};
-        return;
-    }
-    if (std.mem.eql(u8, parsed.value.type, "copy-in-v1") or std.mem.eql(u8, parsed.value.type, "copy-out-v1")) {
-        const path = parsed.value.path orelse {
-            try writeStreamingControlError(stream.socket.handle, "copy request missing path");
-            return;
-        };
-        var session_sequence: u64 = 0;
-        const request = server.copyRequest(&session_sequence, parsed.value.type, path) catch {
-            try writeStreamingControlError(stream.socket.handle, "invalid copy request");
-            return;
-        };
-        defer server.allocator.free(request);
-        server.submitStreamingExec(request, session_sequence, stream.socket.handle, false) catch |err| {
-            try writeStreamingControlError(stream.socket.handle, server.refusalMessage(err));
-            return;
-        };
-        defer server.finishStreamingExec();
-        if (std.mem.eql(u8, parsed.value.type, "copy-in-v1")) {
-            proxyStreamingInput(server, stream.socket.handle, .stdin) catch {};
-        }
-        return;
-    }
-    if (std.mem.eql(u8, parsed.value.type, "initial-output")) {
-        // The initial-output request carries no session id.
-        const response = server.submitExec("{\"type\":\"initial-output\"}\n", 0) catch |err| {
-            try writeControlError(server.io, stream, server.refusalMessage(err));
-            return;
-        };
-        defer std.heap.page_allocator.free(response);
-        try writeAll(server.io, stream, response);
-        return;
-    }
-    if (!std.mem.eql(u8, parsed.value.type, "start")) {
-        try writeControlError(server.io, stream, "unknown control request");
-        return;
-    }
-    const argv = parsed.value.argv orelse {
-        try writeControlError(server.io, stream, "command request missing argv");
-        return;
-    };
-    var session_sequence: u64 = 0;
-    const request = server.detachedExecRequest(&session_sequence, argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
-        try writeControlError(server.io, stream, guestCommandErrorMessage(err));
-        return;
-    };
-    defer server.allocator.free(request);
-    const response = server.submitExec(request, session_sequence) catch |err| {
-        try writeControlError(server.io, stream, server.refusalMessage(err));
-        return;
-    };
-    defer std.heap.page_allocator.free(response);
-    try writeAll(server.io, stream, response);
-    return;
 }
 
 fn guestCommandErrorMessage(err: anyerror) []const u8 {
@@ -2198,21 +2066,6 @@ fn readControlLineFd(fd: std.c.fd_t, buffer: []u8, deadline_ms: u64) ![]const u8
     }
     return error.ControlRequestTooLarge;
 }
-
-const ControlRequest = struct {
-    type: []const u8,
-    argv: ?[]const []const u8 = null,
-    env: ?[]const []const u8 = null,
-    working_dir: ?[]const u8 = null,
-    out_dir: ?[]const u8 = null,
-    publish_dir: ?[]const u8 = null,
-    path: ?[]const u8 = null,
-    @"continue": ?bool = null,
-    stdio: ?[]const u8 = null,
-    terminal_rows: ?u16 = null,
-    terminal_cols: ?u16 = null,
-    retain_output: ?bool = null,
-};
 
 fn monotonicNs() u64 {
     return std.math.mul(u64, lifecycle.monotonicMs(), std.time.ns_per_ms) catch std.math.maxInt(u64);
@@ -2350,34 +2203,18 @@ fn readFdExact(fd: std.c.fd_t, buf: []u8) !void {
     }
 }
 
-fn writeControlOk(io: Io, stream: net.Stream) !void {
-    try writeAll(io, stream, "{\"type\":\"ok\"}\n");
-}
-
-fn writeControlHello(io: Io, stream: net.Stream) !void {
-    var buffer: [256]u8 = undefined;
+/// Writes one response line. `response` is a variant of
+/// `monitor_protocol.Response`, or the hello reply.
+fn writeResponse(io: Io, stream: net.Stream, response: anytype) !void {
+    var buffer: [1024]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&buffer);
-    const payload = struct {
-        type: []const u8 = "hello",
-        schema: []const u8 = lifecycle.monitor_hello_schema,
-        spore_version: []const u8 = version.value,
-        helper_contract: u32 = lifecycle.monitor_helper_contract,
-    }{};
-    const json = try std.json.Stringify.valueAlloc(fixed.allocator(), payload, .{});
+    const json = try std.json.Stringify.valueAlloc(fixed.allocator(), response, .{});
     try writeAll(io, stream, json);
     try writeAll(io, stream, "\n");
 }
 
 fn writeControlError(io: Io, stream: net.Stream, message: []const u8) !void {
-    var buffer: [512]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
-    const payload = struct {
-        type: []const u8 = "error",
-        message: []const u8,
-    }{ .message = message };
-    const json = try std.json.Stringify.valueAlloc(fixed.allocator(), payload, .{});
-    try writeAll(io, stream, json);
-    try writeAll(io, stream, "\n");
+    try writeResponse(io, stream, monitor_protocol.Error{ .message = message });
 }
 
 fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
@@ -3146,7 +2983,8 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     defer monitor.deinit();
     try std.Io.Dir.renameAbsolute(object.?, hidden, io);
     const refusal = monitor.server.imageStoreRefusal(client.monitor_end, &buf) orelse return error.TestExpectedRefusal;
-    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": ImageStoreNotFound", refusal);
+    try std.testing.expectEqualStrings(save_refused_image_store ++ ": ImageStoreNotFound", refusal.message);
+    try std.testing.expectEqual(monitor_protocol.ErrorCode.image_store_incomplete, refusal.code.?);
     try std.testing.expectEqual(RequestState.idle, monitor.server.state);
     // Once the store has it again, the save goes ahead with every object local.
     try std.Io.Dir.renameAbsolute(hidden, object.?, io);
@@ -3161,7 +2999,7 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     try std.Io.Dir.renameAbsolute(object.?, hidden, io);
     try std.testing.expectError(error.ImageStoreNotFound, poisoned.fetcher.fetchObject(digest, try allocator.alloc(u8, len), &.{}));
     try std.Io.Dir.renameAbsolute(hidden, object.?, io);
-    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": a guest read from it failed earlier", poisoned.server.imageStoreRefusal(client.monitor_end, &buf).?);
+    try std.testing.expectEqualStrings(save_refused_image_store ++ ": a guest read from it failed earlier", poisoned.server.imageStoreRefusal(client.monitor_end, &buf).?.message);
 
     // A stopping monitor cancels the fetch and says it is stopping, not that
     // the store failed; a client that left during the fetch gets no save.
@@ -3169,14 +3007,16 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     try canceled.init(try fixture.path("canceled-cache"), ref, allocator, &fixture.env);
     defer canceled.deinit();
     canceled.server.cancelImageStoreFetch();
-    try std.testing.expectEqualStrings(removal_message, canceled.server.imageStoreRefusal(client.monitor_end, &buf).?);
+    const stopping = canceled.server.imageStoreRefusal(client.monitor_end, &buf).?;
+    try std.testing.expectEqualStrings(removal_message, stopping.message);
+    try std.testing.expectEqual(null, stopping.code);
     var gone: StoreMonitor = undefined;
     try gone.init(try fixture.path("gone-cache"), ref, allocator, &fixture.env);
     defer gone.deinit();
     var left: StoreSaveClient = try .init();
     defer left.deinit();
     left.hangUp();
-    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": the client went away", gone.server.imageStoreRefusal(left.monitor_end, &buf).?);
+    try std.testing.expectEqualStrings(save_refused_image_store ++ ": the client went away", gone.server.imageStoreRefusal(left.monitor_end, &buf).?.message);
 }
 
 test "a save is refused when a guest read fails while the monitor fetches the image" {
@@ -3204,7 +3044,7 @@ test "a save is refused when a guest read fails while the monitor fetches the im
     try std.testing.expect(fill_mutex.tryLock());
     var refusal_buf: [256]u8 = undefined;
     const Save = struct {
-        refusal: ?[]const u8 = null,
+        refusal: ?monitor_protocol.Error = null,
         fn run(save: *@This(), server: *ExecServer, fd: std.c.fd_t, buf: []u8) void {
             save.refusal = server.imageStoreRefusal(fd, buf);
         }
@@ -3233,7 +3073,7 @@ test "a save is refused when a guest read fails while the monitor fetches the im
     thread.join();
 
     try std.testing.expect(monitor.fetcher.complete.load(.acquire));
-    try std.testing.expectEqualStrings(lifecycle.save_refused_image_store ++ ": a guest read from it failed earlier", save.refusal orelse return error.TestExpectedRefusal);
+    try std.testing.expectEqualStrings(save_refused_image_store ++ ": a guest read from it failed earlier", (save.refusal orelse return error.TestExpectedRefusal).message);
     try std.testing.expectEqual(RequestState.idle, monitor.server.state);
 }
 
@@ -3270,7 +3110,7 @@ test "stopping the control plane cancels a save's pending image fetch" {
     defer client.deinit();
     var refusal_buf: [256]u8 = undefined;
     const Save = struct {
-        refusal: ?[]const u8 = null,
+        refusal: ?monitor_protocol.Error = null,
         fn run(save: *@This(), exec_server: *ExecServer, fd: std.c.fd_t, buf: []u8) void {
             save.refusal = exec_server.imageStoreRefusal(fd, buf);
         }
@@ -3295,7 +3135,7 @@ test "stopping the control plane cancels a save's pending image fetch" {
     waiting = false;
     fill_mutex.unlock(io);
     thread.join();
-    try std.testing.expectEqualStrings("monitor stopped", save.refusal orelse return error.TestExpectedRefusal);
+    try std.testing.expectEqualStrings("monitor stopped", (save.refusal orelse return error.TestExpectedRefusal).message);
     try std.testing.expectEqual(@as(u64, 0), fetcher.currentStats().fetches);
 }
 
@@ -3349,6 +3189,13 @@ const StoreSaveClient = struct {
 
 /// A local control client with read deadlines, so a monitor that blocks
 /// fails the test instead of hanging it.
+fn expectErrorResponse(message: []const u8, line: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const response = try monitor_protocol.decodeResponse(arena.allocator(), line);
+    try std.testing.expectEqualStrings(message, response.err.message);
+}
+
 const TestControlClient = struct {
     stream: net.Stream,
     fd: std.c.fd_t,
@@ -3449,7 +3296,13 @@ test "monitor records the fork baseline while it holds the guest" {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.response = self.server.submitDiskFork("/tmp/capture", "batch-1", &.{"child-0"}, false, false) catch |err| {
+            self.response = self.server.submitDiskFork(.{
+                .type = runtime_disk_fork_control.prepare_type,
+                .schema = runtime_disk_fork_control.prepare_schema,
+                .out_dir = "/tmp/capture",
+                .batch = "batch-1",
+                .children = &.{"child-0"},
+            }) catch |err| {
                 self.err = err;
                 return;
             };
@@ -3495,11 +3348,12 @@ test "monitor records the fork baseline while it holds the guest" {
     if (prepare.err) |err| return err;
     const response = prepare.response.?;
     defer std.heap.page_allocator.free(response);
-    var prepared = try runtime_disk_fork_control.parsePreparedBytes(allocator, response);
-    defer prepared.deinit();
-    try std.testing.expectEqualStrings(saved_dir, prepared.value.lease.root);
-    try std.testing.expectEqualStrings(lease.baseline_identity, prepared.value.lease.baseline_identity);
-    try std.testing.expectEqualStrings(lease.baseline_identity, prepared.value.disk.?.base);
+    var prepared_arena = std.heap.ArenaAllocator.init(allocator);
+    defer prepared_arena.deinit();
+    const prepared = (try monitor_protocol.decodeResponse(prepared_arena.allocator(), response)).disk_fork_prepared;
+    try std.testing.expectEqualStrings(saved_dir, prepared.lease.root);
+    try std.testing.expectEqualStrings(lease.baseline_identity, prepared.lease.baseline_identity);
+    try std.testing.expectEqualStrings(lease.baseline_identity, prepared.disk.?.base);
     try std.testing.expectEqual(RequestState.idle, server.state);
 }
 
@@ -3570,7 +3424,13 @@ test "a fork waiting for the rootfs cache lock leaves the guest free" {
 
         fn run(self: *@This()) void {
             defer self.finished.store(true, .release);
-            self.response = self.server.submitDiskFork("/tmp/capture", "batch-1", &.{"child-0"}, false, false) catch |err| {
+            self.response = self.server.submitDiskFork(.{
+                .type = runtime_disk_fork_control.prepare_type,
+                .schema = runtime_disk_fork_control.prepare_schema,
+                .out_dir = "/tmp/capture",
+                .batch = "batch-1",
+                .children = &.{"child-0"},
+            }) catch |err| {
                 self.err = err;
                 return;
             };
@@ -3633,10 +3493,11 @@ test "a fork waiting for the rootfs cache lock leaves the guest free" {
     if (prepare.err) |err| return err;
     const response = prepare.response.?;
     defer std.heap.page_allocator.free(response);
-    var prepared = try runtime_disk_fork_control.parsePreparedBytes(allocator, response);
-    defer prepared.deinit();
-    try std.testing.expectEqualStrings(cache_root, prepared.value.lease.root);
-    try std.testing.expect(prepared.value.disk == null);
+    var prepared_arena = std.heap.ArenaAllocator.init(allocator);
+    defer prepared_arena.deinit();
+    const prepared = (try monitor_protocol.decodeResponse(prepared_arena.allocator(), response)).disk_fork_prepared;
+    try std.testing.expectEqualStrings(cache_root, prepared.lease.root);
+    try std.testing.expect(prepared.disk == null);
 }
 
 test "monitor answers hello and shutdown while a guest operation runs" {
@@ -3683,7 +3544,7 @@ test "monitor answers hello and shutdown while a guest operation runs" {
     // Another guest operation waits for the running one, then gives up.
     const queued_ms = lifecycle.monotonicMs();
     const busy = try TestControlClient.call(socket_path, "{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n", &buffer, 5_000);
-    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"monitor busy\"}", busy);
+    try expectErrorResponse("monitor busy", busy);
     try std.testing.expect(lifecycle.monotonicMs() - queued_ms >= timeout_ms);
 
     const ok = try TestControlClient.call(socket_path, "{\"type\":\"shutdown\"}\n", &buffer, 1_000);
@@ -3700,11 +3561,32 @@ test "monitor answers hello and shutdown while a guest operation runs" {
 
     // New guest operations are refused once the monitor is stopping.
     const refused = try TestControlClient.call(socket_path, "{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n", &buffer, 1_000);
-    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"named VM is being removed\"}", refused);
+    try expectErrorResponse(removal_message, refused);
 
     stopped = true;
     server.stopControl(accept_thread, "test finished");
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, socket_path, .{}));
+}
+
+test "monitor refuses a request with an unknown field before it takes the guest" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-strict-{d}.sock", .{std.c.getpid()});
+    var entry_dir = std.testing.tmpDir(.{});
+    defer entry_dir.cleanup();
+    var server = try ExecServer.init(allocator, io, .{ .dir = entry_dir.dir }, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", 10700, 1_000, null, .{});
+    defer server.disk_claims.deinit();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    defer server.stopControl(accept_thread, "test finished");
+
+    var buffer: [512]u8 = undefined;
+    const refused = try TestControlClient.call(socket_path, "{\"type\":\"start\",\"argv\":[\"/bin/true\"],\"retain\":true}\n", &buffer, 1_000);
+    try expectErrorResponse("bad control request", refused);
+    server.mutex.lockUncancelable(io);
+    defer server.mutex.unlock(io);
+    try std.testing.expectEqual(RequestState.idle, server.state);
 }
 
 test "monitor gives a slow client one deadline for its whole request line" {
@@ -3746,5 +3628,5 @@ test "monitor gives a slow client one deadline for its whole request line" {
     try std.testing.expect(lifecycle.monotonicMs() - started_ms < 2 * control_request_timeout_ms);
 
     const refused = try slow.readLine(&buffer, 1_000);
-    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"bad control request\"}", refused);
+    try expectErrorResponse("bad control request", refused);
 }

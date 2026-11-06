@@ -459,7 +459,8 @@ Networked named live fork remains unsupported.
 
 The monitor protocol is local-only and protected by private runtime-directory
 permissions. There is no TCP control socket and no central `spore daemon`.
-Unknown monitor request types fail closed. The monitor answers `hello`,
+Requests are a closed set of JSON lines: an unknown type, an unknown field, or
+a duplicate field fails the request. The monitor answers `hello`,
 `shutdown`, and disk-fork claims and cancels as soon as it accepts the
 connection. Guest
 operations (exec, copy, logs, save, fork) take turns: each waits for the
