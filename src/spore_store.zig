@@ -40,10 +40,9 @@ pub const PushResult = struct {
 
 /// Push the saved spore in `spore_dir` to a directory or S3 store: its RAM
 /// chunks, disk index and disk objects, then its manifest without the
-/// host-local RAM backing, then the tag. The rootfs cache or, for a portable
-/// spore, the spore directory must hold the complete disk. A spore with a
-/// rootfs must have a disk, as every save of one does: a pin roots only a
-/// disk's storage.
+/// host-local RAM backing, then the tag. The rootfs cache must hold the
+/// complete disk. A spore with a rootfs must have a disk, as every save of one
+/// does: a pin roots only a disk's storage.
 pub fn push(context: Context, allocator: std.mem.Allocator, options: PushOptions) !PushResult {
     const destination = try image_store.parsePushDestination(options.destination);
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
@@ -82,10 +81,8 @@ pub fn push(context: Context, allocator: std.mem.Allocator, options: PushOptions
     }
     if (disk) |saved_disk| {
         const storage = try saved_spore_pin.storageForDisk(saved_disk);
-        // A portable spore carries its disk in its own CAS.
-        const root = if (try saved_spore_pin.hasLocalIndex(context.io, arena, options.spore_dir, saved_disk)) options.spore_dir else cache_root;
-        if (!try rootfs_cas.storageContentComplete(context.io, arena, root, storage)) return error.SporeStorageIncomplete;
-        const index_path = try rootfs_cas.manifestIndexPath(arena, root, storage.index_digest);
+        if (!try rootfs_cas.storageContentComplete(context.io, arena, cache_root, storage)) return error.SporeStorageIncomplete;
+        const index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, storage.index_digest);
         const index = try rootfs_cas.readStorageIndexPath(arena, index_path, storage);
         defer index.deinit();
         const index_id = chunk.ChunkId.fromDigest(storage.index_digest) catch return error.BadManifest;
@@ -97,7 +94,7 @@ pub fn push(context: Context, allocator: std.mem.Allocator, options: PushOptions
             try objects.append(arena, .{
                 .digest = try arena.dupe(u8, &entry.id.toDigest()),
                 .size = try rootfs_cas.storageChunkLen(storage, entry.logical_chunk),
-                .path = try rootfs_cas.objectPath(arena, root, entry.id),
+                .path = try rootfs_cas.objectPath(arena, cache_root, entry.id),
             });
         }
     }
@@ -239,7 +236,6 @@ pub fn pull(context: Context, allocator: std.mem.Allocator, options: PullOptions
         try saved_spore_pin.validateRoot(arena, cache_root, storage);
         // GC roots every object a leased index names, fetched or not.
         break :blk try runtime_disk_lease.acquireActive(io, arena, try local_paths.runtimeRootPath(arena, context.environ_map), .{
-            .store = .rootfs_cache,
             .root = cache_root,
             .baseline_kind = .disk_index,
             .baseline_identity = storage.index_digest,

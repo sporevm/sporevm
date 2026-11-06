@@ -321,7 +321,7 @@ with the named monitor. A missing field means no saved exec defaults, so older
 spores retain their existing root-directory and empty-environment behavior.
 Per-exec `--env` and `--workdir` values are never copied into either metadata
 surface.
-Writable-disk saves are `machine-local-pinned` by default. The reference to
+Writable-disk saves are `machine-local-pinned`. The reference to
 their durable cache pin is hard-linked to one cache-side ownership anchor, so
 moving or renaming the directory is safe while ordinary and hard-link copies
 fail closed before restore or removal. Use `spore fork` for another
@@ -364,11 +364,11 @@ spore save bench-1 --out bench-1.spore --stop --annotation saved=true
 ```
 
 Delete a checkpoint with `spore checkpoint rm DIR`. It requires a directory
-whose regular `manifest.json` parses as a spore manifest, refuses with
-`SavedSporeInUse` while a foreground or named restore holds a lazy-disk lease on
-that directory, then deletes the directory and durably syncs its parent. It
-does not read the checkpoint's memory or disk storage, so checkpoints with
-corrupt storage can be removed. A save whose manifest no longer parses cannot
+whose regular `manifest.json` parses as a spore manifest, then deletes the
+directory and durably syncs its parent. A VM restored from it keeps running,
+because its runtime lease keeps the storage in the rootfs cache. It does not
+read the checkpoint's memory or disk storage, so checkpoints with corrupt
+storage can be removed. A save whose manifest no longer parses cannot
 be told apart from another program's directory; remove it with `rm -rf`, and
 `spore cache gc --force` then reclaims its storage. A machine-local
 checkpoint's pin is released by GC, not by removal: deleting the directory,

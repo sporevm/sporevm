@@ -29,6 +29,13 @@ self-contained copy of one any more. `SPOREVM_BUNDLE_CACHE_DIR` is no longer
 read and `spore host-info` no longer reports `cache_roots.bundles`; delete the
 `bundles` directory under the SporeVM cache.
 
+A disk-backed save that carries its own disk index and objects, as
+`spore clone` and `spore unpack` wrote, no longer restores, forks or pushes;
+`spore checkpoint rm` still removes it. To keep one, restore it with an
+earlier release and save it again, which pins its disk in the rootfs cache.
+`spore checkpoint rm` no longer refuses with `SavedSporeInUse` while a VM
+restored from the save runs; that VM's runtime lease keeps its storage.
+
 ### Performance
 
 - On aarch64 each virtio-blk disk serves its requests on a thread of its own

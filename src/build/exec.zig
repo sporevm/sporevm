@@ -135,7 +135,6 @@ pub const StorageLeases = struct {
         if (!try lock.ensureHeldFor(self.allocator, self.cache_root)) return error.RootfsCacheLockNotHeld;
         try self.held.ensureUnusedCapacity(self.allocator, 1);
         self.held.appendAssumeCapacity(try runtime_disk_lease.acquireActive(self.io, self.allocator, self.runtime_root, .{
-            .store = .rootfs_cache,
             .root = self.cache_root,
             .baseline_kind = .disk_index,
             .baseline_identity = storage.index_digest,

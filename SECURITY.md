@@ -70,11 +70,9 @@ batch stage after a crash. Failed ordinary publication preserves the staged
 manifest outside loadable authority for manual recovery. `spore pull`
 publishes the same way.
 Removal requires a regular `manifest.json` that parses as a spore manifest
-and does not read the checkpoint's memory or disk storage. Foreground and named
-restore publish host-private active saved-spore leases before releasing the
-registry lock that serializes authority selection with removal. Removal refuses
-any live lease for the canonical directory, regardless of the descriptor
-currently named by its manifest, then holds the same lock through deletion.
+and does not read the checkpoint's memory or disk storage. A restore's runtime
+lease names the rootfs cache, never the checkpoint directory, so removing a
+checkpoint while a VM restored from it runs leaves that VM's storage in place.
 Ownership reporting changes no portable manifest or device format.
 
 | Surface | Input source | Status |

@@ -333,11 +333,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     // may have been fetching for a save.
     defer if (server.image_store) |fetcher| fetcher.release();
     if (spec.disk_baseline_lease) |lease| {
-        var cache_lock: ?rootfs_mod.RootfsCacheLock = if (lease.store == .rootfs_cache)
-            try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, lease.root)
-        else
-            null;
-        defer if (cache_lock) |*lock| lock.deinit();
+        var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, lease.root);
+        defer cache_lock.deinit();
         server.disk_baseline_active = try runtime_disk_lease.acquireActive(init.io, allocator, paths.runtime_root, lease);
     }
     const metadata_ms = lifecycle.monotonicMs();
@@ -1166,7 +1163,7 @@ const ExecServer = struct {
             // meanwhile.
             self.op = .{ .disk_fork = .{ .request = request } };
             self.mutex.unlock(self.io);
-            const step = ensureDiskBaselineLease(self.io, arena_state.allocator(), self.entry, self.runtime_root, self.cache_root);
+            const step = ensureDiskBaselineLease(self.io, arena_state.allocator(), self.entry, self.cache_root);
             self.mutex.lockUncancelable(self.io);
             const busy_root = switch (step catch |err| {
                 self.op = .idle;
@@ -1289,7 +1286,6 @@ const ExecServer = struct {
         lifecycle_spec: *std.json.Parsed(lifecycle.Spec),
     ) !void {
         const lease = runtime_disk_lease.Lease{
-            .store = .rootfs_cache,
             .root = self.cache_root,
             .baseline_kind = .disk_index,
             .baseline_identity = disk.base,
@@ -1623,8 +1619,7 @@ fn persistSourceDiskLeaseHandoff(
     active_slot: *?runtime_disk_lease.Active,
 ) !void {
     try lease.validate();
-    if (lease.store != .rootfs_cache or
-        lease.baseline_kind != .disk_index or
+    if (lease.baseline_kind != .disk_index or
         !std.mem.eql(u8, lease.baseline_identity, disk.base) or
         !spore.rootfsStorageEql(lease.rootfs_storage orelse return error.BadManifest, try saved_spore_pin.storageForDisk(disk))) return error.BadManifest;
 
@@ -1668,29 +1663,15 @@ fn ensureDiskBaselineLease(
     io: Io,
     arena: std.mem.Allocator,
     entry: vm_registry.Entry,
-    runtime_root: []const u8,
     cache_root: []const u8,
 ) !BaselineStep {
     var spec = (try entry.readSpec(arena, io)).value;
     const rootfs = spec.rootfs orelse return error.UnsupportedNamedForkDisk;
     const recorded = spec.disk_baseline_lease;
-    const lease: runtime_disk_lease.Lease = recorded orelse if (spec.disk) |disk| blk: {
-        if (!std.mem.eql(u8, disk.kind, spore.disk_kind_chunk_index)) return error.UnsupportedNamedForkDisk;
-        try spore.validateDiskDigest(disk.base);
-        const resume_dir = spec.resume_dir orelse return error.UnsupportedNamedForkDisk;
-        const root = try std.fs.path.resolve(arena, &.{resume_dir});
-        const forks_root = try std.fs.path.resolve(arena, &.{ runtime_root, "forks" });
-        if (pathWithin(forks_root, root)) return error.UnsupportedNamedForkDisk;
-        break :blk .{
-            .store = .saved_spore,
-            .root = root,
-            .baseline_kind = .disk_index,
-            .baseline_identity = disk.base,
-        };
-    } else if (rootfs.storage) |storage| blk: {
+    // Restores and saves record a disk's baseline with the disk.
+    const lease: runtime_disk_lease.Lease = recorded orelse if (spec.disk != null) return error.UnsupportedNamedForkDisk else if (rootfs.storage) |storage| blk: {
         try spore.validateRootfsStorageDescriptor(storage);
         break :blk .{
-            .store = .rootfs_cache,
             .root = cache_root,
             .baseline_kind = .disk_index,
             .baseline_identity = storage.index_digest,
@@ -1699,7 +1680,6 @@ fn ensureDiskBaselineLease(
     } else blk: {
         try spore.validateRootfsDigest(rootfs.artifact.digest);
         break :blk .{
-            .store = .rootfs_cache,
             .root = cache_root,
             .baseline_kind = .rootfs,
             .baseline_identity = rootfs.artifact.digest,
@@ -1707,40 +1687,29 @@ fn ensureDiskBaselineLease(
     };
     try lease.validate();
     spec.disk_baseline_lease = lease;
-    if (lease.store == .rootfs_cache) {
-        var cache_lock = rootfs_mod.tryLockRootfsCacheExclusive(io, arena, lease.root) catch |err| switch (err) {
-            error.LockBusy => return .{ .cache_busy = lease.root },
-            else => |e| return e,
-        };
-        defer cache_lock.deinit();
-        switch (lease.baseline_kind) {
-            .rootfs => {
-                const fd = rootfs_cache.openTrustedFromCache(io, arena, lease.root, rootfs) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.DiskForkBaselineUnavailable,
-                };
-                _ = std.c.close(fd);
-            },
-            .disk_index => {
-                const storage = lease.rootfs_storage orelse return error.BadManifest;
-                if (!try rootfs_cas.storageMarkedComplete(io, arena, lease.root, storage)) return error.DiskForkBaselineUnavailable;
-            },
-        }
-        // Publish the root while holding the same lock used by GC/prune. A
-        // collector that started first wins and is verified above; every
-        // collector that starts later observes the lease.
-        if (recorded == null) try entry.writeSpec(arena, io, spec);
-    } else if (recorded == null) {
-        try entry.writeSpec(arena, io, spec);
+    var cache_lock = rootfs_mod.tryLockRootfsCacheExclusive(io, arena, lease.root) catch |err| switch (err) {
+        error.LockBusy => return .{ .cache_busy = lease.root },
+        else => |e| return e,
+    };
+    defer cache_lock.deinit();
+    switch (lease.baseline_kind) {
+        .rootfs => {
+            const fd = rootfs_cache.openTrustedFromCache(io, arena, lease.root, rootfs) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.DiskForkBaselineUnavailable,
+            };
+            _ = std.c.close(fd);
+        },
+        .disk_index => {
+            const storage = lease.rootfs_storage orelse return error.BadManifest;
+            if (!try rootfs_cas.storageMarkedComplete(io, arena, lease.root, storage)) return error.DiskForkBaselineUnavailable;
+        },
     }
+    // Publish the root while holding the same lock used by GC/prune. A
+    // collector that started first wins and is verified above; every
+    // collector that starts later observes the lease.
+    if (recorded == null) try entry.writeSpec(arena, io, spec);
     return .{ .named = .{ .lease = lease, .disk = spec.disk } };
-}
-
-fn pathWithin(parent: []const u8, child: []const u8) bool {
-    if (!std.mem.startsWith(u8, child, parent)) return false;
-    if (child.len == parent.len) return true;
-    if (parent.len != 0 and parent[parent.len - 1] == std.fs.path.sep) return true;
-    return child[parent.len] == std.fs.path.sep;
 }
 
 fn formatSessionId(buffer: *[64]u8, nonce: u64, sequence: u64) ![]const u8 {
@@ -2525,14 +2494,12 @@ test "snapshot disk lease handoff preserves old authority on failure and commits
         .object_namespace = spore.rootfs_storage_object_namespace,
     };
     const old_lease = runtime_disk_lease.Lease{
-        .store = .rootfs_cache,
         .root = cache_root,
         .baseline_kind = .disk_index,
         .baseline_identity = old_digest,
         .rootfs_storage = old_storage,
     };
     const new_lease = runtime_disk_lease.Lease{
-        .store = .rootfs_cache,
         .root = cache_root,
         .baseline_kind = .disk_index,
         .baseline_identity = new_digest,
@@ -2612,7 +2579,7 @@ test "snapshot manifest publication serializes destructive collection until pin 
     const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
     const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
     const save_dir = try std.fs.path.join(arena, &.{ root, "saved.spore" });
-    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, save_dir, 0x75, false);
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, save_dir, 0x75);
 
     var publication_boundary = test_barrier.Barrier{};
     saved_spore_pin.testing.publish_authority_barrier = &publication_boundary;
@@ -2725,8 +2692,8 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
     const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
     const old_dir = try std.fs.path.join(arena, &.{ root, "old.spore" });
     const new_dir = try std.fs.path.join(arena, &.{ root, "new.spore" });
-    const old_fixture = try manifest_test_support.diskFixture(arena, io, cache_root, old_dir, 0x73, false);
-    const new_fixture = try manifest_test_support.diskFixture(arena, io, cache_root, new_dir, 0x74, false);
+    const old_fixture = try manifest_test_support.diskFixture(arena, io, cache_root, old_dir, 0x73);
+    const new_fixture = try manifest_test_support.diskFixture(arena, io, cache_root, new_dir, 0x74);
     try spore.saveManifest(arena, old_dir, old_fixture.manifest);
     try rootfs_cas.markStorageComplete(io, arena, cache_root, old_fixture.storage.index_digest);
     var env = std.process.Environ.Map.init(allocator);
@@ -2741,7 +2708,6 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
         .name = "source",
         .disk = old_fixture.disk,
         .disk_baseline_lease = .{
-            .store = .rootfs_cache,
             .root = cache_root,
             .baseline_kind = .disk_index,
             .baseline_identity = old_fixture.storage.index_digest,
@@ -2749,14 +2715,12 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
         },
     });
     const old_lease = runtime_disk_lease.Lease{
-        .store = .rootfs_cache,
         .root = cache_root,
         .baseline_kind = .disk_index,
         .baseline_identity = old_fixture.storage.index_digest,
         .rootfs_storage = old_fixture.storage,
     };
     const new_lease = runtime_disk_lease.Lease{
-        .store = .rootfs_cache,
         .root = cache_root,
         .baseline_kind = .disk_index,
         .baseline_identity = new_fixture.storage.index_digest,
@@ -3357,18 +3321,22 @@ fn execAttached(op: Op) bool {
     return op == .exec and op.exec.phase == .active;
 }
 
-test "monitor records the fork baseline while it holds the guest" {
+test "a fork of a VM restored from a pinned save shares its recorded baseline" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(root);
     const runtime_root = try std.fs.path.join(allocator, &.{ root, "runtime" });
     defer allocator.free(runtime_root);
-    const saved_dir = try std.fs.path.join(allocator, &.{ root, "saved.spore" });
-    defer allocator.free(saved_dir);
+    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
+    const saved = try manifest_test_support.diskFixture(arena, io, cache_root, try std.fs.path.join(arena, &.{ root, "saved.spore" }), 0x76);
+    try rootfs_cas.markStorageComplete(io, arena, cache_root, saved.storage.index_digest);
     const paths = try lifecycle.pathsFromRoot(allocator, runtime_root, "source");
     defer paths.deinit(allocator);
     try vm_registry.ensureDirPath(io, paths.vm_dir);
@@ -3387,19 +3355,21 @@ test "monitor records the fork baseline while it holds the guest" {
     batch.heads[0] = null;
     defer batch.deinit();
     batch.heads[0] = try runtime_disk_claim.makeSmokeHead(allocator);
-    batch.heads[0].?.descriptor.baseline.kind = .disk_index;
-    const digest = batch.heads[0].?.descriptor.baseline.identity;
+    const digest = try allocator.dupe(u8, saved.disk.base);
+    allocator.free(batch.heads[0].?.descriptor.baseline.identity);
+    batch.heads[0].?.descriptor.baseline = .{ .kind = .disk_index, .identity = digest };
 
-    // A source restored from a saved disk has no recorded baseline yet.
-    try entry.writeSpec(allocator, io, .{
+    // As a restore from a pinned save records it.
+    try entry.writeSpec(arena, io, .{
         .name = "source",
-        .rootfs = .{ .device = .{ .mmio_slot = 1 }, .artifact = .{ .digest = digest, .size = spore.disk_chunk_size } },
-        .disk = .{ .device = .{ .mmio_slot = 1 }, .size = spore.disk_chunk_size, .base = digest },
-        .resume_dir = saved_dir,
+        .rootfs = saved.manifest.rootfs,
+        .disk = saved.disk,
+        .disk_baseline_lease = .{ .root = cache_root, .baseline_kind = .disk_index, .baseline_identity = saved.disk.base, .rootfs_storage = saved.storage },
+        .resume_dir = try std.fs.path.join(arena, &.{ root, "saved.spore" }),
     });
     var path_buf: [64]u8 = undefined;
     const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-fork-{d}.sock", .{std.c.getpid()});
-    var server = try ExecServer.init(allocator, io, entry, paths.vm_dir, runtime_root, socket_path, "/nonexistent", 10700, 5_000, null, .{});
+    var server = try ExecServer.init(allocator, io, entry, paths.vm_dir, runtime_root, socket_path, cache_root, 10700, 5_000, null, .{});
     defer server.disk_claims.deinit();
     defer {
         server.server.deinit(io);
@@ -3433,8 +3403,7 @@ test "monitor records the fork baseline while it holds the guest" {
         if (prepare.response) |response| std.heap.page_allocator.free(response);
     };
 
-    // The baseline is in the spec, where GC finds it, before the capture
-    // starts.
+    // The baseline stays in the spec, where GC finds it, through the capture.
     const started_ms = lifecycle.monotonicMs();
     while (true) {
         {
@@ -3453,8 +3422,7 @@ test "monitor records the fork baseline while it holds the guest" {
     var recorded = try entry.readSpec(allocator, io);
     defer recorded.deinit();
     const lease = recorded.value.disk_baseline_lease.?;
-    try std.testing.expectEqual(runtime_disk_lease.Store.saved_spore, lease.store);
-    try std.testing.expectEqualStrings(saved_dir, lease.root);
+    try std.testing.expectEqualStrings(cache_root, lease.root);
     try std.testing.expectEqualStrings(digest, lease.baseline_identity);
 
     // The fork CLI gets the same baseline and disk in the response.
@@ -3467,7 +3435,7 @@ test "monitor records the fork baseline while it holds the guest" {
     var prepared_arena = std.heap.ArenaAllocator.init(allocator);
     defer prepared_arena.deinit();
     const prepared = (try monitor_protocol.decodeResponse(prepared_arena.allocator(), response)).disk_fork_prepared;
-    try std.testing.expectEqualStrings(saved_dir, prepared.lease.root);
+    try std.testing.expectEqualStrings(cache_root, prepared.lease.root);
     try std.testing.expectEqualStrings(lease.baseline_identity, prepared.lease.baseline_identity);
     try std.testing.expectEqualStrings(lease.baseline_identity, prepared.disk.?.base);
     try std.testing.expectEqual(Op.idle, server.op);
@@ -3485,7 +3453,7 @@ test "a fork waiting for the rootfs cache lock leaves the guest free" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
     const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
     const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
-    const image = try manifest_test_support.diskFixture(arena, io, cache_root, try std.fs.path.join(arena, &.{ root, "image.spore" }), 0x75, false);
+    const image = try manifest_test_support.diskFixture(arena, io, cache_root, try std.fs.path.join(arena, &.{ root, "image.spore" }), 0x75);
     try rootfs_cas.markStorageComplete(io, arena, cache_root, image.storage.index_digest);
     const paths = try lifecycle.pathsFromRoot(arena, runtime_root, "source");
     try vm_registry.ensureDirPath(io, paths.vm_dir);
@@ -3601,7 +3569,6 @@ test "a fork waiting for the rootfs cache lock leaves the guest free" {
     }
     var recorded = try entry.readSpec(allocator, io);
     defer recorded.deinit();
-    try std.testing.expectEqual(runtime_disk_lease.Store.rootfs_cache, recorded.value.disk_baseline_lease.?.store);
     try std.testing.expectEqualStrings(image.storage.index_digest, recorded.value.disk_baseline_lease.?.baseline_identity);
     try server.completeDiskFork(&batch);
     thread.join();

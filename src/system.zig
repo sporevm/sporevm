@@ -1576,10 +1576,17 @@ fn collectStorageRootsFromRuntimeManifests(
     runtime_root: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
 ) !void {
-    const refs = try collectRuntimeForkRefs(allocator, io, runtime_root);
-    for (refs) |resume_dir| {
+    var vms = try vm_registry.Iterator.init(allocator, io, runtime_root);
+    defer vms.deinit();
+    while (try vms.next()) |parsed_spec| {
+        var spec = parsed_spec;
+        defer spec.deinit();
+        const resume_dir = spec.value.resume_dir orelse continue;
         const manifest_path = try std.fs.path.join(allocator, &.{ resume_dir, "manifest.json" });
-        try collectStorageRootFromManifestPath(allocator, io, cache_root, manifest_path, storage_roots);
+        // A VM restored from a checkpoint keeps running after `spore
+        // checkpoint rm` deletes it; its lease, collected below, roots its disk.
+        const leased = spec.value.disk_baseline_lease != null;
+        try collectStorageRootFromManifestPath(allocator, io, cache_root, manifest_path, leased, storage_roots);
     }
     try collectStorageRootsFromRuntimeLeases(allocator, io, cache_root, runtime_root, storage_roots);
 }
@@ -1617,7 +1624,7 @@ fn addStorageRootFromRuntimeLease(
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
 ) !void {
     try lease.validate();
-    if (lease.store != .rootfs_cache or !try sameResolvedPath(allocator, io, lease.root, cache_root)) return;
+    if (!try sameResolvedPath(allocator, io, lease.root, cache_root)) return;
     if (lease.rootfs_storage) |storage| {
         // Parsed lease strings are short-lived. Keep an independent root for
         // the mark phase after the JSON value is released.
@@ -1658,7 +1665,7 @@ fn addProtectedPathsFromRuntimeLease(
     protected_paths: *std.StringHashMap(void),
 ) !void {
     try lease.validate();
-    if (lease.store != .rootfs_cache or !try sameResolvedPath(allocator, io, lease.root, cache_root)) return;
+    if (!try sameResolvedPath(allocator, io, lease.root, cache_root)) return;
 
     switch (lease.baseline_kind) {
         .rootfs => try protected_paths.put(try rootfs_cache.digestPath(allocator, cache_root, lease.baseline_identity), {}),
@@ -1712,10 +1719,12 @@ fn collectStorageRootFromManifestPath(
     io: Io,
     cache_root: []const u8,
     path: []const u8,
+    missing_ok: bool,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
 ) !void {
     const data = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_root_record_bytes)) catch |err| switch (err) {
-        error.FileNotFound, error.StreamTooLong => return error.BadManifest,
+        error.FileNotFound => if (missing_ok) return else return error.BadManifest,
+        error.StreamTooLong => return error.BadManifest,
         else => |e| return e,
     };
     const parsed = std.json.parseFromSlice(ManifestRoot, allocator, data, .{
@@ -3302,7 +3311,6 @@ test "runtime disk lease protects its cache baseline from prune and gc" {
         .name = "child",
         .resume_dir = resume_dir,
         .disk_baseline_lease = .{
-            .store = .rootfs_cache,
             .root = root,
             .baseline_kind = .disk_index,
             .baseline_identity = rooted.storage.index_digest,
@@ -3345,6 +3353,51 @@ test "runtime disk lease protects its cache baseline from prune and gc" {
     try std.testing.expect(!try fileExists(io, gc_orphan_object_path));
 }
 
+test "cache gc runs after the checkpoint a leased VM was restored from is removed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "cache" });
+    const runtime_root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    // As `spore checkpoint rm` leaves a named restore: the spec still names
+    // the deleted checkpoint, and its lease roots the disk.
+    const leased = try writeGcStorageFixture(allocator, io, root, false, 0x64);
+    const removed_checkpoint = try std.fs.path.join(allocator, &.{ tmp_root, "removed.spore" });
+    const vm_dir = try std.fs.path.join(allocator, &.{ runtime_root, "vms", "restored" });
+    try Io.Dir.cwd().createDirPath(io, vm_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ vm_dir, "spec.json" }),
+        .data = try std.json.Stringify.valueAlloc(allocator, vm_registry.Spec{
+            .name = "restored",
+            .resume_dir = removed_checkpoint,
+            .disk_baseline_lease = .{
+                .root = root,
+                .baseline_kind = .disk_index,
+                .baseline_identity = leased.storage.index_digest,
+                .rootfs_storage = leased.storage,
+            },
+        }, .{}),
+    });
+    const collected = try gcRootfsCache(allocator, io, .{ .cache_root = root, .runtime_root = runtime_root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 1), collected.rooted_indexes);
+    try std.testing.expect(try fileExists(io, try rootfs_cas.manifestObjectPath(allocator, root, leased.object_digest)));
+
+    // Without a lease the manifest is the only root, so GC still refuses.
+    const unleased_dir = try std.fs.path.join(allocator, &.{ runtime_root, "vms", "unleased" });
+    try Io.Dir.cwd().createDirPath(io, unleased_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ unleased_dir, "spec.json" }),
+        .data = try std.json.Stringify.valueAlloc(allocator, vm_registry.Spec{ .name = "unleased", .resume_dir = removed_checkpoint }, .{}),
+    });
+    try std.testing.expectError(error.BadManifest, gcRootfsCache(allocator, io, .{ .cache_root = root, .runtime_root = runtime_root, .dry_run = false }));
+}
+
 test "system prune and gc read named VM specs larger than 64 KiB" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3370,7 +3423,6 @@ test "system prune and gc read named VM specs larger than 64 KiB" {
         .name = "large",
         .annotations = annotations,
         .disk_baseline_lease = .{
-            .store = .rootfs_cache,
             .root = root,
             .baseline_kind = .disk_index,
             .baseline_identity = leased.storage.index_digest,
@@ -3495,7 +3547,6 @@ test "cache gc runs after destructive prune deleted storage a VM manifest or ima
             .name = "child",
             .resume_dir = resume_dir,
             .disk_baseline_lease = .{
-                .store = .rootfs_cache,
                 .root = root,
                 .baseline_kind = .disk_index,
                 .baseline_identity = baseline.storage.index_digest,

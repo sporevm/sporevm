@@ -93,7 +93,7 @@ fn crashChild(mode: []const u8, root_path: []const u8) !void {
 fn crashPinPublication(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, root_path: []const u8) !void {
     const cache_root = try std.fs.path.join(allocator, &.{ root_path, "cache" });
     const save_dir = try std.fs.path.join(allocator, &.{ root_path, "saved.spore" });
-    const fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, save_dir, 0x81, false);
+    const fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, save_dir, 0x81);
     saved_spore_pin.testing.publish_fault = .{ .crash_after = if (std.mem.eql(u8, mode, "pin-staged-manifest"))
         .staged_manifest
     else if (std.mem.eql(u8, mode, "pin-complete-stamp"))
@@ -215,7 +215,7 @@ fn crashForkPublication(allocator: std.mem.Allocator, io: std.Io, mode: []const 
     const runtime_root = try std.fs.path.join(allocator, &.{ root_path, "runtime" });
     const parent_dir = try std.fs.path.join(allocator, &.{ root_path, "parent.spore" });
     const children_dir = try std.fs.path.join(allocator, &.{ root_path, "children" });
-    const fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, parent_dir, 0x82, false);
+    const fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, parent_dir, 0x82);
     var lock = try rootfs.lockRootfsCacheExclusive(io, allocator, cache_root);
     const registry = try saved_spore_pin.LockedRegistry.init(allocator, cache_root, &lock);
     try saved_spore_pin.publishManifest(io, allocator, registry, parent_dir, fixture.disk, fixture.manifest);
@@ -317,8 +317,8 @@ fn crashSourceLeaseHandoff(allocator: std.mem.Allocator, io: std.Io, mode: []con
     const runtime_root = try std.fs.path.join(allocator, &.{ root_path, "runtime" });
     const old_dir = try std.fs.path.join(allocator, &.{ root_path, "old" });
     const new_dir = try std.fs.path.join(allocator, &.{ root_path, "new" });
-    const old_fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, old_dir, 0x83, false);
-    const new_fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, new_dir, 0x84, false);
+    const old_fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, old_dir, 0x83);
+    const new_fixture = try manifest_test_support.diskFixture(allocator, io, cache_root, new_dir, 0x84);
     try rootfs_cas.markStorageComplete(io, allocator, cache_root, old_fixture.storage.index_digest);
     try rootfs_cas.markStorageComplete(io, allocator, cache_root, new_fixture.storage.index_digest);
     const paths = try lifecycle.pathsFromRoot(allocator, runtime_root, "source");
@@ -378,7 +378,6 @@ fn recoverSourceLeaseHandoff(allocator: std.mem.Allocator, io: std.Io, mode: []c
 
 fn leaseFor(cache_root: []const u8, storage: spore.RootfsStorage) runtime_disk_lease.Lease {
     return .{
-        .store = .rootfs_cache,
         .root = cache_root,
         .baseline_kind = .disk_index,
         .baseline_identity = storage.index_digest,
