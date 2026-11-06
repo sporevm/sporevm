@@ -1107,7 +1107,7 @@ pub const Fetcher = struct {
         var fill = Fill{ .fetcher = self, .objects = missing };
         var group: Io.Group = .init;
         // This thread is one of the workers.
-        for (1..@min(fill_concurrency, missing.len)) |_| {
+        for (0..@min(fill_concurrency, missing.len) -| 1) |_| {
             group.concurrent(self.io, Fill.run, .{&fill}) catch break;
         }
         Fill.run(&fill) catch {};
@@ -2037,6 +2037,27 @@ test "a read that shares a request that could not install its object fetches it 
     try std.testing.expect(!fetcher.readFailed());
     try awaitWindows(fetcher);
     try std.testing.expectEqual(@as(u32, 3), server.requests.load(.monotonic));
+}
+
+test "filling a cache that already holds every object fetches nothing" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const cache = try fixture.path("cache");
+    const local = try resolve(io, allocator, cache, try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), .{}, &fixture.env);
+    const first = try Fetcher.create(std.testing.allocator, io, cache, local.origin.?, local.storage, &fixture.env);
+    defer first.release();
+    try first.fetchAll();
+    try std.testing.expectEqual(@as(u64, 3), first.currentStats().fetches);
+    // A second VM on the image saves after the first fetched everything.
+    const second = try Fetcher.create(std.testing.allocator, io, cache, local.origin.?, local.storage, &fixture.env);
+    defer second.release();
+    try second.fetchAll();
+    try std.testing.expectEqual(@as(u64, 0), second.currentStats().fetches);
 }
 
 test "file store reads only regular files and never waits for a FIFO writer" {
