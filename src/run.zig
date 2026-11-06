@@ -1,6 +1,7 @@
 //! One-shot VM boot/exec support for `spore run`.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -4405,12 +4406,12 @@ test "local image supplies run env, working directory and rootfs identity" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-image-config";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, cache_root);
 
-    const rootfs_path = tmp ++ "/rootfs.ext4";
+    const rootfs_path = try tmp_dir.path("rootfs.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
@@ -5342,12 +5343,12 @@ test "run pull never fails closed on mutable image ref cache miss" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-image-pull-never-cache-miss";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, tmp ++ "/cache");
+    try env.put(local_paths.rootfs_cache_env, try tmp_dir.path("cache"));
     var process_arena = std.heap.ArenaAllocator.init(allocator);
     defer process_arena.deinit();
     const init = std.process.Init{
@@ -5460,11 +5461,11 @@ test "run --pull=missing converts a registry tag again after a rootfs builder ch
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-image-builder-change";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, cache_root);
-    const rootfs_path = tmp ++ "/rootfs.ext4";
+    const rootfs_path = try tmp_dir.path("rootfs.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, rootfs_cas.default_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload);
@@ -5813,11 +5814,10 @@ test "explicit rootfs input can record exact immutable identity" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-explicit-rootfs-record-artifact";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
     try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
 
@@ -5862,9 +5862,9 @@ test "explicit rootfs input can record exact immutable identity" {
 test "run image cache creates absolute cache directories" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = "zig-cache/test-run-image-cache-dir";
-    const nested = root ++ "/a/b";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const nested = try root_dir.path("a/b");
 
     const absolute_nested = try std.fs.path.resolve(allocator, &.{nested});
     defer allocator.free(absolute_nested);
@@ -6036,12 +6036,12 @@ test "managed kernel repository cache name validates owner and repo" {
 test "managed kernel checksum parser reads sha256 sidecar" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-run-kernel-checksum";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
     try ensureDirPath(io, tmp);
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
 
-    const sha_path = tmp ++ "/Image.sha256";
+    const sha_path = try tmp_dir.path("Image.sha256");
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = sha_path,
         .data = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  Image\n",
@@ -6073,15 +6073,15 @@ test "managed kernel checksum parser reads sha256 sidecar" {
 test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-run-kernel-cache-hit";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
     try ensureDirPath(io, tmp);
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
 
-    const image_path = tmp ++ "/Image";
-    const sha_path = tmp ++ "/Image.sha256";
-    const config_path = tmp ++ "/Image.config";
-    const bad_sha_path = tmp ++ "/Image.bad.sha256";
+    const image_path = try tmp_dir.path("Image");
+    const sha_path = try tmp_dir.path("Image.sha256");
+    const config_path = try tmp_dir.path("Image.config");
+    const bad_sha_path = try tmp_dir.path("Image.bad.sha256");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "kernel bytes" });
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = sha_path,
@@ -6152,7 +6152,7 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
     try chmodFileWritable(allocator, image_path);
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, config_path, "Image"));
     try chmodFileReadOnly(allocator, image_path);
-    const sparse_config_path = tmp ++ "/Image.sparse.config";
+    const sparse_config_path = try tmp_dir.path("Image.sparse.config");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = sparse_config_path, .data = "CONFIG_FILE_LOCKING=y\n" });
     try chmodFileReadOnly(allocator, sparse_config_path);
     try std.testing.expect(!try managedKernelCacheHit(io, allocator, image_path, sha_path, sparse_config_path, "Image"));
@@ -6161,12 +6161,12 @@ test "managed kernel cache hit trusts read-only image with checksum sidecar" {
 test "managed monitor boot materialization verifies and retains opened kernel bytes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-run-managed-boot-materialization";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
     try ensureDirPath(io, tmp);
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
 
-    const image_path = tmp ++ "/Image";
+    const image_path = try tmp_dir.path("Image");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = image_path, .data = "kernel bytes" });
     try chmodFileReadOnly(allocator, image_path);
     var digest: [Sha256.digest_length]u8 = undefined;

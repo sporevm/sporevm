@@ -4,6 +4,7 @@
 //! Ethernet frame backend into the helper's length-prefixed stdio frame stream.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 
@@ -473,10 +474,9 @@ test "spore-net gateway spawns netd with policy arguments" {
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-netd-env"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const script_path = try std.fs.path.resolve(allocator, &.{ root, "netd-env.sh" });
     defer allocator.free(script_path);

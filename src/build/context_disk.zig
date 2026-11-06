@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
 
@@ -293,11 +294,11 @@ test "mtime context disk requires a v2 complete stamp before reuse" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-disk-complete-stamp";
-    const cache_root = root ++ "/cache";
-    const context_root = root ++ "/context";
-    const source_path = context_root ++ "/source.txt";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const cache_root = try root_dir.path("cache");
+    const context_root = try root_dir.path("context");
+    const source_path = try root_dir.path("context/source.txt");
     try Io.Dir.cwd().createDirPath(io, cache_root);
     try Io.Dir.cwd().createDirPath(io, context_root);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "context disk source" });

@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
 
@@ -835,8 +836,9 @@ fn hashCount(h: *Blake3, count: usize) void {
 test "a step slot admits one build at a time" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const cache_root = "zig-cache/test-build-step-slot";
-    defer Io.Dir.cwd().deleteTree(io, cache_root) catch {};
+    var cache_root_dir = try TestDir.init();
+    defer cache_root_dir.deinit();
+    const cache_root = cache_root_dir.root;
     const key = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     var held = (try tryLockStepSlot(io, allocator, cache_root, key)) orelse return error.TestUnexpectedResult;
@@ -1054,12 +1056,11 @@ test "rewriting a step record replaces a prior child snapshot" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-replace";
-    const cache_root = tmp ++ "/cache";
-    const first_rootfs = tmp ++ "/first.ext4";
-    const second_rootfs = tmp ++ "/second.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    const first_rootfs = try tmp_dir.path("first.ext4");
+    const second_rootfs = try tmp_dir.path("second.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = first_rootfs, .data = "first snapshot" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = second_rootfs, .data = "second snapshot" });
 
@@ -1093,11 +1094,10 @@ test "inclusive step record bound is readable and one byte beyond fails closed" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-inclusive-record-bound";
-    const cache_root = tmp ++ "/cache";
-    const child_rootfs = tmp ++ "/child.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    const child_rootfs = try tmp_dir.path("child.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "inclusive record child rootfs bytes" });
 
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
@@ -1169,11 +1169,10 @@ test "prepare record round trips typed identity and exact target" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-prepare";
-    const cache_root = tmp ++ "/cache";
-    const child_rootfs = tmp ++ "/prepared.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    const child_rootfs = try tmp_dir.path("prepared.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "prepared rootfs bytes" });
 
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
@@ -1219,11 +1218,10 @@ test "prepare record rejects target mismatch and missing completeness stamp" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-prepare-validation";
-    const cache_root = tmp ++ "/cache";
-    const child_rootfs = tmp ++ "/prepared.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    const child_rootfs = try tmp_dir.path("prepared.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "prepared rootfs bytes" });
 
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
@@ -1274,11 +1272,10 @@ test "pre-capability COPY record misses after executor identity changes" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-copy-executor-upgrade";
-    const cache_root = tmp ++ "/cache";
-    const child_rootfs = tmp ++ "/child.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    const child_rootfs = try tmp_dir.path("child.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "capability-preserving child rootfs bytes" });
 
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);
@@ -1326,11 +1323,10 @@ test "gc inspection prunes older builder records and keeps newer ones unknown" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-step-cache-old-builder-gc";
-    const cache_root = tmp ++ "/cache";
-    const child_rootfs = tmp ++ "/child.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    const child_rootfs = try tmp_dir.path("child.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = child_rootfs, .data = "old child rootfs bytes" });
 
     const preload = try rootfs_cas.preloadPath(io, arena, cache_root, child_rootfs, rootfs_cas.default_chunk_size);

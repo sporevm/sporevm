@@ -1,6 +1,7 @@
 //! CLI adapter for native image archives and image stores.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const Io = std.Io;
 const api = @import("api.zig");
 const machine_output = @import("machine_output.zig");
@@ -218,12 +219,10 @@ test "json image pack and unpack print their documented result documents" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const io = std.testing.io;
-    const tmp = "zig-cache/test-image-cli-json";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
 
-    const producer_cache = tmp ++ "/producer-cache";
+    const producer_cache = try tmp_dir.path("producer-cache");
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put(local_paths.rootfs_cache_env, producer_cache);
@@ -271,17 +270,17 @@ test "json image pack and unpack print their documented result documents" {
     });
 
     var pack_out: Io.Writer.Allocating = .init(allocator);
-    try run(init, &.{ "pack", "local/cli-json:producer", "--platform", "linux/arm64", "--out", tmp ++ "/image.tar.gz" }, &pack_out.writer, .json);
+    try run(init, &.{ "pack", "local/cli-json:producer", "--platform", "linux/arm64", "--out", try tmp_dir.path("image.tar.gz") }, &pack_out.writer, .json);
     const pack = try std.json.parseFromSliceLeaky(std.json.Value, allocator, pack_out.written(), .{});
     try std.testing.expectEqualStrings("spore.image.archive.pack.result.v1", pack.object.get("schema").?.string);
     try std.testing.expectEqualStrings("image", pack.object.get("resource_type").?.string);
     const archive_digest = pack.object.get("archive_digest").?.string;
     const image_digest = pack.object.get("image_digest").?.string;
 
-    try env.put(local_paths.rootfs_cache_env, tmp ++ "/consumer-cache");
+    try env.put(local_paths.rootfs_cache_env, try tmp_dir.path("consumer-cache"));
     var unpack_out: Io.Writer.Allocating = .init(allocator);
     try run(init, &.{
-        "unpack",                  tmp ++ "/image.tar.gz",
+        "unpack",                  try tmp_dir.path("image.tar.gz"),
         "--archive-digest",        archive_digest,
         "--expected-image-digest", image_digest,
         "--platform",              "linux/arm64",

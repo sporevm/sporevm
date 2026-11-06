@@ -4,6 +4,7 @@
 //! mutate existing filesystems.
 
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const chunk = @import("../chunk.zig");
 const chunk_sealer = @import("../chunk_sealer.zig");
 const disk_index = @import("../disk_index.zig");
@@ -2151,11 +2152,10 @@ fn rotateHash(hash: u32, shift: u5) u32 {
 test "native ext4 writer inline CAS index matches rescanned image" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-native-ext4-inline-cas";
-    const image_path = tmp ++ "/rootfs.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const image_path = try tmp_dir.path("rootfs.ext4");
+    const cache_root = try tmp_dir.path("cache");
 
     const payload = try allocator.alloc(u8, 96 * 1024);
     defer allocator.free(payload);
@@ -2216,10 +2216,9 @@ test "sparse emit plan rejects metadata and data overlap deterministically" {
 test "sparse data span zero pads its partial final block" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-native-ext4-sparse-data-span";
-    const path = tmp ++ "/output";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try tmp_dir.path("output");
     var output = try Io.Dir.cwd().createFile(io, path, .{ .read = true });
     defer output.close(io);
 

@@ -7,6 +7,7 @@
 //! ordinary local image cache.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
@@ -608,9 +609,9 @@ test "image archive must end with exactly two zero blocks after its last object"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = tmp.root;
 
     const seed_tar = try testArchiveTarAlloc(&arena, dir);
     const end = seed_tar.len - 1024;
@@ -749,10 +750,9 @@ test "image pack rejects an image record that does not match its identity" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const io = std.testing.io;
-    const tmp = "zig-cache/test-image-archive-local-digests";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    const cache = tmp ++ "/cache";
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache = try tmp_dir.path("cache");
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
@@ -768,15 +768,15 @@ test "image pack rejects an image record that does not match its identity" {
 
     const published = (try publishTestImage(allocator, io, cache, "local/archive:native", "local digest archive object")).published;
     const arm64 = rootfs.Platform{ .os = "linux", .arch = .arm64 };
-    const native = try pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/native.tar.gz", .platform = arm64 });
+    const native = try pack(init, allocator, .{ .source = "local/archive:native", .output_path = try tmp_dir.path("native.tar.gz"), .platform = arm64 });
     try std.testing.expectEqualStrings(published.identity, native.image_digest);
 
     const record = try Io.Dir.cwd().readFileAlloc(io, published.record_path, allocator, .limited(1024 * 1024));
     const tampered = try std.mem.replaceOwned(u8, allocator, record, "\"architecture\": \"arm64\"", "\"architecture\": \"arm64\", \"config\": {\"WorkingDir\": \"/tampered\"}");
     try std.testing.expect(!std.mem.eql(u8, record, tampered));
     try chunk_sealer.replaceFileAtomicDurable(allocator, published.record_path, tampered, 0o644);
-    try std.testing.expectError(error.BadManifest, pack(init, allocator, .{ .source = "local/archive:native", .output_path = tmp ++ "/tampered.tar.gz", .platform = arm64 }));
-    try std.testing.expectError(error.FileNotFound, pack(init, allocator, .{ .source = "local/archive:missing", .output_path = tmp ++ "/missing.tar.gz", .platform = arm64 }));
+    try std.testing.expectError(error.BadManifest, pack(init, allocator, .{ .source = "local/archive:native", .output_path = try tmp_dir.path("tampered.tar.gz"), .platform = arm64 }));
+    try std.testing.expectError(error.FileNotFound, pack(init, allocator, .{ .source = "local/archive:missing", .output_path = try tmp_dir.path("missing.tar.gz"), .platform = arm64 }));
 }
 
 test "native image archive round-trips into a clean cache and rejects substitution" {
@@ -784,14 +784,12 @@ test "native image archive round-trips into a clean cache and rejects substituti
     defer arena.deinit();
     const allocator = arena.allocator();
     const io = std.testing.io;
-    const tmp = "zig-cache/test-native-image-archive";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, tmp ++ "/producer-cache");
+    try env.put(local_paths.rootfs_cache_env, try tmp_dir.path("producer-cache"));
     const init = std.process.Init{
         .minimal = undefined,
         .arena = &arena,
@@ -802,12 +800,12 @@ test "native image archive round-trips into a clean cache and rejects substituti
     };
 
     const object_bytes = "native image archive object";
-    const producer = try publishTestImage(allocator, io, tmp ++ "/producer-cache", "local/archive:producer", object_bytes);
+    const producer = try publishTestImage(allocator, io, try tmp_dir.path("producer-cache"), "local/archive:producer", object_bytes);
     const published = producer.published;
     const storage = producer.storage;
     const installed_object = producer.object_path;
 
-    const archive_path = tmp ++ "/image.tar.gz";
+    const archive_path = try tmp_dir.path("image.tar.gz");
     const pack_result = try pack(init, allocator, .{
         .source = "local/archive:producer",
         .output_path = archive_path,
@@ -823,7 +821,7 @@ test "native image archive round-trips into a clean cache and rejects substituti
         .platform = .{ .os = "linux", .arch = .arm64 },
     }));
 
-    const duplicate_archive_path = tmp ++ "/image-duplicate.tar.gz";
+    const duplicate_archive_path = try tmp_dir.path("image-duplicate.tar.gz");
     const duplicate = try pack(init, allocator, .{
         .source = "local/archive:producer",
         .output_path = duplicate_archive_path,
@@ -838,11 +836,11 @@ test "native image archive round-trips into a clean cache and rejects substituti
     try chunk_sealer.replaceFileAtomicDurable(allocator, installed_object, &corrupted, 0o444);
     try std.testing.expectError(error.BadChunk, pack(init, allocator, .{
         .source = "local/archive:producer",
-        .output_path = tmp ++ "/corrupt.tar.gz",
+        .output_path = try tmp_dir.path("corrupt.tar.gz"),
         .platform = .{ .os = "linux", .arch = .arm64 },
     }));
 
-    const consumer_cache = tmp ++ "/consumer-cache";
+    const consumer_cache = try tmp_dir.path("consumer-cache");
     try env.put(local_paths.rootfs_cache_env, consumer_cache);
     const unpacked = try unpack(init, allocator, .{
         .archive_path = archive_path,
@@ -855,9 +853,9 @@ test "native image archive round-trips into a clean cache and rejects substituti
     try std.testing.expectEqual(resource.Type.image, unpacked.resource_type);
     try std.testing.expectEqualStrings(pack_result.image_digest, unpacked.image_digest);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, consumer_cache, storage));
-    try Io.Dir.cwd().access(io, consumer_cache ++ "/refs", .{});
+    try Io.Dir.cwd().access(io, try tmp_dir.path("consumer-cache/refs"), .{});
 
-    const rejected_cache = tmp ++ "/rejected-cache";
+    const rejected_cache = try tmp_dir.path("rejected-cache");
     try env.put(local_paths.rootfs_cache_env, rejected_cache);
     try std.testing.expectError(error.ImageArchiveDigestMismatch, unpack(init, allocator, .{
         .archive_path = archive_path,
@@ -866,9 +864,9 @@ test "native image archive round-trips into a clean cache and rejects substituti
         .ref = "local/archive:rejected",
         .platform = .{ .os = "linux", .arch = .arm64 },
     }));
-    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, rejected_cache ++ "/refs", .{}));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try tmp_dir.path("rejected-cache/refs"), .{}));
 
-    const identity_rejected_cache = tmp ++ "/identity-rejected-cache";
+    const identity_rejected_cache = try tmp_dir.path("identity-rejected-cache");
     try env.put(local_paths.rootfs_cache_env, identity_rejected_cache);
     try std.testing.expectError(error.ImageIdentityMismatch, unpack(init, allocator, .{
         .archive_path = archive_path,
@@ -877,7 +875,7 @@ test "native image archive round-trips into a clean cache and rejects substituti
         .ref = "local/archive:wrong-identity",
         .platform = .{ .os = "linux", .arch = .arm64 },
     }));
-    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, identity_rejected_cache ++ "/refs", .{}));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try tmp_dir.path("identity-rejected-cache/refs"), .{}));
 
     try std.testing.expectError(error.BadProtocol, unpack(init, allocator, .{
         .archive_path = archive_path,

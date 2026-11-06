@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const Io = std.Io;
 
 const build_context = @import("context.zig");
@@ -785,11 +786,11 @@ test "RUN context bind cache input follows content and mode but ignores mtime" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const tmp = "zig-cache/test-build-run-context-bind-cache";
-    const context_root = tmp ++ "/context";
-    const cache_root = tmp ++ "/cache";
-    const source_path = context_root ++ "/input";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const context_root = try tmp_dir.path("context");
+    const cache_root = try tmp_dir.path("cache");
+    const source_path = try tmp_dir.path("context/input");
     try Io.Dir.cwd().createDirPath(io, context_root);
     try Io.Dir.cwd().createDirPath(io, cache_root);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "alpha\n" });
@@ -906,14 +907,15 @@ test "COPY parents synthetic tree captures parent directory modes without mtimes
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-copy-parents-metadata";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/secret");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/selected");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/secret/value", .data = "secret\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/selected/value", .data = "selected\n" });
-    const secret_z = try arena.dupeZ(u8, root ++ "/secret");
-    const selected_z = try arena.dupeZ(u8, root ++ "/selected");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("secret"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("selected"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("secret/value"), .data = "secret\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("selected/value"), .data = "selected\n" });
+    const secret_z = try arena.dupeZ(u8, try root_dir.path("secret"));
+    const selected_z = try arena.dupeZ(u8, try root_dir.path("selected"));
     if (std.c.chmod(secret_z.ptr, 0o700) != 0 or std.c.chmod(selected_z.ptr, 0o710) != 0) return error.TestUnexpectedResult;
 
     var ignore_diagnostic: build_context.IgnoreDiagnostic = .{};
@@ -1107,16 +1109,16 @@ test "cache walk advances the parent and reports only the miss suffix" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-instruction-transition";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/base.ext4", .data = "base" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/first.ext4", .data = "first" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/second.ext4", .data = "second" });
-    const base = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, tmp ++ "/base.ext4", rootfs_cas.default_chunk_size));
-    const first = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, tmp ++ "/first.ext4", rootfs_cas.default_chunk_size));
-    const second = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, tmp ++ "/second.ext4", rootfs_cas.default_chunk_size));
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
+    const cache_root = try tmp_dir.path("cache");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("base.ext4"), .data = "base" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("first.ext4"), .data = "first" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("second.ext4"), .data = "second" });
+    const base = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, try tmp_dir.path("base.ext4"), rootfs_cas.default_chunk_size));
+    const first = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, try tmp_dir.path("first.ext4"), rootfs_cas.default_chunk_size));
+    const second = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, try tmp_dir.path("second.ext4"), rootfs_cas.default_chunk_size));
     const executor_identity = "blake3:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const resources = build_exec.RunResources{};
     const transitions = [_]InstructionTransition{
@@ -1181,8 +1183,9 @@ test "context COPY planning reserves the longest generated source prefix" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-build-copy-prefix-preflight";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
     const first = try arena.alloc(u8, 250);
     const second = try arena.alloc(u8, 250);
     @memset(first, 'a');

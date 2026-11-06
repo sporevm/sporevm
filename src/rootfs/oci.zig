@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const architecture = @import("../architecture.zig");
 const image = @import("../image.zig");
 
@@ -371,8 +372,9 @@ test "manifest digest allocation returns sha256 digest ref" {
 
 test "file digest verification validates digest before slicing" {
     const io = std.testing.io;
-    const path = "zig-cache/test-rootfs-oci-digest-file";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try tmp_dir.path("digest-file");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "data" });
     try std.testing.expectError(error.UnsupportedDigest, verifyDigestFile(io, "sha256:short", path));
 }

@@ -10,6 +10,7 @@
 //! removes the partial destination.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const fuzz_support = @import("fuzz_support.zig");
 
@@ -374,11 +375,10 @@ test "copy archive extraction writes children under read-only directories" {
     try w.writeAll("readonly");
     try writeRecordHeader(&w, .end, "", 0, 0);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     const allocator = std.testing.allocator;
-    const out = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "out" });
-    defer allocator.free(out);
+    const out = try tmp.path("out");
     var in: Io.Reader = .fixed(w.buffered());
     try extract(allocator, std.testing.io, &in, out);
 
@@ -397,12 +397,11 @@ test "copy archive extraction applies the process umask to guest modes" {
     try writeRecordHeader(&w, .directory, "dir", 0o777, 0);
     try writeRecordHeader(&w, .end, "", 0, 0);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const out = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "out" });
-    defer allocator.free(out);
+    const out = try tmp.path("out");
     const old_umask = std.c.umask(0o027);
     defer _ = std.c.umask(old_umask);
     var in: Io.Reader = .fixed(w.buffered());

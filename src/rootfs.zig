@@ -5,6 +5,7 @@
 //! so layer application is strict and fail-closed.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const ext4 = @import("rootfs/ext4.zig");
@@ -1637,11 +1638,11 @@ test "cas preload can attach manifest-bound rootfs storage to a spore" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-attach-spore";
-    const spore_dir = tmp ++ "/spore";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const spore_dir = try tmp_dir.path("spore");
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, spore_dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = ("abcd" ** 1024) ++ ("efgh" ** 1024) });
 
@@ -1675,11 +1676,11 @@ test "cas preload attach rejects unexpected disk base" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-attach-spore-bad-disk-base";
-    const spore_dir = tmp ++ "/spore";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const spore_dir = try tmp_dir.path("spore");
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, spore_dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
@@ -1811,11 +1812,10 @@ test "resolved image refs render selected digest" {
 
 test "metadata path rejects symlink alias of existing output" {
     const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-metadata-symlink";
-    const output = tmp ++ "/rootfs.ext4";
-    const metadata = tmp ++ "/metadata.json";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const output = try tmp_dir.path("rootfs.ext4");
+    const metadata = try tmp_dir.path("metadata.json");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = "image" });
     try Io.Dir.cwd().symLink(io, "rootfs.ext4", metadata, .{});
 

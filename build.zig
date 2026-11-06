@@ -155,11 +155,6 @@ pub fn build(b: *std.Build) void {
     x86_64_tests.root_module.link_libc = true;
     const run_x86_64_tests = b.addRunArtifact(x86_64_tests);
 
-    // ponytail: test artifacts share fixed zig-cache paths; serialize until tests use per-process temp dirs.
-    run_durable_crash_tests_suite.step.dependOn(&run_internal_tests.step);
-    run_exe_tests.step.dependOn(&run_durable_crash_tests_suite.step);
-    run_x86_64_tests.step.dependOn(&run_exe_tests.step);
-
     const test_step = b.step("test", "Run unit tests");
     const minimal_exec_initrd_tests = b.addSystemCommand(&.{"bash"});
     minimal_exec_initrd_tests.addFileArg(b.path("scripts/kernel/test-minimal-exec-initrd.sh"));

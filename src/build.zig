@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 
@@ -2794,14 +2795,13 @@ test "cache records reuse custom id and sharing edits but miss default shared to
     const relative_shared = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=cache printf relative >/dev/null\n", "/work");
     const relative_locked = try Helper.run(arena, "FROM scratch\nRUN --mount=type=cache,target=cache,sharing=locked printf relative >/dev/null\n", "/work");
 
-    const tmp = "zig-cache/test-cache-id-result-record";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/base.ext4", .data = "base" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/child.ext4", .data = "child" });
-    const base = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, tmp ++ "/base.ext4", rootfs_cas.default_chunk_size));
-    const child = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, tmp ++ "/child.ext4", rootfs_cas.default_chunk_size));
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cache_root = try tmp_dir.path("cache");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("base.ext4"), .data = "base" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("child.ext4"), .data = "child" });
+    const base = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, try tmp_dir.path("base.ext4"), rootfs_cas.default_chunk_size));
+    const child = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, try rootfs_cas.preloadPath(io, arena, cache_root, try tmp_dir.path("child.ext4"), rootfs_cas.default_chunk_size));
     const resources = runResources(.{ .tag = "local/test:dev", .context_dir = "unused", .dockerfile_path = "unused" });
 
     const custom_input = build_exec.cacheInputForStep(.{}, base.index_digest, test_executor_identity, .{ .run = custom_a }, resources);
@@ -3139,10 +3139,10 @@ test "COPY file source can target non-slash file destination" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-spore-build-copy-file-dest";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/source.txt", .data = "file\n" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("source.txt"), .data = "file\n" });
 
     var ctx_diag: build_context.IgnoreDiagnostic = .{};
     const ctx = try build_context.load(arena, io, root, &ctx_diag);
@@ -3180,11 +3180,11 @@ test "COPY multiple sources require trailing slash destination" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-spore-build-copy-multi-dest";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/a.txt", .data = "a" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/b.txt", .data = "b" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("a.txt"), .data = "a" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("b.txt"), .data = "b" });
 
     var ctx_diag: build_context.IgnoreDiagnostic = .{};
     const ctx = try build_context.load(arena, io, root, &ctx_diag);
@@ -3215,15 +3215,16 @@ test "COPY parents reconstructs ordered file directory and glob roots under WORK
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-spore-build-copy-parents";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/lib");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/app/helpers");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/public");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/lib/x.rb", .data = "ruby\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/app/helpers/value.rb", .data = "helper\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/public/z.html", .data = "z\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/public/a.html", .data = "a\n" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("lib"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("app/helpers"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("public"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("lib/x.rb"), .data = "ruby\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("app/helpers/value.rb"), .data = "helper\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("public/z.html"), .data = "z\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("public/a.html"), .data = "a\n" });
 
     var ctx_diag: build_context.IgnoreDiagnostic = .{};
     const ctx = try build_context.load(arena, io, root, &ctx_diag);
@@ -3283,10 +3284,11 @@ test "COPY parents rejects an internal source pivot during planning" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-spore-build-copy-parents-pivot";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/src");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/payload", .data = "value\n" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("src"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("src/payload"), .data = "value\n" });
     var ignore_diag: build_context.IgnoreDiagnostic = .{};
     const ctx = try build_context.load(arena, io, root, &ignore_diag);
     var context_hash: build_context.HashDiagnostic = .{};
@@ -3344,9 +3346,10 @@ test "COPY directory source preserves empty subdirectory entry" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-spore-build-copy-empty-dir";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/src/empty");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("src/empty"));
 
     var ctx_diag: build_context.IgnoreDiagnostic = .{};
     const ctx = try build_context.load(arena, io, root, &ctx_diag);
@@ -3387,14 +3390,14 @@ test "fully cached build publishes final indexed image" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-cached";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/cache";
-    const dockerfile_path = context_dir ++ "/Dockerfile";
-    const base_rootfs = tmp ++ "/base.ext4";
-    const kernel_path = tmp ++ "/Image";
-    const initrd_path = tmp ++ "/root.cpio";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const context_dir = try tmp_dir.path("context");
+    const cache_dir = try tmp_dir.path("cache");
+    const dockerfile_path = try tmp_dir.path("context/Dockerfile");
+    const base_rootfs = try tmp_dir.path("base.ext4");
+    const kernel_path = try tmp_dir.path("Image");
+    const initrd_path = try tmp_dir.path("root.cpio");
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_rootfs, .data = "base rootfs bytes" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = kernel_path, .data = "test kernel bytes" });
@@ -3510,17 +3513,17 @@ test "metadata-only builds with different CMD publish distinct image identities"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-config-identity";
-    const true_context = tmp ++ "/true-context";
-    const false_context = tmp ++ "/false-context";
-    const cache_dir = tmp ++ "/cache";
-    const base_rootfs = tmp ++ "/base.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const true_context = try tmp_dir.path("true-context");
+    const false_context = try tmp_dir.path("false-context");
+    const cache_dir = try tmp_dir.path("cache");
+    const base_rootfs = try tmp_dir.path("base.ext4");
     try Io.Dir.cwd().createDirPath(io, true_context);
     try Io.Dir.cwd().createDirPath(io, false_context);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_rootfs, .data = "same rootfs bytes" });
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = true_context ++ "/Dockerfile",
+        .sub_path = try tmp_dir.path("true-context/Dockerfile"),
         .data =
         \\FROM local/base:dev
         \\CMD ["/bin/true"]
@@ -3528,7 +3531,7 @@ test "metadata-only builds with different CMD publish distinct image identities"
         ,
     });
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = false_context ++ "/Dockerfile",
+        .sub_path = try tmp_dir.path("false-context/Dockerfile"),
         .data =
         \\FROM local/base:dev
         \\CMD ["/bin/false"]
@@ -3555,14 +3558,14 @@ test "metadata-only builds with different CMD publish distinct image identities"
     const true_result = try build(init, arena, .{
         .tag = "local/app:true",
         .context_dir = true_context,
-        .dockerfile_path = true_context ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("true-context/Dockerfile"),
         .platform = .{},
         .diagnostic = &diagnostic,
     });
     const false_result = try build(init, arena, .{
         .tag = "local/app:false",
         .context_dir = false_context,
-        .dockerfile_path = false_context ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("false-context/Dockerfile"),
         .platform = .{},
         .diagnostic = &diagnostic,
     });
@@ -3589,15 +3592,15 @@ test "multi-stage target inherits config and prunes unreachable bases" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-multistage-target";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/cache";
-    const base_rootfs = tmp ++ "/base.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const context_dir = try tmp_dir.path("context");
+    const cache_dir = try tmp_dir.path("cache");
+    const base_rootfs = try tmp_dir.path("base.ext4");
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = base_rootfs, .data = "base rootfs bytes" });
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = context_dir ++ "/Dockerfile",
+        .sub_path = try tmp_dir.path("context/Dockerfile"),
         .data =
         \\ARG BASE=local/base:dev
         \\FROM --platform=$BUILDPLATFORM ${BASE} AS build
@@ -3637,7 +3640,7 @@ test "multi-stage target inherits config and prunes unreachable bases" {
         .tag = "local/app:runtime",
         .target = "runtime",
         .context_dir = context_dir,
-        .dockerfile_path = context_dir ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("context/Dockerfile"),
         .diagnostic = &diagnostic,
     });
     try std.testing.expectEqualStrings(storage.index_digest, result.index_digest);
@@ -3663,10 +3666,9 @@ test "unsupported reachable platform fails before context or base resolution" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-platform-order";
-    const dockerfile_path = tmp ++ "/Dockerfile";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const dockerfile_path = try tmp_dir.path("Dockerfile");
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = dockerfile_path,
         .data = "FROM --platform=linux/amd64 example.invalid/does-not-exist:latest\n",
@@ -3678,7 +3680,7 @@ test "unsupported reachable platform fails before context or base resolution" {
     var diagnostic: Diagnostic = .{};
     try std.testing.expectError(error.DockerfilePlanFailed, build(init, arena, .{
         .tag = "local/app:invalid-platform",
-        .context_dir = tmp ++ "/missing-context",
+        .context_dir = try tmp_dir.path("missing-context"),
         .dockerfile_path = dockerfile_path,
         .diagnostic = &diagnostic,
     }));
@@ -3692,22 +3694,23 @@ test "an insecure runtime directory fails the build before it resolves a base" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-insecure-runtime";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp ++ "/runtime");
-    if (std.c.chmod(tmp ++ "/runtime", 0o755) != 0) return error.IoFailed;
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp ++ "/Dockerfile", .data = "FROM local/missing:base\nRUN true\n" });
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try tmp_dir.path("runtime"));
+    if (std.c.chmod(try tmp_dir.path("runtime"), 0o755) != 0) return error.IoFailed;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("Dockerfile"), .data = "FROM local/missing:base\nRUN true\n" });
     const cwd = try std.process.currentPathAlloc(io, arena);
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, tmp ++ "/cache");
+    try env.put(local_paths.rootfs_cache_env, try tmp_dir.path("cache"));
     try env.put(local_paths.runtime_dir_env, try std.fs.path.resolve(arena, &.{ cwd, tmp, "runtime" }));
     const init = testInit(allocator, io, &arena_state, &env);
     try std.testing.expectError(error.InsecureRuntimeDir, build(init, arena, .{
         .tag = "local/app:insecure-runtime",
         .context_dir = tmp,
-        .dockerfile_path = tmp ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("Dockerfile"),
     }));
 }
 
@@ -3737,13 +3740,14 @@ test "a stage with three distinct COPY inputs fails before boot with the third i
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-input-limit";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
+    const context_dir = try tmp_dir.path("context");
+    const cache_dir = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = context_dir ++ "/Dockerfile",
+        .sub_path = try tmp_dir.path("context/Dockerfile"),
         .data =
         \\FROM local/input-one:dev AS one
         \\FROM local/input-two:dev AS two
@@ -3778,7 +3782,7 @@ test "a stage with three distinct COPY inputs fails before boot with the third i
     try std.testing.expectError(error.TooManyBuildInputDisks, build(init, arena, .{
         .tag = "local/app:input-limit",
         .context_dir = context_dir,
-        .dockerfile_path = context_dir ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("context/Dockerfile"),
         .diagnostic = &diagnostic,
     }));
     try std.testing.expectEqual(@as(usize, 7), diagnostic.instruction_line);
@@ -3795,11 +3799,11 @@ test "literal COPY --from source restrictions fail before boot" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-copy-from-literals";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/cache";
-    const source_rootfs = tmp ++ "/source.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const context_dir = try tmp_dir.path("context");
+    const cache_dir = try tmp_dir.path("cache");
+    const source_rootfs = try tmp_dir.path("source.ext4");
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_rootfs, .data = "source rootfs" });
 
@@ -3827,13 +3831,13 @@ test "literal COPY --from source restrictions fail before boot" {
             "FROM local/source:dev AS source\nFROM scratch\nCOPY --from=source {s} /dest\n",
             .{case.source},
         );
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_dir ++ "/Dockerfile", .data = dockerfile_source });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("context/Dockerfile"), .data = dockerfile_source });
         var diagnostic: Diagnostic = .{};
         const tag = try std.fmt.allocPrint(arena, "local/app:literal-{d}", .{index});
         try std.testing.expectError(case.expected, build(init, arena, .{
             .tag = tag,
             .context_dir = context_dir,
-            .dockerfile_path = context_dir ++ "/Dockerfile",
+            .dockerfile_path = try tmp_dir.path("context/Dockerfile"),
             .diagnostic = &diagnostic,
         }));
         try std.testing.expectEqual(@as(usize, 3), diagnostic.instruction_line);
@@ -3848,14 +3852,14 @@ test "an invalid later stage fails before an earlier stage boots or publishes a 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-spore-build-later-stage-invalid";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, context_dir ++ "/src");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_dir ++ "/src/payload", .data = "payload\n" });
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const context_dir = try tmp_dir.path("context");
+    const cache_dir = try tmp_dir.path("cache");
+    try Io.Dir.cwd().createDirPath(io, try tmp_dir.path("context/src"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("context/src/payload"), .data = "payload\n" });
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = context_dir ++ "/Dockerfile",
+        .sub_path = try tmp_dir.path("context/Dockerfile"),
         .data =
         \\FROM scratch AS build
         \\RUN printf built >/built
@@ -3873,7 +3877,7 @@ test "an invalid later stage fails before an earlier stage boots or publishes a 
     try std.testing.expectError(error.CopyParentsPivotUnsupported, build(init, arena, .{
         .tag = "local/app:later-stage-invalid",
         .context_dir = context_dir,
-        .dockerfile_path = context_dir ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("context/Dockerfile"),
         // The only fresh-VM shape x86 accepts; arm64 accepts it too.
         .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
         .vcpus = 1,
@@ -3884,7 +3888,7 @@ test "an invalid later stage fails before an earlier stage boots or publishes a 
     try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.boot_count);
     try std.testing.expectEqual(@as(u64, 0), diagnostic.scratch.created);
     // Neither the scratch base nor the first stage's RUN wrote a step record.
-    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, cache_dir ++ "/build/steps", .{}));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, try tmp_dir.path("cache/build/steps"), .{}));
 }
 
 test "scratch stage publishes an empty native rootfs without guest execution" {
@@ -3894,13 +3898,13 @@ test "scratch stage publishes an empty native rootfs without guest execution" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const tmp = "zig-cache/test-spore-build-scratch";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const context_dir = try tmp_dir.path("context");
+    const cache_dir = try tmp_dir.path("cache");
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = context_dir ++ "/Dockerfile",
+        .sub_path = try tmp_dir.path("context/Dockerfile"),
         .data = "FROM scratch\nENTRYPOINT [\"/app\"]\n",
     });
     var env = std.process.Environ.Map.init(allocator);
@@ -3911,7 +3915,7 @@ test "scratch stage publishes an empty native rootfs without guest execution" {
     const result = try build(init, arena, .{
         .tag = "local/app:scratch",
         .context_dir = context_dir,
-        .dockerfile_path = context_dir ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("context/Dockerfile"),
         .diagnostic = &diagnostic,
     });
     try std.testing.expectEqual(@as(usize, 0), diagnostic.executor.boot_count);
@@ -3946,7 +3950,7 @@ test "scratch stage publishes an empty native rootfs without guest execution" {
     const warm = try build(init, arena, .{
         .tag = "local/app:scratch",
         .context_dir = context_dir,
-        .dockerfile_path = context_dir ++ "/Dockerfile",
+        .dockerfile_path = try tmp_dir.path("context/Dockerfile"),
         .diagnostic = &warm_diagnostic,
     });
     try std.testing.expectEqualStrings(result.index_digest, warm.index_digest);
@@ -3964,14 +3968,15 @@ test "GC while a build is unlocked keeps the storage the build later publishes" 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const tmp = "zig-cache/test-spore-build-scratch-gc";
-    const context_dir = tmp ++ "/context";
-    const cache_dir = tmp ++ "/cache";
-    const runtime_dir = tmp ++ "/runtime";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const context_dir = try tmp_dir.path("context");
+    const dockerfile_path = try tmp_dir.path("context/Dockerfile");
+    const cache_dir = try tmp_dir.path("cache");
+    const runtime_dir = try tmp_dir.path("runtime");
     try Io.Dir.cwd().createDirPath(io, context_dir);
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = context_dir ++ "/Dockerfile",
+        .sub_path = dockerfile_path,
         .data = "FROM scratch\nENTRYPOINT [\"/app\"]\n",
     });
     var env = std.process.Environ.Map.init(allocator);
@@ -3986,6 +3991,7 @@ test "GC while a build is unlocked keeps the storage the build later publishes" 
         io: Io,
         env: *const std.process.Environ.Map,
         context_dir: []const u8,
+        dockerfile_path: []const u8,
         arena: *std.heap.ArenaAllocator,
         result: ?Result = null,
         err: ?anyerror = null,
@@ -3996,7 +4002,7 @@ test "GC while a build is unlocked keeps the storage the build later publishes" 
             self.result = build(init, self.arena.allocator(), .{
                 .tag = "local/app:scratch-gc",
                 .context_dir = self.context_dir,
-                .dockerfile_path = "zig-cache/test-spore-build-scratch-gc/context/Dockerfile",
+                .dockerfile_path = self.dockerfile_path,
             }) catch |err| {
                 self.err = err;
                 return;
@@ -4013,6 +4019,7 @@ test "GC while a build is unlocked keeps the storage the build later publishes" 
         .io = io,
         .env = &env,
         .context_dir = context_dir,
+        .dockerfile_path = dockerfile_path,
         .arena = &build_arena_state,
     };
     var build_thread = test_barrier.ThreadGuard{
@@ -4029,7 +4036,7 @@ test "GC while a build is unlocked keeps the storage the build later publishes" 
 
     // Drop the step record so only the build's lease roots its scratch
     // storage, then let prune and GC take everything else.
-    try Io.Dir.cwd().deleteTree(io, cache_dir ++ "/build/steps");
+    try Io.Dir.cwd().deleteTree(io, try tmp_dir.path("cache/build/steps"));
     const pruned = try system_mod.prune(allocator, io, .{
         .cache_root = cache_dir,
         .runtime_root = absolute_runtime_dir,

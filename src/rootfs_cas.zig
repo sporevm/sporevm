@@ -4,6 +4,7 @@
 //! `rootfs.storage`.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
@@ -1028,11 +1029,10 @@ test "materialize assembles the flat artifact from verified chunks" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-materialize";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     const bytes = "abcd" ++ ("\x00" ** 4096) ++ "efgh";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1069,11 +1069,10 @@ test "materialize reproduces exact bytes across chunk boundaries and zero chunks
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-materialize-model";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
 
     var model: [3 * spore.disk_chunk_size + 73]u8 = undefined;
     for (model[0..spore.disk_chunk_size], 0..) |*byte, i| byte.* = @truncate((i * 17) + 3);
@@ -1108,11 +1107,10 @@ test "materialize fails closed on corrupt chunk objects without publishing" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-materialize-corrupt";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "abcd" });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     const preload_result = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
@@ -1146,12 +1144,11 @@ test "materialize fails closed when assembled bytes mismatch the artifact digest
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-materialize-mismatch";
-    const a_path = tmp ++ "/a.ext4";
-    const b_path = tmp ++ "/b.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const a_path = try tmp_dir.path("a.ext4");
+    const b_path = try tmp_dir.path("b.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = a_path, .data = "aaaa" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = b_path, .data = "bbbb" });
 
@@ -1180,11 +1177,10 @@ test "preload repairs corrupt existing chunk objects" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cas-repair";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "abcd" });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
     _ = try preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);

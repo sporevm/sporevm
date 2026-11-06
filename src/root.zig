@@ -48,6 +48,7 @@ pub const platform = @import("platform.zig");
 pub const ram_restore = @import("ram_restore.zig");
 const dirty_ram = @import("dirty_ram.zig");
 const fuzz_support = @import("fuzz_support.zig");
+const test_dir = @import("test_dir.zig");
 pub const hvf = @import("hvf/hvf.zig");
 pub const attach_stream = @import("attach_stream.zig");
 pub const attach_cli = @import("attach_cli.zig");
@@ -115,6 +116,7 @@ test {
     testing.refAllDecls(fd);
     testing.refAllDecls(fanout);
     testing.refAllDecls(fuzz_support);
+    testing.refAllDecls(test_dir);
     testing.refAllDecls(generation);
     testing.refAllDecls(gicv3);
     testing.refAllDecls(host_fetch_policy);

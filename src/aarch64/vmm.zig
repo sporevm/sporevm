@@ -7,6 +7,7 @@
 //! below.
 
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const aarch64_topology = @import("topology.zig");
 const board = @import("board.zig");
 const capture = @import("../capture.zig");
@@ -1683,9 +1684,9 @@ test "prepare resolves vCPUs and RAM from a multi-vCPU restore manifest" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = tmp.root;
 
     var vcpu_states: [2]spore.VcpuState = undefined;
     var redistributors: [2]gicv3.RedistributorState = undefined;
@@ -1874,9 +1875,9 @@ test "dirty tracker marks host writes inside guest RAM and seals them at finish"
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = tmp.root;
     const ram = try arena.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 2 * spore.chunk_size);
     @memset(ram, 0);
 
@@ -2085,10 +2086,9 @@ const TestVcpu = struct {
 };
 
 test "snapshots refuse queued host vsock packets before writing anything" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = try tmp.path("spore");
 
     const config = testBoot(.{});
     var vsock_dev = vsock.Vsock.init(.{});

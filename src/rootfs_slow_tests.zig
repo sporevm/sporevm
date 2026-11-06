@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 
 const ext4 = @import("rootfs/ext4.zig");
 const ext4_writer = @import("rootfs/ext4_writer.zig");
@@ -24,10 +25,10 @@ const debugfs_candidates = [_][]const u8{
 test "native ext4 writer emits deterministic fsck-clean image" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const path_a = "zig-cache/test-native-ext4-a.img";
-    const path_b = "zig-cache/test-native-ext4-b.img";
-    defer Io.Dir.cwd().deleteFile(io, path_a) catch {};
-    defer Io.Dir.cwd().deleteFile(io, path_b) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path_a = try tmp_dir.path("a.img");
+    const path_b = try tmp_dir.path("b.img");
 
     var cap = [_]u8{ 1, 0, 0, 2 } ++ [_]u8{0} ** 16;
     const attrs = [_]xattrs_mod.Attribute{.{ .name = xattrs_mod.security_capability_name, .value = &cap }};
@@ -58,8 +59,9 @@ test "native ext4 writer emits deterministic fsck-clean image" {
 test "native ext4 writer emits fsck-clean multi-group image" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const path = "zig-cache/test-native-ext4-multigroup.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try tmp_dir.path("multigroup.img");
 
     const entries = [_]ext4_writer.Entry{
         .{ .path = "etc/hostname", .kind = .{ .file = "sporevm\n" }, .mode = 0o644 },
@@ -76,8 +78,9 @@ test "native ext4 writer emits fsck-clean multi-group image" {
 test "native ext4 writer emits fsck-clean symlinks at the fast/slow boundary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const path = "zig-cache/test-native-ext4-symlink-boundary.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try tmp_dir.path("symlink-boundary.img");
 
     const prefix = "/usr/share/ca-certificates/mozilla/";
     const target_59 = prefix ++ "a" ** (59 - prefix.len);
@@ -100,8 +103,9 @@ test "native ext4 writer emits fsck-clean symlinks at the fast/slow boundary" {
 test "native ext4 writer supports double indirect regular files" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const path = "zig-cache/test-native-ext4-double-indirect.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try tmp_dir.path("double-indirect.img");
 
     const data = try allocator.alloc(u8, 5 * 1024 * 1024);
     defer allocator.free(data);
@@ -121,9 +125,8 @@ test "native ext4 writer supports double indirect regular files" {
 test "native ext4 writer maps a file through triple-indirect blocks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-native-ext4-triple-indirect";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
     const debugfs = try findTool(allocator, io, &debugfs_candidates);
     defer allocator.free(debugfs);
 
@@ -140,7 +143,7 @@ test "native ext4 writer maps a file through triple-indirect blocks" {
     };
 
     // Only the marker blocks of the source occupy disk.
-    const source_path = try allocator.dupe(u8, tmp ++ "/source.bin");
+    const source_path = try allocator.dupe(u8, try tmp_dir.path("source.bin"));
     defer allocator.free(source_path);
     {
         var source = try Io.Dir.cwd().createFile(io, source_path, .{});
@@ -149,7 +152,7 @@ test "native ext4 writer maps a file through triple-indirect blocks" {
         for (markers) |marker| try source.writePositionalAll(io, marker.bytes, marker.block * block_size);
     }
 
-    const image_path = tmp ++ "/image.ext4";
+    const image_path = try tmp_dir.path("image.ext4");
     const entries = [_]ext4_writer.Entry{.{
         .path = "big.bin",
         .kind = .{ .file_source = .{ .file = .{ .path = source_path, .offset = 0, .size = size } } },
@@ -183,8 +186,9 @@ test "native ext4 writer maps a file through triple-indirect blocks" {
 test "native ext4 writer resolves hardlinks after sorted targets" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const path = "zig-cache/test-native-ext4-hardlink-order.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try tmp_dir.path("hardlink-order.img");
 
     const entries = [_]ext4_writer.Entry{
         .{ .path = "z-target", .kind = .{ .file = "shared\n" }, .mode = 0o644 },
@@ -201,11 +205,11 @@ test "native ext4 writer resolves hardlinks after sorted targets" {
 test "imported tar rootfs is a complete local image" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-native-import-tar";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
 
-    const layer_path = tmp ++ "/rootfs.tar";
+    const layer_path = try tmp_dir.path("rootfs.tar");
     try writeTestTar(allocator, io, layer_path, "etc/native-writer", "native\n");
 
     var env = std.process.Environ.Map.init(allocator);
@@ -235,9 +239,9 @@ test "imported tar rootfs is a complete local image" {
 test "native ext4 image from a representative tar passes e2fsck and reads back" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-native-differential";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
     const debugfs = try findTool(allocator, io, &debugfs_candidates);
     defer allocator.free(debugfs);
 
@@ -255,7 +259,7 @@ test "native ext4 image from a representative tar passes e2fsck and reads back" 
     const pax = try testPaxRecord(allocator, "SCHILY.xattr." ++ xattrs_mod.security_capability_name, &cap);
     defer allocator.free(pax);
 
-    const layer_path = tmp ++ "/rootfs.tar";
+    const layer_path = try tmp_dir.path("rootfs.tar");
     {
         var tar_bytes = std.ArrayList(u8).empty;
         defer tar_bytes.deinit(allocator);
@@ -354,9 +358,8 @@ test "native ext4 image from a representative tar passes e2fsck and reads back" 
 test "native ext4 writer trees match debugfs listings and contents" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-native-ext4-debugfs-trees";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
     const debugfs = try findTool(allocator, io, &debugfs_candidates);
     defer allocator.free(debugfs);
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -388,7 +391,7 @@ test "native ext4 writer trees match debugfs listings and contents" {
         .{ .path = "run/socket", .kind = .socket, .mode = 0o755 },
         .{ .path = "srv", .kind = .directory, .mode = 0o1777 },
     };
-    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/mixed", &mixed, 1024, min_native_image_size);
+    try expectDebugfsMatchesEntries(arena, io, debugfs, try tmp_dir.path("mixed"), &mixed, 1024, min_native_image_size);
 
     // A path 100 directories deep.
     var deep = std.ArrayList(ext4_writer.Entry).empty;
@@ -398,7 +401,7 @@ test "native ext4 writer trees match debugfs listings and contents" {
         try deep.append(arena, .{ .path = deep_path, .kind = .directory, .mode = 0o755 });
     }
     try deep.append(arena, .{ .path = try std.fmt.allocPrint(arena, "{s}/bottom", .{deep_path}), .kind = .{ .file = "deep\n" } });
-    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/deep", deep.items, 1024, min_native_image_size);
+    try expectDebugfsMatchesEntries(arena, io, debugfs, try tmp_dir.path("deep"), deep.items, 1024, min_native_image_size);
 
     // One directory whose entries need more blocks than the 12 direct
     // pointers reach.
@@ -408,12 +411,11 @@ test "native ext4 writer trees match debugfs listings and contents" {
         const path = try std.fmt.allocPrint(arena, "wide/{d:0>4}{s}", .{ index, "w" ** 196 });
         try wide.append(arena, .{ .path = path, .kind = .{ .file = path[path.len - 200 .. path.len - 196] } });
     }
-    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/wide", wide.items, 2048, min_native_image_size);
+    try expectDebugfsMatchesEntries(arena, io, debugfs, try tmp_dir.path("wide"), wide.items, 2048, min_native_image_size);
 
     // Source-backed files with holes: one past the direct and single
     // indirect blocks, and one slice at a tar-like payload offset.
-    try Io.Dir.cwd().createDirPath(io, tmp);
-    const source_path = try arena.dupe(u8, tmp ++ "/sparse-source.bin");
+    const source_path = try arena.dupe(u8, try tmp_dir.path("sparse-source.bin"));
     const source_size: u64 = 40 << 20;
     {
         var source = try Io.Dir.cwd().createFile(io, source_path, .{});
@@ -426,7 +428,7 @@ test "native ext4 writer trees match debugfs listings and contents" {
         .{ .path = "var/sparse.bin", .kind = .{ .file_source = .{ .file = .{ .path = source_path, .offset = 0, .size = source_size } } } },
         .{ .path = "var/slice.bin", .kind = .{ .file_source = .{ .file = .{ .path = source_path, .offset = 512, .size = 10_000 } } } },
     };
-    try expectDebugfsMatchesEntries(arena, io, debugfs, tmp ++ "/sparse", &sparse, 1024, 64 << 20);
+    try expectDebugfsMatchesEntries(arena, io, debugfs, try tmp_dir.path("sparse"), &sparse, 1024, 64 << 20);
 }
 
 /// Writes `entries` with the native ext4 writer and checks the image with
