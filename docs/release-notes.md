@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### x32 syscalls in build RUN
+
+On an x86_64 kernel built with x32 support (the managed kernel has none), a
+build RUN command could make x32 syscalls, which carry the x86_64 audit arch,
+to create vsock sockets and io_uring instances the RUN seccomp filter is meant
+to refuse. The filter now kills any x32 syscall.
+
 ### Commands in restored macOS spores
 
 Release builds on macOS restored every guest SIMD and floating-point register
