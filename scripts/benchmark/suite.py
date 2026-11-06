@@ -29,7 +29,7 @@ SUITE_VERSION = "1.6"
 DEFAULT_IMAGE = "docker.io/library/node:22-alpine"
 DEFAULT_COMMAND = "/usr/local/bin/node -v"
 DEFAULT_PLATFORM = "linux/arm64"
-DEFAULT_SYNTHETIC_ROOTFS_REF = "local/sporevm-benchmark-synthetic:nightly"
+DEFAULT_SYNTHETIC_ROOTFS_REF = "local/sporevm-benchmark-synthetic:bench"
 DEFAULT_SYNTHETIC_ROOTFS_FILE_COUNT = 16_384
 DEFAULT_SYNTHETIC_ROOTFS_FILE_SIZE = 256
 DEFAULT_SYNTHETIC_ROOTFS_DIR_COUNT = 4_096
@@ -152,7 +152,7 @@ PROFILES = {
         "writable_rootfs_workloads": ("sqlite", "package"),
         "timeout_s": 240,
     },
-    "nightly": {
+    "sequential": {
         "iterations": 5,
         "concurrency": 8,
         "stagger_delay_ms": 200,
@@ -1815,7 +1815,7 @@ def self_test() -> None:
         )
         assert writable_profile["rootfs_profile_native_ext4_emit_ms"] == 11
         assert writable_profile["rootfs_profile_native_ext4_emit_objects_written"] == 4
-        assert "writable_rootfs" in PROFILES["nightly"]["benchmarks"]
+        assert "writable_rootfs" in PROFILES["sequential"]["benchmarks"]
         fixture_a = Path(tmp) / "fixture-a.tar"
         fixture_b = Path(tmp) / "fixture-b.tar"
         fixture_kwargs = {
@@ -1903,7 +1903,7 @@ def self_test() -> None:
         assert result["success_count"] == 2
         assert result["samples"] == [214, 216]
         assert result["tti_ms"]["median"] == 215.0
-    print("self-test ok")
+    print("benchmark suite self-test ok")
 
 
 def apply_profile_defaults(args: argparse.Namespace) -> None:
