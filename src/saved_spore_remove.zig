@@ -37,14 +37,6 @@ pub fn remove(context: Context, allocator: std.mem.Allocator, raw_dir: []const u
     const dir = try resolveExistingSporeDir(allocator, context.io, raw_dir);
     errdefer allocator.free(dir);
     try requireManifest(context.io, allocator, dir);
-    const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
-    defer allocator.free(runtime_root);
-    // Restores publish saved-spore leases under this lock, so holding it
-    // through deletion keeps a lazy disk reader from adopting the directory.
-    var lease_lock = try runtime_disk_lease.lockRegistry(context.io, allocator, runtime_root);
-    defer lease_lock.deinit();
-    if (try runtime_disk_lease.savedSporeActiveLocked(context.io, allocator, runtime_root, dir, &lease_lock))
-        return error.SavedSporeInUse;
     try Io.Dir.cwd().deleteTree(context.io, dir);
     try chunk_sealer.fsyncDirPath(allocator, std.fs.path.dirname(dir) orelse ".");
     return .{ .spore_dir = dir };
@@ -115,7 +107,7 @@ const TestHost = struct {
 
     /// Saves a machine-local spore whose disk storage lives only in the cache.
     fn savePinned(self: *TestHost, dir: []const u8, seed: u8) !manifest_test_support.DiskFixture {
-        const fixture = try manifest_test_support.diskFixture(self.arena, self.io, self.cache_root, dir, seed, false);
+        const fixture = try manifest_test_support.diskFixture(self.arena, self.io, self.cache_root, dir, seed);
         var lock = try rootfs_mod.lockRootfsCacheExclusive(self.io, self.arena, self.cache_root);
         defer lock.deinit();
         const registry = try saved_spore_pin.LockedRegistry.init(self.arena, self.cache_root, &lock);
@@ -203,15 +195,13 @@ test "saved-spore removal deletes spore checkpoints without reading their storag
     // Saves with corrupt storage are exactly the ones users most need to
     // delete, so removal never reads the CAS.
     const corrupt = try host.path("corrupt.spore");
-    const fixture = try manifest_test_support.diskFixture(host.arena, io, host.cache_root, corrupt, 0x41, true);
-    try spore.saveManifest(host.arena, corrupt, fixture.manifest);
-    try Io.Dir.cwd().deleteFile(io, try rootfs_cas.manifestObjectPath(host.arena, corrupt, fixture.object_digest));
+    const fixture = try host.savePinned(corrupt, 0x41);
+    try Io.Dir.cwd().deleteFile(io, try rootfs_cas.manifestObjectPath(host.arena, host.cache_root, fixture.object_digest));
     try host.rm(corrupt);
     try std.testing.expect(!try exists(io, corrupt));
-    try std.testing.expect(try host.storageKept(fixture));
 }
 
-test "saved-spore removal refuses directories that are not spores and live saved-spore leases" {
+test "saved-spore removal refuses directories that are not spores" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -238,21 +228,13 @@ test "saved-spore removal refuses directories that are not spores and live saved
     try Io.Dir.cwd().createDirPath(io, linked_manifest);
     try Io.Dir.cwd().symLink(io, try host.path("elsewhere.json"), try std.fs.path.join(host.arena, &.{ linked_manifest, "manifest.json" }), .{});
     try std.testing.expectError(error.BadManifest, host.rm(linked_manifest));
-    const portable = try host.path("portable.spore");
-    const fixture = try manifest_test_support.diskFixture(host.arena, io, host.cache_root, portable, 0x43, true);
-    try spore.saveManifest(host.arena, portable, fixture.manifest);
+    const saved = try host.path("saved.spore");
+    _ = try host.savePinned(saved, 0x43);
     const linked_dir = try host.path("linked.spore");
-    try Io.Dir.cwd().symLink(io, portable, linked_dir, .{});
+    try Io.Dir.cwd().symLink(io, saved, linked_dir, .{});
     try std.testing.expectError(error.InvalidSporeDir, host.rm(linked_dir));
-    for ([_][]const u8{ plain, extension, damaged, linked_manifest }) |dir| try std.testing.expect(try exists(io, dir));
+    for ([_][]const u8{ plain, extension, damaged, linked_manifest, saved }) |dir| try std.testing.expect(try exists(io, dir));
     try std.testing.expect(try exists(io, try std.fs.path.join(host.arena, &.{ extension, ".git" })));
-
-    var active = try runtime_disk_lease.acquireActive(io, std.testing.allocator, host.runtime_root, try runtime_disk_lease.fromSavedDisk(portable, fixture.disk));
-    try std.testing.expectError(error.SavedSporeInUse, host.rm(portable));
-    try std.testing.expect(try exists(io, portable));
-    active.deinit();
-    try host.rm(portable);
-    try std.testing.expect(!try exists(io, portable));
 }
 
 test "cache gc releases storage only after every saved spore referencing it is gone" {
@@ -324,7 +306,6 @@ test "cache gc keeps a removed save's storage while a restore lease is live" {
     const saved = try host.path("restored.spore");
     const fixture = try host.savePinned(saved, 0x61);
     var active = try runtime_disk_lease.acquireActive(io, std.testing.allocator, host.runtime_root, .{
-        .store = .rootfs_cache,
         .root = host.cache_root,
         .baseline_kind = .disk_index,
         .baseline_identity = fixture.disk.base,

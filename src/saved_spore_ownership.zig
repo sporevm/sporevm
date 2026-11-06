@@ -3,7 +3,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const rootfs_cas = @import("rootfs_cas.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const spore = @import("spore.zig");
 
@@ -16,11 +15,8 @@ pub fn classify(allocator: std.mem.Allocator, spore_dir: []const u8, disk: ?spor
     if (pin_reference and disk == null) return error.BadManifest;
     if (try hasBatchRelativeChunks(allocator, spore_dir)) return batch_relative;
     if (pin_reference) return machine_local_pinned;
-    if (disk) |value| {
-        const storage = try saved_spore_pin.storageForDisk(value);
-        const index_path = try rootfs_cas.manifestIndexPath(allocator, spore_dir, storage.index_digest);
-        if (!try regularPathExists(allocator, index_path)) return error.BadManifest;
-    }
+    // A disk-backed save always records a machine-local pin.
+    if (disk != null) return error.BadManifest;
     return portable_self_contained;
 }
 

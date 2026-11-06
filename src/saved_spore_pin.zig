@@ -246,22 +246,6 @@ pub fn storageForDisk(disk: spore.Disk) !spore.RootfsStorage {
     return storage;
 }
 
-/// Returns whether the saved spore carries its authoritative disk index
-/// locally. Portable/local-CAS spores remain self-contained even if a copied
-/// or stale host-private pin reference is present.
-pub fn hasLocalIndex(io: Io, allocator: std.mem.Allocator, spore_dir: []const u8, disk: spore.Disk) !bool {
-    const storage = try storageForDisk(disk);
-    const index_path = try rootfs_cas.manifestIndexPath(allocator, spore_dir, storage.index_digest);
-    defer allocator.free(index_path);
-    if (Io.Dir.cwd().statFile(io, index_path, .{ .follow_symlinks = false })) |stat| {
-        if (stat.kind != .file) return error.BadManifest;
-        return true;
-    } else |err| switch (err) {
-        error.FileNotFound => return false,
-        else => |e| return e,
-    }
-}
-
 /// Refuse a machine-local save before guest execution when its reference
 /// cannot be hard-linked to the cache-side owner anchor. It compares only
 /// devices, so it follows symlinks, such as macOS's /tmp.

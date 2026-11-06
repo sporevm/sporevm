@@ -45,8 +45,6 @@ const TestFault = struct {
     fail_before_child: ?usize = null,
     fail_before_registry_sync: bool = false,
     fail_before_batch_rename: bool = false,
-    fail_before_portable_sync: ?usize = null,
-    portable_sync_count: usize = 0,
     crash_after: CrashBoundary = .none,
 };
 
@@ -101,7 +99,7 @@ test "fork of a pinned save pins its children given relative paths" {
     const root = try test_dir.dir.realPathFileAlloc(io, ".", arena);
     const cache = try std.fs.path.join(arena, &.{ root, "cache" });
     const parent = try std.fs.path.join(arena, &.{ root, "parent.spore" });
-    const fixture = try manifest_test_support.diskFixture(arena, io, cache, parent, 0x72, false);
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache, parent, 0x72);
     {
         var lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
         defer lock.deinit();
@@ -136,7 +134,7 @@ test "a save pinned by an earlier build fails as too old after GC" {
     const cache = try std.fs.path.join(arena, &.{ root, "cache" });
     const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
     const save = try std.fs.path.join(arena, &.{ root, "save.spore" });
-    const fixture = try manifest_test_support.diskFixture(arena, io, cache, save, 0x5a, false);
+    const fixture = try manifest_test_support.diskFixture(arena, io, cache, save, 0x5a);
     try spore.saveManifest(arena, save, fixture.manifest);
     // An earlier build's pin: a v2 record and a v2 reference that is the
     // second link of its ownership anchor.
@@ -193,16 +191,15 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options_in: Optio
         var phase_one_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, cache_root);
         defer phase_one_lock.deinit();
         const phase_one_registry = try saved_spore_pin.LockedRegistry.init(arena, cache_root, &phase_one_lock);
-        if (saved_spore_pin.loadForSporeLocked(context.io, arena, phase_one_registry, options.parent_dir, value)) |pin_value| {
-            var pin = pin_value;
-            defer pin.deinit();
-            disk_root = cache_root;
-            parent_pin_id = try arena.dupe(u8, pin.value.id);
-            validated_storage = try saved_spore_pin.storageForDisk(value);
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => |e| return e,
-        }
+        // A disk-backed save always carries a pin in the rootfs cache.
+        var pin = saved_spore_pin.loadForSporeLocked(context.io, arena, phase_one_registry, options.parent_dir, value) catch |err| return switch (err) {
+            error.FileNotFound => error.BadManifest,
+            else => err,
+        };
+        defer pin.deinit();
+        disk_root = cache_root;
+        parent_pin_id = try arena.dupe(u8, pin.value.id);
+        validated_storage = try saved_spore_pin.storageForDisk(value);
     }
     var nonce: [8]u8 = undefined;
     context.io.random(&nonce);
@@ -214,10 +211,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options_in: Optio
         .out_dir = fork_out,
         .count = options.count,
         .environ_map = context.environ_map,
-        .disk_root = disk_root,
     });
     if (disk_root == null) {
-        if (disk) |portable_disk| try materializeForkDiskStore(context.io, arena, allocator, options.parent_dir, fork_out, portable_disk, options.count);
         if (comptime builtin.is_test) if (testing.fault.fail_before_batch_rename) return error.InjectedFailure;
         crashAfterBoundary(.before_batch_rename);
         try std.Io.Dir.rename(std.Io.Dir.cwd(), fork_out, std.Io.Dir.cwd(), options.out_dir, context.io);
@@ -240,7 +235,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options_in: Optio
     }
     var pin_publish_ms: ?u64 = null;
     var pin_lock_wait_ms: ?u64 = null;
-    if (disk != null and disk_root != null) {
+    if (disk_root != null) {
         const wait_started = runtime_disk_fork_capture.monotonicNs();
         var publish_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, arena, disk_root.?);
         defer publish_lock.deinit();
@@ -281,71 +276,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, options_in: Optio
         .pin_publish_ms = pin_publish_ms,
         .pin_lock_wait_ms = pin_lock_wait_ms,
     };
-}
-
-fn materializeForkDiskStore(
-    io: std.Io,
-    path_allocator: std.mem.Allocator,
-    scratch_allocator: std.mem.Allocator,
-    parent_dir: []const u8,
-    batch_dir: []const u8,
-    disk: spore.Disk,
-    child_count: usize,
-) !void {
-    const storage = try saved_spore_pin.storageForDisk(disk);
-    const source_index = try rootfs_cas.manifestIndexPath(path_allocator, parent_dir, storage.index_digest);
-    const storage_index = try rootfs_cas.readStorageIndexPath(scratch_allocator, source_index, storage);
-    defer storage_index.deinit();
-    const index_bytes = storage_index.bytes;
-    const parsed = storage_index.parsed;
-
-    const shared_root = try std.fs.path.join(path_allocator, &.{ batch_dir, "shared-disk" });
-    const dest_index = try rootfs_cas.manifestIndexPath(path_allocator, shared_root, storage.index_digest);
-    try chunk_sealer.ensureDirPath(path_allocator, std.fs.path.dirname(dest_index).?);
-    try chunk_sealer.writeFileAtomicDurable(path_allocator, dest_index, index_bytes, 0o444);
-    const cas_root = try std.fs.path.join(path_allocator, &.{ shared_root, "cas" });
-    const rootfs_root = try std.fs.path.join(path_allocator, &.{ cas_root, "rootfs" });
-    const blake3_root = try std.fs.path.join(path_allocator, &.{ rootfs_root, "blake3" });
-    const objects_root = try std.fs.path.join(path_allocator, &.{ blake3_root, "objects" });
-    try chunk_sealer.ensureDirPath(path_allocator, objects_root);
-    var seen = std.AutoHashMap(chunk.ChunkId, void).init(path_allocator);
-    defer seen.deinit();
-    for (parsed.value.chunks) |entry| {
-        if ((try seen.getOrPut(entry.id)).found_existing) continue;
-        const digest = entry.id.toDigest();
-        const expected_size = try rootfs_cas.storageChunkLen(storage, entry.logical_chunk);
-        const source_object = try rootfs_cas.objectPath(path_allocator, parent_dir, entry.id);
-        const source_bytes = try rootfs_cas.readVerifiedChunkPath(scratch_allocator, source_object, &digest, expected_size);
-        defer scratch_allocator.free(source_bytes);
-        const dest_object = try rootfs_cas.objectPath(path_allocator, shared_root, entry.id);
-        const dest_parent = std.fs.path.dirname(dest_object) orelse return error.BadManifest;
-        try chunk_sealer.ensureDirPath(path_allocator, dest_parent);
-        if (comptime builtin.is_test) if (testing.fault.fail_before_portable_sync == testing.fault.portable_sync_count) return error.InjectedFailure;
-        switch (try chunk_sealer.publishTrustedFileIfMissing(path_allocator, source_object, dest_object, expected_size)) {
-            .copy_required => try chunk_sealer.writeFileAtomicDurable(path_allocator, dest_object, source_bytes, 0o444),
-            .linked, .reused_existing => try chunk_sealer.fsyncDirPath(path_allocator, dest_parent),
-        }
-        if (comptime builtin.is_test) testing.fault.portable_sync_count += 1;
-        const dest_bytes = try rootfs_cas.readVerifiedChunkPath(scratch_allocator, dest_object, &digest, expected_size);
-        scratch_allocator.free(dest_bytes);
-    }
-    // The shared CAS hierarchy is new in this hidden batch. Sync bottom-up so
-    // every newly created directory entry is durable before children can see
-    // the batch after its final rename.
-    const durable_parents = [_][]const u8{ objects_root, blake3_root, rootfs_root, cas_root, shared_root };
-    for (durable_parents) |path| {
-        if (comptime builtin.is_test) if (testing.fault.fail_before_portable_sync == testing.fault.portable_sync_count) return error.InjectedFailure;
-        try chunk_sealer.fsyncDirPath(path_allocator, path);
-        if (comptime builtin.is_test) testing.fault.portable_sync_count += 1;
-    }
-    for (0..child_count) |index| {
-        const child = try std.fmt.allocPrint(path_allocator, "{s}/{d:0>6}", .{ batch_dir, index });
-        const cas_link = try std.fs.path.join(path_allocator, &.{ child, "cas" });
-        try std.Io.Dir.cwd().deleteFile(io, cas_link);
-        try std.Io.Dir.cwd().symLink(io, "../shared-disk/cas", cas_link, .{});
-        try chunk_sealer.fsyncDirPath(path_allocator, child);
-    }
-    try chunk_sealer.fsyncDirPath(path_allocator, batch_dir);
 }
 
 test "pinned offline fork owns duplicate RAM chunks and independent child disk pins" {
@@ -441,31 +371,16 @@ test "pinned offline fork owns duplicate RAM chunks and independent child disk p
     try local_backing.writeLocalMemoryBackingProof(arena, &env, parent, memory, ram.len);
     const context = Context{ .io = io, .environ_map = &env };
 
-    // A portable/local-CAS fork stays hidden until every new CAS directory
-    // entry has been synced bottom-up. Failure at any boundary leaves no
-    // visible batch; the final rename is a separate injected boundary.
+    // A save that carries its own disk index and objects but no pin, as
+    // `spore clone` and `spore unpack` wrote, no longer forks.
     defer testing.fault = .{};
-    for (0..6) |sync_index| {
-        const failed_portable = try std.fmt.allocPrint(arena, "{s}/portable-sync-{d}", .{ root, sync_index });
-        testing.fault = .{ .fail_before_portable_sync = sync_index };
-        try std.testing.expectError(error.InjectedFailure, execute(context, allocator, .{
-            .parent_dir = parent,
-            .out_dir = failed_portable,
-            .count = 1,
-        }));
-        try std.testing.expectEqual(sync_index, testing.fault.portable_sync_count);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, failed_portable, .{ .follow_symlinks = false }));
-    }
-    const failed_portable_rename = try std.fs.path.join(arena, &.{ root, "portable-rename" });
-    testing.fault = .{ .fail_before_batch_rename = true };
-    try std.testing.expectError(error.InjectedFailure, execute(context, allocator, .{
+    const unpinned_children = try std.fs.path.join(arena, &.{ root, "unpinned-children" });
+    try std.testing.expectError(error.BadManifest, execute(context, allocator, .{
         .parent_dir = parent,
-        .out_dir = failed_portable_rename,
+        .out_dir = unpinned_children,
         .count = 1,
     }));
-    try std.testing.expectEqual(@as(usize, 6), testing.fault.portable_sync_count);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, failed_portable_rename, .{ .follow_symlinks = false }));
-    testing.fault = .{};
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, unpinned_children, .{ .follow_symlinks = false }));
 
     var parent_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, cache);
     defer parent_lock.deinit();

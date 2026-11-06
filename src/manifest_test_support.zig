@@ -192,16 +192,14 @@ pub const DiskFixture = struct {
 };
 
 /// Writes one descriptor-bound disk index and object into `cache_root`, then
-/// returns a minimal manifest that names them. Tests can ask for a local CAS
-/// copy to model a portable/unpacked saved spore without duplicating the
-/// canonical fixture shape in every lifecycle module.
+/// returns a minimal manifest that names them, so lifecycle modules share one
+/// canonical fixture shape.
 pub fn diskFixture(
     allocator: std.mem.Allocator,
     io: std.Io,
     cache_root: []const u8,
     spore_dir: []const u8,
     seed: u8,
-    include_local_cas: bool,
 ) !DiskFixture {
     try std.Io.Dir.cwd().createDirPath(io, spore_dir);
     const object_bytes = try allocator.alloc(u8, 512);
@@ -244,14 +242,6 @@ pub fn diskFixture(
     const cache_index = try rootfs_cas.manifestIndexPath(allocator, cache_root, encoded.digest);
     try chunk_sealer.ensureDirPath(allocator, std.fs.path.dirname(cache_index).?);
     try chunk_sealer.writeFileAtomicDurable(allocator, cache_index, encoded.bytes, 0o444);
-    if (include_local_cas) {
-        const local_object = try rootfs_cas.manifestObjectPath(allocator, spore_dir, object_digest);
-        try chunk_sealer.ensureDirPath(allocator, std.fs.path.dirname(local_object).?);
-        try chunk_sealer.writeFileAtomicDurable(allocator, local_object, object_bytes, 0o444);
-        const local_index = try rootfs_cas.manifestIndexPath(allocator, spore_dir, encoded.digest);
-        try chunk_sealer.ensureDirPath(allocator, std.fs.path.dirname(local_index).?);
-        try chunk_sealer.writeFileAtomicDurable(allocator, local_index, encoded.bytes, 0o444);
-    }
 
     var result_manifest = manifest(.{});
     const devices = try allocator.alloc(spore.TransportState, 2);

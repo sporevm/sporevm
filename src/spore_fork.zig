@@ -1,10 +1,9 @@
 //! Fork: mint child spores from one saved parent.
 //!
-//! Children share the parent's memory chunks (and disk CAS when unpinned)
-//! through links, keep the parent's machine state with the generation
-//! interrupt pending, and carry a fresh identity in the generation parameter
-//! page. A child keeps the local RAM backing only when the parent's proof
-//! validates (see local_backing.zig).
+//! Children share the parent's memory chunks through links, keep the
+//! parent's machine state with the generation interrupt pending, and carry a
+//! fresh identity in the generation parameter page. A child keeps the local
+//! RAM backing only when the parent's proof validates (see local_backing.zig).
 
 const std = @import("std");
 const board = @import("aarch64/board.zig");
@@ -16,9 +15,7 @@ const spore = @import("spore.zig");
 const Blake3 = std.crypto.hash.Blake3;
 
 const Error = spore.Error;
-const Disk = spore.Disk;
 const MemoryManifest = spore.MemoryManifest;
-const disk_kind_chunk_index = spore.disk_kind_chunk_index;
 const loadManifest = spore.loadManifest;
 const prepareForkChildBacking = local_backing.prepareForkChildBacking;
 const provenForkBacking = local_backing.provenForkBacking;
@@ -29,7 +26,6 @@ pub const ForkOptions = struct {
     out_dir: []const u8,
     count: usize,
     environ_map: ?*const std.process.Environ.Map = null,
-    disk_root: ?[]const u8 = null,
 };
 
 pub const ForkResult = struct {
@@ -56,7 +52,7 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
         .single => |*machine| machine.gic = try forkGicState(allocator, machine.gic),
         .multi => |*machine| machine.gic = try forkGicState(allocator, machine.gic),
     }
-    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory, parent.disk, options.disk_root);
+    const shared = try prepareForkSharedStores(allocator, options.parent_dir, options.out_dir, parent.memory);
     const ram_size = parent.memory.logical_size;
     const shared_backing = try provenForkBacking(allocator, options.environ_map, options.parent_dir, parent.memory, ram_size);
     defer if (shared_backing) |backing| backing.deinit();
@@ -101,10 +97,9 @@ pub fn fork(allocator: std.mem.Allocator, options: ForkOptions) Error!ForkResult
 
 const ForkSharedStores = struct {
     chunks: []const u8,
-    disk_cas: ?[]const u8 = null,
 };
 
-fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8, out_dir: []const u8, memory: MemoryManifest, disk: ?Disk, disk_root: ?[]const u8) Error!ForkSharedStores {
+fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8, out_dir: []const u8, memory: MemoryManifest) Error!ForkSharedStores {
     const parent_chunks = try pathZ(allocator, "{s}/chunks", .{parent_dir});
     try ensureDir(try pathZ(allocator, "{s}", .{out_dir}));
     const shared_chunks_path = try pathZ(allocator, "{s}/shared-chunks", .{out_dir});
@@ -120,16 +115,9 @@ fn prepareForkSharedStores(allocator: std.mem.Allocator, parent_dir: []const u8,
     }
     try fsyncDirPath(shared_chunks_path);
     // Child links must survive the API's atomic rename of the hidden batch.
-    var stores = ForkSharedStores{ .chunks = "../shared-chunks" };
-    if (disk) |parent_disk| {
-        if (std.mem.eql(u8, parent_disk.kind, disk_kind_chunk_index)) {
-            // Pinned parents deliberately leave children without a local CAS
-            // symlink. The product API publishes an independent child pin
-            // bound to each rewritten child manifest before returning.
-            if (disk_root == null) stores.disk_cas = try realpathAlloc(allocator, try pathZ(allocator, "{s}/cas", .{parent_dir}));
-        }
-    }
-    return stores;
+    // A disk-backed child needs no link: the saved-spore fork publishes a pin
+    // for each child's disk in the rootfs cache.
+    return .{ .chunks = "../shared-chunks" };
 }
 
 fn fsyncDirPath(path: [:0]const u8) Error!void {
@@ -164,9 +152,6 @@ fn hardlinkOrCopyPath(source: [:0]const u8, dest: [:0]const u8) Error!void {
 
 fn linkForkSharedStores(allocator: std.mem.Allocator, child_dir: []const u8, stores: ForkSharedStores) Error!void {
     try symlinkPath(stores.chunks, try pathZ(allocator, "{s}/chunks", .{child_dir}));
-    if (stores.disk_cas) |cas| {
-        try symlinkPath(cas, try pathZ(allocator, "{s}/cas", .{child_dir}));
-    }
 }
 
 fn forkResult(allocator: std.mem.Allocator, options: ForkOptions, parent_generation: u64) Error!ForkResult {
@@ -403,13 +388,6 @@ fn pathZ(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) 
     return std.fmt.allocPrintSentinel(allocator, fmt, args, 0) catch error.OutOfMemory;
 }
 
-fn realpathAlloc(allocator: std.mem.Allocator, path: []const u8) Error![]const u8 {
-    const path_z = try pathZ(allocator, "{s}", .{path});
-    var buf: [std.c.PATH_MAX]u8 = undefined;
-    const resolved = std.c.realpath(path_z, &buf) orelse return error.IoFailed;
-    return allocator.dupe(u8, std.mem.span(resolved)) catch error.OutOfMemory;
-}
-
 fn symlinkPath(target: []const u8, link_path: []const u8) Error!void {
     const target_z = try std.heap.c_allocator.dupeSentinel(u8, target, 0);
     defer std.heap.c_allocator.free(target_z);
@@ -498,7 +476,6 @@ test "fork mints child manifests with shared chunks and pending generation" {
         .allow_cidrs = &.{"93.184.216.0/24"},
         .allow_hosts = &.{"example.com"},
     };
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, try pathZ(arena, "{s}/cas", .{parent_dir}));
     try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{ .parent_dir = parent_dir, .out_dir = out_dir, .count = 2, .environ_map = &env });
@@ -714,7 +691,6 @@ test "fork mints multi-vCPU child manifests with shared chunks and pending gener
     parent_manifest.rootfs = testRootfs(1);
     parent_manifest.disk = testDisk(1);
     parent_manifest.generation = .{ .generation = 51, .interrupt_status = 0, .params_b64 = "" };
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, try pathZ(arena, "{s}/cas", .{parent_dir}));
     try saveManifest(arena, parent_dir, parent_manifest);
 
     const result = try fork(arena, .{

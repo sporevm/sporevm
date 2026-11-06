@@ -15,7 +15,6 @@ const image = @import("image.zig");
 const image_store = @import("image_store.zig");
 const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
-const manifest_test_support = @import("manifest_test_support.zig");
 const rootfs_mod = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -30,11 +29,6 @@ const Io = std.Io;
 const rootfs_trace_env = "SPOREVM_ROOTFS_TRACE";
 const rootfs_trace_summary_only_env = "SPOREVM_ROOTFS_TRACE_SUMMARY_ONLY";
 const rootfs_eager_materialize_env = "SPOREVM_ROOTFS_EAGER_MATERIALIZE_FOR_BENCHMARK";
-
-const testing = if (builtin.is_test) struct {
-    var local_rootfs_object_reads: ?*usize = null;
-    var saved_spore_authority_barrier: ?*@import("test_barrier.zig").Barrier = null;
-} else struct {};
 
 pub const Options = struct {
     rootfs_path: ?[]const u8 = null,
@@ -171,7 +165,6 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
     if (options.rootfs) |rootfs| {
         if (rootfs.storage) |storage| {
             try validateRuntimeRootfsStorage(rootfs, storage);
-            try installLocalRootfsStorage(context, allocator, options.spore_dir, options.disk_root, storage);
             // The flat digest-addressed ext4 artifact is the only runtime
             // base source on warm paths. When it is not materialized locally
             // (chunk-only pull caches, pruned entries), defer assembly and let
@@ -298,23 +291,6 @@ const SavedDiskAuthority = struct { root: []const u8, runtime_lease: ?runtime_di
 fn resolveSavedDiskRoot(context: Context, allocator: std.mem.Allocator, options: Options, disk: spore.Disk) !SavedDiskAuthority {
     if (options.disk_root) |root| return .{ .root = try allocator.dupe(u8, root) };
     const spore_dir = options.spore_dir orelse return error.BadManifest;
-    const lease_runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
-    defer allocator.free(lease_runtime_root);
-    var lease_lock = try runtime_disk_lease.lockRegistry(context.io, allocator, lease_runtime_root);
-    defer lease_lock.deinit();
-    if (try saved_spore_pin.hasLocalIndex(context.io, allocator, spore_dir, disk)) {
-        var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-        const root_len = try Io.Dir.cwd().realPathFile(context.io, spore_dir, &root_buf);
-        const root = try allocator.dupe(u8, root_buf[0..root_len]);
-        errdefer allocator.free(root);
-        const lease = try runtime_disk_lease.fromSavedDisk(root, disk);
-        if (comptime builtin.is_test) if (testing.saved_spore_authority_barrier) |barrier| barrier.pause(context.io);
-        return .{
-            .root = root,
-            .runtime_lease = try runtime_disk_lease.acquireActiveLocked(context.io, allocator, lease_runtime_root, lease, &lease_lock),
-        };
-    }
-    lease_lock.deinit();
     const configured_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(configured_root);
     const cache_root = if (std.fs.path.isAbsolute(configured_root))
@@ -333,7 +309,6 @@ fn resolveSavedDiskRoot(context: Context, allocator: std.mem.Allocator, options:
     const runtime_root = try local_paths.runtimeRootPath(allocator, context.environ_map);
     defer allocator.free(runtime_root);
     const lease = runtime_disk_lease.Lease{
-        .store = .rootfs_cache,
         .root = cache_root,
         .baseline_kind = .disk_index,
         .baseline_identity = disk.base,
@@ -474,64 +449,6 @@ fn validateRuntimeRootfsStorage(rootfs: spore.Rootfs, storage: spore.RootfsStora
     try spore.validateRootfsStorageDescriptor(storage);
 }
 
-/// Reinstalls a portable spore's exact local rootfs CAS into the selected host
-/// cache before runtime planning. Until an exact target install is complete,
-/// presence of the local index is authoritative: missing or corrupt local
-/// objects fail closed instead of falling back to unrelated host-cache bytes.
-fn installLocalRootfsStorage(
-    context: Context,
-    allocator: std.mem.Allocator,
-    spore_dir: ?[]const u8,
-    root_override: ?[]const u8,
-    storage: spore.RootfsStorage,
-) !void {
-    const local_root = spore_dir orelse return;
-    const local_index_path = try rootfs_cas.manifestIndexPath(allocator, local_root, storage.index_digest);
-    defer allocator.free(local_index_path);
-    const local_index_stat = Io.Dir.cwd().statFile(context.io, local_index_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => |e| return e,
-    };
-    if (local_index_stat.kind != .file) return error.BadManifest;
-
-    const cache_root = try baselineRootPath(context, allocator, root_override);
-    defer allocator.free(cache_root);
-    var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
-    defer cache_lock.deinit();
-
-    // A prior verified install makes the host cache authoritative for warm
-    // opens. Revalidate its exact descriptor-bound index under the lock, then
-    // avoid an O(all rootfs bytes) local and cache object walk.
-    if (try rootfs_cas.storageMarkedComplete(context.io, allocator, cache_root, storage)) return;
-
-    const local_index = (try rootfs_cas.loadCompleteStorageIndex(context.io, allocator, local_root, storage)) orelse return error.BadManifest;
-    defer local_index.deinit();
-
-    var seen_objects = std.AutoHashMap(chunk.ChunkId, void).init(allocator);
-    defer seen_objects.deinit();
-    for (local_index.parsed.value.chunks) |chunk_entry| {
-        const seen = try seen_objects.getOrPut(chunk_entry.id);
-        if (seen.found_existing) continue;
-        const digest = chunk_entry.id.toDigest();
-        const expected_size = try rootfs_cas.storageChunkLen(storage, chunk_entry.logical_chunk);
-        const local_object_path = try rootfs_cas.objectPath(allocator, local_root, chunk_entry.id);
-        defer allocator.free(local_object_path);
-        const object_data = try rootfs_cas.readVerifiedChunkPath(allocator, local_object_path, &digest, expected_size);
-        defer allocator.free(object_data);
-        if (comptime builtin.is_test) {
-            if (testing.local_rootfs_object_reads) |count| count.* += 1;
-        }
-        const cache_object_path = try rootfs_cas.objectPath(allocator, cache_root, chunk_entry.id);
-        defer allocator.free(cache_object_path);
-        _ = try rootfs_cas.installChunkPath(allocator, context.io, cache_object_path, object_data, &digest, expected_size);
-    }
-
-    const cache_index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
-    defer allocator.free(cache_index_path);
-    _ = try rootfs_cas.installStorageIndexPath(allocator, context.io, cache_index_path, local_index.bytes, storage);
-    try rootfs_cas.markStorageComplete(context.io, allocator, cache_root, storage.index_digest);
-}
-
 fn readDiskIndex(
     context: Context,
     allocator: std.mem.Allocator,
@@ -656,7 +573,6 @@ fn acquireLazyRootfsLease(
     defer allocator.free(lease_root);
     return .{
         .lease = try runtime_disk_lease.acquireActive(context.io, allocator, runtime_root, .{
-            .store = .rootfs_cache,
             .root = lease_root,
             .baseline_kind = .disk_index,
             .baseline_identity = storage.index_digest,
@@ -973,97 +889,6 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_errors\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"unique_chunks\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, trace, "\"fault_bytes\":65536") != null);
-}
-
-test "runtime disk installs portable local rootfs storage and trusts complete warm cache" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp_dir = try TestDir.init();
-    defer tmp_dir.deinit();
-    const tmp = tmp_dir.root;
-    const rootfs_path = try tmp_dir.path("source.ext4");
-    const local_spore = try tmp_dir.path("portable.spore");
-    const cache_root = try tmp_dir.path("empty-cache");
-    const runtime_root = try tmp_dir.path("runtime");
-    const rootfs_bytes = (test_support.repeat("abcd", 16384)) ++ (test_support.repeat("efgh", 16384));
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
-
-    const source_artifact = try rootfs_cache.cacheByDigestPath(io, arena, local_spore, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, local_spore, source_artifact.digest, spore.disk_chunk_size);
-    const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
-    const rootfs = spore.Rootfs{
-        .device = .{ .mmio_slot = 1 },
-        .artifact = .{ .digest = storage.index_digest, .size = source_artifact.size },
-        .storage = storage,
-    };
-    const local_flat_path = try rootfs_cache.digestPath(arena, local_spore, source_artifact.digest);
-    try Io.Dir.cwd().deleteFile(io, local_flat_path);
-
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    const cwd = try std.process.currentPathAlloc(io, arena);
-    const absolute_cache_root = try std.fs.path.resolve(arena, &.{ cwd, cache_root });
-    const absolute_local_spore = try std.fs.path.resolve(arena, &.{ cwd, local_spore });
-    const absolute_runtime_root = try std.fs.path.resolve(arena, &.{ cwd, runtime_root });
-    const absolute_tmp_root = try std.fs.path.resolve(arena, &.{ cwd, tmp });
-    try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
-    try env.put(local_paths.runtime_dir_env, absolute_runtime_root);
-    try env.put("TMPDIR", absolute_tmp_root);
-    const context = Context{ .io = io, .environ_map = &env };
-
-    var local_object_reads: usize = 0;
-    testing.local_rootfs_object_reads = &local_object_reads;
-    defer testing.local_rootfs_object_reads = null;
-    var runtime = try open(context, allocator, .{
-        .rootfs = rootfs,
-        .spore_dir = absolute_local_spore,
-    });
-    var runtime_open = true;
-    defer if (runtime_open) runtime.deinit();
-    try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, arena, absolute_cache_root, storage));
-    try std.testing.expect(local_object_reads != 0);
-    var readback: [4]u8 = undefined;
-    try runtime.chunk_mapped.?.readAt(&readback, 0);
-    try std.testing.expectEqualStrings("abcd", &readback);
-    runtime.deinit();
-    runtime_open = false;
-
-    const first_open_object_reads = local_object_reads;
-    const original_local_index = try Io.Dir.cwd().readFileAlloc(io, preload_result.index_path, arena, .limited(disk_index.max_index_bytes));
-    const corrupt_local_index = try arena.dupe(u8, original_local_index);
-    corrupt_local_index[0] ^= 0xff;
-    try Io.Dir.cwd().deleteFile(io, preload_result.index_path);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = preload_result.index_path, .data = corrupt_local_index });
-    var warm_runtime = try open(context, allocator, .{
-        .rootfs = rootfs,
-        .spore_dir = absolute_local_spore,
-    });
-    warm_runtime.deinit();
-    try std.testing.expectEqual(first_open_object_reads, local_object_reads);
-    try Io.Dir.cwd().deleteFile(io, preload_result.index_path);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = preload_result.index_path, .data = original_local_index });
-
-    const index = try rootfs_cas.readStorageIndexPath(arena, preload_result.index_path, storage);
-    const local_object_path = try rootfs_cas.objectPath(arena, absolute_local_spore, index.parsed.value.chunks[0].id);
-    try Io.Dir.cwd().deleteFile(io, local_object_path);
-    var complete_cache_runtime = try open(context, allocator, .{
-        .rootfs = rootfs,
-        .spore_dir = absolute_local_spore,
-    });
-    complete_cache_runtime.deinit();
-    try std.testing.expectEqual(first_open_object_reads, local_object_reads);
-
-    // Removing the target's completeness proof forces reinstall from the
-    // portable local authority, where the missing object must fail closed.
-    try rootfs_cas.removeStorageCompleteStamp(io, arena, absolute_cache_root, storage.index_digest);
-    try std.testing.expectError(error.MissingChunk, open(context, allocator, .{
-        .rootfs = rootfs,
-        .spore_dir = absolute_local_spore,
-    }));
 }
 
 test "runtime disk benchmark env eagerly materializes missing flat rootfs from cas" {
@@ -1525,30 +1350,13 @@ test "runtime disk restores chunk-index disk manifests" {
     var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, absolute_cache_root);
     defer pin_lock.deinit();
     const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, absolute_cache_root, &pin_lock);
-    const pin_id = try saved_spore_pin.testing.pinSave(io, arena, pin_registry, spore_dir, saved_disk);
+    _ = try saved_spore_pin.testing.pinSave(io, arena, pin_registry, spore_dir, saved_disk);
     pin_lock.deinit();
     const storage = try saved_spore_pin.storageForDisk(saved_disk);
-    const global_index_path = try rootfs_cas.manifestIndexPath(arena, absolute_cache_root, storage.index_digest);
-    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, global_index_path, arena, .limited(disk_index.max_index_bytes));
-    var local_index = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
-    defer local_index.deinit();
-    const local_index_path = try rootfs_cas.manifestIndexPath(arena, spore_dir, storage.index_digest);
-    try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(local_index_path).?);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = local_index_path, .data = index_bytes });
-    for (local_index.value.chunks) |entry| {
-        const source_object = try rootfs_cas.objectPath(arena, absolute_cache_root, entry.id);
-        const object_bytes = try Io.Dir.cwd().readFileAlloc(io, source_object, arena, .limited(rootfs_cas.default_chunk_size));
-        const local_object = try rootfs_cas.objectPath(arena, spore_dir, entry.id);
-        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(local_object).?);
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = local_object, .data = object_bytes });
-    }
-    // Leave the host-private ref stale. Runtime open must prefer the complete
-    // local CAS and must not consult the missing global pin.
-    var remove_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, absolute_cache_root);
-    defer remove_lock.deinit();
-    const remove_registry = try saved_spore_pin.LockedRegistry.init(arena, absolute_cache_root, &remove_lock);
-    try saved_spore_pin.remove(io, arena, remove_registry, pin_id);
-    remove_lock.deinit();
+    const index_bytes = try Io.Dir.cwd().readFileAlloc(io, try rootfs_cas.manifestIndexPath(arena, absolute_cache_root, storage.index_digest), arena, .limited(disk_index.max_index_bytes));
+    var index = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
+    defer index.deinit();
+    // A rename keeps the pin.
     const moved_dir = try tmp_dir.path("moved.spore");
     try Io.Dir.rename(Io.Dir.cwd(), spore_dir, Io.Dir.cwd(), moved_dir, io);
 
@@ -1564,109 +1372,10 @@ test "runtime disk restores chunk-index disk manifests" {
     try std.testing.expectEqualStrings(patch, &readback);
 
     runtime.deinit();
-    const missing = try rootfs_cas.objectPath(arena, moved_dir, local_index.value.chunks[0].id);
+    const missing = try rootfs_cas.objectPath(arena, absolute_cache_root, index.value.chunks[0].id);
     try Io.Dir.cwd().deleteFile(io, missing);
     var missing_runtime = try open(context, allocator, .{ .rootfs = rootfs, .disk = saved_disk, .spore_dir = moved_dir });
     defer missing_runtime.deinit();
     var missing_byte: [1]u8 = undefined;
-    try std.testing.expectError(error.MissingChunk, missing_runtime.chunk_mapped.?.readAt(&missing_byte, local_index.value.chunks[0].logical_chunk * storage.chunk_size));
-}
-
-test "foreground local CAS lease serializes concurrent saved-spore removal" {
-    const saved_spore_remove = @import("saved_spore_remove.zig");
-    const test_barrier = @import("test_barrier.zig");
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", arena);
-    const cache_root = try std.fs.path.join(arena, &.{ root, "cache" });
-    const runtime_root = try std.fs.path.join(arena, &.{ root, "runtime" });
-    const spore_dir = try std.fs.path.join(arena, &.{ root, "portable.spore" });
-    const fixture = try manifest_test_support.diskFixture(arena, io, cache_root, spore_dir, 0x51, true);
-    try spore.saveManifest(arena, spore_dir, fixture.manifest);
-    var env = std.process.Environ.Map.init(allocator);
-    defer env.deinit();
-    try env.put(local_paths.rootfs_cache_env, cache_root);
-    try env.put(local_paths.runtime_dir_env, runtime_root);
-    const context = Context{ .io = io, .environ_map = &env };
-
-    var restore_boundary = test_barrier.Barrier{};
-    testing.saved_spore_authority_barrier = &restore_boundary;
-    defer testing.saved_spore_authority_barrier = null;
-    const RestoreContext = struct {
-        allocator: std.mem.Allocator,
-        context: Context,
-        spore_dir: []const u8,
-        disk: spore.Disk,
-        authority: ?SavedDiskAuthority = null,
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.authority = resolveSavedDiskRoot(self.context, self.allocator, .{ .spore_dir = self.spore_dir }, self.disk) catch |err| {
-                self.err = err;
-                return;
-            };
-        }
-    };
-    var restore_arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer restore_arena_state.deinit();
-    var restore_context = RestoreContext{
-        .allocator = restore_arena_state.allocator(),
-        .context = context,
-        .spore_dir = spore_dir,
-        .disk = fixture.disk,
-    };
-    var restore_thread = test_barrier.ThreadGuard{
-        .io = io,
-        .thread = try std.Thread.spawn(.{}, RestoreContext.run, .{&restore_context}),
-        .barriers = &.{&restore_boundary},
-    };
-    defer restore_thread.deinit();
-    restore_boundary.waitReached(io);
-
-    const RemoveContext = struct {
-        allocator: std.mem.Allocator,
-        context: Context,
-        spore_dir: []const u8,
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            const removed = saved_spore_remove.remove(self.context, self.allocator, self.spore_dir) catch |err| {
-                self.err = err;
-                return;
-            };
-            saved_spore_remove.deinit(self.allocator, removed);
-        }
-    };
-    var remove_arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer remove_arena_state.deinit();
-    var remove_blocked = Io.Semaphore{};
-    runtime_disk_lease.testing.registry_lock_blocked = &remove_blocked;
-    defer runtime_disk_lease.testing.registry_lock_blocked = null;
-    var remove_context = RemoveContext{
-        .allocator = remove_arena_state.allocator(),
-        .context = context,
-        .spore_dir = spore_dir,
-    };
-    var remove_thread = test_barrier.ThreadGuard{
-        .io = io,
-        .thread = try std.Thread.spawn(.{}, RemoveContext.run, .{&remove_context}),
-        .barriers = &.{},
-    };
-    defer remove_thread.deinit();
-    remove_blocked.waitUncancelable(io);
-    restore_boundary.release(io);
-    restore_thread.join();
-    remove_thread.join();
-    if (restore_context.err) |err| return err;
-    try std.testing.expectEqual(error.SavedSporeInUse, remove_context.err orelse return error.TestUnexpectedResult);
-    var authority = restore_context.authority orelse return error.TestUnexpectedResult;
-    defer restore_arena_state.allocator().free(authority.root);
-    if (authority.runtime_lease) |*active| active.deinit();
-    authority.runtime_lease = null;
-    _ = try Io.Dir.cwd().statFile(io, spore_dir, .{ .follow_symlinks = false });
+    try std.testing.expectError(error.MissingChunk, missing_runtime.chunk_mapped.?.readAt(&missing_byte, index.value.chunks[0].logical_chunk * storage.chunk_size));
 }

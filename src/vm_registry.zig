@@ -981,7 +981,6 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
             .allow_hosts = &.{"example.com"},
         },
         .disk_baseline_lease = .{
-            .store = .rootfs_cache,
             .root = "/cache",
             .baseline_kind = .rootfs,
             .baseline_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -999,7 +998,6 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqualStrings("docker.io/library/alpine:3.20", spec.value.image_ref.?);
     try std.testing.expectEqualStrings("93.184.216.34/32", spec.value.network.?.allow_cidrs[0]);
     try std.testing.expectEqualStrings("example.com", spec.value.network.?.allow_hosts[0]);
-    try std.testing.expectEqual(runtime_disk_lease.Store.rootfs_cache, spec.value.disk_baseline_lease.?.store);
     try std.testing.expectEqualStrings("/cache", spec.value.disk_baseline_lease.?.root);
     try std.testing.expectEqualStrings("IMAGE_VALUE=default", spec.value.exec_defaults.?.env[0]);
     try std.testing.expectEqualStrings("CLEAR_ME=inherited", spec.value.exec_defaults.?.env[1]);
@@ -1208,7 +1206,7 @@ test "fork disk claims are read once and must name the child" {
     const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const spec = Spec{
         .name = "child",
-        .disk_baseline_lease = .{ .store = .rootfs_cache, .root = "/cache", .baseline_kind = .rootfs, .baseline_identity = digest },
+        .disk_baseline_lease = .{ .root = "/cache", .baseline_kind = .rootfs, .baseline_identity = digest },
     };
     var fork_claim = DiskForkClaim{
         .source_socket_path = "/tmp/source.sock",

@@ -207,8 +207,7 @@ its image's objects, so pushing it to a store that holds the image writes only
 the RAM chunks, the changed disk chunks, the index and the manifest. The pushed
 manifest drops `memory.backing`, a path on the saving host, so its digest is
 not the hash of the local `manifest.json`. The disk must be complete in the
-rootfs cache or, for a portable spore, in the spore directory. Spore tags are
-separate from image tags. An `s3://` destination is uploaded as
+rootfs cache. Spore tags are separate from image tags. An `s3://` destination is uploaded as
 `spore image push` uploads one, with `spores/` in place of `images/`.
 
 `spore pull STORE/<tag|blake3:hex> --out DIR` reads a pushed spore back. It

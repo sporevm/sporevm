@@ -927,10 +927,6 @@ pub fn rmCli(
                 const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove {s}: not a checkpoint (no readable spore manifest.json)", .{args[1]});
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
             },
-            error.SavedSporeInUse => {
-                const message = allocLifecycleMessage(allocator, "spore checkpoint rm: refusing to remove checkpoint in use by a live VM: {s}", .{args[1]});
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
-            },
             else => |e| return e,
         };
         if (mode == .json) try machine_output.writeJson(allocator, stdout, removed) else try writeRemovedSavedSpore(stdout, removed);

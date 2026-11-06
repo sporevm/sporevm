@@ -131,10 +131,7 @@ recorded only in host-private lifecycle metadata. The save directory can be
 renamed or moved on the same host. Its cache-side ownership anchor makes raw
 copies fail closed instead of silently sharing deletion authority. Use `spore
 fork` for another machine-local lifecycle, or `spore push` and `spore pull` to
-move it to another host. The no-copy save fast
-path applies only after the machine-local parent already resides in the global
-CAS; the first save after portable/local-CAS restore performs a one-time
-verified migration into that cache.
+move it to another host.
 
 Use `--commit local/<name>:<tag>` when the command should produce another
 image instead of a resumable machine:
