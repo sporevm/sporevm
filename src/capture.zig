@@ -91,6 +91,9 @@ pub const Request = struct {
     completed: std.atomic.Value(bool) = .init(false),
     wake_fn_addr: std.atomic.Value(usize) = .init(0),
     wake_context_addr: std.atomic.Value(usize) = .init(0),
+    /// Wakes under way in the signal handler. `setWake` and `clearWake`
+    /// wait for them, so no wake reaches a target they replaced.
+    wakes_in_flight: std.atomic.Value(u32) = .init(0),
 
     pub fn request(self: *Request) void {
         self.signal_count.store(1, .release);
@@ -119,76 +122,31 @@ pub const Request = struct {
 
     pub fn setWake(self: *Request, wake_fn: WakeFn, context: ?*anyopaque) void {
         self.wake_context_addr.store(if (context) |ptr| @intFromPtr(ptr) else 0, .release);
-        self.wake_fn_addr.store(@intFromPtr(wake_fn), .release);
+        self.wake_fn_addr.store(@intFromPtr(wake_fn), .seq_cst);
+        self.waitForWakes();
     }
 
     pub fn clearWake(self: *Request) void {
-        self.wake_fn_addr.store(0, .release);
+        self.wake_fn_addr.store(0, .seq_cst);
         self.wake_context_addr.store(0, .release);
+        self.waitForWakes();
+    }
+
+    /// A signal handler cannot take a lock, so wakes count themselves and a
+    /// new target waits until none of them can still call the old one.
+    fn waitForWakes(self: *Request) void {
+        while (self.wakes_in_flight.load(.seq_cst) != 0) std.atomic.spinLoopHint();
     }
 
     fn wake(self: *Request) void {
-        const wake_fn_addr = self.wake_fn_addr.load(.acquire);
+        _ = self.wakes_in_flight.fetchAdd(1, .seq_cst);
+        defer _ = self.wakes_in_flight.fetchSub(1, .release);
+        const wake_fn_addr = self.wake_fn_addr.load(.seq_cst);
         if (wake_fn_addr == 0) return;
         const wake_fn: WakeFn = @ptrFromInt(wake_fn_addr);
         const context_addr = self.wake_context_addr.load(.acquire);
         const context: ?*anyopaque = if (context_addr == 0) null else @ptrFromInt(context_addr);
         wake_fn(context);
-    }
-};
-
-/// Runs a capture wake on its own thread. A wake set with `Request.setWake`
-/// runs inside the signal handler, which may only make async-signal-safe
-/// calls; Hypervisor.framework's `hv_vcpus_exit` is not one. With this, the
-/// handler only writes a byte to a pipe and the thread makes the wake call.
-pub const WakeThread = struct {
-    pipe: [2]posix.fd_t = .{ -1, -1 },
-    thread: ?std.Thread = null,
-    wake_fn: WakeFn = undefined,
-    wake_context: ?*anyopaque = null,
-
-    pub fn start(self: *WakeThread, request: *Request, wake_fn: WakeFn, context: ?*anyopaque) !void {
-        self.* = .{ .wake_fn = wake_fn, .wake_context = context };
-        if (std.c.pipe(&self.pipe) != 0) return error.CaptureWakeStartFailed;
-        errdefer self.closePipe();
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
-        request.setWake(notify, self);
-    }
-
-    pub fn stop(self: *WakeThread, request: *Request) void {
-        request.clearWake();
-        // Closing the write end ends the thread's read after any pending
-        // wake byte.
-        _ = std.c.close(self.pipe[1]);
-        self.pipe[1] = -1;
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
-        self.closePipe();
-    }
-
-    fn closePipe(self: *WakeThread) void {
-        for (&self.pipe) |*fd| {
-            if (fd.* >= 0) _ = std.c.close(fd.*);
-            fd.* = -1;
-        }
-    }
-
-    fn notify(context: ?*anyopaque) callconv(.c) void {
-        const self: *WakeThread = @ptrCast(@alignCast(context orelse return));
-        const byte = [_]u8{1};
-        _ = std.c.write(self.pipe[1], &byte, byte.len);
-    }
-
-    fn run(self: *WakeThread) void {
-        var byte: [1]u8 = undefined;
-        while (true) {
-            const n = std.c.read(self.pipe[0], &byte, byte.len);
-            if (n > 0) {
-                self.wake_fn(self.wake_context);
-            } else if (n == 0 or std.c.errno(n) != .INTR) {
-                return;
-            }
-        }
     }
 };
 
@@ -343,28 +301,31 @@ test "capture request invokes optional wake hook" {
     try std.testing.expectEqual(@as(u32, 1), test_wake_count);
 }
 
-test "capture signal runs a thread wake outside the signal handler" {
-    const Probe = struct {
-        var woke = std.atomic.Value(bool).init(false);
-        var woke_on: std.Thread.Id = 0;
+test "capture wake finishes before clearWake returns" {
+    const Run = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        woken_after_retire: std.atomic.Value(bool) = .init(false),
 
-        fn wake(_: ?*anyopaque) callconv(.c) void {
-            woke_on = std.Thread.getCurrentId();
-            woke.store(true, .release);
+        fn wake(context: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.started.store(true, .release);
+            // Leave the run time to clear the wake while this call is in
+            // flight.
+            const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            if (self.retired.load(.acquire)) self.woken_after_retire.store(true, .release);
         }
     };
-    var request_value = Request{};
-    var wake_thread = WakeThread{};
-    try wake_thread.start(&request_value, Probe.wake, null);
-    var registration = SignalRegistration.install(.USR2, &request_value);
-    // raise() returns after the handler has run on this thread; stop() then
-    // joins the wake thread after it has handled any pending wake.
-    const raised = posix.raise(.USR2);
-    registration.deinit();
-    wake_thread.stop(&request_value);
-    try raised;
 
-    try std.testing.expect(request_value.isRequested());
-    try std.testing.expect(Probe.woke.load(.acquire));
-    try std.testing.expect(Probe.woke_on != std.Thread.getCurrentId());
+    var request_value = Request{};
+    var target: Run = .{};
+    request_value.setWake(Run.wake, &target);
+    const thread = try std.Thread.spawn(.{}, Request.notifySignal, .{&request_value});
+    while (!target.started.load(.acquire)) std.Thread.yield() catch {};
+    request_value.clearWake();
+    target.retired.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(!target.woken_after_retire.load(.acquire));
 }

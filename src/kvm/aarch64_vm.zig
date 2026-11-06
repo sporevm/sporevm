@@ -1,16 +1,14 @@
 //! KVM virtual machine: AArch64 Linux bring-up path.
 //!
-//! This is the first KVM slice: a single-vCPU VM using the shared SporeVM
-//! board, DTB builder, virtio-mmio devices, and generation MMIO device. KVM
+//! The VM uses the shared SporeVM board, DTB builder, virtio-mmio devices,
+//! and generation MMIO device, and runs its vCPUs on `vmm.Threaded`. KVM
 //! owns GICv3 and PSCI emulation; userspace handles only device MMIO exits and
 //! forwards virtio/generation interrupts into the VGIC.
 
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const capture = @import("../capture.zig");
 const dirty_ram = @import("../dirty_ram.zig");
-const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const kvm = @import("aarch64.zig");
 const snapshot = @import("aarch64_snapshot.zig");
 const board = @import("../aarch64/board.zig");
@@ -18,7 +16,6 @@ const boot = @import("../aarch64/boot.zig");
 const gicv3 = @import("../aarch64/gicv3.zig");
 const guestmem = @import("../guestmem.zig");
 const net = @import("../virtio/net.zig");
-const virtio_mem = @import("../virtio/mem.zig");
 const platform = @import("../platform.zig");
 const spore = @import("../spore.zig");
 const spore_fork = @import("../spore_fork.zig");
@@ -82,16 +79,9 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     devices.init(config, if (hotplug) |*region| region.memConfig() else null);
     defer devices.net.shutdown();
     const transports = devices.transports();
-    const net_dev = &devices.net;
-    const vsock_dev = &devices.vsock;
-    const mem_dev = &devices.mem;
-    const gen_dev = &devices.gen;
-    const net_transport_index = devices.net_index;
-    const vsock_transport_index = devices.vsock_index;
-    const mem_transport_index = devices.mem_index;
 
     const vcpu_count: usize = @intCast(prepared.vcpus);
-    var vcpus = try allocator.alloc(Vcpu, vcpu_count);
+    const vcpus = try allocator.alloc(Vcpu, vcpu_count);
     for (vcpus) |*vcpu| vcpu.* = .{};
     defer {
         for (vcpus) |*vcpu| vcpu.deinit();
@@ -100,8 +90,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     for (vcpus, 0..) |*vcpu, index| {
         try vcpu.create(&vm, @intCast(index), !prepared.restoring() and index != 0);
     }
-    const primary_vcpu = &vcpus[0];
-    const vcpu_fd = primary_vcpu.fd;
+    const vcpu_fd = vcpus[0].fd;
     try vm.initGic();
 
     if (prepared.manifest) |parsed| {
@@ -110,12 +99,12 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         try platform.checkManifest(m, platform.contract(prepared.vcpus, prepared.ram_size, snapshot.hostCounterFreq()), transports.len);
         try vmm.restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = try monotonicMs();
-        if (m.memory_state) |state| try mem_dev.restoreState(state);
+        if (m.memory_state) |state| try devices.mem.restoreState(state);
         try vmm.applyTransports(transports, m.devices, ram);
-        try gen_dev.restore(allocator, restore.generation orelse m.generation);
-        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, gen_dev);
+        try devices.gen.restore(allocator, restore.generation orelse m.generation);
+        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, &devices.gen);
         try vmm.restoreMachine(allocator, &vm, vcpus, m.machine);
-        try vmm.raiseGenerationIrqIfPending(&vm, gen_dev);
+        try vmm.raiseGenerationIrqIfPending(&vm, &devices.gen);
         if (restore_stats) |*stats| stats.state_ms = (try monotonicMs()) - state_start;
     } else {
         const fresh = config.start.boot;
@@ -153,166 +142,34 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         }
     }
 
-    // More than one vCPU runs on `vmm.Threaded`, which sets its own wakes.
-    if (prepared.vcpus == 1) {
-        primary_vcpu.wake.thread_id = linux.gettid();
-        if (config.captureRequest()) |request_capture| {
-            request_capture.setWake(wakeKvmRun, &primary_vcpu.wake);
-        }
-        if (config.exec_control) |control| {
-            control.setWake(.{ .context = &primary_vcpu.wake, .wakeFn = wakeControlKvmRun });
-        }
-        config.network.setWake(.{ .context = &primary_vcpu.wake, .wakeFn = wakeNetworkKvmRun });
-    }
-    defer config.network.clearWake();
-    defer if (config.captureRequest()) |request_capture| request_capture.clearWake();
-
     const start_ms = try monotonicMs();
     vmm.emitRestoreMetrics("kvm", &prepared, &restore_stats, start_ms);
     if (config.probe) |probe| {
         if (probe.start == .immediate) {
             probe.stream.markStarted();
-            try vsock_dev.attachHostStream(probe.stream);
-            _ = try vmm.flushRx(&vm, vsock_dev, transports, vsock_transport_index, ram);
+            try devices.vsock.attachHostStream(probe.stream);
+            _ = try vmm.flushRx(&vm, &devices.vsock, transports, devices.vsock_index, ram);
         }
     }
-    const tracker_ref: ?*DirtyTracker = if (dirty_tracker) |*tracker| tracker else null;
-    const snapshot_source = vmm.SnapshotSource{
+    var threaded: vmm.Threaded(Vm, Vcpu, DirtyTracker) = .{
+        .vm = &vm,
+        .vcpus = vcpus,
+        .devices = &devices,
+        .ram = ram,
+        .config = config,
+        .dirty_tracker = if (dirty_tracker) |*tracker| tracker else null,
+    };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
+    return threaded.run(allocator, .{
         .config = config,
         .transports = transports,
-        .gen_dev = gen_dev,
-        .vsock_dev = vsock_dev,
+        .gen_dev = &devices.gen,
+        .vsock_dev = &devices.vsock,
         .ram_bytes = ram_bytes,
         .ram_size = prepared.ram_size,
-        .memory_device = if (mem_transport_index != null) mem_dev else null,
-    };
-    if (prepared.vcpus != 1) {
-        var threaded: vmm.Threaded(Vm, Vcpu, DirtyTracker) = .{
-            .vm = &vm,
-            .vcpus = vcpus,
-            .devices = &devices,
-            .ram = ram,
-            .config = config,
-            .dirty_tracker = tracker_ref,
-        };
-        defer threaded.deinit(allocator);
-        try threaded.start(allocator);
-        return threaded.run(allocator, snapshot_source);
-    }
-    var exec_probe_done = false;
-    var handled_memory_pressure_count: u32 = 0;
-    var requested_hotplug_size: u64 = if (mem_transport_index != null) mem_dev.requested_size else 0;
-    var did_capture_request = false;
-    while (true) {
-        if (mem_transport_index != null) {
-            if (config.probeStream()) |probe| {
-                const new_pressure_events = probe.memory_pressure_count -| handled_memory_pressure_count;
-                if (new_pressure_events > 0 and probe.state == .connected) {
-                    const idx = mem_transport_index.?;
-                    requested_hotplug_size = virtio_mem.requestedSizeAfterPressure(requested_hotplug_size, @intCast(hotplug.?.bytes.len), new_pressure_events);
-                    handled_memory_pressure_count = probe.memory_pressure_count;
-                    try mem_dev.setRequestedSize(@intCast(requested_hotplug_size));
-                    _ = transports[idx].raiseConfigChange();
-                    try vm.setSpi(board.virtioDeviceIntid(@intCast(idx)), true);
-                    std.log.debug("virtio-mem requested hotplug size: bytes={d} pressure_count={d}", .{ requested_hotplug_size, handled_memory_pressure_count });
-                }
-            }
-        }
-        if (config.network.failed()) return error.NetworkGatewayFailed;
-        if (config.exec_control) |control| {
-            control.reportStats(vmm.monitorStats(if (tracker_ref) |tracker| &tracker.sealer else null));
-            switch (try control.poll(vsock_dev)) {
-                .keep_running => {},
-                .stop => return .monitor_stopped,
-                .snapshot => |request| snapshot: {
-                    var preparation = if (request.publish_dir != null)
-                        (try control.prepareSnapshot()) orelse break :snapshot
-                    else
-                        null;
-                    defer if (preparation) |*owned| owned.deinit();
-                    var prepared_root = if (request.publish_dir) |publish_dir|
-                        if (config.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
-                    else
-                        null;
-                    defer if (prepared_root) |*root| root.deinit();
-                    const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    try vmm.writeSnapshot(allocator, "kvm", &vm, vcpus, tracker_ref, snapshot_source, .{
-                        .dir = request.dir,
-                        .rootfs_cache_lock = if (preparation) |*owned| owned.cacheLock() else null,
-                    });
-                    if (!request.continue_after) return .snapshotted;
-                    const completed_dir = if (request.publish_dir) |publish_dir| blk: {
-                        const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
-                        if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (config.environ_map != null) .shared_no_rebind else .local_rebind);
-                        vmm.logNamedSnapshotPublication("kvm", publish_metrics, source_pause_started_ns);
-                        break :blk publish_dir;
-                    } else request.dir;
-                    try control.completeSnapshot(completed_dir);
-                },
-                .rootfs_snapshot => |request| {
-                    const disk_manifest = try vmm.takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
-                    try control.completeRootfsSnapshot(disk_manifest);
-                },
-                .disk_fork => |request| {
-                    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    vmm.captureDiskFork(allocator, "kvm", &vm, vcpus, tracker_ref, snapshot_source, request, control, pause_started_ns) catch |err| control.failDiskFork(err);
-                },
-            }
-            _ = try vmm.flushRx(&vm, vsock_dev, transports, vsock_transport_index, ram);
-        }
-        if (config.captureRequest()) |request_capture| {
-            if (request_capture.isAbortRequested()) return error.CaptureAborted;
-            if (request_capture.isRequested() and !did_capture_request) {
-                try vmm.writeSnapshot(allocator, "kvm", &vm, vcpus, tracker_ref, snapshot_source, .{ .dir = config.capture.?.dir });
-                request_capture.markCompleted();
-                if (request_capture.isAbortRequested()) return error.CaptureAborted;
-                if (config.continueAfterCapture()) {
-                    did_capture_request = true;
-                    continue;
-                }
-                return .snapshotted;
-            }
-        }
-        if (config.probe) |exec_probe| {
-            const probe = exec_probe.stream;
-            if (!exec_probe_done) {
-                if (probe.state == .failed) return error.VsockProbeFailed;
-                if (probe.state == .complete) {
-                    const observed_ms = probe.elapsedMs();
-                    std.log.debug(
-                        "kvm probe completion timing: observed_ms={d} return_ms={d}",
-                        .{ observed_ms, probe.elapsedMs() },
-                    );
-                    if (exec_probe.on_complete == .stop) {
-                        if (config.probeCaptureDir()) |dir| {
-                            try vmm.writeSnapshot(allocator, "kvm", &vm, vcpus, tracker_ref, snapshot_source, .{ .dir = dir });
-                            return .snapshotted;
-                        }
-                        return .probe_complete;
-                    }
-                    // A detached stream stays attached until the control
-                    // replaces or resets it.
-                    exec_probe_done = true;
-                }
-                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > exec_probe.timeout_ms) return error.VsockProbeTimedOut;
-            }
-        }
-
-        switch (try primary_vcpu.run(&vm, vcpus)) {
-            .mmio => |access| try primary_vcpu.completeMmio(try vmm.dispatchMmio(&vm, access, transports, gen_dev, ram)),
-            .shutdown => |kind| return kind.cause(),
-            .kicked => {
-                if (config.captureRequest()) |request_capture| {
-                    if (request_capture.isRequested() or request_capture.isAbortRequested()) continue;
-                }
-                if (config.network.failed()) continue;
-                if (config.network.consumeWake()) {
-                    _ = try vmm.flushRx(&vm, net_dev, transports, net_transport_index, ram);
-                }
-            },
-            .wfi, .handled => unreachable,
-        }
-    }
+        .memory_device = if (devices.mem_index != null) &devices.mem else null,
+    });
 }
 
 const kvm_run_wake_signal = posix.SIG.URG;
@@ -475,21 +332,6 @@ const KvmRunWakeSignal = struct {
         self.active = false;
     }
 };
-
-fn wakeKvmRun(context: ?*anyopaque) callconv(.c) void {
-    const wake: *KvmRunWake = @ptrCast(@alignCast(context orelse return));
-    wake.run[kvm.RunLayout.immediate_exit] = 1;
-}
-
-fn wakeNetworkKvmRun(context: ?*anyopaque) void {
-    const wake: *KvmRunWake = @ptrCast(@alignCast(context orelse return));
-    wake.wakeRun();
-}
-
-fn wakeControlKvmRun(context: *anyopaque) void {
-    const wake: *KvmRunWake = @ptrCast(@alignCast(context));
-    wake.wakeRun();
-}
 
 fn handleKvmRunWakeSignal(_: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
     // Empty handler: the signal exists only to interrupt KVM_RUN after

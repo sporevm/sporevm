@@ -126,11 +126,12 @@ Current portable single-vCPU machine-state set:
 Restore rejects unknown `sys_regs` or `icc_regs` names. New registers require a
 spec update and backend mapping in the same slice.
 
-A multi-vCPU save never stops a vCPU inside an interrupt handler:
-`ap0r0_el1` and `ap1r0_el1` are zero in every saved vCPU. Hypervisor.framework
-does not restore an interrupt the guest acknowledged but had not completed,
-and the restored guest's EOI for it aborts the process, so both backends let
-the guest run on until every vCPU has completed its interrupts.
+A save never stops a vCPU inside an interrupt handler, whatever the vCPU
+count: `ap0r0_el1` and `ap1r0_el1` are zero in every saved vCPU.
+Hypervisor.framework does not restore an interrupt the guest acknowledged but
+had not completed, and the restored guest's EOI for it aborts the process, so
+both backends let the guest run on until every vCPU has completed its
+interrupts.
 
 ### Platform-owned
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixes
+
+- Single-vCPU saves also wait until the vCPU is not in an interrupt handler,
+  or fail with `InterruptStillActive`, as multi-vCPU saves do.
+
 ## v0.18.0
 
 ### Upgrading

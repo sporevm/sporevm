@@ -1090,8 +1090,8 @@ fn moveVtimer(vtimer: *spore.VtimerState, guest_cntvct: u64) void {
     vtimer.cntvct = guest_cntvct;
 }
 
-/// Runs a VM with more than one vCPU: each vCPU on its own thread, while the
-/// calling thread serves the control, the probe, capture requests and
+/// Runs a VM: each vCPU on its own thread, while the calling thread serves
+/// the control, the probe, capture requests, virtio-mem growth and
 /// snapshots.
 ///
 /// `Vm` provides `name`, `spi_needs_kick` (whether a vCPU must be kicked to
@@ -1148,10 +1148,14 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         /// no event of their own (control timeouts and stats, the probe
         /// deadline) run at least this often.
         const main_wait_ms = 10;
-        /// How long a parked or idle vCPU thread waits without an event. HVF
-        /// GIC and CPU_ON requests from other vCPUs and interrupts for an
-        /// idle HVF vCPU only kick, which does not end the wait.
-        const vcpu_wait_ms = 1;
+        /// How long a parked or idle vCPU thread waits without an event:
+        /// 200 µs with one vCPU, 1 ms with more, as the backends' loops did.
+        /// The guest timer, HVF GIC and CPU_ON requests from other vCPUs and
+        /// interrupts that vCPU threads raise for an idle HVF vCPU do not
+        /// end the wait.
+        fn vcpuWaitNs(self: *const Self) i64 {
+            return if (self.vcpus.len == 1) 200 * std.time.ns_per_us else std.time.ns_per_ms;
+        }
         /// How long a capture lets the guest run on for every vCPU to leave
         /// its interrupt handler before it gives up.
         const capture_settle_ms = 1000;
@@ -1276,10 +1280,10 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         }
 
         /// Waits until `vcpu_events` moves past `seen`, at most
-        /// `vcpu_wait_ms`.
+        /// `vcpuWaitNs`.
         fn waitVcpu(self: *Self, seen: u32) void {
             self.config.io.futexWaitTimeout(u32, &self.vcpu_events.raw, seen, .{ .duration = .{
-                .raw = .fromMilliseconds(vcpu_wait_ms),
+                .raw = .fromNanoseconds(self.vcpuWaitNs()),
                 .clock = .awake,
             } }) catch {};
         }
@@ -1435,11 +1439,13 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             }
         }
 
-        /// Lets the guest run and serves the control, the probe and capture
-        /// requests until the run ends.
+        /// Lets the guest run and serves the control, the probe, capture
+        /// requests and virtio-mem growth until the run ends.
         pub fn run(self: *Self, allocator: std.mem.Allocator, source: SnapshotSource) !ExitCause {
             const config = self.config;
             var probe_done = false;
+            var captured_request = false;
+            var pressure_seen: u32 = 0;
             self.resumeAll();
             while (true) {
                 const seen = self.events.load(.acquire);
@@ -1453,6 +1459,18 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                     self.finish(.{ .err = error.NetworkGatewayFailed });
                     continue;
                 }
+                if (config.probe != null and !probe_done) {
+                    // Packets the probe queued that no guest notification
+                    // delivered.
+                    self.deliverVsock() catch |err| {
+                        self.finish(.{ .err = err });
+                        continue;
+                    };
+                }
+                self.growMemoryOnPressure(&pressure_seen) catch |err| {
+                    self.finish(.{ .err = err });
+                    continue;
+                };
                 if (config.exec_control) |control| {
                     control.reportStats(monitorStats(if (self.dirty_tracker) |tracker| &tracker.sealer else null));
                     const action = self.pollControl(control) catch |err| {
@@ -1480,7 +1498,8 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                             continue;
                         }
                         if (probe.state == .complete) {
-                            std.log.debug(Vm.name ++ " multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
+                            const observed_ms = probe.elapsedMs();
+                            std.log.debug(Vm.name ++ " probe completion timing: observed_ms={d} return_ms={d}", .{ observed_ms, probe.elapsedMs() });
                             if (exec_probe.on_complete == .stop) {
                                 if (config.probeCaptureDir()) |dir| {
                                     self.snapshotAndStop(allocator, source, dir, null);
@@ -1504,8 +1523,17 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                         self.finish(.{ .err = error.CaptureAborted });
                         continue;
                     }
-                    if (request_capture.isRequested()) {
-                        self.snapshotAndStop(allocator, source, config.capture.?.dir, request_capture);
+                    if (request_capture.isRequested() and !captured_request) {
+                        if (config.continueAfterCapture()) {
+                            self.snapshotOnce(allocator, source, config.capture.?.dir, request_capture) catch |err| {
+                                self.finish(.{ .err = err });
+                                continue;
+                            };
+                            self.resumeAll();
+                            captured_request = true;
+                        } else {
+                            self.snapshotAndStop(allocator, source, config.capture.?.dir, request_capture);
+                        }
                         continue;
                     }
                 }
@@ -1516,16 +1544,45 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         /// Polls the control and, unless it asked for something else,
         /// delivers the host-to-guest vsock packets it queued.
         fn pollControl(self: *Self, control: vsock_control.Control) !vsock_control.ControlAction {
-            const vsock_dev = &self.devices.vsock;
+            const action = action: {
+                self.device_lock.lockUncancelable(self.config.io);
+                defer self.device_lock.unlock(self.config.io);
+                break :action try control.poll(&self.devices.vsock);
+            };
+            if (action == .keep_running) try self.deliverVsock();
+            return action;
+        }
+
+        /// Delivers the host-to-guest vsock packets that are waiting for
+        /// guest buffers.
+        fn deliverVsock(self: *Self) !void {
             const delivered = delivered: {
                 self.device_lock.lockUncancelable(self.config.io);
                 defer self.device_lock.unlock(self.config.io);
-                const action = try control.poll(vsock_dev);
-                if (action != .keep_running) return action;
-                break :delivered try flushRx(self.vm, vsock_dev, self.devices.transports(), self.devices.vsock_index, self.ram);
+                break :delivered try flushRx(self.vm, &self.devices.vsock, self.devices.transports(), self.devices.vsock_index, self.ram);
             };
             if (delivered and Vm.spi_needs_kick) self.kickAll();
-            return .keep_running;
+        }
+
+        /// Asks the guest to plug more virtio-mem when the probe stream
+        /// reports new memory pressure. `seen` is the pressure count already
+        /// answered.
+        fn growMemoryOnPressure(self: *Self, seen: *u32) !void {
+            const index = self.devices.mem_index orelse return;
+            const probe = self.config.probeStream() orelse return;
+            {
+                self.device_lock.lockUncancelable(self.config.io);
+                defer self.device_lock.unlock(self.config.io);
+                const events = probe.memory_pressure_count -| seen.*;
+                if (events == 0 or probe.state != .connected) return;
+                seen.* = probe.memory_pressure_count;
+                const mem = &self.devices.mem;
+                try mem.setRequestedSize(virtio_mem.requestedSizeAfterPressure(mem.requested_size, mem.region_size, events));
+                _ = self.devices.transports()[index].raiseConfigChange();
+                try self.vm.setSpi(board.virtioDeviceIntid(@intCast(index)), true);
+                std.log.debug("virtio-mem requested hotplug size: bytes={d} pressure_count={d}", .{ mem.requested_size, seen.* });
+            }
+            if (Vm.spi_needs_kick) self.kickAll();
         }
 
         /// Writes a spore from the states the paused vCPUs captured.
@@ -2195,10 +2252,18 @@ const ThreadTestVm = struct {
     pub const spi_needs_kick = true;
 
     counter: ?u64 = null,
-    /// vCPU 1 shuts the guest down once this is set.
+    /// The last vCPU shuts the guest down once this is set.
     shutdown: std.atomic.Value(bool) = .init(false),
+    /// Raising this interrupt sets `shutdown`.
+    shutdown_intid: ?u32 = null,
+    /// Capturing a vCPU sets `shutdown`.
+    shutdown_on_capture: bool = false,
 
-    pub fn setSpi(_: *const ThreadTestVm, _: u32, _: bool) !void {}
+    pub fn setSpi(self: *ThreadTestVm, intid: u32, level: bool) !void {
+        if (self.shutdown_intid) |shutdown_intid| {
+            if (level and intid == shutdown_intid) self.shutdown.store(true, .release);
+        }
+    }
 
     pub fn captureGic(_: *const ThreadTestVm, _: std.mem.Allocator, _: usize) !gicv3.State {
         return test_gic;
@@ -2235,16 +2300,17 @@ const ThreadTestVcpu = struct {
         return false;
     }
 
-    pub fn run(self: *ThreadTestVcpu, vm: *const ThreadTestVm, _: []ThreadTestVcpu) !Exit {
+    pub fn run(self: *ThreadTestVcpu, vm: *const ThreadTestVm, all: []ThreadTestVcpu) !Exit {
         if (self.handler_runs.load(.acquire) > 0) _ = self.handler_runs.fetchSub(1, .acq_rel);
-        if (self.index == 1 and vm.shutdown.load(.acquire)) return .{ .shutdown = .off };
+        if (self.index == all.len - 1 and vm.shutdown.load(.acquire)) return .{ .shutdown = .off };
         return .wfi;
     }
 
     pub fn completeMmio(_: *ThreadTestVcpu, _: u64) !void {}
 
-    pub fn capture(self: *ThreadTestVcpu, _: *const ThreadTestVm, _: std.mem.Allocator) !spore.VcpuState {
+    pub fn capture(self: *ThreadTestVcpu, vm: *ThreadTestVm, _: std.mem.Allocator) !spore.VcpuState {
         self.checkOwner();
+        if (vm.shutdown_on_capture) vm.shutdown.store(true, .release);
         var state = self.live;
         if (self.handler_runs.load(.acquire) > 0) state.icc_regs = &in_handler_icc;
         return state;
@@ -2311,31 +2377,57 @@ test "threaded vCPUs restore and capture themselves on their own threads" {
 }
 
 test "a threaded capture lets a vCPU finish the interrupt it is handling" {
-    const allocator = std.testing.allocator;
-    var config = testBoot(.{ .vcpus = 2 });
-    var devices: Devices = undefined;
-    devices.init(&config, null);
-    defer devices.net.shutdown();
-    var vm = ThreadTestVm{};
-    var vcpus = [_]ThreadTestVcpu{
-        .{ .index = 0, .live = testVcpuState(0, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 530 }), .handler_runs = .init(3) },
-        .{ .index = 1, .live = testVcpuState(1, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 540 }) },
-    };
-    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
-        .vm = &vm,
-        .vcpus = &vcpus,
-        .devices = &devices,
-        .ram = .{ .bytes = &.{}, .base = board.ram_base },
-        .config = &config,
-    };
-    defer threaded.deinit(allocator);
-    try threaded.start(allocator);
+    // Every VM runs on `Threaded`, so a 1-vCPU save can stop its vCPU
+    // mid-handler too.
+    for ([_]topology.VcpuCount{ 1, 2 }) |count| {
+        const allocator = std.testing.allocator;
+        var config = testBoot(.{ .vcpus = count });
+        var devices: Devices = undefined;
+        devices.init(&config, null);
+        defer devices.net.shutdown();
+        var vm = ThreadTestVm{};
+        var vcpus = [_]ThreadTestVcpu{
+            .{ .index = 0, .live = testVcpuState(0, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 530 }), .handler_runs = .init(3) },
+            .{ .index = 1, .live = testVcpuState(1, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 540 }) },
+        };
+        var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+            .vm = &vm,
+            .vcpus = vcpus[0..count],
+            .devices = &devices,
+            .ram = .{ .bytes = &.{}, .base = board.ram_base },
+            .config = &config,
+        };
+        defer threaded.deinit(allocator);
+        try threaded.start(allocator);
 
-    // vCPU 0 stopped mid-handler; the capture resumes the guest until it
-    // completes the interrupt, then keeps that later state.
-    try threaded.pauseAll(.capture);
-    try std.testing.expectEqual(@as(u32, 0), vcpus[0].handler_runs.load(.acquire));
-    for (threaded.states) |captured| try std.testing.expectEqual(@as(usize, 0), captured.state.icc_regs.len);
+        // vCPU 0 stopped mid-handler; the capture resumes the guest until
+        // it completes the interrupt, then keeps that later state.
+        try threaded.pauseAll(.capture);
+        try std.testing.expectEqual(@as(u32, 0), vcpus[0].handler_runs.load(.acquire));
+        for (threaded.states) |captured| try std.testing.expectEqual(@as(usize, 0), captured.state.icc_regs.len);
+    }
+}
+
+/// Gives the guest's vsock RX queue one buffer in `ram`, which holds 0x2000
+/// bytes from `board.ram_base`. Returns the address of the used ring.
+fn testVsockRxBuffer(devices: *Devices, ram: guestmem.GuestRam) !u64 {
+    const desc = board.ram_base;
+    const avail = board.ram_base + 0x400;
+    const used = board.ram_base + 0x800;
+    const rx = &devices.transports()[devices.vsock_index];
+    _ = rx.write(0x030, 0, ram);
+    _ = rx.write(0x038, 8, ram);
+    inline for (.{ .{ 0x080, desc }, .{ 0x090, avail }, .{ 0x0a0, used } }) |reg| {
+        _ = rx.write(reg[0], @truncate(reg[1]), ram);
+        _ = rx.write(reg[0] + 4, @truncate(reg[1] >> 32), ram);
+    }
+    try std.testing.expect(!rx.write(0x044, 1, ram));
+    try ram.write(u64, desc, board.ram_base + 0x1000);
+    try ram.write(u32, desc + 8, 0x100);
+    try ram.write(u16, desc + 12, 2); // VIRTQ_DESC_F_WRITE
+    try ram.write(u16, avail + 4, 0);
+    try ram.write(u16, avail + 2, 1);
+    return used;
 }
 
 /// Attaches a host stream when asked to, as a monitor does to start an exec,
@@ -2374,25 +2466,9 @@ test "threaded control delivery kicks every vCPU once per delivered batch" {
     devices.init(&config, null);
     defer devices.net.shutdown();
 
-    // The guest's vsock RX queue holds one buffer.
     var bytes = [_]u8{0} ** 0x2000;
     const ram = guestmem.GuestRam{ .bytes = &bytes, .base = board.ram_base };
-    const desc = board.ram_base;
-    const avail = board.ram_base + 0x400;
-    const used = board.ram_base + 0x800;
-    const rx = &devices.transports()[devices.vsock_index];
-    _ = rx.write(0x030, 0, ram);
-    _ = rx.write(0x038, 8, ram);
-    inline for (.{ .{ 0x080, desc }, .{ 0x090, avail }, .{ 0x0a0, used } }) |reg| {
-        _ = rx.write(reg[0], @truncate(reg[1]), ram);
-        _ = rx.write(reg[0] + 4, @truncate(reg[1] >> 32), ram);
-    }
-    try std.testing.expect(!rx.write(0x044, 1, ram));
-    try ram.write(u64, desc, board.ram_base + 0x1000);
-    try ram.write(u32, desc + 8, 0x100);
-    try ram.write(u16, desc + 12, 2); // VIRTQ_DESC_F_WRITE
-    try ram.write(u16, avail + 4, 0);
-    try ram.write(u16, avail + 2, 1);
+    const used = try testVsockRxBuffer(&devices, ram);
 
     var vm = ThreadTestVm{};
     var vcpus = [_]ThreadTestVcpu{ .{ .index = 0, .live = undefined }, .{ .index = 1, .live = undefined } };
@@ -2483,4 +2559,111 @@ test "a snapshot fetches a store image's missing objects first, and a disk fork 
     try std.testing.expectError(error.ImageStoreIncomplete, writeSnapshot(std.testing.allocator, "test", &vm, @as([]TestVcpu, &vcpus), @as(?*NoTracker, null), source, .{ .dir = save_dir }));
     try std.testing.expect(fetcher.stats.errors != 0);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, save_dir, .{}));
+}
+
+fn testRunSource(config: *const Config, devices: *Devices, ram_bytes: []const u8) SnapshotSource {
+    return .{
+        .config = config,
+        .transports = devices.transports(),
+        .gen_dev = &devices.gen,
+        .vsock_dev = &devices.vsock,
+        .ram_bytes = ram_bytes,
+        .ram_size = ram_bytes.len,
+        .memory_device = if (devices.mem_index != null) &devices.mem else null,
+    };
+}
+
+test "threaded run delivers a running probe's queued packets without a guest notification" {
+    const allocator = std.testing.allocator;
+    var config = testBoot(.{});
+    var devices: Devices = undefined;
+    devices.init(&config, null);
+    defer devices.net.shutdown();
+    var bytes = [_]u8{0} ** 0x2000;
+    const ram = guestmem.GuestRam{ .bytes = &bytes, .base = board.ram_base };
+    const used = try testVsockRxBuffer(&devices, ram);
+    var stream = try vsock_stream.HostStream.init(1024, "exec");
+    try devices.vsock.attachHostStream(&stream);
+    // A run that never delivers ends when the probe times out.
+    config.probe = .{ .stream = &stream, .timeout_ms = 5_000, .on_complete = .detach };
+
+    // The guest shuts down when the vsock interrupt arrives.
+    var vm = ThreadTestVm{ .shutdown_intid = board.virtioDeviceIntid(@intCast(devices.vsock_index)) };
+    var vcpus = [_]ThreadTestVcpu{.{ .index = 0, .live = undefined }};
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = ram,
+        .config = &config,
+    };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
+    try std.testing.expectEqual(ExitCause.guest_off, try threaded.run(allocator, testRunSource(&config, &devices, &bytes)));
+    try std.testing.expectEqual(@as(u16, 1), try ram.read(u16, used + 2));
+}
+
+test "threaded run grows virtio-mem when the probe reports memory pressure" {
+    const allocator = std.testing.allocator;
+    var config = testBoot(.{});
+    var stream = try vsock_stream.HostStream.init(1024, "exec");
+    stream.state = .connected;
+    stream.memory_pressure_count = 2;
+    // A run that never grows ends when the probe times out.
+    config.probe = .{ .stream = &stream, .timeout_ms = 5_000, .on_complete = .detach };
+    const region_size = 4 * 1024 * 1024 * 1024;
+    var devices: Devices = undefined;
+    devices.init(&config, .{ .addr = board.ram_base + config.start.boot.ram_size, .region_size = region_size, .requested_size = 0 });
+    defer devices.net.shutdown();
+
+    // The guest shuts down when the virtio-mem config change arrives.
+    var vm = ThreadTestVm{ .shutdown_intid = board.virtioDeviceIntid(@intCast(devices.mem_index.?)) };
+    var vcpus = [_]ThreadTestVcpu{.{ .index = 0, .live = undefined }};
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = .{ .bytes = &.{}, .base = board.ram_base },
+        .config = &config,
+    };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
+    try std.testing.expectEqual(ExitCause.guest_off, try threaded.run(allocator, testRunSource(&config, &devices, &.{})));
+    try std.testing.expectEqual(virtio_mem.requestedSizeAfterPressure(0, region_size, 2), devices.mem.requested_size);
+}
+
+test "threaded capture request can keep the guest running" {
+    // A spore records the host counter frequency, which only aarch64 hosts have.
+    _ = platform.hostCounterFrequencyHz() catch return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
+
+    var request = capture.Request{};
+    var config = testBoot(.{});
+    config.capture = .{ .dir = dir, .trigger = .{ .request = .{ .req = &request, .then = .keep_running } } };
+    var devices: Devices = undefined;
+    devices.init(&config, null);
+    defer devices.net.shutdown();
+    var ram: [std.heap.page_size_min]u8 align(std.heap.page_size_min) = @splat(0);
+
+    // The guest shuts down once captured, so a run that stopped at the
+    // capture would end as `snapshotted` instead.
+    var vm = ThreadTestVm{ .shutdown_on_capture = true };
+    var vcpus = [_]ThreadTestVcpu{.{ .index = 0, .live = testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 0, .cntv_cval = 0 }) }};
+    var threaded: Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend)) = .{
+        .vm = &vm,
+        .vcpus = &vcpus,
+        .devices = &devices,
+        .ram = .{ .bytes = &ram, .base = board.ram_base },
+        .config = &config,
+    };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
+    request.request();
+    try std.testing.expectEqual(ExitCause.guest_off, try threaded.run(allocator, testRunSource(&config, &devices, &ram)));
+    try std.testing.expect(request.isCompleted());
+    try tmp.dir.access(std.testing.io, "spore/manifest.json", .{});
 }

@@ -24,6 +24,9 @@ pub const RunStdinControl = struct {
     resize_seen: u32 = 0,
     wake_context_addr: std.atomic.Value(usize) = .init(0),
     wake_fn_addr: std.atomic.Value(usize) = .init(0),
+    /// Wakes under way, from the stdin thread or the SIGWINCH handler.
+    /// `setWake` waits for them, so no wake reaches a target it replaced.
+    wakes_in_flight: std.atomic.Value(u32) = .init(0),
     resize_registration: ?TerminalResizeRegistration = null,
     raw_terminal: ?RawTerminal = null,
 
@@ -156,7 +159,9 @@ pub const RunStdinControl = struct {
     }
 
     fn wakeBackend(self: *RunStdinControl) void {
-        const wake_fn_addr = self.wake_fn_addr.load(.acquire);
+        _ = self.wakes_in_flight.fetchAdd(1, .seq_cst);
+        defer _ = self.wakes_in_flight.fetchSub(1, .release);
+        const wake_fn_addr = self.wake_fn_addr.load(.seq_cst);
         if (wake_fn_addr == 0) return;
         const wake_context_addr = self.wake_context_addr.load(.acquire);
         const wake = vsock_control.Wake{
@@ -179,9 +184,12 @@ pub const RunStdinControl = struct {
         return .keep_running;
     }
 
+    /// Returns once no wake into the previous target is under way. A
+    /// signal handler cannot take a lock, so wakes count themselves instead.
     fn setWake(self: *RunStdinControl, wake: vsock_control.Wake) void {
         self.wake_context_addr.store(@intFromPtr(wake.context), .release);
-        self.wake_fn_addr.store(@intFromPtr(wake.wakeFn), .release);
+        self.wake_fn_addr.store(@intFromPtr(wake.wakeFn), .seq_cst);
+        while (self.wakes_in_flight.load(.seq_cst) != 0) std.atomic.spinLoopHint();
     }
 
     fn completeSnapshot(_: *RunStdinControl, _: []const u8) !void {}
@@ -355,4 +363,37 @@ test "tty attach request uses v1 terminal metadata" {
     try std.testing.expect(std.mem.indexOf(u8, request, "\"stdio\":\"tty\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_rows\":40") != null);
     try std.testing.expect(std.mem.indexOf(u8, request, "\"terminal_cols\":120") != null);
+}
+
+test "stdin control wake finishes before the run replaces it" {
+    const Run = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        retired: std.atomic.Value(bool) = .init(false),
+        woken_after_retire: std.atomic.Value(bool) = .init(false),
+
+        fn wake(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.started.store(true, .release);
+            // Leave the run time to replace the wake while this call is in
+            // flight.
+            const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            if (self.retired.load(.acquire)) self.woken_after_retire.store(true, .release);
+        }
+
+        fn ignore(_: *anyopaque) void {}
+    };
+
+    // A resize only counts and wakes; it does not touch the stream.
+    var control = RunStdinControl.init(undefined, true, false, -1);
+    var target: Run = .{};
+    control.setWake(.{ .context = &target, .wakeFn = Run.wake });
+    const thread = try std.Thread.spawn(.{}, RunStdinControl.notifyResize, .{&control});
+    while (!target.started.load(.acquire)) std.Thread.yield() catch {};
+    // A finished run replaces its wake before its frame goes away.
+    control.setWake(.{ .context = &target, .wakeFn = Run.ignore });
+    target.retired.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(!target.woken_after_retire.load(.acquire));
 }

@@ -7,9 +7,7 @@
 
 const std = @import("std");
 const aarch64_topology = @import("../aarch64/topology.zig");
-const capture = @import("../capture.zig");
 const dirty_ram = @import("../dirty_ram.zig");
-const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
 const board = @import("../aarch64/board.zig");
@@ -17,7 +15,6 @@ const boot = @import("../aarch64/boot.zig");
 const gicv3 = @import("../aarch64/gicv3.zig");
 const guestmem = @import("../guestmem.zig");
 const net = @import("../virtio/net.zig");
-const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
 const platform_contract = @import("../platform.zig");
 const spore = @import("../spore.zig");
@@ -129,92 +126,56 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     devices.init(config, if (hotplug) |*region| region.memConfig() else null);
     defer devices.net.shutdown();
     const transports = devices.transports();
-    const net_dev = &devices.net;
-    const vsock_dev = &devices.vsock;
-    const mem_dev = &devices.mem;
-    const gen_dev = &devices.gen;
-    const net_transport_index = devices.net_index;
-    const vsock_transport_index = devices.vsock_index;
-    const mem_transport_index = devices.mem_index;
     const devices_ms = monotonicMs() - devices_start;
 
-    if (prepared.vcpus != 1) {
-        return runMultiVcpu(allocator, .{
-            .vm = &vm,
-            .prepared = &prepared,
-            .restore_stats = &restore_stats,
-            .devices = &devices,
-            .ram = ram,
-            .ram_bytes = ram_bytes,
-            .ram_file_backed = ram_mapping.file_backed,
-            .dist_base = dist_base,
-            .dist_size = dist_size,
-            .redist_region_base = redist_base,
-            .redist_region_size = redist_size,
-            .setup_start = setup_start,
-            .hv_vm_create_ms = hv_vm_create_ms,
-            .gic_ms = gic_ms,
-            .map_ram_ms = map_ram_ms,
-            .hv_map_ram_ms = hv_map_ram_ms,
-            .devices_ms = devices_ms,
-        });
-    }
-
-    // vCPU. Created before the DTB because the framework assigns the
-    // redistributor frame from the vCPU's MPIDR affinity.
+    // HVF creates each vCPU on the thread that runs it, and places each
+    // redistributor frame by the vCPU's MPIDR, so the GIC layout, boot and
+    // restore wait for the threads.
     const vcpu_start = monotonicMs();
-    var primary: Vcpu = .{ .io = config.io };
-    defer primary.destroyOnOwnerThread();
-    try primary.createOnOwnerThread();
-    const vcpu = primary.handle;
-    var capture_wake: capture.WakeThread = .{};
-    if (config.captureRequest()) |request_capture| {
-        try capture_wake.start(request_capture, wakeCaptureVcpu, &primary.handle);
-    }
-    defer if (config.captureRequest()) |request_capture| capture_wake.stop(request_capture);
-    if (config.exec_control) |control| {
-        control.setWake(.{ .context = &primary.handle, .wakeFn = wakeVcpu });
-    }
-    config.network.setWake(.{ .context = &primary.handle, .wakeFn = wakeNetworkVcpu });
-    defer config.network.clearWake();
+    const vcpus = try allocator.alloc(Vcpu, prepared.vcpus);
+    defer allocator.free(vcpus);
+    for (vcpus, 0..) |*vcpu, index| vcpu.* = .{ .io = config.io, .index = @intCast(index) };
+    var threaded: Threaded = .{ .vm = &vm, .vcpus = vcpus, .devices = &devices, .ram = ram, .config = config };
+    defer threaded.deinit(allocator);
+    try threaded.start(allocator);
 
-    const vcpu_redist_base = primary.redist_base;
     var redist_stride: usize = 0;
     try hvf.check(hvf.hv_gic_get_redistributor_size(&redist_stride), "gic redist stride");
-    try requireBoardRedistributors(.{ .base = vcpu_redist_base, .size = redist_stride }, redist_stride, 1);
-
-    std.log.debug(
-        "gic: dist=0x{x}+0x{x} redist(vcpu0)=0x{x}+0x{x} (region 0x{x}+0x{x})",
-        .{ dist_base, dist_size, vcpu_redist_base, redist_stride, redist_base, redist_size },
-    );
+    const redist_window = try hvfRedistributorWindow(vcpus, @intCast(redist_stride));
+    if (redist_window.size > redist_size) return error.UnsupportedVcpuCount;
+    try requireBoardRedistributors(redist_window, redist_stride, @intCast(vcpus.len));
     const vcpu_ms = monotonicMs() - vcpu_start;
     vm.gic_windows = .{
         .dist_base = dist_base,
         .dist_size = dist_size,
-        .redist_base = vcpu_redist_base,
-        .redist_size = redist_stride,
+        .redist_base = redist_window.base,
+        .redist_size = redist_window.size,
+        .redist_stride = @intCast(redist_stride),
+        .redist_vcpus = vcpus,
     };
-    const vcpus = (&primary)[0..1];
+    std.log.debug(
+        "gic: dist=0x{x}+0x{x} redist=0x{x}+0x{x} stride=0x{x} count={d} (region 0x{x}+0x{x})",
+        .{ dist_base, dist_size, redist_window.base, redist_window.size, redist_stride, vcpus.len, redist_base, redist_size },
+    );
 
     var boot_ms: u64 = 0;
     if (prepared.manifest) |parsed| {
         const restore = config.start.restore;
-        // Restore: memory, device, GIC, and vCPU state from the spore.
-        const m = parsed.value;
-        try platform_contract.checkManifest(m, platform_contract.contract(1, prepared.ram_size, snapshot.hostCounterFreq()), transports.len);
-        try vmm.restoreMemory(allocator, restore, m.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
+        const manifest = &parsed.value;
+        const restore_start = monotonicMs();
+        try platform_contract.checkManifest(manifest.*, platform_contract.contract(prepared.vcpus, prepared.ram_size, snapshot.hostCounterFreq()), transports.len);
+        try vmm.restoreMemory(allocator, restore, manifest.memory, ram_bytes, ram_mapping.file_backed, &restore_stats);
         const state_start = monotonicMs();
-        if (m.memory_state) |state| try mem_dev.restoreState(state);
-        try vmm.applyTransports(transports, m.devices, ram);
-        try gen_dev.restore(allocator, restore.generation orelse m.generation);
-        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, gen_dev);
-        try vmm.restoreMachine(allocator, &vm, vcpus, m.machine);
-        try vmm.raiseGenerationIrqIfPending(&vm, gen_dev);
+        if (manifest.memory_state) |state| try devices.mem.restoreState(state);
+        try vmm.applyTransports(transports, manifest.devices, ram);
+        try devices.gen.restore(allocator, restore.generation orelse manifest.generation);
+        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, &devices.gen);
+        try threaded.restore(allocator, manifest.machine);
+        try vmm.raiseGenerationIrqIfPending(&vm, &devices.gen);
         if (restore_stats) |*stats| stats.state_ms = monotonicMs() - state_start;
+        boot_ms = monotonicMs() - restore_start;
     } else {
         const fresh = config.start.boot;
-        // Fresh boot: DTB + kernel. Backend support is currently gated to one
-        // vCPU, but DTB construction consumes the shared topology contract.
         const boot_start = monotonicMs();
         const boot_ram = ram_bytes[0..initial_ram_len];
         const initrd_range = if (fresh.initrd) |initrd| try boot.planInitrd(boot_ram.len, board.ram_base, fresh.kernel, initrd.len) else null;
@@ -228,50 +189,38 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         });
         defer allocator.free(dtb);
         const layout = try boot.load(boot_ram, board.ram_base, fresh.kernel, fresh.initrd, dtb);
-        var seed_ranges_buf: [3]dirty_ram.ChunkRange = undefined;
-        for (layout.populatedRanges(), 0..) |range, i| {
-            seed_ranges_buf[i] = .{ .start = range.start, .end = range.end };
-        }
-        const seed_ranges = seed_ranges_buf[0..layout.populated_range_count];
-
-        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .cpsr, 0x3c5), "set cpsr"); // EL1h, DAIF masked
-        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .pc, layout.entry), "set pc");
-        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .x0, layout.dtb), "set x0");
+        _ = try vcpus[0].submit(.{ .start = .{ .entry = layout.entry, .arg0 = layout.dtb } });
 
         if (config.dirtyTrackingDir()) |dir| {
+            var seed_ranges_buf: [3]dirty_ram.ChunkRange = undefined;
+            for (layout.populatedRanges(), 0..) |range, i| {
+                seed_ranges_buf[i] = .{ .start = range.start, .end = range.end };
+            }
             dirty_tracker = try DirtyTracker.start(allocator, config.io, .{
                 .dir = dir,
                 .ram = ram_bytes,
-                .seed_ranges = seed_ranges,
+                .seed_ranges = seed_ranges_buf[0..layout.populated_range_count],
             }, .{});
-            if (dirty_tracker) |*tracker| {
-                ram.dirty_context = tracker;
-                ram.dirty_fn = DirtyTracker.markGuestWriteCallback;
-            }
+            const tracker = &dirty_tracker.?;
+            ram.dirty_context = tracker;
+            ram.dirty_fn = DirtyTracker.markGuestWriteCallback;
+            // The vCPU threads are still parked.
+            threaded.ram = ram;
+            threaded.dirty_tracker = tracker;
+            vm.dirty_tracker = tracker;
         }
         boot_ms = monotonicMs() - boot_start;
     }
 
-    const tracker_ref: ?*DirtyTracker = if (dirty_tracker) |*tracker| tracker else null;
-    vm.dirty_tracker = tracker_ref;
-    const snapshot_source = vmm.SnapshotSource{
-        .config = config,
-        .transports = transports,
-        .gen_dev = gen_dev,
-        .vsock_dev = vsock_dev,
-        .ram_bytes = ram_bytes,
-        .ram_size = prepared.ram_size,
-        .memory_device = if (mem_transport_index != null) mem_dev else null,
-    };
-    const start_ms = monotonicMs();
-    vmm.emitRestoreMetrics("hvf", &prepared, &restore_stats, start_ms);
+    vmm.emitRestoreMetrics("hvf", &prepared, &restore_stats, monotonicMs());
+
     var attach_probe_ms: u64 = 0;
     if (config.probe) |probe| {
         if (probe.start == .immediate) {
             const attach_probe_start = monotonicMs();
-            try vsock_dev.attachHostStream(probe.stream);
+            try devices.vsock.attachHostStream(probe.stream);
             probe.stream.markStarted();
-            _ = try vmm.flushRx(&vm, vsock_dev, transports, vsock_transport_index, ram);
+            if (try vmm.flushRx(&vm, &devices.vsock, transports, devices.vsock_index, ram)) threaded.kickAll();
             attach_probe_ms = monotonicMs() - attach_probe_start;
         }
     }
@@ -279,7 +228,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         std.log.debug(
             "hvf cold setup timing: total_ms={d} hv_vm_create_ms={d} gic_ms={d} mmap_ram_ms={d} hv_map_ram_ms={d} devices_ms={d} vcpu_ms={d} boot_ms={d} attach_probe_ms={d} ram_mib={d}",
             .{
-                start_ms - setup_start,
+                monotonicMs() - setup_start,
                 hv_vm_create_ms,
                 gic_ms,
                 map_ram_ms,
@@ -292,150 +241,16 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             },
         );
     }
-    var exec_probe_done = false;
-    var handled_memory_pressure_count: u32 = 0;
-    var requested_hotplug_size: u64 = if (mem_transport_index != null) mem_dev.requested_size else 0;
-    var logged_first_vcpu_entry = false;
-    var logged_first_guest_exit = false;
 
-    // Run loop.
-    var did_capture_request = false;
-    while (true) {
-        if (config.probe != null and !exec_probe_done) {
-            _ = try vmm.flushRx(&vm, vsock_dev, transports, vsock_transport_index, ram);
-        }
-        if (mem_transport_index != null) {
-            if (config.probeStream()) |probe| {
-                const new_pressure_events = probe.memory_pressure_count -| handled_memory_pressure_count;
-                if (new_pressure_events > 0 and probe.state == .connected) {
-                    const idx = mem_transport_index.?;
-                    requested_hotplug_size = virtio_mem.requestedSizeAfterPressure(requested_hotplug_size, @intCast(hotplug.?.bytes.len), new_pressure_events);
-                    handled_memory_pressure_count = probe.memory_pressure_count;
-                    try mem_dev.setRequestedSize(@intCast(requested_hotplug_size));
-                    _ = transports[idx].raiseConfigChange();
-                    try vm.setSpi(board.virtioDeviceIntid(@intCast(idx)), true);
-                    std.log.debug("virtio-mem requested hotplug size: bytes={d} pressure_count={d}", .{ requested_hotplug_size, handled_memory_pressure_count });
-                }
-            }
-        }
-        if (config.network.failed()) return error.NetworkGatewayFailed;
-        if (config.network.consumeWake()) {
-            _ = try vmm.flushRx(&vm, net_dev, transports, net_transport_index, ram);
-            continue;
-        }
-        if (config.exec_control) |control| {
-            control.reportStats(vmm.monitorStats(if (tracker_ref) |tracker| &tracker.sealer else null));
-            switch (try control.poll(vsock_dev)) {
-                .keep_running => {},
-                .stop => return .monitor_stopped,
-                .snapshot => |request| snapshot_action: {
-                    var preparation = if (request.publish_dir != null)
-                        (try control.prepareSnapshot()) orelse break :snapshot_action
-                    else
-                        null;
-                    defer if (preparation) |*owned| owned.deinit();
-                    var prepared_root = if (request.publish_dir) |publish_dir|
-                        if (config.disk_snapshot) |disk_state| try disk_state.prepareSnapshotRoot(publish_dir) else null
-                    else
-                        null;
-                    defer if (prepared_root) |*root| root.deinit();
-                    const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    try vmm.writeSnapshot(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, .{
-                        .dir = request.dir,
-                        .rootfs_cache_lock = if (preparation) |*owned| owned.cacheLock() else null,
-                    });
-                    if (!request.continue_after) return .snapshotted;
-                    const completed_dir = if (request.publish_dir) |publish_dir| blk: {
-                        const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
-                        if (prepared_root) |*root| try config.disk_snapshot.?.commitSnapshotRoot(request.dir, root, if (config.environ_map != null) .shared_no_rebind else .local_rebind);
-                        vmm.logNamedSnapshotPublication("hvf", publish_metrics, source_pause_started_ns);
-                        break :blk publish_dir;
-                    } else request.dir;
-                    try control.completeSnapshot(completed_dir);
-                },
-                .rootfs_snapshot => |request| {
-                    const disk_manifest = try vmm.takeRootfsSnapshot(allocator, request.dir, transports, config.disk_snapshot);
-                    try control.completeRootfsSnapshot(disk_manifest);
-                },
-                .disk_fork => |request| {
-                    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    vmm.captureDiskFork(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, request, control, pause_started_ns) catch |err| control.failDiskFork(err);
-                },
-            }
-            _ = try vmm.flushRx(&vm, vsock_dev, transports, vsock_transport_index, ram);
-        }
-        if (config.captureRequest()) |request_capture| {
-            if (request_capture.isAbortRequested()) return error.CaptureAborted;
-            if (request_capture.isRequested() and !did_capture_request) {
-                try vmm.writeSnapshot(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, .{ .dir = config.capture.?.dir });
-                request_capture.markCompleted();
-                if (request_capture.isAbortRequested()) return error.CaptureAborted;
-                if (config.continueAfterCapture()) {
-                    did_capture_request = true;
-                    continue;
-                }
-                return .snapshotted;
-            }
-        }
-        if (config.probe) |exec_probe| {
-            const probe = exec_probe.stream;
-            if (!exec_probe_done) {
-                if (probe.state == .failed) return error.VsockProbeFailed;
-                if (probe.state == .complete) {
-                    if (exec_probe.on_complete == .stop) {
-                        if (config.probeCaptureDir()) |dir| {
-                            try vmm.writeSnapshot(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, .{ .dir = dir });
-                            return .snapshotted;
-                        }
-                        return .probe_complete;
-                    }
-                    // A detached stream stays attached until the control
-                    // replaces or resets it.
-                    exec_probe_done = true;
-                }
-                if (!exec_probe_done and probe.state != .idle and probe.elapsedMs() > exec_probe.timeout_ms) return error.VsockProbeTimedOut;
-            }
-        }
-        if (prepared.restoring() and config.probe != null and !logged_first_vcpu_entry) {
-            logged_first_vcpu_entry = true;
-            std.log.debug("hvf exec probe timing: first_vcpu_entry_ms={d}", .{monotonicMs() -| start_ms});
-        }
-        const run_exit = try primary.run(&vm, vcpus);
-        if (config.probe != null and !exec_probe_done and run_exit != .kicked) {
-            if (prepared.restoring() and !logged_first_guest_exit) {
-                logged_first_guest_exit = true;
-                std.log.debug(
-                    "hvf exec probe timing: first_guest_exit_ms={d} reason={}",
-                    .{ monotonicMs() -| start_ms, primary.exit.reason },
-                );
-            }
-        }
-        switch (run_exit) {
-            .mmio => |access| try primary.completeMmio(try vmm.dispatchMmio(&vm, access, transports, gen_dev, ram)),
-            .wfi => {
-                // Nothing better to do single-threaded yet; yield briefly and
-                // let the vtimer wake us.
-                var ts = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_us };
-                _ = std.c.nanosleep(&ts, null);
-            },
-            .shutdown => |kind| return kind.cause(),
-            .handled => {},
-            .kicked => {
-                if (config.captureRequest()) |request_capture| {
-                    if (request_capture.isAbortRequested()) return error.CaptureAborted;
-                    if (request_capture.isRequested()) continue;
-                }
-                if (config.probe != null and !exec_probe_done) continue;
-                if (config.network.failed()) continue;
-                if (config.network.consumeWake()) {
-                    _ = try vmm.flushRx(&vm, net_dev, transports, net_transport_index, ram);
-                    continue;
-                }
-                if (config.exec_control != null) continue;
-                return error.VcpuCanceled;
-            },
-        }
-    }
+    return threaded.run(allocator, .{
+        .config = config,
+        .transports = transports,
+        .gen_dev = &devices.gen,
+        .vsock_dev = &devices.vsock,
+        .ram_bytes = ram_bytes,
+        .ram_size = prepared.ram_size,
+        .memory_device = if (devices.mem_index != null) &devices.mem else null,
+    });
 }
 
 const hvf_vcpu_state_off: u8 = 0;
@@ -458,10 +273,16 @@ const HvfVcpuGicWriteCommand = struct {
     value: u64,
 };
 
+const HvfVcpuGicRestoreCommand = struct {
+    allocator: std.mem.Allocator,
+    state: *const gicv3.State,
+};
+
 const HvfVcpuCommand = union(enum) {
     start: HvfVcpuStartCommand,
     gic_read: HvfVcpuGicReadCommand,
     gic_write: HvfVcpuGicWriteCommand,
+    gic_restore: HvfVcpuGicRestoreCommand,
 };
 
 const HvfVcpuCommandResult = union(enum) {
@@ -569,7 +390,13 @@ const Vm = struct {
         return snapshot.captureGicState(arena);
     }
 
-    pub fn applyGic(_: *const Vm, allocator: std.mem.Allocator, vcpus: []const Vcpu, state: gicv3.State) !void {
+    pub fn applyGic(_: *const Vm, allocator: std.mem.Allocator, vcpus: []Vcpu, state: gicv3.State) !void {
+        // Portable state writes redistributor registers, which HVF accepts
+        // only on the thread that owns the vCPU.
+        if (state.kind == .gicv3) {
+            _ = try vcpus[0].submit(.{ .gic_restore = .{ .allocator = allocator, .state = &state } });
+            return;
+        }
         try snapshot.applyGicState(allocator, vcpus[0].handle, state);
     }
 
@@ -866,140 +693,6 @@ fn hvfRedistributorWindow(vcpus: []const Vcpu, stride: u64) !HvfRedistributorWin
 
 const Threaded = vmm.Threaded(Vm, Vcpu, DirtyTracker);
 
-const MultiHvfRunOptions = struct {
-    vm: *Vm,
-    prepared: *const vmm.Prepared,
-    restore_stats: *?vmm.RestoreStats,
-    devices: *vmm.Devices,
-    ram: guestmem.GuestRam,
-    ram_bytes: []align(std.heap.page_size_min) u8,
-    ram_file_backed: bool,
-    dist_base: u64,
-    dist_size: u64,
-    redist_region_base: u64,
-    redist_region_size: u64,
-    setup_start: u64,
-    hv_vm_create_ms: u64,
-    gic_ms: u64,
-    map_ram_ms: u64,
-    hv_map_ram_ms: u64,
-    devices_ms: u64,
-};
-
-/// Runs a VM with more than one vCPU on the shared threaded loop. HVF
-/// creates each vCPU on its own thread, so the GIC layout, boot and restore
-/// wait for the threads.
-fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !ExitCause {
-    const config = &options.prepared.config;
-    const vm = options.vm;
-    const devices = options.devices;
-    const transports = devices.transports();
-    const vcpus = try allocator.alloc(Vcpu, options.prepared.vcpus);
-    defer allocator.free(vcpus);
-    for (vcpus, 0..) |*vcpu, index| vcpu.* = .{ .io = config.io, .index = @intCast(index) };
-
-    var threaded: Threaded = .{ .vm = vm, .vcpus = vcpus, .devices = devices, .ram = options.ram, .config = config };
-    defer threaded.deinit(allocator);
-    try threaded.start(allocator);
-
-    const vcpu_start = monotonicMs();
-    var redist_stride: usize = 0;
-    try hvf.check(hvf.hv_gic_get_redistributor_size(&redist_stride), "gic redist stride");
-    const redist_window = try hvfRedistributorWindow(vcpus, @intCast(redist_stride));
-    if (redist_window.size > options.redist_region_size) return error.UnsupportedVcpuCount;
-    try requireBoardRedistributors(redist_window, redist_stride, @intCast(vcpus.len));
-    const vcpu_ms = monotonicMs() - vcpu_start;
-    vm.gic_windows = .{
-        .dist_base = options.dist_base,
-        .dist_size = options.dist_size,
-        .redist_base = redist_window.base,
-        .redist_size = redist_window.size,
-        .redist_stride = @intCast(redist_stride),
-        .redist_vcpus = vcpus,
-    };
-    std.log.debug(
-        "gic: dist=0x{x}+0x{x} redist=0x{x}+0x{x} stride=0x{x} count={d} (region 0x{x}+0x{x})",
-        .{ options.dist_base, options.dist_size, redist_window.base, redist_window.size, redist_stride, vcpus.len, options.redist_region_base, options.redist_region_size },
-    );
-
-    var boot_ms: u64 = 0;
-    if (options.prepared.manifest) |parsed| {
-        const restore = config.start.restore;
-        const manifest = &parsed.value;
-        const restore_start = monotonicMs();
-        const machine = switch (manifest.machine) {
-            .multi => |multi| multi,
-            .single => return error.PlatformMismatch,
-        };
-        try platform_contract.checkManifest(manifest.*, platform_contract.contract(options.prepared.vcpus, options.prepared.ram_size, snapshot.hostCounterFreq()), transports.len);
-        // HVF restores only its own private GIC blob.
-        if (machine.gic.kind != .backend_private) return error.PlatformMismatch;
-        try vmm.restoreMemory(allocator, restore, manifest.memory, options.ram_bytes, options.ram_file_backed, options.restore_stats);
-        const state_start = monotonicMs();
-        try vmm.applyTransports(transports, manifest.devices, options.ram);
-        try devices.gen.restore(allocator, restore.generation orelse manifest.generation);
-        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, &devices.gen);
-        try threaded.restore(allocator, manifest.machine);
-        try vmm.raiseGenerationIrqIfPending(vm, &devices.gen);
-        if (options.restore_stats.*) |*stats| stats.state_ms = monotonicMs() - state_start;
-        boot_ms = monotonicMs() - restore_start;
-    } else {
-        const fresh = config.start.boot;
-        const boot_start = monotonicMs();
-        const initrd_range = if (fresh.initrd) |initrd| try boot.planInitrd(options.ram.bytes.len, board.ram_base, fresh.kernel, initrd.len) else null;
-        const dtb = try board.buildDtb(allocator, .{
-            .ram_size = options.prepared.ram_size,
-            .cpu_count = options.prepared.vcpus,
-            .gic = try board.gicLayout(options.prepared.vcpus),
-            .virtio_count = @intCast(transports.len),
-            .bootargs = fresh.cmdline,
-            .initrd = if (initrd_range) |r| .{ .start = r.start, .end = r.end } else null,
-        });
-        defer allocator.free(dtb);
-        const layout = try boot.load(options.ram.bytes, board.ram_base, fresh.kernel, fresh.initrd, dtb);
-        _ = try vcpus[0].submit(.{ .start = .{ .entry = layout.entry, .arg0 = layout.dtb } });
-        boot_ms = monotonicMs() - boot_start;
-    }
-
-    vmm.emitRestoreMetrics("hvf", options.prepared, options.restore_stats, monotonicMs());
-
-    var attach_probe_ms: u64 = 0;
-    if (config.probe) |probe| {
-        if (probe.start == .immediate) {
-            const attach_probe_start = monotonicMs();
-            try devices.vsock.attachHostStream(probe.stream);
-            probe.stream.markStarted();
-            if (try vmm.flushRx(vm, &devices.vsock, transports, devices.vsock_index, options.ram)) threaded.kickAll();
-            attach_probe_ms = monotonicMs() - attach_probe_start;
-        }
-    }
-    const start_ms = monotonicMs();
-    std.log.debug(
-        "hvf cold setup timing: total_ms={d} hv_vm_create_ms={d} gic_ms={d} mmap_ram_ms={d} hv_map_ram_ms={d} devices_ms={d} vcpu_ms={d} boot_ms={d} attach_probe_ms={d} ram_mib={d}",
-        .{
-            start_ms - options.setup_start,
-            options.hv_vm_create_ms,
-            options.gic_ms,
-            options.map_ram_ms,
-            options.hv_map_ram_ms,
-            options.devices_ms,
-            vcpu_ms,
-            boot_ms,
-            attach_probe_ms,
-            options.prepared.ram_size / 1024 / 1024,
-        },
-    );
-
-    return threaded.run(allocator, .{
-        .config = config,
-        .transports = transports,
-        .gen_dev = &devices.gen,
-        .vsock_dev = &devices.vsock,
-        .ram_bytes = options.ram_bytes,
-        .ram_size = options.prepared.ram_size,
-    });
-}
-
 fn processHvfVcpuCommand(vcpu: *Vcpu, command: HvfVcpuCommand) void {
     const result: HvfVcpuCommandResult = switch (command) {
         .start => |start| blk: {
@@ -1009,6 +702,10 @@ fn processHvfVcpuCommand(vcpu: *Vcpu, command: HvfVcpuCommand) void {
         .gic_read => |read| .{ .value = gic.mmioRead(read.region, vcpu.handle, read.offset, read.size_log2) },
         .gic_write => |write| blk: {
             gic.mmioWrite(write.region, vcpu.handle, write.offset, write.value);
+            break :blk .ok;
+        },
+        .gic_restore => |restore| blk: {
+            snapshot.applyGicState(restore.allocator, vcpu.handle, restore.state.*) catch |err| break :blk .{ .err = err };
             break :blk .ok;
         },
     };
@@ -1047,12 +744,6 @@ fn monotonicMs() u64 {
     const freq = snapshot.hostCounterFreq();
     if (freq == 0) return 0;
     return snapshot.hostCounter() * std.time.ms_per_s / freq;
-}
-
-fn wakeCaptureVcpu(context: ?*anyopaque) callconv(.c) void {
-    const vcpu_ptr: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
-    var vcpus = [_]hvf.VcpuHandle{vcpu_ptr.*};
-    _ = hvf.hv_vcpus_exit(&vcpus, vcpus.len);
 }
 
 const DirtyTracker = vmm.DirtyTracker(WriteProtect);
@@ -1214,16 +905,6 @@ const WriteProtect = struct {
         );
     }
 };
-
-fn wakeVcpu(context: *anyopaque) void {
-    const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context));
-    _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
-}
-
-fn wakeNetworkVcpu(context: ?*anyopaque) void {
-    const vcpu: *hvf.VcpuHandle = @ptrCast(@alignCast(context orelse return));
-    _ = hvf.hv_vcpus_exit(@ptrCast(vcpu), 1);
-}
 
 fn advancePc(vcpu: hvf.VcpuHandle) !void {
     var pc: u64 = undefined;
