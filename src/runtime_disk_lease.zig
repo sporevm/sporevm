@@ -155,7 +155,12 @@ pub const ActiveIterator = struct {
         while (try iterator.next(self.io)) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, active_file_suffix)) continue;
             const pid = activeOwnerPid(entry.name) orelse return error.BadManifest;
-            if (!ownerAlive(pid)) continue;
+            if (!ownerAlive(pid)) {
+                // A killed owner never removes its record. Drop it so a
+                // later process that reuses the pid does not root it again.
+                self.dir.?.deleteFile(self.io, entry.name) catch {};
+                continue;
+            }
             const path = try std.fs.path.join(self.allocator, &.{ self.dir_path, entry.name });
             defer self.allocator.free(path);
             const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(max_active_lease_bytes)) catch |err| switch (err) {
@@ -370,6 +375,45 @@ test "active lease records reuse Lease JSON and release on teardown" {
 
     active.deinit();
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, active_path, .{ .follow_symlinks = false }));
+}
+
+test "scanning leases deletes records whose owner has exited" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const runtime_root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(runtime_root);
+    var live = try acquireActive(io, allocator, runtime_root, .{
+        .store = .rootfs_cache,
+        .root = "/cache",
+        .baseline_kind = .rootfs,
+        .baseline_identity = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    });
+    defer live.deinit();
+
+    var child = try std.process.spawn(io, .{ .argv = &.{"/usr/bin/true"}, .stdin = .ignore });
+    const dead_pid = child.id.?;
+    _ = try child.wait(io);
+    const dead_name = try std.fmt.allocPrint(allocator, "runtime-{d}-{s}.json", .{ dead_pid, "0" ** (active_nonce_bytes * 2) });
+    defer allocator.free(dead_name);
+    const dead_path = try std.fs.path.join(allocator, &.{ runtime_root, active_dir_name, dead_name });
+    defer allocator.free(dead_path);
+    try Io.Dir.cwd().copyFile(live.path, Io.Dir.cwd(), dead_path, io, .{});
+
+    var active = try ActiveIterator.init(allocator, io, runtime_root);
+    defer active.deinit();
+    var count: usize = 0;
+    while (try active.next()) |parsed_value| {
+        var parsed = parsed_value;
+        parsed.deinit();
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, dead_path, .{ .follow_symlinks = false }));
+    _ = try Io.Dir.cwd().statFile(io, live.path, .{ .follow_symlinks = false });
 }
 
 test "active lease owner parsing rejects out-of-range pids" {
