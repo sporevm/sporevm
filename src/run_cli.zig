@@ -12,10 +12,12 @@ const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
 const local_paths = @import("local_paths.zig");
 const guest_request = @import("guest_request.zig");
+const events_mod = @import("events.zig");
+const machine_output = @import("machine_output.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
-var setup_event_writer: ?*run_mod.EventWriter = null;
+var setup_event_writer: ?*events_mod.EventWriter = null;
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     if (args.len == 0 or wantsHelp(args)) {
@@ -24,7 +26,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     }
 
     const arena = init.arena.allocator();
-    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
+    var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
     if (requestsJsonl(args)) setup_event_writer = &event_writer;
     defer setup_event_writer = null;
     const parsed = run_mod.parseCliArgs(arena, args) catch |err| {
@@ -38,7 +40,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     try runParsedCli(init, arena, parsed, stdout, &event_writer);
 }
 
-fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer, event_writer: *run_mod.EventWriter) !void {
+fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer, event_writer: *events_mod.EventWriter) !void {
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.command.len == 0) {
             failRunSetup("spore run: --from runs a new command from a spore; use `spore attach {s}` to connect to a saved session", .{spore_dir});
@@ -250,7 +252,7 @@ fn writeStderr(bytes: []const u8) void {
 fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
     if (setup_event_writer) |events| {
         const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "spore run: setup failed";
-        const classified = run_mod.ClassifiedFailure.init(.usage_invalid_argument, message, "run");
+        const classified = machine_output.CliError.init(.usage_invalid_argument, message, "run");
         events.emitFailure(classified) catch {};
         events.writer.flush() catch {};
         std.process.exit(classified.exit_code);

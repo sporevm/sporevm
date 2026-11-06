@@ -19,7 +19,9 @@ const ExecNamedStream = monitor_protocol.ExecNamedStream;
 const named_copy_archive = @import("named_copy_archive.zig");
 const guest_request = @import("guest_request.zig");
 const rootfs_input = @import("rootfs_input.zig");
-const run_mod = @import("run.zig");
+const backend_mod = @import("backend.zig");
+const cli_args = @import("cli_args.zig");
+const events_mod = @import("events.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const spore = @import("spore.zig");
@@ -247,7 +249,7 @@ const CreateOptions = struct {
     image_pull_policy: rootfs_input.PullPolicy = .missing,
     initial_output: InitialOutputDisposition = .retain,
     network: spore_net_policy.Network = .disabled,
-    command_mode: run_mod.CommandMode = .shell,
+    command_mode: cli_args.CommandMode = .shell,
     command: []const []const u8 = &.{},
 };
 
@@ -294,19 +296,19 @@ const CreateOptionsFileBoundService = struct {
 
 const ExecOptions = struct {
     name: []const u8,
-    command_mode: run_mod.CommandMode = .shell,
+    command_mode: cli_args.CommandMode = .shell,
     command: []const []const u8,
     guest_env_specs: guest_request.GuestEnvSpecList = .{},
     guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
     timing_json_path: ?[]const u8 = null,
-    event_mode: run_mod.EventMode = .none,
+    event_mode: events_mod.EventMode = .none,
 };
 
-var exec_cli_event_writer: ?*run_mod.EventWriter = null;
+var exec_cli_event_writer: ?*events_mod.EventWriter = null;
 
-var restore_cli_event_writer: ?*run_mod.EventWriter = null;
+var restore_cli_event_writer: ?*events_mod.EventWriter = null;
 
 const SaveOptions = struct {
     name: []const u8,
@@ -325,9 +327,9 @@ const ForkOptions = struct {
 const RestoreOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
-    backend: ?run_mod.Backend = null,
+    backend: ?backend_mod.Backend = null,
     generation_path: ?[]const u8 = null,
-    event_mode: run_mod.EventMode = .none,
+    event_mode: events_mod.EventMode = .none,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
 };
 
@@ -375,7 +377,7 @@ pub fn createCli(
     const caller_command: []const []const u8 = if (parsed.command.len == 0)
         &.{}
     else
-        run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
+        cli_args.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
             error.ShellCommandArgumentCountUnsupported => {
                 const message = "spore create: shell command form accepts one command string; quote it or use -- for argv";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
@@ -385,7 +387,7 @@ pub fn createCli(
     const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
     const result = createNamedWithTiming(init, allocator, .probe(), .{
         .name = spec.name,
-        .backend = run_mod.Backend.parse(spec.backend) orelse unreachable,
+        .backend = backend_mod.Backend.parse(spec.backend) orelse unreachable,
         .kernel_path = spec.kernel_path,
         .initrd_path = spec.initrd_path,
         .rootfs_path = spec.rootfs_path,
@@ -540,7 +542,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         return;
     }
     const allocator = init.arena.allocator();
-    var events = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "exec");
+    var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "exec");
     exec_cli_event_writer = if (requestsJsonl(args)) &events else null;
     defer exec_cli_event_writer = null;
     const parsed = parseExecArgs(args);
@@ -561,7 +563,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
         },
         else => return err,
     };
-    const command = run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
+    const command = cli_args.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
         error.ShellCommandArgumentCountUnsupported => {
             std.debug.print("spore exec: shell command form accepts one command string; quote it or use -- for argv\n", .{});
             std.process.exit(2);
@@ -622,7 +624,7 @@ pub fn execCli(init: std.process.Init, args: []const []const u8, stdout: *Io.Wri
     if (result.exit_code != 0) std.process.exit(result.exit_code);
 }
 
-fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: ExecOptions, events: *run_mod.EventWriter, stdout: *Io.Writer) !void {
+fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: ExecOptions, events: *events_mod.EventWriter, stdout: *Io.Writer) !void {
     try events.emitStart(.auto);
     if (parsed.interactive or parsed.tty) {
         const classified = machine_output.CliError.init(.usage_invalid_argument, "spore exec: --events=jsonl does not support interactive or TTY input", "exec");
@@ -632,12 +634,12 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
 
     var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
     const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| {
-        const classified = run_mod.classifyFailure(err);
+        const classified = events_mod.classifyFailure(err);
         try events.emitFailure(classified);
         std.process.exit(classified.exit_code);
     };
-    const command = run_mod.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| {
-        const classified = run_mod.classifyFailure(err);
+    const command = cli_args.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| {
+        const classified = events_mod.classifyFailure(err);
         try events.emitFailure(classified);
         std.process.exit(classified.exit_code);
     };
@@ -650,7 +652,7 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
         .guest_env = guest_env,
         .guest_working_dir = parsed.guest_working_dir,
     }) catch |err| {
-        const classified = run_mod.classifyFailure(err);
+        const classified = events_mod.classifyFailure(err);
         try events.emitFailure(classified);
         std.process.exit(classified.exit_code);
     };
@@ -659,7 +661,7 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
     var exit_code: u8 = 0;
     while (true) {
         const event = stream.next() catch |err| {
-            const classified = run_mod.classifyFailure(err);
+            const classified = events_mod.classifyFailure(err);
             try events.emitFailure(classified);
             std.process.exit(classified.exit_code);
         };
@@ -1176,7 +1178,7 @@ pub fn restoreCli(
         return;
     }
     const allocator = init.arena.allocator();
-    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
+    var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
     restore_cli_event_writer = if (requestsJsonl(args)) &event_writer else null;
     defer restore_cli_event_writer = null;
     const parsed = parseRestoreArgs(args, allocator, stderr, mode);
@@ -1276,7 +1278,7 @@ pub fn restoreCli(
     };
     defer deinitNamedLifecycleResult(allocator, result);
     if (parsed.event_mode == .jsonl) {
-        const requested_backend: run_mod.Backend = parsed.backend orelse .auto;
+        const requested_backend: backend_mod.Backend = parsed.backend orelse .auto;
         const backend = requested_backend.resolveForHost() catch requested_backend;
         try emitNamedRestoreExit(&event_writer, backend);
     } else if (mode == .json) {
@@ -1286,7 +1288,7 @@ pub fn restoreCli(
     }
 }
 
-fn emitNamedRestoreExit(event_writer: *run_mod.EventWriter, backend: run_mod.Backend) !void {
+fn emitNamedRestoreExit(event_writer: *events_mod.EventWriter, backend: backend_mod.Backend) !void {
     try event_writer.emitExit(.{
         .backend = backend,
         .start_ms = 0,
@@ -1300,8 +1302,8 @@ fn emitNamedRestoreExit(event_writer: *run_mod.EventWriter, backend: run_mod.Bac
     });
 }
 
-fn emitRestoreFailureEvent(event_writer: *run_mod.EventWriter, event_mode: run_mod.EventMode, err: anyerror) void {
-    if (event_mode == .jsonl) event_writer.emitFailure(run_mod.classifyFailure(err)) catch {};
+fn emitRestoreFailureEvent(event_writer: *events_mod.EventWriter, event_mode: events_mod.EventMode, err: anyerror) void {
+    if (event_mode == .jsonl) event_writer.emitFailure(events_mod.classifyFailure(err)) catch {};
 }
 
 pub fn lsCli(
@@ -1516,7 +1518,7 @@ fn parseCreateOptionsFile(
     out.options_path = null;
     out.spec = .{ .name = base.spec.name };
     if (file.backend) |backend| {
-        if (run_mod.Backend.parse(backend) == null) return error.InvalidBackend;
+        if (backend_mod.Backend.parse(backend) == null) return error.InvalidBackend;
         out.spec.backend = backend;
     }
     out.spec.kernel_path = file.kernel;
@@ -1584,7 +1586,7 @@ fn parseCreateArgs(
     var network_requested = false;
     // Plain `--net` leaves egress unrestricted; allow flags narrow it.
     var network_policy = spore_net_policy.Config{ .egress = .unrestricted };
-    var command_mode: run_mod.CommandMode = .shell;
+    var command_mode: cli_args.CommandMode = .shell;
     var command: ?[]const []const u8 = null;
 
     var i: usize = 0;
@@ -1596,7 +1598,7 @@ fn parseCreateArgs(
         } else if (std.mem.eql(u8, args[i], "--backend")) {
             field_flag_seen = true;
             spec.backend = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
-            if (run_mod.Backend.parse(spec.backend) == null) {
+            if (backend_mod.Backend.parse(spec.backend) == null) {
                 const message = "--backend must be auto, hvf, or kvm";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
             }
@@ -1792,14 +1794,14 @@ fn parseCreateArgs(
 fn parseExecArgs(args: []const []const u8) ExecOptions {
     if (args.len < 2) usageExit(exec_usage);
     var name: ?[]const u8 = null;
-    var command_mode: run_mod.CommandMode = .shell;
+    var command_mode: cli_args.CommandMode = .shell;
     var command: []const []const u8 = &.{};
     var guest_env_specs = guest_request.GuestEnvSpecList{};
     var guest_working_dir: ?[]const u8 = null;
     var interactive = false;
     var tty = false;
     var timing_json_path: ?[]const u8 = null;
-    var event_mode: run_mod.EventMode = .none;
+    var event_mode: events_mod.EventMode = .none;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1837,9 +1839,9 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         } else if (std.mem.eql(u8, args[i], "--events")) {
             i += 1;
             if (i >= args.len) usageExit(exec_usage);
-            event_mode = run_mod.EventMode.parse(args[i]) orelse usageExit(exec_usage);
+            event_mode = events_mod.EventMode.parse(args[i]) orelse usageExit(exec_usage);
         } else if (std.mem.startsWith(u8, args[i], "--events=")) {
-            event_mode = run_mod.EventMode.parse(args[i]["--events=".len..]) orelse usageExit(exec_usage);
+            event_mode = events_mod.EventMode.parse(args[i]["--events=".len..]) orelse usageExit(exec_usage);
         } else if (std.mem.startsWith(u8, args[i], "-")) {
             usageExit(exec_usage);
         } else {
@@ -1984,9 +1986,9 @@ fn parseRestoreArgs(
 ) RestoreOptions {
     var spore_dir: ?[]const u8 = null;
     var name: ?[]const u8 = null;
-    var backend: ?run_mod.Backend = null;
+    var backend: ?backend_mod.Backend = null;
     var generation_path: ?[]const u8 = null;
-    var event_mode: run_mod.EventMode = .none;
+    var event_mode: events_mod.EventMode = .none;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
 
     var i: usize = 0;
@@ -1994,13 +1996,13 @@ fn parseRestoreArgs(
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--backend")) {
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
-            backend = run_mod.Backend.parse(raw) orelse {
+            backend = backend_mod.Backend.parse(raw) orelse {
                 const message = "--backend must be auto, hvf, or kvm";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
         } else if (std.mem.startsWith(u8, arg, "--backend=")) {
             const raw = arg["--backend=".len..];
-            backend = run_mod.Backend.parse(raw) orelse {
+            backend = backend_mod.Backend.parse(raw) orelse {
                 const message = "--backend must be auto, hvf, or kvm";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
@@ -2010,13 +2012,13 @@ fn parseRestoreArgs(
             generation_path = arg["--generation=".len..];
         } else if (std.mem.eql(u8, arg, "--events")) {
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
-            event_mode = run_mod.EventMode.parse(raw) orelse {
+            event_mode = events_mod.EventMode.parse(raw) orelse {
                 const message = "--events must be jsonl";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
         } else if (std.mem.startsWith(u8, arg, "--events=")) {
             const raw = arg["--events=".len..];
-            event_mode = run_mod.EventMode.parse(raw) orelse {
+            event_mode = events_mod.EventMode.parse(raw) orelse {
                 const message = "--events must be jsonl";
                 exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
             };
@@ -2657,7 +2659,7 @@ fn parseDurationArgLifecycleCli(
     raw: []const u8,
     flag: []const u8,
 ) u64 {
-    return run_mod.parseDurationMs(raw) catch {
+    return cli_args.parseDurationMs(raw) catch {
         const message = allocLifecycleMessage(allocator, "{s} expects a duration like 30s, 500ms, or 1m", .{flag});
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
@@ -2718,12 +2720,12 @@ test "create parser accepts shell and exact commands" {
     defer stderr.deinit();
 
     const shell_opts = try parseCreateArgs(&.{ "counter", "--image", "alpine:3.20", "echo hi" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(run_mod.CommandMode.shell, shell_opts.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.shell, shell_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), shell_opts.command.len);
     try std.testing.expectEqualStrings("echo hi", shell_opts.command[0]);
 
     const argv_opts = try parseCreateArgs(&.{ "counter", "--", "/bin/echo", "hi" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(run_mod.CommandMode.argv, argv_opts.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.argv, argv_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 2), argv_opts.command.len);
     try std.testing.expectEqualStrings("/bin/echo", argv_opts.command[0]);
     try std.testing.expectEqualStrings("hi", argv_opts.command[1]);
@@ -2755,27 +2757,27 @@ test "create parser keeps image and plain creates commandless" {
 test "exec parser accepts shell and exact commands" {
     const shell_opts = parseExecArgs(&.{ "counter", "cat /tick" });
     try std.testing.expectEqualStrings("counter", shell_opts.name);
-    try std.testing.expectEqual(run_mod.CommandMode.shell, shell_opts.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.shell, shell_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), shell_opts.command.len);
     try std.testing.expectEqualStrings("cat /tick", shell_opts.command[0]);
     try std.testing.expect(!shell_opts.interactive);
     try std.testing.expect(!shell_opts.tty);
 
     const argv_opts = parseExecArgs(&.{ "counter", "--", "/bin/cat", "/tick" });
-    try std.testing.expectEqual(run_mod.CommandMode.argv, argv_opts.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.argv, argv_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 2), argv_opts.command.len);
     try std.testing.expectEqualStrings("/bin/cat", argv_opts.command[0]);
     try std.testing.expectEqualStrings("/tick", argv_opts.command[1]);
 
     const hyphen_shell_opts = parseExecArgs(&.{ "counter", "-c test" });
-    try std.testing.expectEqual(run_mod.CommandMode.shell, hyphen_shell_opts.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.shell, hyphen_shell_opts.command_mode);
     try std.testing.expectEqualStrings("-c test", hyphen_shell_opts.command[0]);
 }
 
 test "exec parser accepts interactive and tty flags" {
     const combined_opts = parseExecArgs(&.{ "--env", "CLEAR_ME=", "--env", "HOST_VALUE", "--workdir", "/app", "-it", "box", "--", "/bin/sh" });
     try std.testing.expectEqualStrings("box", combined_opts.name);
-    try std.testing.expectEqual(run_mod.CommandMode.argv, combined_opts.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.argv, combined_opts.command_mode);
     try std.testing.expect(combined_opts.interactive);
     try std.testing.expect(combined_opts.tty);
     try std.testing.expectEqualStrings("/bin/sh", combined_opts.command[0]);
@@ -2786,7 +2788,7 @@ test "exec parser accepts interactive and tty flags" {
 
     const long_opts = parseExecArgs(&.{ "--interactive", "--tty", "box", "cat" });
     try std.testing.expectEqualStrings("box", long_opts.name);
-    try std.testing.expectEqual(run_mod.CommandMode.shell, long_opts.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.shell, long_opts.command_mode);
     try std.testing.expect(long_opts.interactive);
     try std.testing.expect(long_opts.tty);
     try std.testing.expectEqualStrings("cat", long_opts.command[0]);
@@ -2799,7 +2801,7 @@ test "exec parser accepts timing JSON before the VM name" {
 
     const joined = parseExecArgs(&.{ "--timing-json=/tmp/joined.json", "box", "--", "/bin/true" });
     try std.testing.expectEqualStrings("/tmp/joined.json", joined.timing_json_path.?);
-    try std.testing.expectEqual(run_mod.CommandMode.argv, joined.command_mode);
+    try std.testing.expectEqual(cli_args.CommandMode.argv, joined.command_mode);
 }
 
 test "create parser accepts bounded vcpu count" {
@@ -3021,8 +3023,8 @@ test "named restore parser accepts k8s child command product flags" {
     defer stderr.deinit();
 
     const opts = parseRestoreArgs(&.{ "--events=jsonl", "--backend", "kvm", "--generation", "generation.json", "child.spore", "--name=sporevm-child-42" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(run_mod.EventMode.jsonl, opts.event_mode);
-    try std.testing.expectEqual(run_mod.Backend.kvm, opts.backend.?);
+    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
+    try std.testing.expectEqual(backend_mod.Backend.kvm, opts.backend.?);
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
     try std.testing.expectEqualStrings("sporevm-child-42", opts.name);
@@ -3033,7 +3035,7 @@ test "named restore event mode emits terminal run event" {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    var events = run_mod.EventWriter.init(allocator, &out.writer, "restore");
+    var events = events_mod.EventWriter.init(allocator, &out.writer, "restore");
     try events.emitStart(.kvm);
     try emitNamedRestoreExit(&events, .kvm);
 

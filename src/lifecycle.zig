@@ -218,7 +218,7 @@ pub const InitialCommandResult = struct {
 
 pub const CreateNamedOptions = struct {
     name: []const u8,
-    backend: run_mod.Backend = .auto,
+    backend: backend_mod.Backend = .auto,
     kernel_path: ?[]const u8 = null,
     initrd_path: ?[]const u8 = null,
     rootfs_path: ?[]const u8 = null,
@@ -243,7 +243,7 @@ pub const CreateNamedOptions = struct {
 pub const RestoreNamedOptions = struct {
     spore_dir: []const u8,
     name: []const u8,
-    backend: ?run_mod.Backend = null,
+    backend: ?backend_mod.Backend = null,
     generation_path: ?[]const u8 = null,
     spore_executable: []const u8 = "spore",
     /// Start the monitor with `--debug`.
@@ -540,7 +540,7 @@ pub fn restoreNamed(
 ) !NamedLifecycleResult {
     const start_ms = monotonicMs();
     clearLastError();
-    const requested_backend = options.backend orelse run_mod.Backend.auto;
+    const requested_backend = options.backend orelse backend_mod.Backend.auto;
     const selected_backend = try requested_backend.resolveForHost();
     try run_mod.validateFreshProductPolicy(selected_backend, .{
         .memory = .{},
@@ -906,7 +906,7 @@ pub fn saveNamed(
 }
 
 fn rejectX86NamedPersistence(spec: Spec) !void {
-    const requested = run_mod.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
+    const requested = backend_mod.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
     const selected = try requested.resolveForHost();
     try run_mod.validateFreshProductPolicy(selected, .{
         .memory = spec.memory,
@@ -2333,7 +2333,7 @@ pub fn monotonicMs() u64 {
 }
 
 pub fn monitorBackendSupported(raw: []const u8) bool {
-    _ = (run_mod.Backend.parse(raw) orelse return false).resolveForHost() catch return false;
+    _ = (backend_mod.Backend.parse(raw) orelse return false).resolveForHost() catch return false;
     return true;
 }
 

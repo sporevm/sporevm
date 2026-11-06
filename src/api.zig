@@ -28,6 +28,8 @@ const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const guest_request = @import("guest_request.zig");
 const rootfs_input = @import("rootfs_input.zig");
+const events_mod = @import("events.zig");
+const machine_output = @import("machine_output.zig");
 const run_mod = @import("run.zig");
 const gicv3 = @import("aarch64/gicv3.zig");
 const spore = @import("spore.zig");
@@ -87,7 +89,7 @@ pub const PullResult = spore_store.PullResult;
 pub const BundleChildSummary = contracts.BundleChildSummary;
 pub const InspectBundleResult = contracts.InspectBundleResult;
 
-pub const Backend = run_mod.Backend;
+pub const Backend = backend_mod.Backend;
 pub const MemoryConfig = run_mod.MemoryConfig;
 pub const SaveTrigger = run_mod.SaveTrigger;
 pub const ImagePullPolicy = rootfs_input.PullPolicy;
@@ -112,11 +114,11 @@ pub const ResourceType = resource.Type;
 pub const Portability = resource.Portability;
 pub const RootfsResolveOptions = rootfs_mod.ResolveRequest;
 pub const InjectedFile = boot_assets.InjectedFile;
-pub const RunResult = run_mod.Result;
-pub const AttachResult = run_mod.Result;
-pub const RunEvent = run_mod.RunEvent;
-pub const EventSink = run_mod.EventSink;
-pub const ClassifiedFailure = run_mod.ClassifiedFailure;
+pub const RunResult = events_mod.Result;
+pub const AttachResult = events_mod.Result;
+pub const RunEvent = events_mod.RunEvent;
+pub const EventSink = events_mod.EventSink;
+pub const ClassifiedFailure = machine_output.CliError;
 
 /// CLI-like fresh run options.
 ///
@@ -550,7 +552,7 @@ pub fn deinitSporeInspectResult(allocator: std.mem.Allocator, result: SporeInspe
 /// Map an internal Zig error to the stable failure classification used by
 /// machine output and run/resume event consumers.
 pub fn classifyFailure(err: anyerror) ClassifiedFailure {
-    return run_mod.classifyFailure(err);
+    return events_mod.classifyFailure(err);
 }
 
 /// Resolve managed kernel/initrd/rootfs inputs, boot a VM, and execute a command.

@@ -8,7 +8,7 @@ const Io = std.Io;
 
 const api = @import("api.zig");
 const attach_mod = @import("attach.zig");
-const run_mod = @import("run.zig");
+const events_mod = @import("events.zig");
 
 pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
     if (args.len == 0 or wantsHelp(args)) {
@@ -16,7 +16,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         return;
     }
 
-    var event_writer = run_mod.EventWriter.init(std.heap.page_allocator, stdout, "attach");
+    var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "attach");
     if (requestsJsonl(args)) attach_mod.cli_setup_events = event_writer.sink();
     defer attach_mod.cli_setup_events = null;
     const opts = try attach_mod.parseCliArgs(args);
