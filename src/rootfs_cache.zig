@@ -17,6 +17,7 @@
 //! contents to a third party, such as metadata-only bundle materialization.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const spore = @import("spore.zig");
 
 const Blake3 = std.crypto.hash.Blake3;
@@ -489,11 +490,10 @@ test "digest cache installs rootfs bytes atomically and verifies final content" 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-install";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -520,11 +520,10 @@ test "trusted open accepts installed entry and fails closed on size and shape" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-trusted-open";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -564,11 +563,10 @@ test "trusted open trusts install-time verification for same-size entries" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-trusted-open-same-size";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -590,11 +588,10 @@ test "install trusts existing same-size digest cache hits" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-install-existing-trusted";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -622,11 +619,10 @@ test "copy-only digest cache does not chmod source rootfs" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-copy-source-perms";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
     try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
 
@@ -646,11 +642,10 @@ test "digest cache default does not alias caller-owned source" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-default-copy";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
     try Io.Dir.cwd().setFilePermissions(io, rootfs_path, @enumFromInt(0o644), .{});
 
@@ -675,12 +670,11 @@ test "trusted rootfs copy verifies destination bytes" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-trusted-copy";
-    const expected_path = tmp ++ "/expected.ext4";
-    const source_path = tmp ++ "/source.ext4";
-    const dest_path = tmp ++ "/dest.ext4";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const expected_path = try tmp_dir.path("expected.ext4");
+    const source_path = try tmp_dir.path("source.ext4");
+    const dest_path = try tmp_dir.path("dest.ext4");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = "expected rootfs bytes" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "tampered rootfs bytes" });
 
@@ -704,12 +698,11 @@ test "install after source verification cleans up bad installed bytes" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-preverified-cleanup";
-    const expected_path = tmp ++ "/expected.ext4";
-    const source_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const expected_path = try tmp_dir.path("expected.ext4");
+    const source_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = "expected rootfs bytes" });
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "tampered rootfs bytes" });
 
@@ -734,11 +727,10 @@ test "preverified hardlink install skips second hash for regular source" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-preverified-hardlink";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const source = try hashPath(io, arena, rootfs_path);
@@ -768,11 +760,10 @@ test "digest cache rejects unsafe existing paths" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-rootfs-cache-symlink";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -788,9 +779,9 @@ test "digest cache rejects unsafe existing paths" {
 test "rootfs hashing rejects non-file descriptors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-cache-fd-regular";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
 
     const tmp_z = try allocator.dupeZ(u8, tmp);
     defer allocator.free(tmp_z);

@@ -1,6 +1,7 @@
 //! Per-VM monitor process and local control protocol.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const local_paths = @import("local_paths.zig");
 const Context = @import("context.zig").Context;
@@ -316,8 +317,9 @@ fn monitorReadyMetadata(pid: i64, paths: lifecycle.Paths, console_log_path: ?[]c
 test "monitor console configuration matches opened and advertised path" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = "zig-cache/test-monitor-console-contract";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
     const paths = try lifecycle.pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
     try Io.Dir.cwd().createDirPath(io, paths.vm_dir);

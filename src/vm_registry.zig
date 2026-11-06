@@ -9,6 +9,7 @@
 //! to signal the monitor.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
@@ -859,9 +860,9 @@ test "named control socket ownership detects hash collisions and cleans up" {
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-socket-owner"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = try root_dir.path("runtime");
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
     defer {
@@ -963,9 +964,9 @@ test "lifecycle refuses to write a spec it cannot read back" {
 test "lifecycle metadata helpers round trip spec ready and pid" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-metadata"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = try root_dir.path("runtime");
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
     try ensureDirPath(io, paths.vm_dir);
@@ -1237,9 +1238,9 @@ test "lifecycle rejects insecure existing runtime directories" {
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-insecure"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
     _ = try Io.Dir.cwd().createDirPathStatus(io, root, @enumFromInt(0o755));
     try Io.Dir.cwd().setFilePermissions(io, root, @enumFromInt(0o755), .{});
 

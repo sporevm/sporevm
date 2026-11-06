@@ -5,6 +5,7 @@
 //! than being silently dropped.
 
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const fuzz_support = @import("../fuzz_support.zig");
 const oci = @import("oci.zig");
 const xattrs_mod = @import("xattrs.zig");
@@ -1263,10 +1264,10 @@ test "safe tar path rejects traversal and absolute entries" {
 test "merged tree applies whiteouts and hardlinks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const layer1 = "zig-cache/test-rootfs-merged-tree-1.tar";
-    const layer2 = "zig-cache/test-rootfs-merged-tree-2.tar";
-    defer Io.Dir.cwd().deleteFile(io, layer1) catch {};
-    defer Io.Dir.cwd().deleteFile(io, layer2) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const layer1 = try tmp_dir.path("layer1.tar");
+    const layer2 = try tmp_dir.path("layer2.tar");
 
     var first = std.ArrayList(u8).empty;
     defer first.deinit(allocator);
@@ -1307,12 +1308,11 @@ test "merged tree applies whiteouts and hardlinks" {
 test "merged tree retains hardlink sources until the final path is removed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-merged-tree-hardlink-lifetime";
-    const layer1 = tmp ++ "/layer1.tar";
-    const layer2 = tmp ++ "/layer2.tar";
-    const layer3 = tmp ++ "/layer3.tar";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const layer1 = try tmp_dir.path("layer1.tar");
+    const layer2 = try tmp_dir.path("layer2.tar");
+    const layer3 = try tmp_dir.path("layer3.tar");
 
     var first = std.ArrayList(u8).empty;
     defer first.deinit(allocator);
@@ -1356,11 +1356,10 @@ test "merged tree retains hardlink sources until the final path is removed" {
 test "merged tree replaces a file without scanning or removing siblings" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-merged-tree-file-replacement";
-    const layer1 = tmp ++ "/layer1.tar";
-    const layer2 = tmp ++ "/layer2.tar";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const layer1 = try tmp_dir.path("layer1.tar");
+    const layer2 = try tmp_dir.path("layer2.tar");
 
     var first = std.ArrayList(u8).empty;
     defer first.deinit(allocator);
@@ -1396,9 +1395,8 @@ test "merged tree replaces a file without scanning or removing siblings" {
 test "merged tree spools gzip layers to file sources" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-rootfs-merged-tree-gzip";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
 
     var tar_bytes = std.ArrayList(u8).empty;
     defer tar_bytes.deinit(allocator);
@@ -1408,8 +1406,8 @@ test "merged tree spools gzip layers to file sources" {
     const gzip_bytes = try gzipTestBytes(allocator, tar_bytes.items);
     defer allocator.free(gzip_bytes);
 
-    const layer = tmp ++ "/layer.tar.gz";
-    const spill_dir = tmp ++ "/spill";
+    const layer = try tmp_dir.path("layer.tar.gz");
+    const spill_dir = try tmp_dir.path("spill");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = layer, .data = gzip_bytes });
 
     var tree = try buildMergedTree(allocator, io, &.{.{ .media_type = "application/vnd.oci.image.layer.v1.tar+gzip", .path = layer, .spill_dir = spill_dir }});
@@ -1428,8 +1426,9 @@ test "merged tree spools gzip layers to file sources" {
 test "merged tree rejects symlink traversal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const layer = "zig-cache/test-rootfs-merged-tree-symlink.tar";
-    defer Io.Dir.cwd().deleteFile(io, layer) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const layer = try tmp_dir.path("symlink.tar");
 
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(allocator);
@@ -1447,8 +1446,9 @@ test "merged tree rejects symlink traversal" {
 test "merged tree rejects hardlink that replaces target ancestor" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const layer = "zig-cache/test-rootfs-merged-tree-hardlink-ancestor.tar";
-    defer Io.Dir.cwd().deleteFile(io, layer) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const layer = try tmp_dir.path("hardlink-ancestor.tar");
 
     var bytes = std.ArrayList(u8).empty;
     defer bytes.deinit(allocator);

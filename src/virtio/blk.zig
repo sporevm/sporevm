@@ -5,6 +5,7 @@
 //! and lengths are guest controlled and validated. See SECURITY.md.
 
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const block_source = @import("../block_source.zig");
 const chunk_mapped_disk = @import("../chunk_mapped_disk.zig");
@@ -764,10 +765,9 @@ test "immutable memory source rejects ordinary OUT without mutation" {
 test "immutable build input rejects ordinary OUT on a product-style read-only fd" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const tmp = "zig-cache/test-virtio-blk-immutable-source-fd";
-    const path = tmp ++ "/source.img";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try tmp_dir.path("source.img");
     const canonical = [_]u8{0x5a} ** (2 * sector_size);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &canonical });
     const path_z = try allocator.dupeZ(u8, path);
@@ -1369,15 +1369,10 @@ fn expectLazyFaultInFailureViaVirtio(kind: LazyFaultKind) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = switch (kind) {
-        .missing => "zig-cache/test-blk-lazy-cas-missing-object",
-        .corrupt_same_size => "zig-cache/test-blk-lazy-cas-corrupt-object",
-    };
-    const rootfs_path = try std.fmt.allocPrint(arena, "{s}/source.ext4", .{tmp});
-    const cache_root = try std.fmt.allocPrint(arena, "{s}/cache", .{tmp});
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 

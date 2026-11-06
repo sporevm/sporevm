@@ -6,6 +6,7 @@
 //! manifest/layer media types fail closed.
 
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const fuzz_support = @import("../fuzz_support.zig");
 const oci = @import("oci.zig");
 const tar = @import("tar.zig");
@@ -319,10 +320,11 @@ test "OCI layout reader selects platform manifest and verifies blobs" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-oci-layout-reader";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/blobs/sha256");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/oci-layout", .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("blobs/sha256"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("oci-layout"), .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
 
     const config = "{\"architecture\":\"arm64\",\"os\":\"linux\"}";
     const config_digest = try oci.digestBytesAlloc(allocator, config);
@@ -348,7 +350,7 @@ test "OCI layout reader selects platform manifest and verifies blobs" {
         "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"arm64\"}}}}]}}",
         .{ manifest_digest, manifest.len },
     );
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/index.json", .data = index });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("index.json"), .data = index });
 
     const selected = try readSelectedImage(allocator, io, root, .{});
     try std.testing.expectEqualStrings(manifest_digest, selected.manifest_digest);
@@ -382,13 +384,14 @@ test "OCI layout reader fails on digest mismatch" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-oci-layout-digest-mismatch";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/blobs/sha256");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/oci-layout", .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/index.json", .data = "{\"schemaVersion\":2,\"manifests\":[]}" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("blobs/sha256"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("oci-layout"), .data = "{\"imageLayoutVersion\":\"1.0.0\"}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("index.json"), .data = "{\"schemaVersion\":2,\"manifests\":[]}" });
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = root ++ "/blobs/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        .sub_path = try root_dir.path("blobs/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
         .data = "not matching",
     });
 
@@ -400,11 +403,10 @@ test "OCI layout tar extraction accepts buildx-shaped paths" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-oci-layout-tar-extract";
-    const tar_path = root ++ "/layout.tar";
-    const out_dir = root ++ "/out";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const tar_path = try root_dir.path("layout.tar");
+    const out_dir = try root_dir.path("out");
 
     var archive = [_]u8{0} ** (512 * 7);
     makeTarHeader(archive[0..512], "blobs", '5', 0);
@@ -416,7 +418,7 @@ test "OCI layout tar extraction accepts buildx-shaped paths" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = tar_path, .data = &archive });
 
     try extractTarToDir(allocator, io, tar_path, out_dir);
-    const layout = try Io.Dir.cwd().readFileAlloc(io, out_dir ++ "/oci-layout", allocator, .limited(8));
+    const layout = try Io.Dir.cwd().readFileAlloc(io, try root_dir.path("out/oci-layout"), allocator, .limited(8));
     try std.testing.expectEqualStrings("json", layout);
 }
 

@@ -1,6 +1,7 @@
 //! Local system inspection and cleanup commands.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 
@@ -2614,9 +2615,9 @@ test "system accounts for and reclaims aggregate build cache mount storage" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const relative_root = "zig-cache/test-system-cache-mount-accounting";
-    defer Io.Dir.cwd().deleteTree(io, relative_root) catch {};
-    Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    var relative_root_dir = try TestDir.init();
+    defer relative_root_dir.deinit();
+    const relative_root = relative_root_dir.root;
     const root = try std.fs.path.resolve(allocator, &.{ try std.process.currentPathAlloc(io, allocator), relative_root });
 
     const image_size: u64 = 64 << 20;
@@ -2677,9 +2678,9 @@ test "non-regular cache mount disk does not block system cleanup" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const relative_root = "zig-cache/test-system-cache-mount-non-regular";
-    defer Io.Dir.cwd().deleteTree(io, relative_root) catch {};
-    Io.Dir.cwd().deleteTree(io, relative_root) catch {};
+    var relative_root_dir = try TestDir.init();
+    defer relative_root_dir.deinit();
+    const relative_root = relative_root_dir.root;
     const root = try std.fs.path.resolve(allocator, &.{ try std.process.currentPathAlloc(io, allocator), relative_root });
     const dir = try std.fs.path.join(allocator, &.{ root, build_cache_mount.store_rel });
     try Io.Dir.cwd().createDirPath(io, dir);
@@ -2719,11 +2720,9 @@ fn expectActiveBuildProtectsCacheMount(comptime operation: TestCacheCleanup) !vo
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const suffix = @tagName(operation);
-    const relative_root = try std.fmt.allocPrint(arena, "zig-cache/test-system-active-cache-mount-{s}", .{suffix});
-    defer Io.Dir.cwd().deleteTree(io, relative_root) catch {};
-    Io.Dir.cwd().deleteTree(io, relative_root) catch {};
-    const root = try std.fs.path.resolve(arena, &.{ try std.process.currentPathAlloc(io, arena), relative_root });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = try std.fs.path.resolve(arena, &.{ try std.process.currentPathAlloc(io, arena), root_dir.root });
 
     // A build session holds only the store lock while its VM mounts the disk.
     var store_lock = try build_cache_mount.lockStoreExclusive(io, arena, root);
@@ -2757,26 +2756,25 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-prune";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
-    try Io.Dir.cwd().createDirPath(io, root ++ "/by-digest/blake3");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/cas/rootfs/blake3/indexes");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/cas/rootfs/blake3/objects");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/images");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/refs");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/tmp");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("by-digest/blake3"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("cas/rootfs/blake3/indexes"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("cas/rootfs/blake3/objects"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("images"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("refs"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("tmp"));
 
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/images/a.ext4", .data = "aaaa" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/images/a.json", .data = "{}" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/images/b.ext4", .data = "bbbbbb" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/images/b.json", .data = "{}" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/by-digest/blake3/c.ext4", .data = "cccccccc" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/cas/rootfs/blake3/indexes/d.json", .data = "index" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/cas/rootfs/blake3/objects/e.chunk", .data = "chunkdata" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/refs/ref.json", .data = "{}" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/tmp/tmpfile", .data = "tmp" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("images/a.ext4"), .data = "aaaa" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("images/a.json"), .data = "{}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("images/b.ext4"), .data = "bbbbbb" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("images/b.json"), .data = "{}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("by-digest/blake3/c.ext4"), .data = "cccccccc" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("cas/rootfs/blake3/indexes/d.json"), .data = "index" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("cas/rootfs/blake3/objects/e.chunk"), .data = "chunkdata" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("refs/ref.json"), .data = "{}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("tmp/tmpfile"), .data = "tmp" });
 
     const summary = try summarizeRootfsCache(allocator, io, root);
     try std.testing.expectEqual(@as(usize, 2), summary.image_rootfs.count);
@@ -2798,8 +2796,8 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     try std.testing.expectEqual(@as(u64, 6), dry_run.candidate_reclaimable_bytes);
     try std.testing.expectEqual(@as(u64, 14), dry_run.scope_bytes_before);
     try std.testing.expectEqual(@as(u64, 8), dry_run.scope_bytes_after);
-    try std.testing.expect(try fileExists(io, root ++ "/images/a.ext4"));
-    try std.testing.expect(try fileExists(io, root ++ "/by-digest/blake3/c.ext4"));
+    try std.testing.expect(try fileExists(io, try root_dir.path("images/a.ext4")));
+    try std.testing.expect(try fileExists(io, try root_dir.path("by-digest/blake3/c.ext4")));
 
     const default_dry_run = try pruneRootfsCache(
         allocator,
@@ -2814,11 +2812,11 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     try std.testing.expectEqual(@as(u64, 14), default_dry_run.candidate_bytes);
     try std.testing.expectEqual(@as(u64, 14), default_dry_run.candidate_reclaimable_bytes);
     try std.testing.expectEqual(@as(u64, 0), default_dry_run.scope_bytes_after);
-    try std.testing.expect(try fileExists(io, root ++ "/images/a.ext4"));
-    try std.testing.expect(try fileExists(io, root ++ "/images/b.ext4"));
-    try std.testing.expect(try fileExists(io, root ++ "/by-digest/blake3/c.ext4"));
-    try std.testing.expect(try fileExists(io, root ++ "/cas/rootfs/blake3/indexes/d.json"));
-    try std.testing.expect(try fileExists(io, root ++ "/cas/rootfs/blake3/objects/e.chunk"));
+    try std.testing.expect(try fileExists(io, try root_dir.path("images/a.ext4")));
+    try std.testing.expect(try fileExists(io, try root_dir.path("images/b.ext4")));
+    try std.testing.expect(try fileExists(io, try root_dir.path("by-digest/blake3/c.ext4")));
+    try std.testing.expect(try fileExists(io, try root_dir.path("cas/rootfs/blake3/indexes/d.json")));
+    try std.testing.expect(try fileExists(io, try root_dir.path("cas/rootfs/blake3/objects/e.chunk")));
 
     const include_artifacts_dry_run = try pruneRootfsCache(
         allocator,
@@ -2845,17 +2843,17 @@ test "system summarizes rootfs cache and dry-run prunes oldest image entries" {
     // 2 default image entries (14 bytes) + CAS index (5) + CAS object (9).
     try std.testing.expectEqual(@as(usize, 4), chunks_only_dry_run.candidate_count);
     try std.testing.expectEqual(@as(u64, 28), chunks_only_dry_run.candidate_bytes);
-    try std.testing.expect(try fileExists(io, root ++ "/by-digest/blake3/c.ext4"));
+    try std.testing.expect(try fileExists(io, try root_dir.path("by-digest/blake3/c.ext4")));
 
     const forced = try pruneRootfsCache(allocator, io, root, null, .{ .dry_run = false, .max_bytes = 8 }, std.time.ns_per_s);
     try std.testing.expect(!forced.dry_run);
     try std.testing.expectEqual(@as(usize, 1), forced.deleted_count);
     try std.testing.expectEqual(@as(u64, 6), forced.deleted_bytes);
     try std.testing.expectEqual(@as(u64, 6), forced.deleted_reclaimable_bytes);
-    try std.testing.expect(!try fileExists(io, root ++ "/images/a.ext4"));
-    try std.testing.expect(!try fileExists(io, root ++ "/images/a.json"));
-    try std.testing.expect(try fileExists(io, root ++ "/images/b.ext4"));
-    try std.testing.expect(try fileExists(io, root ++ "/by-digest/blake3/c.ext4"));
+    try std.testing.expect(!try fileExists(io, try root_dir.path("images/a.ext4")));
+    try std.testing.expect(!try fileExists(io, try root_dir.path("images/a.json")));
+    try std.testing.expect(try fileExists(io, try root_dir.path("images/b.ext4")));
+    try std.testing.expect(try fileExists(io, try root_dir.path("by-digest/blake3/c.ext4")));
 }
 
 test "system prunes only unreferenced runtime fork batches" {
@@ -2863,9 +2861,9 @@ test "system prunes only unreferenced runtime fork batches" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-system-runtime-fork-prune"});
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const live_child = try std.fs.path.join(allocator, &.{ root, "forks", "live", "children", "000000" });
     try Io.Dir.cwd().createDirPath(io, live_child);
@@ -2902,9 +2900,9 @@ test "system runtime fork prune fails closed on malformed runtime specs" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-system-runtime-fork-prune-malformed-spec"});
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(allocator, &.{ root, "forks", "candidate" }));
     const vm_dir = try std.fs.path.join(allocator, &.{ root, "vms", "worker" });
@@ -2928,10 +2926,9 @@ test "system prune removes complete stamp once for multiple referenced rootfs ob
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-prune-rootfs-objects-complete-stamp";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const first_digest = try writeGcObjectFixture(allocator, io, root, 0x61);
     const second_digest = try writeGcObjectFixture(allocator, io, root, 0x71);
@@ -2997,10 +2994,9 @@ test "system cache gc preserves rooted disk index objects and deletes CAS orphan
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const rooted = try writeGcStorageFixture(allocator, io, root, true, 0x11);
     const orphan = try writeGcStorageFixture(allocator, io, root, false, 0x22);
@@ -3533,10 +3529,9 @@ test "system cache gc preserves storage rooted only by a PREPARE record" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-build-step-root";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const rooted = try writeGcStorageFixture(allocator, io, root, false, 0x34);
     const orphan = try writeGcStorageFixture(allocator, io, root, false, 0x45);
@@ -3579,10 +3574,9 @@ test "system cache gc reads a large COPY heredoc step record" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-large-build-step-root";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const rooted = try writeGcStorageFixture(allocator, io, root, false, 0x34);
     const orphan = try writeGcStorageFixture(allocator, io, root, false, 0x45);
@@ -3625,10 +3619,9 @@ test "system cache gc ignores known build records with incomplete storage" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-stale-build-step";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const stale = try writeGcStorageFixture(allocator, io, root, false, 0x56);
     try rootfs_cas.markStorageComplete(io, allocator, root, stale.storage.index_digest);
@@ -3670,10 +3663,9 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-conservative-roots";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const orphan = try writeGcStorageFixture(allocator, io, root, false, 0x44);
     const stray_digest = try writeGcObjectFixture(allocator, io, root, 0x55);
@@ -3681,25 +3673,25 @@ test "system cache gc treats unknown rootfs records as conservative roots" {
     const orphan_object_path = try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest);
     const stray_object_path = try rootfs_cas.manifestObjectPath(allocator, root, stray_digest);
 
-    try Io.Dir.cwd().createDirPath(io, root ++ "/images");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("images"));
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = root ++ "/images/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json",
+        .sub_path = try root_dir.path("images/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"),
         .data = "{\"kind\":\"future-local-image-v99\"}",
     });
-    try Io.Dir.cwd().createDirPath(io, root ++ "/build/steps");
-    const stale_step_path = root ++ "/build/steps/stale.json";
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("build/steps"));
+    const stale_step_path = try root_dir.path("build/steps/stale.json");
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = stale_step_path,
         .data = "{\"kind\":\"sporevm-build-step-v2\"}",
     });
-    const future_step_path = root ++ "/build/steps/future.json";
+    const future_step_path = try root_dir.path("build/steps/future.json");
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = future_step_path,
         .data = "{\"kind\":\"future-build-step-v99\"}",
     });
-    try Io.Dir.cwd().createDirPath(io, root ++ "/pins");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("pins"));
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = root ++ "/pins/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
+        .sub_path = try root_dir.path("pins/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"),
         .data = "{\"schema\":\"future-pin-v99\"}",
     });
 
@@ -3727,10 +3719,9 @@ test "system cache gc deletes v6 step records and storage only they rooted" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-v6-record";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     const rooted = try writeGcStorageFixture(allocator, io, root, false, 0x71);
     try rootfs_cas.markStorageComplete(io, allocator, root, rooted.storage.index_digest);
@@ -3786,10 +3777,9 @@ test "system cache gc deletes v6 step records and storage only they rooted" {
 test "system cache mutation lock rejects a concurrent holder" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-lock";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root);
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
 
     var gc_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     defer gc_lock.deinit();
@@ -3802,12 +3792,12 @@ test "durable save pin roots GC until explicit unpin" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-save-pin";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/save");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("save"));
     const fixture = try writeGcStorageFixture(allocator, io, root, false, 0x66);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save/manifest.json", .data = "manifest" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("save/manifest.json"), .data = "manifest" });
     const disk = spore.Disk{
         .kind = spore.disk_kind_chunk_index,
         .device = fixture.storage.device,
@@ -3820,13 +3810,13 @@ test "durable save pin roots GC until explicit unpin" {
     var pin_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     defer pin_lock.deinit();
     const pin_registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &pin_lock);
-    const pin_id = try saved_spore_pin.testing.pinSave(io, allocator, pin_registry, root ++ "/save", disk);
+    const pin_id = try saved_spore_pin.testing.pinSave(io, allocator, pin_registry, try root_dir.path("save"), disk);
     pin_lock.deinit();
     var original_pin = try saved_spore_pin.loadRecord(io, allocator, root, pin_id);
     defer original_pin.deinit();
     // Each extra pin is owned by its own save reference, so none is orphaned.
     // The references live outside the image catalog, which GC also reads.
-    try Io.Dir.cwd().createDirPath(io, root ++ "/saves");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("saves"));
     for (1..1000) |index| {
         const id = try std.fmt.allocPrint(allocator, "{x:0>64}", .{index});
         const record = saved_spore_pin.Record{
@@ -3865,7 +3855,7 @@ test "durable save pin roots GC until explicit unpin" {
         try Io.Dir.cwd().deleteFile(io, try saved_spore_pin.recordPath(allocator, root, id));
         try Io.Dir.cwd().deleteFile(io, try saved_spore_pin.ownerPath(allocator, root, id));
     }
-    try Io.Dir.cwd().deleteTree(io, root ++ "/saves");
+    try Io.Dir.cwd().deleteTree(io, try root_dir.path("saves"));
     var remove_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     defer remove_lock.deinit();
     const remove_registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &remove_lock);
@@ -3882,14 +3872,14 @@ test "cache GC diagnoses and reclaims a pin orphaned by raw directory deletion" 
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-orphan-pin";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/save");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/save-2");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("save"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("save-2"));
     const fixture = try writeGcStorageFixture(allocator, io, root, false, 0x67);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save/manifest.json", .data = "manifest" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save-2/manifest.json", .data = "manifest" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("save/manifest.json"), .data = "manifest" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("save-2/manifest.json"), .data = "manifest" });
     const disk = spore.Disk{
         .kind = spore.disk_kind_chunk_index,
         .device = fixture.storage.device,
@@ -3901,11 +3891,11 @@ test "cache GC diagnoses and reclaims a pin orphaned by raw directory deletion" 
     };
     var pin_lock = try rootfs.lockRootfsCacheExclusive(io, allocator, root);
     const registry = try saved_spore_pin.LockedRegistry.init(allocator, root, &pin_lock);
-    const pin_id = try saved_spore_pin.testing.pinSave(io, allocator, registry, root ++ "/save", disk);
-    const second_pin_id = try saved_spore_pin.testing.pinSave(io, allocator, registry, root ++ "/save-2", disk);
+    const pin_id = try saved_spore_pin.testing.pinSave(io, allocator, registry, try root_dir.path("save"), disk);
+    const second_pin_id = try saved_spore_pin.testing.pinSave(io, allocator, registry, try root_dir.path("save-2"), disk);
     pin_lock.deinit();
-    try Io.Dir.cwd().deleteTree(io, root ++ "/save");
-    try Io.Dir.cwd().deleteTree(io, root ++ "/save-2");
+    try Io.Dir.cwd().deleteTree(io, try root_dir.path("save"));
+    try Io.Dir.cwd().deleteTree(io, try root_dir.path("save-2"));
 
     const listings = try saved_spore_pin.list(io, allocator, root);
     defer saved_spore_pin.deinitListings(allocator, listings);
@@ -3932,12 +3922,12 @@ test "corrupt save pin makes destructive prune retain all CAS" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-prune-corrupt-save-pin";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/pins");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("pins"));
     const fixture = try writeGcStorageFixture(allocator, io, root, false, 0x77);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/pins/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json", .data = "not-json" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("pins/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"), .data = "not-json" });
     const result = try pruneRootfsCache(allocator, io, root, null, .{
         .dry_run = false,
         .include_rootfs_chunks = true,
@@ -3955,17 +3945,17 @@ test "cache GC deletes older pins and the storage only they rooted" {
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
     const io = std.testing.io;
-    const root = "zig-cache/test-system-cache-gc-old-pin";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/pins");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/save");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/save-v2");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("pins"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("save"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("save-v2"));
     const fixture = try writeGcStorageFixture(allocator, io, root, false, 0x68);
     // A v1 save: an old manifest, a copied reference and no ownership anchor.
     const id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save/manifest.json", .data = "{\"version\":2}" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/save/" ++ saved_spore_pin.reference_file, .data = "{\"schema\":\"spore.saved-disk-pin-ref.v1\",\"id\":\"" ++ id ++ "\"}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("save/manifest.json"), .data = "{\"version\":2}" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("save/" ++ saved_spore_pin.reference_file), .data = "{\"schema\":\"spore.saved-disk-pin-ref.v1\",\"id\":\"" ++ id ++ "\"}" });
     const record_json = try std.json.Stringify.valueAlloc(allocator, .{
         .schema = "spore.saved-disk-pin.v1",
         .id = id,
@@ -3985,7 +3975,7 @@ test "cache GC deletes older pins and the storage only they rooted" {
     }, .{}) });
     const v2_owner = try saved_spore_pin.ownerPath(allocator, root, v2_id);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = v2_owner, .data = "{\"schema\":\"spore.saved-disk-pin-ref.v2\",\"id\":\"" ++ v2_id ++ "\"}" });
-    try Io.Dir.cwd().hardLink(v2_owner, Io.Dir.cwd(), root ++ "/save-v2/" ++ saved_spore_pin.reference_file, io, .{});
+    try Io.Dir.cwd().hardLink(v2_owner, Io.Dir.cwd(), try root_dir.path("save-v2/" ++ saved_spore_pin.reference_file), io, .{});
     const index_path = try rootfs_cas.manifestIndexPath(allocator, root, fixture.storage.index_digest);
     const object_path = try rootfs_cas.manifestObjectPath(allocator, root, fixture.object_digest);
 

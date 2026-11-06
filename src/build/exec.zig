@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -1867,11 +1868,9 @@ test "build context bind helpers reject symlinks and preserve owned target state
 
 test "security xattr inspection accepts an ext4 maximum-length clean name" {
     if (comptime guest_agent_fuzz_supported) {
-        const io = std.testing.io;
-        const tmp = "zig-cache/test-copy-security-long-name";
-        Io.Dir.cwd().deleteTree(io, tmp) catch {};
-        defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-        try Io.Dir.cwd().createDirPath(io, tmp);
+        var tmp_dir = try TestDir.init();
+        defer tmp_dir.deinit();
+        const tmp = tmp_dir.root;
         try std.testing.expectEqual(@as(c_int, 0), spore_build_copy_test_security_xattr_long_name(tmp.ptr, tmp.len));
     }
 }

@@ -11,6 +11,7 @@
 //! backing that lost its pages.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const local_paths = @import("local_paths.zig");
 const spore = @import("spore.zig");
@@ -1336,15 +1337,12 @@ test "fork backing hardlink falls back across filesystems" {
 }
 
 test "backing readahead precharge tolerates sparse and empty files and restores position" {
-    const io = std.testing.io;
-    const tmp = "zig-cache/test-spore-precharge";
-    defer std.Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try std.Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
 
     // Sparse file: 1MiB data, 8MiB hole, 1MiB data.
-    const sparse_path = tmp ++ "/sparse.backing";
     {
-        const pathz = sparse_path ++ "";
+        const pathz = try tmp_dir.path("sparse.backing");
         const fd = std.c.open(pathz, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o644));
         try std.testing.expect(fd >= 0);
         defer _ = std.c.close(fd);
@@ -1358,7 +1356,7 @@ test "backing readahead precharge tolerates sparse and empty files and restores 
     }
 
     // Empty file: must be a no-op.
-    const empty_path = tmp ++ "/empty.backing";
+    const empty_path = try tmp_dir.path("empty.backing");
     {
         const fd = std.c.open(empty_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o644));
         try std.testing.expect(fd >= 0);

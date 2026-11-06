@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const Io = std.Io;
 const Blake3 = std.crypto.hash.Blake3;
 
@@ -1179,18 +1180,18 @@ test "COPY source resolution rejects intermediate symlinks" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-intermediate-symlink";
-    const context_root = root ++ "/context";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, context_root ++ "/safe");
-    try Io.Dir.cwd().createDirPath(io, context_root ++ "/src");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/outside");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/outside/secret.txt", .data = "secret" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/safe/inside.txt", .data = "inside" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/src/visible.txt", .data = "visible" });
-    try Io.Dir.cwd().symLink(io, "../../outside", context_root ++ "/safe/leak", .{});
-    try Io.Dir.cwd().symLink(io, "../outside", context_root ++ "/packages", .{});
-    try Io.Dir.cwd().symLink(io, "../outside", context_root ++ "/unrelated", .{});
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const context_root = try root_dir.path("context");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/safe"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/src"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("outside"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("outside/secret.txt"), .data = "secret" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/safe/inside.txt"), .data = "inside" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/src/visible.txt"), .data = "visible" });
+    try Io.Dir.cwd().symLink(io, "../../outside", try root_dir.path("context/safe/leak"), .{});
+    try Io.Dir.cwd().symLink(io, "../outside", try root_dir.path("context/packages"), .{});
+    try Io.Dir.cwd().symLink(io, "../outside", try root_dir.path("context/unrelated"), .{});
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
@@ -1217,13 +1218,13 @@ test "COPY source resolution rejects a selected symlink outside the context" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-final-symlink";
-    const context_root = root ++ "/context";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const context_root = try root_dir.path("context");
     try Io.Dir.cwd().createDirPath(io, context_root);
-    try Io.Dir.cwd().createDirPath(io, root ++ "/outside");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/outside/secret.txt", .data = "secret" });
-    try Io.Dir.cwd().symLink(io, "../outside/secret.txt", context_root ++ "/payload", .{});
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("outside"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("outside/secret.txt"), .data = "secret" });
+    try Io.Dir.cwd().symLink(io, "../outside/secret.txt", try root_dir.path("context/payload"), .{});
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
@@ -1236,13 +1237,13 @@ test "COPY dereferences a selected symlink within the context" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-selected-symlink";
-    const context_root = root ++ "/context";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, context_root ++ "/files");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/files/plain.txt", .data = "plain\n" });
-    try Io.Dir.cwd().setFilePermissions(io, context_root ++ "/files/plain.txt", @enumFromInt(0o640), .{ .follow_symlinks = false });
-    try Io.Dir.cwd().symLink(io, "files/plain.txt", context_root ++ "/plain-link", .{});
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const context_root = try root_dir.path("context");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/files"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/files/plain.txt"), .data = "plain\n" });
+    try Io.Dir.cwd().setFilePermissions(io, try root_dir.path("context/files/plain.txt"), @enumFromInt(0o640), .{ .follow_symlinks = false });
+    try Io.Dir.cwd().symLink(io, "files/plain.txt", try root_dir.path("context/plain-link"), .{});
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
@@ -1274,14 +1275,14 @@ test "RUN context bind accepts one regular file and rejects directory and symlin
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-run-bind-source";
-    const context_root = root ++ "/context";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, context_root ++ "/dir");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/input.txt", .data = "input\n" });
-    try Io.Dir.cwd().symLink(io, "input.txt", context_root ++ "/input-link", .{});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/dir/nested.txt", .data = "nested\n" });
-    try Io.Dir.cwd().symLink(io, "dir", context_root ++ "/dir-link", .{});
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const context_root = try root_dir.path("context");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/dir"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/input.txt"), .data = "input\n" });
+    try Io.Dir.cwd().symLink(io, "input.txt", try root_dir.path("context/input-link"), .{});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/dir/nested.txt"), .data = "nested\n" });
+    try Io.Dir.cwd().symLink(io, "dir", try root_dir.path("context/dir-link"), .{});
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
@@ -1299,14 +1300,14 @@ test "COPY snapshot pins file bytes and symlink targets" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-snapshot-payload";
-    const context_root = root ++ "/context";
-    const cache_root = root ++ "/cache";
-    const file_path = context_root ++ "/payload.txt";
-    const link_path = context_root ++ "/tree/link";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const context_root = try root_dir.path("context");
+    const cache_root = try root_dir.path("cache");
+    const file_path = try root_dir.path("context/payload.txt");
+    const link_path = try root_dir.path("context/tree/link");
     try Io.Dir.cwd().createDirPath(io, context_root);
-    try Io.Dir.cwd().createDirPath(io, context_root ++ "/tree");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/tree"));
     try Io.Dir.cwd().createDirPath(io, cache_root);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = file_path, .data = "alpha" });
     try Io.Dir.cwd().symLink(io, "target-a", link_path, .{});
@@ -1355,11 +1356,11 @@ test "bind capture pins mtime from the same checked source stat" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-snapshot-mtime";
-    const context_root = root ++ "/context";
-    const cache_root = root ++ "/cache";
-    const source_path = context_root ++ "/input";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const context_root = try root_dir.path("context");
+    const cache_root = try root_dir.path("cache");
+    const source_path = try root_dir.path("context/input");
     try Io.Dir.cwd().createDirPath(io, context_root);
     try Io.Dir.cwd().createDirPath(io, cache_root);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "input" });
@@ -1392,21 +1393,21 @@ test "COPY snapshot rejects an intermediate symlink swap" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-snapshot-symlink-swap";
-    const context_root = root ++ "/context";
-    const cache_root = root ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, context_root ++ "/safe");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/outside");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const context_root = try root_dir.path("context");
+    const cache_root = try root_dir.path("cache");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/safe"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("outside"));
     try Io.Dir.cwd().createDirPath(io, cache_root);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/safe/secret.txt", .data = "inside" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/outside/secret.txt", .data = "outside" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/safe/secret.txt"), .data = "inside" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("outside/secret.txt"), .data = "outside" });
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &diag);
     const resolution = try resolveCopySources(arena, io, ctx, &.{"safe/secret.txt"});
-    try Io.Dir.cwd().deleteTree(io, context_root ++ "/safe");
-    try Io.Dir.cwd().symLink(io, "../outside", context_root ++ "/safe", .{});
+    try Io.Dir.cwd().deleteTree(io, try root_dir.path("context/safe"));
+    try Io.Dir.cwd().symLink(io, "../outside", try root_dir.path("context/safe"), .{});
     var snapshot = try CopySnapshot.init(arena, io, cache_root);
     defer snapshot.deinit(io);
     try std.testing.expectError(
@@ -1430,17 +1431,18 @@ test "COPY source resolution supports filepath globs across components" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-copy-globs";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/src/one");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/src/two/deep");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/babel.config.js", .data = "js" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/relay.config.mjs", .data = "mjs" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/plain.js", .data = "plain" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/literal*star", .data = "escaped" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/one/main.c", .data = "c" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/two/main.h", .data = "h" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/src/two/deep/main.c", .data = "deep" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("src/one"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("src/two/deep"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("babel.config.js"), .data = "js" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("relay.config.mjs"), .data = "mjs" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("plain.js"), .data = "plain" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("literal*star"), .data = "escaped" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("src/one/main.c"), .data = "c" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("src/two/main.h"), .data = "h" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("src/two/deep/main.c"), .data = "deep" });
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, root, &diag);
@@ -1477,20 +1479,21 @@ test "dockerignore supports normalization globstars and excluded-parent reinclus
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-dockerignore-modern";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/build/keep");
-    try Io.Dir.cwd().createDirPath(io, root ++ "/vendor");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/build/drop.txt", .data = "drop" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/build/keep/ok.txt", .data = "keep" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/vendor/dependency", .data = "ignored" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/a.tmp", .data = "ignored" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/aa.tmp", .data = "kept" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/a.log", .data = "ignored" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/c.log", .data = "kept" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/#literal", .data = "ignored" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("build/keep"));
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("vendor"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("build/drop.txt"), .data = "drop" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("build/keep/ok.txt"), .data = "keep" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("vendor/dependency"), .data = "ignored" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("a.tmp"), .data = "ignored" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("aa.tmp"), .data = "kept" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("a.log"), .data = "ignored" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("c.log"), .data = "kept" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("#literal"), .data = "ignored" });
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = root ++ "/.dockerignore",
+        .sub_path = try root_dir.path(".dockerignore"),
         .data = "\xef\xbb\xbf# BOM comment\nbuild\n!build/keep/**\n?.tmp\n[ab].log\n/vendor/./\n #literal\n",
     });
 
@@ -1522,16 +1525,16 @@ test "context hashing frames fields so payload NULs cannot alias records" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-hash-framing";
-    const one = root ++ "/one";
-    const two = root ++ "/two";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const one = try root_dir.path("one");
+    const two = try root_dir.path("two");
     try Io.Dir.cwd().createDirPath(io, one);
     try Io.Dir.cwd().createDirPath(io, two);
 
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = two ++ "/a", .data = "left" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = two ++ "/b", .data = "right" });
-    const b_stat = try Io.Dir.cwd().statFile(io, two ++ "/b", .{ .follow_symlinks = false });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("two/a"), .data = "left" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("two/b"), .data = "right" });
+    const b_stat = try Io.Dir.cwd().statFile(io, try root_dir.path("two/b"), .{ .follow_symlinks = false });
     var b_mode: [8]u8 = undefined;
     std.mem.writeInt(u64, &b_mode, @intFromEnum(b_stat.permissions), .little);
 
@@ -1545,7 +1548,7 @@ test "context hashing frames fields so payload NULs cannot alias records" {
     try payload.appendSlice(&b_mode);
     try payload.append(0);
     try payload.appendSlice("right");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = one ++ "/a", .data = payload.items });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("one/a"), .data = payload.items });
 
     var diag: IgnoreDiagnostic = .{};
     const ctx_one = try load(arena, io, one, &diag);
@@ -1565,11 +1568,12 @@ test "COPY roots deterministically keep the earliest overlapping selector" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-root-order";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, root ++ "/nested");
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/a.txt", .data = "a\n" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/b.txt", .data = "b\n" });
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = root_dir.root;
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("nested"));
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("nested/a.txt"), .data = "a\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("nested/b.txt"), .data = "b\n" });
 
     var diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, root, &diag);
@@ -1590,14 +1594,14 @@ test "context stat cache preserves cold hash identity and warms hits" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-stat-cache";
-    const cache_root = root ++ "/cache";
-    const context_root = root ++ "/context";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
-    try Io.Dir.cwd().createDirPath(io, context_root ++ "/src");
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const cache_root = try root_dir.path("cache");
+    const context_root = try root_dir.path("context");
+    try Io.Dir.cwd().createDirPath(io, try root_dir.path("context/src"));
     try Io.Dir.cwd().createDirPath(io, cache_root);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/src/a.txt", .data = "alpha" });
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = context_root ++ "/src/b.txt", .data = "beta" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/src/a.txt"), .data = "alpha" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try root_dir.path("context/src/b.txt"), .data = "beta" });
 
     var ignore_diag: IgnoreDiagnostic = .{};
     const ctx = try load(arena, io, context_root, &ignore_diag);
@@ -1687,11 +1691,11 @@ test "context stat cache invalidates same-size rewrites with restored mtime" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const root = "zig-cache/test-build-context-stat-cache-ctime";
-    const cache_root = root ++ "/cache";
-    const context_root = root ++ "/context";
-    const source_path = context_root ++ "/input.txt";
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const cache_root = try root_dir.path("cache");
+    const context_root = try root_dir.path("context");
+    const source_path = try root_dir.path("context/input.txt");
     try Io.Dir.cwd().createDirPath(io, context_root);
     try Io.Dir.cwd().createDirPath(io, cache_root);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = "alpha" });

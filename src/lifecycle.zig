@@ -1,6 +1,7 @@
 //! Named VM lifecycle orchestration and CLI.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const chunk_sealer = @import("chunk_sealer.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -4021,9 +4022,9 @@ test "lifecycle monitor spawn receives context environment, debug flag and only 
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-monitor-env"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = try root_dir.path("runtime");
     try ensureDirPath(io, root);
 
     const script_path = try std.fs.path.resolve(allocator, &.{ root, "monitor-env.sh" });
@@ -4318,9 +4319,9 @@ test "lifecycle readiness requires monitor control socket hello" {
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-ready-hello"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = try root_dir.path("runtime");
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
@@ -4349,9 +4350,9 @@ test "lifecycle readiness fails on monitor version mismatch" {
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-ready-version"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = try root_dir.path("runtime");
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
@@ -4391,9 +4392,12 @@ test "lifecycle readiness fails on monitor version mismatch" {
 test "lifecycle named not ready diagnostics include state pid and logs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"/tmp/sporevm-test-lifecycle-not-ready-detail"});
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root = try std.fs.path.resolve(allocator, &.{ cwd, try root_dir.path("runtime") });
     defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
@@ -4432,9 +4436,12 @@ test "lifecycle named not ready diagnostics include state pid and logs" {
 test "lifecycle named exists diagnostics include stale state and logs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"/tmp/sporevm-test-lifecycle-exists-detail"});
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+    const root = try std.fs.path.resolve(allocator, &.{ cwd, try root_dir.path("runtime") });
     defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
@@ -6097,9 +6104,9 @@ test "lifecycle fork leaves the source spec to its monitor" {
 test "durable lifecycle metadata drops the live network policy" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const dir = "zig-cache/test-lifecycle-live-network-policy";
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
+    var dir_dir = try TestDir.init();
+    defer dir_dir.deinit();
+    const dir = dir_dir.root;
     try std.testing.expect((try readSporeLifecycleSpec(allocator, io, dir)) == null);
 
     try writeSporeLifecycleSpec(allocator, io, dir, .{
@@ -6115,13 +6122,12 @@ test "durable lifecycle metadata drops the live network policy" {
 
 test "named exec defaults are additive portable manifest metadata" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const dir = "zig-cache/test-lifecycle-exec-defaults-manifest";
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
+    var dir_dir = try TestDir.init();
+    defer dir_dir.deinit();
+    const dir = dir_dir.root;
     try spore.saveManifest(arena, dir, manifest_test_support.manifest(.{}));
 
     try writeSporeExecDefaults(arena, dir, .{
@@ -6955,9 +6961,9 @@ test "named restore active lease survives concurrent saved-spore removal and des
 test "lifecycle list entries sorts and classifies VM directories" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-list"});
-    defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    var root_dir = try TestDir.init();
+    defer root_dir.deinit();
+    const root = try root_dir.path("runtime");
 
     const empty = try listEntries(allocator, io, root);
     defer freeListEntries(allocator, empty);

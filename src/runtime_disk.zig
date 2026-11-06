@@ -1,6 +1,7 @@
 //! Runtime rootfs and writable disk planner shared by run and resume paths.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 
 const block_source = @import("block_source.zig");
@@ -724,11 +725,10 @@ test "runtime disk rejects corrupt rootfs before constructing file block source"
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-corrupt-rootfs";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -743,7 +743,7 @@ test "runtime disk rejects corrupt rootfs before constructing file block source"
     defer env.deinit();
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
-    const trace_path = tmp ++ "/rootfs-trace.jsonl";
+    const trace_path = try tmp_dir.path("rootfs-trace.jsonl");
     const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
     try env.put(rootfs_trace_env, absolute_trace_path);
 
@@ -762,11 +762,10 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-flat-over-cas";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
@@ -780,7 +779,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     defer env.deinit();
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
-    const trace_path = tmp ++ "/rootfs-trace.jsonl";
+    const trace_path = try tmp_dir.path("rootfs-trace.jsonl");
     const absolute_trace_path = try std.fs.path.resolve(arena, &.{trace_path});
     try env.put(rootfs_trace_env, absolute_trace_path);
 
@@ -817,11 +816,11 @@ test "runtime disk exports and adopts a portable fork head" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-runtime-disk-portable-fork-head";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -887,12 +886,12 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-cas-fallback-missing";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    const trace_path = tmp ++ "/lazy-cas-trace.jsonl";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
+    const trace_path = try tmp_dir.path("lazy-cas-trace.jsonl");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
@@ -968,13 +967,13 @@ test "runtime disk installs portable local rootfs storage and trusts complete wa
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-runtime-disk-portable-local-rootfs";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const local_spore = tmp ++ "/portable.spore";
-    const cache_root = tmp ++ "/empty-cache";
-    const runtime_root = tmp ++ "/runtime";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const tmp = tmp_dir.root;
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const local_spore = try tmp_dir.path("portable.spore");
+    const cache_root = try tmp_dir.path("empty-cache");
+    const runtime_root = try tmp_dir.path("runtime");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
@@ -1061,11 +1060,10 @@ test "runtime disk benchmark env eagerly materializes missing flat rootfs from c
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-eager-benchmark-env";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
@@ -1112,11 +1110,10 @@ test "runtime disk ignores wrong-sized flat cache entries and lazily faults cas 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-cas-fallback-size";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
@@ -1164,11 +1161,10 @@ test "runtime disk manifest rootfs cas fails closed without index" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-manifest-rootfs-cas-missing";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1209,12 +1205,10 @@ test "runtime disk lazy rootfs validates storage against artifact" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-lazy-storage-mismatch";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
@@ -1244,13 +1238,11 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-lazy-cas-missing-object";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    const trace_path = tmp ++ "/lazy-cas-trace.jsonl";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
+    const trace_path = try tmp_dir.path("lazy-cas-trace.jsonl");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
@@ -1313,12 +1305,10 @@ test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corr
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-lazy-cas-promoted-and-corrupt";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    try Io.Dir.cwd().createDirPath(io, tmp);
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
     const rootfs_bytes = ("abcd" ** 16384) ++ ("efgh" ** 16384) ++ ("ijkl" ** 16384);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
@@ -1386,12 +1376,11 @@ test "runtime disk rejects unknown disk kinds" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-unknown-kind";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    const spore_dir = tmp ++ "/saved.spore";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
+    const spore_dir = try tmp_dir.path("saved.spore");
     try Io.Dir.cwd().createDirPath(io, spore_dir);
 
     const rootfs_bytes = "abcd" ** 1024;
@@ -1425,12 +1414,11 @@ test "runtime disk restores chunk-index disk manifests" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp = "zig-cache/test-run-runtime-disk-chunk-index-restore";
-    const rootfs_path = tmp ++ "/source.ext4";
-    const cache_root = tmp ++ "/cache";
-    const spore_dir = tmp ++ "/saved.spore";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const rootfs_path = try tmp_dir.path("source.ext4");
+    const cache_root = try tmp_dir.path("cache");
+    const spore_dir = try tmp_dir.path("saved.spore");
     try Io.Dir.cwd().createDirPath(io, spore_dir);
 
     const rootfs_bytes = ("abcd" ** 1024) ++ ("efgh" ** 1024);
@@ -1465,7 +1453,7 @@ test "runtime disk restores chunk-index disk manifests" {
     const absolute_cache_root = try std.fs.path.resolve(arena, &.{cache_root});
     try env.put(local_paths.rootfs_cache_env, absolute_cache_root);
     const context = Context{ .io = io, .environ_map = &env };
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = spore_dir ++ "/manifest.json", .data = "manifest" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try tmp_dir.path("saved.spore/manifest.json"), .data = "manifest" });
     var pin_lock = try rootfs_mod.lockRootfsCacheExclusive(io, arena, absolute_cache_root);
     defer pin_lock.deinit();
     const pin_registry = try saved_spore_pin.LockedRegistry.init(arena, absolute_cache_root, &pin_lock);
@@ -1493,7 +1481,7 @@ test "runtime disk restores chunk-index disk manifests" {
     const remove_registry = try saved_spore_pin.LockedRegistry.init(arena, absolute_cache_root, &remove_lock);
     try saved_spore_pin.remove(io, arena, remove_registry, pin_id);
     remove_lock.deinit();
-    const moved_dir = tmp ++ "/moved.spore";
+    const moved_dir = try tmp_dir.path("moved.spore");
     try Io.Dir.rename(Io.Dir.cwd(), spore_dir, Io.Dir.cwd(), moved_dir, io);
 
     var runtime = try open(context, allocator, .{
