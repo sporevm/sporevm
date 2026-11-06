@@ -1567,6 +1567,34 @@ const TestVcpu = struct {
     }
 };
 
+test "snapshots refuse queued host vsock packets before writing anything" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
+
+    const config = testBoot(.{});
+    var vsock_dev = vsock.Vsock.init(.{});
+    var gen_dev = generation.Device{};
+    var stream = try vsock_stream.HostStream.init(10700, "{}\n");
+    try vsock_dev.attachHostStream(&stream);
+    try std.testing.expect(vsock_dev.pending_len != 0);
+
+    var vm = TestVm{};
+    var one = [_]TestVcpu{.{ .live = testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 0, .cntv_cval = 0 }) }};
+    const ram: [std.heap.page_size_min]u8 = @splat(0);
+    try std.testing.expectError(error.DeviceStatePending, writeSnapshot(
+        std.testing.allocator,
+        "test",
+        &vm,
+        @as([]TestVcpu, &one),
+        @as(?*DirtyTracker(TestDirtyBackend), null),
+        .{ .config = &config, .transports = &.{}, .gen_dev = &gen_dev, .vsock_dev = &vsock_dev, .ram_bytes = &ram, .ram_size = ram.len },
+        .{ .dir = dir },
+    ));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "spore", .{}));
+}
+
 test "one vCPU captures the single shape and more share vCPU 0's counter" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
