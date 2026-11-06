@@ -6,6 +6,7 @@
 //! live reads away from their existing base, overlay, or CAS storage.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const block_source = @import("block_source.zig");
 const chunk = @import("chunk.zig");
@@ -1753,8 +1754,8 @@ const PartialGrowthSource = enum {
 fn testKnownZeroGrowthFromPartialTail(tail_source: PartialGrowthSource) !void {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1779,8 +1780,8 @@ fn testKnownZeroGrowthFromPartialTail(tail_source: PartialGrowthSource) !void {
     var parent_file = try tmp.dir.createFile(io, "parent.img", .{ .read = true });
     defer parent_file.close(io);
     try parent_file.writeStreamingAll(io, parent_bytes);
-    const parent_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent.img", .{tmp.sub_path[0..]});
-    const parent_cache = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent-cache", .{tmp.sub_path[0..]});
+    const parent_path = try tmp.path("parent.img");
+    const parent_cache = try tmp.path("parent-cache");
     const parent_preload = try rootfs_cas.preloadPath(io, arena, parent_cache, parent_path, chunk_size);
     const parent_index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, parent_preload.index_path, arena, .limited(disk_index.max_index_bytes));
     const parent_index = try disk_index.parseDiskIndex(arena, parent_index_bytes, .{
@@ -1843,7 +1844,7 @@ fn testKnownZeroGrowthFromPartialTail(tail_source: PartialGrowthSource) !void {
     try disk.readAt(readback, 0);
     try std.testing.expectEqualSlices(u8, expected, readback);
 
-    const snapshot_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/snapshot", .{tmp.sub_path[0..]});
+    const snapshot_dir = try tmp.path("snapshot");
     try std.Io.Dir.cwd().createDirPath(io, snapshot_dir);
     var stats: SnapshotStats = .{};
     const snapshot = try disk.snapshotIndexWithStats(snapshot_dir, .{ .mmio_slot = 1 }, true, &stats);
@@ -1856,8 +1857,8 @@ fn testKnownZeroGrowthFromPartialTail(tail_source: PartialGrowthSource) !void {
         try std.testing.expectEqual(@as(usize, 1), stats.parent_chunks_reused);
     }
 
-    const oracle_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle.img", .{tmp.sub_path[0..]});
-    const oracle_cache = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle-cache", .{tmp.sub_path[0..]});
+    const oracle_path = try tmp.path("oracle.img");
+    const oracle_cache = try tmp.path("oracle-cache");
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = oracle_path, .data = expected });
     const oracle = try rootfs_cas.preloadPath(io, arena, oracle_cache, oracle_path, chunk_size);
     try std.testing.expectEqualStrings(oracle.index_digest, snapshot.base);
@@ -1887,8 +1888,8 @@ test "known zero growth preserves a partial overlay tail" {
 test "known zero growth rejects a corrupt partial CAS tail before mutation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1902,8 +1903,8 @@ test "known zero growth rejects a corrupt partial CAS tail before mutation" {
     defer parent.close(io);
     try parent.writeStreamingAll(io, &parent_bytes);
 
-    const parent_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent.img", .{tmp.sub_path[0..]});
-    const parent_cache = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/parent-cache", .{tmp.sub_path[0..]});
+    const parent_path = try tmp.path("parent.img");
+    const parent_cache = try tmp.path("parent-cache");
     const preload = try rootfs_cas.preloadPath(io, arena, parent_cache, parent_path, chunk_size);
     const index_bytes = try std.Io.Dir.cwd().readFileAlloc(io, preload.index_path, arena, .limited(disk_index.max_index_bytes));
     const index = try disk_index.parseDiskIndex(arena, index_bytes, .{
@@ -2146,11 +2147,10 @@ test "zero range clears a full lazy CAS chunk without fetching and rejects a cor
 test "zero marking advances dirty state" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
-    const spore_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
-    defer allocator.free(spore_dir);
+    const spore_dir = try tmp.path("spore");
     try std.Io.Dir.cwd().createDirPath(io, spore_dir);
     const chunk_size: usize = 512;
     const base_bytes = try allocator.alloc(u8, chunk_size * 2);
@@ -2190,15 +2190,15 @@ test "zero marking advances dirty state" {
 test "known zero growth reuses appended coverage without sealing" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const snapshot_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/snapshot", .{tmp.sub_path[0..]});
-    const oracle_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle", .{tmp.sub_path[0..]});
-    const oracle_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/oracle.img", .{tmp.sub_path[0..]});
+    const snapshot_dir = try tmp.path("snapshot");
+    const oracle_dir = try tmp.path("oracle");
+    const oracle_path = try tmp.path("oracle.img");
     try std.Io.Dir.cwd().createDirPath(io, snapshot_dir);
 
     const chunk_size: usize = @intCast(spore.disk_chunk_size);
@@ -2338,11 +2338,10 @@ test "known zero growth rolls back every fallible allocation" {
 test "snapshot writes disk index and chunk objects" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
-    const spore_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
-    defer allocator.free(spore_dir);
+    const spore_dir = try tmp.path("spore");
     try std.Io.Dir.cwd().createDirPath(io, spore_dir);
 
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
@@ -2401,15 +2400,12 @@ test "snapshot writes disk index and chunk objects" {
 test "snapshot output does not become live disk storage" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
-    const temp_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/temp.spore", .{tmp.sub_path[0..]});
-    defer allocator.free(temp_dir);
-    const final_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/final.spore", .{tmp.sub_path[0..]});
-    defer allocator.free(final_dir);
-    const second_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/second.spore", .{tmp.sub_path[0..]});
-    defer allocator.free(second_dir);
+    const temp_dir = try tmp.path("temp.spore");
+    const final_dir = try tmp.path("final.spore");
+    const second_dir = try tmp.path("second.spore");
     try std.Io.Dir.cwd().createDirPath(io, temp_dir);
 
     const chunk_size: usize = 512;
@@ -2479,11 +2475,10 @@ test "snapshot output does not become live disk storage" {
 test "failed write cannot leave overlay bytes classified clean" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
-    const spore_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/spore", .{tmp.sub_path[0..]});
-    defer allocator.free(spore_dir);
+    const spore_dir = try tmp.path("spore");
     try std.Io.Dir.cwd().createDirPath(io, spore_dir);
     const base_bytes = [_]u8{0xD4} ** 512;
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
@@ -2509,13 +2504,13 @@ test "failed write cannot leave overlay bytes classified clean" {
 test "snapshot from parent index seals only dirty chunks and matches full rescan" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tmp_root = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    const tmp_root = tmp.root;
     const snapshot_dir = try std.fmt.allocPrint(arena, "{s}/snapshot.spore", .{tmp_root});
     const parent_cache = try std.fmt.allocPrint(arena, "{s}/parent-cache", .{tmp_root});
     const full_cache = try std.fmt.allocPrint(arena, "{s}/full-cache", .{tmp_root});
@@ -2832,11 +2827,10 @@ test "portable fork head round trips overlay and zero overrides" {
 test "post-snapshot fast fork uses sealed baseline without native overlay clone" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
-    const snapshot_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/post-save-cas", .{tmp.sub_path[0..]});
-    defer allocator.free(snapshot_dir);
+    const snapshot_dir = try tmp.path("post-save-cas");
     try std.Io.Dir.cwd().createDirPath(io, snapshot_dir);
 
     const disk_size: usize = @intCast(spore.disk_chunk_size);
@@ -2971,8 +2965,8 @@ test "post-snapshot fast fork uses sealed baseline without native overlay clone"
 test "portable fork adoption preserves authoritative clean grown zeroes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
     const chunk_size: usize = @intCast(spore.disk_chunk_size);
     const grown_size = 2 * chunk_size;
@@ -3015,10 +3009,8 @@ test "portable fork adoption preserves authoritative clean grown zeroes" {
     try std.testing.expectEqual(Source.zero, child.sources[1]);
     try std.testing.expectEqual(@as(usize, 0), child.dirtyChunkCount());
 
-    const parent_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/parent-snapshot", .{tmp.sub_path[0..]});
-    defer allocator.free(parent_dir);
-    const child_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/child-snapshot", .{tmp.sub_path[0..]});
-    defer allocator.free(child_dir);
+    const parent_dir = try tmp.path("parent-snapshot");
+    const child_dir = try tmp.path("child-snapshot");
     try std.Io.Dir.cwd().createDirPath(io, parent_dir);
     try std.Io.Dir.cwd().createDirPath(io, child_dir);
     const parent_snapshot = try parent.snapshotIndex(parent_dir, .{ .mmio_slot = 1 }, true);
@@ -3031,10 +3023,9 @@ test "portable fork adoption preserves authoritative clean grown zeroes" {
 test "native portable fork head uses its configured overlay filesystem" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const overlay_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
-    defer allocator.free(overlay_dir);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const overlay_dir = tmp.root;
 
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
     defer base.close(io);

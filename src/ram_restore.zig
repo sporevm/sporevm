@@ -6,6 +6,7 @@
 //! knobs.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 
 const local_backing = @import("local_backing.zig");
 const local_paths = @import("local_paths.zig");
@@ -124,10 +125,10 @@ test "RAM restore plan preserves proven backing for one and multi-vCPU restore" 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
-    const relative_root = try std.fmt.allocPrintSentinel(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]}, 0);
+    const relative_root = tmp.root;
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved_root = std.c.realpath(relative_root, &root_buf) orelse return error.IoFailed;
     const root = try arena.dupe(u8, std.mem.span(resolved_root));

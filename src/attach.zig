@@ -1,6 +1,7 @@
 //! Product attach support for `spore attach`.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 
@@ -467,9 +468,9 @@ test "attach validates saved sessions before bound service bindings" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = tmp.root;
 
     var manifest = testDiskGuardManifest(&.{}, false);
     manifest.rootfs = null;

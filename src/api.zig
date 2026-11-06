@@ -1,6 +1,7 @@
 //! Product operations and result contracts used by the CLI.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 
 const aarch64_topology = @import("aarch64/topology.zig");
@@ -1304,9 +1305,9 @@ test "inspect spore returns annotation values from saved manifest" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = tmp.root;
 
     var annotations = spore.Annotations{};
     try annotations.map.put(arena, "cleanroom.create", "created");
@@ -1435,9 +1436,9 @@ test "inspect spore summarizes multi-vcpu manifests" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = tmp.root;
 
     var annotations = spore.Annotations{};
     try annotations.map.put(arena, "cleanroom.bake", "warm");

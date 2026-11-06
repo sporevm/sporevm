@@ -609,9 +609,9 @@ test "image archive must end with exactly two zero blocks after its last object"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const dir = tmp.root;
 
     const seed_tar = try testArchiveTarAlloc(&arena, dir);
     const end = seed_tar.len - 1024;

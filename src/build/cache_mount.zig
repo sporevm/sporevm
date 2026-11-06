@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestDir = @import("../test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const Io = std.Io;
 
@@ -500,9 +501,9 @@ test "cache store recreates a host-visible unclean aggregate" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const allocator = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const relative_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const relative_root = tmp.root;
     const root = try Io.Dir.cwd().realPathFileAlloc(io, relative_root, allocator);
     const image_size: u64 = 64 << 20;
     var initial = try Store.openSized(io, allocator, root, image_size, 4096);

@@ -1,6 +1,7 @@
 //! Runtime writable disk snapshot glue for the chunk-mapped rootfs backend.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const block_source = @import("block_source.zig");
 const chunk_mapped_disk = @import("chunk_mapped_disk.zig");
 const fd_util = @import("fd.zig");
@@ -318,13 +319,13 @@ test "snapshot returns null for a clean exact-rootfs baseline" {
 test "clean chunk-index save publishes its index" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const out_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/saved.spore", .{tmp.sub_path[0..]});
+    const out_dir = try tmp.path("saved.spore");
     try std.Io.Dir.cwd().createDirPath(io, out_dir);
     const bytes = [_]u8{0x62} ** 512;
     var base = try tmp.dir.createFile(io, "base.img", .{ .read = true });
@@ -353,14 +354,14 @@ test "clean chunk-index save publishes its index" {
 test "clean save after dirty cow snapshot keeps current identity" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const first_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/first.spore", .{tmp.sub_path[0..]});
-    const second_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/second.spore", .{tmp.sub_path[0..]});
+    const first_dir = try tmp.path("first.spore");
+    const second_dir = try tmp.path("second.spore");
     try std.Io.Dir.cwd().createDirPath(io, first_dir);
     try std.Io.Dir.cwd().createDirPath(io, second_dir);
     const bytes = [_]u8{0x73} ** 512;

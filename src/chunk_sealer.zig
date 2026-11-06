@@ -5,6 +5,7 @@
 //! chunks only if absent, and verify preexisting objects before reusing them.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 
@@ -583,10 +584,9 @@ pub fn threadCpuNs() u64 {
 
 test "write-if-missing verifies existing data" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/chunk", .{tmp.sub_path[0..]});
-    defer allocator.free(path);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const path = try tmp.path("chunk");
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -597,10 +597,9 @@ test "write-if-missing verifies existing data" {
 
 test "batched immutable writes use one caller-owned directory barrier" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const parent = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/objects", .{tmp.sub_path[0..]});
-    defer allocator.free(parent);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const parent = try tmp.path("objects");
     try ensureDirPath(allocator, parent);
     const path = try std.fmt.allocPrint(allocator, "{s}/chunk", .{parent});
     defer allocator.free(path);
@@ -631,10 +630,9 @@ fn concurrentWriteWorker(context: *ConcurrentWriteContext, worker_index: usize) 
 
 test "write-if-missing handles same-digest races" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/chunk", .{tmp.sub_path[0..]});
-    defer allocator.free(path);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const path = try tmp.path("chunk");
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
@@ -663,10 +661,9 @@ test "write-if-missing handles same-digest races" {
 
 test "durable atomic publish verifies existing data" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/index.json", .{tmp.sub_path[0..]});
-    defer allocator.free(path);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const path = try tmp.path("index.json");
 
     try writeFileAtomicDurable(allocator, path, "abc", 0o444);
     try writeFileAtomicDurable(allocator, path, "abc", 0o444);
@@ -675,10 +672,9 @@ test "durable atomic publish verifies existing data" {
 
 test "durable atomic replace updates existing data" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/record.json", .{tmp.sub_path[0..]});
-    defer allocator.free(path);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const path = try tmp.path("record.json");
 
     try replaceFileAtomicDurable(allocator, path, "first", 0o444);
     try replaceFileAtomicDurable(allocator, path, "second", 0o444);
@@ -689,10 +685,9 @@ test "durable atomic replace updates existing data" {
 
 test "ensure directory path durably syncs each newly created ancestor" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/a/b/c", .{tmp.sub_path[0..]});
-    defer allocator.free(path);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const path = try tmp.path("a/b/c");
 
     var sync_count: usize = 0;
     testing.created_dir_syncs = &sync_count;

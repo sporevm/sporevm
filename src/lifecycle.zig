@@ -5007,10 +5007,9 @@ fn appendTestFrame(w: *Io.Writer, frame_type: spore_stream.FrameType, stream_id:
 fn copyStreamAgainstFrames(request_type: []const u8, frames: []const u8, fds: CopyStreamFds) !u8 {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const socket_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/m.sock", .{tmp.sub_path});
-    defer allocator.free(socket_path);
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
+    const socket_path = try tmp.path("m.sock");
     const address = try net.UnixAddress.init(socket_path);
     var fake = FakeCopyMonitor{ .io = io, .server = try address.listen(io, .{ .kernel_backlog = 2 }), .frames = frames };
     defer fake.server.deinit(io);

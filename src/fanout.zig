@@ -1,6 +1,7 @@
 //! Local fan-out orchestration for forked spores.
 
 const std = @import("std");
+const TestDir = @import("test_dir.zig").TestDir;
 const Io = std.Io;
 
 const deadline = @import("deadline.zig");
@@ -705,11 +706,11 @@ test "fanout preflight reads saved session presence" {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tmp = try TestDir.init();
+    defer tmp.deinit();
 
-    const no_session_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/no-session", .{tmp.sub_path[0..]});
-    const session_dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/session", .{tmp.sub_path[0..]});
+    const no_session_dir = try tmp.path("no-session");
+    const session_dir = try tmp.path("session");
     try Io.Dir.cwd().createDirPath(io, no_session_dir);
     try Io.Dir.cwd().createDirPath(io, session_dir);
 
