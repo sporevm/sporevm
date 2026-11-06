@@ -78,8 +78,9 @@ pub fn captureVcpuState(allocator: std.mem.Allocator, vcpu: VcpuRef) !spore.Vcpu
     for (0..32) |i| {
         var q: hvf.SimdReg = undefined;
         try hvf.check(hvf.hv_vcpu_get_simd_fp_reg(vcpu.handle, @intCast(i), &q), "get simd");
-        state.simd[i][0] = std.mem.readInt(u64, q.bytes[0..8], .little);
-        state.simd[i][1] = std.mem.readInt(u64, q.bytes[8..16], .little);
+        const bytes: [16]u8 = q;
+        state.simd[i][0] = std.mem.readInt(u64, bytes[0..8], .little);
+        state.simd[i][1] = std.mem.readInt(u64, bytes[8..16], .little);
     }
 
     const regs = try allocator.alloc(spore.SysRegEntry, saved_sys_regs.len);
@@ -139,10 +140,10 @@ pub fn applyVcpuState(vcpu: hvf.VcpuHandle, state: spore.VcpuState, vtimer_offse
     try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .fpsr, state.fpsr), "set fpsr");
 
     for (0..32) |i| {
-        var q: hvf.SimdReg = undefined;
-        std.mem.writeInt(u64, q.bytes[0..8], state.simd[i][0], .little);
-        std.mem.writeInt(u64, q.bytes[8..16], state.simd[i][1], .little);
-        try hvf.check(hvf.hv_vcpu_set_simd_fp_reg(vcpu, @intCast(i), q), "set simd");
+        var bytes: [16]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], state.simd[i][0], .little);
+        std.mem.writeInt(u64, bytes[8..16], state.simd[i][1], .little);
+        try hvf.check(hvf.hv_vcpu_set_simd_fp_reg(vcpu, @intCast(i), bytes), "set simd");
     }
 
     for (state.sys_regs) |entry| {

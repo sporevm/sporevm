@@ -405,8 +405,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   # Non-destructive multi-vCPU save of an active workload: prove the source VM
   # stays registered and keeps ticking after save, then remove the source and
   # verify the point-in-time spore restores and preserves the captured workload
-  # state. `expect_multi_vcpu_manifest` above verifies the saved vCPU topology; the first
-  # post-restore exec may run under the restored file-stdio affinity gate.
+  # state. `expect_multi_vcpu_manifest` verifies the saved vCPU topology.
   live_name="${vm_name}-live"
   live_restored_name="${vm_name}-live-restored"
   live_dir="${workdir}/live.spore"

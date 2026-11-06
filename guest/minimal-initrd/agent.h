@@ -17,7 +17,6 @@
 #include <linux/fs.h>
 #include <linux/openat2.h>
 #include <poll.h>
-#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -112,7 +111,6 @@ struct session {
   int stdin_close_pending;
   int tty;
   int terminal_close_pending;
-  int file_stdio;
   int exit_code;
   char setup_error[256];
   uint64_t stdout_offset;
@@ -255,7 +253,6 @@ enum exec_lookup_mode {
 
 struct session_start_options {
   int use_rootfs;
-  int file_stdio;
   int memory_pressure;
   int build_run_isolation;
   enum exec_lookup_mode exec_lookup;
@@ -393,8 +390,6 @@ int copy_out_file(struct client *client, const char *root, const char *guest_pat
 int build_workdir_apply(struct client *client, const char *root, const char *path);
 int freeze_or_thaw_rootfs(struct client *client, int freeze);
 int grow_rootfs(struct client *client);
-void pump_session_file(struct session *session, struct client *client, int is_stdout);
-void close_file_stdio(struct session *session);
 int apply_terminal_size(int fd, uint16_t rows, uint16_t cols);
 void execve_or_report( char *const argv[], char *const envp[], int use_rootfs, int failure_fd, enum exec_lookup_mode exec_lookup);
 int start_session(struct session *session, const char *session_id, char *const argv[], char *const envp[], const char *working_dir, const struct session_start_options *options);

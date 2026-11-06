@@ -113,8 +113,11 @@ grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore attach --events=jsonl 
 grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore attach --events=jsonl did not report local RAM restore"
 grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore attach --events=jsonl did not report proof-backed restore"
 
+# Two vCPUs: the first command after restoring a finished multi-vCPU guest
+# once hung on a lost wakeup.
 "${spore_bin}" run \
   --backend "${backend}" \
+  --vcpus 2 \
   --memory "${smoke_memory}" \
   --save "${from_base_dir}" \
   -- /bin/true \

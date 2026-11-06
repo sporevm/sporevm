@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Commands in restored macOS spores
+
+Release builds on macOS restored every guest SIMD and floating-point register
+to one wrong value, so the guest task that was running at save time, usually
+the guest agent, resumed with corrupted vector registers. The first command
+started after restoring a spore whose command had finished, such as
+`spore run --from base.spore -- cmd` or `spore exec` into a restored VM,
+failed with `spore run: exec setup failed`. Restores now set each register
+to its saved value, and the smoke suite builds with the shipped ReleaseSafe
+settings, as release builds do.
+
+The guest agent's old workaround for this symptom, which sent such a
+command's output through files in `/tmp` and kept none of it for replay, is
+gone: `spore attach` of a spore saved while that command ran replays its
+output from the start.
+
 ### Lazy images from a store
 
 `spore image push local/app:1 /srv/images/app` writes a static image store
