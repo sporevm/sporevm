@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const fuzz_support = @import("fuzz_support.zig");
 const spore = @import("spore.zig");
 const spore_net = @import("spore_net.zig");
 
@@ -1419,8 +1420,9 @@ fn fuzzPolicyArg(_: void, s: *std.testing.Smith) !void {
 
 test "fuzz spore-net policy argument parser" {
     try std.testing.fuzz({}, fuzzPolicyArg, .{ .corpus = &.{
-        \\{"default_deny":true,"allow_cidrs":["93.184.216.34/32"],"allow_hosts":["example.org"],"allow_host_ports":[{"host":"github.com","ports":[443]}],"bound_services":[{"name":"metadata","guest_host":"metadata.spore.internal","guest_port":80,"unix_path":"/tmp/metadata.sock"}],"port_forwards":[{"host_port":18080,"guest_port":80}]}
-        ,
+        fuzz_support.sliceSeed(
+            \\{"default_deny":true,"allow_cidrs":["93.184.216.34/32"],"allow_hosts":["example.org"],"allow_host_ports":[{"host":"github.com","ports":[443]}],"bound_services":[{"name":"metadata","guest_host":"metadata.spore.internal","guest_port":80,"unix_path":"/tmp/metadata.sock"}],"port_forwards":[{"host_port":18080,"guest_port":80}]}
+        ),
     } });
 }
 

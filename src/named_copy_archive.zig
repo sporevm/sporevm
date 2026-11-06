@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const fuzz_support = @import("fuzz_support.zig");
 
 const Io = std.Io;
 
@@ -343,33 +344,6 @@ test "copy archive extraction writes children under read-only directories" {
     try std.testing.expectEqualStrings("readonly", data);
 }
 
-/// A test directory at `.zig-cache/tmp/copy-archive-<label>-<pid>`.
-/// `std.testing.tmpDir` names directories from `std.testing.io` randomness,
-/// which the fuzz runner never seeds, so under fuzzing every tmpDir gets the
-/// same name: the seed tree and the oracle would share one directory and
-/// parallel fuzz instances would collide.
-const ScratchDir = struct {
-    dir: Io.Dir,
-    path: []u8,
-
-    fn init(allocator: std.mem.Allocator, label: []const u8) !ScratchDir {
-        const io = std.testing.io;
-        const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/copy-archive-{s}-{d}", .{ label, std.c.getpid() });
-        errdefer allocator.free(path);
-        // Clear what an earlier process with the same pid left behind.
-        try Io.Dir.cwd().deleteTree(io, path);
-        const dir = try Io.Dir.cwd().createDirPathOpen(io, path, .{ .open_options = .{ .iterate = true } });
-        return .{ .dir = dir, .path = path };
-    }
-
-    fn deinit(self: *ScratchDir, allocator: std.mem.Allocator) void {
-        const io = std.testing.io;
-        self.dir.close(io);
-        Io.Dir.cwd().deleteTree(io, self.path) catch {};
-        allocator.free(self.path);
-    }
-};
-
 /// Extracts `input` into `<tmp>/guard/out` and checks that nothing appears
 /// anywhere else under `<tmp>`, that a failure leaves no destination, and that
 /// a success creates only regular files and directories holding no more bytes
@@ -377,10 +351,10 @@ const ScratchDir = struct {
 fn expectContainedExtraction(input: []const u8) !bool {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = try ScratchDir.init(allocator, "oracle");
-    defer tmp.deinit(allocator);
+    var tmp = fuzz_support.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
     try tmp.dir.createDir(io, "guard", .default_dir);
-    const out = try std.fs.path.join(allocator, &.{ tmp.path, "guard", "out" });
+    const out = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "guard", "out" });
     defer allocator.free(out);
 
     var in: Io.Reader = .fixed(input);
@@ -477,14 +451,14 @@ test "fuzz copy archive extraction" {
     // parsing and file creation rather than stopping at the magic.
     var seed: FuzzSeed = .{ .bytes = undefined, .len = 0 };
     {
-        var tree = try ScratchDir.init(allocator, "seed");
-        defer tree.deinit(allocator);
+        var tree = fuzz_support.tmpDir(.{});
+        defer tree.cleanup();
         try tree.dir.createDir(io, "src", @enumFromInt(0o750));
         try tree.dir.createDir(io, "src/sub", @enumFromInt(0o700));
         try tree.dir.createDir(io, "src/sub/empty", @enumFromInt(0o755));
         try tree.dir.writeFile(io, .{ .sub_path = "src/a.txt", .data = "alpha\n" });
         try tree.dir.writeFile(io, .{ .sub_path = "src/sub/b.bin", .data = "\x00\x01\x02bravo" });
-        const src = try std.fs.path.join(allocator, &.{ tree.path, "src" });
+        const src = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tree.sub_path, "src" });
         defer allocator.free(src);
 
         var w: Io.Writer = .fixed(&seed.bytes);

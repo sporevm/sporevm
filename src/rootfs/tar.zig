@@ -5,6 +5,7 @@
 //! than being silently dropped.
 
 const std = @import("std");
+const fuzz_support = @import("../fuzz_support.zig");
 const oci = @import("oci.zig");
 const xattrs_mod = @import("xattrs.zig");
 
@@ -1900,7 +1901,7 @@ fn fuzzTarLayer(_: void, s: *std.testing.Smith) !void {
     // The checking allocator, not an arena, so leaks and double frees on
     // error paths fail the run.
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = fuzz_support.tmpDir(.{});
     defer tmp.cleanup();
     var tree = MergedTree.init(allocator);
     defer tree.deinit(allocator);

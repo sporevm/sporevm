@@ -6,6 +6,7 @@
 //! manifest/layer media types fail closed.
 
 const std = @import("std");
+const fuzz_support = @import("../fuzz_support.zig");
 const oci = @import("oci.zig");
 const tar = @import("tar.zig");
 
@@ -488,7 +489,7 @@ fn fuzzOciLayoutTarExtraction(_: void, s: *std.testing.Smith) !void {
     var buf: [8192]u8 = undefined;
     const len = s.slice(&buf);
 
-    var tmp = std.testing.tmpDir(.{ .access_sub_paths = true, .iterate = true });
+    var tmp = fuzz_support.tmpDir(.{ .access_sub_paths = true, .iterate = true });
     defer tmp.cleanup();
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
