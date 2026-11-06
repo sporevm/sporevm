@@ -3,10 +3,11 @@
 //! The host writes copy-in archives for the guest agent. Copy-out archives are
 //! produced by the guest, so `extract` treats every byte as hostile: record
 //! paths are relative, slash-separated, and free of `.`, `..`, empty, and NUL
-//! components; only regular files and directories are created, files with
-//! O_CREAT|O_EXCL|O_NOFOLLOW and directories with mkdir, into a destination
-//! that must not exist; and a failed extraction removes the partial
-//! destination.
+//! components; only regular files and directories are created, into a
+//! destination that must not exist, each with O_EXCL or mkdirat relative to
+//! its parent's fd, which is opened one component at a time with O_NOFOLLOW;
+//! guest modes pass through the process umask; and a failed extraction
+//! removes the partial destination.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -18,6 +19,10 @@ const magic = "SPCP1\n\x00\n";
 const record_header_len = 16;
 /// The longest record path; the guest agent's MAX_COPY_PATH_LEN.
 pub const max_path = 512;
+
+/// Largest copy-out archive the host accepts from the guest, so a guest
+/// cannot fill the host's temporary directory.
+pub const max_archive_bytes: u64 = 4 << 30;
 
 const Kind = enum(u8) {
     file = 'F',
@@ -171,13 +176,18 @@ fn extract(allocator: std.mem.Allocator, io: Io, in: *Io.Reader, host_path: []co
     var path_buf: [max_path]u8 = undefined;
     const root = try readRecord(in, &path_buf);
     if (root.path.len != 0) return error.BadCopyArchive;
+
+    var parent = try openDirPath(io, std.fs.path.dirname(host_path) orelse ".", .{});
+    defer parent.close(io);
+    const base = try allocator.dupeZ(u8, std.fs.path.basename(host_path));
+    defer allocator.free(base);
     switch (root.kind) {
         .file => {
-            const file = try createHostOutputFile(allocator, host_path, root.mode);
+            const file = try createFileAt(parent.handle, base, root.mode);
             var keep = false;
             defer {
                 file.close(io);
-                if (!keep) Io.Dir.cwd().deleteFile(io, host_path) catch {};
+                if (!keep) _ = std.c.unlinkat(parent.handle, base, 0);
             }
             try copyFileBytes(io, in, file, root.size);
             if ((try readRecord(in, &path_buf)).kind != .end) return error.BadCopyArchive;
@@ -185,22 +195,28 @@ fn extract(allocator: std.mem.Allocator, io: Io, in: *Io.Reader, host_path: []co
             keep = true;
         },
         .directory => {
-            try createHostOutputDir(allocator, host_path, root.mode);
+            try makeDirAt(parent.handle, base, root.mode);
             var keep = false;
-            defer if (!keep) Io.Dir.cwd().deleteTree(io, host_path) catch {};
+            defer if (!keep) parent.deleteTree(io, base) catch {};
+            const dest = std.c.openat(parent.handle, base, directory_flags);
+            if (dest < 0) return error.OpenFailed;
+            defer _ = std.c.close(dest);
+            var name_buf: [max_path + 1]u8 = undefined;
             while (true) {
                 const record = try readRecord(in, &path_buf);
                 if (record.kind == .end) break;
                 if (record.path.len == 0) return error.BadCopyArchive;
-                const target = try std.fs.path.join(allocator, &.{ host_path, record.path });
-                defer allocator.free(target);
+                const entry = try openParentAt(dest, record.path, &name_buf);
+                defer if (entry.dir != dest) {
+                    _ = std.c.close(entry.dir);
+                };
                 switch (record.kind) {
                     .file => {
-                        const file = try createHostOutputFile(allocator, target, record.mode);
+                        const file = try createFileAt(entry.dir, entry.name, record.mode);
                         defer file.close(io);
                         try copyFileBytes(io, in, file, record.size);
                     },
-                    .directory => try createHostOutputDir(allocator, target, record.mode),
+                    .directory => try makeDirAt(entry.dir, entry.name, record.mode),
                     .end => unreachable,
                 }
             }
@@ -209,6 +225,47 @@ fn extract(allocator: std.mem.Allocator, io: Io, in: *Io.Reader, host_path: []co
         },
         .end => return error.BadCopyArchive,
     }
+}
+
+const directory_flags: std.c.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
+
+const ParentEntry = struct {
+    dir: std.c.fd_t,
+    name: [*:0]const u8,
+};
+
+/// Opens the directory that holds `path`'s last component, walking from
+/// `root` one component at a time without following symlinks, so a symlink
+/// swapped in for a directory fails the walk instead of redirecting it.
+fn openParentAt(root: std.c.fd_t, path: []const u8, buf: *[max_path + 1]u8) !ParentEntry {
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    var dir = root;
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, buf[0..path.len], start, '/')) |slash| {
+        buf[slash] = 0;
+        const next = std.c.openat(dir, buf[start..slash :0].ptr, directory_flags);
+        if (dir != root) _ = std.c.close(dir);
+        if (next < 0) return error.OpenFailed;
+        dir = next;
+        start = slash + 1;
+    }
+    return .{ .dir = dir, .name = buf[start..path.len :0].ptr };
+}
+
+/// Creates a new file. The guest mode goes to openat rather than fchmod, so
+/// the process umask applies to it as it does for tar and cp.
+fn createFileAt(dir: std.c.fd_t, name: [*:0]const u8, mode: u32) !Io.File {
+    const flags: std.c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const fd = std.c.openat(dir, name, flags, @as(c_uint, mode & 0o777));
+    if (fd < 0) return error.OpenFailed;
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+/// Creates a new directory, owner-writable so children can land under a
+/// read-only guest directory. mkdirat applies the process umask.
+fn makeDirAt(dir: std.c.fd_t, name: [*:0]const u8, mode: u32) !void {
+    if (std.c.mkdirat(dir, name, @intCast((mode & 0o777) | 0o700)) != 0) return error.CreateDirFailed;
 }
 
 fn readRecord(in: *Io.Reader, path_buf: *[max_path]u8) !Record {
@@ -275,21 +332,6 @@ fn validatePath(path: []const u8, allow_root: bool) !void {
     }
 }
 
-fn createHostOutputFile(allocator: std.mem.Allocator, path: []const u8, mode: u32) !Io.File {
-    const fd = try openHostFileCreate(allocator, path);
-    if (std.c.fchmod(fd, @intCast(mode & 0o777)) != 0) {
-        _ = std.c.close(fd);
-        return error.ChmodFailed;
-    }
-    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
-}
-
-fn createHostOutputDir(allocator: std.mem.Allocator, path: []const u8, mode: u32) !void {
-    const pathz = try allocator.dupeZ(u8, path);
-    defer allocator.free(pathz);
-    if (std.c.mkdir(pathz, @intCast((mode & 0o777) | 0o700)) != 0) return error.CreateDirFailed;
-}
-
 /// Creates a new private file without following a final symlink.
 pub fn openHostFileCreate(allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
     const pathz = try allocator.dupeZ(u8, path);
@@ -343,6 +385,100 @@ test "copy archive extraction writes children under read-only directories" {
     const data = try tmp.dir.readFileAlloc(std.testing.io, "out/child.txt", allocator, .limited(32));
     defer allocator.free(data);
     try std.testing.expectEqualStrings("readonly", data);
+}
+
+test "copy archive extraction applies the process umask to guest modes" {
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.writeAll(magic);
+    try writeRecordHeader(&w, .directory, "", 0o777, 0);
+    try writeRecordHeader(&w, .file, "file", 0o666, 1);
+    try w.writeAll("x");
+    try writeRecordHeader(&w, .directory, "dir", 0o777, 0);
+    try writeRecordHeader(&w, .end, "", 0, 0);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const out = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "out" });
+    defer allocator.free(out);
+    const old_umask = std.c.umask(0o027);
+    defer _ = std.c.umask(old_umask);
+    var in: Io.Reader = .fixed(w.buffered());
+    try extract(allocator, io, &in, out);
+
+    const Expected = struct { path: []const u8, mode: u32 };
+    for ([_]Expected{
+        .{ .path = "out", .mode = 0o750 },
+        .{ .path = "out/file", .mode = 0o640 },
+        .{ .path = "out/dir", .mode = 0o750 },
+    }) |expected| {
+        const stat = try tmp.dir.statFile(io, expected.path, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(expected.mode, modeFromStat(stat));
+    }
+}
+
+/// Serves `before`, then replaces `out/sub` under `dir` with a symlink to
+/// `outside`, then serves `after`.
+const SwapReader = struct {
+    interface: Io.Reader,
+    dir: Io.Dir,
+    before: []const u8,
+    after: []const u8,
+    swapped: bool = false,
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *SwapReader = @alignCast(@fieldParentPtr("interface", r));
+        const io = std.testing.io;
+        if (self.before.len == 0 and !self.swapped) {
+            self.dir.rename("out/sub", self.dir, "out/moved", io) catch return error.ReadFailed;
+            self.dir.symLink(io, "../outside", "out/sub", .{}) catch return error.ReadFailed;
+            self.swapped = true;
+        }
+        const part = if (self.before.len != 0) &self.before else &self.after;
+        if (part.len == 0) return error.EndOfStream;
+        const n = try w.write(limit.sliceConst(part.*));
+        part.* = part.*[n..];
+        return n;
+    }
+};
+
+test "copy archive extraction does not follow a directory swapped for a symlink" {
+    var before_buf: [128]u8 = undefined;
+    var before: Io.Writer = .fixed(&before_buf);
+    try before.writeAll(magic);
+    try writeRecordHeader(&before, .directory, "", 0o755, 0);
+    try writeRecordHeader(&before, .directory, "sub", 0o755, 0);
+    var after_buf: [128]u8 = undefined;
+    var after: Io.Writer = .fixed(&after_buf);
+    try writeRecordHeader(&after, .file, "sub/x", 0o644, 1);
+    try after.writeAll("x");
+    try writeRecordHeader(&after, .end, "", 0, 0);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    try tmp.dir.createDir(io, "outside", .default_dir);
+    const out = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "out" });
+    defer allocator.free(out);
+
+    var read_buf: [64]u8 = undefined;
+    var reader: SwapReader = .{
+        .interface = .{ .vtable = &.{ .stream = SwapReader.stream }, .buffer = &read_buf, .seek = 0, .end = 0 },
+        .dir = tmp.dir,
+        .before = before.buffered(),
+        .after = after.buffered(),
+    };
+    try std.testing.expectError(error.OpenFailed, extract(allocator, io, &reader.interface, out));
+    try std.testing.expect(reader.swapped);
+
+    var outside = try tmp.dir.openDir(io, "outside", .{ .iterate = true });
+    defer outside.close(io);
+    var it = outside.iterate();
+    try std.testing.expectEqual(null, try it.next(io));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "out", .{ .follow_symlinks = false }));
 }
 
 /// Extracts `input` into `<tmp>/guard/out` and checks that nothing appears

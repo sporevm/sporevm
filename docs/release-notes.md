@@ -178,6 +178,13 @@ instead of text.
 Local RAM backing proofs no longer enable or record Linux fs-verity; existing
 schema v2 proofs are ignored and those spores restore from verified chunks.
 
+### Copy treats guest data more strictly
+
+`spore copy-out` stops at 4 GiB of guest archive and applies the host umask to
+the modes it extracts. Guest stdout during `copy-in` is dropped, guest stderr
+during either copy has control bytes escaped, and `--json` copies drop guest
+output entirely.
+
 ## v0.17.1
 
 ### Managed kernel security update
