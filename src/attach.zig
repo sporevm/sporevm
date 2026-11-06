@@ -38,7 +38,6 @@ pub const Options = struct {
     spore_dir: []const u8,
     session_id: ?[]const u8 = null,
     generation_path: ?[]const u8 = null,
-    event_mode: events_mod.EventMode = .none,
     events: ?events_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
@@ -58,7 +57,6 @@ pub const cli_usage =
     \\  --generation FILE       Inject fan-out identity JSON before attach
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service to a host socket
-    \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
     \\  -i, --interactive       Forward stdin when the saved session supports it
     \\  -t, --tty               Attach as a terminal when the saved session has one
@@ -75,7 +73,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var spore_dir: ?[]const u8 = null;
     var session_id: ?[]const u8 = null;
     var generation_path: ?[]const u8 = null;
-    var event_mode: events_mod.EventMode = .none;
     var timeout_ms: u64 = default_attach_timeout_ms;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
     var interactive = false;
@@ -104,16 +101,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
                 failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             }) catch |err| {
                 failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
-            };
-        } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
-            i += 1;
-            event_mode = events_mod.EventMode.parse(args[i]) orelse {
-                failAttachSetup("--events must be jsonl", .{});
-            };
-        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
-            const raw = args[i]["--events=".len..];
-            event_mode = events_mod.EventMode.parse(raw) orelse {
-                failAttachSetup("--events must be jsonl", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
@@ -145,7 +132,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         .backend = backend,
         .session_id = session_id,
         .generation_path = generation_path,
-        .event_mode = event_mode,
         .spore_dir = spore_dir orelse {
             failAttachSetup("{s}", .{cli_usage});
         },
@@ -440,9 +426,8 @@ test "attach cli parser accepts hidden timeout-ms compatibility spelling" {
 }
 
 test "attach cli parser accepts generation file" {
-    const opts = try parseCliArgs(&.{ "--generation", "generation.json", "--events=jsonl", "child.spore" });
+    const opts = try parseCliArgs(&.{ "--generation", "generation.json", "child.spore" });
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
-    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 

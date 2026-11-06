@@ -98,49 +98,6 @@ pub fn fromManifestBytes(bytes: u64) ParseError!Config {
     return Config.fixed(bytes);
 }
 
-pub fn parseCliBytesOrExit(command: []const u8, flag: []const u8, raw: []const u8) u64 {
-    return parseBytes(raw) catch |err| {
-        if (err == error.RemovedAuto) {
-            std.debug.print(
-                "{s}: {s} auto was removed; use --memory 512mb for fixed memory, or --memory 512mb --max-memory 16gb for elastic memory\n",
-                .{ command, flag },
-            );
-        } else {
-            std.debug.print(
-                "{s}: {s} must be a positive page-aligned size like 512mb or 16gb ({s})\n",
-                .{ command, flag, cliReason(err) },
-            );
-        }
-        std.process.exit(2);
-    };
-}
-
-pub fn validateCliOrExit(command: []const u8, config: Config) void {
-    config.validate() catch |err| {
-        switch (err) {
-            error.MaximumBelowInitial => std.debug.print(
-                "{s}: --max-memory must be greater than or equal to --memory\n",
-                .{command},
-            ),
-            error.UnalignedElasticMemory => std.debug.print(
-                "{s}: elastic --memory and --max-memory values must be aligned to 2 MiB\n",
-                .{command},
-            ),
-            error.ElasticRegionTooLarge => std.debug.print(
-                "{s}: --max-memory may exceed --memory by at most 16 GiB\n",
-                .{command},
-            ),
-            else => std.debug.print("{s}: invalid memory configuration ({s})\n", .{ command, cliReason(err) }),
-        }
-        std.process.exit(2);
-    };
-}
-
-pub fn rejectMemoryMiBFlag(command: []const u8) noreturn {
-    std.debug.print("{s}: --memory-mib has been replaced by --memory\n", .{command});
-    std.process.exit(2);
-}
-
 fn validateBytes(bytes: u64) ParseError!void {
     if (bytes == 0) return error.ZeroMemory;
     if (bytes % page_alignment != 0) return error.UnalignedMemory;
@@ -161,7 +118,8 @@ fn unitMultiplier(raw: []const u8) ?u64 {
     return null;
 }
 
-fn cliReason(err: ParseError) []const u8 {
+/// A short reason for a CLI error message.
+pub fn cliReason(err: ParseError) []const u8 {
     return switch (err) {
         error.EmptyMemory => "empty value",
         error.InvalidMemory => "invalid value",

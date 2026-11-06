@@ -139,7 +139,7 @@ completed-base path for starting a fresh command inside a child spore.
 Automation can replace prefixed human output with the shared event contract:
 
 ```bash
-spore fanout children --for 10s --events=jsonl
+spore --json fanout children --for 10s
 ```
 
 Each stdout or stderr record carries the child directory name in `child`, its
@@ -166,9 +166,8 @@ spore run --from child.spore \
 Use `spore attach` when the child should resume an already-saved session:
 
 ```bash
-spore attach child.spore \
-  --generation generation.json \
-  --events=jsonl
+spore --json attach child.spore \
+  --generation generation.json
 ```
 
 `generation.json` is copied through the existing generation resume path and the

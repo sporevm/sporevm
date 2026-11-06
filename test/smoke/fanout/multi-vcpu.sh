@@ -241,9 +241,8 @@ fi
 expect_multi_vcpu_manifest "${fork_dir}/000000"
 expect_multi_vcpu_manifest "${fork_dir}/000001"
 
-if ! "${spore_bin}" run \
+if ! "${spore_bin}" --json run \
   --backend "${backend}" \
-  --events=jsonl \
   --from "${fork_dir}/000000" \
   -- /bin/writeout \
   >"${fork_child_stdout}" 2>"${fork_child_stderr}"; then
@@ -254,9 +253,8 @@ fi
 jsonl_output_contains "${fork_child_stdout}" stdout "spore stdout" || die "multi-vCPU fork child run --from did not emit stdout"
 jsonl_output_contains "${fork_child_stdout}" stderr "spore stderr" || die "multi-vCPU fork child run --from did not emit stderr"
 
-if ! "${spore_bin}" run \
+if ! "${spore_bin}" --json run \
   --backend "${backend}" \
-  --events=jsonl \
   --from "${from_base_dir}" \
   -- /bin/writeout \
   >"${from_stdout}" 2>"${from_stderr}"; then
@@ -272,9 +270,8 @@ capture_stdout="${workdir}/capture.stdout"
 capture_stderr="${workdir}/capture.stderr"
 capture_events_pipe="${workdir}/capture.events.pipe"
 mkfifo "${capture_events_pipe}"
-"${spore_bin}" run \
+"${spore_bin}" --json run \
   --backend "${backend}" \
-  --events=jsonl \
   --vcpus "${vcpus}" \
   --memory "${memory}" \
   --save "${capture_dir}" \
@@ -304,7 +301,7 @@ expect_multi_vcpu_manifest "${capture_dir}"
 
 resume_stdout="${workdir}/resume.stdout"
 resume_stderr="${workdir}/resume.stderr"
-if ! "${spore_bin}" attach --events=jsonl --backend "${backend}" "${capture_dir}" >"${resume_stdout}" 2>"${resume_stderr}"; then
+if ! "${spore_bin}" --json attach --backend "${backend}" "${capture_dir}" >"${resume_stdout}" 2>"${resume_stderr}"; then
   cat "${resume_stdout}" >&2 || true
   cat "${resume_stderr}" >&2 || true
   die "multi-vCPU attach failed"

@@ -33,7 +33,6 @@ const version = @import("version.zig");
 const vm_registry = @import("vm_registry.zig");
 
 const max_metadata_bytes = vm_registry.max_metadata_bytes;
-const writeTimingJson = vm_registry.writeTimingJson;
 const runtime_dir_env = lifecycle.runtime_dir_env;
 const Spec = lifecycle.Spec;
 const validateName = lifecycle.validateName;
@@ -46,13 +45,10 @@ const InitialOutputDisposition = lifecycle.InitialOutputDisposition;
 const ListEntry = lifecycle.ListEntry;
 const ListMemory = lifecycle.ListMemory;
 const ListStats = lifecycle.ListStats;
-const NamedExecTiming = lifecycle.NamedExecTiming;
 const NamedForkResult = lifecycle.NamedForkResult;
 const NamedLifecycleResult = lifecycle.NamedLifecycleResult;
 const NamedListResult = lifecycle.NamedListResult;
 const RemovedSavedSpore = lifecycle.RemovedSavedSpore;
-const named_exec_timing_schema = lifecycle.named_exec_timing_schema;
-const named_exec_timing_schema_version = lifecycle.named_exec_timing_schema_version;
 const initial_output_limit_bytes_per_stream = lifecycle.initial_output_limit_bytes_per_stream;
 const createNamedWithTiming = lifecycle.createNamedWithTiming;
 const restoreNamed = lifecycle.restoreNamed;
@@ -130,8 +126,6 @@ pub const exec_usage =
     \\  --workdir PATH          Override the image working directory
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
-    \\  --events=jsonl          Emit schema-versioned output and completion events
-    \\  --timing-json PATH      Write named-exec phase timing as JSON
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
@@ -225,7 +219,6 @@ pub const restore_usage =
     \\  --name NAME            Name for the restored VM
     \\  --bind-service NAME=unix:/path.sock
     \\                         Bind a manifest-declared service to a host socket
-    \\  --events=jsonl         Emit lifecycle events as JSONL on stdout
     \\  -h, --help             Show this help
     \\
 ;
@@ -303,13 +296,9 @@ const ExecOptions = struct {
     guest_working_dir: ?[]const u8 = null,
     interactive: bool = false,
     tty: bool = false,
-    timing_json_path: ?[]const u8 = null,
-    event_mode: events_mod.EventMode = .none,
 };
 
 var exec_cli_event_writer: ?*events_mod.EventWriter = null;
-
-var restore_cli_event_writer: ?*events_mod.EventWriter = null;
 
 const SaveOptions = struct {
     name: []const u8,
@@ -330,13 +319,7 @@ const RestoreOptions = struct {
     name: []const u8,
     backend: ?backend_mod.Backend = null,
     generation_path: ?[]const u8 = null,
-    event_mode: events_mod.EventMode = .none,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
-};
-
-const ExecNamedStreamingResult = struct {
-    exit_code: u8,
-    timing: ?NamedExecTiming,
 };
 
 pub fn createCli(ctx: *const Ctx, args: []const []const u8) !void {
@@ -512,10 +495,10 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
     const stdout = ctx.stdout;
     const allocator = init.arena.allocator();
     var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "exec");
-    exec_cli_event_writer = if (requestsJsonl(args)) &events else null;
+    exec_cli_event_writer = if (ctx.mode == .json) &events else null;
     defer exec_cli_event_writer = null;
     const parsed = parseExecArgs(args);
-    if (parsed.event_mode == .jsonl) return execCliEvents(init, allocator, parsed, &events, stdout);
+    if (ctx.mode == .json) return execCliEvents(init, allocator, parsed, &events, stdout);
     var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
     const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
         error.MissingHostEnvironment => {
@@ -539,7 +522,7 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
         },
         else => return err,
     };
-    const result = execNamedStreaming(.{
+    const exit_code = execNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
     }, allocator, .{
@@ -573,30 +556,13 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
         },
         else => |e| return e,
     };
-    if (parsed.timing_json_path) |path| {
-        const artifact = struct {
-            schema: []const u8 = named_exec_timing_schema,
-            schema_version: u32 = named_exec_timing_schema_version,
-            name: []const u8,
-            exit_code: u8,
-            timing: ?NamedExecTiming,
-        }{
-            .name = parsed.name,
-            .exit_code = result.exit_code,
-            .timing = result.timing,
-        };
-        writeTimingJson(allocator, init.io, path, artifact) catch |err| {
-            std.debug.print("spore exec: cannot write timing JSON to {s}: {s}\n", .{ path, @errorName(err) });
-            std.process.exit(1);
-        };
-    }
-    if (result.exit_code != 0) std.process.exit(result.exit_code);
+    if (exit_code != 0) std.process.exit(exit_code);
 }
 
 fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: ExecOptions, events: *events_mod.EventWriter, stdout: *Io.Writer) !void {
     try events.emitStart(.auto);
     if (parsed.interactive or parsed.tty) {
-        const classified = machine_output.CliError.init(.usage_invalid_argument, "spore exec: --events=jsonl does not support interactive or TTY input", "exec");
+        const classified = machine_output.CliError.init(.usage_invalid_argument, "spore --json exec does not support interactive or TTY input", "exec");
         try events.emitFailure(classified);
         std.process.exit(classified.exit_code);
     }
@@ -650,25 +616,8 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
             },
         }
     }
-    if (parsed.timing_json_path) |path| {
-        try writeTimingJson(allocator, init.io, path, .{
-            .schema = named_exec_timing_schema,
-            .schema_version = named_exec_timing_schema_version,
-            .name = parsed.name,
-            .exit_code = exit_code,
-            .timing = stream.timing,
-        });
-    }
     try stdout.flush();
     if (exit_code != 0) std.process.exit(exit_code);
-}
-
-fn requestsJsonl(args: []const []const u8) bool {
-    for (args, 0..) |arg, i| {
-        if (std.mem.eql(u8, arg, "--events=jsonl")) return true;
-        if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
-    }
-    return false;
 }
 
 /// Guest diagnostics during a copy go to stderr, escaped. With --json they
@@ -1072,12 +1021,8 @@ pub fn restoreCli(ctx: *const Ctx, args: []const []const u8) !void {
     const stderr = ctx.stderr;
     const mode = ctx.mode;
     const allocator = init.arena.allocator();
-    var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "restore");
-    restore_cli_event_writer = if (requestsJsonl(args)) &event_writer else null;
-    defer restore_cli_event_writer = null;
     const parsed = parseRestoreArgs(args, allocator, stderr, mode);
     const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
-    if (parsed.event_mode == .jsonl) try event_writer.emitStart(parsed.backend orelse .auto);
     const result = restoreNamed(init, allocator, .{
         .spore_dir = parsed.spore_dir,
         .name = parsed.name,
@@ -1087,7 +1032,6 @@ pub fn restoreCli(ctx: *const Ctx, args: []const []const u8) !void {
         .debug = ctx.debug,
         .bound_services = parsed.bound_services.slice(),
     }) catch |err| {
-        emitRestoreFailureEvent(&event_writer, parsed.event_mode, err);
         switch (err) {
             error.BadGenerationPayload => {
                 const message = "spore restore: invalid --generation payload; required JSON fields: run_id, child_id, parallel_index, parallel_count, fork_index, fork_count, fork_batch_id, vm_id";
@@ -1171,33 +1115,11 @@ pub fn restoreCli(ctx: *const Ctx, args: []const []const u8) !void {
         }
     };
     defer deinitNamedLifecycleResult(allocator, result);
-    if (parsed.event_mode == .jsonl) {
-        const requested_backend: backend_mod.Backend = parsed.backend orelse .auto;
-        const backend = requested_backend.resolveForHost() catch requested_backend;
-        try emitNamedRestoreExit(&event_writer, backend);
-    } else if (mode == .json) {
+    if (mode == .json) {
         try machine_output.writeJson(allocator, stdout, result);
     } else {
         try writeNamedLifecycleResult(stdout, result);
     }
-}
-
-fn emitNamedRestoreExit(event_writer: *events_mod.EventWriter, backend: backend_mod.Backend) !void {
-    try event_writer.emitExit(.{
-        .backend = backend,
-        .start_ms = 0,
-        .vsock_connect_ms = 0,
-        .exec_response_ms = 0,
-        .probe_duration_ms = 0,
-        .exit_code = 0,
-        .vcpus = 1,
-        .memory_bytes = 0,
-        .max_memory_bytes = 0,
-    });
-}
-
-fn emitRestoreFailureEvent(event_writer: *events_mod.EventWriter, event_mode: events_mod.EventMode, err: anyerror) void {
-    if (event_mode == .jsonl) event_writer.emitFailure(events_mod.classifyFailure(err)) catch {};
 }
 
 pub fn lsCli(ctx: *const Ctx, args: []const []const u8) !void {
@@ -1679,8 +1601,6 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var guest_working_dir: ?[]const u8 = null;
     var interactive = false;
     var tty = false;
-    var timing_json_path: ?[]const u8 = null;
-    var event_mode: events_mod.EventMode = .none;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1707,20 +1627,6 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         } else if (std.mem.eql(u8, args[i], "-it") or std.mem.eql(u8, args[i], "-ti")) {
             interactive = true;
             tty = true;
-        } else if (std.mem.eql(u8, args[i], "--timing-json")) {
-            i += 1;
-            if (i >= args.len or args[i].len == 0) usageExit(exec_usage);
-            timing_json_path = args[i];
-        } else if (std.mem.startsWith(u8, args[i], "--timing-json=")) {
-            const value = args[i]["--timing-json=".len..];
-            if (value.len == 0) usageExit(exec_usage);
-            timing_json_path = value;
-        } else if (std.mem.eql(u8, args[i], "--events")) {
-            i += 1;
-            if (i >= args.len) usageExit(exec_usage);
-            event_mode = events_mod.EventMode.parse(args[i]) orelse usageExit(exec_usage);
-        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
-            event_mode = events_mod.EventMode.parse(args[i]["--events=".len..]) orelse usageExit(exec_usage);
         } else if (std.mem.startsWith(u8, args[i], "-")) {
             usageExit(exec_usage);
         } else {
@@ -1738,8 +1644,6 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         .guest_working_dir = guest_working_dir,
         .interactive = interactive,
         .tty = tty,
-        .timing_json_path = timing_json_path,
-        .event_mode = event_mode,
     };
 }
 
@@ -1867,7 +1771,6 @@ fn parseRestoreArgs(
     var name: ?[]const u8 = null;
     var backend: ?backend_mod.Backend = null;
     var generation_path: ?[]const u8 = null;
-    var event_mode: events_mod.EventMode = .none;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
 
     var i: usize = 0;
@@ -1889,18 +1792,6 @@ fn parseRestoreArgs(
             generation_path = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
         } else if (std.mem.startsWith(u8, arg, "--generation=")) {
             generation_path = arg["--generation=".len..];
-        } else if (std.mem.eql(u8, arg, "--events")) {
-            const raw = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
-            event_mode = events_mod.EventMode.parse(raw) orelse {
-                const message = "--events must be jsonl";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
-            };
-        } else if (std.mem.startsWith(u8, arg, "--events=")) {
-            const raw = arg["--events=".len..];
-            event_mode = events_mod.EventMode.parse(raw) orelse {
-                const message = "--events must be jsonl";
-                exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
-            };
         } else if (std.mem.eql(u8, arg, "--name")) {
             name = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
             validateNameLifecycleCli(allocator, stderr, mode, "restore", name.?);
@@ -1941,7 +1832,6 @@ fn parseRestoreArgs(
         .name = name.?,
         .backend = backend,
         .generation_path = generation_path,
-        .event_mode = event_mode,
         .bound_services = bound_services,
     };
 }
@@ -2010,7 +1900,7 @@ fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !v
 /// Runs a named exec against this process's stdio: stdin is forwarded when
 /// interactive, an interactive TTY puts the terminal in raw mode, and window
 /// size changes reach the guest.
-fn execNamedStreaming(context: Context, allocator: std.mem.Allocator, options: ExecNamedStreamOptions) !ExecNamedStreamingResult {
+fn execNamedStreaming(context: Context, allocator: std.mem.Allocator, options: ExecNamedStreamOptions) !u8 {
     var stream = try openExecNamedStream(context, allocator, options);
     defer stream.deinit();
     var raw_terminal: ?attach_stream.RawTerminal = null;
@@ -2026,8 +1916,7 @@ fn execNamedStreaming(context: Context, allocator: std.mem.Allocator, options: E
         .interactive = options.interactive,
         .tty = options.tty,
     };
-    const exit_code = try pump.run();
-    return .{ .exit_code = exit_code, .timing = stream.timing };
+    return pump.run();
 }
 
 fn copyNamedStreaming(
@@ -2395,9 +2284,7 @@ fn exitLifecycleCliError(
     err: machine_output.CliError,
     human_text: []const u8,
 ) noreturn {
-    if (restore_cli_event_writer) |events| {
-        events.emitFailure(err) catch {};
-    } else if (mode == .json) {
+    if (mode == .json) {
         machine_output.writeError(allocator, stderr, err) catch {};
     } else {
         stderr.writeAll(human_text) catch {};
@@ -2650,16 +2537,6 @@ test "exec parser accepts interactive and tty flags" {
     try std.testing.expectEqualStrings("cat", long_opts.command[0]);
 }
 
-test "exec parser accepts timing JSON before the VM name" {
-    const separate = parseExecArgs(&.{ "--timing-json", "/tmp/run.json", "box", "true" });
-    try std.testing.expectEqualStrings("/tmp/run.json", separate.timing_json_path.?);
-    try std.testing.expectEqualStrings("box", separate.name);
-
-    const joined = parseExecArgs(&.{ "--timing-json=/tmp/joined.json", "box", "--", "/bin/true" });
-    try std.testing.expectEqualStrings("/tmp/joined.json", joined.timing_json_path.?);
-    try std.testing.expectEqual(cli_args.CommandMode.argv, joined.command_mode);
-}
-
 test "create parser accepts bounded vcpu count" {
     const allocator = std.testing.allocator;
     var stderr: Io.Writer.Allocating = .init(allocator);
@@ -2878,27 +2755,11 @@ test "named restore parser accepts k8s child command product flags" {
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    const opts = parseRestoreArgs(&.{ "--events=jsonl", "--backend", "kvm", "--generation", "generation.json", "child.spore", "--name=sporevm-child-42" }, allocator, &stderr.writer, .human);
-    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
+    const opts = parseRestoreArgs(&.{ "--backend", "kvm", "--generation", "generation.json", "child.spore", "--name=sporevm-child-42" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(backend_mod.Backend.kvm, opts.backend.?);
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
     try std.testing.expectEqualStrings("sporevm-child-42", opts.name);
-}
-
-test "named restore event mode emits terminal run event" {
-    const allocator = std.testing.allocator;
-    var out: Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-
-    var events = events_mod.EventWriter.init(allocator, &out.writer, "restore");
-    try events.emitStart(.kvm);
-    try emitNamedRestoreExit(&events, .kvm);
-
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"event\":\"completion\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"outcome\":\"completed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"command\":\"restore\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"exit_code\":0") != null);
 }
 
 test "lifecycle list entries render human table" {

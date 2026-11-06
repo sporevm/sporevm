@@ -216,7 +216,6 @@ pub const CliOptions = struct {
     continue_after_save: bool = false,
     network: spore_net_policy.Network = .disabled,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
-    event_mode: events_mod.EventMode = .none,
     interactive: bool = false,
     tty: bool = false,
     guest_env_specs: guest_request.GuestEnvSpecList = .{},
@@ -265,7 +264,6 @@ pub const cli_usage =
     \\  --guest-port N          Guest vsock listen port (default: 10700)
     \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output, and, in a VM this command boots, a copy of command output, to PATH
-    \\  --events=jsonl          Emit lifecycle and guest output events as JSONL on stdout
     \\  --env KEY[=VALUE]       Set or copy a host env var for the guest command
     \\  --inject ID=PATH        Inject PATH as /run/sporevm/injected/ID for this run
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
@@ -279,6 +277,24 @@ pub const cli_usage =
     \\  spore fanout children --for 10s
     \\
 ;
+
+/// Set by `spore --json run`: argv and setup errors become a failed
+/// `completion` on this sink instead of a message on stderr.
+pub var cli_setup_events: ?events_mod.EventSink = null;
+
+pub fn failCliSetup(comptime fmt: []const u8, args: anytype) noreturn {
+    if (cli_setup_events) |sink| {
+        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "spore run: setup failed";
+        sink.emit(.{ .failure = .{
+            .command = "run",
+            .backend = null,
+            .classified = machine_output.CliError.init(.usage_invalid_argument, message, "run"),
+        } }) catch {};
+        std.process.exit(2);
+    }
+    std.debug.print(fmt ++ "\n", args);
+    std.process.exit(2);
+}
 
 /// Redirect hints for run flags removed in the spore/saved-session rename.
 fn renamedRunFlagHint(arg: []const u8) ?[]const u8 {
@@ -308,7 +324,6 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
     var network_policy = spore_net_policy.Config{ .egress = .unrestricted };
     var bind_service_args = BoundServiceArgList{};
     var bound_services = spore_net_policy.BoundServiceBindingList{};
-    var event_mode: events_mod.EventMode = .none;
     var interactive = false;
     var tty = false;
     var guest_env_specs = guest_request.GuestEnvSpecList{};
@@ -327,8 +342,7 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         } else if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
             i += 1;
             backend = Backend.parse(args[i]) orelse {
-                std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
-                std.process.exit(2);
+                failCliSetup("--backend must be auto, hvf, or kvm", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--rootfs")) {
             rootfs_path = takeValue(args, &i, args[i]);
@@ -341,25 +355,21 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         } else if (std.mem.eql(u8, args[i], "--disk-size")) {
             const raw = takeValue(args, &i, args[i]);
             const bytes = memory_config.parseBytes(raw) catch |err| {
-                std.debug.print("spore run: invalid --disk-size {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --disk-size {s}: {s}", .{ raw, @errorName(err) });
             };
             if (bytes % rootfs_cas.default_chunk_size != 0) {
-                std.debug.print("spore run: --disk-size must be a positive 64KiB-aligned size like 20gb\n", .{});
-                std.process.exit(2);
+                failCliSetup("spore run: --disk-size must be a positive 64KiB-aligned size like 20gb", .{});
             }
             disk_size = bytes;
         } else if (std.mem.eql(u8, args[i], "--pull")) {
             const raw = takeValue(args, &i, args[i]);
             pull_policy = rootfs_input.PullPolicy.parse(raw) orelse {
-                std.debug.print("--pull must be missing, always, or never\n", .{});
-                std.process.exit(2);
+                failCliSetup("--pull must be missing, always, or never", .{});
             };
         } else if (std.mem.startsWith(u8, args[i], "--pull=")) {
             const raw = args[i]["--pull=".len..];
             pull_policy = rootfs_input.PullPolicy.parse(raw) orelse {
-                std.debug.print("--pull must be missing, always, or never\n", .{});
-                std.process.exit(2);
+                failCliSetup("--pull must be missing, always, or never", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--from")) {
             from_spore_dir = takeValue(args, &i, args[i]);
@@ -372,32 +382,17 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         } else if (std.mem.eql(u8, args[i], "--save-on")) {
             const trigger_raw = takeValue(args, &i, args[i]);
             save_trigger = capture.Trigger.parse(trigger_raw) orelse {
-                std.debug.print("--save-on must be EXIT, INT, TERM, HUP, USR1, or USR2\n", .{});
-                std.process.exit(2);
+                failCliSetup("--save-on must be EXIT, INT, TERM, HUP, USR1, or USR2", .{});
             };
             save_trigger_set = true;
         } else if (std.mem.eql(u8, args[i], "--continue-after-save")) {
             continue_after_save = true;
-        } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
-            i += 1;
-            event_mode = events_mod.EventMode.parse(args[i]) orelse {
-                std.debug.print("--events must be jsonl\n", .{});
-                std.process.exit(2);
-            };
-        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
-            const raw = args[i]["--events=".len..];
-            event_mode = events_mod.EventMode.parse(raw) orelse {
-                std.debug.print("--events must be jsonl\n", .{});
-                std.process.exit(2);
-            };
         } else if (std.mem.eql(u8, args[i], "--env")) {
             const raw = takeValue(args, &i, args[i]);
             guest_env_specs.append(guest_request.parseGuestEnvSpec(raw) catch |err| {
-                std.debug.print("spore run: invalid --env {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --env {s}: {s}", .{ raw, @errorName(err) });
             }) catch |err| {
-                std.debug.print("spore run: invalid --env {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --env {s}: {s}", .{ raw, @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
             interactive = true;
@@ -409,46 +404,38 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         } else if (std.mem.eql(u8, args[i], "--inject")) {
             const raw = takeValue(args, &i, args[i]);
             injected_file_sources.append(boot_assets.parseInjectedFileSource(raw) catch |err| {
-                std.debug.print("spore run: invalid --inject {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --inject {s}: {s}", .{ raw, @errorName(err) });
             }) catch |err| {
-                std.debug.print("spore run: invalid --inject {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --inject {s}: {s}", .{ raw, @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "--net")) {
             network_requested = true;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
             const raw = takeValue(args, &i, args[i]);
             network_policy.addAllowCidr(raw) catch |err| {
-                std.debug.print("spore run: invalid --allow-cidr {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --allow-cidr {s}: {s}", .{ raw, @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "--allow-host")) {
             const raw = takeValue(args, &i, args[i]);
             network_policy.addAllowHost(raw) catch |err| {
-                std.debug.print("spore run: invalid --allow-host {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --allow-host {s}: {s}", .{ raw, @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "--bind-service")) {
             const raw = takeValue(args, &i, args[i]);
             bind_service_args.append(raw) catch |err| {
-                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "--forward")) {
             const raw = takeValue(args, &i, args[i]);
             network_policy.addPortForward(raw) catch |err| {
-                std.debug.print("spore run: invalid --forward {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --forward {s}: {s}", .{ raw, @errorName(err) });
             };
         } else if (try parseSharedOption(&shared, args, &i)) {
             continue;
         } else if (renamedRunFlagHint(args[i])) |replacement| {
-            std.debug.print("spore run: {s} was renamed; use {s}\n", .{ args[i], replacement });
-            std.process.exit(2);
+            failCliSetup("spore run: {s} was renamed; use {s}", .{ args[i], replacement });
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            std.debug.print("unknown run argument: {s}\n\n{s}", .{ args[i], cli_usage });
-            std.process.exit(2);
+            failCliSetup("unknown run argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else {
             command = args[i..];
             break;
@@ -457,110 +444,91 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
 
     const argv = command orelse &.{};
     if (argv.len == 0 and (command_had_delimiter or (from_spore_dir == null and image_ref == null))) {
-        std.debug.print("{s}", .{cli_usage});
-        std.process.exit(2);
+        failCliSetup("{s}", .{cli_usage});
     }
     if (rootfs_path != null and image_ref != null) {
-        std.debug.print("spore run: --rootfs and --image are mutually exclusive\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --rootfs and --image are mutually exclusive", .{});
     }
     if (image_ref == null and pull_policy != .missing) {
-        std.debug.print("spore run: --pull requires --image\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --pull requires --image", .{});
     }
     if (image_entrypoint != null and image_ref == null) {
-        std.debug.print("spore run: --entrypoint requires --image\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --entrypoint requires --image", .{});
     }
     if (disk_size != null and commit_ref == null) {
-        std.debug.print("spore run: --disk-size currently requires --commit\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --disk-size currently requires --commit", .{});
     }
     if (commit_ref) |ref| {
         rootfs_mod.validateLocalTagRef(ref) catch |err| {
-            std.debug.print("spore run: invalid --commit ref {s}: {s}\n", .{ ref, @errorName(err) });
-            std.process.exit(2);
+            failCliSetup("spore run: invalid --commit ref {s}: {s}", .{ ref, @errorName(err) });
         };
         if (image_ref == null) {
-            std.debug.print("spore run: --commit requires --image\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --commit requires --image", .{});
         }
         if (from_spore_dir != null or rootfs_path != null) {
-            std.debug.print("spore run: --commit supports fresh --image runs only\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --commit supports fresh --image runs only", .{});
         }
         if (save_path != null or save_trigger_set or continue_after_save) {
-            std.debug.print("spore run: --commit cannot be combined with --save, --save-on, or --continue-after-save\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --commit cannot be combined with --save, --save-on, or --continue-after-save", .{});
         }
         if (interactive or tty) {
-            std.debug.print("spore run: --commit cannot be combined with -i or -t\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --commit cannot be combined with -i or -t", .{});
         }
     }
     if (from_spore_dir != null) {
         for (bind_service_args.slice()) |raw| {
             bound_services.append(spore_net_policy.parseBoundServiceBinding(raw) catch |err| {
-                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
             }) catch |err| {
-                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
             };
         }
         if (injected_file_sources.len != 0) {
-            std.debug.print("spore run: --inject is not supported with --from; injected files are fresh-run only\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --inject is not supported with --from; injected files are fresh-run only", .{});
         }
         if (rootfs_path != null or image_ref != null) {
-            std.debug.print("spore run: --from is mutually exclusive with --rootfs and --image\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --from is mutually exclusive with --rootfs and --image", .{});
         }
         if (shared.kernel_path != null or shared.initrd_path != null) {
-            std.debug.print("spore run: --from is mutually exclusive with --kernel and --initrd\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --from is mutually exclusive with --kernel and --initrd", .{});
         }
         if (shared.memory_set or shared.max_memory_set) {
-            std.debug.print("spore run: --from uses the spore manifest memory sizes; omit --memory and --max-memory\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --from uses the spore manifest memory sizes; omit --memory and --max-memory", .{});
         }
     } else {
         if (generation_path != null) {
-            std.debug.print("spore run: --generation requires --from\n", .{});
-            std.process.exit(2);
+            failCliSetup("spore run: --generation requires --from", .{});
         }
         for (bind_service_args.slice()) |raw| {
             network_policy.addBindService(allocator, raw) catch |err| {
-                std.debug.print("spore run: invalid --bind-service {s}: {s}\n", .{ raw, @errorName(err) });
-                std.process.exit(2);
+                failCliSetup("spore run: invalid --bind-service {s}: {s}", .{ raw, @errorName(err) });
             };
         }
     }
     if (save_trigger_set and save_path == null) {
-        std.debug.print("spore run: --save-on requires --save\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --save-on requires --save", .{});
     }
     if (continue_after_save and save_path == null) {
-        std.debug.print("spore run: --continue-after-save requires --save\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --continue-after-save requires --save", .{});
     }
     if (continue_after_save and save_trigger.isExit()) {
-        std.debug.print("spore run: --continue-after-save requires a signal save trigger\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --continue-after-save requires a signal save trigger", .{});
     }
     if (save_path != null and injected_file_sources.len != 0) {
-        std.debug.print("spore run: --inject with --save is not supported; injected files are intentionally not persisted\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --inject with --save is not supported; injected files are intentionally not persisted", .{});
     }
     if (!network_requested and network_policy.hasRules()) {
-        std.debug.print("spore run: network flags require --net\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: network flags require --net", .{});
     }
     if (!network_requested and network_policy.hasBoundServices()) {
-        std.debug.print("spore run: --bind-service requires --net\n", .{});
-        std.process.exit(2);
+        failCliSetup("spore run: --bind-service requires --net", .{});
     }
-    memory_config.validateCliOrExit("spore run", shared.memory);
+    shared.memory.validate() catch |err| switch (err) {
+        error.MaximumBelowInitial => failCliSetup("spore run: --max-memory must be greater than or equal to --memory", .{}),
+        error.UnalignedElasticMemory => failCliSetup("spore run: elastic --memory and --max-memory values must be aligned to 2 MiB", .{}),
+        error.ElasticRegionTooLarge => failCliSetup("spore run: --max-memory may exceed --memory by at most 16 GiB", .{}),
+        else => failCliSetup("spore run: invalid memory configuration ({s})", .{memory_config.cliReason(err)}),
+    };
 
     return .{
         .backend = backend,
@@ -578,7 +546,6 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         .continue_after_save = continue_after_save,
         .network = if (network_requested) .{ .spore = network_policy } else .disabled,
         .bound_services = bound_services,
-        .event_mode = event_mode,
         .interactive = interactive,
         .tty = tty,
         .guest_env_specs = guest_env_specs,
@@ -1548,38 +1515,39 @@ pub fn printNetworkGatewayError(err: anyerror) void {
 
 fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
     const parsed = std.fmt.parseInt(T, raw, 10) catch {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
+        failCliSetup("{s} must be a positive integer", .{name});
     };
     if (parsed == 0) {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
+        failCliSetup("{s} must be a positive integer", .{name});
     }
     return parsed;
 }
 
+fn parseMemoryBytes(name: []const u8, raw: []const u8) u64 {
+    return memory_config.parseBytes(raw) catch |err| switch (err) {
+        error.RemovedAuto => failCliSetup("spore run: {s} auto was removed; use --memory 512mb for fixed memory, or --memory 512mb --max-memory 16gb for elastic memory", .{name}),
+        else => failCliSetup("spore run: {s} must be a positive page-aligned size like 512mb or 16gb ({s})", .{ name, memory_config.cliReason(err) }),
+    };
+}
+
 fn parseDurationMsOrExit(name: []const u8, raw: []const u8) u64 {
     return cli_args.parseDurationMs(raw) catch {
-        std.debug.print("{s} expects a duration like 30s, 500ms, or 1m\n", .{name});
-        std.process.exit(2);
+        failCliSetup("{s} expects a duration like 30s, 500ms, or 1m", .{name});
     };
 }
 
 pub fn parseVcpuCountOrExit(name: []const u8, raw: []const u8) topology.VcpuCount {
     return topology.parseVcpuCount(raw) catch {
-        std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, topology.max_vcpus });
-        std.process.exit(2);
+        failCliSetup("{s} must be an integer from 1 to {d}", .{ name, topology.max_vcpus });
     };
 }
 
 fn parseGuestPort(name: []const u8, raw: []const u8) !u32 {
     const parsed = std.fmt.parseInt(u32, raw, 10) catch {
-        std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, max_guest_port });
-        std.process.exit(2);
+        failCliSetup("{s} must be an integer from 1 to {d}", .{ name, max_guest_port });
     };
     if (parsed == 0 or parsed > max_guest_port) {
-        std.debug.print("{s} must be an integer from 1 to {d}\n", .{ name, max_guest_port });
-        std.process.exit(2);
+        failCliSetup("{s} must be an integer from 1 to {d}", .{ name, max_guest_port });
     }
     return parsed;
 }
@@ -1591,14 +1559,14 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
     } else if (std.mem.eql(u8, name, "--initrd")) {
         shared.initrd_path = takeValue(args, i, name);
     } else if (std.mem.eql(u8, name, "--memory")) {
-        shared.memory.initial_bytes = memory_config.parseCliBytesOrExit("spore run", "--memory", takeValue(args, i, name));
+        shared.memory.initial_bytes = parseMemoryBytes(name, takeValue(args, i, name));
         if (!shared.max_memory_set) shared.memory.maximum_bytes = shared.memory.initial_bytes;
         shared.memory_set = true;
     } else if (std.mem.eql(u8, name, "--max-memory")) {
-        shared.memory.maximum_bytes = memory_config.parseCliBytesOrExit("spore run", "--max-memory", takeValue(args, i, name));
+        shared.memory.maximum_bytes = parseMemoryBytes(name, takeValue(args, i, name));
         shared.max_memory_set = true;
     } else if (std.mem.eql(u8, name, "--memory-mib")) {
-        memory_config.rejectMemoryMiBFlag("spore run");
+        failCliSetup("spore run: --memory-mib has been replaced by --memory", .{});
     } else if (std.mem.eql(u8, name, "--vcpus")) {
         shared.vcpus = parseVcpuCountOrExit(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {
@@ -1617,8 +1585,7 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
 
 fn takeValue(args: []const []const u8, i: *usize, name: []const u8) []const u8 {
     if (i.* + 1 >= args.len) {
-        std.debug.print("{s} requires a value\n", .{name});
-        std.process.exit(2);
+        failCliSetup("{s} requires a value", .{name});
     }
     i.* += 1;
     return args[i.*];
@@ -2286,13 +2253,6 @@ test "run cli parser accepts save flags" {
 test "run cli parser accepts bounded vcpu count" {
     const opts = try parseCliArgs(std.testing.allocator, &.{ "--vcpus", "2", "--", "/bin/true" });
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.shared.vcpus);
-}
-
-test "run cli parser accepts jsonl events" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--events=jsonl", "--", "/bin/true" });
-    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
-    try std.testing.expectEqual(@as(usize, 1), opts.command.len);
-    try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 
 test "run cli parser defaults save trigger to exit" {

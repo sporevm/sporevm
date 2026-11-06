@@ -86,7 +86,7 @@ done < <(fork_children "${fork_dir}")
 [[ "${#children[@]}" -eq 1 ]] || die "fork did not create one child spore"
 child_dir="${children[0]}"
 
-"${spore_bin}" attach --events=jsonl --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
+"${spore_bin}" --json attach --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
 resume_pid="$!"
 (
   sleep "${SPORE_SMOKE_RESUME_TIMEOUT_SECONDS:-20}"
@@ -104,14 +104,14 @@ wait "${watchdog_pid}" >/dev/null 2>&1 || true
 if [[ "${resume_rc}" != "0" ]]; then
   cat "${resume_stdout}" >&2 || true
   cat "${resume_stderr}" >&2 || true
-  die "spore attach --events=jsonl exited ${resume_rc}, expected 0"
+  die "spore --json attach exited ${resume_rc}, expected 0"
 fi
-grep -Fq '"event":"ready"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit ready"
-grep -Fq '"event":"stdout"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit stdout"
-grep -Fq '"event":"completion","outcome":"completed"' "${resume_stdout}" || die "spore attach --events=jsonl did not emit completed terminal outcome"
-grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore attach --events=jsonl did not report exit_code 0"
-grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore attach --events=jsonl did not report local RAM restore"
-grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore attach --events=jsonl did not report proof-backed restore"
+grep -Fq '"event":"ready"' "${resume_stdout}" || die "spore --json attach did not emit ready"
+grep -Fq '"event":"stdout"' "${resume_stdout}" || die "spore --json attach did not emit stdout"
+grep -Fq '"event":"completion","outcome":"completed"' "${resume_stdout}" || die "spore --json attach did not emit completed terminal outcome"
+grep -Fq '"exit_code":0' "${resume_stdout}" || die "spore --json attach did not report exit_code 0"
+grep -Fq '"memory_restore_source":"local_backing"' "${resume_stdout}" || die "spore --json attach did not report local RAM restore"
+grep -Fq '"memory_restore_reason":"proof_valid"' "${resume_stdout}" || die "spore --json attach did not report proof-backed restore"
 
 # A guest that powers off before its command exits has no exit status, so run
 # and attach must fail with ProbeDidNotComplete rather than report exit 0.
@@ -122,7 +122,7 @@ expect_probe_incomplete() {
   die "${label} of a guest that powers off exited ${rc} without ProbeDidNotComplete"
 }
 set +e
-with_timeout 60 "${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" --events=jsonl -- /bin/poweroff \
+with_timeout 60 "${spore_bin}" --json run --backend "${backend}" --memory "${smoke_memory}" -- /bin/poweroff \
   >"${workdir}/poweroff-run.jsonl" 2>"${workdir}/poweroff-run.stderr"
 poweroff_rc="$?"
 set -e
@@ -158,7 +158,7 @@ wait "${watchdog_pid}" >/dev/null 2>&1 || true
   die "spore run did not save the guest before it powered off (exit ${run_rc})"
 }
 set +e
-with_timeout 60 "${spore_bin}" attach --events=jsonl --backend "${backend}" "${poweroff_dir}" \
+with_timeout 60 "${spore_bin}" --json attach --backend "${backend}" "${poweroff_dir}" \
   >"${workdir}/poweroff-attach.jsonl" 2>"${workdir}/poweroff-attach.stderr"
 poweroff_rc="$?"
 set -e
@@ -218,9 +218,8 @@ grep -Fq "generation=7007 vm_id=spore-run-from-generation-7 entropy_len=32" "${f
   die "forked spore run --from --generation did not expose explicit generation metadata"
 }
 
-"${spore_bin}" --debug run \
+"${spore_bin}" --json --debug run \
   --backend "${backend}" \
-  --events=jsonl \
   --from "${from_base_dir}" \
   -- /bin/writeout \
   >"${from_stdout}" 2>"${from_stderr}"

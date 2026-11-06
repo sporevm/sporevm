@@ -28,22 +28,22 @@ grep -Fxq "eof" "${workdir}/default.stdout" || {
   die "spore run without -i wrote unexpected stderr"
 }
 
-printf hi | "${spore_bin}" run -i --events=jsonl --image "${image}" -- /bin/cat >"${workdir}/events.jsonl" 2>"${workdir}/events.stderr"
+printf hi | "${spore_bin}" --json run -i --image "${image}" -- /bin/cat >"${workdir}/events.jsonl" 2>"${workdir}/events.stderr"
 grep -Fq '"event":"stdout"' "${workdir}/events.jsonl" || {
   cat "${workdir}/events.jsonl" >&2 || true
-  die "spore run -i --events=jsonl did not emit stdout event"
+  die "spore --json run -i did not emit stdout event"
 }
 grep -Fq '"data_base64":"aGk="' "${workdir}/events.jsonl" || {
   cat "${workdir}/events.jsonl" >&2 || true
-  die "spore run -i --events=jsonl stdout payload did not match stdin"
+  die "spore --json run -i stdout payload did not match stdin"
 }
 grep -Fq '"event":"completion","outcome":"completed"' "${workdir}/events.jsonl" || {
   cat "${workdir}/events.jsonl" >&2 || true
-  die "spore run -i --events=jsonl did not emit a completed completion event"
+  die "spore --json run -i did not emit a completed completion event"
 }
 [[ ! -s "${workdir}/events.stderr" ]] || {
   cat "${workdir}/events.stderr" >&2 || true
-  die "spore run -i --events=jsonl wrote unexpected stderr"
+  die "spore --json run -i wrote unexpected stderr"
 }
 
 echo "smoke:run-stdin ok"

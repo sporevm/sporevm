@@ -1,18 +1,20 @@
 //! The `spore` command table. `main.zig` lists the commands; this module
-//! finds the one argv names, prints help from the table, and refuses global
-//! `--json` for commands that print no result document.
+//! finds the one argv names, prints help from the table, and applies global
+//! `--json`.
 
 const std = @import("std");
 const Io = std.Io;
+const events_mod = @import("events.zig");
 const machine_output = @import("machine_output.zig");
 
 /// What a command prints under global `--json`.
 pub const Output = enum {
     /// One result document on stdout, or `spore.error.v1` on stderr.
     result,
-    /// Nothing: the command streams events with `--events=jsonl` instead.
+    /// `spore.automation.event.v1` lines on stdout ending in one `completion`,
+    /// which also reports a failure.
     events,
-    /// Nothing.
+    /// Nothing: `--json` is refused.
     text,
 };
 
@@ -24,6 +26,11 @@ pub const Ctx = struct {
     mode: machine_output.Mode,
     /// Global `--debug`.
     debug: bool = false,
+
+    /// How a streaming command prints: global `--json` selects the event stream.
+    pub fn eventMode(ctx: *const Ctx) events_mod.EventMode {
+        return if (ctx.mode == .json) .jsonl else .none;
+    }
 };
 
 pub const Command = struct {
@@ -92,22 +99,32 @@ pub fn run(commands: []const Command, ctx: *const Ctx, argv: []const []const u8)
 
 fn invoke(command: *const Command, ctx: *const Ctx, args: []const []const u8) !void {
     const allocator = ctx.init.arena.allocator();
-    if (ctx.mode == .json) {
-        const refusal = switch (command.output) {
-            .result => null,
-            .events => allocMessage(allocator, "spore --json {s} is not supported; use --events=jsonl for stream events", .{command.name}),
-            .text => allocMessage(allocator, "spore --json does not support command: {s}", .{command.name}),
-        };
-        if (refusal) |message| exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
+    if (ctx.mode == .json and command.output == .text) {
+        const message = allocMessage(allocator, "spore --json does not support command: {s}", .{command.name});
+        exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
     }
     if (wantsHelp(args)) {
         if (ctx.mode == .json) {
             const message = allocMessage(allocator, "spore --json {s} does not print help", .{command.name});
-            exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, command.name), message);
+            exitCommandError(command, ctx, machine_output.usageInvalidArgument(message, command.name));
         }
         return ctx.stdout.writeAll(command.usage);
     }
-    return command.run(ctx, args);
+    command.run(ctx, args) catch |err| {
+        if (ctx.mode == .json and command.output == .events) exitCommandError(command, ctx, events_mod.classifyFailure(err));
+        return err;
+    };
+}
+
+/// Reports `err` under `--json` where `command`'s consumer reads it: a failed
+/// `completion` on stdout for a stream, else `spore.error.v1` on stderr.
+fn exitCommandError(command: *const Command, ctx: *const Ctx, err: machine_output.CliError) noreturn {
+    if (command.output == .events) {
+        var events = events_mod.EventWriter.init(ctx.init.arena.allocator(), ctx.stdout, command.name);
+        events.emitFailure(err) catch {};
+        std.process.exit(err.exit_code);
+    }
+    exitWithCliError(ctx.init.arena.allocator(), ctx.stderr, ctx.mode, err, err.message);
 }
 
 /// Whether `args` asks for a command's help: `help` alone, or `-h` or
@@ -145,8 +162,8 @@ const help_header =
     \\
     \\Global options:
     \\  --debug   Show verbose VMM and restore logs
-    \\  --json    Print one JSON result document; run, attach, exec and fanout
-    \\            stream events with --events=jsonl instead
+    \\  --json    Print one JSON result document, or for run, attach, exec and
+    \\            fanout a stream of JSON events
     \\
     \\Commands:
     \\

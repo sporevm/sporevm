@@ -7,6 +7,23 @@ require_spore_bin
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run"
 
+# Under --json a streaming command reports even an argv error, such as an
+# unknown flag or a bad memory size, as one failed completion on stdout.
+for bad_args in "--bogus" "--memory 0"; do
+  read -ra bad_argv <<<"${bad_args}"
+  set +e
+  "${spore_bin}" --json run "${bad_argv[@]}" -- /bin/true >"${workdir}/bad-args.jsonl" 2>"${workdir}/bad-args.stderr"
+  bad_rc="$?"
+  set -e
+  [[ "${bad_rc}" == "2" ]] || die "spore --json run ${bad_args} exited ${bad_rc}, expected 2"
+  [[ "$(grep -c '"event":"completion"' "${workdir}/bad-args.jsonl")" == "1" ]] &&
+    grep -Fq '"event":"completion","outcome":"failed"' "${workdir}/bad-args.jsonl" &&
+    grep -Fq '"code":"usage.invalid_argument"' "${workdir}/bad-args.jsonl" || {
+    cat "${workdir}/bad-args.jsonl" "${workdir}/bad-args.stderr" >&2 || true
+    die "spore --json run ${bad_args} did not print one failed completion"
+  }
+done
+
 set +e
 "${spore_bin}" run -- /bin/writeout >"${workdir}/writeout.stdout" 2>"${workdir}/writeout.stderr"
 writeout_rc="$?"

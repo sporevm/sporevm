@@ -24,7 +24,6 @@ pub const Options = struct {
     duration_ms: ?u64 = null,
     timeout_ms: u64 = default_resume_timeout_ms,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
-    event_mode: events_mod.EventMode = .none,
 };
 
 pub const cli_usage =
@@ -37,7 +36,6 @@ pub const cli_usage =
     \\  --timeout DURATION      Per-child attach probe timeout (default: 30s)
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service in every child
-    \\  --events=jsonl          Emit schema-versioned child output and completion events
     \\  -h, --help              Show this help
     \\
     \\Requires child spores with saved sessions. Verify one with:
@@ -82,34 +80,27 @@ const OutputLock = struct {
 pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
-    if (args.len == 0) {
+    if (args.len == 0 and ctx.mode != .json) {
         try stdout.writeAll(cli_usage);
         return;
     }
 
     var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "fanout");
-    cli_event_writer = if (requestsJsonl(args)) &events else null;
+    cli_event_writer = if (ctx.mode == .json) &events else null;
     defer cli_event_writer = null;
+    const event_mode = ctx.eventMode();
     const opts = try parseCliArgs(args);
-    if (opts.event_mode == .jsonl) try events.emitStart(opts.backend);
-    const exit_code = execute(init, init.arena.allocator(), opts, stdout) catch |err| {
-        if (opts.event_mode == .jsonl) {
+    if (event_mode == .jsonl) try events.emitStart(opts.backend);
+    const exit_code = execute(init, init.arena.allocator(), opts, event_mode, stdout) catch |err| {
+        if (event_mode == .jsonl) {
             const classified = events_mod.classifyFailure(err);
             try events.emitFailure(classified);
             std.process.exit(classified.exit_code);
         }
         return err;
     };
-    if (opts.event_mode == .jsonl) try events.emitExecCompletion(exit_code);
+    if (event_mode == .jsonl) try events.emitExecCompletion(exit_code);
     if (exit_code != 0) std.process.exit(exit_code);
-}
-
-fn requestsJsonl(args: []const []const u8) bool {
-    for (args, 0..) |arg, i| {
-        if (std.mem.eql(u8, arg, "--events=jsonl")) return true;
-        if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
-    }
-    return false;
 }
 
 pub fn parseCliArgs(args: []const []const u8) !Options {
@@ -118,7 +109,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var duration_ms: ?u64 = null;
     var timeout_ms: u64 = default_resume_timeout_ms;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
-    var event_mode: events_mod.EventMode = .none;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -152,11 +142,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             }) catch |err| {
                 failCli("spore fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             };
-        } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
-            i += 1;
-            event_mode = events_mod.EventMode.parse(args[i]) orelse failCli("--events must be jsonl", .{});
-        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
-            event_mode = events_mod.EventMode.parse(args[i]["--events=".len..]) orelse failCli("--events must be jsonl", .{});
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failCli("unknown fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (children_dir == null) {
@@ -174,11 +159,10 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         .duration_ms = duration_ms,
         .timeout_ms = timeout_ms,
         .bound_services = bound_services,
-        .event_mode = event_mode,
     };
 }
 
-fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, event_output: *Io.Writer) !u8 {
+fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, event_mode: events_mod.EventMode, event_output: *Io.Writer) !u8 {
     const children = try listChildren(allocator, init.io, opts.children_dir);
     if (children.len == 0) {
         var buf: [2048]u8 = undefined;
@@ -195,7 +179,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     errdefer cleanupRunning(init.io, running.items);
 
     for (children) |child| {
-        const run = try startRunningChild(init, allocator, spore_executable, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, opts.event_mode, event_output, &output_lock, &event_write_failed);
+        const run = try startRunningChild(init, allocator, spore_executable, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, event_mode, event_output, &output_lock, &event_write_failed);
         running.append(run) catch |err| {
             var single = [_]RunningChild{run};
             cleanupRunning(init.io, single[0..]);
@@ -221,19 +205,19 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     for (running.items) |*run| {
         const term = run.child.wait(init.io) catch |err| {
             writeStderr("spore fanout: child {s} wait failed: {s}\n", .{ run.name, @errorName(err) });
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
             failed = true;
             continue;
         };
         if (termExitCode(term)) |exit_code| {
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, exit_code, null);
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, exit_code, null);
             if (exit_code != 0 and aggregate_exit_code == 0) aggregate_exit_code = exit_code;
         } else if (termOk(term, opts.duration_ms != null)) {
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
         } else {
             writeStderr("spore fanout: child {s} exited {s}\n", .{ run.name, termName(term) });
             const classified = machine_output.fromZigError(error.FanoutChildFailed);
-            if (opts.event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
+            if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
             failed = true;
         }
     }
@@ -608,12 +592,6 @@ test "fanout cli parser accepts requested demo shape" {
 test "fanout cli parser accepts hidden timeout-ms compatibility spelling" {
     const opts = try parseCliArgs(&.{ "children", "--timeout-ms", "120000" });
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
-}
-
-test "fanout cli parser accepts shared automation event mode" {
-    const opts = try parseCliArgs(&.{ "children", "--events=jsonl" });
-    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
-    try std.testing.expect(requestsJsonl(&.{ "children", "--events", "jsonl" }));
 }
 
 test "fanout child output uses the shared event envelope" {

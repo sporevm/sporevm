@@ -1,7 +1,7 @@
 # Automation contract
 
-The CLI's `--json` results and `--events=jsonl` streams are SporeVM's only
-programmatic interface. Human output remains intentionally unstable.
+The CLI's `--json` output is SporeVM's only programmatic interface. Human
+output remains intentionally unstable.
 
 ## CLI surfaces
 
@@ -13,9 +13,10 @@ The bounded surface includes version and inspection, system and cache
 operations, rootfs and image operations, build, named lifecycle and copy
 operations, and checkpoint push and pull.
 
-Runtime streams use command-local `--events=jsonl`. `run`, `attach`, `restore`,
-`exec`, and `fanout` emit `spore.automation.event.v1` records. Each completed stream ends
-with exactly one `completion` record:
+Under the same global `--json`, the streaming commands `run`, `attach`, `exec`
+and `fanout` print `spore.automation.event.v1` records on stdout, one per line,
+instead of the guest's raw output. Every stream, including one that fails on
+its arguments, ends with exactly one `completion` record:
 
 ```json
 {"schema":"spore.automation.event.v1","schema_version":1,"event":"completion","outcome":"completed","command":"exec","backend":null,"exit_code":0}
@@ -32,9 +33,8 @@ An event consumer must treat EOF, a broken pipe, or a transport error before
 stdout/stderr record. Re-running after interruption is caller-dependent because
 the underlying operation may have completed after the consumer lost the stream.
 
-`monitor` and `netd` are internal helper roles, not public automation commands.
-Normal `run`, `attach`, `exec`, and `fanout` output remains raw unless
-`--events=jsonl` is selected. Fanout output events add a `child` field so
+`monitor` and `netd` are internal helper roles, not public automation commands,
+and refuse `--json`. Fanout output events add a `child` field so
 callers can separate each child's stdout and stderr without parsing human
 prefixes. They also carry a byte `offset` and `byte_count` within that child's
 stream. Fanout emits one `child_completion` for every child; a non-zero guest

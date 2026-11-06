@@ -125,22 +125,6 @@ path, procfs can still address paths elsewhere in that VM, so this is not an
 image-root confinement boundary. An argv zero that already contains a slash is
 executed exactly as supplied.
 
-Pass `--timing-json PATH` before the VM name to retain one named-exec phase
-record without changing output streaming or exit propagation:
-
-```bash
-spore exec --timing-json run.json bench-1 -- /bin/true
-```
-
-The `spore.named-exec-timing.v1` artifact separates monitor dispatch, guest
-process start, guest execution wall time, guest user/system CPU in
-microseconds, post-exit output/result delivery, stream teardown, and total
-monitor request time. Dispatch is the residual host-side request/transport
-time after the independently measured guest and teardown phases are removed;
-the calculation does not compare unsynchronised host and guest clocks.
-Telemetry that is absent or malformed is emitted as `null` and never changes
-the guest result. The output path's parent must already exist.
-
 Named create accepts create-time annotations and networking options:
 
 ```bash
@@ -525,8 +509,8 @@ spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
   local socket that cannot accept a complete frame within the 25 ms send
   deadline aborts that exec so it cannot block the VM control loop
   indefinitely.
-- `spore exec --events=jsonl` uses the same `spore.automation.event.v1`
-  envelope as run, attach, restore, and fanout. It emits base64 output records
+- `spore --json exec` uses the same `spore.automation.event.v1` envelope as
+  run, attach, and fanout. It emits base64 output records
   followed by exactly one completed, failed, or canceled completion; EOF before
   completion is `stream.interrupted`.
 - Initial create output uses the existing `spore.lifecycle.v1` result. Create

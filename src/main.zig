@@ -609,7 +609,7 @@ test "command table names each command once and fits the dispatcher" {
     }
 }
 
-test "only stream and internal commands refuse global json" {
+test "only internal commands refuse global json, and only four commands stream" {
     for (commands) |command| {
         const streams = std.mem.eql(u8, command.name, "run") or std.mem.eql(u8, command.name, "attach") or
             std.mem.eql(u8, command.name, "exec") or std.mem.eql(u8, command.name, "fanout");
