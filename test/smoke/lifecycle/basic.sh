@@ -330,12 +330,40 @@ else
   require_success "${status}" "spore rm worker1" "${rm_worker1_stderr}"
 fi
 
+# rm must not wait for a running exec: the monitor answers shutdown at once
+# and fails the exec with the removal message.
+running_exec_stdout="${workdir}/running-exec.stdout"
+running_exec_stderr="${workdir}/running-exec.stderr"
+env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
+  "${spore_bin}" exec "${vm_name}" -- /bin/sh -c 'echo started; exec sleep 300' \
+  >"${running_exec_stdout}" 2>"${running_exec_stderr}" &
+running_exec_pid=$!
+for _ in $(seq 1 300); do
+  grep -Fxq started "${running_exec_stdout}" && break
+  kill -0 "${running_exec_pid}" 2>/dev/null || break
+  sleep 0.1
+done
+grep -Fxq started "${running_exec_stdout}" || {
+  cat "${running_exec_stderr}" >&2 || true
+  die "background spore exec did not start"
+}
+
+rm_started="${SECONDS}"
 if run_capture "${rm_stdout}" "${rm_stderr}" env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" rm "${vm_name}"; then
   created=0
 else
   status=$?
   require_success "${status}" "spore rm" "${rm_stderr}"
 fi
+rm_seconds=$((SECONDS - rm_started))
+((rm_seconds <= 5)) || die "spore rm took ${rm_seconds}s while an exec was running"
+if wait "${running_exec_pid}"; then
+  die "spore exec succeeded although its VM was removed"
+fi
+grep -Fq "named VM is being removed" "${running_exec_stderr}" || {
+  cat "${running_exec_stderr}" >&2 || true
+  die "spore exec did not report the VM removal"
+}
 if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" logs "${vm_name}" >/dev/null 2>&1; then
   die "spore logs unexpectedly retained output after VM removal"
 fi
