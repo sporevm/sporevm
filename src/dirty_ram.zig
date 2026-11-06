@@ -27,6 +27,7 @@ pub const Stats = struct {
     seal_parallel_flush_count: u64 = 0,
     seal_parallel_workers_max: u64 = 0,
     tail_flush_ms: u64 = 0,
+    finish_fsync_ms: u64 = 0,
     finish_fchmod_ms: u64 = 0,
     finish_close_ms: u64 = 0,
     finish_close_deferred: u64 = 0,
@@ -237,6 +238,7 @@ pub const Sealer = struct {
         self.stats.seal_parallel_flush_count = 0;
         self.stats.seal_parallel_workers_max = 0;
         self.stats.tail_flush_ms = 0;
+        self.stats.finish_fsync_ms = 0;
         self.stats.finish_fchmod_ms = 0;
         self.stats.finish_close_ms = 0;
         self.stats.finish_close_deferred = 0;
@@ -257,6 +259,12 @@ pub const Sealer = struct {
     }
 
     pub fn finishBacking(self: *Sealer) !spore.MemoryManifest {
+        // Its proof binds the file, not the bytes: sync them before one exists.
+        const fsync_start = try monotonicMs();
+        const fsync_rc = std.c.fsync(self.backing_fd);
+        self.stats.finish_fsync_ms = (try monotonicMs()) - fsync_start;
+        if (fsync_rc != 0) return error.IoFailed;
+
         const fchmod_start = try monotonicMs();
         const fchmod_rc = std.c.fchmod(self.backing_fd, 0o444);
         self.stats.finish_fchmod_ms = (try monotonicMs()) - fchmod_start;

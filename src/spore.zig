@@ -857,6 +857,8 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
     }
 
     const backing = if (with_backing) blk: {
+        // Its proof binds the file, not the bytes: sync them before one exists.
+        if (std.c.fsync(backing_fd) != 0) return error.IoFailed;
         if (std.c.fchmod(backing_fd, 0o444) != 0) return error.IoFailed;
         _ = std.c.close(backing_fd);
         backing_fd = -1;

@@ -105,13 +105,22 @@ delete the rootfs cache directory to reclaim their space.
 identity as `image_manifest_digest`. `spore run --rootfs` no longer trusts
 files in the rootfs cache without hashing them.
 
-### Durable full-scan RAM saves
+### Durable saves
 
 Saves that scan all of guest RAM instead of sealing a tracked dirty set (runs
 resumed from a spore, elastic memory, and multi-vCPU VMs on macOS) now fsync
 each memory chunk and its directory entry before the manifest names it, as
 dirty-tracked saves already did. On a Linux test host this added about 50 ms
 to a save with 32 MiB of non-zero RAM and 350 ms with 512 MiB (about 12%).
+
+Saves also fsync the local `ram.backing` copy of guest RAM before writing the
+proof that lets restores map it. The proof binds the file, not its bytes, so
+before this a crash could leave a valid proof next to a backing that had lost
+pages, and the guest would resume with zeroed or stale memory. This adds about
+30 ms to a save with 32 MiB of non-zero RAM and 100 ms with 128 MiB on the
+same host; snapshot metrics report it as `finish_fsync_ms`. Proofs written by
+earlier builds fail to validate, so those spores restore from their verified
+chunks.
 
 ### Embedding libraries removed
 

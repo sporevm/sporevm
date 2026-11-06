@@ -92,6 +92,8 @@ never enter the manifest.
 The backing file is never portable restore authority. Product restore maps it
 only when `ram.backing.proof` validates against the canonical memory index
 identity, opened file identity, backing metadata, and host-local runtime key.
+The proof binds the file rather than its bytes, so saves fsync the backing
+before writing it; the snapshot metrics report that as `finish_fsync_ms`.
 That fingerprint uses the same canonical `spore-disk-index-v2` byte encoding as
 disk and rootfs indexes. The fixed backing and proof paths are inspected without
 following symlinks and must name regular files. Missing, symlinked, non-regular,
@@ -148,7 +150,8 @@ memory index and optional local backing remain authoritative for every plugged
 range. Multi-vCPU HVF capture also uses the full scan. Fixed-memory KVM capture
 and single-vCPU HVF capture retain the dirty-tracking fast path. Both paths
 write chunks through `src/chunk_sealer.zig`, which fsyncs each chunk and its
-directory entry before the manifest names it.
+directory entry before the manifest names it, and both fsync the backing file
+before its proof is written.
 
 ## Current Limits
 

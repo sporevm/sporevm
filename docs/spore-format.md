@@ -430,7 +430,10 @@ representation.
   chunks instead. Product restore paths (`spore attach`, `spore run --from`, and
   named monitor restore) may automatically map `ram.backing` when the local
   `ram.backing.proof` validates against the canonical memory index identity,
-  backing metadata, opened file identity, and host-local runtime key. Missing,
+  backing metadata, opened file identity, and host-local runtime key. Saves
+  fsync the backing before writing its proof, because the proof binds the
+  file's identity rather than its bytes; proofs from earlier schemas fall back
+  to chunks. Missing,
   symlinked, non-regular, stale, foreign-key, size-mismatched, or
   cryptographically mismatched optional backing/proof inputs may fall back to
   chunks. Malformed authoritative memory/index/backing metadata, allocation
