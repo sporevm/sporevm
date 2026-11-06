@@ -5363,7 +5363,7 @@ test "run points a registry tag at the image imported from the same OCI manifest
     try std.testing.expectEqualStrings(resolved_ref, input.rootfs.?.source.?.resolved_image_ref);
 }
 
-test "run --pull=missing converts a registry tag again after a rootfs builder change" {
+test "run --pull=missing converts a registry tag again after a rootfs builder change, but keeps a local name" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -5381,15 +5381,16 @@ test "run --pull=missing converts a registry tag again after a rootfs builder ch
 
     // The loopback registry fails every registry request before connecting.
     const manifest = "sha256:" ++ "a" ** 64;
-    for ([_]struct { name: []const u8, builder: []const u8, workdir: []const u8 }{
-        .{ .name = "127.0.0.1:1/app:old", .builder = "sporevm-rootfs-previous", .workdir = "/old" },
-        .{ .name = "127.0.0.1:1/app:current", .builder = rootfs_mod.builder_version, .workdir = "/current" },
+    for ([_]struct { name: []const u8, source: []const u8, builder: []const u8, workdir: []const u8 }{
+        .{ .name = "127.0.0.1:1/app:old", .source = "127.0.0.1:1/app@" ++ manifest, .builder = "sporevm-rootfs-previous", .workdir = "/old" },
+        .{ .name = "127.0.0.1:1/app:current", .source = "127.0.0.1:1/app@" ++ manifest, .builder = rootfs_mod.builder_version, .workdir = "/current" },
+        .{ .name = "local/app:old", .source = "local/app@" ++ manifest, .builder = "sporevm-rootfs-previous", .workdir = "/local-old" },
     }) |published| {
         _ = try local_image.lockAndPublish(io, arena, cache_root, .{
             .platform = direct_image_platform,
             .config = .{ .config = .{ .WorkingDir = published.workdir } },
             .storage = storage,
-            .oci = .{ .ref = "127.0.0.1:1/app@" ++ manifest, .manifest_digest = manifest, .builder_version = published.builder },
+            .oci = .{ .ref = published.source, .manifest_digest = manifest, .builder_version = published.builder },
             .name = published.name,
         });
     }
@@ -5412,6 +5413,8 @@ test "run --pull=missing converts a registry tag again after a rootfs builder ch
         .{ .ref = "127.0.0.1:1/app:current", .pull = .missing, .workdir = "/current" },
         .{ .ref = "127.0.0.1:1/app:old", .pull = .never, .workdir = "/old" },
         .{ .ref = "127.0.0.1:1/app:old", .pull = .missing, .workdir = null },
+        // A local name has no registry to convert from again.
+        .{ .ref = "local/app:old", .pull = .missing, .workdir = "/local-old" },
     }) |case| {
         const result = try resolveRootfsInputDetailedResult(init, arena, .{
             .rootfs_path = null,

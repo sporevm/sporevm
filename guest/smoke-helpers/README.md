@@ -6,6 +6,8 @@ uses. Shipped builds do not carry them.
 
 `writeout.c` writes one line to stdout and one to stderr.
 `finite.c` prints a ready line, three ticks a second apart, and a done line.
+`poweroff.c` prints a ready line, waits the given number of seconds, and powers
+the guest off before its command exits.
 `counter.c` prints its fan-out job once `/run/sporevm/env` names it, and a
 counter every second, until killed.
 `nproc.c` prints the online CPU count.

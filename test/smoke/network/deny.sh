@@ -18,6 +18,13 @@ if [[ "${wget_rc}" == "0" ]]; then
   die "spore run --net unexpectedly reached a hard-floor destination"
 fi
 
+# netd answers a denied SYN with an RST; without one, wget's connect times out
+# after 5 s instead.
+jsonl_output_contains "${workdir}/wget.stdout" stderr "Connection refused" || {
+  cat "${workdir}/wget.stdout" >&2 || true
+  die "denied connect was not refused"
+}
+
 grep -Fq "denied egress" "${workdir}/wget.stderr" || {
   cat "${workdir}/wget.stderr" >&2 || true
   die "debug log did not include denied egress"
