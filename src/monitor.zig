@@ -42,6 +42,13 @@ const max_control_response = 128 * 1024;
 const max_suspend_path = 4096;
 const stats_write_interval_ms = 250;
 const registry_check_interval_ms = 1_000;
+/// Guest operations run on handler threads, at most the listen backlog.
+const max_control_handlers = 8;
+/// A client must send its whole request line this soon after connecting.
+const control_request_timeout_ms = 1_000;
+const control_accept_poll_ms = 100;
+const control_queue_poll_ms = 10;
+const removal_message = "named VM is being removed";
 
 const SnapshotLeaseHandoffTestFault = struct {
     fail_before_source_spec: bool = false,
@@ -120,7 +127,6 @@ const RequestState = enum {
     pending_disk_fork,
     active_disk_fork,
     done,
-    stop_requested,
 };
 
 fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: lifecycle.DiskForkClaim) !runtime_disk_fork.Head {
@@ -339,19 +345,15 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         run.executeMonitorWithBootArtifacts(.{ .io = init.io, .environ_map = init.environ_map }, allocator, monitor_options, artifacts, server.control(), readiness_probe)
     else
         run.executeMonitor(.{ .io = init.io, .environ_map = init.environ_map }, allocator, monitor_options, server.control(), readiness_probe);
-    if (result) |monitor_result| {
-        switch (monitor_result.exit) {
-            .stopped => {},
-            .snapshotted => try server.completeSuspend(),
-        }
-        server.deinit();
-        thread.join();
-    } else |err| {
-        server.failOutstanding("monitor backend stopped");
-        server.deinit();
-        thread.join();
+    const monitor_result = result catch |err| {
+        server.stopControl(thread, "monitor backend stopped");
         return err;
-    }
+    };
+    if (monitor_result.exit == .snapshotted) server.completeSuspend() catch |err| {
+        server.stopControl(thread, "monitor stopped");
+        return err;
+    };
+    server.stopControl(thread, "monitor stopped");
 }
 
 fn monitorReadyMetadata(pid: i64, paths: lifecycle.Paths, console_log_path: ?[]const u8) lifecycle.Ready {
@@ -432,6 +434,12 @@ const ExecServer = struct {
     mutex: Io.Mutex = .init,
     cond: Io.Condition = .init,
     state: RequestState = .idle,
+    /// Set once the monitor is stopping; queued and new guest operations fail
+    /// with this message.
+    stopping: ?[]const u8 = null,
+    /// Ends blocking stdin delivery to an exec that was failed.
+    stream_input_stop: std.atomic.Value(bool) = .init(false),
+    handlers: [max_control_handlers]ControlHandler = @splat(.{}),
     request: [max_control_request]u8 = undefined,
     request_len: usize = 0,
     response: [max_control_response]u8 = undefined,
@@ -516,7 +524,7 @@ const ExecServer = struct {
             .cache_root = cache_root,
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
-            .server = try address.listen(io, .{ .kernel_backlog = 8 }),
+            .server = try address.listen(io, .{ .kernel_backlog = max_control_handlers }),
             .generation_params = generation_params,
             .exec_defaults = exec_defaults,
             .disk_claims = runtime_disk_claim.Registry.init(allocator),
@@ -560,8 +568,12 @@ const ExecServer = struct {
         try lifecycle.writeReady(self.allocator, self.io, startup.paths, startup.ready);
     }
 
-    fn deinit(self: *ExecServer) void {
+    /// Runs after the VM loop returns: fails what is left, waits for the
+    /// accept thread, which joins every handler, then removes the socket.
+    fn stopControl(self: *ExecServer, accept_thread: std.Thread, message: []const u8) void {
+        self.failOutstanding(message);
         self.closed.store(true, .release);
+        accept_thread.join();
         self.server.deinit(self.io);
         Io.Dir.cwd().deleteFile(self.io, self.socket_path) catch {};
     }
@@ -612,14 +624,19 @@ const ExecServer = struct {
         defer self.mutex.unlock(self.io);
 
         if (self.registryDirGone()) {
+            self.stopping = self.stopping orelse "monitor registry disappeared";
             self.failOutstandingLocked("monitor registry disappeared");
+            return .stop;
+        }
+        if (self.stopping) |message| {
+            // A capture runs inside the VM loop, so none is under way here.
+            self.stopLocked(message);
             return .stop;
         }
         _ = self.disk_claims.expire(monotonicNs());
 
         switch (self.state) {
             .idle, .done => return .keep_running,
-            .stop_requested => return .stop,
             .pending_suspend => {
                 self.state = .active_suspend;
                 return .{ .snapshot = .{ .dir = self.suspend_dir[0..self.suspend_dir_len] } };
@@ -761,14 +778,33 @@ const ExecServer = struct {
         return registryDirMissing(self.io, self.vm_dir);
     }
 
-    fn submitExec(self: *ExecServer, request: []const u8) ![]const u8 {
+    /// Waits for the guest operation slot. A request queues behind the
+    /// running operation for up to the VM's timeout.
+    fn acquireOpLocked(self: *ExecServer) !void {
+        const deadline = lifecycle.monotonicMs() +| self.timeout_ms;
+        while (true) {
+            if (self.stopping != null) return error.MonitorStopping;
+            if (self.state == .idle) return;
+            if (lifecycle.monotonicMs() >= deadline) return error.ControlBusy;
+            self.mutex.unlock(self.io);
+            var ts = std.c.timespec{ .sec = 0, .nsec = control_queue_poll_ms * std.time.ns_per_ms };
+            _ = std.c.nanosleep(&ts, null);
+            self.mutex.lockUncancelable(self.io);
+        }
+    }
+
+    /// Copies the response out of the shared buffer before the slot is
+    /// released; the caller frees it with the page allocator.
+    fn takeResponseLocked(self: *ExecServer) ![]const u8 {
+        return std.heap.page_allocator.dupe(u8, self.response[0..self.response_len]);
+    }
+
+    fn submitExec(self: *ExecServer, request: []const u8, session_sequence: u64) ![]const u8 {
         if (request.len > self.request.len) return error.ControlRequestTooLarge;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        while (self.state == .done) {
-            self.cond.waitUncancelable(self.io, &self.mutex);
-        }
-        if (self.state != .idle) return error.ControlBusy;
+        try self.acquireOpLocked();
+        self.active_session_sequence = session_sequence;
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
         self.response_len = 0;
@@ -783,19 +819,18 @@ const ExecServer = struct {
         while (self.state != .done) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        self.state = .idle;
-        return self.response[0..self.response_len];
+        defer self.state = .idle;
+        return self.takeResponseLocked();
     }
 
-    fn submitStreamingExec(self: *ExecServer, request: []const u8, client_fd: std.c.fd_t, timing_enabled: bool) !void {
+    fn submitStreamingExec(self: *ExecServer, request: []const u8, session_sequence: u64, client_fd: std.c.fd_t, timing_enabled: bool) !void {
         if (request.len > self.request.len) return error.ControlRequestTooLarge;
         try setStreamingSendDeadline(client_fd);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        while (self.state == .done) {
-            self.cond.waitUncancelable(self.io, &self.mutex);
-        }
-        if (self.state != .idle) return error.ControlBusy;
+        try self.acquireOpLocked();
+        self.active_session_sequence = session_sequence;
+        self.stream_input_stop.store(false, .release);
         @memcpy(self.request[0..request.len], request);
         self.request_len = request.len;
         self.response_len = 0;
@@ -842,9 +877,9 @@ const ExecServer = struct {
         return @intCast(ns);
     }
 
-    fn interactiveExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, tty: bool, terminal_size: spore_stream.Resize) ![]const u8 {
+    fn interactiveExecRequest(self: *ExecServer, session_sequence: *u64, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, tty: bool, terminal_size: spore_stream.Resize) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try self.nextSessionId(&id_buf);
+        const session_id = try self.nextSessionId(&id_buf, session_sequence);
         var merged_env: [run.max_guest_envc][]const u8 = undefined;
         const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
         return run.interactiveExecRequestWithSession(self.allocator, argv, session_id, .{
@@ -857,9 +892,9 @@ const ExecServer = struct {
         });
     }
 
-    fn detachedExecRequest(self: *ExecServer, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
+    fn detachedExecRequest(self: *ExecServer, session_sequence: *u64, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try self.nextSessionId(&id_buf);
+        const session_id = try self.nextSessionId(&id_buf, session_sequence);
         var merged_env: [run.max_guest_envc][]const u8 = undefined;
         const exec_context = try effectiveExecContext(&merged_env, self.exec_defaults, env, working_dir);
         return run.detachedExecRequestWithSessionContext(self.allocator, argv, session_id, .{
@@ -870,9 +905,9 @@ const ExecServer = struct {
         });
     }
 
-    fn copyRequest(self: *ExecServer, request_type: []const u8, path: []const u8) ![]const u8 {
+    fn copyRequest(self: *ExecServer, session_sequence: *u64, request_type: []const u8, path: []const u8) ![]const u8 {
         var id_buf: [64]u8 = undefined;
-        const session_id = try self.nextSessionId(&id_buf);
+        const session_id = try self.nextSessionId(&id_buf, session_sequence);
         const payload = struct {
             type: []const u8,
             session_id: []const u8,
@@ -887,8 +922,13 @@ const ExecServer = struct {
         return std.fmt.allocPrint(self.allocator, "{s}\n", .{json});
     }
 
-    fn nextSessionId(self: *ExecServer, buffer: *[64]u8) ![]const u8 {
-        self.active_session_sequence = self.next_session_id;
+    /// Reserves the next session id. The submit functions record its
+    /// sequence for stream logging once the request takes the guest.
+    fn nextSessionId(self: *ExecServer, buffer: *[64]u8, sequence: *u64) ![]const u8 {
+        // Handler threads build requests concurrently.
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        sequence.* = self.next_session_id;
         const session_id = try formatSessionId(buffer, self.session_nonce, self.next_session_id);
         self.next_session_id +%= 1;
         if (self.next_session_id == 0) self.next_session_id = 1;
@@ -1009,10 +1049,9 @@ const ExecServer = struct {
             defer self.mutex.unlock(self.io);
             if (self.state != .active_exec or !self.active_streaming_exec or !self.active_stream_valid) return error.ControlStreamClosed;
         }
-        var stop = std.atomic.Value(bool).init(false);
         const queued = switch (stream_id) {
-            .stdin => try self.active_stream.enqueueStdinDataBlocking(bytes, &stop),
-            .terminal => try self.active_stream.enqueueTerminalDataBlocking(bytes, &stop),
+            .stdin => try self.active_stream.enqueueStdinDataBlocking(bytes, &self.stream_input_stop),
+            .terminal => try self.active_stream.enqueueTerminalDataBlocking(bytes, &self.stream_input_stop),
             else => return error.InvalidControlStream,
         };
         if (!queued) return error.ControlStreamClosed;
@@ -1025,10 +1064,9 @@ const ExecServer = struct {
             defer self.mutex.unlock(self.io);
             if (self.state != .active_exec or !self.active_streaming_exec or !self.active_stream_valid) return error.ControlStreamClosed;
         }
-        var stop = std.atomic.Value(bool).init(false);
         const queued = switch (stream_id) {
-            .stdin => try self.active_stream.enqueueStdinCloseBlocking(&stop),
-            .terminal => try self.active_stream.enqueueTerminalCloseBlocking(&stop),
+            .stdin => try self.active_stream.enqueueStdinCloseBlocking(&self.stream_input_stop),
+            .terminal => try self.active_stream.enqueueTerminalCloseBlocking(&self.stream_input_stop),
             else => return error.InvalidControlStream,
         };
         if (!queued) return error.ControlStreamClosed;
@@ -1051,10 +1089,7 @@ const ExecServer = struct {
         defer self.mutex.unlock(self.io);
         // Refuse before the guest pauses: a failed capture ends the VM.
         if (self.snapshots_refused) return error.RemoteImageNotSnapshotable;
-        while (self.state == .done) {
-            self.cond.waitUncancelable(self.io, &self.mutex);
-        }
-        if (self.state != .idle) return error.ControlBusy;
+        try self.acquireOpLocked();
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
         self.response_len = 0;
@@ -1064,7 +1099,8 @@ const ExecServer = struct {
         while (self.state != .done) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        return self.response[0..self.response_len];
+        // The VM ends after a suspend, so the slot stays taken.
+        return self.takeResponseLocked();
     }
 
     fn submitSnapshot(self: *ExecServer, out_dir: []const u8, publish_dir: ?[]const u8) ![]const u8 {
@@ -1075,10 +1111,7 @@ const ExecServer = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.snapshots_refused) return error.RemoteImageNotSnapshotable;
-        while (self.state == .done) {
-            self.cond.waitUncancelable(self.io, &self.mutex);
-        }
-        if (self.state != .idle) return error.ControlBusy;
+        try self.acquireOpLocked();
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
         self.publish_dir_len = 0;
@@ -1093,8 +1126,8 @@ const ExecServer = struct {
         while (self.state != .done) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        self.state = .idle;
-        return self.response[0..self.response_len];
+        defer self.state = .idle;
+        return self.takeResponseLocked();
     }
 
     fn submitDiskFork(
@@ -1118,10 +1151,7 @@ const ExecServer = struct {
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        while (self.state == .done) {
-            self.cond.waitUncancelable(self.io, &self.mutex);
-        }
-        if (self.state != .idle) return error.ControlBusy;
+        try self.acquireOpLocked();
         if (self.disk_claims.hasBatch(batch)) return error.BatchAlreadyRegistered;
         @memcpy(self.suspend_dir[0..out_dir.len], out_dir);
         self.suspend_dir_len = out_dir.len;
@@ -1141,8 +1171,8 @@ const ExecServer = struct {
         while (self.state != .done) {
             self.cond.waitUncancelable(self.io, &self.mutex);
         }
-        self.state = .idle;
-        return self.response[0..self.response_len];
+        defer self.state = .idle;
+        return self.takeResponseLocked();
     }
 
     fn completeSuspend(self: *ExecServer) !void {
@@ -1330,22 +1360,43 @@ const ExecServer = struct {
     fn requestStop(self: *ExecServer) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.state = .stop_requested;
+        self.stopLocked(removal_message);
         if (self.wake) |wake| wake.wake();
-        self.cond.broadcast(self.io);
+    }
+
+    /// Refuses new and queued guest operations with `message` and fails the
+    /// active one, except a capture already under way, which finishes first.
+    fn stopLocked(self: *ExecServer, message: []const u8) void {
+        self.stopping = self.stopping orelse message;
+        switch (self.state) {
+            .active_suspend, .active_snapshot, .active_disk_fork => {},
+            else => self.failOutstandingLocked(message),
+        }
     }
 
     fn failOutstanding(self: *ExecServer, message: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.stopping = self.stopping orelse message;
         self.failOutstandingLocked(message);
+    }
+
+    /// The message for a guest operation the monitor did not run.
+    fn refusalMessage(self: *ExecServer, err: anyerror) []const u8 {
+        if (err != error.MonitorStopping) return snapshotSubmitErrorMessage(err);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.stopping orelse removal_message;
     }
 
     fn failOutstandingLocked(self: *ExecServer, message: []const u8) void {
         switch (self.state) {
             .active_ready, .pending_exec, .active_exec, .pending_suspend, .active_suspend, .pending_snapshot, .active_snapshot, .pending_disk_fork, .active_disk_fork => {
+                self.stream_input_stop.store(true, .release);
                 if (self.active_streaming_exec) {
                     self.sendStreamingErrorLocked(message);
+                    // Nothing follows the error frame.
+                    self.streaming_write_failed = true;
                 } else {
                     self.storeErrorLocked(message) catch {
                         self.response_len = 0;
@@ -1643,21 +1694,41 @@ fn writeFdAll(fd: std.c.fd_t, bytes: []const u8) c_int {
     return 0;
 }
 
+/// One guest operation handed off by the accept thread.
+const ControlHandler = struct {
+    thread: ?std.Thread = null,
+    /// Set by the handler, under the server mutex, as it exits.
+    finished: bool = false,
+    stream: net.Stream = undefined,
+    request: std.json.Parsed(ControlRequest) = undefined,
+    line: [max_control_request]u8 = undefined,
+    line_len: usize = 0,
+};
+
 fn controlThreadMain(server: *ExecServer) void {
-    while (true) {
-        var stream = server.server.accept(server.io) catch {
-            if (server.isClosed()) return;
-            continue;
-        };
-        const stop = handleControlClient(server, stream) catch false;
-        stream.close(server.io);
-        if (stop) return;
+    while (!server.isClosed()) {
+        var fds = [_]std.posix.pollfd{.{ .fd = server.server.socket.handle, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, control_accept_poll_ms) catch continue;
+        if (ready == 0) continue;
+        const stream = server.server.accept(server.io) catch continue;
+        const handed_off = acceptControlClient(server, stream) catch false;
+        if (!handed_off) stream.close(server.io);
+    }
+    for (&server.handlers) |*handler| {
+        if (handler.thread) |thread| thread.join();
+        handler.* = .{};
     }
 }
 
-fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
+/// Answers the requests that need no guest as soon as the connection is
+/// accepted, so `hello`, `shutdown`, and disk-fork claims and cancels never
+/// wait behind a guest operation. Returns true when a handler thread took the
+/// stream.
+fn acceptControlClient(server: *ExecServer, stream: net.Stream) !bool {
+    const fd = stream.socket.handle;
     var read_buffer: [max_control_request]u8 = undefined;
-    const line = readControlLineFd(stream.socket.handle, &read_buffer) catch |err| {
+    const deadline_ms = lifecycle.monotonicMs() +| control_request_timeout_ms;
+    const line = readControlLineFd(fd, &read_buffer, deadline_ms) catch |err| {
         const message = if (err == error.ControlRequestTooLarge)
             "control request exceeds 8191 bytes; shorten the guest command"
         else
@@ -1672,7 +1743,8 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlError(server.io, stream, "bad control request");
         return false;
     };
-    defer parsed.deinit();
+    var handed_off = false;
+    defer if (!handed_off) parsed.deinit();
 
     if (std.mem.eql(u8, parsed.value.type, "hello")) {
         try writeControlHello(server.io, stream);
@@ -1681,7 +1753,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
     if (std.mem.eql(u8, parsed.value.type, "shutdown")) {
         server.requestStop();
         try writeControlOk(server.io, stream);
-        return true;
+        return false;
     }
     if (std.mem.eql(u8, parsed.value.type, runtime_disk_claim.claim_type)) {
         var claim = runtime_disk_claim.parseClaimBytes(server.allocator, line) catch {
@@ -1694,30 +1766,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
             return false;
         };
         defer head.deinit();
-        runtime_disk_claim.sendHead(stream.socket.handle, server.allocator, &head) catch return false;
-        return false;
-    }
-    if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.prepare_type)) {
-        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
-            return false;
-        }
-        var request = runtime_disk_fork_control.parsePrepareBytes(server.allocator, line) catch {
-            try writeControlError(server.io, stream, "bad disk fork prepare request");
-            return false;
-        };
-        defer request.deinit();
-        const response = server.submitDiskFork(
-            request.value.out_dir,
-            request.value.batch,
-            request.value.children,
-            request.value.allow_copy,
-            request.value.force_copy,
-        ) catch |err| {
-            try writeControlError(server.io, stream, @errorName(err));
-            return false;
-        };
-        try writeAll(server.io, stream, response);
+        runtime_disk_claim.sendHead(fd, server.allocator, &head) catch return false;
         return false;
     }
     if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.cancel_type)) {
@@ -1730,121 +1779,212 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream) !bool {
         try writeControlOk(server.io, stream);
         return false;
     }
+    handed_off = try startControlHandler(server, stream, line, parsed);
+    return handed_off;
+}
+
+/// Hands a guest operation to a handler thread, or tells the client the
+/// monitor is busy when every handler is taken.
+fn startControlHandler(server: *ExecServer, stream: net.Stream, line: []const u8, parsed: std.json.Parsed(ControlRequest)) !bool {
+    var finished: [max_control_handlers]?std.Thread = @splat(null);
+    var free: ?*ControlHandler = null;
+    {
+        server.mutex.lockUncancelable(server.io);
+        defer server.mutex.unlock(server.io);
+        for (&server.handlers, &finished) |*handler, *thread| {
+            if (handler.thread != null and handler.finished) {
+                thread.* = handler.thread;
+                handler.* = .{};
+            }
+            if (handler.thread == null and free == null) free = handler;
+        }
+    }
+    for (finished) |thread| if (thread) |value| value.join();
+
+    const handler = free orelse {
+        try writeRequestError(server, stream, parsed.value.type, "monitor busy");
+        return false;
+    };
+    handler.stream = stream;
+    handler.request = parsed;
+    @memcpy(handler.line[0..line.len], line);
+    handler.line_len = line.len;
+    handler.thread = std.Thread.spawn(.{}, controlHandlerMain, .{ server, handler }) catch {
+        try writeRequestError(server, stream, parsed.value.type, "monitor busy");
+        return false;
+    };
+    return true;
+}
+
+fn controlHandlerMain(server: *ExecServer, handler: *ControlHandler) void {
+    handleControlClient(server, handler.stream, handler.request, handler.line[0..handler.line_len]) catch {};
+    handler.request.deinit();
+    handler.stream.close(server.io);
+    server.mutex.lockUncancelable(server.io);
+    defer server.mutex.unlock(server.io);
+    handler.finished = true;
+}
+
+fn writeRequestError(server: *ExecServer, stream: net.Stream, request_type: []const u8, message: []const u8) !void {
+    if (std.mem.eql(u8, request_type, "exec-stream-v1") or
+        std.mem.eql(u8, request_type, "copy-in-v1") or
+        std.mem.eql(u8, request_type, "copy-out-v1"))
+    {
+        return writeStreamingControlError(stream.socket.handle, message);
+    }
+    return writeControlError(server.io, stream, message);
+}
+
+/// Runs one guest operation on a handler thread. Operations take turns on
+/// the guest; each waits for the slot up to the VM's timeout.
+fn handleControlClient(server: *ExecServer, stream: net.Stream, parsed: std.json.Parsed(ControlRequest), line: []const u8) !void {
+    if (std.mem.eql(u8, parsed.value.type, runtime_disk_fork_control.prepare_type)) {
+        if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
+            try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
+            return;
+        }
+        var request = runtime_disk_fork_control.parsePrepareBytes(server.allocator, line) catch {
+            try writeControlError(server.io, stream, "bad disk fork prepare request");
+            return;
+        };
+        defer request.deinit();
+        const response = server.submitDiskFork(
+            request.value.out_dir,
+            request.value.batch,
+            request.value.children,
+            request.value.allow_copy,
+            request.value.force_copy,
+        ) catch |err| {
+            try writeControlError(server.io, stream, if (err == error.MonitorStopping) server.refusalMessage(err) else @errorName(err));
+            return;
+        };
+        defer std.heap.page_allocator.free(response);
+        try writeAll(server.io, stream, response);
+        return;
+    }
     if (std.mem.eql(u8, parsed.value.type, "suspend")) {
         if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
             try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
-            return false;
+            return;
         }
         const out_dir = parsed.value.out_dir orelse {
             try writeControlError(server.io, stream, "suspend request missing out_dir");
-            return false;
+            return;
         };
         const response = server.submitSuspend(out_dir) catch |err| {
-            try writeControlError(server.io, stream, snapshotSubmitErrorMessage(err));
-            return false;
+            try writeControlError(server.io, stream, server.refusalMessage(err));
+            return;
         };
+        defer std.heap.page_allocator.free(response);
         try writeAll(server.io, stream, response);
-        return true;
+        return;
     }
     if (std.mem.eql(u8, parsed.value.type, "snapshot")) {
         if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
             try writeControlError(server.io, stream, "capture is unavailable for the experimental x86-64 KVM fresh profile");
-            return false;
+            return;
         }
         const out_dir = parsed.value.out_dir orelse {
             try writeControlError(server.io, stream, "snapshot request missing out_dir");
-            return false;
+            return;
         };
         const continue_after = parsed.value.@"continue" orelse false;
         if (!continue_after) {
             try writeControlError(server.io, stream, "snapshot request must set continue=true");
-            return false;
+            return;
         }
         const response = server.submitSnapshot(out_dir, parsed.value.publish_dir) catch |err| {
-            try writeControlError(server.io, stream, snapshotSubmitErrorMessage(err));
-            return false;
+            try writeControlError(server.io, stream, server.refusalMessage(err));
+            return;
         };
+        defer std.heap.page_allocator.free(response);
         try writeAll(server.io, stream, response);
-        return false;
+        return;
     }
     if (std.mem.eql(u8, parsed.value.type, "exec-stream-v1")) {
         const argv = parsed.value.argv orelse {
             try writeStreamingControlError(stream.socket.handle, "command request missing argv");
-            return false;
+            return;
         };
         const stdio = parsed.value.stdio orelse {
             try writeStreamingControlError(stream.socket.handle, "stream request missing stdio");
-            return false;
+            return;
         };
         const tty = std.mem.eql(u8, stdio, "tty");
         if (!tty and !std.mem.eql(u8, stdio, "pipe")) {
             try writeStreamingControlError(stream.socket.handle, "unsupported stream stdio");
-            return false;
+            return;
         }
         const terminal_size = spore_stream.Resize{
             .rows = parsed.value.terminal_rows orelse 24,
             .cols = parsed.value.terminal_cols orelse 80,
         };
-        const request = server.interactiveExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, tty, terminal_size) catch |err| {
+        var session_sequence: u64 = 0;
+        const request = server.interactiveExecRequest(&session_sequence, argv, parsed.value.env orelse &.{}, parsed.value.working_dir, tty, terminal_size) catch |err| {
             try writeStreamingControlError(stream.socket.handle, guestCommandErrorMessage(err));
-            return false;
+            return;
         };
         defer server.allocator.free(request);
-        server.submitStreamingExec(request, stream.socket.handle, true) catch {
-            try writeStreamingControlError(stream.socket.handle, "monitor busy");
-            return false;
+        server.submitStreamingExec(request, session_sequence, stream.socket.handle, true) catch |err| {
+            try writeStreamingControlError(stream.socket.handle, server.refusalMessage(err));
+            return;
         };
         defer server.finishStreamingExec();
         proxyStreamingInput(server, stream.socket.handle, if (tty) .terminal else .stdin) catch {};
-        return false;
+        return;
     }
     if (std.mem.eql(u8, parsed.value.type, "copy-in-v1") or std.mem.eql(u8, parsed.value.type, "copy-out-v1")) {
         const path = parsed.value.path orelse {
             try writeStreamingControlError(stream.socket.handle, "copy request missing path");
-            return false;
+            return;
         };
-        const request = server.copyRequest(parsed.value.type, path) catch {
+        var session_sequence: u64 = 0;
+        const request = server.copyRequest(&session_sequence, parsed.value.type, path) catch {
             try writeStreamingControlError(stream.socket.handle, "invalid copy request");
-            return false;
+            return;
         };
         defer server.allocator.free(request);
-        server.submitStreamingExec(request, stream.socket.handle, false) catch {
-            try writeStreamingControlError(stream.socket.handle, "monitor busy");
-            return false;
+        server.submitStreamingExec(request, session_sequence, stream.socket.handle, false) catch |err| {
+            try writeStreamingControlError(stream.socket.handle, server.refusalMessage(err));
+            return;
         };
         defer server.finishStreamingExec();
         if (std.mem.eql(u8, parsed.value.type, "copy-in-v1")) {
             proxyStreamingInput(server, stream.socket.handle, .stdin) catch {};
         }
-        return false;
+        return;
     }
     if (std.mem.eql(u8, parsed.value.type, "initial-output")) {
-        const response = server.submitExec("{\"type\":\"initial-output\"}\n") catch {
-            try writeControlError(server.io, stream, "monitor busy");
-            return false;
+        // The initial-output request carries no session id.
+        const response = server.submitExec("{\"type\":\"initial-output\"}\n", 0) catch |err| {
+            try writeControlError(server.io, stream, server.refusalMessage(err));
+            return;
         };
+        defer std.heap.page_allocator.free(response);
         try writeAll(server.io, stream, response);
-        return false;
+        return;
     }
     if (!std.mem.eql(u8, parsed.value.type, "start")) {
         try writeControlError(server.io, stream, "unknown control request");
-        return false;
+        return;
     }
     const argv = parsed.value.argv orelse {
         try writeControlError(server.io, stream, "command request missing argv");
-        return false;
+        return;
     };
-    const request = server.detachedExecRequest(argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
+    var session_sequence: u64 = 0;
+    const request = server.detachedExecRequest(&session_sequence, argv, parsed.value.env orelse &.{}, parsed.value.working_dir, parsed.value.retain_output orelse false) catch |err| {
         try writeControlError(server.io, stream, guestCommandErrorMessage(err));
-        return false;
+        return;
     };
     defer server.allocator.free(request);
-    const response = server.submitExec(request) catch {
-        try writeControlError(server.io, stream, "monitor busy");
-        return false;
+    const response = server.submitExec(request, session_sequence) catch |err| {
+        try writeControlError(server.io, stream, server.refusalMessage(err));
+        return;
     };
+    defer std.heap.page_allocator.free(response);
     try writeAll(server.io, stream, response);
-    return false;
+    return;
 }
 
 fn guestCommandErrorMessage(err: anyerror) []const u8 {
@@ -1859,9 +1999,16 @@ fn guestCommandErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-fn readControlLineFd(fd: std.c.fd_t, buffer: []u8) ![]const u8 {
+/// Reads one request line a byte at a time, so the stream frames that follow
+/// it stay unread. The whole line must arrive by `deadline_ms`.
+fn readControlLineFd(fd: std.c.fd_t, buffer: []u8, deadline_ms: u64) ![]const u8 {
     var len: usize = 0;
     while (len < buffer.len) {
+        const now = lifecycle.monotonicMs();
+        if (now >= deadline_ms) return error.ControlRequestTimedOut;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        const wait_ms: i32 = @intCast(@min(deadline_ms - now, std.math.maxInt(i32)));
+        if (try std.posix.poll(&fds, wait_ms) == 0) return error.ControlRequestTimedOut;
         var byte: [1]u8 = undefined;
         const n = std.c.read(fd, &byte, 1);
         if (n < 0) {
@@ -2248,20 +2395,22 @@ test "monitor session ids cannot replay across restored monitors" {
 
 test "monitor records the exact generated request sequence for stream logging" {
     var server: ExecServer = undefined;
+    server.io = std.testing.io;
+    server.mutex = .init;
     server.session_nonce = 0x0123_4567_89ab_cdef;
     server.next_session_id = 41;
-    server.active_session_sequence = 0;
     var buffer: [64]u8 = undefined;
+    var sequence: u64 = 0;
 
-    const session_id = try server.nextSessionId(&buffer);
+    const session_id = try server.nextSessionId(&buffer, &sequence);
 
     try std.testing.expectEqualStrings("lifecycle-123456789abcdef-41", session_id);
-    try std.testing.expectEqual(@as(u64, 41), server.active_session_sequence);
+    try std.testing.expectEqual(@as(u64, 41), sequence);
     try std.testing.expectEqual(@as(u64, 42), server.next_session_id);
     var log_buffer: [160]u8 = undefined;
     try std.testing.expectEqualStrings(
         "monitor vsock stream start: kind=exec session_id=lifecycle-123456789abcdef-41 host_port=54321",
-        formatExecHostStreamStart(&log_buffer, server.session_nonce, server.active_session_sequence, 54321),
+        formatExecHostStreamStart(&log_buffer, server.session_nonce, sequence, 54321),
     );
 }
 
@@ -2269,12 +2418,14 @@ test "streaming named exec carries the restored generation" {
     var server: ExecServer = undefined;
     server.allocator = std.testing.allocator;
     server.io = std.testing.io;
+    server.mutex = .init;
     server.exec_defaults = .{};
     server.generation_params = "{\"generation\":2,\"vm_id\":\"child-0\"}";
     server.session_nonce = 1;
     server.next_session_id = 1;
 
-    const request = try server.interactiveExecRequest(&.{"/bin/gencheck"}, &.{}, null, false, .{ .rows = 24, .cols = 80 });
+    var sequence: u64 = 0;
+    const request = try server.interactiveExecRequest(&sequence, &.{"/bin/gencheck"}, &.{}, null, false, .{ .rows = 24, .cols = 80 });
     defer std.testing.allocator.free(request);
     const parsed = try std.json.parseFromSlice(struct { params_json: []const u8 }, std.testing.allocator, request, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -2921,4 +3072,157 @@ test "a monitor whose root disk reads from an image store refuses saves before p
     try std.testing.expectEqual(RequestState.idle, server.state);
     try std.testing.expectEqualStrings(lifecycle.snapshot_refused_store_rootfs, snapshotSubmitErrorMessage(error.RemoteImageNotSnapshotable));
     try std.testing.expectEqualStrings("monitor busy", snapshotSubmitErrorMessage(error.ControlBusy));
+}
+
+/// A local control client with read deadlines, so a monitor that blocks
+/// fails the test instead of hanging it.
+const TestControlClient = struct {
+    stream: net.Stream,
+    fd: std.c.fd_t,
+
+    fn connect(socket_path: []const u8) !TestControlClient {
+        const address = try net.UnixAddress.init(socket_path);
+        const stream = try address.connect(std.testing.io);
+        return .{ .stream = stream, .fd = stream.socket.handle };
+    }
+
+    fn close(self: TestControlClient) void {
+        self.stream.close(std.testing.io);
+    }
+
+    fn send(self: TestControlClient, line: []const u8) !void {
+        if (writeFdAll(self.fd, line) != 0) return error.IoFailed;
+    }
+
+    fn readExact(self: TestControlClient, buffer: []u8, timeout_ms: i32) !void {
+        var len: usize = 0;
+        while (len < buffer.len) {
+            var fds = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&fds, timeout_ms) == 0) return error.Timeout;
+            const n = std.c.read(self.fd, buffer[len..].ptr, buffer.len - len);
+            if (n <= 0) return error.ControlStreamClosed;
+            len += @intCast(n);
+        }
+    }
+
+    fn readLine(self: TestControlClient, buffer: []u8, timeout_ms: i32) ![]const u8 {
+        for (0..buffer.len) |len| {
+            try self.readExact(buffer[len..][0..1], timeout_ms);
+            if (buffer[len] == '\n') return buffer[0..len];
+        }
+        return error.ControlRequestTooLarge;
+    }
+
+    fn call(socket_path: []const u8, line: []const u8, buffer: []u8, timeout_ms: i32) ![]const u8 {
+        const client = try connect(socket_path);
+        defer client.close();
+        try client.send(line);
+        return client.readLine(buffer, timeout_ms);
+    }
+};
+
+test "monitor answers hello and shutdown while a guest operation runs" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-control-{d}.sock", .{std.c.getpid()});
+    // Guest operations queue for at most the VM timeout.
+    const timeout_ms = 300;
+    var server = try ExecServer.init(allocator, io, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", "/nonexistent", 10700, timeout_ms, null, .{});
+    defer server.disk_claims.deinit();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    var stopped = false;
+    defer if (!stopped) server.stopControl(accept_thread, "test finished");
+
+    // A streaming exec takes the guest. The test plays the VM loop, which
+    // starts the exec and never finishes it.
+    const exec = try TestControlClient.connect(socket_path);
+    defer exec.close();
+    try exec.send("{\"type\":\"exec-stream-v1\",\"argv\":[\"/bin/sleep\",\"300\"],\"stdio\":\"pipe\"}\n");
+    const started_ms = lifecycle.monotonicMs();
+    while (true) {
+        {
+            server.mutex.lockUncancelable(io);
+            defer server.mutex.unlock(io);
+            if (server.state == .pending_exec) {
+                server.state = .active_exec;
+                server.cond.broadcast(io);
+                break;
+            }
+        }
+        if (lifecycle.monotonicMs() - started_ms > 5_000) return error.Timeout;
+        var ts = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+    }
+
+    var buffer: [512]u8 = undefined;
+    const hello = try TestControlClient.call(socket_path, "{\"type\":\"hello\"}\n", &buffer, 1_000);
+    try std.testing.expect(std.mem.startsWith(u8, hello, "{\"type\":\"hello\""));
+
+    // Another guest operation waits for the running one, then gives up.
+    const queued_ms = lifecycle.monotonicMs();
+    const busy = try TestControlClient.call(socket_path, "{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n", &buffer, 5_000);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"monitor busy\"}", busy);
+    try std.testing.expect(lifecycle.monotonicMs() - queued_ms >= timeout_ms);
+
+    const ok = try TestControlClient.call(socket_path, "{\"type\":\"shutdown\"}\n", &buffer, 1_000);
+    try std.testing.expectEqualStrings("{\"type\":\"ok\"}", ok);
+
+    // The running exec fails with the removal message.
+    var header_buf: [spore_stream.header_len]u8 = undefined;
+    try exec.readExact(&header_buf, 1_000);
+    const header = try spore_stream.readHeader(&header_buf);
+    try std.testing.expectEqual(spore_stream.FrameType.err, header.frame_type);
+    const message = buffer[0..header.payload_len];
+    try exec.readExact(message, 1_000);
+    try std.testing.expectEqualStrings(removal_message, message);
+
+    // New guest operations are refused once the monitor is stopping.
+    const refused = try TestControlClient.call(socket_path, "{\"type\":\"start\",\"argv\":[\"/bin/true\"]}\n", &buffer, 1_000);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"named VM is being removed\"}", refused);
+
+    stopped = true;
+    server.stopControl(accept_thread, "test finished");
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, socket_path, .{}));
+}
+
+test "monitor gives a slow client one deadline for its whole request line" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var path_buf: [64]u8 = undefined;
+    const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/sporevm-test-trickle-{d}.sock", .{std.c.getpid()});
+    var server = try ExecServer.init(allocator, io, "/nonexistent", "/nonexistent", socket_path, "/nonexistent", "/nonexistent", 10700, 1_000, null, .{});
+    defer server.disk_claims.deinit();
+    const accept_thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
+    defer server.stopControl(accept_thread, "test finished");
+
+    // The client sends one byte of its request line every 200 ms, so each
+    // read is quick but the line would take seconds.
+    const Trickler = struct {
+        fn run(fd: std.c.fd_t) void {
+            for (0..25) |_| {
+                if (std.c.send(fd, "{", 1, std.c.MSG.NOSIGNAL) != 1) return;
+                var ts = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&ts, null);
+            }
+        }
+    };
+    const slow = try TestControlClient.connect(socket_path);
+    defer slow.close();
+    const trickler = try std.Thread.spawn(.{}, Trickler.run, .{slow.fd});
+    defer trickler.join();
+    // Let the accept thread take the slow client first.
+    var ts = std.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ts, null);
+
+    const started_ms = lifecycle.monotonicMs();
+    var buffer: [512]u8 = undefined;
+    const hello = try TestControlClient.call(socket_path, "{\"type\":\"hello\"}\n", &buffer, 3_000);
+    try std.testing.expect(std.mem.startsWith(u8, hello, "{\"type\":\"hello\""));
+    try std.testing.expect(lifecycle.monotonicMs() - started_ms < 2 * control_request_timeout_ms);
+
+    const refused = try slow.readLine(&buffer, 1_000);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"message\":\"bad control request\"}", refused);
 }

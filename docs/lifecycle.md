@@ -78,9 +78,9 @@ spore --json logs bench-1
 Pass `--initial-output discard` when the output is intentionally disposable;
 `retain` is the default and is also accepted explicitly. Retained bytes live
 with the guest agent, are copied with a live fork or saved-memory restore, and
-disappear when the VM is removed. Because retrieval uses the existing
-single-operation monitor path, `spore logs` returns a monitor-busy error while
-another exec, copy, save, or fork operation is active. Create removes the new
+disappear when the VM is removed. Retrieval takes its turn on the guest like
+any other operation, so `spore logs` waits behind a running exec, copy, save,
+or fork for up to the VM timeout and then reports the monitor as busy. Create removes the new
 VM if the process cannot be started, while a non-zero exit after a successful
 start is reported by `spore logs` and does not affect VM readiness.
 `spore exec` always
@@ -431,7 +431,15 @@ Networked named live fork remains unsupported.
 
 The monitor protocol is local-only and protected by private runtime-directory
 permissions. There is no TCP control socket and no central `spore daemon`.
-Unknown monitor request types fail closed. `spore ls` reads monitor-published
+Unknown monitor request types fail closed. The monitor answers `hello`,
+`shutdown`, and disk-fork claims and cancels as soon as it accepts the
+connection. Guest
+operations (exec, copy, logs, save, fork) take turns: each waits for the
+running one for up to the VM timeout and then fails as busy, and at most eight
+run or wait at once. `spore rm` stops a VM even while an exec runs; that exec
+fails with `named VM is being removed`. A save or fork capture already under
+way may finish, but `rm` still signals the monitor if it has not exited within
+a second. `spore ls` reads monitor-published
 metadata such as `monitor-stats.json`; unavailable stats render as unknown
 instead of forcing an expensive VM memory scan.
 

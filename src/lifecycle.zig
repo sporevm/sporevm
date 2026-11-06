@@ -95,6 +95,9 @@ const diskless_resume_device_count = 4;
 const monitor_shutdown_grace_ms = 1_000;
 const monitor_shutdown_term_ms = 1_000;
 const monitor_shutdown_kill_ms = 1_000;
+/// The monitor answers `hello` and `shutdown` when it accepts the connection,
+/// so a monitor that takes longer is wedged; `rm` then falls back to signals.
+const monitor_reply_deadline_ms = 2_000;
 
 const testing = if (builtin.is_test) struct {
     var named_restore_authority_barrier: ?*test_barrier.Barrier = null;
@@ -4252,6 +4255,7 @@ const SmallStackControlClient = struct {
                 client.io,
                 client.socket_path,
                 "{\"type\":\"hello\"}",
+                null,
             ) catch |err| {
                 client.err = err;
                 return;
@@ -4293,6 +4297,47 @@ test "lifecycle control response scratch fits a bounded stack and caller allocat
 
     if (client.err) |err| return err;
     try std.testing.expect(client.response_matches);
+}
+
+const SilentMonitor = struct {
+    io: Io,
+    server: net.Server,
+
+    /// Reads one request and never answers; it closes once the client
+    /// hangs up, or after two seconds.
+    fn run(silent: *SilentMonitor) void {
+        var stream = silent.server.accept(silent.io) catch return;
+        defer stream.close(silent.io);
+        var read_buffer: [256]u8 = undefined;
+        var reader = stream.reader(silent.io, &read_buffer);
+        _ = reader.interface.takeDelimiterExclusive('\n') catch return;
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.c.POLL.IN, .revents = 0 }};
+        _ = std.posix.poll(&fds, 2_000) catch {};
+    }
+};
+
+test "lifecycle control requests with a deadline give up on a silent monitor" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-silent-{d}.sock", .{currentTestPid()});
+    defer allocator.free(socket_path);
+    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    Io.Dir.cwd().deleteFile(io, socket_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
+
+    const address = try net.UnixAddress.init(socket_path);
+    var silent = SilentMonitor{ .io = io, .server = try address.listen(io, .{ .kernel_backlog = 1 }) };
+    defer silent.server.deinit(io);
+    const thread = try std.Thread.spawn(.{}, SilentMonitor.run, .{&silent});
+    defer thread.join();
+
+    const start = monotonicMs();
+    try std.testing.expectError(error.MonitorUnavailable, sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}", 100));
+    try std.testing.expect(monotonicMs() - start < 1_000);
 }
 
 fn readyPollDelayMs(attempt: u32) u64 {
@@ -4664,7 +4709,7 @@ fn sendInitialOutputRequest(allocator: std.mem.Allocator, io: Io, socket_path: [
 }
 
 fn sendShutdownRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) ![]const u8 {
-    return sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}");
+    return sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}", monitor_reply_deadline_ms);
 }
 
 fn sendSuspendRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, out_dir: []const u8) ![]const u8 {
@@ -4743,10 +4788,12 @@ fn parseDiskForkPreparedResponse(
 
 fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
     try verifyMonitorHello(allocator, io, socket_path);
-    return sendControlJsonRaw(allocator, io, socket_path, json);
+    return sendControlJsonRaw(allocator, io, socket_path, json, null);
 }
 
-fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
+/// Sends one request line and reads one response line. With a deadline, a
+/// monitor that has not answered in time is treated as unavailable.
+fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8, deadline_ms: ?u64) ![]const u8 {
     const address = try controlSocketAddress(socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
     defer stream.close(io);
@@ -4756,9 +4803,32 @@ fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const
     writeAll(io, stream, json) catch return error.MonitorUnavailable;
     writeAll(io, stream, "\n") catch return error.MonitorUnavailable;
 
-    var reader = stream.reader(io, read_buffer);
-    const line = reader.interface.takeDelimiterExclusive('\n') catch return error.MonitorUnavailable;
+    const line = try readControlLine(stream.socket.handle, read_buffer, deadline_ms);
     return allocator.dupe(u8, line);
+}
+
+fn readControlLine(fd: std.c.fd_t, buffer: []u8, deadline_ms: ?u64) ![]const u8 {
+    const deadline = if (deadline_ms) |ms| monotonicMs() +| ms else null;
+    var len: usize = 0;
+    while (len < buffer.len) {
+        const wait_ms: i32 = if (deadline) |end| blk: {
+            const now = monotonicMs();
+            if (now >= end) return error.MonitorUnavailable;
+            break :blk @intCast(@min(end - now, std.math.maxInt(i32)));
+        } else -1;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&fds, wait_ms) == 0) return error.MonitorUnavailable;
+        const n = std.c.read(fd, buffer[len..].ptr, buffer.len - len);
+        if (n < 0) {
+            if (std.c.errno(n) == .INTR) continue;
+            return error.MonitorUnavailable;
+        }
+        if (n == 0) return error.MonitorUnavailable;
+        const end = len + @as(usize, @intCast(n));
+        if (std.mem.indexOfScalar(u8, buffer[len..end], '\n')) |index| return buffer[0 .. len + index];
+        len = end;
+    }
+    return error.MonitorUnavailable;
 }
 
 const MonitorHelloResponse = struct {
@@ -4773,7 +4843,7 @@ fn verifyMonitorHello(allocator: std.mem.Allocator, io: Io, socket_path: []const
 }
 
 fn verifyMonitorHelloWithPath(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, spore_executable_path: ?[]const u8) !void {
-    const response = try sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"hello\"}");
+    const response = try sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"hello\"}", monitor_reply_deadline_ms);
     defer allocator.free(response);
     try validateMonitorHello(allocator, response, spore_executable_path);
 }
