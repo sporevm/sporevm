@@ -28,6 +28,7 @@ const attach_mod = @import("attach.zig");
 const backend_mod = @import("backend.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
+const spore_fork = @import("spore_fork.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const system = @import("system.zig");
@@ -1576,7 +1577,7 @@ pub fn forkNamed(
 
         try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
         try writeSporeExecDefaults(arena, snapshot_dir, source_spec.value.exec_defaults);
-        _ = try spore.fork(arena, .{
+        _ = try spore_fork.fork(arena, .{
             .parent_dir = snapshot_dir,
             .out_dir = children_dir,
             .count = options.count,
@@ -1602,7 +1603,7 @@ pub fn forkNamed(
         try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
         try writeSporeExecDefaults(arena, snapshot_dir, source_spec.value.exec_defaults);
 
-        _ = try spore.fork(arena, .{
+        _ = try spore_fork.fork(arena, .{
             .parent_dir = snapshot_dir,
             .out_dir = children_dir,
             .count = options.count,

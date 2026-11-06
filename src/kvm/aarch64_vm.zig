@@ -21,6 +21,7 @@ const net = @import("../virtio/net.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const platform = @import("../platform.zig");
 const spore = @import("../spore.zig");
+const spore_fork = @import("../spore_fork.zig");
 const topology = @import("../topology.zig");
 const vmm = @import("../aarch64/vmm.zig");
 
@@ -125,7 +126,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         if (m.memory_state) |state| try mem_dev.restoreState(state);
         try vmm.applyTransports(transports, m.devices, ram);
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
-        if (restore.generation == null) try spore.refreshResumeParams(allocator, gen_dev);
+        if (restore.generation == null) try spore_fork.refreshResumeParams(allocator, gen_dev);
         try vmm.restoreMachine(allocator, &vm, vcpus, m.machine);
         try vmm.raiseGenerationIrqIfPending(&vm, gen_dev);
         if (restore_stats) |*stats| stats.state_ms = (try monotonicMs()) - state_start;

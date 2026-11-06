@@ -1,10 +1,14 @@
 const std = @import("std");
 
+const aarch64_topology = @import("aarch64/topology.zig");
+const board = @import("aarch64/board.zig");
 const chunk = @import("chunk.zig");
 const chunk_sealer = @import("chunk_sealer.zig");
 const disk_index = @import("disk_index.zig");
+const gicv3 = @import("aarch64/gicv3.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const spore = @import("spore.zig");
+const topology = @import("topology.zig");
 
 pub fn manifest(annotations: spore.Annotations) spore.Manifest {
     return .{
@@ -54,6 +58,130 @@ const sessions = [_]spore.Session{.{
         .terminal = true,
     },
 }};
+
+pub fn testTransport(device_id: u32) spore.TransportState {
+    return .{
+        .device_id = device_id,
+        .status = 0,
+        .device_features_sel = 0,
+        .driver_features_sel = 0,
+        .driver_features = 0,
+        .queue_sel = 0,
+        .interrupt_status = 0,
+        .queues = &.{},
+    };
+}
+
+pub fn testRootfs(mmio_slot: u32) spore.Rootfs {
+    return .{
+        .device = .{ .mmio_slot = mmio_slot },
+        .artifact = .{
+            .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            .size = 4096,
+        },
+        .source = .{
+            .requested_ref = "docker.io/library/ruby:3.3",
+            .resolved_image_ref = "docker.io/library/ruby@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .image_manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            .platform = "linux/arm64",
+            .builder_version = "sporevm-rootfs-v1",
+        },
+    };
+}
+
+pub fn testDisk(mmio_slot: u32) spore.Disk {
+    return .{
+        .device = .{ .mmio_slot = mmio_slot },
+        .size = 4096,
+        .base = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+}
+
+pub fn testVcpuState(index: topology.VcpuIndex) spore.VcpuState {
+    return .{
+        .index = index,
+        .mpidr = aarch64_topology.mpidrForIndex(index),
+        .gprs = [_]u64{0} ** 31,
+        .pc = 0,
+        .cpsr = 0,
+        .fpcr = 0,
+        .fpsr = 0,
+        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .sys_regs = &.{},
+        .icc_regs = &.{},
+        .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+    };
+}
+
+pub fn testManifestMulti(memory: spore.MemoryManifest, ram_size: u64, vcpus: []spore.VcpuState, redists: []const gicv3.RedistributorState) spore.Manifest {
+    return .{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .vcpu_count = @intCast(vcpus.len),
+            .ram_base = 0x8000_0000,
+            .ram_size = ram_size,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0802_0000,
+            .gic_redist_stride = 0x2_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{ .multi = .{
+            .vcpus = vcpus,
+            .gic = .{
+                .kind = .gicv3_multi,
+                .gicv3_multi = .{
+                    .dist_regs = &.{},
+                    .redistributors = redists,
+                    .line_levels = &.{},
+                },
+            },
+        } },
+        .devices = &.{},
+        .generation = .{ .generation = 1, .interrupt_status = 0, .params_b64 = "" },
+        .memory = memory,
+    };
+}
+
+const test_fork_line_levels = [_]gicv3.LineLevel{.{ .intid = board.generationIntid(), .asserted = false }};
+
+pub fn testForkManifest(memory: spore.MemoryManifest, ram_size: u64, initial_generation: u64) spore.Manifest {
+    return .{
+        .platform = .{
+            .cpu_profile = "sporevm-aarch64-v0",
+            .device_model_version = 4,
+            .vcpu_count = 1,
+            .ram_base = 0x8000_0000,
+            .ram_size = ram_size,
+            .gic_dist_base = 0x0800_0000,
+            .gic_redist_base = 0x0801_0000,
+            .gic_redist_stride = 0x2_0000,
+            .counter_frequency_hz = 24_000_000,
+        },
+        .machine = .{ .single = .{
+            .gprs = [_]u64{0} ** 31,
+            .pc = 0,
+            .cpsr = 0,
+            .fpcr = 0,
+            .fpsr = 0,
+            .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+            .sys_regs = &.{},
+            .icc_regs = &.{},
+            .vtimer = .{ .cntvct = 0, .cntv_ctl = 0, .cntv_cval = 0 },
+            .gic = .{
+                .kind = .gicv3,
+                .gicv3 = .{
+                    .dist_regs = &.{},
+                    .redist_regs = &.{},
+                    .line_levels = &test_fork_line_levels,
+                },
+            },
+        } },
+        .devices = &.{},
+        .generation = .{ .generation = initial_generation, .interrupt_status = 0, .params_b64 = "" },
+        .memory = memory,
+    };
+}
 
 pub const DiskFixture = struct {
     manifest: spore.Manifest,

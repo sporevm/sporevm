@@ -7,6 +7,7 @@
 
 const std = @import("std");
 
+const local_backing = @import("local_backing.zig");
 const local_paths = @import("local_paths.zig");
 const spore = @import("spore.zig");
 const topology = @import("topology.zig");
@@ -20,7 +21,7 @@ pub const Strategy = union(enum) {
 
 pub const Plan = struct {
     strategy: Strategy = .fresh,
-    reason: spore.LocalBackingRestoreReason = .not_attempted,
+    reason: local_backing.LocalBackingRestoreReason = .not_attempted,
 
     pub fn fromMemory(
         allocator: std.mem.Allocator,
@@ -31,7 +32,7 @@ pub const Plan = struct {
         vcpu_count: topology.VcpuCount,
     ) !Plan {
         try topology.validateVcpuCount(vcpu_count);
-        const local = try spore.openProvenLocalMemoryBacking(allocator, environ, dir, memory, ram_size);
+        const local = try local_backing.openProvenLocalMemoryBacking(allocator, environ, dir, memory, ram_size);
         return fromLocalBacking(local);
     }
 
@@ -47,7 +48,7 @@ pub const Plan = struct {
         return fromMemory(allocator, environ, dir, manifest.value.memory, ram_size, manifest.value.platform.vcpu_count);
     }
 
-    pub fn restoreSource(self: *const Plan) ?spore.LocalBackingRestoreSource {
+    pub fn restoreSource(self: *const Plan) ?local_backing.LocalBackingRestoreSource {
         return switch (self.strategy) {
             .fresh => null,
             .local_backing => .local_backing,
@@ -62,7 +63,7 @@ pub const Plan = struct {
         self.* = .{};
     }
 
-    fn fromLocalBacking(local: spore.LocalBackingPlan) Plan {
+    fn fromLocalBacking(local: local_backing.LocalBackingPlan) Plan {
         if (local.fd) |fd| {
             std.debug.assert(local.source == .local_backing);
             return .{ .strategy = .{ .local_backing = fd }, .reason = local.reason };
@@ -81,8 +82,8 @@ test "RAM restore plan resolves local and chunk strategies" {
         .reason = .proof_valid,
     });
     try std.testing.expect(local.strategy == .local_backing);
-    try std.testing.expectEqual(spore.LocalBackingRestoreSource.local_backing, local.restoreSource().?);
-    try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_valid, local.reason);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreSource.local_backing, local.restoreSource().?);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreReason.proof_valid, local.reason);
     try std.testing.expect(std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0)) >= 0);
     local.deinit();
     try std.testing.expect(local.strategy == .fresh);
@@ -95,8 +96,8 @@ test "RAM restore plan resolves local and chunk strategies" {
         .reason = .proof_unavailable,
     });
     try std.testing.expect(chunks_plan.strategy == .eager_chunks);
-    try std.testing.expectEqual(spore.LocalBackingRestoreSource.chunks, chunks_plan.restoreSource().?);
-    try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_unavailable, chunks_plan.reason);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreSource.chunks, chunks_plan.restoreSource().?);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreReason.proof_unavailable, chunks_plan.reason);
 }
 
 test "RAM restore plan validates one and multi-vCPU chunk restore" {
@@ -110,10 +111,10 @@ test "RAM restore plan validates one and multi-vCPU chunk restore" {
     };
     const one_vcpu = try Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 1);
     try std.testing.expect(one_vcpu.strategy == .eager_chunks);
-    try std.testing.expectEqual(spore.LocalBackingRestoreReason.no_backing, one_vcpu.reason);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreReason.no_backing, one_vcpu.reason);
     const multi_vcpu = try Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 2);
     try std.testing.expect(multi_vcpu.strategy == .eager_chunks);
-    try std.testing.expectEqual(spore.LocalBackingRestoreReason.no_backing, multi_vcpu.reason);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreReason.no_backing, multi_vcpu.reason);
     try std.testing.expectError(error.UnsupportedVcpuCount, Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, 0));
     try std.testing.expectError(error.UnsupportedVcpuCount, Plan.fromMemory(allocator, &env, "/unused", memory, spore.chunk_size, topology.max_vcpus + 1));
 }
@@ -139,15 +140,15 @@ test "RAM restore plan preserves proven backing for one and multi-vCPU restore" 
     const ram = try arena.alloc(u8, spore.chunk_size);
     @memset(ram, 0x5A);
     const memory = try spore.saveMemoryWithBacking(arena, dir, ram);
-    try spore.writeLocalMemoryBackingProof(arena, &env, dir, memory, ram.len);
+    try local_backing.writeLocalMemoryBackingProof(arena, &env, dir, memory, ram.len);
 
     var one = try Plan.fromMemory(arena, &env, dir, memory, ram.len, 1);
     try std.testing.expect(one.strategy == .local_backing);
-    try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_valid, one.reason);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreReason.proof_valid, one.reason);
     one.deinit();
 
     var multi = try Plan.fromMemory(arena, &env, dir, memory, ram.len, 2);
     defer multi.deinit();
     try std.testing.expect(multi.strategy == .local_backing);
-    try std.testing.expectEqual(spore.LocalBackingRestoreReason.proof_valid, multi.reason);
+    try std.testing.expectEqual(local_backing.LocalBackingRestoreReason.proof_valid, multi.reason);
 }
