@@ -1437,6 +1437,32 @@ test "manifest save replaces a symlink instead of writing through it" {
     loaded.deinit();
 }
 
+test "memory and manifest saves sync their directories" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, 4 * chunk_size);
+    @memset(ram, 0);
+    ram[0] = 1;
+    ram[2 * chunk_size] = 2;
+    ram[3 * chunk_size] = 3;
+
+    var dir_syncs: usize = 0;
+    chunk_sealer.testing.dir_syncs = &dir_syncs;
+    defer chunk_sealer.testing.dir_syncs = null;
+
+    // `chunks/` is synced once per non-zero chunk, before a manifest names it.
+    const memory = try saveMemoryWithBacking(arena, dir, ram);
+    try std.testing.expectEqual(@as(usize, 3), memory.chunks.len);
+    try std.testing.expectEqual(@as(usize, 3), dir_syncs);
+
+    try saveManifest(arena, dir, testForkManifest(memory, ram.len, 1));
+    try std.testing.expectEqual(@as(usize, 4), dir_syncs);
+}
+
 test "memory backing rejects non-canonical paths" {
     const valid_size: u64 = 4096;
     const invalid_paths = [_][]const u8{

@@ -8,9 +8,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const chunk = @import("chunk.zig");
 
-const testing = if (builtin.is_test) struct {
-    var created_dir_syncs: ?*usize = null;
-    var dir_syncs: ?*usize = null;
+pub const testing = if (builtin.is_test) struct {
+    pub var created_dir_syncs: ?*usize = null;
+    pub var dir_syncs: ?*usize = null;
 } else struct {};
 
 pub const Error = error{
