@@ -1008,7 +1008,7 @@ test "spore-netd TCP policy blocks host and control-plane destinations" {
 }
 
 test "spore-netd TCP denies blocked SYN before host socket open" {
-    var policy = try spore_net_policy.Runtime.init(.{});
+    var policy = try spore_net_policy.Runtime.init(.{ .egress = .unrestricted });
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
 
@@ -1035,9 +1035,7 @@ test "spore-netd TCP denies blocked SYN before host socket open" {
 }
 
 test "spore-netd TCP resets a guest connection to a denied destination" {
-    var config = spore_net_policy.Config{};
-    try config.addNetworkPolicy(.{});
-    var policy = try spore_net_policy.Runtime.init(config);
+    var policy = try spore_net_policy.Runtime.init(.{ .egress = .deny_all });
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
     defer gateway.deinit();
@@ -1052,7 +1050,7 @@ test "spore-netd TCP resets a guest connection to a denied destination" {
 }
 
 test "spore-netd TCP drops a SYN without a reset when the flow table is full" {
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-missing-full-table.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
@@ -1074,7 +1072,7 @@ test "spore-netd TCP drops a SYN without a reset when the flow table is full" {
 }
 
 test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial" {
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-missing-bound-service.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
@@ -1103,7 +1101,7 @@ test "spore-netd TCP routes two bound services independently and rejects duplica
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBindService(allocator, "metadata=unix:/tmp/metadata.sock");
     try std.testing.expectError(error.DuplicateBoundService, config.addBindService(allocator, "metadata:8080=unix:/tmp/metadata-2.sock"));
     try std.testing.expectError(error.DuplicateBoundService, config.addBindService(allocator, "cache=unix:/tmp/cache.sock"));
@@ -1174,7 +1172,7 @@ test "spore-netd TCP applies poll results only to the flow that was polled" {
     defer _ = std.c.close(listener);
     defer _ = std.c.unlink(path.ptr);
 
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("first", "first.spore.internal", 80, path);
     try config.addBoundUnixService("second", "second.spore.internal", 8080, path);
     try config.addBoundUnixService("missing", "missing.spore.internal", 81, "/tmp/sporevm-netd-missing-poll-service.sock");
@@ -1220,7 +1218,7 @@ test "spore-netd TCP delivers guest bytes sent after host EOF" {
     defer _ = std.c.close(listener);
     defer _ = std.c.unlink(path.ptr);
 
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
@@ -1262,7 +1260,7 @@ test "spore-netd TCP stops polling a host socket while the guest cannot take mor
     defer _ = std.c.close(listener);
     defer _ = std.c.unlink(path.ptr);
 
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
@@ -1309,7 +1307,7 @@ test "spore-netd TCP stops polling a host socket while the guest cannot take mor
 }
 
 test "spore-netd TCP enforces exact learned host ports" {
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .deny_all };
     try config.addExactHostPorts("github.com", &.{443});
     var policy = try spore_net_policy.Runtime.init(config);
 
@@ -1326,7 +1324,7 @@ test "spore-netd TCP enforces exact learned host ports" {
 }
 
 test "spore-netd TCP routes configured bound service ports to Unix sockets" {
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/missing-cleanroom.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
@@ -1346,8 +1344,7 @@ test "spore-netd TCP routes configured bound service ports to Unix sockets" {
 /// address, ports, sequence and acknowledgment numbers, window, payload
 /// length) followed by its payload.
 fn fuzzGatewayReceiveFrame(_: void, s: *std.testing.Smith) !void {
-    var config = spore_net_policy.Config{};
-    try config.addNetworkPolicy(.{});
+    var config = spore_net_policy.Config{ .egress = .deny_all };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-fuzz-missing.sock");
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;

@@ -347,8 +347,7 @@ const CreateOptions = struct {
     options_path: ?[]const u8 = null,
     image_pull_policy: run_mod.PullPolicy = .missing,
     initial_output: InitialOutputDisposition = .retain,
-    network: run_mod.NetworkMode = .disabled,
-    network_policy: run_mod.NetworkPolicy = .{},
+    network: run_mod.Network = .disabled,
     command_mode: run_mod.CommandMode = .shell,
     command: []const []const u8 = &.{},
 };
@@ -455,17 +454,6 @@ pub const ForkNamedOptions = struct {
     debug: bool = false,
 };
 
-pub const NamedNetworkOptions = struct {
-    enabled: bool = false,
-    allow_cidrs: []const []const u8 = &.{},
-    allow_hosts: []const []const u8 = &.{},
-    /// Null leaves public egress unrestricted, like plain `--net`. A policy
-    /// denies everything its rules do not allow, so `.{}` denies all egress.
-    policy: ?spore_net_policy.NetworkPolicy = null,
-    bound_services: []const spore_net_policy.BoundService = &.{},
-    port_forwards: []const spore_net_policy.PortForwardConfig = &.{},
-};
-
 pub const InitialOutputDisposition = enum {
     retain,
     discard,
@@ -514,7 +502,7 @@ pub const CreateNamedOptions = struct {
     /// Optional caller command. Image-backed creates prepend OCI Entrypoint;
     /// when omitted they use OCI Entrypoint and Cmd. Non-image creates remain idle.
     initial_command: []const []const u8 = &.{},
-    network: NamedNetworkOptions = .{},
+    network: run_mod.Network = .disabled,
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
@@ -543,7 +531,6 @@ pub const ExecNamedOptions = struct {
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
-    network_policy: ?spore_net_policy.NetworkPolicy = null,
     interactive: bool = false,
     tty: bool = false,
 };
@@ -649,40 +636,13 @@ pub const ExecNamedStreamOptions = struct {
     terminal_size: TerminalSize = .{ .rows = 24, .cols = 80 },
 };
 
-const NamedNetworkConfig = struct {
-    mode: run_mod.NetworkMode = .disabled,
-    policy: run_mod.NetworkPolicy = .{},
-};
-
-fn namedNetworkConfig(options: NamedNetworkOptions) !NamedNetworkConfig {
-    if (!options.enabled) {
-        if (options.allow_cidrs.len != 0 or
-            options.allow_hosts.len != 0 or
-            options.policy != null or
-            options.bound_services.len != 0 or
-            options.port_forwards.len != 0) return error.InvalidNetworkPolicy;
-        return .{};
-    }
-    var config = run_mod.NetworkPolicy{};
-    for (options.allow_cidrs) |cidr| {
-        try config.addAllowCidr(cidr);
-    }
-    for (options.allow_hosts) |host| {
-        try config.addAllowHost(host);
-    }
-    if (options.policy) |policy| {
-        try config.addNetworkPolicy(policy);
-    }
-    for (options.bound_services) |service| {
-        try config.addBoundService(service);
-    }
-    for (options.port_forwards) |forward| {
-        if (forward.host_port == 0 or forward.guest_port == 0) return error.InvalidPortForward;
-        if (config.port_forward_count >= spore_net_policy.max_port_forwards) return error.TooManyPortForwards;
-        config.port_forwards[config.port_forward_count] = forward;
-        config.port_forward_count += 1;
-    }
-    return .{ .mode = .spore, .policy = config };
+/// The live policy a monitor reads, encoded next to the manifest form that a
+/// save records.
+fn specNetworkPolicy(arena: std.mem.Allocator, network: *const run_mod.Network) !?[]const u8 {
+    return switch (network.*) {
+        .disabled => null,
+        .spore => |*policy| try spore_net_policy.encodeArgAlloc(arena, policy),
+    };
 }
 
 const CreateTimingAnchors = struct {
@@ -704,7 +664,7 @@ fn createNamedWithTiming(
         .memory = options.memory,
         .vcpus = options.vcpus,
         .rootfs = options.rootfs_path != null or options.image_ref != null,
-        .network = options.network.enabled,
+        .network = options.network != .disabled,
     });
     try topology.validateVcpuCount(options.vcpus);
     try spore.validateAnnotations(options.annotations);
@@ -712,7 +672,6 @@ fn createNamedWithTiming(
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const named_network = try namedNetworkConfig(options.network);
 
     var spec = Spec{
         .name = options.name,
@@ -721,7 +680,8 @@ fn createNamedWithTiming(
         .initrd_path = options.initrd_path,
         .rootfs_path = options.rootfs_path,
         .image_ref = options.image_ref,
-        .network = try run_mod.manifestNetworkFromOptions(arena, named_network.mode, &named_network.policy),
+        .network = try run_mod.manifestNetworkFromOptions(arena, &options.network),
+        .network_policy = try specNetworkPolicy(arena, &options.network),
         .memory = options.memory,
         .vcpus = options.vcpus,
         .guest_port = options.guest_port,
@@ -729,7 +689,6 @@ fn createNamedWithTiming(
         .console_log_path = options.console_log_path,
         .annotations = options.annotations,
     };
-    spec.network_policy = if (named_network.mode == .spore) try spore_net_policy.encodeArgAlloc(arena, &named_network.policy) else null;
     const paths = try apiPaths(.{ .io = init.io, .environ_map = init.environ_map }, arena, spec.name);
     const paths_ms = monotonicMs();
     // Fail fast on a taken name, but claim it only once the image is ready,
@@ -876,7 +835,7 @@ pub fn restoreNamed(
     };
     defer parsed_manifest.deinit();
     const manifest = parsed_manifest.value;
-    const network_options = run_mod.networkOptionsFromManifestWithBindings(arena, manifest.network, options.bound_services) catch |err| switch (err) {
+    const network = run_mod.networkFromManifestWithBindings(arena, manifest.network, options.bound_services) catch |err| switch (err) {
         error.MissingBoundServiceBinding,
         error.UnexpectedBoundServiceBinding,
         error.DuplicateBoundServiceBinding,
@@ -922,8 +881,8 @@ pub fn restoreNamed(
         .rootfs = rootfs,
         .disk = disk,
         .disk_baseline_lease = if (disk_handoff) |handoff| handoff.lease else base.disk_baseline_lease,
-        .network = try run_mod.manifestNetworkFromOptions(arena, network_options.network, &network_options.policy),
-        .network_policy = if (network_options.network == .spore) try spore_net_policy.encodeArgAlloc(arena, &network_options.policy) else null,
+        .network = try run_mod.manifestNetworkFromOptions(arena, &network),
+        .network_policy = try specNetworkPolicy(arena, &network),
         .annotations = manifest.annotations,
         .sessions = manifest.sessions,
         .exec_defaults = manifest.exec_defaults orelse base.exec_defaults,
@@ -1052,7 +1011,6 @@ fn execNamedStreaming(
 ) !ExecNamedStreamingResult {
     clearLastError();
     if (options.command.len == 0) return error.InvalidGuestCommand;
-    if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1104,7 +1062,6 @@ fn startNamed(
     clearLastError();
     if (options.command.len == 0) return error.InvalidGuestCommand;
     if (options.interactive or options.tty) return error.UnsupportedInteractiveExec;
-    if (options.network_policy != null) return error.UnsupportedNetworkPolicyUpdate;
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1577,7 +1534,6 @@ pub fn createCli(
     parsed = try applyCreateOptionsFileLifecycleCli(init.io, allocator, stderr, mode, parsed);
     const parsed_ms = monotonicMs();
     const spec = parsed.spec;
-    const network = try createCliNetworkOptions(allocator, &parsed);
     const caller_command: []const []const u8 = if (parsed.command.len == 0)
         &.{}
     else
@@ -1598,7 +1554,7 @@ pub fn createCli(
         .image_ref = spec.image_ref,
         .image_pull_policy = parsed.image_pull_policy,
         .initial_command = caller_command,
-        .network = network,
+        .network = parsed.network,
         .memory = spec.memory,
         .vcpus = spec.vcpus,
         .guest_port = spec.guest_port,
@@ -2835,55 +2791,6 @@ fn writeOptionalCount(writer: *Io.Writer, value: ?u64) !void {
     }
 }
 
-/// Plain `--net` passes no policy and keeps public egress unrestricted; exact
-/// `--allow-host-port` rules become a policy, which denies by default.
-fn createCliNetworkOptions(allocator: std.mem.Allocator, parsed: *const CreateOptions) !NamedNetworkOptions {
-    if (parsed.network != .spore) return .{};
-    const network_rules = try createNetworkRulesFromConfig(allocator, &parsed.network_policy);
-    return .{
-        .enabled = true,
-        .allow_cidrs = parsed.network_policy.allowCidrSlice(),
-        .allow_hosts = parsed.network_policy.allowHostSlice(),
-        .policy = if (network_rules.len != 0) .{ .allow = network_rules } else null,
-        .bound_services = try createBoundServicesFromConfig(allocator, &parsed.network_policy),
-        .port_forwards = parsed.network_policy.portForwardSlice(),
-    };
-}
-
-fn createNetworkRulesFromConfig(
-    allocator: std.mem.Allocator,
-    policy: *const run_mod.NetworkPolicy,
-) ![]const spore_net_policy.NetworkRule {
-    const exact_rules = policy.exactRuleSlice();
-    if (exact_rules.len == 0) return &.{};
-    const rules = try allocator.alloc(spore_net_policy.NetworkRule, exact_rules.len);
-    for (exact_rules, rules) |rule, *out| {
-        out.* = .{
-            .host = rule.host,
-            .ports = try allocator.dupe(u16, rule.portSlice()),
-        };
-    }
-    return rules;
-}
-
-fn createBoundServicesFromConfig(
-    allocator: std.mem.Allocator,
-    policy: *const run_mod.NetworkPolicy,
-) ![]const spore_net_policy.BoundService {
-    const cli_services = policy.boundServiceSlice();
-    if (cli_services.len == 0) return &.{};
-    const services = try allocator.alloc(spore_net_policy.BoundService, cli_services.len);
-    for (cli_services, services) |service, *out| {
-        out.* = .{
-            .name = service.name,
-            .guest_host = service.guest_host,
-            .guest_port = service.guest_port,
-            .target = .{ .unix = service.unix_path },
-        };
-    }
-    return services;
-}
-
 fn addAnnotationArgLifecycleCli(
     allocator: std.mem.Allocator,
     stderr: *Io.Writer,
@@ -2985,15 +2892,18 @@ fn parseCreateOptionsFile(
             network.bound_services.len != 0;
         if (!network.enabled and has_network_fields) return error.InvalidNetworkPolicy;
         if (network.enabled) {
-            out.network = .spore;
-            for (network.allow_cidrs) |cidr| try out.network_policy.addAllowCidr(cidr);
-            for (network.allow_hosts) |host| try out.network_policy.addAllowHost(host);
-            for (network.allow_host_ports) |rule| try out.network_policy.addExactHostPorts(rule.host, rule.ports);
-            for (network.network_rules) |rule| try out.network_policy.addExactHostPorts(rule.host, rule.ports);
+            // Like plain `--net`, egress stays unrestricted unless a rule
+            // restricts it.
+            var policy = spore_net_policy.Config{ .egress = .unrestricted };
+            for (network.allow_cidrs) |cidr| try policy.addAllowCidr(cidr);
+            for (network.allow_hosts) |host| try policy.addAllowHost(host);
+            for (network.allow_host_ports) |rule| try policy.addExactHostPorts(rule.host, rule.ports);
+            for (network.network_rules) |rule| try policy.addExactHostPorts(rule.host, rule.ports);
             for (network.bound_services) |service| {
                 const guest_host = service.guest_host orelse try std.fmt.allocPrint(allocator, "{s}.spore.internal", .{service.name});
-                try out.network_policy.addBoundUnixService(service.name, guest_host, service.guest_port, service.unix_path);
+                try policy.addBoundUnixService(service.name, guest_host, service.guest_port, service.unix_path);
             }
+            out.network = .{ .spore = policy };
         }
     }
     if (out.spec.rootfs_path != null and out.spec.image_ref != null) return error.InvalidRootfsInput;
@@ -3014,8 +2924,9 @@ fn parseCreateArgs(
     var max_memory_set = false;
     var image_pull_policy: run_mod.PullPolicy = .missing;
     var initial_output: InitialOutputDisposition = .retain;
-    var network: run_mod.NetworkMode = .disabled;
-    var network_policy = run_mod.NetworkPolicy{};
+    var network_requested = false;
+    // Plain `--net` leaves egress unrestricted; allow flags narrow it.
+    var network_policy = spore_net_policy.Config{ .egress = .unrestricted };
     var command_mode: run_mod.CommandMode = .shell;
     var command: ?[]const []const u8 = null;
 
@@ -3066,7 +2977,7 @@ fn parseCreateArgs(
             };
         } else if (std.mem.eql(u8, args[i], "--net")) {
             field_flag_seen = true;
-            network = .spore;
+            network_requested = true;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
             field_flag_seen = true;
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
@@ -3202,7 +3113,7 @@ fn parseCreateArgs(
         const message = "spore create: --pull requires --image";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
-    if (network == .disabled and network_policy.hasRules()) {
+    if (!network_requested and network_policy.hasRules()) {
         const message = "spore create: network flags require --net";
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
     }
@@ -3215,8 +3126,7 @@ fn parseCreateArgs(
         .options_path = options_path,
         .image_pull_policy = image_pull_policy,
         .initial_output = initial_output,
-        .network = network,
-        .network_policy = network_policy,
+        .network = if (network_requested) .{ .spore = network_policy } else .disabled,
         .command_mode = command_mode,
         .command = command orelse &.{},
     };
@@ -5555,7 +5465,7 @@ test "durable lifecycle metadata drops the live network policy" {
     try writeSporeLifecycleSpec(allocator, io, dir, .{
         .name = "child",
         .network = .{ .default_action = spore.network_default_deny },
-        .network_policy = "{\"default_deny\":true}",
+        .network_policy = "{\"egress\":{\"allowlist\":{\"cidrs\":[],\"hosts\":[],\"host_ports\":[]}},\"bound_services\":[],\"port_forwards\":[]}",
     });
     var parsed = (try readSporeLifecycleSpec(allocator, io, dir)).?;
     defer parsed.deinit();
@@ -5815,14 +5725,15 @@ test "create parser accepts network allow policy" {
         "127.0.0.1:8080:80",
     }, allocator, &stderr.writer, .human);
 
-    try std.testing.expectEqual(run_mod.NetworkMode.spore, opts.network);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
-    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
-    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.port_forward_count);
-    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.port_forwards[0].host_port);
-    try std.testing.expectEqual(@as(u16, 80), opts.network_policy.port_forwards[0].guest_port);
+    const policy = &opts.network.spore;
+    try std.testing.expect(policy.egress == .allowlist);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowCidrSlice().len);
+    try std.testing.expectEqualStrings("93.184.216.34/32", policy.allowCidrSlice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowHostSlice().len);
+    try std.testing.expectEqualStrings("example.com", policy.allowHostSlice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), policy.portForwardSlice().len);
+    try std.testing.expectEqual(@as(u16, 8080), policy.portForwardSlice()[0].host_port);
+    try std.testing.expectEqual(@as(u16, 80), policy.portForwardSlice()[0].guest_port);
 }
 
 test "create parser accepts annotations exact host ports and bound services" {
@@ -5845,14 +5756,16 @@ test "create parser accepts annotations exact host ports and bound services" {
     defer opts.spec.annotations.deinit(allocator);
 
     try std.testing.expectEqualStrings("compile=fast", opts.spec.annotations.map.get("cleanroom.stage").?);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.exact_rule_count);
-    try std.testing.expectEqualStrings("github.com", opts.network_policy.exact_rules[0].host);
-    try std.testing.expectEqual(@as(u16, 443), opts.network_policy.exact_rules[0].ports[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.bound_service_count);
-    try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
-    try std.testing.expectEqualStrings("metadata.spore.internal", opts.network_policy.bound_services[0].guest_host);
-    try std.testing.expectEqual(@as(u16, 8170), opts.network_policy.bound_services[0].guest_port);
-    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
+    const policy = &opts.network.spore;
+    try std.testing.expectEqual(@as(usize, 1), policy.exactRuleSlice().len);
+    try std.testing.expectEqualStrings("github.com", policy.exactRuleSlice()[0].host);
+    try std.testing.expectEqual(@as(u16, 443), policy.exactRuleSlice()[0].ports[0]);
+    const services = policy.boundServiceSlice();
+    try std.testing.expectEqual(@as(usize, 1), services.len);
+    try std.testing.expectEqualStrings("metadata", services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", services[0].unix_path);
 }
 
 test "create options file maps to create options" {
@@ -5884,17 +5797,17 @@ test "create options file maps to create options" {
     try std.testing.expectEqual(opts.spec.memory.initial_bytes, opts.spec.memory.maximum_bytes);
     try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.spec.vcpus);
     try std.testing.expectEqual(@as(u64, 120_000), opts.spec.timeout_ms);
-    try std.testing.expectEqual(run_mod.NetworkMode.spore, opts.network);
-    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
-    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
-    try std.testing.expectEqualStrings("github.com", opts.network_policy.exact_rules[0].host);
-    try std.testing.expectEqual(@as(u16, 443), opts.network_policy.exact_rules[0].ports[0]);
-    try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
-    try std.testing.expectEqualStrings("metadata.cleanroom.internal", opts.network_policy.bound_services[0].guest_host);
-    try std.testing.expectEqual(@as(u16, 8170), opts.network_policy.bound_services[0].guest_port);
-    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
-    const services = try createBoundServicesFromConfig(arena, &opts.network_policy);
+    const policy = &opts.network.spore;
+    try std.testing.expect(policy.egress == .allowlist);
+    try std.testing.expectEqualStrings("93.184.216.34/32", policy.allowCidrSlice()[0]);
+    try std.testing.expectEqualStrings("example.com", policy.allowHostSlice()[0]);
+    try std.testing.expectEqualStrings("github.com", policy.exactRuleSlice()[0].host);
+    try std.testing.expectEqual(@as(u16, 443), policy.exactRuleSlice()[0].ports[0]);
+    const services = policy.boundServiceSlice();
+    try std.testing.expectEqualStrings("metadata", services[0].name);
     try std.testing.expectEqualStrings("metadata.cleanroom.internal", services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", services[0].unix_path);
     try std.testing.expectEqualStrings("compile", opts.spec.annotations.map.get("cleanroom.stage").?);
 }
 
@@ -5910,24 +5823,6 @@ test "create options file rejects invalid contract inputs" {
     try std.testing.expectError(error.InvalidPullPolicy, parseCreateOptionsFile(arena, base, "{\"schema_version\":1,\"pull\":\"always\"}"));
 }
 
-test "create cli network rule conversion owns port slices" {
-    var policy = run_mod.NetworkPolicy{};
-    try policy.addExactHostPorts("github.com", &.{443});
-    try policy.addExactHostPorts("example.com", &.{8443});
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const rules = try createNetworkRulesFromConfig(arena, &policy);
-
-    try std.testing.expectEqual(@as(usize, 2), rules.len);
-    try std.testing.expectEqualStrings("github.com", rules[0].host);
-    try std.testing.expectEqual(@as(u16, 443), rules[0].ports[0]);
-    try std.testing.expectEqualStrings("example.com", rules[1].host);
-    try std.testing.expectEqual(@as(u16, 8443), rules[1].ports[0]);
-    try std.testing.expect(rules[0].ports.ptr != policy.exact_rules[0].portSlice().ptr);
-}
-
 fn fuzzCreateOptionsFile(_: void, s: *std.testing.Smith) !void {
     var buf: [4096]u8 = undefined;
     const len = s.slice(&buf);
@@ -5941,74 +5836,37 @@ test "fuzz create options file parsing" {
     try std.testing.fuzz({}, fuzzCreateOptionsFile, .{});
 }
 
-test "named network config accepts create cli policy" {
-    const config = try namedNetworkConfig(.{
-        .enabled = true,
-        .allow_cidrs = &.{"93.184.216.34/32"},
-        .allow_hosts = &.{"example.com"},
-        .policy = .{ .allow = &.{.{
-            .host = "github.com",
-            .ports = &.{443},
-        }} },
-        .bound_services = &.{.{
-            .name = "metadata",
-            .guest_host = "metadata.spore.internal",
-            .guest_port = 8170,
-            .target = .{ .unix = "/tmp/metadata.sock" },
-        }},
-        .port_forwards = &.{.{ .host_port = 8080, .guest_port = 80 }},
-    });
-
-    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
-    try std.testing.expectEqual(@as(usize, 1), config.policy.allow_cidr_count);
-    try std.testing.expectEqualStrings("93.184.216.34/32", config.policy.allow_cidrs[0]);
-    try std.testing.expectEqual(@as(usize, 1), config.policy.allow_host_count);
-    try std.testing.expectEqualStrings("example.com", config.policy.allow_hosts[0]);
-    try std.testing.expectEqual(@as(usize, 1), config.policy.exact_rule_count);
-    try std.testing.expectEqualStrings("github.com", config.policy.exact_rules[0].host);
-    try std.testing.expectEqual(@as(u16, 443), config.policy.exact_rules[0].ports[0]);
-    try std.testing.expectEqual(@as(usize, 1), config.policy.bound_service_count);
-    try std.testing.expectEqualStrings("metadata", config.policy.bound_services[0].name);
-    try std.testing.expectEqualStrings("metadata.spore.internal", config.policy.bound_services[0].guest_host);
-    try std.testing.expectEqual(@as(u16, 8170), config.policy.bound_services[0].guest_port);
-    try std.testing.expectEqualStrings("/tmp/metadata.sock", config.policy.bound_services[0].unix_path);
-    try std.testing.expectEqual(@as(usize, 1), config.policy.port_forward_count);
-    try std.testing.expectEqual(@as(u16, 8080), config.policy.port_forwards[0].host_port);
-    try std.testing.expectEqual(@as(u16, 80), config.policy.port_forwards[0].guest_port);
-}
-
-test "named network config keeps bare network unrestricted" {
-    const config = try namedNetworkConfig(.{ .enabled = true });
-
-    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
-    try std.testing.expect(!config.policy.default_deny);
-    try std.testing.expect(!config.policy.hasRules());
-}
-
-test "named network config enforces an explicit deny-all policy" {
-    const config = try namedNetworkConfig(.{ .enabled = true, .policy = .{} });
-    const runtime = try spore_net_policy.Runtime.init(config.policy);
-
-    try std.testing.expectEqual(run_mod.NetworkMode.spore, config.mode);
-    try std.testing.expectEqual(spore_net_policy.Decision.deny_not_allowed, runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
-}
-
-test "create cli keeps plain --net unrestricted and exact rules deny by default" {
+test "create cli keeps plain --net unrestricted and allow rules restrict egress" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var stderr: Io.Writer.Allocating = .init(arena);
 
     const plain = try parseCreateArgs(&.{ "bench-1", "--net" }, arena, &stderr.writer, .human);
-    const plain_config = try namedNetworkConfig(try createCliNetworkOptions(arena, &plain));
-    try std.testing.expectEqual(run_mod.NetworkMode.spore, plain_config.mode);
-    try std.testing.expect(!plain_config.policy.default_deny);
-    try std.testing.expect(!plain_config.policy.hasRules());
+    try std.testing.expect(plain.network.spore.egress == .unrestricted);
+    try std.testing.expect(!plain.network.spore.hasRules());
 
     const exact = try parseCreateArgs(&.{ "bench-1", "--net", "--allow-host-port", "github.com:443" }, arena, &stderr.writer, .human);
-    const exact_config = try namedNetworkConfig(try createCliNetworkOptions(arena, &exact));
-    try std.testing.expect(exact_config.policy.default_deny);
-    try std.testing.expectEqualStrings("github.com", exact_config.policy.exact_rules[0].host);
+    try std.testing.expect(exact.network.spore.egress == .allowlist);
+    try std.testing.expectEqualStrings("github.com", exact.network.spore.exactRuleSlice()[0].host);
+
+    const disabled = try parseCreateArgs(&.{"bench-1"}, arena, &stderr.writer, .human);
+    try std.testing.expectEqual(run_mod.NetworkMode.disabled, disabled.network);
+}
+
+test "named create hands an explicit deny-all policy to the monitor" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const network: run_mod.Network = .{ .spore = .{ .egress = .deny_all } };
+    const encoded = (try specNetworkPolicy(arena, &network)).?;
+    const runtime = try spore_net_policy.Runtime.init(try spore_net_policy.parseArg(arena, encoded));
+    try std.testing.expectEqual(spore_net_policy.Decision.deny_not_allowed, runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+    const manifest_network = (try run_mod.manifestNetworkFromOptions(arena, &network)).?;
+    try std.testing.expectEqualStrings(spore.network_default_deny, manifest_network.default_action orelse "");
+
+    try std.testing.expect((try specNetworkPolicy(arena, &.disabled)) == null);
 }
 
 test "new output dirs resolve to absolute paths" {

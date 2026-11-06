@@ -177,11 +177,11 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
         .terminal = opts.tty,
     });
 
-    const network_options = try run_mod.networkOptionsFromManifestWithBindings(allocator, manifest.network, opts.bound_services.slice());
+    const saved_network = try run_mod.networkFromManifestWithBindings(allocator, manifest.network, opts.bound_services.slice());
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
-    if (network_options.network == .spore) {
-        try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, network_options.policy);
+    if (saved_network == .spore) {
+        try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, saved_network.spore);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
@@ -225,7 +225,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer if (stdin_control) |*control| control.deinit();
     const exec_control = if (stdin_control) |*control| control.control() else null;
 
-    if (gateway_active) try events.emitPortForwards(&network_options.policy);
+    if (gateway_active) try events.emitPortForwards(&saved_network.spore);
     const ram_size = manifest.platform.ram_size;
     const memory_config = try spore.memoryConfig(ram_size, manifest.memory_state);
     const vcpu_count = manifest.platform.vcpu_count;

@@ -588,7 +588,12 @@ fn monitorOptionsForSession(options: Options, rootfs: spore.Rootfs, network_mode
         .command = &.{},
         .memory = options.resources.memory,
         .vcpus = options.resources.vcpus,
-        .network = if (network_mode == .spore) .spore else .disabled,
+        // `--network spore` gives build RUN steps unrestricted egress, like
+        // plain `spore run --net`.
+        .network = switch (network_mode) {
+            .spore => .{ .spore = .{ .egress = .unrestricted } },
+            .none => .disabled,
+        },
         .timeout_ms = options.timeout_ms,
         .spore_executable = options.spore_executable,
     };
@@ -2279,7 +2284,8 @@ test "build session forwards the selected spore executable to the monitor" {
     };
     const monitor_options = monitorOptionsForSession(options, rootfs, .spore, null);
     try std.testing.expectEqualStrings(executable, monitor_options.spore_executable);
-    try std.testing.expectEqual(run_mod.NetworkMode.spore, monitor_options.network);
+    try std.testing.expect(monitor_options.network.spore.egress == .unrestricted);
+    try std.testing.expectEqual(run_mod.NetworkMode.disabled, monitorOptionsForSession(options, rootfs, .none, null).network);
 }
 
 test "build copy request names context disk source" {

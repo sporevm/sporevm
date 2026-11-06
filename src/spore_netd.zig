@@ -823,7 +823,7 @@ test "spore-netd proxies bounded UDP DNS queries" {
     defer resolver.close();
     var proxy = resolver.proxy();
     defer proxy.deinit();
-    var policy = try spore_net_policy.Runtime.init(.{});
+    var policy = try spore_net_policy.Runtime.init(.{ .egress = .unrestricted });
 
     var query_buf: [512]u8 = undefined;
     const query = testDnsQuery(0x1234, "example.com", &query_buf);
@@ -858,7 +858,7 @@ test "spore-netd does not wait on the resolver and times out unanswered DNS" {
     defer resolver.close();
     var proxy = resolver.proxy();
     defer proxy.deinit();
-    var policy = try spore_net_policy.Runtime.init(.{});
+    var policy = try spore_net_policy.Runtime.init(.{ .egress = .unrestricted });
     var out: [max_frame_len]u8 = undefined;
 
     // Both queries are in flight at once; neither call waits for an answer.
@@ -895,7 +895,7 @@ test "spore-netd drops DNS queries beyond the pending table so the guest retries
     defer resolver.close();
     var proxy = resolver.proxy();
     defer proxy.deinit();
-    var policy = try spore_net_policy.Runtime.init(.{});
+    var policy = try spore_net_policy.Runtime.init(.{ .egress = .unrestricted });
     var out: [max_frame_len]u8 = undefined;
     var query_buf: [512]u8 = undefined;
 
@@ -921,7 +921,7 @@ test "spore-netd resolves bound services to the gateway" {
     const query = testDnsQuery(0x4545, "metadata.spore.internal", &query_buf);
     var proxy = DnsProxy{ .server_ipv4 = .{ 127, 0, 0, 1 } };
     defer proxy.deinit();
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
@@ -942,7 +942,7 @@ test "spore-netd returns empty NOERROR for bound service AAAA queries" {
     std.mem.writeInt(u16, query_buf[query.len - 4 ..][0..2], dns_type_aaaa, .big);
     var proxy = DnsProxy{ .server_ipv4 = .{ 127, 0, 0, 1 } };
     defer proxy.deinit();
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
@@ -961,7 +961,7 @@ test "spore-netd forwards ordinary DNS when a bound service exists" {
     defer resolver.close();
     var proxy = resolver.proxy();
     defer proxy.deinit();
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
@@ -975,7 +975,7 @@ test "spore-netd allow-host policy forwards only matching DNS names" {
     defer resolver.close();
     var proxy = resolver.proxy();
     defer proxy.deinit();
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .deny_all };
     try config.addAllowHost("example.com");
     var policy = try spore_net_policy.Runtime.init(config);
     var out: [max_frame_len]u8 = undefined;
@@ -997,7 +997,7 @@ test "spore-netd exact host-port policy forwards only matching DNS names" {
     defer resolver.close();
     var proxy = resolver.proxy();
     defer proxy.deinit();
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .deny_all };
     try config.addExactHostPorts("github.com", &.{443});
     var policy = try spore_net_policy.Runtime.init(config);
     var out: [max_frame_len]u8 = undefined;
@@ -1015,12 +1015,10 @@ test "spore-netd restricted policies refuse DNS names that cannot open egress" {
     const query = testDnsQuery(0x9595, "example.com", &query_buf);
     var out: [max_frame_len]u8 = undefined;
 
-    var deny_config = spore_net_policy.Config{};
-    try deny_config.addNetworkPolicy(.{});
-    var deny_policy = try spore_net_policy.Runtime.init(deny_config);
+    var deny_policy = try spore_net_policy.Runtime.init(.{ .egress = .deny_all });
     try expectDnsRcode(dnsQueryStep(&proxy, &deny_policy, query, &out).reply, 5);
 
-    var cidr_config = spore_net_policy.Config{};
+    var cidr_config = spore_net_policy.Config{ .egress = .deny_all };
     try cidr_config.addAllowCidr("93.184.216.0/24");
     var cidr_policy = try spore_net_policy.Runtime.init(cidr_config);
     try expectDnsRcode(dnsQueryStep(&proxy, &cidr_policy, query, &out).reply, 5);
@@ -1031,7 +1029,7 @@ test "spore-netd answers bound service DNS locally" {
     const query = testDnsQuery(0x1234, "gateway.cleanroom.internal", &query_buf);
     var proxy = DnsProxy{ .server_ipv4 = .{ 127, 0, 0, 1 } };
     defer proxy.deinit();
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("cleanroom-gateway", "gateway.cleanroom.internal", 8170, "/tmp/gateway.sock");
     var policy = try spore_net_policy.Runtime.init(config);
 
@@ -1061,7 +1059,7 @@ test "spore-netd drops malformed DNS compression and bad IPv4 checksums" {
 
     var proxy = DnsProxy{ .server_ipv4 = .{ 127, 0, 0, 1 } };
     defer proxy.deinit();
-    var policy = try spore_net_policy.Runtime.init(.{});
+    var policy = try spore_net_policy.Runtime.init(.{ .egress = .unrestricted });
     var out: [max_frame_len]u8 = undefined;
     try std.testing.expect(dnsQueryStep(&proxy, &policy, query, &out) == .not_dns);
 
@@ -1113,10 +1111,10 @@ fn fuzzFrameStreamAndArp(_: void, s: *std.testing.Smith) !void {
     var bytes: [frame_header_len + max_frame_len]u8 = undefined;
     const len = @min(s.slice(&bytes), bytes.len);
     var out: [max_frame_len]u8 = undefined;
-    var config = spore_net_policy.Config{};
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/metadata.sock");
     var policy = try spore_net_policy.Runtime.init(config);
-    var open_policy = try spore_net_policy.Runtime.init(.{});
+    var open_policy = try spore_net_policy.Runtime.init(.{ .egress = .unrestricted });
     // Forwarded queries go to the loopback discard port; nothing answers,
     // and the deadline below turns them into SERVFAIL replies.
     var proxy = DnsProxy{ .server_ipv4 = .{ 127, 0, 0, 1 }, .server_port = 9 };

@@ -18,6 +18,12 @@
 - Single-vCPU saves also wait until the vCPU is not in an interrupt handler,
   or fail with `InterruptStillActive`, as multi-vCPU saves do.
 
+### Other changes
+
+- Saved network spores record `default_action: "deny"` for every restricted
+  egress policy, including `--allow-cidr` and `--allow-host` alone; a policy
+  with allow entries but no `default_action` still restores as restricted.
+
 ## v0.18.0
 
 ### Upgrading

@@ -493,7 +493,7 @@ test "spore-net gateway spawns netd with policy arguments" {
     try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
 
     var process: Process = undefined;
-    try process.start(io, allocator, script_path, false, .{ .default_deny = true });
+    try process.start(io, allocator, script_path, false, .{ .egress = .deny_all });
     defer process.deinit();
 
     const observed = try Io.Dir.cwd().readFileAlloc(io, out_path, allocator, .limited(4096));
@@ -505,7 +505,8 @@ test "spore-net gateway spawns netd with policy arguments" {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const policy = try spore_net_policy.parseArg(arena.allocator(), lines.next().?);
-    try std.testing.expectEqualDeep(spore_net_policy.Config{ .default_deny = true }, policy);
+    try std.testing.expect(policy.egress == .allowlist);
+    try std.testing.expectEqual(@as(usize, 0), policy.allowCidrSlice().len + policy.allowHostSlice().len + policy.exactRuleSlice().len);
 }
 
 test "spore-net gateway buffers multiple rx frames" {

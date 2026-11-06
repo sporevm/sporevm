@@ -274,8 +274,8 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const parsed_ms = lifecycle.monotonicMs();
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
-    if (network.mode == .spore) {
-        try gateway.start(init.io, allocator, spore_executable, false, network.policy);
+    if (network == .spore) {
+        try gateway.start(init.io, allocator, spore_executable, false, network.spore);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
@@ -373,8 +373,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .vcpus = spec.vcpus,
         .guest_port = spec.guest_port,
         .timeout_ms = spec.timeout_ms,
-        .network = network.mode,
-        .network_policy = network.policy,
+        .network = network,
         .network_runtime = if (gateway_active) gateway.runtime() else null,
         .spore_executable = spore_executable,
     };
@@ -428,20 +427,15 @@ test "monitor console configuration matches opened and advertised path" {
     try std.testing.expectEqualStrings("console parity\n", bytes);
 }
 
-const MonitorNetwork = struct {
-    mode: run.NetworkMode = .disabled,
-    policy: run.NetworkPolicy = .{},
-};
-
 /// The network the monitor runs, from the live policy the claimer encoded in
 /// the spec next to its manifest form.
-fn monitorNetwork(allocator: std.mem.Allocator, spec: lifecycle.Spec) !MonitorNetwork {
+fn monitorNetwork(allocator: std.mem.Allocator, spec: lifecycle.Spec) !run.Network {
     const raw = spec.network_policy orelse {
         if (spec.network != null) return error.InvalidNetworkPolicy;
-        return .{};
+        return .disabled;
     };
     if (spec.network == null) return error.InvalidNetworkPolicy;
-    return .{ .mode = .spore, .policy = try spore_net_policy.parseArg(allocator, raw) };
+    return .{ .spore = try spore_net_policy.parseArg(allocator, raw) };
 }
 
 const StartupMetadata = struct {
@@ -2305,17 +2299,15 @@ test "monitor network comes from the spec's encoded live policy" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var policy = run.NetworkPolicy{};
-    try policy.addNetworkPolicy(.{});
+    var policy = spore_net_policy.Config{ .egress = .deny_all };
     try policy.addAllowCidr("93.184.216.34/32");
     try policy.addPortForward("127.0.0.1:8080:80");
-    const network = (try run.manifestNetworkFromOptions(allocator, .spore, &policy)).?;
+    const network = (try run.manifestNetworkFromOptions(allocator, &.{ .spore = policy })).?;
     const encoded = try spore_net_policy.encodeArgAlloc(allocator, &policy);
 
     const enabled = try monitorNetwork(allocator, .{ .name = "bench-1", .network = network, .network_policy = encoded });
-    try std.testing.expectEqual(run.NetworkMode.spore, enabled.mode);
-    try std.testing.expectEqualDeep(policy, enabled.policy);
-    try std.testing.expectEqual(run.NetworkMode.disabled, (try monitorNetwork(allocator, .{ .name = "bench-1" })).mode);
+    try std.testing.expectEqualStrings(encoded, try spore_net_policy.encodeArgAlloc(allocator, &enabled.spore));
+    try std.testing.expectEqual(run.NetworkMode.disabled, try monitorNetwork(allocator, .{ .name = "bench-1" }));
     try std.testing.expectError(error.InvalidNetworkPolicy, monitorNetwork(allocator, .{ .name = "bench-1", .network = network }));
     try std.testing.expectError(error.InvalidNetworkPolicy, monitorNetwork(allocator, .{ .name = "bench-1", .network_policy = encoded }));
 }

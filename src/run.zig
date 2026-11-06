@@ -72,7 +72,6 @@ fn directImagePlatformFor(zig_arch: std.Target.Cpu.Arch) !rootfs_mod.Platform {
 
 pub const MemoryConfig = memory_config.Config;
 pub const SaveTrigger = capture.Trigger;
-pub const NetworkPolicy = spore_net_policy.Config;
 pub const Rootfs = spore.Rootfs;
 pub const Disk = spore.Disk;
 pub const ClassifiedFailure = machine_output.CliError;
@@ -162,8 +161,7 @@ pub const Options = struct {
     continue_after_save: bool = false,
     commit: ?CommitOptions = null,
     annotations: spore.Annotations = .{},
-    network: NetworkMode = .disabled,
-    network_policy: spore_net_policy.Config = .{},
+    network: Network = .disabled,
     network_runtime: ?virtio_net.Runtime = null,
     events: ?EventSink = null,
     spore_executable: []const u8 = "spore",
@@ -228,10 +226,15 @@ pub const BoundServiceBindingList = struct {
 
 pub const BoundServiceBindingDiagnostic = spore_net_policy.BoundServiceBindingDiagnostic;
 
-pub const NetworkMode = enum {
+/// Guest networking. Spore networking always carries its policy, and the
+/// policy has no default egress, so enabling the network means choosing
+/// between unrestricted egress and an allowlist.
+pub const Network = union(enum) {
     disabled,
-    spore,
+    spore: spore_net_policy.Config,
 };
+
+pub const NetworkMode = std.meta.Tag(Network);
 
 pub const EventMode = enum {
     none,
@@ -1134,9 +1137,7 @@ pub const CliOptions = struct {
     save_path: ?[]const u8 = null,
     save_trigger: capture.Trigger = .exit,
     continue_after_save: bool = false,
-    network: NetworkMode = .disabled,
-    network_requested: bool = false,
-    network_policy: spore_net_policy.Config = .{},
+    network: Network = .disabled,
     bound_services: BoundServiceBindingList = .{},
     event_mode: EventMode = .none,
     interactive: bool = false,
@@ -1150,11 +1151,6 @@ pub const CliOptions = struct {
 pub const CommandMode = enum {
     argv,
     shell,
-};
-
-pub const NetworkOptions = struct {
-    network: NetworkMode = .disabled,
-    policy: spore_net_policy.Config = .{},
 };
 
 pub const cli_usage =
@@ -1235,9 +1231,9 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
     var save_trigger: capture.Trigger = .exit;
     var save_trigger_set = false;
     var continue_after_save = false;
-    var network: NetworkMode = .disabled;
     var network_requested = false;
-    var network_policy = spore_net_policy.Config{};
+    // Plain `--net` leaves egress unrestricted; allow flags narrow it.
+    var network_policy = spore_net_policy.Config{ .egress = .unrestricted };
     var bind_service_args = BoundServiceArgList{};
     var bound_services = BoundServiceBindingList{};
     var event_mode: EventMode = .none;
@@ -1348,7 +1344,6 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
                 std.process.exit(2);
             };
         } else if (std.mem.eql(u8, args[i], "--net")) {
-            network = .spore;
             network_requested = true;
         } else if (std.mem.eql(u8, args[i], "--allow-cidr")) {
             const raw = takeValue(args, &i, args[i]);
@@ -1485,11 +1480,11 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         std.debug.print("spore run: --inject with --save is not supported; injected files are intentionally not persisted\n", .{});
         std.process.exit(2);
     }
-    if (network == .disabled and network_policy.hasRules()) {
+    if (!network_requested and network_policy.hasRules()) {
         std.debug.print("spore run: network flags require --net\n", .{});
         std.process.exit(2);
     }
-    if (network == .disabled and network_policy.hasBoundServices()) {
+    if (!network_requested and network_policy.hasBoundServices()) {
         std.debug.print("spore run: --bind-service requires --net\n", .{});
         std.process.exit(2);
     }
@@ -1509,9 +1504,7 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         .save_path = save_path,
         .save_trigger = save_trigger,
         .continue_after_save = continue_after_save,
-        .network = network,
-        .network_requested = network_requested,
-        .network_policy = network_policy,
+        .network = if (network_requested) .{ .spore = network_policy } else .disabled,
         .bound_services = bound_services,
         .event_mode = event_mode,
         .interactive = interactive,
@@ -1647,38 +1640,40 @@ pub fn cliGuestCommandFromMode(allocator: std.mem.Allocator, mode: CommandMode, 
     };
 }
 
-pub fn networkOptionsFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !NetworkOptions {
-    return networkOptionsFromManifestWithBindings(allocator, manifest_network, &.{});
+pub fn networkFromManifest(allocator: std.mem.Allocator, manifest_network: ?spore.Network) !Network {
+    return networkFromManifestWithBindings(allocator, manifest_network, &.{});
 }
 
-pub fn networkOptionsFromManifestWithBindings(
+pub fn networkFromManifestWithBindings(
     allocator: std.mem.Allocator,
     manifest_network: ?spore.Network,
     bound_services: []const spore_net_policy.BoundServiceBinding,
-) !NetworkOptions {
-    return networkOptionsFromManifestWithBindingDiagnostic(allocator, manifest_network, bound_services, null);
+) !Network {
+    return networkFromManifestWithBindingDiagnostic(allocator, manifest_network, bound_services, null);
 }
 
-pub fn networkOptionsFromManifestWithBindingDiagnostic(
+pub fn networkFromManifestWithBindingDiagnostic(
     allocator: std.mem.Allocator,
     manifest_network: ?spore.Network,
     bound_services: []const spore_net_policy.BoundServiceBinding,
     diagnostic: ?*BoundServiceBindingDiagnostic,
-) !NetworkOptions {
+) !Network {
     if (diagnostic) |diag| diag.* = .{};
     const network = manifest_network orelse {
         if (bound_services.len != 0) {
             if (diagnostic) |diag| diag.unexpected_name = bound_services[0].name;
             return error.UnexpectedBoundServiceBinding;
         }
-        return .{};
+        return .disabled;
     };
-    return .{ .network = .spore, .policy = try spore_net_policy.configFromManifestNetworkWithBindingDiagnostic(allocator, network, bound_services, diagnostic) };
+    return .{ .spore = try spore_net_policy.configFromManifestNetworkWithBindingDiagnostic(allocator, network, bound_services, diagnostic) };
 }
 
-pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: NetworkMode, policy: *const spore_net_policy.Config) !?spore.Network {
-    if (network != .spore) return null;
-    return try spore_net_policy.manifestNetworkFromConfig(allocator, policy);
+pub fn manifestNetworkFromOptions(allocator: std.mem.Allocator, network: *const Network) !?spore.Network {
+    return switch (network.*) {
+        .disabled => null,
+        .spore => |*policy| try spore_net_policy.manifestNetworkFromConfig(allocator, policy),
+    };
 }
 
 pub fn resumeRootfsForRun(allocator: std.mem.Allocator, manifest: spore.Manifest) !?spore.Rootfs {
@@ -2346,14 +2341,14 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
     if (opts.network == .spore) {
-        try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network_policy);
+        try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network.spore);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
-    if (gateway_active) try events.emitPortForwards(&opts.network_policy);
+    if (gateway_active) try events.emitPortForwards(&opts.network.spore);
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
     errdefer finishGatewayNetworkEvents(&gateway, &gateway_active, &events);
-    const network_manifest = try manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy);
+    const network_manifest = try manifestNetworkFromOptions(allocator, &opts.network);
 
     const resuming = opts.resume_dir != null;
     if (opts.memory.isElastic() and ((!resuming and !opts.auto_memory_hotplug_capable) or opts.vcpus != 1)) return error.ElasticMemoryUnsupported;
@@ -2649,14 +2644,14 @@ pub fn executeMonitorWithBootArtifacts(
     var gateway_active = false;
     const network: virtio_net.Runtime = if (opts.network_runtime) |runtime| runtime else blk: {
         if (opts.network == .spore) {
-            try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network_policy);
+            try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network.spore);
             gateway_active = true;
             break :blk gateway.runtime();
         }
         break :blk .{};
     };
     defer if (gateway_active) gateway.deinit();
-    const network_manifest = try manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy);
+    const network_manifest = try manifestNetworkFromOptions(allocator, &opts.network);
     if (opts.injected_files.len != 0) return error.InjectedFileMonitorUnsupported;
     var runtime_disk = try runtime_disk_mod.open(context, allocator, .{
         .rootfs_path = opts.rootfs_path,
@@ -3966,7 +3961,7 @@ test "event writer emits port forward events" {
     var writer = EventWriter.init(allocator, &out.writer, "run");
     var events = EventEmitter.init(writer.sink(), "run");
     events.setBackend(.hvf);
-    var policy = spore_net_policy.Config{};
+    var policy = spore_net_policy.Config{ .egress = .unrestricted };
     try policy.addBoundUnixService("gateway", "gateway.internal", 8170, "/tmp/gateway.sock");
 
     try events.emitPortForwards(&policy);
@@ -4590,7 +4585,20 @@ test "run cli parser accepts source spore bound service bindings" {
     try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
     try std.testing.expectEqualStrings("metadata", opts.bound_services.items[0].name);
     try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.bound_services.items[0].target.unix);
-    try std.testing.expect(!opts.network_policy.hasRules());
+    try std.testing.expectEqual(NetworkMode.disabled, opts.network);
+}
+
+test "run cli parser keeps plain --net unrestricted and allow rules restrict it" {
+    const plain = try parseCliArgs(std.testing.allocator, &.{ "--net", "--", "/bin/true" });
+    try std.testing.expect(plain.network.spore.egress == .unrestricted);
+    try std.testing.expect(!plain.network.spore.hasRules());
+
+    const restricted = try parseCliArgs(std.testing.allocator, &.{ "--net", "--allow-cidr", "93.184.216.34/32", "--", "/bin/true" });
+    try std.testing.expect(restricted.network.spore.egress == .allowlist);
+    try std.testing.expectEqualStrings("93.184.216.34/32", restricted.network.spore.allowCidrSlice()[0]);
+
+    const disabled = try parseCliArgs(std.testing.allocator, &.{ "--", "/bin/true" });
+    try std.testing.expectEqual(NetworkMode.disabled, disabled.network);
 }
 
 test "run cli parser accepts network allow rules" {
@@ -4603,12 +4611,12 @@ test "run cli parser accepts network allow rules" {
         "--",
         "/bin/true",
     });
-    try std.testing.expectEqual(NetworkMode.spore, opts.network);
-    try std.testing.expect(opts.network_requested);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_cidr_count);
-    try std.testing.expectEqualStrings("93.184.216.34/32", opts.network_policy.allow_cidrs[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.allow_host_count);
-    try std.testing.expectEqualStrings("example.com", opts.network_policy.allow_hosts[0]);
+    const policy = &opts.network.spore;
+    try std.testing.expect(policy.egress == .allowlist);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowCidrSlice().len);
+    try std.testing.expectEqualStrings("93.184.216.34/32", policy.allowCidrSlice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowHostSlice().len);
+    try std.testing.expectEqualStrings("example.com", policy.allowHostSlice()[0]);
     try std.testing.expectEqualStrings("/bin/true", opts.command[0]);
 }
 
@@ -4624,15 +4632,16 @@ test "run cli parser accepts network bind services" {
         "--",
         "/bin/true",
     });
-    try std.testing.expectEqual(NetworkMode.spore, opts.network);
-    try std.testing.expect(opts.network_requested);
-    try std.testing.expectEqual(@as(usize, 2), opts.network_policy.bound_service_count);
-    try std.testing.expectEqualStrings("metadata", opts.network_policy.bound_services[0].name);
-    try std.testing.expectEqualStrings("metadata.spore.internal", opts.network_policy.bound_services[0].guest_host);
-    try std.testing.expectEqualStrings("/tmp/metadata.sock", opts.network_policy.bound_services[0].unix_path);
-    try std.testing.expectEqualStrings("cache", opts.network_policy.bound_services[1].name);
-    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.bound_services[1].guest_port);
-    try std.testing.expectEqualStrings("/tmp/cache.sock", opts.network_policy.bound_services[1].unix_path);
+    const policy = &opts.network.spore;
+    try std.testing.expect(policy.egress == .unrestricted);
+    const services = policy.boundServiceSlice();
+    try std.testing.expectEqual(@as(usize, 2), services.len);
+    try std.testing.expectEqualStrings("metadata", services[0].name);
+    try std.testing.expectEqualStrings("metadata.spore.internal", services[0].guest_host);
+    try std.testing.expectEqualStrings("/tmp/metadata.sock", services[0].unix_path);
+    try std.testing.expectEqualStrings("cache", services[1].name);
+    try std.testing.expectEqual(@as(u16, 8080), services[1].guest_port);
+    try std.testing.expectEqualStrings("/tmp/cache.sock", services[1].unix_path);
 }
 
 test "run cli parser accepts network port forwards" {
@@ -4643,11 +4652,10 @@ test "run cli parser accepts network port forwards" {
         "--",
         "/bin/true",
     });
-    try std.testing.expectEqual(NetworkMode.spore, opts.network);
-    try std.testing.expect(opts.network_requested);
-    try std.testing.expectEqual(@as(usize, 1), opts.network_policy.port_forward_count);
-    try std.testing.expectEqual(@as(u16, 8080), opts.network_policy.port_forwards[0].host_port);
-    try std.testing.expectEqual(@as(u16, 80), opts.network_policy.port_forwards[0].guest_port);
+    const forwards = opts.network.spore.portForwardSlice();
+    try std.testing.expectEqual(@as(usize, 1), forwards.len);
+    try std.testing.expectEqual(@as(u16, 8080), forwards[0].host_port);
+    try std.testing.expectEqual(@as(u16, 80), forwards[0].guest_port);
 }
 
 test "run restores network options from manifest policy" {
@@ -4665,34 +4673,62 @@ test "run restores network options from manifest policy" {
         }},
     };
 
-    const opts = try networkOptionsFromManifest(arena, manifest_network);
-    try std.testing.expectEqual(NetworkMode.spore, opts.network);
-    try std.testing.expect(opts.policy.default_deny);
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_cidr_count);
-    try std.testing.expectEqualStrings("93.184.216.34/32", opts.policy.allow_cidrs[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.allow_host_count);
-    try std.testing.expectEqualStrings("example.com", opts.policy.allow_hosts[0]);
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.exact_rule_count);
-    try std.testing.expectEqualStrings("github.com", opts.policy.exact_rules[0].host);
-    try std.testing.expectEqual(@as(u16, 443), opts.policy.exact_rules[0].ports[0]);
+    const network = try networkFromManifest(arena, manifest_network);
+    const policy = &network.spore;
+    try std.testing.expect(policy.egress == .allowlist);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowCidrSlice().len);
+    try std.testing.expectEqualStrings("93.184.216.34/32", policy.allowCidrSlice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), policy.allowHostSlice().len);
+    try std.testing.expectEqualStrings("example.com", policy.allowHostSlice()[0]);
+    try std.testing.expectEqual(@as(usize, 1), policy.exactRuleSlice().len);
+    try std.testing.expectEqualStrings("github.com", policy.exactRuleSlice()[0].host);
+    try std.testing.expectEqual(@as(u16, 443), policy.exactRuleSlice()[0].ports[0]);
 
-    const disabled = try networkOptionsFromManifest(arena, null);
-    try std.testing.expectEqual(NetworkMode.disabled, disabled.network);
-    try std.testing.expect(!disabled.policy.hasRules());
+    try std.testing.expectEqual(NetworkMode.disabled, try networkFromManifest(arena, null));
+}
+
+test "run manifest network keeps every egress variant" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var hosts_only = spore_net_policy.Config{ .egress = .deny_all };
+    try hosts_only.addAllowHost("example.com");
+    const cases = [_]struct { policy: spore_net_policy.Config, public: spore_net_policy.Decision }{
+        .{ .policy = .{ .egress = .unrestricted }, .public = .allow },
+        .{ .policy = .{ .egress = .deny_all }, .public = .deny_not_allowed },
+        .{ .policy = hosts_only, .public = .deny_not_allowed },
+    };
+    for (cases) |case| {
+        const network: Network = .{ .spore = case.policy };
+        const manifest_network = (try manifestNetworkFromOptions(arena, &network)).?;
+        // A restricted policy always records its default, so the manifest
+        // states the egress instead of implying it from its lists.
+        if (case.policy.egress == .allowlist) {
+            try std.testing.expectEqualStrings(spore.network_default_deny, manifest_network.default_action orelse "");
+        } else {
+            try std.testing.expect(manifest_network.default_action == null);
+        }
+        const restored = try networkFromManifest(arena, manifest_network);
+        try std.testing.expectEqual(std.meta.activeTag(case.policy.egress), std.meta.activeTag(restored.spore.egress));
+        const runtime = try spore_net_policy.Runtime.init(restored.spore);
+        try std.testing.expectEqual(case.public, runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
+    }
+
+    // Allow entries without `default_action` still restrict egress.
+    const implied = try networkFromManifest(arena, .{ .default_action = null, .allow_hosts = &.{"example.com"} });
+    try std.testing.expect(implied.spore.egress == .allowlist);
+    const implied_runtime = try spore_net_policy.Runtime.init(implied.spore);
+    try std.testing.expectEqual(spore_net_policy.Decision.deny_not_allowed, implied_runtime.decideIpv4Port(.{ 93, 184, 216, 34 }, 443));
 }
 
 test "run builds manifest network from active policy" {
-    var policy = spore_net_policy.Config{};
+    var policy = spore_net_policy.Config{ .egress = .deny_all };
     try policy.addAllowCidr("93.184.216.34/32");
     try policy.addAllowHost("example.com");
-    try policy.addNetworkPolicy(.{
-        .allow = &.{.{
-            .host = "github.com",
-            .ports = &.{443},
-        }},
-    });
+    try policy.addExactHostPorts("github.com", &.{443});
 
-    const network = (try manifestNetworkFromOptions(std.testing.allocator, .spore, &policy)) orelse return error.TestUnexpectedResult;
+    const network = (try manifestNetworkFromOptions(std.testing.allocator, &.{ .spore = policy })) orelse return error.TestUnexpectedResult;
     defer std.testing.allocator.free(network.allow_host_ports);
     defer std.testing.allocator.free(network.bound_services);
     try std.testing.expectEqualStrings(spore.network_kind_spore, network.kind);
@@ -4703,7 +4739,7 @@ test "run builds manifest network from active policy" {
     try std.testing.expectEqual(@as(u16, 443), network.allow_host_ports[0].ports[0]);
     try std.testing.expect(network.requirements.exact_host_port);
 
-    try std.testing.expect((try manifestNetworkFromOptions(std.testing.allocator, .disabled, &policy)) == null);
+    try std.testing.expect((try manifestNetworkFromOptions(std.testing.allocator, &.disabled)) == null);
 }
 
 test "run binding diagnostics name missing saved bound service" {
@@ -4725,7 +4761,7 @@ test "run binding diagnostics name missing saved bound service" {
 
         try std.testing.expectError(
             error.MissingBoundServiceBinding,
-            networkOptionsFromManifestWithBindingDiagnostic(arena, manifest_network, &.{}, &diagnostic),
+            networkFromManifestWithBindingDiagnostic(arena, manifest_network, &.{}, &diagnostic),
         );
     }
     try std.testing.expectEqualStrings("cleanroom-gateway", diagnostic.missing_name.?);
@@ -4745,16 +4781,17 @@ test "run restores saved bound services with live bindings" {
         .requirements = .{ .bound_services = true },
     };
 
-    const opts = try networkOptionsFromManifestWithBindings(arena, manifest_network, &.{.{
+    const network = try networkFromManifestWithBindings(arena, manifest_network, &.{.{
         .name = "cleanroom-gateway",
         .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
     }});
-    try std.testing.expectEqual(NetworkMode.spore, opts.network);
-    try std.testing.expectEqual(@as(usize, 1), opts.policy.bound_service_count);
-    try std.testing.expectEqualStrings("cleanroom-gateway", opts.policy.bound_services[0].name);
-    try std.testing.expectEqualStrings("gateway.cleanroom.internal", opts.policy.bound_services[0].guest_host);
-    try std.testing.expectEqual(@as(u16, 8170), opts.policy.bound_services[0].guest_port);
-    try std.testing.expectEqualStrings("/tmp/fresh-cleanroom-gateway.sock", opts.policy.bound_services[0].unix_path);
+    try std.testing.expect(network.spore.egress == .unrestricted);
+    const services = network.spore.boundServiceSlice();
+    try std.testing.expectEqual(@as(usize, 1), services.len);
+    try std.testing.expectEqualStrings("cleanroom-gateway", services[0].name);
+    try std.testing.expectEqualStrings("gateway.cleanroom.internal", services[0].guest_host);
+    try std.testing.expectEqual(@as(u16, 8170), services[0].guest_port);
+    try std.testing.expectEqualStrings("/tmp/fresh-cleanroom-gateway.sock", services[0].unix_path);
 }
 
 test "run rejects live bound service bindings that do not match manifest" {
@@ -4771,12 +4808,12 @@ test "run rejects live bound service bindings that do not match manifest" {
         .requirements = .{ .bound_services = true },
     };
 
-    try std.testing.expectError(error.MissingBoundServiceBinding, networkOptionsFromManifestWithBindings(arena, manifest_network, &.{.{
+    try std.testing.expectError(error.MissingBoundServiceBinding, networkFromManifestWithBindings(arena, manifest_network, &.{.{
         .name = "wrong-service",
         .target = .{ .unix = "/tmp/wrong.sock" },
     }}));
 
-    try std.testing.expectError(error.UnexpectedBoundServiceBinding, networkOptionsFromManifestWithBindings(arena, null, &.{.{
+    try std.testing.expectError(error.UnexpectedBoundServiceBinding, networkFromManifestWithBindings(arena, null, &.{.{
         .name = "cleanroom-gateway",
         .target = .{ .unix = "/tmp/fresh-cleanroom-gateway.sock" },
     }}));
