@@ -73,16 +73,6 @@ pub const RuntimeDisk = struct {
         return null;
     }
 
-    /// Clones the live writable head without sealing a durable disk index.
-    /// The VMM remains responsible for pausing vCPUs and draining virtio-blk.
-    pub fn exportForkHead(
-        self: *RuntimeDisk,
-        options: chunk_mapped_disk.ExportForkOptions,
-    ) !runtime_disk_fork.Head {
-        const disk = if (self.chunk_mapped) |*value| value else return error.ReadOnly;
-        return disk.exportForkHead(try self.forkBaseline(), options);
-    }
-
     /// Adopts a claimed head only after this runtime has independently opened
     /// the exact immutable baseline named by the descriptor.
     pub fn adoptForkHead(self: *RuntimeDisk, head: *runtime_disk_fork.Head) !void {
@@ -90,7 +80,7 @@ pub const RuntimeDisk = struct {
         const overlay = if (self.overlay) |*value| value else return error.ReadOnly;
         const expected = try self.forkBaseline();
         if (expected.kind != head.descriptor.baseline.kind or !std.mem.eql(u8, expected.identity, head.descriptor.baseline.identity)) return error.BadDescriptor;
-        if (disk.overlay_fd != overlay.fd) return error.BadManifest;
+        if ((disk.overlay orelse return error.ReadOnly).fd != overlay.fd) return error.BadManifest;
 
         const claimed_fd = head.overlay_fd;
         if (!try sameFilesystem(overlay.fd, claimed_fd)) return error.BadOverlay;
@@ -809,8 +799,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
 
     try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.chunk_mapped != null);
-    try std.testing.expect(runtime.chunk_mapped.?.cas_root == null);
-    try std.testing.expect(runtime.chunk_mapped.?.parent_root != null);
+    try std.testing.expect(runtime.chunk_mapped.?.index == .parent);
     try std.testing.expectEqual(@as(usize, @intCast(preload_result.nonzero_chunks)), runtime.chunk_mapped.?.indexDigestCount());
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, 0);
@@ -851,13 +840,13 @@ test "runtime disk exports and adopts a portable fork head" {
     defer parent.deinit();
     var child = try open(context, allocator, .{ .rootfs = rootfs });
     defer child.deinit();
-    try std.testing.expectEqualStrings(absolute_tmp_root, parent.chunk_mapped.?.overlay_dir.?);
-    try std.testing.expectEqualStrings(absolute_tmp_root, child.chunk_mapped.?.overlay_dir.?);
+    try std.testing.expectEqualStrings(absolute_tmp_root, parent.chunk_mapped.?.overlay.?.dir);
+    try std.testing.expectEqualStrings(absolute_tmp_root, child.chunk_mapped.?.overlay.?.dir);
 
     const parent_patch = [_]u8{0xA5} ** 97;
     try parent.chunk_mapped.?.writeAt(&parent_patch, spore.disk_chunk_size - 17);
     try parent.chunk_mapped.?.markZeroChunk(2);
-    var head = try parent.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    var head = try parent.snapshot().?.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
     defer head.deinit();
     const parent_overlay_fd = parent.overlay.?.fd;
     const replaced_child_fd = child.overlay.?.fd;
@@ -883,7 +872,7 @@ test "runtime disk exports and adopts a portable fork head" {
     try parent.chunk_mapped.?.readAt(readback[0..5], spore.disk_chunk_size + 1024);
     try std.testing.expectEqualSlices(u8, rootfs_bytes[spore.disk_chunk_size + 1024 ..][0..5], readback[0..5]);
 
-    var mismatched = try parent.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
+    var mismatched = try parent.snapshot().?.exportForkHead(.{ .allow_copy = true, .force_copy = true, .quiesced = true });
     defer mismatched.deinit();
     const mutable_identity = @constCast(mismatched.descriptor.baseline.identity);
     mutable_identity[mutable_identity.len - 1] = if (mutable_identity[mutable_identity.len - 1] == 'a') 'b' else 'a';
@@ -1109,7 +1098,7 @@ test "runtime disk benchmark env eagerly materializes missing flat rootfs from c
 
     try std.testing.expect(runtime.rootfs_fd != null);
     try std.testing.expect(runtime.chunk_mapped != null);
-    try std.testing.expect(runtime.chunk_mapped.?.cas_root == null);
+    try std.testing.expect(runtime.chunk_mapped.?.index != .cas);
     try std.testing.expect(try rootfs_cache.regularFileNoSymlink(io, digest_path));
     var readback: [4]u8 = undefined;
     try runtime.chunk_mapped.?.readAt(&readback, spore.disk_chunk_size);
