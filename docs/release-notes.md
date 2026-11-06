@@ -113,6 +113,10 @@ each memory chunk and its directory entry before the manifest names it, as
 dirty-tracked saves already did. On a Linux test host this added about 50 ms
 to a save with 32 MiB of non-zero RAM and 350 ms with 512 MiB (about 12%).
 
+Every `manifest.json` write is now atomic and fsynced with its directory, as
+pinned saves already were, so after a crash `spore run --save`, fork, clone or
+unpack output has the old manifest or the new one, never a truncated file.
+
 Saves also fsync the local `ram.backing` copy of guest RAM before writing the
 proof that lets restores map it. The proof binds the file, not its bytes, so
 before this a crash could leave a valid proof next to a backing that had lost
