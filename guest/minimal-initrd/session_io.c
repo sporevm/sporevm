@@ -6,20 +6,17 @@
 #define SPIO_RESIZE 4
 
 static void replay_append(struct replay_buffer *replay, uint64_t offset, const unsigned char *buf, size_t len) {
-  if (len >= REPLAY_CAP) {
-    memcpy(replay->data, buf + (len - REPLAY_CAP), REPLAY_CAP);
-    replay->base_offset = offset + len - REPLAY_CAP;
-    replay->len = REPLAY_CAP;
-    return;
+  if (len > REPLAY_CAP) {
+    buf += len - REPLAY_CAP;
+    offset += len - REPLAY_CAP;
+    len = REPLAY_CAP;
   }
-  if (replay->len + len > REPLAY_CAP) {
-    size_t drop = replay->len + len - REPLAY_CAP;
-    memmove(replay->data, replay->data + drop, replay->len - drop);
-    replay->base_offset += drop;
-    replay->len -= drop;
-  }
-  memcpy(replay->data + replay->len, buf, len);
-  replay->len += len;
+  size_t at = (size_t)(offset % REPLAY_CAP);
+  size_t first = len < REPLAY_CAP - at ? len : REPLAY_CAP - at;
+  memcpy(replay->data + at, buf, first);
+  memcpy(replay->data, buf + first, len - first);
+  replay->len = replay->len + len < REPLAY_CAP ? replay->len + len : REPLAY_CAP;
+  replay->base_offset = offset + len - replay->len;
 }
 
 int session_finished(const struct session *session) {
@@ -47,10 +44,13 @@ static int replay_available(const struct replay_buffer *replay, uint64_t offset,
 static int send_replay(struct session *session, struct client *client, const struct replay_buffer *replay, const char *name, uint64_t *client_offset, uint64_t end_offset) {
   if (!replay_available(replay, *client_offset, end_offset)) return -1;
   uint64_t replay_end = replay->base_offset + replay->len;
-  if (*client_offset >= replay_end) return 0;
-  size_t start = (size_t)(*client_offset - replay->base_offset);
-  size_t len = replay->len - start;
-  return send_client_output(session, client, name, client_offset, *client_offset, replay->data + start, len);
+  while (*client_offset < replay_end) {
+    size_t at = (size_t)(*client_offset % REPLAY_CAP);
+    size_t len = (size_t)(replay_end - *client_offset);
+    if (len > REPLAY_CAP - at) len = REPLAY_CAP - at;
+    if (send_client_output(session, client, name, client_offset, *client_offset, replay->data + at, len) != 0) return -1;
+  }
+  return 0;
 }
 
 int attach_client(struct session *session, struct client *client, uint64_t stdout_offset, uint64_t stderr_offset) {
@@ -76,7 +76,8 @@ void pump_session_stream(struct session *session, struct client *client, int is_
   struct replay_buffer *replay = is_stdout ? &session->stdout_replay : &session->stderr_replay;
   const char *name = is_stdout ? "stdout" : "stderr";
   uint64_t *client_offset = is_stdout ? &client->stdout_offset : &client->stderr_offset;
-  unsigned char buf[MAX_FRAME_PAYLOAD];
+  // A batch's worth per read, so each read leaves in one vsock write.
+  static unsigned char buf[SPIO_BATCH_FRAMES * MAX_FRAME_PAYLOAD];
 
   if (!*open) return;
   for (;;) {

@@ -28,6 +28,11 @@ elsewhere, push the parent, pull it there and pass the child's identity to
 - Restores from memory chunks read each chunk straight into guest RAM instead
   of through a heap buffer, taking another 28 to 43 percent off loads with a
   warm page cache and 10 to 35 percent with a cold one.
+- Guest command output reaches `spore run` and `spore exec` at 350 to 700
+  MiB/s, up from 14 MiB/s on KVM and 30 MiB/s on Hypervisor.framework. The
+  guest agent no longer copies it to the console unless the console is
+  logged, and sends it in 64 KiB vsock packets instead of two packets per
+  4 KiB.
 
 ### Fixes
 

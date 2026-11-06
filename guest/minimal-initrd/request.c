@@ -1027,6 +1027,8 @@ struct spore_agent_request_limits {
   uint64_t generation_params_bytes;
   uint64_t frame_payload_bytes;
   uint64_t initial_output_bytes;
+  uint64_t output_read_bytes;
+  uint64_t replay_bytes;
 };
 
 __attribute__((visibility("hidden"))) void spore_agent_test_request_limits(struct spore_agent_request_limits *out) {
@@ -1049,6 +1051,8 @@ __attribute__((visibility("hidden"))) void spore_agent_test_request_limits(struc
   out->generation_params_bytes = sizeof(((struct run_request *)0)->generation_params) - 1;
   out->frame_payload_bytes = MAX_FRAME_PAYLOAD;
   out->initial_output_bytes = INITIAL_OUTPUT_CAP;
+  out->output_read_bytes = SPIO_BATCH_FRAMES * MAX_FRAME_PAYLOAD;
+  out->replay_bytes = REPLAY_CAP;
 }
 
 // Returns -1 when the params are refused, 1 with *generation set when they

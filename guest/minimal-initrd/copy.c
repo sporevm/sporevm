@@ -319,7 +319,7 @@ static int emit_copy_entry(struct client *client, const char *path, const char *
       close(fd);
       return -1;
     }
-    unsigned char buf[MAX_FRAME_PAYLOAD];
+    static unsigned char buf[SPIO_BATCH_FRAMES * MAX_FRAME_PAYLOAD];
     int rc = 0;
     for (;;) {
       ssize_t n = read(fd, buf, sizeof(buf));

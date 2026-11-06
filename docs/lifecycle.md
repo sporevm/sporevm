@@ -287,8 +287,9 @@ state. Saved manifests can record `sessions`: an `id`, `kind: "process"`,
 stream capabilities for `stdin`, `stdout`, `stderr`, and `terminal`, and the
 `stdout_offset` and `stderr_offset` the saving run had printed up to. `spore
 attach` resumes the output there, so it prints only output that run did not.
-The guest keeps the last 64 KiB of each stream, so the attach fails if the run
-had fallen further behind.
+The guest keeps the last 256 KiB of each stream, more than a run can fall
+behind, but the attach fails if the session writes enough after the restore,
+before the attach reaches the guest, to push the saved offset out of it.
 Fresh `spore run --save` calls create a new output directory and record the
 `default` session. Commands started from an existing spore record a generated
 `run-*` session id, so a save of that

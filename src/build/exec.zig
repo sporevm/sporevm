@@ -1515,6 +1515,8 @@ const GuestRequestLimits = extern struct {
     generation_params_bytes: u64,
     frame_payload_bytes: u64,
     initial_output_bytes: u64,
+    output_read_bytes: u64,
+    replay_bytes: u64,
 };
 extern fn spore_agent_test_request_limits(out: *GuestRequestLimits) void;
 extern fn spore_agent_test_serve_requests(captured_script: [*:0]const u8, captured_finishes: c_int, attach: [*]const u8, attach_len: usize, requests: [*]const u8, request_lens: [*]const usize, request_count: usize, response: [*]u8, response_cap: usize, captured_stdout: *u64) isize;
@@ -1688,6 +1690,10 @@ test "host request limits match the guest agent" {
     try std.testing.expectEqual(@as(u64, @import("../generation.zig").params_size), guest.generation_params_bytes);
     try std.testing.expectEqual(@as(u64, @import("../spore_stream.zig").max_payload_len), guest.frame_payload_bytes);
     try std.testing.expectEqual(@as(u64, @import("../lifecycle.zig").initial_output_limit_bytes_per_stream), guest.initial_output_bytes);
+    // A `spore run` save trails the agent by at most a read it is still
+    // sending plus the vsock credit the host grants, and an attach must be
+    // able to resume from there.
+    try std.testing.expect(guest.replay_bytes >= guest.output_read_bytes + @import("../virtio/vsock.zig").host_stream_credit);
 }
 
 test "build agent fd budget covers every bounded hardlink authority" {
@@ -3052,6 +3058,48 @@ test "guest agent refuses an attach at the offsets it was asked to resume from" 
     try std.testing.expectEqualStrings("spore run: no session\n", result.stderr);
     try std.testing.expectEqual(@as(?u64, 5), result.stderr_offset);
     try std.testing.expectEqual(@as(?u32, 2), result.exit_code);
+}
+
+test "guest agent resumes a session's output from as far back as a save leaves the host" {
+    if (comptime !guest_agent_fuzz_supported) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const attach_stream = @import("../attach_stream.zig");
+
+    // More output than the agent keeps, so its replay buffer has wrapped.
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    for (1..60_001) |i| try expected.print(allocator, "{d}\n", .{i});
+    const total = expected.items.len;
+    var limits: GuestRequestLimits = undefined;
+    spore_agent_test_request_limits(&limits);
+    try std.testing.expect(total > limits.replay_bytes);
+    const scenario: AgentScenario = .{ .captured_script = "seq 1 60000", .captured_finishes = true };
+
+    // The furthest a `spore run` save can trail the agent.
+    const lag: usize = @intCast(limits.output_read_bytes + @import("../virtio/vsock.zig").host_stream_credit);
+    const behind = try attach_stream.attachV1Request(allocator, .{ .session_id = "captured", .stdout_offset = total - lag });
+    defer allocator.free(behind);
+    const resumed = try agentServeRequests(scenario, &.{behind});
+    defer resumed.deinit();
+    try std.testing.expectEqual(@as(?u64, total - lag), resumed.stdout_offset);
+    try std.testing.expectEqualSlices(u8, expected.items[total - lag ..], resumed.stdout);
+    try std.testing.expectEqual(@as(?u32, 0), resumed.exit_code);
+
+    // An attach where the output ends gets only the exit.
+    const at_end = try attach_stream.attachV1Request(allocator, .{ .session_id = "captured", .stdout_offset = total });
+    defer allocator.free(at_end);
+    const caught_up = try agentServeRequests(scenario, &.{at_end});
+    defer caught_up.deinit();
+    try std.testing.expectEqualStrings("", caught_up.stdout);
+    try std.testing.expectEqual(@as(?u32, 0), caught_up.exit_code);
+
+    // Output older than the agent keeps is gone.
+    const too_far = try attach_stream.attachV1Request(allocator, .{ .session_id = "captured", .stdout_offset = total - @as(usize, @intCast(limits.replay_bytes)) - 1 });
+    defer allocator.free(too_far);
+    const refused = try agentServeRequests(scenario, &.{too_far});
+    defer refused.deinit();
+    try std.testing.expectEqualStrings("spore run: requested replay offset is unavailable\n", refused.stderr);
+    try std.testing.expectEqual(@as(?u32, 125), refused.exit_code);
 }
 
 test "build nofile limit is bounded" {
