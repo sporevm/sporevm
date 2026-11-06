@@ -3,7 +3,8 @@
 //! Callers describe a run with `Config`; `prepare` validates it once, loads
 //! the restore manifest, and resolves vCPU and memory sizes before either
 //! backend creates a VM. Both backends share the device set, RAM mapping and
-//! restore, and transport snapshot helpers below.
+//! restore, transport snapshot helpers, spore writing and machine restore
+//! below.
 
 const std = @import("std");
 const aarch64_topology = @import("topology.zig");
@@ -15,8 +16,12 @@ const disk_layer = @import("../disk_layer.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const gicv3 = @import("gicv3.zig");
+const local_paths = @import("../local_paths.zig");
+const platform = @import("../platform.zig");
 const ram_restore = @import("../ram_restore.zig");
+const rootfs_mod = @import("../rootfs.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
+const saved_spore_pin = @import("../saved_spore_pin.zig");
 const spore = @import("../spore.zig");
 const topology = @import("../topology.zig");
 const blk = @import("../virtio/blk.zig");
@@ -25,6 +30,7 @@ const virtio_mem = @import("../virtio/mem.zig");
 const mmio = @import("../virtio/mmio.zig");
 const net = @import("../virtio/net.zig");
 const rng = @import("../virtio/rng.zig");
+const transport_snapshot = @import("../virtio/transport_snapshot.zig");
 const vsock = @import("../virtio/vsock.zig");
 const vsock_control = @import("../virtio/vsock_control.zig");
 const vsock_stream = @import("../virtio/vsock_stream.zig");
@@ -585,6 +591,320 @@ pub fn logNamedSnapshotPublication(comptime backend: []const u8, metrics: vsock_
     );
 }
 
+/// Where a backend placed the interrupt controller; manifests record it.
+pub const GicLayout = struct {
+    dist_base: u64,
+    redist_base: u64,
+    redist_stride: u64,
+};
+
+/// The parts of a run a snapshot captures besides machine state. They stay
+/// the same for the whole run.
+pub const SnapshotSource = struct {
+    config: *const Config,
+    transports: []mmio.Transport,
+    gen_dev: *const generation.Device,
+    vsock_dev: *const vsock.Vsock,
+    /// All guest RAM, including any virtio-mem region.
+    ram_bytes: []const u8,
+    /// Initial RAM size.
+    ram_size: u64,
+    /// Present only when the run has virtio-mem, which needs one vCPU.
+    memory_device: ?*const virtio_mem.Mem = null,
+};
+
+pub const SnapshotTarget = struct {
+    dir: []const u8,
+    /// `finish` seals the writable disk layer into the spore. A disk fork
+    /// only checks that the disk queues are idle and leaves the layer live.
+    disk: enum { finish, quiesce_only } = .finish,
+    /// Held by a named save that publishes through the rootfs cache.
+    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock = null,
+};
+
+/// Phase timings and sizes for a `<backend> snapshot metrics` line.
+pub const SnapshotMetrics = struct {
+    ram_mib: u64,
+    chunks: usize,
+    nonzero_chunks: usize,
+    machine_ms: u64,
+    devices_ms: u64,
+    generation_ms: u64,
+    memory_ms: u64,
+    disk_ms: u64,
+    manifest_ms: u64,
+    total_ms: u64,
+};
+
+/// Writes a spore of the stopped guest to `target.dir` and logs
+/// `<backend> snapshot metrics`. Every vCPU must be stopped: device feature
+/// selection is guest-mutable MMIO state, so validating it while a vCPU runs
+/// would race a reset or DRIVER_FEATURES write.
+///
+/// Machine state comes from each `vcpu.capture(vm, arena)` and
+/// `vm.captureGic(arena, vcpus)`; `vm.gic_layout` goes in the manifest.
+/// `dirty_tracker` is an optional pointer to the backend's tracker, which
+/// provides `finish()`, `metrics_mode` and `logSnapshotMetrics(SnapshotMetrics)`;
+/// without one, RAM is scanned in full.
+pub fn writeSnapshot(
+    allocator: std.mem.Allocator,
+    comptime backend: []const u8,
+    vm: anytype,
+    vcpus: anytype,
+    dirty_tracker: anytype,
+    source: SnapshotSource,
+    target: SnapshotTarget,
+) !void {
+    const config = source.config;
+    const dir = target.dir;
+    try transport_snapshot.validateFullSnapshotDevices(source.transports, source.vsock_dev);
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var pin_threaded = std.Io.Threaded.init(allocator, .{});
+    defer pin_threaded.deinit();
+    const pin_io = pin_threaded.io();
+    const clock = deadline.system_clock;
+
+    const total_start = clock.nowMs();
+    const machine = try captureMachine(arena, vm, vcpus);
+    const machine_ms = clock.nowMs() - total_start;
+    const devices_start = clock.nowMs();
+    const devices = try captureTransports(arena, source.transports);
+    const devices_ms = clock.nowMs() - devices_start;
+    var disk_quiesced = false;
+    if (config.disk_snapshot) |disk_state| {
+        if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
+            std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
+            return error.DeviceStatePending;
+        }
+        disk_quiesced = true;
+    } else if (config.rootfs) |rootfs_artifact| {
+        if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
+            std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
+            return error.DeviceStatePending;
+        }
+    }
+    const generation_start = clock.nowMs();
+    const gen_state = try source.gen_dev.capture(arena);
+    const generation_ms = clock.nowMs() - generation_start;
+    const memory_start = clock.nowMs();
+    const memory = if (dirty_tracker) |tracker|
+        try tracker.finish()
+    else
+        try spore.saveMemoryWithBacking(arena, dir, source.ram_bytes);
+    const memory_ms = clock.nowMs() - memory_start;
+    const memory_state = if (source.memory_device) |device| try device.captureState(arena, source.ram_size) else null;
+    if (config.environ_map) |environ| {
+        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, source.ram_bytes.len);
+    }
+    const disk_snapshot = if (target.disk == .finish) config.disk_snapshot else null;
+    var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
+    defer if (owned_cache_lock) |*lock| lock.deinit();
+    const disk_root = if (disk_snapshot != null and config.environ_map != null) blk: {
+        const cache_root = try local_paths.rootfsCacheRootPath(arena, config.environ_map.?);
+        if (target.rootfs_cache_lock) |lock| {
+            if (!try lock.ensureHeldFor(arena, cache_root)) return error.RootfsCacheLockNotHeld;
+        } else owned_cache_lock = try rootfs_mod.lockRootfsCacheExclusive(pin_io, arena, cache_root);
+        break :blk cache_root;
+    } else dir;
+    const disk_start = clock.nowMs();
+    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
+    const disk_ms = clock.nowMs() - disk_start;
+    const manifest_start = clock.nowMs();
+    const gic_layout: GicLayout = vm.gic_layout;
+    const saved_manifest = spore.Manifest{
+        .platform = .{
+            .cpu_profile = board.cpu_profile,
+            .device_model_version = board.device_model_version,
+            .vcpu_count = @intCast(vcpus.len),
+            .ram_base = board.ram_base,
+            .ram_size = source.ram_size,
+            .gic_dist_base = gic_layout.dist_base,
+            .gic_redist_base = gic_layout.redist_base,
+            .gic_redist_stride = gic_layout.redist_stride,
+            .counter_frequency_hz = try platform.hostCounterFrequencyHz(),
+        },
+        .machine = machine,
+        .devices = devices,
+        .generation = gen_state,
+        .annotations = config.annotations,
+        .rootfs = config.rootfs,
+        .disk = disk_manifest,
+        .network = config.network_manifest,
+        .sessions = config.sessions,
+        .memory_state = memory_state,
+        .memory = memory,
+    };
+    if (disk_manifest) |disk| {
+        if (config.environ_map != null) {
+            const registry = try saved_spore_pin.LockedRegistry.init(arena, disk_root, target.rootfs_cache_lock orelse &owned_cache_lock.?);
+            try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
+        } else try spore.saveManifest(arena, dir, saved_manifest);
+    } else try spore.saveManifest(arena, dir, saved_manifest);
+    const manifest_ms = clock.nowMs() - manifest_start;
+    const total_ms = clock.nowMs() - total_start;
+    const memory_plan = try spore.validateMemoryForRam(memory, source.ram_bytes.len);
+    const metrics = SnapshotMetrics{
+        .ram_mib = source.ram_size / 1024 / 1024,
+        .chunks = memory_plan.chunk_count,
+        .nonzero_chunks = memory_plan.nonzero_chunk_count,
+        .machine_ms = machine_ms,
+        .devices_ms = devices_ms,
+        .generation_ms = generation_ms,
+        .memory_ms = memory_ms,
+        .disk_ms = disk_ms,
+        .manifest_ms = manifest_ms,
+        .total_ms = total_ms,
+    };
+    if (vcpus.len > 1) {
+        std.log.info(
+            backend ++ " snapshot metrics: version=1 vcpus={d} mode={s} ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_total_ms={d}",
+            .{
+                vcpus.len,
+                if (dirty_tracker) |tracker| @TypeOf(tracker.*).metrics_mode else "full-scan",
+                metrics.ram_mib,
+                metrics.chunks,
+                metrics.nonzero_chunks,
+                metrics.machine_ms,
+                metrics.devices_ms,
+                metrics.generation_ms,
+                metrics.memory_ms,
+                metrics.disk_ms,
+                metrics.manifest_ms,
+                metrics.total_ms,
+            },
+        );
+    } else if (dirty_tracker) |tracker| {
+        tracker.logSnapshotMetrics(metrics);
+    } else {
+        std.log.info(
+            backend ++ " snapshot metrics: mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d}",
+            .{
+                metrics.ram_mib,
+                metrics.chunks,
+                metrics.nonzero_chunks,
+                metrics.machine_ms,
+                metrics.devices_ms,
+                metrics.generation_ms,
+                metrics.memory_ms,
+                metrics.disk_ms,
+                metrics.manifest_ms,
+                metrics.total_ms,
+                metrics.total_ms,
+            },
+        );
+    }
+    std.log.info("spore written to {s}", .{dir});
+}
+
+/// Writes the RAM half of a disk fork with `writeSnapshot`, then hands the
+/// fork batch to the control. `pause_started_ns` is when the source stopped.
+pub fn captureDiskFork(
+    allocator: std.mem.Allocator,
+    comptime backend: []const u8,
+    vm: anytype,
+    vcpus: anytype,
+    dirty_tracker: anytype,
+    source: SnapshotSource,
+    fork: vsock_control.DiskForkAction,
+    control: vsock_control.Control,
+    pause_started_ns: u64,
+) !void {
+    const disk = source.config.disk_snapshot orelse return error.BadManifest;
+    try writeSnapshot(allocator, backend, vm, vcpus, dirty_tracker, source, .{ .dir = fork.dir, .disk = .quiesce_only });
+    const ram_capture_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
+    var batch = try runtime_disk_fork_capture.prepare(allocator, disk, fork.count, .{
+        .allow_copy = fork.allow_copy,
+        .force_copy = fork.force_copy,
+    });
+    defer batch.deinit();
+    batch.pause_started_ns = pause_started_ns;
+    batch.ram_capture_ns = ram_capture_ns;
+    try control.completeDiskFork(&batch);
+}
+
+/// One vCPU saves the `single` machine shape, more save `multi` with every
+/// vCPU timer moved onto vCPU 0's counter.
+fn captureMachine(arena: std.mem.Allocator, vm: anytype, vcpus: anytype) !spore.Machine {
+    const states = try arena.alloc(spore.VcpuState, vcpus.len);
+    for (vcpus, states) |*vcpu, *state| state.* = try vcpu.capture(vm, arena);
+    const gic = try vm.captureGic(arena, vcpus);
+    try gicv3.validate(gic);
+    if (states.len == 1) {
+        const s = states[0];
+        return .{ .single = .{
+            .gprs = s.gprs,
+            .pc = s.pc,
+            .cpsr = s.cpsr,
+            .fpcr = s.fpcr,
+            .fpsr = s.fpsr,
+            .simd = s.simd,
+            .sys_regs = s.sys_regs,
+            .icc_regs = s.icc_regs,
+            .vtimer = s.vtimer,
+            .gic = gic,
+        } };
+    }
+    shareVcpuCounter(states, states[0].vtimer.cntvct);
+    return .{ .multi = .{ .vcpus = states, .gic = gic } };
+}
+
+/// Restores machine state from a manifest: the GIC, then one guest counter
+/// for the whole VM (vCPU 0's), then each vCPU with its timer moved onto that
+/// counter. `vm` provides `applyGic(allocator, vcpus, state)` and
+/// `setCounter(guest_cntvct)`; each vCPU provides `apply(vm, state)`.
+pub fn restoreMachine(allocator: std.mem.Allocator, vm: anytype, vcpus: anytype, machine: spore.Machine) !void {
+    var single: [1]spore.VcpuState = undefined;
+    const saved: []const spore.VcpuState, const gic: gicv3.State = switch (machine) {
+        .single => |m| blk: {
+            single[0] = .{
+                .index = 0,
+                .mpidr = aarch64_topology.mpidrForIndex(0),
+                .gprs = m.gprs,
+                .pc = m.pc,
+                .cpsr = m.cpsr,
+                .fpcr = m.fpcr,
+                .fpsr = m.fpsr,
+                .simd = m.simd,
+                .sys_regs = m.sys_regs,
+                .icc_regs = m.icc_regs,
+                .vtimer = m.vtimer,
+            };
+            break :blk .{ &single, m.gic };
+        },
+        .multi => |m| .{ m.vcpus, m.gic },
+    };
+    if (saved.len != vcpus.len) return error.PlatformMismatch;
+    for (saved, 0..) |state, index| {
+        if (state.index != index or state.mpidr != aarch64_topology.mpidrForIndex(state.index)) return error.PlatformMismatch;
+    }
+    try vm.applyGic(allocator, vcpus, gic);
+    const guest_cntvct = saved[0].vtimer.cntvct;
+    try vm.setCounter(guest_cntvct);
+    for (vcpus, saved) |*vcpu, state| {
+        var shared = state;
+        moveVtimer(&shared.vtimer, guest_cntvct);
+        try vcpu.apply(vm, shared);
+    }
+}
+
+/// Puts every vCPU timer on one guest counter value, as KVM and HVF give the
+/// whole VM one counter offset.
+fn shareVcpuCounter(states: []spore.VcpuState, guest_cntvct: u64) void {
+    for (states) |*state| moveVtimer(&state.vtimer, guest_cntvct);
+}
+
+/// Moves one vCPU timer onto `guest_cntvct` without changing its deadline
+/// relative to the counter. Modular arithmetic keeps enabled, masked and
+/// already expired timers correct across counter wrap.
+fn moveVtimer(vtimer: *spore.VtimerState, guest_cntvct: u64) void {
+    const delta = guest_cntvct -% vtimer.cntvct;
+    vtimer.cntv_cval +%= delta;
+    vtimer.cntvct = guest_cntvct;
+}
+
 pub const SpinLock = struct {
     locked: std.atomic.Value(bool) = .init(false),
 
@@ -906,4 +1226,159 @@ test "transport restore refuses ready queues whose rings leave guest RAM" {
     queues[0].used_addr = board.ram_base + guest_bytes.len;
     try std.testing.expectError(error.BadManifest, applyTransports(&transports, &states, ram));
     try std.testing.expect(!transports[0].queues[0].ready);
+}
+
+test "vtimers move onto one counter without changing deadlines" {
+    const Case = struct {
+        saved_counter: u64,
+        saved_cval: u64,
+        guest_counter: u64,
+        ctl: u64,
+    };
+    const cases = [_]Case{
+        .{ .saved_counter = 100, .saved_cval = 130, .guest_counter = 140, .ctl = 1 },
+        .{ .saved_counter = 140, .saved_cval = 130, .guest_counter = 100, .ctl = 3 },
+        .{ .saved_counter = std.math.maxInt(u64) - 4, .saved_cval = 3, .guest_counter = 6, .ctl = 0 },
+    };
+    for (cases) |case| {
+        var timer = spore.VtimerState{ .cntvct = case.saved_counter, .cntv_ctl = case.ctl, .cntv_cval = case.saved_cval };
+        const deadline_delta = timer.cntv_cval -% timer.cntvct;
+        moveVtimer(&timer, case.guest_counter);
+        try std.testing.expectEqual(case.guest_counter, timer.cntvct);
+        try std.testing.expectEqual(deadline_delta, timer.cntv_cval -% timer.cntvct);
+        try std.testing.expectEqual(case.ctl, timer.cntv_ctl);
+    }
+}
+
+const test_gic = gicv3.State{
+    .kind = .backend_private,
+    .backend_private = .{ .backend = .hvf, .format = gicv3.hvf_backend_private_format, .data_b64 = "AA==" },
+};
+
+fn testVcpuState(index: topology.VcpuIndex, vtimer: spore.VtimerState) spore.VcpuState {
+    return .{
+        .index = index,
+        .mpidr = aarch64_topology.mpidrForIndex(index),
+        .gprs = [_]u64{0} ** 31,
+        .pc = 0x1000 + @as(u64, index),
+        .cpsr = 0,
+        .fpcr = 0,
+        .fpsr = 0,
+        .simd = [_][2]u64{.{ 0, 0 }} ** 32,
+        .sys_regs = &.{},
+        .icc_regs = &.{},
+        .vtimer = vtimer,
+    };
+}
+
+/// Records the order `restoreMachine` drives a backend in.
+const TestVm = struct {
+    gic_layout: GicLayout = .{ .dist_base = 0, .redist_base = 0, .redist_stride = 0 },
+    gic_applied: bool = false,
+    counter: ?u64 = null,
+
+    pub fn captureGic(_: *const TestVm, _: std.mem.Allocator, _: []TestVcpu) !gicv3.State {
+        return test_gic;
+    }
+
+    pub fn applyGic(self: *TestVm, _: std.mem.Allocator, _: []TestVcpu, _: gicv3.State) !void {
+        self.gic_applied = true;
+    }
+
+    pub fn setCounter(self: *TestVm, guest_cntvct: u64) !void {
+        try std.testing.expect(self.gic_applied);
+        self.counter = guest_cntvct;
+    }
+};
+
+const TestVcpu = struct {
+    live: spore.VcpuState,
+    applied: ?spore.VcpuState = null,
+
+    pub fn capture(self: *TestVcpu, _: *TestVm, _: std.mem.Allocator) !spore.VcpuState {
+        return self.live;
+    }
+
+    pub fn apply(self: *TestVcpu, vm: *const TestVm, state: spore.VcpuState) !void {
+        try std.testing.expect(vm.counter != null);
+        self.applied = state;
+    }
+};
+
+test "one vCPU captures the single shape and more share vCPU 0's counter" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var vm = TestVm{};
+    var one = [_]TestVcpu{.{ .live = testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 1, .cntv_cval = 130 }) }};
+    const single = try captureMachine(arena_state.allocator(), &vm, @as([]TestVcpu, &one));
+    try std.testing.expectEqual(@as(u64, 100), single.single.vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 0x1000), single.single.pc);
+
+    var two = [_]TestVcpu{
+        .{ .live = testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 1, .cntv_cval = 130 }) },
+        .{ .live = testVcpuState(1, .{ .cntvct = 140, .cntv_ctl = 3, .cntv_cval = 120 }) },
+    };
+    const multi = (try captureMachine(arena_state.allocator(), &vm, @as([]TestVcpu, &two))).multi;
+    try std.testing.expectEqual(@as(usize, 2), multi.vcpus.len);
+    try std.testing.expectEqual(@as(u64, 100), multi.vcpus[0].vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 100), multi.vcpus[1].vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 120) -% 140, multi.vcpus[1].vtimer.cntv_cval -% multi.vcpus[1].vtimer.cntvct);
+    try std.testing.expectEqual(@as(u64, 3), multi.vcpus[1].vtimer.cntv_ctl);
+}
+
+test "restore applies the GIC, then one counter, then each vCPU on it" {
+    var vm = TestVm{};
+    var saved = [_]spore.VcpuState{
+        testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 1, .cntv_cval = 130 }),
+        testVcpuState(1, .{ .cntvct = 140, .cntv_ctl = 3, .cntv_cval = 120 }),
+    };
+    var vcpus = [_]TestVcpu{ .{ .live = undefined }, .{ .live = undefined } };
+    try restoreMachine(std.testing.allocator, &vm, @as([]TestVcpu, &vcpus), .{ .multi = .{ .vcpus = &saved, .gic = test_gic } });
+    try std.testing.expectEqual(@as(?u64, 100), vm.counter);
+    for (vcpus, saved) |vcpu, state| {
+        const applied = vcpu.applied.?;
+        try std.testing.expectEqual(state.pc, applied.pc);
+        try std.testing.expectEqual(@as(u64, 100), applied.vtimer.cntvct);
+        try std.testing.expectEqual(state.vtimer.cntv_cval -% state.vtimer.cntvct, applied.vtimer.cntv_cval -% applied.vtimer.cntvct);
+    }
+
+    var single_vm = TestVm{};
+    var one = [_]TestVcpu{.{ .live = undefined }};
+    const s = saved[0];
+    try restoreMachine(std.testing.allocator, &single_vm, @as([]TestVcpu, &one), .{ .single = .{
+        .gprs = s.gprs,
+        .pc = s.pc,
+        .cpsr = s.cpsr,
+        .fpcr = s.fpcr,
+        .fpsr = s.fpsr,
+        .simd = s.simd,
+        .sys_regs = s.sys_regs,
+        .icc_regs = s.icc_regs,
+        .vtimer = s.vtimer,
+        .gic = test_gic,
+    } });
+    try std.testing.expectEqual(@as(?u64, 100), single_vm.counter);
+    try std.testing.expectEqual(@as(topology.VcpuIndex, 0), one[0].applied.?.index);
+    try std.testing.expectEqual(aarch64_topology.mpidrForIndex(0), one[0].applied.?.mpidr);
+}
+
+test "restore rejects vCPU state that does not match the VM before touching it" {
+    var saved = [_]spore.VcpuState{
+        testVcpuState(0, .{ .cntvct = 100, .cntv_ctl = 0, .cntv_cval = 0 }),
+        testVcpuState(1, .{ .cntvct = 100, .cntv_ctl = 0, .cntv_cval = 0 }),
+    };
+    const machine = spore.Machine{ .multi = .{ .vcpus = &saved, .gic = test_gic } };
+
+    var vm = TestVm{};
+    var three = [_]TestVcpu{ .{ .live = undefined }, .{ .live = undefined }, .{ .live = undefined } };
+    try std.testing.expectError(error.PlatformMismatch, restoreMachine(std.testing.allocator, &vm, @as([]TestVcpu, &three), machine));
+
+    saved[1].index = 0;
+    var two = [_]TestVcpu{ .{ .live = undefined }, .{ .live = undefined } };
+    try std.testing.expectError(error.PlatformMismatch, restoreMachine(std.testing.allocator, &vm, @as([]TestVcpu, &two), machine));
+
+    saved[1] = testVcpuState(1, saved[1].vtimer);
+    saved[1].mpidr = aarch64_topology.mpidrForIndex(2);
+    try std.testing.expectError(error.PlatformMismatch, restoreMachine(std.testing.allocator, &vm, @as([]TestVcpu, &two), machine));
+    try std.testing.expect(!vm.gic_applied);
 }

@@ -9,21 +9,18 @@ const std = @import("std");
 const aarch64_topology = @import("../aarch64/topology.zig");
 const capture = @import("../capture.zig");
 const disk_layer = @import("../disk_layer.zig");
-const local_paths = @import("../local_paths.zig");
-const rootfs_mod = @import("../rootfs.zig");
-const saved_spore_pin = @import("../saved_spore_pin.zig");
 const dirty_ram = @import("../dirty_ram.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const hvf = @import("hvf.zig");
 const gic = @import("gic.zig");
 const board = @import("../aarch64/board.zig");
 const boot = @import("../aarch64/boot.zig");
+const gicv3 = @import("../aarch64/gicv3.zig");
 const generation = @import("../generation.zig");
 const guestmem = @import("../guestmem.zig");
 const mmio = @import("../virtio/mmio.zig");
 const blk = @import("../virtio/blk.zig");
 const net = @import("../virtio/net.zig");
-const transport_snapshot = @import("../virtio/transport_snapshot.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const vsock = @import("../virtio/vsock.zig");
 const vsock_control = @import("../virtio/vsock_control.zig");
@@ -197,10 +194,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             .vsock_dev = vsock_dev,
             .net_transport_index = net_transport_index,
             .vsock_transport_index = vsock_transport_index,
-            .rootfs = config.rootfs,
             .disk_snapshot = config.disk_snapshot,
-            .network_manifest = config.network_manifest,
-            .annotations = config.annotations,
             .environ_map = config.environ_map,
             .dist_base = dist_base,
             .dist_size = dist_size,
@@ -242,16 +236,14 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         .{ dist_base, dist_size, vcpu_redist_base, redist_stride, redist_base, redist_size },
     );
     const vcpu_ms = monotonicMs() - vcpu_start;
+    var vm = Vm{ .gic_layout = .{ .dist_base = dist_base, .redist_base = vcpu_redist_base, .redist_stride = redist_stride } };
+    const vcpus = (&primary)[0..1];
 
     var boot_ms: u64 = 0;
     if (prepared.manifest) |parsed| {
         const restore = config.start.restore;
         // Restore: memory, device, GIC, and vCPU state from the spore.
         const m = parsed.value;
-        const machine = switch (m.machine) {
-            .single => |single| single,
-            .multi => return error.UnsupportedVcpuCount,
-        };
         try platform_contract.checkManifest(m, .{
             .vcpu_count = 1,
             .ram_size = prepared.ram_size,
@@ -267,7 +259,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         try vmm.applyTransports(transports, m.devices, ram);
         try gen_dev.restore(allocator, restore.generation orelse m.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, gen_dev);
-        try snapshot.applyMachine(allocator, vcpu, machine);
+        try vmm.restoreMachine(allocator, &vm, vcpus, m.machine);
         try raiseGenerationIrqIfPending(gen_dev);
         if (restore_stats) |*stats| stats.state_ms = monotonicMs() - state_start;
     } else {
@@ -316,6 +308,16 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         boot_ms = monotonicMs() - boot_start;
     }
 
+    const tracker_ref: ?*DirtyTracker = if (dirty_tracker) |*tracker| tracker else null;
+    const snapshot_source = vmm.SnapshotSource{
+        .config = config,
+        .transports = transports,
+        .gen_dev = gen_dev,
+        .vsock_dev = vsock_dev,
+        .ram_bytes = ram_bytes,
+        .ram_size = prepared.ram_size,
+        .memory_device = if (mem_transport_index != null) mem_dev else null,
+    };
     const start_ms = monotonicMs();
     vmm.emitRestoreMetrics("hvf", &prepared, &restore_stats, start_ms);
     var attach_probe_ms: u64 = 0;
@@ -378,7 +380,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             continue;
         }
         if (config.exec_control) |control| {
-            control.reportStats(vmm.monitorStats(if (dirty_tracker) |*tracker| &tracker.sealer else null));
+            control.reportStats(vmm.monitorStats(if (tracker_ref) |tracker| &tracker.sealer else null));
             switch (try control.poll(vsock_dev)) {
                 .keep_running => {},
                 .stop => return .monitor_stopped,
@@ -394,13 +396,10 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                         null;
                     defer if (prepared_root) |*root| root.deinit();
                     const source_pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-                    try takeSnapshot(allocator, request.dir, vcpu, transports, gen_dev, vsock_dev, ram_bytes, .{
-                        .dist_base = dist_base,
-                        .redist_base = vcpu_redist_base,
-                        .redist_stride = @intCast(redist_stride),
-                        .ram_size = prepared.ram_size,
-                        .memory_device = if (mem_transport_index != null) mem_dev else null,
-                    }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, if (preparation) |*owned| owned.cacheLock() else null);
+                    try vmm.writeSnapshot(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, .{
+                        .dir = request.dir,
+                        .rootfs_cache_lock = if (preparation) |*owned| owned.cacheLock() else null,
+                    });
                     if (!request.continue_after) return .snapshotted;
                     const completed_dir = if (request.publish_dir) |publish_dir| blk: {
                         const publish_metrics = try control.publishSnapshot(&preparation.?, request.dir, publish_dir);
@@ -415,25 +414,8 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                     try control.completeRootfsSnapshot(disk_manifest);
                 },
                 .disk_fork => |request| {
-                    captureSingleHvfDiskFork(
-                        allocator,
-                        request,
-                        control,
-                        vcpu,
-                        transports,
-                        gen_dev,
-                        vsock_dev,
-                        ram_bytes,
-                        .{
-                            .dist_base = dist_base,
-                            .redist_base = vcpu_redist_base,
-                            .redist_stride = @intCast(redist_stride),
-                            .ram_size = prepared.ram_size,
-                            .memory_device = if (mem_transport_index != null) mem_dev else null,
-                        },
-                        config,
-                        if (dirty_tracker) |*tracker| tracker else null,
-                    ) catch |err| control.failDiskFork(err);
+                    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
+                    vmm.captureDiskFork(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, request, control, pause_started_ns) catch |err| control.failDiskFork(err);
                 },
             }
             _ = try flushVsockRx(vsock_dev, &transports_buf[vsock_transport_index], ram, @intCast(vsock_transport_index));
@@ -441,13 +423,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         if (config.captureRequest()) |request_capture| {
             if (request_capture.isAbortRequested()) return error.CaptureAborted;
             if (request_capture.isRequested() and !did_capture_request) {
-                try takeSnapshot(allocator, config.capture.?.dir, vcpu, transports, gen_dev, vsock_dev, ram_bytes, .{
-                    .dist_base = dist_base,
-                    .redist_base = vcpu_redist_base,
-                    .redist_stride = @intCast(redist_stride),
-                    .ram_size = prepared.ram_size,
-                    .memory_device = if (mem_transport_index != null) mem_dev else null,
-                }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
+                try vmm.writeSnapshot(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, .{ .dir = config.capture.?.dir });
                 request_capture.markCompleted();
                 if (request_capture.isAbortRequested()) return error.CaptureAborted;
                 if (config.continueAfterCapture()) {
@@ -464,13 +440,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
                 if (probe.state == .complete) {
                     if (exec_probe.on_complete == .stop) {
                         if (config.probeCaptureDir()) |dir| {
-                            try takeSnapshot(allocator, dir, vcpu, transports, gen_dev, vsock_dev, ram_bytes, .{
-                                .dist_base = dist_base,
-                                .redist_base = vcpu_redist_base,
-                                .redist_stride = @intCast(redist_stride),
-                                .ram_size = prepared.ram_size,
-                                .memory_device = if (mem_transport_index != null) mem_dev else null,
-                            }, config.rootfs, config.disk_snapshot, null, config.network_manifest, config.annotations, config.sessions, if (dirty_tracker) |*tracker| tracker else null, config.environ_map, null);
+                            try vmm.writeSnapshot(allocator, "hvf", &vm, vcpus, tracker_ref, snapshot_source, .{ .dir = dir });
                             return .snapshotted;
                         }
                         return .probe_complete;
@@ -486,14 +456,14 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
             std.log.debug("hvf exec probe timing: first_vcpu_entry_ms={d}", .{monotonicMs() -| start_ms});
         }
         const run_exit = try primary.run(.{
-            .all = (&primary)[0..1],
+            .all = vcpus,
             .gic_windows = .{
                 .dist_base = dist_base,
                 .dist_size = dist_size,
                 .redist_base = vcpu_redist_base,
                 .redist_size = redist_stride,
             },
-            .dirty_tracker = if (dirty_tracker) |*tracker| tracker else null,
+            .dirty_tracker = tracker_ref,
         });
         if (config.probe != null and !exec_probe_done and run_exit != .kicked) {
             if (prepared.restoring() and !logged_first_guest_exit) {
@@ -559,7 +529,7 @@ const HvfVcpuCaptureCommand = struct {
 
 const HvfVcpuApplyCommand = struct {
     state: spore.VcpuState,
-    shared_vtimer_offset: u64,
+    vtimer_offset: u64,
 };
 
 const HvfVcpuCommand = union(enum) {
@@ -631,6 +601,26 @@ const HvfVcpuCommandSlot = struct {
         defer self.lock.unlock();
         self.result = result;
         self.state = .complete;
+    }
+};
+
+/// What the shared snapshot code needs from the HVF VM: where the GIC sits
+/// and the guest counter offset every vCPU shares.
+const Vm = struct {
+    gic_layout: vmm.GicLayout,
+    /// Host counter minus guest counter; a restore sets it on every vCPU.
+    vtimer_offset: u64 = 0,
+
+    pub fn captureGic(_: *const Vm, arena: std.mem.Allocator, _: []const Vcpu) !gicv3.State {
+        return snapshot.captureGicState(arena);
+    }
+
+    pub fn applyGic(_: *const Vm, allocator: std.mem.Allocator, vcpus: []const Vcpu, state: gicv3.State) !void {
+        try snapshot.applyGicState(allocator, vcpus[0].handle, state);
+    }
+
+    pub fn setCounter(self: *Vm, guest_cntvct: u64) !void {
+        self.vtimer_offset = snapshot.hostCounter() -% guest_cntvct;
     }
 };
 
@@ -706,6 +696,26 @@ const Vcpu = struct {
 
     fn submit(self: *Vcpu, command: HvfVcpuCommand) !?u64 {
         return self.command_slot.submit(self, command);
+    }
+
+    /// Captures the stopped vCPU, on its owner thread.
+    pub fn capture(self: *Vcpu, _: *const Vm, arena: std.mem.Allocator) !spore.VcpuState {
+        if (std.Thread.getCurrentId() == self.owner_thread) {
+            return snapshot.captureVcpuState(arena, .{ .index = self.index, .handle = self.handle });
+        }
+        var state: spore.VcpuState = undefined;
+        var command = HvfVcpuCaptureCommand{ .allocator = arena, .out = &state };
+        _ = try self.submit(.{ .capture = &command });
+        return state;
+    }
+
+    /// Restores the vCPU on its owner thread, on the VM's shared counter.
+    pub fn apply(self: *Vcpu, vm: *const Vm, state: spore.VcpuState) !void {
+        if (std.Thread.getCurrentId() == self.owner_thread) {
+            return snapshot.applyVcpuState(self.handle, state, vm.vtimer_offset);
+        }
+        const command = HvfVcpuApplyCommand{ .state = state, .vtimer_offset = vm.vtimer_offset };
+        _ = try self.submit(.{ .apply = &command });
     }
 
     fn wake(self: *const Vcpu) void {
@@ -955,10 +965,7 @@ const MultiHvfRunOptions = struct {
     vsock_dev: *vsock.Vsock,
     net_transport_index: usize,
     vsock_transport_index: usize,
-    rootfs: ?spore.Rootfs,
     disk_snapshot: ?disk_layer.SnapshotState,
-    network_manifest: ?spore.Network,
-    annotations: spore.Annotations,
     environ_map: ?*const std.process.Environ.Map,
     dist_base: u64,
     dist_size: u64,
@@ -970,6 +977,17 @@ const MultiHvfRunOptions = struct {
     map_ram_ms: u64,
     hv_map_ram_ms: u64,
     devices_ms: u64,
+
+    fn snapshotSource(self: MultiHvfRunOptions) vmm.SnapshotSource {
+        return .{
+            .config = &self.prepared.config,
+            .transports = self.transports,
+            .gen_dev = self.gen_dev,
+            .vsock_dev = self.vsock_dev,
+            .ram_bytes = self.ram_bytes,
+            .ram_size = self.prepared.ram_size,
+        };
+    }
 };
 
 const MultiHvfThreadContext = struct {
@@ -1055,6 +1073,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         .redist_vcpus = vcpus,
     };
     for (contexts) |*ctx| ctx.gic_windows = gic_windows;
+    var vm = Vm{ .gic_layout = .{ .dist_base = options.dist_base, .redist_base = redist_window.base, .redist_stride = @intCast(redist_stride) } };
     std.log.debug(
         "gic: dist=0x{x}+0x{x} redist=0x{x}+0x{x} stride=0x{x} count={d} (region 0x{x}+0x{x})",
         .{ options.dist_base, options.dist_size, redist_window.base, redist_window.size, redist_stride, vcpus.len, options.redist_region_base, options.redist_region_size },
@@ -1085,8 +1104,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
         try vmm.applyTransports(options.transports, manifest.devices, options.ram);
         try options.gen_dev.restore(allocator, restore.generation orelse manifest.generation);
         if (restore.generation == null) try spore.refreshResumeParams(allocator, options.gen_dev);
-        try snapshot.applyGicState(allocator, vcpus[0].handle, machine.gic);
-        try applyHvfVcpuStates(vcpus, machine);
+        try vmm.restoreMachine(allocator, &vm, vcpus, manifest.machine);
         for (vcpus) |*vcpu| vcpu.setRunning();
         try raiseGenerationIrqIfPending(options.gen_dev);
         if (options.restore_stats.*) |*stats| stats.state_ms = monotonicMs() - state_start;
@@ -1203,28 +1221,10 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                         else
                             null;
                         defer if (prepared_root) |*root| root.deinit();
-                        var source_pause_started_ns: u64 = 0;
-                        takeSnapshotMulti(
-                            allocator,
-                            request.dir,
-                            vcpus,
-                            &state,
-                            &wake_set,
-                            options.transports,
-                            options.gen_dev,
-                            options.vsock_dev,
-                            options.ram_bytes,
-                            .{ .dist_base = options.dist_base, .redist_base = redist_window.base, .redist_stride = @intCast(redist_stride), .ram_size = options.prepared.ram_size },
-                            options.rootfs,
-                            options.disk_snapshot,
-                            null,
-                            options.network_manifest,
-                            options.annotations,
-                            config.sessions,
-                            options.environ_map,
-                            &source_pause_started_ns,
-                            if (preparation) |*owned| owned.cacheLock() else null,
-                        ) catch |err| {
+                        const source_pause_started_ns = snapshotMultiHvf(allocator, options, &vm, vcpus, &state, &wake_set, .{
+                            .dir = request.dir,
+                            .rootfs_cache_lock = if (preparation) |*owned| owned.cacheLock() else null,
+                        }) catch |err| {
                             state.clearSnapshot();
                             state.finish(.{ .err = err });
                             continue;
@@ -1250,7 +1250,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                         };
                         continue;
                     }
-                    return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), request.dir, null);
+                    return snapshotMultiHvfAndStop(allocator, options, &vm, vcpus, &state, &wake_set, request.dir, null);
                 },
                 .rootfs_snapshot => |request| {
                     const disk_manifest = takeRootfsSnapshotMulti(
@@ -1274,17 +1274,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     continue;
                 },
                 .disk_fork => |request| {
-                    captureMultiHvfDiskFork(
-                        allocator,
-                        options,
-                        vcpus,
-                        &state,
-                        &wake_set,
-                        redist_window.base,
-                        @intCast(redist_stride),
-                        request,
-                        control,
-                    ) catch |err| control.failDiskFork(err);
+                    captureMultiHvfDiskFork(allocator, options, &vm, vcpus, &state, &wake_set, request, control) catch |err| control.failDiskFork(err);
                     continue;
                 },
             }
@@ -1300,7 +1290,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                     std.log.debug("hvf multi-vcpu probe completion timing: observed_ms={d}", .{probe.elapsedMs()});
                     if (exec_probe.on_complete == .stop) {
                         if (config.probeCaptureDir()) |dir| {
-                            return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), dir, null);
+                            return snapshotMultiHvfAndStop(allocator, options, &vm, vcpus, &state, &wake_set, dir, null);
                         }
                         state.finish(.{ .exit = .probe_complete });
                         continue;
@@ -1319,7 +1309,7 @@ fn runFreshMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) 
                 continue;
             }
             if (request_capture.isRequested()) {
-                return snapshotMultiHvfAndStop(allocator, options, vcpus, &state, &wake_set, redist_window.base, @intCast(redist_stride), config.capture.?.dir, request_capture);
+                return snapshotMultiHvfAndStop(allocator, options, &vm, vcpus, &state, &wake_set, config.capture.?.dir, request_capture);
             }
         }
         sleepMs(1);
@@ -1333,38 +1323,33 @@ fn finishMultiHvfResult(result: MultiHvfResult) !ExitCause {
     };
 }
 
-fn snapshotMultiHvfAndStop(
+/// Stops every vCPU and writes a spore. Returns when the source paused.
+fn snapshotMultiHvf(
     allocator: std.mem.Allocator,
     options: MultiHvfRunOptions,
+    vm: *const Vm,
     vcpus: []Vcpu,
     state: *MultiHvfRunState,
     wake_set: *HvfVcpuWakeSet,
-    redist_base: u64,
-    redist_stride: u64,
+    target: vmm.SnapshotTarget,
+) !u64 {
+    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
+    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
+    try vmm.writeSnapshot(allocator, "hvf", vm, vcpus, @as(?*DirtyTracker, null), options.snapshotSource(), target);
+    return pause_started_ns;
+}
+
+fn snapshotMultiHvfAndStop(
+    allocator: std.mem.Allocator,
+    options: MultiHvfRunOptions,
+    vm: *const Vm,
+    vcpus: []Vcpu,
+    state: *MultiHvfRunState,
+    wake_set: *HvfVcpuWakeSet,
     snapshot_dir: []const u8,
     request_capture: ?*capture.Request,
 ) !ExitCause {
-    takeSnapshotMulti(
-        allocator,
-        snapshot_dir,
-        vcpus,
-        state,
-        wake_set,
-        options.transports,
-        options.gen_dev,
-        options.vsock_dev,
-        options.ram_bytes,
-        .{ .dist_base = options.dist_base, .redist_base = redist_base, .redist_stride = redist_stride, .ram_size = options.prepared.ram_size },
-        options.rootfs,
-        options.disk_snapshot,
-        null,
-        options.network_manifest,
-        options.annotations,
-        options.prepared.config.sessions,
-        options.environ_map,
-        null,
-        null,
-    ) catch |err| {
+    _ = snapshotMultiHvf(allocator, options, vm, vcpus, state, wake_set, .{ .dir = snapshot_dir }) catch |err| {
         if (state.result()) |result| return finishMultiHvfResult(result);
         state.finish(.{ .err = err });
         return err;
@@ -1420,70 +1405,6 @@ fn pauseHvfVcpusForSnapshot(vcpus: []Vcpu, state: *MultiHvfRunState, wake_set: *
         }
         if (paused_count == vcpus.len) return;
         sleepMs(1);
-    }
-}
-
-fn captureHvfVcpuStates(allocator: std.mem.Allocator, vcpus: []Vcpu) ![]spore.VcpuState {
-    const states = try allocator.alloc(spore.VcpuState, vcpus.len);
-    for (vcpus, states) |*vcpu, *out| {
-        var command = HvfVcpuCaptureCommand{ .allocator = allocator, .out = out };
-        _ = try vcpu.submit(.{ .capture = &command });
-    }
-    normalizeHvfVtimerCounters(states);
-    return states;
-}
-
-fn applyHvfVcpuStates(vcpus: []Vcpu, machine: spore.MachineStateMulti) !void {
-    if (machine.vcpus.len != vcpus.len) return error.PlatformMismatch;
-    const timer_plan = try planHvfVtimerRestore(machine.vcpus, snapshot.hostCounter());
-    for (machine.vcpus, 0..) |vcpu_state, i| {
-        if (vcpu_state.index != vcpus[i].index) return error.PlatformMismatch;
-        var normalized_state = vcpu_state;
-        snapshot.canonicalizeVtimer(&normalized_state.vtimer, timer_plan.canonical_cntvct);
-        var command = HvfVcpuApplyCommand{ .state = normalized_state, .shared_vtimer_offset = timer_plan.shared_offset };
-        _ = try vcpus[i].submit(.{ .apply = &command });
-    }
-}
-
-const HvfVtimerRestorePlan = struct {
-    canonical_cntvct: u64,
-    shared_offset: u64,
-};
-
-fn planHvfVtimerRestore(states: []const spore.VcpuState, host_counter: u64) !HvfVtimerRestorePlan {
-    if (states.len == 0) return error.PlatformMismatch;
-    const canonical_cntvct = states[0].vtimer.cntvct;
-    return .{
-        .canonical_cntvct = canonical_cntvct,
-        .shared_offset = snapshot.vtimerOffset(host_counter, canonical_cntvct),
-    };
-}
-
-fn normalizeHvfVtimerCounters(states: []spore.VcpuState) void {
-    if (states.len == 0) return;
-    const canonical_cntvct = states[0].vtimer.cntvct;
-    for (states) |*state| snapshot.canonicalizeVtimer(&state.vtimer, canonical_cntvct);
-}
-
-test "multi-vcpu HVF timer normalization uses one counter authority" {
-    var states: [2]spore.VcpuState = undefined;
-    states[0].vtimer = .{ .cntvct = 100, .cntv_ctl = 1, .cntv_cval = 130 };
-    states[1].vtimer = .{ .cntvct = 140, .cntv_ctl = 3, .cntv_cval = 120 };
-    const secondary_delta = states[1].vtimer.cntv_cval -% states[1].vtimer.cntvct;
-    normalizeHvfVtimerCounters(&states);
-    try std.testing.expectEqual(@as(u64, 100), states[0].vtimer.cntvct);
-    try std.testing.expectEqual(@as(u64, 100), states[1].vtimer.cntvct);
-    try std.testing.expectEqual(secondary_delta, states[1].vtimer.cntv_cval -% states[1].vtimer.cntvct);
-    try std.testing.expectEqual(@as(u64, 3), states[1].vtimer.cntv_ctl);
-
-    const plan = try planHvfVtimerRestore(&states, 175);
-    try std.testing.expectEqual(@as(u64, 100), plan.canonical_cntvct);
-    try std.testing.expectEqual(@as(u64, 75), plan.shared_offset);
-    for (states) |state| {
-        var normalized = state;
-        snapshot.canonicalizeVtimer(&normalized.vtimer, plan.canonical_cntvct);
-        try std.testing.expectEqual(plan.canonical_cntvct, normalized.vtimer.cntvct);
-        try std.testing.expectEqual(plan.shared_offset, snapshot.vtimerOffset(175, normalized.vtimer.cntvct));
     }
 }
 
@@ -1570,7 +1491,7 @@ fn processHvfVcpuCommand(vcpu: *Vcpu, command: HvfVcpuCommand) void {
             break :blk .ok;
         },
         .apply => |apply_cmd| blk: {
-            snapshot.applyVcpuStateWithOffset(vcpu.handle, apply_cmd.state, apply_cmd.shared_vtimer_offset) catch |err| break :blk .{ .err = err };
+            snapshot.applyVcpuState(vcpu.handle, apply_cmd.state, apply_cmd.vtimer_offset) catch |err| break :blk .{ .err = err };
             break :blk .ok;
         },
     };
@@ -1708,7 +1629,9 @@ const DirtyTracker = struct {
         return true;
     }
 
-    fn finish(self: *DirtyTracker) !spore.MemoryManifest {
+    pub const metrics_mode = "write-protect";
+
+    pub fn finish(self: *DirtyTracker) !spore.MemoryManifest {
         const tail_start = monotonicMs();
         try self.flushDirty();
         self.sealer.stats.tail_flush_ms = monotonicMs() - tail_start;
@@ -1718,6 +1641,63 @@ const DirtyTracker = struct {
         // every chunk here makes suspend scale with configured RAM even when the
         // dirty tail is empty; unfinished teardown still restores permissions.
         return try self.sealer.finishBacking();
+    }
+
+    /// Logs a single-vCPU snapshot's metrics with the write-protect counters.
+    pub fn logSnapshotMetrics(self: *const DirtyTracker, m: vmm.SnapshotMetrics) void {
+        const stats = self.stats;
+        const ram_stats = self.sealer.stats;
+        var metrics_head_buf: [2048]u8 = undefined;
+        var metrics_tail_buf: [3072]u8 = undefined;
+        const metrics_head = std.fmt.bufPrint(
+            &metrics_head_buf,
+            "hvf snapshot metrics: mode=write-protect ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} write_fault_count={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} seed_protect_ms={d} tail_flush_ms={d}",
+            .{
+                m.ram_mib,
+                m.chunks,
+                m.nonzero_chunks,
+                m.machine_ms,
+                m.devices_ms,
+                m.generation_ms,
+                m.memory_ms,
+                m.disk_ms,
+                m.manifest_ms,
+                m.total_ms,
+                m.total_ms,
+                stats.write_fault_count,
+                ram_stats.dirty_chunks_total,
+                ram_stats.host_dirty_ranges_total,
+                ram_stats.host_dirty_chunks_total,
+                ram_stats.sealed_chunks_total,
+                ram_stats.seed_ms,
+                ram_stats.seed_chunks,
+                ram_stats.seed_nonzero_chunks,
+                stats.seed_protect_ms,
+                ram_stats.tail_flush_ms,
+            },
+        ) catch "hvf snapshot metrics: formatting_failed=1";
+        const metrics_tail = std.fmt.bufPrint(
+            &metrics_tail_buf,
+            " seal_ms={d} protect_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_chunks_per_sec={d} sealed_chunks_per_sec={d}",
+            .{
+                ram_stats.seal_ms,
+                stats.protect_ms,
+                ram_stats.sealZeroScanMs(),
+                ram_stats.sealHashMs(),
+                ram_stats.sealChunkWriteMs(),
+                ram_stats.sealBackingWriteMs(),
+                ram_stats.seal_parallel_flush_count,
+                ram_stats.seal_parallel_workers_max,
+                ram_stats.finish_fchmod_ms,
+                ram_stats.finish_close_ms,
+                ram_stats.finish_close_deferred,
+                ram_stats.finish_rename_ms,
+                ram_stats.tracking_ms,
+                ram_stats.dirty_chunks_per_sec,
+                ram_stats.sealed_chunks_per_sec,
+            },
+        ) catch "";
+        std.log.info("{s}{s}", .{ metrics_head, metrics_tail });
     }
 
     fn flushDirty(self: *DirtyTracker) !void {
@@ -1777,240 +1757,6 @@ const DirtyTracker = struct {
     }
 };
 
-const SnapshotPlatform = struct {
-    dist_base: u64,
-    redist_base: u64,
-    redist_stride: u64,
-    ram_size: u64,
-    memory_device: ?*const virtio_mem.Mem = null,
-};
-
-fn captureSingleHvfDiskFork(
-    allocator: std.mem.Allocator,
-    request: vsock_control.DiskForkAction,
-    control: vsock_control.Control,
-    vcpu: hvf.VcpuHandle,
-    transports: []mmio.Transport,
-    gen_dev: *const generation.Device,
-    vsock_dev: *const vsock.Vsock,
-    ram_bytes: []const u8,
-    platform: SnapshotPlatform,
-    config: *const vmm.Config,
-    dirty_tracker: ?*DirtyTracker,
-) !void {
-    const disk = config.disk_snapshot orelse return error.BadManifest;
-    const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
-    try takeSnapshot(
-        allocator,
-        request.dir,
-        vcpu,
-        transports,
-        gen_dev,
-        vsock_dev,
-        ram_bytes,
-        platform,
-        config.rootfs,
-        null,
-        disk,
-        config.network_manifest,
-        config.annotations,
-        config.sessions,
-        dirty_tracker,
-        config.environ_map,
-        null,
-    );
-    const ram_capture_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
-    var batch = try runtime_disk_fork_capture.prepare(allocator, disk, request.count, .{
-        .allow_copy = request.allow_copy,
-        .force_copy = request.force_copy,
-    });
-    defer batch.deinit();
-    batch.pause_started_ns = pause_started_ns;
-    batch.ram_capture_ns = ram_capture_ns;
-    try control.completeDiskFork(&batch);
-}
-
-fn takeSnapshot(
-    allocator: std.mem.Allocator,
-    dir: []const u8,
-    vcpu: hvf.VcpuHandle,
-    transports: []mmio.Transport,
-    gen_dev: *const generation.Device,
-    vsock_dev: *const vsock.Vsock,
-    ram_bytes: []const u8,
-    platform: SnapshotPlatform,
-    rootfs: ?spore.Rootfs,
-    disk_snapshot: ?disk_layer.SnapshotState,
-    quiescence_disk: ?disk_layer.SnapshotState,
-    network_manifest: ?spore.Network,
-    annotations: spore.Annotations,
-    sessions: []const spore.Session,
-    dirty_tracker: ?*DirtyTracker,
-    environ_map: ?*const std.process.Environ.Map,
-    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
-) !void {
-    try transport_snapshot.validateFullSnapshotDevices(transports, vsock_dev);
-
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var pin_threaded = std.Io.Threaded.init(allocator, .{});
-    defer pin_threaded.deinit();
-    const pin_io = pin_threaded.io();
-
-    const total_start = monotonicMs();
-    const machine_start = total_start;
-    const machine = try snapshot.captureMachine(arena, vcpu);
-    const machine_ms = monotonicMs() - machine_start;
-    const devices_start = monotonicMs();
-    const devices = try vmm.captureTransports(arena, transports);
-    const devices_ms = monotonicMs() - devices_start;
-    var disk_quiesced = false;
-    if (disk_snapshot orelse quiescence_disk) |disk_state| {
-        if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
-            std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
-            return error.DeviceStatePending;
-        }
-        disk_quiesced = true;
-    } else if (rootfs) |rootfs_artifact| {
-        if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
-            std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
-            return error.DeviceStatePending;
-        }
-    }
-    const generation_start = monotonicMs();
-    const gen_state = try gen_dev.capture(arena);
-    const generation_ms = monotonicMs() - generation_start;
-    const memory_start = monotonicMs();
-    const memory = if (dirty_tracker) |tracker|
-        try tracker.finish()
-    else
-        try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
-    const memory_ms = monotonicMs() - memory_start;
-    const memory_state = if (platform.memory_device) |device| try device.captureState(arena, platform.ram_size) else null;
-    if (environ_map) |environ| {
-        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, ram_bytes.len);
-    }
-    var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
-    defer if (owned_cache_lock) |*lock| lock.deinit();
-    const disk_root = if (disk_snapshot != null and environ_map != null) blk: {
-        const cache_root = try local_paths.rootfsCacheRootPath(arena, environ_map.?);
-        if (rootfs_cache_lock) |lock| {
-            if (!try lock.ensureHeldFor(arena, cache_root)) return error.RootfsCacheLockNotHeld;
-        } else owned_cache_lock = try rootfs_mod.lockRootfsCacheExclusive(pin_io, arena, cache_root);
-        break :blk cache_root;
-    } else dir;
-    const disk_start = monotonicMs();
-    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
-    const disk_ms = monotonicMs() - disk_start;
-    const manifest_start = monotonicMs();
-    const saved_manifest = spore.Manifest{
-        .platform = .{
-            .cpu_profile = board.cpu_profile,
-            .device_model_version = board.device_model_version,
-            .vcpu_count = 1,
-            .ram_base = board.ram_base,
-            .ram_size = platform.ram_size,
-            .gic_dist_base = platform.dist_base,
-            .gic_redist_base = platform.redist_base,
-            .gic_redist_stride = platform.redist_stride,
-            .counter_frequency_hz = snapshot.hostCounterFreq(),
-        },
-        .machine = .{ .single = machine },
-        .devices = devices,
-        .generation = gen_state,
-        .annotations = annotations,
-        .rootfs = rootfs,
-        .disk = disk_manifest,
-        .network = network_manifest,
-        .sessions = sessions,
-        .memory_state = memory_state,
-        .memory = memory,
-    };
-    if (disk_manifest) |disk| {
-        if (environ_map != null) {
-            const registry = try saved_spore_pin.LockedRegistry.init(arena, disk_root, rootfs_cache_lock orelse &owned_cache_lock.?);
-            try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
-        } else try spore.saveManifest(arena, dir, saved_manifest);
-    } else try spore.saveManifest(arena, dir, saved_manifest);
-    const manifest_ms = monotonicMs() - manifest_start;
-    const snapshot_total_ms = monotonicMs() - total_start;
-    const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
-    if (dirty_tracker) |tracker| {
-        const stats = tracker.stats;
-        const ram_stats = tracker.sealer.stats;
-        var metrics_head_buf: [2048]u8 = undefined;
-        var metrics_tail_buf: [3072]u8 = undefined;
-        const metrics_head = std.fmt.bufPrint(
-            &metrics_head_buf,
-            "hvf snapshot metrics: mode=write-protect ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d} write_fault_count={d} dirty_chunks_total={d} host_dirty_ranges_total={d} host_dirty_chunks_total={d} sealed_chunks_total={d} seed_ms={d} seed_chunks={d} seed_nonzero_chunks={d} seed_protect_ms={d} tail_flush_ms={d}",
-            .{
-                platform.ram_size / 1024 / 1024,
-                memory_plan.chunk_count,
-                memory_plan.nonzero_chunk_count,
-                machine_ms,
-                devices_ms,
-                generation_ms,
-                memory_ms,
-                disk_ms,
-                manifest_ms,
-                snapshot_total_ms,
-                snapshot_total_ms,
-                stats.write_fault_count,
-                ram_stats.dirty_chunks_total,
-                ram_stats.host_dirty_ranges_total,
-                ram_stats.host_dirty_chunks_total,
-                ram_stats.sealed_chunks_total,
-                ram_stats.seed_ms,
-                ram_stats.seed_chunks,
-                ram_stats.seed_nonzero_chunks,
-                stats.seed_protect_ms,
-                ram_stats.tail_flush_ms,
-            },
-        ) catch "hvf snapshot metrics: formatting_failed=1";
-        const metrics_tail = std.fmt.bufPrint(
-            &metrics_tail_buf,
-            " seal_ms={d} protect_ms={d} seal_zero_scan_ms={d} seal_hash_ms={d} seal_chunk_write_ms={d} seal_backing_write_ms={d} seal_parallel_flush_count={d} seal_parallel_workers_max={d} finish_fchmod_ms={d} finish_close_ms={d} finish_close_deferred={d} finish_rename_ms={d} tracking_ms={d} dirty_chunks_per_sec={d} sealed_chunks_per_sec={d}",
-            .{
-                ram_stats.seal_ms,
-                stats.protect_ms,
-                ram_stats.sealZeroScanMs(),
-                ram_stats.sealHashMs(),
-                ram_stats.sealChunkWriteMs(),
-                ram_stats.sealBackingWriteMs(),
-                ram_stats.seal_parallel_flush_count,
-                ram_stats.seal_parallel_workers_max,
-                ram_stats.finish_fchmod_ms,
-                ram_stats.finish_close_ms,
-                ram_stats.finish_close_deferred,
-                ram_stats.finish_rename_ms,
-                ram_stats.tracking_ms,
-                ram_stats.dirty_chunks_per_sec,
-                ram_stats.sealed_chunks_per_sec,
-            },
-        ) catch "";
-        std.log.info("{s}{s}", .{ metrics_head, metrics_tail });
-    } else {
-        std.log.info(
-            "hvf snapshot metrics: mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_pause_ms={d} snapshot_total_ms={d}",
-            .{
-                platform.ram_size / 1024 / 1024,
-                memory_plan.chunk_count,
-                memory_plan.nonzero_chunk_count,
-                machine_ms,
-                devices_ms,
-                generation_ms,
-                memory_ms,
-                disk_ms,
-                manifest_ms,
-                snapshot_total_ms,
-                snapshot_total_ms,
-            },
-        );
-    }
-    std.log.info("spore written to {s}", .{dir});
-}
-
 fn takeRootfsSnapshotMulti(
     allocator: std.mem.Allocator,
     dir: []const u8,
@@ -2024,183 +1770,20 @@ fn takeRootfsSnapshotMulti(
     return try vmm.takeRootfsSnapshot(allocator, dir, transports, disk_snapshot);
 }
 
-fn takeSnapshotMulti(
-    allocator: std.mem.Allocator,
-    dir: []const u8,
-    vcpus: []Vcpu,
-    state: *MultiHvfRunState,
-    wake_set: *HvfVcpuWakeSet,
-    transports: []mmio.Transport,
-    gen_dev: *const generation.Device,
-    vsock_dev: *const vsock.Vsock,
-    ram_bytes: []const u8,
-    platform: SnapshotPlatform,
-    rootfs: ?spore.Rootfs,
-    disk_snapshot: ?disk_layer.SnapshotState,
-    quiescence_disk: ?disk_layer.SnapshotState,
-    network_manifest: ?spore.Network,
-    annotations: spore.Annotations,
-    sessions: []const spore.Session,
-    environ_map: ?*const std.process.Environ.Map,
-    pause_started_ns_out: ?*u64,
-    rootfs_cache_lock: ?*const rootfs_mod.RootfsCacheLock,
-) !void {
-    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
-    if (pause_started_ns_out) |out| out.* = runtime_disk_fork_capture.monotonicNs();
-    // Feature selection is guest-mutable MMIO state. Validate it only after
-    // every vCPU has stopped, immediately before transport capture, so a guest
-    // cannot race validation with a reset or DRIVER_FEATURES write.
-    try transport_snapshot.validateFullSnapshotDevices(transports, vsock_dev);
-
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var pin_threaded = std.Io.Threaded.init(allocator, .{});
-    defer pin_threaded.deinit();
-    const pin_io = pin_threaded.io();
-
-    const total_start = monotonicMs();
-    const machine_start = total_start;
-    const vcpu_states = try captureHvfVcpuStates(arena, vcpus);
-    const machine = try snapshot.captureMachineMulti(arena, vcpu_states);
-    const machine_ms = monotonicMs() - machine_start;
-    const devices_start = monotonicMs();
-    const devices = try vmm.captureTransports(arena, transports);
-    const devices_ms = monotonicMs() - devices_start;
-    var disk_quiesced = false;
-    if (disk_snapshot orelse quiescence_disk) |disk_state| {
-        if (!try spore.diskQueuesQuiescent(disk_state.base.device, devices)) {
-            std.log.err("cannot snapshot writable rootfs-backed VM while virtio-blk has pending requests", .{});
-            return error.DeviceStatePending;
-        }
-        disk_quiesced = true;
-    } else if (rootfs) |rootfs_artifact| {
-        if (!try spore.rootfsQueuesQuiescent(rootfs_artifact, devices)) {
-            std.log.err("cannot snapshot rootfs-backed VM while virtio-blk has pending requests", .{});
-            return error.DeviceStatePending;
-        }
-    }
-    const generation_start = monotonicMs();
-    const gen_state = try gen_dev.capture(arena);
-    const generation_ms = monotonicMs() - generation_start;
-    const memory_start = monotonicMs();
-    const memory = try spore.saveMemoryWithBacking(arena, dir, ram_bytes);
-    const memory_ms = monotonicMs() - memory_start;
-    if (environ_map) |environ| {
-        try spore.writeLocalMemoryBackingProof(arena, environ, dir, memory, platform.ram_size);
-    }
-    var owned_cache_lock: ?rootfs_mod.RootfsCacheLock = null;
-    defer if (owned_cache_lock) |*lock| lock.deinit();
-    const disk_root = if (disk_snapshot != null and environ_map != null) blk: {
-        const cache_root = try local_paths.rootfsCacheRootPath(arena, environ_map.?);
-        if (rootfs_cache_lock) |lock| {
-            if (!try lock.ensureHeldFor(arena, cache_root)) return error.RootfsCacheLockNotHeld;
-        } else owned_cache_lock = try rootfs_mod.lockRootfsCacheExclusive(pin_io, arena, cache_root);
-        break :blk cache_root;
-    } else dir;
-    const disk_start = monotonicMs();
-    const disk_manifest = if (disk_snapshot) |disk_state| try disk_state.finish(arena, disk_root, disk_quiesced) else null;
-    const disk_ms = monotonicMs() - disk_start;
-    const manifest_start = monotonicMs();
-    const saved_manifest = spore.Manifest{
-        .platform = .{
-            .cpu_profile = board.cpu_profile,
-            .device_model_version = board.device_model_version,
-            .vcpu_count = @intCast(vcpus.len),
-            .ram_base = board.ram_base,
-            .ram_size = platform.ram_size,
-            .gic_dist_base = platform.dist_base,
-            .gic_redist_base = platform.redist_base,
-            .gic_redist_stride = platform.redist_stride,
-            .counter_frequency_hz = snapshot.hostCounterFreq(),
-        },
-        .machine = .{ .multi = machine },
-        .devices = devices,
-        .generation = gen_state,
-        .annotations = annotations,
-        .rootfs = rootfs,
-        .disk = disk_manifest,
-        .network = network_manifest,
-        .sessions = sessions,
-        .memory = memory,
-    };
-    if (disk_manifest) |disk| {
-        if (environ_map != null) {
-            const registry = try saved_spore_pin.LockedRegistry.init(arena, disk_root, rootfs_cache_lock orelse &owned_cache_lock.?);
-            try saved_spore_pin.publishManifest(pin_io, arena, registry, dir, disk, saved_manifest);
-        } else try spore.saveManifest(arena, dir, saved_manifest);
-    } else try spore.saveManifest(arena, dir, saved_manifest);
-    const manifest_ms = monotonicMs() - manifest_start;
-    const snapshot_total_ms = monotonicMs() - total_start;
-    const memory_plan = try spore.validateMemoryForRam(memory, ram_bytes.len);
-    std.log.info(
-        "hvf snapshot metrics: version=1 vcpus={d} mode=full-scan ram_mib={d} chunks={d} nonzero_chunks={d} machine_ms={d} devices_ms={d} generation_ms={d} memory_ms={d} disk_ms={d} manifest_ms={d} snapshot_total_ms={d}",
-        .{
-            vcpus.len,
-            platform.ram_size / 1024 / 1024,
-            memory_plan.chunk_count,
-            memory_plan.nonzero_chunk_count,
-            machine_ms,
-            devices_ms,
-            generation_ms,
-            memory_ms,
-            disk_ms,
-            manifest_ms,
-            snapshot_total_ms,
-        },
-    );
-    std.log.info("spore written to {s}", .{dir});
-}
-
 fn captureMultiHvfDiskFork(
     allocator: std.mem.Allocator,
     options: MultiHvfRunOptions,
+    vm: *const Vm,
     vcpus: []Vcpu,
     state: *MultiHvfRunState,
     wake_set: *HvfVcpuWakeSet,
-    redist_base: u64,
-    redist_stride: u64,
     request: vsock_control.DiskForkAction,
     control: vsock_control.Control,
 ) !void {
-    const disk = options.disk_snapshot orelse return error.BadManifest;
     const pause_started_ns = runtime_disk_fork_capture.monotonicNs();
     defer state.clearSnapshot();
-    try takeSnapshotMulti(
-        allocator,
-        request.dir,
-        vcpus,
-        state,
-        wake_set,
-        options.transports,
-        options.gen_dev,
-        options.vsock_dev,
-        options.ram_bytes,
-        .{
-            .dist_base = options.dist_base,
-            .redist_base = redist_base,
-            .redist_stride = redist_stride,
-            .ram_size = options.prepared.ram_size,
-        },
-        options.rootfs,
-        null,
-        disk,
-        options.network_manifest,
-        options.annotations,
-        options.prepared.config.sessions,
-        options.environ_map,
-        null,
-        null,
-    );
-    const ram_capture_ns = runtime_disk_fork_capture.elapsedSince(pause_started_ns);
-    var batch = try runtime_disk_fork_capture.prepare(allocator, disk, request.count, .{
-        .allow_copy = request.allow_copy,
-        .force_copy = request.force_copy,
-    });
-    defer batch.deinit();
-    batch.pause_started_ns = pause_started_ns;
-    batch.ram_capture_ns = ram_capture_ns;
-    try control.completeDiskFork(&batch);
+    try pauseHvfVcpusForSnapshot(vcpus, state, wake_set);
+    try vmm.captureDiskFork(allocator, "hvf", vm, vcpus, @as(?*DirtyTracker, null), options.snapshotSource(), request, control, pause_started_ns);
 }
 
 fn raiseGenerationIrqIfPending(gen_dev: *const generation.Device) !void {
