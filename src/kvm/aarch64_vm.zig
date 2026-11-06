@@ -159,7 +159,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     }
 
     if (config.dirtyTrackingDir()) |dir| {
-        dirty_tracker = try DirtyTracker.start(allocator, .{
+        dirty_tracker = try DirtyTracker.start(allocator, config.io, .{
             .dir = dir,
             .ram = ram_bytes,
             .seed_ranges = boot_seed_ranges,
@@ -530,14 +530,6 @@ fn monotonicMs() !u64 {
         },
     }
     return @as(u64, @intCast(ts.sec)) * std.time.ms_per_s + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
-}
-
-fn sleepMs(ms: u64) void {
-    var ts = std.c.timespec{
-        .sec = @intCast(ms / std.time.ms_per_s),
-        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&ts, null);
 }
 
 fn threadCpuNs() u64 {

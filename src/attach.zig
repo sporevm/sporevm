@@ -231,6 +231,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !r
     defer ram_plan.deinit();
     std.log.info("attach memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     const vm_config: vmm.Config = .{
+        .io = context.io,
         .start = .{ .restore = .{
             .dir = opts.spore_dir,
             .ram = ram_plan.strategy,

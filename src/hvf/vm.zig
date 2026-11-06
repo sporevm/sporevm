@@ -159,7 +159,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
     // vCPU. Created before the DTB because the framework assigns the
     // redistributor frame from the vCPU's MPIDR affinity.
     const vcpu_start = monotonicMs();
-    var primary: Vcpu = .{};
+    var primary: Vcpu = .{ .io = config.io };
     defer primary.destroyOnOwnerThread();
     try primary.createOnOwnerThread();
     const vcpu = primary.handle;
@@ -248,7 +248,7 @@ pub fn run(allocator: std.mem.Allocator, input: vmm.Config) !ExitCause {
         try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .x0, layout.dtb), "set x0");
 
         if (config.dirtyTrackingDir()) |dir| {
-            dirty_tracker = try DirtyTracker.start(allocator, .{
+            dirty_tracker = try DirtyTracker.start(allocator, config.io, .{
                 .dir = dir,
                 .ram = ram_bytes,
                 .seed_ranges = seed_ranges,
@@ -482,58 +482,62 @@ const HvfVcpuCommandResult = union(enum) {
 const HvfVcpuCommandSlot = struct {
     const State = enum { idle, pending, running, complete };
 
-    lock: vmm.SpinLock = .{},
+    mutex: std.Io.Mutex = .init,
+    /// Broadcast when `state` changes or the target vCPU goes away.
+    changed: std.Io.Condition = .init,
     state: State = .idle,
     command: HvfVcpuCommand = undefined,
     result: HvfVcpuCommandResult = .ok,
 
     fn submit(self: *HvfVcpuCommandSlot, target: *Vcpu, command: HvfVcpuCommand) !?u64 {
-        while (true) {
-            if (!target.ready.load(.acquire)) return error.VcpuCanceled;
-            self.lock.lock();
-            if (self.state == .idle) {
-                self.command = command;
-                self.result = .ok;
-                self.state = .pending;
-                self.lock.unlock();
-                target.kick();
-                break;
-            }
-            self.lock.unlock();
-            sleepMs(1);
-        }
-
-        while (true) {
-            if (!target.ready.load(.acquire)) return error.VcpuCanceled;
-            self.lock.lock();
-            if (self.state == .complete) {
-                const result = self.result;
-                self.state = .idle;
-                self.lock.unlock();
-                return switch (result) {
-                    .ok => null,
-                    .value => |value| value,
-                    .err => |err| err,
-                };
-            }
-            self.lock.unlock();
-            sleepMs(1);
-        }
+        const io = target.io;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (self.state != .idle) try self.wait(target);
+        if (!target.ready.load(.acquire)) return error.VcpuCanceled;
+        self.command = command;
+        self.result = .ok;
+        self.state = .pending;
+        target.kick();
+        while (self.state != .complete) try self.wait(target);
+        const result = self.result;
+        self.state = .idle;
+        self.changed.broadcast(io);
+        return switch (result) {
+            .ok => null,
+            .value => |value| value,
+            .err => |err| err,
+        };
     }
 
-    fn take(self: *HvfVcpuCommandSlot) ?HvfVcpuCommand {
-        self.lock.lock();
-        defer self.lock.unlock();
+    /// Waits, with the mutex held, for a change on a target that is still
+    /// there.
+    fn wait(self: *HvfVcpuCommandSlot, target: *const Vcpu) !void {
+        if (!target.ready.load(.acquire)) return error.VcpuCanceled;
+        self.changed.waitUncancelable(target.io, &self.mutex);
+    }
+
+    fn take(self: *HvfVcpuCommandSlot, io: std.Io) ?HvfVcpuCommand {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         if (self.state != .pending) return null;
         self.state = .running;
         return self.command;
     }
 
-    fn finish(self: *HvfVcpuCommandSlot, result: HvfVcpuCommandResult) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+    fn finish(self: *HvfVcpuCommandSlot, io: std.Io, result: HvfVcpuCommandResult) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         self.result = result;
         self.state = .complete;
+        self.changed.broadcast(io);
+    }
+
+    /// Wakes submitters after the target vCPU has gone away.
+    fn cancel(self: *HvfVcpuCommandSlot, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.changed.broadcast(io);
     }
 };
 
@@ -586,6 +590,7 @@ const Vm = struct {
 };
 
 const Vcpu = struct {
+    io: std.Io,
     index: topology.VcpuIndex = 0,
     handle: hvf.VcpuHandle = 0,
     exit: *hvf.VcpuExit = undefined,
@@ -614,6 +619,7 @@ const Vcpu = struct {
             self.created = false;
         }
         self.ready.store(false, .release);
+        self.command_slot.cancel(self.io);
     }
 
     fn setRunning(self: *Vcpu) void {
@@ -658,7 +664,7 @@ const Vcpu = struct {
     /// Serves one start or GIC request another thread submitted; returns
     /// whether there was one.
     pub fn handleCommands(self: *Vcpu) bool {
-        const command = self.command_slot.take() orelse return false;
+        const command = self.command_slot.take(self.io) orelse return false;
         processHvfVcpuCommand(self, command);
         return true;
     }
@@ -889,7 +895,7 @@ fn runMultiVcpu(allocator: std.mem.Allocator, options: MultiHvfRunOptions) !Exit
     const transports = devices.transports();
     const vcpus = try allocator.alloc(Vcpu, options.prepared.vcpus);
     defer allocator.free(vcpus);
-    for (vcpus, 0..) |*vcpu, index| vcpu.* = .{ .index = @intCast(index) };
+    for (vcpus, 0..) |*vcpu, index| vcpu.* = .{ .io = config.io, .index = @intCast(index) };
 
     var threaded: Threaded = .{ .vm = vm, .vcpus = vcpus, .devices = devices, .ram = options.ram, .config = config };
     defer threaded.deinit(allocator);
@@ -1018,7 +1024,7 @@ fn processHvfVcpuCommand(vcpu: *Vcpu, command: HvfVcpuCommand) void {
             break :blk .ok;
         },
     };
-    vcpu.command_slot.finish(result);
+    vcpu.command_slot.finish(vcpu.io, result);
 }
 
 fn psciCpuOn(all: []Vcpu, target_mpidr: u64, entry: u64, context_id: u64) !u64 {
@@ -1053,14 +1059,6 @@ fn monotonicMs() u64 {
     const freq = snapshot.hostCounterFreq();
     if (freq == 0) return 0;
     return snapshot.hostCounter() * std.time.ms_per_s / freq;
-}
-
-fn sleepMs(ms: u64) void {
-    var ts = std.c.timespec{
-        .sec = @intCast(ms / std.time.ms_per_s),
-        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
-    };
-    _ = std.c.nanosleep(&ts, null);
 }
 
 fn wakeCaptureVcpu(context: ?*anyopaque) callconv(.c) void {
@@ -1130,8 +1128,8 @@ const WriteProtect = struct {
         const chunk_index: usize = @intCast(guest_offset / spore.chunk_size);
 
         const self = &tracker.backend;
-        tracker.mutex.lock();
-        defer tracker.mutex.unlock();
+        tracker.mutex.lockUncancelable(tracker.io);
+        defer tracker.mutex.unlock(tracker.io);
         self.stats.write_fault_count += 1;
         tracker.sealer.markCollectedChunkDirty(chunk_index);
         if (!self.writable_chunks[chunk_index]) {
@@ -1403,8 +1401,8 @@ test "redistributor frame helper maps offsets by stride" {
 
 test "HVF redistributor window accepts unordered frames" {
     var vcpus = [_]Vcpu{
-        .{ .redist_base = 0x0803_0000 },
-        .{ .redist_base = 0x0801_0000 },
+        .{ .io = std.testing.io, .redist_base = 0x0803_0000 },
+        .{ .io = std.testing.io, .redist_base = 0x0801_0000 },
     };
     const window = try hvfRedistributorWindow(&vcpus, 0x2_0000);
     try std.testing.expectEqual(@as(u64, 0x0801_0000), window.base);
@@ -1426,8 +1424,8 @@ test "multi-vcpu network wake preserves completed HVF MMIO exit" {
 
 test "gic data-abort classification routes remote redistributor before device lock" {
     var vcpus = [_]Vcpu{
-        .{ .index = 0, .handle = 11, .redist_base = 0x0802_0000 },
-        .{ .index = 1, .handle = 22, .redist_base = 0x0804_0000 },
+        .{ .io = std.testing.io, .index = 0, .handle = 11, .redist_base = 0x0802_0000 },
+        .{ .io = std.testing.io, .index = 1, .handle = 22, .redist_base = 0x0804_0000 },
     };
     var exit = dataAbortExitForTest(0x0802_0000 + 0x2_0000 + 0xc, 2, 3, false);
     const access = try decodeMmioAccess(&exit);
