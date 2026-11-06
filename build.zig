@@ -99,8 +99,15 @@ pub fn build(b: *std.Build) void {
             .root_source_file = minimal_exec_initrd_module,
         });
         mod.addImport("zmoltcp", zmoltcp_dep.module("zmoltcp"));
-        mod.addCSourceFile(.{
-            .file = b.path("guest/minimal-initrd/agent.c"),
+        // The guest agent's sources, as scripts/kernel/make-minimal-exec-initrd.sh
+        // links them into /init, plus the test and fuzz hooks they define here.
+        mod.addCSourceFiles(.{
+            .root = b.path("guest/minimal-initrd"),
+            .files = &.{
+                "agent.c",  "boot.c",     "build_copy.c", "build_run.c", "build_run_sandbox.c",
+                "copy.c",   "detached.c", "generation.c", "network.c",   "request.c",
+                "rootfs.c", "session.c",  "session_io.c", "spio.c",      "util.c",
+            },
             .flags = &.{
                 "-std=c11",
                 "-Wall",
@@ -110,14 +117,6 @@ pub fn build(b: *std.Build) void {
                 "-DSPORE_AGENT_REQUEST_FUZZ",
                 b.fmt("-DSPORE_GENERATION_BASE=0x{x}ULL", .{guest_generation_base}),
             },
-        });
-        mod.addCSourceFile(.{
-            .file = b.path("guest/minimal-initrd/build_copy.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
-        });
-        mod.addCSourceFile(.{
-            .file = b.path("guest/minimal-initrd/build_run_sandbox.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-DSPORE_AGENT_REQUEST_FUZZ" },
         });
         break :blk mod;
     } else internal_mod;
@@ -170,7 +169,7 @@ pub fn build(b: *std.Build) void {
     // Files the check reads besides its arguments.
     minimal_exec_initrd_tests.addFileInput(b.path("scripts/kernel/make-minimal-exec-initrd.sh"));
     minimal_exec_initrd_tests.addFileInput(b.path("build.zig"));
-    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/agent.c"));
+    minimal_exec_initrd_tests.addFileInput(b.path("guest/minimal-initrd/generation.c"));
     // An output makes the check cacheable instead of rerunning every build.
     _ = minimal_exec_initrd_tests.captureStdOut(.{});
     const minimal_exec_initrd_test_step = b.step("minimal-exec-initrd-test", "Build every guest architecture's embedded initrd and check that it rebuilds byte-identically");

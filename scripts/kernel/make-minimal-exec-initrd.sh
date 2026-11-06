@@ -188,8 +188,11 @@ helpers=()
 if ((smoke_helpers)); then
   helpers=(writeout finite counter nproc gencheck rngcheck blkcheck netcheck nslookup wget httpd flockcheck cgroupcheck)
 fi
-agent_sources=("${source_dir}/build_copy.c" "${source_dir}/build_run_sandbox.c")
-inputs=("${agent_sources[@]}" "${source_dir}/build_copy.h" "${source_dir}/build_run_sandbox.h" "${source_dir}/toybox.config")
+agent_sources=()
+for source in boot build_copy build_run build_run_sandbox copy detached generation network request rootfs session session_io spio util; do
+  agent_sources+=("${source_dir}/${source}.c")
+done
+inputs=("${agent_sources[@]}" "${source_dir}/agent.h" "${source_dir}/build_copy.h" "${source_dir}/build_run_sandbox.h" "${source_dir}/toybox.config")
 for program in "${programs[@]}"; do
   inputs+=("${source_dir}/${program}.c")
 done
