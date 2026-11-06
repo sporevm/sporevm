@@ -25,12 +25,14 @@ const rootfs_mod = @import("../rootfs.zig");
 const runtime_disk_fork_capture = @import("../runtime_disk_fork_capture.zig");
 const saved_spore_pin = @import("../saved_spore_pin.zig");
 const spore = @import("../spore.zig");
+const test_barrier = @import("../test_barrier.zig");
 const topology = @import("../topology.zig");
 const blk = @import("../virtio/blk.zig");
 const console = @import("../virtio/console.zig");
 const virtio_mem = @import("../virtio/mem.zig");
 const mmio = @import("../virtio/mmio.zig");
 const net = @import("../virtio/net.zig");
+const queue = @import("../virtio/queue.zig");
 const rng = @import("../virtio/rng.zig");
 const transport_snapshot = @import("../virtio/transport_snapshot.zig");
 const vsock = @import("../virtio/vsock.zig");
@@ -1092,7 +1094,9 @@ fn moveVtimer(vtimer: *spore.VtimerState, guest_cntvct: u64) void {
 
 /// Runs a VM: each vCPU on its own thread, while the calling thread serves
 /// the control, the probe, capture requests, virtio-mem growth and
-/// snapshots.
+/// snapshots. Each virtio-blk device's requests run on a worker thread of its
+/// own, so a slow read (an object fetched from an image store) stalls neither
+/// the vCPU that notified nor any other device.
 ///
 /// `Vm` provides `name`, `spi_needs_kick` (whether a vCPU must be kicked to
 /// see a raised interrupt) and what the device and snapshot code above use.
@@ -1108,7 +1112,9 @@ fn moveVtimer(vtimer: *spore.VtimerState, guest_cntvct: u64) void {
 /// waits until resumed. KVM refuses VGIC register access while any other vCPU
 /// is in an ioctl, hence one at a time and only once all have parked.
 /// Threads start paused, so the backend can boot or restore the vCPUs before
-/// `run`.
+/// `run`. A pause also waits until every virtio-blk worker has served every
+/// notify and returned every request, so a saved queue has nothing in flight
+/// and a restored one needs no kick.
 ///
 /// Nobody spins or polls on a fixed tick: the main thread futex-waits on
 /// `events` and the vCPU threads, when parked or idle, on `vcpu_events`. A
@@ -1127,8 +1133,9 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         slots: []Slot = &.{},
         /// What each vCPU captured, or will apply, at a pause.
         states: []Captured = &.{},
-        /// Serializes device emulation between the vCPU threads and the
-        /// main thread.
+        blk_workers: []BlkWorker = &.{},
+        /// Serializes device emulation between the vCPU threads, the
+        /// virtio-blk workers and the main thread.
         device_lock: std.Io.Mutex = .init,
         /// Held by a vCPU thread while it does a pause action.
         action_lock: std.Io.Mutex = .init,
@@ -1181,6 +1188,18 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             arena: std.heap.ArenaAllocator,
         };
 
+        /// Serves one virtio-blk device's queue. `device_lock` guards
+        /// `shared`, `seen` and `stopping`.
+        const BlkWorker = struct {
+            /// The device's transport slot.
+            index: usize,
+            shared: blk.Worker,
+            /// The notifies served so far.
+            seen: u32 = 0,
+            stopping: bool = false,
+            thread: ?std.Thread = null,
+        };
+
         /// Starts one thread per vCPU and returns once each has started its
         /// vCPU. The threads stay paused until `run`. Call `deinit` even if
         /// this fails.
@@ -1188,6 +1207,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             self.slots = try allocator.alloc(Slot, self.vcpus.len);
             for (self.slots) |*slot| slot.* = .{ .arena = .init(std.heap.page_allocator) };
             self.states = try allocator.alloc(Captured, self.vcpus.len);
+            try self.startBlkWorkers(allocator);
             for (self.slots, 0..) |*slot, index| {
                 slot.thread = try std.Thread.spawn(.{}, threadMain, .{ self, index });
             }
@@ -1220,8 +1240,103 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                 if (slot.thread) |thread| thread.join();
                 slot.arena.deinit();
             }
+            // After the vCPU threads: one may be in a queue reset that waits
+            // for its worker.
+            self.stopBlkWorkers();
             allocator.free(self.slots);
             allocator.free(self.states);
+            allocator.free(self.blk_workers);
+        }
+
+        fn startBlkWorkers(self: *Self, allocator: std.mem.Allocator) !void {
+            const transports = self.devices.transports();
+            var count: usize = 0;
+            for (transports) |t| count += @intFromBool(t.dev.device_id == blk.device_id);
+            self.blk_workers = try allocator.alloc(BlkWorker, count);
+            var next: usize = 0;
+            for (transports, 0..) |t, index| {
+                if (t.dev.device_id != blk.device_id) continue;
+                self.blk_workers[next] = .{ .index = index, .shared = .{ .io = self.config.io, .lock = &self.device_lock } };
+                next += 1;
+            }
+            for (self.blk_workers) |*worker| {
+                self.blkDevice(worker).worker = &worker.shared;
+                worker.thread = try std.Thread.spawn(.{}, blkWorkerMain, .{ self, worker });
+            }
+        }
+
+        fn stopBlkWorkers(self: *Self) void {
+            {
+                self.device_lock.lockUncancelable(self.config.io);
+                defer self.device_lock.unlock(self.config.io);
+                for (self.blk_workers) |*worker| {
+                    worker.stopping = true;
+                    worker.shared.changed.broadcast(self.config.io);
+                }
+            }
+            for (self.blk_workers) |*worker| {
+                if (worker.thread) |thread| thread.join();
+                self.blkDevice(worker).worker = null;
+            }
+        }
+
+        fn blkDevice(self: *Self, worker: *const BlkWorker) *blk.Blk {
+            return @ptrCast(@alignCast(self.devices.transports()[worker.index].dev.context));
+        }
+
+        /// Serves a virtio-blk queue in batches of at most one notify
+        /// budget. Requests come off the queue and go back with the device
+        /// lock held, but run without it; the interrupt goes up once per
+        /// batch.
+        fn blkWorkerMain(self: *Self, worker: *BlkWorker) void {
+            const io = self.config.io;
+            const transport = &self.devices.transports()[worker.index];
+            const device = self.blkDevice(worker);
+            const q = &transport.queues[0];
+            self.device_lock.lockUncancelable(io);
+            defer self.device_lock.unlock(io);
+            while (true) {
+                while (!worker.stopping and worker.seen == worker.shared.kicks) {
+                    worker.shared.changed.waitUncancelable(io, &self.device_lock);
+                }
+                if (worker.stopping) return;
+                worker.seen = worker.shared.kicks;
+                var returned = false;
+                var budget: queue.NotifyBudget = .{};
+                while (budget.hasRemaining()) {
+                    const chain = (q.popAvail(self.ram) catch break) orelse break;
+                    budget.consume();
+                    worker.shared.busy = true;
+                    self.device_lock.unlock(io);
+                    const written = device.handleRequest(&chain);
+                    self.device_lock.lockUncancelable(io);
+                    worker.shared.busy = false;
+                    chain.markWritableDirty(self.ram);
+                    q.pushUsed(self.ram, chain.head, written) catch break;
+                    returned = true;
+                }
+                worker.shared.changed.broadcast(io);
+                if (!transport.signalUsedBuffers(returned)) continue;
+                self.vm.setSpi(board.virtioDeviceIntid(@intCast(worker.index)), true) catch |err| {
+                    self.finish(.{ .err = err });
+                    continue;
+                };
+                if (Vm.spi_needs_kick) self.kickAll();
+            }
+        }
+
+        /// Waits until each virtio-blk worker has served every notify and
+        /// returned every request it took. Bounded once the vCPUs are
+        /// parked, since only they notify.
+        fn drainBlkWorkers(self: *Self) void {
+            const io = self.config.io;
+            self.device_lock.lockUncancelable(io);
+            defer self.device_lock.unlock(io);
+            for (self.blk_workers) |*worker| {
+                while (worker.shared.busy or worker.seen != worker.shared.kicks) {
+                    worker.shared.changed.waitUncancelable(io, &self.device_lock);
+                }
+            }
         }
 
         /// Restores `machine`: the GIC and counter here, then each vCPU
@@ -1320,11 +1435,19 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             };
         }
 
-        /// Parks every vCPU thread, then has each do `action` on its own vCPU.
+        /// Parks every vCPU thread and drains the virtio-blk workers, then
+        /// has each thread do `action` on its own vCPU.
         fn pauseAll(self: *Self, action: Action) !void {
-            try self.pauseFor(.none);
+            try self.park();
             if (action != .none) try self.pauseFor(action);
             if (action == .capture) try self.settleInterrupts();
+        }
+
+        /// Parks every vCPU thread, then waits for the virtio-blk workers,
+        /// so no request is in flight while the vCPUs stay parked.
+        fn park(self: *Self) !void {
+            try self.pauseFor(.none);
+            self.drainBlkWorkers();
         }
 
         /// Captures again, letting the guest run in between, until no vCPU
@@ -1339,7 +1462,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                 if (deadline.system_clock.nowMs() >= give_up_ms) return error.InterruptStillActive;
                 self.resumeAll();
                 try self.waitMain(self.events.load(.acquire));
-                try self.pauseFor(.none);
+                try self.park();
                 try self.pauseFor(.capture);
             }
         }
@@ -2252,6 +2375,8 @@ const ThreadTestVm = struct {
     pub const spi_needs_kick = true;
 
     counter: ?u64 = null,
+    /// Interrupts raised.
+    raises: std.atomic.Value(u32) = .init(0),
     /// The last vCPU shuts the guest down once this is set.
     shutdown: std.atomic.Value(bool) = .init(false),
     /// Raising this interrupt sets `shutdown`.
@@ -2260,6 +2385,7 @@ const ThreadTestVm = struct {
     shutdown_on_capture: bool = false,
 
     pub fn setSpi(self: *ThreadTestVm, intid: u32, level: bool) !void {
+        if (level) _ = self.raises.fetchAdd(1, .monotonic);
         if (self.shutdown_intid) |shutdown_intid| {
             if (level and intid == shutdown_intid) self.shutdown.store(true, .release);
         }
@@ -2287,6 +2413,8 @@ const ThreadTestVcpu = struct {
     /// Guest runs left before this vCPU completes the interrupt it is
     /// handling; until then its CPU interface holds an active priority.
     handler_runs: std.atomic.Value(u32) = .init(0),
+    /// A register write the guest makes as it completes that interrupt.
+    write_after_handler: ?Mmio = null,
 
     var in_handler_icc = [_]spore.SysRegEntry{.{ .name = "ap1r0_el1", .value = 0x10_0000 }};
 
@@ -2301,7 +2429,12 @@ const ThreadTestVcpu = struct {
     }
 
     pub fn run(self: *ThreadTestVcpu, vm: *const ThreadTestVm, all: []ThreadTestVcpu) !Exit {
-        if (self.handler_runs.load(.acquire) > 0) _ = self.handler_runs.fetchSub(1, .acq_rel);
+        if (self.handler_runs.load(.acquire) > 0 and self.handler_runs.fetchSub(1, .acq_rel) == 1) {
+            if (self.write_after_handler) |access| {
+                self.write_after_handler = null;
+                return .{ .mmio = access };
+            }
+        }
         if (self.index == all.len - 1 and vm.shutdown.load(.acquire)) return .{ .shutdown = .off };
         return .wfi;
     }
@@ -2666,4 +2799,232 @@ test "threaded capture request can keep the guest running" {
     try std.testing.expectEqual(ExitCause.guest_off, try threaded.run(allocator, testRunSource(&config, &devices, &ram)));
     try std.testing.expect(request.isCompleted());
     try tmp.dir.access(std.testing.io, "spore/manifest.json", .{});
+}
+
+/// A guest's virtio-blk read of sector 1 into one 512-byte buffer, queued
+/// and not yet notified, in `ram`, which holds 0x2000 bytes from
+/// `board.ram_base`.
+const TestBlkRead = struct {
+    const desc = board.ram_base;
+    const avail = board.ram_base + 0x400;
+    const used = board.ram_base + 0x800;
+    const header = board.ram_base + 0x1000;
+    const data = board.ram_base + 0x1200;
+    const status = board.ram_base + 0x1400;
+
+    fn queue(t: *mmio.Transport, ram: guestmem.GuestRam) !void {
+        _ = t.write(0x030, 0, ram);
+        _ = t.write(0x038, 8, ram);
+        inline for (.{ .{ 0x080, desc }, .{ 0x090, avail }, .{ 0x0a0, used } }) |reg| {
+            _ = t.write(reg[0], @truncate(reg[1]), ram);
+            _ = t.write(reg[0] + 4, @truncate(reg[1] >> 32), ram);
+        }
+        try std.testing.expect(!t.write(0x044, 1, ram));
+        try ram.write(u32, header, 0); // VIRTIO_BLK_T_IN
+        try ram.write(u64, header + 8, 1);
+        inline for (.{ .{ header, 16, 0 }, .{ data, blk.sector_size, 2 }, .{ status, 1, 2 } }, 0..) |segment, index| {
+            const entry = desc + 16 * index;
+            try ram.write(u64, entry, segment[0]);
+            try ram.write(u32, entry + 8, segment[1]);
+            // VIRTQ_DESC_F_NEXT on all but the status byte.
+            try ram.write(u16, entry + 12, segment[2] | @as(u16, if (index < 2) 1 else 0));
+            try ram.write(u16, entry + 14, index + 1);
+        }
+        try ram.write(u16, avail + 4, 0);
+        try ram.write(u16, avail + 2, 1);
+        try ram.write(u8, status, 0xff);
+    }
+
+    fn usedIdx(ram: guestmem.GuestRam) !u16 {
+        return ram.read(u16, used + 2);
+    }
+
+    /// Checks the read returned sector 1 of `disk` with an OK status.
+    fn expectDone(ram: guestmem.GuestRam, disk: []const u8) !void {
+        try std.testing.expectEqual(@as(u16, 1), try usedIdx(ram));
+        try std.testing.expectEqual(@as(u32, blk.sector_size + 1), try ram.read(u32, used + 8));
+        try std.testing.expectEqual(@as(u8, 0), try ram.read(u8, status));
+        try std.testing.expectEqualSlices(u8, disk[blk.sector_size..][0..blk.sector_size], try ram.slice(data, blk.sector_size));
+    }
+};
+
+const BlkTestThreaded = Threaded(ThreadTestVm, ThreadTestVcpu, DirtyTracker(TestDirtyBackend));
+
+/// A 2-vCPU VM on `Threaded` whose root disk holds `disk`, with
+/// `TestBlkRead` queued. The read stops at `read_barrier` before it touches
+/// the disk.
+const BlkTestRig = struct {
+    /// The root disk's transport, after the console.
+    const index = 1;
+
+    disk: [2 * blk.sector_size]u8,
+    read_barrier: test_barrier.Barrier = .{},
+    /// What a thread `spawn` starts may block on.
+    blockers: [1]*test_barrier.Barrier,
+    config: Config,
+    devices: Devices,
+    bytes: [0x2000]u8 = @splat(0),
+    vm: ThreadTestVm = .{},
+    vcpus: [2]ThreadTestVcpu,
+    threaded: BlkTestThreaded,
+
+    /// Initializes in place, since the VM points into the rig. Call
+    /// `deinit` even if this fails.
+    fn start(rig: *BlkTestRig) !void {
+        for (&rig.disk, 0..) |*byte, offset| byte.* = @truncate(offset *% 7);
+        rig.read_barrier = .{};
+        rig.blockers = .{&rig.read_barrier};
+        rig.config = testBoot(.{ .vcpus = 2 });
+        rig.config.disk_backend = .{ .memory = &rig.disk };
+        rig.config.root_blk_options = .{ .test_read_barrier = &rig.read_barrier };
+        rig.devices.init(&rig.config, null);
+        rig.bytes = @splat(0);
+        rig.vm = .{};
+        rig.vcpus = .{
+            .{ .index = 0, .live = testVcpuState(0, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 530 }) },
+            .{ .index = 1, .live = testVcpuState(1, .{ .cntvct = 500, .cntv_ctl = 1, .cntv_cval = 540 }) },
+        };
+        rig.threaded = .{ .vm = &rig.vm, .vcpus = &rig.vcpus, .devices = &rig.devices, .ram = rig.ram(), .config = &rig.config };
+        try TestBlkRead.queue(&rig.devices.transports()[index], rig.ram());
+        try rig.threaded.start(std.testing.allocator);
+    }
+
+    fn deinit(rig: *BlkTestRig) void {
+        rig.threaded.deinit(std.testing.allocator);
+        rig.devices.net.shutdown();
+    }
+
+    fn ram(rig: *BlkTestRig) guestmem.GuestRam {
+        return .{ .bytes = &rig.bytes, .base = board.ram_base };
+    }
+
+    /// Writes `value` to the root disk's register at `offset`, as a vCPU's
+    /// MMIO exit does.
+    fn mmioWrite(rig: *BlkTestRig, offset: u64, value: u32) void {
+        rig.threaded.device_lock.lockUncancelable(rig.config.io);
+        defer rig.threaded.device_lock.unlock(rig.config.io);
+        _ = dispatchMmio(&rig.vm, .{
+            .addr = board.virtioDeviceBase(index) + offset,
+            .size_log2 = 2,
+            .write = value,
+        }, rig.devices.transports(), &rig.devices.gen, rig.ram()) catch unreachable;
+    }
+
+    fn notify(rig: *BlkTestRig) void {
+        rig.mmioWrite(0x050, 0);
+    }
+
+    fn reset(rig: *BlkTestRig) void {
+        rig.mmioWrite(0x070, 0);
+    }
+
+    fn pause(rig: *BlkTestRig) void {
+        rig.threaded.pauseAll(.none) catch unreachable;
+    }
+
+    fn capture(rig: *BlkTestRig) void {
+        rig.threaded.pauseAll(.capture) catch unreachable;
+    }
+
+    /// Runs `func(rig)` on its own thread. The guard releases `read_barrier`
+    /// before it joins the thread, so a failed test cannot leave it blocked.
+    fn spawn(rig: *BlkTestRig, call: *TestCall, func: *const fn (*BlkTestRig) void) !test_barrier.ThreadGuard {
+        const thread = try std.Thread.spawn(.{}, TestCall.run, .{ call, rig, func });
+        return .{ .io = rig.config.io, .thread = thread, .barriers = &rig.blockers };
+    }
+};
+
+/// Records when a call on another thread returns.
+const TestCall = struct {
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *TestCall, rig: *BlkTestRig, func: *const fn (*BlkTestRig) void) void {
+        func(rig);
+        self.done.store(true, .release);
+    }
+
+    /// Whether it has returned after waiting a while.
+    fn returnedSoon(self: *TestCall) bool {
+        const ts = std.c.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+        _ = std.c.nanosleep(&ts, null);
+        return self.done.load(.acquire);
+    }
+};
+
+test "a virtio-blk read runs on its worker, off the notifying vCPU and the device lock" {
+    const io = std.testing.io;
+    var rig: BlkTestRig = undefined;
+    defer rig.deinit();
+    try rig.start();
+
+    var notify: TestCall = .{};
+    var notifier = try rig.spawn(&notify, BlkTestRig.notify);
+    defer notifier.deinit();
+    rig.read_barrier.waitReached(io);
+    // The read is under way. The vCPU that notified holds no lock, so other
+    // vCPUs and devices go on.
+    try std.testing.expect(rig.threaded.device_lock.tryLock());
+    rig.threaded.device_lock.unlock(io);
+    notifier.join();
+    try std.testing.expectEqual(@as(u16, 0), try TestBlkRead.usedIdx(rig.ram()));
+    try std.testing.expectEqual(@as(u32, 0), rig.vm.raises.load(.monotonic));
+
+    rig.read_barrier.release(io);
+    rig.threaded.drainBlkWorkers();
+    try TestBlkRead.expectDone(rig.ram(), &rig.disk);
+    try std.testing.expectEqual(@as(u32, 1), rig.vm.raises.load(.monotonic));
+    // An idle vCPU sees the interrupt only once kicked.
+    for (&rig.vcpus) |*vcpu| try std.testing.expectEqual(@as(u32, 1), vcpu.kicks.load(.monotonic));
+}
+
+test "a pause and a queue reset wait for the virtio-blk request in flight" {
+    const io = std.testing.io;
+    var rig: BlkTestRig = undefined;
+    defer rig.deinit();
+    try rig.start();
+    rig.threaded.resumeAll();
+
+    var notify: TestCall = .{};
+    var notifier = try rig.spawn(&notify, BlkTestRig.notify);
+    defer notifier.deinit();
+    rig.read_barrier.waitReached(io);
+    var pause: TestCall = .{};
+    var pauser = try rig.spawn(&pause, BlkTestRig.pause);
+    defer pauser.deinit();
+    var reset: TestCall = .{};
+    var resetter = try rig.spawn(&reset, BlkTestRig.reset);
+    defer resetter.deinit();
+    try std.testing.expect(!pause.returnedSoon());
+    try std.testing.expect(!reset.returnedSoon());
+
+    rig.read_barrier.release(io);
+    notifier.join();
+    pauser.join();
+    resetter.join();
+    // The request finished before the reset cleared the queue.
+    try TestBlkRead.expectDone(rig.ram(), &rig.disk);
+    try std.testing.expect(!rig.devices.transports()[BlkTestRig.index].queues[0].ready);
+}
+
+test "a capture that waits out an interrupt handler also waits for the disk request the guest makes meanwhile" {
+    const io = std.testing.io;
+    var rig: BlkTestRig = undefined;
+    defer rig.deinit();
+    try rig.start();
+    // vCPU 0 is in an interrupt handler, and as it completes it the guest
+    // notifies the disk. The vCPU threads are parked until the capture lets
+    // the guest run on.
+    rig.vcpus[0].handler_runs = .init(1);
+    rig.vcpus[0].write_after_handler = .{ .addr = board.virtioDeviceBase(BlkTestRig.index) + 0x050, .size_log2 = 2, .write = 0 };
+
+    var capture_call: TestCall = .{};
+    var capturer = try rig.spawn(&capture_call, BlkTestRig.capture);
+    defer capturer.deinit();
+    rig.read_barrier.waitReached(io);
+    try std.testing.expect(!capture_call.returnedSoon());
+
+    rig.read_barrier.release(io);
+    capturer.join();
+    try TestBlkRead.expectDone(rig.ram(), &rig.disk);
+    for (rig.threaded.states) |captured| try std.testing.expectEqual(@as(usize, 0), captured.state.icc_regs.len);
 }

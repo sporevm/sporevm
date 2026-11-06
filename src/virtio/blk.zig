@@ -17,6 +17,7 @@ const rootfs_cas = @import("../rootfs_cas.zig");
 const spore = @import("../spore.zig");
 const queue = @import("queue.zig");
 const mmio = @import("mmio.zig");
+const test_barrier = @import("../test_barrier.zig");
 
 const Io = std.Io;
 
@@ -199,7 +200,32 @@ pub const Options = struct {
     /// this; it proves a later descriptor failure poisons an already-mutated
     /// chunk-mapped head.
     test_fail_out_after_segments: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// Unit-test-only: a read stops here before it touches the backend, so a
+    /// test can hold a request in flight.
+    test_read_barrier: if (builtin.is_test) ?*test_barrier.Barrier else void = if (builtin.is_test) null else {},
     stats: ?*Stats = null,
+};
+
+/// What a `Blk` shares with the thread that serves its queue, when requests
+/// run off the vCPU threads so that a slow read (an object fetched from an
+/// image store) stalls neither the notifying vCPU nor any other device.
+/// `lock` guards every field; every access to the device's transport holds
+/// it.
+pub const Worker = struct {
+    io: Io,
+    lock: *Io.Mutex,
+    /// Broadcast on every notify and whenever the worker finishes a batch.
+    changed: Io.Condition = .init,
+    /// Notifies so far.
+    kicks: u32 = 0,
+    /// The worker has requests off the queue that it has not returned.
+    busy: bool = false,
+
+    /// Waits, with `lock` held, until the worker has returned every request
+    /// it took.
+    fn waitWhileBusy(self: *Worker) void {
+        while (self.busy) self.changed.waitUncancelable(self.io, self.lock);
+    }
 };
 
 pub const Stats = struct {
@@ -254,6 +280,8 @@ pub const Blk = struct {
     capacity_sectors: u64,
     options: Options = .{},
     accepted_features: u64 = 0,
+    /// When set, `notify` leaves the requests to this worker.
+    worker: ?*Worker = null,
 
     pub fn init(backend: Backend) Blk {
         return initWithOptions(backend, .{});
@@ -283,11 +311,14 @@ pub const Blk = struct {
             .notifyFn = notify,
             .configReadFn = configRead,
             .featuresAcceptedFn = featuresAccepted,
+            .resetFn = reset,
         };
     }
 
     fn featuresAccepted(ctx: *anyopaque, accepted_features: u64) void {
         const self: *Blk = @ptrCast(@alignCast(ctx));
+        // A request the worker is running may read them.
+        if (self.worker) |worker| worker.waitWhileBusy();
         self.accepted_features = accepted_features;
         if (self.options.stats) |stats| {
             stats.accepted_features.store(accepted_features, .monotonic);
@@ -307,9 +338,22 @@ pub const Blk = struct {
         };
     }
 
+    /// A transport reset clears the queue, so it must wait for the requests
+    /// the worker took off it: the worker would otherwise return them to a
+    /// cleared queue and write buffers the driver has reclaimed.
+    fn reset(ctx: *anyopaque) void {
+        const self: *Blk = @ptrCast(@alignCast(ctx));
+        if (self.worker) |worker| worker.waitWhileBusy();
+    }
+
     fn notify(ctx: *anyopaque, queue_index: u8, queues: *[mmio.max_queues]queue.VirtQueue, ram: guestmem.GuestRam) bool {
         const self: *Blk = @ptrCast(@alignCast(ctx));
         if (queue_index != 0) return false;
+        if (self.worker) |worker| {
+            worker.kicks +%= 1;
+            worker.changed.broadcast(worker.io);
+            return false;
+        }
         const q = &queues[0];
 
         var did_work = false;
@@ -328,7 +372,7 @@ pub const Blk = struct {
 
     /// Execute one request chain; returns bytes written into writable
     /// segments (including the status byte).
-    fn handleRequest(self: *Blk, chain: *const queue.Chain) u32 {
+    pub fn handleRequest(self: *Blk, chain: *const queue.Chain) u32 {
         const segs = chain.segments.slice();
         // Canonical framing: readable 16-byte header first, writable 1-byte
         // status last. Anything else is malformed; we still try to set the
@@ -387,6 +431,9 @@ pub const Blk = struct {
                 }
 
                 if (want_writable) {
+                    if (builtin.is_test) {
+                        if (self.options.test_read_barrier) |barrier| barrier.pause(std.testing.io);
+                    }
                     const total_len = std.math.cast(usize, offset - request_offset) orelse return failStatus(status);
                     // Each readAt prefaults its own slice for direct callers;
                     // this request-wide pass is still required so a later

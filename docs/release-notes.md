@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Performance
+
+- On aarch64 each virtio-blk disk serves its requests on a thread of its own
+  instead of on the vCPU that issued them. A slow read, such as the first read
+  of an object fetched from an image store, now stalls only that disk: the
+  vCPUs keep running, and the console, network, other disks and `spore exec`
+  keep working.
+
 ### Fixes
 
 - Single-vCPU saves also wait until the vCPU is not in an interrupt handler,
