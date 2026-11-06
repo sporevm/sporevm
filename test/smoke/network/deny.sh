@@ -8,7 +8,7 @@ require_spore_bin
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run-net-deny"
 
 set +e
-"${spore_bin}" --debug run --net --events=jsonl -- /bin/wget -qO- http://169.254.169.254/ >"${workdir}/wget.stdout" 2>"${workdir}/wget.stderr"
+"${spore_bin}" --json --debug run --net -- /bin/wget -qO- http://169.254.169.254/ >"${workdir}/wget.stdout" 2>"${workdir}/wget.stderr"
 wget_rc="$?"
 set -e
 

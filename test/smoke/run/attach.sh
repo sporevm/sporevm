@@ -80,11 +80,10 @@ noninteractive_capture="${workdir}/noninteractive.spore"
 reject_jsonl="${workdir}/reject.jsonl"
 reject_stderr="${workdir}/reject.stderr"
 
-"${spore_bin}" run \
+"${spore_bin}" --json run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   -t \
-  --events=jsonl \
   --image "${image}" \
   --save "${tty_capture}" \
   --save-on USR1 \
@@ -121,10 +120,9 @@ done
   die "live TTY capture did not write a manifest"
 }
 
-with_timeout 60 "${spore_bin}" attach \
+with_timeout 60 "${spore_bin}" --json attach \
   --backend "${backend}" \
   -t \
-  --events=jsonl \
   "${tty_capture}" \
   >"${tty_attach_jsonl}" 2>"${tty_attach_stderr}"
 
@@ -153,10 +151,9 @@ set -e
 [[ -f "${noninteractive_capture}/manifest.json" ]] || die "non-interactive capture did not write a manifest"
 
 set +e
-printf 'input\n' | with_timeout 30 "${spore_bin}" attach \
+printf 'input\n' | with_timeout 30 "${spore_bin}" --json attach \
   --backend "${backend}" \
   -i \
-  --events=jsonl \
   "${noninteractive_capture}" \
   >"${reject_jsonl}" 2>"${reject_stderr}"
 reject_rc="$?"

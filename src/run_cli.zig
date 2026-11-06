@@ -18,28 +18,20 @@ const machine_output = @import("machine_output.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 
-var setup_event_writer: ?*events_mod.EventWriter = null;
-
 pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
-    if (args.len == 0) {
+    if (args.len == 0 and ctx.mode != .json) {
         try stdout.writeAll(run_mod.cli_usage);
         return;
     }
 
     const arena = init.arena.allocator();
     var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
-    if (requestsJsonl(args)) setup_event_writer = &event_writer;
-    defer setup_event_writer = null;
-    const parsed = run_mod.parseCliArgs(arena, args) catch |err| {
-        if (setup_event_writer) |events| {
-            const classified = api.classifyFailure(err);
-            events.emitFailure(classified) catch {};
-            std.process.exit(classified.exit_code);
-        }
-        return err;
-    };
+    if (ctx.mode == .json) run_mod.cli_setup_events = event_writer.sink();
+    defer run_mod.cli_setup_events = null;
+    var parsed = try run_mod.parseCliArgs(arena, args);
+    parsed.event_mode = ctx.eventMode();
     try runParsedCli(init, arena, parsed, stdout, &event_writer, ctx.debug);
 }
 
@@ -240,7 +232,7 @@ const RawOutputSink = struct {
 fn validateTerminalPolicy(parsed: run_mod.CliOptions) void {
     if (!parsed.tty) return;
     if (parsed.event_mode == .none and std.c.isatty(1) == 0) {
-        failRunSetup("spore run: -t requires stdout to be a terminal unless --events=jsonl is used", .{});
+        failRunSetup("spore run: -t requires stdout to be a terminal unless --json is used", .{});
     }
     if (parsed.interactive and std.c.isatty(0) == 0) {
         failRunSetup("spore run: -it requires stdin to be a terminal", .{});
@@ -251,22 +243,4 @@ fn writeStderr(bytes: []const u8) void {
     fd_util.writeAllBestEffort(2, bytes);
 }
 
-fn failRunSetup(comptime fmt: []const u8, args: anytype) noreturn {
-    if (setup_event_writer) |events| {
-        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "spore run: setup failed";
-        const classified = machine_output.CliError.init(.usage_invalid_argument, message, "run");
-        events.emitFailure(classified) catch {};
-        events.writer.flush() catch {};
-        std.process.exit(classified.exit_code);
-    }
-    std.debug.print(fmt ++ "\n", args);
-    std.process.exit(2);
-}
-
-fn requestsJsonl(args: []const []const u8) bool {
-    for (args, 0..) |arg, i| {
-        if (std.mem.eql(u8, arg, "--events=jsonl")) return true;
-        if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
-    }
-    return false;
-}
+const failRunSetup = run_mod.failCliSetup;

@@ -37,7 +37,6 @@ pub const cli_usage =
     \\  --timeout DURATION      Per-child attach probe timeout (default: 30s)
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service in every child
-    \\  --events=jsonl          Emit schema-versioned child output and completion events
     \\  -h, --help              Show this help
     \\
     \\Requires child spores with saved sessions. Verify one with:
@@ -82,15 +81,16 @@ const OutputLock = struct {
 pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
-    if (args.len == 0) {
+    if (args.len == 0 and ctx.mode != .json) {
         try stdout.writeAll(cli_usage);
         return;
     }
 
     var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "fanout");
-    cli_event_writer = if (requestsJsonl(args)) &events else null;
+    cli_event_writer = if (ctx.mode == .json) &events else null;
     defer cli_event_writer = null;
-    const opts = try parseCliArgs(args);
+    var opts = try parseCliArgs(args);
+    opts.event_mode = ctx.eventMode();
     if (opts.event_mode == .jsonl) try events.emitStart(opts.backend);
     const exit_code = execute(init, init.arena.allocator(), opts, stdout) catch |err| {
         if (opts.event_mode == .jsonl) {
@@ -104,21 +104,12 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn requestsJsonl(args: []const []const u8) bool {
-    for (args, 0..) |arg, i| {
-        if (std.mem.eql(u8, arg, "--events=jsonl")) return true;
-        if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
-    }
-    return false;
-}
-
 pub fn parseCliArgs(args: []const []const u8) !Options {
     var backend: Backend = .auto;
     var children_dir: ?[]const u8 = null;
     var duration_ms: ?u64 = null;
     var timeout_ms: u64 = default_resume_timeout_ms;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
-    var event_mode: events_mod.EventMode = .none;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -152,11 +143,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             }) catch |err| {
                 failCli("spore fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             };
-        } else if (std.mem.eql(u8, args[i], "--events") and i + 1 < args.len) {
-            i += 1;
-            event_mode = events_mod.EventMode.parse(args[i]) orelse failCli("--events must be jsonl", .{});
-        } else if (std.mem.startsWith(u8, args[i], "--events=")) {
-            event_mode = events_mod.EventMode.parse(args[i]["--events=".len..]) orelse failCli("--events must be jsonl", .{});
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failCli("unknown fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (children_dir == null) {
@@ -174,7 +160,6 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         .duration_ms = duration_ms,
         .timeout_ms = timeout_ms,
         .bound_services = bound_services,
-        .event_mode = event_mode,
     };
 }
 
@@ -608,12 +593,6 @@ test "fanout cli parser accepts requested demo shape" {
 test "fanout cli parser accepts hidden timeout-ms compatibility spelling" {
     const opts = try parseCliArgs(&.{ "children", "--timeout-ms", "120000" });
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
-}
-
-test "fanout cli parser accepts shared automation event mode" {
-    const opts = try parseCliArgs(&.{ "children", "--events=jsonl" });
-    try std.testing.expectEqual(events_mod.EventMode.jsonl, opts.event_mode);
-    try std.testing.expect(requestsJsonl(&.{ "children", "--events", "jsonl" }));
 }
 
 test "fanout child output uses the shared event envelope" {

@@ -7,6 +7,19 @@ require_spore_bin
 
 smoke_tempdir workdir "${TMPDIR:-/tmp}/sporevm-smoke-run"
 
+# Under --json a streaming command reports even an argv error as a failed
+# completion on stdout.
+set +e
+"${spore_bin}" --json run --bogus >"${workdir}/bogus.jsonl" 2>"${workdir}/bogus.stderr"
+bogus_rc="$?"
+set -e
+[[ "${bogus_rc}" == "2" ]] || die "spore --json run --bogus exited ${bogus_rc}, expected 2"
+grep -Fq '"event":"completion","outcome":"failed"' "${workdir}/bogus.jsonl" &&
+  grep -Fq '"code":"usage.invalid_argument"' "${workdir}/bogus.jsonl" || {
+  cat "${workdir}/bogus.jsonl" "${workdir}/bogus.stderr" >&2 || true
+  die "spore --json run --bogus did not print a failed completion"
+}
+
 set +e
 "${spore_bin}" run -- /bin/writeout >"${workdir}/writeout.stdout" 2>"${workdir}/writeout.stderr"
 writeout_rc="$?"

@@ -1,5 +1,6 @@
 //! What `spore run`, `attach` and the other commands report: the run result,
-//! the `--events=jsonl` records, and how an error maps to a failure code.
+//! the event records streaming commands print under `--json`, and how an
+//! error maps to a failure code.
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,14 +21,11 @@ pub const TerminalOutcome = enum {
     canceled,
 };
 
+/// Whether a streaming command prints raw output or, under global `--json`,
+/// `spore.automation.event.v1` lines.
 pub const EventMode = enum {
     none,
     jsonl,
-
-    pub fn parse(raw: []const u8) ?EventMode {
-        if (std.mem.eql(u8, raw, "jsonl")) return .jsonl;
-        return null;
-    }
 };
 
 pub const Result = struct {

@@ -101,7 +101,7 @@ cat >"${generation_json}" <<'JSON'
 {"run_id":"counter-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"counter-smoke-batch","vm_id":"spore-counter-smoke-7","generation":7,"resume_entropy_seed":"0123456789abcdef0123456789abcdef"}
 JSON
 
-"${spore_bin}" attach --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
+"${spore_bin}" --json attach --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
   >"${generation_resume_stdout}" 2>"${generation_resume_stderr}" &
 resume_pid="$!"
 
@@ -125,17 +125,17 @@ if [[ "${seen_generation}" != "1" ]]; then
   cat "${generation_resume_stderr}" >&2 || true
   die "spore attach --generation did not inject guest fan-out identity"
 fi
-grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore attach --generation --events=jsonl did not emit ready"
-grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore attach --generation --events=jsonl did not emit stdout"
+grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore --json attach --generation did not emit ready"
+grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore --json attach --generation did not emit stdout"
 
-if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" restore --events=jsonl --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
+if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json restore --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
   >"${named_resume_stdout}" 2>"${named_resume_stderr}"; then
   cat "${named_resume_stdout}" >&2 || true
   cat "${named_resume_stderr}" >&2 || true
   die "named spore restore --generation failed"
 fi
-grep -Fq '"event":"ready"' "${named_resume_stdout}" || die "named spore restore --generation --events=jsonl did not emit ready"
-grep -Fq '"event":"completion","outcome":"completed"' "${named_resume_stdout}" || die "named spore restore --generation --events=jsonl did not emit completed terminal outcome"
+[[ "$(json_field "${named_resume_stdout}" schema)" == "spore.lifecycle.v1" && "$(json_field "${named_resume_stdout}" state)" == "ready" ]] ||
+  die "named spore --json restore --generation did not report a ready VM"
 if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" exec "${named_vm}" -- /bin/gencheck \
   >"${named_exec_stdout}" 2>"${named_exec_stderr}"; then
   cat "${named_exec_stdout}" >&2 || true

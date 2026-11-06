@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Global `--json` replaces `--events=jsonl`
+
+`spore --json run|attach|exec|fanout` now prints the
+`spore.automation.event.v1` stream that `--events=jsonl` printed, and
+`--events=jsonl` is gone from every command. Argument errors in those
+commands now also end the stream with a failed `completion` instead of a
+message on stderr. `spore restore` no longer streams events; `spore --json
+restore` prints its `spore.lifecycle.v1` result as before.
+
 ### `spore push` and `spore pull` move spores through image stores
 
 `spore push SPORE STORE/TAG` now writes a saved spore to a directory or S3

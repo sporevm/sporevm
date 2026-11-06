@@ -525,8 +525,8 @@ spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
   local socket that cannot accept a complete frame within the 25 ms send
   deadline aborts that exec so it cannot block the VM control loop
   indefinitely.
-- `spore exec --events=jsonl` uses the same `spore.automation.event.v1`
-  envelope as run, attach, restore, and fanout. It emits base64 output records
+- `spore --json exec` uses the same `spore.automation.event.v1` envelope as
+  run, attach, and fanout. It emits base64 output records
   followed by exactly one completed, failed, or canceled completion; EOF before
   completion is `stream.interrupted`.
 - Initial create output uses the existing `spore.lifecycle.v1` result. Create

@@ -45,10 +45,9 @@ payload="${workdir}/payload.txt"
 printf 'copied-from-transient-injection\n' >"${payload}"
 
 events="${workdir}/commit.jsonl"
-"${spore_bin}" run \
+"${spore_bin}" --json run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
-  --events=jsonl \
   --image "${image_ref}" \
   --commit local/run-commit-smoke:base \
   --inject payload="${payload}" \

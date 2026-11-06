@@ -115,8 +115,8 @@ spore run --from net-enabled.spore -- wget -qO- https://example.com
 
 ## Events And Limits
 
-Denied TCP egress can emit JSONL audit events through `--events=jsonl`. Events
-include destination, port, and denial reason, not guest payload bytes.
+Under `spore --json run`, denied TCP egress emits audit events that include
+destination, port, and denial reason, not guest payload bytes.
 
 Bound Unix services emit a setup `port_forward` event with the service name,
 guest host, guest port, and target kind. The event does not include the host

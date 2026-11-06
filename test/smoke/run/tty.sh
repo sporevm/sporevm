@@ -18,12 +18,12 @@ grep -Fq "requires stdout to be a terminal" "${workdir}/raw.stderr" || {
   die "spore run -t did not reject redirected stdout with the expected message"
 }
 
-with_timeout 60 "${spore_bin}" run -t --events=jsonl --image "${image}" -- \
+with_timeout 60 "${spore_bin}" --json run -t --image "${image}" -- \
   /bin/sh -lc 'stty size; printf "tty-ok\n"' >"${workdir}/events.jsonl" 2>"${workdir}/events.stderr"
 
 [[ ! -s "${workdir}/events.stderr" ]] || {
   cat "${workdir}/events.stderr" >&2 || true
-  die "spore run -t --events=jsonl wrote unexpected stderr"
+  die "spore --json run -t wrote unexpected stderr"
 }
 
 python3 - "${workdir}/events.jsonl" <<'PY'
