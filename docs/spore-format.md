@@ -299,7 +299,7 @@ reset or poweroff.
 
 Every disk-index identity is the BLAKE3 digest of one exact canonical JSON
 encoding, `spore-disk-index-v2`. Indexes of earlier kinds
-(`spore-disk-index-v1`, `rootfs-block-index-v0`) fail as too old. `cache gc`
+(`spore-disk-index-v1`, `rootfs-block-index-v0`) fail as too old. `system gc`
 keeps such an index while a record names it but reclaims the objects only it
 referenced.
 

@@ -1,10 +1,12 @@
-//! CLI adapter for native image archives and image stores.
+//! CLI adapters for `spore image`: local image import, resolve and export,
+//! native image archives, and image stores. The operations are in `api.zig`.
 
 const std = @import("std");
 const TestDir = @import("test_dir.zig").TestDir;
 const Io = std.Io;
 const api = @import("api.zig");
-const Ctx = @import("cli.zig").Ctx;
+const cli = @import("cli.zig");
+const Ctx = cli.Ctx;
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_input = @import("rootfs_input.zig");
@@ -28,6 +30,128 @@ pub const usage =
     \\  -h, --help            Show this help
     \\
 ;
+
+pub const export_usage =
+    \\Usage:
+    \\  spore image export <image@sha256:...|image:tag> --output <rootfs.ext4>
+    \\
+    \\Writes the image's root filesystem as an ext4 file and a metadata sidecar.
+    \\
+    \\Options:
+    \\  --output <path>        Rootfs ext4 output path
+    \\  --metadata <path>      Metadata sidecar path (default: <output>.json)
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  -h, --help             Show this help
+    \\
+;
+
+pub const import_oci_usage =
+    \\Usage:
+    \\  spore image import-oci <layout-dir|layout.tar> --ref local/name:tag
+    \\
+    \\Options:
+    \\  --ref <name:tag>       Local mutable image ref to record
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  --rootfs-storage <policy>
+    \\                       Rootfs storage: chunked (default: chunked)
+    \\  -h, --help             Show this help
+    \\
+;
+
+pub const import_tar_usage =
+    \\Usage:
+    \\  spore image import-tar <rootfs.tar> --ref local/name:tag
+    \\
+    \\Options:
+    \\  --ref <name:tag>       Local mutable image ref to record
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  --rootfs-storage <policy>
+    \\                       Rootfs storage: chunked (default: chunked)
+    \\  -h, --help             Show this help
+    \\
+;
+
+pub const resolve_usage =
+    \\Usage:
+    \\  spore image resolve <image:tag>
+    \\
+    \\Options:
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  -h, --help             Show this help
+    \\
+;
+
+pub fn exportRootfs(ctx: *const Ctx, args: []const []const u8) !void {
+    const arena = ctx.init.arena.allocator();
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image export", "usage: spore image export IMAGE --output FILE");
+    const parsed = try rootfs.parseBuildOptions(arena, args);
+    const result = try api.rootfsBuild(ctx.init, arena, .{
+        .ref = parsed.ref,
+        .output = parsed.output,
+        .metadata = parsed.metadata,
+        .platform = parsed.platform,
+    });
+    if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, result);
+    try ctx.stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_identity: {s}\nrootfs_storage: {s}\n", .{
+        parsed.output,
+        parsed.metadata,
+        parsed.ref,
+        result.rootfs_storage.index_digest,
+        result.rootfs_storage.index_digest,
+    });
+}
+
+pub fn importOci(ctx: *const Ctx, args: []const []const u8) !void {
+    const arena = ctx.init.arena.allocator();
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image import-oci", "usage: spore image import-oci LAYOUT --ref local/NAME:TAG");
+    const parsed = try rootfs.parseImportOciOptions(args);
+    const result = try api.rootfsImportOci(ctx.init, arena, .{
+        .input = parsed.input,
+        .ref = parsed.ref,
+        .platform = parsed.platform,
+        .rootfs_storage = parsed.rootfs_storage,
+    });
+    if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, result);
+    try writeImportResult(ctx.stdout, parsed.ref, result);
+}
+
+pub fn importTar(ctx: *const Ctx, args: []const []const u8) !void {
+    const arena = ctx.init.arena.allocator();
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image import-tar", "usage: spore image import-tar ROOTFS.tar --ref local/NAME:TAG");
+    const parsed = try rootfs.parseImportTarOptions(args);
+    const result = try api.rootfsImportTar(ctx.init, arena, .{
+        .input = parsed.input,
+        .ref = parsed.ref,
+        .platform = parsed.platform,
+        .rootfs_storage = parsed.rootfs_storage,
+    });
+    if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, result);
+    try writeImportResult(ctx.stdout, parsed.ref, result);
+}
+
+fn writeImportResult(writer: *Io.Writer, ref: []const u8, result: api.RootfsImportOciResult) !void {
+    try writer.print(
+        "metadata: {s}\nref: {s}\nresolved: {s}\nrootfs_identity: {s}\n",
+        .{ result.metadata_path, ref, result.resolved_image_ref, result.rootfs_storage.index_digest },
+    );
+}
+
+pub fn resolve(ctx: *const Ctx, args: []const []const u8) !void {
+    const arena = ctx.init.arena.allocator();
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image resolve", "usage: spore image resolve IMAGE");
+    const parsed = try rootfs.parseResolveOptions(args);
+    const resolved = try api.rootfsResolve(ctx.init, arena, .{
+        .ref = parsed.ref,
+        .platform = parsed.platform,
+    });
+    if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, .{
+        .schema = "spore.rootfs.resolve.result.v1",
+        .schema_version = @as(u32, 1),
+        .ref = parsed.ref,
+        .resolved_image_ref = resolved,
+    });
+    try ctx.stdout.print("{s}\n", .{resolved});
+}
 
 pub fn push(ctx: *const Ctx, args: []const []const u8) !void {
     const allocator = ctx.init.arena.allocator();

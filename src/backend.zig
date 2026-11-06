@@ -3,7 +3,7 @@
 //! `resolve` is a pure function of the requested backend, OS and
 //! architecture. `Host.probe` is the only code here that touches the host:
 //! commands that start a fresh VM probe once, `select` against the result
-//! and pass the selected backend down, and host-info renders the same result.
+//! and pass the selected backend down, and `system info` renders the same result.
 
 const std = @import("std");
 const builtin = @import("builtin");

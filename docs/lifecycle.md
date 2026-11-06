@@ -350,10 +350,10 @@ because its runtime lease keeps the storage in the rootfs cache. It does not
 read the checkpoint's memory or disk storage, so checkpoints with corrupt
 storage can be removed. A save whose manifest no longer parses cannot
 be told apart from another program's directory; remove it with `rm -rf`, and
-`spore cache gc --force` then reclaims its storage. A machine-local
+`spore system gc --force` then reclaims its storage. A machine-local
 checkpoint's pin is released by GC, not by removal: deleting the directory,
 whether through `spore checkpoint rm` or `rm -rf`, leaves a one-link ownership
-anchor that `spore cache pins` reports as `orphaned`, and `spore cache gc
+anchor that `spore system pins` reports as `orphaned`, and `spore system gc
 --force` reclaims the pin and any CAS content no other root references. A
 checkpoint renamed within the same filesystem keeps its pin; `mv` to another
 filesystem copies it, which behaves like `cp -r` followed by `rm -rf`. After
@@ -361,9 +361,9 @@ filesystem copies it, which behaves like `cp -r` followed by `rm -rf`. After
 while either exists. A plain `cp -r` copy never owned the pin and cannot
 restore; use `spore checkpoint push` and `spore checkpoint pull` for an independent copy.
 
-`spore cache pins` reports `index_valid` only after validating the record and
+`spore system pins` reports `index_valid` only after validating the record and
 canonical index, and `stale` for a record from an earlier build that
-`spore cache gc --force` deletes. It deliberately does not stat or hash every object; lazy reads
+`spore system gc --force` deletes. It deliberately does not stat or hash every object; lazy reads
 and `spore checkpoint push` still verify object bytes and may fail closed on missing or
 corrupt content. Inspect and save output name the ownership class.
 The hard-link anchor supplies local proof without a global save-path registry.

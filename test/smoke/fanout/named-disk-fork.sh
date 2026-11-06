@@ -176,7 +176,7 @@ expect_eq inherited "$("${spore_bin}" vm exec restored -- /bin/cat /fork-marker)
 # Once the source is gone, live children and durable saves must remain the
 # roots of their own immutable baselines.
 "${spore_bin}" vm rm source
-"${spore_bin}" --json cache gc --rootfs --force >"${workdir}/gc.json"
+"${spore_bin}" --json system gc --rootfs --force >"${workdir}/gc.json"
 "${spore_bin}" --json system prune \
   --rootfs \
   --force \
@@ -207,7 +207,7 @@ first_repeat_dir="${workdir}/repeat-first.spore"
 second_repeat_dir="${workdir}/repeat-second.spore"
 "${spore_bin}" vm save child-1 --out "${first_repeat_dir}"
 "${spore_bin}" checkpoint rm "${first_repeat_dir}"
-"${spore_bin}" --json cache gc --rootfs --force >"${workdir}/repeat-gc.json"
+"${spore_bin}" --json system gc --rootfs --force >"${workdir}/repeat-gc.json"
 "${spore_bin}" --json system prune \
   --rootfs \
   --force \

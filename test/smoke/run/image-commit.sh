@@ -39,7 +39,7 @@ expect_rejected interactive -i --image "${image_ref}" --commit local/run-commit-
   --memory "${smoke_memory}" \
   --image "${image_ref}" \
   --commit local/run-commit-smoke:default-command
-"${spore_bin}" rootfs resolve local/run-commit-smoke:default-command --platform "${smoke_platform}" >/dev/null
+"${spore_bin}" image resolve local/run-commit-smoke:default-command --platform "${smoke_platform}" >/dev/null
 
 payload="${workdir}/payload.txt"
 printf 'copied-from-transient-injection\n' >"${payload}"
@@ -97,7 +97,7 @@ if (( ! x86_fresh_only )); then
     -- /bin/sh -lc 'grep -Fxq multi-vcpu /multi-vcpu.txt'
 fi
 
-before="$("${spore_bin}" rootfs resolve local/run-commit-smoke:base --platform "${smoke_platform}")"
+before="$("${spore_bin}" image resolve local/run-commit-smoke:base --platform "${smoke_platform}")"
 if "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
@@ -107,7 +107,7 @@ if "${spore_bin}" run \
   -- /bin/sh -lc 'echo discarded >/failed.txt; exit 23'; then
   die "nonzero guest command unexpectedly succeeded"
 fi
-after="$("${spore_bin}" rootfs resolve local/run-commit-smoke:base --platform "${smoke_platform}")"
+after="$("${spore_bin}" image resolve local/run-commit-smoke:base --platform "${smoke_platform}")"
 [[ "${before}" == "${after}" ]] || die "nonzero command changed the destination ref"
 
 if (( x86_fresh_only )); then
@@ -121,7 +121,7 @@ if (( x86_fresh_only )); then
     -- /bin/sh -lc 'sleep 5'; then
     die "timed-out x86 commit command unexpectedly succeeded"
   fi
-  if "${spore_bin}" rootfs resolve local/run-commit-smoke:timed-out --platform "${smoke_platform}" >/dev/null 2>&1; then
+  if "${spore_bin}" image resolve local/run-commit-smoke:timed-out --platform "${smoke_platform}" >/dev/null 2>&1; then
     die "timed-out x86 commit published the destination ref"
   fi
   echo "smoke:run-image-commit ok backend=${backend} image=${image_ref} fresh-only=1"

@@ -1,11 +1,24 @@
-//! The `spore` command table. `main.zig` lists the commands; this module
-//! finds the one argv names, prints help from the table, and applies global
-//! `--json`.
+//! The `spore` command table: every command, the global flags, finding the
+//! command argv names, help, and global `--json`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
+const attach_cli = @import("attach_cli.zig");
+const attach_mod = @import("attach.zig");
+const build_cli = @import("build_cli.zig");
+const checkpoint_cli = @import("checkpoint_cli.zig");
 const events_mod = @import("events.zig");
+const fanout = @import("fanout.zig");
+const image_cli = @import("image_cli.zig");
+const lifecycle_cli = @import("lifecycle_cli.zig");
 const machine_output = @import("machine_output.zig");
+const monitor = @import("monitor.zig");
+const run_cli = @import("run_cli.zig");
+const run_mod = @import("run.zig");
+const spore_netd = @import("spore_netd.zig");
+const system = @import("system.zig");
+const version_value = @import("version.zig").value;
 
 /// What a command prints under global `--json`.
 pub const Output = enum {
@@ -44,6 +57,97 @@ pub const Command = struct {
     run: *const fn (ctx: *const Ctx, args: []const []const u8) anyerror!void,
 };
 
+/// Every `spore` command. `spore --help` lists them in this order.
+pub const commands = [_]Command{
+    .{ .name = "run", .summary = "Boot a throwaway VM and run one command", .usage = run_mod.cli_usage, .output = .events, .run = run_cli.cli },
+    .{ .name = "attach", .summary = "Restore a checkpoint and attach to its saved session", .usage = attach_mod.cli_usage, .output = .events, .run = attach_cli.cli },
+    .{ .name = "fanout", .summary = "Attach forked children concurrently with prefixed output", .usage = fanout.cli_usage, .output = .events, .run = fanout.cli },
+    .{ .name = "build", .summary = "Build a Spore image from a Dockerfile subset", .usage = build_cli.usage, .output = .result, .run = build_cli.run },
+    .{ .name = "vm create", .summary = "Create a named VM", .usage = lifecycle_cli.create_usage, .output = .result, .run = lifecycle_cli.createCli },
+    .{ .name = "vm exec", .summary = "Execute a command in a named VM", .usage = lifecycle_cli.exec_usage, .output = .events, .run = lifecycle_cli.execCli },
+    .{ .name = "vm logs", .summary = "Show retained initial-command stdout and stderr", .usage = lifecycle_cli.logs_usage, .output = .result, .run = lifecycle_cli.logsCli },
+    .{ .name = "vm copy-in", .summary = "Copy one host file or directory into a named VM", .usage = lifecycle_cli.copy_in_usage, .output = .result, .run = lifecycle_cli.copyInCli },
+    .{ .name = "vm copy-out", .summary = "Copy one guest file or directory out of a named VM", .usage = lifecycle_cli.copy_out_usage, .output = .result, .run = lifecycle_cli.copyOutCli },
+    .{ .name = "vm save", .summary = "Save a named VM as a checkpoint; --stop removes the VM", .usage = lifecycle_cli.save_usage, .output = .result, .run = lifecycle_cli.saveCli },
+    .{ .name = "vm restore", .summary = "Restore a checkpoint as a named VM", .usage = lifecycle_cli.restore_usage, .output = .result, .run = lifecycle_cli.restoreCli },
+    .{ .name = "vm fork", .summary = "Fork a named VM into named VM children", .usage = lifecycle_cli.fork_usage, .output = .result, .run = lifecycle_cli.forkCli },
+    .{ .name = "vm rm", .summary = "Stop a named VM and delete its runtime state", .usage = lifecycle_cli.rm_usage, .output = .result, .run = lifecycle_cli.rmCli },
+    .{ .name = "vm ls", .summary = "List named VMs", .usage = lifecycle_cli.ls_usage, .output = .result, .run = lifecycle_cli.lsCli },
+    .{ .name = "checkpoint inspect", .summary = "Print a checkpoint manifest summary", .usage = checkpoint_cli.inspect_usage, .output = .result, .run = checkpoint_cli.inspect },
+    .{ .name = "checkpoint fork", .summary = "Fork a checkpoint into child checkpoints", .usage = checkpoint_cli.fork_usage, .output = .result, .run = checkpoint_cli.fork },
+    .{ .name = "checkpoint rm", .summary = "Remove a checkpoint directory", .usage = checkpoint_cli.rm_usage, .output = .result, .run = checkpoint_cli.rm },
+    .{ .name = "checkpoint push", .summary = "Push a checkpoint to an image store", .usage = checkpoint_cli.push_usage, .output = .result, .run = checkpoint_cli.push },
+    .{ .name = "checkpoint pull", .summary = "Pull a checkpoint from an image store", .usage = checkpoint_cli.pull_usage, .output = .result, .run = checkpoint_cli.pull },
+    .{ .name = "image import-oci", .summary = "Import an OCI image layout as a local image", .usage = image_cli.import_oci_usage, .output = .result, .run = image_cli.importOci },
+    .{ .name = "image import-tar", .summary = "Import a rootfs tar as a local image", .usage = image_cli.import_tar_usage, .output = .result, .run = image_cli.importTar },
+    .{ .name = "image resolve", .summary = "Resolve an image tag to a digest reference", .usage = image_cli.resolve_usage, .output = .result, .run = image_cli.resolve },
+    .{ .name = "image export", .summary = "Write an image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .result, .run = image_cli.exportRootfs },
+    .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.usage, .output = .result, .run = image_cli.push },
+    .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.usage, .output = .result, .run = image_cli.pack },
+    .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.usage, .output = .result, .run = image_cli.unpack },
+    .{ .name = "system info", .summary = "Print this host's platform facts", .usage = system.info_usage, .output = .result, .run = system.infoCli },
+    .{ .name = "system df", .summary = "Show local cache usage", .usage = system.usage, .output = .result, .run = system.dfCli },
+    .{ .name = "system prune", .summary = "Prune local caches and old runtime fork batches", .usage = system.usage, .output = .result, .run = system.pruneCli },
+    .{ .name = "system gc", .summary = "Collect unreferenced content-addressed cache storage", .usage = system.gc_usage, .output = .result, .run = system.gcCli },
+    .{ .name = "system pins", .summary = "List saved-spore pins", .usage = system.gc_usage, .output = .result, .run = system.pinsCli },
+    .{ .name = "system unpin", .summary = "Drop one saved-spore pin (expert-only)", .usage = system.gc_usage, .output = .result, .run = system.unpinCli },
+    .{ .name = "version", .summary = "Print the spore version", .usage = "usage: spore version\n", .output = .result, .run = version },
+    .{ .name = "monitor", .summary = null, .usage = monitor.monitor_usage, .output = .text, .run = monitor.cli },
+    .{ .name = "netd", .summary = null, .usage = spore_netd.netd_usage, .output = .text, .run = spore_netd.cli },
+};
+
+fn version(ctx: *const Ctx, _: []const []const u8) !void {
+    if (ctx.mode == .json) {
+        try machine_output.writeJson(ctx.init.arena.allocator(), ctx.stdout, .{
+            .schema = "spore.version.result.v1",
+            .schema_version = @as(u32, 1),
+            .version = version_value,
+            .build_mode = @tagName(builtin.mode),
+        });
+    } else {
+        try writeVersion(ctx.stdout, builtin.mode);
+    }
+}
+
+/// `spore --version` and `spore version`.
+pub fn writeVersion(writer: *Io.Writer, mode: std.builtin.OptimizeMode) !void {
+    try writer.print("spore {s} ({t})\n", .{ version_value, mode });
+}
+
+/// The flags before the command word.
+pub const GlobalArgs = struct {
+    debug: bool = false,
+    mode: machine_output.Mode = .human,
+    help: bool = false,
+    /// The command word and its arguments; empty when there is no command.
+    argv: []const []const u8 = &.{},
+    /// The first argument that is neither a global flag nor a command word.
+    parse_error: ?[]const u8 = null,
+};
+
+/// Parses `args`, the program name first, up to the command word.
+pub fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
+    var parsed = GlobalArgs{};
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--debug")) {
+            parsed.debug = true;
+        } else if (std.mem.eql(u8, args[i], "--json")) {
+            parsed.mode = .json;
+        } else if (isHelpFlag(args[i])) {
+            parsed.help = true;
+            return parsed;
+        } else if (std.mem.startsWith(u8, args[i], "-")) {
+            parsed.parse_error = args[i];
+            return parsed;
+        } else {
+            parsed.argv = args[i..];
+            return parsed;
+        }
+    }
+    return parsed;
+}
+
 const Resolved = union(enum) {
     command: struct { command: *const Command, args: []const []const u8 },
     /// A group word alone or followed by `-h` or `--help`.
@@ -53,17 +157,17 @@ const Resolved = union(enum) {
 };
 
 /// Finds the command `argv` names; `argv[0]` is the command word.
-fn resolve(commands: []const Command, argv: []const []const u8) Resolved {
+fn resolve(table: []const Command, argv: []const []const u8) Resolved {
     std.debug.assert(argv.len != 0);
     const word = argv[0];
-    if (!isGroup(commands, word)) {
-        for (commands) |*command| {
+    if (!isGroup(table, word)) {
+        for (table) |*command| {
             if (std.mem.eql(u8, command.name, word)) return .{ .command = .{ .command = command, .args = argv[1..] } };
         }
         return .unknown;
     }
     if (argv.len == 1 or isHelpFlag(argv[1])) return .{ .group_help = word };
-    for (commands) |*command| {
+    for (table) |*command| {
         const verb = verbOf(command.name, word) orelse continue;
         if (std.mem.eql(u8, verb, argv[1])) return .{ .command = .{ .command = command, .args = argv[2..] } };
     }
@@ -71,9 +175,9 @@ fn resolve(commands: []const Command, argv: []const []const u8) Resolved {
 }
 
 /// Runs the command `argv` names, or prints help or a usage error for it.
-pub fn run(commands: []const Command, ctx: *const Ctx, argv: []const []const u8) !void {
+pub fn run(table: []const Command, ctx: *const Ctx, argv: []const []const u8) !void {
     const allocator = ctx.init.arena.allocator();
-    switch (resolve(commands, argv)) {
+    switch (resolve(table, argv)) {
         .command => |found| return invoke(found.command, ctx, found.args),
         .group_help => |group| {
             if (ctx.mode == .json and argv.len > 1) {
@@ -84,15 +188,15 @@ pub fn run(commands: []const Command, ctx: *const Ctx, argv: []const []const u8)
                 const message = allocMessage(allocator, "usage: spore {s} <command>", .{group});
                 exitUsage(allocator, ctx.stderr, ctx.mode, group, message);
             }
-            return writeHelp(commands, group, ctx.stdout);
+            return writeHelp(table, group, ctx.stdout);
         },
         .unknown_verb => |unknown| {
             const message = allocMessage(allocator, "unknown {s} command: {s}", .{ unknown.group, unknown.verb });
-            exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, unknown.group), withHelp(allocator, commands, unknown.group, message));
+            exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, unknown.group), withHelp(allocator, table, unknown.group, message));
         },
         .unknown => {
             const message = allocMessage(allocator, "unknown command: {s}", .{argv[0]});
-            exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), withHelp(allocator, commands, null, message));
+            exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), withHelp(allocator, table, null, message));
         },
     }
 }
@@ -154,8 +258,8 @@ fn verbOf(name: []const u8, group: []const u8) ?[]const u8 {
     return name[group.len + 1 ..];
 }
 
-fn isGroup(commands: []const Command, word: []const u8) bool {
-    for (commands) |command| {
+fn isGroup(table: []const Command, word: []const u8) bool {
+    for (table) |command| {
         if (verbOf(command.name, word) != null) return true;
     }
     return false;
@@ -176,17 +280,17 @@ const help_header =
 ;
 
 /// Writes `spore --help`, or with `group` the commands of that group.
-pub fn writeHelp(commands: []const Command, group: ?[]const u8, writer: *Io.Writer) !void {
+pub fn writeHelp(table: []const Command, group: ?[]const u8, writer: *Io.Writer) !void {
     if (group) |word| {
         try writer.print("Usage: spore {s} <command> [args...]\n       spore {s} <command> --help\n\nCommands:\n", .{ word, word });
     } else {
         try writer.writeAll(help_header);
     }
     var width: usize = 0;
-    for (commands) |command| {
+    for (table) |command| {
         if (helpName(command, group)) |name| width = @max(width, name.len);
     }
-    for (commands) |command| {
+    for (table) |command| {
         const name = helpName(command, group) orelse continue;
         try writer.print("  {s}", .{name});
         try writer.splatByteAll(' ', width - name.len + 2);
@@ -202,10 +306,10 @@ fn helpName(command: Command, group: ?[]const u8) ?[]const u8 {
 }
 
 /// `message`, a blank line and the help for `group`.
-pub fn withHelp(allocator: std.mem.Allocator, commands: []const Command, group: ?[]const u8, message: []const u8) []const u8 {
+pub fn withHelp(allocator: std.mem.Allocator, table: []const Command, group: ?[]const u8, message: []const u8) []const u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     out.writer.print("{s}\n\n", .{message}) catch return message;
-    writeHelp(commands, group, &out.writer) catch return message;
+    writeHelp(table, group, &out.writer) catch return message;
     return out.written();
 }
 
@@ -341,4 +445,67 @@ test "command help accepts standard help spellings before the argv delimiter" {
     try std.testing.expect(!wantsHelp(&.{ "help", "--out", "bundle" }));
     try std.testing.expect(!wantsHelp(&.{ "--", "--help" }));
     try std.testing.expect(!wantsHelp(&.{ "box", "--", "/bin/true", "-h" }));
+}
+
+test "version output distinguishes development and release builds" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+
+    try writeVersion(&out.writer, .Debug);
+    try std.testing.expectEqualStrings("spore " ++ version_value ++ " (Debug)\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeVersion(&out.writer, .ReleaseSafe);
+    try std.testing.expectEqualStrings("spore " ++ version_value ++ " (ReleaseSafe)\n", out.written());
+}
+
+test "command table names each command once and fits the dispatcher" {
+    for (commands, 0..) |command, i| {
+        for (commands[i + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, command.name, other.name));
+        // A word is either a command or a group of verbs, never both.
+        if (std.mem.indexOfScalar(u8, command.name, ' ')) |space| {
+            for (commands) |other| try std.testing.expect(!std.mem.eql(u8, other.name, command.name[0..space]));
+        }
+        const spelled = try std.fmt.allocPrint(std.testing.allocator, "spore {s}", .{command.name});
+        defer std.testing.allocator.free(spelled);
+        try std.testing.expect(std.mem.indexOf(u8, command.usage, spelled) != null);
+    }
+}
+
+test "only internal commands refuse global json, and only four commands stream" {
+    for (commands) |command| {
+        const streams = std.mem.eql(u8, command.name, "run") or std.mem.eql(u8, command.name, "attach") or
+            std.mem.eql(u8, command.name, "vm exec") or std.mem.eql(u8, command.name, "fanout");
+        const text = std.mem.eql(u8, command.name, "monitor") or std.mem.eql(u8, command.name, "netd");
+        const expected: Output = if (streams) .events else if (text) .text else .result;
+        try std.testing.expectEqual(expected, command.output);
+    }
+}
+
+test "help lists every public command" {
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeHelp(&commands, null, &out.writer);
+    for (commands) |command| {
+        const listed = try std.fmt.allocPrint(std.testing.allocator, "\n  {s}  ", .{command.name});
+        defer std.testing.allocator.free(listed);
+        try std.testing.expectEqual(command.summary != null, std.mem.indexOf(u8, out.written(), listed) != null);
+    }
+}
+
+test "global args parse debug before command" {
+    const parsed = parseGlobalArgs(&.{ "spore", "--debug", "--json", "run", "--", "/bin/true" });
+    try std.testing.expect(parsed.debug);
+    try std.testing.expectEqual(machine_output.Mode.json, parsed.mode);
+    try std.testing.expect(!parsed.help);
+    try std.testing.expectEqual(@as(usize, 3), parsed.argv.len);
+    try std.testing.expectEqualStrings("run", parsed.argv[0]);
+    try std.testing.expectEqualStrings("--", parsed.argv[1]);
+    try std.testing.expectEqualStrings("/bin/true", parsed.argv[2]);
+}
+
+test "global args parse help without command" {
+    const parsed = parseGlobalArgs(&.{ "spore", "--help" });
+    try std.testing.expect(parsed.help);
+    try std.testing.expectEqual(@as(usize, 0), parsed.argv.len);
 }

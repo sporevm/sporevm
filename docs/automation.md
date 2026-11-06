@@ -9,9 +9,9 @@ Bounded commands use global `spore --json <command> ...` and emit exactly one
 schema-versioned JSON result on stdout. SporeVM failures emit one
 `spore.error.v1` document on stderr and nothing on stdout. Help is human
 output: `spore --json <command> --help` fails with `usage.invalid_argument`.
-The bounded surface includes version and inspection, system and cache
-operations, rootfs and image operations, build, named lifecycle and copy
-operations, and checkpoint push and pull.
+The bounded surface includes version and inspection, system operations, image
+operations, build, named lifecycle and copy operations, and checkpoint push and
+pull.
 
 Under the same global `--json`, the streaming commands `run`, `attach`,
 `fanout` and `vm exec` print `spore.automation.event.v1` records on stdout,
@@ -47,11 +47,11 @@ The bounded schema inventory is:
 
 | Operations | Result schemas |
 | --- | --- |
-| `version`, `host-info`, `checkpoint inspect` | `spore.version.result.v1`, `spore.host-info.v3`, `spore.inspect.result.v1` |
+| `version`, `system info`, `checkpoint inspect` | `spore.version.result.v1`, `spore.host-info.v3`, `spore.inspect.result.v1` |
 | `checkpoint fork`/`push`/`pull` | `spore.fork.result.v1`, `spore.push.result.v2`, `spore.pull.result.v2` |
 | `vm create`, `logs`, `save`, `restore`, `rm`, `fork`, `ls`, `copy-in`/`copy-out`; `checkpoint rm` | `spore.lifecycle.v1`, `spore.saved.remove.result.v2`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
-| `build`, rootfs operations, image archive and push operations | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v2`, `spore.rootfs.resolve.result.v1`, `spore.rootfs.cas-preload.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1`, `spore.image.push.result.v1` |
-| `system df`/`prune`, `cache gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v2`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
+| `build`; `image export`, `import-oci`/`import-tar`, `resolve`, `pack`/`unpack`, `push` | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v2`, `spore.rootfs.resolve.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1`, `spore.image.push.result.v1` |
+| `system df`/`prune`/`gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v2`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
 
 Run and attach completion records expose `memory_bytes` as initial
 guest-visible memory and `max_memory_bytes` as the ceiling; equal values mean

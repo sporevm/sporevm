@@ -118,7 +118,6 @@ pub const ExecResult = struct {
     stderr_b64: []const u8,
     stdout_truncated: bool,
     stderr_truncated: bool,
-    timing: lifecycle.NamedExecTiming,
 };
 
 pub const Suspended = struct { type: []const u8 = "suspended", out_dir: []const u8 };
@@ -140,13 +139,6 @@ pub const HelloReply = struct {
     schema: []const u8 = hello_schema,
     spore_version: []const u8 = version.value,
     helper_contract: u32 = helper_contract,
-};
-
-/// The control event a streamed exec sends before its exit frame.
-pub const TimingEvent = struct {
-    type: []const u8 = "named_exec_timing",
-    schema_version: u32 = lifecycle.named_exec_timing_schema_version,
-    timing: lifecycle.NamedExecTiming,
 };
 
 /// Decodes one request line into `arena`.
@@ -397,7 +389,6 @@ pub const ExecNamedStream = struct {
     stdout_offset: u64 = 0,
     stderr_offset: u64 = 0,
     terminal_offset: u64 = 0,
-    timing: ?lifecycle.NamedExecTiming = null,
     payload: [spore_stream.max_payload_len]u8 = undefined,
 
     pub fn deinit(self: *ExecNamedStream) void {
@@ -410,56 +401,49 @@ pub const ExecNamedStream = struct {
     ///
     /// Byte slices are borrowed from the stream and valid until the next call.
     pub fn next(self: *ExecNamedStream) !ExecNamedStreamEvent {
-        while (true) {
-            var header_buf: [spore_stream.header_len]u8 = undefined;
-            readFdExact(self.stream.socket.handle, &header_buf) catch return error.StreamInterrupted;
-            const header = try spore_stream.readHeader(&header_buf);
-            if (header.flags != 0 or header.payload_len > self.payload.len) return error.BadMonitorResponse;
-            const payload = self.payload[0..header.payload_len];
-            if (payload.len > 0) readFdExact(self.stream.socket.handle, payload) catch return error.StreamInterrupted;
-            switch (header.frame_type) {
-                .data => {
-                    const expected = switch (header.stream_id) {
-                        .stdout => self.stdout_offset,
-                        .stderr => self.stderr_offset,
-                        .terminal => self.terminal_offset,
-                        else => return error.BadMonitorResponse,
-                    };
-                    if (header.offset != expected) return error.BadMonitorResponse;
-                    const len: u64 = @intCast(payload.len);
-                    switch (header.stream_id) {
-                        .stdout => {
-                            self.stdout_offset += len;
-                            return .{ .stdout = payload };
-                        },
-                        .stderr => {
-                            self.stderr_offset += len;
-                            return .{ .stderr = payload };
-                        },
-                        .terminal => {
-                            self.terminal_offset += len;
-                            return .{ .terminal = payload };
-                        },
-                        else => unreachable,
-                    }
-                },
-                .exit => {
-                    if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
-                    const code = try spore_stream.readExitPayload(payload);
-                    if (code > 255) return error.BadMonitorResponse;
-                    return .{ .exit = @intCast(code) };
-                },
-                .err => {
-                    if (header.stream_id != .control) return error.BadMonitorResponse;
-                    return .{ .err = payload };
-                },
-                .event => {
-                    if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
-                    if (parseTimingEvent(payload)) |timing| self.timing = timing;
-                    continue;
-                },
-                else => return error.BadMonitorResponse,
-            }
+        var header_buf: [spore_stream.header_len]u8 = undefined;
+        readFdExact(self.stream.socket.handle, &header_buf) catch return error.StreamInterrupted;
+        const header = try spore_stream.readHeader(&header_buf);
+        if (header.flags != 0 or header.payload_len > self.payload.len) return error.BadMonitorResponse;
+        const payload = self.payload[0..header.payload_len];
+        if (payload.len > 0) readFdExact(self.stream.socket.handle, payload) catch return error.StreamInterrupted;
+        switch (header.frame_type) {
+            .data => {
+                const expected = switch (header.stream_id) {
+                    .stdout => self.stdout_offset,
+                    .stderr => self.stderr_offset,
+                    .terminal => self.terminal_offset,
+                    else => return error.BadMonitorResponse,
+                };
+                if (header.offset != expected) return error.BadMonitorResponse;
+                const len: u64 = @intCast(payload.len);
+                switch (header.stream_id) {
+                    .stdout => {
+                        self.stdout_offset += len;
+                        return .{ .stdout = payload };
+                    },
+                    .stderr => {
+                        self.stderr_offset += len;
+                        return .{ .stderr = payload };
+                    },
+                    .terminal => {
+                        self.terminal_offset += len;
+                        return .{ .terminal = payload };
+                    },
+                    else => unreachable,
+                }
+            },
+            .exit => {
+                if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
+                const code = try spore_stream.readExitPayload(payload);
+                if (code > 255) return error.BadMonitorResponse;
+                return .{ .exit = @intCast(code) };
+            },
+            .err => {
+                if (header.stream_id != .control) return error.BadMonitorResponse;
+                return .{ .err = payload };
+            },
+            else => return error.BadMonitorResponse,
         }
     }
 
@@ -517,22 +501,6 @@ pub const ExecNamedStream = struct {
         }
     }
 };
-
-/// Reads a timing event leniently: an unknown event leaves timing unset.
-fn parseTimingEvent(payload: []const u8) ?lifecycle.NamedExecTiming {
-    var storage: [1024]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&storage);
-    var parsed = std.json.parseFromSlice(TimingEvent, fixed.allocator(), payload, .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.type, "named_exec_timing") or
-        parsed.value.schema_version != lifecycle.named_exec_timing_schema_version)
-    {
-        return null;
-    }
-    return parsed.value.timing;
-}
 
 fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
     var write_buffer: [1024]u8 = undefined;
@@ -683,7 +651,7 @@ test "responses decode strictly and carry typed error codes" {
     for ([_][]const u8{
         "{\"type\":\"error\",\"message\":\"x\",\"code\":\"not_a_code\"}",
         "{\"type\":\"snapshotted\",\"out_dir\":\"/tmp/a\",\"extra\":1}",
-        "{\"type\":\"exec_result\",\"exit_code\":0,\"stdout_b64\":\"\",\"stderr_b64\":\"\",\"stdout_truncated\":false,\"stderr_truncated\":false}",
+        "{\"type\":\"exec_result\",\"exit_code\":0,\"stdout_b64\":\"\",\"stderr_b64\":\"\",\"stdout_truncated\":false}",
         "{\"type\":\"hello\"}",
     }) |line| {
         try std.testing.expectError(error.BadMonitorResponse, decodeResponse(allocator, line));
@@ -707,17 +675,6 @@ test "monitor hello response validates helper version" {
     try std.testing.expectError(error.MonitorVersionMismatch, validateHello(allocator,
         \\{"type":"hello","schema":"spore.monitor.hello.v1","spore_version":"1.5.0","helper_contract":2,"features":[]}
     , null));
-}
-
-test "named exec timing event validates type and schema" {
-    const valid =
-        \\{"type":"named_exec_timing","schema_version":1,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
-    ;
-    const timing = parseTimingEvent(valid).?;
-    try std.testing.expectEqual(@as(?u64, 9), timing.guest_execution_ms);
-    try std.testing.expectEqual(@as(u64, 13), timing.total_ms);
-    try std.testing.expect(parseTimingEvent("{\"type\":\"other\",\"schema_version\":1,\"timing\":{\"teardown_ms\":0,\"total_ms\":1}}") == null);
-    try std.testing.expect(parseTimingEvent("not json") == null);
 }
 
 /// Decodes `bytes`; whatever decodes must encode to a line that decodes and

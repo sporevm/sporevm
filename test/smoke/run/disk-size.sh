@@ -34,7 +34,7 @@ fi
   --commit local/run-disk-size:base \
   -- /bin/true
 
-base_before="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
+base_before="$("${spore_bin}" image resolve local/run-disk-size:base)"
 
 "${spore_bin}" run \
   --backend "${backend}" \
@@ -46,7 +46,7 @@ base_before="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
   --commit local/run-disk-size:grown \
   -- /bin/sh -lc 'test ! -x /sbin/resize2fs && test ! -x /usr/sbin/resize2fs && test "$(cat /sys/class/block/vda/size)" -eq 4194304 && test "$(df -k / | awk "NR == 2 { print \$2 }")" -gt 1500000 && echo ready >/grown-marker'
 
-base_after="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
+base_after="$("${spore_bin}" image resolve local/run-disk-size:base)"
 [[ "${base_before}" == "${base_after}" ]] || die "successful growth changed the source ref"
 
 "${spore_bin}" run \
@@ -56,7 +56,7 @@ base_after="$("${spore_bin}" rootfs resolve local/run-disk-size:base)"
   --pull=never \
   -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && grep -Fxq ready /grown-marker'
 
-grown_before="$("${spore_bin}" rootfs resolve local/run-disk-size:grown)"
+grown_before="$("${spore_bin}" image resolve local/run-disk-size:grown)"
 
 failure_context="${workdir}/failure-context"
 mkdir -p "${failure_context}"
@@ -85,7 +85,7 @@ if ! grep -Eq 'write_zeroes_backend_failures=[1-9][0-9]*' "${workdir}/forced-fai
   cat "${workdir}/forced-failure.stderr" >&2
   die "forced growth failure did not report a poisoned backend mutation"
 fi
-grown_after_failure="$("${spore_bin}" rootfs resolve local/run-disk-size:grown)"
+grown_after_failure="$("${spore_bin}" image resolve local/run-disk-size:grown)"
 [[ "${grown_before}" == "${grown_after_failure}" ]] || die "growth failure changed the destination ref"
 cache_after="$(authoritative_cache_state "${SPOREVM_ROOTFS_CACHE_DIR}")"
 [[ "${cache_before}" == "${cache_after}" ]] || die "growth failure published authoritative cache state"
@@ -107,7 +107,7 @@ if "${spore_bin}" run \
   -- /bin/true >"${workdir}/shrink.stdout" 2>"${workdir}/shrink.stderr"; then
   die "shrinking --disk-size unexpectedly succeeded"
 fi
-grown_after="$("${spore_bin}" rootfs resolve local/run-disk-size:grown)"
+grown_after="$("${spore_bin}" image resolve local/run-disk-size:grown)"
 [[ "${grown_before}" == "${grown_after}" ]] || die "shrink failure changed the destination ref"
 
 echo "smoke:run-disk-size ok backend=${backend} image=${image_ref}"

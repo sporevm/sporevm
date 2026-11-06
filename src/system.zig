@@ -1,6 +1,8 @@
-//! Local system inspection and cleanup commands.
+//! `spore system`: host facts, local cache inspection and cleanup, and
+//! saved-spore pins.
 
 const std = @import("std");
+const api = @import("api.zig");
 const cli = @import("cli.zig");
 const Ctx = cli.Ctx;
 const TestDir = @import("test_dir.zig").TestDir;
@@ -36,6 +38,8 @@ pub const testing = if (builtin.is_test) struct {
     pub var prune_mutation_barrier: ?*test_barrier.Barrier = null;
 } else struct {};
 
+pub const info_usage = "usage: spore system info\n";
+
 pub const usage =
     \\Usage:
     \\  spore system df [--rootfs]
@@ -57,11 +61,11 @@ pub const usage =
     \\
 ;
 
-pub const cache_usage =
+pub const gc_usage =
     \\Usage:
-    \\  spore cache gc [--rootfs] [--dry-run|--force]
-    \\  spore cache pins
-    \\  spore cache unpin PIN_ID --force
+    \\  spore system gc [--rootfs] [--dry-run|--force]
+    \\  spore system pins
+    \\  spore system unpin PIN_ID --force
     \\
     \\Options:
     \\  --rootfs    Collect the rootfs CAS and local build cache-mount storage
@@ -389,9 +393,77 @@ pub fn deinitRootfsGcResult(allocator: std.mem.Allocator, result: RootfsGcResult
     allocator.free(result.entries);
 }
 
+pub fn infoCli(ctx: *const Ctx, args: []const []const u8) !void {
+    const arena = ctx.init.arena.allocator();
+    if (args.len != 0) {
+        if (std.mem.startsWith(u8, args[0], "--")) cli.exitUnknownArgument(arena, ctx.stderr, ctx.mode, "system info", args[0]);
+        cli.exitUnexpectedArgument(arena, ctx.stderr, ctx.mode, "system info", args[0]);
+    }
+    const info = try api.hostInfo(.{ .io = ctx.init.io, .environ_map = ctx.init.environ_map }, arena);
+    if (ctx.mode == .json) {
+        try machine_output.writeJson(arena, ctx.stdout, info);
+    } else {
+        try writeHostInfo(ctx.stdout, info);
+    }
+}
+
+fn writeHostInfo(writer: *Io.Writer, info: api.HostInfo) !void {
+    try writer.writeAll("Host info\n");
+    try writer.print("  Class: {s}\n", .{info.host_class});
+    try writer.print("  Architecture: {s}\n", .{info.architecture});
+    switch (info.platform) {
+        .arm64 => |platform| {
+            try writer.print("  Platform: {s}/arm64\n", .{platform.os});
+            try writer.print("  CPU profile: {s}\n", .{platform.cpu_profile});
+            try writer.print("  Device model version: {d}\n", .{platform.device_model_version});
+            try writer.print("  Counter frequency: {d} Hz ({s})\n", .{ platform.counter.frequency_hz, platform.counter.source });
+        },
+        .amd64 => |platform| {
+            try writer.print("  Platform: {s}/amd64\n", .{platform.os});
+            try writer.print("  Board profile: {s}\n", .{platform.board_profile});
+            try writer.print("  CPU profile: {s} ({s})\n", .{ platform.cpu_profile, platform.cpu_profile_status });
+            try writer.print("  Device model version: {d}\n", .{platform.device_model_version});
+            try writer.writeAll("  KVM capabilities:\n");
+            for (platform.kvm_capabilities) |capability| {
+                if (capability.value) |value| {
+                    try writer.print("    {s}: value={d} minimum={d} satisfied={s}\n", .{
+                        capability.name,
+                        value,
+                        capability.minimum,
+                        yesNo(capability.satisfied),
+                    });
+                } else {
+                    try writer.print("    {s}: unavailable satisfied=no\n", .{capability.name});
+                }
+            }
+        },
+    }
+    try writer.writeAll("  Backends:\n");
+    for (info.backends) |backend| {
+        try writer.print("    {s}: supported={s} available={s} reason={s}\n", .{
+            backend.name,
+            yesNo(backend.supported),
+            yesNo(backend.available),
+            backend.reason,
+        });
+    }
+    try writer.writeAll("  Cache roots:\n");
+    try writePathFact(writer, "kernels", info.cache_roots.kernels);
+    try writePathFact(writer, "rootfs", info.cache_roots.rootfs);
+    try writePathFact(writer, "runtime", info.cache_roots.runtime);
+}
+
+fn writePathFact(writer: *Io.Writer, label: []const u8, fact: anytype) !void {
+    if (fact.path) |path| {
+        try writer.print("    {s}: {s}\n", .{ label, path });
+    } else {
+        try writer.print("    {s}: unresolved ({s})\n", .{ label, fact.source });
+    }
+}
+
 pub fn pinsCli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
-    if (args.len != 0) exitUnknownArgument(init.arena.allocator(), ctx.stderr, ctx.mode, "cache pins", args[0]);
+    if (args.len != 0) exitUnknownArgument(init.arena.allocator(), ctx.stderr, ctx.mode, "system pins", args[0]);
     const root = try local_paths.rootfsCacheRootPath(init.arena.allocator(), init.environ_map);
     const entries = try saved_spore_pin.list(init.io, init.arena.allocator(), root);
     try writePinListings(init.arena.allocator(), ctx.stdout, entries, ctx.mode);
@@ -403,8 +475,8 @@ pub fn unpinCli(ctx: *const Ctx, args: []const []const u8) !void {
     const stderr = ctx.stderr;
     const mode = ctx.mode;
     if (args.len != 2 or !std.mem.eql(u8, args[1], "--force")) {
-        const message = "usage: spore cache unpin PIN_ID --force";
-        exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageMissingArgument(message, "cache unpin"), message);
+        const message = "usage: spore system unpin PIN_ID --force";
+        exitWithCliError(init.arena.allocator(), stderr, mode, machine_output.usageMissingArgument(message, "system unpin"), message);
     }
     const root = try local_paths.rootfsCacheRootPath(init.arena.allocator(), init.environ_map);
     var lock = try rootfs.lockRootfsCacheExclusive(init.io, init.arena.allocator(), root);
@@ -541,7 +613,7 @@ pub fn pruneCli(ctx: *const Ctx, args: []const []const u8) !void {
     }
 }
 
-pub fn cacheGcCli(ctx: *const Ctx, args: []const []const u8) !void {
+pub fn gcCli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
     const stderr = ctx.stderr;
@@ -550,7 +622,7 @@ pub fn cacheGcCli(ctx: *const Ctx, args: []const []const u8) !void {
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
-            exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "cache gc");
+            exitLocalJsonUnsupported(init.arena.allocator(), stderr, mode, "system gc");
         } else if (std.mem.eql(u8, arg, "--rootfs")) {
             // The rootfs CAS is the only cache scope in U1.
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
@@ -558,7 +630,7 @@ pub fn cacheGcCli(ctx: *const Ctx, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--force")) {
             dry_run = false;
         } else {
-            exitUnknownArgument(init.arena.allocator(), stderr, mode, "cache gc", arg);
+            exitUnknownArgument(init.arena.allocator(), stderr, mode, "system gc", arg);
         }
     }
 
@@ -570,7 +642,7 @@ pub fn cacheGcCli(ctx: *const Ctx, args: []const []const u8) !void {
                 stderr,
                 mode,
                 machine_output.CliError.init(.cache_unavailable, "cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME", "MissingHome"),
-                "spore cache gc: cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME",
+                "spore system gc: cannot resolve rootfs cache directory; set SPOREVM_ROOTFS_CACHE_DIR or HOME",
             );
         },
         else => |e| return e,
@@ -1902,7 +1974,7 @@ fn collectPruneEntries(
         try collectDigestArtifacts(allocator, io, cache_root, &entries);
     }
     // These paths hold canonical rootfs and writable-disk state. Keep their
-    // destructive pruning separately opt-in; root-aware `spore cache gc` is the
+    // destructive pruning separately opt-in; root-aware `spore system gc` is the
     // safe way to preserve reachable state.
     if (include_rootfs_chunks) {
         try collectCasArtifacts(allocator, io, cache_root, "cas/rootfs/blake3/indexes", ".json", .cas_index, &entries);
@@ -2281,14 +2353,14 @@ fn writeRootfsGcResult(writer: *Io.Writer, result: RootfsGcResult) !void {
             try writer.writeByte('\n');
         }
         if (result.entries.len > visible_count) {
-            try writer.print("  ... {d} more entries omitted; use spore --json cache gc for the full list.\n", .{result.entries.len - visible_count});
+            try writer.print("  ... {d} more entries omitted; use spore --json system gc for the full list.\n", .{result.entries.len - visible_count});
         }
     }
 
     if (result.dry_run and result.candidate_count > 0) {
         try writer.writeAll("\nRun again with --force to delete the selected entries.\n");
     }
-    try writer.writeAll("Use spore --json cache gc for exact paths and byte counts.\n");
+    try writer.writeAll("Use spore --json system gc for exact paths and byte counts.\n");
 }
 
 fn writeRuntimeForkPruneResult(writer: *Io.Writer, result: RuntimeForkPruneResult) !void {

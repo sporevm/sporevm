@@ -41,21 +41,6 @@ pub const testing = if (builtin.is_test) struct {
     pub var publish_lock_barrier: ?*test_barrier.Barrier = null;
 } else struct {};
 
-pub const usage =
-    \\Usage: spore rootfs <command>
-    \\
-    \\Commands:
-    \\  build <image@sha256:...|image:tag> --output <rootfs.ext4>
-    \\  import-oci <layout-dir|layout.tar> --ref local/name:tag
-    \\  import-tar <rootfs.tar> --ref local/name:tag
-    \\  resolve <image:tag>
-    \\
-    \\Options:
-    \\  --platform <os/arch>       Target platform: linux/arm64 or linux/amd64 (default: linux/arm64)
-    \\  --metadata <path>          Metadata sidecar path (default: <output>.json)
-    \\
-;
-
 pub const ParsedBuildOptions = struct {
     ref: []const u8,
     output: []const u8,
@@ -77,12 +62,6 @@ pub const ParsedImportOciOptions = struct {
 
 pub const ParsedImportTarOptions = ParsedImportOciOptions;
 
-pub const ParsedCasPreloadOptions = struct {
-    digest: []const u8,
-    chunk_size: u64 = rootfs_cas.default_chunk_size,
-    attach_spore: ?[]const u8 = null,
-};
-
 pub const BuildRequest = struct {
     ref: []const u8,
     output: []const u8,
@@ -103,14 +82,6 @@ pub const ResolveRequest = struct {
     ref: []const u8,
     platform: Platform = .{},
 };
-
-pub const CasPreloadRequest = struct {
-    digest: []const u8,
-    chunk_size: u64 = rootfs_cas.default_chunk_size,
-    attach_spore: ?[]const u8 = null,
-};
-
-pub const CasPreloadResult = rootfs_cas.PreloadResult;
 
 pub const ImportOciResult = struct {
     schema: []const u8 = "spore.rootfs.import.result.v2",
@@ -138,7 +109,7 @@ const BuildOptions = struct {
 
 /// Where a materialized rootfs goes.
 const Target = union(enum) {
-    /// `spore rootfs build`: an ext4 file and its metadata sidecar.
+    /// `spore image export`: an ext4 file and its metadata sidecar.
     file: struct { output: []const u8, metadata: []const u8 },
     /// The local image catalog, under an optional name.
     catalog: struct { name: ?[]const u8 = null },
@@ -243,13 +214,7 @@ fn rootfsCacheLockFileIdentity(fd: std.c.fd_t) ?RootfsCacheLockFileIdentity {
     return .{ .device = @intCast(stat.dev), .inode = @intCast(stat.ino) };
 }
 
-pub fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedResolveOptions {
-    if (args.len == 0) {
-        try stdout.writeAll(usage);
-        try stdout.flush();
-        std.process.exit(2);
-    }
-
+pub fn parseResolveOptions(args: []const []const u8) !ParsedResolveOptions {
     var image_ref: ?[]const u8 = null;
     var platform: Platform = .{};
 
@@ -275,21 +240,15 @@ pub fn parseResolveOptions(args: []const []const u8, stdout: *Io.Writer) !Parsed
     };
 }
 
-pub fn parseImportOciOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedImportOciOptions {
-    return parseLocalImportOptions(args, stdout, error.MissingOciLayoutPath);
+pub fn parseImportOciOptions(args: []const []const u8) !ParsedImportOciOptions {
+    return parseLocalImportOptions(args, error.MissingOciLayoutPath);
 }
 
-pub fn parseImportTarOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedImportTarOptions {
-    return parseLocalImportOptions(args, stdout, error.MissingRootFSTarPath);
+pub fn parseImportTarOptions(args: []const []const u8) !ParsedImportTarOptions {
+    return parseLocalImportOptions(args, error.MissingRootFSTarPath);
 }
 
-fn parseLocalImportOptions(args: []const []const u8, stdout: *Io.Writer, missing_input: anyerror) !ParsedImportOciOptions {
-    if (args.len == 0) {
-        try stdout.writeAll(usage);
-        try stdout.flush();
-        std.process.exit(2);
-    }
-
+fn parseLocalImportOptions(args: []const []const u8, missing_input: anyerror) !ParsedImportOciOptions {
     var input: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
     var platform: Platform = .{};
@@ -343,92 +302,7 @@ fn ensureSupportedRootfsStoragePolicy(policy: RootfsStoragePolicy) !void {
     }
 }
 
-pub fn parseCasPreloadOptions(args: []const []const u8, stdout: *Io.Writer) !ParsedCasPreloadOptions {
-    if (args.len == 0) {
-        try stdout.writeAll(usage);
-        try stdout.flush();
-        std.process.exit(2);
-    }
-
-    var digest: ?[]const u8 = null;
-    var chunk_size: u64 = rootfs_cas.default_chunk_size;
-    var attach_spore: ?[]const u8 = null;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--chunk-size")) {
-            i += 1;
-            if (i >= args.len) return error.MissingChunkSize;
-            chunk_size = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidChunkSize;
-            if (chunk_size == 0 or chunk_size % 512 != 0 or chunk_size > std.math.maxInt(usize)) return error.InvalidChunkSize;
-        } else if (std.mem.eql(u8, arg, "--attach-spore")) {
-            i += 1;
-            if (i >= args.len) return error.MissingSporeDir;
-            attach_spore = args[i];
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            return error.UnknownRootFSOption;
-        } else if (digest == null) {
-            digest = arg;
-        } else {
-            return error.TooManyRootFSArguments;
-        }
-    }
-
-    return .{
-        .digest = digest orelse return error.MissingRootFSDigest,
-        .chunk_size = chunk_size,
-        .attach_spore = attach_spore,
-    };
-}
-
-fn attachPreloadedRootfsStorage(
-    allocator: std.mem.Allocator,
-    spore_dir: []const u8,
-    expected_digest: []const u8,
-    preload_result: rootfs_cas.PreloadResult,
-) !void {
-    var parsed = try spore.loadManifest(allocator, spore_dir);
-    defer parsed.deinit();
-    var manifest = parsed.value;
-    var rootfs = manifest.rootfs orelse return error.BadManifest;
-    const previous_rootfs_digest = rootfs.artifact.digest;
-    if (!std.mem.eql(u8, preload_result.rootfs_digest, expected_digest)) return error.BadManifest;
-    if (rootfs.artifact.size != preload_result.rootfs_size) return error.BadManifest;
-
-    const storage = rootfs_cas.storageDescriptor(rootfs.device, preload_result);
-    const rootfs_matches_source = std.mem.eql(u8, rootfs.artifact.digest, expected_digest);
-    const rootfs_matches_existing_index = if (rootfs.storage) |existing|
-        std.mem.eql(u8, rootfs.artifact.digest, existing.index_digest)
-    else
-        false;
-    if (!rootfs_matches_source and !rootfs_matches_existing_index) return error.BadManifest;
-    if (rootfs.storage) |existing| {
-        if (!spore.rootfsStorageEql(existing, storage)) return error.BadManifest;
-    }
-    rootfs.artifact.digest = storage.index_digest;
-    rootfs.storage = storage;
-    manifest.rootfs = rootfs;
-
-    if (manifest.disk) |disk_value| {
-        var disk = disk_value;
-        if (!std.mem.eql(u8, disk.base, previous_rootfs_digest) and
-            !std.mem.eql(u8, disk.base, storage.base_identity)) return error.BadManifest;
-        disk.base = storage.base_identity;
-        manifest.disk = disk;
-    }
-
-    try spore.validateManifest(manifest);
-    try spore.saveManifest(allocator, spore_dir, manifest);
-}
-
-pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8, stdout: *Io.Writer) !ParsedBuildOptions {
-    if (args.len == 0) {
-        try stdout.writeAll(usage);
-        try stdout.flush();
-        std.process.exit(2);
-    }
-
+pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8) !ParsedBuildOptions {
     var image_ref: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var metadata: ?[]const u8 = null;
@@ -911,28 +785,12 @@ pub fn resolveReference(init: std.process.Init, allocator: std.mem.Allocator, re
     });
 }
 
-pub fn casPreload(init: std.process.Init, allocator: std.mem.Allocator, request: CasPreloadRequest) !CasPreloadResult {
-    const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    defer allocator.free(cache_root);
-    const result = try rootfs_cas.preload(init.io, allocator, cache_root, request.digest, request.chunk_size);
-    if (request.attach_spore) |spore_dir| {
-        try attachPreloadedRootfsStorage(allocator, spore_dir, request.digest, result);
-    }
-    return result;
-}
-
 pub fn deinitBuildResult(allocator: std.mem.Allocator, result: BuildResult) void {
     deinitStorageDigestFields(allocator, result.rootfs_storage);
 }
 
 pub fn deinitResolvedReference(allocator: std.mem.Allocator, resolved_ref: []const u8) void {
     allocator.free(resolved_ref);
-}
-
-pub fn deinitCasPreloadResult(allocator: std.mem.Allocator, result: CasPreloadResult) void {
-    allocator.free(result.index_path);
-    allocator.free(result.index_digest);
-    allocator.free(result.rootfs_digest);
 }
 
 pub fn deinitRootfsStorageDescriptor(allocator: std.mem.Allocator, storage: spore.RootfsStorage) void {
@@ -1463,9 +1321,6 @@ test "layer blob path validates sha256 digest before slicing" {
 
 test "build options reject metadata path matching output path" {
     const allocator = std.testing.allocator;
-    var stdout: Io.Writer.Allocating = .init(allocator);
-    defer stdout.deinit();
-
     try std.testing.expectError(
         error.RootFSMetadataPathMatchesOutput,
         parseBuildOptions(allocator, &.{
@@ -1474,7 +1329,7 @@ test "build options reject metadata path matching output path" {
             "rootfs.ext4",
             "--metadata",
             "rootfs.ext4",
-        }, &stdout.writer),
+        }),
     );
     try std.testing.expectError(
         error.RootFSMetadataPathMatchesOutput,
@@ -1484,20 +1339,17 @@ test "build options reject metadata path matching output path" {
             "rootfs.ext4",
             "--metadata",
             "./rootfs.ext4",
-        }, &stdout.writer),
+        }),
     );
 }
 
 test "build options accept tag image refs" {
     const allocator = std.testing.allocator;
-    var stdout: Io.Writer.Allocating = .init(allocator);
-    defer stdout.deinit();
-
     const parsed = try parseBuildOptions(allocator, &.{
         "registry.example/repo:latest",
         "--output",
         "rootfs.ext4",
-    }, &stdout.writer);
+    });
     defer allocator.free(parsed.metadata);
     try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
     try std.testing.expectEqualStrings("rootfs.ext4.json", parsed.metadata);
@@ -1534,29 +1386,21 @@ test "rootfs build keeps its temp dir in the rootfs cache and removes it on fail
 }
 
 test "resolve options parse image tag and platform" {
-    const allocator = std.testing.allocator;
-    var stdout: Io.Writer.Allocating = .init(allocator);
-    defer stdout.deinit();
-
     const parsed = try parseResolveOptions(&.{
         "registry.example/repo:latest",
         "--platform",
         "linux/arm64",
-    }, &stdout.writer);
+    });
     try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
     try std.testing.expectEqualStrings("linux", parsed.platform.os);
     try std.testing.expectEqual(.arm64, parsed.platform.arch);
     try std.testing.expectError(
         error.TooManyRootFSArguments,
-        parseResolveOptions(&.{ "registry.example/repo:latest", "extra" }, &stdout.writer),
+        parseResolveOptions(&.{ "registry.example/repo:latest", "extra" }),
     );
 }
 
 test "import-oci options require a local mutable ref" {
-    const allocator = std.testing.allocator;
-    var stdout: Io.Writer.Allocating = .init(allocator);
-    defer stdout.deinit();
-
     const parsed = try parseImportOciOptions(&.{
         "layout.oci",
         "--ref",
@@ -1564,43 +1408,36 @@ test "import-oci options require a local mutable ref" {
         "--platform",
         "linux/arm64",
         "--rootfs-storage=chunked",
-    }, &stdout.writer);
+    });
     try std.testing.expectEqualStrings("layout.oci", parsed.input);
     try std.testing.expectEqualStrings("local/sporevm-app:dev", parsed.ref);
     try std.testing.expectEqual(.chunked, parsed.rootfs_storage);
 
     try std.testing.expectError(
         error.LocalRefMustUseLocalRegistry,
-        parseImportOciOptions(&.{ "layout.oci", "--ref", "ghcr.io/org/image:dev" }, &stdout.writer),
+        parseImportOciOptions(&.{ "layout.oci", "--ref", "ghcr.io/org/image:dev" }),
     );
     try std.testing.expectError(
         error.BadImageReference,
         parseImportOciOptions(
             &.{ "layout.oci", "--ref", "local/sporevm-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-            &stdout.writer,
         ),
     );
     try std.testing.expectError(
         error.UnsupportedRootFSStoragePolicy,
         parseImportOciOptions(
             &.{ "layout.oci", "--ref", "local/sporevm-app:dev", "--rootfs-storage=flat" },
-            &stdout.writer,
         ),
     );
     try std.testing.expectError(
         error.UnsupportedRootFSStoragePolicy,
         parseImportOciOptions(
             &.{ "layout.oci", "--ref", "local/sporevm-app:dev", "--rootfs-storage", "native-oci" },
-            &stdout.writer,
         ),
     );
 }
 
 test "import-tar options require a local mutable ref" {
-    const allocator = std.testing.allocator;
-    var stdout: Io.Writer.Allocating = .init(allocator);
-    defer stdout.deinit();
-
     const parsed = try parseImportTarOptions(&.{
         "rootfs.tar",
         "--ref",
@@ -1609,7 +1446,7 @@ test "import-tar options require a local mutable ref" {
         "linux/arm64",
         "--rootfs-storage",
         "chunked",
-    }, &stdout.writer);
+    });
     try std.testing.expectEqualStrings("rootfs.tar", parsed.input);
     try std.testing.expectEqualStrings("local/sporevm-app:dev", parsed.ref);
     try std.testing.expectEqual(.chunked, parsed.rootfs_storage);
@@ -1618,162 +1455,17 @@ test "import-tar options require a local mutable ref" {
         error.UnsupportedRootFSStoragePolicy,
         parseImportTarOptions(
             &.{ "rootfs.tar", "--ref", "local/sporevm-app:dev", "--rootfs-storage", "flat" },
-            &stdout.writer,
         ),
     );
 
     try std.testing.expectError(
         error.MissingRootFSTarPath,
-        parseImportTarOptions(&.{ "--ref", "local/sporevm-app:dev" }, &stdout.writer),
+        parseImportTarOptions(&.{ "--ref", "local/sporevm-app:dev" }),
     );
     try std.testing.expectError(
         error.LocalRefMustUseLocalRegistry,
-        parseImportTarOptions(&.{ "rootfs.tar", "--ref", "ghcr.io/org/image:dev" }, &stdout.writer),
+        parseImportTarOptions(&.{ "rootfs.tar", "--ref", "ghcr.io/org/image:dev" }),
     );
-}
-
-test "cas preload can attach manifest-bound rootfs storage to a spore" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp_dir = try TestDir.init();
-    defer tmp_dir.deinit();
-    const spore_dir = try tmp_dir.path("spore");
-    const rootfs_path = try tmp_dir.path("source.ext4");
-    const cache_root = try tmp_dir.path("cache");
-    try Io.Dir.cwd().createDirPath(io, spore_dir);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = (test_support.repeat("abcd", 1024)) ++ (test_support.repeat("efgh", 1024)) });
-
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
-    const manifest = try testRootfsAttachManifest(arena, artifact);
-    try spore.saveManifest(arena, spore_dir, manifest);
-
-    try attachPreloadedRootfsStorage(arena, spore_dir, artifact.digest, preload_result);
-
-    const parsed = try spore.loadManifest(arena, spore_dir);
-    defer parsed.deinit();
-    const storage = parsed.value.rootfs.?.storage orelse return error.BadManifest;
-    try std.testing.expectEqualStrings(preload_result.index_digest, storage.index_digest);
-    try std.testing.expectEqualStrings(preload_result.index_digest, storage.base_identity);
-    try std.testing.expectEqual(preload_result.rootfs_size, storage.logical_size);
-    try std.testing.expectEqual(preload_result.chunk_size, storage.chunk_size);
-    try std.testing.expectEqualStrings(storage.base_identity, parsed.value.disk.?.base);
-
-    const first_index_digest = storage.index_digest;
-    try attachPreloadedRootfsStorage(arena, spore_dir, artifact.digest, preload_result);
-    const second = try spore.loadManifest(arena, spore_dir);
-    defer second.deinit();
-    try std.testing.expectEqualStrings(first_index_digest, second.value.rootfs.?.storage.?.index_digest);
-}
-
-test "cas preload attach rejects unexpected disk base" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var tmp_dir = try TestDir.init();
-    defer tmp_dir.deinit();
-    const spore_dir = try tmp_dir.path("spore");
-    const rootfs_path = try tmp_dir.path("source.ext4");
-    const cache_root = try tmp_dir.path("cache");
-    try Io.Dir.cwd().createDirPath(io, spore_dir);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
-
-    const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
-    var manifest = try testRootfsAttachManifest(arena, artifact);
-    manifest.disk.?.base = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    try spore.saveManifest(arena, spore_dir, manifest);
-
-    try std.testing.expectError(
-        error.BadManifest,
-        attachPreloadedRootfsStorage(arena, spore_dir, artifact.digest, preload_result),
-    );
-}
-
-fn testRootfsAttachManifest(allocator: std.mem.Allocator, artifact: spore.RootfsArtifactRef) !spore.Manifest {
-    const devices = try allocator.alloc(spore.TransportState, 2);
-    devices[0] = .{
-        .device_id = 3,
-        .status = 0,
-        .device_features_sel = 0,
-        .driver_features_sel = 0,
-        .driver_features = 0,
-        .queue_sel = 0,
-        .interrupt_status = 0,
-        .queues = &.{},
-    };
-    devices[1] = .{
-        .device_id = spore.rootfs_virtio_blk_device_id,
-        .status = 0,
-        .device_features_sel = 0,
-        .driver_features_sel = 0,
-        .driver_features = 0,
-        .queue_sel = 0,
-        .interrupt_status = 0,
-        .queues = &.{},
-    };
-    return .{
-        .platform = .{
-            .cpu_profile = "sporevm-aarch64-v0",
-            .device_model_version = 4,
-            .vcpu_count = 1,
-            .ram_base = 0x8000_0000,
-            .ram_size = spore.chunk_size,
-            .gic_dist_base = 0x0800_0000,
-            .gic_redist_base = 0x0801_0000,
-            .gic_redist_stride = 0x2_0000,
-            .counter_frequency_hz = 24_000_000,
-        },
-        .machine = .{ .single = .{
-            .gprs = @splat(0),
-            .pc = 0xffff_ffc0_0000_0000,
-            .cpsr = 0x3c5,
-            .fpcr = 0,
-            .fpsr = 0,
-            .simd = @splat(.{ 0, 0 }),
-            .sys_regs = &.{},
-            .icc_regs = &.{},
-            .vtimer = .{ .cntvct = 123, .cntv_ctl = 1, .cntv_cval = 456 },
-            .gic = .{
-                .kind = .gicv3,
-                .gicv3 = .{
-                    .dist_regs = &.{},
-                    .redist_regs = &.{},
-                    .line_levels = &.{},
-                },
-            },
-        } },
-        .devices = devices,
-        .generation = .{
-            .generation = 7,
-            .interrupt_status = 0,
-            .params_b64 = "",
-        },
-        .rootfs = .{
-            .device = .{ .mmio_slot = 1 },
-            .artifact = artifact,
-            .source = .{
-                .requested_ref = "docker.io/library/ruby:3.3",
-                .resolved_image_ref = "docker.io/library/ruby@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                .image_manifest_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                .platform = "linux/arm64",
-                .builder_version = builder_version,
-            },
-        },
-        .disk = .{
-            .device = .{ .mmio_slot = 1 },
-            .size = artifact.size,
-            .base = artifact.digest,
-        },
-        .memory = .{ .logical_size = spore.chunk_size, .chunk_size = spore.chunk_size, .zero_ranges = &.{.{ .start = 0, .count = 1 }} },
-    };
 }
 
 test "tag manifest content digest is computed and registry header is verified" {

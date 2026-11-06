@@ -491,7 +491,7 @@ def produce(args: argparse.Namespace) -> None:
             imported = run(
                 [
                     str(spore_bin),
-                    "rootfs",
+                    "image",
                     "import-oci",
                     str(work / "oci-layout"),
                     "--ref",

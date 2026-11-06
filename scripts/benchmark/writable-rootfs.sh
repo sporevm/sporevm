@@ -249,7 +249,7 @@ resolve_image() {
   if [[ "${ref}" == *@sha256:* ]]; then
     printf '%s\n' "${ref}"
   else
-    "${spore_bin}" rootfs resolve "${ref}" --platform "${platform}"
+    "${spore_bin}" image resolve "${ref}" --platform "${platform}"
   fi
 }
 

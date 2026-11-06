@@ -5,7 +5,7 @@ const std = @import("std");
 const kvm = @import("../kvm/x86_64.zig");
 const topology = @import("../topology.zig");
 
-/// Reported as `cpu_profile_status` by `spore host-info`.
+/// Reported as `cpu_profile_status` by `spore system info`.
 pub const status = "approved_same_host";
 
 pub const profile_name = "sporevm-x86_64-v0";

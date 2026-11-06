@@ -720,7 +720,7 @@ class BenchmarkRunner:
         if is_pinned_image_ref(self.args.image):
             self.effective_image = self.args.image
             return
-        argv = [str(self.spore_bin), "rootfs", "resolve", self.args.image, "--platform", self.args.platform]
+        argv = [str(self.spore_bin), "image", "resolve", self.args.image, "--platform", self.args.platform]
         stdout = self.log_dir / "rootfs-resolve.stdout"
         stderr = self.log_dir / "rootfs-resolve.stderr"
         rc, elapsed_ms, error = run_command(argv, env=self.env, stdout_path=stdout, stderr_path=stderr, timeout_s=self.args.timeout_s)
@@ -740,10 +740,10 @@ class BenchmarkRunner:
                     "stderr_path": str(stderr),
                 })
                 return
-            die(f"rootfs resolve failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
+            die(f"image resolve failed rc={rc} elapsed_ms={elapsed_ms} error={error or ''} stderr={stderr}")
         resolved = stdout.read_text(encoding="utf-8").strip()
         if not is_pinned_image_ref(resolved):
-            die(f"rootfs resolve did not return a digest-pinned image ref: {resolved}")
+            die(f"image resolve did not return a digest-pinned image ref: {resolved}")
         self.effective_image = resolved
         self.emit({
             "benchmark": "rootfs_resolve",
@@ -1150,7 +1150,7 @@ class BenchmarkRunner:
             env["SPOREVM_ROOTFS_BUILD_PROFILE"] = "1"
             argv = [
                 str(self.spore_bin),
-                "rootfs",
+                "image",
                 "import-tar",
                 str(fixture),
                 "--ref",
@@ -1930,7 +1930,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--platform", default=DEFAULT_PLATFORM)
     parser.add_argument("--memory", default="512mb")
     parser.add_argument("--command", default=DEFAULT_COMMAND)
-    parser.add_argument("--allow-image-resolve-fallback", action="store_true", help="Use the requested image ref when rootfs resolve fails")
+    parser.add_argument("--allow-image-resolve-fallback", action="store_true", help="Use the requested image ref when image resolve fails")
     parser.add_argument("--timeout-s", type=int)
     parser.add_argument("--synthetic-rootfs-ref", default=DEFAULT_SYNTHETIC_ROOTFS_REF)
     parser.add_argument("--synthetic-rootfs-file-count", type=int, default=DEFAULT_SYNTHETIC_ROOTFS_FILE_COUNT)

@@ -199,7 +199,7 @@ cache cleanup before forcing it:
 ```bash
 rm -rf docker-children/ docker-base.spore
 spore system prune --rootfs --dry-run
-spore cache gc --rootfs --dry-run
+spore system gc --rootfs --dry-run
 ```
 
 Use the corresponding `--force` forms only after confirming that no retained

@@ -32,9 +32,7 @@ read; pull, import, or build the image again.
 `spore run --image ... --save` is the writable-rootfs product path. It
 records the immutable ext4 artifact, records `rootfs.storage` from the image
 record for image-created spores, and captures rootfs writes as a sealed disk
-index over that base. `spore
-rootfs cas-preload --attach-spore` remains a repair/debug path for existing
-exact-rootfs spores; it is not the normal producer path.
+index over that base.
 
 `spore build` uses the same descriptor-bound indexes and writable head. Before
 the first executor-backed instruction, the current builder v9 retains the v8
@@ -382,7 +380,7 @@ ownership anchor makes raw copies fail closed.
 `spore system df --rootfs` reports image ext4 files, image records, exact digest
 artifacts, rootfs CAS indexes, rootfs CAS objects, ref and derivation records, temporary
 entries, and build cache-mount storage. Its cache-mount fields distinguish
-sparse logical capacity from allocated host bytes. `spore cache gc
+sparse logical capacity from allocated host bytes. `spore system gc
 --rootfs` performs a mark/sweep of rootfs CAS indexes
 and objects from image records, live runtime manifests, and
 process-owned lazy-runtime leases; it is dry-run by default and requires
@@ -400,7 +398,7 @@ is passed with an age or size bound. Canonical rootfs CAS chunks are skipped
 unless `--include-rootfs-chunks` is passed.
 That shared namespace also holds writable-disk state: pruning it can break
 resume and push even when a flat rootfs artifact remains. Use root-aware
-`spore cache gc --rootfs` to preserve reachable state.
+`spore system gc --rootfs` to preserve reachable state.
 
 ## Evidence
 

@@ -108,7 +108,7 @@ with tarfile.open(output, "w", format=tarfile.USTAR_FORMAT) as tar:
 PY
 
 export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/producer-cache"
-"${spore_bin}" rootfs import-tar "${workdir}/rootfs.tar" --ref local/remote-lazy:1 --platform "${platform}" >/dev/null
+"${spore_bin}" image import-tar "${workdir}/rootfs.tar" --ref local/remote-lazy:1 --platform "${platform}" >/dev/null
 "${spore_bin}" --json image push local/remote-lazy:1 "${workdir}/store/demo" >"${workdir}/push.json"
 objects_total="$(json_field "${workdir}/push.json" objects_total)"
 object_bytes="$(json_field "${workdir}/push.json" bytes_written)"

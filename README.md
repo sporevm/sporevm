@@ -231,10 +231,10 @@ limit: a sufficiently dense disk above about 30.62 GiB will fail a later
 snapshot or commit closed. Prefer the smallest required size; the 20 GiB
 example remains encodable even when fully populated.
 
-Build a reusable rootfs artifact explicitly:
+Export an image's root filesystem as a reusable ext4 file:
 
 ```bash
-spore rootfs build docker.io/library/alpine:3.20 \
+spore image export docker.io/library/alpine:3.20 \
   --platform linux/arm64 \
   --output alpine.ext4
 
@@ -397,7 +397,7 @@ spore vm ls
 spore vm rm bench-2
 ```
 
-Use `spore checkpoint rm DIR` to delete saved state; `spore cache gc --force`
+Use `spore checkpoint rm DIR` to delete saved state; `spore system gc --force`
 then reclaims storage nothing else references.
 `spore vm rm NAME` stops the live monitor and deletes runtime state without
 touching checkpoints or images.
@@ -429,7 +429,7 @@ OCI/rootfs execution, image commit, networking, and build are available, while
 capture, saved-state restore/resume, disk fork, multi-vCPU, and elastic memory
 are not. It needs an Intel host whose KVM provides the `sporevm-x86_64-v0` CPU
 profile, including TSC scaling to the 3 GHz guest clock; other hosts fail with
-`IncompatibleCpuProfile` and the mismatched fact, and `spore host-info` reports
+`IncompatibleCpuProfile` and the mismatched fact, and `spore system info` reports
 `cpu_profile_incompatible`. SporeVM never emulates another instruction set.
 
 Known limits: compatible host-class restore only, rootfs-bound writable disk

@@ -24,6 +24,24 @@ checkpoint rm help` removes `./help`. `spore resume` and `spore suspend` no
 longer print a hint. JSON results and their schemas are unchanged. The CLI no
 longer promises to keep 0.x spellings compatible.
 
+### `spore system` and `spore image` replace `cache`, `host-info` and `rootfs`
+
+Host and cache maintenance lives under `spore system` and image commands under
+`spore image`; the old spellings are gone, with no aliases:
+
+| Old | New |
+| --- | --- |
+| `spore host-info` | `spore system info` |
+| `spore cache gc`, `cache pins`, `cache unpin` | `spore system gc`, `system pins`, `system unpin` |
+| `spore rootfs import-oci`, `rootfs import-tar`, `rootfs resolve` | `spore image import-oci`, `image import-tar`, `image resolve` |
+| `spore rootfs build` | `spore image export` |
+
+`spore rootfs cas-preload` and its `spore.rootfs.cas-preload.result.v1`
+schema are gone; `spore run --image ... --save` and `spore checkpoint pull`
+write the storage it used to attach. Other JSON results and their schemas are
+unchanged. The monitor no longer sends a timing event before a `vm exec`
+exit frame, and the client now rejects event frames on that stream.
+
 ### Global `--json` replaces `--events=jsonl`
 
 `spore --json run|attach|fanout|vm exec` now prints the
