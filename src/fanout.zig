@@ -1,6 +1,7 @@
 //! Local fan-out orchestration for forked spores.
 
 const std = @import("std");
+const Ctx = @import("cli.zig").Ctx;
 const TestDir = @import("test_dir.zig").TestDir;
 const Io = std.Io;
 
@@ -26,7 +27,7 @@ pub const Options = struct {
     event_mode: events_mod.EventMode = .none,
 };
 
-const cli_usage =
+pub const cli_usage =
     \\Usage:
     \\  spore fanout [--backend auto|hvf|kvm] [--for DURATION] <children-dir>
     \\
@@ -78,8 +79,10 @@ const OutputLock = struct {
     }
 };
 
-pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or wantsHelp(args)) {
+pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    if (args.len == 0) {
         try stdout.writeAll(cli_usage);
         return;
     }
@@ -594,18 +597,6 @@ fn failOperation(err: anyerror, message: []const u8) noreturn {
     std.process.exit(machine_output.fromZigError(err).exit_code);
 }
 
-fn wantsHelp(args: []const []const u8) bool {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or
-            std.mem.eql(u8, arg, "--help"))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
 test "fanout cli parser accepts requested demo shape" {
     const opts = try parseCliArgs(&.{ "children", "--parallel", "--for", "10s", "--backend", "hvf", "--timeout", "120s" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
@@ -650,13 +641,6 @@ test "fanout child completion preserves a non-zero guest exit" {
     try std.testing.expectEqualStrings("completed", parsed.value.object.get("outcome").?.string);
     try std.testing.expectEqual(@as(i64, 23), parsed.value.object.get("exit_code").?.integer);
     try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("error").?);
-}
-
-test "fanout cli help accepts help after options" {
-    try std.testing.expect(wantsHelp(&.{"--help"}));
-    try std.testing.expect(wantsHelp(&.{ "children", "--for", "10s", "--help" }));
-    try std.testing.expect(!wantsHelp(&.{"children"}));
-    try std.testing.expect(!wantsHelp(&.{ "help", "--for", "10s" }));
 }
 
 test "fanout cli parser accepts bound service bindings" {

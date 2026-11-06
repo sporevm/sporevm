@@ -1,4 +1,4 @@
-//! CLI adapter for `spore rootfs`.
+//! CLI adapters for the `spore rootfs` commands.
 //!
 //! This module owns rootfs argv parsing and human output. Rootfs behavior flows
 //! through `api.zig`.
@@ -7,10 +7,11 @@ const std = @import("std");
 const Io = std.Io;
 
 const api = @import("api.zig");
+const Ctx = @import("cli.zig").Ctx;
 const machine_output = @import("machine_output.zig");
 const rootfs_mod = @import("rootfs.zig");
 
-const build_usage =
+pub const build_usage =
     \\Usage:
     \\  spore rootfs build <image@sha256:...|image:tag> --output <rootfs.ext4>
     \\
@@ -22,7 +23,7 @@ const build_usage =
     \\
 ;
 
-const import_oci_usage =
+pub const import_oci_usage =
     \\Usage:
     \\  spore rootfs import-oci <layout-dir|layout.tar> --ref local/name:tag
     \\
@@ -35,7 +36,7 @@ const import_oci_usage =
     \\
 ;
 
-const import_tar_usage =
+pub const import_tar_usage =
     \\Usage:
     \\  spore rootfs import-tar <rootfs.tar> --ref local/name:tag
     \\
@@ -48,7 +49,7 @@ const import_tar_usage =
     \\
 ;
 
-const resolve_usage =
+pub const resolve_usage =
     \\Usage:
     \\  spore rootfs resolve <image:tag>
     \\
@@ -58,7 +59,7 @@ const resolve_usage =
     \\
 ;
 
-const cas_preload_usage =
+pub const cas_preload_usage =
     \\Usage:
     \\  spore rootfs cas-preload <blake3:digest> [--chunk-size BYTES] [--attach-spore DIR]
     \\
@@ -71,48 +72,10 @@ const cas_preload_usage =
     \\
 ;
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
-    if (args.len == 0) {
-        if (mode == .json) return error.MissingRootFSCommand;
-        try stdout.writeAll(rootfs_mod.usage);
-        return;
-    }
-    if (wantsTopLevelHelp(args)) {
-        try stdout.writeAll(rootfs_mod.usage);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "build")) {
-        try build(init, args[1..], stdout, mode);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "import-oci")) {
-        try importOci(init, args[1..], stdout, mode);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "import-tar")) {
-        try importTar(init, args[1..], stdout, mode);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "resolve")) {
-        try resolve(init, args[1..], stdout, mode);
-        return;
-    }
-    if (std.mem.eql(u8, args[0], "cas-preload")) {
-        try casPreload(init, args[1..], stdout, mode);
-        return;
-    }
-    if (mode == .json) return error.UnknownRootFSCommand;
-    try stdout.print("unknown rootfs command: {s}\n\n", .{args[0]});
-    try stdout.writeAll(rootfs_mod.usage);
-    try stdout.flush();
-    std.process.exit(2);
-}
-
-fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(build_usage);
-        return;
-    }
+pub fn build(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const mode = ctx.mode;
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseBuildOptions(arena, args, stdout);
     const result = try api.rootfsBuild(init, arena, .{
@@ -131,11 +94,10 @@ fn build(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, m
     });
 }
 
-fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(import_oci_usage);
-        return;
-    }
+pub fn importOci(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const mode = ctx.mode;
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseImportOciOptions(args, stdout);
     const result = try api.rootfsImportOci(init, arena, .{
@@ -156,11 +118,10 @@ fn importOci(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     );
 }
 
-fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(import_tar_usage);
-        return;
-    }
+pub fn importTar(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const mode = ctx.mode;
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseImportTarOptions(args, stdout);
     const result = try api.rootfsImportTar(init, arena, .{
@@ -181,11 +142,10 @@ fn importTar(init: std.process.Init, args: []const []const u8, stdout: *Io.Write
     );
 }
 
-fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(resolve_usage);
-        return;
-    }
+pub fn resolve(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const mode = ctx.mode;
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseResolveOptions(args, stdout);
     const resolved = try api.rootfsResolve(init, arena, .{
@@ -201,11 +161,10 @@ fn resolve(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer,
     try stdout.print("{s}\n", .{resolved});
 }
 
-fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, mode: machine_output.Mode) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(cas_preload_usage);
-        return;
-    }
+pub fn casPreload(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const mode = ctx.mode;
     const arena = init.arena.allocator();
     const parsed = try rootfs_mod.parseCasPreloadOptions(args, stdout);
     const result = try api.rootfsCasPreload(init, arena, .{
@@ -233,31 +192,4 @@ fn casPreload(init: std.process.Init, args: []const []const u8, stdout: *Io.Writ
     if (parsed.attach_spore) |spore_dir| {
         try stdout.print("attached_spore: {s}\n", .{spore_dir});
     }
-}
-
-fn wantsHelp(args: []const []const u8) bool {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or
-            std.mem.eql(u8, arg, "--help"))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn wantsTopLevelHelp(args: []const []const u8) bool {
-    return args.len == 1 and wantsHelp(args);
-}
-
-test "rootfs cli help accepts standard help spellings" {
-    try std.testing.expect(wantsHelp(&.{"--help"}));
-    try std.testing.expect(wantsHelp(&.{"-h"}));
-    try std.testing.expect(wantsHelp(&.{"help"}));
-    try std.testing.expect(!wantsHelp(&.{}));
-    try std.testing.expect(wantsHelp(&.{ "registry.example/repo:latest", "--help" }));
-    try std.testing.expect(!wantsHelp(&.{ "help", "--output", "rootfs.ext4" }));
-    try std.testing.expect(wantsTopLevelHelp(&.{"--help"}));
-    try std.testing.expect(!wantsTopLevelHelp(&.{ "build", "--help" }));
 }

@@ -4,6 +4,7 @@
 //! gateway address, narrow DNS proxying, and the first outbound TCP proxy path.
 
 const std = @import("std");
+const Ctx = @import("cli.zig").Ctx;
 const zmoltcp = @import("zmoltcp");
 const Io = std.Io;
 
@@ -41,7 +42,7 @@ const max_dns_payload_len = max_frame_len - ethernet_header_len - ipv4_header_mi
 
 const fallback_dns_ipv4: [4]u8 = .{ 1, 1, 1, 1 };
 
-const netd_usage =
+pub const netd_usage =
     \\Usage:
     \\  spore netd --stdio --policy JSON
     \\
@@ -219,11 +220,8 @@ const DnsProxy = struct {
     }
 };
 
-pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (wantsHelp(args)) {
-        try stdout.writeAll(netd_usage);
-        return;
-    }
+pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
     const config = parseCliArgs(init.arena.allocator(), args);
     var policy = spore_net_policy.Runtime.init(config) catch |err| {
         std.debug.print("spore netd: invalid network policy: {s}\n", .{@errorName(err)});
@@ -311,21 +309,6 @@ fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) spore_ne
         std.process.exit(2);
     }
     return policy.?;
-}
-
-fn wantsHelp(args: []const []const u8) bool {
-    return args.len == 1 and
-        (std.mem.eql(u8, args[0], "help") or
-            std.mem.eql(u8, args[0], "-h") or
-            std.mem.eql(u8, args[0], "--help"));
-}
-
-test "netd cli help accepts standard help spellings" {
-    try std.testing.expect(wantsHelp(&.{"--help"}));
-    try std.testing.expect(wantsHelp(&.{"-h"}));
-    try std.testing.expect(wantsHelp(&.{"help"}));
-    try std.testing.expect(!wantsHelp(&.{}));
-    try std.testing.expect(!wantsHelp(&.{ "--help", "extra" }));
 }
 
 fn takeValue(args: []const []const u8, i: *usize, flag: []const u8) []const u8 {

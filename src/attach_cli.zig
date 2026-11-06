@@ -7,11 +7,14 @@ const std = @import("std");
 const Io = std.Io;
 
 const api = @import("api.zig");
+const Ctx = @import("cli.zig").Ctx;
 const attach_mod = @import("attach.zig");
 const events_mod = @import("events.zig");
 
-pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or wantsHelp(args)) {
+pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    if (args.len == 0) {
         try stdout.writeAll(attach_mod.cli_usage);
         return;
     }
@@ -22,7 +25,6 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const opts = try attach_mod.parseCliArgs(args);
     const events: ?api.EventSink = if (opts.event_mode == .jsonl) event_writer.sink() else null;
     const arena = init.arena.allocator();
-    const full_args = try init.minimal.args.toSlice(arena);
     const result = api.attachSpore(.{
         .io = init.io,
         .environ_map = init.environ_map,
@@ -33,7 +35,7 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         .generation_path = opts.generation_path,
         .timeout_ms = opts.timeout_ms,
         .spore_executable = try std.process.executablePathAlloc(init.io, arena),
-        .debug = runtimeDebugEnabled(full_args),
+        .debug = ctx.debug,
         .interactive = opts.interactive,
         .tty = opts.tty,
         .bound_services = opts.bound_services.slice(),
@@ -76,30 +78,4 @@ fn requestsJsonl(args: []const []const u8) bool {
         if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
     }
     return false;
-}
-
-fn runtimeDebugEnabled(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--debug")) return true;
-    }
-    return false;
-}
-
-fn wantsHelp(args: []const []const u8) bool {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or
-            std.mem.eql(u8, arg, "--help"))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-test "attach cli help accepts help after options" {
-    try std.testing.expect(wantsHelp(&.{"--help"}));
-    try std.testing.expect(wantsHelp(&.{ "--backend", "hvf", "--help" }));
-    try std.testing.expect(!wantsHelp(&.{"base.spore"}));
-    try std.testing.expect(!wantsHelp(&.{ "help", "--backend", "hvf" }));
 }

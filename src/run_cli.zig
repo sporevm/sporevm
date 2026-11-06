@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const api = @import("api.zig");
+const Ctx = @import("cli.zig").Ctx;
 const boot_assets = @import("boot_assets.zig");
 const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
@@ -19,8 +20,10 @@ const spore = @import("spore.zig");
 
 var setup_event_writer: ?*events_mod.EventWriter = null;
 
-pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer) !void {
-    if (args.len == 0 or wantsHelp(args)) {
+pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    if (args.len == 0) {
         try stdout.writeAll(run_mod.cli_usage);
         return;
     }
@@ -37,10 +40,10 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         }
         return err;
     };
-    try runParsedCli(init, arena, parsed, stdout, &event_writer);
+    try runParsedCli(init, arena, parsed, stdout, &event_writer, ctx.debug);
 }
 
-fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer, event_writer: *events_mod.EventWriter) !void {
+fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer, event_writer: *events_mod.EventWriter, debug: bool) !void {
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.command.len == 0) {
             failRunSetup("spore run: --from runs a new command from a spore; use `spore attach {s}` to connect to a saved session", .{spore_dir});
@@ -56,9 +59,8 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
     try run_mod.openConsoleLog(parsed.shared.console_log_path);
     defer run_mod.closeConsoleLog();
 
-    const full_args = try init.minimal.args.toSlice(arena);
     const spore_executable = try std.process.executablePathAlloc(init.io, arena);
-    const result = runParsed(init, arena, parsed, events, spore_executable, runtimeDebugEnabled(full_args)) catch |err| {
+    const result = runParsed(init, arena, parsed, events, spore_executable, debug) catch |err| {
         if (parsed.event_mode == .jsonl) {
             const classified = api.classifyFailure(err);
             event_writer.emitFailure(classified) catch {};
@@ -267,31 +269,4 @@ fn requestsJsonl(args: []const []const u8) bool {
         if (std.mem.eql(u8, arg, "--events") and i + 1 < args.len and std.mem.eql(u8, args[i + 1], "jsonl")) return true;
     }
     return false;
-}
-
-fn runtimeDebugEnabled(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--debug")) return true;
-    }
-    return false;
-}
-
-fn wantsHelp(args: []const []const u8) bool {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, "-h") or
-            std.mem.eql(u8, arg, "--help"))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-test "run cli help accepts help before argv delimiter only" {
-    try std.testing.expect(wantsHelp(&.{"--help"}));
-    try std.testing.expect(wantsHelp(&.{ "--image", "alpine", "--help" }));
-    try std.testing.expect(!wantsHelp(&.{ "help", "--image", "alpine" }));
-    try std.testing.expect(!wantsHelp(&.{ "--", "/bin/true", "--help" }));
 }

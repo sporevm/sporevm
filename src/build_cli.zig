@@ -1,4 +1,5 @@
 const std = @import("std");
+const Ctx = @import("cli.zig").Ctx;
 const Io = std.Io;
 
 const build_mod = @import("build.zig");
@@ -49,12 +50,12 @@ const ParsedOptions = struct {
     nofile: build_mod.NofileLimit = build_mod.default_build_nofile,
 };
 
-pub fn run(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer, stderr: *Io.Writer, mode: machine_output.Mode) !void {
+pub fn run(ctx: *const Ctx, args: []const []const u8) !void {
+    const init = ctx.init;
+    const stdout = ctx.stdout;
+    const stderr = ctx.stderr;
+    const mode = ctx.mode;
     const allocator = init.arena.allocator();
-    if (wantsHelp(args)) {
-        try stdout.writeAll(usage);
-        return;
-    }
 
     const parsed = parseArgs(allocator, args) catch |err| {
         if (mode == .json) exitMachineError(allocator, stderr, machine_output.CliError.init(.usage_invalid_argument, parseErrorMessage(err), @errorName(err)));
@@ -313,13 +314,6 @@ fn validName(name: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-')) return false;
     }
     return true;
-}
-
-fn wantsHelp(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "help")) return true;
-    }
-    return false;
 }
 
 fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
