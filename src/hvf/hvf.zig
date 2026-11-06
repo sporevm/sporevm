@@ -154,10 +154,11 @@ pub const SysReg = enum(u16) {
     _,
 };
 
-/// 16-byte SIMD&FP register value (hv_simd_fp_uchar16_t).
-pub const SimdReg = extern struct {
-    bytes: [16]u8 align(16),
-};
+/// 16-byte SIMD&FP register value (hv_simd_fp_uchar16_t). It is a vector
+/// type, so the C ABI passes it by value in a SIMD register; a 16-byte struct
+/// would go in two general registers and the setter would read whatever
+/// happened to be in v0.
+pub const SimdReg = @Vector(16, u8);
 
 pub extern "c" fn hv_vcpu_get_simd_fp_reg(vcpu: VcpuHandle, reg: u32, value: *SimdReg) ReturnCode;
 pub extern "c" fn hv_vcpu_set_simd_fp_reg(vcpu: VcpuHandle, reg: u32, value: SimdReg) ReturnCode;

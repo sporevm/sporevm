@@ -468,18 +468,18 @@ mise run check
 mise run smoke core
 ```
 
-`mise run smoke core` builds `spore` with `-Dsmoke-helpers`, which adds the
-guest helper binaries the scripts run, then boots real VMs through run, signal
-save, fork, named disk forks with save, restore, prune and GC, the named
-lifecycle, copy, the monitor jail, and networking. CI
-runs it on every commit on Linux ARM64 (KVM) and macOS (HVF). `mise run smoke
-full` adds the other aarch64 scripts in `test/smoke/`. The suite prints one
-line per script and keeps each script's log under `zig-cache/smoke/`. `mise run
-smoke` also takes one script path without `.sh`, such as `mise run smoke
-run/tty`; on Linux x86-64 KVM hosts, `mise run smoke x86/run` and `mise run
-smoke x86/build` run the x86-64 smokes. Each script also runs on its own
-against such a build in `zig-out/bin/spore` (or `SPORE_BIN`), for example
-`test/smoke/run/tty.sh`.
+`mise run smoke core` builds `spore` with the shipped ReleaseSafe settings and
+`-Dsmoke-helpers`, which adds the guest helper binaries the scripts run, then
+boots real VMs through run, signal save, fork, named disk forks with save,
+restore, prune and GC, the named lifecycle, copy, the monitor jail, and
+networking. CI runs it on every commit on Linux ARM64 (KVM) and macOS (HVF).
+`mise run smoke full` adds the other aarch64 scripts in `test/smoke/`. The
+suite prints one line per script and keeps each script's log under
+`zig-cache/smoke/`. `mise run smoke` also takes one script path without `.sh`,
+such as `mise run smoke run/tty`; on Linux x86-64 KVM hosts, `mise run smoke
+x86/run` and `mise run smoke x86/build` run the x86-64 smokes. Each script also
+runs on its own against such a build in `zig-out/bin/spore` (or `SPORE_BIN`),
+for example `test/smoke/run/tty.sh`.
 
 Repeatable benchmark runs live in [docs/benchmarks.md](docs/benchmarks.md).
 Release notes and release-gate summaries live on
