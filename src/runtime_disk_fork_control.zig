@@ -14,9 +14,10 @@ pub const prepared_schema = "spore.disk-fork-prepared.v1";
 pub const cancel_type = "disk-fork-cancel";
 pub const cancel_schema = "spore.disk-fork-cancel.v1";
 pub const max_capture_dir_bytes = 4096;
-pub const max_response_bytes = 128 * 1024;
 
 pub const PrepareRequest = struct {
+    pub const wire_type = prepare_type;
+
     type: []const u8,
     schema: []const u8,
     out_dir: []const u8,
@@ -27,6 +28,8 @@ pub const PrepareRequest = struct {
 };
 
 pub const CancelRequest = struct {
+    pub const wire_type = cancel_type;
+
     type: []const u8,
     schema: []const u8,
     batch: []const u8,
@@ -41,6 +44,8 @@ pub const PreparedClaim = struct {
 };
 
 pub const PreparedResponse = struct {
+    pub const wire_type = prepared_type;
+
     type: []const u8,
     schema: []const u8,
     batch: []const u8,
@@ -56,39 +61,10 @@ pub const PreparedResponse = struct {
     copied_bytes: u64,
 };
 
-pub fn parsePreparedBytes(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(PreparedResponse) {
-    if (bytes.len == 0 or bytes.len >= max_response_bytes) return error.BadControlResponse;
-    var parsed = std.json.parseFromSlice(PreparedResponse, allocator, bytes, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = false,
-    }) catch return error.BadControlResponse;
-    errdefer parsed.deinit();
-    try validatePrepared(parsed.value);
-    return parsed;
-}
-
-pub fn parsePrepareBytes(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(PrepareRequest) {
-    if (bytes.len == 0 or bytes.len >= runtime_disk_claim.max_claim_request_bytes) return error.BadControlRequest;
-    var parsed = std.json.parseFromSlice(PrepareRequest, allocator, bytes, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = false,
-    }) catch return error.BadControlRequest;
-    errdefer parsed.deinit();
-    try validatePrepare(parsed.value);
-    return parsed;
-}
-
-pub fn parseCancelBytes(allocator: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(CancelRequest) {
-    if (bytes.len == 0 or bytes.len >= runtime_disk_claim.max_claim_request_bytes) return error.BadControlRequest;
-    var parsed = std.json.parseFromSlice(CancelRequest, allocator, bytes, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = false,
-    }) catch return error.BadControlRequest;
-    errdefer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.type, cancel_type) or
-        !std.mem.eql(u8, parsed.value.schema, cancel_schema) or
-        !runtime_disk_claim.validBindingName(parsed.value.batch, runtime_disk_claim.max_batch_name_bytes)) return error.BadControlRequest;
-    return parsed;
+pub fn validateCancel(request: CancelRequest) !void {
+    if (!std.mem.eql(u8, request.type, cancel_type) or
+        !std.mem.eql(u8, request.schema, cancel_schema) or
+        !runtime_disk_claim.validBindingName(request.batch, runtime_disk_claim.max_batch_name_bytes)) return error.BadControlRequest;
 }
 
 pub fn validatePrepare(request: PrepareRequest) !void {
@@ -137,47 +113,4 @@ pub fn validateBindings(batch: []const u8, children: []const []const u8, allow_c
             if (std.mem.eql(u8, earlier, child)) return error.DuplicateChild;
         }
     }
-}
-
-test "prepare and cancel requests are strict and versioned" {
-    const allocator = std.testing.allocator;
-    var prepare = try parsePrepareBytes(allocator,
-        \\{"type":"disk-fork-prepare","schema":"spore.disk-fork-prepare.v1","out_dir":"/tmp/capture","batch":"batch-1","children":["child-0","child-1"]}
-    );
-    defer prepare.deinit();
-    try std.testing.expectEqual(@as(usize, 2), prepare.value.children.len);
-    try std.testing.expectError(error.BadControlRequest, parsePrepareBytes(allocator,
-        \\{"type":"disk-fork-prepare","schema":"spore.disk-fork-prepare.v1","out_dir":"/tmp/capture","batch":"batch-1","children":["child-0"],"extra":true}
-    ));
-    var cancel = try parseCancelBytes(allocator,
-        \\{"type":"disk-fork-cancel","schema":"spore.disk-fork-cancel.v1","batch":"batch-1"}
-    );
-    defer cancel.deinit();
-
-    const token = "abababababababababababababababababababababababababababababababab";
-    const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const prepared_format = "{{\"type\":\"disk-fork-prepared\",\"schema\":\"spore.disk-fork-prepared.v1\",\"batch\":\"batch-1\",\"capture_dir\":\"/tmp/capture\",\"claims\":[{{\"child\":\"child-0\",\"child_index\":0,\"token\":\"{s}\",\"baseline_kind\":\"rootfs\",\"baseline_identity\":\"{s}\"}}],\"lease\":{{\"store\":\"rootfs_cache\",\"root\":\"/cache\",\"baseline_kind\":\"rootfs\",\"baseline_identity\":\"{s}\"}},\"disk\":null,\"ram_capture_ns\":1,\"disk_fork_ns\":2,\"source_pause_ns\":3,\"copied_bytes\":0}}";
-    const prepared_json = try std.fmt.allocPrint(allocator, prepared_format, .{ token, digest, digest });
-    defer allocator.free(prepared_json);
-    var prepared = try parsePreparedBytes(allocator, prepared_json);
-    defer prepared.deinit();
-    try std.testing.expectEqualStrings("child-0", prepared.value.claims[0].child);
-    try std.testing.expectEqualStrings(digest, prepared.value.lease.baseline_identity);
-
-    // Every claim must be for the baseline the lease names.
-    const other = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const mismatched_json = try std.fmt.allocPrint(allocator, prepared_format, .{ token, digest, other });
-    defer allocator.free(mismatched_json);
-    try std.testing.expectError(error.BadControlResponse, parsePreparedBytes(allocator, mismatched_json));
-}
-
-fn fuzzPrepare(_: void, smith: *std.testing.Smith) anyerror!void {
-    var bytes: [runtime_disk_claim.max_claim_request_bytes]u8 = undefined;
-    const len = smith.slice(&bytes);
-    var parsed = parsePrepareBytes(std.testing.allocator, bytes[0..len]) catch return;
-    defer parsed.deinit();
-}
-
-test "fuzz runtime disk fork prepare parser" {
-    try std.testing.fuzz({}, fuzzPrepare, .{});
 }

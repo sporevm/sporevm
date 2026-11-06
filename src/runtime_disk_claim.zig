@@ -57,6 +57,8 @@ pub const Error = runtime_disk_fork.Error || std.mem.Allocator.Error || error{
 };
 
 pub const ClaimRequest = struct {
+    pub const wire_type = claim_type;
+
     type: []const u8,
     schema: []const u8,
     token: []const u8,

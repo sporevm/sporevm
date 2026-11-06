@@ -12,6 +12,8 @@ const local_paths = @import("local_paths.zig");
 const machine_output = @import("machine_output.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
 const memory_config = @import("memory.zig");
+const monitor_protocol = @import("monitor_protocol.zig");
+const ExecNamedStream = monitor_protocol.ExecNamedStream;
 const named_copy_archive = @import("named_copy_archive.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
@@ -39,8 +41,6 @@ const version = @import("version.zig");
 const vm_registry = @import("vm_registry.zig");
 
 pub const runtime_dir_env = local_paths.runtime_dir_env;
-pub const monitor_hello_schema = "spore.monitor.hello.v1";
-pub const monitor_helper_contract: u32 = 1;
 
 // Registry names that lifecycle code and its callers still reach through
 // this module.
@@ -74,7 +74,6 @@ const max_metadata_bytes = vm_registry.max_metadata_bytes;
 const setLastError = vm_registry.setLastError;
 const writeTimingJson = vm_registry.writeTimingJson;
 const validateSpec = vm_registry.validateSpec;
-const controlSocketAddress = vm_registry.controlSocketAddress;
 const readMonitorStats = vm_registry.readMonitorStats;
 const pathExists = vm_registry.pathExists;
 const openDirPath = vm_registry.openDirPath;
@@ -85,15 +84,11 @@ const claimControlSocketPath = vm_registry.claimControlSocketPath;
 const releaseControlSocketPath = vm_registry.releaseControlSocketPath;
 const deleteVmState = vm_registry.deleteVmState;
 
-const max_control_response = 128 * 1024;
 const lifecycle_spore_metadata_file = "sporevm-lifecycle.json";
 const diskless_resume_device_count = 4;
 const monitor_shutdown_grace_ms = 1_000;
 const monitor_shutdown_term_ms = 1_000;
 const monitor_shutdown_kill_ms = 1_000;
-/// The monitor answers `hello` and `shutdown` when it accepts the connection,
-/// so a monitor that takes longer is wedged; `rm` then falls back to signals.
-const monitor_reply_deadline_ms = 2_000;
 
 const testing = if (builtin.is_test) struct {
     var named_restore_authority_barrier: ?*test_barrier.Barrier = null;
@@ -654,165 +649,6 @@ pub const ExecNamedStreamOptions = struct {
     terminal_size: TerminalSize = .{ .rows = 24, .cols = 80 },
 };
 
-pub const ExecNamedStreamEvent = union(enum) {
-    stdout: []const u8,
-    stderr: []const u8,
-    terminal: []const u8,
-    exit: u8,
-    err: []const u8,
-};
-
-pub const ExecNamedStream = struct {
-    io: Io,
-    stream: net.Stream,
-    closed: bool = false,
-    stdin_offset: u64 = 0,
-    terminal_input_offset: u64 = 0,
-    stdout_offset: u64 = 0,
-    stderr_offset: u64 = 0,
-    terminal_offset: u64 = 0,
-    timing: ?NamedExecTiming = null,
-    payload: [spore_stream.max_payload_len]u8 = undefined,
-
-    pub fn deinit(self: *ExecNamedStream) void {
-        if (self.closed) return;
-        self.stream.close(self.io);
-        self.closed = true;
-    }
-
-    /// Return the next output, terminal, exit, or monitor-error frame.
-    ///
-    /// Byte slices are borrowed from the stream and valid until the next call.
-    pub fn next(self: *ExecNamedStream) !ExecNamedStreamEvent {
-        while (true) {
-            var header_buf: [spore_stream.header_len]u8 = undefined;
-            readFdExact(self.stream.socket.handle, &header_buf) catch return error.StreamInterrupted;
-            const header = try spore_stream.readHeader(&header_buf);
-            if (header.flags != 0 or header.payload_len > self.payload.len) return error.BadMonitorResponse;
-            const payload = self.payload[0..header.payload_len];
-            if (payload.len > 0) readFdExact(self.stream.socket.handle, payload) catch return error.StreamInterrupted;
-            switch (header.frame_type) {
-                .data => {
-                    const expected = switch (header.stream_id) {
-                        .stdout => self.stdout_offset,
-                        .stderr => self.stderr_offset,
-                        .terminal => self.terminal_offset,
-                        else => return error.BadMonitorResponse,
-                    };
-                    if (header.offset != expected) return error.BadMonitorResponse;
-                    const len: u64 = @intCast(payload.len);
-                    switch (header.stream_id) {
-                        .stdout => {
-                            self.stdout_offset += len;
-                            return .{ .stdout = payload };
-                        },
-                        .stderr => {
-                            self.stderr_offset += len;
-                            return .{ .stderr = payload };
-                        },
-                        .terminal => {
-                            self.terminal_offset += len;
-                            return .{ .terminal = payload };
-                        },
-                        else => unreachable,
-                    }
-                },
-                .exit => {
-                    if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
-                    const code = try spore_stream.readExitPayload(payload);
-                    if (code > 255) return error.BadMonitorResponse;
-                    return .{ .exit = @intCast(code) };
-                },
-                .err => {
-                    if (header.stream_id != .control) return error.BadMonitorResponse;
-                    return .{ .err = payload };
-                },
-                .event => {
-                    if (header.stream_id != .control or header.offset != 0) return error.BadMonitorResponse;
-                    if (parseNamedExecTimingEvent(payload)) |timing| self.timing = timing;
-                    continue;
-                },
-                else => return error.BadMonitorResponse,
-            }
-        }
-    }
-
-    pub fn writeStdin(self: *ExecNamedStream, bytes: []const u8) !void {
-        try self.writeInputData(.stdin, bytes);
-    }
-
-    pub fn writeTerminal(self: *ExecNamedStream, bytes: []const u8) !void {
-        try self.writeInputData(.terminal, bytes);
-    }
-
-    pub fn closeStdin(self: *ExecNamedStream) !void {
-        try self.writeInputFrame(.close, .stdin, "");
-    }
-
-    pub fn closeTerminal(self: *ExecNamedStream) !void {
-        try self.writeInputFrame(.close, .terminal, "");
-    }
-
-    pub fn resizeTerminal(self: *ExecNamedStream, size: TerminalSize) !void {
-        var payload: [4]u8 = undefined;
-        spore_stream.writeResizePayload(&payload, size);
-        try self.writeInputFrame(.resize, .terminal, &payload);
-    }
-
-    fn writeInputData(self: *ExecNamedStream, stream_id: spore_stream.StreamId, bytes: []const u8) !void {
-        var remaining = bytes;
-        while (remaining.len > 0) {
-            const take = @min(remaining.len, spore_stream.max_payload_len);
-            try self.writeInputFrame(.data, stream_id, remaining[0..take]);
-            remaining = remaining[take..];
-        }
-    }
-
-    fn writeInputFrame(self: *ExecNamedStream, frame_type: spore_stream.FrameType, stream_id: spore_stream.StreamId, payload: []const u8) !void {
-        const offset = switch (stream_id) {
-            .stdin => self.stdin_offset,
-            .terminal => self.terminal_input_offset,
-            else => 0,
-        };
-        var frame_buf: [spore_stream.max_frame_len]u8 = undefined;
-        const frame = try spore_stream.writeFrame(&frame_buf, .{
-            .frame_type = frame_type,
-            .stream_id = stream_id,
-            .offset = if (frame_type == .resize) 0 else offset,
-        }, payload);
-        try writeFdAll(self.stream.socket.handle, frame);
-        if (frame_type == .data) {
-            const len: u64 = @intCast(payload.len);
-            switch (stream_id) {
-                .stdin => self.stdin_offset += len,
-                .terminal => self.terminal_input_offset += len,
-                else => {},
-            }
-        }
-    }
-};
-
-const NamedExecTimingEvent = struct {
-    type: []const u8,
-    schema_version: u32,
-    timing: NamedExecTiming,
-};
-
-fn parseNamedExecTimingEvent(payload: []const u8) ?NamedExecTiming {
-    var storage: [1024]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&storage);
-    var parsed = std.json.parseFromSlice(NamedExecTimingEvent, fixed.allocator(), payload, .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.type, "named_exec_timing") or
-        parsed.value.schema_version != named_exec_timing_schema_version)
-    {
-        return null;
-    }
-    return parsed.value.timing;
-}
-
 const NamedNetworkConfig = struct {
     mode: run_mod.NetworkMode = .disabled,
     policy: run_mod.NetworkPolicy = .{},
@@ -1242,7 +1078,7 @@ fn copyNamedStreaming(
     context: Context,
     allocator: std.mem.Allocator,
     options: CopyNamedOptions,
-    request_type: []const u8,
+    direction: CopyDirection,
     fds: CopyStreamFds,
 ) !u8 {
     clearLastError();
@@ -1256,7 +1092,7 @@ fn copyNamedStreaming(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "copy", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    return copyStreamControl(context, arena, ready.value.control_socket_path, request_type, options.guest_path, fds);
+    return copyStreamControl(context, arena, ready.value.control_socket_path, direction, options.guest_path, fds);
 }
 
 fn startNamed(
@@ -1279,8 +1115,13 @@ fn startNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "start", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    const response = try sendStartRequest(arena, context.io, ready.value.control_socket_path, options.command, options.guest_env, options.guest_working_dir, retain_output);
-    return parseExecNamedResponse(allocator, arena, response);
+    const response = try monitor_protocol.call(arena, context.io, ready.value.control_socket_path, .{ .start = .{
+        .argv = options.command,
+        .env = options.guest_env,
+        .working_dir = options.guest_working_dir,
+        .retain_output = retain_output,
+    } });
+    return execNamedResult(allocator, response);
 }
 
 pub fn initialOutputNamed(
@@ -1298,8 +1139,8 @@ pub fn initialOutputNamed(
     if (state != .ready) return namedVmNotReady(arena, context.io, paths, "logs", options.name, state);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    const response = try sendInitialOutputRequest(arena, context.io, ready.value.control_socket_path);
-    const snapshot = try parseExecNamedResponse(allocator, arena, response);
+    const response = try monitor_protocol.call(arena, context.io, ready.value.control_socket_path, .{ .initial_output = .{} });
+    const snapshot = try execNamedResult(allocator, response);
     defer deinitExecNamedResult(allocator, snapshot);
     if (snapshot.exit_code != 0) {
         setLastError("named VM {s} has no retained initial-command output", .{options.name});
@@ -1382,11 +1223,11 @@ fn saveContinueNamed(
     try writeSporeLifecycleSpec(arena, context.io, temp_dir, snapshot_spec);
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    const response = try sendSnapshotRequest(arena, context.io, ready.value.control_socket_path, temp_dir, out_dir);
-    if (!try snapshotResponseOk(arena, response)) {
-        try checkImageStoreRefusal(arena, options.name, response);
-        return error.MonitorRequestFailed;
-    }
+    const response = try monitor_protocol.call(arena, context.io, ready.value.control_socket_path, .{ .snapshot = .{
+        .out_dir = temp_dir,
+        .publish_dir = out_dir,
+    } });
+    if (response != .snapshotted) return saveFailed(options.name, response);
     cleanup_temp = false;
     return ownedNamedLifecycleResult(allocator, .{
         .action = "saved",
@@ -1453,11 +1294,8 @@ fn saveStopNamed(
     }
     var ready = try readReady(arena, context.io, paths);
     defer ready.deinit();
-    const response = try sendSuspendRequest(arena, context.io, ready.value.control_socket_path, out_dir);
-    if (try suspendResponseFailureMessage(arena, response) != null) {
-        try checkImageStoreRefusal(arena, options.name, response);
-        return error.MonitorRequestFailed;
-    }
+    const response = try monitor_protocol.call(arena, context.io, ready.value.control_socket_path, .{ .@"suspend" = .{ .out_dir = out_dir } });
+    if (response != .suspended) return saveFailed(options.name, response);
 
     var cleanup_after_suspend = true;
     defer if (cleanup_after_suspend) {
@@ -1550,7 +1388,11 @@ pub fn forkNamed(
     defer if (cleanup_batch) Io.Dir.cwd().deleteTree(init.io, batch_dir) catch {};
     var prepared_batch: ?[]const u8 = null;
     defer if (cleanup_batch) {
-        if (prepared_batch) |batch| sendDiskForkCancelRequest(arena, init.io, ready.value.control_socket_path, batch) catch {};
+        if (prepared_batch) |batch| _ = monitor_protocol.call(arena, init.io, ready.value.control_socket_path, .{ .disk_fork_cancel = .{
+            .type = runtime_disk_fork_control.cancel_type,
+            .schema = runtime_disk_fork_control.cancel_schema,
+            .batch = batch,
+        } }) catch {};
     };
 
     var ram_capture_ms: ?u64 = null;
@@ -1572,19 +1414,17 @@ pub fn forkNamed(
         // Cancellation is idempotent and must cover a response transport
         // failure after the source has already registered the batch.
         prepared_batch = batch_name;
-        const response = try sendDiskForkPrepareRequest(arena, init.io, ready.value.control_socket_path, prepare_request);
-        var prepared = try parseDiskForkPreparedResponse(arena, response);
-        defer prepared.deinit();
-        try validatePreparedDiskFork(prepared.value, prepare_request);
+        const prepared = try diskForkPrepared(try monitor_protocol.call(arena, init.io, ready.value.control_socket_path, .{ .disk_fork_prepare = prepare_request }));
+        try validatePreparedDiskFork(prepared, prepare_request);
         // The source monitor names and records the baseline while it holds
         // the guest, so a save that replaced the disk after this CLI read the
         // spec is already reflected in the response. The CLI never writes
         // the source's spec.
-        source_spec.value.disk = prepared.value.disk;
-        source_spec.value.disk_baseline_lease = prepared.value.lease;
-        ram_capture_ms = prepared.value.ram_capture_ns / std.time.ns_per_ms;
-        disk_fork_ms = prepared.value.disk_fork_ns / std.time.ns_per_ms;
-        source_pause_ms = prepared.value.source_pause_ns / std.time.ns_per_ms;
+        source_spec.value.disk = prepared.disk;
+        source_spec.value.disk_baseline_lease = prepared.lease;
+        ram_capture_ms = prepared.ram_capture_ns / std.time.ns_per_ms;
+        disk_fork_ms = prepared.disk_fork_ns / std.time.ns_per_ms;
+        source_pause_ms = prepared.source_pause_ns / std.time.ns_per_ms;
         const children_start_ms = monotonicMs();
 
         try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
@@ -1595,7 +1435,7 @@ pub fn forkNamed(
             .count = options.count,
             .environ_map = init.environ_map,
         });
-        for (children, prepared.value.claims, 0..) |*child, claim, index| {
+        for (children, prepared.claims, 0..) |*child, claim, index| {
             const spore_dir = try childSporeDir(arena, children_dir, index);
             startForkChildExecutable(init, arena, child, spore_dir, source_spec.value, options.spore_executable, options.debug, .{
                 .source_socket_path = ready.value.control_socket_path,
@@ -1608,8 +1448,8 @@ pub fn forkNamed(
         }
         child_ready_ms = monotonicMs() -| children_start_ms;
     } else {
-        const response = try sendSnapshotRequest(arena, init.io, ready.value.control_socket_path, snapshot_dir, null);
-        if (!(snapshotResponseOk(arena, response) catch return error.BadMonitorResponse)) return error.MonitorRequestFailed;
+        const response = try monitor_protocol.call(arena, init.io, ready.value.control_socket_path, .{ .snapshot = .{ .out_dir = snapshot_dir } });
+        if (response != .snapshotted) return monitorRequestFailed(if (response == .err) response.err.message else null);
         try writeSporeLifecycleSpec(arena, init.io, snapshot_dir, source_spec.value);
         try writeSporeExecDefaults(arena, snapshot_dir, source_spec.value.exec_defaults);
 
@@ -2110,7 +1950,7 @@ pub fn copyInCli(init: std.process.Init, args: []const []const u8, stdout: *Io.W
     const exit_code = copyNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
-    }, allocator, parsed, "copy-in-v1", .{
+    }, allocator, parsed, .in, .{
         .input_fd = source_fd,
         // Guest stdout is dropped during copy-in, so there is no archive to cap.
         .archive_limit = std.math.maxInt(u64),
@@ -2192,7 +2032,7 @@ pub fn copyOutCli(init: std.process.Init, args: []const []const u8, stdout: *Io.
     const exit_code = copyNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
-    }, allocator, parsed, "copy-out-v1", .{
+    }, allocator, parsed, .out, .{
         .archive_fd = archive_fd,
         .stderr_fd = copyGuestStderrFd(mode),
     }) catch |err| switch (err) {
@@ -4018,111 +3858,6 @@ fn spawnMonitorExecutable(init: std.process.Init, allocator: std.mem.Allocator, 
     claim.release(init.io);
 }
 
-test "a control request with a deadline gives up when the monitor's backlog is full" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-busy-{d}.sock", .{currentTestPid()});
-    defer allocator.free(socket_path);
-    Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    // A listener that never accepts stands in for a monitor whose accept
-    // thread is stuck; clients queued behind it fill the backlog, and a
-    // blocking connect would then wait for an accept that never comes.
-    const address = try net.UnixAddress.init(socket_path);
-    var server = try address.listen(io, .{ .kernel_backlog = 1 });
-    defer server.deinit(io);
-    var queued: [64]std.c.fd_t = undefined;
-    var count: usize = 0;
-    defer for (queued[0..count]) |fd| {
-        _ = std.c.close(fd);
-    };
-    while (count < queued.len) : (count += 1) {
-        queued[count] = connectControlSocketBefore(socket_path, monotonicMs() + 100) catch break;
-    }
-    try std.testing.expect(count < queued.len);
-
-    const start = monotonicMs();
-    try std.testing.expectError(error.MonitorUnavailable, sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}", 100));
-    try std.testing.expect(monotonicMs() - start < 2_000);
-}
-
-test "a control request to a monitor that closed its socket fails instead of raising SIGPIPE" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-closed-{d}.sock", .{currentTestPid()});
-    defer allocator.free(socket_path);
-    Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    // A client queued on the monitor's socket, which the monitor then closes
-    // as it exits, so the connection is reset before the request is written.
-    const address = try net.UnixAddress.init(socket_path);
-    var server = try address.listen(io, .{});
-    const fd = connectControlSocketBefore(socket_path, monotonicMs() + 1_000) catch |err| {
-        server.deinit(io);
-        return err;
-    };
-    defer _ = std.c.close(fd);
-    server.deinit(io);
-    // The test runtime catches SIGPIPE and the spore CLI does not, so restore
-    // the default: a write that raises it ends the test process.
-    var old_action: std.posix.Sigaction = undefined;
-    std.posix.sigaction(.PIPE, &.{ .handler = .{ .handler = std.c.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 }, &old_action);
-    defer std.posix.sigaction(.PIPE, &old_action, null);
-    try std.testing.expectError(error.MonitorUnavailable, writeControlRequest(fd, "{\"type\":\"shutdown\"}"));
-}
-
-test "a control request with a deadline waits for the monitor's backlog to drain" {
-    // macOS refuses a connect to a full backlog at once instead of waiting.
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-drain-{d}.sock", .{currentTestPid()});
-    defer allocator.free(socket_path);
-    Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    const address = try net.UnixAddress.init(socket_path);
-    var server = try address.listen(io, .{ .kernel_backlog = 1 });
-    defer server.deinit(io);
-    var queued: [64]std.c.fd_t = undefined;
-    var count: usize = 0;
-    defer for (queued[0..count]) |fd| {
-        _ = std.c.close(fd);
-    };
-    while (count < queued.len) : (count += 1) {
-        queued[count] = connectControlSocketBefore(socket_path, monotonicMs() + 100) catch break;
-    }
-    try std.testing.expect(count < queued.len);
-
-    // The monitor's accept thread comes back partway through the deadline,
-    // takes the queued clients, then answers the request.
-    const Monitor = struct {
-        fn run(listener: std.c.fd_t, backlog: usize) void {
-            sleepMs(300);
-            for (0..backlog) |_| _ = std.c.close(std.c.accept(listener, null, null));
-            // Bounded, so a request that gave up fails the test instead of
-            // hanging it.
-            var fds = [_]std.posix.pollfd{.{ .fd = listener, .events = std.c.POLL.IN, .revents = 0 }};
-            if ((std.posix.poll(&fds, 3_000) catch 0) == 0) return;
-            const client = std.c.accept(listener, null, null);
-            if (client < 0) return;
-            defer _ = std.c.close(client);
-            var buf: [64]u8 = undefined;
-            _ = std.c.read(client, &buf, buf.len);
-            const reply = "{\"type\":\"ok\"}\n";
-            _ = std.c.write(client, reply, reply.len);
-        }
-    };
-    const monitor = try std.Thread.spawn(.{}, Monitor.run, .{ server.socket.handle, count });
-    defer monitor.join();
-    const start = monotonicMs();
-    const response = try sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"hello\"}", 2_000);
-    defer allocator.free(response);
-    try std.testing.expectEqualStrings("{\"type\":\"ok\"}", response);
-    try std.testing.expect(monotonicMs() - start >= 250);
-}
-
 test "lifecycle monitor spawn receives context environment, debug flag and only the name" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -4212,112 +3947,6 @@ fn fakeHelloServerOnce(fake: *FakeHelloServer) !void {
     try writeAll(fake.io, stream, "\n");
 }
 
-const small_stack_control_requests = 16;
-// The exact Linux ARM64 test binary needs 272 KiB after TLS and guard overhead.
-// Keep functional coverage comfortably above that runtime-specific floor; the
-// ReleaseSafe frame budget is verified separately from this thread size.
-const small_stack_control_bytes = 512 * 1024;
-
-const SmallStackControlClient = struct {
-    io: Io,
-    socket_path: []const u8,
-    response_matches: bool = false,
-    err: ?anyerror = null,
-
-    fn run(client: *SmallStackControlClient) void {
-        var caller_storage: [64]u8 = undefined;
-        var caller_allocator = std.heap.FixedBufferAllocator.init(&caller_storage);
-        for (0..small_stack_control_requests) |_| {
-            const response = sendControlJsonRaw(
-                caller_allocator.allocator(),
-                client.io,
-                client.socket_path,
-                "{\"type\":\"hello\"}",
-                null,
-            ) catch |err| {
-                client.err = err;
-                return;
-            };
-            const response_matches = std.mem.eql(u8, "{\"type\":\"hello\"}", response);
-            caller_allocator.allocator().free(response);
-            if (!response_matches) return;
-        }
-        client.response_matches = true;
-    }
-};
-
-test "lifecycle control response scratch fits a bounded stack and caller allocator" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-small-stack-{d}.sock", .{currentTestPid()});
-    defer allocator.free(socket_path);
-    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    Io.Dir.cwd().deleteFile(io, socket_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    };
-
-    const address = try net.UnixAddress.init(socket_path);
-    var fake = FakeHelloServer{
-        .io = io,
-        .server = try address.listen(io, .{ .kernel_backlog = 1 }),
-        .response = "{\"type\":\"hello\"}",
-        .request_count = small_stack_control_requests,
-    };
-    defer fake.server.deinit(io);
-
-    var client = SmallStackControlClient{ .io = io, .socket_path = socket_path };
-    const client_thread = try std.Thread.spawn(.{ .stack_size = small_stack_control_bytes }, SmallStackControlClient.run, .{&client});
-    fakeHelloServerMain(&fake);
-    client_thread.join();
-
-    if (client.err) |err| return err;
-    try std.testing.expect(client.response_matches);
-}
-
-const SilentMonitor = struct {
-    io: Io,
-    server: net.Server,
-
-    /// Reads one request and never answers; it closes once the client
-    /// hangs up, or after two seconds.
-    fn run(silent: *SilentMonitor) void {
-        var stream = silent.server.accept(silent.io) catch return;
-        defer stream.close(silent.io);
-        var read_buffer: [256]u8 = undefined;
-        var reader = stream.reader(silent.io, &read_buffer);
-        _ = reader.interface.takeDelimiterExclusive('\n') catch return;
-        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.c.POLL.IN, .revents = 0 }};
-        _ = std.posix.poll(&fds, 2_000) catch {};
-    }
-};
-
-test "lifecycle control requests with a deadline give up on a silent monitor" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const socket_path = try std.fmt.allocPrint(allocator, "/tmp/sporevm-control-silent-{d}.sock", .{currentTestPid()});
-    defer allocator.free(socket_path);
-    defer Io.Dir.cwd().deleteFile(io, socket_path) catch {};
-    Io.Dir.cwd().deleteFile(io, socket_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => |e| return e,
-    };
-
-    const address = try net.UnixAddress.init(socket_path);
-    var silent = SilentMonitor{ .io = io, .server = try address.listen(io, .{ .kernel_backlog = 1 }) };
-    defer silent.server.deinit(io);
-    const thread = try std.Thread.spawn(.{}, SilentMonitor.run, .{&silent});
-    defer thread.join();
-
-    const start = monotonicMs();
-    try std.testing.expectError(error.MonitorUnavailable, sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}", 100));
-    try std.testing.expect(monotonicMs() - start < 1_000);
-}
-
 fn readyPollDelayMs(attempt: u32) u64 {
     if (attempt < 10) return 1;
     if (attempt < 110) return 5;
@@ -4346,7 +3975,7 @@ fn waitForReadyResult(allocator: std.mem.Allocator, io: Io, paths: Paths, timeou
             readyPollSleep(&sleep_attempt);
             continue;
         };
-        verifyMonitorHelloWithPath(allocator, io, ready.value.control_socket_path, spore_executable_path) catch |err| switch (err) {
+        monitor_protocol.hello(allocator, io, ready.value.control_socket_path, spore_executable_path) catch |err| switch (err) {
             error.MonitorVersionMismatch => {
                 ready.deinit();
                 return err;
@@ -4660,32 +4289,15 @@ test "lifecycle create claims the name only once the image is ready" {
 }
 
 fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_path: []const u8, options: ExecNamedStreamOptions) !ExecNamedStream {
-    const payload = struct {
-        type: []const u8 = "exec-stream-v1",
-        argv: []const []const u8,
-        env: []const []const u8,
-        working_dir: ?[]const u8,
-        stdio: []const u8,
-        terminal_rows: u16,
-        terminal_cols: u16,
-    }{
+    var exec_stream = try monitor_protocol.openStream(allocator, context.io, socket_path, .{ .exec_stream = .{
         .argv = options.command,
         .env = options.guest_env,
         .working_dir = options.guest_working_dir,
-        .stdio = if (options.tty) "tty" else "pipe",
+        .stdio = if (options.tty) .tty else .pipe,
         .terminal_rows = options.terminal_size.rows,
         .terminal_cols = options.terminal_size.cols,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-
-    try verifyMonitorHello(allocator, context.io, socket_path);
-    const address = try controlSocketAddress(socket_path);
-    const stream = address.connect(context.io) catch return error.MonitorUnavailable;
-    errdefer stream.close(context.io);
-    writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
-    writeAll(context.io, stream, "\n") catch return error.MonitorUnavailable;
-    var exec_stream = ExecNamedStream{ .io = context.io, .stream = stream };
+    } });
+    errdefer exec_stream.deinit();
     if (!options.interactive) {
         if (options.tty) {
             try exec_stream.closeTerminal();
@@ -4719,20 +4331,26 @@ fn execStreamControl(context: Context, allocator: std.mem.Allocator, socket_path
     return .{ .exit_code = exit_code, .timing = stream.timing };
 }
 
+const CopyDirection = enum { in, out };
+
 fn copyStreamControl(
     context: Context,
     allocator: std.mem.Allocator,
     socket_path: []const u8,
-    request_type: []const u8,
+    direction: CopyDirection,
     guest_path: []const u8,
     fds: CopyStreamFds,
 ) !u8 {
-    var stream = try openCopyNamedStreamAt(context, allocator, socket_path, request_type, guest_path);
+    const request: monitor_protocol.Request = switch (direction) {
+        .in => .{ .copy_in = .{ .path = guest_path } },
+        .out => .{ .copy_out = .{ .path = guest_path } },
+    };
+    var stream = try monitor_protocol.openStream(allocator, context.io, socket_path, request);
     defer stream.deinit();
 
     var pump = ExecStreamPump{
         .stream = &stream,
-        .interactive = std.mem.eql(u8, request_type, "copy-in-v1"),
+        .interactive = direction == .in,
         .tty = false,
         .input_fd = fds.input_fd,
         .stdout_fd = fds.archive_fd,
@@ -4741,275 +4359,6 @@ fn copyStreamControl(
         .escape_stderr = true,
     };
     return pump.run();
-}
-
-fn openCopyNamedStreamAt(
-    context: Context,
-    allocator: std.mem.Allocator,
-    socket_path: []const u8,
-    request_type: []const u8,
-    guest_path: []const u8,
-) !ExecNamedStream {
-    const payload = struct {
-        type: []const u8,
-        path: []const u8,
-    }{
-        .type = request_type,
-        .path = guest_path,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-
-    try verifyMonitorHello(allocator, context.io, socket_path);
-    const address = try controlSocketAddress(socket_path);
-    const stream = address.connect(context.io) catch return error.MonitorUnavailable;
-    errdefer stream.close(context.io);
-    writeAll(context.io, stream, json) catch return error.MonitorUnavailable;
-    writeAll(context.io, stream, "\n") catch return error.MonitorUnavailable;
-    return .{ .io = context.io, .stream = stream };
-}
-
-fn sendStartRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, argv: []const []const u8, env: []const []const u8, working_dir: ?[]const u8, retain_output: bool) ![]const u8 {
-    const payload = struct {
-        type: []const u8 = "start",
-        argv: []const []const u8,
-        env: []const []const u8,
-        working_dir: ?[]const u8,
-        retain_output: bool,
-    }{ .argv = argv, .env = env, .working_dir = working_dir, .retain_output = retain_output };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    return sendControlJson(allocator, io, socket_path, json);
-}
-
-fn sendInitialOutputRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) ![]const u8 {
-    return sendControlJson(allocator, io, socket_path, "{\"type\":\"initial-output\"}");
-}
-
-fn sendShutdownRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) ![]const u8 {
-    return sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"shutdown\"}", monitor_reply_deadline_ms);
-}
-
-/// Connect to a control socket by `deadline`. While the monitor's listen
-/// backlog is full (its accept thread is waiting out a slow client and
-/// others queue behind it), Linux makes a blocking AF_UNIX connect wait for
-/// room for up to the send timeout, then fail with EAGAIN. macOS refuses a
-/// full backlog at once with ECONNREFUSED, which is not retried: it also
-/// means a dead monitor's socket, and `spore vm rm` should not wait on that.
-fn connectControlSocketBefore(socket_path: []const u8, deadline: u64) !std.c.fd_t {
-    try validateControlSocketPath(socket_path);
-    var address = std.mem.zeroes(std.c.sockaddr.un);
-    address.family = std.c.AF.UNIX;
-    if (@hasField(std.c.sockaddr.un, "len")) address.len = @sizeOf(std.c.sockaddr.un);
-    if (socket_path.len >= address.path.len) return error.NameTooLong;
-    @memcpy(address.path[0..socket_path.len], socket_path);
-    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
-    if (fd < 0) return error.MonitorUnavailable;
-    errdefer _ = std.c.close(fd);
-    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
-    while (true) {
-        try setControlSendDeadline(fd, deadline);
-        const rc = std.c.connect(fd, @ptrCast(&address), @sizeOf(std.c.sockaddr.un));
-        if (rc == 0) return fd;
-        if (std.c.errno(rc) != .INTR) return error.MonitorUnavailable;
-    }
-}
-
-/// Bounds blocking connects and writes on `fd` by `deadline`.
-fn setControlSendDeadline(fd: std.c.fd_t, deadline: u64) !void {
-    const now = monotonicMs();
-    if (now >= deadline) return error.MonitorUnavailable;
-    const ms = deadline - now;
-    const timeout = std.c.timeval{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * std.time.us_per_ms) };
-    if (std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, &timeout, @sizeOf(std.c.timeval)) != 0) return error.MonitorUnavailable;
-}
-
-/// Write `json` and a newline to the control socket `fd`, whose send
-/// timeout bounds a write the monitor does not take. A monitor that closed
-/// its socket fails the write instead of raising SIGPIPE.
-fn writeControlRequest(fd: std.c.fd_t, json: []const u8) !void {
-    for ([_][]const u8{ json, "\n" }) |part| {
-        var remaining = part;
-        while (remaining.len != 0) {
-            const n = std.c.send(fd, remaining.ptr, remaining.len, std.c.MSG.NOSIGNAL);
-            if (n >= 0) {
-                remaining = remaining[@intCast(n)..];
-            } else if (std.c.errno(n) != .INTR) {
-                return error.MonitorUnavailable;
-            }
-        }
-    }
-}
-
-fn sendSuspendRequest(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, out_dir: []const u8) ![]const u8 {
-    const payload = struct {
-        type: []const u8 = "suspend",
-        out_dir: []const u8,
-    }{ .out_dir = out_dir };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    return sendControlJson(allocator, io, socket_path, json);
-}
-
-fn sendSnapshotRequest(
-    allocator: std.mem.Allocator,
-    io: Io,
-    socket_path: []const u8,
-    out_dir: []const u8,
-    publish_dir: ?[]const u8,
-) ![]const u8 {
-    const payload = struct {
-        type: []const u8 = "snapshot",
-        out_dir: []const u8,
-        publish_dir: ?[]const u8,
-        @"continue": bool = true,
-    }{ .out_dir = out_dir, .publish_dir = publish_dir };
-    const json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(json);
-    return sendControlJson(allocator, io, socket_path, json);
-}
-
-fn sendDiskForkPrepareRequest(
-    allocator: std.mem.Allocator,
-    io: Io,
-    socket_path: []const u8,
-    request: runtime_disk_fork_control.PrepareRequest,
-) ![]const u8 {
-    try runtime_disk_fork_control.validatePrepare(request);
-    const json = try std.json.Stringify.valueAlloc(allocator, request, .{});
-    defer allocator.free(json);
-    if (json.len + 1 > runtime_disk_claim.max_claim_request_bytes) return error.ControlRequestTooLarge;
-    return sendControlJson(allocator, io, socket_path, json);
-}
-
-fn sendDiskForkCancelRequest(
-    allocator: std.mem.Allocator,
-    io: Io,
-    socket_path: []const u8,
-    batch: []const u8,
-) !void {
-    const request = runtime_disk_fork_control.CancelRequest{
-        .type = runtime_disk_fork_control.cancel_type,
-        .schema = runtime_disk_fork_control.cancel_schema,
-        .batch = batch,
-    };
-    const json = try std.json.Stringify.valueAlloc(allocator, request, .{});
-    defer allocator.free(json);
-    _ = try sendControlJson(allocator, io, socket_path, json);
-}
-
-fn parseDiskForkPreparedResponse(
-    allocator: std.mem.Allocator,
-    response: []const u8,
-) !std.json.Parsed(runtime_disk_fork_control.PreparedResponse) {
-    var envelope = std.json.parseFromSlice(ControlResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    }) catch return error.BadMonitorResponse;
-    defer envelope.deinit();
-    if (std.mem.eql(u8, envelope.value.type, "error")) {
-        const message = envelope.value.message orelse "monitor request failed";
-        if (std.mem.endsWith(u8, message, "FastForkUnavailable")) return error.FastForkUnavailable;
-        if (std.mem.eql(u8, message, "UnsupportedNamedForkDisk")) return error.UnsupportedNamedForkDisk;
-        if (std.mem.eql(u8, message, "DiskForkBaselineUnavailable")) return error.DiskForkBaselineUnavailable;
-        return monitorRequestFailed(message);
-    }
-    return runtime_disk_fork_control.parsePreparedBytes(allocator, response) catch return error.BadMonitorResponse;
-}
-
-fn sendControlJson(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8) ![]const u8 {
-    try verifyMonitorHello(allocator, io, socket_path);
-    return sendControlJsonRaw(allocator, io, socket_path, json, null);
-}
-
-/// Sends one request line and reads one response line. With a deadline, a
-/// monitor that has not taken the request and answered in time is treated
-/// as unavailable.
-fn sendControlJsonRaw(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, json: []const u8, deadline_ms: ?u64) ![]const u8 {
-    // Callers commonly use arenas that cannot reclaim scratch beneath the response.
-    const read_buffer = try std.heap.page_allocator.alloc(u8, max_control_response);
-    defer std.heap.page_allocator.free(read_buffer);
-    if (deadline_ms) |ms| {
-        // Connecting shares the deadline: an unbounded connect waits as long
-        // as the monitor's listen backlog stays full.
-        const deadline = monotonicMs() +| ms;
-        const fd = try connectControlSocketBefore(socket_path, deadline);
-        defer _ = std.c.close(fd);
-        try setControlSendDeadline(fd, deadline);
-        try writeControlRequest(fd, json);
-        return allocator.dupe(u8, try readControlLine(fd, read_buffer, deadline -| monotonicMs()));
-    }
-    const address = try controlSocketAddress(socket_path);
-    const stream = address.connect(io) catch return error.MonitorUnavailable;
-    defer stream.close(io);
-    writeAll(io, stream, json) catch return error.MonitorUnavailable;
-    writeAll(io, stream, "\n") catch return error.MonitorUnavailable;
-
-    const line = try readControlLine(stream.socket.handle, read_buffer, null);
-    return allocator.dupe(u8, line);
-}
-
-fn readControlLine(fd: std.c.fd_t, buffer: []u8, deadline_ms: ?u64) ![]const u8 {
-    const deadline = if (deadline_ms) |ms| monotonicMs() +| ms else null;
-    var len: usize = 0;
-    while (len < buffer.len) {
-        const wait_ms: i32 = if (deadline) |end| blk: {
-            const now = monotonicMs();
-            if (now >= end) return error.MonitorUnavailable;
-            break :blk @intCast(@min(end - now, std.math.maxInt(i32)));
-        } else -1;
-        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-        if (try std.posix.poll(&fds, wait_ms) == 0) return error.MonitorUnavailable;
-        const n = std.c.read(fd, buffer[len..].ptr, buffer.len - len);
-        if (n < 0) {
-            if (std.c.errno(n) == .INTR) continue;
-            return error.MonitorUnavailable;
-        }
-        if (n == 0) return error.MonitorUnavailable;
-        const end = len + @as(usize, @intCast(n));
-        if (std.mem.indexOfScalar(u8, buffer[len..end], '\n')) |index| return buffer[0 .. len + index];
-        len = end;
-    }
-    return error.MonitorUnavailable;
-}
-
-const MonitorHelloResponse = struct {
-    type: []const u8,
-    schema: ?[]const u8 = null,
-    spore_version: ?[]const u8 = null,
-    helper_contract: ?u32 = null,
-};
-
-fn verifyMonitorHello(allocator: std.mem.Allocator, io: Io, socket_path: []const u8) !void {
-    try verifyMonitorHelloWithPath(allocator, io, socket_path, null);
-}
-
-fn verifyMonitorHelloWithPath(allocator: std.mem.Allocator, io: Io, socket_path: []const u8, spore_executable_path: ?[]const u8) !void {
-    const response = try sendControlJsonRaw(allocator, io, socket_path, "{\"type\":\"hello\"}", monitor_reply_deadline_ms);
-    defer allocator.free(response);
-    try validateMonitorHello(allocator, response, spore_executable_path);
-}
-
-fn validateMonitorHello(allocator: std.mem.Allocator, response: []const u8, spore_executable_path: ?[]const u8) !void {
-    var parsed = std.json.parseFromSlice(MonitorHelloResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    }) catch return error.BadMonitorResponse;
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.type, "hello")) return monitorHelloMismatch(parsed.value, spore_executable_path);
-    if (!std.mem.eql(u8, parsed.value.schema orelse "", monitor_hello_schema)) return monitorHelloMismatch(parsed.value, spore_executable_path);
-    if (!std.mem.eql(u8, parsed.value.spore_version orelse "", version.value)) return monitorHelloMismatch(parsed.value, spore_executable_path);
-    if ((parsed.value.helper_contract orelse 0) != monitor_helper_contract) return monitorHelloMismatch(parsed.value, spore_executable_path);
-}
-
-fn monitorHelloMismatch(hello: MonitorHelloResponse, spore_executable_path: ?[]const u8) error{MonitorVersionMismatch} {
-    const reported = hello.spore_version orelse "unknown";
-    if (spore_executable_path) |path| {
-        setLastError("spore {s} cannot use spore executable {s} at {s}", .{ version.value, reported, path });
-    } else {
-        setLastError("spore {s} cannot use monitor helper reporting version {s}", .{ version.value, reported });
-    }
-    return error.MonitorVersionMismatch;
 }
 
 /// Where a copy stream's bytes go. Guest stdout is the copy-out archive and
@@ -5154,7 +4503,7 @@ const FakeCopyMonitor = struct {
             _ = try reader.interface.takeDelimiterExclusive('\n');
             try writeAll(io, hello, std.fmt.comptimePrint(
                 "{{\"type\":\"hello\",\"schema\":\"{s}\",\"spore_version\":\"{s}\",\"helper_contract\":{d}}}\n",
-                .{ monitor_hello_schema, version.value, monitor_helper_contract },
+                .{ monitor_protocol.hello_schema, version.value, monitor_protocol.helper_contract },
             ));
         }
         var copy = try fake.server.accept(io);
@@ -5172,7 +4521,7 @@ fn appendTestFrame(w: *Io.Writer, frame_type: spore_stream.FrameType, stream_id:
 }
 
 /// Runs one copy stream against a fake monitor that sends `frames`.
-fn copyStreamAgainstFrames(request_type: []const u8, frames: []const u8, fds: CopyStreamFds) !u8 {
+fn copyStreamAgainstFrames(direction: CopyDirection, frames: []const u8, fds: CopyStreamFds) !u8 {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = try TestDir.init();
@@ -5186,7 +4535,7 @@ fn copyStreamAgainstFrames(request_type: []const u8, frames: []const u8, fds: Co
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
-    return copyStreamControl(.{ .io = io, .environ_map = &env }, allocator, socket_path, request_type, "/tmp/guest", fds);
+    return copyStreamControl(.{ .io = io, .environ_map = &env }, allocator, socket_path, direction, "/tmp/guest", fds);
 }
 
 fn readPipeToEnd(fd: std.c.fd_t, buf: []u8) ![]const u8 {
@@ -5226,7 +4575,7 @@ test "copy-in drops guest stdout and escapes guest stderr" {
     const saved_stdout = std.c.dup(1);
     try std.testing.expect(saved_stdout >= 0);
     try std.testing.expect(std.c.dup2(stdout_pipe[1], 1) == 1);
-    const result = copyStreamAgainstFrames("copy-in-v1", frames.buffered(), .{
+    const result = copyStreamAgainstFrames(.in, frames.buffered(), .{
         .input_fd = input[0],
         .stderr_fd = stderr_pipe[1],
     });
@@ -5255,7 +4604,7 @@ test "copy-out refuses an archive over its limit" {
     defer tmp.cleanup();
     var archive = try tmp.dir.createFile(io, "payload.spcp", .{});
     defer archive.close(io);
-    try std.testing.expectError(error.CopyArchiveTooLarge, copyStreamAgainstFrames("copy-out-v1", frames.buffered(), .{
+    try std.testing.expectError(error.CopyArchiveTooLarge, copyStreamAgainstFrames(.out, frames.buffered(), .{
         .archive_fd = archive.handle,
         .archive_limit = 8,
     }));
@@ -5342,38 +4691,17 @@ fn terminalSizeFd() std.c.fd_t {
     return if (std.c.isatty(1) != 0) 1 else if (std.c.isatty(0) != 0) 0 else 1;
 }
 
-const ControlResponse = struct {
-    type: []const u8,
-    exit_code: ?i32 = null,
-    stdout_b64: ?[]const u8 = null,
-    stderr_b64: ?[]const u8 = null,
-    stdout_truncated: bool = false,
-    stderr_truncated: bool = false,
-    out_dir: ?[]const u8 = null,
-    message: ?[]const u8 = null,
-    timing: ?NamedExecTiming = null,
-};
-
-fn parseExecNamedResponse(
-    allocator: std.mem.Allocator,
-    parse_allocator: std.mem.Allocator,
-    response: []const u8,
-) !ExecNamedResult {
-    var parsed = try std.json.parseFromSlice(ControlResponse, parse_allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.type, "exec_result")) {
-        if (std.mem.eql(u8, parsed.value.type, "error")) return monitorRequestFailed(parsed.value.message);
-        return error.MonitorRequestFailed;
-    }
-    const exit_code = parsed.value.exit_code orelse return error.BadMonitorResponse;
-    if (exit_code < 0 or exit_code > 255) return error.BadMonitorResponse;
-    if (parsed.value.stdout_truncated or parsed.value.stderr_truncated) {
-        const stream_name = if (parsed.value.stdout_truncated and parsed.value.stderr_truncated)
+fn execNamedResult(allocator: std.mem.Allocator, response: monitor_protocol.Response) !ExecNamedResult {
+    const result = switch (response) {
+        .exec_result => |result| result,
+        .err => |failure| return monitorRequestFailed(failure.message),
+        else => return error.BadMonitorResponse,
+    };
+    if (result.exit_code < 0 or result.exit_code > 255) return error.BadMonitorResponse;
+    if (result.stdout_truncated or result.stderr_truncated) {
+        const stream_name = if (result.stdout_truncated and result.stderr_truncated)
             "stdout and stderr"
-        else if (parsed.value.stdout_truncated)
+        else if (result.stdout_truncated)
             "stdout"
         else
             "stderr";
@@ -5384,17 +4712,17 @@ fn parseExecNamedResponse(
         return error.ExecOutputTruncated;
     }
 
-    const stdout = try decodeControlOutput(allocator, parsed.value.stdout_b64 orelse return error.BadMonitorResponse);
+    const stdout = try decodeControlOutput(allocator, result.stdout_b64);
     errdefer allocator.free(stdout);
-    const stderr = try decodeControlOutput(allocator, parsed.value.stderr_b64 orelse return error.BadMonitorResponse);
+    const stderr = try decodeControlOutput(allocator, result.stderr_b64);
     errdefer allocator.free(stderr);
     return .{
-        .exit_code = @intCast(exit_code),
+        .exit_code = @intCast(result.exit_code),
         .stdout = stdout,
         .stderr = stderr,
-        .stdout_truncated = parsed.value.stdout_truncated,
-        .stderr_truncated = parsed.value.stderr_truncated,
-        .timing = parsed.value.timing,
+        .stdout_truncated = result.stdout_truncated,
+        .stderr_truncated = result.stderr_truncated,
+        .timing = result.timing,
     };
 }
 
@@ -5405,43 +4733,30 @@ fn monitorRequestFailed(message: ?[]const u8) error{MonitorRequestFailed} {
     return error.MonitorRequestFailed;
 }
 
-fn suspendResponseFailureMessage(allocator: std.mem.Allocator, response: []const u8) !?[]const u8 {
-    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    if (std.mem.eql(u8, parsed.value.type, "suspended")) return null;
-    const message = parsed.value.message orelse "monitor request failed";
-    return try allocator.dupe(u8, message);
-}
-
-/// How the monitor's refusal of a save begins when the root disk's image
-/// store cannot supply every object. It refuses before pausing the guest, so
-/// the VM keeps running.
-pub const save_refused_image_store = "the image store of the root disk could not supply every object";
-
-/// Fails with `error.ImageStoreIncomplete`, and the refusal as last error,
-/// when the monitor refused the save for the root disk's image store.
-fn checkImageStoreRefusal(allocator: std.mem.Allocator, name: []const u8, response: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    const message = parsed.value.message orelse return;
-    if (!std.mem.eql(u8, parsed.value.type, "error") or !std.mem.startsWith(u8, message, save_refused_image_store)) return;
-    setLastError("VM {s} was not saved: {s}; the VM keeps running", .{ name, message });
+/// The error for a save the monitor did not take. A refusal for the root
+/// disk's image store leaves the VM running.
+fn saveFailed(name: []const u8, response: monitor_protocol.Response) error{ ImageStoreIncomplete, MonitorRequestFailed } {
+    const failure = switch (response) {
+        .err => |failure| failure,
+        else => return error.MonitorRequestFailed,
+    };
+    if (failure.code != .image_store_incomplete) return monitorRequestFailed(failure.message);
+    setLastError("VM {s} was not saved: {s}; the VM keeps running", .{ name, failure.message });
     return error.ImageStoreIncomplete;
 }
 
-fn snapshotResponseOk(allocator: std.mem.Allocator, response: []const u8) !bool {
-    var parsed = try std.json.parseFromSlice(ControlResponse, allocator, response, .{
-        .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-    return std.mem.eql(u8, parsed.value.type, "snapshotted");
+fn diskForkPrepared(response: monitor_protocol.Response) !runtime_disk_fork_control.PreparedResponse {
+    const failure = switch (response) {
+        .disk_fork_prepared => |prepared| return prepared,
+        .err => |failure| failure,
+        else => return error.BadMonitorResponse,
+    };
+    return switch (failure.code orelse return monitorRequestFailed(failure.message)) {
+        .fast_fork_unavailable => error.FastForkUnavailable,
+        .unsupported_named_fork_disk => error.UnsupportedNamedForkDisk,
+        .disk_fork_baseline_unavailable => error.DiskForkBaselineUnavailable,
+        .image_store_incomplete => monitorRequestFailed(failure.message),
+    };
 }
 
 fn ownedNamedLifecycleResult(allocator: std.mem.Allocator, result: NamedLifecycleResult) !NamedLifecycleResult {
@@ -5501,21 +4816,6 @@ fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
     try writer.interface.flush();
 }
 
-fn readFdExact(fd: std.c.fd_t, buf: []u8) !void {
-    var remaining = buf;
-    while (remaining.len > 0) {
-        const n = std.c.read(fd, remaining.ptr, remaining.len);
-        if (n < 0) {
-            switch (std.c.errno(n)) {
-                .INTR => continue,
-                else => return error.MonitorUnavailable,
-            }
-        }
-        if (n == 0) return error.MonitorUnavailable;
-        remaining = remaining[@intCast(n)..];
-    }
-}
-
 /// Writes guest text with every byte other than printable ASCII, tab, and
 /// newline shown as `\xNN`, so the guest cannot send terminal escapes.
 fn writeEscapedFd(fd: std.c.fd_t, bytes: []const u8) !void {
@@ -5555,7 +4855,7 @@ fn writeFdAll(fd: std.c.fd_t, bytes: []const u8) !void {
 fn decodeControlOutput(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     const dec = std.base64.standard.Decoder;
     const decoded_size = dec.calcSizeForSlice(encoded) catch return error.BadMonitorResponse;
-    if (decoded_size > max_control_response) return error.BadMonitorResponse;
+    if (decoded_size > monitor_protocol.max_response_bytes) return error.BadMonitorResponse;
     const decoded = try allocator.alloc(u8, decoded_size);
     errdefer allocator.free(decoded);
     dec.decode(decoded, encoded) catch return error.BadMonitorResponse;
@@ -5601,7 +4901,7 @@ fn stopLockHolder(allocator: std.mem.Allocator, io: Io, paths: Paths) !Io.File {
         sleepMs(20);
     };
     // The monitor answers `shutdown` as it accepts it and then exits.
-    _ = sendShutdownRequest(allocator, io, paths.control_socket_path) catch {};
+    monitor_protocol.shutdown(allocator, io, paths.control_socket_path) catch {};
     return awaitMonitorExit(io, paths, pid);
 }
 
@@ -5876,14 +5176,20 @@ fn lessListEntry(_: void, a: ListEntry, b: ListEntry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
+const test_exec_timing = NamedExecTiming{ .teardown_ms = 0, .total_ms = 13 };
+
 test "named exec response rejects truncated collector output" {
     const allocator = std.testing.allocator;
     clearLastError();
     defer clearLastError();
-    const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"b2s=","stderr_b64":"ZXJy","stdout_truncated":false,"stderr_truncated":true}
-    ;
-    try std.testing.expectError(error.ExecOutputTruncated, parseExecNamedResponse(allocator, allocator, response));
+    try std.testing.expectError(error.ExecOutputTruncated, execNamedResult(allocator, .{ .exec_result = .{
+        .exit_code = 7,
+        .stdout_b64 = "b2s=",
+        .stderr_b64 = "ZXJy",
+        .stdout_truncated = false,
+        .stderr_truncated = true,
+        .timing = test_exec_timing,
+    } }));
     try std.testing.expectEqualStrings(
         "named exec stderr exceeded the bounded 16384-byte collector; use openExecNamedStream",
         lastErrorMessage(),
@@ -5892,62 +5198,28 @@ test "named exec response rejects truncated collector output" {
 
 test "named exec response decodes complete bounded output" {
     const allocator = std.testing.allocator;
-    const response =
-        \\{"type":"exec_result","exit_code":7,"stdout_b64":"/wBB","stderr_b64":"/kI=","stdout_truncated":false,"stderr_truncated":false,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
-    ;
-    const result = try parseExecNamedResponse(allocator, allocator, response);
+    const result = try execNamedResult(allocator, .{ .exec_result = .{
+        .exit_code = 7,
+        .stdout_b64 = "/wBB",
+        .stderr_b64 = "/kI=",
+        .stdout_truncated = false,
+        .stderr_truncated = false,
+        .timing = test_exec_timing,
+    } });
     defer deinitExecNamedResult(allocator, result);
 
     try std.testing.expectEqual(@as(u8, 7), result.exit_code);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 'A' }, result.stdout);
     try std.testing.expectEqualSlices(u8, &.{ 0xfe, 'B' }, result.stderr);
-    try std.testing.expectEqual(@as(?u64, 2), result.timing.?.dispatch_ms);
-    try std.testing.expectEqual(@as(?u64, 7_000), result.timing.?.guest_user_cpu_us);
     try std.testing.expectEqual(@as(u64, 13), result.timing.?.total_ms);
-}
-
-test "named exec timing event validates type and schema" {
-    const valid =
-        \\{"type":"named_exec_timing","schema_version":1,"timing":{"dispatch_ms":2,"guest_process_start_ms":1,"guest_execution_ms":9,"guest_user_cpu_us":7000,"guest_system_cpu_us":1000,"output_result_delivery_ms":1,"teardown_ms":0,"total_ms":13}}
-    ;
-    const timing = parseNamedExecTimingEvent(valid).?;
-    try std.testing.expectEqual(@as(?u64, 9), timing.guest_execution_ms);
-    try std.testing.expectEqual(@as(u64, 13), timing.total_ms);
-    try std.testing.expect(parseNamedExecTimingEvent("{\"type\":\"other\",\"schema_version\":1,\"timing\":{\"teardown_ms\":0,\"total_ms\":1}}") == null);
-    try std.testing.expect(parseNamedExecTimingEvent("not json") == null);
 }
 
 test "named exec response preserves monitor error detail" {
     clearLastError();
     defer clearLastError();
-    try std.testing.expectError(error.MonitorRequestFailed, parseExecNamedResponse(std.testing.allocator, std.testing.allocator,
-        \\{"type":"error","message":"guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest"}
-    ));
-    try std.testing.expectEqualStrings(
-        "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest",
-        lastErrorMessage(),
-    );
-}
-
-test "monitor hello response validates helper version" {
-    const allocator = std.testing.allocator;
-    const ok = try std.fmt.allocPrint(allocator, "{{\"type\":\"hello\",\"schema\":\"{s}\",\"spore_version\":\"{s}\",\"helper_contract\":{d}}}", .{
-        monitor_hello_schema,
-        version.value,
-        monitor_helper_contract,
-    });
-    defer allocator.free(ok);
-    try validateMonitorHello(allocator, ok, null);
-
-    try std.testing.expectError(error.MonitorVersionMismatch, validateMonitorHello(allocator,
-        \\{"type":"error","message":"unknown control request"}
-    , null));
-    try std.testing.expectError(error.MonitorVersionMismatch, validateMonitorHello(allocator,
-        \\{"type":"hello","schema":"spore.monitor.hello.v1","spore_version":"1.3.0","helper_contract":1}
-    , null));
-    try std.testing.expectError(error.MonitorVersionMismatch, validateMonitorHello(allocator,
-        \\{"type":"hello","schema":"spore.monitor.hello.v1","spore_version":"1.5.0","helper_contract":2}
-    , null));
+    const message = "guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest";
+    try std.testing.expectError(error.MonitorRequestFailed, execNamedResult(std.testing.allocator, .{ .err = .{ .message = message } }));
+    try std.testing.expectEqualStrings(message, lastErrorMessage());
 }
 
 test "lifecycle renders fork name patterns" {
@@ -7403,12 +6675,27 @@ fn currentTestPid() i64 {
 }
 
 test "save reports the monitor's refusal for a root disk's image store" {
-    const allocator = std.testing.allocator;
-    const refused = try std.json.Stringify.valueAlloc(allocator, .{ .type = "error", .message = save_refused_image_store ++ ": ImageStoreNotFound" }, .{});
-    defer allocator.free(refused);
     clearLastError();
-    try std.testing.expectError(error.ImageStoreIncomplete, checkImageStoreRefusal(allocator, "app", refused));
-    try std.testing.expectEqualStrings("VM app was not saved: " ++ save_refused_image_store ++ ": ImageStoreNotFound; the VM keeps running", lastErrorMessage());
-    try checkImageStoreRefusal(allocator, "app", "{\"type\":\"error\",\"message\":\"monitor busy\"}");
-    try checkImageStoreRefusal(allocator, "app", "{\"type\":\"snapshotted\",\"out_dir\":\"/tmp/a\"}");
+    defer clearLastError();
+    const message = "the image store of the root disk could not supply every object: ImageStoreNotFound";
+    try std.testing.expectEqual(error.ImageStoreIncomplete, saveFailed("app", .{ .err = .{ .message = message, .code = .image_store_incomplete } }));
+    try std.testing.expectEqualStrings("VM app was not saved: " ++ message ++ "; the VM keeps running", lastErrorMessage());
+    clearLastError();
+    try std.testing.expectEqual(error.MonitorRequestFailed, saveFailed("app", .{ .err = .{ .message = "monitor busy" } }));
+    try std.testing.expectEqualStrings("monitor busy", lastErrorMessage());
+}
+
+test "fork maps the monitor's typed refusals to their errors" {
+    clearLastError();
+    defer clearLastError();
+    try std.testing.expectError(error.FastForkUnavailable, diskForkPrepared(.{ .err = .{
+        .message = "disk fork capture failed: FastForkUnavailable",
+        .code = .fast_fork_unavailable,
+    } }));
+    try std.testing.expectError(error.DiskForkBaselineUnavailable, diskForkPrepared(.{ .err = .{
+        .message = "DiskForkBaselineUnavailable",
+        .code = .disk_fork_baseline_unavailable,
+    } }));
+    try std.testing.expectError(error.MonitorRequestFailed, diskForkPrepared(.{ .err = .{ .message = "the source VM has no rootfs" } }));
+    try std.testing.expectEqualStrings("the source VM has no rootfs", lastErrorMessage());
 }
