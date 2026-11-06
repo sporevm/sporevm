@@ -3067,14 +3067,17 @@ test "guest agent resumes a session's output from as far back as a save leaves t
     const attach_stream = @import("../attach_stream.zig");
 
     // More output than the agent keeps, so its replay buffer has wrapped.
+    // `seq` writes whole 4 KiB pages; the leading byte stops the agent's reads
+    // from ending exactly at the ring's end, so one read's append crosses it.
     var expected: std.ArrayList(u8) = .empty;
     defer expected.deinit(allocator);
+    try expected.append(allocator, 'x');
     for (1..60_001) |i| try expected.print(allocator, "{d}\n", .{i});
     const total = expected.items.len;
     var limits: GuestRequestLimits = undefined;
     spore_agent_test_request_limits(&limits);
     try std.testing.expect(total > limits.replay_bytes);
-    const scenario: AgentScenario = .{ .captured_script = "seq 1 60000", .captured_finishes = true };
+    const scenario: AgentScenario = .{ .captured_script = "printf x; seq 1 60000", .captured_finishes = true };
 
     // The furthest a `spore run` save can trail the agent.
     const lag: usize = @intCast(limits.output_read_bytes + @import("../virtio/vsock.zig").host_stream_credit);
