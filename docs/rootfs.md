@@ -364,7 +364,9 @@ versioned disk indexes from local image records, live
 runtime manifests, and process-owned lazy-runtime leases, then selects only
 unrooted CAS indexes and chunk objects. Names and derivations are not roots: an
 image pruned by `spore system prune` leaves its names pointing at nothing, and
-GC collects its storage. An image record GC cannot parse keeps every CAS entry. It is the preferred command when the
+GC collects its storage. An image record or live runtime manifest whose index
+`spore system prune --include-rootfs-chunks` deleted roots nothing. An image
+record GC cannot parse keeps every CAS entry. It is the preferred command when the
 goal is to clean chunk garbage without discarding reachable chunked storage.
 The mutable cache-mount aggregate is not a step-record or image root and is
 therefore collectable as a unit. A build holds the rootfs-cache `flock` from

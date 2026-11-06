@@ -1478,7 +1478,7 @@ fn collectStorageRootsFromImages(
         if (entry.kind != .file) continue;
         const identity = try local_image.identityFromFileName(allocator, entry.name, ".json") orelse continue;
         const path = try std.fs.path.join(allocator, &.{ images_path, entry.name });
-        collectStorageRootFromImagePath(allocator, io, path, identity, storage_roots) catch {
+        collectStorageRootFromImagePath(allocator, io, cache_root, path, identity, storage_roots) catch {
             conservative_roots.metadata_count += 1;
         };
     }
@@ -1575,7 +1575,7 @@ fn collectStorageRootsFromRuntimeManifests(
     const refs = try collectRuntimeForkRefs(allocator, io, runtime_root);
     for (refs) |resume_dir| {
         const manifest_path = try std.fs.path.join(allocator, &.{ resume_dir, "manifest.json" });
-        try collectStorageRootFromManifestPath(allocator, io, manifest_path, storage_roots);
+        try collectStorageRootFromManifestPath(allocator, io, cache_root, manifest_path, storage_roots);
     }
     try collectStorageRootsFromRuntimeLeases(allocator, io, cache_root, runtime_root, storage_roots);
 }
@@ -1704,6 +1704,7 @@ fn sameResolvedPath(allocator: std.mem.Allocator, io: Io, a: []const u8, b: []co
 fn collectStorageRootFromImagePath(
     allocator: std.mem.Allocator,
     io: Io,
+    cache_root: []const u8,
     path: []const u8,
     identity: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
@@ -1713,12 +1714,13 @@ fn collectStorageRootFromImagePath(
         else => |e| return e,
     };
     const local = try local_image.parseRecord(allocator, data, identity);
-    try addStorageRoot(storage_roots, local.storage);
+    try addStorageRootUnlessPruned(allocator, io, cache_root, storage_roots, local.storage);
 }
 
 fn collectStorageRootFromManifestPath(
     allocator: std.mem.Allocator,
     io: Io,
+    cache_root: []const u8,
     path: []const u8,
     storage_roots: *std.StringHashMap(spore.RootfsStorage),
 ) !void {
@@ -1732,8 +1734,28 @@ fn collectStorageRootFromManifestPath(
     }) catch return error.BadManifest;
     const rootfs_record = parsed.value.rootfs orelse return;
     if (rootfs_record.storage) |storage| {
-        try addStorageRoot(storage_roots, storage);
+        try addStorageRootUnlessPruned(allocator, io, cache_root, storage_roots, storage);
     }
+}
+
+/// `system prune --include-rootfs-chunks` may delete storage that an image
+/// record or a VM manifest still names. With its index gone that storage has
+/// nothing left to keep, so it roots nothing. Prune never deletes what pins
+/// and leases name, so those still require their index.
+fn addStorageRootUnlessPruned(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_root: []const u8,
+    storage_roots: *std.StringHashMap(spore.RootfsStorage),
+    storage: spore.RootfsStorage,
+) !void {
+    try spore.validateRootfsStorageDescriptor(storage);
+    const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
+    _ = Io.Dir.cwd().statFile(io, index_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    try storage_roots.put(storage.index_digest, storage);
 }
 
 fn addStorageRoot(storage_roots: *std.StringHashMap(spore.RootfsStorage), storage: spore.RootfsStorage) !void {
@@ -3491,6 +3513,72 @@ test "lazy runtime survives destructive prune and gc before its first cas read" 
     });
     try std.testing.expect(!try fileExists(io, rooted_index_path));
     try std.testing.expect(!try fileExists(io, rooted_object_path));
+}
+
+test "cache gc runs after destructive prune deleted storage a VM manifest or image record still names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "cache" });
+    const runtime_root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    try Io.Dir.cwd().createDirPath(io, root);
+
+    // A pulled image keeps a flat file, so prune deletes its record with it;
+    // a built image has no flat file, so prune leaves its record behind.
+    const pulled = try writeGcStorageFixture(allocator, io, root, false, 0x91);
+    const flat_path = try std.fs.path.join(allocator, &.{ tmp_root, "pulled.ext4" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = flat_path, .data = "ext4" });
+    _ = try local_image.lockAndPublish(io, allocator, root, .{ .platform = .{}, .storage = pulled.storage, .flat_path = flat_path });
+    const built = try writeGcStorageFixture(allocator, io, root, true, 0x92);
+
+    // A disk fork of a VM created from the pulled image: its manifest still
+    // names the image storage, and its lease holds the forked disk baseline.
+    const baseline = try writeGcStorageFixture(allocator, io, root, false, 0x93);
+    const vm_dir = try std.fs.path.join(allocator, &.{ runtime_root, "vms", "child" });
+    const resume_dir = try std.fs.path.join(allocator, &.{ runtime_root, "forks", "batch", "children", "000000" });
+    try Io.Dir.cwd().createDirPath(io, vm_dir);
+    try Io.Dir.cwd().createDirPath(io, resume_dir);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ resume_dir, "manifest.json" }),
+        .data = try std.json.Stringify.valueAlloc(allocator, ManifestRoot{ .rootfs = .{ .storage = pulled.storage } }, .{}),
+    });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = try std.fs.path.join(allocator, &.{ vm_dir, "spec.json" }),
+        .data = try std.json.Stringify.valueAlloc(allocator, lifecycle.Spec{
+            .name = "child",
+            .resume_dir = resume_dir,
+            .disk_baseline_lease = .{
+                .store = .rootfs_cache,
+                .root = root,
+                .baseline_kind = .disk_index,
+                .baseline_identity = baseline.storage.index_digest,
+                .rootfs_storage = baseline.storage,
+            },
+        }, .{}),
+    });
+
+    _ = try prune(allocator, io, .{
+        .cache_root = root,
+        .runtime_root = runtime_root,
+        .dry_run = false,
+        .include_digest_artifacts = true,
+        .include_rootfs_chunks = true,
+        .max_bytes = 0,
+    }, std.time.ns_per_s);
+    try std.testing.expect(!try fileExists(io, try rootfs_cas.manifestIndexPath(allocator, root, pulled.storage.index_digest)));
+    try std.testing.expect(!try fileExists(io, try rootfs_cas.manifestIndexPath(allocator, root, built.storage.index_digest)));
+
+    const orphan = try writeGcStorageFixture(allocator, io, root, false, 0x94);
+    const collected = try gc(allocator, io, .{ .cache_root = root, .runtime_root = runtime_root, .dry_run = false });
+    try std.testing.expectEqual(@as(usize, 1), collected.rooted_indexes);
+    try std.testing.expect(try fileExists(io, try rootfs_cas.manifestIndexPath(allocator, root, baseline.storage.index_digest)));
+    try std.testing.expect(try fileExists(io, try rootfs_cas.manifestObjectPath(allocator, root, baseline.object_digest)));
+    try std.testing.expect(!try fileExists(io, try rootfs_cas.manifestIndexPath(allocator, root, orphan.storage.index_digest)));
+    try std.testing.expect(!try fileExists(io, try rootfs_cas.manifestObjectPath(allocator, root, orphan.object_digest)));
 }
 
 test "system cache gc preserves storage rooted only by a PREPARE record" {
