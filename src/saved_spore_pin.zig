@@ -629,10 +629,7 @@ fn parseRecord(allocator: std.mem.Allocator, bytes: []const u8, id: []const u8) 
 pub fn validateRoot(allocator: std.mem.Allocator, cache_root: []const u8, storage: spore.RootfsStorage) !void {
     const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);
-    const bytes = try rootfs_cas.readVerifiedStorageIndexPath(allocator, index_path, storage);
-    defer allocator.free(bytes);
-    var parsed = try disk_index.parseDiskIndex(allocator, bytes, try spore.diskIndexDescriptorForStorage(storage));
-    defer parsed.deinit();
+    try rootfs_cas.verifyStorageIndexPath(allocator, index_path, storage);
 }
 
 pub fn recordPath(allocator: std.mem.Allocator, cache_root: []const u8, id: []const u8) ![]const u8 {

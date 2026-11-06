@@ -1146,11 +1146,10 @@ pub const Fetcher = struct {
     /// CAS at their indexed length.
     fn missingObjects(self: *Fetcher, arena: std.mem.Allocator) ![]const Object {
         const index_path = try rootfs_cas.manifestIndexPath(arena, self.cache_root, self.storage.index_digest);
-        const bytes = try rootfs_cas.readVerifiedStorageIndexPath(arena, index_path, self.storage);
-        const parsed = try disk_index.parseDiskIndex(arena, bytes, try spore.diskIndexDescriptorForStorage(self.storage));
+        const index = try rootfs_cas.readStorageIndexPath(arena, index_path, self.storage);
         var seen = std.AutoHashMap(chunk.ChunkId, void).init(arena);
         var missing: std.ArrayList(Object) = .empty;
-        for (parsed.value.chunks) |entry| {
+        for (index.parsed.value.chunks) |entry| {
             if ((try seen.getOrPut(entry.id)).found_existing) continue;
             const object = Object{ .digest = entry.id.toDigest(), .len = try rootfs_cas.storageChunkLen(self.storage, entry.logical_chunk) };
             if (!try self.isLocal(object)) try missing.append(arena, object);

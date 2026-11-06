@@ -232,7 +232,7 @@ pub fn publish(
         // GC and a later fetch both need the index to know the objects.
         const index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, request.storage.index_digest);
         defer allocator.free(index_path);
-        allocator.free(try rootfs_cas.readVerifiedStorageIndexPath(allocator, index_path, request.storage));
+        try rootfs_cas.verifyStorageIndexPath(allocator, index_path, request.storage);
         break :origin origin;
     };
 

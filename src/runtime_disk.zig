@@ -208,14 +208,15 @@ pub fn open(context: Context, allocator: std.mem.Allocator, options: Options) !R
             defer allocator.free(cache_root);
             var origin: ?[]u8 = null;
             defer if (origin) |value| allocator.free(value);
-            runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, .{ .rootfs = rootfs, .out = &origin });
+            const lazy = try acquireLazyRootfsLease(context, allocator, cache_root, storage, .{ .rootfs = rootfs, .out = &origin });
+            runtime.runtime_lease = lazy.lease;
+            const parsed = lazy.index orelse try readDiskIndex(context, allocator, cache_root, storage);
+            defer parsed.deinit();
             runtime.rootfs_fd = try createSparseTempFd(context, allocator, grown_size);
             const base_source = try runtime.baseSource(grown_size);
             const writable = try openWritable(context, allocator, base_source, storage.logical_size, storage.chunk_size);
             runtime.overlay = writable.overlay;
             runtime.chunk_mapped = writable.disk;
-            var parsed = try readDiskIndex(context, allocator, cache_root, storage);
-            defer parsed.deinit();
             try runtime.chunk_mapped.?.attachCasIndexTraced(cache_root, parsed.value, runtime.trace_fd);
             if (origin) |store| {
                 // Faults run on vCPU threads and fetches on Io workers, so the
@@ -277,12 +278,13 @@ pub fn openReadOnlyRootfs(
         }
         const cache_root = try baselineRootPath(context, allocator, disk_root);
         defer allocator.free(cache_root);
-        runtime.runtime_lease = try acquireLazyRootfsLease(context, allocator, cache_root, storage, null);
+        const lazy = try acquireLazyRootfsLease(context, allocator, cache_root, storage, null);
+        runtime.runtime_lease = lazy.lease;
+        const parsed = lazy.index orelse try readDiskIndex(context, allocator, cache_root, storage);
+        defer parsed.deinit();
         runtime.rootfs_fd = try createSparseTempFd(context, allocator, storage.logical_size);
         const base_source = try runtime.baseSource(storage.logical_size);
         runtime.chunk_mapped = try chunk_mapped_disk.ChunkMappedDisk.initReadOnly(allocator, base_source, storage.logical_size, storage.chunk_size);
-        var parsed = try readDiskIndex(context, allocator, cache_root, storage);
-        defer parsed.deinit();
         try runtime.chunk_mapped.?.attachCasIndexTraced(cache_root, parsed.value, runtime.trace_fd);
         return runtime;
     }
@@ -501,15 +503,12 @@ fn installLocalRootfsStorage(
     // avoid an O(all rootfs bytes) local and cache object walk.
     if (try rootfs_cas.storageMarkedComplete(context.io, allocator, cache_root, storage)) return;
 
-    if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, local_root, storage)) return error.BadManifest;
-    const index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(allocator, local_index_path, storage);
-    defer allocator.free(index_bytes);
-    var parsed = try disk_index.parseDiskIndex(allocator, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
-    defer parsed.deinit();
+    const local_index = (try rootfs_cas.loadCompleteStorageIndex(context.io, allocator, local_root, storage)) orelse return error.BadManifest;
+    defer local_index.deinit();
 
     var seen_objects = std.AutoHashMap(chunk.ChunkId, void).init(allocator);
     defer seen_objects.deinit();
-    for (parsed.value.chunks) |chunk_entry| {
+    for (local_index.parsed.value.chunks) |chunk_entry| {
         const seen = try seen_objects.getOrPut(chunk_entry.id);
         if (seen.found_existing) continue;
         const digest = chunk_entry.id.toDigest();
@@ -528,7 +527,7 @@ fn installLocalRootfsStorage(
 
     const cache_index_path = try rootfs_cas.manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(cache_index_path);
-    _ = try rootfs_cas.installStorageIndexPath(allocator, context.io, cache_index_path, index_bytes, storage);
+    _ = try rootfs_cas.installStorageIndexPath(allocator, context.io, cache_index_path, local_index.bytes, storage);
     try rootfs_cas.markStorageComplete(context.io, allocator, cache_root, storage.index_digest);
 }
 
@@ -608,25 +607,37 @@ const StoreOrigin = struct {
     out: *?[]u8,
 };
 
+/// A lazy rootfs lease and, when the cache holds the complete storage, the
+/// index decoded from the read that proved it under the cache lock.
+const LazyRootfs = struct {
+    lease: ?runtime_disk_lease.Active,
+    index: ?disk_index.ParsedDiskIndex,
+};
+
 fn acquireLazyRootfsLease(
     context: Context,
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     storage: spore.RootfsStorage,
     store_origin: ?StoreOrigin,
-) !?runtime_disk_lease.Active {
+) !LazyRootfs {
     const configured_cache_root = try rootfsCacheRootPath(context, allocator);
     defer allocator.free(configured_cache_root);
-    if (!std.mem.eql(u8, configured_cache_root, cache_root)) return null;
+    if (!std.mem.eql(u8, configured_cache_root, cache_root)) return .{ .lease = null, .index = null };
 
     var cache_lock = try rootfs_mod.lockRootfsCacheExclusive(context.io, allocator, cache_root);
     defer cache_lock.deinit();
-    if (!try rootfs_cas.storageMarkedComplete(context.io, allocator, cache_root, storage)) {
+    const index: ?disk_index.ParsedDiskIndex = if (try rootfs_cas.loadCompleteStorageIndex(context.io, allocator, cache_root, storage)) |complete| blk: {
+        allocator.free(complete.bytes);
+        break :blk complete.parsed;
+    } else blk: {
         // Objects still in the image's store are rooted by the lease below:
         // GC protects every object the leased index names.
         const origin = store_origin orelse return error.BadManifest;
         origin.out.* = (try imageStoreOrigin(context, allocator, cache_root, origin.rootfs, storage)) orelse return error.BadManifest;
-    }
+        break :blk null;
+    };
+    errdefer if (index) |value| value.deinit();
     errdefer if (store_origin) |origin| if (origin.out.*) |value| {
         allocator.free(value);
         origin.out.* = null;
@@ -642,13 +653,16 @@ fn acquireLazyRootfsLease(
         break :blk try std.fs.path.resolve(allocator, &.{ cwd, cache_root });
     };
     defer allocator.free(lease_root);
-    return try runtime_disk_lease.acquireActive(context.io, allocator, runtime_root, .{
-        .store = .rootfs_cache,
-        .root = lease_root,
-        .baseline_kind = .disk_index,
-        .baseline_identity = storage.index_digest,
-        .rootfs_storage = storage,
-    });
+    return .{
+        .lease = try runtime_disk_lease.acquireActive(context.io, allocator, runtime_root, .{
+            .store = .rootfs_cache,
+            .root = lease_root,
+            .baseline_kind = .disk_index,
+            .baseline_identity = storage.index_digest,
+            .rootfs_storage = storage,
+        }),
+        .index = index,
+    };
 }
 
 /// The store recorded as origin by the local image `rootfs.source` names, if
@@ -1032,10 +1046,8 @@ test "runtime disk installs portable local rootfs storage and trusts complete wa
     try Io.Dir.cwd().deleteFile(io, preload_result.index_path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = preload_result.index_path, .data = original_local_index });
 
-    const index_bytes = try rootfs_cas.readVerifiedStorageIndexPath(arena, preload_result.index_path, storage);
-    var parsed = try disk_index.parseDiskIndex(arena, index_bytes, try spore.diskIndexDescriptorForStorage(storage));
-    defer parsed.deinit();
-    const local_object_path = try rootfs_cas.objectPath(arena, absolute_local_spore, parsed.value.chunks[0].id);
+    const index = try rootfs_cas.readStorageIndexPath(arena, preload_result.index_path, storage);
+    const local_object_path = try rootfs_cas.objectPath(arena, absolute_local_spore, index.parsed.value.chunks[0].id);
     try Io.Dir.cwd().deleteFile(io, local_object_path);
     var complete_cache_runtime = try open(context, allocator, .{
         .rootfs = rootfs,
@@ -1196,6 +1208,61 @@ test "runtime disk manifest rootfs cas fails closed without index" {
     try std.testing.expectError(error.BadManifest, open(context, allocator, .{
         .rootfs = rootfs,
     }));
+}
+
+test "lazy runtime disk refuses a stamped cache index swapped for another valid index" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const cwd = try std.process.currentPathAlloc(io, arena);
+    const absolute_tmp = try std.fs.path.resolve(arena, &.{ cwd, tmp_dir.root });
+    const cache_root = try std.fs.path.join(arena, &.{ absolute_tmp, "cache" });
+    var indexes: [2][]const u8 = undefined;
+    var storages: [2]spore.RootfsStorage = undefined;
+    var artifacts: [2]spore.RootfsArtifactRef = undefined;
+    for (&indexes, &storages, &artifacts, [_][]const u8{ "abcd", "wxyz" }) |*index, *storage, *artifact, contents| {
+        const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_tmp, contents });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = try std.mem.concat(arena, u8, &(.{contents} ** 16384)) });
+        artifact.* = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
+        const result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+        storage.* = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, result);
+        index.* = try Io.Dir.cwd().readFileAlloc(io, result.index_path, arena, .limited(disk_index.max_index_bytes));
+        // Without the flat artifact the open reads through the index.
+        try Io.Dir.cwd().deleteFile(io, try rootfs_cache.digestPath(arena, cache_root, artifact.digest));
+    }
+    const rootfs = spore.Rootfs{
+        .device = .{ .mmio_slot = 1 },
+        .artifact = .{ .digest = storages[0].index_digest, .size = artifacts[0].size },
+        .storage = storages[0],
+    };
+
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put(local_paths.rootfs_cache_env, cache_root);
+    try env.put(local_paths.runtime_dir_env, try std.fs.path.join(arena, &.{ absolute_tmp, "runtime" }));
+    try env.put("TMPDIR", absolute_tmp);
+    const context = Context{ .io = io, .environ_map = &env };
+
+    // The other index decodes against the same descriptor shape, so only the
+    // digest of the bytes the open decodes can refuse it.
+    const index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, storages[0].index_digest);
+    try Io.Dir.cwd().deleteFile(io, index_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = indexes[1] });
+    try std.testing.expectError(error.BadManifest, open(context, allocator, .{ .rootfs = rootfs }));
+
+    try Io.Dir.cwd().deleteFile(io, index_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = indexes[0] });
+    var runtime = try open(context, allocator, .{ .rootfs = rootfs });
+    defer runtime.deinit();
+    try std.testing.expect(runtime.runtime_lease != null);
+    var readback: [4]u8 = undefined;
+    try runtime.chunk_mapped.?.readAt(&readback, 0);
+    try std.testing.expectEqualStrings("abcd", &readback);
 }
 
 test "runtime disk lazy rootfs validates storage against artifact" {
