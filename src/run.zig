@@ -3290,6 +3290,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     // with elastic memory.
     if (vm_capture) |*value| value.dirty_tracking = value.dirty_tracking and !opts.memory.isElastic() and (backend == .kvm or opts.vcpus == 1);
     const vm_config: vmm.Config = .{
+        .io = context.io,
         .start = if (opts.resume_dir) |dir| .{ .restore = .{
             .dir = dir,
             .ram = ram_plan.strategy,
@@ -3617,6 +3618,7 @@ fn executeMonitorWithOptionalRootfsCacheLock(
     defer if (opts.rootfs_grow_target != 0) logRootBlkStats(&root_blk_stats);
 
     const vm_config: vmm.Config = .{
+        .io = context.io,
         .start = if (opts.resume_dir) |dir| .{ .restore = .{
             .dir = dir,
             .ram = ram_plan.strategy,

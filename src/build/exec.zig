@@ -622,6 +622,7 @@ const BuildControl = struct {
     checkpoint_kind: CheckpointKind = .dockerfile_step,
     step_index: usize = 0,
     phase: Phase = .start_run,
+    wake: ?vsock_control.Wake = null,
     active_stream: ActiveStream = .run,
     stream: vsock_stream.HostStream = undefined,
     stream_valid: bool = false,
@@ -691,6 +692,13 @@ const BuildControl = struct {
     }
 
     fn poll(self: *BuildControl, dev: *vsock.Vsock) !vsock_control.ControlAction {
+        const phase = self.phase;
+        // A new phase acts on the next poll.
+        defer if (self.phase != phase) self.requestPoll();
+        return self.pollPhase(dev);
+    }
+
+    fn pollPhase(self: *BuildControl, dev: *vsock.Vsock) !vsock_control.ControlAction {
         switch (self.phase) {
             .start_resize => {
                 try self.startResize(dev);
@@ -974,9 +982,17 @@ const BuildControl = struct {
         try rootfs_cas.markStorageComplete(self.io, self.allocator, self.cache_root, storage.index_digest);
         self.pending_storage = storage;
         self.phase = .start_thaw;
+        self.requestPoll();
     }
 
-    fn setWake(_: *BuildControl, _: vsock_control.Wake) void {}
+    fn setWake(self: *BuildControl, wake: vsock_control.Wake) void {
+        self.wake = wake;
+    }
+
+    /// Asks the VMM to poll again without waiting for guest activity.
+    fn requestPoll(self: *BuildControl) void {
+        if (self.wake) |wake| wake.wake();
+    }
 
     fn completeSnapshot(_: *BuildControl, _: []const u8) !void {}
 
@@ -2098,6 +2114,44 @@ test "checkpoint controls use step-specific vsock identities" {
     defer allocator.free(prepare_thaw);
     try std.testing.expectEqualStrings("spore-build-prepare-freeze", prepare_freeze);
     try std.testing.expectEqualStrings("spore-build-prepare-thaw", prepare_thaw);
+}
+
+test "a build control phase change asks the VMM to poll again" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var build_control: BuildControl = .{
+        .io = std.testing.io,
+        .allocator = arena,
+        .platform = undefined,
+        .executor_identity = "",
+        .cache_root = "",
+        .steps = &.{},
+        .resources = .{},
+        .timeout_ms = std.time.ms_per_min,
+        .output = null,
+        .current_storage = undefined,
+        .capture = .init(arena),
+        .resize_stdout = .init(arena),
+        .phase = .start_thaw,
+    };
+    const PollCounter = struct {
+        fn wake(context: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(context));
+            count.* += 1;
+        }
+    };
+    var polls: usize = 0;
+    build_control.control().setWake(.{ .context = &polls, .wakeFn = PollCounter.wake });
+    var dev = vsock.Vsock.init(.{});
+
+    try std.testing.expect(try build_control.poll(&dev) == .keep_running);
+    try std.testing.expectEqual(Phase.active_thaw, build_control.phase);
+    try std.testing.expectEqual(@as(usize, 1), polls);
+
+    // Waiting on the guest is not a new phase.
+    try std.testing.expect(try build_control.poll(&dev) == .keep_running);
+    try std.testing.expectEqual(@as(usize, 1), polls);
 }
 
 test "instruction timeout accounting resets between Dockerfile steps" {

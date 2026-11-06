@@ -76,6 +76,8 @@ pub const Exit = union(enum) {
 pub const max_build_input_disks = 2;
 
 pub const Config = struct {
+    /// Blocks and wakes the run's threads.
+    io: std.Io,
     start: Start,
     /// On restore, 1 means "use the manifest's count"; any other count must
     /// match the manifest.
@@ -692,12 +694,13 @@ pub fn DirtyTracker(comptime Backend: type) type {
         sealer: dirty_ram.Sealer,
         backend: Backend,
         tracking_start_ms: u64 = 0,
-        mutex: SpinLock = .{},
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
 
         pub const metrics_mode = Backend.metrics_mode;
 
-        pub fn start(allocator: std.mem.Allocator, options: dirty_ram.Options, backend: Backend) !Self {
-            var tracker = Self{ .sealer = try dirty_ram.Sealer.start(allocator, options), .backend = backend };
+        pub fn start(allocator: std.mem.Allocator, io: std.Io, options: dirty_ram.Options, backend: Backend) !Self {
+            var tracker = Self{ .sealer = try dirty_ram.Sealer.start(allocator, options), .backend = backend, .io = io };
             errdefer tracker.sealer.deinit();
             try Backend.start(&tracker, allocator);
             tracker.tracking_start_ms = deadline.system_clock.nowMs();
@@ -714,8 +717,8 @@ pub fn DirtyTracker(comptime Backend: type) type {
             const clock = deadline.system_clock;
             const tail_start = clock.nowMs();
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
                 try Backend.flush(self);
             }
             self.sealer.stats.tail_flush_ms = clock.nowMs() - tail_start;
@@ -744,8 +747,8 @@ pub fn DirtyTracker(comptime Backend: type) type {
             const capped_len: usize = @intCast(@min(len, remaining));
             if (capped_len == 0) return;
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.sealer.markHostDirtyRange(start_offset, capped_len);
         }
     };
@@ -1098,6 +1101,11 @@ fn moveVtimer(vtimer: *spore.VtimerState, guest_cntvct: u64) void {
 /// is in an ioctl, hence one at a time and only once all have parked.
 /// Threads start paused, so the backend can boot or restore the vCPUs before
 /// `run`.
+///
+/// Nobody spins or polls on a fixed tick: the main thread futex-waits on
+/// `events` and the vCPU threads, when parked or idle, on `vcpu_events`. A
+/// waiter loads the counter, checks its state, then waits for the counter to
+/// move; whoever changes that state bumps the counter afterwards.
 pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) type {
     return struct {
         const Self = @This();
@@ -1113,13 +1121,29 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         states: []Captured = &.{},
         /// Serializes device emulation between the vCPU threads and the
         /// main thread.
-        device_lock: SpinLock = .{},
+        device_lock: std.Io.Mutex = .init,
         /// Held by a vCPU thread while it does a pause action.
-        action_lock: SpinLock = .{},
+        action_lock: std.Io.Mutex = .init,
         stop: std.atomic.Value(bool) = .init(false),
-        result_lock: SpinLock = .{},
+        result_lock: std.Io.Mutex = .init,
         result_value: ?Result = null,
         pause: Pause = .{},
+        /// Bumped when the main thread has something to look at: a vCPU
+        /// thread started or acknowledged a pause, the run ended, a control,
+        /// capture or network wake, or the guest wrote to the vsock device.
+        events: std.atomic.Value(u32) = .init(0),
+        /// Bumped when the vCPU threads have something to look at: a pause,
+        /// resume or stop, or a kick.
+        vcpu_events: std.atomic.Value(u32) = .init(0),
+
+        /// How long the main thread waits without an event. Its checks with
+        /// no event of their own (control timeouts and stats, the probe
+        /// deadline) run at least this often.
+        const main_wait_ms = 10;
+        /// How long a parked or idle vCPU thread waits without an event. HVF
+        /// GIC and CPU_ON requests from other vCPUs and interrupts for an
+        /// idle HVF vCPU only kick, which does not end the wait.
+        const vcpu_wait_ms = 1;
 
         const Result = union(enum) { exit: ExitCause, err: anyerror };
 
@@ -1152,13 +1176,17 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             for (self.slots, 0..) |*slot, index| {
                 slot.thread = try std.Thread.spawn(.{}, threadMain, .{ self, index });
             }
-            // The vCPU threads flush network RX, so a network wake kicks them.
-            // The main thread polls the control and capture requests itself.
+            // The vCPU threads flush network RX and check for gateway
+            // failure, so a network wake kicks them.
             self.config.network.setWake(.{ .context = self, .wakeFn = kickAllFromNetwork });
+            if (self.config.exec_control) |control| control.setWake(.{ .context = self, .wakeFn = notifyMainFromControl });
+            if (self.config.captureRequest()) |request| request.setWake(notifyMainFromSignal, self);
             for (self.slots) |*slot| {
-                while (!slot.started.load(.acquire)) {
+                while (true) {
+                    const seen = self.events.load(.acquire);
+                    if (slot.started.load(.acquire)) break;
                     if (self.stopped()) return self.stopError();
-                    sleepMs(1);
+                    try self.waitMain(seen);
                 }
                 if (slot.start_error) |err| return err;
             }
@@ -1167,6 +1195,10 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         /// Stops and joins every vCPU thread.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.config.network.clearWake();
+            if (self.config.captureRequest()) |request| request.clearWake();
+            // The control outlives the run, so its later wakes must not
+            // reach this one.
+            if (self.config.exec_control) |control| control.setWake(.{ .context = self, .wakeFn = ignoreWake });
             self.stop.store(true, .release);
             self.kickAll();
             for (self.slots) |*slot| {
@@ -1186,13 +1218,59 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             try self.pauseAll(.apply);
         }
 
+        /// Makes every vCPU thread look again: a vCPU in the guest exits,
+        /// and a parked or idle thread wakes.
         pub fn kickAll(self: *Self) void {
+            self.wakeVcpuThreads();
             for (self.vcpus) |*vcpu| vcpu.kick();
+        }
+
+        /// Wakes the parked or idle vCPU threads.
+        fn wakeVcpuThreads(self: *Self) void {
+            _ = self.vcpu_events.fetchAdd(1, .release);
+            self.config.io.futexWake(u32, &self.vcpu_events.raw, std.math.maxInt(u32));
         }
 
         fn kickAllFromNetwork(context: ?*anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(context orelse return));
             self.kickAll();
+        }
+
+        /// Makes the main thread look again. Async-signal-safe: an atomic
+        /// add and a futex wake.
+        fn notifyMain(self: *Self) void {
+            _ = self.events.fetchAdd(1, .release);
+            self.config.io.futexWake(u32, &self.events.raw, 1);
+        }
+
+        fn notifyMainFromControl(context: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            self.notifyMain();
+        }
+
+        fn ignoreWake(_: *anyopaque) void {}
+
+        /// Runs in the capture signal handler.
+        fn notifyMainFromSignal(context: ?*anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(context orelse return));
+            self.notifyMain();
+        }
+
+        /// Waits until `events` moves past `seen`, at most `main_wait_ms`.
+        fn waitMain(self: *Self, seen: u32) !void {
+            try self.config.io.futexWaitTimeout(u32, &self.events.raw, seen, .{ .duration = .{
+                .raw = .fromMilliseconds(main_wait_ms),
+                .clock = .awake,
+            } });
+        }
+
+        /// Waits until `vcpu_events` moves past `seen`, at most
+        /// `vcpu_wait_ms`.
+        fn waitVcpu(self: *Self, seen: u32) void {
+            self.config.io.futexWaitTimeout(u32, &self.vcpu_events.raw, seen, .{ .duration = .{
+                .raw = .fromMilliseconds(vcpu_wait_ms),
+                .clock = .awake,
+            } }) catch {};
         }
 
         fn stopped(self: *const Self) bool {
@@ -1202,15 +1280,19 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         /// Records how the run ends and stops every vCPU. The first result
         /// wins.
         fn finish(self: *Self, outcome: Result) void {
-            self.result_lock.lock();
-            defer self.result_lock.unlock();
-            if (self.result_value == null) self.result_value = outcome;
-            self.stop.store(true, .release);
+            {
+                self.result_lock.lockUncancelable(self.config.io);
+                defer self.result_lock.unlock(self.config.io);
+                if (self.result_value == null) self.result_value = outcome;
+                self.stop.store(true, .release);
+            }
+            self.notifyMain();
+            self.kickAll();
         }
 
         fn result(self: *Self) ?Result {
-            self.result_lock.lock();
-            defer self.result_lock.unlock();
+            self.result_lock.lockUncancelable(self.config.io);
+            defer self.result_lock.unlock(self.config.io);
             return self.result_value;
         }
 
@@ -1238,15 +1320,18 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             self.pause.active.store(true, .release);
             self.kickAll();
             for (self.slots) |*slot| {
-                while (slot.acked.load(.acquire) != seq) {
+                while (true) {
+                    const seen = self.events.load(.acquire);
+                    if (slot.acked.load(.acquire) == seq) break;
                     if (self.stopped()) return self.stopError();
-                    sleepMs(1);
+                    try self.waitMain(seen);
                 }
             }
         }
 
         fn resumeAll(self: *Self) void {
             self.pause.active.store(false, .release);
+            self.wakeVcpuThreads();
         }
 
         fn threadMain(self: *Self, index: usize) void {
@@ -1260,12 +1345,17 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             };
             defer vcpu.threadExit();
             slot.started.store(true, .release);
+            self.notifyMain();
             self.vcpuLoop(vcpu, slot, &self.states[index]) catch |err| self.finish(.{ .err = err });
         }
 
         fn vcpuLoop(self: *Self, vcpu: *Vcpu, slot: *Slot, captured: *Captured) !void {
+            const io = self.config.io;
             const transports = self.devices.transports();
-            while (!self.stopped()) {
+            const vsock_base = board.virtioDeviceBase(@intCast(self.devices.vsock_index));
+            while (true) {
+                const seen = self.vcpu_events.load(.acquire);
+                if (self.stopped()) return;
                 // Served even while paused: a running vCPU may be waiting on
                 // this one before it can see the pause.
                 if (vcpu.handleCommands()) continue;
@@ -1274,8 +1364,8 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                     if (slot.acked.load(.monotonic) != seq) {
                         const action = self.pause.action.load(.monotonic);
                         if (action != .none) {
-                            self.action_lock.lock();
-                            defer self.action_lock.unlock();
+                            self.action_lock.lockUncancelable(io);
+                            defer self.action_lock.unlock(io);
                             switch (action) {
                                 .none => unreachable,
                                 .capture => captured.state = try vcpu.capture(self.vm, slot.arena.allocator()),
@@ -1283,14 +1373,15 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                             }
                         }
                         slot.acked.store(seq, .release);
+                        self.notifyMain();
                     }
-                    sleepMs(1);
+                    self.waitVcpu(seen);
                     continue;
                 }
                 if (self.config.network.failed()) return error.NetworkGatewayFailed;
                 if (self.config.network.consumeWake()) {
-                    self.device_lock.lock();
-                    defer self.device_lock.unlock();
+                    self.device_lock.lockUncancelable(io);
+                    defer self.device_lock.unlock(io);
                     _ = try flushRx(self.vm, &self.devices.net, transports, self.devices.net_index, self.ram);
                     continue;
                 }
@@ -1299,13 +1390,16 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                 switch (exit) {
                     .mmio => |access| {
                         const value = value: {
-                            self.device_lock.lock();
-                            defer self.device_lock.unlock();
+                            self.device_lock.lockUncancelable(io);
+                            defer self.device_lock.unlock(io);
                             break :value try dispatchMmio(self.vm, access, transports, &self.devices.gen, self.ram);
                         };
                         try vcpu.completeMmio(value);
+                        // A vsock write can move the probe or a control's
+                        // stream along.
+                        if (access.write != null and access.addr -% vsock_base < board.virtio_stride) self.notifyMain();
                     },
-                    .wfi => sleepMs(1),
+                    .wfi => self.waitVcpu(seen),
                     .shutdown => |kind| self.finish(.{ .exit = kind.cause() }),
                     .handled, .kicked => {},
                 }
@@ -1319,8 +1413,8 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
             var probe_done = false;
             self.resumeAll();
             while (true) {
+                const seen = self.events.load(.acquire);
                 if (self.result()) |outcome| {
-                    self.kickAll();
                     return switch (outcome) {
                         .exit => |cause| cause,
                         .err => |err| err,
@@ -1386,7 +1480,7 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                         continue;
                     }
                 }
-                sleepMs(1);
+                try self.waitMain(seen);
             }
         }
 
@@ -1395,8 +1489,8 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
         fn pollControl(self: *Self, control: vsock_control.Control) !vsock_control.ControlAction {
             const vsock_dev = &self.devices.vsock;
             const delivered = delivered: {
-                self.device_lock.lock();
-                defer self.device_lock.unlock();
+                self.device_lock.lockUncancelable(self.config.io);
+                defer self.device_lock.unlock(self.config.io);
                 const action = try control.poll(vsock_dev);
                 if (action != .keep_running) return action;
                 break :delivered try flushRx(self.vm, vsock_dev, self.devices.transports(), self.devices.vsock_index, self.ram);
@@ -1486,24 +1580,6 @@ const Captured = struct {
     }
 };
 
-fn sleepMs(ms: u64) void {
-    deadline.system_clock.sleepMs(ms);
-}
-
-pub const SpinLock = struct {
-    locked: std.atomic.Value(bool) = .init(false),
-
-    pub fn lock(self: *SpinLock) void {
-        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.Thread.yield() catch {};
-        }
-    }
-
-    pub fn unlock(self: *SpinLock) void {
-        self.locked.store(false, .release);
-    }
-};
-
 fn testConsoleSink(_: []const u8) void {}
 
 fn testBoot(overrides: struct {
@@ -1511,6 +1587,7 @@ fn testBoot(overrides: struct {
     virtio_mem_region_size: u64 = 0,
 }) Config {
     return .{
+        .io = std.testing.io,
         .start = .{ .boot = .{ .kernel = "", .virtio_mem_region_size = overrides.virtio_mem_region_size } },
         .vcpus = overrides.vcpus,
         .console_sink = testConsoleSink,
@@ -1764,7 +1841,7 @@ test "dirty tracker marks host writes inside guest RAM and seals them at finish"
     @memset(ram, 0);
 
     const Tracker = DirtyTracker(TestDirtyBackend);
-    var tracker = try Tracker.start(arena, .{ .dir = dir, .ram = ram, .seed_ranges = &.{} }, .{});
+    var tracker = try Tracker.start(arena, std.testing.io, .{ .dir = dir, .ram = ram, .seed_ranges = &.{} }, .{});
     defer tracker.deinit();
     Tracker.markGuestWriteCallback(&tracker, board.ram_base - 1, 1);
     Tracker.markGuestWriteCallback(&tracker, board.ram_base + ram.len, 1);
