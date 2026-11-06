@@ -199,9 +199,6 @@ fn parseGlobalArgs(args: []const []const u8) GlobalArgs {
 const exitWithCliError = cli.exitWithCliError;
 const exitUnknownArgument = cli.exitUnknownArgument;
 const exitUnexpectedArgument = cli.exitUnexpectedArgument;
-const exitInvalidValue = cli.exitInvalidValue;
-const exitUsage = cli.exitUsage;
-const allocMessage = cli.allocMessage;
 
 fn writeVersion(writer: *Io.Writer, mode: std.builtin.OptimizeMode) !void {
     try writer.print("spore {s} ({t})\n", .{ spore_internal.version, mode });

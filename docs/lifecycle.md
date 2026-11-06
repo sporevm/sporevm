@@ -226,8 +226,9 @@ If `SPOREVM_RUNTIME_DIR` is unset, SporeVM uses the platform runtime directory
 or a private temp fallback. Runtime directories must be private to the current
 user.
 
-`create`, `restore --name` and each `vm fork` child claim the name by creating
-`vms/<name>/` and its `lock` file and taking an exclusive `flock` on the lock.
+`vm create`, `vm restore --name` and each `vm fork` child claim the name by
+creating `vms/<name>/` and its `lock` file and taking an exclusive `flock` on
+the lock.
 A name that already has an entry, in any state, fails with "already exists";
 fork claims every child name before it pauses the source, and `create` checks
 the name before it pulls the image but claims it only once the image is

@@ -1212,15 +1212,15 @@ fn addAnnotationArgLifecycleCli(
     raw: []const u8,
 ) void {
     const eq = std.mem.indexOfScalar(u8, raw, '=') orelse {
-        const message = allocLifecycleMessage(allocator, "spore {s}: invalid --annotation {s}", .{ command, raw });
+        const message = allocLifecycleMessage(allocator, "spore vm {s}: invalid --annotation {s}", .{ command, raw });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
     annotations.map.put(allocator, raw[0..eq], raw[eq + 1 ..]) catch |err| {
-        const message = allocLifecycleMessage(allocator, "spore {s}: invalid --annotation {s}: {s}", .{ command, raw, @errorName(err) });
+        const message = allocLifecycleMessage(allocator, "spore vm {s}: invalid --annotation {s}: {s}", .{ command, raw, @errorName(err) });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
     spore.validateAnnotations(annotations.*) catch {
-        const message = allocLifecycleMessage(allocator, "spore {s}: invalid --annotation {s}", .{ command, raw });
+        const message = allocLifecycleMessage(allocator, "spore vm {s}: invalid --annotation {s}", .{ command, raw });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
 }
@@ -2226,7 +2226,7 @@ fn allocLifecycleMessage(allocator: std.mem.Allocator, comptime fmt: []const u8,
 fn allocLifecycleLastErrorMessage(allocator: std.mem.Allocator, command: []const u8, fallback: []const u8) []const u8 {
     const detail = lastErrorMessage();
     if (detail.len == 0) return fallback;
-    return std.fmt.allocPrint(allocator, "spore {s}: {s}", .{ command, detail }) catch fallback;
+    return std.fmt.allocPrint(allocator, "spore vm {s}: {s}", .{ command, detail }) catch fallback;
 }
 
 fn exitLifecycleCliError(
@@ -2254,19 +2254,19 @@ fn exitLifecycleRuntimePathError(
     err: anyerror,
 ) noreturn {
     const message = switch (err) {
-        error.InvalidRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{ command, runtime_dir_env }),
-        error.InsecureRuntimeDir => allocLifecycleMessage(allocator, "spore {s}: insecure runtime directory; registry directories must be private to the current user", .{command}),
+        error.InvalidRuntimeDir => allocLifecycleMessage(allocator, "spore vm {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path", .{ command, runtime_dir_env }),
+        error.InsecureRuntimeDir => allocLifecycleMessage(allocator, "spore vm {s}: insecure runtime directory; registry directories must be private to the current user", .{command}),
         error.ControlSocketPathTooLong => allocLifecycleLastErrorMessage(
             allocator,
             command,
-            allocLifecycleMessage(allocator, "spore {s}: internal control socket path exceeds the platform limit", .{command}),
+            allocLifecycleMessage(allocator, "spore vm {s}: internal control socket path exceeds the platform limit", .{command}),
         ),
         error.ControlSocketPathCollision => allocLifecycleLastErrorMessage(
             allocator,
             command,
-            allocLifecycleMessage(allocator, "spore {s}: internal control socket path collision", .{command}),
+            allocLifecycleMessage(allocator, "spore vm {s}: internal control socket path collision", .{command}),
         ),
-        else => allocLifecycleMessage(allocator, "spore {s}: runtime directory error: {s}", .{ command, @errorName(err) }),
+        else => allocLifecycleMessage(allocator, "spore vm {s}: runtime directory error: {s}", .{ command, @errorName(err) }),
     };
     exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
 }
@@ -2275,12 +2275,12 @@ fn validateNameOrExit(command: []const u8, name: []const u8) !void {
     validateName(name) catch {
         if (exec_cli_event_writer) |events| {
             var buf: [512]u8 = undefined;
-            const message = std.fmt.bufPrint(&buf, "spore {s}: invalid VM name: {s}", .{ command, name }) catch "spore vm exec: invalid VM name";
+            const message = std.fmt.bufPrint(&buf, "spore vm {s}: invalid VM name: {s}", .{ command, name }) catch "spore vm exec: invalid VM name";
             const classified = machine_output.usageInvalidArgument(message, command);
             events.emitFailure(classified) catch {};
             std.process.exit(classified.exit_code);
         }
-        std.debug.print("spore {s}: invalid VM name: {s}\n", .{ command, name });
+        std.debug.print("spore vm {s}: invalid VM name: {s}\n", .{ command, name });
         std.process.exit(2);
     };
 }
@@ -2293,7 +2293,7 @@ fn validateNameLifecycleCli(
     name: []const u8,
 ) void {
     validateName(name) catch {
-        const message = allocLifecycleMessage(allocator, "spore {s}: invalid VM name: {s}", .{ command, name });
+        const message = allocLifecycleMessage(allocator, "spore vm {s}: invalid VM name: {s}", .{ command, name });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
 }
@@ -2301,25 +2301,25 @@ fn validateNameLifecycleCli(
 fn cliRuntimePathExit(command: []const u8, err: anyerror) noreturn {
     switch (err) {
         error.InvalidRuntimeDir => std.debug.print(
-            "spore {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path\n",
+            "spore vm {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path\n",
             .{ command, runtime_dir_env },
         ),
         error.InsecureRuntimeDir => std.debug.print(
-            "spore {s}: insecure runtime directory; registry directories must be private to the current user\n",
+            "spore vm {s}: insecure runtime directory; registry directories must be private to the current user\n",
             .{command},
         ),
         error.ControlSocketPathTooLong => {
             const detail = lastErrorMessage();
             if (detail.len != 0) {
-                std.debug.print("spore {s}: {s}\n", .{ command, detail });
+                std.debug.print("spore vm {s}: {s}\n", .{ command, detail });
             } else {
                 std.debug.print(
-                    "spore {s}: internal control socket path exceeds the platform limit\n",
+                    "spore vm {s}: internal control socket path exceeds the platform limit\n",
                     .{command},
                 );
             }
         },
-        else => std.debug.print("spore {s}: runtime directory error: {s}\n", .{ command, @errorName(err) }),
+        else => std.debug.print("spore vm {s}: runtime directory error: {s}\n", .{ command, @errorName(err) }),
     }
     std.process.exit(2);
 }

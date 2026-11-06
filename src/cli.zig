@@ -46,7 +46,7 @@ pub const Command = struct {
 
 const Resolved = union(enum) {
     command: struct { command: *const Command, args: []const []const u8 },
-    /// A group word alone or followed by `help`, `-h` or `--help`.
+    /// A group word alone or followed by `-h` or `--help`.
     group_help: []const u8,
     unknown_verb: struct { group: []const u8, verb: []const u8 },
     unknown,
@@ -62,7 +62,7 @@ fn resolve(commands: []const Command, argv: []const []const u8) Resolved {
         }
         return .unknown;
     }
-    if (argv.len == 1 or isHelpWord(argv[1])) return .{ .group_help = word };
+    if (argv.len == 1 or isHelpFlag(argv[1])) return .{ .group_help = word };
     for (commands) |*command| {
         const verb = verbOf(command.name, word) orelse continue;
         if (std.mem.eql(u8, verb, argv[1])) return .{ .command = .{ .command = command, .args = argv[2..] } };
@@ -106,7 +106,8 @@ fn invoke(command: *const Command, ctx: *const Ctx, args: []const []const u8) !v
     if (wantsHelp(args)) {
         if (ctx.mode == .json) {
             const message = allocMessage(allocator, "spore --json {s} does not print help", .{command.name});
-            exitCommandError(command, ctx, machine_output.usageInvalidArgument(message, command.name));
+            const source = if (command.output == .events) streamCommand(command.name) else command.name;
+            exitCommandError(command, ctx, machine_output.usageInvalidArgument(message, source));
         }
         return ctx.stdout.writeAll(command.usage);
     }
@@ -120,26 +121,31 @@ fn invoke(command: *const Command, ctx: *const Ctx, args: []const []const u8) !v
 /// `completion` on stdout for a stream, else `spore.error.v1` on stderr.
 fn exitCommandError(command: *const Command, ctx: *const Ctx, err: machine_output.CliError) noreturn {
     if (command.output == .events) {
-        var events = events_mod.EventWriter.init(ctx.init.arena.allocator(), ctx.stdout, command.name);
+        var events = events_mod.EventWriter.init(ctx.init.arena.allocator(), ctx.stdout, streamCommand(command.name));
         events.emitFailure(err) catch {};
         std.process.exit(err.exit_code);
     }
     exitWithCliError(ctx.init.arena.allocator(), ctx.stderr, ctx.mode, err, err.message);
 }
 
-/// Whether `args` asks for a command's help: `help` alone, or `-h` or
-/// `--help` anywhere before `--`.
+/// The `command` a stream reports: the verb alone, so `vm exec` says "exec".
+fn streamCommand(name: []const u8) []const u8 {
+    const space = std.mem.lastIndexOfScalar(u8, name, ' ') orelse return name;
+    return name[space + 1 ..];
+}
+
+/// Whether `args` asks for a command's help: `-h` or `--help` anywhere
+/// before `--`.
 fn wantsHelp(args: []const []const u8) bool {
-    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) return true;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--")) return false;
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return true;
+        if (isHelpFlag(arg)) return true;
     }
     return false;
 }
 
-fn isHelpWord(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
+fn isHelpFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
 /// The verb of a "group verb" command name in `group`.
@@ -297,7 +303,7 @@ test "resolve finds commands, group verbs and their arguments" {
 test "resolve reports group help, unknown verbs and unknown commands" {
     try std.testing.expectEqualStrings("vm", resolve(&test_commands, &.{"vm"}).group_help);
     try std.testing.expectEqualStrings("vm", resolve(&test_commands, &.{ "vm", "--help" }).group_help);
-    try std.testing.expectEqualStrings("vm", resolve(&test_commands, &.{ "vm", "help" }).group_help);
+    try std.testing.expectEqualStrings("help", resolve(&test_commands, &.{ "vm", "help" }).unknown_verb.verb);
     const unknown_verb = resolve(&test_commands, &.{ "vm", "ls" }).unknown_verb;
     try std.testing.expectEqualStrings("vm", unknown_verb.group);
     try std.testing.expectEqualStrings("ls", unknown_verb.verb);
@@ -329,7 +335,7 @@ test "help lists public commands and a group's verbs" {
 test "command help accepts standard help spellings before the argv delimiter" {
     try std.testing.expect(wantsHelp(&.{"--help"}));
     try std.testing.expect(wantsHelp(&.{"-h"}));
-    try std.testing.expect(wantsHelp(&.{"help"}));
+    try std.testing.expect(!wantsHelp(&.{"help"}));
     try std.testing.expect(wantsHelp(&.{ "base.spore", "--help" }));
     try std.testing.expect(!wantsHelp(&.{}));
     try std.testing.expect(!wantsHelp(&.{ "help", "--out", "bundle" }));

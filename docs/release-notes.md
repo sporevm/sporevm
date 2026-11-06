@@ -18,9 +18,11 @@ hints:
 | `spore fork DIR` | `spore checkpoint fork DIR` |
 | `spore inspect`, `push`, `pull` | `spore checkpoint inspect`, `checkpoint push`, `checkpoint pull` |
 
-`spore help` is gone (use `spore --help`), and `spore resume` and `spore
-suspend` no longer print a hint. JSON results and their schemas are
-unchanged. The CLI no longer promises to keep 0.x spellings compatible.
+`spore help` is gone (use `spore --help`), and only `-h` and `--help` ask
+for help, so `spore vm help` fails as an unknown `vm` command and `spore
+checkpoint rm help` removes `./help`. `spore resume` and `spore suspend` no
+longer print a hint. JSON results and their schemas are unchanged. The CLI no
+longer promises to keep 0.x spellings compatible.
 
 ### Global `--json` replaces `--events=jsonl`
 
