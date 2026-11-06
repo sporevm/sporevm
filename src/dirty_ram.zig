@@ -261,9 +261,9 @@ pub const Sealer = struct {
     pub fn finishBacking(self: *Sealer) !spore.MemoryManifest {
         // Its proof binds the file, not the bytes: sync them before one exists.
         const fsync_start = try monotonicMs();
-        const fsync_rc = std.c.fsync(self.backing_fd);
+        const fsync_result = chunk_sealer.fsyncFile(self.backing_fd);
         self.stats.finish_fsync_ms = (try monotonicMs()) - fsync_start;
-        if (fsync_rc != 0) return error.IoFailed;
+        try fsync_result;
 
         const fchmod_start = try monotonicMs();
         const fchmod_rc = std.c.fchmod(self.backing_fd, 0o444);
@@ -622,7 +622,12 @@ test "dirty RAM sealer seeds zero-elided chunks and finalizes backing" {
     try std.testing.expect(sealer.refs[2] != null);
     try std.testing.expectEqual(@as(u64, 0), sealer.stats.dirty_chunks_total);
 
+    // The backing is synced before its caller writes a proof for it.
+    var file_syncs: usize = 0;
+    chunk_sealer.testing.file_syncs = &file_syncs;
+    defer chunk_sealer.testing.file_syncs = null;
     const manifest = try sealer.finishBacking();
+    try std.testing.expectEqual(@as(usize, 1), file_syncs);
     const plan = try spore.validateMemoryForRam(manifest, ram.len);
     try std.testing.expectEqual(@as(usize, 3), plan.chunk_count);
     try std.testing.expectEqual(@as(usize, 2), plan.nonzero_chunk_count);

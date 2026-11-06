@@ -11,6 +11,7 @@ const chunk = @import("chunk.zig");
 pub const testing = if (builtin.is_test) struct {
     pub var created_dir_syncs: ?*usize = null;
     pub var dir_syncs: ?*usize = null;
+    pub var file_syncs: ?*usize = null;
 } else struct {};
 
 pub const Error = error{
@@ -339,6 +340,15 @@ fn writeAll(fd: std.c.fd_t, data: []const u8) Error!void {
 
 fn fsyncFd(fd: std.c.fd_t) Error!void {
     if (std.c.fsync(fd) != 0) return error.IoFailed;
+}
+
+/// Syncs a file the caller is about to vouch for, such as a RAM backing
+/// before its proof is written. Tests count these calls.
+pub fn fsyncFile(fd: std.c.fd_t) Error!void {
+    try fsyncFd(fd);
+    if (comptime builtin.is_test) {
+        if (testing.file_syncs) |count| count.* += 1;
+    }
 }
 
 fn verifyExistingFile(path: [:0]const u8, expected: []const u8) Error!void {

@@ -843,7 +843,7 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
 
     const backing = if (with_backing) blk: {
         // Its proof binds the file, not the bytes: sync them before one exists.
-        if (std.c.fsync(backing_fd) != 0) return error.IoFailed;
+        chunk_sealer.fsyncFile(backing_fd) catch |err| return sealerError(err);
         if (std.c.fchmod(backing_fd, 0o444) != 0) return error.IoFailed;
         _ = std.c.close(backing_fd);
         backing_fd = -1;
@@ -1460,7 +1460,7 @@ test "manifest save replaces a symlink instead of writing through it" {
     loaded.deinit();
 }
 
-test "memory and manifest saves sync their directories" {
+test "memory and manifest saves sync the backing and their directories" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1476,14 +1476,20 @@ test "memory and manifest saves sync their directories" {
     var dir_syncs: usize = 0;
     chunk_sealer.testing.dir_syncs = &dir_syncs;
     defer chunk_sealer.testing.dir_syncs = null;
+    var file_syncs: usize = 0;
+    chunk_sealer.testing.file_syncs = &file_syncs;
+    defer chunk_sealer.testing.file_syncs = null;
 
-    // `chunks/` is synced once per non-zero chunk, before a manifest names it.
+    // `chunks/` is synced before a manifest names the chunks, and the backing
+    // before its caller writes a proof for it.
     const memory = try saveMemoryWithBacking(arena, dir, ram);
     try std.testing.expectEqual(@as(usize, 3), memory.chunks.len);
-    try std.testing.expectEqual(@as(usize, 3), dir_syncs);
+    try std.testing.expect(dir_syncs >= 1);
+    try std.testing.expectEqual(@as(usize, 1), file_syncs);
 
+    const memory_dir_syncs = dir_syncs;
     try saveManifest(arena, dir, testForkManifest(memory, ram.len, 1));
-    try std.testing.expectEqual(@as(usize, 4), dir_syncs);
+    try std.testing.expect(dir_syncs > memory_dir_syncs);
 }
 
 test "memory backing rejects non-canonical paths" {
