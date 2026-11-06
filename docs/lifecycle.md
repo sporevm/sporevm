@@ -223,8 +223,10 @@ Live VM state is runtime state, not cache state:
 
 ```text
 $SPOREVM_RUNTIME_DIR/vms/<name>/
+  lock                        # held by the claimer, then for the monitor's life
+  spec.json                   # the complete VM spec, written before the monitor starts
+  disk-claim.json             # fork children only, deleted once claimed
   pid
-  spec.json
   ready.json
   create-timing.json
   monitor-timing.json
@@ -244,8 +246,21 @@ they still belong to that registry entry.
 
 If `SPOREVM_RUNTIME_DIR` is unset, SporeVM uses the platform runtime directory
 or a private temp fallback. Runtime directories must be private to the current
-user. Stale entries fail closed unless the recorded monitor pid is dead and the
-user removes or recreates the VM.
+user.
+
+`create`, `restore --name` and each `vm fork` child claim the name by creating
+`vms/<name>/` and its `lock` file and taking an exclusive `flock` on the lock.
+A name that already has an entry, in any state, fails with "already exists";
+fork claims every child name before it pauses the source. The claimer writes
+the complete spec, then starts `spore monitor NAME` with the lock as stdin.
+The monitor holds the lock until it exits and keeps it out of every helper it
+starts. `spore ls` reports `starting` while the lock is held before
+`ready.json` exists, `ready` once it does, and `stale` when nobody holds the
+lock, for example after the monitor was killed. The `pid` file is used only to
+signal the monitor, never to decide whether it is alive. `spore rm` takes the
+lock before it deletes the entry: a stale entry is deleted at once, a live one
+is asked to shut down and then signalled, and an entry whose claimer has not
+started its monitor yet is reported as still starting.
 
 Each VM has one monitor process. The monitor owns the hypervisor VM, vCPU loop,
 virtio state, rootfs fd, writable disk state, optional configured console log,
@@ -255,7 +270,9 @@ console path only when the monitor actually opened one. Restore never reuses a
 saved lifecycle console path as host authority; a future explicit restore option
 would need to select a new path. `spore --debug` on `create`, `restore`, or
 `fork` starts the monitor with `--debug`, so `monitor.log` includes its info
-and debug logs, such as save timing metrics.
+and debug logs, such as save timing metrics. The monitor never creates its
+registry directory: once `rm` has deleted it, the monitor's writes fail
+instead of bringing the entry back.
 
 ## Session Handles
 
@@ -445,15 +462,16 @@ instead of forcing an expensive VM memory scan.
 
 `spore create`, `spore restore --name`, and `spore vm fork` report success
 only after the restored guest agent has answered a dedicated readiness request,
-the monitor has written `ready.json`, the recorded PID is alive, and the local
-`control.sock` answers a `hello` request with the same SporeVM version as the
-calling `spore`. This means a successful named restore is immediately ready for
+the monitor has written `ready.json` while holding the entry's lock, and the
+local `control.sock` answers a `hello` request with the same SporeVM version as
+the calling `spore`. A monitor that exits first is reported as a startup error
+at once instead of after the readiness timeout. This means a successful named restore is immediately ready for
 `spore exec`; callers do not need to poll with a no-op command. For disk-backed
 fork children, the baseline and one-shot `SCM_RIGHTS` overlay claim are validated
-and adopted before that guest readiness probe succeeds. The monitor argv and
-control protocol are a private
-same-version contract, so matching is exact: a `spore` `1.5.0` caller cannot
-use a monitor reporting `1.3.0`. Version mismatch is a startup error that names
+and adopted before that guest readiness probe succeeds. The monitor's only
+argument is the VM name; it reads everything else from `spec.json`. The spec
+and control protocol are a private same-version contract, so matching is exact:
+a `spore` `1.5.0` caller cannot use a monitor reporting `1.3.0`. Version mismatch is a startup error that names
 both versions and the resolved executable path.
 
 Named lifecycle failures include the last known lifecycle state, recorded PID

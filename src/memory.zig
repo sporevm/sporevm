@@ -57,16 +57,6 @@ pub const Config = struct {
             }
         }
     }
-
-    pub fn initialCliValueAlloc(self: Config, allocator: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "{d}b", .{self.initial_bytes});
-    }
-
-    pub fn maximumCliValueAlloc(self: Config, allocator: std.mem.Allocator) !?[]const u8 {
-        if (!self.isElastic()) return null;
-        const value = try std.fmt.allocPrint(allocator, "{d}b", .{self.maximum_bytes});
-        return value;
-    }
 };
 
 pub const ParseError = error{
@@ -242,16 +232,4 @@ test "manifest memory must be positive and page-aligned" {
     try std.testing.expectEqual(page_alignment, (try fromManifestBytes(page_alignment)).initial_bytes);
     try std.testing.expectError(error.ZeroMemory, fromManifestBytes(0));
     try std.testing.expectError(error.UnalignedMemory, fromManifestBytes(1));
-}
-
-test "memory config formats monitor CLI values" {
-    const allocator = std.testing.allocator;
-    const fixed_value = try (Config.fixed(4096)).initialCliValueAlloc(allocator);
-    defer allocator.free(fixed_value);
-    try std.testing.expectEqualStrings("4096b", fixed_value);
-    try std.testing.expectEqual(@as(?[]const u8, null), try (Config.fixed(4096)).maximumCliValueAlloc(allocator));
-
-    const max_value = (try (Config{ .initial_bytes = 4096, .maximum_bytes = 8192 }).maximumCliValueAlloc(allocator)).?;
-    defer allocator.free(max_value);
-    try std.testing.expectEqualStrings("8192b", max_value);
 }

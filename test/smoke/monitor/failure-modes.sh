@@ -107,8 +107,10 @@ if ! run_spore rm "${rootfs_vm}"; then
 fi
 rootfs_created=0
 
+# The killed VM has a network gateway, the helper most likely to outlive its
+# monitor and keep a dead VM looking live.
 if run_capture "${workdir}/dead-create.out" "${workdir}/dead-create.err" \
-  run_spore create "${dead_vm}" --backend "${backend}" --memory "${dead_memory}" --timeout 60s; then
+  run_spore create "${dead_vm}" --backend "${backend}" --memory "${dead_memory}" --timeout 60s --net; then
   dead_created=1
 else
   cat "${workdir}/dead-create.err" >&2 || true
@@ -123,13 +125,17 @@ monitor_pid="$(tr -d '[:space:]' <"${pid_path}")"
 [[ "${monitor_pid}" =~ ^[0-9]+$ ]] || {
   die "monitor pid file did not contain a numeric pid: ${pid_path}"
 }
-kill -TERM "${monitor_pid}" 2>/dev/null || true
-if ! wait_dead "${monitor_pid}"; then
-  kill -KILL "${monitor_pid}" 2>/dev/null || true
-  wait_dead "${monitor_pid}" || {
-    die "monitor pid did not exit after SIGKILL: ${monitor_pid}"
-  }
-fi
+pgrep -g "${monitor_pid}" >/dev/null || die "monitor process group ${monitor_pid} is empty"
+kill -KILL "${monitor_pid}"
+wait_dead "${monitor_pid}" || die "monitor pid did not exit after SIGKILL: ${monitor_pid}"
+
+dead_state=""
+for _ in $(seq 1 20); do
+  dead_state="$(run_spore --json ls | python3 -c 'import json, sys; print(next((e["state"] for e in json.load(sys.stdin)["entries"] if e["name"] == sys.argv[1]), "missing"))' "${dead_vm}")"
+  [[ "${dead_state}" == "stale" ]] && break
+  sleep 0.1
+done
+[[ "${dead_state}" == "stale" ]] || die "spore ls reported ${dead_state} for a VM whose monitor was killed, expected stale"
 
 if run_capture "${workdir}/dead-exec.out" "${workdir}/dead-exec.err" \
   run_spore exec "${dead_vm}" -- /bin/true; then
@@ -161,5 +167,13 @@ dead_created=0
 [[ ! -e "${runtime_dir}/vms/${dead_vm}" ]] || {
   die "spore rm did not clean killed monitor state"
 }
+for _ in $(seq 1 50); do
+  pgrep -g "${monitor_pid}" >/dev/null || break
+  sleep 0.1
+done
+if pgrep -g "${monitor_pid}" >/dev/null; then
+  ps -o pid,pgid,command -p "$(pgrep -d, -g "${monitor_pid}")" >&2 || true
+  die "processes from the killed monitor's group outlived it"
+fi
 
-echo "smoke:monitor-failure-modes ok backend=${backend} sigterm=${sigterm_status} sigkill=${sigkill_status} oom=${oom_status} killed-monitor-exec=${dead_exec_status}"
+echo "smoke:monitor-failure-modes ok backend=${backend} sigterm=${sigterm_status} sigkill=${sigkill_status} oom=${oom_status} killed-monitor-exec=${dead_exec_status} killed-monitor-state=${dead_state}"

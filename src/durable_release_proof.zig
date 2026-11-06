@@ -22,6 +22,7 @@ const saved_spore_fork = @import("saved_spore_fork.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const spore = @import("spore.zig");
 const system = @import("system.zig");
+const vm_registry = @import("vm_registry.zig");
 
 const mode_env = "SPOREVM_DURABLE_CRASH_MODE";
 const root_env = "SPOREVM_DURABLE_CRASH_ROOT";
@@ -326,6 +327,7 @@ fn crashSourceLeaseHandoff(allocator: std.mem.Allocator, io: std.Io, mode: []con
     const paths = try lifecycle.pathsFromRoot(allocator, runtime_root, "source");
     const old_lease = leaseFor(cache_root, old_fixture.storage);
     const new_lease = leaseFor(cache_root, new_fixture.storage);
+    try vm_registry.ensureDirPath(io, paths.vm_dir);
     try lifecycle.writeSpec(allocator, io, paths, .{ .name = "source", .disk = old_fixture.disk, .disk_baseline_lease = old_lease });
     var active: ?runtime_disk_lease.Active = try runtime_disk_lease.acquireActive(io, allocator, runtime_root, old_lease);
     monitor.testing.snapshot_lease_handoff_fault = .{ .crash_after = if (std.mem.eql(u8, mode, "handoff-active-lease"))

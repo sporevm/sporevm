@@ -3390,6 +3390,7 @@ test "system prune and gc read named VM specs larger than 64 KiB" {
     var annotations = spore.Annotations{};
     try annotations.map.put(allocator, key, value);
     const paths = try vm_registry.pathsFromRoot(allocator, runtime_root, "large");
+    try vm_registry.ensureDirPath(io, paths.vm_dir);
     try vm_registry.writeSpec(allocator, io, paths, .{
         .name = "large",
         .annotations = annotations,

@@ -15,7 +15,7 @@ const Io = std.Io;
 const net = std.Io.net;
 
 const lifecycle = @import("lifecycle.zig");
-const memory_config = @import("memory.zig");
+const vm_registry = @import("vm_registry.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk = @import("runtime_disk.zig");
@@ -75,44 +75,17 @@ const disk_claim_timeout_ns = 5 * 60 * std.time.ns_per_s;
 
 const monitor_usage =
     \\Usage:
-    \\  spore monitor NAME [options]
+    \\  spore monitor NAME
     \\
-    \\Internal helper for named VM lifecycle monitors.
+    \\Internal helper for named VM lifecycle monitors. `spore create`,
+    \\`spore restore --name` and `spore vm fork` start it after claiming NAME:
+    \\the VM's spec is read from its registry entry, and stdin must be the
+    \\entry's lock.
     \\
     \\Options:
-    \\  --backend auto|hvf|kvm  Backend to run (default: auto)
-    \\  --kernel Image          Kernel Image path
-    \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
-    \\  --rootfs rootfs.ext4    Resolved rootfs image path
-    \\  --image REF             Original OCI image ref for metadata
-    \\  --resume DIR            Resume from a spore directory
-    \\  --net-policy JSON       Enable SporeVM-managed networking with this encoded policy
-    \\  --memory SIZE           Initial guest memory (default: 512mb)
-    \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
-    \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
-    \\  --guest-port N          Guest vsock listen port (default: 10700)
-    \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
-    \\  --console-log PATH      Write guest console output to PATH
     \\  -h, --help              Show this help
     \\
 ;
-
-const MonitorOptions = struct {
-    name: []const u8,
-    backend: run.Backend = .auto,
-    kernel_path: ?[]const u8 = null,
-    initrd_path: ?[]const u8 = null,
-    rootfs_path: ?[]const u8 = null,
-    image_ref: ?[]const u8 = null,
-    resume_dir: ?[]const u8 = null,
-    network: run.NetworkMode = .disabled,
-    network_policy: run.NetworkPolicy = .{},
-    memory: memory_config.Config = .{},
-    vcpus: topology.VcpuCount = 1,
-    guest_port: u32 = 10700,
-    timeout_ms: u64 = 30_000,
-    console_log_path: ?[]const u8 = null,
-};
 
 const RequestState = enum {
     active_ready,
@@ -128,7 +101,7 @@ const RequestState = enum {
     done,
 };
 
-fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: lifecycle.DiskForkClaim) !runtime_disk_fork.Head {
+fn claimRuntimeDiskHead(io: Io, allocator: std.mem.Allocator, claim: vm_registry.DiskForkClaim) !runtime_disk_fork.Head {
     const address = try net.UnixAddress.init(claim.source_socket_path);
     const stream = address.connect(io) catch return error.MonitorUnavailable;
     defer stream.close(io);
@@ -153,85 +126,68 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
         return;
     }
 
-    const opts = try parseMonitorArgs(allocator, args);
-    const parsed_ms = lifecycle.monotonicMs();
+    if (args.len != 1) usageExit();
+    const name = args[0];
+    lifecycle.validateName(name) catch usageExit();
+    const paths = try lifecycle.pathsFor(allocator, init.environ_map, name);
+    // The claimer passes the entry's lock as stdin. Holding it for the
+    // monitor's whole life is what makes the VM live.
+    var registry_lock = vm_registry.adoptMonitorLock(init.io, paths) catch |err| {
+        std.debug.print("spore monitor: stdin is not the registry lock of {s}: {s}\n", .{ name, @errorName(err) });
+        std.process.exit(2);
+    };
+    defer registry_lock.close(init.io);
+    try lifecycle.writePid(allocator, init.io, paths, currentPid());
+    try lifecycle.validateControlSocketOwner(init.io, paths);
+    const paths_ms = lifecycle.monotonicMs();
+
+    var parsed_spec = try lifecycle.readSpec(allocator, init.io, paths);
+    defer parsed_spec.deinit();
+    const spec = parsed_spec.value;
+    if (!std.mem.eql(u8, spec.name, name)) return error.BadManifest;
+    const requested_backend = run.Backend.parse(spec.backend) orelse return error.UnsupportedBackend;
     // No host probe here: `create` probes before spawning its monitor, x86
     // rejects restore and fork monitors below, and opening the backend
     // reports an unusable arm64 KVM.
-    const selected_backend = opts.backend.resolveForHost() catch |err| {
+    const selected_backend = requested_backend.resolveForHost() catch |err| {
         std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };
     run.validateFreshProductPolicy(selected_backend, .{
-        .memory = opts.memory,
-        .vcpus = opts.vcpus,
-        .resuming = opts.resume_dir != null,
-        .rootfs = opts.rootfs_path != null or opts.image_ref != null,
-        .network = opts.network != .disabled,
+        .memory = spec.memory,
+        .vcpus = spec.vcpus,
+        .resuming = spec.resume_dir != null or spec.resume_generation != null or
+            spec.sessions.len != 0 or spec.disk != null or spec.disk_baseline_lease != null,
+        .rootfs = spec.rootfs_path != null or spec.rootfs != null or
+            spec.image_ref != null or spec.disk != null,
+        .network = spec.network != null,
     }) catch |err| {
         std.debug.print("spore monitor: x86 fresh profile rejected request: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };
-    if (opts.resume_dir != null and opts.rootfs_path != null) {
-        std.debug.print("spore monitor: direct --resume with --rootfs is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
+    if (spec.resume_dir != null and spec.rootfs_path != null) {
+        std.debug.print("spore monitor: direct resume with a rootfs path is not supported; use lifecycle metadata for disk-backed named resume\n", .{});
         std.process.exit(2);
     }
-    topology.validateVcpuCount(opts.vcpus) catch {
-        std.debug.print("spore monitor: unsupported vCPU count\n", .{});
-        std.process.exit(2);
-    };
-    const paths = try lifecycle.pathsFor(allocator, init.environ_map, opts.name);
-    try lifecycle.validateControlSocketOwner(init.io, paths);
-    const paths_ms = lifecycle.monotonicMs();
-    var existing_spec = lifecycle.readSpec(allocator, init.io, paths) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => |e| return e,
-    };
-    defer if (existing_spec) |*spec| spec.deinit();
-    if (existing_spec) |spec| {
-        run.validateFreshProductPolicy(selected_backend, .{
-            .memory = spec.value.memory,
-            .vcpus = spec.value.vcpus,
-            .resuming = spec.value.resume_dir != null or spec.value.resume_generation != null or
-                spec.value.sessions.len != 0 or spec.value.disk != null or
-                spec.value.disk_baseline_lease != null or spec.value.disk_fork_claim != null,
-            .rootfs = spec.value.rootfs_path != null or spec.value.rootfs != null or
-                spec.value.image_ref != null or spec.value.disk != null,
-            .network = spec.value.network != null,
-        }) catch |err| {
-            std.debug.print("spore monitor: stored state is outside the x86 fresh profile: {s}\n", .{@errorName(err)});
-            std.process.exit(2);
-        };
-    }
-    const spec_rootfs = if (existing_spec) |spec| spec.value.rootfs else null;
-    if (!monitorImageRootfsAvailable(opts.image_ref, opts.rootfs_path, spec_rootfs != null)) {
-        std.debug.print("spore monitor: --image requires an explicit --rootfs path or lifecycle rootfs metadata\n", .{});
-        std.process.exit(2);
-    }
+    try topology.validateVcpuCount(spec.vcpus);
+    try spec.memory.validate();
+    const network = try monitorNetwork(allocator, spec);
+    const parsed_ms = lifecycle.monotonicMs();
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
-    if (opts.network == .spore) {
-        try gateway.start(init.io, allocator, spore_executable, false, opts.network_policy);
+    if (network.mode == .spore) {
+        try gateway.start(init.io, allocator, spore_executable, false, network.policy);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
     try monitor_jail.applyForMonitor(init.environ_map);
-    const spec_disk = if (existing_spec) |spec| spec.value.disk else null;
-    const spec_disk_baseline_lease = if (existing_spec) |spec| spec.value.disk_baseline_lease else null;
-    const spec_disk_fork_claim = if (existing_spec) |spec| spec.value.disk_fork_claim else null;
-    const spec_resume_generation = if (existing_spec) |spec| spec.value.resume_generation else null;
-    const spec_resume_generation_params = if (spec_resume_generation) |state| blk: {
+    const spec_resume_generation_params = if (spec.resume_generation) |state| blk: {
         var gen_dev = generation.Device{};
         try gen_dev.restore(allocator, state);
         break :blk try allocator.dupe(u8, gen_dev.paramsPayload());
     } else null;
-    const spec_annotations = if (existing_spec) |spec| spec.value.annotations else spore.Annotations{};
-    const spec_exec_defaults = if (existing_spec) |spec| spec.value.exec_defaults orelse lifecycle.ExecDefaults{} else lifecycle.ExecDefaults{};
-    const spec_sessions = if (existing_spec) |spec|
-        if (spec.value.sessions.len != 0) spec.value.sessions else sessionHandlesForResume(allocator, opts.resume_dir)
-    else
-        sessionHandlesForResume(allocator, opts.resume_dir);
-    const managed_boot_descriptor = if (opts.kernel_path == null and opts.initrd_path == null and
+    const spec_exec_defaults = spec.exec_defaults orelse lifecycle.ExecDefaults{};
+    const managed_boot_descriptor = if (spec.kernel_path == null and spec.initrd_path == null and
         init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null)
         run.resolveManagedMonitorBootDescriptor(init, allocator) catch |err| {
             std.debug.print("spore monitor: managed boot setup failed: {s}\n", .{@errorName(err)});
@@ -249,50 +205,29 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     const kernel_path = if (managed_boot_descriptor) |descriptor|
         descriptor.kernel_path
     else
-        opts.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
+        spec.kernel_path orelse run.resolveDefaultKernelPath(init, allocator) catch |err| {
             std.debug.print("spore monitor: kernel setup failed: {s}\n", .{@errorName(err)});
             std.process.exit(2);
         };
-    const initrd_path = if (managed_boot_descriptor != null) null else run.resolveConfiguredInitrdPath(init, opts.initrd_path) catch |err| {
+    const initrd_path = if (managed_boot_descriptor != null) null else run.resolveConfiguredInitrdPath(init, spec.initrd_path) catch |err| {
         std.debug.print("spore monitor: initrd setup failed: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };
     const assets_ms = lifecycle.monotonicMs();
 
-    try lifecycle.writePid(allocator, init.io, paths, currentPid());
-    var runtime_disk_head: ?runtime_disk_fork.Head = if (spec_disk_fork_claim) |claim|
-        try claimRuntimeDiskHead(init.io, allocator, claim)
+    var disk_claim = try vm_registry.takeDiskForkClaim(allocator, init.io, paths, spec);
+    defer if (disk_claim) |*claim| claim.deinit();
+    var runtime_disk_head: ?runtime_disk_fork.Head = if (disk_claim) |claim|
+        try claimRuntimeDiskHead(init.io, allocator, claim.value)
     else
         null;
     defer if (runtime_disk_head) |*head| head.deinit();
-    try lifecycle.writeSpec(allocator, init.io, paths, .{
-        .name = opts.name,
-        .backend = opts.backend.name(),
-        .kernel_path = kernel_path,
-        .initrd_path = initrd_path,
-        .rootfs_path = opts.rootfs_path,
-        .rootfs = spec_rootfs,
-        .disk = spec_disk,
-        .disk_baseline_lease = spec_disk_baseline_lease,
-        .network = try run.manifestNetworkFromOptions(allocator, opts.network, &opts.network_policy),
-        .annotations = spec_annotations,
-        .sessions = spec_sessions,
-        .exec_defaults = if (spec_exec_defaults.env.len != 0 or spec_exec_defaults.working_dir != null) spec_exec_defaults else null,
-        .image_ref = opts.image_ref,
-        .resume_dir = opts.resume_dir,
-        .resume_generation = spec_resume_generation,
-        .memory = opts.memory,
-        .vcpus = opts.vcpus,
-        .guest_port = opts.guest_port,
-        .timeout_ms = opts.timeout_ms,
-        .console_log_path = opts.console_log_path,
-    });
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
-    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, opts.guest_port, opts.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
+    var server = try ExecServer.init(allocator, init.io, paths.vm_dir, paths.runtime_root, paths.control_socket_path, paths.monitor_stats_path, cache_root, spec.guest_port, spec.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
-    if (spec_disk_baseline_lease) |lease| {
+    if (spec.disk_baseline_lease) |lease| {
         var cache_lock: ?rootfs_mod.RootfsCacheLock = if (lease.store == .rootfs_cache)
             try rootfs_mod.lockRootfsCacheExclusive(init.io, allocator, lease.root)
         else
@@ -304,42 +239,42 @@ pub fn cli(init: std.process.Init, args: []const []const u8, stdout: *Io.Writer)
     server.startup = .{
         .paths = paths,
         .timing = .{
-            .parse_ms = parsed_ms - start_ms,
-            .paths_ms = paths_ms - parsed_ms,
-            .asset_resolve_ms = assets_ms - paths_ms,
+            .parse_ms = parsed_ms - paths_ms,
+            .paths_ms = paths_ms - start_ms,
+            .asset_resolve_ms = assets_ms - parsed_ms,
             .metadata_ms = metadata_ms - assets_ms,
             .ready_after_start_ms = 0,
         },
         .started_ms = start_ms,
-        .ready = monitorReadyMetadata(currentPid(), paths, opts.console_log_path),
+        .ready = monitorReadyMetadata(currentPid(), paths, spec.console_log_path),
     };
     const readiness_probe = try server.startReadinessProbe();
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
 
-    try run.openConsoleLog(opts.console_log_path);
+    try run.openConsoleLog(spec.console_log_path);
     defer run.closeConsoleLog();
 
     const monitor_options = run.Options{
-        .backend = opts.backend,
+        .backend = requested_backend,
         .kernel_path = kernel_path,
         .initrd_path = initrd_path,
-        .rootfs_path = opts.rootfs_path,
-        .rootfs = spec_rootfs,
-        .disk = spec_disk,
-        .disk_root = if (spec_disk_baseline_lease) |lease| lease.root else null,
+        .rootfs_path = spec.rootfs_path,
+        .rootfs = spec.rootfs,
+        .disk = spec.disk,
+        .disk_root = if (spec.disk_baseline_lease) |lease| lease.root else null,
         .runtime_disk_head = if (runtime_disk_head) |*head| head else null,
-        .resume_dir = opts.resume_dir,
-        .resume_generation = spec_resume_generation,
-        .resume_sessions = spec_sessions,
-        .annotations = spec_annotations,
+        .resume_dir = spec.resume_dir,
+        .resume_generation = spec.resume_generation,
+        .resume_sessions = spec.sessions,
+        .annotations = spec.annotations,
         .command = &.{"/bin/true"},
-        .memory = opts.memory,
-        .vcpus = opts.vcpus,
-        .guest_port = opts.guest_port,
-        .timeout_ms = opts.timeout_ms,
-        .console_log_path = opts.console_log_path,
-        .network = opts.network,
-        .network_policy = opts.network_policy,
+        .memory = spec.memory,
+        .vcpus = spec.vcpus,
+        .guest_port = spec.guest_port,
+        .timeout_ms = spec.timeout_ms,
+        .console_log_path = spec.console_log_path,
+        .network = network.mode,
+        .network_policy = network.policy,
         .network_runtime = if (gateway_active) gateway.runtime() else null,
         .spore_executable = spore_executable,
     };
@@ -392,8 +327,20 @@ test "monitor console configuration matches opened and advertised path" {
     try std.testing.expectEqualStrings("console parity\n", bytes);
 }
 
-fn monitorImageRootfsAvailable(image_ref: ?[]const u8, rootfs_path: ?[]const u8, lifecycle_rootfs: bool) bool {
-    return image_ref == null or rootfs_path != null or lifecycle_rootfs;
+const MonitorNetwork = struct {
+    mode: run.NetworkMode = .disabled,
+    policy: run.NetworkPolicy = .{},
+};
+
+/// The network the monitor runs, from the live policy the claimer encoded in
+/// the spec next to its manifest form.
+fn monitorNetwork(allocator: std.mem.Allocator, spec: lifecycle.Spec) !MonitorNetwork {
+    const raw = spec.network_policy orelse {
+        if (spec.network != null) return error.InvalidNetworkPolicy;
+        return .{};
+    };
+    if (spec.network == null) return error.InvalidNetworkPolicy;
+    return .{ .mode = .spore, .policy = try spore_net_policy.parseArg(allocator, raw) };
 }
 
 const StartupMetadata = struct {
@@ -2219,84 +2166,9 @@ fn writeAll(io: Io, stream: net.Stream, bytes: []const u8) !void {
     try writer.interface.flush();
 }
 
-fn sessionHandlesForResume(allocator: std.mem.Allocator, maybe_resume_dir: ?[]const u8) []const spore.Session {
-    const resume_dir = maybe_resume_dir orelse return &.{};
-    const manifest = spore.loadManifest(allocator, resume_dir) catch return &.{};
-    return manifest.value.sessions;
-}
-
-fn parseMonitorArgs(allocator: std.mem.Allocator, args: []const []const u8) !MonitorOptions {
-    if (args.len == 0) usageExit();
-    var opts = MonitorOptions{ .name = args[0] };
-    var max_memory_set = false;
-    try lifecycle.validateName(opts.name);
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--backend")) {
-            opts.backend = run.Backend.parse(takeValue(args, &i, args[i])) orelse {
-                std.debug.print("--backend must be auto, hvf, or kvm\n", .{});
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--kernel")) {
-            opts.kernel_path = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--initrd")) {
-            opts.initrd_path = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--rootfs")) {
-            opts.rootfs_path = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--image")) {
-            opts.image_ref = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--resume")) {
-            opts.resume_dir = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--net-policy")) {
-            const raw = takeValue(args, &i, args[i]);
-            opts.network = .spore;
-            opts.network_policy = spore_net_policy.parseArg(allocator, raw) catch |err| {
-                std.debug.print("spore monitor: invalid --net-policy: {s}\n", .{@errorName(err)});
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--memory")) {
-            opts.memory.initial_bytes = memory_config.parseCliBytesOrExit("spore monitor", "--memory", takeValue(args, &i, args[i]));
-            if (!max_memory_set) opts.memory.maximum_bytes = opts.memory.initial_bytes;
-        } else if (std.mem.eql(u8, args[i], "--max-memory")) {
-            opts.memory.maximum_bytes = memory_config.parseCliBytesOrExit("spore monitor", "--max-memory", takeValue(args, &i, args[i]));
-            max_memory_set = true;
-        } else if (std.mem.eql(u8, args[i], "--memory-mib")) {
-            memory_config.rejectMemoryMiBFlag("spore monitor");
-        } else if (std.mem.eql(u8, args[i], "--vcpus")) {
-            opts.vcpus = run.parseVcpuCountOrExit(args[i], takeValue(args, &i, args[i]));
-        } else if (std.mem.eql(u8, args[i], "--guest-port")) {
-            opts.guest_port = try parsePositive(u32, args[i], takeValue(args, &i, args[i]));
-        } else if (std.mem.eql(u8, args[i], "--timeout")) {
-            opts.timeout_ms = run.parseDurationMs(takeValue(args, &i, args[i])) catch {
-                std.debug.print("--timeout expects a duration like 30s, 500ms, or 1m\n", .{});
-                std.process.exit(2);
-            };
-        } else if (std.mem.eql(u8, args[i], "--timeout-ms")) {
-            opts.timeout_ms = try parsePositive(u64, args[i], takeValue(args, &i, args[i]));
-        } else if (std.mem.eql(u8, args[i], "--console-log")) {
-            opts.console_log_path = takeValue(args, &i, args[i]);
-        } else {
-            std.debug.print("unknown monitor argument: {s}\n\n{s}", .{ args[i], monitor_usage });
-            std.process.exit(2);
-        }
-    }
-    memory_config.validateCliOrExit("spore monitor", opts.memory);
-    return opts;
-}
-
 fn usageExit() noreturn {
     std.debug.print("{s}", .{monitor_usage});
     std.process.exit(2);
-}
-
-fn takeValue(args: []const []const u8, i: *usize, flag: []const u8) []const u8 {
-    if (i.* + 1 >= args.len) {
-        std.debug.print("{s} requires a value\n", .{flag});
-        std.process.exit(2);
-    }
-    i.* += 1;
-    return args[i.*];
 }
 
 fn wantsHelp(args: []const []const u8) bool {
@@ -2311,18 +2183,6 @@ fn wantsHelp(args: []const []const u8) bool {
     return false;
 }
 
-fn parsePositive(comptime T: type, name: []const u8, raw: []const u8) !T {
-    const parsed = std.fmt.parseInt(T, raw, 10) catch {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
-    };
-    if (parsed == 0) {
-        std.debug.print("{s} must be a positive integer\n", .{name});
-        std.process.exit(2);
-    }
-    return parsed;
-}
-
 fn currentPid() i64 {
     if (comptime @import("builtin").os.tag == .windows) return 1;
     return @intCast(std.c.getpid());
@@ -2333,13 +2193,6 @@ test "monitor cli help accepts help after name" {
     try std.testing.expect(wantsHelp(&.{ "bench-1", "--help" }));
     try std.testing.expect(!wantsHelp(&.{"bench-1"}));
     try std.testing.expect(!wantsHelp(&.{ "help", "--backend", "auto" }));
-}
-
-test "monitor image handoff accepts lifecycle rootfs metadata" {
-    try std.testing.expect(monitorImageRootfsAvailable("local/buildkite-spore:dev", null, true));
-    try std.testing.expect(monitorImageRootfsAvailable("local/buildkite-spore:dev", "/tmp/rootfs.ext4", false));
-    try std.testing.expect(!monitorImageRootfsAvailable("local/buildkite-spore:dev", null, false));
-    try std.testing.expect(monitorImageRootfsAvailable(null, null, false));
 }
 
 test "named exec context applies image defaults and ephemeral overrides" {
@@ -2363,7 +2216,7 @@ test "named exec context applies image defaults and ephemeral overrides" {
     try std.testing.expectEqualStrings("/app", inherited.working_dir.?);
 }
 
-test "monitor parser enables networking with the encoded policy" {
+test "monitor network comes from the spec's encoded live policy" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2371,19 +2224,15 @@ test "monitor parser enables networking with the encoded policy" {
     try policy.addNetworkPolicy(.{});
     try policy.addAllowCidr("93.184.216.34/32");
     try policy.addPortForward("127.0.0.1:8080:80");
+    const network = (try run.manifestNetworkFromOptions(allocator, .spore, &policy)).?;
+    const encoded = try spore_net_policy.encodeArgAlloc(allocator, &policy);
 
-    const opts = try parseMonitorArgs(allocator, &.{
-        "bench-1",
-        "--net-policy",
-        try spore_net_policy.encodeArgAlloc(allocator, &policy),
-    });
-    try std.testing.expectEqual(run.NetworkMode.spore, opts.network);
-    try std.testing.expectEqualDeep(policy, opts.network_policy);
-}
-
-test "monitor parser accepts bounded vcpu count" {
-    const opts = try parseMonitorArgs(std.testing.allocator, &.{ "bench-1", "--vcpus", "2" });
-    try std.testing.expectEqual(@as(topology.VcpuCount, 2), opts.vcpus);
+    const enabled = try monitorNetwork(allocator, .{ .name = "bench-1", .network = network, .network_policy = encoded });
+    try std.testing.expectEqual(run.NetworkMode.spore, enabled.mode);
+    try std.testing.expectEqualDeep(policy, enabled.policy);
+    try std.testing.expectEqual(run.NetworkMode.disabled, (try monitorNetwork(allocator, .{ .name = "bench-1" })).mode);
+    try std.testing.expectError(error.InvalidNetworkPolicy, monitorNetwork(allocator, .{ .name = "bench-1", .network = network }));
+    try std.testing.expectError(error.InvalidNetworkPolicy, monitorNetwork(allocator, .{ .name = "bench-1", .network_policy = encoded }));
 }
 
 test "monitor session ids cannot replay across restored monitors" {
@@ -2607,6 +2456,7 @@ test "snapshot disk lease handoff preserves old authority on failure and commits
         .baseline_identity = new_digest,
         .rootfs_storage = new_storage,
     };
+    try vm_registry.ensureDirPath(io, paths.vm_dir);
     try lifecycle.writeSpec(allocator, io, paths, .{
         .name = "source",
         .disk = old_disk,
@@ -2800,6 +2650,7 @@ test "snapshot publication handoff retains the new baseline across concurrent sa
     try env.put(local_paths.rootfs_cache_env, cache_root);
     try env.put(local_paths.runtime_dir_env, runtime_root);
     const source_paths = try lifecycle.pathsFromRoot(arena, runtime_root, "source");
+    try vm_registry.ensureDirPath(io, source_paths.vm_dir);
     try lifecycle.writeSpec(arena, io, source_paths, .{
         .name = "source",
         .disk = old_fixture.disk,

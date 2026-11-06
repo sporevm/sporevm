@@ -1,6 +1,12 @@
 //! The named-VM registry under `$SPOREVM_RUNTIME_DIR/vms/<name>/`: paths,
-//! the spec, ready, pid and timing files, VM state, control socket ownership,
-//! and private-directory checks.
+//! the name claim and its lock, the spec, ready, pid and timing files, VM
+//! state, control socket ownership, and private-directory checks.
+//!
+//! `vms/<name>/lock` decides liveness. A claimer creates the directory and the
+//! lock and holds `flock(LOCK_EX)` on it; the monitor it starts inherits the
+//! lock as stdin and holds it until it exits. A held lock means the entry is
+//! live, a free or missing one means it is stale. The `pid` file is only used
+//! to signal the monitor.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -8,7 +14,6 @@ const Io = std.Io;
 const net = std.Io.net;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-const chunk_sealer = @import("chunk_sealer.zig");
 const generation = @import("generation.zig");
 const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
@@ -20,7 +25,9 @@ const topology = @import("topology.zig");
 
 pub const max_name_len = 128;
 pub const max_metadata_bytes = 128 * 1024;
+const lock_file = "lock";
 const spec_file = "spec.json";
+const disk_claim_file = "disk-claim.json";
 const ready_file = "ready.json";
 const create_timing_file = "create-timing.json";
 const monitor_timing_file = "monitor-timing.json";
@@ -55,7 +62,9 @@ pub const Paths = struct {
     runtime_root: []const u8,
     vms_dir: []const u8,
     vm_dir: []const u8,
+    lock_path: []const u8,
     spec_path: []const u8,
+    disk_claim_path: []const u8,
     ready_path: []const u8,
     create_timing_path: []const u8,
     monitor_timing_path: []const u8,
@@ -71,7 +80,9 @@ pub const Paths = struct {
         allocator.free(self.runtime_root);
         allocator.free(self.vms_dir);
         allocator.free(self.vm_dir);
+        allocator.free(self.lock_path);
         allocator.free(self.spec_path);
+        allocator.free(self.disk_claim_path);
         allocator.free(self.ready_path);
         allocator.free(self.create_timing_path);
         allocator.free(self.monitor_timing_path);
@@ -94,8 +105,11 @@ pub const Spec = struct {
     rootfs: ?spore.Rootfs = null,
     disk: ?spore.Disk = null,
     disk_baseline_lease: ?runtime_disk_lease.Lease = null,
-    disk_fork_claim: ?DiskForkClaim = null,
     network: ?spore.Network = null,
+    /// The policy the monitor's network gateway enforces, in the encoding
+    /// `spore netd --policy` takes. Set exactly when `network` is. Saved
+    /// lifecycle metadata drops it; restore derives it again.
+    network_policy: ?[]const u8 = null,
     annotations: spore.Annotations = .{},
     sessions: []const spore.Session = &.{},
     exec_defaults: ?spore.ExecDefaults = null,
@@ -109,6 +123,8 @@ pub const Spec = struct {
     console_log_path: ?[]const u8 = null,
 };
 
+/// A fork child's one-use disk-head claim, written to `disk-claim.json` by
+/// the fork CLI and deleted by the child's monitor once it has claimed.
 pub const DiskForkClaim = struct {
     source_socket_path: []const u8,
     request: runtime_disk_claim.ClaimRequest,
@@ -151,15 +167,19 @@ pub const MonitorTiming = struct {
 };
 
 pub const VmState = enum {
+    /// No entry directory.
     absent,
-    incomplete,
+    /// The lock is held and the monitor has not written `ready.json`.
+    starting,
+    /// The lock is held and `ready.json` exists.
     ready,
+    /// The entry exists and nobody holds its lock.
     stale,
 
     pub fn name(self: VmState) []const u8 {
         return switch (self) {
             .absent => "absent",
-            .incomplete => "incomplete",
+            .starting => "starting",
             .ready => "ready",
             .stale => "stale",
         };
@@ -236,8 +256,12 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
     errdefer allocator.free(vms_dir);
     const vm_dir = try std.fs.path.resolve(allocator, &.{ vms_dir, name });
     errdefer allocator.free(vm_dir);
+    const lock_path = try std.fs.path.resolve(allocator, &.{ vm_dir, lock_file });
+    errdefer allocator.free(lock_path);
     const spec_path = try std.fs.path.resolve(allocator, &.{ vm_dir, spec_file });
     errdefer allocator.free(spec_path);
+    const disk_claim_path = try std.fs.path.resolve(allocator, &.{ vm_dir, disk_claim_file });
+    errdefer allocator.free(disk_claim_path);
     const ready_path = try std.fs.path.resolve(allocator, &.{ vm_dir, ready_file });
     errdefer allocator.free(ready_path);
     const create_timing_path = try std.fs.path.resolve(allocator, &.{ vm_dir, create_timing_file });
@@ -267,7 +291,9 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
         .runtime_root = runtime_root_owned,
         .vms_dir = vms_dir,
         .vm_dir = vm_dir,
+        .lock_path = lock_path,
         .spec_path = spec_path,
+        .disk_claim_path = disk_claim_path,
         .ready_path = ready_path,
         .create_timing_path = create_timing_path,
         .monitor_timing_path = monitor_timing_path,
@@ -281,6 +307,8 @@ pub fn pathsFromRoot(allocator: std.mem.Allocator, runtime_root: []const u8, nam
     };
 }
 
+/// Replaces the spec of an existing entry. It never creates the directory, so
+/// a writer racing `rm` fails instead of bringing the entry back.
 pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec) !void {
     try validateSpec(spec);
     const json = try std.json.Stringify.valueAlloc(allocator, spec, .{ .whitespace = .indent_2 });
@@ -288,8 +316,16 @@ pub fn writeSpec(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec)
     // readSpecFile must read back every spec written here, and readFileAlloc
     // fails once its limit is reached.
     if (json.len >= max_metadata_bytes) return error.SpecTooLarge;
-    try ensureVmDir(io, paths);
-    try chunk_sealer.replaceFileAtomicDurable(allocator, paths.spec_path, json, 0o600);
+    // `iterate` opens a readable fd instead of an O_PATH one, so it can be
+    // fsynced.
+    var dir = try openDirPath(io, paths.vm_dir, .{ .follow_symlinks = false, .iterate = true });
+    defer dir.close(io);
+    var file = try dir.createFileAtomic(io, spec_file, .{ .permissions = @enumFromInt(0o600), .replace = true });
+    defer file.deinit(io);
+    try file.file.writeStreamingAll(io, json);
+    try file.file.sync(io);
+    try file.replace(io);
+    if (std.c.fsync(dir.handle) != 0) return error.IoFailed;
 }
 
 pub fn readSpec(allocator: std.mem.Allocator, io: Io, paths: Paths) !std.json.Parsed(Spec) {
@@ -312,19 +348,41 @@ pub fn readSpecFile(allocator: std.mem.Allocator, io: Io, spec_path: []const u8)
 pub fn validateSpec(spec: Spec) !void {
     if (spec.exec_defaults) |defaults| try run_mod.validateGuestExecContext(defaults.env, defaults.working_dir);
     if (spec.disk_baseline_lease) |lease| try lease.validate();
-    if (spec.disk_fork_claim) |claim| {
-        if (!std.fs.path.isAbsolute(claim.source_socket_path)) return error.BadManifest;
-        try validateControlSocketPath(claim.source_socket_path);
-        try runtime_disk_claim.validateClaimRequest(claim.request);
-        const lease = spec.disk_baseline_lease orelse return error.BadManifest;
-        if (!std.mem.eql(u8, claim.request.child, spec.name) or
-            claim.request.baseline_kind != lease.baseline_kind or
-            !std.mem.eql(u8, claim.request.baseline_identity, lease.baseline_identity)) return error.BadManifest;
-    }
+}
+
+pub fn writeDiskForkClaim(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec, claim_value: DiskForkClaim) !void {
+    try validateDiskForkClaim(spec, claim_value);
+    const json = try std.json.Stringify.valueAlloc(allocator, claim_value, .{});
+    defer allocator.free(json);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.disk_claim_path, .data = json, .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) } });
+}
+
+/// Reads and deletes the entry's one-use fork claim. Returns null when the
+/// entry has none.
+pub fn takeDiskForkClaim(allocator: std.mem.Allocator, io: Io, paths: Paths, spec: Spec) !?std.json.Parsed(DiskForkClaim) {
+    const data = Io.Dir.cwd().readFileAlloc(io, paths.disk_claim_path, allocator, .limited(max_metadata_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |e| return e,
+    };
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(DiskForkClaim, allocator, data, .{ .allocate = .alloc_always });
+    errdefer parsed.deinit();
+    try validateDiskForkClaim(spec, parsed.value);
+    try Io.Dir.cwd().deleteFile(io, paths.disk_claim_path);
+    return parsed;
+}
+
+fn validateDiskForkClaim(spec: Spec, claim_value: DiskForkClaim) !void {
+    if (!std.fs.path.isAbsolute(claim_value.source_socket_path)) return error.BadManifest;
+    try validateControlSocketPath(claim_value.source_socket_path);
+    try runtime_disk_claim.validateClaimRequest(claim_value.request);
+    const lease = spec.disk_baseline_lease orelse return error.BadManifest;
+    if (!std.mem.eql(u8, claim_value.request.child, spec.name) or
+        claim_value.request.baseline_kind != lease.baseline_kind or
+        !std.mem.eql(u8, claim_value.request.baseline_identity, lease.baseline_identity)) return error.BadManifest;
 }
 
 pub fn writeReady(allocator: std.mem.Allocator, io: Io, paths: Paths, ready: Ready) !void {
-    try ensureVmDir(io, paths);
     const json = try std.json.Stringify.valueAlloc(allocator, ready, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.ready_path, .data = json });
@@ -365,7 +423,6 @@ pub fn writeTimingJson(allocator: std.mem.Allocator, io: Io, path: []const u8, t
 
 pub fn writePid(allocator: std.mem.Allocator, io: Io, paths: Paths, pid: i64) !void {
     if (pid <= 0) return error.InvalidPid;
-    try ensureVmDir(io, paths);
     const data = try std.fmt.allocPrint(allocator, "{d}\n", .{pid});
     defer allocator.free(data);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.pid_path, .data = data });
@@ -381,30 +438,151 @@ pub fn readPid(allocator: std.mem.Allocator, io: Io, paths: Paths) !i64 {
     return pid;
 }
 
-pub const PidAliveFn = *const fn (pid: i64) bool;
+/// Reports an entry's state from its lock. Probes never write; a shared lock
+/// taken here is released before returning.
+pub fn probe(io: Io, paths: Paths) !VmState {
+    while (true) {
+        const stat = Io.Dir.cwd().statFile(io, paths.vm_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return .absent,
+            else => |e| return e,
+        };
+        if (stat.kind != Io.File.Kind.directory) return error.InvalidVMState;
+        const lock = Io.Dir.cwd().openFile(io, paths.lock_path, lock_open_options) catch |err| switch (err) {
+            error.FileNotFound => return if (try pathExists(io, paths.vm_dir)) .stale else .absent,
+            else => |e| return e,
+        };
+        defer lock.close(io);
+        const free = try lock.tryLock(io, .shared);
+        // `rm` deletes the lock file while holding it. A lock opened before
+        // that is not the entry's lock any more; look again.
+        if (!try lockIsCurrent(io, paths, lock)) continue;
+        if (free) return .stale;
+        return if (try pathExists(io, paths.ready_path)) .ready else .starting;
+    }
+}
 
-pub fn classifyVmState(allocator: std.mem.Allocator, io: Io, paths: Paths, pid_alive: PidAliveFn) !VmState {
-    const stat = Io.Dir.cwd().statFile(io, paths.vm_dir, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return .absent,
+const lock_open_options: Io.Dir.OpenFileOptions = .{ .follow_symlinks = false, .allow_directory = false };
+
+fn lockIsCurrent(io: Io, paths: Paths, lock: Io.File) !bool {
+    const held = try lock.stat(io);
+    const current = Io.Dir.cwd().statFile(io, paths.lock_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
         else => |e| return e,
     };
-    if (stat.kind != Io.File.Kind.directory) return error.InvalidVMState;
+    return held.inode == current.inode;
+}
 
-    var spec = readSpec(allocator, io, paths) catch |err| switch (err) {
-        error.FileNotFound => return .stale,
-        else => return .stale,
-    };
-    defer spec.deinit();
-    if (!std.mem.eql(u8, spec.value.name, std.fs.path.basename(paths.vm_dir))) return .stale;
-    var ready = readReady(allocator, io, paths) catch |err| switch (err) {
-        error.FileNotFound => return .incomplete,
-        else => return .stale,
-    };
-    defer ready.deinit();
+/// A claimer's exclusive hold on a new entry. Every lock fd is close-on-exec;
+/// only the monitor spawn passes it on, as the monitor's stdin.
+pub const Claim = struct {
+    lock: Io.File,
 
-    const pid = readPid(allocator, io, paths) catch return .stale;
-    if (ready.value.pid != pid) return .stale;
-    return if (pid_alive(pid)) .ready else .stale;
+    /// Closes the claimer's copy once the monitor holds the lock.
+    pub fn release(self: *Claim, io: Io) void {
+        self.lock.close(io);
+        self.* = undefined;
+    }
+
+    /// Gives up a claim whose monitor never started: deletes the entry while
+    /// still holding its lock. The control socket is released only if this
+    /// entry owns it.
+    pub fn abandon(self: *Claim, io: Io, paths: Paths) void {
+        releaseControlSocketPath(io, paths) catch {};
+        Io.Dir.cwd().deleteTree(io, paths.vm_dir) catch {};
+        self.release(io);
+    }
+};
+
+/// Claims a name for create, restore or a fork child. Fails with
+/// `NamedVmExists` when the entry exists in any state.
+pub fn claim(io: Io, paths: Paths) !Claim {
+    try ensureDirPath(io, paths.runtime_root);
+    try requirePrivateDir(io, paths.runtime_root);
+    try ensureDirPath(io, paths.vms_dir);
+    try requirePrivateDir(io, paths.vms_dir);
+    Io.Dir.cwd().createDir(io, paths.vm_dir, private_dir_permissions) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.NamedVmExists,
+        else => |e| return e,
+    };
+    const lock = Io.Dir.cwd().createFile(io, paths.lock_path, .{
+        .exclusive = true,
+        .read = true,
+        .permissions = @enumFromInt(0o600),
+    }) catch |err| switch (err) {
+        // A racing `rm` saw the directory without a lock and removed it.
+        error.FileNotFound, error.PathAlreadyExists => return claimLost(paths),
+        else => |e| {
+            Io.Dir.cwd().deleteDir(io, paths.vm_dir) catch {};
+            return e;
+        },
+    };
+    errdefer lock.close(io);
+    // Only a prober (briefly) or a racing `rm` can hold a lock file this
+    // claim just created, so waiting is bounded. After an `rm` the file is
+    // no longer the entry's lock.
+    try lock.lock(io, .exclusive);
+    if (!try lockIsCurrent(io, paths, lock)) return claimLost(paths);
+    return .{ .lock = lock };
+}
+
+fn claimLost(paths: Paths) error{NamedVmBusy} {
+    setLastError("named VM {s} was removed while it was being claimed", .{std.fs.path.basename(paths.vm_dir)});
+    return error.NamedVmBusy;
+}
+
+/// Takes the entry's lock so the caller can delete the entry while holding
+/// it. Returns null while a claimer or monitor holds the lock, and
+/// `NamedVmNotFound` once the entry is gone.
+pub fn tryLockForRemoval(io: Io, paths: Paths) !?Io.File {
+    while (true) {
+        const lock = Io.Dir.cwd().openFile(io, paths.lock_path, lock_open_options) catch |err| switch (err) {
+            // An entry whose claimer died before creating the lock. Creating
+            // it here makes a claimer that is still about to create it fail.
+            error.FileNotFound => Io.Dir.cwd().createFile(io, paths.lock_path, .{
+                .exclusive = true,
+                .read = true,
+                .permissions = @enumFromInt(0o600),
+            }) catch |create_err| switch (create_err) {
+                error.PathAlreadyExists => continue,
+                error.FileNotFound => return error.NamedVmNotFound,
+                else => |e| return e,
+            },
+            else => |e| return e,
+        };
+        errdefer lock.close(io);
+        const free = try lock.tryLock(io, .exclusive);
+        if (try lockIsCurrent(io, paths, lock)) {
+            if (free) return lock;
+            lock.close(io);
+            return null;
+        }
+        lock.close(io);
+    }
+}
+
+/// Verifies that the monitor's stdin is its entry's lock and takes it over:
+/// the returned fd is close-on-exec, so no helper the monitor starts can keep
+/// a dead VM looking live, and fd 0 becomes `/dev/null`.
+pub fn adoptMonitorLock(io: Io, paths: Paths) !Io.File {
+    return adoptLockFd(io, paths, 0);
+}
+
+fn adoptLockFd(io: Io, paths: Paths, inherited: std.c.fd_t) !Io.File {
+    const stdin = Io.File{ .handle = inherited, .flags = .{ .nonblocking = false } };
+    const held = stdin.stat(io) catch return error.MonitorLockMissing;
+    const current = Io.Dir.cwd().statFile(io, paths.lock_path, .{ .follow_symlinks = false }) catch return error.MonitorLockMissing;
+    if (held.kind != .file or current.kind != .file or held.inode != current.inode) return error.MonitorLockMissing;
+    // The claimer's lock is on the open file description this fd shares, so
+    // this succeeds exactly when the monitor inherited it.
+    if (!try stdin.tryLock(io, .exclusive)) return error.MonitorLockMissing;
+    const fd = std.c.fcntl(inherited, std.c.F.DUPFD_CLOEXEC, @as(c_int, 3));
+    if (fd < 0) return error.MonitorLockMissing;
+    errdefer _ = std.c.close(fd);
+    const null_fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(c_uint, 0));
+    if (null_fd < 0) return error.MonitorLockMissing;
+    defer _ = std.c.close(null_fd);
+    if (std.c.dup2(null_fd, inherited) < 0) return error.MonitorLockMissing;
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 pub fn readMonitorStats(allocator: std.mem.Allocator, io: Io, paths: Paths) !MonitorStats {
@@ -429,15 +607,6 @@ pub fn pathExists(io: Io, path: []const u8) !bool {
 pub fn openDirPath(io: Io, path: []const u8, flags: Io.Dir.OpenOptions) !Io.Dir {
     if (Io.Dir.path.isAbsolute(path)) return Io.Dir.openDirAbsolute(io, path, flags);
     return Io.Dir.cwd().openDir(io, path, flags);
-}
-
-pub fn ensureVmDir(io: Io, paths: Paths) !void {
-    try ensureDirPath(io, paths.runtime_root);
-    try requirePrivateDir(io, paths.runtime_root);
-    try ensureDirPath(io, paths.vms_dir);
-    try requirePrivateDir(io, paths.vms_dir);
-    try ensureDirPath(io, paths.vm_dir);
-    try requirePrivateDir(io, paths.vm_dir);
 }
 
 pub fn claimControlSocketPath(io: Io, paths: Paths) !void {
@@ -562,12 +731,6 @@ fn validateExistingPrivateDir(io: Io, path: []const u8) !void {
     };
 }
 
-pub fn pidAlive(pid: i64) bool {
-    if (pid <= 0) return false;
-    const owner_pid = std.math.cast(runtime_disk_lease.OwnerPid, pid) orelse return false;
-    return runtime_disk_lease.ownerAlive(owner_pid);
-}
-
 /// Walks `vms/` and yields the spec of each VM directory that has one. A spec
 /// that cannot be read fails closed with `error.BadManifest`.
 pub const Iterator = struct {
@@ -651,7 +814,7 @@ test "named control socket ownership detects hash collisions and cleans up" {
         Io.Dir.cwd().deleteFile(io, paths.control_socket_path) catch {};
     }
 
-    try ensureVmDir(io, paths);
+    try Io.Dir.cwd().createDirPath(io, paths.vm_dir);
     try claimControlSocketPath(io, paths);
     try validateControlSocketOwner(io, paths);
 
@@ -696,7 +859,9 @@ test "lifecycle paths are rooted under vms by name" {
 
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms", paths.vms_dir);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1", paths.vm_dir);
+    try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/lock", paths.lock_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/spec.json", paths.spec_path);
+    try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/disk-claim.json", paths.disk_claim_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/ready.json", paths.ready_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/create-timing.json", paths.create_timing_path);
     try std.testing.expectEqualStrings("/tmp/sporevm-runtime/vms/bench-1/monitor-timing.json", paths.monitor_timing_path);
@@ -720,6 +885,7 @@ test "lifecycle refuses to write a spec it cannot read back" {
     defer allocator.free(root);
     const paths = try pathsFromRoot(allocator, root, "large");
     defer paths.deinit(allocator);
+    try ensureDirPath(io, paths.vm_dir);
 
     // Size `kernel_path` so the spec lands exactly on the reader's limit.
     try writeSpec(allocator, io, paths, .{ .name = "large", .kernel_path = "" });
@@ -747,6 +913,7 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     defer Io.Dir.cwd().deleteTree(io, root) catch {};
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
+    try ensureDirPath(io, paths.vm_dir);
 
     try writeSpec(allocator, io, paths, .{
         .name = "bench-1",
@@ -797,37 +964,196 @@ test "lifecycle metadata helpers round trip spec ready and pid" {
     try std.testing.expectEqual(@as(i64, 1234), try readPid(allocator, io, paths));
 }
 
-test "lifecycle detects incomplete ready and stale pid state" {
+test "registry state comes from the lock, not the pid" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const root = try std.fs.path.resolve(allocator, &.{"zig-cache/test-lifecycle-state"});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
     defer allocator.free(root);
-    defer Io.Dir.cwd().deleteTree(io, root) catch {};
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
 
-    try std.testing.expectEqual(VmState.absent, try classifyVmState(allocator, io, paths, alwaysDead));
-
-    try writeSpec(allocator, io, paths, .{ .name = "bench-1" });
-    try std.testing.expectEqual(VmState.incomplete, try classifyVmState(allocator, io, paths, alwaysDead));
-
-    try writeReady(allocator, io, paths, .{
-        .pid = 7777,
-        .control_socket_path = paths.control_socket_path,
-        .console_log_path = paths.console_log_path,
-    });
-    try writePid(allocator, io, paths, 7777);
-    try std.testing.expectEqual(VmState.stale, try classifyVmState(allocator, io, paths, alwaysDead));
-    try std.testing.expectEqual(VmState.ready, try classifyVmState(allocator, io, paths, alwaysAlive));
-
-    try writePid(allocator, io, paths, 8888);
-    try std.testing.expectEqual(VmState.stale, try classifyVmState(allocator, io, paths, alwaysAlive));
-
+    try std.testing.expectEqual(VmState.absent, try probe(io, paths));
+    var held = try claim(io, paths);
+    try std.testing.expectEqual(VmState.starting, try probe(io, paths));
+    try std.testing.expectError(error.NamedVmExists, claim(io, paths));
+    try std.testing.expect((try tryLockForRemoval(io, paths)) == null);
+    try writeReady(allocator, io, paths, .{ .pid = 1, .control_socket_path = paths.control_socket_path });
+    // pid 1 is alive and not ours, so kill(1, 0) fails with EPERM. Only
+    // the lock decides liveness.
+    try writePid(allocator, io, paths, 1);
+    try std.testing.expectEqual(VmState.ready, try probe(io, paths));
+    // An unreadable spec does not make a live entry stale.
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = paths.spec_path, .data = "not json" });
-    try std.testing.expectEqual(VmState.stale, try classifyVmState(allocator, io, paths, alwaysAlive));
+    try std.testing.expectEqual(VmState.ready, try probe(io, paths));
 
-    try writeSpec(allocator, io, paths, .{ .name = "wrong-name" });
-    try std.testing.expectEqual(VmState.stale, try classifyVmState(allocator, io, paths, alwaysAlive));
+    held.release(io);
+    try std.testing.expectEqual(VmState.stale, try probe(io, paths));
+    try std.testing.expectError(error.NamedVmExists, claim(io, paths));
+    const lock = (try tryLockForRemoval(io, paths)).?;
+    try std.testing.expectEqual(VmState.ready, try probe(io, paths));
+    try deleteVmState(io, paths);
+    lock.close(io);
+    try std.testing.expectEqual(VmState.absent, try probe(io, paths));
+
+    // A claimer that died before creating the lock leaves a stale entry
+    // that removal can still lock.
+    try Io.Dir.cwd().createDir(io, paths.vm_dir, private_dir_permissions);
+    try std.testing.expectEqual(VmState.stale, try probe(io, paths));
+    const orphan_lock = (try tryLockForRemoval(io, paths)).?;
+    try deleteVmState(io, paths);
+    orphan_lock.close(io);
+
+    var reclaimed = try claim(io, paths);
+    reclaimed.abandon(io, paths);
+    try std.testing.expectEqual(VmState.absent, try probe(io, paths));
+}
+
+test "registry claims a name exactly once" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+
+    const Claimer = struct {
+        fn run(claim_io: Io, claim_paths: Paths, start: *std.atomic.Value(bool), result: *?Claim, failure: *?anyerror) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            result.* = claim(claim_io, claim_paths) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var results = [_]?Claim{null} ** 8;
+    var failures = [_]?anyerror{null} ** 8;
+    var threads: [8]std.Thread = undefined;
+    for (&threads, &results, &failures) |*thread, *result, *failure| {
+        thread.* = try std.Thread.spawn(.{}, Claimer.run, .{ io, paths, &start, result, failure });
+    }
+    start.store(true, .release);
+    for (threads) |thread| thread.join();
+
+    var winners: usize = 0;
+    for (&results, failures) |*result, failure| {
+        if (result.*) |*won| {
+            winners += 1;
+            won.release(io);
+        } else {
+            try std.testing.expectEqual(@as(?anyerror, error.NamedVmExists), failure);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), winners);
+}
+
+test "registry writers never recreate a removed entry" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+
+    // A monitor still running after `rm` deleted its entry.
+    try ensureDirPath(io, paths.vm_dir);
+    try Io.Dir.cwd().deleteTree(io, paths.vm_dir);
+    try std.testing.expectError(error.FileNotFound, writePid(allocator, io, paths, 1));
+    try std.testing.expectError(error.FileNotFound, writeReady(allocator, io, paths, .{ .pid = 1, .control_socket_path = paths.control_socket_path }));
+    try std.testing.expectError(error.FileNotFound, writeSpec(allocator, io, paths, .{ .name = "bench-1" }));
+    try std.testing.expect(!try pathExists(io, paths.vm_dir));
+}
+
+test "monitor lock adoption leaves no inheritable copy" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const root = try std.fs.path.join(allocator, &.{ tmp_root, "runtime" });
+    defer allocator.free(root);
+    const paths = try pathsFromRoot(allocator, root, "bench-1");
+    defer paths.deinit(allocator);
+
+    // fd 0 belongs to the test runner, so another inheritable fd stands in
+    // for the monitor's stdin.
+    var held = try claim(io, paths);
+    const inherited = std.c.dup(held.lock.handle);
+    try std.testing.expect(inherited >= 0);
+    held.release(io);
+    var adopted = try adoptLockFd(io, paths, inherited);
+    defer _ = std.c.close(inherited);
+    try std.testing.expect(std.c.fcntl(adopted.handle, std.c.F.GETFD) & std.c.FD_CLOEXEC != 0);
+    const replaced = try (Io.File{ .handle = inherited, .flags = .{ .nonblocking = false } }).stat(io);
+    try std.testing.expectEqual(Io.File.Kind.character_device, replaced.kind);
+    try std.testing.expectEqual(VmState.starting, try probe(io, paths));
+
+    // A helper started after adoption, like netd, must not keep the entry
+    // live once the monitor is gone.
+    var helper = try std.process.spawn(io, .{ .argv = &.{ "/bin/sleep", "5" }, .stdin = .ignore });
+    defer helper.kill(io);
+    adopted.close(io);
+    try std.testing.expectEqual(VmState.stale, try probe(io, paths));
+
+    // A stdin that is not the entry's lock is refused.
+    const other = try Io.Dir.cwd().createFile(io, paths.spec_path, .{ .read = true });
+    defer other.close(io);
+    try std.testing.expectError(error.MonitorLockMissing, adoptLockFd(io, paths, other.handle));
+}
+
+test "fork disk claims are read once and must name the child" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_root);
+    const paths = try pathsFromRoot(allocator, tmp_root, "child");
+    defer paths.deinit(allocator);
+    try Io.Dir.cwd().createDirPath(io, paths.vm_dir);
+
+    const digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const spec = Spec{
+        .name = "child",
+        .disk_baseline_lease = .{ .store = .rootfs_cache, .root = "/cache", .baseline_kind = .rootfs, .baseline_identity = digest },
+    };
+    var fork_claim = DiskForkClaim{
+        .source_socket_path = "/tmp/source.sock",
+        .request = .{
+            .type = runtime_disk_claim.claim_type,
+            .schema = runtime_disk_claim.claim_schema,
+            .token = "b" ** 64,
+            .batch = "batch",
+            .child = "other",
+            .child_index = 0,
+            .baseline_kind = .rootfs,
+            .baseline_identity = digest,
+        },
+    };
+    try std.testing.expectError(error.BadManifest, writeDiskForkClaim(allocator, io, paths, spec, fork_claim));
+    fork_claim.request.child = "child";
+    try writeDiskForkClaim(allocator, io, paths, spec, fork_claim);
+    var taken = (try takeDiskForkClaim(allocator, io, paths, spec)).?;
+    defer taken.deinit();
+    try std.testing.expectEqualStrings(fork_claim.request.token, taken.value.request.token);
+    try std.testing.expect((try takeDiskForkClaim(allocator, io, paths, spec)) == null);
 }
 
 test "lifecycle rejects insecure existing runtime directories" {
@@ -844,12 +1170,4 @@ test "lifecycle rejects insecure existing runtime directories" {
     const paths = try pathsFromRoot(allocator, root, "bench-1");
     defer paths.deinit(allocator);
     try std.testing.expectError(error.InsecureRuntimeDir, validateExistingRuntimeDirs(io, paths));
-}
-
-fn alwaysDead(_: i64) bool {
-    return false;
-}
-
-fn alwaysAlive(_: i64) bool {
-    return true;
 }

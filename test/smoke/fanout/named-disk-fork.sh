@@ -136,7 +136,9 @@ runtime_root = Path(sys.argv[2])
 identities = []
 for index, child in enumerate(document["children"]):
     spec = json.load(open(runtime_root / "vms" / child / "spec.json", encoding="utf-8"))
-    assert spec["disk_fork_claim"] is None, spec
+    assert "disk_fork_claim" not in spec, spec
+    # The child's monitor deletes its one-use claim once it has claimed.
+    assert not (runtime_root / "vms" / child / "disk-claim.json").exists(), child
     assert spec["disk_baseline_lease"] is not None, spec
     manifest = json.load(open(Path(spec["resume_dir"]) / "manifest.json", encoding="utf-8"))
     assert manifest["disk"] is None, manifest
