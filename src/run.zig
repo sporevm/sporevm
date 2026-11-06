@@ -282,7 +282,6 @@ pub const Options = struct {
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
     resume_sessions: []const spore.Session = &.{},
-    attach_session_id: []const u8 = spore.default_session_id,
     start_generation_params: ?[]const u8 = null,
     require_generation_ready: bool = false,
     command: []const []const u8,
@@ -295,8 +294,6 @@ pub const Options = struct {
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
-    console_log_path: ?[]const u8 = null,
-    stream_output: bool = true,
     save_path: ?[]const u8 = null,
     save_trigger: capture.Trigger = .exit,
     continue_after_save: bool = false,
@@ -1288,34 +1285,6 @@ pub const SharedOptions = struct {
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
-
-    fn completeWithAssets(
-        self: SharedOptions,
-        backend: Backend,
-        kernel_path: []const u8,
-        initrd_path: ?[]const u8,
-        rootfs_path: ?[]const u8,
-        rootfs: ?spore.Rootfs,
-        command: []const []const u8,
-        stream_output: bool,
-    ) Options {
-        return .{
-            .backend = backend,
-            .kernel_path = kernel_path,
-            .initrd_path = initrd_path,
-            .rootfs_path = rootfs_path,
-            .rootfs = rootfs,
-            .disk = null,
-            .resume_dir = null,
-            .command = command,
-            .memory = self.memory,
-            .vcpus = self.vcpus,
-            .guest_port = self.guest_port,
-            .timeout_ms = self.timeout_ms,
-            .console_log_path = self.console_log_path,
-            .stream_output = stream_output,
-        };
-    }
 };
 
 pub const CliOptions = struct {
@@ -3127,14 +3096,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     try spore.validateAnnotations(opts.annotations);
     if (opts.rootfs_grow_target != 0 and opts.commit == null) return error.InvalidRunDiskSize;
     if (opts.commit != null and (opts.resume_dir != null or opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save or opts.interactive or opts.tty or opts.command.len == 0)) return error.InvalidRunCommitOptions;
-    if (opts.tty and opts.resume_dir != null and opts.command.len != 0) return error.TtyRunFromSporeUnsupported;
-    if (opts.resume_dir != null and opts.command.len == 0) {
-        try spore.validateSessionAttach(opts.resume_sessions, .{
-            .id = opts.attach_session_id,
-            .stdin = opts.interactive and !opts.tty,
-            .terminal = opts.tty,
-        });
-    }
+    if (opts.tty and opts.resume_dir != null) return error.TtyRunFromSporeUnsupported;
 
     const backend = try opts.backend.resolveForHost();
     events.setBackend(backend);
@@ -3161,7 +3123,6 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
 
     const resuming = opts.resume_dir != null;
     if (opts.memory.isElastic() and ((!resuming and !opts.auto_memory_hotplug_capable) or opts.vcpus != 1)) return error.ElasticMemoryUnsupported;
-    const memory_plan = runMemoryPlan(opts.memory);
     const local_backing_start = monotonicMs();
     var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.maximum_bytes);
     const local_backing_ms = monotonicMs() -| local_backing_start;
@@ -3200,15 +3161,13 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     const base_boot_args = if (resuming) "" else try cmdline(allocator, opts.guest_port, hasRootfs(opts), rootfsWritable(opts), growth_session, noinit_itable, opts.network, false, false, 0);
     const boot_args = if (resuming) "" else try productBootArgs(allocator, base_boot_args);
     const request_start = monotonicMs();
-    const request = try execRequestForRun(context, allocator, opts, memory_plan.virtio_mem_region_size != 0);
+    const request = try execRequestForRun(context, allocator, opts, opts.memory.isElastic());
     var stream = try vsock_stream.HostStream.init(opts.guest_port, request.bytes);
     const request_ms = monotonicMs() -| request_start;
     if (resuming) stream.host_port = vsock_stream.HostStream.deriveHostPort(request.bytes);
     if (opts.events != null) {
         stream.setLifecycleSink(&events, runEventLifecycleSink);
         stream.setOutputSink(&events, runEventOutputSink);
-    } else if (opts.stream_output) {
-        stream.setOutputSink(null, runOutputSink);
     }
     var stdin_control = if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(&stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null;
     if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
@@ -3261,13 +3220,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
     // anything, so remove the directory this run created (dirty-RAM tracking
     // may already have written memory into it).
     errdefer |err| if (err == error.ImageStoreIncomplete) if (capture_plan.capture) |vm_capture| Io.Dir.cwd().deleteTree(context.io, vm_capture.dir) catch {};
-    var saved_session_buf: [1]spore.Session = undefined;
-    const saved_sessions = if (request.attaches_existing and opts.resume_sessions.len != 0)
-        opts.resume_sessions
-    else blk: {
-        saved_session_buf[0] = spore.processSession(request.session_id, opts.interactive, opts.tty);
-        break :blk saved_session_buf[0..1];
-    };
+    const saved_sessions = [_]spore.Session{spore.processSession(request.session_id, opts.interactive, opts.tty)};
     if (capture_plan.signal) |signal| {
         signal_registration = capture.SignalRegistration.install(signal, &capture_request);
     }
@@ -3280,8 +3233,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             initrd_ms,
             disk_ms,
             request_ms,
-            memory_plan.boot_ram_size / 1024 / 1024,
-            memory_plan.virtio_mem_region_size / 1024 / 1024,
+            opts.memory.initial_bytes / 1024 / 1024,
+            (opts.memory.maximum_bytes - opts.memory.initial_bytes) / 1024 / 1024,
         },
     );
 
@@ -3299,8 +3252,8 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             .kernel = kernel,
             .cmdline = boot_args,
             .initrd = initrd,
-            .ram_size = memory_plan.boot_ram_size,
-            .virtio_mem_region_size = memory_plan.virtio_mem_region_size,
+            .ram_size = opts.memory.initial_bytes,
+            .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
         } },
         .vcpus = opts.vcpus,
         .console_sink = consoleSink,
@@ -3310,7 +3263,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
         .rootfs = opts.rootfs,
         .network_manifest = network_manifest,
         .annotations = opts.annotations,
-        .sessions = saved_sessions,
+        .sessions = &saved_sessions,
         .environ_map = context.environ_map,
         .probe = .{
             .stream = &stream,
@@ -3337,7 +3290,7 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !R
             if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
                 break :blk x86_vm.run(allocator, .{
                     .kernel = kernel,
-                    .ram_size = memory_plan.boot_ram_size,
+                    .ram_size = opts.memory.initial_bytes,
                     .vcpu_count = @intCast(opts.vcpus),
                     .cmdline = boot_args,
                     .initrd = initrd,
@@ -3427,18 +3380,6 @@ pub fn finishGatewayNetworkEvents(gateway: *net_gateway.Process, gateway_active:
     while (gateway.popNetworkEvent()) |event| {
         events.emitNetworkEventBestEffort(event);
     }
-}
-
-const RunMemoryPlan = struct {
-    boot_ram_size: u64,
-    virtio_mem_region_size: u64,
-};
-
-fn runMemoryPlan(memory: memory_config.Config) RunMemoryPlan {
-    return .{
-        .boot_ram_size = memory.initial_bytes,
-        .virtio_mem_region_size = memory.maximum_bytes - memory.initial_bytes,
-    };
 }
 
 pub const MonitorBootArtifacts = struct {
@@ -3667,15 +3608,6 @@ fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !s
 
 pub var console_fd: std.c.fd_t = -1;
 
-fn runOutputSink(_: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
-    const fd: std.c.fd_t = switch (output) {
-        .stdout => 1,
-        .stderr => 2,
-        .terminal => 1,
-    };
-    fd_util.writeAllBestEffort(fd, bytes);
-}
-
 fn runEventOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
     const events: *EventEmitter = @ptrCast(@alignCast(context.?));
     events.emitOutputBestEffort(output, bytes);
@@ -3723,21 +3655,10 @@ pub fn execRequest(allocator: std.mem.Allocator, argv: []const []const u8) ![]co
 const RunRequestInfo = struct {
     bytes: []const u8,
     session_id: []const u8,
-    attaches_existing: bool = false,
 };
 
 fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) !RunRequestInfo {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
-    if (opts.resume_dir != null and opts.command.len == 0) return .{
-        .bytes = try attach_stream.attachV1Request(allocator, .{
-            .session_id = opts.attach_session_id,
-            .interactive = opts.interactive,
-            .tty = opts.tty,
-            .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
-        }),
-        .session_id = opts.attach_session_id,
-        .attaches_existing = true,
-    };
     if (opts.resume_dir == null) return .{
         .bytes = try execRequestWithSessionOptions(allocator, opts.command, spore.default_session_id, .{
             .env = opts.guest_env,
@@ -5214,18 +5135,6 @@ test "run cli parser separates initial and maximum memory" {
     const default_initial = try parseCliArgs(std.testing.allocator, &.{ "--max-memory", "16gb", "--", "/bin/true" });
     try std.testing.expectEqual(memory_config.default_bytes, default_initial.shared.memory.initial_bytes);
     try std.testing.expectEqual(elastic.shared.memory.maximum_bytes, default_initial.shared.memory.maximum_bytes);
-}
-
-test "run memory plan is fixed unless maximum exceeds initial" {
-    const fixed = memory_config.Config.fixed(2 * 1024 * 1024 * 1024);
-    const fixed_plan = runMemoryPlan(fixed);
-    try std.testing.expectEqual(fixed.initial_bytes, fixed_plan.boot_ram_size);
-    try std.testing.expectEqual(@as(u64, 0), fixed_plan.virtio_mem_region_size);
-
-    const elastic = memory_config.Config{ .initial_bytes = memory_config.default_bytes, .maximum_bytes = 16 * 1024 * 1024 * 1024 };
-    const elastic_plan = runMemoryPlan(elastic);
-    try std.testing.expectEqual(elastic.initial_bytes, elastic_plan.boot_ram_size);
-    try std.testing.expectEqual(elastic.maximum_bytes - elastic.initial_bytes, elastic_plan.virtio_mem_region_size);
 }
 
 test "x86 fresh product policy is fixed and fail closed" {
