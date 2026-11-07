@@ -835,7 +835,7 @@ test "RUN context bind cache input follows content and mode but ignores mtime" {
     const content = try cacheContextBindRun(io, arena, ctx, &content_cache, &diagnostic, step);
     try std.testing.expect(!std.mem.eql(u8, first.context_bind_digest, content.context_bind_digest));
 
-    try Io.Dir.cwd().setFilePermissions(io, source_path, @enumFromInt(0o755), .{ .follow_symlinks = false });
+    try Io.Dir.cwd().setFilePermissions(io, source_path, @fromBackingInt(@intCast(0o755)), .{ .follow_symlinks = false });
     var mode_cache = build_context.StatCache.load(arena, io, cache_root, &context_hash);
     const mode = try cacheContextBindRun(io, arena, ctx, &mode_cache, &diagnostic, step);
     try std.testing.expect(!std.mem.eql(u8, content.context_bind_digest, mode.context_bind_digest));

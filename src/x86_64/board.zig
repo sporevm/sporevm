@@ -321,7 +321,7 @@ test "virtio inventory locks role address GSI and device multiset" {
     const expected_ids = [_]u32{ 3, 2, 2, 2, 2, 1, 19, 4 };
     for (virtio_inventory, 0..) |attachment, index| {
         try std.testing.expectEqual(expected_roles[index], attachment.role);
-        try std.testing.expectEqual(expected_ids[index], @intFromEnum(attachment.device));
+        try std.testing.expectEqual(expected_ids[index], @backingInt(attachment.device));
         try std.testing.expectEqual(virtio_base + virtio_stride * index, attachment.slot.base);
         try std.testing.expectEqual(virtio_first_gsi + index, attachment.slot.gsi);
     }

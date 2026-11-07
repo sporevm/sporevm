@@ -9,6 +9,9 @@ const Ip4Address = Io.net.Ip4Address;
 
 pub const Options = struct {
     require_https: bool = false,
+    /// Accept loopback, private and reserved addresses. Only for URLs the
+    /// user names, such as an image store, never for URLs an image supplies.
+    allow_private: bool = false,
 };
 
 pub const ConnectionTarget = struct {
@@ -66,7 +69,7 @@ pub fn resolveUriAddresses(io: Io, uri: std.Uri, options: Options) Error!Address
     const port = normalizedPort(uri) orelse return error.UnsupportedRemoteFetchScheme;
     var host_buffer: [HostName.max_len]u8 = undefined;
     const host = rawHost(uri, &host_buffer) catch return error.UnsafeRemoteFetchTarget;
-    return resolveHostAddresses(io, host.bytes, port);
+    return resolveHostAddresses(io, host.bytes, port, options.allow_private);
 }
 
 /// The URI's host as written, IP literals included. Zig 0.17 removes
@@ -79,15 +82,16 @@ pub fn rawHost(uri: std.Uri, buffer: *[HostName.max_len]u8) !HostName {
 }
 
 pub fn validateHost(io: Io, raw_host: []const u8, port: u16) Error!void {
-    _ = try resolveHostAddresses(io, raw_host, port);
+    _ = try resolveHostAddresses(io, raw_host, port, false);
 }
 
-/// Resolves `raw_host` and validates every answer: one unsafe address fails
-/// the whole resolution, even past the `max_addresses` kept for connecting.
-pub fn resolveHostAddresses(io: Io, raw_host: []const u8, port: u16) Error!Addresses {
+/// Resolves `raw_host` and, unless `allow_private`, validates every answer:
+/// one unsafe address fails the whole resolution, even past the
+/// `max_addresses` kept for connecting.
+pub fn resolveHostAddresses(io: Io, raw_host: []const u8, port: u16, allow_private: bool) Error!Addresses {
     var addresses: Addresses = .{};
     if (parseIpLiteral(raw_host, port)) |addr| {
-        try validateAddress(addr);
+        if (!allow_private) try validateAddress(addr);
         addresses.append(addr);
         return addresses;
     }
@@ -100,7 +104,7 @@ pub fn resolveHostAddresses(io: Io, raw_host: []const u8, port: u16) Error!Addre
     while (results.getOneUncancelable(io)) |result| {
         switch (result) {
             .address => |address| {
-                try validateAddress(address);
+                if (!allow_private) try validateAddress(address);
                 addresses.append(address);
             },
             .canonical_name => {},

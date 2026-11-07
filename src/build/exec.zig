@@ -1809,7 +1809,7 @@ test "build COPY parents preserves conflicts without changing auto directory mer
         try std.testing.expectEqualStrings("old", root_value);
         const root_after = try tmp.dir.statFile(io, "root-conflict/dest", .{ .follow_symlinks = false });
         try std.testing.expectEqual(root_before.inode, root_after.inode);
-        try std.testing.expectEqual(@intFromEnum(root_before.permissions) & 0o7777, @intFromEnum(root_after.permissions) & 0o7777);
+        try std.testing.expectEqual(@backingInt(root_before.permissions) & 0o7777, @backingInt(root_after.permissions) & 0o7777);
 
         @memset(diagnostic[0..], 0);
         const nested_rc = spore_build_copy_apply(
@@ -1833,7 +1833,7 @@ test "build COPY parents preserves conflicts without changing auto directory mer
         try std.testing.expectEqualStrings("old", nested_value);
         const nested_after = try tmp.dir.statFile(io, "nested-conflict/dest/secret", .{ .follow_symlinks = false });
         try std.testing.expectEqual(nested_before.inode, nested_after.inode);
-        try std.testing.expectEqual(@intFromEnum(nested_before.permissions) & 0o7777, @intFromEnum(nested_after.permissions) & 0o7777);
+        try std.testing.expectEqual(@backingInt(nested_before.permissions) & 0o7777, @backingInt(nested_after.permissions) & 0o7777);
 
         @memset(diagnostic[0..], 0);
         const auto_rc = spore_build_copy_apply(
@@ -2768,11 +2768,11 @@ test "builder and runtime share bounded guest PATH resolution" {
     var resolved: [512]u8 = undefined;
     const empty = "";
     try std.testing.expectEqual(
-        @as(c_int, @intFromEnum(std.posix.E.NOENT)),
+        @as(c_int, @backingInt(std.posix.E.NOENT)),
         spore_agent_test_resolve_exec_path("tool", 4, empty, 0, 0, &resolved, resolved.len),
     );
     try std.testing.expectEqual(
-        @as(c_int, @intFromEnum(std.posix.E.NOENT)),
+        @as(c_int, @backingInt(std.posix.E.NOENT)),
         spore_agent_test_resolve_exec_path("tool", 4, empty, 0, 1, &resolved, resolved.len),
     );
 
@@ -2828,7 +2828,7 @@ test "builder and runtime share bounded guest PATH resolution" {
         too_many_entries[first_entry.len + i * 2 + 1] = '/';
     }
     try std.testing.expectEqual(
-        @as(c_int, @intFromEnum(std.posix.E.@"2BIG")),
+        @as(c_int, @backingInt(std.posix.E.@"2BIG")),
         spore_agent_test_resolve_exec_path("tool", 4, too_many_entries.ptr, too_many_entries.len, 1, &resolved, resolved.len),
     );
 
@@ -2846,13 +2846,13 @@ test "builder and runtime share bounded guest PATH resolution" {
 
     const long_path = test_support.repeat("/", 251);
     try std.testing.expectEqual(
-        @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
+        @as(c_int, @backingInt(std.posix.E.NAMETOOLONG)),
         spore_agent_test_resolve_exec_path("missing", 7, long_path, long_path.len, 1, &resolved, resolved.len),
     );
 
     const long_command = test_support.repeat("x", 511);
     try std.testing.expectEqual(
-        @as(c_int, @intFromEnum(std.posix.E.NAMETOOLONG)),
+        @as(c_int, @backingInt(std.posix.E.NAMETOOLONG)),
         spore_agent_test_resolve_exec_path(long_command, long_command.len, "/bin", 4, 1, &resolved, resolved.len),
     );
 }

@@ -71,7 +71,7 @@ pub fn createTempFromHostPath(allocator: std.mem.Allocator, io: Io, host_path: [
 
     var file = try Io.Dir.createFileAbsolute(io, archive.path, .{
         .exclusive = true,
-        .permissions = @enumFromInt(0o600),
+        .permissions = @fromBackingInt(@intCast(0o600)),
     });
     defer file.close(io);
     var buffer: [64 * 1024]u8 = undefined;
@@ -145,7 +145,7 @@ fn writeRecordHeader(w: *Io.Writer, kind: Kind, archive_path: []const u8, mode: 
     if (kind != .end) try validatePath(archive_path, true);
     if (archive_path.len > max_path) return error.NameTooLong;
     var header: [record_header_len]u8 = undefined;
-    header[0] = @intFromEnum(kind);
+    header[0] = @backingInt(kind);
     std.mem.writeInt(u16, header[1..3], @intCast(archive_path.len), .little);
     std.mem.writeInt(u32, header[3..7], mode & 0o777, .little);
     std.mem.writeInt(u64, header[7..15], size, .little);
@@ -273,9 +273,9 @@ fn readRecord(in: *Io.Reader, path_buf: *[max_path]u8) !Record {
     var header: [record_header_len]u8 = undefined;
     try readExact(in, &header);
     const kind: Kind = switch (header[0]) {
-        @intFromEnum(Kind.file) => .file,
-        @intFromEnum(Kind.directory) => .directory,
-        @intFromEnum(Kind.end) => .end,
+        @backingInt(Kind.file) => .file,
+        @backingInt(Kind.directory) => .directory,
+        @backingInt(Kind.end) => .end,
         else => return error.BadCopyArchive,
     };
     const path_len = std.mem.readInt(u16, header[1..3], .little);
@@ -343,7 +343,7 @@ pub fn openHostFileCreate(allocator: std.mem.Allocator, path: []const u8) !std.c
 }
 
 fn modeFromStat(stat: Io.File.Stat) u32 {
-    return @intCast(@intFromEnum(stat.permissions) & 0o777);
+    return @intCast(@backingInt(stat.permissions) & 0o777);
 }
 
 fn openDirPath(io: Io, path: []const u8, flags: Io.Dir.OpenOptions) !Io.Dir {
@@ -537,7 +537,7 @@ test "copy archive extraction fails closed on hostile records" {
         try writeRecordHeader(&w, .directory, "", 0o755, 0);
         // Hand-written header: writeRecordHeader would refuse the bad paths.
         var header: [record_header_len]u8 = @splat(0);
-        header[0] = @intFromEnum(case.kind);
+        header[0] = @backingInt(case.kind);
         std.mem.writeInt(u16, header[1..3], @intCast(case.path.len), .little);
         std.mem.writeInt(u32, header[3..7], 0o644, .little);
         std.mem.writeInt(u64, header[7..15], case.size, .little);
@@ -589,9 +589,9 @@ test "fuzz copy archive extraction" {
     {
         var tree = fuzz_support.tmpDir(.{});
         defer tree.cleanup();
-        try tree.dir.createDir(io, "src", @enumFromInt(0o750));
-        try tree.dir.createDir(io, "src/sub", @enumFromInt(0o700));
-        try tree.dir.createDir(io, "src/sub/empty", @enumFromInt(0o755));
+        try tree.dir.createDir(io, "src", @fromBackingInt(@intCast(0o750)));
+        try tree.dir.createDir(io, "src/sub", @fromBackingInt(@intCast(0o700)));
+        try tree.dir.createDir(io, "src/sub/empty", @fromBackingInt(@intCast(0o755)));
         try tree.dir.writeFile(io, .{ .sub_path = "src/a.txt", .data = "alpha\n" });
         try tree.dir.writeFile(io, .{ .sub_path = "src/sub/b.bin", .data = "\x00\x01\x02bravo" });
         const src = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tree.sub_path, "src" });

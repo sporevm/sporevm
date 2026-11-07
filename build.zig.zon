@@ -2,11 +2,11 @@
     .name = .sporevm,
     .version = "0.0.0",
     .fingerprint = 0x95e05adceafdec8a, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zmoltcp = .{
-            .url = "git+https://github.com/sporevm/zmoltcp.git#v0.3.0",
-            .hash = "zmoltcp-0.3.0-AMqcQe-lEwC2lJYPeDLWPW92MKk8HupiihlX0HghL9c8",
+            .url = "git+https://github.com/sporevm/zmoltcp.git#89fabad3d657d37d20e3d0e8f3fb87344f0d245d",
+            .hash = "zmoltcp-0.3.0-AMqcQWy3EwA-JhBqp_ZxQIcZtRWFgrC7HYHiV9Ih1KmV",
         },
         .toybox = .{
             .url = "git+https://github.com/landley/toybox.git?ref=0.8.14#b7ec52ac35e075caffca5d330995d44e8dbfc8c3",

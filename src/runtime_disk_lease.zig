@@ -18,7 +18,7 @@ const max_active_lease_bytes = 64 * 1024;
 const private_dir_permissions: Io.File.Permissions = if (builtin.os.tag == .windows)
     .default_dir
 else
-    @enumFromInt(0o700);
+    @fromBackingInt(@intCast(0o700));
 
 pub const OwnerPid = if (builtin.os.tag == .windows) i32 else std.posix.pid_t;
 
@@ -159,7 +159,7 @@ pub fn acquireActive(
     defer allocator.free(json);
     var file = try Io.Dir.createFileAbsolute(io, path, .{
         .exclusive = true,
-        .permissions = if (builtin.os.tag == .windows) .default_file else @enumFromInt(0o600),
+        .permissions = if (builtin.os.tag == .windows) .default_file else @fromBackingInt(@intCast(0o600)),
     });
     errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
     defer file.close(io);
@@ -184,7 +184,7 @@ pub fn activeOwnerPid(file_name: []const u8) ?OwnerPid {
 
 pub fn ownerAlive(pid: OwnerPid) bool {
     if (pid <= 0 or comptime builtin.os.tag == .windows) return false;
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| return err == error.PermissionDenied;
+    std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| return err == error.PermissionDenied;
     return true;
 }
 
@@ -195,7 +195,7 @@ pub fn ensurePrivateDir(io: Io, path: []const u8) !void {
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != .directory) return error.InvalidRuntimeDir;
     if (comptime builtin.os.tag != .windows) {
-        const mode = @intFromEnum(stat.permissions);
+        const mode = @backingInt(stat.permissions);
         if (mode & 0o077 != 0) return error.InsecureRuntimeDir;
     }
 }

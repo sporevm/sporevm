@@ -538,7 +538,7 @@ const Vcpu = struct {
                         if (access.is_write) {
                             value = 0;
                             if (access.srt < 31) {
-                                try hvf.check(hvf.hv_vcpu_get_reg(self.handle, @enumFromInt(@as(u32, access.srt)), &value.?), "mmio read xt");
+                                try hvf.check(hvf.hv_vcpu_get_reg(self.handle, @fromBackingInt(@intCast(@as(u32, access.srt))), &value.?), "mmio read xt");
                             }
                         }
                         self.mmio_access = access;
@@ -596,7 +596,7 @@ const Vcpu = struct {
                 2 => value & 0xffff_ffff,
                 3 => value,
             };
-            try hvf.check(hvf.hv_vcpu_set_reg(self.handle, @enumFromInt(@as(u32, access.srt)), masked), "mmio write xt");
+            try hvf.check(hvf.hv_vcpu_set_reg(self.handle, @fromBackingInt(@intCast(@as(u32, access.srt))), masked), "mmio write xt");
         }
         try advancePc(self.handle);
     }
@@ -732,8 +732,8 @@ fn psciTargetIndex(vcpu_count: usize, target_mpidr: u64) ?usize {
 fn handleUnknownSysreg(vcpu: hvf.VcpuHandle, exit: *hvf.VcpuExit) !void {
     const iss: u32 = @truncate(exit.exception.syndrome & 0x1ff_ffff);
     if (iss & 1 != 0) {
-        const rt: hvf.Reg = @enumFromInt(@as(u32, @truncate((iss >> 5) & 0x1f)));
-        if (@intFromEnum(rt) < 31) {
+        const rt: hvf.Reg = @fromBackingInt(@intCast(@as(u32, @truncate((iss >> 5) & 0x1f))));
+        if (@backingInt(rt) < 31) {
             try hvf.check(hvf.hv_vcpu_set_reg(vcpu, rt, 0), "sysreg raz");
         }
     }
@@ -1021,7 +1021,7 @@ fn handleGicMmioAccess(
     if (access.is_write) {
         var value: u64 = 0;
         if (access.srt < 31) {
-            try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @enumFromInt(@as(u32, access.srt)), &value), "gic read xt");
+            try hvf.check(hvf.hv_vcpu_get_reg(vcpu, @fromBackingInt(@intCast(@as(u32, access.srt))), &value), "gic read xt");
         }
         try writeGicMmioTarget(current_owner, g, value);
     } else if (access.srt < 31) {
@@ -1032,7 +1032,7 @@ fn handleGicMmioAccess(
             2 => value & 0xffff_ffff,
             3 => value,
         };
-        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, access.srt)), masked), "gic write xt");
+        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @fromBackingInt(@intCast(@as(u32, access.srt))), masked), "gic write xt");
     }
     try advancePc(vcpu);
     return true;

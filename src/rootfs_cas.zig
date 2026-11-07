@@ -1117,7 +1117,7 @@ test "materialize assembles the flat artifact from verified chunks" {
     const assembled = try Io.Dir.cwd().readFileAlloc(io, digest_path, arena, .limited(1 << 20));
     try std.testing.expectEqualSlices(u8, bytes, assembled);
     const stat = try Io.Dir.cwd().statFile(io, digest_path, .{ .follow_symlinks = false });
-    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@intFromEnum(stat.permissions) & 0o777)));
+    try std.testing.expectEqual(@as(u32, 0o444), @as(u32, @intCast(@backingInt(stat.permissions) & 0o777)));
 
     // Idempotent: a second call with a valid entry present is a no-op.
     try materializeFlatFromChunks(io, allocator, cache_root, rootfs);

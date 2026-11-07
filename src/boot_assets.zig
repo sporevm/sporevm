@@ -453,7 +453,7 @@ fn readOnlyRegularFileNoSymlink(io: Io, path: []const u8) !bool {
         error.FileNotFound, error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return false,
         else => |e| return e,
     };
-    return stat.kind == .file and @intFromEnum(stat.permissions) & 0o222 == 0;
+    return stat.kind == .file and @backingInt(stat.permissions) & 0o222 == 0;
 }
 
 fn readExpectedSha256Digest(
@@ -494,7 +494,7 @@ fn readRegularFileNoSymlinkAlloc(
     const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
     const stat = file.stat(io) catch return error.ManagedKernelAssetOpenFailed;
     if (stat.kind != .file) return error.ManagedKernelAssetOpenFailed;
-    if (require_read_only and @intFromEnum(stat.permissions) & 0o222 != 0)
+    if (require_read_only and @backingInt(stat.permissions) & 0o222 != 0)
         return error.ManagedKernelCacheEntryWritable;
     if (stat.size > max_size) return error.ManagedKernelAssetTooLarge;
     const len: usize = @intCast(stat.size);

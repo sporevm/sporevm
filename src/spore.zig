@@ -391,15 +391,15 @@ pub const Manifest = struct {
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
-        inline for (std.meta.fields(Manifest)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "exec_defaults") or std.mem.eql(u8, field.name, "memory_state")) {
-                if (@field(self, field.name)) |value| {
-                    try writer.objectField(field.name);
+        inline for (@typeInfo(Manifest).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "exec_defaults") or std.mem.eql(u8, name, "memory_state")) {
+                if (@field(self, name)) |value| {
+                    try writer.objectField(name);
                     try writer.write(value);
                 }
             } else {
-                try writer.objectField(field.name);
-                try writer.write(@field(self, field.name));
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
             }
         }
         try writer.endObject();

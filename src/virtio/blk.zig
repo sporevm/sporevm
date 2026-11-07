@@ -1674,7 +1674,7 @@ fn fuzzWriteZeroesSemantics(_: void, s: *std.testing.Smith) !void {
         readonly_status,
         extra_segment,
     };
-    const fault: Fault = @enumFromInt(s.value(u8) % (@intFromEnum(Fault.extra_segment) + 1));
+    const fault: Fault = @fromBackingInt(@intCast(s.value(u8) % (@backingInt(Fault.extra_segment) + 1)));
     var header: []u8 = header_buf[0..16];
     var range: []u8 = &range_buf;
     var status: []u8 = status_buf[0..1];

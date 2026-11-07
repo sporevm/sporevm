@@ -76,7 +76,7 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(message_level) <= @intFromEnum(runtime_log_level)) {
+    if (@backingInt(message_level) <= @backingInt(runtime_log_level)) {
         std.log.defaultLog(message_level, scope, format, args);
     }
 }

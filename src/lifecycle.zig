@@ -1651,7 +1651,7 @@ test "lifecycle monitor spawn receives context environment, debug flag and only 
         .sub_path = script_path,
         .data = "#!/bin/sh\nprintf '%s\\n%s\\n' \"$HOME\" \"$*\" > \"$SPOREVM_TEST_ENV_OUT\"\n",
     });
-    try Io.Dir.cwd().setFilePermissions(io, script_path, @enumFromInt(0o755), .{});
+    try Io.Dir.cwd().setFilePermissions(io, script_path, @fromBackingInt(@intCast(0o755)), .{});
 
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();

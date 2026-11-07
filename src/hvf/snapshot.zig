@@ -68,7 +68,7 @@ pub fn captureVcpuState(allocator: std.mem.Allocator, vcpu: VcpuRef) !spore.Vcpu
     state.mpidr = aarch64_topology.mpidrForIndex(vcpu.index);
 
     for (0..31) |i| {
-        try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, @enumFromInt(@as(u32, @intCast(i))), &state.gprs[i]), "get gpr");
+        try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, @fromBackingInt(@intCast(@as(u32, @intCast(i)))), &state.gprs[i]), "get gpr");
     }
     try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, .pc, &state.pc), "get pc");
     try hvf.check(hvf.hv_vcpu_get_reg(vcpu.handle, .cpsr, &state.cpsr), "get cpsr");
@@ -132,7 +132,7 @@ pub fn applyVcpuState(vcpu: hvf.VcpuHandle, state: spore.VcpuState, vtimer_offse
     if (state.mpidr != aarch64_topology.mpidrForIndex(state.index)) return error.PlatformMismatch;
 
     for (0..31) |i| {
-        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @enumFromInt(@as(u32, @intCast(i))), state.gprs[i]), "set gpr");
+        try hvf.check(hvf.hv_vcpu_set_reg(vcpu, @fromBackingInt(@intCast(@as(u32, @intCast(i)))), state.gprs[i]), "set gpr");
     }
     try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .pc, state.pc), "set pc");
     try hvf.check(hvf.hv_vcpu_set_reg(vcpu, .cpsr, state.cpsr), "set cpsr");

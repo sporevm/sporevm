@@ -7,7 +7,7 @@
 [![Buildkite](https://badge.buildkite.com/43af213c90bb781b385d58fc664e5ee8f1b99502f66102e53a.svg?branch=main)](https://buildkite.com/buildkite/sporevm)
 [![Release](https://img.shields.io/github/v/release/sporevm/sporevm?sort=semver)](https://github.com/sporevm/sporevm/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Zig 0.16.0](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](mise.toml)
+[![Zig 0.17.1](https://img.shields.io/badge/Zig-0.17.1-f7a41d?logo=zig&logoColor=white)](mise.toml)
 
 SporeVM is a small virtual machine monitor for saving and forking Linux
 microVM state on ARM64. Linux x86-64/KVM also has an experimental fresh
