@@ -47,8 +47,8 @@ document on stderr and nothing on stdout. Each result has `schema`,
 - `initial_command`, from `vm create` and `vm logs`, reports the output
   disposition, destination, bound and startup status; `vm logs` adds the
   process status, exit code, retained output and per-stream truncation flags.
-- Each `vm ls` entry has a `memory` object with `initial_bytes` and
-  `maximum_bytes`.
+- Each `vm ls` entry's `memory` is an object with `initial_bytes` and
+  `maximum_bytes`, or null when the VM's spec cannot be read.
 - A fixed-memory checkpoint reports one value for all four memory sizes and an
   empty `plugged_memory_ranges`.
 - `build` suppresses executor output, so its result is the only stdout.
