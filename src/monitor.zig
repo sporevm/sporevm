@@ -40,6 +40,7 @@ const system = @import("system.zig");
 const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
 const version = @import("version.zig");
+const vm_session = @import("vm_session.zig");
 const vsock = @import("virtio/vsock.zig");
 const vsock_control = @import("virtio/vsock_control.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
@@ -252,14 +253,11 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
         std.debug.print("spore monitor: backend unavailable: {s}\n", .{@errorName(err)});
         std.process.exit(2);
     };
-    run.validateFreshProductPolicy(selected_backend, .{
+    vm_session.validateFreshProductPolicy(selected_backend, .{
         .memory = spec.memory,
         .vcpus = spec.vcpus,
         .resuming = spec.resume_dir != null or spec.resume_generation != null or
             spec.sessions.len != 0 or spec.disk != null or spec.disk_baseline_lease != null,
-        .rootfs = spec.rootfs_path != null or spec.rootfs != null or
-            spec.image_ref != null or spec.disk != null,
-        .network = spec.network != null,
     }) catch |err| {
         std.debug.print("spore monitor: x86 fresh profile rejected request: {s}\n", .{@errorName(err)});
         std.process.exit(2);

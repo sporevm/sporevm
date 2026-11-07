@@ -25,11 +25,11 @@ const rootfs_mod = @import("rootfs.zig");
 const ext4 = @import("rootfs/ext4.zig");
 const ext4_writer = @import("rootfs/ext4_writer.zig");
 const rootfs_input = @import("rootfs_input.zig");
-const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
 const system_mod = @import("system.zig");
 const test_barrier = @import("test_barrier.zig");
 const topology = @import("topology.zig");
+const vm_session = @import("vm_session.zig");
 
 const scratch_inode_count: u32 = 131_072;
 const scratch_format_identity = "sporevm-empty-ext4-scratch-v2:image=16GiB:inodes=131072:writer=ext4-sparse-spans-v1";
@@ -203,7 +203,7 @@ const automatic_build_capacity_bytes: u64 = 16 * 1024 * 1024 * 1024;
 
 pub fn build(init: std.process.Init, allocator: std.mem.Allocator, options: Options) !Result {
     const backend = try backend_mod.select(.auto, options.host);
-    try run_mod.validateFreshProductPolicy(backend, .{
+    try vm_session.validateFreshProductPolicy(backend, .{
         .memory = options.memory,
         .vcpus = options.vcpus,
     });
@@ -3880,7 +3880,7 @@ test "an invalid later stage fails before an earlier stage boots or publishes a 
         .context_dir = context_dir,
         .dockerfile_path = try tmp_dir.path("context/Dockerfile"),
         // The only fresh-VM shape x86 accepts; arm64 accepts it too.
-        .memory = memory_config.Config.fixed(run_mod.x86_experimental_memory_bytes),
+        .memory = memory_config.Config.fixed(vm_session.x86_experimental_memory_bytes),
         .vcpus = 1,
         .diagnostic = &diagnostic,
     }));

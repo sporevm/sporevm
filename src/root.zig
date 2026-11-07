@@ -86,6 +86,7 @@ const spore_fork = @import("spore_fork.zig");
 pub const system = @import("system.zig");
 pub const vm_registry = @import("vm_registry.zig");
 pub const vmm = @import("aarch64/vmm.zig");
+const vm_session = @import("vm_session.zig");
 pub const kvm_native = @import("kvm/native.zig");
 pub const kvm = kvm_native.binding;
 pub const virtio = struct {
@@ -179,6 +180,7 @@ test {
     testing.refAllDecls(system);
     testing.refAllDecls(vm_registry);
     testing.refAllDecls(vmm);
+    testing.refAllDecls(vm_session);
     testing.refAllDecls(virtio.queue);
     testing.refAllDecls(virtio.mmio);
     testing.refAllDecls(virtio.console);
