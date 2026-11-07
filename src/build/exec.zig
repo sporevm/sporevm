@@ -10,8 +10,9 @@ const rootfs_mod = @import("../rootfs.zig");
 const boot_assets = @import("../boot_assets.zig");
 const guest_request = @import("../guest_request.zig");
 const spore_net_policy = @import("../spore_net_policy.zig");
-const run_mod = @import("../run.zig");
 const vm_session = @import("../vm_session.zig");
+const backend_mod = @import("../backend.zig");
+const net_gateway = @import("../net_gateway.zig");
 const local_paths = @import("../local_paths.zig");
 const memory_config = @import("../memory.zig");
 const topology = @import("../topology.zig");
@@ -524,7 +525,6 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     defer control.deinit();
 
     const rootfs = try rootfsFromStorage(allocator, options.base_storage);
-    const monitor_options = monitorOptionsForSession(options, rootfs, network_mode, if (cache_store) |*store| store.fd else null);
     const boot = switch (options.producer.boot_source) {
         .retained => |retained| retained,
         .managed => |managed| blk: {
@@ -536,14 +536,49 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
             break :blk artifacts;
         },
     };
-    _ = try run_mod.executeMonitorWithBootArtifacts(
-        .{ .io = init.io, .environ_map = init.environ_map },
-        allocator,
-        monitor_options,
-        boot,
-        control.control(),
-        null,
-    );
+    const backend = try backend_mod.Backend.auto.resolveForHost();
+    const cause = cause: {
+        // The gateway lives as long as the VM.
+        const network = sessionNetwork(network_mode);
+        var gateway: net_gateway.Process = undefined;
+        var gateway_active = false;
+        if (network == .spore) {
+            try gateway.start(init.io, allocator, options.spore_executable, false, network.spore);
+            gateway_active = true;
+        }
+        defer if (gateway_active) gateway.deinit();
+        break :cause try vm_session.run(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
+            .backend = backend,
+            .machine = .{ .boot = .{
+                .kernel = boot.kernel,
+                .initrd = boot.initrd,
+                .memory = options.resources.memory,
+                .guest_port = guest_port,
+                .console_mirror = vm_session.console_fd >= 0,
+            } },
+            .vcpus = options.resources.vcpus,
+            .disks = .{
+                .rootfs = rootfs,
+                .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
+            },
+            .network = .{
+                .runtime = if (gateway_active) gateway.runtime() else .{},
+                .manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &network),
+            },
+            .console_sink = vm_session.consoleSink,
+            .mode = .{ .build = .{
+                .control = control.control(),
+                .context_disk_path = options.context_disk_path,
+                .inputs = options.build_input_rootfs,
+                .cache_disk_fd = if (cache_store) |*store| store.fd else null,
+                .snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
+            } },
+        });
+    };
+    switch (cause) {
+        .monitor_stopped, .snapshotted => {},
+        .guest_off, .guest_reset, .probe_complete => return error.MonitorDidNotStopCleanly,
+    }
     if (cache_store) |*store| try store.sync();
 
     if (control.failed_exit_code) |exit_code| {
@@ -577,28 +612,12 @@ pub fn runSession(init: std.process.Init, allocator: std.mem.Allocator, options:
     return try spore.cloneRootfsStorage(allocator, control.current_storage);
 }
 
-fn monitorOptionsForSession(options: Options, rootfs: spore.Rootfs, network_mode: step_cache.NetworkMode, cache_disk_fd: ?std.c.fd_t) run_mod.Options {
-    return .{
-        .kernel_path = "",
-        .initrd_path = null,
-        .rootfs = rootfs,
-        .rootfs_grow_target = if (options.preparation) |preparation| preparation.exact_target else 0,
-        .context_disk_path = options.context_disk_path,
-        .build_input_rootfs = options.build_input_rootfs,
-        .build_cache_disk_fd = cache_disk_fd,
-        .build_mode = true,
-        .disk_snapshot_metrics = if (options.diagnostic) |diag| &diag.snapshot_metrics else null,
-        .command = &.{},
-        .memory = options.resources.memory,
-        .vcpus = options.resources.vcpus,
-        // `--network spore` gives build RUN steps unrestricted egress, like
-        // plain `spore run --net`.
-        .network = switch (network_mode) {
-            .spore => .{ .spore = .{ .egress = .unrestricted } },
-            .none => .disabled,
-        },
-        .timeout_ms = options.timeout_ms,
-        .spore_executable = options.spore_executable,
+/// `--network spore` gives build RUN steps unrestricted egress, like plain
+/// `spore run --net`.
+fn sessionNetwork(network_mode: step_cache.NetworkMode) spore_net_policy.Network {
+    return switch (network_mode) {
+        .spore => .{ .spore = .{ .egress = .unrestricted } },
+        .none => .disabled,
     };
 }
 
@@ -2284,25 +2303,9 @@ test "build session network mode derives from RUN steps" {
     try std.testing.expectError(error.BuildNetworkModeMismatch, networkModeForSteps(&.{ spore_run, none_run }));
 }
 
-test "build session forwards the selected spore executable to the monitor" {
-    const executable = "/opt/sporevm/exact-build/spore";
-    const options = Options{
-        .platform = .{},
-        .cache_root = "/cache",
-        .base_storage = undefined,
-        .steps = &.{},
-        .leases = undefined,
-        .producer = undefined,
-        .spore_executable = executable,
-    };
-    const rootfs = spore.Rootfs{
-        .device = .{ .mmio_slot = 1 },
-        .artifact = .{ .digest = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .size = 4096 },
-    };
-    const monitor_options = monitorOptionsForSession(options, rootfs, .spore, null);
-    try std.testing.expectEqualStrings(executable, monitor_options.spore_executable);
-    try std.testing.expect(monitor_options.network.spore.egress == .unrestricted);
-    try std.testing.expectEqual(spore_net_policy.NetworkMode.disabled, monitorOptionsForSession(options, rootfs, .none, null).network);
+test "build RUN steps with --network spore get unrestricted egress" {
+    try std.testing.expect(sessionNetwork(.spore).spore.egress == .unrestricted);
+    try std.testing.expectEqual(spore_net_policy.NetworkMode.disabled, sessionNetwork(.none));
 }
 
 test "build copy request names context disk source" {
