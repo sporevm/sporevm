@@ -22,6 +22,7 @@ const lifecycle = @import("lifecycle.zig");
 const vm_registry = @import("vm_registry.zig");
 const monitor_jail = @import("monitor_jail.zig");
 const monitor_protocol = @import("monitor_protocol.zig");
+const ram_restore = @import("ram_restore.zig");
 const runtime_disk_claim = @import("runtime_disk_claim.zig");
 const runtime_disk = @import("runtime_disk.zig");
 const runtime_disk_fork = @import("runtime_disk_fork.zig");
@@ -32,7 +33,6 @@ const net_gateway = @import("net_gateway.zig");
 const boot_assets = @import("boot_assets.zig");
 const guest_request = @import("guest_request.zig");
 const backend_mod = @import("backend.zig");
-const run = @import("run.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
@@ -344,43 +344,62 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const readiness_probe = try server.startReadinessProbe();
     const thread = try std.Thread.spawn(.{}, controlThreadMain, .{&server});
 
-    try run.openConsoleLog(spec.console_log_path);
-    defer run.closeConsoleLog();
+    try vm_session.openConsoleLog(spec.console_log_path);
+    defer vm_session.closeConsoleLog();
 
-    const monitor_options = run.Options{
-        .backend = requested_backend,
-        .kernel_path = kernel_path,
-        .initrd_path = initrd_path,
-        .rootfs_path = spec.rootfs_path,
-        .rootfs = spec.rootfs,
-        .disk = spec.disk,
-        .disk_root = if (spec.disk_baseline_lease) |lease| lease.root else null,
-        .runtime_disk_head = if (runtime_disk_head) |*head| head else null,
-        .resume_dir = spec.resume_dir,
-        .resume_generation = spec.resume_generation,
-        .resume_sessions = spec.sessions,
-        .annotations = spec.annotations,
-        .command = &.{"/bin/true"},
-        .memory = spec.memory,
-        .vcpus = spec.vcpus,
-        .guest_port = spec.guest_port,
-        .timeout_ms = spec.timeout_ms,
-        .network = network,
-        .network_runtime = if (gateway_active) gateway.runtime() else null,
-        .spore_executable = spore_executable,
+    const cause = blk: {
+        errdefer server.stopControl(thread, "monitor backend stopped");
+        try spore.validateAnnotations(spec.annotations);
+        const artifacts = managed_boot_artifacts orelse try boot_assets.loadMonitorBootArtifacts(init.io, allocator, kernel_path, initrd_path);
+        var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, init.environ_map, spec.resume_dir, spec.memory.maximum_bytes);
+        defer ram_plan.deinit();
+        if (spec.resume_dir != null) std.log.info("named monitor memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
+        break :blk try vm_session.run(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
+            .backend = selected_backend,
+            .machine = if (spec.resume_dir) |dir| .{ .restore = .{
+                .dir = dir,
+                .ram = ram_plan.strategy,
+                .generation = spec.resume_generation,
+            } } else .{ .boot = .{
+                .kernel = artifacts.kernel,
+                .initrd = artifacts.initrd,
+                .memory = spec.memory,
+                .guest_port = spec.guest_port,
+                .console_mirror = vm_session.console_fd >= 0,
+            } },
+            .vcpus = spec.vcpus,
+            .disks = .{
+                .rootfs_path = spec.rootfs_path,
+                .rootfs = spec.rootfs,
+                .disk = spec.disk,
+                .spore_dir = spec.resume_dir,
+                .disk_root = if (spec.disk_baseline_lease) |lease| lease.root else null,
+            },
+            .network = .{
+                .runtime = if (gateway_active) gateway.runtime() else .{},
+                .manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &network),
+            },
+            .record = .{ .annotations = spec.annotations, .sessions = spec.sessions },
+            .console_sink = vm_session.consoleSink,
+            .mode = .{ .monitor = .{
+                .control = server.control(),
+                .readiness = readiness_probe,
+                .timeout_ms = spec.timeout_ms,
+                .fork_head = if (runtime_disk_head) |*head| head else null,
+            } },
+        });
     };
-    const result = if (managed_boot_artifacts) |artifacts|
-        run.executeMonitorWithBootArtifacts(.{ .io = init.io, .environ_map = init.environ_map }, allocator, monitor_options, artifacts, server.control(), readiness_probe)
-    else
-        run.executeMonitor(.{ .io = init.io, .environ_map = init.environ_map }, allocator, monitor_options, server.control(), readiness_probe);
-    const monitor_result = result catch |err| {
-        server.stopControl(thread, "monitor backend stopped");
-        return err;
-    };
-    if (monitor_result.exit == .snapshotted) server.completeSuspend() catch |err| {
-        server.stopControl(thread, "monitor stopped");
-        return err;
-    };
+    switch (cause) {
+        .monitor_stopped => {},
+        .snapshotted => server.completeSuspend() catch |err| {
+            server.stopControl(thread, "monitor stopped");
+            return err;
+        },
+        .guest_off, .guest_reset, .probe_complete => {
+            server.stopControl(thread, "monitor backend stopped");
+            return error.MonitorDidNotStopCleanly;
+        },
+    }
     server.stopControl(thread, "monitor stopped");
 }
 
@@ -404,16 +423,16 @@ test "monitor console configuration matches opened and advertised path" {
 
     const default_ready = monitorReadyMetadata(1, paths, null);
     try std.testing.expectEqual(@as(?[]const u8, null), default_ready.console_log_path);
-    try run.openConsoleLog(null);
-    run.closeConsoleLog();
+    try vm_session.openConsoleLog(null);
+    vm_session.closeConsoleLog();
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, paths.console_log_path, .{}));
 
     const explicit_ready = monitorReadyMetadata(2, paths, paths.console_log_path);
     try std.testing.expectEqualStrings(paths.console_log_path, explicit_ready.console_log_path.?);
-    try run.openConsoleLog(paths.console_log_path);
-    defer run.closeConsoleLog();
-    run.consoleSink("console parity\n");
-    run.closeConsoleLog();
+    try vm_session.openConsoleLog(paths.console_log_path);
+    defer vm_session.closeConsoleLog();
+    vm_session.consoleSink("console parity\n");
+    vm_session.closeConsoleLog();
     const bytes = try Io.Dir.cwd().readFileAlloc(io, paths.console_log_path, allocator, .limited(4096));
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("console parity\n", bytes);

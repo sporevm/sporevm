@@ -12,19 +12,10 @@ const boot_assets = @import("boot_assets.zig");
 const capture = @import("capture.zig");
 const cli_args = @import("cli_args.zig");
 const Context = @import("context.zig").Context;
-const disk_layer = @import("disk_layer.zig");
 const events_mod = @import("events.zig");
-const fd_util = @import("fd.zig");
 const generation = @import("generation.zig");
 const guest_request = @import("guest_request.zig");
-const hvf = @import("hvf/hvf.zig");
 const image = @import("image.zig");
-const kvm_native = @import("kvm/native.zig");
-const kvm = kvm_native.binding;
-const x86_vm = if (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)
-    @import("x86_64/vm.zig")
-else
-    struct {};
 const image_store = @import("image_store.zig");
 const local_image = @import("local_image.zig");
 const local_paths = @import("local_paths.zig");
@@ -39,16 +30,13 @@ const rootfs_mod = @import("rootfs.zig");
 const saved_spore_ownership = @import("saved_spore_ownership.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const runtime_disk_mod = @import("runtime_disk.zig");
-const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const run_contract = @import("build/run_contract.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const spore_stream = @import("spore_stream.zig");
 const topology = @import("topology.zig");
 const vm_session = @import("vm_session.zig");
-const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
-const vmm = @import("aarch64/vmm.zig");
 const vsock = @import("virtio/vsock.zig");
 const vsock_control = @import("virtio/vsock_control.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
@@ -71,24 +59,9 @@ pub const Options = struct {
     rootfs_path: ?[]const u8 = null,
     rootfs: ?spore.Rootfs = null,
     rootfs_grow_target: u64 = 0,
-    context_disk_path: ?[]const u8 = null,
-    /// Immutable rootfs artifacts attached read-only after the optional build
-    /// context disk. Build requests address these by bounded input index.
-    build_input_rootfs: []const spore.Rootfs = &.{},
-    /// Mutable host-local cache volume attached after immutable build inputs.
-    /// It is build-only state and is never represented in a Spore manifest.
-    build_cache_disk_fd: ?std.c.fd_t = null,
-    /// Selects the build guest contract. Build checkpoints must persist
-    /// Docker-visible rootfs paths such as /tmp and /run instead of covering
-    /// them with the runtime's ephemeral tmpfs mounts.
-    build_mode: bool = false,
-    disk_snapshot_metrics: ?*disk_layer.SnapshotMetrics = null,
     disk: ?spore.Disk = null,
-    disk_root: ?[]const u8 = null,
-    runtime_disk_head: ?*runtime_disk_fork.Head = null,
     resume_dir: ?[]const u8 = null,
     resume_generation: ?generation.State = null,
-    resume_sessions: []const spore.Session = &.{},
     start_generation_params: ?[]const u8 = null,
     require_generation_ready: bool = false,
     command: []const []const u8,
@@ -107,7 +80,6 @@ pub const Options = struct {
     commit: ?CommitOptions = null,
     annotations: spore.Annotations = .{},
     network: spore_net_policy.Network = .disabled,
-    network_runtime: ?virtio_net.Runtime = null,
     events: ?events_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
@@ -142,16 +114,6 @@ pub fn isX86ProductPolicyError(err: anyerror) bool {
         err == error.X86CaptureUnsupported or
         err == error.X86DiskForkUnsupported;
 }
-
-pub const MonitorExit = enum {
-    stopped,
-    snapshotted,
-};
-
-pub const MonitorResult = struct {
-    backend: Backend,
-    exit: MonitorExit,
-};
 
 pub const SharedOptions = struct {
     kernel_path: ?[]const u8 = null,
@@ -871,13 +833,13 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
             .initrd = initrd,
             .memory = opts.memory,
             .guest_port = opts.guest_port,
-            .console_mirror = console_fd >= 0,
+            .console_mirror = vm_session.console_fd >= 0,
         } },
         .vcpus = opts.vcpus,
         .disks = disks,
         .network = .{ .runtime = network, .manifest = network_manifest },
         .record = .{ .annotations = opts.annotations, .sessions = &saved_sessions },
-        .console_sink = consoleSink,
+        .console_sink = vm_session.consoleSink,
         .mode = .{ .oneshot = .{
             .probe = .{
                 .stream = &stream,
@@ -941,173 +903,6 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     return result;
 }
 
-pub fn executeMonitor(context: Context, allocator: std.mem.Allocator, opts: Options, control: vsock_control.Control, startup_probe: ?*vsock_stream.HostStream) !MonitorResult {
-    _ = try opts.backend.resolveForHost();
-    const artifacts = try boot_assets.loadMonitorBootArtifacts(context.io, allocator, opts.kernel_path, opts.initrd_path);
-    return executeMonitorWithBootArtifacts(context, allocator, opts, artifacts, control, startup_probe);
-}
-
-pub fn executeMonitorWithBootArtifacts(
-    context: Context,
-    allocator: std.mem.Allocator,
-    opts: Options,
-    artifacts: boot_assets.MonitorBootArtifacts,
-    control: vsock_control.Control,
-    startup_probe: ?*vsock_stream.HostStream,
-) !MonitorResult {
-    try topology.validateVcpuCount(opts.vcpus);
-    try spore.validateAnnotations(opts.annotations);
-
-    const backend = try opts.backend.resolveForHost();
-    try vm_session.validateFreshProductPolicy(backend, .{
-        .memory = opts.memory,
-        .vcpus = opts.vcpus,
-        .resuming = opts.resume_dir != null or opts.resume_generation != null or opts.resume_sessions.len != 0,
-        .disk_fork = opts.runtime_disk_head != null,
-    });
-    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.maximum_bytes);
-    defer ram_plan.deinit();
-    if (opts.resume_dir != null) std.log.info("named monitor memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
-    var gateway: net_gateway.Process = undefined;
-    var gateway_active = false;
-    const network: virtio_net.Runtime = if (opts.network_runtime) |runtime| runtime else blk: {
-        if (opts.network == .spore) {
-            try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network.spore);
-            gateway_active = true;
-            break :blk gateway.runtime();
-        }
-        break :blk .{};
-    };
-    defer if (gateway_active) gateway.deinit();
-    const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &opts.network);
-    if (opts.injected_files.len != 0) return error.InjectedFileMonitorUnsupported;
-    const disks: runtime_disk_mod.Options = .{
-        .rootfs_path = opts.rootfs_path,
-        .rootfs = opts.rootfs,
-        .rootfs_grow_target = opts.rootfs_grow_target,
-        .disk = opts.disk,
-        .spore_dir = opts.resume_dir,
-        .disk_root = opts.disk_root,
-    };
-    var runtime_disk = try runtime_disk_mod.open(context, allocator, disks);
-    defer runtime_disk.deinit();
-    if (opts.runtime_disk_head) |head| try runtime_disk.adoptForkHead(head);
-    if (runtime_disk.fetcher) |fetcher| control.attachImageStore(fetcher);
-    const context_disk_fd = if (opts.context_disk_path) |path| try openReadOnlyDiskFd(context.io, allocator, path) else null;
-    defer if (context_disk_fd) |fd| {
-        _ = std.c.close(fd);
-    };
-    const build_input_disks = try allocator.alloc(runtime_disk_mod.RuntimeDisk, opts.build_input_rootfs.len);
-    defer allocator.free(build_input_disks);
-    var build_input_count: usize = 0;
-    defer {
-        for (build_input_disks[0..build_input_count]) |*disk| disk.deinit();
-    }
-    for (opts.build_input_rootfs, 0..) |input_rootfs, index| {
-        build_input_disks[index] = try runtime_disk_mod.openReadOnlyRootfs(context, allocator, input_rootfs, opts.disk_root);
-        build_input_count += 1;
-    }
-    const build_input_backends = try allocator.alloc(virtio_blk.Backend, build_input_disks.len);
-    defer allocator.free(build_input_backends);
-    for (build_input_disks, 0..) |*disk, index| build_input_backends[index] = disk.backend() orelse return error.BadManifest;
-    const growth_session = opts.rootfs_grow_target != 0;
-    const noinit_itable = growth_session and vm_session.rootfsGrowthNoInitItable(context.environ_map);
-    const base_boot_args = try vm_session.cmdline(allocator, opts.guest_port, disks.hasRootfs(), disks.rootfsWritable(), growth_session, noinit_itable, opts.network, console_fd >= 0, opts.context_disk_path != null, opts.build_mode, build_input_disks.len);
-    const boot_args = try vm_session.productBootArgs(allocator, base_boot_args);
-    var root_blk_stats: virtio_blk.Stats = .{};
-    const root_blk_options = vm_session.rootBlkOptions(context.environ_map, opts.rootfs_grow_target != 0, &root_blk_stats);
-    defer if (opts.rootfs_grow_target != 0) vm_session.logRootBlkStats(&root_blk_stats);
-
-    const vm_config: vmm.Config = .{
-        .io = context.io,
-        .start = if (opts.resume_dir) |dir| .{ .restore = .{
-            .dir = dir,
-            .ram = ram_plan.strategy,
-            .generation = opts.resume_generation,
-        } } else .{ .boot = .{
-            .kernel = artifacts.kernel,
-            .cmdline = boot_args,
-            .initrd = artifacts.initrd,
-            .ram_size = opts.memory.initial_bytes,
-            .virtio_mem_region_size = opts.memory.maximum_bytes - opts.memory.initial_bytes,
-        } },
-        .vcpus = opts.vcpus,
-        .console_sink = consoleSink,
-        .disk_backend = runtime_disk.backend(),
-        .root_blk_options = root_blk_options,
-        .context_disk_fd = context_disk_fd,
-        .build_input_disk_backends = build_input_backends,
-        .build_cache_disk_backend = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
-        .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-        .rootfs = opts.rootfs,
-        .network_manifest = network_manifest,
-        .annotations = opts.annotations,
-        .sessions = opts.resume_sessions,
-        .environ_map = context.environ_map,
-        .probe = if (startup_probe) |stream| .{ .stream = stream, .timeout_ms = opts.timeout_ms, .on_complete = .detach } else null,
-        .network = network,
-        .exec_control = control,
-    };
-
-    const cause = switch (backend) {
-        .auto => unreachable,
-        .hvf => blk: {
-            if (comptime !(builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)) return error.UnsupportedBackend;
-            break :blk try hvf.vm.run(allocator, vm_config);
-        },
-        .kvm => blk: {
-            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) {
-                break :blk try kvm.vm.run(allocator, vm_config);
-            }
-            if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
-                break :blk try x86_vm.run(allocator, .{
-                    .kernel = artifacts.kernel,
-                    .ram_size = opts.memory.initial_bytes,
-                    .vcpu_count = @intCast(opts.vcpus),
-                    .cmdline = boot_args,
-                    .initrd = artifacts.initrd,
-                    .console_sink = consoleSink,
-                    .root_disk = runtime_disk.backend(),
-                    .root_blk_options = root_blk_options,
-                    .context_disk = if (context_disk_fd) |fd| .{ .file = fd } else null,
-                    .build_input_disks = build_input_backends,
-                    .cache_disk = if (opts.build_cache_disk_fd) |fd| .{ .file = fd } else null,
-                    .cache_disk_writable = opts.build_cache_disk_fd != null,
-                    .disk_snapshot = runtime_disk.snapshotWithMetrics(opts.disk_snapshot_metrics),
-                    .network = network,
-                    .exec_probe = startup_probe,
-                    .exec_probe_completes_run = false,
-                    .exec_control = control,
-                    .exec_probe_timeout_ms = opts.timeout_ms,
-                });
-            }
-            return error.UnsupportedBackend;
-        },
-    };
-    if (network.failed()) return error.NetworkGatewayFailed;
-    return switch (cause) {
-        .monitor_stopped => .{ .backend = backend, .exit = .stopped },
-        .snapshotted => .{ .backend = backend, .exit = .snapshotted },
-        else => error.MonitorDidNotStopCleanly,
-    };
-}
-
-fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
-    const path_z = try allocator.dupeSentinel(u8, path, 0);
-    defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
-    if (fd < 0) return error.ContextDiskOpenFailed;
-    errdefer _ = std.c.close(fd);
-    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
-    const stat = file.stat(io) catch return error.ContextDiskOpenFailed;
-    if (stat.kind != .file) return error.ContextDiskOpenFailed;
-    return fd;
-}
-
-/// The console log, when there is one. A VM booted while it is open has the
-/// guest agent copy command output to the console too.
-pub var console_fd: std.c.fd_t = -1;
-
 fn runEventOutputSink(context: ?*anyopaque, output: vsock_stream.HostStreamOutput, bytes: []const u8) void {
     const events: *events_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     events.emitOutputBestEffort(output, bytes);
@@ -1117,27 +912,6 @@ fn runEventLifecycleSink(context: ?*anyopaque, event: vsock_stream.HostStreamLif
     const events: *events_mod.EventEmitter = @ptrCast(@alignCast(context.?));
     switch (event) {
         .ready => events.emitReadyBestEffort(),
-    }
-}
-
-pub fn consoleSink(bytes: []const u8) void {
-    if (console_fd < 0) return;
-    fd_util.writeAllBestEffort(console_fd, bytes);
-}
-
-pub fn openConsoleLog(path: ?[]const u8) !void {
-    if (path == null) return;
-    const pathz = try std.heap.page_allocator.dupeSentinel(u8, path.?, 0);
-    defer std.heap.page_allocator.free(pathz);
-    const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
-    if (fd < 0) return error.ConsoleLogOpenFailed;
-    console_fd = fd;
-}
-
-pub fn closeConsoleLog() void {
-    if (console_fd >= 0) {
-        _ = std.c.close(console_fd);
-        console_fd = -1;
     }
 }
 

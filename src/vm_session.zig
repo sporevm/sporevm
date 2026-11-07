@@ -1,27 +1,36 @@
 //! Runs one VM. This is the code that turns a resolved backend and a
 //! description of the VM into a running guest: the x86 profile check, the
-//! root disk, the kernel command line, the `vmm.Config`, the backend call and
-//! the network check after it. Callers own what surrounds the VM: the network
-//! gateway, the RAM restore plan and the events they report.
+//! disks, the kernel command line, the `vmm.Config`, the backend call and the
+//! network check after it. Callers own what surrounds the VM: the network
+//! gateway, the RAM restore plan and the events they report. The process's
+//! console log lives here too.
 
 const std = @import("std");
 const TestDir = @import("test_dir.zig").TestDir;
 const builtin = @import("builtin");
+const Io = std.Io;
 
 const Backend = @import("backend.zig").Backend;
 const capture = @import("capture.zig");
 const Context = @import("context.zig").Context;
 const deadline = @import("deadline.zig");
+const disk_layer = @import("disk_layer.zig");
+const fd_util = @import("fd.zig");
 const hvf_binding = @import("hvf/hvf.zig");
+const image_store = @import("image_store.zig");
 const kvm_binding = @import("kvm/native.zig").binding;
+const local_paths = @import("local_paths.zig");
 const memory_config = @import("memory.zig");
+const rootfs_input = @import("rootfs_input.zig");
 const runtime_disk = @import("runtime_disk.zig");
+const runtime_disk_fork = @import("runtime_disk_fork.zig");
 const spore = @import("spore.zig");
 const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
 const virtio_blk = @import("virtio/blk.zig");
 const virtio_net = @import("virtio/net.zig");
 const vmm = @import("aarch64/vmm.zig");
+const vsock = @import("virtio/vsock.zig");
 const vsock_control = @import("virtio/vsock_control.zig");
 const vsock_stream = @import("virtio/vsock_stream.zig");
 const x86_board = @import("x86_64/board.zig");
@@ -80,13 +89,46 @@ pub const Record = struct {
 };
 
 pub const Mode = union(enum) {
+    oneshot: Oneshot,
+    monitor: Monitor,
+    build: Build,
+
     /// A command whose completion or capture ends the VM: `spore run`,
     /// `run --from` and `attach`.
-    oneshot: struct {
+    pub const Oneshot = struct {
         probe: vmm.Probe,
         capture: ?capture.Capture = null,
         control: ?vsock_control.Control = null,
-    },
+    };
+
+    /// A named VM's monitor. The control serves exec, save and stop
+    /// requests until one of them ends the VM.
+    pub const Monitor = struct {
+        control: vsock_control.Control,
+        /// The readiness request. It detaches once the guest agent answers.
+        readiness: *vsock_stream.HostStream,
+        /// How long the guest agent has to answer it.
+        timeout_ms: u64,
+        /// A disk fork's claimed head, which the root disk adopts.
+        fork_head: ?*runtime_disk_fork.Head = null,
+    };
+
+    /// A `spore build` session. The control runs the Dockerfile steps, and
+    /// the guest follows the build contract: checkpoints keep Docker-visible
+    /// paths such as /tmp and /run instead of covering them with the
+    /// runtime's tmpfs mounts.
+    pub const Build = struct {
+        control: vsock_control.Control,
+        /// A disk image of the build context, attached read-only.
+        context_disk_path: ?[]const u8 = null,
+        /// Immutable rootfs images attached read-only after the context
+        /// disk. Build requests address them by index.
+        inputs: []const spore.Rootfs = &.{},
+        /// The host-local cache-mount volume, attached writable after the
+        /// inputs. It is never recorded in a manifest.
+        cache_disk_fd: ?std.c.fd_t = null,
+        snapshot_metrics: ?*disk_layer.SnapshotMetrics = null,
+    };
 };
 
 /// Runs the session's VM until it exits. A failed network gateway fails the
@@ -123,12 +165,48 @@ fn runOn(comptime Vms: type, context: Context, allocator: std.mem.Allocator, ses
     // this is the backstop.
     if (@hasDecl(Vms, "x86")) try validateFreshProductPolicyFor(.x86_64, session.backend, policy(session));
 
+    const probe: ?vmm.Probe, const control: ?vsock_control.Control = switch (session.mode) {
+        .oneshot => |oneshot| .{ oneshot.probe, oneshot.control },
+        .monitor => |monitor| .{ .{ .stream = monitor.readiness, .timeout_ms = monitor.timeout_ms, .on_complete = .detach }, monitor.control },
+        .build => |build| .{ null, build.control },
+    };
+    const build: ?Mode.Build = switch (session.mode) {
+        .build => |build| build,
+        .oneshot, .monitor => null,
+    };
+
     var disk = try runtime_disk.open(context, allocator, session.disks);
     defer disk.deinit();
+    if (session.mode == .monitor) {
+        if (session.mode.monitor.fork_head) |head| try disk.adoptForkHead(head);
+    }
+    if (disk.fetcher) |fetcher| {
+        if (control) |value| value.attachImageStore(fetcher);
+    }
+    const context_disk_path = if (build) |value| value.context_disk_path else null;
+    const context_disk_fd = if (context_disk_path) |path| try openReadOnlyDiskFd(context.io, allocator, path) else null;
+    defer if (context_disk_fd) |fd| {
+        _ = std.c.close(fd);
+    };
+    const inputs: []const spore.Rootfs = if (build) |value| value.inputs else &.{};
+    const input_disks = try allocator.alloc(runtime_disk.RuntimeDisk, inputs.len);
+    defer allocator.free(input_disks);
+    var input_count: usize = 0;
+    defer {
+        for (input_disks[0..input_count]) |*input| input.deinit();
+    }
+    for (inputs, input_disks) |rootfs, *input| {
+        input.* = try runtime_disk.openReadOnlyRootfs(context, allocator, rootfs, session.disks.disk_root);
+        input_count += 1;
+    }
+    const input_backends = try allocator.alloc(virtio_blk.Backend, inputs.len);
+    defer allocator.free(input_backends);
+    for (input_disks, input_backends) |*input, *input_backend| input_backend.* = input.backend() orelse return error.BadManifest;
+    const cache_disk_fd = if (build) |value| value.cache_disk_fd else null;
+
     const growth = session.disks.rootfs_grow_target != 0;
     var root_blk_stats: virtio_blk.Stats = .{};
     defer if (growth) logRootBlkStats(&root_blk_stats);
-    const oneshot = session.mode.oneshot;
     const config: vmm.Config = .{
         .io = context.io,
         .start = switch (session.machine) {
@@ -143,9 +221,9 @@ fn runOn(comptime Vms: type, context: Context, allocator: std.mem.Allocator, ses
                     growth and rootfsGrowthNoInitItable(context.environ_map),
                     if (session.network.manifest != null) .spore else .disabled,
                     boot.console_mirror,
-                    false,
-                    false,
-                    0,
+                    context_disk_path != null,
+                    build != null,
+                    inputs.len,
                 )),
                 .initrd = boot.initrd,
                 .ram_size = boot.memory.initial_bytes,
@@ -157,16 +235,19 @@ fn runOn(comptime Vms: type, context: Context, allocator: std.mem.Allocator, ses
         .console_sink = session.console_sink,
         .disk_backend = disk.backend(),
         .root_blk_options = rootBlkOptions(context.environ_map, growth, &root_blk_stats),
-        .disk_snapshot = disk.snapshot(),
+        .context_disk_fd = context_disk_fd,
+        .build_input_disk_backends = input_backends,
+        .build_cache_disk_backend = if (cache_disk_fd) |fd| .{ .file = fd } else null,
+        .disk_snapshot = disk.snapshotWithMetrics(if (build) |value| value.snapshot_metrics else null),
         .rootfs = session.disks.rootfs,
         .network_manifest = session.network.manifest,
         .annotations = session.record.annotations,
         .sessions = session.record.sessions,
         .environ_map = context.environ_map,
-        .probe = oneshot.probe,
+        .probe = probe,
         .capture = trackedCapture(session),
         .network = session.network.runtime,
-        .exec_control = oneshot.control,
+        .exec_control = control,
     };
 
     const run_start_ms = deadline.system_clock.nowMs();
@@ -180,16 +261,55 @@ fn runOn(comptime Vms: type, context: Context, allocator: std.mem.Allocator, ses
         else
             unreachable,
     };
-    const run_ms = deadline.system_clock.nowMs() -| run_start_ms;
-    const stream = oneshot.probe.stream;
-    const response_ms = stream.response_ms orelse stream.elapsedMs();
-    // scripts/benchmark/suite.py reads this line.
-    std.log.debug(
-        "run backend timing: elapsed_ms={d} stream_response_ms={d} tail_ms={d} cause={s}",
-        .{ run_ms, response_ms, run_ms -| response_ms, @tagName(cause) },
-    );
+    if (session.mode == .oneshot) {
+        const run_ms = deadline.system_clock.nowMs() -| run_start_ms;
+        const stream = session.mode.oneshot.probe.stream;
+        const response_ms = stream.response_ms orelse stream.elapsedMs();
+        // scripts/benchmark/suite.py reads this line.
+        std.log.debug(
+            "run backend timing: elapsed_ms={d} stream_response_ms={d} tail_ms={d} cause={s}",
+            .{ run_ms, response_ms, run_ms -| response_ms, @tagName(cause) },
+        );
+    }
     if (session.network.runtime.failed()) return error.NetworkGatewayFailed;
     return cause;
+}
+
+/// The console log, when there is one. A VM booted while it is open has the
+/// guest agent copy command output to the console too.
+pub var console_fd: std.c.fd_t = -1;
+
+pub fn consoleSink(bytes: []const u8) void {
+    if (console_fd < 0) return;
+    fd_util.writeAllBestEffort(console_fd, bytes);
+}
+
+pub fn openConsoleLog(path: ?[]const u8) !void {
+    if (path == null) return;
+    const pathz = try std.heap.page_allocator.dupeSentinel(u8, path.?, 0);
+    defer std.heap.page_allocator.free(pathz);
+    const fd = std.c.open(pathz, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+    if (fd < 0) return error.ConsoleLogOpenFailed;
+    console_fd = fd;
+}
+
+pub fn closeConsoleLog() void {
+    if (console_fd >= 0) {
+        _ = std.c.close(console_fd);
+        console_fd = -1;
+    }
+}
+
+fn openReadOnlyDiskFd(io: Io, allocator: std.mem.Allocator, path: []const u8) !std.c.fd_t {
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(c_uint, 0));
+    if (fd < 0) return error.ContextDiskOpenFailed;
+    errdefer _ = std.c.close(fd);
+    const file = Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(io) catch return error.ContextDiskOpenFailed;
+    if (stat.kind != .file) return error.ContextDiskOpenFailed;
+    return fd;
 }
 
 fn policy(session: Session) FreshProductPolicy {
@@ -200,13 +320,15 @@ fn policy(session: Session) FreshProductPolicy {
         },
         .vcpus = session.vcpus,
         .resuming = session.machine == .restore,
-        .capture = session.mode.oneshot.capture != null,
+        .capture = session.mode == .oneshot and session.mode.oneshot.capture != null,
+        .disk_fork = session.mode == .monitor and session.mode.monitor.fork_head != null,
     };
 }
 
 /// The capture with dirty tracking only where the backend can track: HVF
 /// with one vCPU, and neither backend with elastic memory.
 fn trackedCapture(session: Session) ?capture.Capture {
+    if (session.mode != .oneshot) return null;
     var value = session.mode.oneshot.capture orelse return null;
     const elastic = switch (session.machine) {
         .boot => |boot| boot.memory.isElastic(),
@@ -222,13 +344,7 @@ fn x86Config(config: vmm.Config, mode: Mode) !x86_vm.Config {
         .boot => |boot| boot,
         .restore => return error.UnsupportedBackend,
     };
-    const probe, const watchdog_until_control = switch (mode) {
-        // A detached one-shot probe (`run --commit`) leaves the end of the
-        // run to its control, so the watchdog stays armed until the control
-        // finishes.
-        .oneshot => |oneshot| .{ oneshot.probe, oneshot.probe.on_complete == .detach },
-    };
-    return .{
+    var x86: x86_vm.Config = .{
         .kernel = boot.kernel,
         .initrd = boot.initrd,
         .cmdline = boot.cmdline,
@@ -237,15 +353,25 @@ fn x86Config(config: vmm.Config, mode: Mode) !x86_vm.Config {
         .console_sink = config.console_sink,
         .root_disk = config.disk_backend,
         .root_blk_options = config.root_blk_options,
+        .context_disk = if (config.context_disk_fd) |fd| .{ .file = fd } else null,
+        .build_input_disks = config.build_input_disk_backends,
+        .cache_disk = config.build_cache_disk_backend,
+        .cache_disk_writable = config.build_cache_disk_backend != null,
         .disk_snapshot = config.disk_snapshot,
         .network = config.network,
-        .exec_probe = probe.stream,
-        .exec_probe_start = probe.start,
-        .exec_probe_completes_run = probe.on_complete == .stop,
-        .exec_probe_watchdog_until_control = watchdog_until_control,
         .exec_control = config.exec_control,
-        .exec_probe_timeout_ms = probe.timeout_ms,
     };
+    if (config.probe) |probe| {
+        x86.exec_probe = probe.stream;
+        x86.exec_probe_start = probe.start;
+        x86.exec_probe_completes_run = probe.on_complete == .stop;
+        x86.exec_probe_timeout_ms = probe.timeout_ms;
+        // A detached one-shot probe (`run --commit`) leaves the end of the
+        // run to its control, so the watchdog stays armed until the control
+        // finishes. A monitor's readiness probe just detaches.
+        x86.exec_probe_watchdog_until_control = mode == .oneshot and probe.on_complete == .detach;
+    }
+    return x86;
 }
 
 fn x86Exit(cause: x86_vm.ExitCause) vmm.ExitCause {
@@ -288,7 +414,7 @@ fn validateFreshProductPolicyFor(zig_arch: std.Target.Cpu.Arch, selected_backend
     if (fresh_policy.vcpus != 1) return error.X86VcpuCountUnsupported;
 }
 
-pub fn rootBlkOptions(environ: *const std.process.Environ.Map, growth_session: bool, stats: *virtio_blk.Stats) virtio_blk.Options {
+fn rootBlkOptions(environ: *const std.process.Environ.Map, growth_session: bool, stats: *virtio_blk.Stats) virtio_blk.Options {
     if (!growth_session) return .{};
     const experiments_enabled = rootfsGrowthExperimentsEnabled(environ);
     return .{
@@ -317,7 +443,7 @@ pub fn rootfsGrowthNoInitItable(environ: *const std.process.Environ.Map) bool {
         !internalExperimentEnabled(environ.get(lazy_init_negative_control_experiment_env));
 }
 
-pub fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
+fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
     const snapshot = stats.snapshot();
     std.log.info(
         "rootfs growth blk metrics: accepted_features=0x{x} write_zeroes_requests={d} write_zeroes_bytes={d} write_zeroes_unmap={d} write_zeroes_ok={d} write_zeroes_errors={d} write_zeroes_backend_failures={d} write_zeroes_unsupported={d} out_requests={d} out_bytes={d} out_all_zero_requests={d} out_all_zero_bytes={d}",
@@ -338,7 +464,7 @@ pub fn logRootBlkStats(stats: *const virtio_blk.Stats) void {
     );
 }
 
-pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: spore_net_policy.NetworkMode, console_mirror: bool, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
+fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, rootfs_writable: bool, rootfs_growth: bool, noinit_itable: bool, network: spore_net_policy.NetworkMode, console_mirror: bool, build_context: bool, build_mode: bool, build_input_count: usize) ![]const u8 {
     const rootfs_flag = if (rootfs) " spore_rootfs=1" else "";
     const rootfs_rw_flag = if (rootfs and rootfs_writable) " spore_rootfs_rw=1" else "";
     const rootfs_growth_flag = if (rootfs and rootfs_writable and rootfs_growth) " spore_rootfs_growth=1" else "";
@@ -361,7 +487,7 @@ pub fn cmdline(allocator: std.mem.Allocator, guest_port: u32, rootfs: bool, root
     );
 }
 
-pub fn productBootArgs(allocator: std.mem.Allocator, base: []const u8) ![]const u8 {
+fn productBootArgs(allocator: std.mem.Allocator, base: []const u8) ![]const u8 {
     if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64) {
         var descriptors_buf: [x86_board.max_virtio_command_line_len]u8 = undefined;
         const descriptors = try x86_board.formatVirtioCommandLine(&descriptors_buf);
@@ -646,6 +772,110 @@ test "dirty tracking stays off where the backend cannot track it" {
     }
 }
 
+const FakeControl = struct {
+    fetcher: ?*image_store.Fetcher = null,
+
+    fn control(self: *FakeControl) vsock_control.Control {
+        return .{
+            .context = self,
+            .pollFn = poll,
+            .setWakeFn = setWake,
+            .completeSnapshotFn = completeSnapshot,
+            .completeRootfsSnapshotFn = completeRootfsSnapshot,
+            .attachImageStoreFn = attachImageStore,
+            .reportStatsFn = reportStats,
+        };
+    }
+
+    fn poll(_: *anyopaque, _: *vsock.Vsock) anyerror!vsock_control.ControlAction {
+        return .keep_running;
+    }
+    fn setWake(_: *anyopaque, _: vsock_control.Wake) void {}
+    fn completeSnapshot(_: *anyopaque, _: []const u8) anyerror!void {}
+    fn completeRootfsSnapshot(_: *anyopaque, _: ?spore.Disk) anyerror!void {}
+    fn reportStats(_: *anyopaque, _: vsock_control.ControlStats) void {}
+
+    fn attachImageStore(context: *anyopaque, fetcher: *image_store.Fetcher) void {
+        const self: *FakeControl = @ptrCast(@alignCast(context));
+        self.fetcher = fetcher;
+    }
+};
+
+test "a monitor's readiness request detaches, and a store-backed root disk hands the monitor its image store" {
+    var fixture: image_store.TestImage = undefined;
+    try fixture.init(rootfs_input.direct_image_platform);
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    try fixture.env.put(local_paths.rootfs_cache_env, try fixture.path("cache"));
+    const resolved = switch (try rootfs_input.resolveRootfsInputDetailedResult(fixture.processInit(), allocator, .{
+        .rootfs_path = null,
+        .image_ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}),
+        .command_name = "run",
+    })) {
+        .resolved => |resolved| resolved,
+        .failure => return error.ExpectedStoreImage,
+    };
+
+    var readiness = try vsock_stream.HostStream.init(10700, "{\"type\":\"ready\"}\n");
+    var control: FakeControl = .{};
+    var session = testSession(&readiness, test_boot);
+    session.disks = .{ .rootfs = resolved.rootfs };
+    session.mode = .{ .monitor = .{ .control = control.control(), .readiness = &readiness, .timeout_ms = 1234 } };
+    FakeVm.reset(.monitor_stopped);
+    try std.testing.expectEqual(vmm.ExitCause.monitor_stopped, try runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &fixture.env }, allocator, session));
+
+    const config = FakeVm.seen.?;
+    const probe = config.probe.?;
+    try std.testing.expectEqual(&readiness, probe.stream);
+    try std.testing.expectEqual(vmm.Probe.OnComplete.detach, probe.on_complete);
+    try std.testing.expectEqual(@as(u64, 1234), probe.timeout_ms);
+    try std.testing.expectEqual(@as(*anyopaque, &control), config.exec_control.?.context);
+    try std.testing.expect(config.capture == null);
+    try std.testing.expect(std.mem.indexOf(u8, config.start.boot.cmdline, "spore_build=1") == null);
+    // A save then fetches the objects the cache lacks before it seals.
+    try std.testing.expect(control.fetcher != null);
+}
+
+test "a build session attaches its context and cache disks and boots the build contract" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const context_path = try dir.path("context.ext4");
+    const context_bytes: [4096]u8 = @splat(0);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = context_path, .data = &context_bytes });
+    const cache_fd = std.c.open(try dir.path("cache.ext4"), .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o600));
+    try std.testing.expect(cache_fd >= 0);
+    defer _ = std.c.close(cache_fd);
+
+    var stream = try vsock_stream.HostStream.init(10700, "request\n");
+    var control: FakeControl = .{};
+    var session = testSession(&stream, test_boot);
+    session.mode = .{ .build = .{ .control = control.control(), .context_disk_path = context_path, .cache_disk_fd = cache_fd } };
+    FakeVm.reset(.monitor_stopped);
+    _ = try runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &env }, arena_state.allocator(), session);
+
+    const config = FakeVm.seen.?;
+    try std.testing.expect(config.probe == null);
+    try std.testing.expectEqual(@as(*anyopaque, &control), config.exec_control.?.context);
+    try std.testing.expect(config.context_disk_fd != null);
+    try std.testing.expectEqual(cache_fd, config.build_cache_disk_backend.?.file);
+    for ([_][]const u8{ "spore_build=1", "spore_build_context=1" }) |flag| {
+        try std.testing.expect(std.mem.indexOf(u8, config.start.boot.cmdline, flag) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, config.start.boot.cmdline, "spore_build_inputs=") == null);
+
+    // A context path that is not a regular file fails before the VM runs.
+    session.mode.build.context_disk_path = try dir.path("");
+    FakeVm.reset(.monitor_stopped);
+    try std.testing.expectError(error.ContextDiskOpenFailed, runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &env }, arena_state.allocator(), session));
+    try std.testing.expect(FakeVm.seen == null);
+}
+
 test "x86 boots only, and keeps the probe watchdog armed while a detached probe's control runs" {
     if (comptime !(builtin.os.tag == .linux and builtin.cpu.arch == .x86_64)) return error.SkipZigTest;
     const FakeX86 = struct {
@@ -686,6 +916,20 @@ test "x86 boots only, and keeps the probe watchdog armed while a detached probe'
     try std.testing.expectEqual(vmm.ExitCause.guest_off, try runOn(FakeX86, context, arena_state.allocator(), session));
     FakeX86.exit = .{ .terminal = .{ .vcpu_index = 0, .cause = .{ .system_event_reset = .{ .exit_reason = 0 } } } };
     try std.testing.expectEqual(vmm.ExitCause.guest_reset, try runOn(FakeX86, context, arena_state.allocator(), session));
+
+    // A monitor's readiness request detaches without arming the watchdog
+    // past it; a build has no probe and a writable cache disk.
+    var control: FakeControl = .{};
+    FakeX86.exit = .monitor_stopped;
+    session.mode = .{ .monitor = .{ .control = control.control(), .readiness = &stream, .timeout_ms = 1234 } };
+    try std.testing.expectEqual(vmm.ExitCause.monitor_stopped, try runOn(FakeX86, context, arena_state.allocator(), session));
+    try std.testing.expect(!FakeX86.seen.?.exec_probe_completes_run);
+    try std.testing.expect(!FakeX86.seen.?.exec_probe_watchdog_until_control);
+    try std.testing.expectEqual(@as(u64, 1234), FakeX86.seen.?.exec_probe_timeout_ms);
+    session.mode = .{ .build = .{ .control = control.control(), .cache_disk_fd = 0 } };
+    _ = try runOn(FakeX86, context, arena_state.allocator(), session);
+    try std.testing.expect(FakeX86.seen.?.exec_probe == null);
+    try std.testing.expect(FakeX86.seen.?.cache_disk_writable);
 
     FakeX86.seen = null;
     session.machine = .{ .restore = .{ .dir = "saved.spore", .ram = .eager_chunks } };

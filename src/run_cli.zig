@@ -17,6 +17,7 @@ const events_mod = @import("events.zig");
 const machine_output = @import("machine_output.zig");
 const run_mod = @import("run.zig");
 const spore = @import("spore.zig");
+const vm_session = @import("vm_session.zig");
 
 pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
@@ -46,8 +47,8 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
     var raw_output = RawOutputSink{};
     const events: api.EventSink = if (json_events) |writer| writer.sink() else raw_output.sink();
 
-    try run_mod.openConsoleLog(parsed.shared.console_log_path);
-    defer run_mod.closeConsoleLog();
+    try vm_session.openConsoleLog(parsed.shared.console_log_path);
+    defer vm_session.closeConsoleLog();
 
     const spore_executable = try std.process.executablePathAlloc(init.io, arena);
     const result = runParsed(init, arena, parsed, events, json_events != null, spore_executable, debug) catch |err| {
