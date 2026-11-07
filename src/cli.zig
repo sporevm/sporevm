@@ -261,6 +261,11 @@ fn invoke(command: *const Command, ctx: *const Ctx, args: []const []const u8) !v
         }
         return ctx.stdout.writeAll(command.usage);
     }
+    // What the handler prints under `--json` must be the table's schema.
+    machine_output.result_schema = switch (command.output) {
+        .result => |schema| schema.name,
+        .events, .text => null,
+    };
     command.run(ctx, args) catch |err| {
         if (ctx.mode == .json and command.output == .events) exitCommandError(command, ctx, events_mod.classifyFailure(err));
         return err;

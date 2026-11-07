@@ -312,15 +312,34 @@ pub fn fromZigError(err: anyerror) CliError {
     };
 }
 
+/// The schema of the running command's result in the `cli` command table,
+/// which every result `writeJson` prints must carry.
+pub var result_schema: ?[]const u8 = null;
+
+/// Prints a command's result document.
 pub fn writeJson(allocator: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
+    if (result_schema) |expected| std.debug.assert(std.mem.eql(u8, value.schema, expected));
+    try writeDocument(allocator, writer, value);
+}
+
+pub fn writeError(allocator: std.mem.Allocator, writer: *Io.Writer, err: CliError) !void {
+    try writeDocument(allocator, writer, err.envelope());
+}
+
+fn writeDocument(allocator: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
     const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
     try writer.writeAll(json);
     try writer.writeByte('\n');
 }
 
-pub fn writeError(allocator: std.mem.Allocator, writer: *Io.Writer, err: CliError) !void {
-    try writeJson(allocator, writer, err.envelope());
+test "a command whose result schema is set still prints errors" {
+    result_schema = "spore.version.result.v1";
+    defer result_schema = null;
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeError(std.testing.allocator, &out.writer, usageInvalidArgument("bad", "test"));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "\"spore.error.v1\"") != null);
 }
 
 test "stable error code table matches the plan" {
