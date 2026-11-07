@@ -12,8 +12,8 @@ same change that alters a surface.
 | Host user | Trusted. Owns the `spore` binary, kernels, the runtime root, the rootfs and kernel caches, and the monitor sockets. Local callers of a monitor are the same user. |
 | Guest | Untrusted. Runs hostile code and controls guest memory, virtqueues, MMIO and port I/O exits, vsock streams, network frames, and everything it prints. It must not escape the VMM, crash it, or gain host authority. |
 | Images and registries | Untrusted content. OCI manifests, layers, layouts, rootfs tars, image archives, Dockerfiles, and remote `ADD` sources are parsed with bounds and fail closed. Image code runs only as guest code. |
-| Image stores | Untrusted transport. A store chooses which image or checkpoint a tag names; everything else is checked against a digest. A store can deny service but cannot inject state. |
-| Network peers | Untrusted. DNS resolvers, remote `ADD` servers, and guest egress destinations can deny service or return wrong data, but gain no host authority: DNS answers never pass the network hard floor, and `ADD` bytes are only file content. |
+| Image stores | Untrusted transport; every file but a tag is checked against a digest. Through a digest ref a store can only deny service; through a tag it chooses the whole image or checkpoint, including a checkpoint's memory and network policy. |
+| Network peers | Untrusted. DNS resolvers, remote `ADD` servers, and guest egress destinations can deny service or return wrong data, but gain no host authority: DNS answers never pass the network hard floor, and an `ADD` server chooses only a file's bytes, its name (reduced to one safe component), and its mtime. |
 
 Local caches share the host user's trust domain: whoever can write them can
 also replace the binary or kernel. Cache integrity is enforced where bytes
@@ -73,6 +73,9 @@ Input: guest memory, rings, MMIO registers, and x86 port I/O and MMIO exits.
   queues.
 - Ring index accesses carry acquire/release barriers, so another vCPU's chains
   are parsed only after they are published.
+- A chain has at most 64 descriptors, and indirect descriptors are rejected.
+  Segments alias guest RAM that other vCPUs can rewrite, so devices read a
+  header or payload into host memory once and validate that copy.
 - One notify processes at most 256 chains (`queue.max_notify_chains`). On
   aarch64, a virtio-blk notify only wakes the disk's worker thread, which runs
   requests without the device lock and returns them before a queue reset or
@@ -90,8 +93,10 @@ Input: guest memory, rings, MMIO registers, and x86 port I/O and MMIO exits.
   one-byte accesses (CMOS, keyboard-controller status and reset, the `0x80`
   delay) is allowed. MMIO exits must be naturally aligned 1-, 2-, or 4-byte
   accesses inside one device window (8-byte also in the generation window).
-  The bzImage planner bounds every offset with checked arithmetic and fails
-  before writing guest RAM.
+  The poweroff doorbell accepts only a 32-bit write of `0x46464f50` at
+  offset `0x20` of the generation window; any other write touching it fails,
+  and reads return zero. The bzImage planner bounds every offset with checked
+  arithmetic and fails before writing guest RAM.
 - Restored multi-vCPU GIC state is validated before use.
 
 Fuzz tests: `fuzz virtqueue parsing`, `fuzz mmio register interface`,
@@ -265,7 +270,9 @@ the guest bytes a monitor relays.
 
 - The socket lives in `/tmp/sporevm-control-<uid>` under a digest of the
   runtime root and VM name, bound to the VM's registry directory by an owner
-  symlink, so collisions fail closed.
+  symlink, so collisions fail closed. That directory and the runtime root
+  must be real directories with no group or other permission bits, so only
+  the same user can reach a monitor.
 - A VM is live while its monitor holds an exclusive `flock` on the entry's
   `lock` file, never by pid. `spore vm rm` deletes an entry only while holding
   that lock; the monitor writes its entry only through a directory fd, and
@@ -307,6 +314,8 @@ policy argument.
   CIDR allows, and DNS-learned hosts.
 - DNS learning follows only in-order CNAME chains from the query name within
   one response, with bounded chain length and name decoding.
+- Under an allowlist, netd forwards only A/IN queries for allowed names; other
+  names get REFUSED and other query types for allowed names get NODATA.
 - At most 64 forwarded DNS queries are in flight, each on its own socket; one
   without an answer in 1 s gets SERVFAIL and excess queries are dropped.
 - The policy reaches the monitor and netd as one JSON argument with a strict
@@ -336,17 +345,24 @@ with everything they do inside the build VM.
   minimal `/dev`, and a cgroup device policy that denies block devices and
   consoles. A seccomp filter kills other syscall ABIs (including x32) and
   denies `io_uring_setup` and `AF_VSOCK` sockets. The capability set excludes
-  `CAP_SYS_ADMIN`, `CAP_SYS_RAWIO`, and `CAP_NET_ADMIN`. A setup or cleanup
-  failure blocks every publication.
+  `CAP_SYS_ADMIN`, `CAP_SYS_RAWIO`, and `CAP_NET_ADMIN`. The command inherits
+  no initrd fd: every agent fd is close-on-exec. A setup or cleanup failure
+  blocks every publication.
 - Cache mounts and context binds are at most 8 each per RUN. Cache IDs become
-  BLAKE3 keys, never host paths; binds are read-only regular files.
+  BLAKE3 keys, never host paths; binds are read-only regular files whose
+  targets must not overlap `/proc`, `/dev`, `/sys`, `/run/sporevm`,
+  `/run/buildkit`, or `/etc/resolv.conf`.
 - COPY resolves sources and destinations under the rootfs with
-  `RESOLVE_IN_ROOT` or a confined walk, capped at 65,536 entries.
+  `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS` or a confined walk, capped at
+  65,536 entries.
 - Remote `ADD` fetches only public HTTPS URLs: every request and redirect goes
   through `host_fetch_policy.zig`, sends no `Authorization`, and is bounded to
   64 instructions, 1 GiB, and 10 minutes per build. Bodies are staged,
-  synced, and hashed before cache lookup. `--chmod` must be octal `0` to
-  `07777`.
+  synced, and hashed before cache lookup. The file name, from
+  `Content-Disposition` or the URL path, is joined into the destination, so
+  `safeFileName` is the path-traversal guard: it keeps one component that is
+  not `.` or `..` and has no control characters. `Last-Modified` sets only
+  the mtime. `--chmod` must be octal `0` to `07777`.
 - Rootfs growth validates the ext4 superblock in the trusted initrd before the
   first writable mount; the host independently checks the reported geometry.
 - Step records are at most 16 MiB and publish only after their storage is
