@@ -126,6 +126,12 @@ restored from the save runs; that VM's runtime lease keeps its storage.
   of being partly applied. `spore run --from`, `spore attach` and
   `spore vm restore` check a `--generation` file against the same rules before
   the VM starts.
+- A `spore build` RUN could leave its root through a nested chroot (BuildKit
+  also grants `CAP_SYS_CHROOT`) and reach the build VM's initramfs, with its
+  guest-wide `/proc`, cgroup tree and build disks. The RUN root is now moved
+  over `/` before the chroot, as switch_root does. RUN still can't create user
+  namespaces, now enforced by seccomp, and `clone3` reports `ENOSYS`, as under
+  BuildKit's default profile.
 
 ### Other changes
 

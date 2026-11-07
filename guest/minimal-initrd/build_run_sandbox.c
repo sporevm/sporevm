@@ -382,15 +382,21 @@ enum syscall_filter_instruction {
   SYSCALL_LOAD_NUMBER,
   SYSCALL_KILL_X32,
   SYSCALL_DENY_IO_URING,
+  SYSCALL_HIDE_CLONE3,
+  SYSCALL_CHECK_CLONE,
+  SYSCALL_CHECK_UNSHARE,
   SYSCALL_CHECK_SOCKET,
   SYSCALL_CHECK_SOCKETPAIR,
   SYSCALL_ALLOW_OTHER_CALL,
+  SYSCALL_LOAD_CLONE_FLAGS,
+  SYSCALL_DENY_USER_NAMESPACE,
   SYSCALL_LOAD_SOCKET_FAMILY,
   SYSCALL_DENY_VSOCK,
   SYSCALL_ALLOW_OTHER_FAMILY,
   SYSCALL_DENY_RESULT,
   SYSCALL_ALLOW_RESULT,
   SYSCALL_KILL_RESULT,
+  SYSCALL_ENOSYS_RESULT,
   SYSCALL_FILTER_INSTRUCTION_COUNT,
 };
 
@@ -404,12 +410,28 @@ static int install_syscall_policy(char *error, size_t cap) {
              FORWARD_OFFSET(SYSCALL_KILL_X32, SYSCALL_KILL_RESULT), 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup,
              FORWARD_OFFSET(SYSCALL_DENY_IO_URING, SYSCALL_DENY_RESULT), 0),
+    /*
+     * A user namespace would grant capabilities the sandbox dropped, and the
+     * moved root no longer counts as a chroot that makes the kernel refuse
+     * one. clone3 passes its flags in memory, so like BuildKit's default
+     * profile it reports ENOSYS and libc falls back to clone.
+     */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone3,
+             FORWARD_OFFSET(SYSCALL_HIDE_CLONE3, SYSCALL_ENOSYS_RESULT), 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone,
+             FORWARD_OFFSET(SYSCALL_CHECK_CLONE, SYSCALL_LOAD_CLONE_FLAGS), 0),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_unshare,
+             FORWARD_OFFSET(SYSCALL_CHECK_UNSHARE, SYSCALL_LOAD_CLONE_FLAGS), 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket,
              FORWARD_OFFSET(SYSCALL_CHECK_SOCKET, SYSCALL_LOAD_SOCKET_FAMILY), 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socketpair,
              FORWARD_OFFSET(SYSCALL_CHECK_SOCKETPAIR, SYSCALL_LOAD_SOCKET_FAMILY), 0),
     BPF_STMT(BPF_JMP | BPF_JA,
              FORWARD_OFFSET(SYSCALL_ALLOW_OTHER_CALL, SYSCALL_ALLOW_RESULT)),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+    BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEWUSER,
+             FORWARD_OFFSET(SYSCALL_DENY_USER_NAMESPACE, SYSCALL_DENY_RESULT),
+             FORWARD_OFFSET(SYSCALL_DENY_USER_NAMESPACE, SYSCALL_ALLOW_RESULT)),
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_VSOCK,
              FORWARD_OFFSET(SYSCALL_DENY_VSOCK, SYSCALL_DENY_RESULT), 0),
@@ -418,6 +440,7 @@ static int install_syscall_policy(char *error, size_t cap) {
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (ENOSYS & SECCOMP_RET_DATA)),
   };
   _Static_assert(sizeof(filter) / sizeof(filter[0]) == SYSCALL_FILTER_INSTRUCTION_COUNT,
                  "syscall filter labels must describe every instruction");
@@ -469,11 +492,15 @@ int spore_build_run_sandbox_enter(
   if (setup_operation_mounts(rootfs, error, error_cap) != 0) return -1;
 
   /*
-   * The initramfs rootfs cannot be a pivot_root old root. A private mount
-   * namespace plus a descriptor-clean chroot is the equivalent confinement:
-   * scoped procfs contains no ancestor task, and exec closes every initrd fd.
+   * The initramfs rootfs cannot be a pivot_root old root, so switch roots as
+   * switch_root does: move the operation rootfs over "/" in this private mount
+   * namespace and chroot into it. ".." at its root then stays there, even from
+   * a working directory left outside a later chroot by the command, which
+   * keeps CAP_SYS_CHROOT as harmless as it is after pivot_root. Scoped procfs
+   * names no ancestor task, and exec closes every initrd fd.
    */
-  if (chdir(rootfs) != 0 || chroot(".") != 0 || chdir("/") != 0) {
+  if (chdir(rootfs) != 0 || mount(".", "/", NULL, MS_MOVE, NULL) != 0 ||
+      chroot(".") != 0 || chdir("/") != 0) {
     return set_error(error, error_cap, "enter operation rootfs");
   }
   if (install_syscall_policy(error, error_cap) != 0) return -1;
