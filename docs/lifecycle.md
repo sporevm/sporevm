@@ -493,7 +493,7 @@ spawned. `test/smoke/monitor/jail.sh` covers the denied-operation path.
 - `spore run -i` supports pipe-style stdin forwarding for one-shot runs.
 - `spore run -t` allocates a guest PTY for one-shot runs, and `spore run -it`
   forwards host terminal input in raw mode. TTY mode has one merged terminal
-  output stream; JSONL emits it as `event:"terminal"`.
+  output stream; `--json` emits it as `event:"terminal"` records.
 - `spore attach -i` and `spore attach -t` can attach to saved live sessions
   only when that session was originally started with interactive stdin or a PTY.
   `spore run --from <spore-dir> <command>` starts a new command from saved VM

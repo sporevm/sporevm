@@ -157,8 +157,8 @@ updates the destination ref.
 Every RUN executes in an operation-owned PID and mount view with scoped procfs,
 a fresh minimal `/dev`, protected kernel paths, cgroup device controls, and
 seccomp restrictions around host-control surfaces. Cleanup must complete before
-the step result can be published. The full isolation and parser boundaries live
-in [SECURITY.md](../SECURITY.md).
+the step result can be published. The isolation and parser invariants are in
+[SECURITY.md](../SECURITY.md).
 
 The final local image identity binds the selected rootfs index and canonical OCI
 runtime configuration. `--no-cache` bypasses Dockerfile step-record reads but
