@@ -346,8 +346,12 @@ with everything they do inside the build VM.
   consoles. A seccomp filter kills other syscall ABIs (including x32) and
   denies `io_uring_setup` and `AF_VSOCK` sockets. The capability set excludes
   `CAP_SYS_ADMIN`, `CAP_SYS_RAWIO`, and `CAP_NET_ADMIN`. The command inherits
-  no initrd fd: every agent fd is close-on-exec. A setup or cleanup failure
-  blocks every publication.
+  no initrd fd: every agent fd is close-on-exec. The rootfs is moved over `/`
+  before the chroot, as switch_root does, so a nested chroot with the granted
+  `CAP_SYS_CHROOT` cannot walk `..` out of it, and as in BuildKit's default
+  profile the filter denies `CLONE_NEWUSER` to `clone` and `unshare` and
+  returns `ENOSYS` for `clone3`. A setup or cleanup failure blocks every
+  publication.
 - Cache mounts and context binds are at most 8 each per RUN. Cache IDs become
   BLAKE3 keys, never host paths; binds are read-only regular files whose
   targets must not overlap `/proc`, `/dev`, `/sys`, `/run/sporevm`,
