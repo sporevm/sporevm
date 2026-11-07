@@ -5,18 +5,60 @@ output remains intentionally unstable.
 
 ## CLI surfaces
 
-Bounded commands use global `spore --json <command> ...` and emit exactly one
-schema-versioned JSON result on stdout. SporeVM failures emit one
-`spore.error.v1` document on stderr and nothing on stdout. Help is human
-output: `spore --json <command> --help` fails with `usage.invalid_argument`.
-The bounded surface includes version and inspection, system operations, image
-operations, build, named lifecycle and copy operations, and checkpoint push and
-pull.
+Put global `--json` before the command, as in `spore --json vm ls`. Help is
+human output: `spore --json <command> --help` fails with
+`usage.invalid_argument`. The internal `monitor` and `netd` commands refuse
+`--json`.
 
-Under the same global `--json`, the streaming commands `run`, `attach`,
-`fanout` and `vm exec` print `spore.automation.event.v1` records on stdout,
-one per line, instead of the guest's raw output. Every stream, including one
-that fails on its arguments, ends with exactly one `completion` record:
+### Results
+
+Commands other than `run`, `attach`, `fanout` and `vm exec` print exactly one
+JSON result on stdout. A failure prints one `spore.error.v1`
+document on stderr and nothing on stdout. Each result has `schema`,
+`schema_version` and these top-level fields:
+
+| Schema | Commands | Fields |
+| --- | --- | --- |
+| `spore.build.result.v1` | `build` | `resolved_image_ref`: string, `index_digest`: string, `metadata_path`: string, `local_ref_path`: string, `cache_hit`: boolean |
+| `spore.lifecycle.v1` | `vm create`, `vm logs`, `vm save`, `vm restore`, `vm rm` | `resource_type`: string, `action`: string, `name`: string, `state`: string, `pid`: integer or null, `console_log_path`: string or null, `spore_dir`: string or null, `saved_sessions`: integer or null, `ownership`: string or null, `timing`: object or null, `initial_command`: object or null |
+| `spore.copy.result.v1` | `vm copy-in`, `vm copy-out` | `direction`: string, `name`: string, `host_path`: string, `guest_path`: string |
+| `spore.lifecycle.fork.result.v1` | `vm fork` | `resource_type`: string, `source`: string, `count`: integer, `children`: array of strings, `ram_capture_ms`: integer or null, `disk_fork_ms`: integer or null, `source_pause_ms`: integer or null, `child_ready_ms`: integer or null |
+| `spore.lifecycle.list.result.v2` | `vm ls` | `entries`: array of objects |
+| `spore.inspect.result.v1` | `checkpoint inspect` | `resource_type`: string, `portability`: string, `can_attach`: boolean, `can_run_from`: boolean, `version`: integer, `vm_state_present`: boolean, `storage_mode`: string, `ownership`: string, `vcpu_count`: integer, `platform`: object, `device_count`: integer, `memory_chunk_count`: integer, `present_memory_chunk_count`: integer, `memory_backing_kind`: string or null, `memory_backing_size`: integer or null, `initial_memory_bytes`: integer, `max_memory_bytes`: integer, `requested_memory_bytes`: integer, `captured_memory_bytes`: integer, `plugged_memory_ranges`: array of objects, `gic_kind`: string, `sessions`: array of objects, `network`: object or null, `annotations`: object, `annotation_keys`: array of strings |
+| `spore.fork.result.v1` | `checkpoint fork` | `resource_type`: string, `parent`: string, `out_dir`: string, `count`: integer, `parent_generation`: integer, `first_generation`: integer, `last_generation`: integer, `first_child`: string, `last_child`: string, `pin_publish_ms`: integer or null, `pin_lock_wait_ms`: integer or null |
+| `spore.saved.remove.result.v2` | `checkpoint rm` | `resource_type`: string, `action`: string, `spore_dir`: string |
+| `spore.push.result.v2` | `checkpoint push` | `resource_type`: string, `ref`: string, `spore_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
+| `spore.pull.result.v2` | `checkpoint pull` | `resource_type`: string, `ref`: string, `spore_digest`: string, `out_dir`: string, `ram`: object, `disk`: object |
+| `spore.rootfs.import.result.v2` | `image import-oci`, `image import-tar` | `metadata_path`: string, `local_ref_path`: string, `resolved_image_ref`: string, `image_manifest_digest`: string, `rootfs_storage`: object |
+| `spore.rootfs.resolve.result.v1` | `image resolve` | `ref`: string, `resolved_image_ref`: string |
+| `spore.rootfs.build.result.v1` | `image export` | `rootfs_storage`: object |
+| `spore.image.push.result.v1` | `image push` | `resource_type`: string, `ref`: string, `image_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
+| `spore.image.archive.pack.result.v1` | `image pack` | `resource_type`: string, `archive_digest`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `archive_bytes`: integer |
+| `spore.image.archive.unpack.result.v1` | `image unpack` | `resource_type`: string, `resolved_image_ref`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer |
+| `spore.host-info.v3` | `system info` | `host_class`: string, `architecture`: string, `platform`: object, `backends`: array of objects, `cache_roots`: object |
+| `spore.system.df.result.v1` | `system df` | `cache_root`: string, `image_rootfs`: object, `linked_image_rootfs`: object, `image_metadata`: object, `digest_artifacts`: object, `cas_indexes`: object, `cas_objects`: object, `cas_complete_stamps`: object, `ref_records`: object, `temp_entries`: object, `build_cache_mounts`: object, `known_logical_bytes`: integer, `default_prunable_bytes`: integer |
+| `spore.system.prune.result.v1` | `system prune` | `cache_root`: string, `dry_run`: boolean, `include_digest_artifacts`: boolean, `include_rootfs_chunks`: boolean, `older_than_seconds`: integer or null, `max_bytes`: integer or null, `scope_bytes_before`: integer, `scope_bytes_after`: integer, `candidate_count`: integer, `candidate_bytes`: integer, `candidate_reclaimable_bytes`: integer, `cache_mount_candidate_count`: integer, `cache_mount_candidate_reclaimable_bytes`: integer, `default_selection`: boolean, `deleted_count`: integer, `deleted_bytes`: integer, `deleted_reclaimable_bytes`: integer, `cache_mount_deleted_count`: integer, `cache_mount_deleted_reclaimable_bytes`: integer, `entries`: array of objects, `runtime_forks`: object or null |
+| `spore.cache.gc.result.v2` | `system gc` | `cache_root`: string, `dry_run`: boolean, `rooted_indexes`: integer, `rooted_objects`: integer, `unparseable_metadata_count`: integer, `unparseable_step_record_count`: integer, `unparseable_pin_count`: integer, `pin_index_validation_count`: integer, `stale_step_record_count`: integer, `step_record_candidate_count`: integer, `step_record_deleted_count`: integer, `candidate_count`: integer, `candidate_bytes`: integer, `deleted_count`: integer, `deleted_bytes`: integer, `cache_mount_candidate_count`: integer, `cache_mount_candidate_bytes`: integer, `cache_mount_deleted_count`: integer, `cache_mount_deleted_bytes`: integer, `entries`: array of objects |
+| `spore.cache.pins.result.v1` | `system pins` | `entries`: array of objects |
+| `spore.cache.unpin.result.v1` | `system unpin` | `action`: string, `id`: string |
+| `spore.version.result.v1` | `version` | `version`: string, `build_mode`: string |
+
+- `resource_type` is `live_vm`, `checkpoint` or `image`.
+- `initial_command`, from `vm create` and `vm logs`, reports the output
+  disposition, destination, bound and startup status; `vm logs` adds the
+  process status, exit code, retained output and per-stream truncation flags.
+- Each `vm ls` entry has a `memory` object with `initial_bytes` and
+  `maximum_bytes`.
+- A fixed-memory checkpoint reports one value for all four memory sizes and an
+  empty `plugged_memory_ranges`.
+- `build` suppresses executor output, so its result is the only stdout.
+
+### Event streams
+
+`run`, `attach`, `fanout` and `vm exec` print `spore.automation.event.v1`
+records on stdout, one per line, instead of the guest's raw output. Every
+stream, including one that fails on its arguments, ends with exactly one
+`completion` record:
 
 ```json
 {"schema":"spore.automation.event.v1","schema_version":1,"event":"completion","outcome":"completed","command":"exec","backend":null,"exit_code":0}
@@ -26,55 +68,21 @@ that fails on its arguments, ends with exactly one `completion` record:
 delivered the operation's terminal result; a guest process can therefore be
 completed with a non-zero `exit_code`. Failed and canceled completions contain
 the same `error` body as `spore.error.v1`, and their top-level `exit_code`
-matches the stable classified status in that body.
+matches the stable classified status in that body. Run and attach completions
+report `memory_bytes`, the initial guest-visible memory, and
+`max_memory_bytes`, the ceiling; equal values mean fixed memory.
 
 An event consumer must treat EOF, a broken pipe, or a transport error before
 `completion` as `stream.interrupted`. It must not infer success from a final
 stdout/stderr record. Re-running after interruption is caller-dependent because
 the underlying operation may have completed after the consumer lost the stream.
 
-`monitor` and `netd` are internal helper roles, not public automation commands,
-and refuse `--json`. Fanout output events add a `child` field so
-callers can separate each child's stdout and stderr without parsing human
-prefixes. They also carry a byte `offset` and `byte_count` within that child's
-stream. Fanout emits one `child_completion` for every child; a non-zero guest
-exit is a completed child result and contributes that status to the aggregate
-completion, while an abnormal child termination fails the aggregate stream.
-Build is bounded in global JSON mode: executor output is suppressed
-and the final `spore.build.result.v1` document is the only stdout value.
-
-The bounded schema inventory is:
-
-| Operations | Result schemas |
-| --- | --- |
-| `version`, `system info`, `checkpoint inspect` | `spore.version.result.v1`, `spore.host-info.v3`, `spore.inspect.result.v1` |
-| `checkpoint fork`/`push`/`pull` | `spore.fork.result.v1`, `spore.push.result.v2`, `spore.pull.result.v2` |
-| `vm create`, `logs`, `save`, `restore`, `rm`, `fork`, `ls`, `copy-in`/`copy-out`; `checkpoint rm` | `spore.lifecycle.v1`, `spore.saved.remove.result.v2`, `spore.lifecycle.fork.result.v1`, `spore.lifecycle.list.result.v2`, `spore.copy.result.v1` |
-| `build`; `image export`, `import-oci`/`import-tar`, `resolve`, `pack`/`unpack`, `push` | `spore.build.result.v1`, `spore.rootfs.build.result.v1`, `spore.rootfs.import.result.v2`, `spore.rootfs.resolve.result.v1`, `spore.image.archive.pack.result.v1`, `spore.image.archive.unpack.result.v1`, `spore.image.push.result.v1` |
-| `system df`/`prune`/`gc`/`pins`/`unpin` | `spore.system.df.result.v1`, `spore.system.prune.result.v1`, `spore.cache.gc.result.v2`, `spore.cache.pins.result.v1`, `spore.cache.unpin.result.v1` |
-
-Run and attach completion records expose `memory_bytes` as initial
-guest-visible memory and `max_memory_bytes` as the ceiling; equal values mean
-fixed memory. Checkpoint inspection adds `initial_memory_bytes`,
-`max_memory_bytes`, `requested_memory_bytes`, `captured_memory_bytes`, and
-`plugged_memory_ranges`. Fixed-memory manifests report the same value for all
-four sizes and an empty range list.
-
-`vm create` and `vm logs` share `spore.lifecycle.v1`. Its optional
-`initial_command` object first reports output disposition, destination, bound,
-and startup status, then the logs result adds process status, optional exit
-code, retained bytes, and per-stream truncation flags.
-
-`vm ls` uses `spore.lifecycle.list.result.v2`; its `memory` object
-contains `initial_bytes` and `maximum_bytes`. Version 1 exposed the removed
-automatic-memory policy and is not compatible with the explicit two-size
-contract.
-
-Result schemas keep their existing names. Additive `resource_type` fields
-identify `live_vm`, `checkpoint`, or `image`, and checkpoint
-inspection also reports `can_attach`, `can_run_from`, `sessions` with
-per-session stream support, `portability`, and `ownership`. Existing consumers
-may ignore these fields under the v1 additive-field rule.
+Fanout output events add a `child` field so callers can separate each child's
+stdout and stderr without parsing human prefixes. They also carry a byte
+`offset` and `byte_count` within that child's stream. Fanout emits one
+`child_completion` for every child; a non-zero guest exit is a completed child
+result and contributes that status to the aggregate completion, while an
+abnormal child termination fails the aggregate stream.
 
 ## Stable failures
 

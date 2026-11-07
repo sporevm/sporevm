@@ -318,8 +318,6 @@ pub const NamedListResult = struct {
 };
 
 pub const ExecNamedResult = struct {
-    schema: []const u8 = "spore.exec.result.v1",
-    schema_version: u32 = 1,
     exit_code: u8,
     stdout: []u8,
     stderr: []u8,

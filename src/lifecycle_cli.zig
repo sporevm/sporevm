@@ -603,6 +603,15 @@ fn copyGuestStderrFd(mode: machine_output.Mode) std.c.fd_t {
     return if (mode == .json) -1 else 2;
 }
 
+pub const CopyResult = struct {
+    schema: []const u8 = "spore.copy.result.v1",
+    schema_version: u32 = 1,
+    direction: []const u8,
+    name: []const u8,
+    host_path: []const u8,
+    guest_path: []const u8,
+};
+
 pub fn copyInCli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
@@ -672,9 +681,7 @@ pub fn copyInCli(ctx: *const Ctx, args: []const []const u8) !void {
         }
         exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
     }
-    if (mode == .json) try machine_output.writeJson(allocator, stdout, .{
-        .schema = "spore.copy.result.v1",
-        .schema_version = @as(u32, 1),
+    if (mode == .json) try machine_output.writeJson(allocator, stdout, CopyResult{
         .direction = "in",
         .name = parsed.name,
         .host_path = parsed.host_path,
@@ -765,9 +772,7 @@ pub fn copyOutCli(ctx: *const Ctx, args: []const []const u8) !void {
         std.debug.print("spore vm copy-out: cannot write host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
         exitAfterCopyArchiveCleanup(&archive, init.io, 1);
     };
-    if (mode == .json) try machine_output.writeJson(allocator, stdout, .{
-        .schema = "spore.copy.result.v1",
-        .schema_version = @as(u32, 1),
+    if (mode == .json) try machine_output.writeJson(allocator, stdout, CopyResult{
         .direction = "out",
         .name = parsed.name,
         .host_path = parsed.host_path,

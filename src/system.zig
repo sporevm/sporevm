@@ -469,6 +469,19 @@ pub fn pinsCli(ctx: *const Ctx, args: []const []const u8) !void {
     try writePinListings(init.arena.allocator(), ctx.stdout, entries, ctx.mode);
 }
 
+pub const UnpinResult = struct {
+    schema: []const u8 = "spore.cache.unpin.result.v1",
+    schema_version: u32 = 1,
+    action: []const u8 = "unpinned",
+    id: []const u8,
+};
+
+pub const PinsResult = struct {
+    schema: []const u8 = "spore.cache.pins.result.v1",
+    schema_version: u32 = 1,
+    entries: []const saved_spore_pin.Listing,
+};
+
 pub fn unpinCli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
@@ -484,12 +497,7 @@ pub fn unpinCli(ctx: *const Ctx, args: []const []const u8) !void {
     const registry = try saved_spore_pin.LockedRegistry.init(init.arena.allocator(), root, &lock);
     if (mode != .json) try stderr.print("warning: force-unpinning {s} may invalidate every raw copy that shares this pin\n", .{args[0]});
     try saved_spore_pin.remove(init.io, init.arena.allocator(), registry, args[0]);
-    const result = struct {
-        schema: []const u8 = "spore.cache.unpin.result.v1",
-        schema_version: u32 = 1,
-        action: []const u8 = "unpinned",
-        id: []const u8,
-    }{ .id = args[0] };
+    const result = UnpinResult{ .id = args[0] };
     if (mode == .json) try machine_output.writeJson(init.arena.allocator(), stdout, result) else {
         try stdout.print("unpinned {s}\n", .{args[0]});
         try stdout.flush();
@@ -497,11 +505,7 @@ pub fn unpinCli(ctx: *const Ctx, args: []const []const u8) !void {
 }
 
 fn writePinListings(allocator: std.mem.Allocator, writer: *Io.Writer, entries: []const saved_spore_pin.Listing, mode: machine_output.Mode) !void {
-    if (mode == .json) return machine_output.writeJson(allocator, writer, .{
-        .schema = "spore.cache.pins.result.v1",
-        .schema_version = @as(u32, 1),
-        .entries = entries,
-    });
+    if (mode == .json) return machine_output.writeJson(allocator, writer, PinsResult{ .entries = entries });
     for (entries) |entry| try writer.print("{s}\t{s}\t{s}\t{s}\n", .{ entry.id, @tagName(entry.owner_state), @tagName(entry.state), entry.index_digest orelse "-" });
     try writer.flush();
 }
