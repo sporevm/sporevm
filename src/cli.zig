@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const api = @import("api.zig");
 const attach_cli = @import("attach_cli.zig");
 const attach_mod = @import("attach.zig");
 const build_cli = @import("build_cli.zig");
@@ -11,6 +12,7 @@ const checkpoint_cli = @import("checkpoint_cli.zig");
 const events_mod = @import("events.zig");
 const fanout = @import("fanout.zig");
 const image_cli = @import("image_cli.zig");
+const lifecycle = @import("lifecycle.zig");
 const lifecycle_cli = @import("lifecycle_cli.zig");
 const machine_output = @import("machine_output.zig");
 const monitor = @import("monitor.zig");
@@ -21,9 +23,9 @@ const system = @import("system.zig");
 const version_value = @import("version.zig").value;
 
 /// What a command prints under global `--json`.
-pub const Output = enum {
+pub const Output = union(enum) {
     /// One result document on stdout, or `spore.error.v1` on stderr.
-    result,
+    result: Schema,
     /// `spore.automation.event.v1` lines on stdout ending in one `completion`,
     /// which also reports a failure.
     events,
@@ -46,6 +48,48 @@ pub const Ctx = struct {
     }
 };
 
+/// A result document's schema name and top-level fields.
+pub const Schema = struct {
+    name: []const u8,
+    /// Each field but `schema` and `schema_version` as "`name`: type",
+    /// joined by ", ", as docs/automation.md lists them.
+    fields: []const u8,
+
+    /// The schema of result type `T`, whose `schema` field defaults to its name.
+    pub fn of(comptime T: type) Schema {
+        comptime {
+            @setEvalBranchQuota(10_000);
+            std.debug.assert(@FieldType(T, "schema_version") == u32);
+            var fields: []const u8 = "";
+            for (std.meta.fieldNames(T)) |name| {
+                if (std.mem.eql(u8, name, "schema") or std.mem.eql(u8, name, "schema_version")) continue;
+                const separator = if (fields.len == 0) "" else ", ";
+                fields = fields ++ separator ++ "`" ++ name ++ "`: " ++ jsonType(@FieldType(T, name));
+            }
+            return .{ .name = std.meta.fieldInfo(T, .schema).defaultValue().?, .fields = fields };
+        }
+    }
+};
+
+/// How `std.json` prints a value of type `T`.
+fn jsonType(comptime T: type) []const u8 {
+    return switch (@typeInfo(T)) {
+        .bool => "boolean",
+        .int => "integer",
+        .float => "number",
+        .@"enum" => "string",
+        .@"struct", .@"union" => "object",
+        .optional => |optional| jsonType(optional.child) ++ " or null",
+        .pointer => |pointer| if (pointer.size == .one) jsonType(pointer.child) else arrayType(pointer.child),
+        .array => |array| arrayType(array.child),
+        else => @compileError("no JSON type for " ++ @typeName(T)),
+    };
+}
+
+fn arrayType(comptime Element: type) []const u8 {
+    return if (Element == u8) "string" else "array of " ++ jsonType(Element) ++ "s";
+}
+
 pub const Command = struct {
     /// A word, or a group word and a verb such as "vm rm".
     name: []const u8,
@@ -62,48 +106,50 @@ pub const commands = [_]Command{
     .{ .name = "run", .summary = "Boot a throwaway VM and run one command", .usage = run_mod.cli_usage, .output = .events, .run = run_cli.cli },
     .{ .name = "attach", .summary = "Restore a checkpoint and attach to its saved session", .usage = attach_mod.cli_usage, .output = .events, .run = attach_cli.cli },
     .{ .name = "fanout", .summary = "Attach forked children concurrently with prefixed output", .usage = fanout.cli_usage, .output = .events, .run = fanout.cli },
-    .{ .name = "build", .summary = "Build a Spore image from a Dockerfile subset", .usage = build_cli.usage, .output = .result, .run = build_cli.run },
-    .{ .name = "vm create", .summary = "Create a named VM", .usage = lifecycle_cli.create_usage, .output = .result, .run = lifecycle_cli.createCli },
+    .{ .name = "build", .summary = "Build a Spore image from a Dockerfile subset", .usage = build_cli.usage, .output = .{ .result = .of(@import("build.zig").Result) }, .run = build_cli.run },
+    .{ .name = "vm create", .summary = "Create a named VM", .usage = lifecycle_cli.create_usage, .output = .{ .result = .of(lifecycle.NamedLifecycleResult) }, .run = lifecycle_cli.createCli },
     .{ .name = "vm exec", .summary = "Execute a command in a named VM", .usage = lifecycle_cli.exec_usage, .output = .events, .run = lifecycle_cli.execCli },
-    .{ .name = "vm logs", .summary = "Show retained initial-command stdout and stderr", .usage = lifecycle_cli.logs_usage, .output = .result, .run = lifecycle_cli.logsCli },
-    .{ .name = "vm copy-in", .summary = "Copy one host file or directory into a named VM", .usage = lifecycle_cli.copy_in_usage, .output = .result, .run = lifecycle_cli.copyInCli },
-    .{ .name = "vm copy-out", .summary = "Copy one guest file or directory out of a named VM", .usage = lifecycle_cli.copy_out_usage, .output = .result, .run = lifecycle_cli.copyOutCli },
-    .{ .name = "vm save", .summary = "Save a named VM as a checkpoint; --stop removes the VM", .usage = lifecycle_cli.save_usage, .output = .result, .run = lifecycle_cli.saveCli },
-    .{ .name = "vm restore", .summary = "Restore a checkpoint as a named VM", .usage = lifecycle_cli.restore_usage, .output = .result, .run = lifecycle_cli.restoreCli },
-    .{ .name = "vm fork", .summary = "Fork a named VM into named VM children", .usage = lifecycle_cli.fork_usage, .output = .result, .run = lifecycle_cli.forkCli },
-    .{ .name = "vm rm", .summary = "Stop a named VM and delete its runtime state", .usage = lifecycle_cli.rm_usage, .output = .result, .run = lifecycle_cli.rmCli },
-    .{ .name = "vm ls", .summary = "List named VMs", .usage = lifecycle_cli.ls_usage, .output = .result, .run = lifecycle_cli.lsCli },
-    .{ .name = "checkpoint inspect", .summary = "Print a checkpoint manifest summary", .usage = checkpoint_cli.inspect_usage, .output = .result, .run = checkpoint_cli.inspect },
-    .{ .name = "checkpoint fork", .summary = "Fork a checkpoint into child checkpoints", .usage = checkpoint_cli.fork_usage, .output = .result, .run = checkpoint_cli.fork },
-    .{ .name = "checkpoint rm", .summary = "Remove a checkpoint directory", .usage = checkpoint_cli.rm_usage, .output = .result, .run = checkpoint_cli.rm },
-    .{ .name = "checkpoint push", .summary = "Push a checkpoint to an image store", .usage = checkpoint_cli.push_usage, .output = .result, .run = checkpoint_cli.push },
-    .{ .name = "checkpoint pull", .summary = "Pull a checkpoint from an image store", .usage = checkpoint_cli.pull_usage, .output = .result, .run = checkpoint_cli.pull },
-    .{ .name = "image import-oci", .summary = "Import an OCI image layout as a local image", .usage = image_cli.import_oci_usage, .output = .result, .run = image_cli.importOci },
-    .{ .name = "image import-tar", .summary = "Import a rootfs tar as a local image", .usage = image_cli.import_tar_usage, .output = .result, .run = image_cli.importTar },
-    .{ .name = "image resolve", .summary = "Resolve an image tag to a digest reference", .usage = image_cli.resolve_usage, .output = .result, .run = image_cli.resolve },
-    .{ .name = "image export", .summary = "Write a registry image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .result, .run = image_cli.exportRootfs },
-    .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.usage, .output = .result, .run = image_cli.push },
-    .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.usage, .output = .result, .run = image_cli.pack },
-    .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.usage, .output = .result, .run = image_cli.unpack },
-    .{ .name = "system info", .summary = "Print this host's platform facts", .usage = system.info_usage, .output = .result, .run = system.infoCli },
-    .{ .name = "system df", .summary = "Show local cache usage", .usage = system.usage, .output = .result, .run = system.dfCli },
-    .{ .name = "system prune", .summary = "Prune local caches and old runtime fork batches", .usage = system.usage, .output = .result, .run = system.pruneCli },
-    .{ .name = "system gc", .summary = "Collect unreferenced content-addressed cache storage", .usage = system.gc_usage, .output = .result, .run = system.gcCli },
-    .{ .name = "system pins", .summary = "List saved-spore pins", .usage = system.gc_usage, .output = .result, .run = system.pinsCli },
-    .{ .name = "system unpin", .summary = "Drop one saved-spore pin (expert-only)", .usage = system.gc_usage, .output = .result, .run = system.unpinCli },
-    .{ .name = "version", .summary = "Print the spore version", .usage = "usage: spore version\n", .output = .result, .run = version },
+    .{ .name = "vm logs", .summary = "Show retained initial-command stdout and stderr", .usage = lifecycle_cli.logs_usage, .output = .{ .result = .of(lifecycle.NamedLifecycleResult) }, .run = lifecycle_cli.logsCli },
+    .{ .name = "vm copy-in", .summary = "Copy one host file or directory into a named VM", .usage = lifecycle_cli.copy_in_usage, .output = .{ .result = .of(lifecycle_cli.CopyResult) }, .run = lifecycle_cli.copyInCli },
+    .{ .name = "vm copy-out", .summary = "Copy one guest file or directory out of a named VM", .usage = lifecycle_cli.copy_out_usage, .output = .{ .result = .of(lifecycle_cli.CopyResult) }, .run = lifecycle_cli.copyOutCli },
+    .{ .name = "vm save", .summary = "Save a named VM as a checkpoint; --stop removes the VM", .usage = lifecycle_cli.save_usage, .output = .{ .result = .of(lifecycle.NamedLifecycleResult) }, .run = lifecycle_cli.saveCli },
+    .{ .name = "vm restore", .summary = "Restore a checkpoint as a named VM", .usage = lifecycle_cli.restore_usage, .output = .{ .result = .of(lifecycle.NamedLifecycleResult) }, .run = lifecycle_cli.restoreCli },
+    .{ .name = "vm fork", .summary = "Fork a named VM into named VM children", .usage = lifecycle_cli.fork_usage, .output = .{ .result = .of(lifecycle.NamedForkResult) }, .run = lifecycle_cli.forkCli },
+    .{ .name = "vm rm", .summary = "Stop a named VM and delete its runtime state", .usage = lifecycle_cli.rm_usage, .output = .{ .result = .of(lifecycle.NamedLifecycleResult) }, .run = lifecycle_cli.rmCli },
+    .{ .name = "vm ls", .summary = "List named VMs", .usage = lifecycle_cli.ls_usage, .output = .{ .result = .of(lifecycle.NamedListResult) }, .run = lifecycle_cli.lsCli },
+    .{ .name = "checkpoint inspect", .summary = "Print a checkpoint manifest summary", .usage = checkpoint_cli.inspect_usage, .output = .{ .result = .of(api.SporeInspectResult) }, .run = checkpoint_cli.inspect },
+    .{ .name = "checkpoint fork", .summary = "Fork a checkpoint into child checkpoints", .usage = checkpoint_cli.fork_usage, .output = .{ .result = .of(api.ForkResult) }, .run = checkpoint_cli.fork },
+    .{ .name = "checkpoint rm", .summary = "Remove a checkpoint directory", .usage = checkpoint_cli.rm_usage, .output = .{ .result = .of(lifecycle.RemovedSavedSpore) }, .run = checkpoint_cli.rm },
+    .{ .name = "checkpoint push", .summary = "Push a checkpoint to an image store", .usage = checkpoint_cli.push_usage, .output = .{ .result = .of(api.PushResult) }, .run = checkpoint_cli.push },
+    .{ .name = "checkpoint pull", .summary = "Pull a checkpoint from an image store", .usage = checkpoint_cli.pull_usage, .output = .{ .result = .of(api.PullResult) }, .run = checkpoint_cli.pull },
+    .{ .name = "image import-oci", .summary = "Import an OCI image layout as a local image", .usage = image_cli.import_oci_usage, .output = .{ .result = .of(api.RootfsImportOciResult) }, .run = image_cli.importOci },
+    .{ .name = "image import-tar", .summary = "Import a rootfs tar as a local image", .usage = image_cli.import_tar_usage, .output = .{ .result = .of(api.RootfsImportTarResult) }, .run = image_cli.importTar },
+    .{ .name = "image resolve", .summary = "Resolve an image tag to a digest reference", .usage = image_cli.resolve_usage, .output = .{ .result = .of(image_cli.ResolveResult) }, .run = image_cli.resolve },
+    .{ .name = "image export", .summary = "Write a registry image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .{ .result = .of(api.RootfsBuildResult) }, .run = image_cli.exportRootfs },
+    .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.usage, .output = .{ .result = .of(api.ImagePushResult) }, .run = image_cli.push },
+    .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchivePackResult) }, .run = image_cli.pack },
+    .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchiveUnpackResult) }, .run = image_cli.unpack },
+    .{ .name = "system info", .summary = "Print this host's platform facts", .usage = system.info_usage, .output = .{ .result = .of(api.HostInfo) }, .run = system.infoCli },
+    .{ .name = "system df", .summary = "Show local cache usage", .usage = system.usage, .output = .{ .result = .of(system.RootfsSystemSummary) }, .run = system.dfCli },
+    .{ .name = "system prune", .summary = "Prune local caches and old runtime fork batches", .usage = system.usage, .output = .{ .result = .of(system.RootfsPruneResult) }, .run = system.pruneCli },
+    .{ .name = "system gc", .summary = "Collect unreferenced content-addressed cache storage", .usage = system.gc_usage, .output = .{ .result = .of(system.RootfsGcResult) }, .run = system.gcCli },
+    .{ .name = "system pins", .summary = "List saved-spore pins", .usage = system.gc_usage, .output = .{ .result = .of(system.PinsResult) }, .run = system.pinsCli },
+    .{ .name = "system unpin", .summary = "Drop one saved-spore pin (expert-only)", .usage = system.gc_usage, .output = .{ .result = .of(system.UnpinResult) }, .run = system.unpinCli },
+    .{ .name = "version", .summary = "Print the spore version", .usage = "usage: spore version\n", .output = .{ .result = .of(VersionResult) }, .run = version },
     .{ .name = "monitor", .summary = null, .usage = monitor.monitor_usage, .output = .text, .run = monitor.cli },
     .{ .name = "netd", .summary = null, .usage = spore_netd.netd_usage, .output = .text, .run = spore_netd.cli },
 };
 
+const VersionResult = struct {
+    schema: []const u8 = "spore.version.result.v1",
+    schema_version: u32 = 1,
+    version: []const u8 = version_value,
+    build_mode: []const u8,
+};
+
 fn version(ctx: *const Ctx, _: []const []const u8) !void {
     if (ctx.mode == .json) {
-        try machine_output.writeJson(ctx.init.arena.allocator(), ctx.stdout, .{
-            .schema = "spore.version.result.v1",
-            .schema_version = @as(u32, 1),
-            .version = version_value,
-            .build_mode = @tagName(builtin.mode),
-        });
+        try machine_output.writeJson(ctx.init.arena.allocator(), ctx.stdout, VersionResult{ .build_mode = @tagName(builtin.mode) });
     } else {
         try writeVersion(ctx.stdout, builtin.mode);
     }
@@ -384,9 +430,9 @@ fn testRun(_: *const Ctx, _: []const []const u8) anyerror!void {}
 
 const test_commands = [_]Command{
     .{ .name = "run", .summary = "Run a VM", .usage = "", .output = .events, .run = testRun },
-    .{ .name = "ls", .summary = "List VMs", .usage = "", .output = .result, .run = testRun },
-    .{ .name = "vm rm", .summary = "Remove a VM", .usage = "", .output = .result, .run = testRun },
-    .{ .name = "vm fork", .summary = "Fork a VM", .usage = "", .output = .result, .run = testRun },
+    .{ .name = "ls", .summary = "List VMs", .usage = "", .output = .{ .result = .of(VersionResult) }, .run = testRun },
+    .{ .name = "vm rm", .summary = "Remove a VM", .usage = "", .output = .{ .result = .of(VersionResult) }, .run = testRun },
+    .{ .name = "vm fork", .summary = "Fork a VM", .usage = "", .output = .{ .result = .of(VersionResult) }, .run = testRun },
     .{ .name = "monitor", .summary = null, .usage = "", .output = .text, .run = testRun },
 };
 
@@ -477,8 +523,51 @@ test "only internal commands refuse global json, and only four commands stream" 
         const streams = std.mem.eql(u8, command.name, "run") or std.mem.eql(u8, command.name, "attach") or
             std.mem.eql(u8, command.name, "vm exec") or std.mem.eql(u8, command.name, "fanout");
         const text = std.mem.eql(u8, command.name, "monitor") or std.mem.eql(u8, command.name, "netd");
-        const expected: Output = if (streams) .events else if (text) .text else .result;
-        try std.testing.expectEqual(expected, command.output);
+        const expected: std.meta.Tag(Output) = if (streams) .events else if (text) .text else .result;
+        try std.testing.expectEqual(expected, std.meta.activeTag(command.output));
+    }
+}
+
+test "docs/automation.md lists each result schema, the commands that print it and its fields" {
+    const allocator = std.testing.allocator;
+    const doc = @embedFile("automation_md");
+    var lines = std.mem.splitScalar(u8, doc, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "| `spore.")) continue;
+        var cells = std.mem.splitSequence(u8, line, " | ");
+        const name = std.mem.trim(u8, cells.next().?, "|` ");
+        const listed = cells.next().?;
+        const fields = std.mem.trimEnd(u8, cells.next().?, " |");
+        var printers: usize = 0;
+        for (commands) |command| {
+            const schema = switch (command.output) {
+                .result => |schema| schema,
+                .events, .text => continue,
+            };
+            if (!std.mem.eql(u8, schema.name, name)) continue;
+            printers += 1;
+            const spelled = try std.fmt.allocPrint(allocator, "`{s}`", .{command.name});
+            defer allocator.free(spelled);
+            std.testing.expect(std.mem.indexOf(u8, listed, spelled) != null) catch |err| {
+                std.debug.print("{s} is missing {s}\n", .{ name, spelled });
+                return err;
+            };
+            try std.testing.expectEqualStrings(schema.fields, fields);
+        }
+        // The row lists no command that prints something else.
+        try std.testing.expectEqual(printers, std.mem.count(u8, listed, "`") / 2);
+    }
+    for (commands) |command| {
+        const schema = switch (command.output) {
+            .result => |schema| schema,
+            .events, .text => continue,
+        };
+        const row = try std.fmt.allocPrint(allocator, "\n| `{s}` | ", .{schema.name});
+        defer allocator.free(row);
+        std.testing.expect(std.mem.indexOf(u8, doc, row) != null) catch |err| {
+            std.debug.print("docs/automation.md has no row for {s}\n", .{schema.name});
+            return err;
+        };
     }
 }
 

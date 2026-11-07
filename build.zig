@@ -120,6 +120,8 @@ pub fn build(b: *std.Build) void {
         });
         break :blk mod;
     } else internal_mod;
+    // cli.zig checks the result schemas docs/automation.md lists.
+    internal_test_mod.addAnonymousImport("automation_md", .{ .root_source_file = b.path("docs/automation.md") });
     const internal_tests = b.addTest(.{ .root_module = internal_test_mod });
     const run_internal_tests = b.addRunArtifact(internal_tests);
     const durable_crash_test_mod = b.createModule(.{

@@ -29,8 +29,6 @@ pub const EventMode = enum {
 };
 
 pub const Result = struct {
-    schema: []const u8 = "spore.run.result.v1",
-    schema_version: u32 = 1,
     backend: Backend,
     start_ms: u64,
     vsock_connect_ms: u64,

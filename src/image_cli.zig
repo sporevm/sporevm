@@ -143,6 +143,13 @@ fn writeImportResult(writer: *Io.Writer, ref: []const u8, result: api.RootfsImpo
     );
 }
 
+pub const ResolveResult = struct {
+    schema: []const u8 = "spore.rootfs.resolve.result.v1",
+    schema_version: u32 = 1,
+    ref: []const u8,
+    resolved_image_ref: []const u8,
+};
+
 pub fn resolve(ctx: *const Ctx, args: []const []const u8) !void {
     const arena = ctx.init.arena.allocator();
     if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image resolve", "usage: spore image resolve IMAGE");
@@ -151,9 +158,7 @@ pub fn resolve(ctx: *const Ctx, args: []const []const u8) !void {
         .ref = parsed.ref,
         .platform = parsed.platform,
     });
-    if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, .{
-        .schema = "spore.rootfs.resolve.result.v1",
-        .schema_version = @as(u32, 1),
+    if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, ResolveResult{
         .ref = parsed.ref,
         .resolved_image_ref = resolved,
     });
