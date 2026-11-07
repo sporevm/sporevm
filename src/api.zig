@@ -450,51 +450,47 @@ pub fn runManaged(
     };
     const default_kernel = options.kernel_path == null and init.environ_map.get("SPOREVM_KERNEL_IMAGE") == null;
     const default_initrd = options.initrd_path == null and init.environ_map.get("SPOREVM_RUN_INITRD") == null;
-    const managed_boot_descriptor = if (default_kernel and default_initrd)
-        try boot_assets.resolveManagedMonitorBootDescriptor(init, arena)
+    const assets: run_mod.Request.Assets = if (default_kernel and default_initrd)
+        .{ .managed = try boot_assets.materializeManagedMonitorBootArtifacts(init.io, arena, try boot_assets.resolveManagedMonitorBootDescriptor(init, arena)) }
     else
-        null;
-    const boot_artifacts = if (managed_boot_descriptor) |descriptor|
-        try boot_assets.materializeManagedMonitorBootArtifacts(init.io, arena, descriptor)
-    else
-        null;
-    const kernel_path = if (managed_boot_descriptor) |descriptor|
-        descriptor.kernel_path
-    else
-        options.kernel_path orelse try boot_assets.resolveDefaultKernelPath(init, arena);
-    const initrd_path = if (managed_boot_descriptor != null) null else try boot_assets.resolveConfiguredInitrdPath(init, options.initrd_path);
+        .{ .files = .{
+            .kernel = options.kernel_path orelse try boot_assets.resolveDefaultKernelPath(init, arena),
+            .initrd = try boot_assets.resolveConfiguredInitrdPath(init, options.initrd_path),
+        } };
     const guest_env = try guest_request.mergeGuestEnv(arena, rootfs.guest_env, options.guest_env);
-    const rootfs_grow_target = if (options.disk_size) |target| blk: {
+    const grow_target = if (options.disk_size) |target| blk: {
         const resolved_rootfs = rootfs.rootfs orelse return error.RunCommitRootfsNotSnapshotable;
         const storage = resolved_rootfs.storage orelse return error.RunCommitRootfsNotSnapshotable;
         break :blk try run_mod.rootfsGrowTarget(storage.logical_size, target);
     } else 0;
+    const commit: ?run_mod.Request.Commit = if (options.commit_ref) |ref| .{
+        .ref = ref,
+        .config = rootfs.image_config orelse return error.RunCommitImageConfigUnavailable,
+        .grow_target = grow_target,
+    } else null;
 
     return run_mod.execute(.{ .io = init.io, .environ_map = init.environ_map }, arena, .{
         .backend = options.backend,
-        .kernel_path = kernel_path,
-        .initrd_path = initrd_path,
-        .boot_artifacts = boot_artifacts,
-        .auto_memory_hotplug_capable = default_kernel and default_initrd,
-        .rootfs_path = rootfs.path,
-        .rootfs = rootfs.rootfs,
-        .rootfs_grow_target = rootfs_grow_target,
+        .machine = .{ .boot = .{
+            .assets = assets,
+            .rootfs_path = rootfs.path,
+            .rootfs = rootfs.rootfs,
+            .injected_files = options.injected_files,
+            .working_dir = rootfs.guest_working_dir,
+            .commit = commit,
+        } },
         .command = command,
-        .injected_files = options.injected_files,
         .interactive = options.interactive,
         .tty = options.tty,
         .guest_env = guest_env,
-        .guest_working_dir = rootfs.guest_working_dir,
         .memory = options.memory,
         .vcpus = options.vcpus,
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
-        .save_path = options.save_path,
-        .save_trigger = options.save_trigger,
-        .continue_after_save = options.continue_after_save,
-        .commit = if (options.commit_ref) |ref| .{
-            .ref = ref,
-            .config = rootfs.image_config orelse return error.RunCommitImageConfigUnavailable,
+        .save = if (options.save_path) |dir| .{
+            .dir = dir,
+            .trigger = options.save_trigger,
+            .continue_after = options.continue_after_save,
         } else null,
         .annotations = options.annotations,
         .network = options.network,
@@ -542,15 +538,13 @@ pub fn runFromSpore(
 
     return run_mod.execute(context, arena, .{
         .backend = options.backend,
-        .kernel_path = "",
-        .initrd_path = null,
-        .rootfs_path = null,
-        .rootfs = rootfs,
-        .disk = disk,
-        .resume_dir = options.spore_dir,
-        .resume_generation = run_generation.resume_generation,
-        .start_generation_params = run_generation.start_generation_params,
-        .require_generation_ready = run_generation.start_generation_params != null,
+        .machine = .{ .from = .{
+            .dir = options.spore_dir,
+            .rootfs = rootfs,
+            .disk = disk,
+            .generation = run_generation.resume_generation,
+            .generation_params = run_generation.start_generation_params,
+        } },
         .command = options.command,
         .guest_env = options.guest_env,
         .interactive = options.interactive,
@@ -559,9 +553,11 @@ pub fn runFromSpore(
         .vcpus = manifest.platform.vcpu_count,
         .guest_port = options.guest_port,
         .timeout_ms = options.timeout_ms,
-        .save_path = options.save_path,
-        .save_trigger = options.save_trigger,
-        .continue_after_save = options.continue_after_save,
+        .save = if (options.save_path) |dir| .{
+            .dir = dir,
+            .trigger = options.save_trigger,
+            .continue_after = options.continue_after_save,
+        } else null,
         .annotations = manifest.annotations,
         .network = network,
         .spore_executable = options.spore_executable,

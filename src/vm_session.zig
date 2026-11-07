@@ -836,43 +836,80 @@ test "a monitor's readiness request detaches, and a store-backed root disk hands
     try std.testing.expect(std.mem.indexOf(u8, config.start.boot.cmdline, "spore_build=1") == null);
     // A save then fetches the objects the cache lacks before it seals.
     try std.testing.expect(control.fetcher != null);
+
+    // A disk fork's claimed head goes to the root disk, which refuses one
+    // cut from another baseline.
+    var head: runtime_disk_fork.Head = .{
+        .descriptor = .{
+            .allocator = allocator,
+            .baseline = .{ .kind = .disk_index, .identity = "blake3:other" },
+            .clone_method = .sparse,
+            .logical_size = 0,
+            .chunk_size = 0,
+            .chunk_count = 0,
+            .overlay_chunks = &.{},
+            .zero_chunks = &.{},
+        },
+        .overlay_fd = -1,
+    };
+    session.mode.monitor.fork_head = &head;
+    FakeVm.reset(.monitor_stopped);
+    try std.testing.expectError(error.BadDescriptor, runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &fixture.env }, allocator, session));
+    try std.testing.expect(FakeVm.seen == null);
 }
 
-test "a build session attaches its context and cache disks and boots the build contract" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var env = std.process.Environ.Map.init(std.testing.allocator);
-    defer env.deinit();
-    var dir = try TestDir.init();
-    defer dir.deinit();
-    const context_path = try dir.path("context.ext4");
+test "a build session attaches its context, input and cache disks and boots the build contract" {
+    var fixture: image_store.TestImage = undefined;
+    try fixture.init(rootfs_input.direct_image_platform);
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    // Build inputs are images whose objects are all local.
+    const image = switch (try rootfs_input.resolveRootfsInputDetailedResult(fixture.processInit(), allocator, .{
+        .rootfs_path = null,
+        .image_ref = "local/app:1",
+        .command_name = "build",
+    })) {
+        .resolved => |resolved| resolved.rootfs.?,
+        .failure => return error.ExpectedStoreImage,
+    };
+    const context_path = try fixture.path("context.ext4");
     const context_bytes: [4096]u8 = @splat(0);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = context_path, .data = &context_bytes });
-    const cache_fd = std.c.open(try dir.path("cache.ext4"), .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o600));
+    const cache_fd = std.c.open(try allocator.dupeSentinel(u8, try fixture.path("cache.ext4"), 0), .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, @as(c_uint, 0o600));
     try std.testing.expect(cache_fd >= 0);
     defer _ = std.c.close(cache_fd);
 
     var stream = try vsock_stream.HostStream.init(10700, "request\n");
     var control: FakeControl = .{};
+    var metrics: disk_layer.SnapshotMetrics = undefined;
     var session = testSession(&stream, test_boot);
-    session.mode = .{ .build = .{ .control = control.control(), .context_disk_path = context_path, .cache_disk_fd = cache_fd } };
+    session.disks = .{ .rootfs = image };
+    session.mode = .{ .build = .{
+        .control = control.control(),
+        .context_disk_path = context_path,
+        .inputs = &.{image},
+        .cache_disk_fd = cache_fd,
+        .snapshot_metrics = &metrics,
+    } };
     FakeVm.reset(.monitor_stopped);
-    _ = try runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &env }, arena_state.allocator(), session);
+    _ = try runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &fixture.env }, allocator, session);
 
     const config = FakeVm.seen.?;
     try std.testing.expect(config.probe == null);
     try std.testing.expectEqual(@as(*anyopaque, &control), config.exec_control.?.context);
     try std.testing.expect(config.context_disk_fd != null);
+    try std.testing.expectEqual(@as(usize, 1), config.build_input_disk_backends.len);
     try std.testing.expectEqual(cache_fd, config.build_cache_disk_backend.?.file);
-    for ([_][]const u8{ "spore_build=1", "spore_build_context=1" }) |flag| {
+    // A step checkpoint reports what sealing the root disk cost.
+    try std.testing.expectEqual(@as(?*disk_layer.SnapshotMetrics, &metrics), config.disk_snapshot.?.metrics);
+    for ([_][]const u8{ "spore_build=1", "spore_build_context=1", "spore_build_inputs=1" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, config.start.boot.cmdline, flag) != null);
     }
-    try std.testing.expect(std.mem.indexOf(u8, config.start.boot.cmdline, "spore_build_inputs=") == null);
 
     // A context path that is not a regular file fails before the VM runs.
-    session.mode.build.context_disk_path = try dir.path("");
+    session.mode.build.context_disk_path = try fixture.path("");
     FakeVm.reset(.monitor_stopped);
-    try std.testing.expectError(error.ContextDiskOpenFailed, runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &env }, arena_state.allocator(), session));
+    try std.testing.expectError(error.ContextDiskOpenFailed, runOn(FakeArm, .{ .io = std.testing.io, .environ_map = &fixture.env }, allocator, session));
     try std.testing.expect(FakeVm.seen == null);
 }
 
@@ -926,9 +963,15 @@ test "x86 boots only, and keeps the probe watchdog armed while a detached probe'
     try std.testing.expect(!FakeX86.seen.?.exec_probe_completes_run);
     try std.testing.expect(!FakeX86.seen.?.exec_probe_watchdog_until_control);
     try std.testing.expectEqual(@as(u64, 1234), FakeX86.seen.?.exec_probe_timeout_ms);
-    session.mode = .{ .build = .{ .control = control.control(), .cache_disk_fd = 0 } };
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const context_path = try dir.path("context.ext4");
+    const context_bytes: [4096]u8 = @splat(0);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = context_path, .data = &context_bytes });
+    session.mode = .{ .build = .{ .control = control.control(), .context_disk_path = context_path, .cache_disk_fd = 0 } };
     _ = try runOn(FakeX86, context, arena_state.allocator(), session);
     try std.testing.expect(FakeX86.seen.?.exec_probe == null);
+    try std.testing.expect(FakeX86.seen.?.context_disk != null);
     try std.testing.expect(FakeX86.seen.?.cache_disk_writable);
 
     FakeX86.seen = null;

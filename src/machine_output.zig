@@ -231,7 +231,6 @@ pub fn fromZigError(err: anyerror) CliError {
         error.DuplicateInjectedFile,
         error.InjectedFileTooLarge,
         error.InjectedFileCaptureUnsupported,
-        error.InjectedFileResumeUnsupported,
         error.SavedSessionUnavailable,
         error.SavedSessionHasNoInteractiveStdin,
         error.SavedSessionHasNoTerminal,
