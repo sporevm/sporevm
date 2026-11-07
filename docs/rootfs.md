@@ -401,8 +401,9 @@ the cache lacks into the rootfs cache `SPOREVM_ROOTFS_CACHE_DIR` selects.
 Plain `spore run --rootfs PATH` remains a local read-only run escape hatch.
 Named `spore vm create --rootfs PATH` records exact immutable rootfs identity in
 the digest cache for lifecycle saves. Combining one-shot `spore run
---rootfs PATH` with `--save` is rejected until an import/preload command can
-record chunked portable rootfs identity for arbitrary local images.
+--rootfs PATH` with `--save` is rejected; run an image with `--image` (for
+example one imported with `spore image import-tar`) so the save can record
+immutable rootfs identity.
 
 Validate OCI rootfs capture, fork, and parallel `spore run --from` execution
 with the opt-in Ruby fan-out smoke:

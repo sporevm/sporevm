@@ -1,359 +1,381 @@
-# Security Posture
+# Security
 
 SporeVM is an isolation boundary written in Zig, which is not memory-safe.
-That is a deliberate tradeoff, bought back structurally. This document is a
-founding constraint, not a retrofit: it must be updated in the same change
-that alters the attack surface.
+This file names every surface where attacker-influenced bytes enter, the
+invariants that hold there, and the fuzz tests that cover it. Change it in the
+same change that alters a surface.
 
-## Threat Model
+## Threat model
 
-An untrusted guest must not escape the VMM. The current threat model is self-hosted
-CI and agent isolation: hostile code runs inside the guest, and chunk data may
-arrive from untrusted peers. We do not claim hardened multi-tenant public
-cloud isolation.
+| Party | Trust |
+| --- | --- |
+| Host user | Trusted. Owns the `spore` binary, kernels, the runtime root, the rootfs and kernel caches, and the monitor sockets. Local callers of a monitor are the same user. |
+| Guest | Untrusted. Runs hostile code and controls guest memory, virtqueues, MMIO and port I/O exits, vsock streams, network frames, and everything it prints. It must not escape the VMM, crash it, or gain host authority. |
+| Images and registries | Untrusted content. OCI manifests, layers, layouts, rootfs tars, image archives, Dockerfiles, and remote `ADD` sources are parsed with bounds and fail closed. Image code runs only as guest code. |
+| Image stores | Untrusted transport. A store chooses which image or checkpoint a tag names; everything else is checked against a digest. A store can deny service but cannot inject state. |
+| Network peers | Untrusted. DNS resolvers, remote `ADD` servers, and guest egress destinations can deny service or return wrong data, but gain no host authority: DNS answers never pass the network hard floor, and `ADD` bytes are only file content. |
 
-Credential mediation belongs to consumers (for example cleanroom's host
-gateway). Values explicitly supplied through per-exec `--env` necessarily
-transit the monitor and guest request, but SporeVM does not copy them into host
-runtime metadata, saved lifecycle metadata, or manifest fields. As with any
-guest process environment, their bytes can remain in guest memory or workload
-files and therefore can enter a later save or pushed spore; `--env` is
-not a secret broker. OCI `Config.Env` is image configuration rather than a
-secret channel; named image defaults are persisted in `exec_defaults`, so
-images must not put credentials there.
+Local caches share the host user's trust domain: whoever can write them can
+also replace the binary or kernel. Cache integrity is enforced where bytes
+enter: every install verifies content against the expected digest before
+publishing it read-only. Opens trust installed entries without re-hashing
+them, but still require a regular file of the exact size with no symlinks, and
+fail closed otherwise. This verify-at-install, trust-at-open contract assumes a
+per-user cache on a single-tenant host; a shared cache would need open-time
+verification and is out of scope.
 
-Local caches (rootfs cache, kernel cache) live in
-the same host trust domain as the `spore` binary itself: a principal who can
-write to them can also replace the binary or kernel image. Cache integrity is
-therefore enforced where bytes enter a cache — every install verifies content
-against the expected digest before publishing it read-only — and ordinary
-product open paths trust installed entries without re-hashing them. The build
-executor is stricter when a managed kernel is actually needed: it derives
-cache identity from the canonical read-only checksum sidecar, then reads the
-Image once, verifies those opened bytes against that digest, and boots the
-same allocation. Structural checks
-(no symlinks, regular file, exact size) still apply at open time and fail
-closed. This verify-at-install, trust-at-open contract assumes a per-user
-cache on a single-tenant host; a shared or multi-tenant cache would need
-open-time verification and is out of scope today.
+Not goals:
 
-## Attack Surface
+- Hardened multi-tenant public cloud isolation.
+- Secret handling; credential mediation belongs to consumers. Per-exec `--env`
+  values are never written to host metadata or manifests, but like any guest
+  data they can enter a later save. OCI `Config.Env` is persisted in
+  `exec_defaults`, so images must not put credentials there.
+- Confidentiality of pushed checkpoints. A checkpoint carries guest memory,
+  so its store needs the access control its contents need.
 
-Every path that parses attacker-influenced data is enumerated here and carries
-fuzz targets from the slice that introduces it:
+## Rules
 
-Saved-spore durable pin records are host-private, strict versioned JSON bounded
-to 64KiB and fuzzed. A pin binds the exact validated disk storage descriptor,
-not the manifest bytes. Publication is serialized with GC/prune: objects and
-the canonical index are durable before the derived completeness stamp, the
-stamp is durable before the pin, and the pin is durable before final save
-publication. A continuing named monitor acquires the exact new active lease,
-durably replaces its source registry spec, and only then releases the old
-lease; a failed handoff leaves the old spec and lease intact. Restore fails
-closed on missing or mismatched
-pin, index, and object shape; lazy restore keeps content verification at
-its existing boundary. Unknown or corrupt pin records make GC and
-destructive prune retain all CAS. A pin record from an earlier build (v1 or
-v2) fails as too old, roots nothing, and GC deletes it: its save no longer
-restores, and the save's earlier-build reference keeps failing as too old
-after GC. Pin
-references are hard-linked to one cache-side ownership anchor: the anchor and
-artifact must be the only two links. Ordinary copies have the wrong inode,
-hard-link duplicates raise the link count, and both fail closed before
-restore. A rename preserves the
-identity. Deleting a save, through `spore checkpoint rm` or directly, leaves a
-one-link anchor that GC diagnoses and reclaims without scanning arbitrary
-paths; removal itself never releases a pin. Pin records remain
-explicitly pending until the artifact directory commit is durable, so GC can
-also diagnose and reclaim a two-link reference left in an unpublished save or
-batch stage after a crash. Failed ordinary publication preserves the staged
-manifest outside loadable authority for manual recovery. `spore checkpoint pull`
-publishes the same way.
-Removal requires a regular `manifest.json` that parses as a spore manifest
-and does not read the checkpoint's memory or disk storage. A restore's runtime
-lease names the rootfs cache, never the checkpoint directory, so removing a
-checkpoint while a VM restored from it runs leaves that VM's storage in place.
-Ownership reporting changes no portable manifest or device format.
+- **ReleaseSafe only for shipping builds.** ReleaseFast is for benchmarks;
+  release packaging never overrides `build.zig`.
+- **Guest RAM goes through `guestmem.GuestRam`**, so bounds checks live in one
+  place.
+- **Content is verified before use.** A memory chunk, disk object, or index
+  read from a checkpoint, store, or archive is checked against its BLAKE3
+  digest before it is mapped into guest memory, parsed, or installed.
+- **Fail closed.** Unknown versions, unsatisfiable platform contracts, and
+  unverifiable content are errors, never degraded behavior.
+- **Live runtimes root their storage.** A lazy disk publishes its runtime lease
+  under the rootfs cache lock before it opens its index, and keeps it until the
+  disk closes, so GC and prune cannot remove an object a running VM may read.
+- **Caller paths are validated** before a helper spawns or a socket binds;
+  for example, against the 104-byte macOS `sun_path` limit.
+- **The device model is frozen**: virtio-mmio console, blk, net, vsock, rng,
+  mem, and the generation device. An addition updates
+  `docs/spore-format.md`, this file, and the relevant design doc.
+- **New parsers come with fuzz tests** in the same change. `zig build test` runs
+  every fuzz test over its seed corpus (CI does this on every commit);
+  `zig build test --fuzz` searches beyond it.
 
-| Surface | Input source | Status |
-|---|---|---|
-| OCI runtime command and user metadata | OCI image configuration persisted by the rootfs builder | Fresh image-backed run and create compose bounded `Entrypoint` and `Cmd` arrays before guest boot, retain the existing 16-argument and per-argument byte limits, and fail when the effective command is empty. Explicit caller argv replaces only `Cmd`; `spore run --entrypoint` may replace `Entrypoint` explicitly, while saved-spore, restore, attach, and later named-exec paths do not reapply command defaults. `User` accepts only unambiguous root user and root-group spellings until guest credential switching exists, with focused unit and fuzz coverage for the validator. |
-| Native image archive | immutable CI or object-store artifact supplied to `spore image unpack` | The client requires the expected SHA-256 of the complete gzip archive, expected native BLAKE3 image identity, and an explicit `linux/arm64` or `linux/amd64` platform. The strict USTAR reader reads records through the same tar record iterator as OCI layers and accepts only the canonical manifest, config, index, sorted distinct object closure, and terminal zero blocks; it rejects alternate order, non-regular or extra entries, malformed headers, bad checksums, truncation, trailing bytes, aggregate bound violations, platform mismatch, native-image mismatch, and object length or BLAKE3 mismatch. It hashes the same open file it parses and refuses any outer or inner identity mismatch before cache publication. All bytes stage privately outside the cache lock. The existing CAS transaction re-verifies objects and the index, marks complete storage, and publishes image metadata plus the local ref last. Extraction has continuous fuzz coverage from the tar stream through the manifest, index, and object checks, seeded with a packed archive, and round-trip tests prove digest, identity, and architecture substitution leave no ref. The archive contains no saved-machine state. |
-| x86-64 Linux direct-boot planner | host-selected bzImage, initrd, command line, and RAM size | The fresh-only x86 VM's planner requires a complete Linux 2.10 setup header before reading its relocation fields, bounds every setup and payload offset, requires a nonzero `init_size` large enough for the loaded payload, and validates the relocatable-kernel alignment as a bounded power of two. It computes the separate load and runtime windows with the Linux boot protocol algorithm using checked arithmetic, bounds both within the single low-RAM slot, and places a nonempty initrd outside both. Command-line length excludes its separately checked terminator, absent or explicitly empty initrds produce zero ramdisk fields, and malformed inputs fail before guest RAM writes. Arbitrary raw images, header-derived placement fields, command lines, initrd lengths, and RAM sizes have continuous fuzz coverage alongside focused malformed-input tests. Product routing is limited to the reviewed fresh-run profile: one vCPU, explicit 512 MiB memory, and no capture path. |
-| x86-64 KVM PIO exit envelope and finite board policy | guest-issued x86 port I/O reflected through `KVM_EXIT_IO` | The fresh-only x86 VM validates the mapped `kvm_run` length, direction, width, decoded u16 port, nonzero count, checked aggregate byte length capped at 4KiB, data offset conversion, and the complete data range before reading or completing an exit. Its policy accepts only one-byte, count-one accesses: writes of `0x0f` to CMOS index port `0x70`, writes of `0x0a` or `0x00` to CMOS data port `0x71`, reads of keyboard-controller status port `0x64` which return zero, writes of reset command `0xfe` to port `0x64` which terminate as `guest_reset`, and the exact `0x80 <- 0x00` legacy I/O-delay no-op observed while the managed kernel initializes the in-kernel PIC. Direction, port, width, count, and value are all policy inputs; every other tuple fails before exit completion. The bounded envelope and finite policy retain their focused malformed/nearby-input tests and continuous fuzz coverage. Raw `KVM_EXIT_SHUTDOWN` remains an unclassified fatal exit and cannot acquire reset or poweroff meaning. Product routing is limited to the reviewed fresh-run profile: one vCPU, explicit 512 MiB memory, and no capture path. |
-| x86-64 KVM MMIO exit routing and board lifecycle control | guest-issued MMIO reflected through `KVM_EXIT_MMIO` | The fresh-only x86 VM requires a complete mapped `kvm_run` MMIO envelope, accepts only naturally aligned 1-, 2-, or 4-byte accesses wholly contained in one frozen virtio-mmio window, permits the generation-device window to additionally accept aligned 8-byte accesses, and rejects every other address, width, overflow, boundary crossing, or truncated envelope before dispatch. The x86 board alone decodes its generation-page poweroff doorbell: an aligned 32-bit write of `0x46464f50` at offset `0x020` terminates as `guest_off`; any write touching that register with another width, placement, or value fails closed, while reads touching it return zero and have no side effect. The shared SPGN v1 device remains unchanged and inert for the board-owned control range. The bounded router and exact stateless control retain focused malformed/nearby-input tests and continuous fuzz coverage, including 8-byte laundering rejection. Empty fixed slots expose device ID zero and no queues. Product routing is limited to the reviewed fresh-run profile: one vCPU, explicit 512 MiB memory, and no capture path. |
-| Native image manifest, config, and rootfs index | image archive entries supplied to `spore image unpack`; image store files read by `spore run`/`vm create --image` | The canonical JSON manifest parser accepts at most 64 KiB, rejects unknown or duplicate fields, alternate formatting, unsupported platform or rootfs device/storage values, malformed lowercase fixed-length digests, inconsistent index/base identities, impossible object summaries, and trailing input, and carries a fuzz target. Config and rootfs-index inputs retain their 64 MiB bounds and the strict config parser is separately fuzzed. Verification binds the expected manifest SHA-256 transport digest and platform; requires strict canonical config bytes with matching SHA-256 transport and BLAKE3 config digests; requires config OS/architecture to match; parses the rootfs index through the existing canonical full-coverage and BLAKE3 authority; checks exact index bytes, unique object count, and object bytes including a short final chunk; and recomputes native image identity. |
-| Image store refs, tags, and responses | `--image` and `spore checkpoint pull` store refs; files served by a directory, HTTP(S), or S3 image store; AWS credentials in the environment | Store refs accept only absolute directories, `file:///` paths, `http(s)://` URLs, and `s3://bucket/prefix` refs, without userinfo, query, fragment, percent escapes, backslashes, or empty, `.`, or `..` path segments; an S3 bucket must be one DNS label of 3 to 63 `[a-z0-9-]` bytes with no dots or port, and its prefix only unreserved bytes, so the key path is its own canonical SigV4 URI. Tags match `[a-z0-9][a-z0-9._-]{0,127}`; a tag over plain HTTP is accepted only from 127.0.0.1 or `[::1]` because nothing authenticates it, while digest refs are accepted over any scheme. The tag parser accepts exactly `blake3:<64 lowercase hex>\n` and is fuzzed. HTTP(S) requests send no credentials. S3 requests go only to `https://<bucket>.s3.<region>.amazonaws.com` (a set `AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` fails the read rather than being ignored) and are SigV4-signed (unsigned payload) from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, the optional `AWS_SESSION_TOKEN`, and `AWS_REGION` or `AWS_DEFAULT_REGION`; the key id must be alphanumeric, the secret and token printable without whitespace, and the region `[a-z0-9-]`, so none can inject a header. The secret only derives the per-request signing key, which is zeroed after use; credentials travel only in the signature and the session token header, and refs, log lines, errors, trace fields, and the catalog's origin carry only the `s3://` URL. The S3 response is trusted no more than an HTTP(S) store's. Requests do not follow redirects, so a signed request never reaches another host; they require identity encoding and status 200, and read at most the bounded size (tag 72 bytes, manifest 64 KiB, config and index 64 MiB, object exactly its index-derived length); other statuses, encodings, and lengths fail closed, and only connection failures, timeouts, 429, and 5xx are retried. Store hosts are not checked against the public-target policy because a store may be private. Manifest, config, and index pass the `spore image unpack` verifier and must recompute the requested image digest for the host platform before the index is installed and the catalog records the store as the image's origin. An object is fetched on the first guest read of its missing chunk. On aarch64 the fetch runs on the disk's virtio-blk worker thread without the VMM device lock, so only that disk's requests wait for it; on x86_64 it runs on the vCPU thread. The same fault starts fetches of the missing objects of the next 7 chunks, verified and installed the same way but never copied into the head, and returns without waiting for them; at most 7 run at once. Concurrent requesters of one object share one request, except that a requester whose shared request could not install the object fetches it itself, and a failed window fetch neither fails a guest read nor poisons the head, but disables windows for the rest of the disk's life. An HTTP(S) fetch makes at most 3 attempts within 10 s, each canceled at its 5 s deadline. A directory store reads only regular files (opening never waits for a FIFO writer) but has no deadline, so a hung mount blocks the disk, and pausing or stopping the VM waits for it. Its BLAKE3 digest is verified before the bytes reach guest memory or the cache. It is installed into the local CAS without the cache lock; the runtime lease, taken under the lock after the index was installed, roots every object the index names. A missing, corrupt, or unreachable object returns a virtio-blk I/O error and poisons the head, and a poisoned head fetches nothing more: later reads of missing objects fail at once. A fault waits only for its own object, which an earlier window may already be fetching, so a failing HTTP(S) store stalls a head for at most one 10 s budget. A corrupt local object is not refetched. A snapshot of a head with a store attached first fetches every object of the index that is not local, up to 16 at a time, verified and installed the same way, so the completeness stamp the save publishes is true; the VMM fetches before it writes memory or takes the rootfs cache lock, and if the store cannot supply one, the snapshot fails before it writes anything, the head is not poisoned, and a run removes its save directory. A named VM's monitor runs that fetch on the save's control handler thread before it pauses the guest, and refuses the save when it fails, when a guest read poisoned the head before or during it, or when the client left; stopping the monitor cancels the fetch before it joins the handlers, and `spore vm rm` gives the connect and the shutdown answer one 2 s deadline before it signals the monitor. `spore image push` to S3 stages hard links to the cached objects under the rootfs cache's `tmp` directory, releases the cache lock, verifies the staged objects (a link pins its inode), and runs the `aws` CLI with the caller's environment and credential chain, uploading the tag last. `spore checkpoint push` writes a saved spore with the same writer: it drops `memory.backing`, a path on the saving host, from the manifest and names the uploaded bytes `spores/<their BLAKE3>`; it refuses a disk that is not complete locally before writing anything, verifies every RAM chunk, the disk index, and every disk object against its BLAKE3 digest and size as it copies or stages it, and writes `spore-tags/<name>` last. A pushed spore carries guest memory, and with it any secret the guest held, so its store needs the access control its contents need. `spore checkpoint pull` reads `spore-tags/<name>` with the same tag parser and `spores/<hex>` (at most 64 MiB) under the same request rules, accepts the manifest only when its bytes hash to the ref and the fuzzed manifest decoder accepts them, and refuses `memory.backing`, a host path the store must not choose, a rootfs without a disk, and more than 128 GiB of distinct nonzero RAM chunks, before it creates the spore directory. It writes each RAM chunk into the new spore directory only after the exact-length response matches its BLAKE3 id, installs the disk index only after it matches `disk.base`, then takes a runtime lease on it under the cache lock, so GC keeps every object it names, fetches the missing disk objects as a save's fill does, and publishes the pinned manifest last. A failure to fetch or verify anything removes the spore directory and leaves no pin or completeness stamp; installed objects stay for GC. A failure while publishing also removes the directory, but can leave the completeness stamp, which is then true because every object is local, and a pending pin that GC reclaims. The pulled manifest is restore input with the same trust as any saved spore: restore validates device and GIC state, and its network policy comes from the manifest. |
-| OCI platform selection | registry and local OCI-layout index descriptors | Direct registry pulls and local OCI-layout imports share one selector. It ignores unrelated operating systems and architectures, descriptors without platform metadata, and non-image media types, but rejects two eligible matches or an unsupported variant for the requested platform (arm64 accepts no variant or `v8`; amd64 accepts none). Selection never falls back to another architecture and is unit and fuzz tested. |
-| Rootfs-growth virtio-blk profile and initrd resize control | guest virtqueue descriptors and guest-supplied control-stream output | Rootfs-growth sessions alone offer `VIRTIO_BLK_F_WRITE_ZEROES` (bit 14) on the existing root virtio-blk device; ordinary and savable attachments retain the frozen feature surface. The shared virtio-mmio transport clears `FEATURES_OK` when the selected features are not a subset of those offered, latches the accepted set until reset, and validates restored or serializable feature state before applying it to a device. Both HVF and KVM full-machine capture reject any transport that offers the growth profile; rootfs-only checkpoints may inspect the queue for quiescence but serialize no growth transport state. `WRITE_ZEROES` is accepted only after negotiation and only as an exact three-descriptor request: a 16-byte header, one 16-byte range, and a one-byte status. The command-level sector must be zero, the historical `ioprio` field is ignored, the nonzero range is capped at 4 MiB, only `UNMAP` is accepted, and all shape, flag, overflow, capacity, and backend-writability checks complete before mutation. Parser, malformed-chain, status, and stateful before/after fuzz coverage enforce this boundary. Whole chunks become logical zero-map entries without payload writes; partial boundary chunks are read and lazy-CAS verified before mutation. A backend failure after a validated request permanently poisons the unpublished head, and snapshot, fork, head export, step-record publication, and image publication then fail closed. The bounded `spore-rootfs-grow-v1` request is a strict two-member object containing exactly one type and one nonempty bounded session identifier; missing, duplicate, unknown, over-limit, trailing, or embedded-NUL input is rejected, and the request carries no capacity or shell authority. Before the first writable mount, the trusted initrd agent opens `/dev/vda` read-only and decodes the primary ext4 superblock. It rejects journal presence, recovery or journal-device flags, filesystem error or orphan state, a nonzero legacy orphan head, and the orphan-file pending-cleanup flag; a frozen journal-less checkpoint need not carry the clean-unmount bit. The product default then mounts with internal `noinit_itable` so new inode tables initialize synchronously; only the master-gated engineering negative control can omit it. The agent derives target geometry from `BLKGETSIZE64`, re-reads and validates the same source-state fields before invoking `EXT4_IOC_RESIZE_FS`, calls `syncfs`, validates those fields again, and requires the filesystem block count to increase without exceeding the target or falling short by a complete ext4 block group. `statfs` supplies only bounded usable/free/inode diagnostics. The exact response is capped at 1,024 bytes, and the host independently enforces the same block-count progression, terminal-group bound, requested device size, and arithmetic constraints. Preflight rejection, source-state regression, nonzero exit, malformed output, or geometry mismatch aborts growth before user or Dockerfile work. No selected rootfs package, shell, or `resize2fs` binary is trusted or required. |
-| `spore build` rootfs PREPARE cache and publication | local parent indexes, host cache records, and guest-produced rootfs state | The current `sporevm-build-v9` cache ABI represents capacity normalization as a typed synthetic `PREPARE`, keyed by the exact parent index digest, absolute target, platform, and kernel/initrd plus block/control producer identity. PREPARE lookup remains enabled under `--no-cache`; a hit must match the recomputed key and explicit fields, name a child whose logical size is exactly the target, pass normal chunked-rootfs descriptor validation, and have a completeness stamp. The build takes the exclusive rootfs cache lock only for step-record lookups and context-disk emission, each checkpoint from snapshot sealing through its completeness stamp, and final publication; process-owned runtime leases on every input and produced storage keep GC and prune from collecting them in between, and a build holds a lock slot for the first step a stage misses until that stage's session ends, so builds that miss the same first step run that stage once, while a build that starts during another's session may rerun steps not yet recorded. On a miss, the quiesced rootfs checkpoint durably publishes verified objects first and the canonical index second, then publishes the completeness stamp; only a successful thaw permits the atomic PREPARE step record. Product-published step records use an inclusive 16 MiB cap before atomic replacement. Warm lookup and GC share one reader with a one-byte overflow sentinel, so an exact-cap record remains readable while a larger foreign record remains unknown and conservatively roots the namespace. Final image metadata and the mutable destination ref are published only after the selected storage is revalidated. The ordinary step-record GC inspection roots complete PREPARE children. Resize, freeze, queue-quiescence, poisoned-head, snapshot, completeness, record, metadata, or ref failure cannot make incomplete storage reachable and leaves the destination ref unchanged. |
-| Virtqueue descriptors, rings, and device request headers | guest memory | shared queue/MMIO paths and current console/blk/net/vsock/rng device paths fuzzed, including virtio-net receive delivery into guest-posted buffers; QueueReady enables a queue only when its size is a power of two no larger than 256 and its descriptor table, available ring, and used ring have the virtio 1.2 §2.7 alignments and lie wholly inside guest RAM, otherwise the queue stays disabled and the device reports DEVICE_NEEDS_RESET; size and ring-address writes are ignored while a queue is ready; manifest parsing applies the same checks, except guest RAM bounds, to serialized ready queues, and restore refuses a manifest whose ready queues fail any of them once guest RAM is mapped; ring index reads and writes carry the virtio acquire/release barriers so other vCPUs' chains are parsed only after they are published; virtio notify handlers process at most one shared descriptor-chain budget per MMIO notify before returning to the VMM loop, except that on aarch64 a virtio-blk notify only wakes the disk's worker thread, which takes at most one budget per batch off the queue with the device lock held, runs the requests without it, and returns them before a queue reset or a pause proceeds; virtio-net TX/RX frame-boundary handling, short virtio-net headers, oversized frames, queue exhaustion, reset, shutdown paths, and the grow-only virtio-mem request parser are fuzz/unit covered; vsock receive delivery splits stream packets to fit guest-posted buffer chains and never truncates, honors the guest's advertised credit window before sending, volunteers credit updates while consuming guest stream data, and resets abandoned or unknown stream connections; guest-controlled receive descriptor layouts driving the split path are fuzz covered; a guest vsock packet is dropped unless its chain holds the whole payload its header claims, at most 64 KiB, which the device copies out of guest memory in pieces before the stream parser sees it, and transmit chains addressed to the host stream are fuzz covered; new device parsers require fuzz targets in the same slice |
-| `spore-netd` frame stream, ARP, IPv4/UDP/TCP, DNS, and policy parsers | guest-originated Ethernet frames via virtio-net | length-prefixed frame bounds, ARP reply handling, IPv4/UDP DNS dispatch, DNS name parsing, malformed DNS handling, bound-service `*.spore.internal` answers, policy-gated DNS forwarding, TCP frame classification, the TCP gateway receive path over checksum-correct generated frames, hard-floor policy, CIDR allow rules, DNS-learned host allow rules, and DNS-rebinding hard-floor precedence are unit and fuzz covered. DNS answer learning follows bounded in-order CNAME chains from the query name within a single response; A or CNAME records not chained from the query name are ignored, chain length and name decoding are bounded, and the resolver-response answer parser carries a dedicated fuzz target. Forwarded DNS queries never block the netd loop: at most 64 are in flight, each on its own connected UDP socket to the host resolver, and a query without a matching answer within 1 s gets SERVFAIL; queries beyond that bound are dropped so the guest resolver retries them. The CLI passes the whole policy to the monitor and `spore-netd` as one JSON argument whose strict parser (every field required, unknown fields rejected) rebuilds it through the CLI validators and is round-trip fuzzed. Egress is a tagged union, `unrestricted` or an `allowlist` (empty denies all public egress), and neither the policy type nor the argument has a default, so a dropped or unknown egress fails closed. Explicit bound services proxy guest-controlled TCP bytes to declared host Unix stream sockets, so service providers must treat bound sockets as guest-exposed. Named lifecycle monitors spawn the optional `spore-netd` helper before applying the monitor jail, then own helper shutdown with the VM |
-| Guest memory access during dirty scans | guest | Fresh fixed-memory product captures use KVM dirty logs or single-vCPU HVF write-protect faults; at capture, dirty pages plus VMM-originated virtio writes are coalesced to fixed 2MiB chunks, zero chunks are elided, and non-zero chunks are BLAKE3-addressed before being recorded in the manifest. Multi-vCPU HVF and elastic captures use the bounded full-scan path; elastic scans cover the maximum mapping so hotplugged pages cannot escape the portable chunk authority. |
-| Spore manifest decode | registry, disk | manifest v7 parsing/validation, including single- and multi-vCPU machine state and fixed or elastic memory, is fuzzed from valid single- and multi-vCPU seeds; the version and the `platform`, `machine`, and `memory` objects every version has carried are read first, so versions 0-6 fail with a format-too-old error while other programs' `manifest.json` files, newer versions, and malformed manifests fail closed. Saves validate the same way before writing. Elastic state is normalized data, never raw KVM or Hypervisor.framework structures. Validation binds initial RAM to `platform.ram_size`, bounds the maximum elastic region to 8192 2MiB blocks, requires requested/captured sizes within that region, checks sorted non-overlapping plugged ranges with checked arithmetic, recomputes captured bytes, requires exactly one virtio-mem transport only when elastic state is present, and rejects elastic state on multi-vCPU manifests before mapping guest memory. |
-| CAS chunk reads | peers, registry, disk | BLAKE3 verified before restore; malformed memory manifests are fuzzed; compression is unsupported |
-| Local RAM backing and proof sidecar | local disk | Product restore paths treat the fixed `ram.backing` and `ram.backing.proof` paths as optional accelerators: they inspect each path without following symlinks, open only regular files, and read at most 16KiB from the proof. An optional path that is absent, symlinked, non-regular, or size-mismatched, or a proof that is stale, foreign, malformed, or cryptographically mismatched, may select verified chunks. Malformed authoritative memory/index/backing metadata, verified-chunk corruption, allocation failure, unexpected host I/O, and backend/platform/topology failures remain errors rather than being hidden by fallback. Fork keeps the proven parent fd open while linking children and verifies every child link against the proof-bound parent file identity before writing a child proof, so pathname replacement cannot bless a different inode. The proof is an HMAC over the canonical memory index identity, backing metadata, and backing file identity (device, inode, owner, size, and mtime), keyed by a per-user key in the runtime root; because it binds the file and not its bytes, saves fsync the backing before writing the proof, so a crash cannot leave a valid proof next to a backing that lost pages; proof creation re-stats the opened fd before publishing and refuses a changed identity. Under the same-user trust domain above, a principal who can rewrite the backing can also read that key, so the proof is host-local provenance for a `MAP_PRIVATE` fd, not byte-integrity authority. Proofs from other schemas, including v1 (written for unsynced backings) and the removed fs-verity schema v2, fall back to chunks. Chunks remain authoritative and an absent proof selects verified chunks |
-| Immutable rootfs artifact resolution | manifest, local rootfs cache | product restore paths only accept the immutable ext4 rootfs kind, validate virtio-blk binding, and open the identity-addressed materialization cache read-only under the verify-at-install, trust-at-open cache contract: the open refuses symlinked or non-regular entries and size mismatches without re-hashing installed bytes. Exact fd-backed installs still verify content against the manifest digest and size before atomically publishing the entry read-only; chunked rootfs installs publish flat materializations only after verifying the descriptor-selected index and BLAKE3 chunk objects. User-supplied rootfs paths are always copied for exact fd-backed records so later edits cannot alias cache entries |
-| Manifest-bound chunked rootfs storage descriptor and disk index | manifest, registry, disk, image store, peers | `rootfs.storage` is parsed as a separate storage authority from OCI provenance, requires `chunked-ext4-rootfs-v0`, BLAKE3, exact `rootfs/blake3` namespace, matching rootfs device binding, 64KiB disk chunks, logical size matching the ext4 artifact size, `base_identity == index_digest`, and `rootfs.artifact.digest == index_digest`; writable disks use `disk.kind: "chunk-index-disk-v0"` with the same descriptor fields and name their versioned index by `disk.base`; index inputs remain capped at 64 MiB and are BLAKE3-checked against the descriptor before parse. Readers accept only the canonical `spore-disk-index-v2` encoding of packed contiguous digest ranges and counted zero ranges, which the manifest memory index shares; earlier disk-index kinds fail as too old and manifests with an earlier memory index shape are rejected. The memory index is decoded from the token stream with the same range validation and has its own near-valid fuzz target. The decoder rejects unknown or duplicate fields, malformed or uppercase packed digests, empty, adjacent, overlapping, overflowing, out-of-order, out-of-bounds, gapped, or incomplete ranges, descriptor mismatches, alternate canonical bytes, and unsupported namespaces before storage authority is returned; zero ranges remain compressed so a small hostile input cannot force one allocation per logical zero chunk. Raw-input and near-valid v2 decoder fuzz targets cover the parser. Product restore opens the selected disk/rootfs index over a sparse base when the flat cache is absent, verifies and promotes every lazy CAS source across the complete logical read before copying disk payload, and fails missing or corrupt multi-chunk, multi-descriptor requests by writing only the virtio I/O-error status |
-| Same-version runtime disk-fork claim, descriptor, and overlay fd | local child/source monitors | The private prepare and claim requests are strict, versioned JSON lines capped at 8,192 bytes, decoded by the monitor's fuzzed request decoder; the claim reader is fuzzed too. Prepare validates batch/name/count/copy policy before pausing; HVF/KVM then pause every vCPU, reject pending virtio-blk or vsock work, capture RAM/machine state without sealing the writable disk, clone every required physical head at that one epoch, and resume the source after atomic registration or cleanup. The claim is bound to a 256-bit random one-use token, batch, validated child name/index, and exact baseline kind/digest. The registry rejects duplicate or oversized batches before allocation (32 children, 4KiB rendered names, 2MiB per descriptor, 64MiB aggregate), expires claims, and closes every unclaimed head on cancellation or shutdown. A successful claim switches the one-shot Unix stream to a fixed 16-byte binary frame whose first bytes carry one `SCM_RIGHTS` fd; the receiver rejects missing/multiple fds, `MSG_CTRUNC`, ancillary data on later reads, short/trailing bytes, and unknown tags or versions. The private descriptor is exact-length and fuzzed, and binds the baseline to a 64KiB logical geometry plus disjoint, zero-padded physical-overlay and logical-zero bitmaps. Its internal `sparse` clone method is accepted only with no physical-overlay bits; it is used when an exact committed baseline owns every clean byte, while native-clone failure for remaining physical overrides is closed unless an explicit slow-copy caller opts in. Adoption independently reopens and checks that baseline, and accepts only one unlinked regular exact-size `O_RDWR` fd without append semantics; `FD_CLOEXEC` is set immediately when ancillary data is parsed. Runtime overlays honor absolute `TMPDIR`, retain that factory root with the live disk, and reject cross-filesystem fd adoption; transient APFS clone names therefore stay on the source overlay filesystem. Every linked APFS clone exists only inside a private `0700` directory, then is opened and unlinked before ownership transfer. A validated lifecycle lease keeps cache-backed indexes/objects or the saved-spore authority rooted through destructive prune and GC after the source disappears; the source monitor records that lease in its own spec while it holds the guest-operation slot, under the rootfs cache lock for cache-backed baselines (waiting for a held cache lock without the slot), and the prepared response carries it, so the CLI rejects claims for any other baseline and never writes the source's spec. The fork CLI hands each child its claim in a private one-use `disk-claim.json` next to the child's spec, never in the spec or the monitor argv; the child's monitor validates it against its own name and baseline, deletes it, and claims before it reports ready. The existing monitor-jail smoke exercises an fd round trip after applying the unchanged jail. |
-| `spore run` SPIO frames and guest agent requests | guest vsock stream | bounded host buffers; SPIO v1 is the only exec stream protocol; a guest timing event is only logged, never parsed; SPIO v1 frame headers, stream ids, payload lengths, flags, per-stream offsets, terminal output frames, and resize payloads are unit covered; malformed frames fail the run. The guest agent parses every request with one strict parser: one newline-terminated object with a known type and exactly that type's members, each once, with per-type value rules; a rejected request gets an SPIO error on its own connection and leaves any attached client in place. Generation params, from a request's `params_json` or the generation device, are one JSON object read in the same single walk: the members the agent uses (fork and parallel positions, generations, resume time, VM id, fork batch id, hostname, and entropy seed) must be non-negative integers or strings of at most 127 bytes and appear once, and other members are validated as JSON of any type and skipped, so a nested or look-alike key cannot stand in for a top-level member; malformed params fail the request or the generation update. The exec, attach, readiness, copy, and build-control requests are unit covered and share the guest request-parser fuzz target, which also parses the generation params of start and attach requests and is seeded with exec and attach requests, one carrying fork generation params, and their duplicate- and unknown-member variants. A host unit test checks the agent's limits on request size, argv, environment, working directory, session id, generation params, copy paths, SPIO frame payloads, and retained initial output against the host's. The dedicated named-startup readiness request succeeds only after required rootfs and network setup and does not spawn a guest process. `start-v1` and `attach-v1` requests select `null`, `pipe`, or `tty` stdio and fail closed on any other mode or a zero terminal dimension, detached starts require `null` stdio, and input attach validates the saved guest session had an interactive stdin pipe or PTY before accepting host bytes. TTY mode exposes a guest PTY to the child process and treats merged terminal bytes as untrusted guest output |
-| `spore run --inject` files | caller-provided local files | host validates flat injected file ids and regular non-symlink source files, appends bytes to the existing initrd as `newc` entries, and the initrd agent copies only flat regular files into `/run/sporevm/injected` tmpfs before exec. The bytes are not rootfs cache inputs, and injection is rejected with `--save` and `--from` to avoid ambiguous persistence. Disk-only `--commit` permits injection because tmpfs is outside the root disk; an explicit guest copy onto the root disk is intentional persisted state |
-| `spore run --commit` image publication | guest-written root disk, local rootfs CAS, local mutable image ref | commit is fresh-image and non-interactive only; optional absolute disk growth rejects shrinking, grows only the private sparse head, and completes the shared growth-only virtio-blk/direct-ioctl path before the user command. Publication begins only after guest exit zero, sends the fixed `fsfreeze-v1` request, requires virtio-blk queue quiescence, seals the root disk through the existing bounded disk-index path, and publishes only a complete `chunked-ext4-rootfs-v0` descriptor. The exclusive rootfs cache lock spans snapshot sealing, completeness publication, image metadata, and atomic local-ref replacement so GC cannot race unpublished objects. Source refs are resolved before execution and destination refs are replaced last; growth, command, freeze, snapshot, validation, or publication failure leaves the destination ref unchanged |
-| OCI manifest, OCI layout, rootfs tar, and layer decode | registry, local OCI layout, local rootfs tar | rootfs builder only, outside the monitor process; mutable tags are resolved into digest-pinned refs before build materialization, registry fetches require HTTPS and reject loopback, link-local, private, multicast, or reserved resolved targets before each GET including manual redirects, then try at most four of the resolved addresses in order and move to the next only when connecting fails or the connection closes before a response head, cross-origin redirects drop Authorization, an operator-set `SPOREVM_DOCKER_HUB_MIRROR` gets the same fetch policy and Docker Hub's trust for docker.io tag resolution, local refs resolve to digest-pinned local identities, blobs are verified, layout tar extraction and layer/rootfs tar application read records through one tar record iterator, layout tar extraction is path-safe and byte-bounded, layer/rootfs tar application uses one in-memory seekable parser that is path-safe and writes ext4 with the native writer without host staging or e2fsprogs, tar metadata records and PAX xattr handling are bounded, PAX xattrs are limited to deliberately supported capability records, and JSON/tar fuzz targets cover parser inputs, including that layer parser and its record iterator |
-| Remote URL `ADD` fetches | Dockerfile URL operands and numeric mode expressions; public DNS answers; HTTPS response headers, redirects, and bodies | The selected plan's deterministic RUN/COPY/ADD/WORKDIR semantics are preflighted before any ADD fetch or guest execution. Response-derived filenames and effective destinations are validated after the bounded fetch and before cache locking or guest startup. Every request and redirect re-resolves through the public-target policy, which fails if any answer is unsafe, then connects to at most four of the resolved addresses in order with TLS bound to the URL host, moving to the next only when connecting fails or the connection closes before a response head. URLs, redirects, response heads, instruction count, aggregate bytes, and total fetch time are bounded. Opaque bytes are privately staged, synced, made read-only, and content-hashed before cache lookup; failures publish no authority, and the next staging session scavenges abandoned files after a crashed process. Optional `--chmod` is expanded from the instruction-start snapshot and must resolve to an octal value from `0` through `07777` before any GET; symbolic, empty, malformed, duplicate, or out-of-range modes fail closed with the source line. |
-| Attacker-controlled build RUN process and operation-owned filesystem view | Dockerfile shell or exec command, descendants, syscalls, rootfs state, procfs paths, device nodes, sockets, and attached build-input disks | Every build RUN executes beneath a trusted supervisor in dedicated PID, mount, cgroup, IPC, and UTS namespaces. Mount propagation is recursively private, the command enters a descriptor-clean rootfs confinement and is PID 1 behind a procfs mounted from that PID namespace, so `/proc/1/root` cannot name the initrd or agent namespace. BuildKit-compatible read-only and masked proc paths deny guest-global sysctl mutation and sensitive kernel pseudo-files, preventing unrecorded state from affecting a later RUN or cache reconstruction. A fresh minimal `/dev` exposes only standard character devices, devpts, shared memory, and mqueue; auxiliary virtio block and console nodes are absent. A cgroup device policy rejects reads and writes to every block device and console alias, including attacker-created nodes, while retaining BuildKit-compatible harmless `mknod` behavior. A fixed seccomp filter kills calls from any other syscall ABI, including x32 calls that report the x86_64 audit arch, and rejects `socket(AF_VSOCK)`, `socketpair(AF_VSOCK)`, and `io_uring_setup`, closing the direct and asynchronous socket-creation paths to the agent/host control transport while leaving ordinary IP networking available. The command receives only the pinned default BuildKit capability set, excluding `CAP_SYS_ADMIN`, `CAP_SYS_RAWIO`, and `CAP_NET_ADMIN`; sysfs and the scoped cgroup view are read-only, and setup descriptors are closed before exec. The supervisor mirrors exit or signal status, and namespace destruction plus cgroup kill-and-empty verification owns teardown after success, nonzero exit, signal, timeout, setup failure, or control loss. Any setup or cleanup failure blocks checkpoint, cache-record, and destination-ref publication. This boundary adds no mount syntax, secret or credential authority, device type, or manifest field. |
-| `spore build` Dockerfile subset, `.dockerignore`, build-context hashing, context/stage disks, and build executor control | local build contexts and caller-selected Dockerfiles; guest-originated RUN/COPY output after the first executor miss; host-generated read-only ext4 context disks and immutable stage rootfs disks parsed by the guest kernel | The builder supports only an explicit fail-closed Dockerfile subset, source-spanned multi-stage plans, and named OCI-layout build contexts; unsupported syntax, context escape attempts, missing sources, forward stage references, and special-file COPY inputs fail before image publication. A single unquoted, non-chomping COPY heredoc is bounded by the 1 MiB Dockerfile limit, consumed with its exact source span during the full-file parse, and validated by the existing Dockerfile-parser fuzz target. Its body expands through the bounded instruction-start engine while preserving literal quotes, then enters the typed COPY transition as one BLAKE3-addressed root-owned `0644` regular file; quoted/chomping delimiters, multiple or mixed sources, COPY flags, malformed expansion, and unterminated bodies fail closed before execution. The selected target graph is resolved before execution, and only its reachable external bases are fetched. The bounded path-pattern parser implements the accepted COPY and ordered `.dockerignore` dialects, is fuzz/unit covered, and never replaces the fd-relative, no-follow context traversal or immutable capture boundary. Context `COPY --parents` accepts only the strict boolean context form: destinations derive from cleaned `CopyRoot.rel` values below the normalized destination, and ordered roots plus captured modes and bytes enter typed COPY identity. Context-root operands `.` and `./`, internal `/./` pivots, and compositions with `--from`, `--link`, heredocs, or other flags fail during full-file planning. Its explicit-directory synthetic tree merges each reconstructed directory only with a directory; root and nested non-directory conflicts fail before unlinking the existing inode, while ordinary and build-input COPY request shapes retain their prior overwrite behavior. The existing Dockerfile fuzz target covers the flag grammar; the COPY request parser/framing, immutable capture, and fd-relative no-follow confinement boundary remain unchanged, while parents-specific apply semantics add the strict conflict rule inside the walker. RUN cache identity uses length-framed typed fields for network, ENV/ARG, memory, vCPU count, and `nofile`, plus the exact canonical instruction text, so guest-observable resource, environment, shell/exec form, and argv changes cannot alias. Duplicate inherited `Config.Env` keys are normalized in the current stage before hashing and serialization with the same last-value-wins rule as runc, while their raw order remains available for OCI publication and reconstruction by a later `FROM`. Effective RUN entries that are bare empty strings, have an empty `=value` name, or contain an embedded NUL fail before cache lookup or executor startup; nonempty entries without `=` become empty-valued `NAME=` entries in the effective environment to match the pinned BuildKit/runc path, while the raw OCI list remains unchanged. On executor misses, each regular context input is streamed once through BLAKE3 into a private sparse spool, checked for concurrent mutation, and emitted only from that sealed slice; resolved heredoc bytes instead remain bounded inline data and are emitted through the same immutable, complete-stamped, read-only context-disk authority. `COPY --from` attaches at most two already-complete stage/local/OCI rootfs artifacts as additional read-only instances of the existing virtio-blk device type. Chunk-indexed inputs remain lazy, verify CAS chunks through the existing storage authority, never receive a writable overlay, and are mounted `MS_RDONLY,noload` under an initrd-owned path. The strict guest COPY JSON parser and SPIO framing are fuzzed separately from the filesystem walker: requests select context or stage input by a bounded index and validate relative source plus absolute destination paths. Every request names its destination policy: `link` accepts only immutable build-input disks, while ordinary context, heredoc, and stage COPY use `follow`. The walker caps source traversal and link-conflict removal at 65,536 entries, resolves every source and destination fd-relatively, and has a generated-tree fuzz harness covering files, directories, bounded and escaping symlink targets, hardlinks, special inodes, and entry-count failures; focused unit tests cover parent-symlink confinement and symlink-target bounds. Cross-stage copies preserve source entry modes, ownership, mtimes, hardlink topology within each source tree, and bounded `security.capability` only for regular files under the managed kernel with `CONFIG_EXT4_FS_SECURITY=y`. Every copied inode kind and every existing overwrite destination is inspected without following the final symlink; directories, symlinks, overwrite destinations, and regular files carrying any other visible `security.*` xattr fail closed before destination mutation. Cross-stage link policy never follows lower destination symlinks, replaces conflicting lower subtrees within the shared bound, and merges only directory-on-directory results. A single RUN heredoc is accepted only when one unquoted, non-chomping `<<NAME` token is the complete command after the bounded default cache flags. Its non-empty body must not contain NUL or begin with a shebang; it is source-spanned and fuzzed during the full-file parse, preserved with its final newline, and streamed as the ordinary shell command, so ARG/ENV expansion, quoting, escaping, unset behavior, and parameter operators remain guest-shell semantics. Shell-prefix, quoted, chomping, multiple, empty, shebang/direct-exec, exec-form, malformed, and unterminated RUN heredocs fail before executor startup. All shell RUN commands are capped at 64 KiB and reuse the existing RUN request, so this syntax adds no guest parser or protocol authority. Shell and exec RUN share one `spore-build-run-v4` request carrying exact bounded cache-mount and context-bind lists plus either the streamed shell command length or a non-empty argv array of at most 16 JSON strings with a non-empty argv zero and at most 4 KiB of decoded argv; context binds are shell-only, and the host preflights the fully serialized request before executor startup. One strict parser accepts only the exact newline-terminated object, requires every documented field once, rejects aliases, duplicates, unknown fields, malformed scalars or arrays, trailing commas, trailing non-whitespace bytes, and removed request versions, and the request-parser fuzz target covers both forms. The shared guest request boundary rejects full-buffer truncation and duplicate top-level type keys for every request kind. Its JSON strings require valid raw UTF-8, decode Unicode escapes and valid surrogate pairs to UTF-8, and reject embedded NULs and invalid or unpaired scalars. Exec form performs no implicit shell expansion. For a slashless executable, PATH lookup skips candidates that fail lookup, rejects an executable relative match, selects the first executable absolute candidate, and calls `execve` exactly once; failure to execute the selected program cannot fall through to a different binary. The Dockerfile parser and guest request parser fuzz targets cover malformed arrays and objects, heredoc markers and bodies, embedded NULs, raw and escaped JSON controls and Unicode, duplicate and unknown fields, missing newlines, trailing input, truncation, and bounds. Environment/workdir/COPY controls have matching host/guest limits, and `nofile` is validated before `setrlimit`. Each RUN executes in a dedicated cgroup leaf, then all descendants are killed and reaped before success. Build boots deliberately leave rootfs `/tmp` and `/run` on ext4 so Docker-visible state enters checkpoints; normal `spore run` keeps its ephemeral tmpfs contract. Network resolver injection remains an initrd-owned bind mount. A missing symlink target is scaffolded only on the rootfs device; the agent records what it created, unmounts and removes it before freeze, then revalidates the current link, refreshes resolver contents, and remounts after thaw. Cleanup or restore failure blocks reusable step-record and destination-ref publication; any complete orphaned CAS snapshot remains unreachable and collectable, and helper bytes never enter a checkpoint. Capacity preparation uses only the bounded `spore-rootfs-grow-v1` request. The trusted initrd validates the ext4 source before writable mount, the host exposes transient root-vda `WRITE_ZEROES`, and the initrd derives geometry from `BLKGETSIZE64` before invoking `EXT4_IOC_RESIZE_FS`; the selected image contributes no executable, parser, or capacity authority. The obsolete `spore-build-resize-v1` request is rejected. Freeze/thaw and resize controls fail closed, rootfs snapshots require virtio-blk quiescence, and step records publish only after CAS completeness. COPY and WORKDIR resolve from an fd for `/mnt/rootfs` with `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` or a confined component walk, so symlinks cannot escape into the initrd namespace. Current builder-v9 typed SCRATCH, PREPARE, and Dockerfile step records root their complete CAS children and bind COPY destination policy explicitly. Records from older builder versions, malformed or incomplete known records, and semantically stale current-v9 records are pruneable, while genuinely unknown future record kinds or builder versions remain conservative roots. |
-| Generation device inputs | guest | MMIO register surface and fork/restore parameter schemas are fuzz/unit covered |
-| Control socket JSON and named exec/copy SPIO stream | local consumers | local-only lifecycle monitor protocol is implemented for HVF and KVM, including fixed-RAM multi-vCPU create, exec, file copy, save, restore, and fork; named startup publishes ready metadata only after the guest agent answers the dedicated readiness request, then requires the socket to answer a `hello` request carrying the `spore.monitor.hello.v1` schema, an exact SporeVM version match, and the monitor helper contract before create, restore, or fork-child startup reports success, and control operations other than shutdown re-verify the same handshake; disk-backed children validate and adopt their baseline plus one-shot overlay fd before probing guest readiness; all normal, detached, interactive, and TTY named exec requests carry a bounded effective environment and absolute working directory, with image defaults merged against request-local overrides before the existing guest request is encoded; request-local values are not written to lifecycle or manifest state; all attached named exec and named file copy use streaming control requests plus the same bounded SPIO frame parser for optional stdin, terminal input, resize, separate stdout/stderr or merged terminal output, and exit; local clients reject event frames, unknown frame types and malformed frame structure without granting guest authority; output frames use fail-fast local backpressure, aborting the exec when a disconnected or slow consumer cannot accept a complete frame within the 25 ms socket send deadline so the VMM/control loop cannot block indefinitely; monitor-generated guest session ids include a random per-process nonce so a restored guest cannot replay a prior monitor's cached request id, and host-side vsock ports advance from that random nonce for readiness and every request; detaching a completed stream drops queued packets for its old four-tuple before the next stream is attached; copy requests accept explicit regular files or directory trees, reject non-absolute guest paths plus `.`/`..` components, reject symlinks and special files, publish copy-in through no-overwrite temp paths, and create copy-out host destinations with no-overwrite flags; the guest-produced copy-out archive is capped at 4 GiB while it streams into the host temp file, then parsed as hostile input: record paths must be relative with no empty, `.`, `..`, or NUL components, only regular files and directories are created, into a destination that must not exist, each with O_EXCL or mkdirat relative to its parent directory's fd, which is opened one component at a time from the destination with O_NOFOLLOW so a symlink swapped in for a directory fails the copy instead of redirecting it; guest modes carry only permission bits and pass through the process umask; trailing or truncated input fails, and a failed extraction removes the partial destination; guest stdout during copy-in is dropped, and guest stderr during either copy reaches the CLI's stderr with control bytes escaped, or is dropped under `--json`, so guest bytes cannot precede the JSON result or drive the terminal; a fuzz target seeded from a real archive checks that extraction never creates anything outside the destination; monitor processes deny child process execution through an embedded macOS sandbox profile or Linux seccomp filter; the monitor reads each request line within 1 s, answers `hello`, `shutdown`, and disk-fork claims and cancels on its accept thread, and runs guest operations on at most eight handler threads that each wait for the guest at most the VM timeout; requests are a closed set decoded strictly, so an unknown type, unknown field, or duplicate field fails the request, and the decoder is fuzzed; the socket lives in a private per-user `/tmp` namespace under a fixed-size digest of the resolved runtime root and full VM name. An adjacent owner symlink binds that digest to the readable private VM registry directory before monitor spawn, so collisions and ownership mismatches fail closed and cleanup cannot unlink another VM's socket. A VM name is claimed by creating its registry directory and an exclusive `flock` on its `lock` file, so a live entry is never overwritten; the monitor receives that lock as stdin, verifies it, moves it to a close-on-exec fd before starting any helper, and holds it for its whole life. Liveness is the lock alone, never a pid, so a reused or foreign pid cannot make a dead VM look live; `rm` deletes an entry only while holding its lock, and the monitor writes its entry only through a directory fd it holds open, so it never recreates a removed entry or writes into a new one that reuses the name. The monitor takes only the VM name on its command line and reads its configuration, including the network policy, from the private spec |
-| Named create options JSON | local callers, toolchains | `spore vm create --options @file.json` is bounded to the lifecycle metadata size limit, parsed into the same create option validators as CLI flags, rejects unknown schema versions and mixed file/field configuration, and is fuzz covered |
-| Retained initial-command output | guest workload stdout and stderr | Named create either discards output or continuously drains it into fixed 16,381-byte guest-agent buffers per stream. Excess bytes are discarded with explicit truncation flags, so an unattended child cannot block on a full pipe or grow host storage. The local monitor's `initial-output` request returns only that bounded snapshot through the existing framed collector, and removing the VM destroys the guest-resident bytes. |
-| Saved lifecycle and exec-default metadata | input spore directories | Saved lifecycle fields are compatibility hints, not fresh host authority. In particular, `console_log_path` is untrusted and restore never opens or truncates it; named restore currently configures no console log until a future explicit restore option selects a new host path. Optional manifest `exec_defaults` and the compatible lifecycle copy are bounded to 64 environment entries and one absolute working directory before monitor startup. They contain image configuration only; per-exec overrides are never persisted. A saved session's `stdout_offset` and `stderr_offset` only choose where an attach asks the guest agent to resume its output: the agent replays only from the output it still retains and fails the attach for any other offset, and the host's stream offsets saturate instead of overflowing. Ready, list, result, and failure output expose only the path actually configured for the live monitor. |
-| Embedded initrd Toybox shell and applets | host-selected guest argv and guest workload input | the default initrd builds Toybox from pinned source with a minimal applet config and runs it only as guest child workload code; Toybox does not add host parsers, VMM devices, monitor control requests, or rootfs cache authority. Unsupported applets are absent. Besides the agent and Toybox, the shipped initrd carries only the `/bin/sh` wrapper, `/bin/true` and `/bin/false`; the smoke-test helper binaries are added only by `-Dsmoke-helpers` test builds. Exact argv with a slash executes argv zero directly; slashless argv zero uses the shared builder/runtime guest resolver, bounded to the existing 250-byte PATH value, 64 entries, and a 512-byte candidate buffer. Missing or empty PATH fails without searching the working directory, executable relative matches fail closed, and absolute traversal cannot leave the guest VM after chroot. Procfs remains guest-wide and can name paths outside the image root just as an explicit slash-containing argv zero can; PATH lookup grants no host-filesystem authority. The selected executable path changes only the `execve` file argument; the original bounded argv is preserved. |
+## Attack surfaces
 
-RUN cache mounts add no host credential or portable-state authority. The
-parser accepts at most eight `type=cache,target=...` entries with an optional
-opaque `id` and `sharing=shared|locked`. Target, ID, and sharing expand through
-the bounded builder-owned engine; an omitted ID is `path.Clean` of the resolved
-target, while every resolved ID becomes a domain-separated BLAKE3 key before
-it can select storage. Raw IDs therefore never become host paths or lock names.
-Empty, NUL-containing, oversized, malformed, unsupported, or contradictory
-same-ID declarations fail during semantic preflight before remote ADD
-preparation or guest execution. Reachable base resolution/import may already
-have populated its cache because inherited OCI configuration is required for
-that resolution; after a cache option fails semantic preflight, no remote ADD
-request, aggregate-cache open or mutation, VM/runtime activity, snapshot, step
-record, or destination publication occurs. The strict newline-terminated RUN
-request requires every field once, canonical absolute targets, lowercase fixed-length keys, and
-complete input consumption; it shares the existing request-parser fuzz entry
-point. The host opens one fixed-size regular no-follow ext4 file while holding
-an exclusive aggregate cache-store lock and exposes it as a transient writable
-virtio-blk device only to build VMs. The guest creates and opens targets through
-the rootfs-confined resolver and bind-mounts only the selected cache directories
-onto those targets before entering the operation-owned RUN sandbox. The
-aggregate mount and sibling cache keys remain outside the sandbox chroot; its
-scoped procfs, minimal `/dev`, device policy, capability set, and syscall filter
-close namespace, raw-device, console, vsock, and io_uring paths back to them.
-After killing and reaping RUN descendants, the agent unmounts selected targets
-in reverse order, calls `syncfs`, cleanly unmounts the aggregate disk, and
-removes builder-created mountpoints before acknowledging exit or allowing a
-rootfs freeze. Mount-target and created-component device/inode identities plus
-a no-symlink walk make path replacement fail closed, including for a target
-that already existed. Pre-existing symlink ancestry is rejected during setup
-before the command runs. Empty created ancestors are removed, while
-an `ENOTEMPTY` ancestor is preserved because it now contains ordinary rootfs
-state written beside the mount. Actual unmount failure, a nonempty mountpoint,
-or unverifiable ownership poisons the guest build session, returns exit 125,
-and blocks step-record and ref publication. Dirty,
-symlinked, non-regular, size-mismatched, bad-magic, or host-visible unclean cache
-disks are discarded; a guest mount rejection remains a build error. Both
-`shared` and `locked` use the same safe serialization: the aggregate lock spans
-the uncached executor session, so concurrent builds take turns on the
-aggregate. Spore does not claim BuildKit's concurrent shared-writer
-scheduling. Fully cached builds never open or attach
-the aggregate. BuildKit result identity retains cache options only for a shared
-ID whose value equals the resolved destination; Spore matches that value-based
-rule without trying to recover whether the ID was written explicitly. Cache
-bytes are never rootfs CAS, manifest, secret, SSH, or credential input.
-The aggregate disk is one mutable cleanup unit rather than durable state rooted
-by build-step records. System prune and root-aware GC hold the rootfs-cache
-`flock` and then try the aggregate-store lock, which a build holds for its
-whole executor session; while it is busy they leave the aggregate alone rather
-than wait. An active mount therefore cannot race cleanup. The kernel releases
-both locks on process exit, including a crash. Lock pathnames may remain as
-inert files, but they carry no lease authority or retention lifetime; abandoned
-regular emit temps are reclaimed by cleanup or the next store open, and a later
-build rejects or replaces an unclean disk. Symlinked and non-regular aggregate
-paths remain fail-closed and are skipped by system maintenance without being
-followed.
+Fuzz tests are listed by their exact `test` names.
 
-Default context bind mounts accept only one expanded literal relative source
-and one expanded target per declaration on ordinary shell-form RUN. Exec-form
-and heredoc RUN combinations fail during the full-file parse. Planning resolves the source
-through `.dockerignore`, rejects missing paths, directories, symlinks, special
-files, globs, parent traversal, and non-context authorities, and records the
-normalized source/target, read-only policy, mode, and BLAKE3 bytes in ordered
-RUN cache identity. Captured mtime is intentionally excluded from that semantic
-identity to match BuildKit's mtime-only cache hits. A miss validates the source
-mtime against ext4's nanosecond timestamp range, binds its presence and value
-to the context-disk transport identity, selecting v2 whenever a captured mtime
-is present, and seals each regular file through the existing mutation-checked
-context snapshot. Context disks without captured mtime retain the unchanged v1
-identity, and ordinary COPY/ADD entries plus rootfs/import producers retain
-their existing zero-timestamp behavior and identity. The live host path is
-never mounted or opened by the VM. Out-of-range seconds or
-nanoseconds fail before execution rather than being truncated or wrapped. The strict
-newline-terminated RUN request accepts at most eight canonical captured source
-paths and absolute targets, rejects duplicate, unknown, malformed, trailing,
-overlapping cache/bind, and bind/bind fields, and shares the existing
-attacker-input request fuzz target. Targets overlapping the sandbox-owned
-`/proc`, `/dev`, and `/sys` views, the agent-owned `/run/sporevm` path, the
-inert SSH compatibility path at `/run/buildkit`, or the managed resolver target
-fail before setup; this includes ancestors that would hide a protected path and
-descendants that would alter one.
+### Virtio devices and VM exits
 
-The trusted agent opens the selected context-disk source and rootfs target
-component-by-component without following symlinks, mounts the regular file
-with `MS_RDONLY|MS_NOSUID|MS_NODEV`, and exposes it only through the
-operation-owned RUN sandbox. Existing regular-file targets remain the lower
-inode; absent targets and parent components carry recorded device/inode
-ownership. After descendants are killed and reaped, binds unmount in reverse
-order, descriptors close, the owned target is removed, and only still-empty
-owned ancestors are removed. `ENOTEMPTY` on an ancestor preserves legitimate
-rootfs sibling state; unmount failure, non-regular or replaced paths, symlinked
-ancestry, or unverifiable ownership poisons the build session with exit 125 and
-blocks checkpoint, step-record, and ref publication. Bind sources, target
-mountpoints, setup scaffolding, and context-disk transport inodes never enter
-rootfs CAS or portable state. Ordinary files that RUN deliberately writes from
-bind data remain normal rootfs output.
-Writable/custom, directory, stage/image/named-context, tmpfs, secret, and
-credential-bearing bind authorities remain rejected.
+Input: guest memory, rings, MMIO registers, and x86 port I/O and MMIO exits.
 
-The only accepted SSH syntax is one exact default
-`RUN --mount=type=ssh` declaration with no caller-supplied input. Full-file
-planning rejects every option, duplicate, required or custom socket, secret,
-and credential-bearing form. The builder adds BuildKit's inert
-`SSH_AUTH_SOCK=/run/buildkit/ssh_agent.0` value to that RUN only when its
-effective environment lacks the key; it creates no socket, directory, guest
-request field, file descriptor, host/VMM transport, broker, CLI option, or
-durable state. The resolved environment and typed `ssh_declared_absent` state
-are separate RUN cache inputs so a future credential-bearing operation cannot
-reuse the result. A command that requires the nonexistent socket exits through
-the ordinary RUN failure path, which publishes no step record or image ref.
+- A queue becomes ready only if its size is a power of two no larger than 256
+  and its descriptor table, available ring, and used ring are aligned (16, 2,
+  and 4 bytes) and lie wholly inside guest RAM. Otherwise it stays disabled and
+  the device reports `DEVICE_NEEDS_RESET`. Size and address writes are ignored
+  while a queue is ready. Restore applies the same checks to serialized
+  queues.
+- Ring index accesses carry acquire/release barriers, so another vCPU's chains
+  are parsed only after they are published.
+- One notify processes at most 256 chains (`queue.max_notify_chains`). On
+  aarch64, a virtio-blk notify only wakes the disk's worker thread, which runs
+  requests without the device lock and returns them before a queue reset or
+  pause proceeds.
+- The transport clears `FEATURES_OK` unless the accepted features are a subset
+  of those offered, and validates restored feature state.
+- `WRITE_ZEROES` is offered only during rootfs growth. A request must be exactly
+  a 16-byte header, one range of at most 4 MiB, and a status byte, with only
+  `UNMAP`, and is fully validated before any mutation. Full-machine capture
+  refuses a transport that offers it.
+- vsock drops a guest packet unless its chain holds the whole payload, at most
+  64 KiB. Receive splits packets across guest buffers without truncating and
+  honors the guest's credit window.
+- On x86-64, a port I/O exit must carry at most 4 KiB, and only a fixed list of
+  one-byte accesses (CMOS, keyboard-controller status and reset, the `0x80`
+  delay) is allowed. MMIO exits must be naturally aligned 1-, 2-, or 4-byte
+  accesses inside one device window (8-byte also in the generation window).
+  The bzImage planner bounds every offset with checked arithmetic and fails
+  before writing guest RAM.
+- Restored multi-vCPU GIC state is validated before use.
 
-Builder-owned Dockerfile expansion is part of the full-file parse boundary.
-Expansion-capable operands retain their exact quote and escape spelling through
-parsing, and the bounded stable `$NAME`, `${NAME}`, default, and alternate
-grammar is validated before any base fetch or guest boot. Unset variables
-resolve to empty, automatic platform args derive from the selected platform,
-and every ENV instruction resolves all pairs from one instruction-start
-snapshot; malformed or unsupported modifiers remain fail-closed. The existing
-Dockerfile parser fuzz target and a dedicated expansion fuzz target cover
-malformed quoting, escaping, nesting, substitutions, and modifier bytes.
-Expansion depth, each resolved word, and aggregate builder variable state are
-capped at 64 levels, 1 MiB, and 64 MiB respectively, with a source-spanned
-failure before executor startup or image publication.
+Fuzz tests: `fuzz virtqueue parsing`, `fuzz mmio register interface`,
+`fuzz block request handling`, `fuzz write zeroes state transitions`,
+`fuzz console queue handling`, `fuzz net tx handling`, `fuzz net rx delivery`,
+`fuzz vsock tx handling`, `fuzz vsock rx delivery splitting`,
+`fuzz rng queue handling`, `fuzz virtio-mem queue handling`,
+`fuzz generation mmio`, `fuzz multi-vCPU GICv3 validation`,
+`fuzz KVM_EXIT_IO envelope decoder`, `fuzz finite x86 PIO policy`,
+`fuzz x86 KVM MMIO exit router`,
+`fuzz x86 generation control never launders a poweroff`,
+`fuzz x86 bzImage parser and placement planner`.
 
-The accepted remote `ADD` surface is one public HTTPS URL with a literal scheme
-and authority plus one destination. The optional numeric mode, URL path/query,
-and destination are expanded. Full-file parsing and deterministic selected-plan
-semantic preflight complete before any ADD fetch or guest execution;
-response-derived filename/destination validation completes after fetching but
-before guest startup.
-Each build performs a fresh GET, and every request and redirect independently
-resolves all DNS answers through `host_fetch_policy.zig`; loopback, private,
-link-local, multicast, reserved, HTTPS downgrade, URI userinfo, fragment, Git,
-excessive-redirect, missing-location, non-200, non-identity content encoding,
-malformed length, and over-budget inputs fail closed with the source line. The
-builder sends no `Authorization` header and does not consult host credential
-stores. Requested query strings and server-provided HTTPS redirect targets
-remain ordinary URL data. URLs and redirect locations are capped at 64 KiB,
-and each response-head buffer is capped at 16 KiB.
-At most 64 remote ADD instructions may run in one build, their combined body
-bytes are capped at 1 GiB, and their combined host-fetch time is capped at ten
-minutes or the smaller build timeout. Response bytes stream into a private
-exclusive `0600` staging file, remain bounded even without `Content-Length`,
-are synced, made read-only, and BLAKE3-hashed before cache lookup. Failure
-deletes every staged file and cannot publish a step record or destination ref.
-A process crash leaves no reusable authority; the next remote ADD staging
-session scavenges abandoned files while no live session holds the directory
-lock. The typed ADD key binds the resolved
-URL/destination, safe response `Content-Disposition` filename or URL-path
-fallback, actual content digest, resolved numeric result mode (default `0600`),
-validated optional `Last-Modified` timestamp, ENV/ARG snapshot, platform,
-parent rootfs, and executor identity. A valid HTTP-date is applied through an
-fd opened by the shared rootfs-confined resolver after COPY; absent or malformed
-dates apply the Unix epoch. The `spore-build-copy-v5` request is a bounded exact
-object whose fields appear once, whose timestamp is a JSON `null` or signed
-64-bit integer, and whose object plus required newline consumes the complete
-request. The existing read-only context-disk and guest COPY protocol perform
-the filesystem apply, so the host fetch adds no guest network or credential
-authority. URL, redirect, content-disposition, HTTP-date, streaming, cache,
-cleanup, and COPY framing behavior has focused unit or differential coverage. URL
-operands, numeric mode values, content-disposition values, HTTP dates, and COPY
-scalar framing have dedicated fuzz coverage. ADD flags other than numeric
-`--chmod`, symbolic modes, local inputs, ambient authentication, remote Git,
-SSH, archive extraction, and special files remain rejected.
+### Guest agent requests and exec streams
 
-Cross-stage `COPY --link=true` sends the `link` destination policy in the same
-strict newline-terminated `spore-build-copy-v5` object. Every documented field
-appears exactly once, unknown fields and malformed destination policies fail
-closed, and the host preflights the complete serialized request before boot.
-`link` selects only an immutable bounded build-input disk. Its source operand follows final symlinks
-through a root-confined, depth-bounded resolver, while symlinks below a copied
-directory remain data. The filesystem walker constructs real
-destination directories without following lower symlinks, removes conflicting
-lower subtrees with fd-relative no-follow traversal capped at 65,536 entries,
-and rejects unsupported destination security xattrs before mutation. The
-Dockerfile parser, COPY request parser, generated-tree walker, stage-source cache
-transitions, and pinned BuildKit destination conflicts have focused fuzz,
-unit, or differential coverage. Local-context link policy remains rejected.
+Input: guest bytes on vsock, and requests the trusted initrd agent parses.
 
-Builder-v9 RUN/COPY/ADD/WORKDIR cache keys bind the same exact kernel/initrd and
-agent-contract identity used for PREPARE. On the managed default, the identity
-uses the canonical SHA-256 from the bounded read-only kernel sidecar and the
-build-generated SHA-256 of the embedded initrd, so a fully cached build reads
-neither artifact body. A later miss reads the kernel once, verifies the opened
-bytes against the bound digest, and boots that same allocation. Explicit
-kernel/initrd overrides remain eager: the builder loads, hashes, retains, and
-boots those exact bytes. A different producer cannot reuse downstream results
-merely because it happens to emit the same prepared rootfs index. Malformed
-sidecars, digest mismatch, or changed custom bytes fail closed.
+- SPIO v1 is the only exec stream protocol. Frame headers, stream ids, lengths,
+  flags, and offsets are bounded; a malformed frame fails the run.
+- The agent parses every request with one strict parser: one newline-terminated
+  object, a known type, exactly that type's members once each. Generation
+  params are walked in the same pass: members the agent uses must be
+  non-negative integers or strings of at most 127 bytes; other members are
+  validated and skipped.
+- A host unit test checks that the agent's request, argv, environment, path,
+  SPIO payload, and retained-output limits match the host's.
+- `tty` output and copy stderr are untrusted guest output: the CLI escapes
+  control bytes in copy stderr and drops it under `--json`.
+- Named create keeps at most 16,381 bytes of initial output per stream in the
+  guest, with explicit truncation flags.
+- A saved session's output offsets only select what the agent replays from
+  output it still holds; any other offset fails the attach.
+- The shipped initrd holds only the agent, a pinned Toybox, `/bin/sh`,
+  `/bin/true`, and `/bin/false`; smoke helpers need `-Dsmoke-helpers`.
 
-Build capacity policy is fixed: a validated parent below 16 GiB normalizes
-once to exactly 16 GiB, while a parent already at or above that cap is never
-enlarged automatically. Block or inode ENOSPC after an executor instruction is
-terminal for that invocation; SporeVM does not replay a potentially
-side-effecting step and publishes neither its step record nor the destination
-ref. The supported growth envelope is SporeVM's journal-less native ext4
-profile, or equivalent journal-less layouts that pass the pre-mount recovery/error/orphan checks and
-that the pinned guest kernel can online-grow under the product-default
-synchronous inode-table policy. Unsupported features or inconsistent geometry
-fail before publication, without a `resize2fs` fallback.
+Fuzz tests: `fuzz host stream frame parsing`, and `fuzz guest build request
+parser`, which runs the agent's request parser for every request kind with
+generation params and runs only on aarch64 Linux.
 
-When a valid source ends in a partial final chunk, growth verifies any CAS
-authority and preserves the old prefix before exposing a sparse-zero suffix.
-It materializes at most that one boundary chunk; failed reads, writes, or
-resize leave the logical map and digest authority unchanged.
+### Checkpoints, indexes, chunks, and pins
 
-## Structural Rules
+Input: checkpoint directories on disk or pulled from a store; disk indexes;
+pin records; runtime disk-fork messages between local monitors.
 
-- **ReleaseSafe only for shipping builds.** ReleaseFast is for benchmarks.
-  `build.zig` prefers ReleaseSafe; release packaging must never override it.
-- **Chunks are verified before use.** Any chunk received from any source is
-  checked against its BLAKE3 id before being mapped into guest memory or
-  parsed. A malicious peer can deny service, never inject state.
-- **Live lazy runtimes root their CAS.** Before a cache-backed lazy disk opens
-  its index, the runtime publishes its validated baseline lease while holding
-  the rootfs cache lock. Foreground runs and named monitors retain that root
-  until the runtime disk closes, so GC or destructive prune cannot remove an
-  unread object during the VM lifetime.
-- **Fail closed.** Unknown manifest versions, unsatisfiable platform
-  contracts, and unverifiable chunks are errors, never degraded behavior.
-- **Caller-influenced paths are validated before use.** Platform limits such
-  as the 104-byte macOS `sun_path` bound are enforced with actionable errors
-  before spawning helpers or binding sockets; unvalidated path input must
-  never reach a code path that can panic.
-- **The stable monitor scope is local named lifecycle.** `spore vm create`,
-  `exec`, `save`, `restore --name`, `fork`, `ls`, and `rm` are available on
-  supported backends, with fixed-RAM multi-vCPU
-  create, exec, explicit file/directory copy, save, restore, and disk-backed
-  fork. Monitor processes deny child process
-  execution through an embedded macOS sandbox profile or Linux seccomp filter
-  after optional startup helpers are spawned, covered by
-  `test/smoke/monitor/jail.sh`. Startup fails closed unless the guest agent
-  completes its readiness request and the local control socket answers the
-  same-version monitor handshake. Disk-backed named spores preserve
-  immutable-rootfs identity and sealed writable disk indexes; image-created VMs
-  use chunked rootfs storage, and explicit `--rootfs PATH` VMs use exact rootfs
-  artifacts.
-- **The device model stays minimal.** Every device addition expands both the
-  attack surface and the portability contract, and requires updating
-  `docs/spore-format.md`, this document, and the relevant durable design doc.
-  Rootfs growth adds no device, slot, backend-specific register, or manifest
-  field: it is a transient, non-resumable feature profile on the existing root
-  virtio-blk device, implemented in shared device code and rejected by both
-  backends' full-machine save paths.
-- **Fuzzing runs continuously in CI**, not as a one-off audit.
+- `manifest.json` is format v7, at most 64 MiB, and strictly validated before
+  anything is mapped; versions 0 to 6 fail as too old. Saves validate the same
+  way before writing. Machine state is normalized architectural state, never
+  raw KVM or Hypervisor.framework structures.
+- Elastic memory is bounded to 8192 blocks of 2 MiB, with sorted,
+  non-overlapping ranges checked with overflow-safe arithmetic, and is refused
+  on multi-vCPU manifests.
+- Memory chunks are 2 MiB and BLAKE3-addressed; zero chunks are elided.
+- A disk index is at most 64 MiB, checked against its manifest descriptor's
+  BLAKE3 digest before parsing, and must be canonical `spore-disk-index-v2`.
+  Ranges that are empty, overlapping, out of order, out of bounds, or
+  incomplete are rejected; zero ranges stay compressed, so small input cannot
+  force large allocations.
+- `ram.backing` and its proof (at most 16 KiB) are optional accelerators,
+  opened without following symlinks. The proof is an HMAC, keyed per user,
+  over the memory index and the backing file's identity: host-local
+  provenance, not byte integrity. Anything absent, stale, or mismatched falls
+  back to verified chunks.
+- Saved lifecycle metadata are hints. Restore never opens the saved
+  `console_log_path`; `exec_defaults` is bounded to 64 environment entries
+  and one absolute working directory.
+- Pin records are strict versioned JSON of at most 64 KiB; v1 and v2 fail as
+  too old. A save is published in order: objects, index, completeness stamp,
+  pin, manifest. A pin reference must be a hard link to its cache-side anchor
+  with exactly two links, so a copy or extra link fails closed. Unknown or
+  corrupt pins make GC keep all CAS storage.
+- `spore checkpoint rm` reads only a regular `manifest.json`. A running VM's
+  lease names the rootfs cache, not the checkpoint, so removing a checkpoint
+  does not affect VMs restored from it.
+- Runtime disk forks: prepare and claim requests are strict JSON lines of at
+  most 8,192 bytes; a claim needs a 256-bit one-use token; a batch has at most
+  32 children, 4 KiB of names, 2 MiB per descriptor and 64 MiB in total. The
+  claim reply is one 16-byte frame carrying exactly one `SCM_RIGHTS` fd, which
+  must be an unlinked regular `O_RDWR` file of the exact size.
+
+Fuzz tests: `fuzz manifest parsing`, `fuzz memory manifest decoder`,
+`fuzz elastic memory state validation`, `fuzz manifest-bound disk index
+parser`, `fuzz v2 ranged disk index decoder`, `fuzz saved spore pin parsers`,
+`fuzz runtime disk claim request parser`, `fuzz runtime disk claim frame
+header`, `fuzz runtime disk fork descriptor parser`.
+
+### Image stores
+
+Input: store refs, tags, and the files a directory, HTTP(S), or S3 store
+serves; AWS credentials in the environment.
+
+- Refs are absolute directories, `file:///` paths, `http(s)://` URLs, or
+  `s3://bucket/prefix`, with no userinfo, query, fragment, percent escapes,
+  backslashes, or empty, `.`, or `..` segments. Tags match
+  `[a-z0-9][a-z0-9._-]{0,127}`.
+- A tag file is exactly `blake3:<64 lowercase hex>\n`. Over plain HTTP, a tag
+  is accepted only from `127.0.0.1` or `[::1]`, since nothing authenticates it;
+  digest refs work over any scheme.
+- Requests follow no redirects, require status 200 and identity encoding, and
+  read at most: tag 72 bytes, manifest 64 KiB, config and index 64 MiB, object
+  exactly its indexed length. Only connection failures, timeouts, 429, and 5xx
+  are retried. HTTP(S) requests send no credentials. Store hosts are not
+  checked against the public-target policy, because stores may be private.
+- An image's manifest, config, and index must recompute the requested image
+  digest for the host platform before the index is installed.
+- An object is fetched on the first guest read of its chunk (with up to 7
+  following chunks in the background) and verified before it reaches guest
+  memory or the cache. An HTTP(S) object fetch makes at most 3 attempts within
+  10 s. If a read's own fetch fails, the guest gets an I/O error and the disk
+  is poisoned and fetches nothing more. Directory stores read only regular
+  files but have no deadline.
+- Saving a VM whose disk has a store attached first fetches every missing
+  object, at most 16 at a time, before memory is written or the cache lock is
+  taken. If that fails, the save fails before writing anything, the disk is
+  not poisoned, and a named VM keeps running. Stopping a VM cancels the fetch.
+- S3 reads go only to `https://<bucket>.s3.<region>.amazonaws.com`; a set
+  `AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` fails the read. Requests are
+  SigV4-signed from the standard `AWS_*` variables, whose characters are
+  checked so none can inject a header; the secret and derived keys are zeroed
+  after use.
+  Credentials never appear in refs, logs, errors, trace output, or the
+  catalog. `spore image push` to S3 runs the `aws` CLI on staged, verified
+  objects and uploads the tag last.
+- `spore checkpoint push` refuses a disk that is not complete locally,
+  verifies everything it uploads, drops `memory.backing`, and writes the tag
+  last.
+- `spore checkpoint pull` accepts a manifest (at most 64 MiB) only if its bytes
+  hash to the ref and it decodes. Before creating the output directory, it
+  refuses `memory.backing`, a rootfs without a disk, and more than 128 GiB of
+  nonzero RAM. Every chunk and object is verified, the disk is leased under
+  the cache lock, and the pinned manifest is published last; a fetch failure
+  removes the directory. A pulled checkpoint is restore input like any other,
+  including its network policy.
+
+Fuzz tests: `fuzz image store tag`, `fuzz image-manifest parser`,
+`fuzz canonical image-config parser`; pulled manifests use
+`fuzz manifest parsing`.
+
+### Registries, OCI images, tar, and ext4
+
+Input: registry responses, local OCI layouts, rootfs tars, native image
+archives, and OCI image configuration.
+
+- Images are built outside the monitor process from digest-pinned refs, and
+  every blob is verified.
+- Registry fetches require HTTPS. Before each request, including each of at
+  most 5 redirects, every resolved address must pass the public-target policy
+  in `host_fetch_policy.zig` (no loopback, private, link-local, multicast, or
+  reserved targets); at most 4 addresses are tried. Cross-origin redirects
+  drop `Authorization`. `SPOREVM_DOCKER_HUB_MIRROR` gets the same policy.
+- Platform selection never falls back to another architecture and rejects two
+  eligible matches.
+- One tar record iterator reads layout tars, layers, and image archives.
+  Extraction is path-safe and byte-bounded; PAX xattrs are limited to
+  `security.capability`. Layers are applied into ext4 by the native writer
+  with no host staging or e2fsprogs.
+- `spore image unpack` requires the archive's SHA-256, the image's BLAKE3
+  identity, and the platform. It hashes the same open file it parses, accepts
+  only the canonical entries, and publishes the local ref last.
+- OCI `Entrypoint` and `Cmd` obey the guest request limits; `User` must be root.
+
+Fuzz tests: `fuzz OCI manifest parsing`, `fuzz OCI layout index selection`,
+`fuzz OCI layout tar extraction`, `fuzz OCI tar layer parsing`,
+`image archive extraction is fuzzed from a packed archive`,
+`fuzz native ext4 writer planner and metadata emitter`,
+`fuzz OCI root user validation`.
+
+### Monitor socket, protocol, and jail
+
+Input: requests on a named VM's control socket from same-user processes, and
+the guest bytes a monitor relays.
+
+- The socket lives in `/tmp/sporevm-control-<uid>` under a digest of the
+  runtime root and VM name, bound to the VM's registry directory by an owner
+  symlink, so collisions fail closed.
+- A VM is live while its monitor holds an exclusive `flock` on the entry's
+  `lock` file, never by pid. `spore vm rm` deletes an entry only while holding
+  that lock; the monitor writes its entry only through a directory fd, and
+  reads its configuration, including network policy, from the private spec.
+- Startup succeeds only after the guest agent answers its readiness request
+  and the socket answers `hello` with schema `spore.monitor.hello.v1`, the same
+  SporeVM version, and the same helper contract.
+- Requests are a closed set decoded strictly; unknown types, unknown fields,
+  and duplicates fail. A request line must arrive within 1 s. The accept thread
+  answers `hello`, `shutdown`, and disk-fork claims itself; guest operations run
+  on at most 8 handler threads, and further requests get "monitor busy".
+- Output frames have a 25 ms send deadline, so a slow client aborts its exec
+  instead of blocking the VMM.
+- Guest session ids include a random per-monitor nonce, so a restored guest
+  cannot replay an earlier monitor's request.
+- `spore vm copy-out` treats the guest's archive as hostile: at most 4 GiB;
+  relative paths with no empty, `.`, `..`, or NUL components; only regular files
+  and directories, created with `O_EXCL` or `mkdirat` under parent fds opened
+  one component at a time with `O_NOFOLLOW`, into a destination that must not
+  exist; permission bits only. A failure removes the partial destination.
+- `spore vm create --options @FILE` is bounded to the lifecycle metadata limit
+  and runs the same validators as the flags.
+- After spawning its helpers, a monitor denies process execution: on macOS
+  with a sandbox profile, on Linux with a seccomp filter that kills any other
+  audit arch or any x32 syscall and denies `execve` and `execveat`.
+  `test/smoke/monitor/jail.sh` checks it.
+
+Fuzz tests: `fuzz monitor request decoding`, `fuzz copy archive extraction`,
+`fuzz create options file parsing`.
+
+### spore-netd and network policy
+
+Input: guest Ethernet frames, DNS answers from the host resolver, and the
+policy argument.
+
+- netd bounds every length-prefixed guest frame before parsing it.
+- The hard floor (loopback, private, link-local, CGNAT, multicast, and other
+  reserved IPv4 ranges) is checked first and wins over unrestricted egress,
+  CIDR allows, and DNS-learned hosts.
+- DNS learning follows only in-order CNAME chains from the query name within
+  one response, with bounded chain length and name decoding.
+- At most 64 forwarded DNS queries are in flight, each on its own socket; one
+  without an answer in 1 s gets SERVFAIL and excess queries are dropped.
+- The policy reaches the monitor and netd as one JSON argument with a strict
+  parser (every field required, unknown fields rejected) that reruns the CLI
+  validators. Egress is `unrestricted` or an `allowlist` (empty denies all
+  public egress) with no default, so a missing egress fails closed.
+- Bound services pass guest TCP bytes to declared host Unix sockets; their
+  providers must treat them as guest-exposed.
+
+Fuzz tests: `fuzz spore-netd frame stream, ARP, IPv4, UDP, and DNS handling`,
+`fuzz spore-netd TCP gateway guest frames`,
+`fuzz spore-netd TCP Ethernet and IPv4 frame classification`,
+`fuzz spore-net policy DNS answer learning`,
+`fuzz spore-net policy argument parser`.
+
+### spore build
+
+Input: Dockerfiles, build contexts, remote `ADD` responses, and RUN commands
+with everything they do inside the build VM.
+
+- The Dockerfile parser accepts at most 1 MiB and a fail-closed subset;
+  expansion is bounded and validated before any fetch or boot.
+- The context is walked fd-relative without following symlinks; each input is
+  hashed into a private spool and checked for concurrent changes before use.
+- Every RUN runs under a trusted supervisor in its own PID, mount, cgroup, IPC,
+  and UTS namespaces, with procfs from its PID namespace, masked proc paths, a
+  minimal `/dev`, and a cgroup device policy that denies block devices and
+  consoles. A seccomp filter kills other syscall ABIs (including x32) and
+  denies `io_uring_setup` and `AF_VSOCK` sockets. The capability set excludes
+  `CAP_SYS_ADMIN`, `CAP_SYS_RAWIO`, and `CAP_NET_ADMIN`. A setup or cleanup
+  failure blocks every publication.
+- Cache mounts and context binds are at most 8 each per RUN. Cache IDs become
+  BLAKE3 keys, never host paths; binds are read-only regular files.
+- COPY resolves sources and destinations under the rootfs with
+  `RESOLVE_IN_ROOT` or a confined walk, capped at 65,536 entries.
+- Remote `ADD` fetches only public HTTPS URLs: every request and redirect goes
+  through `host_fetch_policy.zig`, sends no `Authorization`, and is bounded to
+  64 instructions, 1 GiB, and 10 minutes per build. Bodies are staged,
+  synced, and hashed before cache lookup. `--chmod` must be octal `0` to
+  `07777`.
+- Rootfs growth validates the ext4 superblock in the trusted initrd before the
+  first writable mount; the host independently checks the reported geometry.
+- Step records are at most 16 MiB and publish only after their storage is
+  complete; the destination ref is replaced last and never on failure. Unknown
+  future record kinds stay GC roots.
+
+Fuzz tests: `fuzz Dockerfile subset parser`, `fuzz Dockerfile variable
+expansion`, `fuzz dockerignore parser`, `fuzz path pattern`,
+`fuzz guest build request parser`, `fuzz build control request framing`,
+`fuzz build copy request framing`, `fuzz guest copy tree`,
+`fuzz guest proc stat parser`, `fuzz guest build resolv target`,
+`fuzz remote ADD URL redirect and response scalar parsing`,
+`fuzz remote ADD numeric chmod`, `fuzz rootfs grow response parser`,
+`fuzz guest ext4 geometry parser`, `fuzz guest ext4 growth source preflight`.
+
+### CLI inputs
+
+Input: caller-supplied files and values.
+
+- `--generation FILE` (`spore run --from`, `spore attach`, `spore vm restore`)
+  is at most 3,840 bytes and checked by `generation.validateFanoutParams`: one
+  JSON object with every required field, each count nonzero and each index
+  below its count, and the strings the agent reads at most 127 bytes without
+  NUL. Unit tests cover it; the agent's fuzz test covers the guest's parse.
+- `--inject ID=PATH` takes at most 16 regular, non-symlink files and 16 MiB in
+  total. They are appended to the initrd and copied into tmpfs in the guest,
+  and refused with `--save` and `--from` so they never persist by accident.
+- `--commit` publishes only after the command exits zero, the filesystem is
+  frozen, and the disk is quiescent, and replaces the ref last.
 
 ## Reporting
 
