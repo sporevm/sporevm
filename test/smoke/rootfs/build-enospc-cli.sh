@@ -52,7 +52,7 @@ runtime_dir="${tmp}/runtime"
 context_dir="${tmp}/context"
 [[ -f "${context_dir}/Dockerfile" ]] || die "${mode} ENOSPC VM smoke did not preserve its CLI workspace"
 
-before_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${cache_root}" "${spore_bin}" rootfs resolve "${destination}")"
+before_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${cache_root}" "${spore_bin}" image resolve "${destination}")"
 before_state="$(authoritative_cache_state "${cache_root}")"
 stdout="${tmp}/cli.stdout"
 stderr="${tmp}/cli.stderr"
@@ -76,7 +76,7 @@ grep -Fq "${marker}" "${stderr}" || die "${mode} ENOSPC CLI output omitted its s
 grep -Fq 'spore build: build rootfs ran out of block or inode space' "${stderr}" || die "${mode} ENOSPC CLI output omitted the actionable capacity diagnostic"
 grep -Fq 'failed steps are not retried' "${stderr}" || die "${mode} ENOSPC CLI output omitted the no-retry contract"
 
-after_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${cache_root}" "${spore_bin}" rootfs resolve "${destination}")"
+after_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${cache_root}" "${spore_bin}" image resolve "${destination}")"
 [[ "${after_ref}" == "${before_ref}" ]] || die "${mode} ENOSPC CLI build changed the destination ref"
 after_state="$(authoritative_cache_state "${cache_root}")"
 [[ "${after_state}" == "${before_state}" ]] || die "${mode} ENOSPC CLI build published authoritative cache state"

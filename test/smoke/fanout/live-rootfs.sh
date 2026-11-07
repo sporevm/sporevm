@@ -41,7 +41,7 @@ fanout_stderr="${workdir}/fanout.stderr"
 if [[ "${image_ref}" == *@sha256:* ]]; then
   resolved_image_ref="${image_ref}"
 else
-  resolved_image_ref="$("${spore_bin}" rootfs resolve "${image_ref}" --platform "${platform}")"
+  resolved_image_ref="$("${spore_bin}" image resolve "${image_ref}" --platform "${platform}")"
 fi
 printf 'live rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 

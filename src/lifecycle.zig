@@ -317,19 +317,6 @@ pub const NamedListResult = struct {
     entries: []const ListEntry,
 };
 
-pub const named_exec_timing_schema_version: u32 = 1;
-
-pub const NamedExecTiming = struct {
-    dispatch_ms: ?u64 = null,
-    guest_process_start_ms: ?u64 = null,
-    guest_execution_ms: ?u64 = null,
-    guest_user_cpu_us: ?u64 = null,
-    guest_system_cpu_us: ?u64 = null,
-    output_result_delivery_ms: ?u64 = null,
-    teardown_ms: u64,
-    total_ms: u64,
-};
-
 pub const ExecNamedResult = struct {
     schema: []const u8 = "spore.exec.result.v1",
     schema_version: u32 = 1,
@@ -338,7 +325,6 @@ pub const ExecNamedResult = struct {
     stderr: []u8,
     stdout_truncated: bool = false,
     stderr_truncated: bool = false,
-    timing: ?NamedExecTiming = null,
 };
 
 /// Per-stream limit for output the monitor retains for `start` and
@@ -2132,7 +2118,6 @@ fn execNamedResult(allocator: std.mem.Allocator, response: monitor_protocol.Resp
         .stderr = stderr,
         .stdout_truncated = result.stdout_truncated,
         .stderr_truncated = result.stderr_truncated,
-        .timing = result.timing,
     };
 }
 
@@ -2319,8 +2304,6 @@ fn lessListEntry(_: void, a: ListEntry, b: ListEntry) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-const test_exec_timing = NamedExecTiming{ .teardown_ms = 0, .total_ms = 13 };
-
 test "named exec response rejects truncated collector output" {
     const allocator = std.testing.allocator;
     clearLastError();
@@ -2331,7 +2314,6 @@ test "named exec response rejects truncated collector output" {
         .stderr_b64 = "ZXJy",
         .stdout_truncated = false,
         .stderr_truncated = true,
-        .timing = test_exec_timing,
     } }));
     try std.testing.expectEqualStrings(
         "named exec stderr exceeded the bounded 16384-byte collector; use openExecNamedStream",
@@ -2347,14 +2329,12 @@ test "named exec response decodes complete bounded output" {
         .stderr_b64 = "/kI=",
         .stdout_truncated = false,
         .stderr_truncated = false,
-        .timing = test_exec_timing,
     } });
     defer deinitExecNamedResult(allocator, result);
 
     try std.testing.expectEqual(@as(u8, 7), result.exit_code);
     try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 'A' }, result.stdout);
     try std.testing.expectEqualSlices(u8, &.{ 0xfe, 'B' }, result.stderr);
-    try std.testing.expectEqual(@as(u64, 13), result.timing.?.total_ms);
 }
 
 test "named exec response preserves monitor error detail" {

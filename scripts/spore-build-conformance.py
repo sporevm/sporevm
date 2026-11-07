@@ -374,17 +374,17 @@ def create_builder(
 
 def check_spore_host(spore_bin: str, logs: pathlib.Path) -> str:
     result = run_command(
-        [spore_bin, "--json", "host-info"],
-        log_prefix=logs / "spore-host-info",
+        [spore_bin, "--json", "system", "info"],
+        log_prefix=logs / "spore-system-info",
     )
     require_success(result)
     try:
         info = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise HarnessError(f"spore host-info did not return JSON: {error}") from error
+        raise HarnessError(f"spore system info did not return JSON: {error}") from error
     available = [backend.get("name") for backend in info.get("backends", []) if backend.get("available")]
     if not available:
-        raise HarnessError("spore host-info reports no available native hypervisor")
+        raise HarnessError("spore system info reports no available native hypervisor")
     return ",".join(str(name) for name in available)
 
 

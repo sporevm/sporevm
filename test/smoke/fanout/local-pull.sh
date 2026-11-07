@@ -32,7 +32,7 @@ push_rootfs_cache="${workdir}/push-rootfs-cache"
 capture_dir="${workdir}/ruby.spore"
 store_dir="${workdir}/store"
 
-resolved_image_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" rootfs resolve "${image_ref}" --platform "${platform}")"
+resolved_image_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" image resolve "${image_ref}" --platform "${platform}")"
 printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 
 SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" run \

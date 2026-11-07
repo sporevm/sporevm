@@ -89,7 +89,7 @@ compressed file is its immutable publication name.
 `spore image pack` resolves the requested local tag to its digest-pinned image
 before writing anything, verifies the complete local CAS closure, and prints
 the archive SHA-256, image-manifest SHA-256, and native-image BLAKE3
-identities. Tags from `spore rootfs import-oci` or `import-tar` (SHA-256 local
+identities. Tags from `spore image import-oci` or `import-tar` (SHA-256 local
 digests) are packed under their recomputed native image identity. It refuses to replace an existing output. `spore image unpack`
 requires the expected archive digest, expected native image digest, target
 platform, and destination local tag. It hashes the same open file it parses,
@@ -217,7 +217,7 @@ RAM, then fetches every RAM chunk into `DIR/chunks`, and the disk index and
 every disk object the rootfs cache lacks into the cache, verifying each against
 its digest and size. DIR is then a save pinned in the rootfs cache, as
 `spore vm save` writes them, so it must be on the cache's filesystem, and
-`spore checkpoint rm` and `spore cache gc` treat it like any other save. Reads
+`spore checkpoint rm` and `spore system gc` treat it like any other save. Reads
 follow the store rules above, so a tag over plain HTTP is read only from
 loopback. The pull is eager, so `spore run --from DIR` needs no store; give
 each copy its own identity with `--generation` (see

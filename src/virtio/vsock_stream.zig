@@ -86,12 +86,6 @@ pub const HostStream = struct {
     first_output_ms: ?u64 = null,
     response_ms: ?u64 = null,
     guest_timing_ms: ?u64 = null,
-    guest_accept_ms: ?u64 = null,
-    guest_spawn_ms: ?u64 = null,
-    guest_exit_ms: ?u64 = null,
-    guest_now_ms: ?u64 = null,
-    guest_user_cpu_us: ?u64 = null,
-    guest_system_cpu_us: ?u64 = null,
     backend_restore_memory_ms: ?u64 = null,
     backend_restore_state_ms: ?u64 = null,
     backend_restore_pre_run_ms: ?u64 = null,
@@ -320,7 +314,6 @@ pub const HostStream = struct {
 
     fn recordGuestTiming(self: *HostStream, payload: []const u8) void {
         if (self.guest_timing_ms == null) self.guest_timing_ms = self.elapsedMs();
-        parseGuestTiming(payload, self);
         std.log.debug("vsock host stream guest timing: {s}", .{payload});
     }
 
@@ -514,32 +507,6 @@ pub const HostStream = struct {
     }
 };
 
-fn parseGuestTiming(payload: []const u8, stream: *HostStream) void {
-    var fields = std.mem.splitScalar(u8, payload, ' ');
-    if (!std.mem.eql(u8, fields.next() orelse return, "timing")) return;
-    while (fields.next()) |field| {
-        const separator = std.mem.indexOfScalar(u8, field, '=') orelse continue;
-        if (separator == 0 or separator + 1 >= field.len) continue;
-        const value = std.fmt.parseInt(i64, field[separator + 1 ..], 10) catch continue;
-        if (value < 0) continue;
-        const unsigned: u64 = @intCast(value);
-        const key = field[0..separator];
-        if (std.mem.eql(u8, key, "accept")) {
-            stream.guest_accept_ms = unsigned;
-        } else if (std.mem.eql(u8, key, "spawn")) {
-            stream.guest_spawn_ms = unsigned;
-        } else if (std.mem.eql(u8, key, "exit")) {
-            stream.guest_exit_ms = unsigned;
-        } else if (std.mem.eql(u8, key, "now")) {
-            stream.guest_now_ms = unsigned;
-        } else if (std.mem.eql(u8, key, "user_us")) {
-            stream.guest_user_cpu_us = unsigned;
-        } else if (std.mem.eql(u8, key, "system_us")) {
-            stream.guest_system_cpu_us = unsigned;
-        }
-    }
-}
-
 fn monotonicMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
@@ -625,11 +592,6 @@ test "host stream parses spore stream v1 frames" {
     try std.testing.expectEqual(@as(i32, 7), stream.exit_code.?);
     try std.testing.expectEqual(@as(u32, 1), stream.memory_pressure_count);
     try std.testing.expect(stream.guest_timing_ms != null);
-    try std.testing.expectEqual(@as(u64, 2), stream.guest_accept_ms.?);
-    try std.testing.expectEqual(@as(u64, 4), stream.guest_spawn_ms.?);
-    try std.testing.expectEqual(@as(u64, 5), stream.guest_exit_ms.?);
-    try std.testing.expectEqual(@as(u64, 7_000), stream.guest_user_cpu_us.?);
-    try std.testing.expectEqual(@as(u64, 8_000), stream.guest_system_cpu_us.?);
     try std.testing.expectEqualStrings("hello world", capture.stdout[0..capture.stdout_len]);
     try std.testing.expectEqualStrings("err", capture.stderr[0..capture.stderr_len]);
     try std.testing.expectEqualStrings("tty", capture.terminal[0..capture.terminal_len]);
@@ -812,22 +774,4 @@ fn fuzzHostStreamFrames(_: void, s: *std.testing.Smith) !void {
 
 test "fuzz host stream frame parsing" {
     try std.testing.fuzz({}, fuzzHostStreamFrames, .{});
-}
-
-fn fuzzGuestTimingEvent(_: void, s: *std.testing.Smith) !void {
-    var bytes: [512]u8 = undefined;
-    const len = s.slice(&bytes);
-    var stream = try HostStream.init(10700, "{}\n");
-    parseGuestTiming(bytes[0..len], &stream);
-
-    var tail: [480]u8 = undefined;
-    const tail_len = s.slice(&tail);
-    var prefixed: ["timing ".len + tail.len]u8 = undefined;
-    @memcpy(prefixed[0.."timing ".len], "timing ");
-    @memcpy(prefixed["timing ".len..][0..tail_len], tail[0..tail_len]);
-    parseGuestTiming(prefixed[0 .. "timing ".len + tail_len], &stream);
-}
-
-test "fuzz guest timing event parsing" {
-    try std.testing.fuzz({}, fuzzGuestTimingEvent, .{});
 }

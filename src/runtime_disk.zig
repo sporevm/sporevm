@@ -711,7 +711,7 @@ test "runtime disk prefers flat cached artifact over rootfs cas chunks" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     _ = try rootfs_cache.installTrustedMaterializationByHardlink(io, arena, cache_root, rootfs_path, rootfs_artifact.digest, rootfs_artifact.size);
@@ -837,7 +837,7 @@ test "runtime disk lazily faults rootfs cas chunks when the flat artifact is mis
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
@@ -916,7 +916,7 @@ test "runtime disk benchmark env eagerly materializes missing flat rootfs from c
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
@@ -966,7 +966,7 @@ test "runtime disk ignores wrong-sized flat cache entries and lazily faults cas 
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
@@ -1016,7 +1016,7 @@ test "runtime disk manifest rootfs cas fails closed without index" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const index_path = try rootfs_cas.manifestIndexPath(arena, cache_root, preload_result.index_digest);
@@ -1065,7 +1065,7 @@ test "lazy runtime disk refuses a stamped cache index swapped for another valid 
         const rootfs_path = try std.fmt.allocPrint(arena, "{s}/{s}.ext4", .{ absolute_tmp, contents });
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = try std.mem.concat(arena, u8, &@as([16384][]const u8, @splat(contents))) });
         artifact.* = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-        const result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+        const result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
         storage.* = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, result);
         index.* = try Io.Dir.cwd().readFileAlloc(io, result.index_path, arena, .limited(disk_index.max_index_bytes));
         // Without the flat artifact the open reads through the index.
@@ -1115,7 +1115,7 @@ test "runtime disk lazy rootfs validates storage against artifact" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = "rootfs bytes" });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
 
     var env = std.process.Environ.Map.init(allocator);
@@ -1150,7 +1150,7 @@ test "runtime disk reports missing cas object on first read of that chunk" {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);
@@ -1216,7 +1216,7 @@ test "runtime disk lazy rootfs survives promoted chunk eviction and rejects corr
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = rootfs_path, .data = rootfs_bytes });
 
     const artifact = try rootfs_cache.cacheByDigestPath(io, arena, cache_root, rootfs_path);
-    const preload_result = try rootfs_cas.preload(io, arena, cache_root, artifact.digest, spore.disk_chunk_size);
+    const preload_result = try rootfs_cas.preloadPath(io, arena, cache_root, rootfs_path, spore.disk_chunk_size);
     const storage = rootfs_cas.storageDescriptor(.{ .mmio_slot = 1 }, preload_result);
     const rootfs_artifact = spore.RootfsArtifactRef{ .digest = storage.index_digest, .size = artifact.size };
     const digest_path = try rootfs_cache.digestPath(arena, cache_root, rootfs_artifact.digest);

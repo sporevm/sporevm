@@ -348,7 +348,7 @@ if [[ "${pin_image_once}" == "1" && "${requested_image}" != *@sha256:* ]]; then
   image_resolve_stderr="${log_dir}/image-resolve.err"
   image_resolve_start_ms="$(now_ms)"
   if run_capture "${image_resolve_stdout}" "${image_resolve_stderr}" \
-    env "${spore_env[@]}" "${spore_bin}" rootfs resolve "${requested_image}"; then
+    env "${spore_env[@]}" "${spore_bin}" image resolve "${requested_image}"; then
     image_resolution_ms="$(( $(now_ms) - image_resolve_start_ms ))"
   else
     status=$?

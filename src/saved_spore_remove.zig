@@ -1,7 +1,7 @@
 //! Checked deletion of saved spore directories.
 //!
 //! Removal deletes only the directory. A machine-local pin is released by
-//! `spore cache gc`: once the save is gone its cache-side ownership anchor has
+//! `spore system gc`: once the save is gone its cache-side ownership anchor has
 //! one link, so GC reclaims the pin and any storage no other root references.
 
 const std = @import("std");

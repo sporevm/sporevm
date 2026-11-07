@@ -136,12 +136,12 @@ require_spore_bin
 
 printf 'workdir: %s\n' "${workdir}"
 printf 'building rootfs from %s for %s\n' "${image_ref}" "${platform}"
-"${spore_bin}" rootfs build "${image_ref}" \
+"${spore_bin}" image export "${image_ref}" \
   --platform "${platform}" \
   --output "${output_path}" \
   --metadata "${metadata_path}"
-[[ -f "${output_path}" ]] || die "rootfs build did not create ${output_path}"
-[[ -f "${metadata_path}" ]] || die "rootfs build did not create ${metadata_path}"
+[[ -f "${output_path}" ]] || die "image export did not create ${output_path}"
+[[ -f "${metadata_path}" ]] || die "image export did not create ${metadata_path}"
 
 resolved_image_ref="$(
   python3 - "${metadata_path}" <<'PY'

@@ -62,7 +62,6 @@ pub const rootfs = @import("rootfs.zig");
 pub const rootfs_ext4 = @import("rootfs/ext4.zig");
 pub const rootfs_cache = @import("rootfs_cache.zig");
 pub const rootfs_cas = @import("rootfs_cas.zig");
-pub const rootfs_cli = @import("rootfs_cli.zig");
 const rootfs_input = @import("rootfs_input.zig");
 pub const disk_index = @import("disk_index.zig");
 pub const run = @import("run.zig");
@@ -157,7 +156,6 @@ test {
     testing.refAllDecls(rootfs_cache);
     testing.refAllDecls(rootfs_ext4);
     testing.refAllDecls(rootfs_cas);
-    testing.refAllDecls(rootfs_cli);
     testing.refAllDecls(rootfs_input);
     testing.refAllDecls(disk_index);
     testing.refAllDecls(run);

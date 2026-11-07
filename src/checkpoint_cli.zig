@@ -40,7 +40,7 @@ pub const rm_usage =
     \\  spore checkpoint rm DIR
     \\
     \\Deletes the checkpoint directory. A VM restored from it keeps its storage
-    \\through its runtime lease; `spore cache gc --force` then reclaims storage
+    \\through its runtime lease; `spore system gc --force` then reclaims storage
     \\nothing else references.
     \\
     \\Options:
@@ -312,7 +312,7 @@ fn writeForkResult(writer: *Io.Writer, result: api.ForkResult) !void {
 }
 
 fn writeRemovedSavedSpore(writer: *Io.Writer, result: lifecycle.RemovedSavedSpore) !void {
-    try writer.print("removed checkpoint {s}; run `spore cache gc --force` to reclaim storage nothing else references\n", .{result.spore_dir});
+    try writer.print("removed checkpoint {s}; run `spore system gc --force` to reclaim storage nothing else references\n", .{result.spore_dir});
     try writer.flush();
 }
 
@@ -338,5 +338,5 @@ test "checkpoint rm names the follow-up storage collection" {
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try writeRemovedSavedSpore(&out.writer, .{ .spore_dir = "disk.spore" });
-    try std.testing.expectEqualStrings("removed checkpoint disk.spore; run `spore cache gc --force` to reclaim storage nothing else references\n", out.written());
+    try std.testing.expectEqualStrings("removed checkpoint disk.spore; run `spore system gc --force` to reclaim storage nothing else references\n", out.written());
 }

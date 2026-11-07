@@ -133,7 +133,6 @@ const Exec = struct {
     /// The guest request; attaching the stream copies it.
     request: []const u8,
     session_sequence: u64,
-    submitted_ms: u64,
     output: union(enum) {
         /// Kept in `ExecServer.capture` and returned in the response.
         captured,
@@ -144,8 +143,6 @@ const Exec = struct {
 /// Output written to the client as SPIO frames while the guest runs.
 const Streamed = struct {
     client_fd: std.c.fd_t,
-    /// Whether a timing event precedes the exit frame.
-    timing: bool,
     stdout_offset: u64 = 0,
     stderr_offset: u64 = 0,
     terminal_offset: u64 = 0,
@@ -799,12 +796,10 @@ const ExecServer = struct {
                     return .keep_running;
                 };
                 dev.resetHostStream();
-                const timing = namedExecTiming(&self.active_stream, active.submitted_ms, lifecycle.monotonicMs());
                 if (streamed) |output| {
-                    if (output.timing) self.sendStreamingTimingLocked(output, timing);
                     self.sendStreamingExitLocked(output, exit_code);
                 } else {
-                    try self.storeExecResultLocked(exit_code, timing);
+                    try self.storeExecResultLocked(exit_code);
                 }
                 active.phase = .done;
                 self.cond.broadcast(self.io);
@@ -868,7 +863,6 @@ const ExecServer = struct {
         self.op = .{ .exec = .{
             .request = request,
             .session_sequence = session_sequence,
-            .submitted_ms = lifecycle.monotonicMs(),
             .output = .captured,
         } };
         if (self.wake) |wake| wake.wake();
@@ -880,7 +874,7 @@ const ExecServer = struct {
         return self.takeResponseLocked();
     }
 
-    fn submitStreamingExec(self: *ExecServer, request: []const u8, session_sequence: u64, client_fd: std.c.fd_t, timing_enabled: bool) !void {
+    fn submitStreamingExec(self: *ExecServer, request: []const u8, session_sequence: u64, client_fd: std.c.fd_t) !void {
         if (request.len > vsock.max_payload) return error.ControlRequestTooLarge;
         try setStreamingSendDeadline(client_fd);
         self.mutex.lockUncancelable(self.io);
@@ -891,8 +885,7 @@ const ExecServer = struct {
         self.op = .{ .exec = .{
             .request = request,
             .session_sequence = session_sequence,
-            .submitted_ms = lifecycle.monotonicMs(),
-            .output = .{ .streamed = .{ .client_fd = client_fd, .timing = timing_enabled } },
+            .output = .{ .streamed = .{ .client_fd = client_fd } },
         } };
         if (self.wake) |wake| wake.wake();
         self.cond.broadcast(self.io);
@@ -1034,17 +1027,6 @@ const ExecServer = struct {
         var payload: [4]u8 = undefined;
         spore_stream.writeExitPayload(&payload, code);
         if (writeSpioFrameFdBounded(streamed.client_fd, .exit, .control, 0, &payload) != 0) {
-            streamed.write_failed = true;
-        }
-    }
-
-    fn sendStreamingTimingLocked(self: *ExecServer, streamed: *Streamed, timing: lifecycle.NamedExecTiming) void {
-        if (streamed.write_failed) return;
-        const json = std.json.Stringify.valueAlloc(self.allocator, monitor_protocol.TimingEvent{ .timing = timing }, .{}) catch return;
-        defer self.allocator.free(json);
-        if (json.len > spore_stream.max_payload_len or
-            writeSpioFrameFdBounded(streamed.client_fd, .event, .control, 0, json) != 0)
-        {
             streamed.write_failed = true;
         }
     }
@@ -1479,7 +1461,7 @@ const ExecServer = struct {
         self.cond.broadcast(self.io);
     }
 
-    fn storeExecResultLocked(self: *ExecServer, exit_code: i32, timing: lifecycle.NamedExecTiming) !void {
+    fn storeExecResultLocked(self: *ExecServer, exit_code: i32) !void {
         const stdout_b64 = try base64Alloc(self.allocator, self.capture.stdout[0..self.capture.stdout_len]);
         defer self.allocator.free(stdout_b64);
         const stderr_b64 = try base64Alloc(self.allocator, self.capture.stderr[0..self.capture.stderr_len]);
@@ -1490,7 +1472,6 @@ const ExecServer = struct {
             .stderr_b64 = stderr_b64,
             .stdout_truncated = self.capture.stdout_truncated,
             .stderr_truncated = self.capture.stderr_truncated,
-            .timing = timing,
         });
     }
 
@@ -1567,42 +1548,6 @@ const ExecServer = struct {
         self.streamOutput(output, bytes);
     }
 };
-
-fn elapsedOptional(later: ?u64, earlier: ?u64) ?u64 {
-    const end = later orelse return null;
-    const start = earlier orelse return null;
-    if (end < start) return null;
-    return end - start;
-}
-
-fn namedExecTiming(stream: *const vsock_stream.HostStream, submitted_ms: u64, finished_ms: u64) lifecycle.NamedExecTiming {
-    const total_ms = finished_ms -| submitted_ms;
-    const guest_process_start_ms = elapsedOptional(stream.guest_spawn_ms, stream.guest_accept_ms);
-    const guest_execution_ms = elapsedOptional(stream.guest_exit_ms, stream.guest_spawn_ms);
-    const guest_result_ms = elapsedOptional(stream.guest_now_ms, stream.guest_exit_ms);
-    const host_result_ms = elapsedOptional(stream.response_ms, stream.guest_timing_ms);
-    const output_result_delivery_ms = if (guest_result_ms != null and host_result_ms != null)
-        guest_result_ms.? +| host_result_ms.?
-    else
-        null;
-    const response_elapsed_ms = stream.response_ms orelse (finished_ms -| stream.started_at_ms);
-    const response_finished_ms = stream.started_at_ms +| response_elapsed_ms;
-    const teardown_ms = finished_ms -| response_finished_ms;
-    const dispatch_ms = if (guest_process_start_ms != null and guest_execution_ms != null and output_result_delivery_ms != null) dispatch: {
-        const accounted = guest_process_start_ms.? +| guest_execution_ms.? +| output_result_delivery_ms.? +| teardown_ms;
-        break :dispatch if (accounted <= total_ms) total_ms - accounted else null;
-    } else null;
-    return .{
-        .dispatch_ms = dispatch_ms,
-        .guest_process_start_ms = guest_process_start_ms,
-        .guest_execution_ms = guest_execution_ms,
-        .guest_user_cpu_us = stream.guest_user_cpu_us,
-        .guest_system_cpu_us = stream.guest_system_cpu_us,
-        .output_result_delivery_ms = output_result_delivery_ms,
-        .teardown_ms = teardown_ms,
-        .total_ms = total_ms,
-    };
-}
 
 fn persistSourceDiskLeaseHandoff(
     io: Io,
@@ -1976,7 +1921,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor
                 return writeStreamingControlError(fd, guestCommandErrorMessage(err));
             };
             defer server.allocator.free(exec_request);
-            server.submitStreamingExec(exec_request, session_sequence, fd, true) catch |err| {
+            server.submitStreamingExec(exec_request, session_sequence, fd) catch |err| {
                 return writeStreamingControlError(fd, server.refusalMessage(err));
             };
             defer server.finishStreamingExec();
@@ -1990,7 +1935,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor
                 return writeStreamingControlError(fd, "invalid copy request");
             };
             defer server.allocator.free(exec_request);
-            server.submitStreamingExec(exec_request, session_sequence, fd, false) catch |err| {
+            server.submitStreamingExec(exec_request, session_sequence, fd) catch |err| {
                 return writeStreamingControlError(fd, server.refusalMessage(err));
             };
             defer server.finishStreamingExec();
@@ -2897,29 +2842,6 @@ test "streaming output backpressure fails instead of blocking" {
     try std.testing.expect(rejected);
 }
 
-test "named exec timing partitions monitor and guest phases" {
-    var stream = try vsock_stream.HostStream.init(10700, "{}\n");
-    stream.started_at_ms = 110;
-    stream.response_ms = 80;
-    stream.guest_timing_ms = 70;
-    stream.guest_accept_ms = 10;
-    stream.guest_spawn_ms = 20;
-    stream.guest_exit_ms = 60;
-    stream.guest_now_ms = 63;
-    stream.guest_user_cpu_us = 31_000;
-    stream.guest_system_cpu_us = 7_000;
-
-    const timing = namedExecTiming(&stream, 100, 200);
-    try std.testing.expectEqual(@as(?u64, 27), timing.dispatch_ms);
-    try std.testing.expectEqual(@as(?u64, 10), timing.guest_process_start_ms);
-    try std.testing.expectEqual(@as(?u64, 40), timing.guest_execution_ms);
-    try std.testing.expectEqual(@as(?u64, 31_000), timing.guest_user_cpu_us);
-    try std.testing.expectEqual(@as(?u64, 7_000), timing.guest_system_cpu_us);
-    try std.testing.expectEqual(@as(?u64, 13), timing.output_result_delivery_ms);
-    try std.testing.expectEqual(@as(u64, 10), timing.teardown_ms);
-    try std.testing.expectEqual(@as(u64, 100), timing.total_ms);
-}
-
 test "a monitor fetches a store-backed root disk before a save pauses the guest, or refuses the save" {
     var fixture: image_store_mod.TestImage = undefined;
     try fixture.init(.{});
@@ -3183,8 +3105,7 @@ test "a streaming input wake finishes before the run replaces its wake" {
         .phase = .active,
         .request = "{}\n",
         .session_sequence = 1,
-        .submitted_ms = 0,
-        .output = .{ .streamed = .{ .client_fd = -1, .timing = false } },
+        .output = .{ .streamed = .{ .client_fd = -1 } },
     } };
     server.active_stream = try vsock_stream.HostStream.init(10700, "{}\n");
     var target: Run = .{};

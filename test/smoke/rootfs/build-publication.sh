@@ -232,7 +232,7 @@ done
 gc_start="${SECONDS}"
 SPOREVM_ROOTFS_CACHE_DIR="${gc_cache}" \
 SPOREVM_RUNTIME_DIR="${gc_runtime}" \
-  with_timeout 10 "${spore_bin}" --json cache gc --rootfs --force >"${workdir}/gc-window.json" ||
+  with_timeout 10 "${spore_bin}" --json system gc --rootfs --force >"${workdir}/gc-window.json" ||
   die "GC did not finish within 10 s while the build ran"
 gc_seconds=$((SECONDS - gc_start))
 kill -0 "${gc_build_pid}" 2>/dev/null || die "GC-window build finished before GC ran"
@@ -249,7 +249,7 @@ for boundary in object index completeness prepare-record image-metadata mutable-
   cache="${workdir}/failure-${boundary}-cache"
   runtime="${workdir}/failure-${boundary}-runtime"
   clone_tree "${template_cache}" "${cache}"
-  old_resolved="$(SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" rootfs resolve "${old_ref}")"
+  old_resolved="$(SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" image resolve "${old_ref}")"
   before_objects="$(count_files "${cache}/cas/rootfs/blake3/objects")"
   before_indexes="$(count_files "${cache}/cas/rootfs/blake3/indexes")"
   before_complete="$(count_files "${cache}/cas/rootfs/blake3/complete")"
@@ -282,7 +282,7 @@ for boundary in object index completeness prepare-record image-metadata mutable-
     cat "${workdir}/failure-${boundary}.stderr" >&2 || true
     die "${boundary} publication failure exited ${status}, expected 2"
   fi
-  after_failure="$(SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" rootfs resolve "${old_ref}")"
+  after_failure="$(SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" image resolve "${old_ref}")"
   [[ "${after_failure}" == "${old_resolved}" ]] || die "${boundary} failure replaced the destination ref"
   after_objects="$(count_files "${cache}/cas/rootfs/blake3/objects")"
   after_indexes="$(count_files "${cache}/cas/rootfs/blake3/indexes")"
@@ -320,7 +320,7 @@ for boundary in object index completeness prepare-record image-metadata mutable-
   fi
 
   SPOREVM_ROOTFS_CACHE_DIR="${cache}" \
-    "${spore_bin}" --json cache gc --rootfs --force >"${workdir}/failure-${boundary}-gc.json"
+    "${spore_bin}" --json system gc --rootfs --force >"${workdir}/failure-${boundary}-gc.json"
   SPOREVM_ROOTFS_CACHE_DIR="${cache}" \
   SPOREVM_RUNTIME_DIR="${workdir}/recovery-${boundary}-runtime" \
     "${spore_bin}" build --network none -t "${old_ref}" "${build_context}" \
@@ -329,7 +329,7 @@ for boundary in object index completeness prepare-record image-metadata mutable-
         cat "${workdir}/recovery-${boundary}.stderr" >&2 || true
         die "${boundary} recovery build failed"
       }
-  recovered="$(SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" rootfs resolve "${old_ref}")"
+  recovered="$(SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" image resolve "${old_ref}")"
   [[ "${recovered}" != "${old_resolved}" ]] || die "${boundary} recovery did not publish the new destination"
   SPOREVM_ROOTFS_CACHE_DIR="${cache}" \
     "${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" \

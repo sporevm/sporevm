@@ -63,8 +63,6 @@ pub const NetworkBoundServiceRequirement = spore.NetworkBoundServiceRequirement;
 pub const Session = spore.Session;
 pub const RootfsBuildOptions = rootfs_mod.BuildRequest;
 pub const RootfsBuildResult = rootfs_mod.BuildResult;
-pub const RootfsCasPreloadOptions = rootfs_mod.CasPreloadRequest;
-pub const RootfsCasPreloadResult = rootfs_mod.CasPreloadResult;
 pub const RootfsImportOciOptions = rootfs_mod.ImportOciRequest;
 pub const RootfsImportOciResult = rootfs_mod.ImportOciResult;
 pub const RootfsImportTarOptions = rootfs_mod.ImportTarRequest;
@@ -344,18 +342,6 @@ pub fn imageArchiveUnpack(
     return image_archive.unpack(init, allocator, options);
 }
 
-/// Preload a cached rootfs into chunked CAS storage.
-pub fn rootfsCasPreload(
-    init: std.process.Init,
-    allocator: std.mem.Allocator,
-    options: RootfsCasPreloadOptions,
-) !RootfsCasPreloadResult {
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const result = try rootfs_mod.casPreload(init, arena_state.allocator(), options);
-    return ownRootfsCasPreloadResult(allocator, result);
-}
-
 fn ownRootfsStorageDigestFields(allocator: std.mem.Allocator, storage: spore.RootfsStorage) !spore.RootfsStorage {
     return rootfs_mod.cloneRootfsStorageDigestFields(allocator, storage);
 }
@@ -376,37 +362,6 @@ fn ownRootfsImportOciResult(allocator: std.mem.Allocator, result: RootfsImportOc
         .resolved_image_ref = resolved_image_ref,
         .image_manifest_digest = image_manifest_digest,
         .rootfs_storage = rootfs_storage,
-    };
-}
-
-fn ownRootfsCasPreloadResult(allocator: std.mem.Allocator, result: RootfsCasPreloadResult) !RootfsCasPreloadResult {
-    const index_path = try allocator.dupe(u8, result.index_path);
-    errdefer allocator.free(index_path);
-    const index_digest = try allocator.dupe(u8, result.index_digest);
-    errdefer allocator.free(index_digest);
-    const rootfs_digest = try allocator.dupe(u8, result.rootfs_digest);
-    return .{
-        .index_path = index_path,
-        .index_digest = index_digest,
-        .rootfs_digest = rootfs_digest,
-        .rootfs_size = result.rootfs_size,
-        .chunk_size = result.chunk_size,
-        .chunk_count = result.chunk_count,
-        .zero_chunks = result.zero_chunks,
-        .nonzero_chunks = result.nonzero_chunks,
-        .objects_written = result.objects_written,
-        .object_bytes_written = result.object_bytes_written,
-        .index_bytes = result.index_bytes,
-        .source_verify_ms = result.source_verify_ms,
-        .chunk_scan_ms = result.chunk_scan_ms,
-        .object_check_ms = result.object_check_ms,
-        .object_write_ms = result.object_write_ms,
-        .index_build_ms = result.index_build_ms,
-        .index_write_ms = result.index_write_ms,
-        .sealed_chunks = result.sealed_chunks,
-        .seal_workers = result.seal_workers,
-        .seal_wall_ms = result.seal_wall_ms,
-        .seal_worker_cpu_ms = result.seal_worker_cpu_ms,
     };
 }
 

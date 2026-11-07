@@ -24,6 +24,26 @@ checkpoint rm help` removes `./help`. `spore resume` and `spore suspend` no
 longer print a hint. JSON results and their schemas are unchanged. The CLI no
 longer promises to keep 0.x spellings compatible.
 
+### `spore system` and `spore image` replace `cache`, `host-info` and `rootfs`
+
+Host and cache maintenance lives under `spore system` and image commands under
+`spore image`; the old spellings are gone, with no aliases:
+
+| Old | New |
+| --- | --- |
+| `spore host-info` | `spore system info` |
+| `spore cache gc`, `cache pins`, `cache unpin` | `spore system gc`, `system pins`, `system unpin` |
+| `spore rootfs import-oci`, `rootfs import-tar`, `rootfs resolve` | `spore image import-oci`, `image import-tar`, `image resolve` |
+| `spore rootfs build` | `spore image export` |
+
+`spore rootfs cas-preload` and its `spore.rootfs.cas-preload.result.v1`
+schema are gone; `spore run --image ... --save` and `spore checkpoint pull`
+write the storage it used to attach. `spore image export` takes only registry
+images: a `local/` ref now fails with a usage error instead of looking up host
+`local`. Other JSON results and their schemas are unchanged. The monitor no
+longer sends a timing event before a `vm exec` exit frame, and the client now
+rejects event frames on that stream.
+
 ### Global `--json` replaces `--events=jsonl`
 
 `spore --json run|attach|fanout|vm exec` now prints the
@@ -58,7 +78,7 @@ removed, with their `spore.pack.result.v1`, `spore.unpack.result.v1`,
 resource type; use `spore checkpoint push` and `spore checkpoint pull`. A
 disk-backed save is always pinned in the rootfs cache and must be on its
 filesystem; nothing makes a self-contained copy of one any more.
-`SPOREVM_BUNDLE_CACHE_DIR` is no longer read and `spore host-info` no longer
+`SPOREVM_BUNDLE_CACHE_DIR` is no longer read and `spore system info` no longer
 reports `cache_roots.bundles`; delete the `bundles` directory under the SporeVM
 cache.
 

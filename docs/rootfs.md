@@ -3,14 +3,14 @@
 For the durable root disk, rootfs CAS, writable disk index, cache, and
 verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
 
-`spore rootfs build` materializes an OCI image into a deterministic ext4 rootfs
+`spore image export` materializes an OCI image into a deterministic ext4 rootfs
 image, installs that image into the local digest cache, and writes chunked
 rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata
 sidecar. Local image imports use the same chunked rootfs storage path.
 The first OCI-capable run workflow is deliberately two-step:
 
 ```bash
-zig-out/bin/spore rootfs build docker.io/library/alpine:3.20 \
+zig-out/bin/spore image export docker.io/library/alpine:3.20 \
   --platform linux/arm64 \
   --output alpine.ext4
 
@@ -20,12 +20,12 @@ zig-out/bin/spore run --rootfs alpine.ext4 'echo hi'
 The input can be either a digest-pinned ref or a registry tag:
 
 ```bash
-spore rootfs build ghcr.io/org/image@sha256:<digest> \
+spore image export ghcr.io/org/image@sha256:<digest> \
   --platform linux/arm64 \
   --output rootfs.ext4 \
   --metadata rootfs.ext4.json
 
-spore rootfs build ghcr.io/org/image:latest \
+spore image export ghcr.io/org/image:latest \
   --platform linux/arm64 \
   --output rootfs.ext4
 ```
@@ -234,7 +234,7 @@ GC retain the selected index and objects until the foreground run exits or the
 named monitor stops.
 
 For local Docker buildx workflows, SporeVM consumes an OCI layout instead of the
-Docker daemon or socket. Buildx writes the layout, then `spore rootfs
+Docker daemon or socket. Buildx writes the layout, then `spore image
 import-oci` imports it into the same deterministic rootfs cache:
 
 ```bash
@@ -243,7 +243,7 @@ docker buildx build \
   --output type=oci,dest=/tmp/sporevm-app.oci \
   .
 
-spore rootfs import-oci /tmp/sporevm-app.oci \
+spore image import-oci /tmp/sporevm-app.oci \
   --ref local/sporevm-app:dev \
   --platform linux/arm64
 
@@ -267,7 +267,7 @@ docker buildx build \
   --output type=tar,dest=/tmp/sporevm-app-rootfs.tar \
   .
 
-spore rootfs import-tar /tmp/sporevm-app-rootfs.tar \
+spore image import-tar /tmp/sporevm-app-rootfs.tar \
   --ref local/sporevm-app:dev \
   --platform linux/arm64
 ```
@@ -315,9 +315,9 @@ spore system prune --force
 spore system prune --rootfs --dry-run --max-bytes 20gb
 spore system prune --rootfs --force --max-bytes 20gb
 spore --json system prune --dry-run
-spore cache gc --rootfs
-spore cache gc --rootfs --force
-spore --json cache gc --rootfs
+spore system gc --rootfs
+spore system gc --rootfs --force
+spore --json system gc --rootfs
 ```
 
 Rootfs cache GC treats current `spore build` step records as roots. Records
@@ -353,9 +353,9 @@ prune selectors:
   objects, including writable-disk state in the shared namespace. This can
   break resume and push even when the flat rootfs artifact remains. Use it only
   for deliberate destructive reclamation; use the root-aware
-  `spore cache gc --rootfs` command to preserve reachable state.
+  `spore system gc --rootfs` command to preserve reachable state.
 
-`spore cache gc --rootfs` is stricter than prune. It roots descriptor-selected
+`spore system gc --rootfs` is stricter than prune. It roots descriptor-selected
 versioned disk indexes from local image records, live
 runtime manifests, and process-owned lazy-runtime leases, then selects only
 unrooted CAS indexes and chunk objects. Names and derivations are not roots: an
@@ -393,10 +393,6 @@ or corrupt at resume (for example after pruning), resume opens the local index a
 chunks on demand, failing closed before unverifiable bytes reach the guest.
 Spores without `rootfs.storage` use the same trusted
 fd-backed open.
-
-`spore rootfs cas-preload <blake3:digest> --attach-spore DIR` remains available
-for repairing or upgrading an existing exact-rootfs spore. It is no longer the
-normal image-build or image-capture path.
 
 `spore checkpoint pull STORE/TAG --out DIR` fetches a spore pushed to an
 [image store](image-format.md#spores) into DIR, and the disk index and objects
@@ -475,10 +471,10 @@ metadata support does not imply runtime support: the experimental AMD64
 backend executes only native `linux/amd64` image and rootfs content and rejects
 cross-architecture cache substitution.
 
-`spore rootfs resolve` prints the digest-pinned ref without building a rootfs:
+`spore image resolve` prints the digest-pinned ref without building a rootfs:
 
 ```bash
-spore rootfs resolve ghcr.io/org/image:latest --platform linux/arm64
+spore image resolve ghcr.io/org/image:latest --platform linux/arm64
 ```
 
 The builder verifies fetched blobs against their SHA256 descriptors, applies OCI
