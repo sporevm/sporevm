@@ -50,45 +50,76 @@ pub const Rootfs = spore.Rootfs;
 pub const Disk = spore.Disk;
 const Backend = backend_mod.Backend;
 
-pub const Options = struct {
+/// One `spore run`: a command in a VM that boots fresh or restores a spore,
+/// optionally saving the VM or committing its root disk as an image.
+pub const Request = struct {
+    /// As asked; `execute` resolves it for the host.
     backend: Backend = .auto,
-    kernel_path: []const u8,
-    initrd_path: ?[]const u8 = null,
-    boot_artifacts: ?boot_assets.MonitorBootArtifacts = null,
-    auto_memory_hotplug_capable: bool = false,
-    rootfs_path: ?[]const u8 = null,
-    rootfs: ?spore.Rootfs = null,
-    rootfs_grow_target: u64 = 0,
-    disk: ?spore.Disk = null,
-    resume_dir: ?[]const u8 = null,
-    resume_generation: ?generation.State = null,
-    start_generation_params: ?[]const u8 = null,
-    require_generation_ready: bool = false,
+    machine: Machine,
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
-    guest_working_dir: ?[]const u8 = null,
-    injected_files: []const boot_assets.InjectedFile = &.{},
     interactive: bool = false,
     tty: bool = false,
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
     timeout_ms: u64 = 30_000,
-    save_path: ?[]const u8 = null,
-    save_trigger: capture.Trigger = .exit,
-    continue_after_save: bool = false,
-    commit: ?CommitOptions = null,
+    save: ?Save = null,
     annotations: spore.Annotations = .{},
     network: spore_net_policy.Network = .disabled,
     events: ?events_mod.EventSink = null,
     spore_executable: []const u8 = "spore",
     debug: bool = false,
-};
 
-pub const CommitOptions = struct {
-    ref: []const u8,
-    config: rootfs_mod.ImageConfig,
-    platform: rootfs_mod.Platform = rootfs_input.direct_image_platform,
+    pub const Machine = union(enum) {
+        boot: Boot,
+        /// `spore run --from DIR`.
+        from: From,
+    };
+
+    pub const Boot = struct {
+        assets: Assets,
+        rootfs_path: ?[]const u8 = null,
+        rootfs: ?spore.Rootfs = null,
+        injected_files: []const boot_assets.InjectedFile = &.{},
+        working_dir: ?[]const u8 = null,
+        commit: ?Commit = null,
+    };
+
+    pub const Assets = union(enum) {
+        /// The managed kernel and initrd, already verified. Only they
+        /// support memory hotplug, so only they boot elastic memory.
+        managed: boot_assets.MonitorBootArtifacts,
+        files: struct {
+            kernel: []const u8,
+            initrd: ?[]const u8 = null,
+        },
+    };
+
+    pub const From = struct {
+        dir: []const u8,
+        rootfs: ?spore.Rootfs = null,
+        disk: ?spore.Disk = null,
+        generation: ?generation.State = null,
+        /// Fan-out identity for the command. The guest must apply it before
+        /// the command starts.
+        generation_params: ?[]const u8 = null,
+    };
+
+    pub const Save = struct {
+        dir: []const u8,
+        trigger: capture.Trigger = .exit,
+        continue_after: bool = false,
+    };
+
+    /// On command success, publish the writable root disk as a local image.
+    pub const Commit = struct {
+        ref: []const u8,
+        config: rootfs_mod.ImageConfig,
+        platform: rootfs_mod.Platform = rootfs_input.direct_image_platform,
+        /// Grow the root disk to this size before the command; 0 keeps it.
+        grow_target: u64 = 0,
+    };
 };
 
 pub const BoundServiceArgList = struct {
@@ -674,11 +705,11 @@ const CommitControl = struct {
     fn reportStatsThunk(_: *anyopaque, _: vsock_control.ControlStats) void {}
 };
 
-pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !events_mod.Result {
-    var events = events_mod.EventEmitter.init(opts.events, "run");
-    try events.emitStart(opts.backend);
+pub fn execute(context: Context, allocator: std.mem.Allocator, request: Request) !events_mod.Result {
+    var events = events_mod.EventEmitter.init(request.events, "run");
+    try events.emitStart(request.backend);
     var created_save_dir = false;
-    return executeWithEvents(context, allocator, opts, &events, &created_save_dir) catch |err| {
+    return executeWithEvents(context, allocator, request, &events, &created_save_dir) catch |err| {
         // A store that cannot supply the image fails the save before it
         // publishes anything, so remove the directory this run created
         // (dirty-RAM tracking may already have written memory into it).
@@ -687,9 +718,9 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
         // stays.
         if (created_save_dir) {
             if (err == error.ImageStoreIncomplete)
-                Io.Dir.cwd().deleteTree(context.io, opts.save_path.?) catch {}
+                Io.Dir.cwd().deleteTree(context.io, request.save.?.dir) catch {}
             else
-                Io.Dir.cwd().deleteDir(context.io, opts.save_path.?) catch {};
+                Io.Dir.cwd().deleteDir(context.io, request.save.?.dir) catch {};
         }
         events.emitFailure(err) catch {};
         return err;
@@ -698,73 +729,94 @@ pub fn execute(context: Context, allocator: std.mem.Allocator, opts: Options) !e
 
 /// Sets `created_save_dir` once the save directory exists, for `execute` to
 /// clean up.
-fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Options, events: *events_mod.EventEmitter, created_save_dir: *bool) !events_mod.Result {
+fn executeWithEvents(context: Context, allocator: std.mem.Allocator, request: Request, events: *events_mod.EventEmitter, created_save_dir: *bool) !events_mod.Result {
     const setup_start = monotonicMs();
-    try topology.validateVcpuCount(opts.vcpus);
-    try spore.validateAnnotations(opts.annotations);
-    if (opts.rootfs_grow_target != 0 and opts.commit == null) return error.InvalidRunDiskSize;
-    if (opts.commit != null and (opts.resume_dir != null or opts.save_path != null or !opts.save_trigger.isExit() or opts.continue_after_save or opts.interactive or opts.tty or opts.command.len == 0)) return error.InvalidRunCommitOptions;
-    if (opts.tty and opts.resume_dir != null) return error.TtyRunFromSporeUnsupported;
+    try topology.validateVcpuCount(request.vcpus);
+    try spore.validateAnnotations(request.annotations);
+    const commit: ?Request.Commit = switch (request.machine) {
+        .boot => |fresh| fresh.commit,
+        .from => null,
+    };
+    if (commit != null and (request.save != null or request.interactive or request.tty or request.command.len == 0)) return error.InvalidRunCommitOptions;
+    if (request.tty and request.machine == .from) return error.TtyRunFromSporeUnsupported;
+    const grow_target = if (commit) |value| value.grow_target else 0;
 
-    const backend = try opts.backend.resolveForHost();
+    const backend = try request.backend.resolveForHost();
     events.setBackend(backend);
     var gateway: net_gateway.Process = undefined;
     var gateway_active = false;
-    if (opts.network == .spore) {
-        try gateway.start(context.io, allocator, opts.spore_executable, opts.debug, opts.network.spore);
+    if (request.network == .spore) {
+        try gateway.start(context.io, allocator, request.spore_executable, request.debug, request.network.spore);
         gateway_active = true;
     }
     defer if (gateway_active) gateway.deinit();
-    if (gateway_active) try events.emitPortForwards(&opts.network.spore);
+    if (gateway_active) try events.emitPortForwards(&request.network.spore);
     const network: virtio_net.Runtime = if (gateway_active) gateway.runtime() else .{};
     errdefer events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
-    const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &opts.network);
+    const network_manifest = try spore_net_policy.manifestNetworkFromOptions(allocator, &request.network);
 
-    const resuming = opts.resume_dir != null;
-    if (opts.memory.isElastic() and ((!resuming and !opts.auto_memory_hotplug_capable) or opts.vcpus != 1)) return error.ElasticMemoryUnsupported;
+    const resume_dir: ?[]const u8 = switch (request.machine) {
+        .boot => null,
+        .from => |from| from.dir,
+    };
+    // Only the managed kernel boots with memory hotplug.
+    const boot_without_hotplug = request.machine == .boot and request.machine.boot.assets != .managed;
+    if (request.memory.isElastic() and (boot_without_hotplug or request.vcpus != 1)) return error.ElasticMemoryUnsupported;
     const local_backing_start = monotonicMs();
-    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, opts.resume_dir, opts.memory.maximum_bytes);
+    var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, resume_dir, request.memory.maximum_bytes);
     const local_backing_ms = monotonicMs() -| local_backing_start;
     defer ram_plan.deinit();
-    if (resuming) std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
-    const kernel_start = monotonicMs();
-    const kernel = if (resuming)
-        ""
-    else if (opts.boot_artifacts) |artifacts|
-        artifacts.kernel
-    else
-        try std.Io.Dir.cwd().readFileAlloc(context.io, opts.kernel_path, allocator, .limited(boot_assets.max_file_size));
-    const kernel_ms = monotonicMs() -| kernel_start;
-    const initrd_start = monotonicMs();
-    if (resuming and opts.injected_files.len != 0) return error.InjectedFileResumeUnsupported;
-    if (opts.save_path != null and opts.injected_files.len != 0) return error.InjectedFileCaptureUnsupported;
-    const initrd: ?[]const u8 = if (resuming)
-        null
-    else if (opts.boot_artifacts) |artifacts|
-        if (opts.injected_files.len == 0) artifacts.initrd else try boot_assets.loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files)
-    else
-        try boot_assets.loadRunInitrd(context.io, allocator, opts.initrd_path, opts.injected_files);
-    const initrd_ms = monotonicMs() -| initrd_start;
-    const disks: runtime_disk_mod.Options = .{
-        .rootfs_path = opts.rootfs_path,
-        .rootfs = opts.rootfs,
-        .rootfs_grow_target = opts.rootfs_grow_target,
-        .disk = opts.disk,
-        .spore_dir = opts.resume_dir,
+    if (resume_dir != null) std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
+    const boot_start = monotonicMs();
+    const machine: vm_session.Machine = switch (request.machine) {
+        .from => |from| .{ .restore = .{
+            .dir = from.dir,
+            .ram = ram_plan.strategy,
+            .generation = from.generation,
+        } },
+        .boot => |fresh| boot: {
+            if (request.save != null and fresh.injected_files.len != 0) return error.InjectedFileCaptureUnsupported;
+            break :boot .{ .boot = .{
+                .kernel = switch (fresh.assets) {
+                    .managed => |managed| managed.kernel,
+                    .files => |files| try std.Io.Dir.cwd().readFileAlloc(context.io, files.kernel, allocator, .limited(boot_assets.max_file_size)),
+                },
+                .initrd = switch (fresh.assets) {
+                    .managed => |managed| if (fresh.injected_files.len == 0) managed.initrd else try boot_assets.loadRunInitrd(context.io, allocator, null, fresh.injected_files),
+                    .files => |files| try boot_assets.loadRunInitrd(context.io, allocator, files.initrd, fresh.injected_files),
+                },
+                .memory = request.memory,
+                .guest_port = request.guest_port,
+                .console_mirror = vm_session.console_fd >= 0,
+            } };
+        },
+    };
+    const boot_ms = monotonicMs() -| boot_start;
+    const disks: runtime_disk_mod.Options = switch (request.machine) {
+        .boot => |fresh| .{
+            .rootfs_path = fresh.rootfs_path,
+            .rootfs = fresh.rootfs,
+            .rootfs_grow_target = grow_target,
+        },
+        .from => |from| .{
+            .rootfs = from.rootfs,
+            .disk = from.disk,
+            .spore_dir = from.dir,
+        },
     };
     const request_start = monotonicMs();
-    const request = try execRequestForRun(context, allocator, opts, opts.memory.isElastic());
-    var stream = try vsock_stream.HostStream.init(opts.guest_port, request.bytes);
+    const guest_request_info = try execRequestForRun(context, allocator, request, request.memory.isElastic());
+    var stream = try vsock_stream.HostStream.init(request.guest_port, guest_request_info.bytes);
     const request_ms = monotonicMs() -| request_start;
-    if (resuming) stream.host_port = vsock_stream.HostStream.deriveHostPort(request.bytes);
-    if (opts.events != null) {
+    if (resume_dir != null) stream.host_port = vsock_stream.HostStream.deriveHostPort(guest_request_info.bytes);
+    if (request.events != null) {
         stream.setLifecycleSink(events, runEventLifecycleSink);
         stream.setOutputSink(events, runEventOutputSink);
     }
-    var stdin_control = if (opts.interactive or opts.tty) attach_stream.RunStdinControl.init(&stream, opts.tty, opts.interactive, attach_stream.terminalSizeFd()) else null;
-    if (stdin_control) |*control| try control.start(opts.tty and opts.interactive);
+    var stdin_control = if (request.interactive or request.tty) attach_stream.RunStdinControl.init(&stream, request.tty, request.interactive, attach_stream.terminalSizeFd()) else null;
+    if (stdin_control) |*control| try control.start(request.tty and request.interactive);
     defer if (stdin_control) |*control| control.deinit();
-    const commit_cache_root = if (opts.commit != null)
+    const commit_cache_root = if (commit != null)
         try local_paths.rootfsCacheRootPath(allocator, context.environ_map)
     else
         null;
@@ -772,11 +824,11 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
         .io = context.io,
         .allocator = allocator,
         .command_stream = &stream,
-        .guest_port = opts.guest_port,
-        .timeout_ms = opts.timeout_ms,
+        .guest_port = request.guest_port,
+        .timeout_ms = request.timeout_ms,
         .cache_root = cache_root,
-        .rootfs_grow_target = opts.rootfs_grow_target,
-        .phase = if (opts.rootfs_grow_target != 0) .start_resize else .wait_command,
+        .rootfs_grow_target = grow_target,
+        .phase = if (grow_target != 0) .start_resize else .wait_command,
         .resize_stdout = std.array_list.Managed(u8).init(allocator),
     } else null;
     defer if (commit_control) |*control| control.deinit();
@@ -789,13 +841,13 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     var capture_request = capture.Request{};
     var signal_registration: ?capture.SignalRegistration = null;
     defer if (signal_registration) |*registration| registration.deinit();
-    const capture_plan = capture.Plan.productRun(.{
-        .capture_path = opts.save_path,
-        .trigger = opts.save_trigger,
-        .resume_dir = opts.resume_dir,
+    const capture_plan = if (request.save) |save| capture.Plan.productRun(.{
+        .capture_path = save.dir,
+        .trigger = save.trigger,
+        .resume_dir = resume_dir,
         .request = &capture_request,
-        .continue_after_capture = opts.continue_after_save,
-    });
+        .continue_after_capture = save.continue_after,
+    }) else capture.Plan{};
     if (capture_plan.capture) |vm_capture| {
         try spore.createSnapshotRoot(allocator, vm_capture.dir);
         created_save_dir.* = true;
@@ -805,47 +857,36 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
             try saved_spore_pin.ensureOwnershipLinkCompatible(allocator, cache_root, vm_capture.dir);
         }
     }
-    const saved_sessions = [_]spore.Session{spore.processSession(request.session_id, opts.interactive, opts.tty)};
+    const saved_sessions = [_]spore.Session{spore.processSession(guest_request_info.session_id, request.interactive, request.tty)};
     if (capture_plan.signal) |signal| {
         signal_registration = capture.SignalRegistration.install(signal, &capture_request);
     }
     std.log.debug(
-        "run host setup timing: total_ms={d} local_backing_ms={d} kernel_ms={d} initrd_ms={d} request_ms={d} ram_mib={d} virtio_mem_mib={d}",
+        "run host setup timing: total_ms={d} local_backing_ms={d} boot_ms={d} request_ms={d} ram_mib={d} virtio_mem_mib={d}",
         .{
             monotonicMs() -| setup_start,
             local_backing_ms,
-            kernel_ms,
-            initrd_ms,
+            boot_ms,
             request_ms,
-            opts.memory.initial_bytes / 1024 / 1024,
-            (opts.memory.maximum_bytes - opts.memory.initial_bytes) / 1024 / 1024,
+            request.memory.initial_bytes / 1024 / 1024,
+            (request.memory.maximum_bytes - request.memory.initial_bytes) / 1024 / 1024,
         },
     );
 
     const cause = vm_session.run(context, allocator, .{
         .backend = backend,
-        .machine = if (opts.resume_dir) |dir| .{ .restore = .{
-            .dir = dir,
-            .ram = ram_plan.strategy,
-            .generation = opts.resume_generation,
-        } } else .{ .boot = .{
-            .kernel = kernel,
-            .initrd = initrd,
-            .memory = opts.memory,
-            .guest_port = opts.guest_port,
-            .console_mirror = vm_session.console_fd >= 0,
-        } },
-        .vcpus = opts.vcpus,
+        .machine = machine,
+        .vcpus = request.vcpus,
         .disks = disks,
         .network = .{ .runtime = network, .manifest = network_manifest },
-        .record = .{ .annotations = opts.annotations, .sessions = &saved_sessions },
+        .record = .{ .annotations = request.annotations, .sessions = &saved_sessions },
         .console_sink = vm_session.consoleSink,
         .mode = .{ .oneshot = .{
             .probe = .{
                 .stream = &stream,
-                .timeout_ms = opts.timeout_ms,
-                .start = if (opts.rootfs_grow_target != 0) .control else .immediate,
-                .on_complete = if (opts.commit == null) .stop else .detach,
+                .timeout_ms = request.timeout_ms,
+                .start = if (grow_target != 0) .control else .immediate,
+                .on_complete = if (commit == null) .stop else .detach,
                 .session_output = true,
             },
             .capture = capture_plan.capture,
@@ -853,8 +894,8 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
         } },
     }) catch |err| {
         if (capture_plan.isSignalCapture() and capture_request.isCompleted() and isCaptureAborted(err)) {
-            var result = resultFromAbortedSignalCapture(backend, opts, &stream);
-            if (resuming) result = result.withMemoryRestore(&ram_plan);
+            var result = resultFromAbortedSignalCapture(backend, request, &stream);
+            if (resume_dir != null) result = result.withMemoryRestore(&ram_plan);
             events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
             try events.emitExit(result);
             if (events.write_failed) return error.EventSinkFailed;
@@ -864,39 +905,39 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
     };
     const signal_capture_observed = capture_plan.isSignalCapture() and capture_request.isCompleted();
     var result = try switch (cause) {
-        .probe_complete => resultFromStream(backend, opts, &stream, signal_capture_observed),
-        .monitor_stopped => if (opts.commit != null)
-            resultFromStream(backend, opts, &stream, false)
+        .probe_complete => resultFromStream(backend, request, &stream, signal_capture_observed),
+        .monitor_stopped => if (commit != null)
+            resultFromStream(backend, request, &stream, false)
         else
             error.ProbeDidNotComplete,
         .snapshotted => if (capture_plan.isExitCapture())
-            resultFromExitCapture(backend, opts, &stream)
+            resultFromExitCapture(backend, request, &stream)
         else
-            resultFromSignalCapture(backend, opts, &stream),
+            resultFromSignalCapture(backend, request, &stream),
         else => error.ProbeDidNotComplete,
     };
-    if (opts.commit) |commit| {
+    if (commit) |commit_request| {
         if (result.exit_code == 0) {
             const control = if (commit_control) |*value| value else return error.RunCommitDidNotComplete;
             const storage = control.storage orelse return error.RunCommitDidNotComplete;
             const cache_lock = if (control.cache_lock) |*lock| lock else return error.RunCommitDidNotComplete;
             const published = try local_image.publish(context.io, allocator, control.cache_root, cache_lock, .{
-                .platform = commit.platform,
-                .config = commit.config,
+                .platform = commit_request.platform,
+                .config = commit_request.config,
                 .storage = storage,
-                .name = commit.ref,
+                .name = commit_request.ref,
             });
             events.emitImageCommitBestEffort(.{
                 .command = "run",
                 .backend = backend,
-                .ref = commit.ref,
+                .ref = commit_request.ref,
                 .resolved_image_ref = published.resolved_ref,
                 .rootfs_index_digest = storage.index_digest,
             });
             result.committed = true;
         }
     }
-    if (resuming) result = result.withMemoryRestore(&ram_plan);
+    if (resume_dir != null) result = result.withMemoryRestore(&ram_plan);
     events_mod.finishGatewayNetworkEvents(&gateway, &gateway_active, events);
     try events.emitExit(result);
     if (events.write_failed) return error.EventSinkFailed;
@@ -920,40 +961,43 @@ const RunRequestInfo = struct {
     session_id: []const u8,
 };
 
-fn execRequestForRun(context: Context, allocator: std.mem.Allocator, opts: Options, memory_pressure: bool) !RunRequestInfo {
+fn execRequestForRun(context: Context, allocator: std.mem.Allocator, request: Request, memory_pressure: bool) !RunRequestInfo {
     const resume_time_unix_ns: u64 = @intCast(Io.Clock.real.now(context.io).nanoseconds);
-    if (opts.resume_dir == null) return .{
-        .bytes = try guest_request.execRequestWithSessionOptions(allocator, opts.command, spore.default_session_id, .{
-            .env = opts.guest_env,
-            .working_dir = opts.guest_working_dir,
-            .resume_time_unix_ns = resume_time_unix_ns,
-            .memory_pressure = memory_pressure,
-            .stdio = runStdio(opts),
-            .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
-        }),
-        .session_id = spore.default_session_id,
-    };
-
-    const session_id = try randomRunSessionId(context, allocator);
-    return .{
-        .bytes = try guest_request.execRequestWithSessionOptions(allocator, opts.command, session_id, .{
-            .env = opts.guest_env,
-            .resume_time_unix_ns = resume_time_unix_ns,
-            .memory_pressure = memory_pressure,
-            .stdio = runStdio(opts),
-            .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
-            .generation_params = opts.start_generation_params,
-            .require_generation_ready = opts.require_generation_ready,
-        }),
-        .session_id = session_id,
-    };
+    switch (request.machine) {
+        .boot => |boot| return .{
+            .bytes = try guest_request.execRequestWithSessionOptions(allocator, request.command, spore.default_session_id, .{
+                .env = request.guest_env,
+                .working_dir = boot.working_dir,
+                .resume_time_unix_ns = resume_time_unix_ns,
+                .memory_pressure = memory_pressure,
+                .stdio = runStdio(request),
+                .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
+            }),
+            .session_id = spore.default_session_id,
+        },
+        .from => |from| {
+            const session_id = try randomRunSessionId(context, allocator);
+            return .{
+                .bytes = try guest_request.execRequestWithSessionOptions(allocator, request.command, session_id, .{
+                    .env = request.guest_env,
+                    .resume_time_unix_ns = resume_time_unix_ns,
+                    .memory_pressure = memory_pressure,
+                    .stdio = runStdio(request),
+                    .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
+                    .generation_params = from.generation_params,
+                    .require_generation_ready = from.generation_params != null,
+                }),
+                .session_id = session_id,
+            };
+        },
+    }
 }
 
 // `spore run` forwards host stdin only with -i; without it the command
 // reads /dev/null, as it did before the guest agent spoke only SPIO.
-fn runStdio(opts: Options) guest_request.GuestStdio {
-    if (opts.tty) return .tty;
-    if (opts.interactive) return .pipe;
+fn runStdio(request: Request) guest_request.GuestStdio {
+    if (request.tty) return .tty;
+    if (request.interactive) return .pipe;
     return .null;
 }
 
@@ -970,7 +1014,7 @@ pub fn rootfsGrowTarget(current_size: u64, requested_size: u64) !u64 {
     return if (requested_size == current_size) 0 else requested_size;
 }
 
-fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream, saved: bool) !events_mod.Result {
+fn resultFromStream(backend: Backend, request: Request, stream: *const vsock_stream.HostStream, saved: bool) !events_mod.Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -993,24 +1037,24 @@ fn resultFromStream(backend: Backend, opts: Options, stream: *const vsock_stream
         .exec_response_ms = response_ms,
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
-        .vcpus = opts.vcpus,
-        .memory_bytes = opts.memory.initial_bytes,
-        .max_memory_bytes = opts.memory.maximum_bytes,
+        .vcpus = request.vcpus,
+        .memory_bytes = request.memory.initial_bytes,
+        .max_memory_bytes = request.memory.maximum_bytes,
         .saved = saved,
-        .save_path = if (saved) opts.save_path else null,
-        .save_ownership = if (saved) saveOwnership(opts) else null,
+        .save_path = if (saved) request.save.?.dir else null,
+        .save_ownership = if (saved) saveOwnership(request) else null,
     };
 }
 
-fn resultFromSignalCapture(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream) events_mod.Result {
-    return resultFromSignalCaptureExitCode(backend, opts, stream, 0);
+fn resultFromSignalCapture(backend: Backend, request: Request, stream: *const vsock_stream.HostStream) events_mod.Result {
+    return resultFromSignalCaptureExitCode(backend, request, stream, 0);
 }
 
-fn resultFromAbortedSignalCapture(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream) events_mod.Result {
-    return resultFromSignalCaptureExitCode(backend, opts, stream, 130);
+fn resultFromAbortedSignalCapture(backend: Backend, request: Request, stream: *const vsock_stream.HostStream) events_mod.Result {
+    return resultFromSignalCaptureExitCode(backend, request, stream, 130);
 }
 
-fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream, exit_code: u8) events_mod.Result {
+fn resultFromSignalCaptureExitCode(backend: Backend, request: Request, stream: *const vsock_stream.HostStream, exit_code: u8) events_mod.Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -1021,16 +1065,16 @@ fn resultFromSignalCaptureExitCode(backend: Backend, opts: Options, stream: *con
         .exec_response_ms = response_ms,
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = exit_code,
-        .vcpus = opts.vcpus,
-        .memory_bytes = opts.memory.initial_bytes,
-        .max_memory_bytes = opts.memory.maximum_bytes,
+        .vcpus = request.vcpus,
+        .memory_bytes = request.memory.initial_bytes,
+        .max_memory_bytes = request.memory.maximum_bytes,
         .saved = true,
-        .save_path = opts.save_path,
-        .save_ownership = saveOwnership(opts),
+        .save_path = request.save.?.dir,
+        .save_ownership = saveOwnership(request),
     };
 }
 
-fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock_stream.HostStream) !events_mod.Result {
+fn resultFromExitCapture(backend: Backend, request: Request, stream: *const vsock_stream.HostStream) !events_mod.Result {
     const start_ms = stream.start_ms orelse 0;
     const connect_ms = stream.connect_ms orelse stream.elapsedMs();
     const response_ms = stream.response_ms orelse stream.elapsedMs();
@@ -1041,17 +1085,21 @@ fn resultFromExitCapture(backend: Backend, opts: Options, stream: *const vsock_s
         .exec_response_ms = response_ms,
         .probe_duration_ms = if (response_ms >= connect_ms) response_ms - connect_ms else 0,
         .exit_code = stream.exit_code orelse return error.BadRunExitFrame,
-        .vcpus = opts.vcpus,
-        .memory_bytes = opts.memory.initial_bytes,
-        .max_memory_bytes = opts.memory.maximum_bytes,
+        .vcpus = request.vcpus,
+        .memory_bytes = request.memory.initial_bytes,
+        .max_memory_bytes = request.memory.maximum_bytes,
         .saved = true,
-        .save_path = opts.save_path,
-        .save_ownership = saveOwnership(opts),
+        .save_path = request.save.?.dir,
+        .save_ownership = saveOwnership(request),
     };
 }
 
-fn saveOwnership(opts: Options) []const u8 {
-    return if (opts.disk != null or opts.rootfs != null or opts.rootfs_path != null)
+fn saveOwnership(request: Request) []const u8 {
+    const disk_backed = switch (request.machine) {
+        .boot => |boot| boot.rootfs != null or boot.rootfs_path != null,
+        .from => |from| from.disk != null or from.rootfs != null,
+    };
+    return if (disk_backed)
         saved_spore_ownership.machine_local_pinned
     else
         saved_spore_ownership.portable_self_contained;
@@ -1165,8 +1213,7 @@ test "run request encodes env for run from spore command" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     const request = try execRequestForRun(.{ .io = std.testing.io, .environ_map = &env }, std.testing.allocator, .{
-        .kernel_path = "",
-        .resume_dir = "base.spore",
+        .machine = .{ .from = .{ .dir = "base.spore" } },
         .command = &.{"/usr/bin/env"},
         .guest_env = &.{"SPORE_TEST_ENV=ok"},
     }, false);
@@ -1485,12 +1532,13 @@ test "a run that fails before its VM starts leaves no save directory behind" {
     // fail after the save directory exists.
     const expected = if (builtin.cpu.arch == .x86_64) error.X86CaptureUnsupported else error.RootFSOpenFailed;
     try std.testing.expectError(expected, execute(.{ .io = io, .environ_map = &env }, arena_state.allocator(), .{
-        .kernel_path = "",
-        .boot_artifacts = .{ .kernel = "kernel", .initrd = "initrd" },
-        .rootfs_path = try tmp_dir.path("missing.ext4"),
+        .machine = .{ .boot = .{
+            .assets = .{ .managed = .{ .kernel = "kernel", .initrd = "initrd" } },
+            .rootfs_path = try tmp_dir.path("missing.ext4"),
+        } },
         .command = &.{"true"},
         .memory = memory_config.Config.fixed(vm_session.x86_experimental_memory_bytes),
-        .save_path = save_path,
+        .save = .{ .dir = save_path },
     }));
     // A second `--save` to the same path would otherwise fail AlreadyExists.
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, save_path, .{}));
@@ -1828,11 +1876,37 @@ test "run cli parser defaults save trigger to exit" {
     try std.testing.expect(!opts.continue_after_save);
 }
 
+test "a fresh run's guest request carries the image's working directory, and a --from request its fan-out identity" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    const context: Context = .{ .io = std.testing.io, .environ_map = &env };
+
+    var request = Request{
+        .machine = .{ .boot = .{ .assets = .{ .files = .{ .kernel = "Image" } }, .working_dir = "/app" } },
+        .command = &.{"/bin/true"},
+    };
+    const fresh = try execRequestForRun(context, arena, request, false);
+    try std.testing.expectEqualStrings(spore.default_session_id, fresh.session_id);
+    try std.testing.expect(std.mem.indexOf(u8, fresh.bytes, "\"working_dir\":\"/app\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fresh.bytes, "\"require_generation_ready\":false") != null);
+
+    request.machine = .{ .from = .{ .dir = "saved.spore", .generation_params = "{\"resume_entropy_seed\":\"abcd\"}" } };
+    const from = try execRequestForRun(context, arena, request, false);
+    try std.testing.expect(std.mem.startsWith(u8, from.session_id, "run-"));
+    try std.testing.expect(std.mem.indexOf(u8, from.bytes, "\"working_dir\":\"\"") != null);
+    // The guest applies the identity before the command starts.
+    try std.testing.expect(std.mem.indexOf(u8, from.bytes, "\"params_json\":\"{\\\"resume_entropy_seed\\\":\\\"abcd\\\"}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, from.bytes, "\"require_generation_ready\":true") != null);
+}
+
 test "save ownership distinguishes disk-backed and diskless captures" {
-    const base = Options{ .kernel_path = "Image", .command = &.{} };
+    const base = Request{ .machine = .{ .boot = .{ .assets = .{ .files = .{ .kernel = "Image" } } } }, .command = &.{} };
     try std.testing.expectEqualStrings(saved_spore_ownership.portable_self_contained, saveOwnership(base));
     var disk_backed = base;
-    disk_backed.rootfs_path = "rootfs.ext4";
+    disk_backed.machine.boot.rootfs_path = "rootfs.ext4";
     try std.testing.expectEqualStrings(saved_spore_ownership.machine_local_pinned, saveOwnership(disk_backed));
 }
 
