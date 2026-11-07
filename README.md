@@ -231,7 +231,7 @@ limit: a sufficiently dense disk above about 30.62 GiB will fail a later
 snapshot or commit closed. Prefer the smallest required size; the 20 GiB
 example remains encodable even when fully populated.
 
-Export an image's root filesystem as a reusable ext4 file:
+Export a registry image's root filesystem as a reusable ext4 file:
 
 ```bash
 spore image export docker.io/library/alpine:3.20 \

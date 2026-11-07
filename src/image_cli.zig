@@ -35,7 +35,8 @@ pub const export_usage =
     \\Usage:
     \\  spore image export <image@sha256:...|image:tag> --output <rootfs.ext4>
     \\
-    \\Writes the image's root filesystem as an ext4 file and a metadata sidecar.
+    \\Writes a registry image's root filesystem as an ext4 file and a metadata
+    \\sidecar. Local images (local/NAME:TAG) cannot be exported.
     \\
     \\Options:
     \\  --output <path>        Rootfs ext4 output path
@@ -83,8 +84,14 @@ pub const resolve_usage =
 
 pub fn exportRootfs(ctx: *const Ctx, args: []const []const u8) !void {
     const arena = ctx.init.arena.allocator();
-    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image export", "usage: spore image export IMAGE --output FILE");
-    const parsed = try rootfs.parseBuildOptions(arena, args);
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image export", "usage: spore image export REGISTRY_IMAGE --output FILE");
+    const parsed = rootfs.parseBuildOptions(arena, args) catch |err| switch (err) {
+        error.LocalImageExportUnsupported => {
+            const message = "spore image export: only registry images can be exported, not local/ images";
+            cli.exitWithCliError(arena, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "image export"), message);
+        },
+        else => |e| return e,
+    };
     const result = try api.rootfsBuild(ctx.init, arena, .{
         .ref = parsed.ref,
         .output = parsed.output,

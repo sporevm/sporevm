@@ -81,7 +81,7 @@ pub const commands = [_]Command{
     .{ .name = "image import-oci", .summary = "Import an OCI image layout as a local image", .usage = image_cli.import_oci_usage, .output = .result, .run = image_cli.importOci },
     .{ .name = "image import-tar", .summary = "Import a rootfs tar as a local image", .usage = image_cli.import_tar_usage, .output = .result, .run = image_cli.importTar },
     .{ .name = "image resolve", .summary = "Resolve an image tag to a digest reference", .usage = image_cli.resolve_usage, .output = .result, .run = image_cli.resolve },
-    .{ .name = "image export", .summary = "Write an image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .result, .run = image_cli.exportRootfs },
+    .{ .name = "image export", .summary = "Write a registry image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .result, .run = image_cli.exportRootfs },
     .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.usage, .output = .result, .run = image_cli.push },
     .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.usage, .output = .result, .run = image_cli.pack },
     .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.usage, .output = .result, .run = image_cli.unpack },

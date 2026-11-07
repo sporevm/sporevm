@@ -332,11 +332,14 @@ pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8)
         }
     }
 
+    const ref = image_ref orelse return error.MissingImageReference;
+    // Export pulls from a registry; a local name would be looked up as host `local`.
+    if (isLocalImageRef(ref)) return error.LocalImageExportUnsupported;
     const out = output orelse return error.MissingOutputPath;
     const meta = metadata orelse try std.fmt.allocPrint(allocator, "{s}.json", .{out});
     if (try sameResolvedPath(allocator, out, meta)) return error.RootFSMetadataPathMatchesOutput;
     return .{
-        .ref = image_ref orelse return error.MissingImageReference,
+        .ref = ref,
         .output = out,
         .metadata = meta,
         .platform = platform,
@@ -449,7 +452,7 @@ const RootfsBuildProfile = struct {
     fn casPhase(self: RootfsBuildProfile, name: []const u8, start_ms: u64, result: rootfs_cas.PreloadResult) void {
         if (!self.enabled) return;
         std.debug.print(
-            "spore rootfs profile: phase={s} ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} source_verify_ms={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d} sealed_chunks={d} seal_workers={d} seal_wall_ms={d} seal_worker_cpu_ms={d}\n",
+            "spore rootfs profile: phase={s} ms={d} chunks={d} zero_chunks={d} nonzero_chunks={d} objects_written={d} object_bytes_written={d} index_bytes={d} chunk_scan_ms={d} object_check_ms={d} object_write_ms={d} index_build_ms={d} index_write_ms={d} sealed_chunks={d} seal_workers={d} seal_wall_ms={d} seal_worker_cpu_ms={d}\n",
             .{
                 name,
                 monotonicMs() -| start_ms,
@@ -459,7 +462,6 @@ const RootfsBuildProfile = struct {
                 result.objects_written,
                 result.object_bytes_written,
                 result.index_bytes,
-                result.source_verify_ms,
                 result.chunk_scan_ms,
                 result.object_check_ms,
                 result.object_write_ms,
@@ -1353,6 +1355,13 @@ test "build options accept tag image refs" {
     defer allocator.free(parsed.metadata);
     try std.testing.expectEqualStrings("registry.example/repo:latest", parsed.ref);
     try std.testing.expectEqualStrings("rootfs.ext4.json", parsed.metadata);
+}
+
+test "build options reject a local image ref" {
+    try std.testing.expectError(
+        error.LocalImageExportUnsupported,
+        parseBuildOptions(std.testing.allocator, &.{ "local/seed:v1", "--output", "rootfs.ext4" }),
+    );
 }
 
 test "rootfs build keeps its temp dir in the rootfs cache and removes it on failure" {
