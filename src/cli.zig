@@ -448,7 +448,10 @@ pub fn exitWithCliError(
     if (mode == .json) {
         machine_output.writeError(allocator, stderr, err) catch {};
     } else {
-        stderr.print("{s} [{s}]\n", .{ std.mem.trimEnd(u8, human_text, "\n"), err.code.text() }) catch {};
+        const text = std.mem.trimEnd(u8, human_text, "\n");
+        const first_line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+        stderr.print("{s} [{s}]\n", .{ text[0..first_line_end], err.code.text() }) catch {};
+        if (first_line_end < text.len) stderr.print("{s}\n", .{text[first_line_end + 1 ..]}) catch {};
     }
     stderr.flush() catch {};
     std.process.exit(err.exit_code);

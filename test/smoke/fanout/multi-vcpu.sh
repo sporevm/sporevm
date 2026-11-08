@@ -372,7 +372,7 @@ if [[ "${SPORE_SMOKE_NAMED_LIFECYCLE:-0}" == "1" ]]; then
   fi
   run_disk_point_in_time_case image --image "${resolved_disk_image}"
   explicit_rootfs="${workdir}/explicit-rootfs.ext4"
-  "${spore_bin}" image export "${resolved_disk_image}" \
+  "${spore_bin}" image export-rootfs "${resolved_disk_image}" \
     --platform "${disk_platform}" \
     --output "${explicit_rootfs}" \
     >"${workdir}/explicit-rootfs-build.stdout" 2>"${workdir}/explicit-rootfs-build.stderr"

@@ -27,6 +27,7 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
         (["checkpoint", "fanout"], 2, "usage.invalid_argument", "Usage:", True),
         (["checkpoint", "inspect", str(root / "missing")], 22, "object.not_found", "missing", False),
         (["vm", "logs", "missing"], 2, "usage.missing_argument", "--initial", False),
+        (["vm", "copy-in"], 2, "usage.missing_argument", "Usage:", False),
         (["vm", "restore", "missing", "--name", "dev"], 2, "usage.invalid_argument", "--checkpoint", False),
         (["build", ".", "-t", "local/app:dev"], 2, "usage.invalid_argument", "--tag", False),
         (["image", "pack", "local/app:dev"], 2, "usage.missing_argument", "archive", False),
@@ -76,6 +77,9 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
                 assert not result.stdout, (argv, result.stdout)
                 assert message.lower() in result.stderr.lower(), (argv, result.stderr)
                 assert f"[{code}]" in result.stderr, (argv, result.stderr)
+                if args == ["vm", "copy-in"]:
+                    assert result.stderr.splitlines()[0] == f"Usage: [{code}]", (argv, result.stderr)
+                    assert result.stderr.splitlines()[1] == "  spore vm copy-in NAME HOST_PATH GUEST_PATH", (argv, result.stderr)
                 if args[:2] == ["checkpoint", "resume"]:
                     assert result.stderr.startswith("spore checkpoint resume:"), (argv, result.stderr)
 

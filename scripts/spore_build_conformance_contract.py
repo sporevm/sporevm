@@ -777,7 +777,7 @@ def assert_expected_builds(case: Case, docker: CommandResult, spore: SporeBuildR
             f"{command_failure(spore.command)}"
         )
     if expected.spore is Outcome.FAILURE:
-        expected_diagnostic = expected.spore_diagnostic
+        expected_diagnostic = f"{expected.spore_diagnostic} [runtime.execution_failed]"
         actual_diagnostic = exact_spore_diagnostic(spore.command.stderr)
         if expected_diagnostic != actual_diagnostic:
             raise CaseError(
