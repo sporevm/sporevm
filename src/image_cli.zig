@@ -10,30 +10,53 @@ const Ctx = cli.Ctx;
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
 
-pub const usage =
+pub const push_usage =
     \\Usage:
     \\  spore image push local/name:tag --to STORE/TAG [--platform os/arch]
-    \\  spore image pack local/name:tag --output image.tar.gz [--platform os/arch]
-    \\  spore image unpack image.tar.gz --expected-archive-digest sha256:... --expected-image-digest blake3:... --tag local/name:tag [--platform os/arch]
     \\
     \\STORE is a directory, a file:// URL or s3://bucket/prefix (uploaded with
-    \\the aws CLI); TAG may be blake3:<digest>.
+    \\the aws CLI); TAG may be blake3:<digest>. HTTP(S) stores are read-only;
+    \\publish a directory and serve it with a static HTTP server instead.
     \\Run a pushed image with `spore run --image <store-url>/TAG`.
-    \\Reads require explicit AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional
-    \\AWS_SESSION_TOKEN and AWS_REGION (or AWS_DEFAULT_REGION); AWS_PROFILE is
-    \\only supported by the push CLI. Credentials are not refreshed during reads.
-    \\Use image pull to acquire a complete image without booting; pack/unpack
-    \\transfers native images offline. Resolve only resolves identity.
+    \\S3 reads use explicit environment credentials first, otherwise AWS CLI v2's
+    \\provider chain (including AWS_PROFILE), refreshing expiring credentials.
+    \\Use image pull for complete offline acquisition; resolve only finds identity.
     \\
     \\Options:
-    \\  --expected-archive-digest DIGEST  Expected immutable SHA-256 archive identity
-    \\  --expected-image-digest DIGEST  Expected native BLAKE3 image identity
-    \\  --tag local/name:tag  Local mutable image ref to publish
     \\  --platform os/arch    linux/arm64 or linux/amd64 (infer recorded platform;
     \\                        prefer native when a local tag has both)
     \\  --to STORE/TAG        Store publication destination, not an OCI registry
-    \\  --output PATH            New image archive path
     \\  -h, --help            Show this help
+    \\
+;
+
+pub const pack_usage =
+    \\Usage:
+    \\  spore image pack IMAGE --output image.tar.gz [--platform os/arch]
+    \\
+    \\Write a native image archive for offline transfer, not a checkpoint bundle.
+    \\The output must be new. Record both returned digests for trusted unpacking.
+    \\
+    \\Options:
+    \\  --output PATH        New image archive path
+    \\  --platform os/arch   Infer recorded platform; prefer native for multi-platform tags
+    \\  -h, --help           Show this help
+    \\
+;
+
+pub const unpack_usage =
+    \\Usage:
+    \\  spore image unpack ARCHIVE --expected-archive-digest sha256:... --expected-image-digest blake3:... --tag local/name:tag [--platform os/arch]
+    \\
+    \\Verify a native image archive against independently trusted digests before
+    \\publishing its local tag. Hashes from the archive alone are not trust anchors.
+    \\
+    \\Options:
+    \\  --expected-archive-digest DIGEST  Expected SHA-256 archive identity
+    \\  --expected-image-digest DIGEST    Expected native BLAKE3 image identity
+    \\  --tag REF                        Local mutable image name to publish
+    \\  --platform os/arch               Infer the archive's recorded platform
+    \\  -h, --help                       Show this help
     \\
 ;
 

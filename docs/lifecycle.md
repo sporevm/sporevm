@@ -94,7 +94,7 @@ Pass `--initial-output discard` when the output is intentionally disposable;
 with the guest agent, are copied with a live fork or saved-memory restore, and
 disappear when the VM is removed. Retrieval takes its turn on the guest like
 any other operation, so `spore vm logs` waits behind a running exec, copy, save,
-or fork for up to the VM timeout and then reports the monitor as busy. Create removes the new
+or fork for up to the VM's startup timeout and then reports the monitor as busy. Create removes the new
 VM if the process cannot be started, while a non-zero exit after a successful
 start is reported by `spore vm logs` and does not affect VM readiness.
 `spore vm exec` always
@@ -105,6 +105,13 @@ guest terminal for the exec. The usual shell spelling is:
 ```bash
 spore vm exec -it bench-1 -- /bin/sh
 ```
+
+Create uses `--startup-timeout` for readiness and `--exec-timeout` as the
+default limit for later commands (both default to 30s). `vm exec
+--exec-timeout DURATION|none` overrides that execution limit for one command;
+`none` never disables startup or queue limits. Command time starts at complete
+guest-request delivery, after queueing. Timeout or disconnect cancels the
+command and its descendants, not the VM or its detached initial command.
 
 `-i` and `-t` are independent: neither flag selects output attachment, and a
 host terminal is not required when PTY output or input is redirected.
@@ -171,6 +178,7 @@ spore vm create bench-1 --options @create-options.json
   "memory": "512mb",
   "max_memory": "16gb",
   "vcpus": 2,
+  "startup_timeout_ms": 30000,
   "timeout_ms": 120000,
   "initial_output": "retain",
   "network": {
@@ -467,7 +475,7 @@ a duplicate field fails the request. The monitor answers `hello`,
 `shutdown`, and disk-fork claims and cancels as soon as it accepts the
 connection. Guest
 operations (exec, copy, logs, save, fork) take turns: each waits for the
-running one for up to the VM timeout and then fails as busy, and at most eight
+running one for up to the VM's startup timeout and then fails as busy, and at most eight
 run or wait at once. `spore vm rm` stops a VM even while an exec runs; that exec
 fails with `named VM is being removed`. A save or fork capture already under
 way may finish, but `rm` still signals the monitor if it has not exited within
