@@ -210,6 +210,7 @@ pub fn fromZigError(err: anyerror) CliError {
         error.InvalidImageStoreRef, error.InvalidImageStoreTag => CliError.init(.usage_invalid_argument, "Invalid image-store reference; use STORE/TAG or STORE/blake3:DIGEST without credentials, query parameters or fragments.", @errorName(err)),
         error.ImageStoreRejected => CliError.init(.object_invalid, "Image store rejected the request; check authorization and, for S3, credential expiry and region. Access denial does not mean the object is missing.", @errorName(err)),
         error.ImageStoreNotFound => CliError.init(.object_not_found, "Image-store object not found; check the store path and tag or digest reference.", @errorName(err)),
+        error.PathAlreadyExists => CliError.init(.object_invalid, "Destination already exists; choose a new output path.", @errorName(err)),
         error.X86ForkUnsupported => CliError.init(.usage_invalid_argument, "x86-64 KVM checkpoint fork is unavailable; only fresh execution is supported.", @errorName(err)),
         error.X86NamedCopyUnsupported => CliError.init(.usage_invalid_argument, "x86-64 KVM does not support copying files into or out of a named VM.", @errorName(err)),
         error.MissingImageArchiveOutput,

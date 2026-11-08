@@ -22,8 +22,8 @@ pub const usage =
     \\Reads require explicit AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional
     \\AWS_SESSION_TOKEN and AWS_REGION (or AWS_DEFAULT_REGION); AWS_PROFILE is
     \\only supported by the push CLI. Credentials are not refreshed during reads.
-    \\No fetch-only image pull command exists; pack/unpack transfers native local
-    \\images offline. Resolve only resolves identity; run acquires content lazily.
+    \\Use image pull to acquire a complete image without booting; pack/unpack
+    \\transfers native images offline. Resolve only resolves identity.
     \\
     \\Options:
     \\  --expected-archive-digest DIGEST  Expected immutable SHA-256 archive identity
@@ -37,17 +37,34 @@ pub const usage =
     \\
 ;
 
+pub const pull_usage =
+    \\Usage:
+    \\  spore image pull SOURCE [--tag local/name:tag] [--platform os/arch]
+    \\
+    \\Acquire a registry image, native image store ref, or local image completely
+    \\without starting a VM. Success roots verified content in the local cache;
+    \\the returned local digest_ref works offline until explicit image prune.
+    \\Registry tags are refreshed. Resolve alone does not acquire content.
+    \\
+    \\Options:
+    \\  --tag REF             Optional local mutable name for the acquired image
+    \\  --platform os/arch    Registry: host-native Linux; native input: recorded
+    \\  -h, --help            Show this help
+    \\
+;
+
 pub const export_usage =
     \\Usage:
-    \\  spore image export-rootfs <image@sha256:...|image:tag> --output <rootfs.ext4>
+    \\  spore image export-rootfs IMAGE --output <rootfs.ext4>
     \\
-    \\Writes a registry image's root filesystem as an ext4 file and a metadata
-    \\sidecar. Local images (local/NAME:TAG) cannot be exported.
+    \\Writes a registry, local or native-store image as a new ext4 file and
+    \\metadata sidecar. Native sources are fully acquired first. Output is an
+    \\independent writable copy, not a hard link into the image cache.
     \\
     \\Options:
     \\  --output <path>        Rootfs ext4 output path
     \\  --metadata <path>      Metadata sidecar path (default: <output>.json)
-    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: host-native Linux)
+    \\  --platform <os/arch>   Registry: host-native Linux; native input: recorded
     \\  -h, --help             Show this help
     \\
 ;
@@ -92,20 +109,20 @@ pub const resolve_usage =
 
 pub fn exportRootfs(ctx: *const Ctx, args: []const []const u8) !void {
     const arena = ctx.init.arena.allocator();
-    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image export", "usage: spore image export-rootfs REGISTRY_IMAGE --output FILE");
-    const parsed = rootfs.parseBuildOptions(arena, args) catch |err| switch (err) {
-        error.LocalImageExportUnsupported => {
-            const message = "spore image export-rootfs: only registry images can be exported, not local/ images";
-            cli.exitWithCliError(arena, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "image export"), message);
-        },
-        else => |e| return e,
-    };
-    const result = try api.rootfsBuild(ctx.init, arena, .{
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image export-rootfs", "usage: spore image export-rootfs IMAGE --output FILE");
+    const parsed = try rootfs.parseBuildOptions(arena, args);
+    const result = api.rootfsBuild(ctx.init, arena, .{
         .ref = parsed.ref,
         .output = parsed.output,
         .metadata = parsed.metadata,
         .platform = parsed.platform,
-    });
+    }) catch |err| {
+        if (err != error.FileNotFound and err != error.PathAlreadyExists) return err;
+        var failure = machine_output.fromZigError(err);
+        const source = if (rootfs.isLocalImageRef(parsed.ref)) parsed.ref else "registry/store image";
+        failure.message = cli.allocMessage(arena, "spore image export-rootfs: {s}; source: {s}; output: {s}; metadata: {s}", .{ failure.message, source, parsed.output, parsed.metadata });
+        cli.exitWithCliError(arena, ctx.stderr, ctx.mode, failure, failure.message);
+    };
     if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, result);
     try ctx.stdout.print("rootfs: {s}\nmetadata: {s}\nsource: {s}\nrootfs_identity: {s}\nrootfs_storage: {s}\n", .{
         parsed.output,
@@ -114,7 +131,46 @@ pub fn exportRootfs(ctx: *const Ctx, args: []const []const u8) !void {
         result.rootfs_storage.index_digest,
         result.rootfs_storage.index_digest,
     });
-    try ctx.stdout.print("platform: {s}/{s}\n", .{ parsed.platform.os, parsed.platform.arch.name() });
+    try ctx.stdout.print("platform: {s}/{s}\n", .{ result.platform.os, result.platform.arch.name() });
+}
+
+pub fn pull(ctx: *const Ctx, args: []const []const u8) !void {
+    const allocator = ctx.init.arena.allocator();
+    const options = try parsePullOptions(args);
+    const result = api.imagePull(ctx.init, allocator, options) catch |err| {
+        if (err != error.FileNotFound) return err;
+        const message = cli.allocMessage(allocator, "spore image pull: image not found: {s}; build, import or unpack it first, or select a registry/store source", .{options.source});
+        const failure = machine_output.CliError.init(.object_not_found, message, "image pull");
+        cli.exitWithCliError(allocator, ctx.stderr, ctx.mode, failure, message);
+    };
+    if (ctx.mode == .json) return machine_output.writeJson(allocator, ctx.stdout, result);
+    try ctx.stdout.print("digest_ref: {s}\nimage_digest: {s}\nplatform: {s}/{s}\n", .{ result.digest_ref, result.image_digest, result.platform.os, result.platform.arch.name() });
+    if (result.tag_ref) |tag| try ctx.stdout.print("tag_ref: {s}\n", .{tag});
+}
+
+pub fn parsePullOptions(args: []const []const u8) !api.ImagePullOptions {
+    var source: ?[]const u8 = null;
+    var tag: ?[]const u8 = null;
+    var platform: ?rootfs.Platform = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--tag")) {
+            i += 1;
+            if (i >= args.len) return error.MissingImageReference;
+            tag = args[i];
+        } else if (std.mem.eql(u8, arg, "--platform")) {
+            i += 1;
+            if (i >= args.len) return error.MissingPlatform;
+            platform = try rootfs.Platform.parse(args[i]);
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.UnknownImageOption;
+        } else if (source == null) {
+            source = arg;
+        } else return error.TooManyImageArguments;
+    }
+    if (tag) |name| try rootfs.validateLocalTagRef(name);
+    return .{ .source = source orelse return error.MissingImageSource, .tag = tag, .platform = platform };
 }
 
 pub fn importOci(ctx: *const Ctx, args: []const []const u8) !void {
