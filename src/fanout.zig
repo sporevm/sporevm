@@ -28,24 +28,28 @@ pub const Options = struct {
 
 pub const cli_usage =
     \\Usage:
-    \\  spore fanout [--backend auto|hvf|kvm] [--for DURATION] <children-dir>
+    \\  spore checkpoint fanout [--backend auto|hvf|kvm] [--for DURATION] <children-dir>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --for DURATION          Stop attached children after DURATION, e.g. 10s, 500ms, 1m
-    \\  --timeout DURATION      Per-child attach probe timeout (default: 30s)
+    \\  --timeout DURATION      Per-child resume probe timeout (default: 30s)
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service in every child
     \\  -h, --help              Show this help
+    \\
+    \\--for caps batch lifetime after all child processes launch; omitted means
+    \\no batch cap. --timeout applies separately to each restored command probe,
+    \\including execution; --timeout-ms is also accepted. Neither bounds store I/O.
     \\
     \\Requires child spores with saved sessions. Verify one with:
     \\  spore checkpoint inspect children/000000
     \\  # Sessions: 1
     \\
     \\Workflow:
-    \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
-    \\  spore checkpoint fork base.spore --count 2 --out children
-    \\  spore fanout children --for 10s
+    \\  spore run --save-checkpoint base.spore --save-on TERM --shell 'while true; do echo tick; sleep 1; done'
+    \\  spore checkpoint fork base.spore --count 2 --output children
+    \\  spore checkpoint fanout children --for 10s
     \\
 ;
 
@@ -80,11 +84,6 @@ const OutputLock = struct {
 pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
-    if (args.len == 0 and ctx.mode != .json) {
-        try stdout.writeAll(cli_usage);
-        return;
-    }
-
     var events = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "fanout");
     cli_event_writer = if (ctx.mode == .json) &events else null;
     defer cli_event_writer = null;
@@ -138,9 +137,9 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--bind-service") and i + 1 < args.len) {
             i += 1;
             bound_services.append(spore_net_policy.parseBoundServiceBinding(args[i]) catch |err| {
-                failCli("spore fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
+                failCli("spore checkpoint fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             }) catch |err| {
-                failCli("spore fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
+                failCli("spore checkpoint fanout: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             };
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failCli("unknown fanout argument: {s}\n\n{s}", .{ args[i], cli_usage });
@@ -166,7 +165,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     const children = try listChildren(allocator, init.io, opts.children_dir);
     if (children.len == 0) {
         var buf: [2048]u8 = undefined;
-        const message = std.fmt.bufPrint(&buf, "spore fanout: no child spore directories found in {s}", .{opts.children_dir}) catch "spore fanout: no child spore directories found";
+        const message = std.fmt.bufPrint(&buf, "spore checkpoint fanout: no child spore directories found in {s}", .{opts.children_dir}) catch "spore checkpoint fanout: no child spore directories found";
         failOperation(error.SavedSessionNotFound, message);
     }
     try requireSavedSessions(allocator, children);
@@ -204,7 +203,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     var aggregate_exit_code: u8 = 0;
     for (running.items) |*run| {
         const term = run.child.wait(init.io) catch |err| {
-            writeStderr("spore fanout: child {s} wait failed: {s}\n", .{ run.name, @errorName(err) });
+            writeStderr("spore checkpoint fanout: child {s} wait failed: {s}\n", .{ run.name, @errorName(err) });
             if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, machine_output.fromZigError(err).exit_code, machine_output.fromZigError(err));
             failed = true;
             continue;
@@ -215,7 +214,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
         } else if (termOk(term, opts.duration_ms != null)) {
             if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .completed, 0, null);
         } else {
-            writeStderr("spore fanout: child {s} exited {s}\n", .{ run.name, termName(term) });
+            writeStderr("spore checkpoint fanout: child {s} exited {s}\n", .{ run.name, termName(term) });
             const classified = machine_output.fromZigError(error.FanoutChildFailed);
             if (event_mode == .jsonl) writeChildCompletion(event_output, &output_lock, &event_write_failed, run.name, .failed, classified.exit_code, classified);
             failed = true;
@@ -239,7 +238,7 @@ fn spawnAttach(
     const backend_arg = @tagName(backend);
     const timeout_arg = try std.fmt.allocPrint(allocator, "{d}ms", .{timeout_ms});
     var argv = std.array_list.Managed([]const u8).init(allocator);
-    try argv.appendSlice(&.{ spore_executable, "attach", "--backend", backend_arg, "--timeout", timeout_arg });
+    try argv.appendSlice(&.{ spore_executable, "checkpoint", "resume", "--backend", backend_arg, "--timeout", timeout_arg });
     for (bound_services) |binding| {
         const unix_path = switch (binding.target) {
             .unix => |path| path,
@@ -314,7 +313,7 @@ fn cleanupRunning(io: Io, children: []RunningChild) void {
 fn listChildren(allocator: std.mem.Allocator, io: Io, children_dir: []const u8) ![]ChildSpec {
     var dir = Io.Dir.cwd().openDir(io, children_dir, .{ .iterate = true }) catch |err| {
         var buf: [2048]u8 = undefined;
-        const message = std.fmt.bufPrint(&buf, "spore fanout: cannot open {s}: {s}", .{ children_dir, @errorName(err) }) catch "spore fanout: cannot open children directory";
+        const message = std.fmt.bufPrint(&buf, "spore checkpoint fanout: cannot open {s}: {s}", .{ children_dir, @errorName(err) }) catch "spore checkpoint fanout: cannot open children directory";
         failOperation(err, message);
     };
     defer dir.close(io);
@@ -340,18 +339,18 @@ fn requireSavedSessions(allocator: std.mem.Allocator, children: []const ChildSpe
     for (children) |child| {
         const sessions = childSessionCount(allocator, child.path) catch |err| {
             var buf: [2048]u8 = undefined;
-            const message = std.fmt.bufPrint(&buf, "spore fanout: child {s} has an invalid spore manifest: {s}", .{ child.name, @errorName(err) }) catch "spore fanout: child has an invalid manifest";
+            const message = std.fmt.bufPrint(&buf, "spore checkpoint fanout: child {s} has an invalid spore manifest: {s}", .{ child.name, @errorName(err) }) catch "spore checkpoint fanout: child has an invalid manifest";
             failOperation(err, message);
         };
         if (sessions == 0) {
             var buf: [2048]u8 = undefined;
             const message = std.fmt.bufPrint(&buf,
-                \\spore fanout: child {s} has no saved session.
+                \\spore checkpoint fanout: child {s} has no saved session.
                 \\This spore can still run new commands with:
-                \\  spore run --from {s} '...'
+                \\  spore run --checkpoint {s} --shell '...'
                 \\To fan out the original running command, create the spore with:
-                \\  spore run --save base.spore --save-on TERM '...'
-            , .{ child.name, child.path }) catch "spore fanout: child has no saved session";
+                \\  spore run --save-checkpoint base.spore --save-on TERM --shell '...'
+            , .{ child.name, child.path }) catch "spore checkpoint fanout: child has no saved session";
             failOperation(error.SavedSessionNotFound, message);
         }
     }
@@ -566,7 +565,7 @@ fn failCli(comptime fmt: []const u8, args: anytype) noreturn {
         events.emitFailure(classified) catch {};
         std.process.exit(classified.exit_code);
     }
-    writeStderr(fmt ++ "\n", args);
+    writeStderr(fmt ++ " [usage.invalid_argument]\n", args);
     std.process.exit(2);
 }
 
@@ -577,7 +576,7 @@ fn failOperation(err: anyerror, message: []const u8) noreturn {
         events.emitFailure(classified) catch {};
         std.process.exit(classified.exit_code);
     }
-    writeStderr("{s}\n", .{message});
+    writeStderr("{s} [{s}]\n", .{ message, machine_output.fromZigError(err).code.text() });
     std.process.exit(machine_output.fromZigError(err).exit_code);
 }
 

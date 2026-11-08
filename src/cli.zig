@@ -104,8 +104,8 @@ pub const Command = struct {
 /// Every `spore` command. `spore --help` lists them in this order.
 pub const commands = [_]Command{
     .{ .name = "run", .summary = "Boot a throwaway VM and run one command", .usage = run_mod.cli_usage, .output = .events, .run = run_cli.cli },
-    .{ .name = "attach", .summary = "Restore a checkpoint and attach to its saved session", .usage = attach_mod.cli_usage, .output = .events, .run = attach_cli.cli },
-    .{ .name = "fanout", .summary = "Attach forked children concurrently with prefixed output", .usage = fanout.cli_usage, .output = .events, .run = fanout.cli },
+    .{ .name = "checkpoint resume", .summary = "Restore a throwaway VM and resume its saved process session", .usage = attach_mod.cli_usage, .output = .events, .run = attach_cli.cli },
+    .{ .name = "checkpoint fanout", .summary = "Resume saved children concurrently with prefixed output", .usage = fanout.cli_usage, .output = .events, .run = fanout.cli },
     .{ .name = "build", .summary = "Build a Spore image from a Dockerfile subset", .usage = build_cli.usage, .output = .{ .result = .of(@import("build.zig").Result) }, .run = build_cli.run },
     .{ .name = "vm create", .summary = "Create a named VM", .usage = lifecycle_cli.create_usage, .output = .{ .result = .of(lifecycle.NamedLifecycleResult) }, .run = lifecycle_cli.createCli },
     .{ .name = "vm exec", .summary = "Execute a command in a named VM", .usage = lifecycle_cli.exec_usage, .output = .events, .run = lifecycle_cli.execCli },
@@ -125,7 +125,7 @@ pub const commands = [_]Command{
     .{ .name = "image import-oci", .summary = "Import an OCI image layout as a local image", .usage = image_cli.import_oci_usage, .output = .{ .result = .of(api.RootfsImportOciResult) }, .run = image_cli.importOci },
     .{ .name = "image import-tar", .summary = "Import a rootfs tar as a local image", .usage = image_cli.import_tar_usage, .output = .{ .result = .of(api.RootfsImportTarResult) }, .run = image_cli.importTar },
     .{ .name = "image resolve", .summary = "Resolve an image tag to a digest reference", .usage = image_cli.resolve_usage, .output = .{ .result = .of(image_cli.ResolveResult) }, .run = image_cli.resolve },
-    .{ .name = "image export", .summary = "Write a registry image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .{ .result = .of(api.RootfsBuildResult) }, .run = image_cli.exportRootfs },
+    .{ .name = "image export-rootfs", .summary = "Write a registry image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .{ .result = .of(api.RootfsBuildResult) }, .run = image_cli.exportRootfs },
     .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.usage, .output = .{ .result = .of(api.ImagePushResult) }, .run = image_cli.push },
     .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchivePackResult) }, .run = image_cli.pack },
     .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchiveUnpackResult) }, .run = image_cli.unpack },
@@ -237,10 +237,19 @@ pub fn run(table: []const Command, ctx: *const Ctx, argv: []const []const u8) !v
             return writeHelp(table, group, ctx.stdout);
         },
         .unknown_verb => |unknown| {
+            if (std.mem.eql(u8, unknown.group, "image") and std.mem.eql(u8, unknown.verb, "export")) {
+                const message = "spore image export was renamed; use spore image export-rootfs REGISTRY_REF --output FILE";
+                exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "image export"), message);
+            }
             const message = allocMessage(allocator, "unknown {s} command: {s}", .{ unknown.group, unknown.verb });
             exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, unknown.group), withHelp(allocator, table, unknown.group, message));
         },
         .unknown => {
+            if (std.mem.eql(u8, argv[0], "attach") or std.mem.eql(u8, argv[0], "fanout")) {
+                const verb = if (std.mem.eql(u8, argv[0], "attach")) "resume" else "fanout";
+                const message = allocMessage(allocator, "spore {s} was renamed; use spore checkpoint {s}", .{ argv[0], verb });
+                exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), message);
+            }
             const message = allocMessage(allocator, "unknown command: {s}", .{argv[0]});
             exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "CommandDispatch"), withHelp(allocator, table, null, message));
         },
@@ -252,6 +261,10 @@ fn invoke(command: *const Command, ctx: *const Ctx, args: []const []const u8) !v
     if (ctx.mode == .json and command.output == .text) {
         const message = allocMessage(allocator, "spore --json does not support command: {s}", .{command.name});
         exitWithCliError(allocator, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "GlobalJson"), message);
+    }
+    if (command.summary != null) {
+        if (try argumentError(allocator, command.name, args)) |message|
+            exitCommandError(command, ctx, machine_output.usageInvalidArgument(message, command.name));
     }
     if (wantsHelp(args)) {
         if (ctx.mode == .json) {
@@ -266,25 +279,71 @@ fn invoke(command: *const Command, ctx: *const Ctx, args: []const []const u8) !v
         .result => |schema| schema.name,
         .events, .text => null,
     };
-    command.run(ctx, args) catch |err| {
-        if (ctx.mode == .json and command.output == .events) exitCommandError(command, ctx, events_mod.classifyFailure(err));
-        return err;
-    };
+    command.run(ctx, args) catch |err| exitCommandError(command, ctx, events_mod.classifyFailure(err));
+}
+
+// The shared option policy stops at the guest boundary and skips option values.
+// Resource-specific parsing and validation remain with each command.
+const value_options = std.StaticStringMap(void).initComptime(.{
+    .{ "--backend", {} },               .{ "--kernel", {} },          .{ "--initrd", {} },         .{ "--rootfs", {} },
+    .{ "--image", {} },                 .{ "--checkpoint", {} },      .{ "--entrypoint", {} },     .{ "--pull", {} },
+    .{ "--save-checkpoint", {} },       .{ "--save-on", {} },         .{ "--commit-image", {} },   .{ "--memory", {} },
+    .{ "--max-memory", {} },            .{ "--vcpus", {} },           .{ "--guest-port", {} },     .{ "--timeout", {} },
+    .{ "--timeout-ms", {} },            .{ "--console-log", {} },     .{ "--disk-size", {} },      .{ "--env", {} },
+    .{ "--workdir", {} },               .{ "--shell", {} },           .{ "--inject", {} },         .{ "--allow-cidr", {} },
+    .{ "--allow-host", {} },            .{ "--allow-host-port", {} }, .{ "--bind-service", {} },   .{ "--forward", {} },
+    .{ "--annotation", {} },            .{ "--output", {} },          .{ "--to", {} },             .{ "--tag", {} },
+    .{ "--platform", {} },              .{ "--metadata", {} },        .{ "--rootfs-storage", {} }, .{ "--expected-archive-digest", {} },
+    .{ "--expected-image-digest", {} }, .{ "--count", {} },           .{ "--name-prefix", {} },    .{ "--generation", {} },
+    .{ "--session", {} },               .{ "--for", {} },             .{ "--options", {} },        .{ "--initial-output", {} },
+    .{ "--file", {} },                  .{ "-f", {} },                .{ "--target", {} },         .{ "--build-context", {} },
+    .{ "--build-arg", {} },             .{ "--network", {} },         .{ "--ulimit", {} },         .{ "--older-than", {} },
+    .{ "--max-bytes", {} },
+});
+
+fn argumentError(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) !?[]const u8 {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (isHelpFlag(arg)) break;
+        const flag = arg[0 .. std.mem.indexOfScalar(u8, arg, '=') orelse arg.len];
+        if (std.mem.eql(u8, flag, "--json") or std.mem.eql(u8, flag, "--debug"))
+            return allocMessage(allocator, "spore {s}: put global {s} before the command: spore {s} {s} ...", .{ command, flag, flag, command });
+        const replacement: ?[]const u8 = if (std.mem.eql(u8, flag, "--out")) "--output" else if (std.mem.eql(u8, flag, "--ref")) "--tag" else if (std.mem.eql(u8, flag, "--save")) "--save-checkpoint" else if (std.mem.eql(u8, flag, "--commit")) "--commit-image" else if (std.mem.eql(u8, flag, "--from")) "--checkpoint" else if (std.mem.eql(u8, flag, "--archive-digest")) "--expected-archive-digest" else if (std.mem.eql(u8, flag, "--name")) (if (std.mem.eql(u8, command, "vm restore")) "vm restore NAME --checkpoint DIR" else "--name-prefix") else if (std.mem.eql(u8, command, "build") and std.mem.eql(u8, flag, "-t")) "--tag" else null;
+        if (replacement) |new| return allocMessage(allocator, "spore {s}: {s} was replaced; use {s}", .{ command, flag, new });
+        if (!std.mem.startsWith(u8, flag, "-")) continue;
+        const repeated = std.mem.eql(u8, flag, "--env") or std.mem.eql(u8, flag, "--annotation") or std.mem.startsWith(u8, flag, "--allow-") or std.mem.eql(u8, flag, "--bind-service") or std.mem.eql(u8, flag, "--forward") or std.mem.eql(u8, flag, "--inject") or std.mem.eql(u8, flag, "--build-context") or std.mem.eql(u8, flag, "--build-arg");
+        if (!repeated) {
+            const canonical = if (std.mem.eql(u8, flag, "-f")) "--file" else if (std.mem.eql(u8, flag, "--timeout-ms")) "--timeout" else flag;
+            const entry = try seen.getOrPut(allocator, canonical);
+            if (entry.found_existing) return allocMessage(allocator, "spore {s}: {s} may be supplied once", .{ command, flag });
+        }
+        if (value_options.has(flag) and flag.len == arg.len) i += 1;
+    }
+    return null;
 }
 
 /// Reports `err` under `--json` where `command`'s consumer reads it: a failed
 /// `completion` on stdout for a stream, else `spore.error.v1` on stderr.
 fn exitCommandError(command: *const Command, ctx: *const Ctx, err: machine_output.CliError) noreturn {
-    if (command.output == .events) {
+    var classified = err;
+    if (!std.mem.startsWith(u8, err.message, "spore "))
+        classified.message = allocMessage(ctx.init.arena.allocator(), "spore {s}: {s}", .{ command.name, err.message });
+    if (ctx.mode == .json and command.output == .events) {
         var events = events_mod.EventWriter.init(ctx.init.arena.allocator(), ctx.stdout, streamCommand(command.name));
-        events.emitFailure(err) catch {};
-        std.process.exit(err.exit_code);
+        events.emitFailure(classified) catch {};
+        std.process.exit(classified.exit_code);
     }
-    exitWithCliError(ctx.init.arena.allocator(), ctx.stderr, ctx.mode, err, err.message);
+    exitWithCliError(ctx.init.arena.allocator(), ctx.stderr, ctx.mode, classified, classified.message);
 }
 
 /// The `command` a stream reports: the verb alone, so `vm exec` says "exec".
 fn streamCommand(name: []const u8) []const u8 {
+    // CLI spellings change independently of the stable event identifiers.
+    if (std.mem.eql(u8, name, "checkpoint resume")) return "attach";
     const space = std.mem.lastIndexOfScalar(u8, name, ' ') orelse return name;
     return name[space + 1 ..];
 }
@@ -292,9 +351,12 @@ fn streamCommand(name: []const u8) []const u8 {
 /// Whether `args` asks for a command's help: `-h` or `--help` anywhere
 /// before `--`.
 fn wantsHelp(args: []const []const u8) bool {
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--")) return false;
         if (isHelpFlag(arg)) return true;
+        if (value_options.has(arg)) i += 1;
     }
     return false;
 }
@@ -323,8 +385,8 @@ const help_header =
     \\
     \\Global options:
     \\  --debug   Show verbose VMM and restore logs
-    \\  --json    Print one JSON result document, or for run, attach, fanout and
-    \\            vm exec a stream of JSON events
+    \\  --json    Print one JSON result document, or for run, checkpoint resume,
+    \\            checkpoint fanout and vm exec a stream of JSON events
     \\
     \\Commands:
     \\
@@ -346,6 +408,12 @@ pub fn writeHelp(table: []const Command, group: ?[]const u8, writer: *Io.Writer)
         try writer.print("  {s}", .{name});
         try writer.splatByteAll(' ', width - name.len + 2);
         try writer.print("{s}\n", .{command.summary.?});
+    }
+    if (group) |word| {
+        if (std.mem.eql(u8, word, "image"))
+            try writer.writeAll("\nNo fetch-only image pull command in this release. Resolve finds identity;\nrun --image acquires content lazily; pack/unpack transfers local images offline.\n");
+        if (std.mem.eql(u8, word, "checkpoint"))
+            try writer.writeAll("\nResume continues a saved process in a throwaway VM. For a new command use\nrun --checkpoint DIR -- ARGV; for a named VM use vm restore NAME --checkpoint DIR.\n");
     }
 }
 
@@ -380,8 +448,10 @@ pub fn exitWithCliError(
     if (mode == .json) {
         machine_output.writeError(allocator, stderr, err) catch {};
     } else {
-        stderr.writeAll(human_text) catch {};
-        if (!std.mem.endsWith(u8, human_text, "\n")) stderr.writeByte('\n') catch {};
+        const text = std.mem.trimEnd(u8, human_text, "\n");
+        const first_line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+        stderr.print("{s} [{s}]\n", .{ text[0..first_line_end], err.code.text() }) catch {};
+        if (first_line_end < text.len) stderr.print("{s}\n", .{text[first_line_end + 1 ..]}) catch {};
     }
     stderr.flush() catch {};
     std.process.exit(err.exit_code);
@@ -525,8 +595,8 @@ test "command table names each command once and fits the dispatcher" {
 
 test "only internal commands refuse global json, and only four commands stream" {
     for (commands) |command| {
-        const streams = std.mem.eql(u8, command.name, "run") or std.mem.eql(u8, command.name, "attach") or
-            std.mem.eql(u8, command.name, "vm exec") or std.mem.eql(u8, command.name, "fanout");
+        const streams = std.mem.eql(u8, command.name, "run") or std.mem.eql(u8, command.name, "checkpoint resume") or
+            std.mem.eql(u8, command.name, "vm exec") or std.mem.eql(u8, command.name, "checkpoint fanout");
         const text = std.mem.eql(u8, command.name, "monitor") or std.mem.eql(u8, command.name, "netd");
         const expected: std.meta.Tag(Output) = if (streams) .events else if (text) .text else .result;
         try std.testing.expectEqual(expected, std.meta.activeTag(command.output));

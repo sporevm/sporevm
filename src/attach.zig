@@ -1,4 +1,4 @@
-//! Product attach support for `spore attach`.
+//! Product attach support for `spore checkpoint resume`.
 
 const std = @import("std");
 const TestDir = @import("test_dir.zig").TestDir;
@@ -44,7 +44,11 @@ pub const Options = struct {
 
 pub const cli_usage =
     \\Usage:
-    \\  spore attach [options] <spore-dir>
+    \\  spore checkpoint resume [options] <spore-dir>
+    \\
+    \\Restores a new throwaway VM and continues a recorded process. This does
+    \\not connect to a named VM. For a new command use run --checkpoint DIR -- ARGV;
+    \\for a persistent named machine use vm restore NAME --checkpoint DIR.
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
@@ -52,7 +56,7 @@ pub const cli_usage =
     \\  --generation FILE       Inject fan-out identity JSON before attach
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service to a host socket
-    \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
+    \\  --timeout DURATION      Resume command-probe timeout (default: 30s)
     \\  -i, --interactive       Forward stdin when the saved session supports it
     \\  -t, --tty               Attach as a terminal when the saved session has one
     \\  -h, --help              Show this help
@@ -60,6 +64,10 @@ pub const cli_usage =
     \\Requires a spore with saved sessions. Verify with:
     \\  spore checkpoint inspect <spore-dir>
     \\  # Sessions: 1
+    \\
+    \\The timeout applies while the restored command probe is active, not to
+    \\checkpoint acquisition as a whole. Expiry fails and removes the throwaway
+    \\VM. --timeout-ms is also accepted. stdin/TTY must have been saved originally.
     \\
 ;
 
@@ -93,9 +101,9 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--bind-service") and i + 1 < args.len) {
             i += 1;
             bound_services.append(spore_net_policy.parseBoundServiceBinding(args[i]) catch |err| {
-                failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
+                failAttachSetup("spore checkpoint resume: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             }) catch |err| {
-                failAttachSetup("spore attach: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
+                failAttachSetup("spore checkpoint resume: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             };
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
@@ -113,7 +121,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             interactive = true;
             tty = true;
         } else if (std.mem.eql(u8, args[i], "--count")) {
-            failAttachSetup("spore attach attaches exactly one checkpoint; use spore checkpoint fork DIR --count N --out OUT_DIR, then attach each child", .{});
+            failAttachSetup("spore checkpoint resume attaches exactly one checkpoint; use spore checkpoint fork DIR --count N --output OUT_DIR, then attach each child", .{});
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             failAttachSetup("unknown attach argument: {s}\n\n{s}", .{ args[i], cli_usage });
         } else if (spore_dir == null) {
@@ -374,7 +382,7 @@ fn validateAttachDiskManifestParts(devices: []const spore.TransportState, rootfs
 
 fn failAttachSetup(comptime fmt: []const u8, args: anytype) noreturn {
     if (cli_setup_events) |sink| {
-        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "spore attach: setup failed";
+        const message = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch "spore checkpoint resume: setup failed";
         sink.emit(.{ .failure = .{
             .command = "attach",
             .backend = null,
@@ -382,7 +390,7 @@ fn failAttachSetup(comptime fmt: []const u8, args: anytype) noreturn {
         } }) catch {};
         std.process.exit(2);
     }
-    std.debug.print(fmt ++ "\n", args);
+    std.debug.print(fmt ++ " [usage.invalid_argument]\n", args);
     std.process.exit(2);
 }
 

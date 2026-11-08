@@ -15,7 +15,7 @@ pub const usage =
     \\  spore build [options] CONTEXT
     \\
     \\Options:
-    \\  -t, --tag REF                  Local image ref to update, for example local/app:dev
+    \\  --tag REF                      Local image ref to update, for example local/app:dev
     \\  -f, --file PATH                Dockerfile path, defaults to CONTEXT/Dockerfile
     \\  --platform OS/ARCH             Native target: linux/arm64 or linux/amd64
     \\  --target STAGE                 Build and publish the named stage
@@ -58,27 +58,17 @@ pub fn run(ctx: *const Ctx, args: []const []const u8) !void {
     const allocator = init.arena.allocator();
 
     const parsed = parseArgs(allocator, args) catch |err| {
-        if (mode == .json) exitMachineError(allocator, stderr, machine_output.CliError.init(.usage_invalid_argument, parseErrorMessage(err), @errorName(err)));
-        try writeParseError(stderr, err);
-        try stderr.writeAll("\n");
-        try stderr.writeAll(usage);
-        try stderr.flush();
-        std.process.exit(2);
+        const message = parseErrorMessage(err);
+        @import("cli.zig").exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "build"), message);
     };
 
     const tag = parsed.tag orelse {
-        if (mode == .json) exitMachineError(allocator, stderr, machine_output.usageMissingArgument("spore build: missing required -t/--tag local image ref", "build"));
-        try stderr.writeAll("spore build: missing required -t/--tag local image ref\n\n");
-        try stderr.writeAll(usage);
-        try stderr.flush();
-        std.process.exit(2);
+        const message = "spore build: missing --tag local/NAME:TAG; usage: spore build CONTEXT --tag REF";
+        @import("cli.zig").exitWithCliError(allocator, stderr, mode, machine_output.usageMissingArgument(message, "build"), message);
     };
     const context_dir = parsed.context_dir orelse {
-        if (mode == .json) exitMachineError(allocator, stderr, machine_output.usageMissingArgument("spore build: missing build context directory", "build"));
-        try stderr.writeAll("spore build: missing build context directory\n\n");
-        try stderr.writeAll(usage);
-        try stderr.flush();
-        std.process.exit(2);
+        const message = "spore build: missing build context directory; usage: spore build CONTEXT --tag REF";
+        @import("cli.zig").exitWithCliError(allocator, stderr, mode, machine_output.usageMissingArgument(message, "build"), message);
     };
     const dockerfile_path = parsed.dockerfile_path orelse try std.fs.path.join(allocator, &.{ context_dir, "Dockerfile" });
     const spore_executable = try std.process.executablePathAlloc(init.io, allocator);
@@ -103,10 +93,12 @@ pub fn run(ctx: *const Ctx, args: []const []const u8) !void {
         .diagnostic = &diagnostic,
         .host = .probe(),
     }) catch |err| {
-        if (mode == .json) exitMachineError(allocator, stderr, machine_output.fromZigError(err));
-        try writeBuildError(stderr, err, diagnostic);
-        try stderr.flush();
-        std.process.exit(2);
+        const classified = machine_output.fromZigError(err);
+        var diagnostic_text: Io.Writer.Allocating = .init(allocator);
+        defer diagnostic_text.deinit();
+        try writeBuildError(&diagnostic_text.writer, err, diagnostic);
+        const failure = machine_output.CliError.init(classified.code, diagnostic_text.written(), classified.source);
+        @import("cli.zig").exitWithCliError(allocator, stderr, mode, failure, failure.message);
     };
 
     if (mode == .json) return machine_output.writeJson(allocator, stdout, result);
@@ -193,7 +185,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
     var i: usize = 0;
     while (i < args.len) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--tag")) {
+        if (std.mem.eql(u8, arg, "--tag")) {
             parsed.tag = try nextValue(args, &i, arg);
         } else if (std.mem.startsWith(u8, arg, "--tag=")) {
             parsed.tag = try nonEmptyValue(arg["--tag=".len..]);
@@ -316,10 +308,6 @@ fn validName(name: []const u8) bool {
     return true;
 }
 
-fn writeParseError(stderr: *Io.Writer, err: anyerror) !void {
-    try stderr.print("{s}\n", .{parseErrorMessage(err)});
-}
-
 fn parseErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.MissingOptionValue => "spore build: option requires a value",
@@ -335,12 +323,6 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.BadPlatform, error.UnsupportedPlatform => "spore build: --platform must be linux/arm64 or linux/amd64",
         else => "spore build: invalid arguments",
     };
-}
-
-fn exitMachineError(allocator: std.mem.Allocator, stderr: *Io.Writer, classified: machine_output.CliError) noreturn {
-    machine_output.writeError(allocator, stderr, classified) catch {};
-    stderr.flush() catch {};
-    std.process.exit(classified.exit_code);
 }
 
 fn writeBuildError(stderr: *Io.Writer, err: anyerror, diagnostic: build_mod.Diagnostic) !void {
@@ -691,7 +673,7 @@ fn nsToMs(ns: u64) u64 {
 test "build CLI parses M1 options" {
     const allocator = std.testing.allocator;
     var parsed = try parseArgs(allocator, &.{
-        "-t",
+        "--tag",
         "local/app:dev",
         "--build-context",
         "base=oci-layout://zig-cache/base",

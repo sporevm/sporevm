@@ -9,23 +9,77 @@
 v0.18.0 gives each command one spelling and resets SporeVM's local formats;
 it reads nothing earlier versions saved.
 
+#### Scripts already tracking unreleased main
+
+The unreleased-main spellings below are replaced before 0.18.0. They are not
+executable aliases: obsolete flags/commands fail with a correction. This adds
+a migration for scripts already tracking main as well as the 0.17.1 upgrade.
+
+| Previous main | Canonical spelling |
+| --- | --- |
+| `attach DIR` | `checkpoint resume DIR` |
+| `fanout BATCH` | `checkpoint fanout BATCH` |
+| `image export REF` | `image export-rootfs REF` (registry images only) |
+| `build -t REF CONTEXT` | `build CONTEXT --tag REF` |
+| Import/unpack `--ref REF` | `--tag REF` |
+| Artifact `--out PATH` | `--output PATH` |
+| `image push REF STORE/TAG` | `image push REF --to STORE/TAG` |
+| `checkpoint push DIR STORE/TAG` | `checkpoint push DIR --to STORE/TAG` |
+| `run --from DIR` | `run --checkpoint DIR` |
+| `run --save DIR`, `--commit REF` | `--save-checkpoint DIR`, `--commit-image REF` |
+| `vm restore DIR --name NAME` | `vm restore NAME --checkpoint DIR` |
+| `vm fork NAME --name PATTERN` | `vm fork NAME --name-prefix PREFIX` → `PREFIX-0…PREFIX-(N-1)` |
+| `vm logs NAME` | `vm logs NAME --initial` (bounded initial output, not exec history) |
+| Unpack `--archive-digest DIGEST` | `--expected-archive-digest DIGEST` |
+| Bare guest command/string | `-- ARGV…` or `--shell STRING` |
+
+Command options work before or after resource operands until `--`; global
+`--json`/`--debug` must precede the command. Duplicate scalar flags fail,
+while collection flags retain repetition. Options-file JSON keys, result
+schemas, and event identifiers (`attach`, `fanout`, `exec`) are unchanged.
+Both output modes now use classified failure statuses, including named exec
+readiness failures (22, not human-only 2). Push results add immutable
+`digest_ref` and nullable mutable `tag_ref`, preserving legacy `ref` meanings.
+
+Registry/layout/tar selection defaults to host-native Linux. Pack, push and
+unpack infer a single recorded platform; explicit selection never substitutes
+another platform. Disk-backed checkpoint summaries identify cache-pinned
+storage rather than implying a standalone portable `.spore` artifact.
+
+No fetch-only `image pull`, local-image ext4 export, AWS profile/refresh support
+for reads, or timeout redesign is included. `--save-on INT` still makes Ctrl-C
+save successfully, not cancel; human mode prints a notice. S3 reads still need
+explicit environment credentials and region, unlike AWS-CLI-backed pushes.
+Pinned Kubernetes deployments must stay on their current CLI until the removed
+bundle workflow is migrated and tested; this is not a coordinated k8s upgrade.
+
+#### Upgrading from v0.17.1
+
 Commands on named VMs live under `spore vm`, saved state under
 `spore checkpoint`, host and cache maintenance under `spore system`, and image
-commands under `spore image`. The old spellings are gone, with no aliases or
-hints:
+commands under `spore image`. The old executable spellings are gone; use these
+canonical forms:
 
 | Old | New |
 | --- | --- |
-| `spore create`, `exec`, `logs`, `copy-in`, `copy-out`, `save`, `restore` | `spore vm create`, `vm exec`, `vm logs`, `vm copy-in`, `vm copy-out`, `vm save`, `vm restore` |
+| `spore create`, `exec`, `copy-in`, `copy-out`, `save` | `spore vm create`, `vm exec`, `vm copy-in`, `vm copy-out`, `vm save` |
+| `spore logs NAME` | `spore vm logs NAME --initial` |
+| `spore restore DIR --name NAME` | `spore vm restore NAME --checkpoint DIR` |
 | `spore rm NAME`, `ls`, `ps` | `spore vm rm NAME`, `vm ls` |
 | `spore fork --vm NAME` | `spore vm fork NAME` |
 | `spore fork DIR`, `inspect DIR`, `rm --spore DIR` | `spore checkpoint fork DIR`, `checkpoint inspect DIR`, `checkpoint rm DIR` |
 | `spore host-info` | `spore system info` |
 | `spore cache gc`, `cache pins`, `cache unpin` | `spore system gc`, `system pins`, `system unpin` |
 | `spore rootfs import-oci`, `rootfs import-tar`, `rootfs resolve` | `spore image import-oci`, `image import-tar`, `image resolve` |
-| `spore rootfs build` | `spore image export` |
+| `spore rootfs build` | `spore image export-rootfs` (registry images only) |
 
-- `spore --json run|attach|fanout|vm exec` prints the
+`checkpoint resume` continues a checkpoint's saved process in a throwaway VM;
+it does not connect to a named VM. `vm restore NAME --checkpoint DIR` creates
+a named live VM, while `run --checkpoint DIR -- COMMAND` starts a new command
+in restored state.
+
+- Global `spore --json` with `run`, `checkpoint resume`, `checkpoint fanout`
+  or `vm exec` prints the
   `spore.automation.event.v1` stream that `--events=jsonl` printed, and
   `--events=jsonl` is gone from every command. Argument errors in those
   commands end the stream with a failed `completion` instead of a message on
@@ -37,7 +91,7 @@ hints:
   `spore rootfs cas-preload`, `spore exec --timing-json`, `spore image pull`
   and `spore image export-fixture`. Only `-h` and `--help` ask for help, so
   `spore checkpoint rm help` removes `./help`.
-- `spore attach` without `--json`, and so `spore fanout`, prints the
+- `spore checkpoint resume` without `--json`, and so `spore checkpoint fanout`, prints the
   session's stdout and stderr instead of the guest console.
 - The guest copies command output to the console, and so to a console log,
   only in VMs started with `--console-log`. A spore saved from a VM started
@@ -101,7 +155,7 @@ hints:
   look-alike key can't supply a member's value. Params that aren't valid JSON,
   repeat a member the agent reads, give it the wrong type, or set a VM id,
   fork batch id, hostname or entropy seed over 127 bytes or containing NUL now
-  fail instead of being partly applied. `spore run --from`, `spore attach` and
+  fail instead of being partly applied. `spore run --checkpoint`, `spore checkpoint resume` and
   `spore vm restore` check a `--generation` file the same way before the VM
   starts.
 - Virtqueue rings are checked against guest RAM when a queue becomes ready and
@@ -112,22 +166,22 @@ hints:
 
 ### Image stores
 
-- `spore image push local/app:1 DEST` writes a static image store to a
+- `spore image push local/app:1 --to DEST` writes a static image store to a
   directory, or to `s3://bucket/prefix` with the aws CLI.
 - `spore run --image` and `spore vm create --image` boot a store ref
   (`file://`, `https://` or `s3://`, by tag or `blake3:<hex>`) with only the
   image's manifest, config and index local. Each rootfs object the guest reads
   is fetched on first use, with the objects of the next 7 chunks.
-- `--save`, `--save-on`, `--commit` and `spore vm save` first fetch the rest
+- `--save-checkpoint`, `--save-on`, `--commit-image` and `spore vm save` first fetch the rest
   of the image, so the result needs nothing from the store.
-- `spore checkpoint push SPORE STORE/TAG` writes a saved spore to a directory
+- `spore checkpoint push SPORE --to STORE/TAG` writes a saved spore to a directory
   or S3 store. Its RAM chunks and disk objects share the store's `objects/`, so
   pushing to the store that holds its image uploads only the RAM, the changed
   disk chunks, the disk index and the manifest. `spore checkpoint pull
-  STORE/TAG --out DIR` fetches it from a directory, HTTP(S) or S3 store,
+  STORE/TAG --output DIR` fetches it from a directory, HTTP(S) or S3 store,
   verifies every object and writes a save pinned in the rootfs cache. To run
   one child of a fork batch elsewhere, push the parent, pull it there and pass
-  the child's identity to `spore run --from DIR --generation FILE`.
+  the child's identity to `spore run --checkpoint DIR --generation FILE`.
 - S3 reads are SigV4-signed with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
   the optional `AWS_SESSION_TOKEN`, and `AWS_REGION` or `AWS_DEFAULT_REGION`
   from the environment only. Profiles, `~/.aws`, instance roles and pod
@@ -167,13 +221,13 @@ hints:
   aborts.
 - macOS release builds restore guest SIMD registers correctly, so commands
   started in a restored spore no longer fail with `exec setup failed`.
-- `spore run --save` and `spore checkpoint fork --out` accept relative paths,
+- `spore run --save-checkpoint` and `spore checkpoint fork --output` accept relative paths,
   and saves into a directory under a symlink, such as `/tmp` on macOS, work;
   both failed with `BadManifest`.
-- `spore attach` and `spore fanout` resume a saved session's output where the
+- `spore checkpoint resume` and `spore checkpoint fanout` resume a saved session's output where the
   `spore run` that saved it left off, and no longer fail once the session has
   written more than 64 KiB.
-- `spore attach` fails instead of exiting 0 when the guest powers off before
+- `spore checkpoint resume` fails instead of exiting 0 when the guest powers off before
   reporting its exit status, or with `NetworkGatewayFailed` when the network
   gateway died.
 - `spore vm rm` stops a VM within about a second while an exec runs; the exec
@@ -185,9 +239,9 @@ hints:
   specs over 64 KiB.
 - Networking: a slow DNS resolver no longer stalls other traffic, connects to
   denied addresses are refused at once, bytes sent after the host half-closes
-  are delivered, and `spore run --bind-service ... --save` works.
+  are delivered, and `spore run --bind-service ... --save-checkpoint` works.
 - A terminal resize with a full vsock ring no longer stalls `run -t` or
-  `attach`, and single-vCPU macOS snapshots no longer drop queued vsock
+  `checkpoint resume`, and single-vCPU macOS snapshots no longer drop queued vsock
   packets.
 
 ### Other changes
@@ -223,7 +277,7 @@ hints:
   fails to connect or closes before answering.
 - The shipped guest initrd is about 45% smaller; smoke-test helpers are only
   in `-Dsmoke-helpers` builds.
-- `spore image export` keeps its temporary files in the rootfs cache instead
+- `spore image export-rootfs` keeps its temporary files in the rootfs cache instead
   of `.zig-cache/` in the current directory.
 
 ## v0.17.1

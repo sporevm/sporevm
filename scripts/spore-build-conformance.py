@@ -792,12 +792,13 @@ def run_case(
                 f"{transitioned.command.returncode}\n{command_failure(transitioned.command)}"
             )
         if transition.outcome is Outcome.FAILURE:
+            expected_diagnostic = f"{transition.spore_diagnostic} [runtime.execution_failed]"
             actual_diagnostic = exact_spore_diagnostic(transitioned.command.stderr)
-            if actual_diagnostic != transition.spore_diagnostic:
+            if actual_diagnostic != expected_diagnostic:
                 raise CaseError(
                     f"transition {name}: Spore diagnostic mismatch:\n"
                     + diff_json(
-                        transition.spore_diagnostic,
+                        expected_diagnostic,
                         actual_diagnostic,
                         "expected",
                         "actual",

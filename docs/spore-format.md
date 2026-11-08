@@ -36,12 +36,12 @@ A spore is a directory:
     └── objects/<hex>.chunk # optional content-addressed disk/rootfs chunks
 ```
 
-Spores saved from `spore run --image ... --save` may also require rootfs
+Spores saved from `spore run --image ... --save-checkpoint` may also require rootfs
 storage from the local rootfs cache. The manifest records an immutable ext4
 artifact identity, size, device binding, and provenance. For image-created
 spores, that identity is the rootfs storage index digest and the manifest also
 records `rootfs.storage` for the default chunked rootfs CAS path.
-Rootfs bytes are not stored inside the spore directory today; `spore attach`
+Rootfs bytes are not stored inside the spore directory today; `spore checkpoint resume`
 opens and verifies the manifest-selected exact artifact or chunked storage
 before boot.
 
@@ -104,7 +104,7 @@ future record kinds or builder versions are preserved and conservatively retain
 the rootfs CAS namespace.
 
 The local image identity published by indexed-image producers such as
-`spore build` and `spore run --commit` is distinct from the raw rootfs storage
+`spore build` and `spore run --commit-image` is distinct from the raw rootfs storage
 identity. Publication first serializes the final
 `ImageConfig` as canonical JSON with optional null fields omitted and the
 deterministic struct field order owned by `src/image.zig`
@@ -281,7 +281,7 @@ reset or poweroff.
   no portable manifest names that board before a later format revision.
 - `sessions`: optional low-level process/session handles captured with the VM.
   A handle is generic: `id`, `kind: "process"`, and stream capabilities for
-  `stdin`, `stdout`, `stderr`, and `terminal`. `spore run --from` uses the
+  `stdin`, `stdout`, `stderr`, and `terminal`. `spore checkpoint resume` uses the
   `default` handle when present, or the sole recorded handle for captures of a
   resumed command that was started under a generated `run-*` id. The handle
   records guest-side capability only. Host stdin, PTY ownership, terminal mode,
@@ -342,7 +342,7 @@ representation.
   local acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks remain the
   portable verified source of truth; imported and cold spores materialize from
-  chunks instead. Product restore paths (`spore attach`, `spore run --from`, and
+  chunks instead. Product restore paths (`spore checkpoint resume`, `spore run --checkpoint`, and
   named monitor restore) may automatically map `ram.backing` when the local
   `ram.backing.proof` validates against the canonical memory index identity,
   backing metadata, opened file identity, and host-local runtime key. Saves
@@ -410,7 +410,7 @@ representation.
   requirements by name, guest host, and guest port. The manifest does not carry
   live gateway state, TCP flows, DNS response caches, host socket paths,
   host port forwards, credential material, or helper process state. Resume and
-  `spore run --from` must attach a fresh gateway that satisfies the recorded
+  `spore run --checkpoint` must attach a fresh gateway that satisfies the recorded
   `requirements` and policy or fail closed. `spore --json checkpoint inspect` exposes the
   network kind, requirements, and bound-service requirements so callers can
   preflight restore-time bindings without parsing `manifest.json` directly.

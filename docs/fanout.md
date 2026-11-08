@@ -1,22 +1,22 @@
 # Fan-Out
 
-`spore checkpoint fork` mints local child checkpoints, and `spore fanout`
+`spore checkpoint fork` mints local child checkpoints, and `spore checkpoint fanout`
 attaches those children with prefixed output:
 
 ```bash
-spore checkpoint fork warm.spore --count 5 --out children/
-spore fanout children/
+spore checkpoint fork warm.spore --count 5 --output children/
+spore checkpoint fanout children/
 ```
 
 Children are named `000000` through zero-padded `N-1` and share the parent's
-chunk store. `spore fanout` is local orchestration over child spore directories;
+chunk store. `spore checkpoint fanout` is local orchestration over child spore directories;
 distributed offset/range partitioning is deferred.
 
 `spore checkpoint fork` preserves the source checkpoint's vCPU count. A source
 saved with `--vcpus 4` mints children that also restore with 4 vCPUs;
 fork does not downshift an already-booted guest to a smaller CPU topology.
 
-For a running named VM, `spore vm fork NAME --count N --name PATTERN` creates
+For a running named VM, `spore vm fork NAME --count N --name-prefix PREFIX` creates
 ready named children directly. Disk-backed sources use a queue-drained,
 single-epoch RAM/machine capture plus independent disk heads, so siblings
 inherit the same bytes and then diverge without a read-depth chain. Physical
@@ -27,13 +27,13 @@ unsupported. See [Named Lifecycle](lifecycle.md#saves-and-forks) for the
 fallback, readiness, and baseline-lease contract.
 
 Fan-out attaches to the saved process session. Machine-only spores can
-still start new commands with `spore run --from`, but they cannot fan out the
+still start new commands with `spore run --checkpoint`, but they cannot fan out the
 original command stream:
 
-| Spore source | Sessions | Good for fanout | Good for `run --from <cmd>` |
+| Spore source | Sessions | Good for fanout | Good for `run --checkpoint DIR -- ARGV` |
 | --- | --- | --- | --- |
 | `spore vm save NAME --stop` | none | no | yes |
-| `spore run --save` | saved session | yes | yes |
+| `spore run --save-checkpoint` | saved session | yes | yes |
 | `spore checkpoint fork base.spore` | inherits parent | if parent has one | yes |
 | `spore checkpoint pull STORE/TAG` | inherits the pushed spore | if it has one | yes |
 
@@ -41,7 +41,7 @@ If the parent manifest declares bound services, fan-out supplies one fresh host
 socket binding per service and applies the same binding to every child:
 
 ```bash
-spore fanout children/ \
+spore checkpoint fanout children/ \
   --bind-service metadata=unix:/tmp/metadata.sock
 ```
 
@@ -54,9 +54,9 @@ that file into each child, and writes a child-local `ram.backing.proof`. Each ch
 without following symlinks and must match the proof-bound parent file identity
 before the proof is written. A missing or stale parent proof, an unavailable
 hard-link capability, or a conflicting child proof produces a chunk-only child;
-identity races and unexpected I/O abort the fork. `spore fanout` does not need a
-trust flag or special mode: each child uses normal product attach (`spore
-attach`, or `spore run --from` for run/rootfs children), which maps local
+identity races and unexpected I/O abort the fork. `spore checkpoint fanout` does not need a
+trust flag or special mode: each child uses normal product resume (`spore
+checkpoint resume`, or `spore run --checkpoint` for run/rootfs children), which maps local
 backing only when the proof validates and otherwise restores from verified
 chunks.
 
@@ -64,7 +64,7 @@ The batch directory is the movement and ownership boundary. Child `chunks`
 links are batch-relative (`../shared-chunks`), so moving the complete batch
 preserves RAM authority. Moving or deleting one child does not transfer or
 clean up the shared store. To run a child on another host, push the parent and
-pass the child's identity to `spore run --from` with `--generation`.
+pass the child's identity to `spore run --checkpoint` with `--generation`.
 
 Each disk-backed child gets its own durable disk pin, so removing the parent or
 a sibling cannot release that child's disk state. The child still reports
@@ -126,20 +126,20 @@ SPORE_PARENT_GENERATION`. Harnesses that can read the child manifest can compare
 the exact expected generation.
 
 The guest agent mixes the resume-time entropy seed into the kernel RNG before a
-forked `spore run --from` command starts. Live-forked processes can still carry
+forked `spore run --checkpoint` command starts. Live-forked processes can still carry
 process-local RNG state copied from the parent, so entropy-sensitive workloads
 must reexec, reseed their own runtime, or wait behind an application-level
 after-restore hook before generating secrets.
 
-`spore fanout` orchestrates child attaches and prefixes output. It does not prove
+`spore checkpoint fanout` orchestrates child resumes and prefixes output. It does not prove
 that arbitrary already-running workloads consumed the metadata; workload
-harnesses own the identity-before-work barrier. `spore run --from` remains the
+harnesses own the identity-before-work barrier. `spore run --checkpoint` remains the
 completed-base path for starting a fresh command inside a child spore.
 
 Automation can replace prefixed human output with the shared event contract:
 
 ```bash
-spore --json fanout children --for 10s
+spore --json checkpoint fanout children --for 10s
 ```
 
 Each stdout or stderr record carries the child directory name in `child`, its
@@ -154,19 +154,19 @@ requiring callers to infer status from EOF or prefixed diagnostics. See
 ## Single-Child Resume Identity
 
 Fleet adapters that materialize one child can inject the same guest-visible
-identity surface without running local fan-out. Use `spore run --from` when the
+identity surface without running local fan-out. Use `spore run --checkpoint` when the
 child should run a fresh one-shot command:
 
 ```bash
-spore run --from child.spore \
+spore run --checkpoint child.spore \
   --generation generation.json \
   -- ./bin/test-one-shard
 ```
 
-Use `spore attach` when the child should resume an already-saved session:
+Use `spore checkpoint resume` when the child should resume an already-saved session:
 
 ```bash
-spore --json attach child.spore \
+spore --json checkpoint resume child.spore \
   --generation generation.json
 ```
 

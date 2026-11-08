@@ -22,16 +22,18 @@ const vm_session = @import("vm_session.zig");
 pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const init = ctx.init;
     const stdout = ctx.stdout;
-    if (args.len == 0 and ctx.mode != .json) {
-        try stdout.writeAll(run_mod.cli_usage);
-        return;
-    }
-
     const arena = init.arena.allocator();
     var event_writer = events_mod.EventWriter.init(std.heap.page_allocator, stdout, "run");
     if (ctx.mode == .json) run_mod.cli_setup_events = event_writer.sink();
     defer run_mod.cli_setup_events = null;
     const parsed = try run_mod.parseCliArgs(arena, args);
+    if (ctx.mode == .human) if (parsed.save_path) |path| switch (parsed.save_trigger) {
+        .signal => |signal| if (signal == .INT) {
+            try ctx.stderr.print("Ctrl-C saves to {s} and {s}; it does not cancel. Send SIGTERM to cancel.\n", .{ path, if (parsed.continue_after_save) "keeps running" else "stops" });
+            try ctx.stderr.flush();
+        },
+        .exit => {},
+    };
     try runParsedCli(init, arena, parsed, stdout, if (ctx.mode == .json) &event_writer else null, ctx.debug);
 }
 
@@ -40,7 +42,7 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
 fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mod.CliOptions, stdout: *Io.Writer, json_events: ?*events_mod.EventWriter, debug: bool) !void {
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.command.len == 0) {
-            failRunSetup("spore run: --from runs a new command from a spore; use `spore attach {s}` to connect to a saved session", .{spore_dir});
+            failRunSetup("spore run: --checkpoint runs a new command from a spore; use `spore checkpoint resume {s}` to connect to a saved session", .{spore_dir});
         }
     }
 
@@ -52,40 +54,19 @@ fn runParsedCli(init: std.process.Init, arena: std.mem.Allocator, parsed: run_mo
 
     const spore_executable = try std.process.executablePathAlloc(init.io, arena);
     const result = runParsed(init, arena, parsed, events, json_events != null, spore_executable, debug) catch |err| {
+        const classified = api.classifyFailure(err);
         if (json_events) |writer| {
-            const classified = api.classifyFailure(err);
             writer.emitFailure(classified) catch {};
-            std.process.exit(classified.exit_code);
-        }
-        if (run_mod.isCaptureAborted(err)) std.process.exit(130);
-        if (run_mod.isNetworkGatewayError(err)) {
-            run_mod.printNetworkGatewayError(err);
-            std.process.exit(1);
-        }
-        if (run_mod.isX86ProductPolicyError(err)) {
-            const classified = api.classifyFailure(err);
-            writeStderr(classified.message);
-            writeStderr("\n");
-            std.process.exit(classified.exit_code);
-        }
-        if (err == error.ImageCommandMissing or err == error.UnsupportedImageUser or err == error.RunArgCountUnsupported or err == error.RunArgTooLong or err == error.RunProgramEmpty or err == error.ImageStoreIncomplete) {
-            const classified = api.classifyFailure(err);
-            writeStderr(classified.message);
-            writeStderr("\n");
-            std.process.exit(classified.exit_code);
-        }
-        if (parsed.commit_ref != null) {
-            const classified = api.classifyFailure(err);
-            writeStderr(classified.message);
-            writeStderr("\n");
             std.process.exit(classified.exit_code);
         }
         return err;
     };
     if (result.saved and json_events == null) {
         if (result.save_path) |path| {
-            const message = try std.fmt.allocPrint(arena, "spore run: saved spore at {s}\n", .{path});
+            const message = try std.fmt.allocPrint(arena, "spore run: saved checkpoint at {s} ({s})\n", .{ path, result.save_ownership orelse "unknown ownership" });
             writeStderr(message);
+            if (std.mem.eql(u8, result.save_ownership orelse "", "machine-local-pinned"))
+                writeStderr("Cache-pinned directory; do not copy standalone. Transfer with checkpoint push/pull.\n");
         }
     }
     if (json_events != null) {
@@ -119,7 +100,7 @@ fn runParsed(
     };
     if (parsed.from_spore_dir) |spore_dir| {
         if (parsed.network != .disabled) {
-            failRunSetup("spore run: --from uses the saved network policy; omit --net and network flags", .{});
+            failRunSetup("spore run: --checkpoint uses the saved network policy; omit --net and network flags", .{});
         }
         const command = if (parsed.command.len == 0)
             &.{}
@@ -129,7 +110,7 @@ fn runParsed(
                 else => return err,
             };
         if (parsed.tty and command.len != 0) {
-            failRunSetup("spore run: -t with --from command execution is not supported yet; use `spore attach -t {s}` to connect to a saved terminal session", .{spore_dir});
+            failRunSetup("spore run: -t with --checkpoint command execution is not supported yet; use `spore checkpoint resume -t {s}` to connect to a saved terminal session", .{spore_dir});
         }
         validateTerminalPolicy(parsed, json);
         var binding_diagnostic = api.BoundServiceBindingDiagnostic{};
@@ -169,7 +150,7 @@ fn runParsed(
     validateTerminalPolicy(parsed, json);
 
     if (parsed.save_path != null and parsed.rootfs_path != null and parsed.image_ref == null) {
-        failRunSetup("spore run: --rootfs with --save is not portable yet; use --image so save can record immutable rootfs identity", .{});
+        failRunSetup("spore run: --rootfs with --save-checkpoint is not portable yet; use --image so save can record immutable rootfs identity", .{});
     }
 
     const command: []const []const u8 = if (parsed.command.len == 0)

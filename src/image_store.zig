@@ -203,7 +203,7 @@ fn imagePathAlloc(allocator: std.mem.Allocator, identity: []const u8, file: []co
 pub const PushOptions = struct {
     source: []const u8,
     destination: []const u8,
-    platform: rootfs.Platform,
+    platform: ?rootfs.Platform = null,
     /// Uploads to an S3 store.
     aws_executable: []const u8 = "aws",
 };
@@ -213,6 +213,9 @@ pub const PushResult = struct {
     schema_version: u32 = 1,
     resource_type: resource.Type = .image,
     ref: []const u8,
+    digest_ref: []const u8,
+    tag_ref: ?[]const u8,
+    platform: rootfs.Platform,
     image_digest: []const u8,
     objects_total: usize,
     objects_written: usize,
@@ -265,8 +268,13 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
         .digest => |digest| digest,
     });
     errdefer allocator.free(ref);
+    const digest_ref = try pushedRefAlloc(allocator, destination.base, closure.image_digest);
+    errdefer allocator.free(digest_ref);
     return .{
         .ref = ref,
+        .digest_ref = digest_ref,
+        .tag_ref = if (destination.target == .tag) ref else null,
+        .platform = closure.platform,
         .image_digest = try allocator.dupe(u8, closure.image_digest),
         .objects_total = closure.objects.len,
         .objects_written = written.objects,
@@ -486,6 +494,7 @@ fn runAws(io: Io, allocator: std.mem.Allocator, aws: []const u8, args: []const [
 
 pub fn deinitPushResult(allocator: std.mem.Allocator, result: PushResult) void {
     allocator.free(result.ref);
+    allocator.free(result.digest_ref);
     allocator.free(result.image_digest);
 }
 
@@ -1513,6 +1522,8 @@ test "image push writes a complete store once and retags without rewriting" {
 
     const first = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}/1", .{store}), first.ref);
+    try std.testing.expectEqualStrings(first.ref, first.tag_ref.?);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ store, fixture.identity }), first.digest_ref);
     try std.testing.expect(isStoreRef(first.ref));
     try std.testing.expectEqualStrings(fixture.identity, first.image_digest);
     try std.testing.expectEqual(@as(usize, 3), first.objects_total);
@@ -1548,6 +1559,8 @@ test "image push writes a complete store once and retags without rewriting" {
     // A damaged object is replaced; a digest destination must name the image.
     try chunk_sealer.replaceFileAtomicDurable(allocator, object_path, "damaged", 0o644);
     const repaired = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ store, fixture.identity }));
+    try std.testing.expectEqual(null, repaired.tag_ref);
+    try std.testing.expectEqualStrings(first.digest_ref, repaired.digest_ref);
     try std.testing.expectEqual(@as(usize, 1), repaired.objects_written);
     try std.testing.expectEqual(@as(usize, 8), (try fixture.listStore(store)).len);
     try std.testing.expectError(error.ImageIdentityMismatch, fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, test_support.repeat("b", 64) })));

@@ -26,9 +26,9 @@ SPORE_TEST_ENV=ok "${spore_bin}" run --backend "${backend}" --env SPORE_TEST_ENV
   >"${workdir}/copy.stdout" 2>"${workdir}/copy.stderr"
 expect_env "${workdir}/copy.stdout" "${workdir}/copy.stderr"
 
-"${spore_bin}" run --backend "${backend}" --save "${workdir}/base.spore" -- /bin/true \
+"${spore_bin}" run --backend "${backend}" --save-checkpoint "${workdir}/base.spore" -- /bin/true \
   >"${workdir}/save.stdout" 2>"${workdir}/save.stderr"
-"${spore_bin}" run --backend "${backend}" --from "${workdir}/base.spore" --env SPORE_TEST_ENV=ok -- /usr/bin/env \
+"${spore_bin}" run --backend "${backend}" --checkpoint "${workdir}/base.spore" --env SPORE_TEST_ENV=ok -- /usr/bin/env \
   >"${workdir}/from.stdout" 2>"${workdir}/from.stderr"
 expect_env "${workdir}/from.stdout" "${workdir}/from.stderr"
 

@@ -41,7 +41,7 @@ const object_prefix = "objects/";
 pub const PackOptions = struct {
     source: []const u8,
     output_path: []const u8,
-    platform: rootfs.Platform,
+    platform: ?rootfs.Platform = null,
 };
 
 pub const PackResult = struct {
@@ -53,6 +53,7 @@ pub const PackResult = struct {
     image_digest: []const u8,
     object_count: usize,
     archive_bytes: u64,
+    platform: rootfs.Platform,
 };
 
 pub const UnpackOptions = struct {
@@ -60,7 +61,7 @@ pub const UnpackOptions = struct {
     archive_digest: []const u8,
     expected_image_digest: []const u8,
     ref: []const u8,
-    platform: rootfs.Platform,
+    platform: ?rootfs.Platform = null,
 };
 
 pub const UnpackResult = struct {
@@ -71,6 +72,7 @@ pub const UnpackResult = struct {
     manifest_digest: []const u8,
     image_digest: []const u8,
     object_count: usize,
+    platform: rootfs.Platform,
 };
 
 pub const ObjectDescriptor = struct {
@@ -113,6 +115,7 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
         .image_digest = try allocator.dupe(u8, closure.image_digest),
         .object_count = closure.objects.len,
         .archive_bytes = archive_stat.size,
+        .platform = closure.platform,
     };
 }
 
@@ -122,6 +125,7 @@ pub fn pack(init: std.process.Init, allocator: std.mem.Allocator, options: PackO
 /// `rootfs_cas.readVerifiedManifestObject`.
 pub const LocalClosure = struct {
     image_digest: []const u8,
+    platform: rootfs.Platform,
     storage: spore.RootfsStorage,
     manifest: image_manifest.EncodedImageManifest,
     config_bytes: []const u8,
@@ -145,14 +149,16 @@ pub fn loadLocalClosure(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     source: []const u8,
-    platform: rootfs.Platform,
+    requested_platform: ?rootfs.Platform,
 ) !LocalClosure {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const catalog_allocator = arena.allocator();
+    const platform = try local_image.selectPlatform(io, catalog_allocator, cache_root, source, requested_platform);
     const identity = (try local_image.lookup(io, catalog_allocator, cache_root, source, platform)) orelse
         return error.FileNotFound;
     const local = (try local_image.readRecord(io, catalog_allocator, cache_root, identity)) orelse return error.FileNotFound;
+    if (local.platform.arch != platform.arch or !std.mem.eql(u8, local.platform.os, platform.os)) return error.UnsupportedPlatform;
     if (!try rootfs_cas.storageCompleteWithStampRepair(io, catalog_allocator, cache_root, local.storage))
         return error.LocalImageStorageUnavailable;
 
@@ -196,6 +202,7 @@ pub fn loadLocalClosure(
     });
     return .{
         .image_digest = local.identity,
+        .platform = .{ .arch = platform.arch },
         .storage = storage,
         .manifest = manifest,
         .config_bytes = config_bytes,
@@ -252,7 +259,7 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
     if (!try rootfs_cas.storageContentComplete(init.io, allocator, cache_root, storage)) return error.IncompleteImageArchive;
     try rootfs_cas.markStorageComplete(init.io, allocator, cache_root, storage.index_digest);
     const published = try local_image.publish(init.io, allocator, cache_root, &cache_lock, .{
-        .platform = options.platform,
+        .platform = .{ .arch = extracted.verified.value.image.platform.arch },
         .config = extracted.config.value,
         .storage = storage,
         .name = options.ref,
@@ -265,6 +272,7 @@ pub fn unpack(init: std.process.Init, allocator: std.mem.Allocator, options: Unp
         .manifest_digest = try allocator.dupe(u8, extracted.manifest_digest),
         .image_digest = try allocator.dupe(u8, published.identity),
         .object_count = extracted.objects.len,
+        .platform = .{ .arch = extracted.verified.value.image.platform.arch },
     };
 }
 
@@ -302,7 +310,7 @@ fn extractArchive(
     archive_path: []const u8,
     expected_archive_digest: []const u8,
     stage_dir: []const u8,
-    platform: rootfs.Platform,
+    platform: ?rootfs.Platform,
 ) !Extracted {
     var file = try Io.Dir.cwd().openFile(io, archive_path, .{});
     defer file.close(io);
@@ -323,10 +331,12 @@ fn extractArchive(
 
     const manifest_digest = try image_manifest.transportDigestAlloc(allocator, manifest_bytes);
     errdefer allocator.free(manifest_digest);
+    var described = try image_manifest.parseImageManifest(allocator, manifest_bytes);
+    defer described.deinit();
     var verified = try image_manifest.verifyImageManifest(
         allocator,
         manifest_digest,
-        platform,
+        platform orelse described.value.image.platform,
         manifest_bytes,
         config_bytes,
         index_bytes,
@@ -805,9 +815,9 @@ test "native image archive round-trips into a clean cache and rejects substituti
     const pack_result = try pack(init, allocator, .{
         .source = "local/archive:producer",
         .output_path = archive_path,
-        .platform = .{ .os = "linux", .arch = .arm64 },
     });
     defer deinitPackResult(allocator, pack_result);
+    try std.testing.expectEqual(.arm64, pack_result.platform.arch);
     try std.testing.expectEqual(resource.Type.image, pack_result.resource_type);
     try std.testing.expectEqualStrings(published.identity, pack_result.image_digest);
     try std.testing.expectEqual(@as(usize, 1), pack_result.object_count);
@@ -821,10 +831,15 @@ test "native image archive round-trips into a clean cache and rejects substituti
     const duplicate = try pack(init, allocator, .{
         .source = "local/archive:producer",
         .output_path = duplicate_archive_path,
-        .platform = .{ .os = "linux", .arch = .arm64 },
+        .platform = .{ .arch = .arm64 },
     });
     defer deinitPackResult(allocator, duplicate);
     try std.testing.expectEqualStrings(pack_result.archive_digest, duplicate.archive_digest);
+    try std.testing.expectError(error.FileNotFound, pack(init, allocator, .{
+        .source = "local/archive:producer",
+        .output_path = try tmp_dir.path("wrong-platform.tar.gz"),
+        .platform = .{ .arch = .amd64 },
+    }));
 
     var corrupted: [object_bytes.len]u8 = undefined;
     @memcpy(&corrupted, object_bytes);
@@ -843,9 +858,9 @@ test "native image archive round-trips into a clean cache and rejects substituti
         .archive_digest = pack_result.archive_digest,
         .expected_image_digest = pack_result.image_digest,
         .ref = "local/archive:consumer",
-        .platform = .{ .os = "linux", .arch = .arm64 },
     });
     defer deinitUnpackResult(allocator, unpacked);
+    try std.testing.expectEqual(.arm64, unpacked.platform.arch);
     try std.testing.expectEqual(resource.Type.image, unpacked.resource_type);
     try std.testing.expectEqualStrings(pack_result.image_digest, unpacked.image_digest);
     try std.testing.expect(try rootfs_cas.storageMarkedComplete(io, allocator, consumer_cache, storage));
