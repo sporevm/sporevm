@@ -31,7 +31,7 @@ smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   --save-checkpoint "${capture_dir}" \
-  --save-on USR1 \
+  --save-on INT \
   -- /bin/finite \
   >"${run_stdout}" 2>"${run_stderr}" &
 run_pid="$!"
@@ -52,7 +52,7 @@ if [[ "${seen_ready}" != "1" ]]; then
 fi
 
 sleep "${SPORE_SMOKE_CAPTURE_SETTLE_SECONDS:-0.3}"
-kill -USR1 "${run_pid}"
+kill -INT "${run_pid}"
 
 (
   sleep "${SPORE_SMOKE_CAPTURE_TIMEOUT_SECONDS:-20}"
@@ -72,6 +72,10 @@ if [[ "${run_rc}" != "0" ]]; then
   cat "${run_stderr}" >&2 || true
   die "spore run save exited ${run_rc}, expected 0"
 fi
+grep -Fq "Ctrl-C saves to ${capture_dir} and stops; it does not cancel" "${run_stderr}" || {
+  cat "${run_stderr}" >&2 || true
+  die "Ctrl-C capture notice was lost from redirected stderr"
+}
 [[ -f "${capture_dir}/manifest.json" ]] || die "save did not write ${capture_dir}/manifest.json"
 grep -Fq "saved checkpoint at ${capture_dir} (portable-self-contained)" "${run_stderr}" || {
   cat "${run_stderr}" >&2 || true

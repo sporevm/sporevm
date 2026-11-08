@@ -29,8 +29,8 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
     const parsed = try run_mod.parseCliArgs(arena, args);
     if (ctx.mode == .human) if (parsed.save_path) |path| switch (parsed.save_trigger) {
         .signal => |signal| if (signal == .INT) {
-            try ctx.stderr.print("Ctrl-C saves to {s} and {s}; it does not cancel. Send SIGTERM to cancel.\n", .{ path, if (parsed.continue_after_save) "keeps running" else "stops" });
-            try ctx.stderr.flush();
+            const notice = try std.fmt.allocPrint(arena, "Ctrl-C saves to {s} and {s}; it does not cancel. Send SIGTERM to cancel.\n", .{ path, if (parsed.continue_after_save) "keeps running" else "stops" });
+            writeStderr(notice);
         },
         .exit => {},
     };
