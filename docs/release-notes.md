@@ -2,7 +2,14 @@
 
 ## Unreleased
 
-### Consistent CLI names and guest-command boundaries
+## v0.18.0
+
+### Upgrading
+
+v0.18.0 gives each command one spelling and resets SporeVM's local formats;
+it reads nothing earlier versions saved.
+
+#### Scripts already tracking unreleased main
 
 The unreleased-main spellings below are replaced before 0.18.0. They are not
 executable aliases: obsolete flags/commands fail with a correction. This adds
@@ -25,6 +32,8 @@ a migration for scripts already tracking main as well as the 0.17.1 upgrade.
 | `vm logs NAME` | `vm logs NAME --initial` (bounded initial output, not exec history) |
 | Unpack `--archive-digest DIGEST` | `--expected-archive-digest DIGEST` |
 | Bare guest command/string | `-- ARGV…` or `--shell STRING` |
+| `run` / `vm create --timeout DURATION` | `--startup-timeout DURATION` for readiness, `--exec-timeout DURATION` for commands |
+| Build `--timeout DURATION` | `--step-timeout DURATION` (legacy alias accepted) |
 
 Command options work before or after resource operands until `--`; global
 `--json`/`--debug` must precede the command. Duplicate scalar flags fail,
@@ -65,163 +74,66 @@ not cancel; human mode prints a notice.
 Pinned Kubernetes deployments must stay on their current CLI until the removed
 bundle workflow is migrated and tested; this is not a coordinated k8s upgrade.
 
-### One spelling per command: `spore vm` and `spore checkpoint`
+#### Upgrading from v0.17.1
 
-Commands on named VMs live under `spore vm` and commands on saved state under
-`spore checkpoint`, and the top-level spellings are gone, with no aliases or
-hints:
+Commands on named VMs live under `spore vm`, saved state under
+`spore checkpoint`, host and cache maintenance under `spore system`, and image
+commands under `spore image`. The old executable spellings are gone; use these
+canonical forms:
 
 | Old | New |
 | --- | --- |
-| `spore create`, `exec`, `logs`, `copy-in`, `copy-out`, `save`, `restore`, `ls` | `spore vm create`, `vm exec`, `vm logs`, `vm copy-in`, `vm copy-out`, `vm save`, `vm restore`, `vm ls` |
-| `spore ps` | `spore vm ls` |
-| `spore rm NAME` | `spore vm rm NAME` |
+| `spore create`, `exec`, `copy-in`, `copy-out`, `save` | `spore vm create`, `vm exec`, `vm copy-in`, `vm copy-out`, `vm save` |
+| `spore logs NAME` | `spore vm logs NAME --initial` |
+| `spore restore DIR --name NAME` | `spore vm restore NAME --checkpoint DIR` |
+| `spore rm NAME`, `ls`, `ps` | `spore vm rm NAME`, `vm ls` |
 | `spore fork --vm NAME` | `spore vm fork NAME` |
-| `spore rm --spore DIR` | `spore checkpoint rm DIR` |
-| `spore fork DIR` | `spore checkpoint fork DIR` |
-| `spore inspect`, `push`, `pull` | `spore checkpoint inspect`, `checkpoint push`, `checkpoint pull` |
-
-`spore help` is gone (use `spore --help`), and only `-h` and `--help` ask
-for help, so `spore vm help` fails as an unknown `vm` command and `spore
-checkpoint rm help` removes `./help`. `spore resume` and `spore suspend` no
-longer print a hint. JSON results and their schemas are unchanged. The CLI no
-longer promises to keep 0.x spellings compatible.
-
-### `spore system` and `spore image` replace `cache`, `host-info` and `rootfs`
-
-Host and cache maintenance lives under `spore system` and image commands under
-`spore image`; the old spellings are gone, with no aliases:
-
-| Old | New |
-| --- | --- |
+| `spore fork DIR`, `inspect DIR`, `rm --spore DIR` | `spore checkpoint fork DIR`, `checkpoint inspect DIR`, `checkpoint rm DIR` |
 | `spore host-info` | `spore system info` |
 | `spore cache gc`, `cache pins`, `cache unpin` | `spore system gc`, `system pins`, `system unpin` |
 | `spore rootfs import-oci`, `rootfs import-tar`, `rootfs resolve` | `spore image import-oci`, `image import-tar`, `image resolve` |
-| `spore rootfs build` | `spore image export` |
+| `spore rootfs build` | `spore image export-rootfs` (registry, local or native-store images) |
 
-`spore rootfs cas-preload` and its `spore.rootfs.cas-preload.result.v1`
-schema are gone; `spore run --image ... --save` and `spore checkpoint pull`
-write the storage it used to attach. `spore image export` takes only registry
-images: a `local/` ref now fails with a usage error instead of looking up host
-`local`. Other JSON results and their schemas are unchanged. The monitor no
-longer sends a timing event before a `vm exec` exit frame, and the client now
-rejects event frames on that stream.
+`checkpoint resume` continues a checkpoint's saved process in a throwaway VM;
+it does not connect to a named VM. `vm restore NAME --checkpoint DIR` creates
+a named live VM, while `run --checkpoint DIR -- COMMAND` starts a new command
+in restored state.
 
-### Global `--json` replaces `--events=jsonl`
-
-`spore --json run|attach|fanout|vm exec` now prints the
-`spore.automation.event.v1` stream that `--events=jsonl` printed, and
-`--events=jsonl` is gone from every command. Argument errors in those
-commands now also end the stream with a failed `completion` instead of a
-message on stderr. `spore vm restore` no longer streams events; `spore --json
-vm restore` prints its `spore.lifecycle.v1` result as before. `spore exec
---timing-json` and its `spore.named-exec-timing.v1` file are gone.
-
-### `spore checkpoint push` and `spore checkpoint pull` move spores through image stores
-
-`spore checkpoint push SPORE STORE/TAG` now writes a saved spore to a
-directory or S3 image store: its RAM chunks and disk objects go in the store's
-shared `objects/`, so a spore pushed to a store holding its image uploads only
-its RAM, changed disk chunks, disk index and manifest. It prints the
-digest-pinned ref, and `--json` prints `spore.push.result.v2`.
-`spore checkpoint pull STORE/TAG --out DIR` fetches it back from a directory,
-HTTP(S) or S3 store, verifying every object, and writes a save pinned in the
-rootfs cache; `--json` prints `spore.pull.result.v2`. Bundles no longer travel:
-pushing a bundle to S3 (`spore push BUNDLE s3://... [--region]`) and pulling
-one (`spore pull file://|s3://|http(s)://... [--child] [--region]
-[--allow-metadata-only-rootfs]`) are gone. To run one child of a fork batch
-elsewhere, push the parent, pull it there and pass the child's identity to
-`spore run --from DIR --generation FILE`.
-
-### Bundles and `spore clone` are gone
-
-`spore pack`, `spore unpack`, `spore inspect-bundle` and `spore clone` are
-removed, with their `spore.pack.result.v1`, `spore.unpack.result.v1`,
-`spore.bundle.inspect.v1` and `spore.clone.result.v1` results and the `bundle`
-resource type; use `spore checkpoint push` and `spore checkpoint pull`. A
-disk-backed save is always pinned in the rootfs cache and must be on its
-filesystem; nothing makes a self-contained copy of one any more.
-`SPOREVM_BUNDLE_CACHE_DIR` is no longer read and `spore system info` no longer
-reports `cache_roots.bundles`; delete the `bundles` directory under the SporeVM
-cache.
-
-A disk-backed save that carries its own disk index and objects, as
-`spore clone` and `spore unpack` wrote, no longer restores, forks or pushes;
-`spore checkpoint rm` still removes it. To keep one, restore it with an
-earlier release and save it again, which pins its disk in the rootfs cache.
-`spore checkpoint rm` no longer refuses with `SavedSporeInUse` while a VM
-restored from the save runs; that VM's runtime lease keeps its storage.
-
-### Performance
-
-- On aarch64 each virtio-blk disk serves its requests on a thread of its own
-  instead of on the vCPU that issued them. A slow read, such as the first read
-  of an object fetched from an image store, now stalls only that disk: the
-  vCPUs keep running, and the console, network, other disks and `spore vm exec`
-  keep working.
-- Restores from memory chunks read each chunk straight into guest RAM instead
-  of through a heap buffer, taking another 28 to 43 percent off loads with a
-  warm page cache and 10 to 35 percent with a cold one.
-- Guest command output reaches `spore run` and `spore vm exec` at 350 to 700
-  MiB/s, up from 14 MiB/s on KVM and 30 MiB/s on Hypervisor.framework. The
-  guest agent no longer copies it to the console unless the console is
-  logged, and sends it in 64 KiB vsock packets instead of two packets per
-  4 KiB.
-
-### Fixes
-
-- `spore attach` and `spore fanout` resume a saved session's output where the
-  `spore run` that saved it left off. `spore attach --events=jsonl` replayed
-  it from the start and the others printed the console instead, and all of
-  them asked the guest for the output from the start, so they failed once the
-  session had written more than 64 KiB.
-- Single-vCPU saves also wait until the vCPU is not in an interrupt handler,
-  or fail with `InterruptStillActive`, as multi-vCPU saves do.
-
-### Security
-
-- The guest agent reads generation params (from `--generation` files, forks
-  and restores) in one pass over the JSON object instead of searching the
-  text for each key, so a nested object or a look-alike key can't supply a
-  member's value. Params that aren't valid JSON, or that repeat a member the
-  agent reads, give it the wrong type, or set a VM id, fork batch id,
-  hostname or entropy seed over 127 bytes or containing NUL, now fail instead
-  of being partly applied. `spore run --from`, `spore attach` and
-  `spore vm restore` check a `--generation` file against the same rules before
-  the VM starts.
-- A `spore build` RUN could leave its root through a nested chroot (BuildKit
-  also grants `CAP_SYS_CHROOT`) and reach the build VM's initramfs, with its
-  guest-wide `/proc`, cgroup tree and build disks. The RUN root is now moved
-  over `/` before the chroot, as switch_root does. RUN still can't create user
-  namespaces, now enforced by seccomp, and `clone3` reports `ENOSYS`, as under
-  BuildKit's default profile.
-
-### Other changes
-
-- `spore attach` without `--json`, and so `spore fanout`, prints the
-  session's stdout and stderr, as its `--json` event stream does, instead of
-  the guest console.
+- Global `spore --json` with `run`, `checkpoint resume`, `checkpoint fanout`
+  or `vm exec` prints the
+  `spore.automation.event.v1` stream that `--events=jsonl` printed, and
+  `--events=jsonl` is gone from every command. Argument errors in those
+  commands end the stream with a failed `completion` instead of a message on
+  stderr. `spore vm restore` no longer streams events. Other JSON results keep
+  their schemas.
+- Removed commands: bundles (`spore pack`, `unpack`, `inspect-bundle`, and
+  `spore push` and `pull` of bundles) and `spore clone`, replaced by
+  `spore checkpoint push` and `pull`; `spore help` (use `spore --help`),
+  `spore rootfs cas-preload`, `spore exec --timing-json`
+  and `spore image export-fixture`. The old experimental image-pull protocol
+  is not restored: `spore image pull` now acquires verified native content
+  for offline use without booting. Only `-h` and `--help` ask for help, so
+  `spore checkpoint rm help` removes `./help`.
+- `spore checkpoint resume` without `--json`, and so `spore checkpoint fanout`, prints the
+  session's stdout and stderr instead of the guest console.
 - The guest copies command output to the console, and so to a console log,
   only in VMs started with `--console-log`. A spore saved from a VM started
   without it does not gain it when restored with `--console-log`.
-- Saved network spores record `default_action: "deny"` for every restricted
-  egress policy, including `--allow-cidr` and `--allow-host` alone; a policy
-  with allow entries but no `default_action` still restores as restricted.
-
-## v0.18.0
-
-### Upgrading
-
-v0.18.0 resets SporeVM's local formats and reads nothing older.
-
-- Re-create saved spores, checkpoints and bundles from earlier versions; they
-  fail with `FormatTooOld`. Spore manifests are version 7, one shape for any
-  vCPU count, and disk and memory indexes are only `spore-disk-index-v2`.
+- `spore build` refuses a runtime directory that isn't private to the
+  current user (mode 0700), such as a shared `SPOREVM_RUNTIME_DIR`.
+- The C ABI (`spore.h` and the `libspore` archives), the Go binding and the
+  Zig `libspore` module are gone. The CLI's `--json` output is the only
+  interface.
+- The e2fsprogs ext4 writer is gone, with `SPOREVM_EXT4_WRITER=external` and
+  the `--mkfs` and `--debugfs` options of `spore build` and `spore rootfs`.
+- Re-create saved spores and checkpoints from earlier versions; they fail
+  with `FormatTooOld`. Spore manifests are version 8, one shape for any vCPU
+  count, and disk and memory indexes are only `spore-disk-index-v2`.
 - Saved RAM carries the guest agent, which now speaks only the SPIO exec
   protocol and parses every request strictly. The text protocol and its
   `start`, `attach` and `generation` requests are gone.
 - Saved-spore pins are `spore.saved-disk-pin.v3`. Older pins root nothing;
-  `spore cache pins` lists them as `stale` and `spore cache gc` deletes them.
+  `spore system pins` lists them as `stale` and `spore system gc` deletes them.
 - Local RAM backing proofs are v3, without fs-verity. Spores with an older
   proof restore from their verified chunks instead.
 - On macOS the GICv3 redistributors moved to `0x08020000`, where KVM has them.
@@ -229,34 +141,75 @@ v0.18.0 resets SporeVM's local formats and reads nothing older.
 - Stop named VMs before upgrading. A VM is live only while its monitor holds
   `vms/<name>/lock`, which older monitors don't take, so their VMs show as
   stale. `spore vm rm NAME` removes them, and any VM whose spec has removed
-  fields. `spore ls` shows `starting` where it showed `incomplete`.
+  fields. `spore vm ls` shows `starting` where `spore ls` showed `incomplete`.
 - Local images from earlier versions (built, committed, imported or unpacked)
   are no longer listed; build or import them again. Registry images are
   pulled again on first use.
 - To reclaim space, delete the `rootfs` and `bundles` directories under the
   SporeVM cache (`~/.cache/sporevm` on Linux, `~/Library/Caches/sporevm` on
-  macOS, or `SPOREVM_ROOTFS_CACHE_DIR` and `SPOREVM_BUNDLE_CACHE_DIR`).
-  Otherwise the first `spore cache gc` deletes step records from older
-  builders and the objects only they and old indexes kept.
+  macOS, or `SPOREVM_ROOTFS_CACHE_DIR`). `SPOREVM_BUNDLE_CACHE_DIR` is no
+  longer read. Otherwise the first `spore system gc` deletes step records from
+  older builders and the objects only they and old indexes kept.
 - The first `spore build` after upgrading misses its cache once, because the
   guest initrd changed.
-- JSON: `spore host-info` reports only `spore.host-info.v3`.
-  `spore.cache.gc.result.v2` drops `legacy_step_record_count` and
-  `unparseable_ref_count`. `spore.rootfs.import.result.v2` drops `rootfs_path`
-  and reports the image identity as `image_manifest_digest`.
-  `spore.saved.remove.result.v2` drops `ownership`, `pin_id` and
-  `pin_removed`. `spore inspect-bundle` no longer reports `indexed`.
+- JSON: `spore system info` reports only `spore.host-info.v3`, without
+  `cache_roots.bundles`. `spore.cache.gc.result.v2` drops
+  `legacy_step_record_count` and `unparseable_ref_count`.
+  `spore.rootfs.import.result.v2` drops `rootfs_path` and reports the image
+  identity as `image_manifest_digest`. `spore.saved.remove.result.v2` drops
+  `ownership`, `pin_id` and `pin_removed`. The removed commands' results, the
+  `bundle` resource type and `spore.named-exec-timing.v1` are gone.
 
-### Lazy images from a store
+### Security
 
-- `spore image push local/app:1 DEST` writes a static image store to a
+- A `spore build` RUN step could leave its root through a nested chroot
+  (BuildKit also grants `CAP_SYS_CHROOT`) and reach the build VM's
+  initramfs, with its guest-wide `/proc`, cgroup tree and build disks.
+  v0.17.1 is affected. The RUN root is now moved over `/` before the chroot,
+  as switch_root does. RUN still can't create user namespaces, now
+  enforced by seccomp, and `clone3` reports `ENOSYS`, as under BuildKit's
+  default profile.
+- x32 syscalls are killed in the monitor jail and in build RUN steps.
+- `spore vm copy-out` stops at 4 GiB of guest archive, applies the host umask,
+  and can't be redirected by symlinks the guest swaps in. Guest output during
+  a copy no longer reaches stdout, and stderr has control bytes escaped.
+- The guest agent reads generation params (from `--generation` files, forks
+  and restores) in one pass over the JSON object, so a nested object or a
+  look-alike key can't supply a member's value. Params that aren't valid JSON,
+  repeat a member the agent reads, give it the wrong type, or set a VM id,
+  fork batch id, hostname or entropy seed over 127 bytes or containing NUL now
+  fail instead of being partly applied. `spore run --checkpoint`, `spore checkpoint resume` and
+  `spore vm restore` check a `--generation` file the same way before the VM
+  starts.
+- Virtqueue rings are checked against guest RAM when a queue becomes ready and
+  on restore, and ring accesses are ordered on multi-vCPU arm64.
+- Manifests listing more than eight GIC redistributors are rejected instead of
+  hanging validation.
+- Image layers and image archives are read through one fuzzed tar parser.
+
+### Image stores
+
+- `spore image push local/app:1 --to DEST` writes a static image store to a
   directory, or to `s3://bucket/prefix` with the aws CLI.
-- `spore run --image` and `spore create --image` boot a store ref (`file://`,
-  `https://` or `s3://`, by tag or `blake3:<hex>`) with only the image's
-  manifest, config and index local. Each rootfs object the guest reads is
-  fetched on first use, with the objects of the next 7 chunks.
-- `--save`, `--save-on`, `--commit` and `spore save` first fetch the rest of
-  the image, so the result needs nothing from the store.
+- `spore image pull SOURCE` acquires all verified objects into rooted local
+  storage without booting. Its immutable native digest works offline until
+  explicit image pruning. `image resolve` remains identity-only and
+  `run --image` remains lazy. `image export-rootfs` also accepts native local
+  and store inputs and writes an independent writable ext4 copy.
+- `spore run --image` and `spore vm create --image` boot a store ref
+  (`file://`, `https://` or `s3://`, by tag or `blake3:<hex>`) with only the
+  image's manifest, config and index local. Each rootfs object the guest reads
+  is fetched on first use, with the objects of the next 7 chunks.
+- `--save-checkpoint`, `--save-on`, `--commit-image` and `spore vm save` first fetch the rest
+  of the image, so the result needs nothing from the store.
+- `spore checkpoint push SPORE --to STORE/TAG` writes a saved spore to a directory
+  or S3 store. Its RAM chunks and disk objects share the store's `objects/`, so
+  pushing to the store that holds its image uploads only the RAM, the changed
+  disk chunks, the disk index and the manifest. `spore checkpoint pull
+  STORE/TAG --output DIR` fetches it from a directory, HTTP(S) or S3 store,
+  verifies every object and writes a save pinned in the rootfs cache. To run
+  one child of a fork batch elsewhere, push the parent, pull it there and pass
+  the child's identity to `spore run --checkpoint DIR --generation FILE`.
 - S3 reads use explicit environment credentials or AWS CLI v2's credential
   chain, including `AWS_PROFILE` and renewable role credentials. Provider
   credentials refresh before expiry; explicit environment credentials remain
@@ -264,47 +217,22 @@ v0.18.0 resets SporeVM's local formats and reads nothing older.
   profile. `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3` still fail closed.
   Readers need `s3:GetObject`. See `docs/image-format.md`.
 
-### Other changes
-
-- `SPOREVM_DOCKER_HUB_MIRROR=mirror.gcr.io` pulls `docker.io` images through
-  a mirror; refs, cache keys and digests still name `docker.io`. Registry 404
-  and 429 responses fail as `RegistryNotFound` and `RegistryRateLimited`.
-- Cold image pulls (`run --image`, `rootfs import-oci` and `import-tar`)
-  download and merge layers without the rootfs cache lock, so other VM starts
-  no longer wait for them.
-- `spore build` holds the rootfs cache lock only to look up, seal and publish
-  steps, so runs, saves and `cache gc` no longer wait for a long build. It now
-  needs a runtime directory private to the current user.
-- `spore build` rejects an invalid later stage before any stage runs, and
-  pulls `COPY --from` images only after the whole Dockerfile is planned.
-- Image rootfs builds handle files larger than 4 GiB.
-- `spore image pack` accepts tags from `rootfs import-oci` and `import-tar`,
-  and `spore --json image pack` and `image unpack` print result documents.
-- `spore pack` without `--children` always writes an indexed bundle, which
-  changes the `bundle_digest` of spores without chunked rootfs storage.
-- `spore checkpoint rm DIR` deletes any checkpoint whose manifest parses, even
-  with corrupt storage; `spore cache gc --force` releases its pin.
-- `spore run`, `create` and `build` check the hypervisor before any download.
-  Linux arm64 hosts without a usable `/dev/kvm` fail with `MissingKvmDevice`
-  or `KvmOpenFailed`, and incompatible x86 hosts fail with
-  `IncompatibleCpuProfile` and log which CPU fact differs. `spore host-info`
-  reports a `/dev/kvm` that exists but can't be opened as `kvm_open_failed`.
-- Remote `ADD` and registry fetches try the host's other addresses when one
-  fails to connect or closes before answering.
-- The shipped guest initrd is about 45% smaller; smoke-test helpers are only
-  in `-Dsmoke-helpers` builds.
-- `spore rootfs build` keeps its temporary files in the rootfs cache instead
-  of `.zig-cache/` in the current directory.
-
 ### Performance
 
-- Restores from memory chunks skip zero chunks: in a 512 MiB VM with 32 MiB
-  in use, loading memory takes 55 ms instead of 324 ms and leaves 32 MiB
-  resident instead of 512 MiB.
+- Guest command output reaches `spore run` and `spore vm exec` at 350 to 700
+  MiB/s, up from 14 MiB/s on KVM and 30 MiB/s on Hypervisor.framework.
+- Restores from memory chunks skip zero chunks and read the rest straight into
+  guest RAM. In a 512 MiB VM with 32 MiB in use, skipping zero chunks cut
+  loading from 324 ms to 55 ms and resident memory from 512 MiB to 32 MiB; the
+  direct read takes another 28 to 43 percent off warm loads.
+- On aarch64 each virtio-blk disk serves requests on its own thread, so a slow
+  read, such as an object fetched from an image store, stalls only that disk:
+  the vCPUs, console, network, other disks and `spore vm exec` keep working.
+- A dense 32 GiB disk index decodes into 21 MB of heap instead of 226 MB, and
+  once per open: such a local image opens lazily in about 0.5 s instead of
+  1.4 s.
 - Fresh x86 VMs no longer make all guest RAM resident at boot: a 512 MiB VM's
   monitor uses 46 MiB instead of 521 MiB.
-- Decoding a dense 32 GiB disk index peaks at 21 MB of heap instead of 226 MB,
-  and runs faster.
 - Idle multi-vCPU VMs no longer poll every millisecond on the host.
 
 ### Fixes
@@ -313,48 +241,69 @@ v0.18.0 resets SporeVM's local formats and reads nothing older.
   `manifest.json` write is atomic, and the local RAM backing is fsynced before
   its proof. On a Linux test host a full-scan save took 50 ms longer with
   32 MiB of RAM in use and 350 ms longer with 512 MiB.
-- Multi-vCPU saves wait until no vCPU is in an interrupt handler, or fail with
-  `InterruptStillActive`, so restoring them on macOS no longer aborts.
+- Saves wait until no vCPU is in an interrupt handler, or fail with
+  `InterruptStillActive`, so restoring a multi-vCPU save on macOS no longer
+  aborts.
 - macOS release builds restore guest SIMD registers correctly, so commands
   started in a restored spore no longer fail with `exec setup failed`.
-- `spore rm` stops a VM within about a second while an exec runs; the exec
+- `spore run --save-checkpoint` and `spore checkpoint fork --output` accept relative paths,
+  and saves into a directory under a symlink, such as `/tmp` on macOS, work;
+  both failed with `BadManifest`.
+- `spore checkpoint resume` and `spore checkpoint fanout` resume a saved session's output where the
+  `spore run` that saved it left off, and no longer fail once the session has
+  written more than 64 KiB.
+- `spore checkpoint resume` fails instead of exiting 0 when the guest powers off before
+  reporting its exit status, or with `NetworkGatewayFailed` when the network
+  gateway died.
+- `spore vm rm` stops a VM within about a second while an exec runs; the exec
   fails with `named VM is being removed`.
-- `create`, `restore --name` and `vm fork` claim names atomically, and
-  `vm fork` no longer undoes a `spore save` that finished while it started.
-- `spore cache gc` collects unreferenced storage on hosts with local images,
+- `vm create`, `vm restore` and `vm fork` claim names atomically, and
+  `vm fork` no longer undoes a `spore vm save` that finished while it started.
+- `spore system gc` collects unreferenced storage on hosts with local images,
   works after a destructive prune while disk-forked VMs run, and reads VM
   specs over 64 KiB.
-- A named VM given an explicit deny-all policy through the embedding API no
-  longer gets unrestricted egress; the CLI could not set one.
-- `spore attach` fails instead of exiting 0 when the guest powers off before
-  reporting its exit status.
 - Networking: a slow DNS resolver no longer stalls other traffic, connects to
   denied addresses are refused at once, bytes sent after the host half-closes
-  are delivered, and `spore run --bind-service ... --save` works.
+  are delivered, and `spore run --bind-service ... --save-checkpoint` works.
 - A terminal resize with a full vsock ring no longer stalls `run -t` or
-  `attach`, and single-vCPU macOS snapshots no longer drop queued vsock
+  `checkpoint resume`, and single-vCPU macOS snapshots no longer drop queued vsock
   packets.
 
-### Security
+### Other changes
 
-- `spore copy-out` stops at 4 GiB of guest archive, applies the host umask,
-  and can't be redirected by symlinks the guest swaps in. Guest output during
-  a copy no longer reaches stdout, and stderr has control bytes escaped.
-- x32 syscalls are killed in the monitor jail and in build `RUN` steps.
-- Virtqueue rings are checked against guest RAM when a queue becomes ready and
-  on restore, and ring accesses are ordered on multi-vCPU arm64.
-- Manifests listing more than eight GIC redistributors are rejected instead of
-  hanging validation.
-- Image layers and image archives are read through one fuzzed tar parser.
-
-### Removed
-
-- The C ABI (`spore.h` and the `libspore` archives), the Go binding and the
-  Zig `libspore` module. The CLI's `--json` output is the only interface.
-- `spore image pull`, experimental since v0.15, and
-  `spore image export-fixture`.
-- The e2fsprogs ext4 writer, with `SPOREVM_EXT4_WRITER=external` and the
-  `--mkfs` and `--debugfs` options of `spore build` and `spore rootfs`.
+- `spore --help` lists every command, and a bare group such as `spore vm`
+  lists its verbs.
+- `SPOREVM_DOCKER_HUB_MIRROR=mirror.gcr.io` pulls `docker.io` images through
+  a mirror; refs, cache keys and digests still name `docker.io`. Registry 404
+  and 429 responses fail as `RegistryNotFound` and `RegistryRateLimited`.
+- Cold image pulls (`run --image`, `image import-oci` and `import-tar`)
+  download and merge layers without the rootfs cache lock, so other VM starts
+  no longer wait for them.
+- `spore build` holds the rootfs cache lock only to look up, seal and publish
+  steps, so runs, saves and `system gc` no longer wait for a long build.
+- `spore build` rejects an invalid later stage before any stage runs, and
+  pulls `COPY --from` images only after the whole Dockerfile is planned.
+- Image rootfs builds handle files larger than 4 GiB.
+- `spore image pack` accepts tags from `image import-oci` and `import-tar`,
+  and `spore --json image pack` and `image unpack` print result documents.
+- `spore checkpoint rm DIR` deletes any checkpoint whose manifest parses, even
+  with corrupt storage, and no longer refuses with `SavedSporeInUse` while a
+  VM restored from it runs; that VM's runtime lease keeps its storage.
+  `spore system gc --force` releases a removed checkpoint's pin.
+- Saved network spores record `default_action: "deny"` for every restricted
+  egress policy, including `--allow-cidr` and `--allow-host` alone; a policy
+  with allow entries but no `default_action` still restores as restricted.
+- `spore run`, `vm create` and `build` check the hypervisor before any
+  download. Linux arm64 hosts without a usable `/dev/kvm` fail with
+  `MissingKvmDevice` or `KvmOpenFailed`, and incompatible x86 hosts fail with
+  `IncompatibleCpuProfile` and log which CPU fact differs. `spore system info`
+  reports a `/dev/kvm` that exists but can't be opened as `kvm_open_failed`.
+- Remote `ADD` and registry fetches try the host's other addresses when one
+  fails to connect or closes before answering.
+- The shipped guest initrd is about 45% smaller; smoke-test helpers are only
+  in `-Dsmoke-helpers` builds.
+- `spore image export-rootfs` keeps its temporary files in the rootfs cache instead
+  of `.zig-cache/` in the current directory.
 
 ## v0.17.1
 
