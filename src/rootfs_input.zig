@@ -339,7 +339,7 @@ fn resolveImageRootfs(
 
 /// The image the current builder converted from `resolved`, pulling it if
 /// this host has none. Points `name` at it.
-fn pulledImage(
+pub fn pulledImage(
     init: std.process.Init,
     allocator: std.mem.Allocator,
     cache_root: []const u8,

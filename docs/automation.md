@@ -31,7 +31,8 @@ document on stderr and nothing on stdout. Each result has `schema`,
 | `spore.pull.result.v2` | `checkpoint pull` | `resource_type`: string, `ref`: string, `spore_digest`: string, `out_dir`: string, `ram`: object, `disk`: object |
 | `spore.rootfs.import.result.v2` | `image import-oci`, `image import-tar` | `metadata_path`: string, `local_ref_path`: string, `resolved_image_ref`: string, `image_manifest_digest`: string, `rootfs_storage`: object |
 | `spore.rootfs.resolve.result.v1` | `image resolve` | `ref`: string, `resolved_image_ref`: string, `platform`: object |
-| `spore.rootfs.build.result.v1` | `image export-rootfs` | `rootfs_storage`: object |
+| `spore.rootfs.build.result.v1` | `image export-rootfs` | `rootfs_storage`: object, `platform`: object |
+| `spore.image.pull.result.v1` | `image pull` | `image_digest`: string, `digest_ref`: string, `tag_ref`: string or null, `platform`: object |
 | `spore.image.push.result.v1` | `image push` | `resource_type`: string, `ref`: string, `digest_ref`: string, `tag_ref`: string or null, `platform`: object, `image_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
 | `spore.image.archive.pack.result.v1` | `image pack` | `resource_type`: string, `archive_digest`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `archive_bytes`: integer, `platform`: object |
 | `spore.image.archive.unpack.result.v1` | `image unpack` | `resource_type`: string, `resolved_image_ref`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `platform`: object |

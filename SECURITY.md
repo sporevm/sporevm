@@ -200,7 +200,14 @@ serves; AWS credentials in the environment.
   are retried. HTTP(S) requests send no credentials. Store hosts are not
   checked against the public-target policy, because stores may be private.
 - An image's manifest, config, and index must recompute the requested image
-  digest for the host platform before the index is installed.
+  digest for the selected platform before the index is installed. Explicit
+  acquisition/export may select a recorded foreign platform without executing
+  it; runtime reads still require the host execution platform.
+- `spore image pull` holds the cache lock through missing-object fetch and
+  complete image publication, and publishes its requested local tag only after
+  the closure is complete. Native ext4 export shares the verified sparse chunk
+  assembler, writes an independent caller-writable file, and never replaces an
+  existing output or links writable output into immutable cache storage.
 - An object is fetched on the first guest read of its chunk (with up to 7
   following chunks in the background) and verified before it reaches guest
   memory or the cache. An HTTP(S) object fetch makes at most 3 attempts within

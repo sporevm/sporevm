@@ -509,7 +509,7 @@ pub fn resolve(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     raw: []const u8,
-    platform: rootfs.Platform,
+    requested_platform: ?rootfs.Platform,
     env: *const std.process.Environ.Map,
 ) !local_image.LocalImage {
     const ref = try parseStoreRef(raw);
@@ -526,7 +526,9 @@ pub fn resolve(
 
     try Io.Dir.cwd().createDirPath(io, cache_root);
     if (try local_image.loadAllowingOrigin(io, allocator, cache_root, identity)) |local| {
-        if (local.platform.arch != platform.arch or !std.mem.eql(u8, local.platform.os, platform.os)) return error.UnsupportedPlatform;
+        if (requested_platform) |platform| {
+            if (local.platform.arch != platform.arch or !std.mem.eql(u8, local.platform.os, platform.os)) return error.UnsupportedPlatform;
+        }
         if (local.origin == null or std.mem.eql(u8, local.origin.?, ref.base.url)) return local;
         // Fetch missing objects from the store this run names.
         _ = try local_image.lockAndPublish(io, allocator, cache_root, .{
@@ -542,6 +544,7 @@ pub fn resolve(
     const manifest_path = try imagePathAlloc(allocator, identity, "manifest");
     const manifest_bytes = try client.get(allocator, manifest_path, .{ .max = image_manifest.max_image_manifest_bytes }, metadata_budget);
     const summary = try image_manifest.parseImageManifest(allocator, manifest_bytes);
+    const platform = requested_platform orelse summary.value.image.platform;
     if (summary.value.image.platform.arch != platform.arch or !std.mem.eql(u8, summary.value.image.platform.os, platform.os)) return error.UnsupportedPlatform;
     const config_path = try imagePathAlloc(allocator, identity, "config");
     const config_bytes = try client.get(allocator, config_path, .{ .max = image_manifest.max_config_blob_bytes }, metadata_budget);

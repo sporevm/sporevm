@@ -125,7 +125,8 @@ pub const commands = [_]Command{
     .{ .name = "image import-oci", .summary = "Import an OCI image layout as a local image", .usage = image_cli.import_oci_usage, .output = .{ .result = .of(api.RootfsImportOciResult) }, .run = image_cli.importOci },
     .{ .name = "image import-tar", .summary = "Import a rootfs tar as a local image", .usage = image_cli.import_tar_usage, .output = .{ .result = .of(api.RootfsImportTarResult) }, .run = image_cli.importTar },
     .{ .name = "image resolve", .summary = "Resolve an image tag to a digest reference", .usage = image_cli.resolve_usage, .output = .{ .result = .of(image_cli.ResolveResult) }, .run = image_cli.resolve },
-    .{ .name = "image export-rootfs", .summary = "Write a registry image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .{ .result = .of(api.RootfsBuildResult) }, .run = image_cli.exportRootfs },
+    .{ .name = "image pull", .summary = "Acquire a complete image for offline use without booting", .usage = image_cli.pull_usage, .output = .{ .result = .of(api.ImagePullResult) }, .run = image_cli.pull },
+    .{ .name = "image export-rootfs", .summary = "Write an image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .{ .result = .of(api.RootfsBuildResult) }, .run = image_cli.exportRootfs },
     .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.usage, .output = .{ .result = .of(api.ImagePushResult) }, .run = image_cli.push },
     .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchivePackResult) }, .run = image_cli.pack },
     .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchiveUnpackResult) }, .run = image_cli.unpack },
@@ -411,7 +412,7 @@ pub fn writeHelp(table: []const Command, group: ?[]const u8, writer: *Io.Writer)
     }
     if (group) |word| {
         if (std.mem.eql(u8, word, "image"))
-            try writer.writeAll("\nNo fetch-only image pull command in this release. Resolve finds identity;\nrun --image acquires content lazily; pack/unpack transfers local images offline.\n");
+            try writer.writeAll("\nPull acquires complete images without booting; resolve only finds identity.\nRun acquires content lazily; pack/unpack transfers native images offline.\n");
         if (std.mem.eql(u8, word, "checkpoint"))
             try writer.writeAll("\nResume continues a saved process in a throwaway VM. For a new command use\nrun --checkpoint DIR -- ARGV; for a named VM use vm restore NAME --checkpoint DIR.\n");
     }

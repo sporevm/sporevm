@@ -165,6 +165,12 @@ pub fn find(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, ref: [
 /// otherwise preserve the only recorded platform. Explicit selection never falls back.
 pub fn selectPlatform(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, ref: []const u8, requested: ?Platform) !Platform {
     if (requested) |platform| return platform;
+    if (std.mem.lastIndexOfScalar(u8, ref, '@')) |at| {
+        if (std.mem.startsWith(u8, ref[at + 1 ..], image.digest_prefix)) {
+            const identity = (try lookup(io, allocator, cache_root, ref, rootfs.native_platform)) orelse return error.FileNotFound;
+            return ((try readRecord(io, allocator, cache_root, identity)) orelse return error.FileNotFound).platform;
+        }
+    }
     const native = rootfs.native_platform;
     if (try lookup(io, allocator, cache_root, ref, native) != null) return native;
     const other: Platform = .{ .arch = if (native.arch == .arm64) .amd64 else .arm64 };

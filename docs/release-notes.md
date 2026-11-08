@@ -12,7 +12,7 @@ a migration for scripts already tracking main as well as the 0.17.1 upgrade.
 | --- | --- |
 | `attach DIR` | `checkpoint resume DIR` |
 | `fanout BATCH` | `checkpoint fanout BATCH` |
-| `image export REF` | `image export-rootfs REF` (registry images only) |
+| `image export REF` | `image export-rootfs REF` (registry, local or native-store images) |
 | `build -t REF CONTEXT` | `build CONTEXT --tag REF` |
 | Import/unpack `--ref REF` | `--tag REF` |
 | Artifact `--out PATH` | `--output PATH` |
@@ -39,8 +39,14 @@ unpack infer a single recorded platform; explicit selection never substitutes
 another platform. Disk-backed checkpoint summaries identify cache-pinned
 storage rather than implying a standalone portable `.spore` artifact.
 
-No fetch-only `image pull`, local-image ext4 export, AWS profile/refresh support
-for reads, or timeout redesign is included. `--save-on INT` still makes Ctrl-C
+`image pull SOURCE [--tag local/NAME:TAG]` now acquires a complete verified image
+without booting and returns a native local digest reference for offline use.
+Registry tags refresh; native inputs preserve their recorded platform. Local
+and native-store images can also be exported as independent writable ext4 files
+with native-identity metadata, without fabricated OCI provenance.
+
+AWS profile/refresh support for reads and timeout redesign are still pending.
+`--save-on INT` still makes Ctrl-C
 save successfully, not cancel; human mode prints a notice. S3 reads still need
 explicit environment credentials and region, unlike AWS-CLI-backed pushes.
 Pinned Kubernetes deployments must stay on their current CLI until the removed

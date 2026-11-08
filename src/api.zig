@@ -10,6 +10,7 @@ const backend_mod = @import("backend.zig");
 const boot_assets = @import("boot_assets.zig");
 const context_mod = @import("context.zig");
 const generation = @import("generation.zig");
+const image_acquire = @import("image_acquire.zig");
 const image_archive = @import("image_archive.zig");
 const image_store = @import("image_store.zig");
 const manifest_test_support = @import("manifest_test_support.zig");
@@ -40,6 +41,8 @@ pub const ImageArchiveUnpackOptions = image_archive.UnpackOptions;
 pub const ImageArchiveUnpackResult = image_archive.UnpackResult;
 pub const ImagePushOptions = image_store.PushOptions;
 pub const ImagePushResult = image_store.PushResult;
+pub const ImagePullOptions = image_acquire.Options;
+pub const ImagePullResult = image_acquire.Result;
 
 /// Process IO and environment access shared by product operations.
 pub const Context = context_mod.Context;
@@ -265,7 +268,7 @@ pub fn hostInfo(
     return platform.hostInfo(allocator, context.environ_map);
 }
 
-/// Build an ext4 rootfs from an OCI image reference.
+/// Export an ext4 rootfs from a registry, local image or native image store.
 pub fn rootfsBuild(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -273,10 +276,16 @@ pub fn rootfsBuild(
 ) !RootfsBuildResult {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
-    const result = try rootfs_mod.build(init, arena_state.allocator(), options);
+    const result = try image_acquire.exportRootfs(init, arena_state.allocator(), options);
     return .{
         .rootfs_storage = try ownRootfsStorageDigestFields(allocator, result.rootfs_storage),
+        .platform = .{ .arch = result.platform.arch },
     };
+}
+
+/// Fully acquire and root an image without starting a VM. Uses the caller's arena.
+pub fn imagePull(init: std.process.Init, allocator: std.mem.Allocator, options: ImagePullOptions) !ImagePullResult {
+    return image_acquire.pull(init, allocator, options);
 }
 
 /// Import an OCI layout into the local rootfs cache under a local ref.
