@@ -42,7 +42,7 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
         (["vm", "exec", "missing", "--json", "--", "true"], 2, "usage.invalid_argument", "before", True),
         (["vm", "exec", "missing", "--workdir", "/one", "--workdir", "/two", "--", "pwd"], 2, "usage.invalid_argument", "once", True),
         (["run", "--timeout", "1s", "--timeout-ms", "2000", "--", "true"], 2, "usage.invalid_argument", "once", True),
-        (["checkpoint", "pull", "s3://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "AWS_PROFILE", False),
+        (["checkpoint", "pull", "s3://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "incomplete AWS credentials", False),
         (["checkpoint", "pull", "gs://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "scheme", False),
     ]
     # A missing VM, not a parse failure, proves guest options weren't stolen.
@@ -61,7 +61,12 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
     for args, status, code, message, stream in cases:
         for structured in (False, True):
             argv = [binary, *(["--json"] if structured else []), *args]
-            result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+            case_env = env.copy()
+            if args[:3] == ["checkpoint", "pull", "s3://test-bucket/warm"]:
+                # A partial explicit identity must fail before any CLI provider
+                # or network access, regardless of tools installed on the host.
+                case_env["AWS_ACCESS_KEY_ID"] = "INCOMPLETEKEY"
+            result = subprocess.run(argv, env=case_env, capture_output=True, text=True, timeout=10)
             assert result.returncode == status, (argv, result.returncode, result.stdout, result.stderr)
             if structured:
                 if stream:

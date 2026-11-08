@@ -220,9 +220,14 @@ serves; AWS credentials in the environment.
   not poisoned, and a named VM keeps running. Stopping a VM cancels the fetch.
 - S3 reads go only to `https://<bucket>.s3.<region>.amazonaws.com`; a set
   `AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` fails the read. Requests are
-  SigV4-signed from the standard `AWS_*` variables, whose characters are
-  checked so none can inject a header; the secret and derived keys are zeroed
-  after use.
+  SigV4-signed from explicit `AWS_*` credentials or AWS CLI v2 process
+  credentials. The provider's JSON is capped at 32 KiB; version, credential
+  characters and UTC expiration are validated before signing. Provider output
+  and stderr are never logged. Explicit partial credentials fail closed;
+  provider credentials refresh under a mutex before expiry and request-owned
+  session tokens survive concurrent refresh. No credential can inject a
+  header; owned secrets and derived keys are zeroed after use.
+  Fuzz coverage: `fuzz AWS process credentials`.
   Credentials never appear in refs, logs, errors, trace output, or the
   catalog. `spore image push` to S3 runs the `aws` CLI on staged, verified
   objects and uploads the tag last.

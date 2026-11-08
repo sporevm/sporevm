@@ -203,9 +203,10 @@ pub fn usageMissingArgument(message: []const u8, source: []const u8) CliError {
 
 pub fn fromZigError(err: anyerror) CliError {
     return switch (err) {
-        error.AwsCredentialsMissing, error.AwsCredentialsInvalid => CliError.init(.usage_invalid_argument, "S3 reads require explicit AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, plus AWS_SESSION_TOKEN for temporary credentials. AWS_PROFILE is supported for push only; export credentials before reading. Reads do not refresh credentials.", @errorName(err)),
-        error.AwsRegionMissing, error.AwsRegionInvalid => CliError.init(.usage_invalid_argument, "S3 reads require AWS_REGION or AWS_DEFAULT_REGION; profile region lookup is not supported.", @errorName(err)),
-        error.AwsCliUnavailable => CliError.init(.host_unavailable, "S3 push requires the aws CLI on PATH; install it and verify its selected identity.", @errorName(err)),
+        error.AwsCredentialsMissing, error.AwsCredentialsInvalid => CliError.init(.usage_invalid_argument, "Invalid or incomplete AWS credentials. Set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (plus AWS_SESSION_TOKEN for temporary credentials), or unset them to use the AWS CLI credential chain.", @errorName(err)),
+        error.AwsRegionMissing, error.AwsRegionInvalid => CliError.init(.usage_invalid_argument, "Set a valid AWS_REGION or AWS_DEFAULT_REGION, or configure a region in the selected AWS profile.", @errorName(err)),
+        error.AwsCliUnavailable => CliError.init(.host_unavailable, "S3 push and profile-based reads require AWS CLI v2 on PATH. For reads without the CLI, set explicit AWS credentials and region.", @errorName(err)),
+        error.AwsCredentialProviderFailed, error.AwsCredentialsExpired => CliError.init(.host_unavailable, "AWS credential resolution or refresh failed. Verify the selected AWS_PROFILE, renew its login if needed, and check aws configure export-credentials --format process without sharing its output.", @errorName(err)),
         error.UnsupportedImageStoreScheme, error.ImageStorePushUnsupportedScheme => CliError.init(.usage_invalid_argument, "Unsupported image-store scheme. Reads support directories, file://, http(s):// and s3://; push supports directories, file:// and s3:// only.", @errorName(err)),
         error.InvalidImageStoreRef, error.InvalidImageStoreTag => CliError.init(.usage_invalid_argument, "Invalid image-store reference; use STORE/TAG or STORE/blake3:DIGEST without credentials, query parameters or fragments.", @errorName(err)),
         error.ImageStoreRejected => CliError.init(.object_invalid, "Image store rejected the request; check authorization and, for S3, credential expiry and region. Access denial does not mean the object is missing.", @errorName(err)),
