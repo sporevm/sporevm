@@ -71,9 +71,9 @@ pub const pull_usage =
     \\filesystem. This is a cache-pinned directory, not a standalone archive.
     \\Use `spore run --checkpoint DIR -- ARGV` for a new command, `spore checkpoint
     \\resume DIR` for its saved process, or `spore vm restore NAME --checkpoint DIR`.
-    \\S3 reads require explicit AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional
-    \\AWS_SESSION_TOKEN and AWS_REGION (or AWS_DEFAULT_REGION). AWS_PROFILE is
-    \\push-only; reads do not refresh credentials.
+    \\S3 reads use explicit environment credentials first, otherwise AWS CLI v2's
+    \\provider chain (including AWS_PROFILE), refreshing expiring credentials.
+    \\Region uses AWS_REGION, AWS_DEFAULT_REGION, then the selected profile.
     \\
     \\Options:
     \\  --output DIR            Write the pulled checkpoint to DIR

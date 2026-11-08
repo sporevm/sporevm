@@ -40,9 +40,20 @@ pub const testing = if (builtin.is_test) struct {
 
 pub const info_usage = "usage: spore system info\n";
 
-pub const usage =
+pub const df_usage =
     \\Usage:
     \\  spore system df [--rootfs]
+    \\
+    \\Report rootfs cache storage, not guest memory usage. No entries are removed.
+    \\
+    \\Options:
+    \\  --rootfs    Inspect the rootfs cache (the current cache scope)
+    \\  -h, --help  Show this help
+    \\
+;
+
+pub const prune_usage =
+    \\Usage:
     \\  spore system prune [--rootfs] [--dry-run|--force] [--older-than DURATION] [--max-bytes SIZE] [--include-digest-artifacts] [--include-rootfs-chunks]
     \\
     \\Options:
@@ -64,8 +75,6 @@ pub const usage =
 pub const gc_usage =
     \\Usage:
     \\  spore system gc [--rootfs] [--dry-run|--force]
-    \\  spore system pins
-    \\  spore system unpin PIN_ID --force
     \\
     \\Options:
     \\  --rootfs    Collect the rootfs CAS and local build cache-mount storage
@@ -73,9 +82,26 @@ pub const gc_usage =
     \\  --force     Delete unrooted CAS entries and build cache-mount storage
     \\  -h, --help  Show this help
     \\
-    \\Pin safety:
-    \\  pins reports pin IDs and canonical-index health, not orphan detection
-    \\  unpin is expert-only and permanently drops the exact PIN_ID; raw copies may break
+    \\Respects live runtime leases, image records and checkpoint pins. This is
+    \\root-aware collection, unlike destructive `system prune` selectors.
+    \\
+;
+
+pub const pins_usage =
+    \\Usage:
+    \\  spore system pins
+    \\
+    \\Report checkpoint pin IDs and canonical-index health, not orphan detection.
+    \\No storage is removed. Use checkpoint rm to remove a saved checkpoint.
+    \\
+;
+
+pub const unpin_usage =
+    \\Usage:
+    \\  spore system unpin PIN_ID --force
+    \\
+    \\Expert-only: permanently drop the exact pin. Raw copies depending on it
+    \\may become unrestorable after GC. Prefer checkpoint rm for ordinary cleanup.
     \\
 ;
 
@@ -409,6 +435,15 @@ pub fn infoCli(ctx: *const Ctx, args: []const []const u8) !void {
 
 fn writeHostInfo(writer: *Io.Writer, info: api.HostInfo) !void {
     try writer.writeAll("Host info\n");
+    try writer.writeAll("  Execution backends:\n");
+    for (info.backends) |backend| {
+        try writer.print("    {s}: supported={s} available={s} reason={s}\n", .{
+            backend.name,
+            yesNo(backend.supported),
+            yesNo(backend.available),
+            backend.reason,
+        });
+    }
     try writer.print("  Class: {s}\n", .{info.host_class});
     try writer.print("  Architecture: {s}\n", .{info.architecture});
     switch (info.platform) {
@@ -437,15 +472,6 @@ fn writeHostInfo(writer: *Io.Writer, info: api.HostInfo) !void {
                 }
             }
         },
-    }
-    try writer.writeAll("  Backends:\n");
-    for (info.backends) |backend| {
-        try writer.print("    {s}: supported={s} available={s} reason={s}\n", .{
-            backend.name,
-            yesNo(backend.supported),
-            yesNo(backend.available),
-            backend.reason,
-        });
     }
     try writer.writeAll("  Cache roots:\n");
     try writePathFact(writer, "kernels", info.cache_roots.kernels);
@@ -666,7 +692,7 @@ pub fn gcCli(ctx: *const Ctx, args: []const []const u8) !void {
 }
 
 fn messageWithUsage(allocator: std.mem.Allocator, message: []const u8) []const u8 {
-    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ message, usage }) catch message;
+    return std.fmt.allocPrint(allocator, "{s}\nUse spore system <command> --help for options.", .{message}) catch message;
 }
 
 fn exitLocalJsonUnsupported(
