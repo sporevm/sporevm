@@ -73,7 +73,7 @@ pub const Request = struct {
 
     pub const Machine = union(enum) {
         boot: Boot,
-        /// `spore run --from DIR`.
+        /// `spore run --checkpoint DIR`.
         from: From,
     };
 
@@ -185,54 +185,64 @@ pub const CliOptions = struct {
 pub const cli_usage =
     \\Usage:
     \\  spore run --image REF [options]
-    \\  spore run [--kernel Image] [--initrd root.cpio] [options] 'shell command'
+    \\  spore run [--kernel Image] [--initrd root.cpio] [options] --shell 'command'
     \\  spore run [--kernel Image] [--initrd root.cpio] [options] -- <argv...>
-    \\  spore run --from DIR [options] 'shell command'
-    \\  spore run --from DIR [options] -- <argv...>
+    \\  spore run --checkpoint DIR [options] --shell 'command'
+    \\  spore run --checkpoint DIR [options] -- <argv...>
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --kernel Image          Kernel Image path (default: managed SporeVM kernel)
     \\  --initrd root.cpio      Initrd path (default: embedded minimal exec initrd)
-    \\  --from DIR              Restore VM state from a spore and run a new command
+    \\  --checkpoint DIR       Restore VM state and run a new command, not its saved session
     \\                          Uses spore memory/device sizing; omit --memory
-    \\  --generation FILE       With --from, inject fan-out identity JSON before command
+    \\  --generation FILE       With --checkpoint, inject fan-out identity JSON before command
     \\  --rootfs rootfs.ext4    Attach local rootfs read-only; save unsupported
     \\  --image REF             Build or reuse cached OCI rootfs; default to Entrypoint + Cmd
     \\  --entrypoint PATH       Override the OCI Entrypoint for --image
     \\  --pull=missing|always|never
     \\                          Pull policy for mutable --image refs (default: missing)
-    \\  --commit LOCAL_REF      On command success, publish the writable root disk as an image
+    \\  --commit-image REF     On command success, publish the writable root disk as an image
     \\  --disk-size SIZE        Grow an image-backed commit disk before the command (e.g. 20gb)
     \\  --net                   Experimental SporeVM-managed networking
     \\  --allow-cidr CIDR       With --net, restrict public egress to this CIDR
     \\  --allow-host HOST       With --net, restrict public egress to DNS A answers for this host
+    \\  --allow-host-port HOST:PORT
+    \\                          With --net, restrict egress to this exact host and port
     \\  --bind-service NAME[:PORT]=unix:/path.sock
     \\                          With --net, declare a guest-local Unix service
     \\  --bind-service NAME=unix:/path.sock
-    \\                          With --from, bind a manifest-declared service
+    \\                          With --checkpoint, bind a manifest-declared service
     \\  --forward 127.0.0.1:HOST_PORT:GUEST_PORT
     \\                          With --net, forward host loopback TCP to a guest port
-    \\  --save DIR              Save a spore to DIR; defaults to --save-on EXIT
+    \\  --save-checkpoint DIR  Save a checkpoint to DIR; defaults to --save-on EXIT
     \\  --save-on WHEN          Save trigger: EXIT, INT, TERM, HUP, USR1, or USR2
     \\  --continue-after-save   Keep running after a signal-triggered save
     \\  --memory SIZE           Initial guest memory (default: 512mb)
     \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
     \\  --vcpus N               Guest vCPU count (1-8; save/restore backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
-    \\  --timeout DURATION      Probe timeout (default: 30s; e.g. 500ms, 1m)
+    \\  --timeout DURATION      Command-probe timeout, including execution (default: 30s)
     \\  --console-log PATH      Write guest console output, and, in a VM this command boots, a copy of command output, to PATH
     \\  --env KEY[=VALUE]       Set or copy a host env var for the guest command
     \\  --inject ID=PATH        Inject PATH as /run/sporevm/injected/ID for this run
+    \\  --shell STRING          Run /bin/sh -lc STRING instead of exact argv
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
+    \\--timeout starts with the guest command probe, not image acquisition;
+    \\expiry fails the invocation and tears down its throwaway VM. --timeout-ms
+    \\is also accepted. --save-on INT makes Ctrl-C save successfully, not cancel;
+    \\send SIGTERM to cancel instead. --continue-after-save keeps the source alive.
+    \\Checkpoints are cache-pinned directories, not standalone portable files.
+    \\Transfer dependencies with checkpoint push/pull; restore compatibility still applies.
+    \\
     \\Workflow:
-    \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
-    \\  spore checkpoint fork base.spore --count 2 --out children
-    \\  spore fanout children --for 10s
+    \\  spore run --save-checkpoint base.spore --save-on TERM --shell 'while true; do echo tick; sleep 1; done'
+    \\  spore checkpoint fork base.spore --count 2 --output children
+    \\  spore checkpoint fanout children --for 10s
     \\
 ;
 
@@ -250,13 +260,13 @@ pub fn failCliSetup(comptime fmt: []const u8, args: anytype) noreturn {
         } }) catch {};
         std.process.exit(2);
     }
-    std.debug.print(fmt ++ "\n", args);
+    std.debug.print(fmt ++ " [usage.invalid_argument]\n", args);
     std.process.exit(2);
 }
 
 /// Redirect hints for run flags removed in the spore/saved-session rename.
 fn renamedRunFlagHint(arg: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, arg, "--capture")) return "--save DIR";
+    if (std.mem.eql(u8, arg, "--capture")) return "--save-checkpoint DIR";
     if (std.mem.eql(u8, arg, "--capture-on")) return "--save-on WHEN";
     if (std.mem.eql(u8, arg, "--continue-after-capture")) return "--continue-after-save";
     return null;
@@ -293,10 +303,15 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--")) {
+            if (command != null) failCliSetup("spore run: --shell and trailing argv are mutually exclusive", .{});
             command_mode = .argv;
             command_had_delimiter = true;
             command = args[i + 1 ..];
             break;
+        } else if (std.mem.eql(u8, args[i], "--shell")) {
+            if (command != null) failCliSetup("spore run: --shell may be supplied once", .{});
+            _ = takeValue(args, &i, args[i]);
+            command = args[i .. i + 1];
         } else if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
             i += 1;
             backend = Backend.parse(args[i]) orelse {
@@ -308,7 +323,7 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
             image_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--entrypoint")) {
             image_entrypoint = takeValue(args, &i, args[i]);
-        } else if (std.mem.eql(u8, args[i], "--commit")) {
+        } else if (std.mem.eql(u8, args[i], "--commit-image")) {
             commit_ref = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--disk-size")) {
             const raw = takeValue(args, &i, args[i]);
@@ -329,13 +344,13 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
             pull_policy = rootfs_input.PullPolicy.parse(raw) orelse {
                 failCliSetup("--pull must be missing, always, or never", .{});
             };
-        } else if (std.mem.eql(u8, args[i], "--from")) {
+        } else if (std.mem.eql(u8, args[i], "--checkpoint")) {
             from_spore_dir = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--generation")) {
             generation_path = takeValue(args, &i, args[i]);
         } else if (std.mem.startsWith(u8, args[i], "--generation=")) {
             generation_path = args[i]["--generation=".len..];
-        } else if (std.mem.eql(u8, args[i], "--save")) {
+        } else if (std.mem.eql(u8, args[i], "--save-checkpoint")) {
             save_path = takeValue(args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--save-on")) {
             const trigger_raw = takeValue(args, &i, args[i]);
@@ -378,6 +393,14 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
             network_policy.addAllowHost(raw) catch |err| {
                 failCliSetup("spore run: invalid --allow-host {s}: {s}", .{ raw, @errorName(err) });
             };
+        } else if (std.mem.eql(u8, args[i], "--allow-host-port")) {
+            const raw = takeValue(args, &i, args[i]);
+            const parsed = spore_net_policy.parseHostPort(raw) catch {
+                failCliSetup("spore run: invalid --allow-host-port {s}; expected HOST:PORT", .{raw});
+            };
+            network_policy.addExactHostPorts(parsed.host, &.{parsed.port}) catch |err| {
+                failCliSetup("spore run: invalid --allow-host-port {s}: {s}", .{ raw, @errorName(err) });
+            };
         } else if (std.mem.eql(u8, args[i], "--bind-service")) {
             const raw = takeValue(args, &i, args[i]);
             bind_service_args.append(raw) catch |err| {
@@ -393,10 +416,9 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         } else if (renamedRunFlagHint(args[i])) |replacement| {
             failCliSetup("spore run: {s} was renamed; use {s}", .{ args[i], replacement });
         } else if (std.mem.startsWith(u8, args[i], "--")) {
-            failCliSetup("unknown run argument: {s}\n\n{s}", .{ args[i], cli_usage });
+            failCliSetup("unknown run argument: {s}; see `spore run --help`", .{args[i]});
         } else {
-            command = args[i..];
-            break;
+            failCliSetup("spore run: put guest argv after --, or use --shell STRING (unexpected: {s})", .{args[i]});
         }
     }
 
@@ -414,23 +436,23 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         failCliSetup("spore run: --entrypoint requires --image", .{});
     }
     if (disk_size != null and commit_ref == null) {
-        failCliSetup("spore run: --disk-size currently requires --commit", .{});
+        failCliSetup("spore run: --disk-size currently requires --commit-image", .{});
     }
     if (commit_ref) |ref| {
         rootfs_mod.validateLocalTagRef(ref) catch |err| {
-            failCliSetup("spore run: invalid --commit ref {s}: {s}", .{ ref, @errorName(err) });
+            failCliSetup("spore run: invalid --commit-image ref {s}: {s}", .{ ref, @errorName(err) });
         };
         if (image_ref == null) {
-            failCliSetup("spore run: --commit requires --image", .{});
+            failCliSetup("spore run: --commit-image requires --image", .{});
         }
         if (from_spore_dir != null or rootfs_path != null) {
-            failCliSetup("spore run: --commit supports fresh --image runs only", .{});
+            failCliSetup("spore run: --commit-image supports fresh --image runs only", .{});
         }
         if (save_path != null or save_trigger_set or continue_after_save) {
-            failCliSetup("spore run: --commit cannot be combined with --save, --save-on, or --continue-after-save", .{});
+            failCliSetup("spore run: --commit-image cannot be combined with --save-checkpoint, --save-on, or --continue-after-save", .{});
         }
         if (interactive or tty) {
-            failCliSetup("spore run: --commit cannot be combined with -i or -t", .{});
+            failCliSetup("spore run: --commit-image cannot be combined with -i or -t", .{});
         }
     }
     if (from_spore_dir != null) {
@@ -442,20 +464,20 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
             };
         }
         if (injected_file_sources.len != 0) {
-            failCliSetup("spore run: --inject is not supported with --from; injected files are fresh-run only", .{});
+            failCliSetup("spore run: --inject is not supported with --checkpoint; injected files are fresh-run only", .{});
         }
         if (rootfs_path != null or image_ref != null) {
-            failCliSetup("spore run: --from is mutually exclusive with --rootfs and --image", .{});
+            failCliSetup("spore run: --checkpoint is mutually exclusive with --rootfs and --image", .{});
         }
         if (shared.kernel_path != null or shared.initrd_path != null) {
-            failCliSetup("spore run: --from is mutually exclusive with --kernel and --initrd", .{});
+            failCliSetup("spore run: --checkpoint is mutually exclusive with --kernel and --initrd", .{});
         }
         if (shared.memory_set or shared.max_memory_set) {
-            failCliSetup("spore run: --from uses the spore manifest memory sizes; omit --memory and --max-memory", .{});
+            failCliSetup("spore run: --checkpoint uses the spore manifest memory sizes; omit --memory and --max-memory", .{});
         }
     } else {
         if (generation_path != null) {
-            failCliSetup("spore run: --generation requires --from", .{});
+            failCliSetup("spore run: --generation requires --checkpoint", .{});
         }
         for (bind_service_args.slice()) |raw| {
             network_policy.addBindService(allocator, raw) catch |err| {
@@ -464,16 +486,16 @@ pub fn parseCliArgs(allocator: std.mem.Allocator, args: []const []const u8) !Cli
         }
     }
     if (save_trigger_set and save_path == null) {
-        failCliSetup("spore run: --save-on requires --save", .{});
+        failCliSetup("spore run: --save-on requires --save-checkpoint", .{});
     }
     if (continue_after_save and save_path == null) {
-        failCliSetup("spore run: --continue-after-save requires --save", .{});
+        failCliSetup("spore run: --continue-after-save requires --save-checkpoint", .{});
     }
     if (continue_after_save and save_trigger.isExit()) {
         failCliSetup("spore run: --continue-after-save requires a signal save trigger", .{});
     }
     if (save_path != null and injected_file_sources.len != 0) {
-        failCliSetup("spore run: --inject with --save is not supported; injected files are intentionally not persisted", .{});
+        failCliSetup("spore run: --inject with --save-checkpoint is not supported; injected files are intentionally not persisted", .{});
     }
     if (!network_requested and network_policy.hasRules()) {
         failCliSetup("spore run: network flags require --net", .{});
@@ -766,7 +788,7 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, request: Re
     var ram_plan = try ram_restore.Plan.fromSporeDir(allocator, context.environ_map, resume_dir, request.memory.maximum_bytes);
     const local_backing_ms = monotonicMs() -| local_backing_start;
     defer ram_plan.deinit();
-    if (resume_dir != null) std.log.info("run --from memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
+    if (resume_dir != null) std.log.info("run --checkpoint memory restore source={s} reason={s}", .{ @tagName(ram_plan.restoreSource().?), @tagName(ram_plan.reason) });
     const boot_start = monotonicMs();
     const machine: vm_session.Machine = switch (request.machine) {
         .from => |from| .{ .restore = .{
@@ -1540,7 +1562,7 @@ test "a run that fails before its VM starts leaves no save directory behind" {
         .memory = memory_config.Config.fixed(vm_session.x86_experimental_memory_bytes),
         .save = .{ .dir = save_path },
     }));
-    // A second `--save` to the same path would otherwise fail AlreadyExists.
+    // A second `--save-checkpoint` to the same path would otherwise fail AlreadyExists.
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, save_path, .{}));
 }
 
@@ -1602,7 +1624,7 @@ test "run cli parser accepts tty and combined interactive tty" {
 }
 
 test "run cli parser accepts shell command with source spore" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "base.spore", "cat /work-ready" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--checkpoint", "base.spore", "--shell", "cat /work-ready" });
     try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
     try std.testing.expectEqual(cli_args.CommandMode.shell, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), opts.command.len);
@@ -1610,14 +1632,14 @@ test "run cli parser accepts shell command with source spore" {
 }
 
 test "run cli parser accepts commandless source spore" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "live.spore" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--checkpoint", "live.spore" });
     try std.testing.expectEqualStrings("live.spore", opts.from_spore_dir.?);
     try std.testing.expectEqual(cli_args.CommandMode.shell, opts.command_mode);
     try std.testing.expectEqual(@as(usize, 0), opts.command.len);
 }
 
 test "run cli guest command wraps shell command" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "echo hi" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "--shell", "echo hi" });
     const argv = try cliGuestCommand(std.testing.allocator, opts);
     defer std.testing.allocator.free(argv);
     try std.testing.expectEqual(@as(usize, 3), argv.len);
@@ -1635,7 +1657,8 @@ test "run cli guest command keeps exact argv" {
 }
 
 test "run cli guest command rejects unquoted shell words" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "echo", "hi" });
+    var opts = try parseCliArgs(std.testing.allocator, &.{ "--image", "docker.io/library/alpine:3.20", "--shell", "echo hi" });
+    opts.command = &.{ "echo", "hi" };
     try std.testing.expectError(error.ShellCommandArgumentCountUnsupported, cliGuestCommand(std.testing.allocator, opts));
 }
 
@@ -1699,7 +1722,7 @@ test "run cli parser accepts image commit" {
     const opts = try parseCliArgs(std.testing.allocator, &.{
         "--image",
         "docker.io/library/alpine:3.20",
-        "--commit",
+        "--commit-image",
         "local/example:prepared",
         "--inject",
         "setup=prepare.sh",
@@ -1716,7 +1739,7 @@ test "run cli parser accepts commit disk size" {
     const opts = try parseCliArgs(std.testing.allocator, &.{
         "--image",
         "docker.io/library/alpine:3.20",
-        "--commit",
+        "--commit-image",
         "local/example:prepared",
         "--disk-size",
         "20gb",
@@ -1741,19 +1764,19 @@ test "run cli parser accepts image pull policy" {
 }
 
 test "run cli parser accepts source spore generation file" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "base.spore", "--generation", "generation.json", "--", "/bin/writeout" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--checkpoint", "base.spore", "--generation", "generation.json", "--", "/bin/writeout" });
     try std.testing.expectEqualStrings("base.spore", opts.from_spore_dir.?);
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
     try std.testing.expectEqual(cli_args.CommandMode.argv, opts.command_mode);
     try std.testing.expectEqualStrings("/bin/writeout", opts.command[0]);
 
-    const equals_opts = try parseCliArgs(std.testing.allocator, &.{ "--from", "base.spore", "--generation=generation.json", "--", "/bin/writeout" });
+    const equals_opts = try parseCliArgs(std.testing.allocator, &.{ "--checkpoint", "base.spore", "--generation=generation.json", "--", "/bin/writeout" });
     try std.testing.expectEqualStrings("generation.json", equals_opts.generation_path.?);
 }
 
 test "run cli parser accepts source spore bound service bindings" {
     const opts = try parseCliArgs(std.testing.allocator, &.{
-        "--from",
+        "--checkpoint",
         "base.spore",
         "--bind-service",
         "metadata=unix:/tmp/metadata.sock",
@@ -1845,15 +1868,15 @@ test "run network gateway errors are reported clearly" {
 }
 
 test "removed capture flags map to save rename hints" {
-    try std.testing.expectEqualStrings("--save DIR", renamedRunFlagHint("--capture").?);
+    try std.testing.expectEqualStrings("--save-checkpoint DIR", renamedRunFlagHint("--capture").?);
     try std.testing.expectEqualStrings("--save-on WHEN", renamedRunFlagHint("--capture-on").?);
     try std.testing.expectEqualStrings("--continue-after-save", renamedRunFlagHint("--continue-after-capture").?);
-    try std.testing.expect(renamedRunFlagHint("--save") == null);
+    try std.testing.expect(renamedRunFlagHint("--save-checkpoint") == null);
     try std.testing.expect(renamedRunFlagHint("--unknown") == null);
 }
 
 test "run cli parser accepts save flags" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--save", "out.spore", "--save-on", "USR1", "--continue-after-save", "--", "/bin/sleeper" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--save-checkpoint", "out.spore", "--save-on", "USR1", "--continue-after-save", "--", "/bin/sleeper" });
     try std.testing.expectEqualStrings("out.spore", opts.save_path.?);
     switch (opts.save_trigger) {
         .signal => |signal| try std.testing.expectEqual(capture.Signal.USR1, signal),
@@ -1870,13 +1893,13 @@ test "run cli parser accepts bounded vcpu count" {
 }
 
 test "run cli parser defaults save trigger to exit" {
-    const opts = try parseCliArgs(std.testing.allocator, &.{ "--save", "out.spore", "--", "/bin/true" });
+    const opts = try parseCliArgs(std.testing.allocator, &.{ "--save-checkpoint", "out.spore", "--", "/bin/true" });
     try std.testing.expectEqualStrings("out.spore", opts.save_path.?);
     try std.testing.expect(opts.save_trigger.isExit());
     try std.testing.expect(!opts.continue_after_save);
 }
 
-test "a fresh run's guest request carries the image's working directory, and a --from request its fan-out identity" {
+test "a fresh run's guest request carries the image's working directory, and a --checkpoint request its fan-out identity" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

@@ -135,7 +135,7 @@ fi
 for _ in $(seq 1 50); do
   if run_capture "${initial_output_json}" "${initial_output_stderr}" \
     env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-    "${spore_bin}" --json vm logs "${vm_name}"; then
+    "${spore_bin}" --json vm logs "${vm_name}" --initial; then
     if python3 - "${initial_output_json}" <<'PY'
 import json
 import sys
@@ -209,7 +209,7 @@ printf -v long_payload '%04096d' 0
 long_command="echo ${long_payload}"
 if run_capture "${long_command_stdout}" "${long_command_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-  "${spore_bin}" vm exec "${vm_name}" "${long_command}"; then
+  "${spore_bin}" vm exec "${vm_name}" --shell "${long_command}"; then
   :
 else
   status=$?
@@ -233,7 +233,7 @@ else
     die "oversized spore vm exec exited ${status}, expected 1"
   }
 fi
-grep -Fxq "spore vm exec: guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest" "${oversized_command_stderr}" || {
+grep -Fxq "spore vm exec: guest command exceeds the 8191-byte request limit; shorten it or run a script in the guest [runtime.execution_failed]" "${oversized_command_stderr}" || {
   cat "${oversized_command_stderr}" >&2 || true
   die "oversized spore vm exec did not report the guest request limit"
 }
@@ -244,7 +244,7 @@ fi
 
 if run_capture "${fork_stdout}" "${fork_stderr}" \
   env SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-  "${spore_bin}" vm fork "${vm_name}" --count 2 --name "${vm_name}-worker-%d"; then
+  "${spore_bin}" vm fork "${vm_name}" --count 2 --name-prefix "${vm_name}-worker"; then
   worker_created=1
 else
   status=$?
@@ -276,7 +276,7 @@ grep -Fq "already exists" "${workdir}/create-existing.stderr" || {
   cat "${workdir}/create-existing.stderr" >&2 || true
   die "spore vm create of an existing name did not report it"
 }
-if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm fork "${vm_name}" --count 1 --name "${worker0}" \
+if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm fork "${vm_name}" --count 1 --name-prefix "${vm_name}-worker" \
   >/dev/null 2>"${workdir}/fork-existing.stderr"; then
   die "spore vm fork onto an existing name unexpectedly succeeded"
 fi
@@ -386,7 +386,7 @@ grep -Fq "named VM is being removed" "${running_exec_stderr}" || {
   cat "${running_exec_stderr}" >&2 || true
   die "spore vm exec did not report the VM removal"
 }
-if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm logs "${vm_name}" >/dev/null 2>&1; then
+if env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm logs "${vm_name}" --initial >/dev/null 2>&1; then
   die "spore vm logs unexpectedly retained output after VM removal"
 fi
 [[ ! -e "${runtime_dir}/vms/${vm_name}" ]] || die "spore vm rm left retained initial output state behind"

@@ -43,6 +43,8 @@ pub const Error = error{
     BadForkCount,
     AlreadyExists,
     PlatformMismatch,
+    FileNotFound,
+    AccessDenied,
     IoFailed,
     OutOfMemory,
 };
@@ -455,7 +457,11 @@ fn publishFileNoOverwrite(tmp_path: [:0]const u8, final_path: [:0]const u8) Erro
 
 fn readFileAll(allocator: std.mem.Allocator, path: [:0]const u8, max: usize) Error![]u8 {
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(c_uint, 0));
-    if (fd < 0) return error.IoFailed;
+    if (fd < 0) return switch (std.c.errno(fd)) {
+        .NOENT => error.FileNotFound,
+        .ACCES, .PERM => error.AccessDenied,
+        else => error.IoFailed,
+    };
     defer _ = std.c.close(fd);
     const size = try seekFileSize(fd);
     if (size > max) return error.BadChunk;
@@ -1964,7 +1970,7 @@ test "manifest save validates the whole manifest" {
     var manifest = testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3);
     manifest.platform.counter_frequency_hz = 0;
     try std.testing.expectError(error.BadManifest, saveManifest(arena, dir, manifest));
-    try std.testing.expectError(error.IoFailed, loadManifest(arena, dir));
+    try std.testing.expectError(error.FileNotFound, loadManifest(arena, dir));
 }
 
 fn cloneJsonValue(allocator: std.mem.Allocator, value: std.json.Value) !std.json.Value {

@@ -44,7 +44,7 @@ printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --save "${capture_dir}" \
+  --save-checkpoint "${capture_dir}" \
   -- /bin/true \
   >"${run_stdout}" 2>"${run_stderr}" || {
   cat "${run_stdout}" >&2 || true
@@ -57,7 +57,7 @@ grep -Fq '"digest": "blake3:' "${capture_dir}/manifest.json" || die "capture man
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${capture_dir}" \
+  --checkpoint "${capture_dir}" \
   -- /bin/sh -lc 'echo rootfs-base-out; echo rootfs-base-err >&2' \
   >"${base_from_stdout}" 2>"${base_from_stderr}" || {
   cat "${base_from_stdout}" >&2 || true
@@ -75,7 +75,7 @@ grep -Fxq "rootfs-base-err" "${base_from_stderr}" || {
   die "rootfs base run-from did not stream stderr"
 }
 
-"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --output "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
 children=()
 while IFS= read -r child; do
@@ -93,7 +93,7 @@ for child in "${children[@]}"; do
   child_stderr+=("${stderr_path}")
   "${spore_bin}" run \
     --backend "${backend}" \
-    --from "${child}" \
+    --checkpoint "${child}" \
     -- /usr/local/bin/ruby \
       -e 'STDOUT.sync = true; STDERR.sync = true; child = ARGV.fetch(0); puts "ruby child #{child}"; warn "ruby stderr #{child}"' \
       "${child_name}" \

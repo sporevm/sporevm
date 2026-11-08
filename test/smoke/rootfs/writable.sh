@@ -56,7 +56,7 @@ printf 'writable rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --save "${base_dir}" \
+  --save-checkpoint "${base_dir}" \
   -- /bin/sh -lc 'printf "parent-layer-ok\n" >/var/sporevm-parent && sync' \
   >"${base_stdout}" 2>"${base_stderr}" || {
   cat "${base_stdout}" >&2 || true
@@ -79,7 +79,7 @@ base_disk="$(disk_base "${base_dir}/manifest.json")"
   die "spore checkpoint inspect rejected a disk-backed capture that resume accepts"
 }
 
-"${spore_bin}" checkpoint fork "${base_dir}" --count 4 --out "${fork_dir}" >"${workdir}/fork.json" || {
+"${spore_bin}" checkpoint fork "${base_dir}" --count 4 --output "${fork_dir}" >"${workdir}/fork.json" || {
   cat "${workdir}/fork.json" >&2 || true
   die "writable rootfs fork failed"
 }
@@ -95,8 +95,8 @@ done
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${fork_dir}/000000" \
-  --save "${fork_child0_capture_dir}" \
+  --checkpoint "${fork_dir}/000000" \
+  --save-checkpoint "${fork_child0_capture_dir}" \
   -- /bin/sh -lc 'test "$(cat /var/sporevm-parent)" = "parent-layer-ok" && printf "fork-child0-layer-ok\n" >/var/sporevm-fork-child && sync' \
   >"${fork_child0_stdout}" 2>"${fork_child0_stderr}" || {
   cat "${fork_child0_stdout}" >&2 || true
@@ -112,7 +112,7 @@ fork_child0_disk="$(disk_base "${fork_child0_capture_dir}/manifest.json")"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${fork_child0_capture_dir}" \
+  --checkpoint "${fork_child0_capture_dir}" \
   -- /bin/sh -lc 'cat /var/sporevm-parent /var/sporevm-fork-child' \
   >"${fork_child0_verify_stdout}" 2>"${fork_child0_verify_stderr}" || {
   cat "${fork_child0_verify_stdout}" >&2 || true
@@ -136,7 +136,7 @@ for child_name in 000001 000002 000003; do
   sibling_stderr="${workdir}/fork-${child_name}.stderr"
   "${spore_bin}" run \
     --backend "${backend}" \
-    --from "${fork_dir}/${child_name}" \
+    --checkpoint "${fork_dir}/${child_name}" \
     -- /bin/sh -lc 'test "$(cat /var/sporevm-parent)" = "parent-layer-ok" && test ! -e /var/sporevm-fork-child && printf "fork-sibling-clean\n"' \
     >"${sibling_stdout}" 2>"${sibling_stderr}" || {
     cat "${sibling_stdout}" >&2 || true
@@ -153,8 +153,8 @@ done
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${base_dir}" \
-  --save "${child_dir}" \
+  --checkpoint "${base_dir}" \
+  --save-checkpoint "${child_dir}" \
   -- /bin/sh -lc 'test "$(cat /var/sporevm-parent)" = "parent-layer-ok" && printf "child-layer-ok\n" >/var/sporevm-child && sync' \
   >"${child_stdout}" 2>"${child_stderr}" || {
   cat "${child_stdout}" >&2 || true
@@ -171,7 +171,7 @@ child_disk="$(disk_base "${child_dir}/manifest.json")"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${child_dir}" \
+  --checkpoint "${child_dir}" \
   -- /bin/sh -lc 'cat /var/sporevm-parent /var/sporevm-child' \
   >"${verify_stdout}" 2>"${verify_stderr}" || {
   cat "${verify_stdout}" >&2 || true
@@ -190,14 +190,14 @@ grep -Fxq "child-layer-ok" "${verify_stdout}" || {
   die "verification run did not see child layer contents"
 }
 
-"${spore_bin}" --json checkpoint push "${child_dir}" "${store_dir}/child" >"${workdir}/push.json" || {
+"${spore_bin}" --json checkpoint push "${child_dir}" --to "${store_dir}/child" >"${workdir}/push.json" || {
   cat "${workdir}/push.json" >&2 || true
   die "writable rootfs push failed"
 }
 
 # Into an empty rootfs cache, so the pull must fetch the child's disk.
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
-  "${spore_bin}" --json checkpoint pull "file://${store_dir}/child" --out "${pulled_dir}" >"${workdir}/pull.json" || {
+  "${spore_bin}" --json checkpoint pull "file://${store_dir}/child" --output "${pulled_dir}" >"${workdir}/pull.json" || {
   cat "${workdir}/pull.json" >&2 || true
   die "writable rootfs pull failed"
 }
@@ -210,7 +210,7 @@ SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
 
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${pulled_dir}" \
+  --checkpoint "${pulled_dir}" \
   -- /bin/sh -lc 'cat /var/sporevm-parent /var/sporevm-child' \
   >"${pulled_verify_stdout}" 2>"${pulled_verify_stderr}" || {
   cat "${pulled_verify_stdout}" >&2 || true

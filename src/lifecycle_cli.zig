@@ -68,7 +68,7 @@ const listStatsFromMemory = lifecycle.listStatsFromMemory;
 pub const create_usage =
     \\Usage:
     \\  spore vm create NAME --image REF [options]
-    \\  spore vm create NAME [options] ['shell command']
+    \\  spore vm create NAME [options] --shell 'command'
     \\  spore vm create NAME [options] -- <argv...>
     \\
     \\Options:
@@ -97,6 +97,7 @@ pub const create_usage =
     \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
     \\  --console-log PATH      Write guest console output, and, in a VM this command boots, a copy of command output, to PATH
     \\  --initial-output MODE   retain or discard initial-command output (default: retain)
+    \\  --shell STRING          Run /bin/sh -lc STRING instead of exact argv
     \\  -- <argv...>            Start exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
@@ -104,9 +105,11 @@ pub const create_usage =
 
 pub const logs_usage =
     \\Usage:
-    \\  spore vm logs NAME
+    \\  spore vm logs NAME --initial
     \\
-    \\Print the bounded stdout and stderr retained for the initial command.
+    \\Print an initial-command snapshot (16,381 bytes per stream, with truncation
+    \\reported). This is not execution history or --follow; later exec output
+    \\belongs to its caller.
     \\The named VM monitor must be idle while the snapshot is retrieved.
     \\
     \\Options:
@@ -116,16 +119,21 @@ pub const logs_usage =
 
 pub const exec_usage =
     \\Usage:
-    \\  spore vm exec [options] NAME 'shell command'
+    \\  spore vm exec NAME [options] --shell 'command'
     \\  spore vm exec [options] NAME -- <argv...>
     \\
     \\Options:
     \\  --env KEY[=VALUE]       Override image environment; KEY copies the host value
     \\  --workdir PATH          Override the image working directory
+    \\  --shell STRING          Run /bin/sh -lc STRING instead of exact argv
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
+    \\
+    \\Options may precede or follow NAME, but must precede --. Everything after
+    \\-- is guest argv. The command inherits the VM's --timeout; there is no
+    \\per-exec override. On timeout the exec stream fails; the named VM remains.
     \\
 ;
 
@@ -161,10 +169,10 @@ pub const rm_usage =
 
 pub const save_usage =
     \\Usage:
-    \\  spore vm save NAME --out DIR [--stop]
+    \\  spore vm save NAME --output DIR [--stop]
     \\
     \\Options:
-    \\  --out DIR              Write a spore to DIR
+    \\  --output DIR              Write a spore to DIR
     \\  --stop                 Stop and remove the named VM after saving
     \\  --annotation KEY=VALUE Merge an annotation into the spore manifest
     \\  -h, --help             Show this help
@@ -176,11 +184,11 @@ pub const save_usage =
 
 pub const fork_usage =
     \\Usage:
-    \\  spore vm fork NAME --count N --name PATTERN [--allow-slow-copy]
+    \\  spore vm fork NAME --count N --name-prefix PREFIX [--allow-slow-copy]
     \\
     \\Options:
     \\  --count N             Number of children to create
-    \\  --name PATTERN        Child VM name or pattern, e.g. worker-%d
+    \\  --name-prefix PREFIX  Child names PREFIX-0 through PREFIX-(N-1)
     \\  --allow-slow-copy     Permit a full overlay copy when native cloning is unavailable
     \\  -h, --help            Show this help
     \\
@@ -190,12 +198,12 @@ pub const fork_usage =
 
 pub const restore_usage =
     \\Usage:
-    \\  spore vm restore DIR --name NAME
+    \\  spore vm restore NAME --checkpoint DIR
     \\
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: saved lifecycle metadata)
     \\  --generation FILE       Inject fan-out identity JSON before restore
-    \\  --name NAME            Name for the restored VM
+    \\  --checkpoint DIR       Saved machine state; does not attach saved streams
     \\  --bind-service NAME=unix:/path.sock
     \\                         Bind a manifest-declared service to a host socket
     \\  -h, --help             Show this help
@@ -425,35 +433,36 @@ pub fn logsCli(ctx: *const Ctx, args: []const []const u8) !void {
     const stderr = ctx.stderr;
     const mode = ctx.mode;
     const allocator = init.arena.allocator();
-    if (args.len != 1) {
+    if (args.len != 2 or (!std.mem.eql(u8, args[0], "--initial") and !std.mem.eql(u8, args[1], "--initial"))) {
         exitLifecycleCliError(
             allocator,
             stderr,
             mode,
-            machine_output.usageMissingArgument("usage: spore vm logs NAME", "logs"),
+            machine_output.usageMissingArgument("usage: spore vm logs NAME --initial (initial output only, not exec history)", "logs"),
             logs_usage,
         );
     }
-    validateNameLifecycleCli(allocator, stderr, mode, "logs", args[0]);
+    const name = args[if (std.mem.eql(u8, args[0], "--initial")) @as(usize, 1) else 0];
+    validateNameLifecycleCli(allocator, stderr, mode, "logs", name);
     const result = initialOutputNamed(.{ .io = init.io, .environ_map = init.environ_map }, allocator, .{
-        .name = args[0],
+        .name = name,
     }) catch |err| switch (err) {
         error.NamedVmNotFound => {
-            const message = allocLifecycleMessage(allocator, "spore vm logs: VM not found: {s}", .{args[0]});
+            const message = allocLifecycleMessage(allocator, "spore vm logs: VM not found: {s}", .{name});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "logs"), message);
         },
         error.NamedVmNotReady => {
-            const fallback = allocLifecycleMessage(allocator, "spore vm logs: VM is not ready: {s}", .{args[0]});
+            const fallback = allocLifecycleMessage(allocator, "spore vm logs: VM is not ready: {s}", .{name});
             const message = allocLifecycleLastErrorMessage(allocator, "logs", fallback);
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "logs"), message);
         },
         error.InitialOutputUnavailable => {
-            const fallback = allocLifecycleMessage(allocator, "spore vm logs: VM {s} has no retained initial-command output", .{args[0]});
+            const fallback = allocLifecycleMessage(allocator, "spore vm logs: VM {s} has no retained initial-command output", .{name});
             const message = allocLifecycleLastErrorMessage(allocator, "logs", fallback);
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_not_found, message, "logs"), message);
         },
         error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse => {
-            const fallback = allocLifecycleMessage(allocator, "spore vm logs: could not retrieve initial-command output for VM {s}: {s}", .{ args[0], @errorName(err) });
+            const fallback = allocLifecycleMessage(allocator, "spore vm logs: could not retrieve initial-command output for VM {s}: {s}", .{ name, @errorName(err) });
             const message = allocLifecycleLastErrorMessage(allocator, "logs", fallback);
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "logs"), message);
         },
@@ -475,30 +484,21 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
     exec_cli_event_writer = if (ctx.mode == .json) &events else null;
     defer exec_cli_event_writer = null;
     const parsed = parseExecArgs(args);
-    if (ctx.mode == .json) return execCliEvents(init, allocator, parsed, &events, stdout);
     var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
     const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| switch (err) {
         error.MissingHostEnvironment => {
-            std.debug.print("spore vm exec: --env {s} is not set in the host environment\n", .{env_diagnostic.missing_key orelse "unknown"});
-            std.process.exit(2);
+            const message = allocLifecycleMessage(allocator, "spore vm exec: --env {s} is not set in the host environment", .{env_diagnostic.missing_key orelse "unknown"});
+            usageExit(message);
         },
-        error.RunEnvTooLong => {
-            std.debug.print("spore vm exec: --env entry exceeds 255 bytes\n", .{});
-            std.process.exit(2);
-        },
-        error.RunEnvCountUnsupported => {
-            std.debug.print("spore vm exec: too many --env entries\n", .{});
-            std.process.exit(2);
-        },
+        error.RunEnvTooLong => usageExit("spore vm exec: --env entry exceeds 255 bytes\n"),
+        error.RunEnvCountUnsupported => usageExit("spore vm exec: too many --env entries\n"),
         else => return err,
     };
     const command = cli_args.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| switch (err) {
-        error.ShellCommandArgumentCountUnsupported => {
-            std.debug.print("spore vm exec: shell command form accepts one command string; quote it or use -- for argv\n", .{});
-            std.process.exit(2);
-        },
+        error.ShellCommandArgumentCountUnsupported => usageExit("spore vm exec: shell command form accepts one command string; quote it or use -- for argv\n"),
         else => return err,
     };
+    if (ctx.mode == .json) return execCliEvents(init, allocator, parsed, command, guest_env, &events, stdout);
     const exit_code = execNamedStreaming(.{
         .io = init.io,
         .environ_map = init.environ_map,
@@ -510,33 +510,15 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
         .interactive = parsed.interactive,
         .tty = parsed.tty,
         .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
-    }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => cliRuntimePathExit("exec", err),
-        error.NamedVmNotReady => {
-            const detail = lastErrorMessage();
-            if (detail.len != 0) {
-                std.debug.print("spore vm exec: {s}\n", .{detail});
-            } else {
-                std.debug.print("spore vm exec: VM is not ready: {s}\n", .{parsed.name});
-            }
-            std.process.exit(2);
-        },
-        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-            const detail = lastErrorMessage();
-            if (detail.len != 0) {
-                std.debug.print("spore vm exec: {s}\n", .{detail});
-            } else switch (err) {
-                error.MonitorUnavailable => std.debug.print("spore vm exec: monitor is unavailable for VM: {s}\n", .{parsed.name}),
-                else => std.debug.print("spore vm exec: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) }),
-            }
-            std.process.exit(1);
-        },
-        else => |e| return e,
+    }) catch |err| {
+        const classified = events_mod.classifyFailure(err);
+        const message = allocLifecycleLastErrorMessage(allocator, "exec", classified.message);
+        exitLifecycleCliError(allocator, ctx.stderr, ctx.mode, machine_output.CliError.init(classified.code, message, classified.source), message);
     };
     if (exit_code != 0) std.process.exit(exit_code);
 }
 
-fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: ExecOptions, events: *events_mod.EventWriter, stdout: *Io.Writer) !void {
+fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: ExecOptions, command: []const []const u8, guest_env: []const []const u8, events: *events_mod.EventWriter, stdout: *Io.Writer) !void {
     try events.emitStart(.auto);
     if (parsed.interactive or parsed.tty) {
         const classified = machine_output.CliError.init(.usage_invalid_argument, "spore --json vm exec does not support interactive or TTY input", "exec");
@@ -544,17 +526,6 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
         std.process.exit(classified.exit_code);
     }
 
-    var env_diagnostic = guest_request.GuestEnvResolveDiagnostic{};
-    const guest_env = guest_request.resolveCliGuestEnv(allocator, parsed.guest_env_specs.slice(), init.environ_map, &env_diagnostic) catch |err| {
-        const classified = events_mod.classifyFailure(err);
-        try events.emitFailure(classified);
-        std.process.exit(classified.exit_code);
-    };
-    const command = cli_args.cliGuestCommandFromMode(allocator, parsed.command_mode, parsed.command) catch |err| {
-        const classified = events_mod.classifyFailure(err);
-        try events.emitFailure(classified);
-        std.process.exit(classified.exit_code);
-    };
     var stream = openExecNamedStream(.{
         .io = init.io,
         .environ_map = init.environ_map,
@@ -565,7 +536,8 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
         .guest_working_dir = parsed.guest_working_dir,
     }) catch |err| {
         const classified = events_mod.classifyFailure(err);
-        try events.emitFailure(classified);
+        const message = allocLifecycleLastErrorMessage(allocator, "exec", classified.message);
+        try events.emitFailure(machine_output.CliError.init(classified.code, message, classified.source));
         std.process.exit(classified.exit_code);
     };
     defer stream.deinit();
@@ -624,17 +596,13 @@ pub fn copyInCli(ctx: *const Ctx, args: []const []const u8) !void {
     try rejectX86NamedCopy();
 
     var archive = named_copy_archive.createTempFromHostPath(allocator, init.io, parsed.host_path) catch |err| {
-        if (mode == .json) return err;
-        std.debug.print("spore vm copy-in: cannot archive host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
-        std.process.exit(1);
+        const classified = machine_output.fromZigError(err);
+        const message = allocLifecycleMessage(allocator, "spore vm copy-in: cannot archive host path {s}; check that it exists, is readable and contains supported file types", .{parsed.host_path});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(classified.code, message, classified.source), message);
     };
     defer archive.deinit(init.io);
 
-    const source_fd = openHostFileRead(allocator, init.io, archive.path) catch |err| {
-        if (mode == .json) return err;
-        std.debug.print("spore vm copy-in: cannot read transfer archive: {s}\n", .{@errorName(err)});
-        exitAfterCopyArchiveCleanup(&archive, init.io, 1);
-    };
+    const source_fd = try openHostFileRead(allocator, init.io, archive.path);
     defer _ = std.c.close(source_fd);
 
     const exit_code = copyNamedStreaming(.{
@@ -645,41 +613,17 @@ pub fn copyInCli(ctx: *const Ctx, args: []const []const u8) !void {
         // Guest stdout is dropped during copy-in, so there is no archive to cap.
         .archive_limit = std.math.maxInt(u64),
         .stderr_fd = copyGuestStderrFd(mode),
-    }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
-            if (mode == .json) return err;
-            archive.deinit(init.io);
-            cliRuntimePathExit("copy-in", err);
-        },
-        error.NamedVmNotReady => {
-            if (mode == .json) return err;
-            const detail = lastErrorMessage();
-            if (detail.len != 0) {
-                std.debug.print("spore vm copy-in: {s}\n", .{detail});
-            } else {
-                std.debug.print("spore vm copy-in: VM is not ready: {s}\n", .{parsed.name});
-            }
-            exitAfterCopyArchiveCleanup(&archive, init.io, 2);
-        },
-        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-            if (mode == .json) return err;
-            const detail = lastErrorMessage();
-            if (detail.len != 0) {
-                std.debug.print("spore vm copy-in: {s}\n", .{detail});
-            } else {
-                std.debug.print("spore vm copy-in: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
-            }
-            exitAfterCopyArchiveCleanup(&archive, init.io, 1);
-        },
-        else => |e| return e,
+    }) catch |err| {
+        archive.deinit(init.io);
+        const classified = machine_output.fromZigError(err);
+        const fallback = allocLifecycleMessage(allocator, "spore vm copy-in: VM {s}: {s}", .{ parsed.name, classified.message });
+        const message = allocLifecycleLastErrorMessage(allocator, "copy-in", fallback);
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(classified.code, message, classified.source), message);
     };
     if (exit_code != 0) {
-        if (mode == .json) {
-            archive.deinit(init.io);
-            const message = "spore vm copy-in: guest copy operation failed";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "copy-in"), message);
-        }
-        exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+        archive.deinit(init.io);
+        const message = "spore vm copy-in: guest copy operation failed";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "copy-in"), message);
     }
     if (mode == .json) try machine_output.writeJson(allocator, stdout, CopyResult{
         .direction = "in",
@@ -700,18 +644,10 @@ pub fn copyOutCli(ctx: *const Ctx, args: []const []const u8) !void {
     const parsed = CopyNamedOptions{ .name = args[0], .guest_path = args[1], .host_path = args[2] };
     try rejectX86NamedCopy();
 
-    var archive = named_copy_archive.createTemp(allocator) catch |err| {
-        if (mode == .json) return err;
-        std.debug.print("spore vm copy-out: cannot create transfer archive: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
+    var archive = try named_copy_archive.createTemp(allocator);
     defer archive.deinit(init.io);
 
-    const archive_fd = named_copy_archive.openHostFileCreate(allocator, archive.path) catch |err| {
-        if (mode == .json) return err;
-        std.debug.print("spore vm copy-out: cannot open transfer archive: {s}\n", .{@errorName(err)});
-        exitAfterCopyArchiveCleanup(&archive, init.io, 1);
-    };
+    const archive_fd = try named_copy_archive.openHostFileCreate(allocator, archive.path);
     var archive_fd_open = true;
     defer {
         if (archive_fd_open) _ = std.c.close(archive_fd);
@@ -723,54 +659,29 @@ pub fn copyOutCli(ctx: *const Ctx, args: []const []const u8) !void {
     }, allocator, parsed, .out, .{
         .archive_fd = archive_fd,
         .stderr_fd = copyGuestStderrFd(mode),
-    }) catch |err| switch (err) {
-        error.InvalidRuntimeDir, error.InsecureRuntimeDir, error.ControlSocketPathTooLong => {
-            if (mode == .json) return err;
-            archive.deinit(init.io);
-            cliRuntimePathExit("copy-out", err);
-        },
-        error.NamedVmNotReady => {
-            if (mode == .json) return err;
-            const detail = lastErrorMessage();
-            if (detail.len != 0) {
-                std.debug.print("spore vm copy-out: {s}\n", .{detail});
-            } else {
-                std.debug.print("spore vm copy-out: VM is not ready: {s}\n", .{parsed.name});
-            }
-            exitAfterCopyArchiveCleanup(&archive, init.io, 2);
-        },
-        error.MonitorUnavailable, error.MonitorRequestFailed, error.BadMonitorResponse, error.MonitorVersionMismatch => {
-            if (mode == .json) return err;
-            const detail = lastErrorMessage();
-            if (detail.len != 0) {
-                std.debug.print("spore vm copy-out: {s}\n", .{detail});
-            } else {
-                std.debug.print("spore vm copy-out: monitor request failed for VM {s}: {s}\n", .{ parsed.name, @errorName(err) });
-            }
-            exitAfterCopyArchiveCleanup(&archive, init.io, 1);
-        },
-        error.CopyArchiveTooLarge => {
-            if (mode == .json) return err;
-            std.debug.print("spore vm copy-out: guest archive exceeds the {d} GiB copy-out limit\n", .{named_copy_archive.max_archive_bytes >> 30});
-            exitAfterCopyArchiveCleanup(&archive, init.io, 1);
-        },
-        else => |e| return e,
+    }) catch |err| {
+        archive.deinit(init.io);
+        const classified = machine_output.fromZigError(err);
+        const fallback = if (err == error.CopyArchiveTooLarge)
+            allocLifecycleMessage(allocator, "spore vm copy-out: guest archive exceeds the {d} GiB copy-out limit", .{named_copy_archive.max_archive_bytes >> 30})
+        else
+            allocLifecycleMessage(allocator, "spore vm copy-out: VM {s}: {s}", .{ parsed.name, classified.message });
+        const message = allocLifecycleLastErrorMessage(allocator, "copy-out", fallback);
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(classified.code, message, classified.source), message);
     };
     _ = std.c.close(archive_fd);
     archive_fd_open = false;
 
     if (exit_code != 0) {
-        if (mode == .json) {
-            archive.deinit(init.io);
-            const message = "spore vm copy-out: guest copy operation failed";
-            exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "copy-out"), message);
-        }
-        exitAfterCopyArchiveCleanup(&archive, init.io, exit_code);
+        archive.deinit(init.io);
+        const message = "spore vm copy-out: guest copy operation failed";
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.runtime_execution_failed, message, "copy-out"), message);
     }
     named_copy_archive.extractFile(allocator, init.io, archive.path, parsed.host_path) catch |err| {
-        if (mode == .json) return err;
-        std.debug.print("spore vm copy-out: cannot write host path {s}: {s}\n", .{ parsed.host_path, @errorName(err) });
-        exitAfterCopyArchiveCleanup(&archive, init.io, 1);
+        archive.deinit(init.io);
+        const classified = machine_output.fromZigError(err);
+        const message = allocLifecycleMessage(allocator, "spore vm copy-out: cannot write host path {s}; choose a new destination in a writable directory", .{parsed.host_path});
+        exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(classified.code, message, classified.source), message);
     };
     if (mode == .json) try machine_output.writeJson(allocator, stdout, CopyResult{
         .direction = "out",
@@ -837,7 +748,7 @@ pub fn saveCli(ctx: *const Ctx, args: []const []const u8) !void {
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, "save"), message);
         },
         error.UnsupportedSnapshotMode => {
-            const message = "spore vm save: this save mode is not supported; use `spore vm save NAME --out DIR --stop` for a consuming save";
+            const message = "spore vm save: this save mode is not supported; use `spore vm save NAME --output DIR --stop` for a consuming save";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
         error.X86CaptureUnsupported => {
@@ -845,15 +756,15 @@ pub fn saveCli(ctx: *const Ctx, args: []const []const u8) !void {
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, @errorName(err)), message);
         },
         error.OutputDirExists => {
-            const message = allocLifecycleMessage(allocator, "spore vm save: output directory already exists: {s}; choose a new --out DIR", .{parsed.out_dir});
+            const message = allocLifecycleMessage(allocator, "spore vm save: output directory already exists: {s}; choose a new --output DIR", .{parsed.out_dir});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
         error.CrossDeviceOwnershipLink => {
-            const message = "spore vm save: a machine-local pinned save must be on the rootfs cache's filesystem; choose --out DIR there";
+            const message = "spore vm save: a machine-local pinned save must be on the rootfs cache's filesystem; choose --output DIR there";
             exitLifecycleCliError(allocator, stderr, mode, machine_output.CliError.init(.object_invalid, message, @errorName(err)), message);
         },
         error.InvalidOutputDir => {
-            const message = allocLifecycleMessage(allocator, "spore vm save: invalid --out directory: {s}; the parent directory must exist", .{parsed.out_dir});
+            const message = allocLifecycleMessage(allocator, "spore vm save: invalid --output directory: {s}; the parent directory must exist", .{parsed.out_dir});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "save"), message);
         },
         error.MissingRootfsIdentity => {
@@ -1350,9 +1261,14 @@ fn parseCreateArgs(
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--")) {
+            if (command != null) return error.InvalidGuestCommand;
             command_mode = .argv;
             command = args[i + 1 ..];
             break;
+        } else if (std.mem.eql(u8, args[i], "--shell")) {
+            if (command != null) return error.InvalidGuestCommand;
+            _ = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
+            command = args[i .. i + 1];
         } else if (std.mem.eql(u8, args[i], "--backend")) {
             field_flag_seen = true;
             spec.backend = takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, args[i]);
@@ -1493,8 +1409,8 @@ fn parseCreateArgs(
             name = args[i];
             spec.name = args[i];
         } else {
-            command = args[i..];
-            break;
+            const message = "spore vm create: put guest argv after --, or use --shell STRING";
+            exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "create"), message);
         }
     }
 
@@ -1562,12 +1478,15 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--")) {
+            if (command.len != 0) usageExit("spore vm exec: --shell and trailing argv are mutually exclusive\n");
             command_mode = .argv;
             command = args[i + 1 ..];
             break;
-        } else if (name != null) {
-            command = args[i..];
-            break;
+        } else if (std.mem.eql(u8, args[i], "--shell")) {
+            if (command.len != 0) usageExit("spore vm exec: --shell may be supplied once\n");
+            if (i + 1 >= args.len) usageExit("spore vm exec: --shell requires a command string\n");
+            i += 1;
+            command = args[i .. i + 1];
         } else if (std.mem.eql(u8, args[i], "--env")) {
             if (i + 1 >= args.len) usageExit(exec_usage);
             i += 1;
@@ -1575,7 +1494,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         } else if (std.mem.eql(u8, args[i], "--workdir")) {
             if (i + 1 >= args.len) usageExit(exec_usage);
             i += 1;
-            guest_request.validateGuestExecContext(&.{}, args[i]) catch usageExit(exec_usage);
+            guest_request.validateGuestExecContext(&.{}, args[i]) catch usageExit("spore vm exec: --workdir must be an absolute guest path\n");
             guest_working_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
             interactive = true;
@@ -1585,10 +1504,12 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
             interactive = true;
             tty = true;
         } else if (std.mem.startsWith(u8, args[i], "-")) {
-            usageExit(exec_usage);
-        } else {
+            usageExit("spore vm exec: unknown option; see `spore vm exec --help`\n");
+        } else if (name == null) {
             validateNameOrExit("exec", args[i]) catch unreachable;
             name = args[i];
+        } else {
+            usageExit("spore vm exec: put guest argv after --, or use --shell STRING\n");
         }
     }
     const vm_name = name orelse usageExit(exec_usage);
@@ -1631,7 +1552,7 @@ fn parseSaveArgs(
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--out")) {
+        if (std.mem.eql(u8, args[i], "--output")) {
             out_dir = takeValueLifecycleCli(allocator, stderr, mode, "save", args, &i, args[i]);
         } else if (std.mem.eql(u8, args[i], "--stop")) {
             stop = true;
@@ -1654,7 +1575,7 @@ fn parseSaveArgs(
             allocator,
             stderr,
             mode,
-            machine_output.usageMissingArgument("usage: spore vm save NAME --out DIR [--stop]", "save"),
+            machine_output.usageMissingArgument("usage: spore vm save NAME --output DIR [--stop]", "save"),
             save_usage,
         );
     }
@@ -1677,8 +1598,10 @@ fn parseForkArgs(
         if (std.mem.eql(u8, args[i], "--count")) {
             const flag = args[i];
             count = parseIntArgLifecycleCli(usize, allocator, stderr, mode, "fork", takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, flag), flag);
-        } else if (std.mem.eql(u8, args[i], "--name")) {
-            name_pattern = takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--name-prefix")) {
+            const prefix = takeValueLifecycleCli(allocator, stderr, mode, "fork", args, &i, args[i]);
+            validateNameLifecycleCli(allocator, stderr, mode, "fork", prefix);
+            name_pattern = allocLifecycleMessage(allocator, "{s}-%d", .{prefix});
         } else if (std.mem.eql(u8, args[i], "--allow-slow-copy")) {
             allow_slow_copy = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -1698,7 +1621,7 @@ fn parseForkArgs(
             allocator,
             stderr,
             mode,
-            machine_output.usageMissingArgument("usage: spore vm fork NAME --count N --name PATTERN", "fork"),
+            machine_output.usageMissingArgument("usage: spore vm fork NAME --count N --name-prefix PREFIX", "fork"),
             fork_usage,
         );
     }
@@ -1749,12 +1672,8 @@ fn parseRestoreArgs(
             generation_path = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
         } else if (std.mem.startsWith(u8, arg, "--generation=")) {
             generation_path = arg["--generation=".len..];
-        } else if (std.mem.eql(u8, arg, "--name")) {
-            name = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
-            validateNameLifecycleCli(allocator, stderr, mode, "restore", name.?);
-        } else if (std.mem.startsWith(u8, arg, "--name=")) {
-            name = arg["--name=".len..];
-            validateNameLifecycleCli(allocator, stderr, mode, "restore", name.?);
+        } else if (std.mem.eql(u8, arg, "--checkpoint")) {
+            spore_dir = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
         } else if (std.mem.eql(u8, arg, "--bind-service")) {
             const raw = takeValueLifecycleCli(allocator, stderr, mode, "restore", args, &i, arg);
             bound_services.append(spore_net_policy.parseBoundServiceBinding(raw) catch |err| {
@@ -1767,8 +1686,9 @@ fn parseRestoreArgs(
         } else if (std.mem.startsWith(u8, arg, "--")) {
             const message = allocLifecycleMessage(allocator, "unknown restore argument: {s}", .{arg});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
-        } else if (spore_dir == null) {
-            spore_dir = arg;
+        } else if (name == null) {
+            validateNameLifecycleCli(allocator, stderr, mode, "restore", arg);
+            name = arg;
         } else {
             const message = allocLifecycleMessage(allocator, "unexpected restore argument: {s}", .{arg});
             exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "restore"), message);
@@ -1805,7 +1725,7 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
         if (result.initial_command) |initial| {
             if (initial.output_destination == .named_logs) {
                 try writer.print(
-                    "initial command started; output retained up to {d} bytes per stream; retrieve with `spore vm logs {s}`\n",
+                    "initial command started; output retained up to {d} bytes per stream; retrieve with `spore vm logs {s} --initial`\n",
                     .{ initial.output_limit_bytes_per_stream orelse 0, result.name },
                 );
             } else {
@@ -1819,15 +1739,17 @@ fn writeNamedLifecycleResult(writer: *Io.Writer, result: NamedLifecycleResult) !
     } else if (std.mem.eql(u8, result.action, "saved_stopped")) {
         try writer.print("saved checkpoint {s} ({s}) and stopped live VM {s}\n", .{ result.spore_dir orelse result.name, result.ownership orelse saved_spore_ownership.portable_self_contained, result.name });
         if ((result.saved_sessions orelse 0) > 0) {
-            try writer.writeAll("checkpoint has a saved session; use `spore attach <checkpoint>` to reconnect, or `spore run --from <checkpoint> ...` to run new commands.\n");
+            try writer.writeAll("checkpoint has a saved session; use `spore checkpoint resume <checkpoint>` to reconnect, or `spore run --checkpoint <checkpoint> ...` to run new commands.\n");
         } else {
-            try writer.writeAll("checkpoint has no saved session; use `spore run --from <checkpoint> ...` to run new commands, or `spore run --save <checkpoint> --save-on TERM ...` if you want fanout to attach to the original command.\n");
+            try writer.writeAll("checkpoint has no saved session; use `spore run --checkpoint <checkpoint> ...` to run new commands, or `spore run --save-checkpoint <checkpoint> --save-on TERM ...` if you want fanout to attach to the original command.\n");
         }
     } else if (std.mem.eql(u8, result.action, "removed")) {
         try writer.print("removed live VM {s}; monitor stopped and runtime state deleted, checkpoints and images unchanged\n", .{result.name});
     } else {
         try writer.print("{s} vm {s}\n", .{ result.action, result.name });
     }
+    if (std.mem.eql(u8, result.ownership orelse "", saved_spore_ownership.machine_local_pinned))
+        try writer.writeAll("Cache-pinned directory; do not copy standalone. Transfer with checkpoint push/pull.\n");
 }
 
 fn writeInitialOutputResult(writer: *Io.Writer, result: NamedLifecycleResult) !void {
@@ -2199,11 +2121,6 @@ fn writeFdAll(fd: std.c.fd_t, bytes: []const u8) !void {
     }
 }
 
-fn exitAfterCopyArchiveCleanup(archive: *named_copy_archive.TempArchive, io: Io, code: u8) noreturn {
-    archive.deinit(io);
-    std.process.exit(code);
-}
-
 fn openHostFileRead(allocator: std.mem.Allocator, io: Io, path: []const u8) !std.c.fd_t {
     const stat = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
     if (stat.kind != .file) return error.NotRegularFile;
@@ -2214,13 +2131,13 @@ fn openHostFileRead(allocator: std.mem.Allocator, io: Io, path: []const u8) !std
     return fd;
 }
 
-fn usageExit(comptime text: []const u8) noreturn {
+fn usageExit(text: []const u8) noreturn {
     if (exec_cli_event_writer) |events| {
         const classified = machine_output.usageInvalidArgument(text, "exec");
         events.emitFailure(classified) catch {};
         std.process.exit(classified.exit_code);
     }
-    std.debug.print("{s}", .{text});
+    std.debug.print("{s} [usage.invalid_argument]\n", .{std.mem.trimEnd(u8, text, "\n")});
     std.process.exit(2);
 }
 
@@ -2241,14 +2158,7 @@ fn exitLifecycleCliError(
     err: machine_output.CliError,
     human_text: []const u8,
 ) noreturn {
-    if (mode == .json) {
-        machine_output.writeError(allocator, stderr, err) catch {};
-    } else {
-        stderr.writeAll(human_text) catch {};
-        if (!std.mem.endsWith(u8, human_text, "\n")) stderr.writeByte('\n') catch {};
-    }
-    stderr.flush() catch {};
-    std.process.exit(err.exit_code);
+    @import("cli.zig").exitWithCliError(allocator, stderr, mode, err, human_text);
 }
 
 fn exitLifecycleRuntimePathError(
@@ -2301,32 +2211,6 @@ fn validateNameLifecycleCli(
         const message = allocLifecycleMessage(allocator, "spore vm {s}: invalid VM name: {s}", .{ command, name });
         exitLifecycleCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, command), message);
     };
-}
-
-fn cliRuntimePathExit(command: []const u8, err: anyerror) noreturn {
-    switch (err) {
-        error.InvalidRuntimeDir => std.debug.print(
-            "spore vm {s}: invalid runtime directory; set {s} or XDG_RUNTIME_DIR to an absolute path\n",
-            .{ command, runtime_dir_env },
-        ),
-        error.InsecureRuntimeDir => std.debug.print(
-            "spore vm {s}: insecure runtime directory; registry directories must be private to the current user\n",
-            .{command},
-        ),
-        error.ControlSocketPathTooLong => {
-            const detail = lastErrorMessage();
-            if (detail.len != 0) {
-                std.debug.print("spore vm {s}: {s}\n", .{ command, detail });
-            } else {
-                std.debug.print(
-                    "spore vm {s}: internal control socket path exceeds the platform limit\n",
-                    .{command},
-                );
-            }
-        },
-        else => std.debug.print("spore vm {s}: runtime directory error: {s}\n", .{ command, @errorName(err) }),
-    }
-    std.process.exit(2);
 }
 
 fn takeValueLifecycleCli(
@@ -2412,7 +2296,7 @@ test "create parser accepts shell and exact commands" {
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    const shell_opts = try parseCreateArgs(&.{ "counter", "--image", "alpine:3.20", "echo hi" }, allocator, &stderr.writer, .human);
+    const shell_opts = try parseCreateArgs(&.{ "counter", "--image", "alpine:3.20", "--shell", "echo hi" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(cli_args.CommandMode.shell, shell_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), shell_opts.command.len);
     try std.testing.expectEqualStrings("echo hi", shell_opts.command[0]);
@@ -2448,7 +2332,7 @@ test "create parser keeps image and plain creates commandless" {
 }
 
 test "exec parser accepts shell and exact commands" {
-    const shell_opts = parseExecArgs(&.{ "counter", "cat /tick" });
+    const shell_opts = parseExecArgs(&.{ "counter", "--shell", "cat /tick" });
     try std.testing.expectEqualStrings("counter", shell_opts.name);
     try std.testing.expectEqual(cli_args.CommandMode.shell, shell_opts.command_mode);
     try std.testing.expectEqual(@as(usize, 1), shell_opts.command.len);
@@ -2462,7 +2346,7 @@ test "exec parser accepts shell and exact commands" {
     try std.testing.expectEqualStrings("/bin/cat", argv_opts.command[0]);
     try std.testing.expectEqualStrings("/tick", argv_opts.command[1]);
 
-    const hyphen_shell_opts = parseExecArgs(&.{ "counter", "-c test" });
+    const hyphen_shell_opts = parseExecArgs(&.{ "counter", "--shell", "-c test" });
     try std.testing.expectEqual(cli_args.CommandMode.shell, hyphen_shell_opts.command_mode);
     try std.testing.expectEqualStrings("-c test", hyphen_shell_opts.command[0]);
 }
@@ -2479,7 +2363,7 @@ test "exec parser accepts interactive and tty flags" {
     try std.testing.expectEqualStrings("HOST_VALUE", combined_opts.guest_env_specs.items[1].copy);
     try std.testing.expectEqualStrings("/app", combined_opts.guest_working_dir.?);
 
-    const long_opts = parseExecArgs(&.{ "--interactive", "--tty", "box", "cat" });
+    const long_opts = parseExecArgs(&.{ "box", "--interactive", "--tty", "--shell", "cat" });
     try std.testing.expectEqualStrings("box", long_opts.name);
     try std.testing.expectEqual(cli_args.CommandMode.shell, long_opts.command_mode);
     try std.testing.expect(long_opts.interactive);
@@ -2679,7 +2563,7 @@ test "save parser accepts annotations and stop" {
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    var opts = parseSaveArgs(&.{ "bench-1", "--out", "bench-1.spore", "--stop", "--annotation", "saved=true=1" }, allocator, &stderr.writer, .human);
+    var opts = parseSaveArgs(&.{ "bench-1", "--output", "bench-1.spore", "--stop", "--annotation", "saved=true=1" }, allocator, &stderr.writer, .human);
     defer opts.annotations.deinit(allocator);
     try std.testing.expectEqualStrings("bench-1", opts.name);
     try std.testing.expectEqualStrings("bench-1.spore", opts.out_dir);
@@ -2692,7 +2576,7 @@ test "named restore parser accepts bound service bindings" {
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    const opts = parseRestoreArgs(&.{ "bench-1.spore", "--name", "bench-2", "--bind-service", "metadata=unix:/tmp/metadata.sock" }, allocator, &stderr.writer, .human);
+    const opts = parseRestoreArgs(&.{ "bench-2", "--checkpoint", "bench-1.spore", "--bind-service", "metadata=unix:/tmp/metadata.sock" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqualStrings("bench-1.spore", opts.spore_dir);
     try std.testing.expectEqualStrings("bench-2", opts.name);
     try std.testing.expectEqual(@as(usize, 1), opts.bound_services.len);
@@ -2705,7 +2589,7 @@ test "named restore parser accepts k8s child command product flags" {
     var stderr: Io.Writer.Allocating = .init(allocator);
     defer stderr.deinit();
 
-    const opts = parseRestoreArgs(&.{ "--backend", "kvm", "--generation", "generation.json", "child.spore", "--name=sporevm-child-42" }, allocator, &stderr.writer, .human);
+    const opts = parseRestoreArgs(&.{ "--backend", "kvm", "--generation", "generation.json", "--checkpoint", "child.spore", "sporevm-child-42" }, allocator, &stderr.writer, .human);
     try std.testing.expectEqual(backend_mod.Backend.kvm, opts.backend.?);
     try std.testing.expectEqualStrings("generation.json", opts.generation_path.?);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
@@ -2778,7 +2662,7 @@ test "lifecycle human results render terse status lines" {
     });
     try std.testing.expectEqualStrings(
         "created live VM counter\n" ++
-            "initial command started; output retained up to 16381 bytes per stream; retrieve with `spore vm logs counter`\n",
+            "initial command started; output retained up to 16381 bytes per stream; retrieve with `spore vm logs counter --initial`\n",
         out.written(),
     );
 
@@ -2800,7 +2684,7 @@ test "lifecycle human results render terse status lines" {
     });
     try std.testing.expectEqualStrings(
         "saved checkpoint counter.spore (portable-self-contained) and stopped live VM counter\n" ++
-            "checkpoint has no saved session; use `spore run --from <checkpoint> ...` to run new commands, or `spore run --save <checkpoint> --save-on TERM ...` if you want fanout to attach to the original command.\n",
+            "checkpoint has no saved session; use `spore run --checkpoint <checkpoint> ...` to run new commands, or `spore run --save-checkpoint <checkpoint> --save-on TERM ...` if you want fanout to attach to the original command.\n",
         out.written(),
     );
 
@@ -2814,7 +2698,7 @@ test "lifecycle human results render terse status lines" {
     });
     try std.testing.expectEqualStrings(
         "saved checkpoint counter.spore (portable-self-contained) and stopped live VM counter\n" ++
-            "checkpoint has a saved session; use `spore attach <checkpoint>` to reconnect, or `spore run --from <checkpoint> ...` to run new commands.\n",
+            "checkpoint has a saved session; use `spore checkpoint resume <checkpoint>` to reconnect, or `spore run --checkpoint <checkpoint> ...` to run new commands.\n",
         out.written(),
     );
 

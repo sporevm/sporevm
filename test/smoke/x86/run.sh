@@ -64,7 +64,7 @@ fi
   --memory 512mib \
   --image docker.io/library/alpine:3.20 \
   --disk-size 2gb \
-  --commit local/x86-run:growth \
+  --commit-image local/x86-run:growth \
   -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && test "$(df -k / | awk "NR == 2 { print \$2 }")" -gt 1500000 && echo x86-growth-ok >/x86-growth-marker'
 "${spore_bin}" run \
   --backend kvm \

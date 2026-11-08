@@ -127,7 +127,7 @@ zig-out/bin/spore --version
 Run one command in a throwaway VM:
 
 ```bash
-spore run 'echo hi'
+spore run --shell 'echo hi'
 ```
 
 `spore run` uses the managed SporeVM run kernel and the embedded minimal exec
@@ -162,8 +162,8 @@ printf 'hello\n' | spore run -i -- /bin/cat
 Inject a caller-provided file into the run with `--inject ID=PATH`. The guest
 sees it at `/run/sporevm/injected/ID`; the file is carried by the run
 initrd and copied into rootfs `/run` tmpfs, so it is not added to the image
-rootfs cache. `--inject` is rejected with `--save` and `--from` because file
-persistence would otherwise be ambiguous. Disk-only `--commit` allows
+rootfs cache. `--inject` is rejected with `--save-checkpoint` and `--checkpoint` because file
+persistence would otherwise be ambiguous. Disk-only `--commit-image` allows
 injection; the tmpfs file remains transient unless the guest copies it onto the
 root disk:
 
@@ -195,7 +195,7 @@ Build or reuse a cached ext4 rootfs from an OCI reference, then run a shell
 command inside it:
 
 ```bash
-spore run --image docker.io/library/alpine:3.20 'echo hi'
+spore run --image docker.io/library/alpine:3.20 --shell 'echo hi'
 ```
 
 `--image` applies OCI `Env`, `WorkingDir`, `Entrypoint`, and `Cmd` when present.
@@ -211,7 +211,7 @@ naturally expressed as a command than a Dockerfile:
 ```bash
 spore run \
   --image docker.io/library/alpine:3.20 \
-  --commit local/alpine-with-git:dev \
+  --commit-image local/alpine-with-git:dev \
   -- /bin/sh -lc 'apk add --no-cache git'
 ```
 
@@ -230,11 +230,11 @@ example remains encodable even when fully populated.
 Export a registry image's root filesystem as a reusable ext4 file:
 
 ```bash
-spore image export docker.io/library/alpine:3.20 \
+spore image export-rootfs docker.io/library/alpine:3.20 \
   --platform linux/arm64 \
   --output alpine.ext4
 
-spore run --rootfs alpine.ext4 'echo hi'
+spore run --rootfs alpine.ext4 --shell 'echo hi'
 ```
 
 See [docs/rootfs.md](docs/rootfs.md) for cache behavior, local OCI layout
@@ -252,7 +252,7 @@ spore run --net --allow-host example.com \
 
 Plain `--net` allows public egress outside the built-in hard floor;
 `--allow-host` or `--allow-cidr` restrict it to those hosts or CIDRs. Saved
-network policy is replayed by `spore run --from`; omit `--net` and allow flags
+network policy is replayed by `spore run --checkpoint`; omit `--net` and allow flags
 on run-from commands.
 
 Use `--forward 127.0.0.1:HOST_PORT:GUEST_PORT` to expose one live guest TCP
@@ -267,20 +267,20 @@ Start a named VM with a running process:
 
 ```bash
 spore vm create counter --image docker.io/library/alpine:3.20 \
-  'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done'
+  --shell 'i=0; while true; do echo "$i" > /tick; i=$((i + 1)); sleep 1; done'
 ```
 
 Fork it while that process is still running:
 
 ```bash
-spore vm fork counter --count 2 --name child-%d
+spore vm fork counter --count 2 --name-prefix child
 ```
 
 Both children keep running from the fork point:
 
 ```bash
-spore vm exec child-0 'cat /tick; sleep 1; cat /tick'
-spore vm exec child-1 'cat /tick; sleep 1; cat /tick'
+spore vm exec child-0 --shell 'cat /tick; sleep 1; cat /tick'
+spore vm exec child-1 --shell 'cat /tick; sleep 1; cat /tick'
 ```
 
 Named exec can also be interactive when you opt in to input or a terminal:
@@ -299,7 +299,7 @@ spore vm copy-in child-0 ./src /tmp/src
 spore vm copy-out child-0 /tmp/src ./src-roundtrip
 ```
 
-`spore vm create`, `spore run`, and `spore vm exec` run shell commands as
+`spore vm create`, `spore run`, and `spore vm exec` use explicit `--shell STRING` as
 `/bin/sh -lc`. Use `-- <argv...>` when you need exact argv.
 
 ## Save and attach
@@ -308,38 +308,40 @@ Save a run when the command exits:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
-  --save base.spore \
-  'echo warmed > /var/tmp/example'
+  --save-checkpoint base.spore \
+  --shell 'echo warmed > /var/tmp/example'
 ```
 
-The `--save` target must not already exist; SporeVM creates the output
+The `--save-checkpoint` target must not already exist; SporeVM creates the output
 directory before the backend starts writing snapshot files.
 
 Run another command from that completed base spore, or attach to a saved
 session:
 
 ```bash
-spore run --from base.spore 'cat /var/tmp/example'
-spore attach live-shell.spore
+spore run --checkpoint base.spore --shell 'cat /var/tmp/example'
+spore checkpoint resume live-shell.spore
 ```
 
 If the saved session was still running with a guest terminal, reattach with
 the same explicit terminal flags:
 
 ```bash
-spore attach -it live-shell.spore
+spore checkpoint resume -it live-shell.spore
 ```
 
 Input attach fails closed when the saved session was not started with
 interactive stdin or a terminal. The spore contains guest process and PTY
 state, not the original host terminal connection.
 
-`--from` restores the spore and runs a fresh command through the restored exec
-agent. `attach` restores the spore and connects to a saved session. See
+`--checkpoint` restores the spore and runs a fresh command through the restored exec
+agent. `checkpoint resume` restores a new throwaway VM and resumes its saved session;
+it does not connect to a live named VM. Use `vm restore NAME --checkpoint DIR`
+to keep a restored named machine without attaching saved streams. See
 [docs/filesystem.md](docs/filesystem.md) for rootfs-backed writable state and
 [docs/memory.md](docs/memory.md) for memory restore behavior.
 For one-shot child runs with externally assigned shard identity, add
-`--generation generation.json` to `spore run --from`; the JSON is published to
+`--generation generation.json` to `spore run --checkpoint`; the JSON is published to
 the guest before the command starts.
 
 ## Fork and fan out
@@ -347,7 +349,7 @@ the guest before the command starts.
 Fork an existing checkpoint:
 
 ```bash
-spore checkpoint fork base.spore --count 100 --out forks
+spore checkpoint fork base.spore --count 100 --output forks
 ```
 
 Children are named `000000`, `000001`, and so on. They share verified content
@@ -356,7 +358,7 @@ and get distinct generation metadata.
 Attach forked children locally with prefixed output:
 
 ```bash
-spore fanout forks --for 20s
+spore checkpoint fanout forks --for 20s
 ```
 
 See [docs/fanout.md](docs/fanout.md) for the child identity contract and
@@ -368,9 +370,9 @@ To move a saved spore between hosts, push it to an
 [image store](docs/image-format.md#spores) and pull it on the other host:
 
 ```bash
-spore checkpoint push base.spore s3://bucket/spores/base
-spore checkpoint pull s3://bucket/spores/base --out base.spore
-spore run --from base.spore -- ./bin/test
+spore checkpoint push base.spore --to s3://bucket/spores/base
+spore checkpoint pull s3://bucket/spores/base --output base.spore
+spore run --checkpoint base.spore -- ./bin/test
 ```
 
 See
@@ -385,10 +387,10 @@ The complete named VM lifecycle is stable on ARM64 HVF/KVM hosts:
 export SPOREVM_RUNTIME_DIR=/tmp/sporevm-demo
 
 spore vm create bench-1 --image docker.io/library/alpine:3.20
-spore vm logs bench-1
-spore vm exec bench-1 'echo hi'
-spore vm save bench-1 --out bench-1.spore --stop --annotation saved=true
-spore vm restore bench-1.spore --name bench-2
+spore vm logs bench-1 --initial
+spore vm exec bench-1 --shell 'echo hi'
+spore vm save bench-1 --output bench-1.spore --stop --annotation saved=true
+spore vm restore bench-2 --checkpoint bench-1.spore
 spore vm ls
 spore vm rm bench-2
 ```
@@ -407,7 +409,8 @@ spore vm create bench-net \
 ```
 
 Create retains bounded initial-command output by default; use
-`spore vm logs NAME` to retrieve it after create returns. Machine callers can use global `--json`
+`spore vm logs NAME --initial` to retrieve it after create returns. It is not
+exec history or a following log. Machine callers can use global `--json`
 for structured lifecycle state. See [docs/lifecycle.md](docs/lifecycle.md) for
 runtime layout, monitor jailing, named live fork, and limits.
 

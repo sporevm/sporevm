@@ -31,7 +31,7 @@ fi
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   --image "${image_ref}" \
-  --commit local/run-disk-size:base \
+  --commit-image local/run-disk-size:base \
   -- /bin/true
 
 base_before="$("${spore_bin}" image resolve local/run-disk-size:base)"
@@ -43,7 +43,7 @@ base_before="$("${spore_bin}" image resolve local/run-disk-size:base)"
   --image local/run-disk-size:base \
   --pull=never \
   --disk-size 2gb \
-  --commit local/run-disk-size:grown \
+  --commit-image local/run-disk-size:grown \
   -- /bin/sh -lc 'test ! -x /sbin/resize2fs && test ! -x /usr/sbin/resize2fs && test "$(cat /sys/class/block/vda/size)" -eq 4194304 && test "$(df -k / | awk "NR == 2 { print \$2 }")" -gt 1500000 && echo ready >/grown-marker'
 
 base_after="$("${spore_bin}" image resolve local/run-disk-size:base)"
@@ -103,7 +103,7 @@ if "${spore_bin}" run \
   --image local/run-disk-size:grown \
   --pull=never \
   --disk-size 1gb \
-  --commit local/run-disk-size:grown \
+  --commit-image local/run-disk-size:grown \
   -- /bin/true >"${workdir}/shrink.stdout" 2>"${workdir}/shrink.stderr"; then
   die "shrinking --disk-size unexpectedly succeeded"
 fi

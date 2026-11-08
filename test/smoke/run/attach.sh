@@ -85,7 +85,7 @@ reject_stderr="${workdir}/reject.stderr"
   --memory "${smoke_memory}" \
   -t \
   --image "${image}" \
-  --save "${tty_capture}" \
+  --save-checkpoint "${tty_capture}" \
   --save-on USR1 \
   --continue-after-save \
   -- /bin/sh -lc 'i=0; while [ "$i" -lt 8 ]; do echo "tty-attach-tick:$i"; i=$((i + 1)); sleep 1; done' \
@@ -120,7 +120,7 @@ done
   die "live TTY capture did not write a manifest"
 }
 
-with_timeout 60 "${spore_bin}" --json attach \
+with_timeout 60 "${spore_bin}" --json checkpoint resume \
   --backend "${backend}" \
   -t \
   "${tty_capture}" \
@@ -145,13 +145,13 @@ set -e
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
-  --save "${noninteractive_capture}" \
+  --save-checkpoint "${noninteractive_capture}" \
   -- /bin/true \
   >"${workdir}/noninteractive.stdout" 2>"${workdir}/noninteractive.stderr"
 [[ -f "${noninteractive_capture}/manifest.json" ]] || die "non-interactive capture did not write a manifest"
 
 set +e
-printf 'input\n' | with_timeout 30 "${spore_bin}" --json attach \
+printf 'input\n' | with_timeout 30 "${spore_bin}" --json checkpoint resume \
   --backend "${backend}" \
   -i \
   "${noninteractive_capture}" \

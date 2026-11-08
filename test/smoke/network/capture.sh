@@ -22,7 +22,7 @@ smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
   --memory "${smoke_memory}" \
   --net \
   --allow-host example.com \
-  --save "${capture_dir}" \
+  --save-checkpoint "${capture_dir}" \
   -- /bin/true \
   >"${capture_stdout}" 2>"${capture_stderr}"
 
@@ -33,7 +33,7 @@ grep -Fq "example.com" "${manifest}" || die "captured manifest did not record al
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${capture_dir}" \
+  --checkpoint "${capture_dir}" \
   -- /bin/wget -qO- http://example.com/ \
   >"${from_stdout}" 2>"${from_stderr}"
 
@@ -46,7 +46,7 @@ grep -Fq "Example Domain" "${from_stdout}" || {
 set +e
 "${spore_bin}" --debug run \
   --backend "${backend}" \
-  --from "${capture_dir}" \
+  --checkpoint "${capture_dir}" \
   -- /bin/wget -qO- http://169.254.169.254/ \
   >"${deny_stdout}" 2>"${deny_stderr}"
 deny_rc="$?"

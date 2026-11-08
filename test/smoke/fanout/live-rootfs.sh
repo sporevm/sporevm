@@ -58,7 +58,7 @@ ruby_args=(
 "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --save "${capture_dir}" \
+  --save-checkpoint "${capture_dir}" \
   --save-on USR1 \
   -- "${ruby_args[@]}" \
   >"${run_stdout}" 2>"${run_stderr}" &
@@ -101,7 +101,7 @@ if [[ "${run_rc}" != "0" ]]; then
 fi
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
 
-"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --output "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
 children=()
 while IFS= read -r child; do
@@ -110,7 +110,7 @@ done < <(fork_children "${fork_dir}")
 [[ "${#children[@]}" == "${count}" ]] || die "expected ${count} child spores, found ${#children[@]}"
 
 set +e
-"${spore_bin}" fanout --backend "${backend}" "${fork_dir}" --for "${SPORE_SMOKE_LIVE_ROOTFS_FANOUT_DURATION:-20s}" \
+"${spore_bin}" checkpoint fanout --backend "${backend}" "${fork_dir}" --for "${SPORE_SMOKE_LIVE_ROOTFS_FANOUT_DURATION:-20s}" \
   >"${fanout_stdout}" 2>"${fanout_stderr}"
 fanout_rc="$?"
 set -e

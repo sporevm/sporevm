@@ -65,7 +65,7 @@ grep -Fxq "spore-smoke" "${workdir}/echo.stdout" || {
 }
 
 set +e
-"${spore_bin}" run 'echo spore-shell-smoke' >"${workdir}/shell.stdout" 2>"${workdir}/shell.stderr"
+"${spore_bin}" run --shell 'echo spore-shell-smoke' >"${workdir}/shell.stdout" 2>"${workdir}/shell.stderr"
 shell_rc="$?"
 set -e
 [[ "${shell_rc}" == "0" ]] || {
@@ -108,7 +108,7 @@ set +e
 json_rc="$?"
 set -e
 [[ "${json_rc}" == "2" ]] || die "spore run --json exited ${json_rc}, expected 2"
-grep -Fq "unknown run argument: --json" "${workdir}/json.stderr" || {
+grep -Fq "put global --json before the command: spore --json run" "${workdir}/json.stderr" || {
   cat "${workdir}/json.stderr" >&2 || true
   die "spore run --json did not reject with the expected message"
 }

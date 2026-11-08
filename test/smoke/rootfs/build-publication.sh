@@ -119,7 +119,7 @@ SPOREVM_RUNTIME_DIR="${template_runtime}" \
     --backend "${backend}" \
     --memory "${smoke_memory}" \
     --image "${image_ref}" \
-    --commit "${base_ref}" \
+    --commit-image "${base_ref}" \
     -- /bin/true
 
 cat >"${old_context}/Dockerfile" <<EOF
@@ -128,7 +128,7 @@ CMD ["/bin/true"]
 EOF
 SPOREVM_ROOTFS_CACHE_DIR="${template_cache}" \
 SPOREVM_RUNTIME_DIR="${template_runtime}" \
-  "${spore_bin}" build --network none -t "${old_ref}" "${old_context}" \
+  "${spore_bin}" build --network none --tag "${old_ref}" "${old_context}" \
     >"${workdir}/old-build.stdout" 2>"${workdir}/old-build.stderr"
 
 cat >"${build_context}/Dockerfile" <<EOF
@@ -172,12 +172,12 @@ concurrent_a="local/build-publication-smoke:concurrent-a"
 concurrent_b="local/build-publication-smoke:concurrent-b"
 SPOREVM_ROOTFS_CACHE_DIR="${concurrent_cache}" \
 SPOREVM_RUNTIME_DIR="${workdir}/concurrent-runtime-a" \
-  "${spore_bin}" --debug build --network none -t "${concurrent_a}" "${build_context}" \
+  "${spore_bin}" --debug build --network none --tag "${concurrent_a}" "${build_context}" \
     >"${workdir}/concurrent-a.stdout" 2>"${workdir}/concurrent-a.stderr" &
 concurrent_a_pid=$!
 SPOREVM_ROOTFS_CACHE_DIR="${concurrent_cache}" \
 SPOREVM_RUNTIME_DIR="${workdir}/concurrent-runtime-b" \
-  "${spore_bin}" --debug build --network none -t "${concurrent_b}" "${build_context}" \
+  "${spore_bin}" --debug build --network none --tag "${concurrent_b}" "${build_context}" \
     >"${workdir}/concurrent-b.stdout" 2>"${workdir}/concurrent-b.stderr" &
 concurrent_b_pid=$!
 wait_for_lock_waiter "${concurrent_a_pid}" "${cache_lock_path}" "first concurrent build"
@@ -220,7 +220,7 @@ EOF
 clone_tree "${template_cache}" "${gc_cache}"
 SPOREVM_ROOTFS_CACHE_DIR="${gc_cache}" \
 SPOREVM_RUNTIME_DIR="${gc_runtime}" \
-  "${spore_bin}" --debug build --network none -t "${gc_ref}" "${gc_context}" \
+  "${spore_bin}" --debug build --network none --tag "${gc_ref}" "${gc_context}" \
     >"${workdir}/gc-build.stdout" 2>"${workdir}/gc-build.stderr" &
 gc_build_pid=$!
 gc_deadline=$((SECONDS + 60))
@@ -271,16 +271,16 @@ for boundary in object index completeness prepare-record image-metadata mutable-
   set +e
   SPOREVM_ROOTFS_CACHE_DIR="${cache}" \
   SPOREVM_RUNTIME_DIR="${runtime}" \
-    "${spore_bin}" --debug build --network none --no-cache -t "${old_ref}" "${build_context}" \
+    "${spore_bin}" --debug build --network none --no-cache --tag "${old_ref}" "${build_context}" \
       >"${workdir}/failure-${boundary}.stdout" 2>"${workdir}/failure-${boundary}.stderr"
   status=$?
   set -e
   chmod u+w "${blocked_path}"
 
-  if [[ "${status}" -ne 2 ]]; then
+  if [[ "${status}" -ne 1 ]]; then
     cat "${workdir}/failure-${boundary}.stdout" >&2 || true
     cat "${workdir}/failure-${boundary}.stderr" >&2 || true
-    die "${boundary} publication failure exited ${status}, expected 2"
+    die "${boundary} publication failure exited ${status}, expected 1"
   fi
   after_failure="$(SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" image resolve "${old_ref}")"
   [[ "${after_failure}" == "${old_resolved}" ]] || die "${boundary} failure replaced the destination ref"
@@ -323,7 +323,7 @@ for boundary in object index completeness prepare-record image-metadata mutable-
     "${spore_bin}" --json system gc --rootfs --force >"${workdir}/failure-${boundary}-gc.json"
   SPOREVM_ROOTFS_CACHE_DIR="${cache}" \
   SPOREVM_RUNTIME_DIR="${workdir}/recovery-${boundary}-runtime" \
-    "${spore_bin}" build --network none -t "${old_ref}" "${build_context}" \
+    "${spore_bin}" build --network none --tag "${old_ref}" "${build_context}" \
       >"${workdir}/recovery-${boundary}.stdout" 2>"${workdir}/recovery-${boundary}.stderr" || {
         cat "${workdir}/recovery-${boundary}.stdout" >&2 || true
         cat "${workdir}/recovery-${boundary}.stderr" >&2 || true

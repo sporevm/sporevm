@@ -276,10 +276,10 @@ Current hard failures include:
 
 State portability checks should use product-created spores wherever possible:
 
-- `spore run --save ...` to create diskless, immutable-rootfs, or locally
+- `spore run --save-checkpoint ...` to create diskless, immutable-rootfs, or locally
   layered writable-rootfs spores;
-- `spore attach` to validate session restore;
-- `spore checkpoint fork` and `spore fanout` to validate child identity and parallel
+- `spore checkpoint resume` to validate session restore;
+- `spore checkpoint fork` and `spore checkpoint fanout` to validate child identity and parallel
   resume behavior.
 
 Current evidence:

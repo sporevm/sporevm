@@ -26,7 +26,7 @@ zig-out/bin/spore build \
 pack_output="$(zig-out/bin/spore image pack \
   local/ci-final-image:producer \
   --platform linux/arm64 \
-  --out "${archive}")"
+  --output "${archive}")"
 printf '%s\n' "${pack_output}"
 
 archive_digest="$(awk '$1 == "archive_digest:" { print $2 }' <<<"${pack_output}")"

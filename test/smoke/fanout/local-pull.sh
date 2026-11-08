@@ -38,7 +38,7 @@ printf 'rootfs image: %s -> %s\n' "${image_ref}" "${resolved_image_ref}"
 SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" run \
   --backend "${backend}" \
   --image "${resolved_image_ref}" \
-  --save "${capture_dir}" \
+  --save-checkpoint "${capture_dir}" \
   -- /bin/sh -c 'echo saved >/saved-marker' \
   >"${workdir}/run.stdout" 2>"${workdir}/run.stderr" || {
   cat "${workdir}/run.stderr" >&2 || true
@@ -46,7 +46,7 @@ SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" run \
 }
 [[ -f "${capture_dir}/manifest.json" ]] || die "save did not write ${capture_dir}/manifest.json"
 
-SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" --json checkpoint push "${capture_dir}" "${store_dir}/ruby" >"${workdir}/push.json"
+SPOREVM_ROOTFS_CACHE_DIR="${push_rootfs_cache}" "${spore_bin}" --json checkpoint push "${capture_dir}" --to "${store_dir}/ruby" >"${workdir}/push.json"
 spore_digest="$(json_field "${workdir}/push.json" spore_digest)"
 [[ "${spore_digest}" == blake3:* ]] || die "push reported spore digest ${spore_digest}"
 
@@ -83,7 +83,7 @@ for i in $(seq 0 $((count - 1))); do
   cache="${workdir}/pull-rootfs-cache-${i}"
   pulled="${workdir}/pulled-${i}.spore"
   pull_json="${workdir}/pull-${i}.json"
-  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" --json checkpoint pull "${ref}" --out "${pulled}" >"${pull_json}"
+  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" --json checkpoint pull "${ref}" --output "${pulled}" >"${pull_json}"
   expect_eq "$(json_field "${pull_json}" spore_digest)" "${spore_digest}" "pull ${i} spore digest"
   ram_fetched="$(json_field "${pull_json}" ram.objects_fetched)"
   disk_objects="$(json_field "${pull_json}" disk.objects)"
@@ -100,7 +100,7 @@ for i in $(seq 0 $((count - 1))); do
 JSON
   SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" run \
     --backend "${backend}" \
-    --from "${pulled}" \
+    --checkpoint "${pulled}" \
     --generation "${generation_json}" \
     -- /bin/sh -c 'cat /saved-marker /run/sporevm/env /run/sporevm/generation.json' \
     >"${workdir}/from-${i}.stdout" 2>"${workdir}/from-${i}.stderr" || {

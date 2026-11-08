@@ -61,15 +61,15 @@ set +e
 TMPDIR="${tmp}" \
 SPOREVM_ROOTFS_CACHE_DIR="${cache_root}" \
 SPOREVM_RUNTIME_DIR="${runtime_dir}" \
-  "${spore_bin}" build --network none --no-cache -t "${destination}" "${context_dir}" \
+  "${spore_bin}" build --network none --no-cache --tag "${destination}" "${context_dir}" \
     >"${stdout}" 2>"${stderr}"
 status=$?
 set -e
 
-if [[ "${status}" -ne 2 ]]; then
+if [[ "${status}" -ne 1 ]]; then
   cat "${stdout}" >&2 || true
   cat "${stderr}" >&2 || true
-  die "${mode} ENOSPC CLI build exited ${status}, expected 2"
+  die "${mode} ENOSPC CLI build exited ${status}, expected 1"
 fi
 grep -Fq "${marker}" "${stderr}" || die "${mode} ENOSPC CLI output omitted its single-execution marker"
 [[ "$(grep -Fc "${marker}" "${stderr}")" == "1" ]] || die "${mode} ENOSPC CLI output repeated its execution marker"
@@ -81,4 +81,4 @@ after_ref="$(SPOREVM_ROOTFS_CACHE_DIR="${cache_root}" "${spore_bin}" image resol
 after_state="$(authoritative_cache_state "${cache_root}")"
 [[ "${after_state}" == "${before_state}" ]] || die "${mode} ENOSPC CLI build published authoritative cache state"
 
-echo "smoke:build-${mode}-enospc-cli ok status=2 ref=${after_ref}"
+echo "smoke:build-${mode}-enospc-cli ok status=1 ref=${after_ref}"

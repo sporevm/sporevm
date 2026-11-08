@@ -32,6 +32,8 @@ pub const PushResult = struct {
     resource_type: resource.Type = .checkpoint,
     /// The digest-pinned ref of the pushed spore.
     ref: []const u8,
+    digest_ref: []const u8,
+    tag_ref: ?[]const u8,
     spore_digest: []const u8,
     objects_total: usize,
     objects_written: usize,
@@ -109,8 +111,15 @@ pub fn push(context: Context, allocator: std.mem.Allocator, options: PushOptions
     });
     const ref = try image_store.pushedRefAlloc(allocator, destination.base, &digest);
     errdefer allocator.free(ref);
+    const tag_ref = switch (destination.target) {
+        .tag => |tag| try image_store.pushedRefAlloc(allocator, destination.base, tag),
+        .digest => null,
+    };
+    errdefer if (tag_ref) |tag| allocator.free(tag);
     return .{
         .ref = ref,
+        .digest_ref = ref,
+        .tag_ref = tag_ref,
         .spore_digest = try allocator.dupe(u8, &digest),
         .objects_total = objects.items.len,
         .objects_written = written.objects,
@@ -396,6 +405,8 @@ test "spore checkpoint push writes a spore once, without its RAM backing, and de
     try std.testing.expectEqual(@as(usize, 4), first.objects_written);
     try std.testing.expectEqual(spore.chunk_size + 19 + saved.index_len + rootfs_cas.default_chunk_size, first.bytes_written);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ store, first.spore_digest }), first.ref);
+    try std.testing.expectEqualStrings(first.ref, first.digest_ref);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "file://{s}/warm", .{store}), first.tag_ref.?);
 
     const hex = first.spore_digest[chunk.ChunkId.digest_prefix.len..];
     const bytes = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(allocator, "{s}/spores/{s}", .{ store, hex }), allocator, .limited(spore.max_manifest_bytes));
@@ -408,6 +419,7 @@ test "spore checkpoint push writes a spore once, without its RAM backing, and de
     try std.testing.expectEqualStrings(first.spore_digest, try image_store.parseTag(tag));
 
     const again = try testPush(&fixture, saved.dir, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ store, first.spore_digest }), "aws");
+    try std.testing.expectEqual(null, again.tag_ref);
     try std.testing.expectEqualStrings(first.spore_digest, again.spore_digest);
     try std.testing.expectEqual(@as(usize, 0), again.objects_written);
     try std.testing.expectError(error.SporeIdentityMismatch, testPush(&fixture, saved.dir, try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, test_support.repeat("b", 64) }), "aws"));

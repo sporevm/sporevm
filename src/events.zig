@@ -756,7 +756,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.X86ResumeUnsupported or err == error.X86CaptureUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: x86-64 KVM currently supports fresh execution only; resume, save, capture, and fork are unavailable",
+            "x86-64 KVM currently supports fresh execution only; resume, save, capture, and fork are unavailable",
             @errorName(err),
         );
     }
@@ -784,7 +784,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.InvalidRunCommitOptions or err == error.RunCommitImageConfigUnavailable or err == error.RunCommitRootfsNotSnapshotable) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: --commit requires a fresh non-interactive --image run with an effective command and cannot be combined with save options",
+            "spore run: --commit-image requires a fresh non-interactive --image run with an effective command and cannot be combined with save options",
             @errorName(err),
         );
     }
@@ -798,7 +798,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.InvalidRunDiskSize or err == error.RunDiskSizeWouldShrink) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: --disk-size must be a 64KiB-aligned absolute size at least as large as the source image and currently requires --commit",
+            "spore run: --disk-size must be a 64KiB-aligned absolute size at least as large as the source image and currently requires --commit-image",
             @errorName(err),
         );
     }
@@ -819,7 +819,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.CrossDeviceOwnershipLink) {
         return machine_output.CliError.init(
             .object_invalid,
-            "spore run: a machine-local pinned save must be on the rootfs cache's filesystem; choose --save DIR there",
+            "spore run: a machine-local pinned save must be on the rootfs cache's filesystem; choose --save-checkpoint DIR there",
             @errorName(err),
         );
     }
@@ -833,7 +833,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.TtyRunFromSporeUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: -t with --from command execution is not supported yet; use `spore attach -t <spore>` to connect to a saved terminal session",
+            "spore run: -t with --checkpoint command execution is not supported yet; use `spore checkpoint resume -t <spore>` to connect to a saved terminal session",
             @errorName(err),
         );
     }
@@ -854,7 +854,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.NoSavedSession) {
         return machine_output.CliError.init(
             .object_invalid,
-            "spore run: spore has no saved session; pass a command after --from or use spore run --save to create a session spore",
+            "spore checkpoint resume: checkpoint has no saved session; use `spore run --checkpoint DIR -- ARGV` for a new command, or `spore run --save-checkpoint DIR` to create a saved session",
             @errorName(err),
         );
     }
@@ -1073,7 +1073,7 @@ test "saved session attach failures are usage errors" {
 test "tty run-from unsupported failure has a clear public message" {
     const classified = classifyFailure(error.TtyRunFromSporeUnsupported);
     try std.testing.expectEqual(machine_output.ErrorCode.usage_invalid_argument, classified.code);
-    try std.testing.expect(std.mem.indexOf(u8, classified.message, "-t with --from") != null);
+    try std.testing.expect(std.mem.indexOf(u8, classified.message, "-t with --checkpoint") != null);
 }
 
 test "event writer emits terminal output records" {

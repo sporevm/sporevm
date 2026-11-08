@@ -3,29 +3,29 @@
 For the durable root disk, rootfs CAS, writable disk index, cache, and
 verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
 
-`spore image export` materializes an OCI image into a deterministic ext4 rootfs
+`spore image export-rootfs` materializes an OCI image into a deterministic ext4 rootfs
 image, installs that image into the local digest cache, and writes chunked
 rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata
 sidecar. Local image imports use the same chunked rootfs storage path.
 The first OCI-capable run workflow is deliberately two-step:
 
 ```bash
-zig-out/bin/spore image export docker.io/library/alpine:3.20 \
+zig-out/bin/spore image export-rootfs docker.io/library/alpine:3.20 \
   --platform linux/arm64 \
   --output alpine.ext4
 
-zig-out/bin/spore run --rootfs alpine.ext4 'echo hi'
+zig-out/bin/spore run --rootfs alpine.ext4 --shell 'echo hi'
 ```
 
 The input can be either a digest-pinned ref or a registry tag:
 
 ```bash
-spore image export ghcr.io/org/image@sha256:<digest> \
+spore image export-rootfs ghcr.io/org/image@sha256:<digest> \
   --platform linux/arm64 \
   --output rootfs.ext4 \
   --metadata rootfs.ext4.json
 
-spore image export ghcr.io/org/image:latest \
+spore image export-rootfs ghcr.io/org/image:latest \
   --platform linux/arm64 \
   --output rootfs.ext4
 ```
@@ -33,7 +33,7 @@ spore image export ghcr.io/org/image:latest \
 Run a command from a built rootfs by attaching it read-only:
 
 ```bash
-spore run --rootfs rootfs.ext4 'echo hi'
+spore run --rootfs rootfs.ext4 --shell 'echo hi'
 ```
 
 For the direct convenience path, ordinary `spore run --image` resolves the image
@@ -41,10 +41,10 @@ ref, builds or reuses a cached ext4 rootfs, and runs a command with the rootfs
 attached read-only:
 
 ```bash
-spore run --image docker.io/library/alpine:3.20 'echo hi'
+spore run --image docker.io/library/alpine:3.20 --shell 'echo hi'
 ```
 
-Without `--`, a caller command is represented as `/bin/sh -lc <string>`; use
+With `--shell STRING`, a caller command is represented as `/bin/sh -lc <string>`; use
 `-- <argv...>` for exact argv. For `--image`, SporeVM prepends OCI Entrypoint
 and uses OCI Cmd when no caller command is supplied. A caller command replaces
 Cmd but keeps Entrypoint. `--entrypoint PATH` replaces the image Entrypoint;
@@ -112,19 +112,19 @@ populated rootfs index below the bounded canonical-index limit. The v2 ranged
 encoding removes the former roughly 30.62 GiB dense-disk cliff; a larger
 automatic build capacity remains a separate product and filesystem decision.
 
-Add `--save` to make rootfs writes part of the spore. The guest still sees a
+Add `--save-checkpoint` to make rootfs writes part of the spore. The guest still sees a
 normal root filesystem, but writes land in a local chunk-mapped head and save
 seals the changed chunks as a disk index:
 
 ```bash
 spore run --image docker.io/library/alpine:3.20 \
-  --save base.spore \
-  'echo warmed > /var/tmp/example'
+  --save-checkpoint base.spore \
+  --shell 'echo warmed > /var/tmp/example'
 
-spore run --from base.spore 'cat /var/tmp/example'
+spore run --checkpoint base.spore --shell 'cat /var/tmp/example'
 ```
 
-The `--save` target must be a new path. SporeVM creates the output directory
+The `--save-checkpoint` target must be a new path. SporeVM creates the output directory
 itself before writing memory, disk, and manifest files. Writable-disk bytes
 remain in the machine's rootfs CAS and are protected by a durable pin
 recorded only in host-private lifecycle metadata. The save directory can be
@@ -133,13 +133,13 @@ copies fail closed instead of silently sharing deletion authority. Use
 `spore checkpoint fork` for another machine-local lifecycle, or
 `spore checkpoint push` and `spore checkpoint pull` to move it to another host.
 
-Use `--commit local/<name>:<tag>` when the command should produce another
+Use `--commit-image local/<name>:<tag>` when the command should produce another
 image instead of a resumable machine:
 
 ```bash
 spore run \
   --image docker.io/library/alpine:3.20 \
-  --commit local/alpine-with-tools:dev \
+  --commit-image local/alpine-with-tools:dev \
   -- /bin/sh -lc 'apk add --no-cache git'
 
 spore run --image local/alpine-with-tools:dev --pull=never -- /usr/bin/git --version
@@ -155,7 +155,7 @@ Commit retains disk state only. It does not retain memory, processes, network
 state, or injected files under `/run/sporevm/injected`. A command can
 deliberately copy an injected file onto the root disk, in which case the copy is
 ordinary committed disk state. The first version accepts fresh non-interactive
-`--image` runs only and cannot be combined with `--rootfs`, `--from`, or save
+`--image` runs only and cannot be combined with `--rootfs`, `--checkpoint`, or save
 flags. Source and destination may be the same local ref because SporeVM resolves
 the source before publishing the result.
 
@@ -165,7 +165,7 @@ Image commit can grow the root disk before setup runs:
 spore run \
   --image local/docker-capable:base \
   --disk-size 20gb \
-  --commit local/docker-capable:large \
+  --commit-image local/docker-capable:large \
   -- /usr/local/bin/prepare
 ```
 
@@ -175,7 +175,7 @@ growth. Index inputs remain bounded to 64 MiB, but current v2 indexes pack
 contiguous digests and zero ranges instead of emitting a JSON object per
 logical chunk; a dense 32 GiB disk is covered by focused tests. Use the smallest
 required capacity because metadata still grows with distinct chunk digests.
-The first version requires `--commit`;
+The first version requires `--commit-image`;
 it also requires the fresh
 `--image` source to resolve to complete indexed rootfs storage and the
 destination to be a valid mutable local ref. SporeVM resolves that immutable
@@ -202,7 +202,7 @@ response-validation failure aborts before the command and publishes nothing.
 Commit is the storage-preparation layer for fan-out, not the warm-machine
 layer. Prepare stable dependencies or Docker data into an image, put frequently
 changing code above it with `spore build FROM local/...`, then capture one warm
-spore and use `spore checkpoint fork` plus `spore run --from` for children.
+spore and use `spore checkpoint fork` plus `spore run --checkpoint` for children.
 
 Pulled, imported, and built images live in a host-local catalog in the rootfs
 cache, each identified by its native BLAKE3 image identity over the rootfs
@@ -244,10 +244,10 @@ docker buildx build \
   .
 
 spore image import-oci /tmp/sporevm-app.oci \
-  --ref local/sporevm-app:dev \
+  --tag local/sporevm-app:dev \
   --platform linux/arm64
 
-spore run --image local/sporevm-app:dev 'echo hi'
+spore run --image local/sporevm-app:dev --shell 'echo hi'
 ```
 
 `import-oci` accepts either an OCI layout directory or an uncompressed OCI layout
@@ -268,7 +268,7 @@ docker buildx build \
   .
 
 spore image import-tar /tmp/sporevm-app-rootfs.tar \
-  --ref local/sporevm-app:dev \
+  --tag local/sporevm-app:dev \
   --platform linux/arm64
 ```
 
@@ -373,7 +373,7 @@ lifetime.
 Abandoned regular emit temps are reported and reclaimed by maintenance, and the
 next cache-store open scavenges them before reuse.
 
-When `spore run --image ... --save SPORE` saves a VM, the spore manifest
+When `spore run --image ... --save-checkpoint SPORE` saves a VM, the spore manifest
 records an immutable rootfs artifact: the ext4 materialization identity, size,
 virtio-blk binding, resolved OCI image identity, platform, and builder version.
 For image-created spores, that identity is the `rootfs.storage.index_digest`;
@@ -383,7 +383,7 @@ Any rootfs writes made during
 the run are represented as a `chunk-index-disk-v0` disk: `disk.base` names a
 `spore-disk-index-v2` under `cas/rootfs/blake3/indexes/`, and each nonzero
 writable chunk is stored under `cas/rootfs/blake3/objects/`. Product
-`spore attach` and `spore run --from` serve immutable rootfs bases from the
+`spore checkpoint resume` and `spore run --checkpoint` serve immutable rootfs bases from the
 flat materialization cache, opened under the verify-at-install,
 trust-at-open cache contract (see SECURITY.md) without re-hashing it. Saved
 writable disks open from their verified disk index and fault referenced chunk
@@ -394,18 +394,18 @@ chunks on demand, failing closed before unverifiable bytes reach the guest.
 Spores without `rootfs.storage` use the same trusted
 fd-backed open.
 
-`spore checkpoint pull STORE/TAG --out DIR` fetches a spore pushed to an
+`spore checkpoint pull STORE/TAG --output DIR` fetches a spore pushed to an
 [image store](image-format.md#spores) into DIR, and the disk index and objects
 the cache lacks into the rootfs cache `SPOREVM_ROOTFS_CACHE_DIR` selects.
 
 Plain `spore run --rootfs PATH` remains a local read-only run escape hatch.
 Named `spore vm create --rootfs PATH` records exact immutable rootfs identity in
 the digest cache for lifecycle saves. Combining one-shot `spore run
---rootfs PATH` with `--save` is rejected; run an image with `--image` (for
+--rootfs PATH` with `--save-checkpoint` is rejected; run an image with `--image` (for
 example one imported with `spore image import-tar`) so the save can record
 immutable rootfs identity.
 
-Validate OCI rootfs capture, fork, and parallel `spore run --from` execution
+Validate OCI rootfs capture, fork, and parallel `spore run --checkpoint` execution
 with the opt-in Ruby fan-out smoke:
 
 ```bash
@@ -428,7 +428,7 @@ SPORE_RESUME_TIME_UNIX_NS=...
 ```
 
 For the first local fan-out contract, `SPORE_PARALLEL_JOB` is the child index
-within the local `spore checkpoint fork DIR --count N --out OUT_DIR` batch and
+within the local `spore checkpoint fork DIR --count N --output OUT_DIR` batch and
 `SPORE_PARALLEL_JOB_COUNT` is `N`. The generation JSON also retains
 `fork_index`, `fork_count`, `generation`, `parent_generation`, and resume-time
 fields; the fork fields currently match the parallel fields. Distributed
@@ -446,7 +446,7 @@ Harnesses that can read the child manifest can compare the exact expected
 generation.
 
 The guest agent mixes the resume-time entropy seed into the kernel RNG before a
-forked `spore run --from` command starts. Live-forked processes can still carry
+forked `spore run --checkpoint` command starts. Live-forked processes can still carry
 process-local RNG state copied from the parent, so entropy-sensitive workloads
 must reexec, reseed their own runtime, or wait behind an application-level
 after-restore hook before generating secrets.

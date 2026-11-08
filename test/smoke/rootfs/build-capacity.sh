@@ -65,7 +65,7 @@ build_image() {
   local tag="$2"
   local stdout="$3"
   local stderr="$4"
-  "${spore_bin}" --debug build --network none -t "${tag}" "${context}" \
+  "${spore_bin}" --debug build --network none --tag "${tag}" "${context}" \
     >"${stdout}" 2>"${stderr}" || {
       cat "${stdout}" >&2 || true
       cat "${stderr}" >&2 || true
@@ -113,7 +113,7 @@ above_built_ref="local/build-capacity-smoke:above-cap-built"
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   --image "${image_ref}" \
-  --commit "${base_ref}" \
+  --commit-image "${base_ref}" \
   -- /bin/true
 
 build_context="${workdir}/build-context"
@@ -143,22 +143,22 @@ capture_dir="${workdir}/built.spore"
   --memory "${smoke_memory}" \
   --image "${built_ref}" \
   --pull=never \
-  --save "${capture_dir}" \
+  --save-checkpoint "${capture_dir}" \
   -- /bin/sh -lc 'grep -Fxq prepared-build /prepared-build-marker'
 assert_manifest_rootfs "${capture_dir}/manifest.json" "${built_index}" "${capacity_16}"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${capture_dir}" \
+  --checkpoint "${capture_dir}" \
   -- /bin/sh -lc "grep -Fxq prepared-build /prepared-build-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_16} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 15000000"
 
 pulled_dir="${workdir}/pulled.spore"
-"${spore_bin}" --json checkpoint push "${capture_dir}" "${workdir}/store/built" >"${workdir}/push.json"
+"${spore_bin}" --json checkpoint push "${capture_dir}" --to "${workdir}/store/built" >"${workdir}/push.json"
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
-  "${spore_bin}" --json checkpoint pull "file://${workdir}/store/built" --out "${pulled_dir}" >"${workdir}/pull.json"
+  "${spore_bin}" --json checkpoint pull "file://${workdir}/store/built" --output "${pulled_dir}" >"${workdir}/pull.json"
 assert_manifest_rootfs "${pulled_dir}/manifest.json" "${built_index}" "${capacity_16}"
 SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
-  "${spore_bin}" run --backend "${backend}" --from "${pulled_dir}" -- \
+  "${spore_bin}" run --backend "${backend}" --checkpoint "${pulled_dir}" -- \
     /bin/sh -lc "grep -Fxq prepared-build /prepared-build-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_16} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 15000000"
 
 "${spore_bin}" run \
@@ -166,7 +166,7 @@ SPOREVM_ROOTFS_CACHE_DIR="${pull_cache}" \
   --memory "${smoke_memory}" \
   --image "${built_ref}" \
   --pull=never \
-  --commit "${committed_ref}" \
+  --commit-image "${committed_ref}" \
   -- /bin/sh -lc 'printf "committed-build\n" >/committed-build-marker'
 
 committed_context="${workdir}/committed-context"
@@ -195,7 +195,7 @@ assert_no_resize "${workdir}/rebuilt.stdout" "${workdir}/rebuilt.stderr"
   --image "${built_ref}" \
   --pull=never \
   --disk-size 20gb \
-  --commit "${above_ref}" \
+  --commit-image "${above_ref}" \
   -- /bin/sh -lc 'printf "above-cap\n" >/above-cap-marker'
 
 above_context="${workdir}/above-context"
@@ -218,12 +218,12 @@ above_capture="${workdir}/above-cap.spore"
   --memory "${smoke_memory}" \
   --image "${above_built_ref}" \
   --pull=never \
-  --save "${above_capture}" \
+  --save-checkpoint "${above_capture}" \
   -- /bin/sh -lc 'grep -Fxq above-cap-built /above-cap-built-marker'
 assert_manifest_rootfs "${above_capture}/manifest.json" "${above_built_index}" "${capacity_20}"
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${above_capture}" \
+  --checkpoint "${above_capture}" \
   -- /bin/sh -lc "grep -Fxq above-cap-built /above-cap-built-marker && test \"\$(cat /sys/class/block/vda/size)\" -eq ${sectors_20} && test \"\$(df -k / | awk 'NR == 2 { print \$2 }')\" -gt 19000000"
 
 # Last, so the runs above start from the lazy chunked base: materialize the

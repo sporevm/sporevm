@@ -28,17 +28,17 @@ expect_rejected() {
   fi
 }
 
-expect_rejected remote-ref --image "${image_ref}" --commit registry.example/project:tag -- /bin/true
-expect_rejected raw-rootfs --rootfs missing.ext4 --commit local/run-commit-smoke:bad -- /bin/true
-expect_rejected saved-spore --from missing.spore --commit local/run-commit-smoke:bad -- /bin/true
-expect_rejected save --image "${image_ref}" --commit local/run-commit-smoke:bad --save "${workdir}/bad.spore" -- /bin/true
-expect_rejected interactive -i --image "${image_ref}" --commit local/run-commit-smoke:bad -- /bin/true
+expect_rejected remote-ref --image "${image_ref}" --commit-image registry.example/project:tag -- /bin/true
+expect_rejected raw-rootfs --rootfs missing.ext4 --commit-image local/run-commit-smoke:bad -- /bin/true
+expect_rejected saved-spore --checkpoint missing.spore --commit-image local/run-commit-smoke:bad -- /bin/true
+expect_rejected save --image "${image_ref}" --commit-image local/run-commit-smoke:bad --save-checkpoint "${workdir}/bad.spore" -- /bin/true
+expect_rejected interactive -i --image "${image_ref}" --commit-image local/run-commit-smoke:bad -- /bin/true
 
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   --image "${image_ref}" \
-  --commit local/run-commit-smoke:default-command
+  --commit-image local/run-commit-smoke:default-command
 "${spore_bin}" image resolve local/run-commit-smoke:default-command --platform "${smoke_platform}" >/dev/null
 
 payload="${workdir}/payload.txt"
@@ -49,7 +49,7 @@ events="${workdir}/commit.jsonl"
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   --image "${image_ref}" \
-  --commit local/run-commit-smoke:base \
+  --commit-image local/run-commit-smoke:base \
   --inject payload="${payload}" \
   -- /bin/sh -lc 'cat /run/sporevm/injected/payload >/committed.txt' \
   >"${events}"
@@ -70,7 +70,7 @@ grep -Fq '"rootfs_index_digest":"blake3:' "${events}" || die "commit event omitt
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   --image local/run-commit-smoke:base \
-  --commit local/run-commit-smoke:base \
+  --commit-image local/run-commit-smoke:base \
   --pull=never \
   -- /bin/sh -lc 'echo refreshed >/refreshed.txt'
 "${spore_bin}" run \
@@ -86,7 +86,7 @@ if (( ! x86_fresh_only )); then
     --memory "${smoke_memory}" \
     --vcpus 2 \
     --image local/run-commit-smoke:base \
-    --commit local/run-commit-smoke:multi-vcpu \
+    --commit-image local/run-commit-smoke:multi-vcpu \
     --pull=never \
     -- /bin/sh -lc 'echo multi-vcpu >/multi-vcpu.txt'
   "${spore_bin}" run \
@@ -102,7 +102,7 @@ if "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
   --image local/run-commit-smoke:base \
-  --commit local/run-commit-smoke:base \
+  --commit-image local/run-commit-smoke:base \
   --pull=never \
   -- /bin/sh -lc 'echo discarded >/failed.txt; exit 23'; then
   die "nonzero guest command unexpectedly succeeded"
@@ -116,7 +116,7 @@ if (( x86_fresh_only )); then
     --memory "${smoke_memory}" \
     --timeout 100ms \
     --image local/run-commit-smoke:base \
-    --commit local/run-commit-smoke:timed-out \
+    --commit-image local/run-commit-smoke:timed-out \
     --pull=never \
     -- /bin/sh -lc 'sleep 5'; then
     die "timed-out x86 commit command unexpectedly succeeded"
@@ -135,19 +135,19 @@ children_dir="${workdir}/children"
   --memory "${smoke_memory}" \
   --image local/run-commit-smoke:base \
   --pull=never \
-  --save "${warm_spore}" \
+  --save-checkpoint "${warm_spore}" \
   -- /bin/sh -lc 'test ! -e /failed.txt && grep -Fxq copied-from-transient-injection /committed.txt'
-"${spore_bin}" checkpoint fork "${warm_spore}" --count 2 --out "${children_dir}"
+"${spore_bin}" checkpoint fork "${warm_spore}" --count 2 --output "${children_dir}"
 
 children=("${children_dir}"/[0-9][0-9][0-9][0-9][0-9][0-9])
 [[ "${#children[@]}" -eq 2 ]] || die "fork did not create two children"
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${children[0]}" \
+  --checkpoint "${children[0]}" \
   -- /bin/sh -lc 'test ! -e /child-private && grep -Fxq copied-from-transient-injection /committed.txt && echo child-0 >/child-private'
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${children[1]}" \
+  --checkpoint "${children[1]}" \
   -- /bin/sh -lc 'test ! -e /child-private && grep -Fxq copied-from-transient-injection /committed.txt && echo child-1 >/child-private'
 
 echo "smoke:run-image-commit ok backend=${backend} image=${image_ref}"

@@ -16,7 +16,7 @@ source_name="image-context-source"
 override_name="image-context-override"
 lookup_name="image-context-lookup"
 failed_name="image-context-failed"
-child_name="image-context-child"
+child_name="image-context-child-0"
 restored_name="image-context-restored"
 saved_spore="${workdir}/child.spore"
 image_ref="local/sporevm-image-context:smoke"
@@ -75,7 +75,7 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 expect_eq 'default|inherited|/workspace' "${default_context}" "detached image command defaults"
-"${spore_bin}" --json vm logs "${source_name}" | python3 -c '
+"${spore_bin}" --json vm logs "${source_name}" --initial | python3 -c '
 import json
 import sys
 
@@ -122,7 +122,7 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 expect_eq 'default|inherited|/workspace' "${detached_context}" "detached create context"
-if "${spore_bin}" vm logs "${override_name}" >/dev/null 2>&1; then
+if "${spore_bin}" vm logs "${override_name}" --initial >/dev/null 2>&1; then
   die "discarded initial output was unexpectedly retrievable"
 fi
 
@@ -221,12 +221,12 @@ if grep -Fq 'ephemeral-only' "${SPOREVM_RUNTIME_DIR}/vms/${source_name}/spec.jso
   die "per-exec environment value persisted in named runtime metadata"
 fi
 
-"${spore_bin}" vm fork "${source_name}" --count 1 --name "${child_name}"
+"${spore_bin}" vm fork "${source_name}" --count 1 --name-prefix image-context-child
 expect_eq 'default|inherited|/workspace' \
   "$("${spore_bin}" vm exec "${child_name}" -- /bin/sh -lc 'printf "%s|%s|%s" "$IMAGE_VALUE" "$CLEAR_ME" "$PWD"')" \
   "forked named exec defaults"
 
-"${spore_bin}" vm save "${child_name}" --out "${saved_spore}" --stop
+"${spore_bin}" vm save "${child_name}" --output "${saved_spore}" --stop
 for metadata in "${saved_spore}/sporevm-lifecycle.json" "${saved_spore}/manifest.json"; do
   grep -Fq '"IMAGE_VALUE=default"' "${metadata}" || die "image environment missing from ${metadata}"
   grep -Fq '"CLEAR_ME=inherited"' "${metadata}" || die "clearable image environment missing from ${metadata}"
@@ -236,7 +236,7 @@ for metadata in "${saved_spore}/sporevm-lifecycle.json" "${saved_spore}/manifest
   fi
 done
 
-"${spore_bin}" vm restore "${saved_spore}" --name "${restored_name}" --backend "${backend}"
+"${spore_bin}" vm restore "${restored_name}" --checkpoint "${saved_spore}" --backend "${backend}"
 expect_eq 'default|inherited|/workspace' \
   "$("${spore_bin}" vm exec "${restored_name}" -- /bin/sh -lc 'printf "%s|%s|%s" "$IMAGE_VALUE" "$CLEAR_ME" "$PWD"')" \
   "restored named exec defaults"
