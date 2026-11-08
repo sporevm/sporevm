@@ -48,4 +48,15 @@ store corruption fails before the requested tag is published, explicit platform
 mismatch fails, and modifying an export does not alter a later export.
 
 CI and hardware acceptance remain required. SSM access works on the managed
-Mac and ARM64 CI host; AWS credential refresh and scoped timeouts are next.
+Mac and ARM64 CI host. Acquisition/export is in #695.
+
+AWS read credentials now resolve through AWS CLI v2 unless explicit environment
+credentials are present, with validated expiry, synchronized refresh and
+request-owned session tokens. Local review found no material issues after
+checking refresh/cancellation, credential precedence and token lifetime. The
+full suite passes 1,664 tests with 36 skips; the 27 public CLI cases, contract
+checks and version check pass. A scratch test against the actual AWS CLI v2
+resolved the selected shared-file profile, its region and session token and
+signed with that profile's identity. The scratch test was removed; deterministic
+provider/expiry tests and parser fuzz seeds remain. CI acceptance and scoped
+timeouts are next.

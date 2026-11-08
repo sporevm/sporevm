@@ -45,10 +45,10 @@ Registry tags refresh; native inputs preserve their recorded platform. Local
 and native-store images can also be exported as independent writable ext4 files
 with native-identity metadata, without fabricated OCI provenance.
 
-AWS profile/refresh support for reads and timeout redesign are still pending.
-`--save-on INT` still makes Ctrl-C
-save successfully, not cancel; human mode prints a notice. S3 reads still need
-explicit environment credentials and region, unlike AWS-CLI-backed pushes.
+S3 reads now use AWS CLI v2's profile/provider chain when explicit environment
+credentials are absent, and refresh expiring provider credentials before use.
+Timeout redesign is still pending. `--save-on INT` makes Ctrl-C save
+successfully, not cancel; human mode prints a notice.
 Pinned Kubernetes deployments must stay on their current CLI until the removed
 bundle workflow is migrated and tested; this is not a coordinated k8s upgrade.
 
@@ -244,15 +244,12 @@ v0.18.0 resets SporeVM's local formats and reads nothing older.
   fetched on first use, with the objects of the next 7 chunks.
 - `--save`, `--save-on`, `--commit` and `spore save` first fetch the rest of
   the image, so the result needs nothing from the store.
-- S3 reads are SigV4-signed with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-  the optional `AWS_SESSION_TOKEN`, and `AWS_REGION` or `AWS_DEFAULT_REGION`
-  from the environment only. Profiles, `~/.aws`, instance roles and pod
-  identity are not read; without the variables a run fails with
-  `AwsCredentialsMissing` or `AwsRegionMissing`, and with `AWS_ENDPOINT_URL`
-  or `AWS_ENDPOINT_URL_S3` set it fails with `AwsEndpointUrlUnsupported`. A VM
-  reads them when its disk opens and keeps them, so fetches fail once
-  temporary credentials expire. Readers need `s3:GetObject`. See
-  `docs/image-format.md`.
+- S3 reads use explicit environment credentials or AWS CLI v2's credential
+  chain, including `AWS_PROFILE` and renewable role credentials. Provider
+  credentials refresh before expiry; explicit environment credentials remain
+  fixed. Region comes from `AWS_REGION`, `AWS_DEFAULT_REGION`, or the selected
+  profile. `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3` still fail closed.
+  Readers need `s3:GetObject`. See `docs/image-format.md`.
 
 ### Other changes
 
