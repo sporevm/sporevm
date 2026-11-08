@@ -321,6 +321,8 @@ pub fn fromZigError(err: anyerror) CliError {
         error.EventSinkFailed,
         error.StreamInterrupted,
         => CliError.init(.stream_interrupted, ErrorCode.stream_interrupted.defaultMessage(), @errorName(err)),
+        error.GuestStartupTimedOut => CliError.init(.runtime_execution_failed, "guest startup timed out before request delivery; increase --startup-timeout", @errorName(err)),
+        error.GuestExecutionTimedOut => CliError.init(.runtime_execution_failed, "guest execution timed out; increase --exec-timeout (checkpoint resume: --for), or use none", @errorName(err)),
         else => CliError.init(.runtime_execution_failed, ErrorCode.runtime_execution_failed.defaultMessage(), @errorName(err)),
     };
 }

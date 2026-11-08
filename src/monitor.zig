@@ -133,6 +133,7 @@ const Exec = struct {
     /// The guest request; attaching the stream copies it.
     request: []const u8,
     session_sequence: u64,
+    timeout_ms: ?u64 = null,
     output: union(enum) {
         /// Kept in `ExecServer.capture` and returned in the response.
         captured,
@@ -319,6 +320,7 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
 
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     var server = try ExecServer.init(allocator, init.io, entry, paths.vm_dir, paths.runtime_root, paths.control_socket_path, cache_root, spec.guest_port, spec.timeout_ms, spec_resume_generation_params, spec_exec_defaults);
+    server.startup_timeout_ms = spec.startup_timeout_ms;
     defer server.disk_claims.deinit();
     defer if (server.disk_baseline_active) |*active| active.deinit();
     // Runs after the accept thread has joined every handler, any of which
@@ -384,7 +386,7 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
             .mode = .{ .monitor = .{
                 .control = server.control(),
                 .readiness = readiness_probe,
-                .timeout_ms = spec.timeout_ms,
+                .timeout_ms = spec.startup_timeout_ms,
                 .fork_head = if (runtime_disk_head) |*head| head else null,
             } },
         });
@@ -483,6 +485,7 @@ const ExecServer = struct {
     cache_root: []const u8,
     guest_port: u32,
     timeout_ms: u64,
+    startup_timeout_ms: u64 = 30_000,
     server: net.Server,
     generation_params: ?[]const u8,
     exec_defaults: lifecycle.ExecDefaults,
@@ -555,6 +558,7 @@ const ExecServer = struct {
             .cache_root = cache_root,
             .guest_port = guest_port,
             .timeout_ms = timeout_ms,
+            .startup_timeout_ms = if (timeout_ms == 0) 30_000 else timeout_ms,
             .server = try address.listen(io, .{ .kernel_backlog = max_control_handlers }),
             .generation_params = generation_params,
             .exec_defaults = exec_defaults,
@@ -824,8 +828,12 @@ const ExecServer = struct {
                 self.cond.broadcast(self.io);
             },
             else => {
-                if (self.active_stream.elapsedMs() > self.timeout_ms) {
-                    try self.failExecLocked(exec orelse return error.GuestReadinessProbeFailed, "guest exec timed out");
+                const execution_ms = if (exec) |active| active.timeout_ms orelse self.timeout_ms else self.startup_timeout_ms;
+                if (self.active_stream.timeoutPhase(self.startup_timeout_ms, execution_ms)) |phase| {
+                    try self.failExecLocked(exec orelse return error.GuestStartupTimedOut, switch (phase) {
+                        .startup => "guest startup timed out before request delivery",
+                        .execution => "guest execution timed out; command cancelled, named VM retained",
+                    });
                     dev.resetHostStream();
                 }
             },
@@ -853,9 +861,9 @@ const ExecServer = struct {
     }
 
     /// Waits for the guest operation slot. A request queues behind the
-    /// running operation for up to the VM's timeout.
+    /// running operation for up to the VM's startup timeout.
     fn acquireOpLocked(self: *ExecServer) !void {
-        const deadline = lifecycle.monotonicMs() +| self.timeout_ms;
+        const deadline = lifecycle.monotonicMs() +| self.startup_timeout_ms;
         while (true) {
             if (self.stopping != null) return error.MonitorStopping;
             if (self.op == .idle) return;
@@ -893,7 +901,7 @@ const ExecServer = struct {
         return self.takeResponseLocked();
     }
 
-    fn submitStreamingExec(self: *ExecServer, request: []const u8, session_sequence: u64, client_fd: std.c.fd_t) !void {
+    fn submitStreamingExec(self: *ExecServer, request: []const u8, session_sequence: u64, client_fd: std.c.fd_t, timeout_ms: ?u64) !void {
         if (request.len > vsock.max_payload) return error.ControlRequestTooLarge;
         try setStreamingSendDeadline(client_fd);
         self.mutex.lockUncancelable(self.io);
@@ -904,6 +912,7 @@ const ExecServer = struct {
         self.op = .{ .exec = .{
             .request = request,
             .session_sequence = session_sequence,
+            .timeout_ms = timeout_ms,
             .output = .{ .streamed = .{ .client_fd = client_fd } },
         } };
         if (self.wake) |wake| wake.wake();
@@ -964,6 +973,7 @@ const ExecServer = struct {
             .terminal_size = terminal_size,
             .resume_time_unix_ns = self.wallClockUnixNs(),
             .generation_params = self.generation_params,
+            .cancel_on_disconnect = true,
         });
     }
 
@@ -1940,7 +1950,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor
                 return writeStreamingControlError(fd, guestCommandErrorMessage(err));
             };
             defer server.allocator.free(exec_request);
-            server.submitStreamingExec(exec_request, session_sequence, fd) catch |err| {
+            server.submitStreamingExec(exec_request, session_sequence, fd, exec.timeout_ms) catch |err| {
                 return writeStreamingControlError(fd, server.refusalMessage(err));
             };
             defer server.finishStreamingExec();
@@ -1954,7 +1964,7 @@ fn handleControlClient(server: *ExecServer, stream: net.Stream, request: monitor
                 return writeStreamingControlError(fd, "invalid copy request");
             };
             defer server.allocator.free(exec_request);
-            server.submitStreamingExec(exec_request, session_sequence, fd) catch |err| {
+            server.submitStreamingExec(exec_request, session_sequence, fd, null) catch |err| {
                 return writeStreamingControlError(fd, server.refusalMessage(err));
             };
             defer server.finishStreamingExec();

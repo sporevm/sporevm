@@ -31,6 +31,11 @@ pub fn parseDurationMs(raw: []const u8) !u64 {
     return parsePositiveDuration(raw, std.time.ms_per_s);
 }
 
+/// Execution/session limits alone accept `none`; readiness stays bounded.
+pub fn parseExecutionDurationMs(raw: []const u8) !u64 {
+    return if (std.mem.eql(u8, raw, "none")) 0 else parseDurationMs(raw);
+}
+
 fn parsePositiveDuration(number: []const u8, multiplier: u64) !u64 {
     const value = try parsePositiveDurationInteger(number);
     return try std.math.mul(u64, value, multiplier);

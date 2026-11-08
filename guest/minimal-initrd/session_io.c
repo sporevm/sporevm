@@ -423,7 +423,14 @@ void poll_session_exit(struct session *session, struct client *client) {
       session->stderr_open = 0;
     }
   }
-  if (!session->build_run_isolation) close_session_cgroup(session);
+  if (session->cancel_on_disconnect) {
+    if (stop_session_processes(session, session->pid) != 0) {
+      dprintf(2, "spore exec: process cleanup failed\n");
+      _exit(125);
+    }
+  } else if (!session->build_run_isolation) {
+    close_session_cgroup(session);
+  }
 }
 
 void maybe_send_session_exit(struct session *session, struct client *client) {
@@ -469,6 +476,7 @@ int start_transient_exec(struct exec_op *op, struct client *client, const struct
 
   const struct session_start_options options = {
     .use_rootfs = use_rootfs,
+    .cancel_on_disconnect = request->cancel_on_disconnect,
     .exec_lookup = EXEC_LOOKUP_PATH,
     .stdin_enabled = request->stdin_enabled,
     .terminal_rows = request->terminal_rows,
@@ -488,8 +496,10 @@ int start_transient_exec(struct exec_op *op, struct client *client, const struct
 // killing the command if the client went first.
 void finish_transient_exec(struct exec_op *op, struct client *client) {
   if (client->fd < 0 && op->session.started && !op->session.exited) {
-    (void)kill(op->session.pid, SIGKILL);
-    wait_child_blocking(op->session.pid);
+    if (stop_session_processes(&op->session, op->session.pid) != 0) {
+      dprintf(2, "spore exec: process cleanup failed\n");
+      _exit(125);
+    }
   }
   reset_session(&op->session);
   close_client(client);

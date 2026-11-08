@@ -129,6 +129,12 @@ Input: guest bytes on vsock, and requests the trusted initrd agent parses.
   guest, with explicit truncation flags.
 - A saved session's output offsets only select what the agent replays from
   output it still holds; any other offset fails the attach.
+- Named streamed commands use `exec-v1`, with the same exact member set as
+  `start-v1` but explicit client-owned lifetime; detached execution is rejected.
+  Before releasing the child, the agent creates a cgroup for its descendants.
+  Disconnect, timeout, or command exit kills and drains that cgroup before
+  reuse; cleanup failure stops the agent rather than claiming cancellation.
+  Saved `start-v1` sessions retain their disconnect-and-resume behavior.
 - The shipped initrd holds only the agent, a pinned Toybox, `/bin/sh`,
   `/bin/true`, and `/bin/false`; smoke helpers need `-Dsmoke-helpers`.
 
@@ -141,8 +147,8 @@ generation params and runs only on aarch64 Linux.
 Input: checkpoint directories on disk or pulled from a store; disk indexes;
 pin records; runtime disk-fork messages between local monitors.
 
-- `manifest.json` is format v7, at most 64 MiB, and strictly validated before
-  anything is mapped; versions 0 to 6 fail as too old. Saves validate the same
+- `manifest.json` is format v8, at most 64 MiB, and strictly validated before
+  anything is mapped; versions 0 to 7 fail as too old. Saves validate the same
   way before writing. Machine state is normalized architectural state, never
   raw KVM or Hypervisor.framework structures.
 - Elastic memory is bounded to 8192 blocks of 2 MiB, with sorted,

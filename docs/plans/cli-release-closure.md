@@ -47,8 +47,8 @@ preserves native identity. A 512 MiB sparse export occupies 320 KiB. Native
 store corruption fails before the requested tag is published, explicit platform
 mismatch fails, and modifying an export does not alter a later export.
 
-CI and hardware acceptance remain required. SSM access works on the managed
-Mac and ARM64 CI host. Acquisition/export is in #695.
+Acquisition/export landed in #695 after Buildkite 2121 passed. SSM access works
+on the managed Mac and ARM64 CI host.
 
 AWS read credentials now resolve through AWS CLI v2 unless explicit environment
 credentials are present, with validated expiry, synchronized refresh and
@@ -59,4 +59,13 @@ checks and version check pass. A scratch test against the actual AWS CLI v2
 resolved the selected shared-file profile, its region and session token and
 signed with that profile's identity. The scratch test was removed; deterministic
 provider/expiry tests and parser fuzz seeds remain. CI acceptance and scoped
-timeouts are next.
+timeouts were next; #696 has now landed after Buildkite 2122 passed.
+
+Scoped deadlines and named process-tree cancellation are implemented. The
+pre-fix delayed-child reproducer failed on both managed hosts; the new timeout
+smoke passes on both. Final-candidate hardware and CI acceptance remain.
+Local clean-cache checks pass 1,666 tests with 36 skips, all 32 public CLI
+cases in both modes, initrd reproducibility, contracts and version checks.
+Checkpoint format advances to v8: saved older agents cannot implement managed
+command cancellation. Re-create older checkpoints; native image layout stays
+unchanged. Final usage-lab audit, #693 and release publication remain open.

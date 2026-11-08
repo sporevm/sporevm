@@ -94,7 +94,8 @@ pub const create_usage =
     \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
     \\  --vcpus N               Guest vCPU count (1-8; backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
-    \\  --timeout DURATION      Exec timeout (default: 30s; e.g. 500ms, 1m)
+    \\  --startup-timeout DURATION  Monitor/guest readiness limit (default: 30s)
+    \\  --exec-timeout DURATION     Default command limit (default: 30s; none disables)
     \\  --console-log PATH      Write guest console output, and, in a VM this command boots, a copy of command output, to PATH
     \\  --initial-output MODE   retain or discard initial-command output (default: retain)
     \\  --shell STRING          Run /bin/sh -lc STRING instead of exact argv
@@ -125,6 +126,7 @@ pub const exec_usage =
     \\Options:
     \\  --env KEY[=VALUE]       Override image environment; KEY copies the host value
     \\  --workdir PATH          Override the image working directory
+    \\  --exec-timeout DURATION  Override the VM's command limit; none disables
     \\  --shell STRING          Run /bin/sh -lc STRING instead of exact argv
     \\  -i, --interactive       Keep stdin open and forward it to the guest process
     \\  -t, --tty               Allocate a guest terminal for the process
@@ -132,8 +134,8 @@ pub const exec_usage =
     \\  -h, --help              Show this help
     \\
     \\Options may precede or follow NAME, but must precede --. Everything after
-    \\-- is guest argv. The command inherits the VM's --timeout; there is no
-    \\per-exec override. On timeout the exec stream fails; the named VM remains.
+    \\-- is guest argv. Execution starts at guest request delivery, not in the
+    \\queue. Timeout cancels the command and descendants; the named VM remains.
     \\
 ;
 
@@ -245,6 +247,7 @@ const CreateOptionsFile = struct {
     max_memory: ?[]const u8 = null,
     vcpus: ?topology.VcpuCount = null,
     guest_port: ?u32 = null,
+    startup_timeout_ms: ?u64 = null,
     timeout_ms: ?u64 = null,
     console_log_path: ?[]const u8 = null,
     initial_output: ?InitialOutputDisposition = null,
@@ -279,6 +282,7 @@ const ExecOptions = struct {
     command: []const []const u8,
     guest_env_specs: guest_request.GuestEnvSpecList = .{},
     guest_working_dir: ?[]const u8 = null,
+    timeout_ms: ?u64 = null,
     interactive: bool = false,
     tty: bool = false,
 };
@@ -352,6 +356,7 @@ pub fn createCli(ctx: *const Ctx, args: []const []const u8) !void {
         .memory = spec.memory,
         .vcpus = spec.vcpus,
         .guest_port = spec.guest_port,
+        .startup_timeout_ms = spec.startup_timeout_ms,
         .timeout_ms = spec.timeout_ms,
         .console_log_path = spec.console_log_path,
         .initial_output = parsed.initial_output,
@@ -507,6 +512,7 @@ pub fn execCli(ctx: *const Ctx, args: []const []const u8) !void {
         .command = command,
         .guest_env = guest_env,
         .guest_working_dir = parsed.guest_working_dir,
+        .timeout_ms = parsed.timeout_ms,
         .interactive = parsed.interactive,
         .tty = parsed.tty,
         .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
@@ -534,6 +540,10 @@ fn execCliEvents(init: std.process.Init, allocator: std.mem.Allocator, parsed: E
         .command = command,
         .guest_env = guest_env,
         .guest_working_dir = parsed.guest_working_dir,
+        .timeout_ms = parsed.timeout_ms,
+        .interactive = parsed.interactive,
+        .tty = parsed.tty,
+        .terminal_size = attach_stream.terminalSizeOrDefault(attach_stream.terminalSizeFd()),
     }) catch |err| {
         const classified = events_mod.classifyFailure(err);
         const message = allocLifecycleLastErrorMessage(allocator, "exec", classified.message);
@@ -1206,6 +1216,10 @@ fn parseCreateOptionsFile(
     try out.spec.memory.validate();
     if (file.vcpus) |vcpus| out.spec.vcpus = vcpus;
     if (file.guest_port) |port| out.spec.guest_port = port;
+    if (file.startup_timeout_ms) |timeout| {
+        if (timeout == 0) return error.InvalidStartupTimeout;
+        out.spec.startup_timeout_ms = timeout;
+    }
     if (file.timeout_ms) |timeout| out.spec.timeout_ms = timeout;
     out.spec.console_log_path = file.console_log_path;
     out.initial_output = file.initial_output orelse out.initial_output;
@@ -1380,10 +1394,14 @@ fn parseCreateArgs(
             field_flag_seen = true;
             const flag = args[i];
             spec.guest_port = parseIntArgLifecycleCli(u32, allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
-        } else if (std.mem.eql(u8, args[i], "--timeout")) {
+        } else if (std.mem.eql(u8, args[i], "--startup-timeout")) {
             field_flag_seen = true;
             const flag = args[i];
-            spec.timeout_ms = parseDurationArgLifecycleCli(allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
+            spec.startup_timeout_ms = parseDurationArgLifecycleCli(allocator, stderr, mode, "create", takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag), flag);
+        } else if (std.mem.eql(u8, args[i], "--exec-timeout") or std.mem.eql(u8, args[i], "--timeout")) {
+            field_flag_seen = true;
+            const flag = args[i];
+            spec.timeout_ms = cli_args.parseExecutionDurationMs(takeValueLifecycleCli(allocator, stderr, mode, "create", args, &i, flag)) catch usageExit("spore vm create: --exec-timeout expects a positive duration or none\n");
         } else if (std.mem.eql(u8, args[i], "--timeout-ms")) {
             field_flag_seen = true;
             const flag = args[i];
@@ -1472,6 +1490,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
     var command: []const []const u8 = &.{};
     var guest_env_specs = guest_request.GuestEnvSpecList{};
     var guest_working_dir: ?[]const u8 = null;
+    var timeout_ms: ?u64 = null;
     var interactive = false;
     var tty = false;
 
@@ -1487,6 +1506,10 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
             if (i + 1 >= args.len) usageExit("spore vm exec: --shell requires a command string\n");
             i += 1;
             command = args[i .. i + 1];
+        } else if (std.mem.eql(u8, args[i], "--exec-timeout")) {
+            if (i + 1 >= args.len) usageExit(exec_usage);
+            i += 1;
+            timeout_ms = cli_args.parseExecutionDurationMs(args[i]) catch usageExit("spore vm exec: --exec-timeout expects a positive duration or none\n");
         } else if (std.mem.eql(u8, args[i], "--env")) {
             if (i + 1 >= args.len) usageExit(exec_usage);
             i += 1;
@@ -1520,6 +1543,7 @@ fn parseExecArgs(args: []const []const u8) ExecOptions {
         .command = command,
         .guest_env_specs = guest_env_specs,
         .guest_working_dir = guest_working_dir,
+        .timeout_ms = timeout_ms,
         .interactive = interactive,
         .tty = tty,
     };

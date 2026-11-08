@@ -42,6 +42,11 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
         (["vm", "exec", "missing", "--json", "--", "true"], 2, "usage.invalid_argument", "before", True),
         (["vm", "exec", "missing", "--workdir", "/one", "--workdir", "/two", "--", "pwd"], 2, "usage.invalid_argument", "once", True),
         (["run", "--timeout", "1s", "--timeout-ms", "2000", "--", "true"], 2, "usage.invalid_argument", "once", True),
+        (["run", "--exec-timeout", "none", "--timeout", "1s", "--", "true"], 2, "usage.invalid_argument", "once", True),
+        (["run", "--startup-timeout", "none", "--", "true"], 2, "usage.invalid_argument", "duration", True),
+        (["vm", "exec", "--exec-timeout", "none", "missing", "--", "true"], 22, "object.invalid", "missing", True),
+        (["vm", "exec", "missing", "--exec-timeout", "0s", "--", "true"], 2, "usage.invalid_argument", "positive duration", True),
+        (["build", ".", "--step-timeout", "none"], 2, "usage.invalid_argument", "positive duration", False),
         (["checkpoint", "pull", "s3://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "incomplete AWS credentials", False),
         (["checkpoint", "pull", "gs://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "scheme", False),
     ]

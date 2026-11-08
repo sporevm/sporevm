@@ -232,6 +232,7 @@ pub const CreateNamedOptions = struct {
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
+    startup_timeout_ms: u64 = 30_000,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
     initial_output: InitialOutputDisposition = .retain,
@@ -338,6 +339,7 @@ pub const ExecNamedStreamOptions = struct {
     command: []const []const u8,
     guest_env: []const []const u8 = &.{},
     guest_working_dir: ?[]const u8 = null,
+    timeout_ms: ?u64 = null,
     interactive: bool = false,
     tty: bool = false,
     terminal_size: TerminalSize = .{ .rows = 24, .cols = 80 },
@@ -390,6 +392,7 @@ pub fn createNamedWithTiming(
         .memory = options.memory,
         .vcpus = options.vcpus,
         .guest_port = options.guest_port,
+        .startup_timeout_ms = options.startup_timeout_ms,
         .timeout_ms = options.timeout_ms,
         .console_log_path = options.console_log_path,
         .annotations = options.annotations,
@@ -436,7 +439,7 @@ pub fn createNamedWithTiming(
     try spawnMonitorExecutable(init, arena, paths, &claim, spec, options.spore_executable, options.debug);
     claimed = false;
     const monitor_spawned_ms = monotonicMs();
-    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
+    try waitForReadyResult(arena, init.io, paths, spec.startup_timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
     writeCreateTiming(arena, init.io, paths, .{
         .parse_ms = timing.parsed_ms - timing.start_ms,
@@ -594,6 +597,7 @@ pub fn restoreNamed(
         .memory = memory,
         .vcpus = manifest.platform.vcpu_count,
         .guest_port = base.guest_port,
+        .startup_timeout_ms = base.startup_timeout_ms,
         .timeout_ms = base.timeout_ms,
         // Saved lifecycle metadata is part of the spore input and must not
         // authorize truncating an arbitrary host path during restore.
@@ -610,7 +614,7 @@ pub fn restoreNamed(
     try spawnMonitorExecutable(init, arena, paths, &claim, spec, options.spore_executable, options.debug);
     claimed = false;
     const monitor_spawned_ms = monotonicMs();
-    try waitForReadyResult(arena, init.io, paths, spec.timeout_ms, options.spore_executable);
+    try waitForReadyResult(arena, init.io, paths, spec.startup_timeout_ms, options.spore_executable);
     const ready_ms = monotonicMs();
 
     var ready = try readReady(arena, init.io, paths);
@@ -1576,6 +1580,7 @@ fn startForkChildExecutable(
         .memory = memory,
         .vcpus = manifest.platform.vcpu_count,
         .guest_port = base.guest_port,
+        .startup_timeout_ms = base.startup_timeout_ms,
         .timeout_ms = base.timeout_ms,
         .console_log_path = null,
     };
@@ -1594,7 +1599,7 @@ fn startForkChildExecutable(
     });
     try spawnMonitorExecutable(init, allocator, child.paths, &child.claim.?, spec, spore_executable, debug);
     child.claim = null;
-    try waitForReadyResult(allocator, init.io, child.paths, spec.timeout_ms, spore_executable);
+    try waitForReadyResult(allocator, init.io, child.paths, spec.startup_timeout_ms, spore_executable);
 }
 
 /// Stops and removes every child whose monitor started. Children still
@@ -2069,6 +2074,7 @@ fn openExecNamedStreamAt(context: Context, allocator: std.mem.Allocator, socket_
         .env = options.guest_env,
         .working_dir = options.guest_working_dir,
         .stdio = if (options.tty) .tty else .pipe,
+        .timeout_ms = options.timeout_ms,
         .terminal_rows = options.terminal_size.rows,
         .terminal_cols = options.terminal_size.cols,
     } });

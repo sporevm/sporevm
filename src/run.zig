@@ -63,6 +63,7 @@ pub const Request = struct {
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
+    startup_timeout_ms: u64 = 30_000,
     timeout_ms: u64 = 30_000,
     save: ?Save = null,
     annotations: spore.Annotations = .{},
@@ -154,6 +155,7 @@ pub const SharedOptions = struct {
     max_memory_set: bool = false,
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
+    startup_timeout_ms: u64 = 30_000,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
 };
@@ -222,7 +224,8 @@ pub const cli_usage =
     \\  --max-memory SIZE       Elastic memory ceiling (default: same as --memory)
     \\  --vcpus N               Guest vCPU count (1-8; save/restore backend-dependent)
     \\  --guest-port N          Guest vsock listen port (default: 10700)
-    \\  --timeout DURATION      Command-probe timeout, including execution (default: 30s)
+    \\  --startup-timeout DURATION  Guest readiness limit (default: 30s)
+    \\  --exec-timeout DURATION     Command limit after request delivery (default: 30s; none disables)
     \\  --console-log PATH      Write guest console output, and, in a VM this command boots, a copy of command output, to PATH
     \\  --env KEY[=VALUE]       Set or copy a host env var for the guest command
     \\  --inject ID=PATH        Inject PATH as /run/sporevm/injected/ID for this run
@@ -232,8 +235,8 @@ pub const cli_usage =
     \\  -- <argv...>            Run exact argv instead of /bin/sh -lc
     \\  -h, --help              Show this help
     \\
-    \\--timeout starts with the guest command probe, not image acquisition;
-    \\expiry fails the invocation and tears down its throwaway VM. --timeout-ms
+    \\Startup and execution have separate clocks; neither bounds image acquisition.
+    \\Expiry fails the invocation and tears down its throwaway VM. --timeout-ms
     \\is also accepted. --save-on INT makes Ctrl-C save successfully, not cancel;
     \\send SIGTERM to cancel instead. --continue-after-save keeps the source alive.
     \\Checkpoints are cache-pinned directories, not standalone portable files.
@@ -847,7 +850,7 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, request: Re
         .allocator = allocator,
         .command_stream = &stream,
         .guest_port = request.guest_port,
-        .timeout_ms = request.timeout_ms,
+        .timeout_ms = request.startup_timeout_ms,
         .cache_root = cache_root,
         .rootfs_grow_target = grow_target,
         .phase = if (grow_target != 0) .start_resize else .wait_command,
@@ -906,6 +909,7 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, request: Re
         .mode = .{ .oneshot = .{
             .probe = .{
                 .stream = &stream,
+                .startup_timeout_ms = request.startup_timeout_ms,
                 .timeout_ms = request.timeout_ms,
                 .start = if (grow_target != 0) .control else .immediate,
                 .on_complete = if (commit == null) .stop else .detach,
@@ -1211,8 +1215,10 @@ fn parseSharedOption(shared: *SharedOptions, args: []const []const u8, i: *usize
         shared.vcpus = parseVcpuCountOrExit(name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--guest-port")) {
         shared.guest_port = try parseGuestPort(name, takeValue(args, i, name));
-    } else if (std.mem.eql(u8, name, "--timeout")) {
-        shared.timeout_ms = parseDurationMsOrExit(name, takeValue(args, i, name));
+    } else if (std.mem.eql(u8, name, "--startup-timeout")) {
+        shared.startup_timeout_ms = parseDurationMsOrExit(name, takeValue(args, i, name));
+    } else if (std.mem.eql(u8, name, "--exec-timeout") or std.mem.eql(u8, name, "--timeout")) {
+        shared.timeout_ms = cli_args.parseExecutionDurationMs(takeValue(args, i, name)) catch failCliSetup("{s} expects a positive duration or none", .{name});
     } else if (std.mem.eql(u8, name, "--timeout-ms")) {
         shared.timeout_ms = try parsePositive(u64, name, takeValue(args, i, name));
     } else if (std.mem.eql(u8, name, "--console-log")) {

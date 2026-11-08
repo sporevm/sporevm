@@ -167,7 +167,7 @@ fn runOn(comptime Vms: type, context: Context, allocator: std.mem.Allocator, ses
 
     const probe: ?vmm.Probe, const control: ?vsock_control.Control = switch (session.mode) {
         .oneshot => |oneshot| .{ oneshot.probe, oneshot.control },
-        .monitor => |monitor| .{ .{ .stream = monitor.readiness, .timeout_ms = monitor.timeout_ms, .on_complete = .detach }, monitor.control },
+        .monitor => |monitor| .{ .{ .stream = monitor.readiness, .startup_timeout_ms = monitor.timeout_ms, .timeout_ms = monitor.timeout_ms, .on_complete = .detach }, monitor.control },
         .build => |build| .{ null, build.control },
     };
     const build: ?Mode.Build = switch (session.mode) {
@@ -366,6 +366,7 @@ fn x86Config(config: vmm.Config, mode: Mode) !x86_vm.Config {
         x86.exec_probe_start = probe.start;
         x86.exec_probe_completes_run = probe.on_complete == .stop;
         x86.exec_probe_timeout_ms = probe.timeout_ms;
+        x86.exec_probe_startup_timeout_ms = probe.startup_timeout_ms;
         // A detached one-shot probe (`run --commit`) leaves the end of the
         // run to its control, so the watchdog stays armed until the control
         // finishes. A monitor's readiness probe just detaches.

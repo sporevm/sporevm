@@ -66,7 +66,7 @@ static int setup_session_cgroup(struct session *session, pid_t pid, int memory_p
   return 0;
 }
 
-static int abort_session_cgroup_setup(struct session *session, pid_t pid) {
+int stop_session_processes(struct session *session, pid_t pid) {
   if (session->cgroup_path[0] != '\0') {
     char path[192];
     if (cgroup_child_path(path, sizeof(path), session->cgroup_path, "cgroup.kill") != 0 ||
@@ -469,10 +469,11 @@ int start_session(struct session *session, const char *session_id, char *const a
     return 127;
   }
   session->build_run_isolation = build_run_isolation;
-  if (((memory_pressure || build_run_isolation) && setup_session_cgroup(session, pid, memory_pressure) != 0) || write_all(start_pipe[1], "\1", 1) != 0) {
+  session->cancel_on_disconnect = options->cancel_on_disconnect;
+  if (((memory_pressure || build_run_isolation || options->cancel_on_disconnect) && setup_session_cgroup(session, pid, memory_pressure) != 0) || write_all(start_pipe[1], "\1", 1) != 0) {
     close(start_pipe[1]);
     close(ready_pipe[0]);
-    int cleanup_rc = abort_session_cgroup_setup(session, pid);
+    int cleanup_rc = stop_session_processes(session, pid);
     if (stdin_pipe[1] >= 0) close(stdin_pipe[1]);
     if (pty_master >= 0) close(pty_master);
     if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
@@ -513,7 +514,7 @@ int start_session(struct session *session, const char *session_id, char *const a
   }
   close(ready_pipe[0]);
   if (ready_read != 1 || ready_result[0] != 1) {
-    int cleanup_rc = abort_session_cgroup_setup(session, pid);
+    int cleanup_rc = stop_session_processes(session, pid);
     if (ready_read > 1 && ready_result[0] == 0) {
       size_t message_len = (size_t)ready_read - 1;
       if (message_len >= sizeof(session->setup_error)) message_len = sizeof(session->setup_error) - 1;

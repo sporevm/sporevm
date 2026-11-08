@@ -180,6 +180,8 @@ pub const Start = union(enum) {
 
 pub const Probe = struct {
     stream: *vsock_stream.HostStream,
+    startup_timeout_ms: u64 = 30_000,
+    /// Execution after request delivery; zero means no execution limit.
     timeout_ms: u64 = 30_000,
     start: vsock_stream.HostStreamStart = .immediate,
     on_complete: OnComplete = .stop,
@@ -1654,9 +1656,14 @@ pub fn Threaded(comptime Vm: type, comptime Vcpu: type, comptime Tracker: type) 
                             // control replaces or resets it.
                             probe_done = true;
                         }
-                        if (!probe_done and probe.state != .idle and probe.elapsedMs() > exec_probe.timeout_ms) {
-                            self.finish(.{ .err = error.VsockProbeTimedOut });
-                            continue;
+                        if (!probe_done and probe.state != .idle) {
+                            if (probe.timeoutPhase(exec_probe.startup_timeout_ms, exec_probe.timeout_ms)) |phase| {
+                                self.finish(.{ .err = switch (phase) {
+                                    .startup => error.GuestStartupTimedOut,
+                                    .execution => error.GuestExecutionTimedOut,
+                                } });
+                                continue;
+                            }
                         }
                     }
                 }
