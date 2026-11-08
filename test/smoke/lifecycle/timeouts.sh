@@ -29,10 +29,13 @@ else
   [[ "${status}" == 1 ]] || die "execution timeout returned ${status}, expected 1"
 fi
 grep -Fq 'execution timed out' "${workdir}/timeout.stderr" || die "missing timeout phase"
+# A new connection may arrive before the previous guest hangup is polled.
+"${spore_bin}" vm exec "${vm_name}" --exec-timeout 5s --shell \
+  '(sleep 2; touch /tmp/completed-orphan) &'
 sleep 3
 "${spore_bin}" vm exec --exec-timeout 5s "${vm_name}" --shell \
-  'test ! -e /tmp/timeout-orphan && echo descendants-stopped' >"${workdir}/recovery.stdout"
-grep -Fxq descendants-stopped "${workdir}/recovery.stdout" || die "timed-out descendant survived"
+  'test ! -e /tmp/timeout-orphan && test ! -e /tmp/completed-orphan && echo descendants-stopped' >"${workdir}/recovery.stdout"
+grep -Fxq descendants-stopped "${workdir}/recovery.stdout" || die "completed or timed-out descendant survived"
 
 # The override must not replace the VM's default. The same command succeeds
 # without a limit, then fails in JSON mode with the inherited 200ms limit.

@@ -127,9 +127,9 @@ pub fn main(init: std.process.Init) !void {
             .build_input_disks = &.{.{ .memory = disks[2] }},
             .cache_disk = .{ .memory = disks[3] },
             .exec_probe = &timeout_stream,
-            .exec_probe_timeout_ms = 250,
+            .exec_probe_startup_timeout_ms = 250,
         }) catch |err| {
-            if (err != error.ExecProbeTimeout) return err;
+            if (err != error.GuestStartupTimedOut) return err;
             break :blk true;
         };
         break :blk false;
@@ -137,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
     if (!timed_out) return error.ExpectedProbeTimeout;
     const timeout_elapsed_ms = monotonicMs() -| timeout_start_ms;
     if (timeout_elapsed_ms > 5_000) return error.ProbeTimeoutUnbounded;
-    std.debug.print("x86 board smoke: timeout=ExecProbeTimeout bounded_ms={d}\n", .{timeout_elapsed_ms});
+    std.debug.print("x86 board smoke: timeout=GuestStartupTimedOut bounded_ms={d}\n", .{timeout_elapsed_ms});
 
     var kernel_digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(kernel, &kernel_digest, .{});
