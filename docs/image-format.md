@@ -170,13 +170,22 @@ guest is frozen, so its fetch runs under it.
 bucket must be one DNS label (3 to 63 lowercase letters, digits and `-`, no
 dots) and the prefix plain segments of letters, digits, `-`, `.`, `_` and `~`.
 Reads are SigV4-signed GETs to `https://<bucket>.s3.<region>.amazonaws.com`
-with the same bounds, deadlines and verification as an HTTP(S) store. They use
-only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, the optional
-`AWS_SESSION_TOKEN`, and `AWS_REGION` or `AWS_DEFAULT_REGION` from the
-environment; profiles, `~/.aws` and instance roles are not read. A run with
-`AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` set fails, since it would
-otherwise read from AWS rather than the store that variable names. A run, or a named VM's monitor, reads them when it opens the disk and
-keeps them for its life, so fetches fail once temporary credentials expire.
+with the same bounds, deadlines and verification as an HTTP(S) store.
+Explicit `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and optional
+`AWS_SESSION_TOKEN` take precedence. Partial explicit credentials fail rather
+than selecting another identity; these fixed credentials cannot be refreshed.
+Otherwise reads use AWS CLI v2's `aws configure export-credentials --format
+process`, including `AWS_PROFILE`, shared configuration, role chains and the
+CLI's other credential providers. Expiring provider credentials refresh within
+60 seconds of expiry, shared across concurrent reads. Refresh failure fails
+the read, never silently falling back to stale credentials. Requests remain
+direct GETs; the CLI is not spawned for each object. Region precedence is
+`AWS_REGION`, then `AWS_DEFAULT_REGION`, then `aws configure get region`.
+A run with `AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` set fails, since it would
+otherwise read from AWS rather than the store that variable names. A named
+monitor inherits the environment/profile selection at creation; use a profile
+with renewable credentials for long-running VMs, and renew interactive logins
+outside SporeVM when needed. Provider output is bounded and never logged.
 The reader needs `s3:GetObject`; without `s3:ListBucket`, S3 reports a missing
 tag or object as access denied rather than not found, and either fails closed.
 

@@ -45,7 +45,7 @@ pub const ParsedBuildOptions = struct {
     ref: []const u8,
     output: []const u8,
     metadata: []const u8,
-    platform: Platform = .{},
+    platform: ?Platform = null,
 };
 
 pub const ParsedResolveOptions = struct {
@@ -66,7 +66,7 @@ pub const BuildRequest = struct {
     ref: []const u8,
     output: []const u8,
     metadata: []const u8,
-    platform: Platform = .{},
+    platform: ?Platform = null,
 };
 
 pub const ImportOciRequest = struct {
@@ -306,7 +306,7 @@ pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8)
     var image_ref: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var metadata: ?[]const u8 = null;
-    var platform: Platform = native_platform;
+    var platform: ?Platform = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -333,8 +333,6 @@ pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8)
     }
 
     const ref = image_ref orelse return error.MissingImageReference;
-    // Export pulls from a registry; a local name would be looked up as host `local`.
-    if (isLocalImageRef(ref)) return error.LocalImageExportUnsupported;
     const out = output orelse return error.MissingOutputPath;
     const meta = metadata orelse try std.fmt.allocPrint(allocator, "{s}.json", .{out});
     if (try sameResolvedPath(allocator, out, meta)) return error.RootFSMetadataPathMatchesOutput;
@@ -377,6 +375,7 @@ pub const BuildResult = struct {
     schema: []const u8 = "spore.rootfs.build.result.v1",
     schema_version: u32 = 1,
     rootfs_storage: spore.RootfsStorage,
+    platform: Platform = native_platform,
 };
 
 const MaterializeResult = struct {
@@ -656,11 +655,11 @@ pub fn build(init: std.process.Init, allocator: std.mem.Allocator, request: Buil
     const cache_root = try local_paths.rootfsCacheRootPath(allocator, init.environ_map);
     const result = try buildRootFS(init, allocator, .{
         .ref = request.ref,
-        .platform = request.platform,
+        .platform = request.platform orelse native_platform,
         .temp_dir_root = try std.fs.path.join(allocator, &.{ cache_root, "tmp" }),
         .target = .{ .file = .{ .output = request.output, .metadata = request.metadata } },
     });
-    return .{ .rootfs_storage = result.rootfs_storage };
+    return .{ .rootfs_storage = result.rootfs_storage, .platform = request.platform orelse native_platform };
 }
 
 /// Pull `resolved` from its registry, convert it, and publish it as a local
@@ -1359,11 +1358,11 @@ test "build options accept tag image refs" {
     try std.testing.expectEqualStrings("rootfs.ext4.json", parsed.metadata);
 }
 
-test "build options reject a local image ref" {
-    try std.testing.expectError(
-        error.LocalImageExportUnsupported,
-        parseBuildOptions(std.testing.allocator, &.{ "local/seed:v1", "--output", "rootfs.ext4" }),
-    );
+test "build options preserve platform inference for a local image ref" {
+    const parsed = try parseBuildOptions(std.testing.allocator, &.{ "local/seed:v1", "--output", "rootfs.ext4" });
+    defer std.testing.allocator.free(parsed.metadata);
+    try std.testing.expectEqualStrings("local/seed:v1", parsed.ref);
+    try std.testing.expectEqual(null, parsed.platform);
 }
 
 test "rootfs build keeps its temp dir in the rootfs cache and removes it on failure" {

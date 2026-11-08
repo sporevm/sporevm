@@ -42,14 +42,13 @@ cleanup() {
   --memory "${memory}" \
   --image "${image_ref}" \
   --console-log "${source_console_log}" \
-  -- /bin/sh -lc 'while true; do sleep 3600; done'
+  -- /bin/sh -lc 'i=0; while :; do i=$((i + 1)); printf "snapshot-lock-counter:%s\n" "$i" >/dev/console; sleep 0.05; done'
 "${spore_bin}" vm exec source -- /bin/sh -lc 'printf inherited > /fork-marker; sync'
 
 # Cache contention must be resolved before the source pause begins. Keep a
-# guest-side counter moving while an external process owns the exact cache
+# detached initial counter moving while an external process owns the exact cache
 # lock, then require the pending save to report the accumulated wait.
 monitor_log="${SPOREVM_RUNTIME_DIR}/vms/source/monitor.log"
-"${spore_bin}" vm exec source -- /bin/sh -lc 'nohup sh -c '\''i=0; while :; do i=$((i + 1)); printf "snapshot-lock-counter:%s\n" "$i" >/dev/console; sleep 0.05; done'\'' </dev/null >/dev/null 2>&1 &'
 deadline=$((SECONDS + 10))
 while ! grep -q 'snapshot-lock-counter:' "${source_console_log}"; do
   if (( SECONDS >= deadline )); then

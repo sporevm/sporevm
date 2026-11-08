@@ -1,9 +1,9 @@
 # Spore Format
 
-**Status:** manifest format v7 (`src/spore.zig`) is the only accepted
+**Status:** manifest format v8 (`src/spore.zig`) is the only accepted
 contract. It covers one or more vCPUs and fixed or elastic memory for HVF and
 KVM producers/consumers, with KVM portable multi-vCPU capture/restore and HVF
-same-backend multi-vCPU capture/restore. Manifests from versions 0-6 are
+same-backend multi-vCPU capture/restore. Manifests from versions 0-7 are
 rejected as too old and must be re-created.
 
 A spore is sealed, content-addressed VM state. The format, not the
@@ -208,14 +208,16 @@ count, or value fails closed. The generation doorbell reports `guest_off`.
 `KVM_EXIT_SHUTDOWN`, triple fault, and a halted guest are never reclassified as
 reset or poweroff.
 
-## Manifest Format v7
+## Manifest Format v8
 
 `manifest.json` fields (see `src/spore.zig` for the authoritative shapes):
 
-- `version`: 7. Consumers read it before the rest of the manifest, reject
-  versions 0-6 with a format-too-old error, and reject newer versions as
-  malformed. Version 7 has the same fields as version 6; it marks saved RAM
-  whose guest agent speaks only the SPIO exec protocol.
+- `version`: 8. Consumers read it before the rest of the manifest, reject
+  versions 0-7 with a format-too-old error, and reject newer versions as
+  malformed. Version 8 retains the version 7 fields but marks saved RAM whose
+  guest agent supports client-owned `exec-v1` commands and cancels their
+  process trees on disconnect. Re-create older checkpoints; changing their
+  version field cannot upgrade the saved agent.
 - `annotations`: optional opaque string map for namespaced caller metadata,
   such as `dev.buildkite.cleanroom.policy_hash`. Keys and values are UTF-8
   strings, values are not interpreted by SporeVM, and the serialized annotation

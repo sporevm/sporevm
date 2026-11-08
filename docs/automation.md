@@ -31,7 +31,8 @@ document on stderr and nothing on stdout. Each result has `schema`,
 | `spore.pull.result.v2` | `checkpoint pull` | `resource_type`: string, `ref`: string, `spore_digest`: string, `out_dir`: string, `ram`: object, `disk`: object |
 | `spore.rootfs.import.result.v2` | `image import-oci`, `image import-tar` | `metadata_path`: string, `local_ref_path`: string, `resolved_image_ref`: string, `image_manifest_digest`: string, `rootfs_storage`: object |
 | `spore.rootfs.resolve.result.v1` | `image resolve` | `ref`: string, `resolved_image_ref`: string, `platform`: object |
-| `spore.rootfs.build.result.v1` | `image export-rootfs` | `rootfs_storage`: object |
+| `spore.rootfs.build.result.v1` | `image export-rootfs` | `rootfs_storage`: object, `platform`: object |
+| `spore.image.pull.result.v1` | `image pull` | `image_digest`: string, `digest_ref`: string, `tag_ref`: string or null, `platform`: object |
 | `spore.image.push.result.v1` | `image push` | `resource_type`: string, `ref`: string, `digest_ref`: string, `tag_ref`: string or null, `platform`: object, `image_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
 | `spore.image.archive.pack.result.v1` | `image pack` | `resource_type`: string, `archive_digest`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `archive_bytes`: integer, `platform`: object |
 | `spore.image.archive.unpack.result.v1` | `image unpack` | `resource_type`: string, `resolved_image_ref`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `platform`: object |
@@ -133,6 +134,39 @@ The stable v1 codes are:
 | `runtime.execution_failed` | `runtime` | `unknown` |
 | `operation.canceled` | `operation` | `unknown` |
 | `stream.interrupted` | `stream` | `unknown` |
+
+## Scoped deadlines
+
+`run` and `vm create` accept `--startup-timeout DURATION` (default 30s)
+and `--exec-timeout DURATION|none` (default 30s). The startup phase ends when
+the complete request reaches the guest; execution gets a fresh clock then.
+`vm create` also uses its startup limit while waiting for monitor readiness.
+`vm exec --exec-timeout` overrides the VM default for that invocation only;
+omitting it inherits the default. A timed-out named exec and its descendants
+are cancelled without removing the named VM or its initial command.
+
+`checkpoint resume` uses `--startup-timeout` and `--for DURATION|none`;
+saved-session execution is unlimited by default. Its `--for` clock starts at
+attach-request delivery. `checkpoint fanout --for DURATION` retains the batch
+limit after all child processes launch, with separate per-child startup limits
+and no implicit execution limit. `build --step-timeout DURATION` remains a
+positive per-instruction budget, including that instruction's guest exchanges;
+it also bounds each remote ADD fetch, not the complete build.
+
+Only execution/session limits accept `none`; zero and `none` are invalid for
+startup and build-step limits. Legacy `--timeout`/`--timeout-ms` remain accepted
+for execution (`run`/`vm create`), session execution (`checkpoint resume` and
+`checkpoint fanout`), and build steps (`build --timeout`). They are not
+whole-operation deadlines. Image/checkpoint acquisition, credential resolution,
+and store I/O keep their own limits. Named control-slot queueing is bounded by
+the VM's startup limit and does not consume the command's execution budget.
+
+Startup and execution expiry both use `runtime.execution_failed` and status 1
+in human and JSON modes, with the phase in the diagnostic. An explicitly
+duration-limited fanout treats its intentional child termination as success.
+Timeouts for throwaway `run`/`checkpoint resume` remove that invocation's VM.
+Create-options JSON adds `startup_timeout_ms`; existing `timeout_ms` remains
+the execution default, where 0 means unlimited.
 
 ## Compatibility
 

@@ -129,6 +129,16 @@ static void accept_request(struct agent *a) {
     return;
   }
 
+  // A reset and the next connection can be ready in the same poll. Finish
+  // the previous client-owned command before replacing its client, even if
+  // the listener's event is handled before that client's hangup.
+  if (session->started && !session->exited && session->cancel_on_disconnect) {
+    if (stop_session_processes(session, session->pid) != 0) {
+      dprintf(2, "spore exec: process cleanup failed\n");
+      _exit(125);
+    }
+    reset_session(session);
+  }
   close_client(client);
   client->fd = conn;
   if (request.kind == REQUEST_ATTACH) {
@@ -361,6 +371,7 @@ static void accept_request(struct agent *a) {
     const struct session_start_options options = {
       .use_rootfs = a->use_rootfs,
       .memory_pressure = request.memory_pressure,
+      .cancel_on_disconnect = request.cancel_on_disconnect,
       .exec_lookup = EXEC_LOOKUP_PATH,
       .stdin_enabled = request.stdin_enabled,
       .tty = request.tty,
@@ -539,6 +550,14 @@ static void poll_agent(struct agent *a) {
         drain_session_stdin(&op->session);
       }
     }
+  }
+  if (op->kind == EXEC_OP_NONE && a->client.fd < 0 && session->started &&
+      !session->exited && session->cancel_on_disconnect) {
+    if (stop_session_processes(session, session->pid) != 0) {
+      dprintf(2, "spore exec: process cleanup failed\n");
+      _exit(125);
+    }
+    reset_session(session);
   }
   drain_session_stdin(session);
   drain_session_terminal(session);

@@ -44,6 +44,8 @@ pub const ExecStream = struct {
     argv: []const []const u8,
     env: []const []const u8 = &.{},
     working_dir: ?[]const u8 = null,
+    /// Null inherits the VM default; zero disables the execution limit.
+    timeout_ms: ?u64 = null,
     stdio: Stdio,
     terminal_rows: u16 = 24,
     terminal_cols: u16 = 80,

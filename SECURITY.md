@@ -129,6 +129,12 @@ Input: guest bytes on vsock, and requests the trusted initrd agent parses.
   guest, with explicit truncation flags.
 - A saved session's output offsets only select what the agent replays from
   output it still holds; any other offset fails the attach.
+- Named streamed commands use `exec-v1`, with the same exact member set as
+  `start-v1` but explicit client-owned lifetime; detached execution is rejected.
+  Before releasing the child, the agent creates a cgroup for its descendants.
+  Disconnect, timeout, or command exit kills and drains that cgroup before
+  reuse; cleanup failure stops the agent rather than claiming cancellation.
+  Saved `start-v1` sessions retain their disconnect-and-resume behavior.
 - The shipped initrd holds only the agent, a pinned Toybox, `/bin/sh`,
   `/bin/true`, and `/bin/false`; smoke helpers need `-Dsmoke-helpers`.
 
@@ -141,8 +147,8 @@ generation params and runs only on aarch64 Linux.
 Input: checkpoint directories on disk or pulled from a store; disk indexes;
 pin records; runtime disk-fork messages between local monitors.
 
-- `manifest.json` is format v7, at most 64 MiB, and strictly validated before
-  anything is mapped; versions 0 to 6 fail as too old. Saves validate the same
+- `manifest.json` is format v8, at most 64 MiB, and strictly validated before
+  anything is mapped; versions 0 to 7 fail as too old. Saves validate the same
   way before writing. Machine state is normalized architectural state, never
   raw KVM or Hypervisor.framework structures.
 - Elastic memory is bounded to 8192 blocks of 2 MiB, with sorted,
@@ -200,7 +206,14 @@ serves; AWS credentials in the environment.
   are retried. HTTP(S) requests send no credentials. Store hosts are not
   checked against the public-target policy, because stores may be private.
 - An image's manifest, config, and index must recompute the requested image
-  digest for the host platform before the index is installed.
+  digest for the selected platform before the index is installed. Explicit
+  acquisition/export may select a recorded foreign platform without executing
+  it; runtime reads still require the host execution platform.
+- `spore image pull` holds the cache lock through missing-object fetch and
+  complete image publication, and publishes its requested local tag only after
+  the closure is complete. Native ext4 export shares the verified sparse chunk
+  assembler, writes an independent caller-writable file, and never replaces an
+  existing output or links writable output into immutable cache storage.
 - An object is fetched on the first guest read of its chunk (with up to 7
   following chunks in the background) and verified before it reaches guest
   memory or the cache. An HTTP(S) object fetch makes at most 3 attempts within
@@ -213,9 +226,14 @@ serves; AWS credentials in the environment.
   not poisoned, and a named VM keeps running. Stopping a VM cancels the fetch.
 - S3 reads go only to `https://<bucket>.s3.<region>.amazonaws.com`; a set
   `AWS_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` fails the read. Requests are
-  SigV4-signed from the standard `AWS_*` variables, whose characters are
-  checked so none can inject a header; the secret and derived keys are zeroed
-  after use.
+  SigV4-signed from explicit `AWS_*` credentials or AWS CLI v2 process
+  credentials. The provider's JSON is capped at 32 KiB; version, credential
+  characters and UTC expiration are validated before signing. Provider output
+  and stderr are never logged. Explicit partial credentials fail closed;
+  provider credentials refresh under a mutex before expiry and request-owned
+  session tokens survive concurrent refresh. No credential can inject a
+  header; owned secrets and derived keys are zeroed after use.
+  Fuzz coverage: `fuzz AWS process credentials`.
   Credentials never appear in refs, logs, errors, trace output, or the
   catalog. `spore image push` to S3 runs the `aws` CLI on staged, verified
   objects and uploads the tag last.

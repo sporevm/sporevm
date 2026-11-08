@@ -19,7 +19,7 @@ a migration for scripts already tracking main as well as the 0.17.1 upgrade.
 | --- | --- |
 | `attach DIR` | `checkpoint resume DIR` |
 | `fanout BATCH` | `checkpoint fanout BATCH` |
-| `image export REF` | `image export-rootfs REF` (registry images only) |
+| `image export REF` | `image export-rootfs REF` (registry, local or native-store images) |
 | `build -t REF CONTEXT` | `build CONTEXT --tag REF` |
 | Import/unpack `--ref REF` | `--tag REF` |
 | Artifact `--out PATH` | `--output PATH` |
@@ -32,6 +32,8 @@ a migration for scripts already tracking main as well as the 0.17.1 upgrade.
 | `vm logs NAME` | `vm logs NAME --initial` (bounded initial output, not exec history) |
 | Unpack `--archive-digest DIGEST` | `--expected-archive-digest DIGEST` |
 | Bare guest command/string | `-- ARGV…` or `--shell STRING` |
+| `run` / `vm create --timeout DURATION` | `--startup-timeout DURATION` for readiness, `--exec-timeout DURATION` for commands |
+| Build `--timeout DURATION` | `--step-timeout DURATION` (legacy alias accepted) |
 
 Command options work before or after resource operands until `--`; global
 `--json`/`--debug` must precede the command. Duplicate scalar flags fail,
@@ -46,10 +48,29 @@ unpack infer a single recorded platform; explicit selection never substitutes
 another platform. Disk-backed checkpoint summaries identify cache-pinned
 storage rather than implying a standalone portable `.spore` artifact.
 
-No fetch-only `image pull`, local-image ext4 export, AWS profile/refresh support
-for reads, or timeout redesign is included. `--save-on INT` still makes Ctrl-C
-save successfully, not cancel; human mode prints a notice. S3 reads still need
-explicit environment credentials and region, unlike AWS-CLI-backed pushes.
+`image pull SOURCE [--tag local/NAME:TAG]` now acquires a complete verified image
+without booting and returns a native local digest reference for offline use.
+Registry tags refresh; native inputs preserve their recorded platform. Local
+and native-store images can also be exported as independent writable ext4 files
+with native-identity metadata, without fabricated OCI provenance.
+
+S3 reads now use AWS CLI v2's profile/provider chain when explicit environment
+credentials are absent, and refresh expiring provider credentials before use.
+Startup readiness uses `--startup-timeout`, commands use `--exec-timeout`
+(including per-exec overrides), builds use `--step-timeout`, and resumed saved
+sessions use `--for`. Execution alone accepts `none`; resumed sessions no
+longer inherit a hidden 30s limit. These do not bound artifact acquisition or
+the whole operation. Named exec timeouts cancel descendants while preserving
+the VM and its initial command. Named exec process trees now belong to the
+invocation, including normal completion; start long-lived background services
+as the detached `vm create` initial command instead of `vm exec ... &`.
+Legacy timeout spellings remain accepted.
+
+Checkpoint format is now v8 because saved RAM includes the guest agent that
+implements client-owned command cancellation. Re-create checkpoints from
+formats 0–7; rewriting their version cannot upgrade the saved agent. Native
+image layout is unchanged. `--save-on INT` makes Ctrl-C save successfully,
+not cancel; human mode prints a notice.
 Pinned Kubernetes deployments must stay on their current CLI until the removed
 bundle workflow is migrated and tested; this is not a coordinated k8s upgrade.
 
@@ -71,7 +92,7 @@ canonical forms:
 | `spore host-info` | `spore system info` |
 | `spore cache gc`, `cache pins`, `cache unpin` | `spore system gc`, `system pins`, `system unpin` |
 | `spore rootfs import-oci`, `rootfs import-tar`, `rootfs resolve` | `spore image import-oci`, `image import-tar`, `image resolve` |
-| `spore rootfs build` | `spore image export-rootfs` (registry images only) |
+| `spore rootfs build` | `spore image export-rootfs` (registry, local or native-store images) |
 
 `checkpoint resume` continues a checkpoint's saved process in a throwaway VM;
 it does not connect to a named VM. `vm restore NAME --checkpoint DIR` creates
@@ -88,8 +109,10 @@ in restored state.
 - Removed commands: bundles (`spore pack`, `unpack`, `inspect-bundle`, and
   `spore push` and `pull` of bundles) and `spore clone`, replaced by
   `spore checkpoint push` and `pull`; `spore help` (use `spore --help`),
-  `spore rootfs cas-preload`, `spore exec --timing-json`, `spore image pull`
-  and `spore image export-fixture`. Only `-h` and `--help` ask for help, so
+  `spore rootfs cas-preload`, `spore exec --timing-json`
+  and `spore image export-fixture`. The old experimental image-pull protocol
+  is not restored: `spore image pull` now acquires verified native content
+  for offline use without booting. Only `-h` and `--help` ask for help, so
   `spore checkpoint rm help` removes `./help`.
 - `spore checkpoint resume` without `--json`, and so `spore checkpoint fanout`, prints the
   session's stdout and stderr instead of the guest console.
@@ -104,7 +127,7 @@ in restored state.
 - The e2fsprogs ext4 writer is gone, with `SPOREVM_EXT4_WRITER=external` and
   the `--mkfs` and `--debugfs` options of `spore build` and `spore rootfs`.
 - Re-create saved spores and checkpoints from earlier versions; they fail
-  with `FormatTooOld`. Spore manifests are version 7, one shape for any vCPU
+  with `FormatTooOld`. Spore manifests are version 8, one shape for any vCPU
   count, and disk and memory indexes are only `spore-disk-index-v2`.
 - Saved RAM carries the guest agent, which now speaks only the SPIO exec
   protocol and parses every request strictly. The text protocol and its
@@ -168,6 +191,11 @@ in restored state.
 
 - `spore image push local/app:1 --to DEST` writes a static image store to a
   directory, or to `s3://bucket/prefix` with the aws CLI.
+- `spore image pull SOURCE` acquires all verified objects into rooted local
+  storage without booting. Its immutable native digest works offline until
+  explicit image pruning. `image resolve` remains identity-only and
+  `run --image` remains lazy. `image export-rootfs` also accepts native local
+  and store inputs and writes an independent writable ext4 copy.
 - `spore run --image` and `spore vm create --image` boot a store ref
   (`file://`, `https://` or `s3://`, by tag or `blake3:<hex>`) with only the
   image's manifest, config and index local. Each rootfs object the guest reads
@@ -182,15 +210,12 @@ in restored state.
   verifies every object and writes a save pinned in the rootfs cache. To run
   one child of a fork batch elsewhere, push the parent, pull it there and pass
   the child's identity to `spore run --checkpoint DIR --generation FILE`.
-- S3 reads are SigV4-signed with `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-  the optional `AWS_SESSION_TOKEN`, and `AWS_REGION` or `AWS_DEFAULT_REGION`
-  from the environment only. Profiles, `~/.aws`, instance roles and pod
-  identity are not read; without the variables a run fails with
-  `AwsCredentialsMissing` or `AwsRegionMissing`, and with `AWS_ENDPOINT_URL`
-  or `AWS_ENDPOINT_URL_S3` set it fails with `AwsEndpointUrlUnsupported`. A VM
-  reads them when its disk opens and keeps them, so fetches fail once
-  temporary credentials expire. Readers need `s3:GetObject`. See
-  `docs/image-format.md`.
+- S3 reads use explicit environment credentials or AWS CLI v2's credential
+  chain, including `AWS_PROFILE` and renewable role credentials. Provider
+  credentials refresh before expiry; explicit environment credentials remain
+  fixed. Region comes from `AWS_REGION`, `AWS_DEFAULT_REGION`, or the selected
+  profile. `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3` still fail closed.
+  Readers need `s3:GetObject`. See `docs/image-format.md`.
 
 ### Performance
 

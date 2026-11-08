@@ -22,7 +22,8 @@ pub const Options = struct {
     backend: Backend = .auto,
     children_dir: []const u8,
     duration_ms: ?u64 = null,
-    timeout_ms: u64 = default_resume_timeout_ms,
+    startup_timeout_ms: u64 = default_resume_timeout_ms,
+    timeout_ms: u64 = 0,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
 };
 
@@ -33,14 +34,15 @@ pub const cli_usage =
     \\Options:
     \\  --backend auto|hvf|kvm  Backend to run (default: auto)
     \\  --for DURATION          Stop attached children after DURATION, e.g. 10s, 500ms, 1m
-    \\  --timeout DURATION      Per-child resume probe timeout (default: 30s)
+    \\  --startup-timeout DURATION  Per-child guest readiness limit (default: 30s)
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service in every child
     \\  -h, --help              Show this help
     \\
     \\--for caps batch lifetime after all child processes launch; omitted means
-    \\no batch cap. --timeout applies separately to each restored command probe,
-    \\including execution; --timeout-ms is also accepted. Neither bounds store I/O.
+    \\no batch cap; saved sessions have no implicit 30s execution deadline.
+    \\Startup limits apply separately to each child, not to store I/O. Legacy
+    \\--timeout and --timeout-ms still set a per-child execution limit.
     \\
     \\Requires child spores with saved sessions. Verify one with:
     \\  spore checkpoint inspect children/000000
@@ -106,7 +108,8 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var backend: Backend = .auto;
     var children_dir: ?[]const u8 = null;
     var duration_ms: ?u64 = null;
-    var timeout_ms: u64 = default_resume_timeout_ms;
+    var startup_timeout_ms: u64 = default_resume_timeout_ms;
+    var timeout_ms: u64 = 0;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
 
     var i: usize = 0;
@@ -123,6 +126,11 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             i += 1;
             duration_ms = cli_args.parseDurationMs(args[i]) catch {
                 failCli("--for expects a duration like 10s, 500ms, or 1m", .{});
+            };
+        } else if (std.mem.eql(u8, args[i], "--startup-timeout") and i + 1 < args.len) {
+            i += 1;
+            startup_timeout_ms = cli_args.parseDurationMs(args[i]) catch {
+                failCli("--startup-timeout expects a positive duration like 30s", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
@@ -156,6 +164,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             failCli("{s}", .{cli_usage});
         },
         .duration_ms = duration_ms,
+        .startup_timeout_ms = startup_timeout_ms,
         .timeout_ms = timeout_ms,
         .bound_services = bound_services,
     };
@@ -178,7 +187,7 @@ fn execute(init: std.process.Init, allocator: std.mem.Allocator, opts: Options, 
     errdefer cleanupRunning(init.io, running.items);
 
     for (children) |child| {
-        const run = try startRunningChild(init, allocator, spore_executable, opts.backend, opts.timeout_ms, opts.bound_services.slice(), child, event_mode, event_output, &output_lock, &event_write_failed);
+        const run = try startRunningChild(init, allocator, spore_executable, opts.backend, opts.startup_timeout_ms, opts.timeout_ms, opts.bound_services.slice(), child, event_mode, event_output, &output_lock, &event_write_failed);
         running.append(run) catch |err| {
             var single = [_]RunningChild{run};
             cleanupRunning(init.io, single[0..]);
@@ -231,14 +240,16 @@ fn spawnAttach(
     allocator: std.mem.Allocator,
     spore_executable: []const u8,
     backend: Backend,
+    startup_timeout_ms: u64,
     timeout_ms: u64,
     bound_services: []const spore_net_policy.BoundServiceBinding,
     spore_dir: []const u8,
 ) !std.process.Child {
     const backend_arg = @tagName(backend);
-    const timeout_arg = try std.fmt.allocPrint(allocator, "{d}ms", .{timeout_ms});
+    const timeout_arg = if (timeout_ms == 0) "none" else try std.fmt.allocPrint(allocator, "{d}ms", .{timeout_ms});
+    const startup_arg = try std.fmt.allocPrint(allocator, "{d}ms", .{startup_timeout_ms});
     var argv = std.array_list.Managed([]const u8).init(allocator);
-    try argv.appendSlice(&.{ spore_executable, "checkpoint", "resume", "--backend", backend_arg, "--timeout", timeout_arg });
+    try argv.appendSlice(&.{ spore_executable, "checkpoint", "resume", "--backend", backend_arg, "--startup-timeout", startup_arg, "--for", timeout_arg });
     for (bound_services) |binding| {
         const unix_path = switch (binding.target) {
             .unix => |path| path,
@@ -261,6 +272,7 @@ fn startRunningChild(
     allocator: std.mem.Allocator,
     spore_executable: []const u8,
     backend: Backend,
+    startup_timeout_ms: u64,
     timeout_ms: u64,
     bound_services: []const spore_net_policy.BoundServiceBinding,
     child: ChildSpec,
@@ -269,7 +281,7 @@ fn startRunningChild(
     output_lock: *OutputLock,
     event_write_failed: *std.atomic.Value(bool),
 ) !RunningChild {
-    var proc = try spawnAttach(init, allocator, spore_executable, backend, timeout_ms, bound_services, child.path);
+    var proc = try spawnAttach(init, allocator, spore_executable, backend, startup_timeout_ms, timeout_ms, bound_services, child.path);
     const stdout_fd = proc.stdout.?.handle;
     const stderr_fd = proc.stderr.?.handle;
     proc.stdout = null;

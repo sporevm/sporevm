@@ -93,6 +93,28 @@ pub fn materializeFlatFromChunks(
     cache_root: []const u8,
     rootfs: spore.Rootfs,
 ) !void {
+    return writeFlatFromChunks(io, allocator, cache_root, rootfs, null);
+}
+
+/// Write a new, independent writable sparse ext4 from verified chunks. Unlike
+/// the rebuildable cache materialization, a caller output is never replaced.
+pub fn exportFlatFromChunks(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs: spore.Rootfs,
+    output: []const u8,
+) !void {
+    return writeFlatFromChunks(io, allocator, cache_root, rootfs, output);
+}
+
+fn writeFlatFromChunks(
+    io: Io,
+    allocator: std.mem.Allocator,
+    cache_root: []const u8,
+    rootfs: spore.Rootfs,
+    output: ?[]const u8,
+) !void {
     const storage = rootfs.storage orelse return error.BadManifest;
     if (!std.mem.eql(u8, rootfs.artifact.format, spore.rootfs_artifact_format_ext4)) return error.BadManifest;
     if (!spore.rootfsDeviceEql(storage.device, rootfs.device)) return error.BadManifest;
@@ -100,10 +122,12 @@ pub fn materializeFlatFromChunks(
     if (!std.mem.eql(u8, storage.index_digest, rootfs.artifact.digest)) return error.BadManifest;
 
     // Already materialized and shaped correctly: nothing to do.
-    if (rootfs_cache.openTrustedFromCache(io, allocator, cache_root, rootfs)) |fd| {
-        _ = std.c.close(fd);
-        return;
-    } else |_| {}
+    if (output == null) {
+        if (rootfs_cache.openTrustedFromCache(io, allocator, cache_root, rootfs)) |fd| {
+            _ = std.c.close(fd);
+            return;
+        } else |_| {}
+    }
 
     const index_path = try manifestIndexPath(allocator, cache_root, storage.index_digest);
     defer allocator.free(index_path);
@@ -113,9 +137,9 @@ pub fn materializeFlatFromChunks(
     const object_dir_path = try objectDir(allocator, cache_root);
     defer allocator.free(object_dir_path);
 
-    const dest_path = try rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest);
+    const dest_path = if (output) |path| try allocator.dupe(u8, path) else try rootfs_cache.digestPath(allocator, cache_root, rootfs.artifact.digest);
     defer allocator.free(dest_path);
-    const dest_dir = std.fs.path.dirname(dest_path) orelse return error.IoFailed;
+    const dest_dir = std.fs.path.dirname(dest_path) orelse ".";
     try ensureDirPath(io, dest_dir);
 
     var nonce_bytes: [8]u8 = undefined;
@@ -148,10 +172,14 @@ pub fn materializeFlatFromChunks(
         }
     }
 
-    if (std.c.fchmod(temp_fd, 0o444) != 0) return error.IoFailed;
+    if (std.c.fchmod(temp_fd, if (output == null) 0o444 else 0o644) != 0) return error.IoFailed;
     const dest_z = try allocator.dupeSentinel(u8, dest_path, 0);
     defer allocator.free(dest_z);
-    if (std.c.rename(temp_path.ptr, dest_z.ptr) != 0) return error.IoFailed;
+    if (output == null) {
+        if (std.c.rename(temp_path.ptr, dest_z.ptr) != 0) return error.IoFailed;
+    } else {
+        try Io.Dir.hardLink(Io.Dir.cwd(), temp_path, Io.Dir.cwd(), dest_path, io, .{});
+    }
     std.log.debug("materialized flat rootfs artifact from chunks: digest={s} size={d}", .{ rootfs.artifact.digest, rootfs.artifact.size });
 }
 

@@ -36,6 +36,7 @@ const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cas = @import("rootfs_cas.zig");
 const s3_sigv4 = @import("s3_sigv4.zig");
+const aws_credentials = @import("aws_credentials.zig");
 const spore = @import("spore.zig");
 const test_support = @import("test_support.zig");
 
@@ -509,7 +510,7 @@ pub fn resolve(
     allocator: std.mem.Allocator,
     cache_root: []const u8,
     raw: []const u8,
-    platform: rootfs.Platform,
+    requested_platform: ?rootfs.Platform,
     env: *const std.process.Environ.Map,
 ) !local_image.LocalImage {
     const ref = try parseStoreRef(raw);
@@ -526,7 +527,9 @@ pub fn resolve(
 
     try Io.Dir.cwd().createDirPath(io, cache_root);
     if (try local_image.loadAllowingOrigin(io, allocator, cache_root, identity)) |local| {
-        if (local.platform.arch != platform.arch or !std.mem.eql(u8, local.platform.os, platform.os)) return error.UnsupportedPlatform;
+        if (requested_platform) |platform| {
+            if (local.platform.arch != platform.arch or !std.mem.eql(u8, local.platform.os, platform.os)) return error.UnsupportedPlatform;
+        }
         if (local.origin == null or std.mem.eql(u8, local.origin.?, ref.base.url)) return local;
         // Fetch missing objects from the store this run names.
         _ = try local_image.lockAndPublish(io, allocator, cache_root, .{
@@ -542,6 +545,7 @@ pub fn resolve(
     const manifest_path = try imagePathAlloc(allocator, identity, "manifest");
     const manifest_bytes = try client.get(allocator, manifest_path, .{ .max = image_manifest.max_image_manifest_bytes }, metadata_budget);
     const summary = try image_manifest.parseImageManifest(allocator, manifest_bytes);
+    const platform = requested_platform orelse summary.value.image.platform;
     if (summary.value.image.platform.arch != platform.arch or !std.mem.eql(u8, summary.value.image.platform.os, platform.os)) return error.UnsupportedPlatform;
     const config_path = try imagePathAlloc(allocator, identity, "config");
     const config_bytes = try client.get(allocator, config_path, .{ .max = image_manifest.max_config_blob_bytes }, metadata_budget);
@@ -604,6 +608,10 @@ pub const GetError = error{
     ImageStoreUnavailable,
     /// The budget ran out.
     ImageStoreTimeout,
+    AwsCliUnavailable,
+    AwsCredentialProviderFailed,
+    AwsCredentialsInvalid,
+    AwsCredentialsExpired,
     /// The task making the request was canceled. Not retried.
     Canceled,
     OutOfMemory,
@@ -626,37 +634,34 @@ pub const Client = struct {
     const S3 = struct {
         /// Owns every slice here.
         arena: std.heap.ArenaAllocator,
-        credentials: s3_sigv4.Credentials,
+        provider: aws_credentials.Provider,
         region: []const u8,
         /// `https://<bucket>.s3.<region>.amazonaws.com`, without a path.
         endpoint: []const u8,
         /// The signed Host header: the endpoint's authority.
         host: []const u8,
 
-        fn init(allocator: std.mem.Allocator, base: Base, env: *const std.process.Environ.Map, endpoint_override: ?[]const u8) !S3 {
+        fn init(allocator: std.mem.Allocator, io: Io, base: Base, env: *const std.process.Environ.Map, endpoint_override: ?[]const u8) !S3 {
             // Reads go only to AWS, so an endpoint meant for an S3-compatible
             // store must not be ignored silently.
             for ([_][]const u8{ "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3" }) |name| {
                 const value: []const u8 = env.get(name) orelse "";
                 if (value.len != 0) return error.AwsEndpointUrlUnsupported;
             }
-            const credentials = try s3_sigv4.Credentials.fromEnv(env);
-            const region = try s3_sigv4.regionFromEnv(env);
+            var provider = try aws_credentials.Provider.init(allocator, io, env, "aws");
+            errdefer provider.deinit();
             var arena: std.heap.ArenaAllocator = .init(allocator);
             errdefer arena.deinit();
             const a = arena.allocator();
+            const region = try aws_credentials.regionAlloc(a, io, env, "aws");
             const endpoint = if (endpoint_override) |value|
                 try a.dupe(u8, value)
             else
                 try std.fmt.allocPrint(a, "https://{s}.s3.{s}.amazonaws.com", .{ base.bucket, region });
             const authority = std.mem.indexOf(u8, endpoint, "://") orelse return error.InvalidImageStoreRef;
             return .{
-                .credentials = .{
-                    .access_key_id = try a.dupe(u8, credentials.access_key_id),
-                    .secret_access_key = try a.dupe(u8, credentials.secret_access_key),
-                    .session_token = if (credentials.session_token) |token| try a.dupe(u8, token) else null,
-                },
-                .region = try a.dupe(u8, region),
+                .provider = provider,
+                .region = region,
                 .endpoint = endpoint,
                 .host = endpoint[authority + 3 ..],
                 .arena = arena,
@@ -664,7 +669,7 @@ pub const Client = struct {
         }
 
         fn deinit(self: *S3) void {
-            std.crypto.secureZero(u8, @constCast(self.credentials.secret_access_key));
+            self.provider.deinit();
             self.arena.deinit();
         }
     };
@@ -680,7 +685,7 @@ pub const Client = struct {
         const url = try allocator.dupe(u8, base_url);
         errdefer allocator.free(url);
         const base = try parseBase(url);
-        var s3: ?S3 = if (base.scheme == .s3) try S3.init(allocator, base, env, s3_endpoint) else null;
+        var s3: ?S3 = if (base.scheme == .s3) try S3.init(allocator, io, base, env, s3_endpoint) else null;
         errdefer if (s3) |*value| value.deinit();
         var client: Client = .{ .allocator = allocator, .io = io, .base = base, .http = .{ .allocator = allocator, .io = io }, .s3 = s3 };
         errdefer client.http.deinit();
@@ -751,6 +756,10 @@ pub const Client = struct {
                         error.ImageStoreNotFound => error.ImageStoreNotFound,
                         error.ImageStoreRejected => error.ImageStoreRejected,
                         error.ImageStoreBadResponse => error.ImageStoreBadResponse,
+                        error.AwsCliUnavailable => error.AwsCliUnavailable,
+                        error.AwsCredentialProviderFailed => error.AwsCredentialProviderFailed,
+                        error.AwsCredentialsInvalid => error.AwsCredentialsInvalid,
+                        error.AwsCredentialsExpired => error.AwsCredentialsExpired,
                         error.OutOfMemory => error.OutOfMemory,
                         else => blk: {
                             std.log.debug("image store GET {s} failed: {s}", .{ attempt.url, @errorName(any) });
@@ -809,12 +818,18 @@ pub const Client = struct {
         var amz_headers: [3]std.http.Header = undefined;
         var extra_headers: []const std.http.Header = &.{};
         var signed: s3_sigv4.SignedGet = undefined;
-        if (self.s3) |s3| {
+        var session_token: ?[]const u8 = null;
+        defer if (session_token) |token| {
+            std.crypto.secureZero(u8, @constCast(token));
+            allocator.free(token);
+        };
+        if (self.s3) |*s3| {
             const path = switch (uri.path) {
                 .raw, .percent_encoded => |value| value,
             };
             const now = Io.Clock.real.now(self.io).toSeconds();
-            signed = try s3_sigv4.signGet(s3.credentials, s3.region, s3.host, path, @intCast(now));
+            signed = try s3.provider.signGet(allocator, s3.region, s3.host, path, @intCast(now));
+            session_token = signed.session_token;
             var signed_buf: [4]s3_sigv4.Header = undefined;
             // Host goes first; the client writes it from `headers.host`.
             const signed_headers = signed.headers(&signed_buf)[1..];
@@ -1937,13 +1952,14 @@ test "S3 store reads are signed with the environment's credentials, which only t
     try std.testing.expectEqual(@as(u32, 0), server.leaked.load(.monotonic));
     try std.testing.expectEqualStrings("s3://bucket-1/team", client.base.url);
 
-    // Credentials and region must be present and plain before any request.
+    // Partial explicit credentials never fall through to another identity.
     var missing = std.process.Environ.Map.init(std.testing.allocator);
     defer missing.deinit();
-    try std.testing.expectError(error.AwsCredentialsMissing, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));
     try missing.put("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    try std.testing.expectError(error.AwsCredentialsMissing, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));
     try missing.put("AWS_SECRET_ACCESS_KEY", secret);
-    try std.testing.expectError(error.AwsRegionMissing, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));
+    try missing.put("AWS_REGION", "bad/region");
+    try std.testing.expectError(error.AwsRegionInvalid, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));
     try missing.put("AWS_REGION", "eu-west-2");
     try missing.put("AWS_SESSION_TOKEN", "token\r\nx-injected: 1");
     try std.testing.expectError(error.AwsCredentialsInvalid, Client.init(std.testing.allocator, io, "s3://bucket-1/team", &missing));

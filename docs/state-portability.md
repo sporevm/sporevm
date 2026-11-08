@@ -1,6 +1,6 @@
 # Spore State Portability Contract
 
-**Status:** current implementation for manifest format v7, with fixed memory
+**Status:** current implementation for manifest format v8, with fixed memory
 for any vCPU count and elastic memory for one vCPU.
 This document records what SporeVM can capture, map, translate, and reject when
 restoring an aarch64 spore across the KVM and Hypervisor.framework backends.

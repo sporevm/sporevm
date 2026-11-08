@@ -36,8 +36,8 @@ pub const Credentials = struct {
 
     /// The key id goes into the credential scope and the token into a
     /// header, so neither may carry separators or line breaks.
-    fn validate(self: Credentials) !void {
-        if (self.access_key_id.len > max_key_len or self.secret_access_key.len > max_key_len) return error.AwsCredentialsInvalid;
+    pub fn validate(self: Credentials) !void {
+        if (self.access_key_id.len == 0 or self.access_key_id.len > max_key_len or self.secret_access_key.len > max_key_len) return error.AwsCredentialsInvalid;
         for (self.access_key_id) |byte| if (!std.ascii.isAlphanumeric(byte)) return error.AwsCredentialsInvalid;
         if (!visible(self.secret_access_key)) return error.AwsCredentialsInvalid;
         if (self.session_token) |token| if (token.len > max_token_len or !visible(token)) return error.AwsCredentialsInvalid;
@@ -47,9 +47,13 @@ pub const Credentials = struct {
 /// `AWS_REGION`, else `AWS_DEFAULT_REGION`, borrowed from `env`.
 pub fn regionFromEnv(env: *const std.process.Environ.Map) ![]const u8 {
     const region = nonEmpty(env, "AWS_REGION") orelse nonEmpty(env, "AWS_DEFAULT_REGION") orelse return error.AwsRegionMissing;
-    if (region.len > max_region_len) return error.AwsRegionInvalid;
-    for (region) |byte| if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-')) return error.AwsRegionInvalid;
+    try validateRegion(region);
     return region;
+}
+
+pub fn validateRegion(region: []const u8) !void {
+    if (region.len == 0 or region.len > max_region_len) return error.AwsRegionInvalid;
+    for (region) |byte| if (!(std.ascii.isLower(byte) or std.ascii.isDigit(byte) or byte == '-')) return error.AwsRegionInvalid;
 }
 
 fn nonEmpty(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {

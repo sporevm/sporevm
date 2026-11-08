@@ -125,16 +125,17 @@ pub const commands = [_]Command{
     .{ .name = "image import-oci", .summary = "Import an OCI image layout as a local image", .usage = image_cli.import_oci_usage, .output = .{ .result = .of(api.RootfsImportOciResult) }, .run = image_cli.importOci },
     .{ .name = "image import-tar", .summary = "Import a rootfs tar as a local image", .usage = image_cli.import_tar_usage, .output = .{ .result = .of(api.RootfsImportTarResult) }, .run = image_cli.importTar },
     .{ .name = "image resolve", .summary = "Resolve an image tag to a digest reference", .usage = image_cli.resolve_usage, .output = .{ .result = .of(image_cli.ResolveResult) }, .run = image_cli.resolve },
-    .{ .name = "image export-rootfs", .summary = "Write a registry image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .{ .result = .of(api.RootfsBuildResult) }, .run = image_cli.exportRootfs },
-    .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.usage, .output = .{ .result = .of(api.ImagePushResult) }, .run = image_cli.push },
-    .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchivePackResult) }, .run = image_cli.pack },
-    .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.usage, .output = .{ .result = .of(api.ImageArchiveUnpackResult) }, .run = image_cli.unpack },
+    .{ .name = "image pull", .summary = "Acquire a complete image for offline use without booting", .usage = image_cli.pull_usage, .output = .{ .result = .of(api.ImagePullResult) }, .run = image_cli.pull },
+    .{ .name = "image export-rootfs", .summary = "Write an image's root filesystem as an ext4 file", .usage = image_cli.export_usage, .output = .{ .result = .of(api.RootfsBuildResult) }, .run = image_cli.exportRootfs },
+    .{ .name = "image push", .summary = "Push a local image to an image store", .usage = image_cli.push_usage, .output = .{ .result = .of(api.ImagePushResult) }, .run = image_cli.push },
+    .{ .name = "image pack", .summary = "Pack a local image into an immutable archive", .usage = image_cli.pack_usage, .output = .{ .result = .of(api.ImageArchivePackResult) }, .run = image_cli.pack },
+    .{ .name = "image unpack", .summary = "Unpack an image archive as a local image", .usage = image_cli.unpack_usage, .output = .{ .result = .of(api.ImageArchiveUnpackResult) }, .run = image_cli.unpack },
     .{ .name = "system info", .summary = "Print this host's platform facts", .usage = system.info_usage, .output = .{ .result = .of(api.HostInfo) }, .run = system.infoCli },
-    .{ .name = "system df", .summary = "Show local cache usage", .usage = system.usage, .output = .{ .result = .of(system.RootfsSystemSummary) }, .run = system.dfCli },
-    .{ .name = "system prune", .summary = "Prune local caches and old runtime fork batches", .usage = system.usage, .output = .{ .result = .of(system.RootfsPruneResult) }, .run = system.pruneCli },
+    .{ .name = "system df", .summary = "Show local cache usage", .usage = system.df_usage, .output = .{ .result = .of(system.RootfsSystemSummary) }, .run = system.dfCli },
+    .{ .name = "system prune", .summary = "Prune local caches and old runtime fork batches", .usage = system.prune_usage, .output = .{ .result = .of(system.RootfsPruneResult) }, .run = system.pruneCli },
     .{ .name = "system gc", .summary = "Collect unreferenced content-addressed cache storage", .usage = system.gc_usage, .output = .{ .result = .of(system.RootfsGcResult) }, .run = system.gcCli },
-    .{ .name = "system pins", .summary = "List saved-spore pins", .usage = system.gc_usage, .output = .{ .result = .of(system.PinsResult) }, .run = system.pinsCli },
-    .{ .name = "system unpin", .summary = "Drop one saved-spore pin (expert-only)", .usage = system.gc_usage, .output = .{ .result = .of(system.UnpinResult) }, .run = system.unpinCli },
+    .{ .name = "system pins", .summary = "List saved-spore pins", .usage = system.pins_usage, .output = .{ .result = .of(system.PinsResult) }, .run = system.pinsCli },
+    .{ .name = "system unpin", .summary = "Drop one saved-spore pin (expert-only)", .usage = system.unpin_usage, .output = .{ .result = .of(system.UnpinResult) }, .run = system.unpinCli },
     .{ .name = "version", .summary = "Print the spore version", .usage = "usage: spore version\n", .output = .{ .result = .of(VersionResult) }, .run = version },
     .{ .name = "monitor", .summary = null, .usage = monitor.monitor_usage, .output = .text, .run = monitor.cli },
     .{ .name = "netd", .summary = null, .usage = spore_netd.netd_usage, .output = .text, .run = spore_netd.cli },
@@ -298,7 +299,7 @@ const value_options = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },               .{ "--for", {} },             .{ "--options", {} },        .{ "--initial-output", {} },
     .{ "--file", {} },                  .{ "-f", {} },                .{ "--target", {} },         .{ "--build-context", {} },
     .{ "--build-arg", {} },             .{ "--network", {} },         .{ "--ulimit", {} },         .{ "--older-than", {} },
-    .{ "--max-bytes", {} },
+    .{ "--max-bytes", {} },             .{ "--startup-timeout", {} }, .{ "--exec-timeout", {} },   .{ "--step-timeout", {} },
 });
 
 fn argumentError(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) !?[]const u8 {
@@ -317,7 +318,7 @@ fn argumentError(allocator: std.mem.Allocator, command: []const u8, args: []cons
         if (!std.mem.startsWith(u8, flag, "-")) continue;
         const repeated = std.mem.eql(u8, flag, "--env") or std.mem.eql(u8, flag, "--annotation") or std.mem.startsWith(u8, flag, "--allow-") or std.mem.eql(u8, flag, "--bind-service") or std.mem.eql(u8, flag, "--forward") or std.mem.eql(u8, flag, "--inject") or std.mem.eql(u8, flag, "--build-context") or std.mem.eql(u8, flag, "--build-arg");
         if (!repeated) {
-            const canonical = if (std.mem.eql(u8, flag, "-f")) "--file" else if (std.mem.eql(u8, flag, "--timeout-ms")) "--timeout" else flag;
+            const canonical = if (std.mem.eql(u8, flag, "-f")) "--file" else if (std.mem.eql(u8, flag, "--timeout-ms") or std.mem.eql(u8, flag, "--timeout")) (if (std.mem.eql(u8, command, "build")) "--step-timeout" else if (std.mem.eql(u8, command, "checkpoint resume")) "--for" else "--exec-timeout") else flag;
             const entry = try seen.getOrPut(allocator, canonical);
             if (entry.found_existing) return allocMessage(allocator, "spore {s}: {s} may be supplied once", .{ command, flag });
         }
@@ -411,7 +412,7 @@ pub fn writeHelp(table: []const Command, group: ?[]const u8, writer: *Io.Writer)
     }
     if (group) |word| {
         if (std.mem.eql(u8, word, "image"))
-            try writer.writeAll("\nNo fetch-only image pull command in this release. Resolve finds identity;\nrun --image acquires content lazily; pack/unpack transfers local images offline.\n");
+            try writer.writeAll("\nPull acquires complete images without booting; resolve only finds identity.\nRun acquires content lazily; pack/unpack transfers native images offline.\n");
         if (std.mem.eql(u8, word, "checkpoint"))
             try writer.writeAll("\nResume continues a saved process in a throwaway VM. For a new command use\nrun --checkpoint DIR -- ARGV; for a named VM use vm restore NAME --checkpoint DIR.\n");
     }

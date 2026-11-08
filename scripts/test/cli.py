@@ -31,7 +31,9 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
         (["vm", "restore", "missing", "--name", "dev"], 2, "usage.invalid_argument", "--checkpoint", False),
         (["build", ".", "-t", "local/app:dev"], 2, "usage.invalid_argument", "--tag", False),
         (["image", "pack", "local/app:dev"], 2, "usage.missing_argument", "archive", False),
-        (["image", "export-rootfs", "local/app:dev", "--output", str(root / "disk")], 2, "usage.invalid_argument", "registry", False),
+        (["image", "export-rootfs", "local/app:dev", "--output", str(root / "disk")], 22, "object.not_found", "local/app:dev", False),
+        (["image", "pull", "local/missing:dev"], 22, "object.not_found", "local/missing:dev", False),
+        (["image", "pull"], 2, "usage.missing_argument", "required", False),
         (["vm", "exec", "missing", "--workdir", "relative", "--", "pwd"], 2, "usage.invalid_argument", "absolute", True),
         (["vm", "exec", "missing", "echo hi"], 2, "usage.invalid_argument", "--shell", True),
         (["vm", "exec", "missing", "--env", "SPORE_TEST_UNSET", "--", "true"], 2, "usage.invalid_argument", "SPORE_TEST_UNSET", True),
@@ -40,7 +42,12 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
         (["vm", "exec", "missing", "--json", "--", "true"], 2, "usage.invalid_argument", "before", True),
         (["vm", "exec", "missing", "--workdir", "/one", "--workdir", "/two", "--", "pwd"], 2, "usage.invalid_argument", "once", True),
         (["run", "--timeout", "1s", "--timeout-ms", "2000", "--", "true"], 2, "usage.invalid_argument", "once", True),
-        (["checkpoint", "pull", "s3://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "AWS_PROFILE", False),
+        (["run", "--exec-timeout", "none", "--timeout", "1s", "--", "true"], 2, "usage.invalid_argument", "once", True),
+        (["run", "--startup-timeout", "none", "--", "true"], 2, "usage.invalid_argument", "duration", True),
+        (["vm", "exec", "--exec-timeout", "none", "missing", "--", "true"], 22, "object.invalid", "missing", True),
+        (["vm", "exec", "missing", "--exec-timeout", "0s", "--", "true"], 2, "usage.invalid_argument", "positive duration", True),
+        (["build", ".", "--step-timeout", "none"], 2, "usage.invalid_argument", "positive duration", False),
+        (["checkpoint", "pull", "s3://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "incomplete AWS credentials", False),
         (["checkpoint", "pull", "gs://test-bucket/warm", "--output", str(root / "pulled")], 2, "usage.invalid_argument", "scheme", False),
     ]
     # A missing VM, not a parse failure, proves guest options weren't stolen.
@@ -59,7 +66,12 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
     for args, status, code, message, stream in cases:
         for structured in (False, True):
             argv = [binary, *(["--json"] if structured else []), *args]
-            result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+            case_env = env.copy()
+            if args[:3] == ["checkpoint", "pull", "s3://test-bucket/warm"]:
+                # A partial explicit identity must fail before any CLI provider
+                # or network access, regardless of tools installed on the host.
+                case_env["AWS_ACCESS_KEY_ID"] = "INCOMPLETEKEY"
+            result = subprocess.run(argv, env=case_env, capture_output=True, text=True, timeout=10)
             assert result.returncode == status, (argv, result.returncode, result.stdout, result.stderr)
             if structured:
                 if stream:

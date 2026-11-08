@@ -24,10 +24,10 @@ const spore_net_policy = @import("spore_net_policy.zig");
 const topology = @import("topology.zig");
 const virtqueue = @import("virtio/queue.zig");
 
-/// Version 7 marks saved RAM whose guest agent speaks only SPIO and parses
-/// every request strictly. Version 6 has the same manifest shape, but its RAM
-/// runs an agent with the old text exec protocol, so it is too old.
-pub const format_version: u32 = 7;
+/// Version 8 marks saved RAM whose guest agent supports client-owned exec-v1
+/// sessions and cgroup cancellation. Earlier agents cannot honor the named
+/// command lifetime contract even when their manifest has the same shape.
+pub const format_version: u32 = 8;
 pub const max_manifest_bytes: usize = 64 * 1024 * 1024;
 pub const chunk_size: usize = 2 * 1024 * 1024;
 pub const ram_backing_kind = "map-private-file-v0";
@@ -1599,10 +1599,10 @@ test "fuzz manifest parsing" {
     // machine union arms and validation.
     try std.testing.fuzz({}, fuzzManifestParse, .{ .corpus = &.{
         fuzz_support.sliceSeed(
-            \\{"version":7,"platform":{"cpu_profile":"sporevm-aarch64-v0","device_model_version":4,"vcpu_count":1,"ram_base":2147483648,"ram_size":2097152,"gic_dist_base":134217728,"gic_redist_base":134283264,"gic_redist_stride":131072,"counter_frequency_hz":24000000},"machine":{"single":{"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0},"gic":{"kind":"gicv3","gicv3":{"dist_regs":[],"redist_regs":[],"line_levels":[{"intid":56,"asserted":false}]}}}},"devices":[],"generation":{"generation":1,"interrupt_status":0,"params_b64":""},"memory":{"kind":"spore-disk-index-v2","logical_size":2097152,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunk_ranges":[],"zero_ranges":[{"start":0,"count":1}]}}
+            \\{"version":8,"platform":{"cpu_profile":"sporevm-aarch64-v0","device_model_version":4,"vcpu_count":1,"ram_base":2147483648,"ram_size":2097152,"gic_dist_base":134217728,"gic_redist_base":134283264,"gic_redist_stride":131072,"counter_frequency_hz":24000000},"machine":{"single":{"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0},"gic":{"kind":"gicv3","gicv3":{"dist_regs":[],"redist_regs":[],"line_levels":[{"intid":56,"asserted":false}]}}}},"devices":[],"generation":{"generation":1,"interrupt_status":0,"params_b64":""},"memory":{"kind":"spore-disk-index-v2","logical_size":2097152,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunk_ranges":[],"zero_ranges":[{"start":0,"count":1}]}}
         ),
         fuzz_support.sliceSeed(
-            \\{"version":7,"platform":{"cpu_profile":"sporevm-aarch64-v0","device_model_version":4,"vcpu_count":2,"ram_base":2147483648,"ram_size":2097152,"gic_dist_base":134217728,"gic_redist_base":134348800,"gic_redist_stride":131072,"counter_frequency_hz":24000000},"machine":{"multi":{"vcpus":[{"index":0,"mpidr":2147483648,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0}},{"index":1,"mpidr":2147483649,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0}}],"gic":{"kind":"gicv3_multi","gicv3_multi":{"schema_version":1,"dist_regs":[],"redistributors":[{"mpidr":2147483648,"regs":[]},{"mpidr":2147483649,"regs":[]}],"line_levels":[]}}}},"devices":[],"generation":{"generation":1,"interrupt_status":0,"params_b64":""},"memory":{"kind":"spore-disk-index-v2","logical_size":2097152,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunk_ranges":[],"zero_ranges":[{"start":0,"count":1}]}}
+            \\{"version":8,"platform":{"cpu_profile":"sporevm-aarch64-v0","device_model_version":4,"vcpu_count":2,"ram_base":2147483648,"ram_size":2097152,"gic_dist_base":134217728,"gic_redist_base":134348800,"gic_redist_stride":131072,"counter_frequency_hz":24000000},"machine":{"multi":{"vcpus":[{"index":0,"mpidr":2147483648,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0}},{"index":1,"mpidr":2147483649,"gprs":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"pc":0,"cpsr":0,"fpcr":0,"fpsr":0,"simd":[[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0],[0,0]],"sys_regs":[],"icc_regs":[],"vtimer":{"cntvct":0,"cntv_ctl":0,"cntv_cval":0}}],"gic":{"kind":"gicv3_multi","gicv3_multi":{"schema_version":1,"dist_regs":[],"redistributors":[{"mpidr":2147483648,"regs":[]},{"mpidr":2147483649,"regs":[]}],"line_levels":[]}}}},"devices":[],"generation":{"generation":1,"interrupt_status":0,"params_b64":""},"memory":{"kind":"spore-disk-index-v2","logical_size":2097152,"chunk_size":2097152,"hash_algorithm":"blake3","object_namespace":"memory/blake3","chunk_ranges":[],"zero_ranges":[{"start":0,"count":1}]}}
         ),
     } });
 }
@@ -1897,12 +1897,14 @@ test "manifests from older formats fail as too old" {
         try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, multi, .{}));
         try std.testing.expectError(error.FormatTooOld, loadManifest(arena, dir));
     }
-    // Version 6 has the current shape, but its saved RAM runs a guest agent
-    // that speaks the removed text exec protocol.
+    // Versions 6 and 7 have the current shape, but their saved agents lack
+    // the current protocol or client-owned command cleanup.
     var v6 = try cloneJsonValue(arena, current);
-    try v6.object.put(arena, "version", .{ .integer = 6 });
-    try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, v6, .{}));
-    try std.testing.expectError(error.FormatTooOld, loadManifest(arena, dir));
+    for ([_]i64{ 6, 7 }) |version| {
+        try v6.object.put(arena, "version", .{ .integer = version });
+        try writeFileAll(path, try std.json.Stringify.valueAlloc(arena, v6, .{}));
+        try std.testing.expectError(error.FormatTooOld, loadManifest(arena, dir));
+    }
 
     // Unknown newer versions and manifests without a version are malformed.
     var future = try cloneJsonValue(arena, current);
@@ -1929,7 +1931,7 @@ test "manifest machine state is one tagged union" {
     const path = try pathZ(arena, "{s}/manifest.json", .{dir});
     try saveManifest(arena, dir, testForkManifest(testZeroMemoryManifest(1 << 29), 1 << 29, 3));
     const json = try readFileAll(arena, path, max_manifest_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 7,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 8,") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"machine\": {\n    \"single\": {\n      \"gprs\"") != null);
 
     var vcpus = [_]VcpuState{ testVcpuState(0), testVcpuState(1) };

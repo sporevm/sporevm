@@ -714,6 +714,10 @@ static const struct request_spec {
    MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(RESUME_TIME) | MEMBER(ARGV) | MEMBER(ENV) | MEMBER(WORKING_DIR) |
        EXEC_STDIO_MEMBERS | MEMBER(MEMORY_PRESSURE) | MEMBER(PARAMS_JSON) | MEMBER(REQUIRE_GENERATION_READY) |
        MEMBER(DETACHED) | MEMBER(RETAIN_OUTPUT) | MEMBER(CLOSED_ENV)},
+  {"exec-v1", REQUEST_START,
+   MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(RESUME_TIME) | MEMBER(ARGV) | MEMBER(ENV) | MEMBER(WORKING_DIR) |
+       EXEC_STDIO_MEMBERS | MEMBER(MEMORY_PRESSURE) | MEMBER(PARAMS_JSON) | MEMBER(REQUIRE_GENERATION_READY) |
+       MEMBER(DETACHED) | MEMBER(RETAIN_OUTPUT) | MEMBER(CLOSED_ENV)},
   {"attach-v1", REQUEST_ATTACH,
    MEMBER(TYPE) | MEMBER(SESSION_ID) | MEMBER(STDOUT_OFFSET) | MEMBER(STDERR_OFFSET) | EXEC_STDIO_MEMBERS |
        MEMBER(INTERACTIVE) | MEMBER(PARAMS_JSON)},
@@ -894,6 +898,7 @@ static int validate_request(struct run_request *out) {
   case REQUEST_START:
     if (out->argv[0] == NULL) return -1;
     if (out->working_dir[0] != '\0' && out->working_dir[0] != '/') return -1;
+    if (out->cancel_on_disconnect && out->detached) return -1;
     if (out->retain_output && !out->detached) return -1;
     if (out->detached && out->stdio != REQUEST_STDIO_NULL) return -1;
     return apply_exec_stdio(out);
@@ -946,6 +951,7 @@ int parse_request(const char *req, size_t req_len, struct run_request *out) {
     if (strcmp(type, request_specs[i].type) != 0) continue;
     if (seen != request_specs[i].members) return -1;
     out->kind = request_specs[i].kind;
+    out->cancel_on_disconnect = strcmp(type, "exec-v1") == 0;
     return validate_request(out);
   }
   return -1;

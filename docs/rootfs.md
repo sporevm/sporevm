@@ -7,7 +7,35 @@ verification contract, see [Filesystem And Root Disk Contract](filesystem.md).
 image, installs that image into the local digest cache, and writes chunked
 rootfs CAS objects plus a `rootfs_storage` descriptor into the metadata
 sidecar. Local image imports use the same chunked rootfs storage path.
-The first OCI-capable run workflow is deliberately two-step:
+
+`image pull SOURCE [--tag local/NAME:TAG] [--platform P]` acquires a complete
+image without starting a VM. Registry tags are resolved afresh; digest-pinned
+conversions may be reused. Native store inputs use `file://`, `http(s)://` or
+`s3://` references. Every missing store object is fetched and verified before
+success, and the complete image record roots the content against GC. A failed
+pull never publishes the requested local tag. `system prune` can explicitly
+remove acquired images, like built/imported images.
+
+Pull returns a native `local/...@blake3:...` digest reference that does not need
+the original registry/store, credentials, or network. An optional `--tag` is a
+mutable convenience name. Registry inputs default to host-native Linux; native
+inputs infer their recorded platform, with explicit mismatches rejected. This
+does not add cross-architecture execution. `image resolve` remains metadata-only
+and `run --image` remains lazy.
+
+```bash
+spore image pull docker.io/library/alpine:3.20 --tag local/alpine:offline
+spore run --image local/alpine:offline --pull never -- /bin/echo offline
+```
+
+`image export-rootfs` also accepts local images and native-store refs. It fully
+acquires native content, then writes an independent writable ext4 copy and a
+sidecar; neither output may already exist. Registry export retains its OCI
+metadata. Native export uses `spore.rootfs.export.metadata.v1`, recording
+`image_ref`, `image_digest`, `platform`, `config`, `rootfs_path`, `rootfs_size`
+and `rootfs_storage`, without inventing OCI layers or a registry manifest.
+
+One explicit ext4 workflow is:
 
 ```bash
 zig-out/bin/spore image export-rootfs docker.io/library/alpine:3.20 \

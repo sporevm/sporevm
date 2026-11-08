@@ -37,6 +37,7 @@ pub const Options = struct {
     spore_executable: []const u8 = "spore",
     debug: bool = false,
     timeout_ms: u64 = default_attach_timeout_ms,
+    duration_ms: u64 = 0,
     bound_services: spore_net_policy.BoundServiceBindingList = .{},
     interactive: bool = false,
     tty: bool = false,
@@ -56,7 +57,8 @@ pub const cli_usage =
     \\  --generation FILE       Inject fan-out identity JSON before attach
     \\  --bind-service NAME=unix:/path.sock
     \\                          Bind a manifest-declared service to a host socket
-    \\  --timeout DURATION      Resume command-probe timeout (default: 30s)
+    \\  --startup-timeout DURATION  Restored guest readiness limit (default: 30s)
+    \\  --for DURATION          Saved-session execution limit (default: none)
     \\  -i, --interactive       Forward stdin when the saved session supports it
     \\  -t, --tty               Attach as a terminal when the saved session has one
     \\  -h, --help              Show this help
@@ -65,9 +67,10 @@ pub const cli_usage =
     \\  spore checkpoint inspect <spore-dir>
     \\  # Sessions: 1
     \\
-    \\The timeout applies while the restored command probe is active, not to
-    \\checkpoint acquisition as a whole. Expiry fails and removes the throwaway
-    \\VM. --timeout-ms is also accepted. stdin/TTY must have been saved originally.
+    \\The startup clock ends when the attach request is delivered; --for starts
+    \\then. Neither bounds checkpoint acquisition. Expiry fails and removes the
+    \\throwaway VM. stdin/TTY must have been saved originally. Legacy --timeout
+    \\and --timeout-ms set the execution limit; prefer --for.
     \\
 ;
 
@@ -77,6 +80,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
     var session_id: ?[]const u8 = null;
     var generation_path: ?[]const u8 = null;
     var timeout_ms: u64 = default_attach_timeout_ms;
+    var duration_ms: u64 = 0;
     var bound_services = spore_net_policy.BoundServiceBindingList{};
     var interactive = false;
     var tty = false;
@@ -105,14 +109,19 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             }) catch |err| {
                 failAttachSetup("spore checkpoint resume: invalid --bind-service {s}: {s}", .{ args[i], @errorName(err) });
             };
-        } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--startup-timeout") and i + 1 < args.len) {
             i += 1;
             timeout_ms = cli_args.parseDurationMs(args[i]) catch {
-                failAttachSetup("--timeout expects a duration like 30s, 500ms, or 1m", .{});
+                failAttachSetup("--startup-timeout expects a positive duration like 30s", .{});
+            };
+        } else if ((std.mem.eql(u8, args[i], "--for") or std.mem.eql(u8, args[i], "--timeout")) and i + 1 < args.len) {
+            i += 1;
+            duration_ms = cli_args.parseExecutionDurationMs(args[i]) catch {
+                failAttachSetup("--for expects a positive duration or none", .{});
             };
         } else if (std.mem.eql(u8, args[i], "--timeout-ms") and i + 1 < args.len) {
             i += 1;
-            timeout_ms = parsePositive(u64, "--timeout-ms", args[i]);
+            duration_ms = parsePositive(u64, "--timeout-ms", args[i]);
         } else if (std.mem.eql(u8, args[i], "-i") or std.mem.eql(u8, args[i], "--interactive")) {
             interactive = true;
         } else if (std.mem.eql(u8, args[i], "-t") or std.mem.eql(u8, args[i], "--tty")) {
@@ -139,6 +148,7 @@ pub fn parseCliArgs(args: []const []const u8) !Options {
             failAttachSetup("{s}", .{cli_usage});
         },
         .timeout_ms = timeout_ms,
+        .duration_ms = duration_ms,
         .bound_services = bound_services,
         .interactive = interactive,
         .tty = tty,
@@ -240,7 +250,7 @@ fn executeWithEvents(context: Context, allocator: std.mem.Allocator, opts: Optio
         // the console only for a VM that booted with a console log.
         .console_sink = discardConsoleSink,
         .mode = .{ .oneshot = .{
-            .probe = .{ .stream = &stream, .timeout_ms = opts.timeout_ms },
+            .probe = .{ .stream = &stream, .startup_timeout_ms = opts.timeout_ms, .timeout_ms = opts.duration_ms },
             .control = exec_control,
         } },
     });
@@ -395,15 +405,17 @@ fn failAttachSetup(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 test "attach cli parser accepts one spore dir" {
-    const opts = try parseCliArgs(&.{ "--backend", "hvf", "--timeout", "120s", "child.spore" });
+    const opts = try parseCliArgs(&.{ "--backend", "hvf", "--startup-timeout", "120s", "--for", "7s", "child.spore" });
     try std.testing.expectEqual(Backend.hvf, opts.backend);
     try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
+    try std.testing.expectEqual(@as(u64, 7_000), opts.duration_ms);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 
 test "attach cli parser accepts hidden timeout-ms compatibility spelling" {
     const opts = try parseCliArgs(&.{ "--timeout-ms", "120000", "child.spore" });
-    try std.testing.expectEqual(@as(u64, 120_000), opts.timeout_ms);
+    try std.testing.expectEqual(@as(u64, 30_000), opts.timeout_ms);
+    try std.testing.expectEqual(@as(u64, 120_000), opts.duration_ms);
     try std.testing.expectEqualStrings("child.spore", opts.spore_dir);
 }
 

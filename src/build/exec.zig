@@ -1575,7 +1575,7 @@ const guest_fork_params_json_string =
 // that reach every member parser, including the generation params parser.
 const guest_exec_request_seeds = [_]struct { body: []const u8, kind: c_int, last_member: []const u8 }{
     .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"run-1\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/true\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
-    .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/sh\",\"-c\",\"cat\"],\"env\":[\"A=1\"],\"working_dir\":\"/work\",\"stdio\":\"pipe\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":true,\"params_json\":\"{\\\"generation\\\":2}\",\"require_generation_ready\":true,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
+    .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"exec-v1\",\"session_id\":\"lifecycle-1\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/sh\",\"-c\",\"cat\"],\"env\":[\"A=1\"],\"working_dir\":\"/work\",\"stdio\":\"pipe\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":true,\"params_json\":\"{\\\"generation\\\":2}\",\"require_generation_ready\":true,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
     .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-2\",\"resume_time_unix_ns\":1,\"argv\":[\"sh\"],\"env\":[],\"working_dir\":\"/\",\"stdio\":\"tty\",\"terminal_rows\":40,\"terminal_cols\":120,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":false,\"retain_output\":false,\"closed_env\":true" },
     .{ .kind = guest_agent_fuzz_start_request, .last_member = ",\"closed_env\":true", .body = "{\"type\":\"start-v1\",\"session_id\":\"lifecycle-3\",\"resume_time_unix_ns\":1,\"argv\":[\"/bin/sleep\",\"60\"],\"env\":[],\"working_dir\":\"\",\"stdio\":\"null\",\"terminal_rows\":24,\"terminal_cols\":80,\"memory_pressure\":false,\"params_json\":\"\",\"require_generation_ready\":false,\"detached\":true,\"retain_output\":true,\"closed_env\":true" },
     .{ .kind = guest_agent_fuzz_attach_request, .last_member = ",\"params_json\":\"\"", .body = "{\"type\":\"attach-v1\",\"session_id\":\"default\",\"stdout_offset\":0,\"stderr_offset\":0,\"stdio\":\"null\",\"interactive\":false,\"terminal_rows\":24,\"terminal_cols\":80,\"params_json\":\"\"" },
@@ -1665,7 +1665,7 @@ fn fuzzGuestBuildRequest(_: void, s: *std.testing.Smith) !void {
 
         if (mode == 9) {
             const tty = fuzz_len > 1 and (fuzz_bytes[1] & 1) != 0;
-            const request = guest_request.interactiveExecRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", command }, "spore-exec-fuzz", .{ .tty = tty }) catch return;
+            const request = guest_request.interactiveExecRequestWithSession(std.testing.allocator, &.{ "/bin/sh", "-c", command }, "spore-exec-fuzz", .{ .tty = tty, .cancel_on_disconnect = fuzz_len > 1 and (fuzz_bytes[1] & 2) != 0 }) catch return;
             defer std.testing.allocator.free(request);
             _ = spore_agent_fuzz_build_request(request.ptr, request.len, stream[0..0].ptr, 0);
             return;
@@ -3292,6 +3292,10 @@ test "guest agent parses exec and control requests strictly" {
     const detached_start = try guest_request.detachedExecRequestWithSessionContext(allocator, &.{"/bin/true"}, "s", .{ .retain_output = true });
     defer allocator.free(detached_start);
     try expectGuestRequestKind(start, detached_start);
+    const managed_exec = try guest_request.interactiveExecRequestWithSession(allocator, &.{"/bin/cat"}, "s", .{ .cancel_on_disconnect = true });
+    defer allocator.free(managed_exec);
+    try expectGuestRequestKind(start, managed_exec);
+    try expectGuestRequestEdit(invalid, detached_start, &.{.{ "\"type\":\"start-v1\"", "\"type\":\"exec-v1\"" }});
 
     // Each edit of a valid start-v1 request breaks one rule.
     const start_rejects = [_][]const [2][]const u8{
