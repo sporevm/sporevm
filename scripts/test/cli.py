@@ -46,6 +46,15 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
     for options in (["missing", "--env", "MODE=test"], ["--env", "MODE=test", "missing"]):
         cases.append((["vm", "exec", *options, "--", "echo", "--json", "--help", "--out"], 22, "object.invalid", "missing", True))
 
+    # Unsupported x86 operations reject before opening the missing resources.
+    if sys.platform == "linux" and os.uname().machine == "x86_64":
+        cases.extend([
+            (["checkpoint", "resume", str(root / "missing")], 2, "usage.invalid_argument", "fresh execution only", True),
+            (["checkpoint", "fork", str(root / "missing"), "--count", "1", "--output", str(root / "children")], 2, "usage.invalid_argument", "checkpoint fork is unavailable", False),
+            (["vm", "copy-in", "missing", str(root / "input"), "/tmp/input"], 2, "usage.invalid_argument", "does not support copying files", False),
+            (["vm", "copy-out", "missing", "/tmp/output", str(root / "output")], 2, "usage.invalid_argument", "does not support copying files", False),
+        ])
+
     for args, status, code, message, stream in cases:
         for structured in (False, True):
             argv = [binary, *(["--json"] if structured else []), *args]
@@ -67,5 +76,7 @@ with tempfile.TemporaryDirectory(prefix="spore-cli-") as directory:
                 assert not result.stdout, (argv, result.stdout)
                 assert message.lower() in result.stderr.lower(), (argv, result.stderr)
                 assert f"[{code}]" in result.stderr, (argv, result.stderr)
+                if args[:2] == ["checkpoint", "resume"]:
+                    assert result.stderr.startswith("spore checkpoint resume:"), (argv, result.stderr)
 
 print(f"CLI contracts: {len(cases)} cases passed in human and JSON modes")

@@ -73,7 +73,7 @@ if [[ "${run_rc}" != "0" ]]; then
   die "spore run save exited ${run_rc}, expected 0"
 fi
 [[ -f "${capture_dir}/manifest.json" ]] || die "save did not write ${capture_dir}/manifest.json"
-grep -Fq "saved spore at ${capture_dir}" "${run_stderr}" || {
+grep -Fq "saved checkpoint at ${capture_dir} (portable-self-contained)" "${run_stderr}" || {
   cat "${run_stderr}" >&2 || true
   die "spore run save did not report the save path"
 }

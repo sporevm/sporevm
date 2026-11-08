@@ -57,9 +57,9 @@ expect_failure run-resume "fresh execution only" \
   "${run_env[@]}" "${spore_bin}" run --backend kvm --checkpoint "${workdir}/missing.spore" -- /bin/true
 expect_failure restore "resume is unavailable" \
   "${run_env[@]}" "${spore_bin}" vm restore restored-$$ --checkpoint "${workdir}/missing.spore" --backend kvm
-expect_failure attach "X86ResumeUnsupported" \
+expect_failure attach "fresh execution only" \
   "${run_env[@]}" "${spore_bin}" checkpoint resume "${workdir}/missing.spore"
-expect_failure checkpoint-fork "X86ForkUnsupported" \
+expect_failure checkpoint-fork "checkpoint fork is unavailable" \
   "${run_env[@]}" "${spore_bin}" checkpoint fork "${workdir}/missing.spore" --count 1 --output "${workdir}/children"
 expect_failure build-vcpus "X86VcpuCountUnsupported" \
   "${run_env[@]}" "${spore_bin}" build --platform linux/amd64 --vcpus 2 --tag local/x86-rejected:dev -f "${workdir}/missing-Dockerfile" "${workdir}/missing-context"
@@ -79,9 +79,9 @@ if [[ -n "${seed_dir}" ]]; then
 fi
 "${run_env[@]}" "${spore_bin}" vm create "${vm_name}" --backend kvm --memory 512mib --vcpus 1 >/dev/null
 created=1
-expect_failure named-copy-in "X86NamedCopyUnsupported" \
+expect_failure named-copy-in "does not support copying files" \
   "${run_env[@]}" "${spore_bin}" vm copy-in "${vm_name}" "${workdir}/missing-host-input" /tmp/input
-expect_failure named-copy-out "X86NamedCopyUnsupported" \
+expect_failure named-copy-out "does not support copying files" \
   "${run_env[@]}" "${spore_bin}" vm copy-out "${vm_name}" /tmp/output "${workdir}/host-output"
 [[ ! -e "${workdir}/host-output" ]] || die "rejected named copy-out created output"
 expect_failure named-save "capture is unavailable" \

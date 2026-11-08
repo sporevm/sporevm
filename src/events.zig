@@ -756,7 +756,7 @@ pub fn classifyFailure(err: anyerror) machine_output.CliError {
     if (err == error.X86ResumeUnsupported or err == error.X86CaptureUnsupported) {
         return machine_output.CliError.init(
             .usage_invalid_argument,
-            "spore run: x86-64 KVM currently supports fresh execution only; resume, save, capture, and fork are unavailable",
+            "x86-64 KVM currently supports fresh execution only; resume, save, capture, and fork are unavailable",
             @errorName(err),
         );
     }
