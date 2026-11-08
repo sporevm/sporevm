@@ -81,6 +81,9 @@ pub const HostStream = struct {
     connect_request_delivered_ms: ?u64 = null,
     connect_ms: ?u64 = null,
     request_delivered_ms: ?u64 = null,
+    /// Absolute time, shared with the x86 watchdog. Execution is timed from
+    /// delivery of the complete request, separately from startup/connect.
+    request_delivered_at_ms: std.atomic.Value(u64) = .init(0),
     memory_pressure_ms: ?u64 = null,
     memory_pressure_count: u32 = 0,
     first_output_ms: ?u64 = null,
@@ -166,7 +169,19 @@ pub const HostStream = struct {
     }
 
     pub fn markRequestDelivered(self: *HostStream) void {
-        if (self.request_delivered_ms == null) self.request_delivered_ms = self.elapsedMs();
+        if (self.request_delivered_ms == null) {
+            self.request_delivered_ms = self.elapsedMs();
+            self.request_delivered_at_ms.store(monotonicMs(), .release);
+        }
+    }
+
+    pub const TimeoutPhase = enum { startup, execution };
+
+    /// Zero disables only the execution clock, never startup readiness.
+    pub fn timeoutPhase(self: *const HostStream, startup_ms: u64, execution_ms: u64) ?TimeoutPhase {
+        const delivered = self.request_delivered_at_ms.load(.acquire);
+        if (delivered == 0) return if (self.elapsedMs() >= startup_ms) .startup else null;
+        return if (execution_ms != 0 and monotonicMs() -| delivered >= execution_ms) .execution else null;
     }
 
     pub fn setOutputSink(self: *HostStream, context: ?*anyopaque, sink: HostStreamOutputSink) void {
@@ -762,6 +777,17 @@ test "host stream sequences dynamic host ports without early reuse" {
     try std.testing.expectEqual(dynamic_host_port_first, HostStream.hostPortForSequence(0));
     try std.testing.expectEqual(dynamic_host_port_first + 1, HostStream.hostPortForSequence(1));
     try std.testing.expectEqual(dynamic_host_port_first, HostStream.hostPortForSequence(dynamic_host_port_count));
+}
+
+test "startup and execution deadlines are separate and only execution can be unlimited" {
+    var stream = try HostStream.init(10700, "{}\n");
+    stream.started_at_ms = monotonicMs() -| 5_000;
+    try std.testing.expectEqual(HostStream.TimeoutPhase.startup, stream.timeoutPhase(1_000, 0).?);
+    stream.request_delivered_at_ms.store(monotonicMs(), .release);
+    try std.testing.expect(stream.timeoutPhase(1_000, 10_000) == null);
+    stream.request_delivered_at_ms.store(monotonicMs() -| 5_000, .release);
+    try std.testing.expectEqual(HostStream.TimeoutPhase.execution, stream.timeoutPhase(10_000, 1_000).?);
+    try std.testing.expect(stream.timeoutPhase(1_000, 0) == null);
 }
 
 fn fuzzHostStreamFrames(_: void, s: *std.testing.Smith) !void {

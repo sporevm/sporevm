@@ -6,7 +6,7 @@ pushable OCI image.
 
 ```bash
 spore build \
-  -t local/app:dev \
+  --tag local/app:dev \
   .
 
 spore run --image local/app:dev --pull=never -- /usr/local/bin/app
@@ -22,13 +22,13 @@ while every reachable stage is planned, before a `COPY --from` image or remote
 
 ## Command Line
 
-`-t` is required and must name a mutable `local/<name>:<tag>` ref. The build
+`--tag` is required and must name a mutable `local/<name>:<tag>` ref. The build
 context defaults to `.` and `-f` defaults to `<context>/Dockerfile`.
 
 ```text
 spore build [options] CONTEXT
 
-  -t, --tag REF                  Local image ref to update
+  --tag REF                      Local image ref to update
   -f, --file PATH                Dockerfile path
   --platform OS/ARCH             Native linux/arm64 or linux/amd64 platform
   --target STAGE                 Selected stage
@@ -39,7 +39,7 @@ spore build [options] CONTEXT
   --no-cache                     Bypass Dockerfile step-cache reads
   --memory SIZE                  Build VM memory
   --vcpus COUNT                  Build VM vCPUs, from 1 through 8
-  --timeout DURATION             Per-instruction timeout
+  --step-timeout DURATION        Positive per-instruction timeout
   --ulimit nofile=SOFT[:HARD]    RUN open-file limit
 ```
 

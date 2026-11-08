@@ -121,6 +121,7 @@ pub const Spec = struct {
     memory: memory_config.Config = .{},
     vcpus: topology.VcpuCount = 1,
     guest_port: u32 = 10700,
+    startup_timeout_ms: u64 = 30_000,
     timeout_ms: u64 = 30_000,
     console_log_path: ?[]const u8 = null,
 };

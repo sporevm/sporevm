@@ -60,6 +60,7 @@ pub const Config = struct {
     exec_probe_watchdog_until_control: bool = false,
     exec_control: ?vsock_control.Control = null,
     exec_probe_timeout_ms: u64 = 30_000,
+    exec_probe_startup_timeout_ms: u64 = 30_000,
     generation_seed: ?GenerationSeed = null,
 };
 
@@ -338,6 +339,8 @@ const ProbeWatchdogContext = struct {
     active: *std.atomic.Value(bool),
     deadline_ms: *std.atomic.Value(u64),
     timeout_ms: u64,
+    execution_timeout_ms: u64,
+    completion_seen: *const std.atomic.Value(bool),
 };
 
 fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
@@ -353,13 +356,19 @@ fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
             _ = std.c.nanosleep(&delay, null);
             continue;
         }
-        const deadline_ms = ctx.deadline_ms.load(.acquire);
+        const startup_deadline_ms = ctx.deadline_ms.load(.acquire);
+        const delivered_ms = ctx.probe.request_delivered_at_ms.load(.acquire);
+        const executing = delivered_ms != 0 and !ctx.completion_seen.load(.acquire);
+        const deadline_ms = if (executing)
+            if (ctx.execution_timeout_ms == 0) std.math.maxInt(u64) else delivered_ms +| ctx.execution_timeout_ms
+        else
+            startup_deadline_ms;
         const now = monotonicMs();
         if (now >= deadline_ms) {
             if (ctx.done.load(.acquire)) return;
-            if (ctx.deadline_ms.load(.acquire) != deadline_ms) continue;
+            if (ctx.deadline_ms.load(.acquire) != startup_deadline_ms) continue;
             if (!ctx.attachment_seen.load(.acquire) and !ctx.probe.claimStartTimeout()) continue;
-            if (ctx.state.finishError(error.ExecProbeTimeout)) ctx.wake_set.wakeAll();
+            if (ctx.state.finishError(if (executing) error.GuestExecutionTimedOut else error.GuestStartupTimedOut)) ctx.wake_set.wakeAll();
             return;
         }
         var delay = std.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
@@ -370,7 +379,7 @@ fn probeWatchdogMain(ctx: *ProbeWatchdogContext) void {
 pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     try board.validateLayout(config.ram_size);
     try topology.validateVcpuCount(config.vcpu_count);
-    if (config.exec_probe != null and config.exec_probe_timeout_ms == 0) return error.InvalidProbeTimeout;
+    if (config.exec_probe != null and config.exec_probe_startup_timeout_ms == 0) return error.InvalidProbeTimeout;
     if (config.exec_probe_start == .control and (config.exec_probe == null or config.exec_control == null)) return error.DeferredExecProbeRequiresControl;
 
     const kvm_fd = try kvm.openDevKvm();
@@ -519,7 +528,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
     var exec_probe_attachment_seen = std.atomic.Value(bool).init(config.exec_probe_start == .immediate);
     var exec_probe_completion_seen = std.atomic.Value(bool).init(false);
     var exec_probe_watchdog_active = std.atomic.Value(bool).init(config.exec_probe_start == .immediate or config.exec_probe_watchdog_until_control);
-    var exec_probe_deadline_ms = std.atomic.Value(u64).init(monotonicMs() +| config.exec_probe_timeout_ms);
+    var exec_probe_deadline_ms = std.atomic.Value(u64).init(monotonicMs() +| config.exec_probe_startup_timeout_ms);
     var wake_set = WakeSet{ .vcpus = vcpus[0..initialized] };
     config.network.setWake(.{ .context = &wake_set, .wakeFn = wakeNetwork });
     defer config.network.clearWake();
@@ -545,7 +554,7 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .exec_probe_done = &exec_probe_done,
             .exec_probe_completion_seen = &exec_probe_completion_seen,
             .exec_probe_deadline_ms = &exec_probe_deadline_ms,
-            .exec_probe_timeout_ms = config.exec_probe_timeout_ms,
+            .exec_probe_timeout_ms = config.exec_probe_startup_timeout_ms,
             .exec_probe_watchdog_until_control = config.exec_probe_watchdog_until_control,
             .exec_control = config.exec_control,
             .disk_snapshot = config.disk_snapshot,
@@ -570,7 +579,9 @@ pub fn run(allocator: std.mem.Allocator, config: Config) !ExitCause {
             .attachment_seen = &exec_probe_attachment_seen,
             .active = &exec_probe_watchdog_active,
             .deadline_ms = &exec_probe_deadline_ms,
-            .timeout_ms = config.exec_probe_timeout_ms,
+            .timeout_ms = config.exec_probe_startup_timeout_ms,
+            .execution_timeout_ms = config.exec_probe_timeout_ms,
+            .completion_seen = &exec_probe_completion_seen,
         };
         break :blk std.Thread.spawn(.{}, probeWatchdogMain, .{&watchdog_context}) catch |err| {
             if (state.finishError(err)) wake_set.wakeAll();
@@ -688,6 +699,10 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                 const owns_terminal = if (terminal) |result| ctx.state.reserveTerminal(result) else blk: {
                     if (ctx.exec_probe) |probe| switch (probe.state) {
                         .complete => {
+                            if (ctx.exec_probe_completion_seen.load(.acquire)) break :blk false;
+                            if (ctx.exec_probe_watchdog_until_control) {
+                                ctx.exec_probe_deadline_ms.store(monotonicMs() +| ctx.exec_probe_timeout_ms, .release);
+                            }
                             if (ctx.exec_probe_completion_seen.swap(true, .acq_rel)) break :blk false;
                             if (ctx.exec_probe_completes_run) {
                                 ctx.exec_probe_done.store(true, .release);
@@ -695,9 +710,7 @@ fn vcpuThreadMain(ctx: *ThreadContext) void {
                                 break :blk ctx.state.reserveProbeComplete(ctx.vcpu.index);
                             }
                             ctx.vsock_dev.resetHostStream();
-                            if (ctx.exec_probe_watchdog_until_control) {
-                                ctx.exec_probe_deadline_ms.store(monotonicMs() +| ctx.exec_probe_timeout_ms, .release);
-                            } else {
+                            if (!ctx.exec_probe_watchdog_until_control) {
                                 ctx.exec_probe_done.store(true, .release);
                             }
                         },
@@ -1352,6 +1365,7 @@ test "probe watchdog publishes a typed timeout" {
     var attachment_seen = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(bool).init(true);
     var deadline_ms = std.atomic.Value(u64).init(0);
+    var completion_seen = std.atomic.Value(bool).init(false);
     var context = ProbeWatchdogContext{
         .state = &state,
         .wake_set = &wake_set,
@@ -1361,12 +1375,14 @@ test "probe watchdog publishes a typed timeout" {
         .active = &active,
         .deadline_ms = &deadline_ms,
         .timeout_ms = 0,
+        .execution_timeout_ms = 0,
+        .completion_seen = &completion_seen,
     };
     probeWatchdogMain(&context);
     try std.testing.expect(state.stopped());
     switch (state.publishedResult().?) {
         .cause => return error.TestUnexpectedResult,
-        .err => |err| try std.testing.expectEqual(error.ExecProbeTimeout, err),
+        .err => |err| try std.testing.expectEqual(error.GuestStartupTimedOut, err),
     }
 }
 
@@ -1379,6 +1395,7 @@ test "completed exec probe disarms watchdog without stopping commit control" {
     var attachment_seen = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(bool).init(true);
     var deadline_ms = std.atomic.Value(u64).init(0);
+    var completion_seen = std.atomic.Value(bool).init(true);
     var context = ProbeWatchdogContext{
         .state = &state,
         .wake_set = &wake_set,
@@ -1388,6 +1405,8 @@ test "completed exec probe disarms watchdog without stopping commit control" {
         .active = &active,
         .deadline_ms = &deadline_ms,
         .timeout_ms = 0,
+        .execution_timeout_ms = 0,
+        .completion_seen = &completion_seen,
     };
     probeWatchdogMain(&context);
     try std.testing.expect(!state.stopped());
@@ -1404,6 +1423,7 @@ test "deferred exec probe refreshes watchdog when command starts" {
     var attachment_seen = std.atomic.Value(bool).init(false);
     var active = std.atomic.Value(bool).init(true);
     var deadline_ms = std.atomic.Value(u64).init(0);
+    var completion_seen = std.atomic.Value(bool).init(false);
     var context = ProbeWatchdogContext{
         .state = &state,
         .wake_set = &wake_set,
@@ -1413,6 +1433,8 @@ test "deferred exec probe refreshes watchdog when command starts" {
         .active = &active,
         .deadline_ms = &deadline_ms,
         .timeout_ms = 10_000,
+        .execution_timeout_ms = 10_000,
+        .completion_seen = &completion_seen,
     };
     const watchdog = try std.Thread.spawn(.{}, probeWatchdogMain, .{&context});
     while (!attachment_seen.load(.acquire)) std.Thread.yield() catch {};

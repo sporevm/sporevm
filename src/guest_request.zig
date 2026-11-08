@@ -179,6 +179,7 @@ pub const InteractiveExecRequestOptions = struct {
     terminal_size: spore_stream.Resize = .{ .rows = 24, .cols = 80 },
     resume_time_unix_ns: u64 = 0,
     generation_params: ?[]const u8 = null,
+    cancel_on_disconnect: bool = false,
 };
 
 /// Encodes a streamed exec. Stdin is always a pipe (or the terminal): the
@@ -191,6 +192,7 @@ pub fn interactiveExecRequestWithSession(allocator: std.mem.Allocator, argv: []c
         .terminal_size = options.terminal_size,
         .resume_time_unix_ns = options.resume_time_unix_ns,
         .generation_params = options.generation_params,
+        .cancel_on_disconnect = options.cancel_on_disconnect,
     });
 }
 
@@ -219,6 +221,7 @@ const GuestExecOptions = struct {
     require_generation_ready: bool = false,
     detached: bool = false,
     retain_output: bool = false,
+    cancel_on_disconnect: bool = false,
 };
 
 /// Encodes the guest agent's `start-v1` request. Every member is always
@@ -227,7 +230,7 @@ pub fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const
     try validateGuestArgv(argv);
     try validateGuestExecOptions(options);
     const payload = struct {
-        type: []const u8 = "start-v1",
+        type: []const u8,
         session_id: []const u8,
         resume_time_unix_ns: u64,
         argv: []const []const u8,
@@ -243,6 +246,7 @@ pub fn execRequestWithSessionOptions(allocator: std.mem.Allocator, argv: []const
         retain_output: bool,
         closed_env: bool = true,
     }{
+        .type = if (options.cancel_on_disconnect) "exec-v1" else "start-v1",
         .session_id = session_id,
         .resume_time_unix_ns = options.resume_time_unix_ns,
         .argv = argv,

@@ -47,8 +47,21 @@ with native-identity metadata, without fabricated OCI provenance.
 
 S3 reads now use AWS CLI v2's profile/provider chain when explicit environment
 credentials are absent, and refresh expiring provider credentials before use.
-Timeout redesign is still pending. `--save-on INT` makes Ctrl-C save
-successfully, not cancel; human mode prints a notice.
+Startup readiness uses `--startup-timeout`, commands use `--exec-timeout`
+(including per-exec overrides), builds use `--step-timeout`, and resumed saved
+sessions use `--for`. Execution alone accepts `none`; resumed sessions no
+longer inherit a hidden 30s limit. These do not bound artifact acquisition or
+the whole operation. Named exec timeouts cancel descendants while preserving
+the VM and its initial command. Named exec process trees now belong to the
+invocation, including normal completion; start long-lived background services
+as the detached `vm create` initial command instead of `vm exec ... &`.
+Legacy timeout spellings remain accepted.
+
+Checkpoint format is now v8 because saved RAM includes the guest agent that
+implements client-owned command cancellation. Re-create checkpoints from
+formats 0–7; rewriting their version cannot upgrade the saved agent. Native
+image layout is unchanged. `--save-on INT` makes Ctrl-C save successfully,
+not cancel; human mode prints a notice.
 Pinned Kubernetes deployments must stay on their current CLI until the removed
 bundle workflow is migrated and tested; this is not a coordinated k8s upgrade.
 

@@ -110,6 +110,7 @@ struct session {
   int exited;
   int memory_pressure_fd;
   int build_run_isolation;
+  int cancel_on_disconnect;
   char cgroup_path[128];
   char session_id[64];
   pid_t pid;
@@ -259,6 +260,7 @@ struct run_request {
   int memory_pressure;
   int detached;
   int retain_output;
+  int cancel_on_disconnect;
   int require_generation_ready;
   char generation_params[GEN_PARAMS_MAX];
   char copy_path[MAX_COPY_PATH_LEN + 1];
@@ -302,6 +304,7 @@ struct session_start_options {
   int use_rootfs;
   int memory_pressure;
   int build_run_isolation;
+  int cancel_on_disconnect;
   enum exec_lookup_mode exec_lookup;
   uint64_t nofile_soft;
   uint64_t nofile_hard;
@@ -415,6 +418,7 @@ int write_pid_file(const char *path, pid_t pid);
 int read_u64_file(const char *path, uint64_t *out);
 int cgroup_child_path(char *out, size_t out_len, const char *dir, const char *file);
 void close_session_cgroup(struct session *session);
+int stop_session_processes(struct session *session, pid_t pid);
 __attribute__((noreturn)) void fail_closed_build_run_cleanup(const char *phase);
 void drain_memory_pressure_events(struct session *session);
 int rearm_memory_pressure_limit(struct session *session);

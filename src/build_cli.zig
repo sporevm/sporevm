@@ -26,7 +26,7 @@ pub const usage =
     \\  --no-cache                     Bypass Dockerfile step-cache reads; PREPARE is still reused
     \\  --memory SIZE                  Build VM memory, for example 512mb or 16gb
     \\  --vcpus COUNT                  Build VM vCPUs, from 1 through 8
-    \\  --timeout DURATION             Per-step timeout, for example 30s or 5m
+    \\  --step-timeout DURATION        Per-step limit, for example 30s or 5m
     \\  --ulimit nofile=SOFT[:HARD]    RUN open-file limit, up to 1048576
     \\  -h, --help                     Show this help
     \\
@@ -223,8 +223,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedOpti
             parsed.vcpus = topology.parseVcpuCount(try nextValue(args, &i, arg)) catch return error.BadVcpus;
         } else if (std.mem.startsWith(u8, arg, "--vcpus=")) {
             parsed.vcpus = topology.parseVcpuCount(try nonEmptyValue(arg["--vcpus=".len..])) catch return error.BadVcpus;
-        } else if (std.mem.eql(u8, arg, "--timeout")) {
+        } else if (std.mem.eql(u8, arg, "--step-timeout") or std.mem.eql(u8, arg, "--timeout")) {
             parsed.timeout_ms = cli_args.parseDurationMs(try nextValue(args, &i, arg)) catch return error.BadTimeout;
+        } else if (std.mem.startsWith(u8, arg, "--step-timeout=")) {
+            parsed.timeout_ms = cli_args.parseDurationMs(try nonEmptyValue(arg["--step-timeout=".len..])) catch return error.BadTimeout;
         } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
             parsed.timeout_ms = cli_args.parseDurationMs(try nonEmptyValue(arg["--timeout=".len..])) catch return error.BadTimeout;
         } else if (std.mem.eql(u8, arg, "--ulimit")) {
@@ -318,7 +320,7 @@ fn parseErrorMessage(err: anyerror) []const u8 {
         error.BadNetworkMode => "spore build: --network must be spore or none",
         error.BadMemory => "spore build: --memory must be a positive page-aligned size like 512mb or 16gb",
         error.BadVcpus => "spore build: --vcpus must be an integer from 1 through 8",
-        error.BadTimeout => "spore build: --timeout must be a positive duration like 30s, 5m, or 500ms",
+        error.BadTimeout => "spore build: --step-timeout must be a positive duration like 30s, 5m, or 500ms",
         error.BadUlimit => "spore build: --ulimit currently accepts only nofile=SOFT:HARD up to 1048576",
         error.BadPlatform, error.UnsupportedPlatform => "spore build: --platform must be linux/arm64 or linux/amd64",
         else => "spore build: invalid arguments",
@@ -695,7 +697,7 @@ test "build CLI parses M1 options" {
     try std.testing.expectEqualStrings("test", parsed.build_args.items[0].value);
     try std.testing.expectEqual(.amd64, parsed.platform.arch);
     try std.testing.expect(std.mem.indexOf(u8, usage, "--disk-grow-target") == null);
-    for ([_][]const u8{ "--memory", "--vcpus", "--timeout", "--ulimit" }) |option| {
+    for ([_][]const u8{ "--memory", "--vcpus", "--step-timeout", "--ulimit" }) |option| {
         try std.testing.expect(std.mem.indexOf(u8, usage, option) != null);
     }
 

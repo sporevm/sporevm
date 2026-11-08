@@ -20,6 +20,7 @@ core=(
   fanout/counter.sh
   fanout/named-disk-fork.sh
   lifecycle/basic.sh
+  lifecycle/timeouts.sh
   lifecycle/copy.sh
   monitor/jail.sh
   network/deny.sh

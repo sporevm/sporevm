@@ -299,7 +299,7 @@ const value_options = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },               .{ "--for", {} },             .{ "--options", {} },        .{ "--initial-output", {} },
     .{ "--file", {} },                  .{ "-f", {} },                .{ "--target", {} },         .{ "--build-context", {} },
     .{ "--build-arg", {} },             .{ "--network", {} },         .{ "--ulimit", {} },         .{ "--older-than", {} },
-    .{ "--max-bytes", {} },
+    .{ "--max-bytes", {} },             .{ "--startup-timeout", {} }, .{ "--exec-timeout", {} },   .{ "--step-timeout", {} },
 });
 
 fn argumentError(allocator: std.mem.Allocator, command: []const u8, args: []const []const u8) !?[]const u8 {
@@ -318,7 +318,7 @@ fn argumentError(allocator: std.mem.Allocator, command: []const u8, args: []cons
         if (!std.mem.startsWith(u8, flag, "-")) continue;
         const repeated = std.mem.eql(u8, flag, "--env") or std.mem.eql(u8, flag, "--annotation") or std.mem.startsWith(u8, flag, "--allow-") or std.mem.eql(u8, flag, "--bind-service") or std.mem.eql(u8, flag, "--forward") or std.mem.eql(u8, flag, "--inject") or std.mem.eql(u8, flag, "--build-context") or std.mem.eql(u8, flag, "--build-arg");
         if (!repeated) {
-            const canonical = if (std.mem.eql(u8, flag, "-f")) "--file" else if (std.mem.eql(u8, flag, "--timeout-ms")) "--timeout" else flag;
+            const canonical = if (std.mem.eql(u8, flag, "-f")) "--file" else if (std.mem.eql(u8, flag, "--timeout-ms") or std.mem.eql(u8, flag, "--timeout")) (if (std.mem.eql(u8, command, "build")) "--step-timeout" else if (std.mem.eql(u8, command, "checkpoint resume")) "--for" else "--exec-timeout") else flag;
             const entry = try seen.getOrPut(allocator, canonical);
             if (entry.found_existing) return allocMessage(allocator, "spore {s}: {s} may be supplied once", .{ command, flag });
         }
