@@ -64,7 +64,7 @@ export SPOREVM_ROOTFS_CACHE_DIR="${workdir}/cache"
 cd "${workdir}/run"
 
 "${spore_bin}" vm create diskless-rm-1 --backend "${backend}" --memory 256mb --vcpus 1
-"${spore_bin}" vm save diskless-rm-1 --out stopped-1.spore --stop
+"${spore_bin}" vm save diskless-rm-1 --output stopped-1.spore --stop
 "${spore_bin}" checkpoint inspect stopped-1.spore > inspect-1.txt
 grep -Fq "vCPUs: 1" inspect-1.txt
 saved_1="$(cd stopped-1.spore && pwd -P)"
@@ -84,7 +84,7 @@ if "${spore_bin}" checkpoint rm stopped-1.spore >/dev/null 2>&1; then
 fi
 
 "${spore_bin}" vm create diskless-rm-2 --backend "${backend}" --memory 256mb --vcpus 2
-"${spore_bin}" vm save diskless-rm-2 --out stopped-2.spore --stop
+"${spore_bin}" vm save diskless-rm-2 --output stopped-2.spore --stop
 "${spore_bin}" checkpoint inspect stopped-2.spore > inspect-2.txt
 grep -Fq "vCPUs: 2" inspect-2.txt
 saved_2="$(cd stopped-2.spore && pwd -P)"

@@ -7,6 +7,7 @@ cd "${repo_root}"
 zig build test --summary all
 zig build
 scripts/test/version.sh zig-out
+python3 scripts/test/cli.py zig-out/bin/spore
 if [[ "$(uname -s)" == "Linux" ]]; then
   zig fmt --check build.zig src
 fi

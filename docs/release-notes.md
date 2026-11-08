@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+### Consistent CLI names and guest-command boundaries
+
+The unreleased-main spellings below are replaced before 0.18.0. They are not
+executable aliases: obsolete flags/commands fail with a correction. This adds
+a migration for scripts already tracking main as well as the 0.17.1 upgrade.
+
+| Previous main | Canonical spelling |
+| --- | --- |
+| `attach DIR` | `checkpoint resume DIR` |
+| `fanout BATCH` | `checkpoint fanout BATCH` |
+| `image export REF` | `image export-rootfs REF` (registry images only) |
+| `build -t REF CONTEXT` | `build CONTEXT --tag REF` |
+| Import/unpack `--ref REF` | `--tag REF` |
+| Artifact `--out PATH` | `--output PATH` |
+| `image push REF STORE/TAG` | `image push REF --to STORE/TAG` |
+| `checkpoint push DIR STORE/TAG` | `checkpoint push DIR --to STORE/TAG` |
+| `run --from DIR` | `run --checkpoint DIR` |
+| `run --save DIR`, `--commit REF` | `--save-checkpoint DIR`, `--commit-image REF` |
+| `vm restore DIR --name NAME` | `vm restore NAME --checkpoint DIR` |
+| `vm fork NAME --name PATTERN` | `vm fork NAME --name-prefix PREFIX` → `PREFIX-0…PREFIX-(N-1)` |
+| `vm logs NAME` | `vm logs NAME --initial` (bounded initial output, not exec history) |
+| Unpack `--archive-digest DIGEST` | `--expected-archive-digest DIGEST` |
+| Bare guest command/string | `-- ARGV…` or `--shell STRING` |
+
+Command options work before or after resource operands until `--`; global
+`--json`/`--debug` must precede the command. Duplicate scalar flags fail,
+while collection flags retain repetition. Options-file JSON keys, result
+schemas, and event identifiers (`attach`, `fanout`, `exec`) are unchanged.
+Both output modes now use classified failure statuses, including named exec
+readiness failures (22, not human-only 2). Push results add immutable
+`digest_ref` and nullable mutable `tag_ref`, preserving legacy `ref` meanings.
+
+Registry/layout/tar selection defaults to host-native Linux. Pack, push and
+unpack infer a single recorded platform; explicit selection never substitutes
+another platform. Disk-backed checkpoint summaries identify cache-pinned
+storage rather than implying a standalone portable `.spore` artifact.
+
+No fetch-only `image pull`, local-image ext4 export, AWS profile/refresh support
+for reads, or timeout redesign is included. `--save-on INT` still makes Ctrl-C
+save successfully, not cancel; human mode prints a notice. S3 reads still need
+explicit environment credentials and region, unlike AWS-CLI-backed pushes.
+Pinned Kubernetes deployments must stay on their current CLI until the removed
+bundle workflow is migrated and tested; this is not a coordinated k8s upgrade.
+
 ### One spelling per command: `spore vm` and `spore checkpoint`
 
 Commands on named VMs live under `spore vm` and commands on saved state under

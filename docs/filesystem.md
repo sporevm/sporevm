@@ -29,7 +29,7 @@ directory. Only image records root CAS storage; names and derivations may
 dangle after prune, and then miss. Records from earlier cache layouts are not
 read; pull, import, or build the image again.
 
-`spore run --image ... --save` is the writable-rootfs product path. It
+`spore run --image ... --save-checkpoint` is the writable-rootfs product path. It
 records the immutable ext4 artifact, records `rootfs.storage` from the image
 record for image-created spores, and captures rootfs writes as a sealed disk
 index over that base.
@@ -236,7 +236,7 @@ Known-zero partial tails remain metadata-only. Allocation, read, write, or
 resize failure leaves the source map, digests, dirty state, and logical size
 unchanged.
 
-`spore run --image ... --commit local/name:tag` uses the same writable head but
+`spore run --image ... --commit-image local/name:tag` uses the same writable head but
 publishes its sealed root disk as a new indexed local image after a successful
 guest command. The transaction holds the rootfs cache lock from snapshot
 sealing through the completeness stamp, image record write, and atomic
@@ -270,7 +270,7 @@ source index remains unchanged.
 Plain `spore run --rootfs PATH` is still a local read-only escape hatch. Named
 `spore vm create --rootfs PATH` records exact immutable rootfs identity in the
 digest cache, so lifecycle saves can restore through the fd-backed rootfs
-path. Combining one-shot `spore run --rootfs PATH` with `--save` is rejected
+path. Combining one-shot `spore run --rootfs PATH` with `--save-checkpoint` is rejected
 until an import path can record chunked portable rootfs identity for arbitrary
 local images.
 
@@ -278,8 +278,8 @@ local images.
 `/run/sporevm/injected/ID` for a fresh run. The bytes are appended to the run
 initrd and, when a rootfs is attached, copied into the rootfs `/run` tmpfs
 before the command starts. They are not installed into the image rootfs cache or
-the immutable rootfs artifact. Spore rejects `--inject` with `--save` and
-`--from`; `--commit` allows injection because tmpfs state is outside the root
+the immutable rootfs artifact. Spore rejects `--inject` with `--save-checkpoint` and
+`--checkpoint`; `--commit-image` allows injection because tmpfs state is outside the root
 disk. A guest command that explicitly copies those bytes onto the root disk is
 deliberately making them persistent.
 

@@ -12,7 +12,7 @@ human output: `spore --json <command> --help` fails with
 
 ### Results
 
-Commands other than `run`, `attach`, `fanout` and `vm exec` print exactly one
+Commands other than `run`, `checkpoint resume`, `checkpoint fanout` and `vm exec` print exactly one
 JSON result on stdout. A failure prints one `spore.error.v1`
 document on stderr and nothing on stdout. Each result has `schema`,
 `schema_version` and these top-level fields:
@@ -27,14 +27,14 @@ document on stderr and nothing on stdout. Each result has `schema`,
 | `spore.inspect.result.v1` | `checkpoint inspect` | `resource_type`: string, `portability`: string, `can_attach`: boolean, `can_run_from`: boolean, `version`: integer, `vm_state_present`: boolean, `storage_mode`: string, `ownership`: string, `vcpu_count`: integer, `platform`: object, `device_count`: integer, `memory_chunk_count`: integer, `present_memory_chunk_count`: integer, `memory_backing_kind`: string or null, `memory_backing_size`: integer or null, `initial_memory_bytes`: integer, `max_memory_bytes`: integer, `requested_memory_bytes`: integer, `captured_memory_bytes`: integer, `plugged_memory_ranges`: array of objects, `gic_kind`: string, `sessions`: array of objects, `network`: object or null, `annotations`: object, `annotation_keys`: array of strings |
 | `spore.fork.result.v1` | `checkpoint fork` | `resource_type`: string, `parent`: string, `out_dir`: string, `count`: integer, `parent_generation`: integer, `first_generation`: integer, `last_generation`: integer, `first_child`: string, `last_child`: string, `pin_publish_ms`: integer or null, `pin_lock_wait_ms`: integer or null |
 | `spore.saved.remove.result.v2` | `checkpoint rm` | `resource_type`: string, `action`: string, `spore_dir`: string |
-| `spore.push.result.v2` | `checkpoint push` | `resource_type`: string, `ref`: string, `spore_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
+| `spore.push.result.v2` | `checkpoint push` | `resource_type`: string, `ref`: string, `digest_ref`: string, `tag_ref`: string or null, `spore_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
 | `spore.pull.result.v2` | `checkpoint pull` | `resource_type`: string, `ref`: string, `spore_digest`: string, `out_dir`: string, `ram`: object, `disk`: object |
 | `spore.rootfs.import.result.v2` | `image import-oci`, `image import-tar` | `metadata_path`: string, `local_ref_path`: string, `resolved_image_ref`: string, `image_manifest_digest`: string, `rootfs_storage`: object |
-| `spore.rootfs.resolve.result.v1` | `image resolve` | `ref`: string, `resolved_image_ref`: string |
-| `spore.rootfs.build.result.v1` | `image export` | `rootfs_storage`: object |
-| `spore.image.push.result.v1` | `image push` | `resource_type`: string, `ref`: string, `image_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
-| `spore.image.archive.pack.result.v1` | `image pack` | `resource_type`: string, `archive_digest`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `archive_bytes`: integer |
-| `spore.image.archive.unpack.result.v1` | `image unpack` | `resource_type`: string, `resolved_image_ref`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer |
+| `spore.rootfs.resolve.result.v1` | `image resolve` | `ref`: string, `resolved_image_ref`: string, `platform`: object |
+| `spore.rootfs.build.result.v1` | `image export-rootfs` | `rootfs_storage`: object |
+| `spore.image.push.result.v1` | `image push` | `resource_type`: string, `ref`: string, `digest_ref`: string, `tag_ref`: string or null, `platform`: object, `image_digest`: string, `objects_total`: integer, `objects_written`: integer, `bytes_written`: integer |
+| `spore.image.archive.pack.result.v1` | `image pack` | `resource_type`: string, `archive_digest`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `archive_bytes`: integer, `platform`: object |
+| `spore.image.archive.unpack.result.v1` | `image unpack` | `resource_type`: string, `resolved_image_ref`: string, `manifest_digest`: string, `image_digest`: string, `object_count`: integer, `platform`: object |
 | `spore.host-info.v3` | `system info` | `host_class`: string, `architecture`: string, `platform`: object, `backends`: array of objects, `cache_roots`: object |
 | `spore.system.df.result.v1` | `system df` | `cache_root`: string, `image_rootfs`: object, `linked_image_rootfs`: object, `image_metadata`: object, `digest_artifacts`: object, `cas_indexes`: object, `cas_objects`: object, `cas_complete_stamps`: object, `ref_records`: object, `temp_entries`: object, `build_cache_mounts`: object, `known_logical_bytes`: integer, `default_prunable_bytes`: integer |
 | `spore.system.prune.result.v1` | `system prune` | `cache_root`: string, `dry_run`: boolean, `include_digest_artifacts`: boolean, `include_rootfs_chunks`: boolean, `older_than_seconds`: integer or null, `max_bytes`: integer or null, `scope_bytes_before`: integer, `scope_bytes_after`: integer, `candidate_count`: integer, `candidate_bytes`: integer, `candidate_reclaimable_bytes`: integer, `cache_mount_candidate_count`: integer, `cache_mount_candidate_reclaimable_bytes`: integer, `default_selection`: boolean, `deleted_count`: integer, `deleted_bytes`: integer, `deleted_reclaimable_bytes`: integer, `cache_mount_deleted_count`: integer, `cache_mount_deleted_reclaimable_bytes`: integer, `entries`: array of objects, `runtime_forks`: object or null |
@@ -55,7 +55,7 @@ document on stderr and nothing on stdout. Each result has `schema`,
 
 ### Event streams
 
-`run`, `attach`, `fanout` and `vm exec` print `spore.automation.event.v1`
+`run`, `checkpoint resume`, `checkpoint fanout` and `vm exec` print `spore.automation.event.v1`
 records on stdout, one per line, instead of the guest's raw output. Every
 stream, including one that fails on its arguments, ends with exactly one
 `completion` record:
@@ -63,6 +63,13 @@ stream, including one that fails on its arguments, ends with exactly one
 ```json
 {"schema":"spore.automation.event.v1","schema_version":1,"event":"completion","outcome":"completed","command":"exec","backend":null,"exit_code":0}
 ```
+
+Wire identifiers do not change with CLI spelling: `checkpoint resume` reports
+`command: "attach"`, `checkpoint fanout` reports `"fanout"`, and `vm exec`
+reports `"exec"`. Historical schema and capability names such as `can_attach`
+also remain unchanged. Push results add `digest_ref` and nullable `tag_ref`;
+use `digest_ref` for immutable automation inputs. The legacy `ref` is still
+the publication ref for image push and the digest ref for checkpoint push.
 
 `outcome` is `completed`, `failed`, or `canceled`. `completed` means SporeVM
 delivered the operation's terminal result; a guest process can therefore be

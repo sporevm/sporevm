@@ -21,17 +21,17 @@ pub const inspect_usage = "usage: spore checkpoint inspect DIR\n";
 
 pub const fork_usage =
     \\Usage:
-    \\  spore checkpoint fork DIR --count N --out DIR
+    \\  spore checkpoint fork DIR --count N --output DIR
     \\
     \\Options:
     \\  --count N   Number of children to create
-    \\  --out DIR   Directory for the child checkpoints
+    \\  --output DIR   Directory for the child checkpoints
     \\  -h, --help  Show this help
     \\
     \\Workflow:
-    \\  spore run --save base.spore --save-on TERM 'while true; do echo tick; sleep 1; done'
-    \\  spore checkpoint fork base.spore --count 2 --out children
-    \\  spore fanout children --for 10s
+    \\  spore run --save-checkpoint base.spore --save-on TERM --shell 'while true; do echo tick; sleep 1; done'
+    \\  spore checkpoint fork base.spore --count 2 --output children
+    \\  spore checkpoint fanout children --for 10s
     \\
 ;
 
@@ -50,27 +50,33 @@ pub const rm_usage =
 
 pub const push_usage =
     \\Usage:
-    \\  spore checkpoint push DIR STORE/TAG
+    \\  spore checkpoint push DIR --to STORE/TAG
     \\
     \\STORE is a directory, a file:// URL or s3://bucket/prefix (uploaded with
     \\the aws CLI); TAG may be blake3:<digest>. The checkpoint's RAM chunks and
     \\disk objects share the store's objects with images.
     \\
     \\Options:
+    \\  --to STORE/TAG       Store publication destination
     \\  -h, --help           Show this help
     \\
 ;
 
 pub const pull_usage =
     \\Usage:
-    \\  spore checkpoint pull STORE/TAG --out DIR
+    \\  spore checkpoint pull STORE/TAG --output DIR
     \\
     \\STORE is a directory, a file://, http(s):// or s3://bucket/prefix URL; TAG
     \\may be blake3:<digest>. DIR must not exist and must be on the rootfs cache's
-    \\filesystem. Run the pulled checkpoint with `spore run --from DIR`.
+    \\filesystem. This is a cache-pinned directory, not a standalone archive.
+    \\Use `spore run --checkpoint DIR -- ARGV` for a new command, `spore checkpoint
+    \\resume DIR` for its saved process, or `spore vm restore NAME --checkpoint DIR`.
+    \\S3 reads require explicit AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional
+    \\AWS_SESSION_TOKEN and AWS_REGION (or AWS_DEFAULT_REGION). AWS_PROFILE is
+    \\push-only; reads do not refresh credentials.
     \\
     \\Options:
-    \\  --out DIR            Write the pulled checkpoint to DIR
+    \\  --output DIR            Write the pulled checkpoint to DIR
     \\  -h, --help           Show this help
     \\
 ;
@@ -82,7 +88,11 @@ fn apiContext(ctx: *const Ctx) api.Context {
 pub fn inspect(ctx: *const Ctx, args: []const []const u8) !void {
     const arena = ctx.init.arena.allocator();
     if (args.len != 1) exitUsage(arena, ctx.stderr, ctx.mode, "checkpoint inspect", "usage: spore checkpoint inspect DIR");
-    const summary = try api.inspectSpore(arena, args[0]);
+    const summary = api.inspectSpore(arena, args[0]) catch |err| {
+        const classified = machine_output.fromZigError(err);
+        const message = allocMessage(arena, "spore checkpoint inspect: cannot read checkpoint {s}; check the path and manifest ({s})", .{ args[0], classified.code.text() });
+        exitWithCliError(arena, ctx.stderr, ctx.mode, machine_output.CliError.init(classified.code, message, "checkpoint inspect"), message);
+    };
     if (ctx.mode == .json) {
         try machine_output.writeJson(arena, ctx.stdout, summary);
     } else {
@@ -154,7 +164,7 @@ fn forkCommand(
             count = std.fmt.parseInt(usize, args[i], 10) catch {
                 exitInvalidValue(allocator, stderr, mode, command_label, "--count", args[i]);
             };
-        } else if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--output") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -167,7 +177,7 @@ fn forkCommand(
     }
 
     if (parent_dir == null or out_dir == null or count == null) {
-        exitUsage(allocator, stderr, mode, command_label, "usage: spore checkpoint fork DIR --count N --out DIR");
+        exitUsage(allocator, stderr, mode, command_label, "usage: spore checkpoint fork DIR --count N --output DIR");
     }
 
     return api.fork(context, allocator, .{
@@ -192,13 +202,16 @@ fn pushCommand(
 ) !api.PushResult {
     var spore_dir: ?[]const u8 = null;
     var destination: ?[]const u8 = null;
-    for (args) |arg| {
-        if (std.mem.startsWith(u8, arg, "--")) {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--to") and i + 1 < args.len) {
+            i += 1;
+            destination = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--")) {
             exitUnknownArgument(allocator, stderr, mode, "checkpoint push", arg);
         } else if (spore_dir == null) {
             spore_dir = arg;
-        } else if (destination == null) {
-            destination = arg;
         } else {
             exitUnexpectedArgument(allocator, stderr, mode, "checkpoint push", arg);
         }
@@ -220,7 +233,7 @@ fn pullCommand(
     var out_dir: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--out") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--output") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
         } else if (std.mem.startsWith(u8, args[i], "--")) {
@@ -232,7 +245,7 @@ fn pullCommand(
         }
     }
     if (source == null or out_dir == null) {
-        exitUsage(allocator, stderr, mode, "checkpoint pull", "usage: spore checkpoint pull STORE/TAG --out DIR");
+        exitUsage(allocator, stderr, mode, "checkpoint pull", "usage: spore checkpoint pull STORE/TAG --output DIR");
     }
     return api.pull(context, allocator, .{ .source = source.?, .out_dir = out_dir.? }) catch |err| switch (err) {
         error.CrossDeviceOwnershipLink => {
@@ -249,10 +262,15 @@ fn yesNo(value: bool) []const u8 {
 
 fn writeInspectSummary(writer: *Io.Writer, summary: api.SporeInspectResult) !void {
     try writer.writeAll("Checkpoint manifest\n");
+    switch (summary.portability) {
+        .host_local => try writer.writeAll("  Cache-pinned directory: do not copy standalone; transfer with checkpoint push/pull.\n"),
+        .batch_relative => try writer.writeAll("  Batch-relative directory: depends on shared batch storage; transfer with checkpoint push/pull.\n"),
+        .portable => try writer.writeAll("  Diskless self-contained directory; machine compatibility still applies.\n"),
+    }
     try writer.print("  Resource type: {t}\n", .{summary.resource_type});
     try writer.print("  Portability: {t}\n", .{summary.portability});
-    try writer.print("  Can attach: {s}\n", .{yesNo(summary.can_attach)});
-    try writer.print("  Can run from: {s}\n", .{yesNo(summary.can_run_from)});
+    try writer.print("  Can resume saved process: {s}\n", .{yesNo(summary.can_attach)});
+    try writer.print("  Can run new command: {s}\n", .{yesNo(summary.can_run_from)});
     try writer.print("  Version: {d}\n", .{summary.version});
     try writer.print("  Platform: {s}/{s}\n", .{ summary.platform.arch, summary.platform.cpu_profile });
     try writer.print("  vCPUs: {d}\n", .{summary.vcpu_count});
@@ -318,9 +336,10 @@ fn writeRemovedSavedSpore(writer: *Io.Writer, result: lifecycle.RemovedSavedSpor
 
 fn writePushResult(writer: *Io.Writer, result: api.PushResult) !void {
     try writer.print(
-        "ref: {s}\nspore_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
-        .{ result.ref, result.spore_digest, result.objects_total, result.objects_written, result.bytes_written },
+        "digest_ref: {s}\nspore_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
+        .{ result.digest_ref, result.spore_digest, result.objects_total, result.objects_written, result.bytes_written },
     );
+    if (result.tag_ref) |tag| try writer.print("tag_ref (mutable): {s}\n", .{tag});
 }
 
 fn writePullResult(writer: *Io.Writer, result: api.PullResult) !void {

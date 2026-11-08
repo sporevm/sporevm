@@ -9,31 +9,37 @@ const cli = @import("cli.zig");
 const Ctx = cli.Ctx;
 const machine_output = @import("machine_output.zig");
 const rootfs = @import("rootfs.zig");
-const rootfs_input = @import("rootfs_input.zig");
 
 pub const usage =
     \\Usage:
-    \\  spore image push local/name:tag STORE/TAG [--platform os/arch]
-    \\  spore image pack local/name:tag --platform os/arch --out image.tar.gz
-    \\  spore image unpack image.tar.gz --archive-digest sha256:... --expected-image-digest blake3:... --platform os/arch --ref local/name:tag
+    \\  spore image push local/name:tag --to STORE/TAG [--platform os/arch]
+    \\  spore image pack local/name:tag --output image.tar.gz [--platform os/arch]
+    \\  spore image unpack image.tar.gz --expected-archive-digest sha256:... --expected-image-digest blake3:... --tag local/name:tag [--platform os/arch]
     \\
     \\STORE is a directory, a file:// URL or s3://bucket/prefix (uploaded with
     \\the aws CLI); TAG may be blake3:<digest>.
     \\Run a pushed image with `spore run --image <store-url>/TAG`.
+    \\Reads require explicit AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, optional
+    \\AWS_SESSION_TOKEN and AWS_REGION (or AWS_DEFAULT_REGION); AWS_PROFILE is
+    \\only supported by the push CLI. Credentials are not refreshed during reads.
+    \\No fetch-only image pull command exists; pack/unpack transfers native local
+    \\images offline. Resolve only resolves identity; run acquires content lazily.
     \\
     \\Options:
-    \\  --archive-digest DIGEST  Expected immutable SHA-256 archive identity
+    \\  --expected-archive-digest DIGEST  Expected immutable SHA-256 archive identity
     \\  --expected-image-digest DIGEST  Expected native BLAKE3 image identity
-    \\  --ref local/name:tag  Local mutable image ref to publish
-    \\  --platform os/arch    linux/arm64 or linux/amd64 (push defaults to this host's)
-    \\  --out PATH            New image archive path
+    \\  --tag local/name:tag  Local mutable image ref to publish
+    \\  --platform os/arch    linux/arm64 or linux/amd64 (infer recorded platform;
+    \\                        prefer native when a local tag has both)
+    \\  --to STORE/TAG        Store publication destination, not an OCI registry
+    \\  --output PATH            New image archive path
     \\  -h, --help            Show this help
     \\
 ;
 
 pub const export_usage =
     \\Usage:
-    \\  spore image export <image@sha256:...|image:tag> --output <rootfs.ext4>
+    \\  spore image export-rootfs <image@sha256:...|image:tag> --output <rootfs.ext4>
     \\
     \\Writes a registry image's root filesystem as an ext4 file and a metadata
     \\sidecar. Local images (local/NAME:TAG) cannot be exported.
@@ -41,18 +47,18 @@ pub const export_usage =
     \\Options:
     \\  --output <path>        Rootfs ext4 output path
     \\  --metadata <path>      Metadata sidecar path (default: <output>.json)
-    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: host-native Linux)
     \\  -h, --help             Show this help
     \\
 ;
 
 pub const import_oci_usage =
     \\Usage:
-    \\  spore image import-oci <layout-dir|layout.tar> --ref local/name:tag
+    \\  spore image import-oci <layout-dir|layout.tar> --tag local/name:tag
     \\
     \\Options:
-    \\  --ref <name:tag>       Local mutable image ref to record
-    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  --tag <name:tag>       Local mutable image ref to record
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: host-native Linux)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked (default: chunked)
     \\  -h, --help             Show this help
@@ -61,11 +67,11 @@ pub const import_oci_usage =
 
 pub const import_tar_usage =
     \\Usage:
-    \\  spore image import-tar <rootfs.tar> --ref local/name:tag
+    \\  spore image import-tar <rootfs.tar> --tag local/name:tag
     \\
     \\Options:
-    \\  --ref <name:tag>       Local mutable image ref to record
-    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  --tag <name:tag>       Local mutable image ref to record
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: host-native Linux)
     \\  --rootfs-storage <policy>
     \\                       Rootfs storage: chunked (default: chunked)
     \\  -h, --help             Show this help
@@ -76,18 +82,20 @@ pub const resolve_usage =
     \\Usage:
     \\  spore image resolve <image:tag>
     \\
+    \\Resolves identity and metadata, not an offline image acquisition.
+    \\
     \\Options:
-    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: linux/arm64)
+    \\  --platform <os/arch>   linux/arm64 or linux/amd64 (default: host-native Linux)
     \\  -h, --help             Show this help
     \\
 ;
 
 pub fn exportRootfs(ctx: *const Ctx, args: []const []const u8) !void {
     const arena = ctx.init.arena.allocator();
-    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image export", "usage: spore image export REGISTRY_IMAGE --output FILE");
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image export", "usage: spore image export-rootfs REGISTRY_IMAGE --output FILE");
     const parsed = rootfs.parseBuildOptions(arena, args) catch |err| switch (err) {
         error.LocalImageExportUnsupported => {
-            const message = "spore image export: only registry images can be exported, not local/ images";
+            const message = "spore image export-rootfs: only registry images can be exported, not local/ images";
             cli.exitWithCliError(arena, ctx.stderr, ctx.mode, machine_output.usageInvalidArgument(message, "image export"), message);
         },
         else => |e| return e,
@@ -106,11 +114,12 @@ pub fn exportRootfs(ctx: *const Ctx, args: []const []const u8) !void {
         result.rootfs_storage.index_digest,
         result.rootfs_storage.index_digest,
     });
+    try ctx.stdout.print("platform: {s}/{s}\n", .{ parsed.platform.os, parsed.platform.arch.name() });
 }
 
 pub fn importOci(ctx: *const Ctx, args: []const []const u8) !void {
     const arena = ctx.init.arena.allocator();
-    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image import-oci", "usage: spore image import-oci LAYOUT --ref local/NAME:TAG");
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image import-oci", "usage: spore image import-oci LAYOUT --tag local/NAME:TAG");
     const parsed = try rootfs.parseImportOciOptions(args);
     const result = try api.rootfsImportOci(ctx.init, arena, .{
         .input = parsed.input,
@@ -120,11 +129,12 @@ pub fn importOci(ctx: *const Ctx, args: []const []const u8) !void {
     });
     if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, result);
     try writeImportResult(ctx.stdout, parsed.ref, result);
+    try ctx.stdout.print("platform: {s}/{s}\n", .{ parsed.platform.os, parsed.platform.arch.name() });
 }
 
 pub fn importTar(ctx: *const Ctx, args: []const []const u8) !void {
     const arena = ctx.init.arena.allocator();
-    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image import-tar", "usage: spore image import-tar ROOTFS.tar --ref local/NAME:TAG");
+    if (args.len == 0) cli.exitUsage(arena, ctx.stderr, ctx.mode, "image import-tar", "usage: spore image import-tar ROOTFS.tar --tag local/NAME:TAG");
     const parsed = try rootfs.parseImportTarOptions(args);
     const result = try api.rootfsImportTar(ctx.init, arena, .{
         .input = parsed.input,
@@ -134,6 +144,7 @@ pub fn importTar(ctx: *const Ctx, args: []const []const u8) !void {
     });
     if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, result);
     try writeImportResult(ctx.stdout, parsed.ref, result);
+    try ctx.stdout.print("platform: {s}/{s}\n", .{ parsed.platform.os, parsed.platform.arch.name() });
 }
 
 fn writeImportResult(writer: *Io.Writer, ref: []const u8, result: api.RootfsImportOciResult) !void {
@@ -148,6 +159,7 @@ pub const ResolveResult = struct {
     schema_version: u32 = 1,
     ref: []const u8,
     resolved_image_ref: []const u8,
+    platform: rootfs.Platform,
 };
 
 pub fn resolve(ctx: *const Ctx, args: []const []const u8) !void {
@@ -161,8 +173,11 @@ pub fn resolve(ctx: *const Ctx, args: []const []const u8) !void {
     if (ctx.mode == .json) return machine_output.writeJson(arena, ctx.stdout, ResolveResult{
         .ref = parsed.ref,
         .resolved_image_ref = resolved,
+        .platform = parsed.platform,
     });
     try ctx.stdout.print("{s}\n", .{resolved});
+    try ctx.stderr.print("platform: {s}/{s}\n", .{ parsed.platform.os, parsed.platform.arch.name() });
+    try ctx.stderr.flush();
 }
 
 pub fn push(ctx: *const Ctx, args: []const []const u8) !void {
@@ -171,8 +186,8 @@ pub fn push(ctx: *const Ctx, args: []const []const u8) !void {
     const result = try api.imagePush(ctx.init, allocator, options);
     if (ctx.mode == .json) return machine_output.writeJson(allocator, ctx.stdout, result);
     try ctx.stdout.print(
-        "ref: {s}\nimage_digest: {s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
-        .{ result.ref, result.image_digest, result.objects_total, result.objects_written, result.bytes_written },
+        "digest_ref: {s}\ntag_ref: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\nobjects_written: {d}\nbytes_written: {d}\n",
+        .{ result.digest_ref, result.tag_ref orelse "(none)", result.image_digest, result.platform.os, result.platform.arch.name(), result.objects_total, result.objects_written, result.bytes_written },
     );
 }
 
@@ -183,7 +198,7 @@ pub fn pack(ctx: *const Ctx, args: []const []const u8) !void {
     if (ctx.mode == .json) return machine_output.writeJson(allocator, ctx.stdout, result);
     try ctx.stdout.print(
         "archive: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\nbytes: {d}\n",
-        .{ options.output_path, result.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count, result.archive_bytes },
+        .{ options.output_path, result.archive_digest, result.manifest_digest, result.image_digest, result.platform.os, result.platform.arch.name(), result.object_count, result.archive_bytes },
     );
 }
 
@@ -194,14 +209,14 @@ pub fn unpack(ctx: *const Ctx, args: []const []const u8) !void {
     if (ctx.mode == .json) return machine_output.writeJson(allocator, ctx.stdout, result);
     try ctx.stdout.print(
         "ref: {s}\nresolved: {s}\narchive_digest: {s}\nmanifest_digest: {s}\nimage_digest: {s}\nplatform: {s}/{s}\nobjects: {d}\n",
-        .{ options.ref, result.resolved_image_ref, options.archive_digest, result.manifest_digest, result.image_digest, options.platform.os, options.platform.arch.name(), result.object_count },
+        .{ options.ref, result.resolved_image_ref, options.archive_digest, result.manifest_digest, result.image_digest, result.platform.os, result.platform.arch.name(), result.object_count },
     );
 }
 
 pub fn parsePushOptions(args: []const []const u8) !api.ImagePushOptions {
-    var positional: [2][]const u8 = undefined;
-    var count: usize = 0;
-    var platform: rootfs.Platform = rootfs_input.direct_image_platform;
+    var source: ?[]const u8 = null;
+    var destination: ?[]const u8 = null;
+    var platform: ?rootfs.Platform = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -209,16 +224,17 @@ pub fn parsePushOptions(args: []const []const u8) !api.ImagePushOptions {
             i += 1;
             if (i >= args.len) return error.MissingPlatform;
             platform = try rootfs.Platform.parse(args[i]);
+        } else if (std.mem.eql(u8, arg, "--to")) {
+            i += 1;
+            if (i >= args.len) return error.MissingImageReference;
+            destination = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnknownImageOption;
-        } else if (count < positional.len) {
-            positional[count] = arg;
-            count += 1;
+        } else if (source == null) {
+            source = arg;
         } else return error.TooManyImageArguments;
     }
-    if (count == 0) return error.MissingImageSource;
-    if (count == 1) return error.MissingImageReference;
-    return .{ .source = positional[0], .destination = positional[1], .platform = platform };
+    return .{ .source = source orelse return error.MissingImageSource, .destination = destination orelse return error.MissingImageReference, .platform = platform };
 }
 
 pub fn parsePackOptions(args: []const []const u8) !api.ImageArchivePackOptions {
@@ -228,7 +244,7 @@ pub fn parsePackOptions(args: []const []const u8) !api.ImageArchivePackOptions {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--out")) {
+        if (std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= args.len) return error.MissingImageArchiveOutput;
             output_path = args[i];
@@ -245,7 +261,7 @@ pub fn parsePackOptions(args: []const []const u8) !api.ImageArchivePackOptions {
     return .{
         .source = source orelse return error.MissingImageSource,
         .output_path = output_path orelse return error.MissingImageArchiveOutput,
-        .platform = platform orelse return error.MissingPlatform,
+        .platform = platform,
     };
 }
 
@@ -258,7 +274,7 @@ pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptio
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--archive-digest")) {
+        if (std.mem.eql(u8, arg, "--expected-archive-digest")) {
             i += 1;
             if (i >= args.len) return error.MissingImageArchiveDigest;
             archive_digest = args[i];
@@ -266,7 +282,7 @@ pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptio
             i += 1;
             if (i >= args.len) return error.MissingExpectedImageDigest;
             expected_image_digest = args[i];
-        } else if (std.mem.eql(u8, arg, "--ref")) {
+        } else if (std.mem.eql(u8, arg, "--tag")) {
             i += 1;
             if (i >= args.len) return error.MissingImageReference;
             ref = args[i];
@@ -285,45 +301,45 @@ pub fn parseUnpackOptions(args: []const []const u8) !api.ImageArchiveUnpackOptio
         .archive_digest = archive_digest orelse return error.MissingImageArchiveDigest,
         .expected_image_digest = expected_image_digest orelse return error.MissingExpectedImageDigest,
         .ref = ref orelse return error.MissingImageReference,
-        .platform = platform orelse return error.MissingPlatform,
+        .platform = platform,
     };
 }
 
-test "image archive options require immutable digest and explicit platform" {
+test "image archive options require immutable digests and allow platform inference" {
     const pack_options = try parsePackOptions(&.{
         "local/app:ci",
-        "--out",
+        "--output",
         "app.spore-image.tar.gz",
         "--platform",
         "linux/arm64",
     });
     try std.testing.expectEqualStrings("local/app:ci", pack_options.source);
-    try std.testing.expectEqual(.arm64, pack_options.platform.arch);
-    try std.testing.expectError(error.MissingPlatform, parsePackOptions(&.{
+    try std.testing.expectEqual(.arm64, pack_options.platform.?.arch);
+    try std.testing.expectEqual(null, (try parsePackOptions(&.{
         "local/app:ci",
-        "--out",
+        "--output",
         "app.spore-image.tar.gz",
-    }));
+    })).platform);
 
     const unpack_options = try parseUnpackOptions(&.{
         "app.spore-image.tar.gz",
-        "--archive-digest",
+        "--expected-archive-digest",
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "--expected-image-digest",
         "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "--platform",
         "linux/amd64",
-        "--ref",
+        "--tag",
         "local/app:ci",
     });
-    try std.testing.expectEqual(.amd64, unpack_options.platform.arch);
+    try std.testing.expectEqual(.amd64, unpack_options.platform.?.arch);
     try std.testing.expectError(error.MissingImageArchiveDigest, parseUnpackOptions(&.{
         "app.spore-image.tar.gz",
         "--expected-image-digest",
         "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "--platform",
         "linux/amd64",
-        "--ref",
+        "--tag",
         "local/app:ci",
     }));
 }
@@ -393,7 +409,7 @@ test "json image pack and unpack print their documented result documents" {
     var pack_out: Io.Writer.Allocating = .init(allocator);
     var discard: Io.Writer = .failing;
     const pack_ctx = Ctx{ .init = init, .stdout = &pack_out.writer, .stderr = &discard, .mode = .json };
-    try pack(&pack_ctx, &.{ "local/cli-json:producer", "--platform", "linux/arm64", "--out", try tmp_dir.path("image.tar.gz") });
+    try pack(&pack_ctx, &.{ "local/cli-json:producer", "--platform", "linux/arm64", "--output", try tmp_dir.path("image.tar.gz") });
     const pack_doc = try std.json.parseFromSliceLeaky(std.json.Value, allocator, pack_out.written(), .{});
     try std.testing.expectEqualStrings("spore.image.archive.pack.result.v1", pack_doc.object.get("schema").?.string);
     try std.testing.expectEqualStrings("image", pack_doc.object.get("resource_type").?.string);
@@ -405,13 +421,13 @@ test "json image pack and unpack print their documented result documents" {
     const unpack_ctx = Ctx{ .init = init, .stdout = &unpack_out.writer, .stderr = &discard, .mode = .json };
     try unpack(&unpack_ctx, &.{
         try tmp_dir.path("image.tar.gz"),
-        "--archive-digest",
+        "--expected-archive-digest",
         archive_digest,
         "--expected-image-digest",
         image_digest,
         "--platform",
         "linux/arm64",
-        "--ref",
+        "--tag",
         "local/cli-json:consumer",
     });
     const unpack_doc = try std.json.parseFromSliceLeaky(std.json.Value, allocator, unpack_out.written(), .{});

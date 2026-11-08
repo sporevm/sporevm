@@ -506,6 +506,7 @@ pub fn unpinCli(ctx: *const Ctx, args: []const []const u8) !void {
 
 fn writePinListings(allocator: std.mem.Allocator, writer: *Io.Writer, entries: []const saved_spore_pin.Listing, mode: machine_output.Mode) !void {
     if (mode == .json) return machine_output.writeJson(allocator, writer, PinsResult{ .entries = entries });
+    if (entries.len == 0) try writer.writeAll("No checkpoint pins\n");
     for (entries) |entry| try writer.print("{s}\t{s}\t{s}\t{s}\n", .{ entry.id, @tagName(entry.owner_state), @tagName(entry.state), entry.index_digest orelse "-" });
     try writer.flush();
 }

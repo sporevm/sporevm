@@ -52,7 +52,7 @@ fanout_stderr="${workdir}/fanout.stderr"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --save "${capture_dir}" \
+  --save-checkpoint "${capture_dir}" \
   --save-on USR1 \
   -- /bin/counter \
   >"${run_stdout}" 2>"${run_stderr}" &
@@ -96,12 +96,12 @@ if [[ "${run_rc}" != "0" ]]; then
 fi
 [[ -f "${capture_dir}/manifest.json" ]] || die "capture did not write ${capture_dir}/manifest.json"
 
-"${spore_bin}" checkpoint fork "${capture_dir}" --count 1 --out "${generation_fork_dir}" >"${workdir}/generation-fork.stdout" 2>"${workdir}/generation-fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count 1 --output "${generation_fork_dir}" >"${workdir}/generation-fork.stdout" 2>"${workdir}/generation-fork.stderr"
 cat >"${generation_json}" <<'JSON'
 {"run_id":"counter-smoke","child_id":7,"parallel_index":7,"parallel_count":1000,"fork_index":7,"fork_count":1000,"fork_batch_id":"counter-smoke-batch","vm_id":"spore-counter-smoke-7","generation":7,"resume_entropy_seed":"0123456789abcdef0123456789abcdef"}
 JSON
 
-"${spore_bin}" --json attach --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
+"${spore_bin}" --json checkpoint resume --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" \
   >"${generation_resume_stdout}" 2>"${generation_resume_stderr}" &
 resume_pid="$!"
 
@@ -128,7 +128,7 @@ fi
 grep -Fq '"event":"ready"' "${generation_resume_stdout}" || die "spore --json attach --generation did not emit ready"
 grep -Fq '"event":"stdout"' "${generation_resume_stdout}" || die "spore --json attach --generation did not emit stdout"
 
-if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json vm restore --generation "${generation_json}" --backend "${backend}" "${generation_fork_dir}/000000" --name "${named_vm}" \
+if ! env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" --json vm restore "${named_vm}" --generation "${generation_json}" --backend "${backend}" --checkpoint "${generation_fork_dir}/000000" \
   >"${named_resume_stdout}" 2>"${named_resume_stderr}"; then
   cat "${named_resume_stdout}" >&2 || true
   cat "${named_resume_stderr}" >&2 || true
@@ -149,7 +149,7 @@ grep -Fq "spore generation ready " "${named_exec_stdout}" || {
 }
 env SPOREVM_RUNTIME_DIR="${runtime_dir}" "${spore_bin}" vm rm "${named_vm}" >/dev/null
 
-"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count "${count}" --output "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 
 children=()
 while IFS= read -r child; do
@@ -158,7 +158,7 @@ done < <(fork_children "${fork_dir}")
 [[ "${#children[@]}" == "${count}" ]] || die "expected ${count} child spores, found ${#children[@]}"
 
 set +e
-"${spore_bin}" fanout --backend "${backend}" "${fork_dir}" --for "${SPORE_SMOKE_FANOUT_DURATION:-20s}" \
+"${spore_bin}" checkpoint fanout --backend "${backend}" "${fork_dir}" --for "${SPORE_SMOKE_FANOUT_DURATION:-20s}" \
   >"${fanout_stdout}" 2>"${fanout_stderr}"
 fanout_rc="$?"
 set -e

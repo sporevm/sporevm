@@ -153,15 +153,15 @@ error, and the disk then fetches nothing more: later reads of objects not yet
 local fail at once, so a failing HTTP(S) store stalls the disk for at most
 one 10-second fetch.
 
-Saving or committing a disk run from a store (`run --save`, `--save-on`,
-`--commit`, `spore vm save`) first fetches every object of the image that is not
+Saving or committing a disk run from a store (`run --save-checkpoint`, `--save-on`,
+`--commit-image`, `spore vm save`) first fetches every object of the image that is not
 yet local, up to 16 at a time, so the result needs nothing from the store.
 `spore vm save` fetches before it pauses the guest; if the store cannot supply an
 object, or a guest read from it fails before the save, the save fails and the
 VM keeps running. `spore vm rm` and a client that quits also stop that fetch.
-`run --save` and `--save-on` fetch while the guest is paused for the capture,
+`run --save-checkpoint` and `--save-on` fetch while the guest is paused for the capture,
 before they write the spore or take the rootfs cache lock; a failure fails the
-run and removes the save directory. `--commit` takes the cache lock once the
+run and removes the save directory. `--commit-image` takes the cache lock once the
 guest is frozen, so its fetch runs under it.
 
 ### S3 stores
@@ -210,7 +210,7 @@ not the hash of the local `manifest.json`. The disk must be complete in the
 rootfs cache. Spore tags are separate from image tags. An `s3://` destination is uploaded as
 `spore image push` uploads one, with `spores/` in place of `images/`.
 
-`spore checkpoint pull STORE/<tag|blake3:hex> --out DIR` reads a pushed spore back. It
+`spore checkpoint pull STORE/<tag|blake3:hex> --output DIR` reads a pushed spore back. It
 fetches `spores/<hex>` and checks its BLAKE3 digest against the tag or ref,
 refuses a manifest that names `memory.backing` or more than 128 GiB of nonzero
 RAM, then fetches every RAM chunk into `DIR/chunks`, and the disk index and
@@ -219,7 +219,7 @@ its digest and size. DIR is then a save pinned in the rootfs cache, as
 `spore vm save` writes them, so it must be on the cache's filesystem, and
 `spore checkpoint rm` and `spore system gc` treat it like any other save. Reads
 follow the store rules above, so a tag over plain HTTP is read only from
-loopback. The pull is eager, so `spore run --from DIR` needs no store; give
+loopback. The pull is eager, so `spore run --checkpoint DIR -- ARGV` needs no store; give
 each copy its own identity with `--generation` (see
 [fanout.md](fanout.md#single-child-resume-identity)). `--json` prints
 `spore.pull.result.v2` with the objects and bytes fetched.

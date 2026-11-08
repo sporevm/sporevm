@@ -24,7 +24,7 @@ spore run \
   --image local/docker-capable:base \
   --pull=never \
   --disk-size 20gb \
-  --commit local/project-docker:prepared \
+  --commit-image local/project-docker:prepared \
   --memory 4gb \
   --net \
   --allow-host auth.docker.io \
@@ -130,7 +130,7 @@ spore run \
   --image local/project-docker:prepared \
   --pull=never \
   --memory 4gb \
-  --save docker-base.spore \
+  --save-checkpoint docker-base.spore \
   --save-on TERM \
   -- /bin/sh -lc '
 set -eu
@@ -160,22 +160,22 @@ done
 kill -TERM "$spore_pid"
 wait "$spore_pid"
 
-spore checkpoint fork docker-base.spore --count 4 --out docker-children/
-spore run --from docker-children/000000 -- /bin/sh -lc \
+spore checkpoint fork docker-base.spore --count 4 --output docker-children/
+spore run --checkpoint docker-children/000000 -- /bin/sh -lc \
   'docker --host unix:///run/docker.sock run --rm \
     docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
     /bin/echo child-ready'
 ```
 
 Each child gets its own writable disk head over the same committed rootfs and
-shared CAS chunks. `spore run --from` resumes the saved daemon and starts a
-fresh command in that child. `spore fanout` instead resumes only the saved
+shared CAS chunks. `spore run --checkpoint` resumes the saved daemon and starts a
+fresh command in that child. `spore checkpoint fanout` instead resumes only the saved
 process session; use it when that session itself owns the work and has an
 after-restore identity barrier described in [Fan-Out](fanout.md).
 
 ## What is captured
 
-`--commit` captures the root disk only. It includes Docker images, layers,
+`--commit-image` captures the root disk only. It includes Docker images, layers,
 volumes, and other bytes under `/var/lib/docker`. It does not include guest
 memory, processes, vCPU state, network state, `/run/docker.sock`, PID files, or
 other tmpfs state. The output is a normal local Spore image whose unchanged

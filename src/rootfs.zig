@@ -109,7 +109,7 @@ const BuildOptions = struct {
 
 /// Where a materialized rootfs goes.
 const Target = union(enum) {
-    /// `spore image export`: an ext4 file and its metadata sidecar.
+    /// `spore image export-rootfs`: an ext4 file and its metadata sidecar.
     file: struct { output: []const u8, metadata: []const u8 },
     /// The local image catalog, under an optional name.
     catalog: struct { name: ?[]const u8 = null },
@@ -216,7 +216,7 @@ fn rootfsCacheLockFileIdentity(fd: std.c.fd_t) ?RootfsCacheLockFileIdentity {
 
 pub fn parseResolveOptions(args: []const []const u8) !ParsedResolveOptions {
     var image_ref: ?[]const u8 = null;
-    var platform: Platform = .{};
+    var platform: Platform = native_platform;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -251,13 +251,13 @@ pub fn parseImportTarOptions(args: []const []const u8) !ParsedImportTarOptions {
 fn parseLocalImportOptions(args: []const []const u8, missing_input: anyerror) !ParsedImportOciOptions {
     var input: ?[]const u8 = null;
     var image_ref: ?[]const u8 = null;
-    var platform: Platform = .{};
+    var platform: Platform = native_platform;
     var rootfs_storage: RootfsStoragePolicy = .chunked;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--ref")) {
+        if (std.mem.eql(u8, arg, "--tag")) {
             i += 1;
             if (i >= args.len) return error.MissingImageReference;
             image_ref = args[i];
@@ -306,7 +306,7 @@ pub fn parseBuildOptions(allocator: std.mem.Allocator, args: []const []const u8)
     var image_ref: ?[]const u8 = null;
     var output: ?[]const u8 = null;
     var metadata: ?[]const u8 = null;
-    var platform: Platform = .{};
+    var platform: Platform = native_platform;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -366,6 +366,8 @@ fn rejectMetadataOutputAlias(io: Io, output: []const u8, metadata: []const u8) !
 }
 
 pub const Platform = oci.Platform;
+pub const native_platform: Platform = .{ .arch = @import("architecture.zig").fromTarget(builtin.cpu.arch) orelse
+    @compileError("SporeVM requires an arm64 or amd64 host architecture") };
 pub const ImageRef = oci.ImageRef;
 const ImageTag = oci.ImageTag;
 const ImageManifest = oci.ImageManifest;
@@ -1395,6 +1397,7 @@ test "rootfs build keeps its temp dir in the rootfs cache and removes it on fail
 }
 
 test "resolve options parse image tag and platform" {
+    try std.testing.expectEqual(native_platform.arch, (try parseResolveOptions(&.{"registry.example/repo:latest"})).platform.arch);
     const parsed = try parseResolveOptions(&.{
         "registry.example/repo:latest",
         "--platform",
@@ -1412,7 +1415,7 @@ test "resolve options parse image tag and platform" {
 test "import-oci options require a local mutable ref" {
     const parsed = try parseImportOciOptions(&.{
         "layout.oci",
-        "--ref",
+        "--tag",
         "local/sporevm-app:dev",
         "--platform",
         "linux/arm64",
@@ -1424,32 +1427,33 @@ test "import-oci options require a local mutable ref" {
 
     try std.testing.expectError(
         error.LocalRefMustUseLocalRegistry,
-        parseImportOciOptions(&.{ "layout.oci", "--ref", "ghcr.io/org/image:dev" }),
+        parseImportOciOptions(&.{ "layout.oci", "--tag", "ghcr.io/org/image:dev" }),
     );
     try std.testing.expectError(
         error.BadImageReference,
         parseImportOciOptions(
-            &.{ "layout.oci", "--ref", "local/sporevm-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+            &.{ "layout.oci", "--tag", "local/sporevm-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
         ),
     );
     try std.testing.expectError(
         error.UnsupportedRootFSStoragePolicy,
         parseImportOciOptions(
-            &.{ "layout.oci", "--ref", "local/sporevm-app:dev", "--rootfs-storage=flat" },
+            &.{ "layout.oci", "--tag", "local/sporevm-app:dev", "--rootfs-storage=flat" },
         ),
     );
     try std.testing.expectError(
         error.UnsupportedRootFSStoragePolicy,
         parseImportOciOptions(
-            &.{ "layout.oci", "--ref", "local/sporevm-app:dev", "--rootfs-storage", "native-oci" },
+            &.{ "layout.oci", "--tag", "local/sporevm-app:dev", "--rootfs-storage", "native-oci" },
         ),
     );
 }
 
 test "import-tar options require a local mutable ref" {
+    try std.testing.expectEqual(native_platform.arch, (try parseImportTarOptions(&.{ "rootfs.tar", "--tag", "local/default:dev" })).platform.arch);
     const parsed = try parseImportTarOptions(&.{
         "rootfs.tar",
-        "--ref",
+        "--tag",
         "local/sporevm-app:dev",
         "--platform",
         "linux/arm64",
@@ -1463,17 +1467,17 @@ test "import-tar options require a local mutable ref" {
     try std.testing.expectError(
         error.UnsupportedRootFSStoragePolicy,
         parseImportTarOptions(
-            &.{ "rootfs.tar", "--ref", "local/sporevm-app:dev", "--rootfs-storage", "flat" },
+            &.{ "rootfs.tar", "--tag", "local/sporevm-app:dev", "--rootfs-storage", "flat" },
         ),
     );
 
     try std.testing.expectError(
         error.MissingRootFSTarPath,
-        parseImportTarOptions(&.{ "--ref", "local/sporevm-app:dev" }),
+        parseImportTarOptions(&.{ "--tag", "local/sporevm-app:dev" }),
     );
     try std.testing.expectError(
         error.LocalRefMustUseLocalRegistry,
-        parseImportTarOptions(&.{ "rootfs.tar", "--ref", "ghcr.io/org/image:dev" }),
+        parseImportTarOptions(&.{ "rootfs.tar", "--tag", "ghcr.io/org/image:dev" }),
     );
 }
 

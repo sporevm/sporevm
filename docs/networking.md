@@ -71,11 +71,11 @@ guest port, but never durable host socket paths. Restore fails closed unless a
 caller supplies fresh live bindings for each declared service:
 
 ```bash
-spore attach net-enabled.spore \
+spore checkpoint resume net-enabled.spore \
   --bind-service metadata=unix:/tmp/fresh-metadata.sock
-spore run --from net-enabled.spore \
-  --bind-service metadata=unix:/tmp/fresh-metadata.sock
-spore fanout children/ \
+spore run --checkpoint net-enabled.spore \
+  --bind-service metadata=unix:/tmp/fresh-metadata.sock -- /bin/true
+spore checkpoint fanout children/ \
   --bind-service metadata=unix:/tmp/fresh-metadata.sock
 ```
 
@@ -102,7 +102,7 @@ spore manifests.
 
 Saved network spores persist requested capability and policy, not live TCP
 flows, DNS caches, helper state, host socket paths, host port forwards, or
-credentials. `spore attach` and `spore run --from` attach a fresh gateway under
+credentials. `spore checkpoint resume` and `spore run --checkpoint` attach a fresh gateway under
 the recorded policy or fail closed.
 
 When running from a saved spore, omit `--net` and policy flags. Bound-service
@@ -110,7 +110,7 @@ bindings are allowed because they satisfy already-saved policy; they do not
 change the manifest:
 
 ```bash
-spore run --from net-enabled.spore -- wget -qO- https://example.com
+spore run --checkpoint net-enabled.spore -- wget -qO- https://example.com
 ```
 
 ## Events And Limits

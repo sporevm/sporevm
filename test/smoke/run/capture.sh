@@ -30,7 +30,7 @@ smoke_memory="${SPORE_SMOKE_MEMORY:-${SPORE_SMOKE_MEMORY_MIB:-256}mib}"
 "${spore_bin}" run \
   --backend "${backend}" \
   --memory "${smoke_memory}" \
-  --save "${capture_dir}" \
+  --save-checkpoint "${capture_dir}" \
   --save-on USR1 \
   -- /bin/finite \
   >"${run_stdout}" 2>"${run_stderr}" &
@@ -78,7 +78,7 @@ grep -Fq "saved spore at ${capture_dir}" "${run_stderr}" || {
   die "spore run save did not report the save path"
 }
 
-"${spore_bin}" checkpoint fork "${capture_dir}" --count 1 --out "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
+"${spore_bin}" checkpoint fork "${capture_dir}" --count 1 --output "${fork_dir}" >"${workdir}/fork.stdout" 2>"${workdir}/fork.stderr"
 children=()
 while IFS= read -r child; do
   children+=("${child}")
@@ -86,7 +86,7 @@ done < <(fork_children "${fork_dir}")
 [[ "${#children[@]}" -eq 1 ]] || die "fork did not create one child spore"
 child_dir="${children[0]}"
 
-"${spore_bin}" --json attach --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
+"${spore_bin}" --json checkpoint resume --backend "${backend}" "${child_dir}" >"${resume_stdout}" 2>"${resume_stderr}" &
 resume_pid="$!"
 (
   sleep "${SPORE_SMOKE_RESUME_TIMEOUT_SECONDS:-20}"
@@ -133,7 +133,7 @@ expect_probe_incomplete "spore run" "${poweroff_rc}" "${workdir}/poweroff-run.js
 # `$!`, and USR1 would kill that subshell instead of saving.
 poweroff_dir="${workdir}/poweroff.spore"
 "${spore_bin}" run --backend "${backend}" --memory "${smoke_memory}" \
-  --save "${poweroff_dir}" --save-on USR1 -- /bin/poweroff 5 \
+  --save-checkpoint "${poweroff_dir}" --save-on USR1 -- /bin/poweroff 5 \
   >"${workdir}/poweroff-save.stdout" 2>"${workdir}/poweroff-save.stderr" &
 run_pid="$!"
 (
@@ -158,7 +158,7 @@ wait "${watchdog_pid}" >/dev/null 2>&1 || true
   die "spore run did not save the guest before it powered off (exit ${run_rc})"
 }
 set +e
-with_timeout 60 "${spore_bin}" --json attach --backend "${backend}" "${poweroff_dir}" \
+with_timeout 60 "${spore_bin}" --json checkpoint resume --backend "${backend}" "${poweroff_dir}" \
   >"${workdir}/poweroff-attach.jsonl" 2>"${workdir}/poweroff-attach.stderr"
 poweroff_rc="$?"
 set -e
@@ -170,18 +170,18 @@ expect_probe_incomplete "spore attach" "${poweroff_rc}" "${workdir}/poweroff-att
   --backend "${backend}" \
   --vcpus 2 \
   --memory "${smoke_memory}" \
-  --save "${from_base_dir}" \
+  --save-checkpoint "${from_base_dir}" \
   -- /bin/true \
   >"${from_base_stdout}" 2>"${from_base_stderr}"
 [[ -f "${from_base_dir}/manifest.json" ]] || die "run --from base save did not write ${from_base_dir}/manifest.json"
 
-"${spore_bin}" checkpoint fork "${from_base_dir}" --count 1 --out "${from_base_fork_dir}" >"${workdir}/from-base-fork.stdout" 2>"${workdir}/from-base-fork.stderr"
+"${spore_bin}" checkpoint fork "${from_base_dir}" --count 1 --output "${from_base_fork_dir}" >"${workdir}/from-base-fork.stdout" 2>"${workdir}/from-base-fork.stderr"
 from_child_dir="$(fork_children "${from_base_fork_dir}" | head -n 1)"
 [[ -n "${from_child_dir}" ]] || die "forked run --from base did not create a child spore"
 
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${from_child_dir}" \
+  --checkpoint "${from_child_dir}" \
   -- /bin/gencheck \
   >"${from_child_stdout}" 2>"${from_child_stderr}" || {
   cat "${from_child_stdout}" >&2 || true
@@ -204,7 +204,7 @@ cat >"${from_generation_json}" <<'JSON'
 JSON
 "${spore_bin}" run \
   --backend "${backend}" \
-  --from "${from_child_dir}" \
+  --checkpoint "${from_child_dir}" \
   --generation "${from_generation_json}" \
   -- /bin/gencheck \
   >"${from_generation_stdout}" 2>"${from_generation_stderr}" || {
@@ -220,7 +220,7 @@ grep -Fq "generation=7007 vm_id=spore-run-from-generation-7 entropy_len=32" "${f
 
 "${spore_bin}" --json --debug run \
   --backend "${backend}" \
-  --from "${from_base_dir}" \
+  --checkpoint "${from_base_dir}" \
   -- /bin/writeout \
   >"${from_stdout}" 2>"${from_stderr}"
 jsonl_output_contains "${from_stdout}" stdout "spore stdout" || {

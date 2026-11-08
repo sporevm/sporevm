@@ -352,22 +352,22 @@ run_workload() {
 
     timed_run "${workload_name}" "base-layer-capture" "${iteration}" "${resolved_image}" \
       "${iter_dir}/base.stdout" "${iter_dir}/base.stderr" "${base_dir}" \
-      "${spore_image_common[@]}" "${net_args[@]}" --image "${resolved_image}" --save "${base_dir}" \
+      "${spore_image_common[@]}" "${net_args[@]}" --image "${resolved_image}" --save-checkpoint "${base_dir}" \
       -- /bin/sh -lc 'printf "base-layer\n" >/var/tmp/sporevm-bench-base && sync'
 
     timed_run "${workload_name}" "cow-active-capture" "${iteration}" "${resolved_image}" \
       "${iter_dir}/cow.stdout" "${iter_dir}/cow.stderr" "${cow_dir}" \
-      "${spore_image_common[@]}" "${net_args[@]}" --image "${resolved_image}" --save "${cow_dir}" \
+      "${spore_image_common[@]}" "${net_args[@]}" --image "${resolved_image}" --save-checkpoint "${cow_dir}" \
       -- /bin/sh -lc "${command}"
 
     timed_run "${workload_name}" "sealed-layer-append" "${iteration}" "${resolved_image}" \
       "${iter_dir}/layered.stdout" "${iter_dir}/layered.stderr" "${layered_dir}" \
-      "${spore_from_common[@]}" --from "${base_dir}" --save "${layered_dir}" \
+      "${spore_from_common[@]}" --checkpoint "${base_dir}" --save-checkpoint "${layered_dir}" \
       -- /bin/sh -lc "${command}"
 
     timed_run "${workload_name}" "sealed-layer-replay" "${iteration}" "${resolved_image}" \
       "${iter_dir}/replay.stdout" "${iter_dir}/replay.stderr" "${layered_dir}" \
-      "${spore_from_common[@]}" --from "${layered_dir}" \
+      "${spore_from_common[@]}" --checkpoint "${layered_dir}" \
       -- /bin/sh -lc "${verify}"
 
     if [[ -n "${raw_rootfs}" ]]; then

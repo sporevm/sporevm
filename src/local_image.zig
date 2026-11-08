@@ -161,6 +161,17 @@ pub fn find(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, ref: [
     return local;
 }
 
+/// Select an existing local tag: prefer native when both platforms exist,
+/// otherwise preserve the only recorded platform. Explicit selection never falls back.
+pub fn selectPlatform(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, ref: []const u8, requested: ?Platform) !Platform {
+    if (requested) |platform| return platform;
+    const native = rootfs.native_platform;
+    if (try lookup(io, allocator, cache_root, ref, native) != null) return native;
+    const other: Platform = .{ .arch = if (native.arch == .arm64) .amd64 else .arm64 };
+    if (try lookup(io, allocator, cache_root, ref, other) != null) return other;
+    return error.FileNotFound;
+}
+
 /// Load an image whose record exists and whose storage is complete locally.
 /// Returns null otherwise. Allocates into `allocator`; use an arena.
 pub fn load(io: Io, allocator: std.mem.Allocator, cache_root: []const u8, identity: []const u8) !?LocalImage {
@@ -463,6 +474,9 @@ test "local image names resolve through refs, identities and derivations across 
     const native = try lockAndPublish(io, allocator, cache.root, .{ .platform = arm64, .storage = try cache.storage(1), .name = "local/app:dev" });
     try std.testing.expectEqualStrings(native.identity, (try lookup(io, allocator, cache.root, "local/app:dev", arm64)).?);
     try std.testing.expectEqual(null, try lookup(io, allocator, cache.root, "local/app:dev", amd64));
+    try std.testing.expectEqual(.arm64, (try selectPlatform(io, allocator, cache.root, "local/app:dev", null)).arch);
+    _ = try lockAndPublish(io, allocator, cache.root, .{ .platform = amd64, .storage = try cache.storage(5), .name = "local/app:dev" });
+    try std.testing.expectEqual(rootfs.native_platform.arch, (try selectPlatform(io, allocator, cache.root, "local/app:dev", null)).arch);
     const pinned = try std.fmt.allocPrint(allocator, "local/app@{s}", .{native.identity});
     try std.testing.expectEqualStrings(pinned, native.resolved_ref);
     try std.testing.expectEqualStrings(native.identity, (try find(io, allocator, cache.root, pinned, arm64)).?.identity);

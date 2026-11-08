@@ -35,10 +35,10 @@ export SPOREVM_RUNTIME_DIR="${scratch}/runtime"
 mise run build:release
 unpack_output="$(zig-out/bin/spore image unpack \
   "${archive}" \
-  --archive-digest "${ARCHIVE_DIGEST}" \
+  --expected-archive-digest "${ARCHIVE_DIGEST}" \
   --expected-image-digest "${IMAGE_DIGEST}" \
   --platform "${PLATFORM}" \
-  --ref local/ci-final-image:consumer)"
+  --tag local/ci-final-image:consumer)"
 printf '%s\n' "${unpack_output}"
 
 resolved_image="$(awk '$1 == "image_digest:" { print $2 }' <<<"${unpack_output}")"
