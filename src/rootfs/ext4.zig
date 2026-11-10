@@ -18,13 +18,16 @@ pub const Determinism = struct {
     uuid: [36]u8,
     uuid_bytes: [16]u8,
     hash_seed: [36]u8,
+    hash_seed_bytes: [16]u8,
 
     pub fn fromDigest(digest: []const u8) Determinism {
         const uuid = uuidFromDigest("sporevm-rootfs-ext4-uuid", digest);
+        const hash_seed = uuidFromDigest("sporevm-rootfs-ext4-hash-seed", digest);
         return .{
             .uuid = uuid.text,
             .uuid_bytes = uuid.bytes,
-            .hash_seed = uuidFromDigest("sporevm-rootfs-ext4-hash-seed", digest).text,
+            .hash_seed = hash_seed.text,
+            .hash_seed_bytes = hash_seed.bytes,
         };
     }
 };

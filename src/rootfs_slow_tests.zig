@@ -101,12 +101,12 @@ test "native ext4 writer emits fsck-clean symlinks at the fast/slow boundary" {
     try runE2fsck(allocator, io, path);
 }
 
-test "native ext4 writer supports double indirect regular files" {
+test "native ext4 writer supports multi-megabyte regular files" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp_dir = try TestDir.init();
     defer tmp_dir.deinit();
-    const path = try tmp_dir.path("double-indirect.img");
+    const path = try tmp_dir.path("large-file.img");
 
     const data = try allocator.alloc(u8, 5 * 1024 * 1024);
     defer allocator.free(data);
@@ -118,12 +118,12 @@ test "native ext4 writer supports double indirect regular files" {
     _ = try ext4_writer.emit(allocator, io, path, &entries, .{
         .image_size = 32 << 20,
         .inode_count = 1024,
-        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-double-indirect"),
+        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-large-file"),
     });
     try runE2fsck(allocator, io, path);
 }
 
-test "native ext4 writer maps a file through triple-indirect blocks" {
+test "native ext4 writer maps extent files beyond four GiB" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp_dir = try TestDir.init();
@@ -131,16 +131,16 @@ test "native ext4 writer maps a file through triple-indirect blocks" {
     const debugfs = try findTool(allocator, io, &debugfs_candidates);
     defer allocator.free(debugfs);
 
-    // Direct, single, and double indirect pointers reach 12 + 1024 + 1024^2
-    // blocks, just over 4 GiB. The last two blocks need the triple tree.
+    // Cross both the 32-bit size boundary and enough block groups to need
+    // an external extent leaf. Only marker blocks occupy source storage.
     const block_size = ext4.rootfs_ext4_block_size;
-    const double_reach: u64 = 12 + 1024 + 1024 * 1024;
-    const size: u64 = (double_reach + 1) * block_size + 100;
+    const boundary: u64 = (@as(u64, 4) << 30) / block_size;
+    const size: u64 = (boundary + 1) * block_size + 100;
     const markers = [_]struct { block: u64, bytes: []const u8 }{
         .{ .block = 0, .bytes = "first block" },
-        .{ .block = double_reach - 1, .bytes = "last double-indirect block" },
-        .{ .block = double_reach, .bytes = "first triple-indirect block" },
-        .{ .block = double_reach + 1, .bytes = "partial tail" },
+        .{ .block = boundary - 1, .bytes = "before four GiB" },
+        .{ .block = boundary, .bytes = "after four GiB" },
+        .{ .block = boundary + 1, .bytes = "partial tail" },
     };
 
     // Only the marker blocks of the source occupy disk.
@@ -161,7 +161,7 @@ test "native ext4 writer maps a file through triple-indirect blocks" {
     _ = try ext4_writer.emit(allocator, io, image_path, &entries, .{
         .image_size = ext4.computeImageSize(size),
         .inode_count = 1024,
-        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-triple-indirect"),
+        .determinism = ext4.Determinism.fromDigest("sha256:test-native-ext4-extent-large"),
     });
     try runE2fsck(allocator, io, image_path);
 
@@ -169,6 +169,7 @@ test "native ext4 writer maps a file through triple-indirect blocks" {
     defer allocator.free(stat);
     const expected_size = std.fmt.comptimePrint("Size: {d}\n", .{size});
     try std.testing.expect(std.mem.indexOf(u8, stat, expected_size) != null);
+    try std.testing.expect(std.mem.indexOf(u8, stat, "EXTENTS:") != null);
 
     var image = try Io.Dir.cwd().openFile(io, image_path, .{});
     defer image.close(io);
@@ -181,6 +182,47 @@ test "native ext4 writer maps a file through triple-indirect blocks" {
         var bytes: [64]u8 = undefined;
         const read = try image.readPositionalAll(io, bytes[0..marker.bytes.len], physical * block_size);
         try std.testing.expectEqualStrings(marker.bytes, bytes[0..read]);
+    }
+}
+
+test "native ext4 writer emits deterministic fsck-clean multi-level htrees" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp_dir = try TestDir.init();
+    defer tmp_dir.deinit();
+    const path = try allocator.dupe(u8, try tmp_dir.path("indexed.img"));
+    defer allocator.free(path);
+    const second_path = try tmp_dir.path("indexed-again.img");
+    const debugfs = try findTool(allocator, io, &debugfs_candidates);
+    defer allocator.free(debugfs);
+
+    // Long, non-ASCII names cross the 508-leaf root capacity without a
+    // huge fixture. e2fsck independently checks every hash range and dirent.
+    const entries = try a.alloc(ext4_writer.Entry, 9000);
+    for (entries, 0..) |*entry, i| entry.* = .{
+        .path = try std.fmt.allocPrint(a, "wide/{s}-{d:0>5}-é", .{ test_support.repeat("x", 230), i }),
+        .kind = .{ .file = "indexed content\n" },
+    };
+    const opts: ext4_writer.Options = .{
+        .image_size = 128 << 20,
+        .inode_count = 12_000,
+        .determinism = ext4.Determinism.fromDigest("sha256:htree-conformance"),
+    };
+    _ = try ext4_writer.emit(allocator, io, path, entries, opts);
+    _ = try ext4_writer.emit(allocator, io, second_path, entries, opts);
+    try std.testing.expectEqualSlices(u8, &(try ext4.blake3File(io, path)), &(try ext4.blake3File(io, second_path)));
+    try runE2fsck(allocator, io, path);
+    const index = try runDebugfs(allocator, io, debugfs, path, "htree_dump /wide");
+    defer allocator.free(index);
+    try std.testing.expect(std.mem.indexOf(u8, index, "Indirect levels: 1") != null);
+    for ([_]usize{ 0, 4499, 8999 }) |i| {
+        const request = try std.fmt.allocPrint(a, "cat /{s}", .{entries[i].path});
+        const bytes = try runDebugfs(allocator, io, debugfs, path, request);
+        defer allocator.free(bytes);
+        try std.testing.expectEqualStrings("indexed content\n", bytes);
     }
 }
 
@@ -671,7 +713,7 @@ fn runDebugfs(
 ) ![]u8 {
     const result = try std.process.run(allocator, io, .{
         .argv = &.{ debugfs, "-R", request, image },
-        .stdout_limit = .limited(256 * 1024),
+        .stdout_limit = .limited(4 * 1024 * 1024),
         .stderr_limit = .limited(256 * 1024),
     });
     defer allocator.free(result.stderr);

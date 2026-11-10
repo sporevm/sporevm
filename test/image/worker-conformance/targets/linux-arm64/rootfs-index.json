@@ -7,15 +7,15 @@
   "chunk_ranges": [
     {
       "start": 0,
-      "digests": "c5a0c8569e34497cbe9a9421bb838da5e3b811b8dcaea88e941a6db91f7d114b"
+      "digests": "af3c0f44d0039c16b1d486d3909d07700b7390a0585ba8e130f2f07dd12e58d810e5342b6cc365f46a3f4d7a1254e7fa16e68e7591d49f3c9fb84e3ec5be9a7e"
     },
     {
       "start": 64,
-      "digests": "e2cb1dc733a6f0a2febc0ff47cba432d6df56e0c992f35a6df92b756de78e827617588d5cab9e8b5c0753055329014b57f473492e09aec8f92f172b21b7538c176dda0f1585476a5244e778abc404f9dca8a32b8679b90cfb03079f0c70a7744"
+      "digests": "cf3078bdd6c127dd254ab5d734c66868b671b022237fc94e7fd3af6c93a731c720fee5e34a85fb091dcb65d1d9ad4c3337fb88903dc5c73e0ff7f5bd2273af69f23b2ac673fe3c808b087b29d96da3a8b68b9e9a8b0ee394846c00183e156bc0"
     },
     {
       "start": 2048,
-      "digests": "7419c7a4467d31c80ad792e97128c4b2d3087dd060127f27aa7eb66658a93163"
+      "digests": "165f96c0c6e024ed05fe992c63170ca959695648a41f43d29a09596baf366347"
     },
     {
       "start": 4096,
@@ -23,13 +23,13 @@
     },
     {
       "start": 6144,
-      "digests": "26a95bb21390520c0c1a2a8db91db17725845473d5db32e779dc22ee30787a46"
+      "digests": "8b8e72db826540a45dbcc9f133a1c9285018656200bac76eb956c2763257ed04"
     }
   ],
   "zero_ranges": [
     {
-      "start": 1,
-      "count": 63
+      "start": 2,
+      "count": 62
     },
     {
       "start": 67,
