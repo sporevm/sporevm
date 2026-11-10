@@ -1397,6 +1397,11 @@ test "spore-netd TCP delivers concurrent reply bursts without retransmission" {
     // frame queue without a burst limit. Fixed time rules out retransmission.
     var chunk: [16384]u8 = undefined;
     for (peers, 0..) |fd, i| {
+        // macOS defaults to an 8 KiB Unix send buffer. Queue the whole reply
+        // before the gateway reads, and fail rather than block on a short write.
+        const send_buffer: c_int = chunk.len;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, &send_buffer, @sizeOf(c_int)));
+        try std.testing.expect(setNonBlocking(fd));
         @memset(&chunk, @intCast('A' + i));
         try std.testing.expectEqual(@as(isize, chunk.len), std.c.send(fd, &chunk, chunk.len, 0));
     }
