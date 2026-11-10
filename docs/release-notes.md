@@ -2,27 +2,57 @@
 
 ## Unreleased
 
-- Managed networking now supports 256 concurrent TCP flows instead of eight.
-  Full TCP and DNS tables fail promptly instead of silently dropping requests,
-  and TCP dispatch bursts respect the helper's frame queue capacity.
-- Native rootfs conversion now enables extents and directory indexing, and
-  builds htrees for populated multi-block directories. This removes linear
-  lookup from large imported directories and lets Linux index new directories
-  as they grow. Builder `sporevm-rootfs-v7` changes converted image bytes and
-  content digests, invalidating old conversion-cache keys without changing
-  native image, chunk or checkpoint formats. Existing immutable images and
-  checkpoints remain readable and are not rewritten; reconvert OCI/tar inputs
-  to get the new filesystem profile. The deterministic, journal-less profile,
-  content deduplication and lazy rootfs reads are retained.
-- New ARM64 managed-kernel selections use `sporevm/kernels` release `v0.7.2`.
-  It patches Linux 6.1.191 so ext4 without a journal reuses freed inodes
-  immediately, as it does with a journal, instead of rescanning every inode
-  deleted in the last minutes on each new file. Creating files after deleting
-  others in a guest root no longer slows down with each round: in a 4 vCPU
-  guest, batches of 2,500 small files that took 340 to 950 ms after earlier
-  batches were deleted now take about 17 ms. x86_64 keeps the approved
-  bzImage, which does not have the patch. Running VMs and saved spores keep
-  their kernels, and build steps cached with the previous kernel run again.
+## v0.18.1
+
+### Highlights
+
+This patch release fixes networking and filesystem bottlenecks in native
+builds. With these fixes, Buildkite's unchanged native setup went from failing
+inside a VM to completing in 570 seconds on ARM64 KVM. In a repeated
+small-file probe, a batch of 2,500 files went from about 390 ms to
+about 14 ms with the new kernel. These are workload-specific measurements,
+not a promise of the same speedup on every host.
+
+- **Parallel downloads no longer hit an eight-connection ceiling.** Managed
+  guest networking allows 256 concurrent outbound TCP flows. Once the pool
+  is full, new connections are refused promptly rather than left waiting for
+  retries. DNS saturation returns SERVFAIL, and dispatch bursts stay within
+  the helper's bounded frame queues. ([#699](https://github.com/sporevm/sporevm/pull/699))
+- **Large rootfs directories get native ext4 indexes.** The rootfs writer now
+  emits htrees for populated multi-block directories and extent trees for
+  files, directories and long symlinks. Enabling `dir_index` also lets Linux
+  index new directories as they grow, avoiding linear directory lookups.
+  The deterministic, journal-less profile, content deduplication and lazy
+  rootfs reads are retained. ([#700](https://github.com/sporevm/sporevm/pull/700))
+- **Repeated file creation stays fast on ARM64.** The managed kernel moves to
+  [kernels v0.7.2](https://github.com/sporevm/kernels/releases/tag/v0.7.2),
+  patching Linux 6.1.191's quadratic journal-less ext4 inode allocation.
+  Freed inodes can be reused immediately rather than repeatedly scanned for
+  minutes after deletion. x86_64 keeps the same approved, unpatched bzImage.
+  ([#701](https://github.com/sporevm/sporevm/pull/701))
+
+### Upgrading from v0.18.0
+
+- Image, chunk, checkpoint and wire formats remain compatible. Existing
+  immutable images and checkpoints remain readable with their exact identities;
+  upgrading does not rewrite them or require recreating checkpoints.
+- Conversion builder `sporevm-rootfs-v7` invalidates old conversion-cache keys.
+  Reconverted OCI/tar inputs produce new filesystem bytes and content digests.
+  Reconvert those inputs to get indexed directories and extent trees; existing
+  native images do not acquire the new profile automatically.
+- **ARM64 build steps cached with the previous managed kernel rerun once**
+  because the kernel SHA changed. x86_64 kernel bytes and its kernel-based cache
+  identity are unchanged. Running VMs and saved checkpoints retain their old
+  kernels; start a fresh VM with the new managed kernel to get the inode fix.
+- Upgrading from v0.17.1 or earlier still requires the migrations documented
+  under v0.18.0 below.
+
+### Known issue
+
+Guest loopback is still not brought up by default. Workloads that depend on
+guest-local services through `127.0.0.1` or `localhost` must bring up `lo`
+inside the guest (for example, `ip link set lo up`, where available).
+This release does not fix that limitation.
 
 ## v0.18.0
 
