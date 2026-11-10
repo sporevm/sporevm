@@ -517,11 +517,24 @@ repeated builds of the same resolved image produce identical bytes. This
 journal-less native profile is inside the automatic-growth support envelope.
 
 The native writer is the only rootfs writer and needs no e2fsprogs. It uses
-builder version `sporevm-rootfs-v6`.
+builder version `sporevm-rootfs-v7`.
 
-The writer maps file data with ext4 block maps rather than extents: direct,
-single, double, and triple indirect blocks. Without the `huge_file` feature,
+The writer uses extent trees for regular files, directories and non-inline
+symlinks, coalescing contiguous blocks into initialized extents. It enables
+`dir_index` and emits htrees for directories larger than one block, with up to
+one internal index level. Single-block directories remain linear until Linux
+indexes them on growth. Directory hashes use unsigned TEA with the recorded
+manifest-derived seed, including on workers whose native `char` is signed.
+Without the `huge_file` feature,
 the inode's 32-bit sector count limits one regular file to just under 2 TiB,
 and larger files fail closed with `UnsupportedExt4FileSize`; the 32 GiB rootfs
-content limit applies first to OCI and tar imports. The profile also omits
-`dir_index`, so lookup in unusually large directories remains linear.
+content limit applies first to OCI and tar imports.
+
+Version v7 changes ext4 bytes and therefore flat-artifact, chunk, disk-index and
+native image digests for reconverted OCI/tar inputs. Conversion cache keys
+include the builder version; reconversion does not reuse a v6 result. Existing
+immutable native images and checkpoints keep their exact bytes and identities
+and remain readable. Their filesystems are not upgraded in place. The image,
+chunked-rootfs and checkpoint wire formats are unchanged; deduplication and
+lazy chunk reads use the same content-addressed path. No new guest kernel
+feature beyond standard ext4 extent and htree support is required.
