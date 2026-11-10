@@ -94,9 +94,8 @@ const PendingDns = struct {
 /// Guest DNS handling. Local answers are immediate; forwarded queries each
 /// get a connected UDP socket to the host resolver in the netd poll set, so
 /// a slow resolver never stalls other guest traffic. A query without a valid
-/// answer by its deadline gets SERVFAIL. A query arriving while every slot is
-/// in use is dropped, like a SYN when the TCP flow table is full, so the
-/// guest resolver retries it instead of failing the lookup.
+/// answer by its deadline, or arriving while every slot is in use, gets
+/// SERVFAIL rather than leaving the guest waiting for a resolver timeout.
 const DnsProxy = struct {
     server_ipv4: [4]u8,
     server_port: u16 = dns_port,
@@ -106,7 +105,6 @@ const DnsProxy = struct {
         not_dns,
         reply: []const u8,
         pending,
-        dropped,
     };
 
     fn deinit(self: *DnsProxy) void {
@@ -125,8 +123,7 @@ const DnsProxy = struct {
         else switch (policy.dnsForwardDecision(request.payload, dns_header_len, question.qtype, question.qclass)) {
             .forward => switch (self.startForward(request, now)) {
                 .started => return .pending,
-                .full => return .dropped,
-                .failed => buildDnsServfail(request.payload, request.question_end, &response_buf),
+                .full, .failed => buildDnsServfail(request.payload, request.question_end, &response_buf),
             },
             .no_data => buildDnsNoData(request.payload, request.question_end, &response_buf),
             .refuse => buildDnsRefused(request.payload, request.question_end, &response_buf),
@@ -264,7 +261,6 @@ pub fn cli(ctx: *const Ctx, args: []const []const u8) !void {
             } else switch (dns.receiveFrame(frame, &policy, after_poll, &reply_buf)) {
                 .reply => |reply| try writeFrameFd(1, reply),
                 .pending => {},
-                .dropped => std.log.debug("spore-netd dropped DNS query: {d} already pending", .{max_pending_dns}),
                 .not_dns => if (!tcp_gateway.receiveFrame(frame, after_poll)) {
                     std.log.debug("spore-netd dropped unsupported frame len={d}", .{frame.len});
                 },
@@ -873,7 +869,7 @@ test "spore-netd does not wait on the resolver and times out unanswered DNS" {
     try std.testing.expectEqual(@as(i32, -1), proxy.nextPollTimeoutMs(Instant.fromMillis(dns_forward_timeout_ms)));
 }
 
-test "spore-netd drops DNS queries beyond the pending table so the guest retries" {
+test "spore-netd answers excess DNS queries with SERVFAIL and recovers capacity" {
     var resolver = try TestResolver.open();
     defer resolver.close();
     var proxy = resolver.proxy();
@@ -887,7 +883,12 @@ test "spore-netd drops DNS queries beyond the pending table so the guest retries
         try std.testing.expect(dnsQueryStep(&proxy, &policy, testDnsQuery(id, "example.com", &query_buf), &out) == .pending);
     }
     const overflow = testDnsQuery(max_pending_dns, "example.com", &query_buf);
-    try std.testing.expect(dnsQueryStep(&proxy, &policy, overflow, &out) == .dropped);
+    const reply = switch (dnsQueryStep(&proxy, &policy, overflow, &out)) {
+        .reply => |frame| frame,
+        else => return error.TestUnexpectedResult,
+    };
+    try expectDnsReplyId(reply, max_pending_dns);
+    try expectDnsRcode(reply, 2);
 
     // Once an earlier query has its answer, the guest's retry is forwarded.
     var forwarded_buf: [512]u8 = undefined;

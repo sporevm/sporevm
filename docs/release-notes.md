@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Managed networking now supports 256 concurrent TCP flows instead of eight.
+  Full TCP and DNS tables fail promptly instead of silently dropping requests,
+  and TCP dispatch bursts respect the helper's frame queue capacity.
 - Native rootfs conversion now enables extents and directory indexing, and
   builds htrees for populated multi-block directories. This removes linear
   lookup from large imported directories and lets Linux index new directories
