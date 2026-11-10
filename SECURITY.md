@@ -335,7 +335,9 @@ policy argument.
 - Under an allowlist, netd forwards only A/IN queries for allowed names; other
   names get REFUSED and other query types for allowed names get NODATA.
 - At most 64 forwarded DNS queries are in flight, each on its own socket; one
-  without an answer in 1 s gets SERVFAIL and excess queries are dropped.
+  without an answer in 1 s gets SERVFAIL, as do excess queries.
+- At most 256 TCP flows share bounded heap buffers. Excess SYNs are reset;
+  admission still checks policy before opening a host socket.
 - The policy reaches the monitor and netd as one JSON argument with a strict
   parser (every field required, unknown fields rejected) that reruns the CLI
   validators. Egress is `unrestricted` or an `allowlist` (empty denies all

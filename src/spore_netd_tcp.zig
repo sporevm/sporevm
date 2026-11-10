@@ -27,19 +27,52 @@ const Duration = time.Duration;
 const tcp_stack_ipv4: ipv4.Address = .{ 100, 96, 0, 3 };
 const tcp_stack_prefix_len: u8 = 31;
 
-pub const max_flows = 8;
+// Shared by outbound TCP, bound services, and host port forwards. Keep the
+// bounded buffers off the helper's stack as the pool grows.
+pub const max_flows = 256;
 pub const max_port_forwards = spore_net_policy.max_port_forwards;
 pub const flow_buffer_len = 8 * 1024;
 pub const tcp_rx_buffer_len = 16 * 1024;
 pub const tcp_tx_buffer_len = 16 * 1024;
-pub const output_queue_len = 32;
+pub const output_queue_len = 64;
 pub const connect_timeout_ms = 10_000;
 pub const flow_idle_timeout_ms = 120_000;
 const first_forward_local_port: u16 = 49152;
 const last_forward_local_port: u16 = 60999;
 
 const TcpSock = tcp_socket.Socket(ipv4, 4);
-const Device = stack_mod.LoopbackDevice(output_queue_len);
+// netd polls once for an incoming frame and once for host I/O before draining
+// output. Bound each burst so neither poll advances TCP past a dropped frame.
+const Device = struct {
+    rx: OutputQueue = .{},
+    tx: OutputQueue = .{},
+
+    pub fn capabilities() zmoltcp.iface.DeviceCapabilities {
+        return .{ .max_burst_size = output_queue_len / 2 - 1 };
+    }
+
+    pub fn init() Device {
+        return .{};
+    }
+
+    pub fn enqueueRx(self: *Device, frame: []const u8) void {
+        const queued = self.rx.push(frame);
+        std.debug.assert(queued);
+    }
+
+    pub fn receive(self: *Device) ?[]const u8 {
+        return self.rx.pop();
+    }
+
+    pub fn transmit(self: *Device, frame: []const u8) void {
+        const queued = self.tx.push(frame);
+        std.debug.assert(queued);
+    }
+
+    pub fn dequeueTx(self: *Device) ?[]const u8 {
+        return self.tx.pop();
+    }
+};
 const ForwardRequest = tcp_socket.ForwardRequest(ipv4);
 const Forwarder = tcp_socket.Forwarder(ipv4, TcpSock, Gateway);
 const Sockets = struct {
@@ -241,7 +274,7 @@ const OutputQueue = struct {
 
 pub const Gateway = struct {
     device: Device = Device.init(),
-    flows: [max_flows]Flow = undefined,
+    flows: []Flow = undefined,
     port_forwards: [max_port_forwards]PortForward = @splat(.{}),
     port_forward_count: usize = 0,
     sock_ptrs: [max_flows]*TcpSock = undefined,
@@ -253,8 +286,8 @@ pub const Gateway = struct {
     next_forward_local_port: u16 = first_forward_local_port,
     stats: Stats = .{},
     emit_events: bool = false,
-    /// Set by `offer` when policy denies the SYN being processed.
-    syn_denied: bool = false,
+    /// Set by `offer` when policy or capacity rejects the SYN being processed.
+    syn_rejected: bool = false,
 
     pub fn init(self: *Gateway, policy: *spore_net_policy.Runtime, port_forwards: []const spore_net_policy.PortForwardConfig) !void {
         self.device = Device.init();
@@ -266,9 +299,11 @@ pub const Gateway = struct {
         self.next_forward_local_port = first_forward_local_port;
         self.stats = .{};
         self.emit_events = false;
-        self.syn_denied = false;
-        for (&self.flows, 0..) |*flow, i| {
-            flow.init();
+        self.syn_rejected = false;
+        self.flows = try std.heap.page_allocator.alloc(Flow, max_flows);
+        for (self.flows, 0..) |*flow, i| {
+            flow.* = .{};
+            flow.initSocket();
             self.sock_ptrs[i] = &flow.sock;
         }
         self.forwarder = Forwarder.init(self, offer);
@@ -288,9 +323,10 @@ pub const Gateway = struct {
             forward.close();
         }
         self.port_forward_count = 0;
-        for (&self.flows) |*flow| {
+        for (self.flows) |*flow| {
             flow.closeFd();
         }
+        std.heap.page_allocator.free(self.flows);
     }
 
     fn addPortForward(self: *Gateway, config: spore_net_policy.PortForwardConfig) !void {
@@ -307,10 +343,10 @@ pub const Gateway = struct {
     pub fn receiveFrame(self: *Gateway, frame: []const u8, now: Instant) bool {
         if (!isGuestTcpFrame(frame)) return false;
         self.current_now = now;
-        self.syn_denied = false;
+        self.syn_rejected = false;
         self.device.enqueueRx(frame);
         self.pollStack(now);
-        if (self.syn_denied) {
+        if (self.syn_rejected) {
             var reset_buf: [spore_net.max_frame_len]u8 = undefined;
             if (buildSynReset(frame, &reset_buf)) |reset| {
                 if (!self.output.push(reset)) self.stats.output_drops += 1;
@@ -325,11 +361,11 @@ pub const Gateway = struct {
             self.stack.iface.neighbor_cache.fill(spore_net.guest_ipv4, spore_net.guest_mac, now);
         }
         self.acceptPortForwards(now);
-        for (&self.flows) |*flow| {
+        for (self.flows) |*flow| {
             self.serviceFlow(flow, now);
         }
         self.pollStack(now);
-        for (&self.flows) |*flow| {
+        for (self.flows) |*flow| {
             self.reapFlow(flow);
         }
     }
@@ -341,7 +377,7 @@ pub const Gateway = struct {
             fds[count] = .{ .fd = forward.fd, .events = std.c.POLL.IN, .revents = 0 };
             count += 1;
         }
-        for (&self.flows) |*flow| {
+        for (self.flows) |*flow| {
             flow.poll_index = null;
             if (flow.fd < 0) continue;
             var events: i16 = 0;
@@ -371,7 +407,7 @@ pub const Gateway = struct {
             forward.poll_revents = fds[count].revents;
             count += 1;
         }
-        for (&self.flows) |*flow| {
+        for (self.flows) |*flow| {
             flow.poll_revents = 0;
             const index = flow.poll_index orelse continue;
             flow.poll_index = null;
@@ -382,7 +418,7 @@ pub const Gateway = struct {
     pub fn nextPollTimeoutMs(self: *const Gateway, now: Instant) i32 {
         var next: ?Instant = null;
         if (self.stack.pollAt()) |at| next = minInstant(next, at);
-        for (&self.flows) |*flow| {
+        for (self.flows) |*flow| {
             if (flow.state == .free) continue;
             next = minInstant(next, flow.idle_deadline);
             if (flow.state == .connecting) next = minInstant(next, flow.connect_deadline);
@@ -438,12 +474,13 @@ pub const Gateway = struct {
     fn offer(self: *Gateway, request: ForwardRequest) ?*TcpSock {
         const target = self.targetForRequest(request) orelse {
             self.stats.denied += 1;
-            self.syn_denied = true;
+            self.syn_rejected = true;
             return null;
         };
 
         const flow = self.freeFlow() orelse {
             self.stats.flow_limit_drops += 1;
+            self.syn_rejected = true;
             return null;
         };
         flow.start(request, self.current_now);
@@ -499,7 +536,7 @@ pub const Gateway = struct {
     }
 
     fn freeFlow(self: *Gateway) ?*Flow {
-        for (&self.flows) |*flow| {
+        for (self.flows) |*flow| {
             if (flow.state == .free) return flow;
         }
         return null;
@@ -963,6 +1000,17 @@ const TestGuest = struct {
             if (!moved) return;
         }
     }
+
+    fn deliverAll(guests: []TestGuest, gateway: *Gateway) !void {
+        while (gateway.dequeueFrame()) |frame| {
+            const ip_data = frame[ethernet.HEADER_LEN..];
+            const segment = try ipv4.payloadSlice(ip_data);
+            const header = try tcp_wire.parse(segment);
+            const index = header.dst_port - 49152;
+            try std.testing.expect(index < guests.len);
+            guests[index].device.enqueueRx(frame);
+        }
+    }
 };
 
 /// One iteration of the netd host side: poll host sockets, then service.
@@ -1011,6 +1059,7 @@ test "spore-netd TCP denies blocked SYN before host socket open" {
     var policy = try spore_net_policy.Runtime.init(.{ .egress = .unrestricted });
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
+    defer gateway.deinit();
 
     const blocked = [_]ipv4.Address{
         .{ 169, 254, 169, 254 },
@@ -1049,7 +1098,7 @@ test "spore-netd TCP resets a guest connection to a denied destination" {
     try std.testing.expectEqual(tcp_socket.State.closed, guest.sock.getState());
 }
 
-test "spore-netd TCP drops a SYN without a reset when the flow table is full" {
+test "spore-netd TCP admits parallel SYNs and resets excess connections" {
     var config = spore_net_policy.Config{ .egress = .unrestricted };
     try config.addBoundUnixService("metadata", "metadata.spore.internal", 80, "/tmp/sporevm-netd-missing-full-table.sock");
     var policy = try spore_net_policy.Runtime.init(config);
@@ -1062,13 +1111,19 @@ test "spore-netd TCP drops a SYN without a reset when the flow table is full" {
     var port: u16 = 0;
     while (port < max_flows) : (port += 1) {
         try std.testing.expect(gateway.receiveFrame(buildTcpSynFrameFrom(49152 + port, spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
+        while (gateway.dequeueFrame()) |_| {}
     }
-    while (gateway.dequeueFrame()) |_| {}
+    // A package manager's parallel fetches must not hit the old eight-flow cap.
+    try std.testing.expect(gateway.stats.connect_attempts >= 64);
+    try std.testing.expectEqual(@as(usize, 0), gateway.stats.flow_limit_drops);
 
-    try std.testing.expect(gateway.receiveFrame(buildTcpSynFrameFrom(49152 + max_flows, spore_net.gateway_ipv4, 80, &frame_buf), Instant.fromMillis(1)));
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49152 + max_flows);
+    guest.exchange(&gateway, Instant.fromMillis(1));
     try std.testing.expectEqual(@as(usize, 1), gateway.stats.flow_limit_drops);
     try std.testing.expectEqual(@as(usize, 0), gateway.stats.denied);
-    try std.testing.expectEqual(@as(?[]const u8, null), gateway.dequeueFrame());
+    try std.testing.expectEqual(tcp_socket.State.closed, guest.sock.getState());
 }
 
 test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial" {
@@ -1077,6 +1132,7 @@ test "spore-netd TCP routes bound service SYNs before gateway hard-floor denial"
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
+    defer gateway.deinit();
 
     var frame_buf: [spore_net.max_frame_len]u8 = undefined;
     const service_syn = buildTcpSynFrame(spore_net.gateway_ipv4, 80, &frame_buf);
@@ -1110,6 +1166,7 @@ test "spore-netd TCP routes two bound services independently and rejects duplica
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
+    defer gateway.deinit();
 
     const metadata = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 80)) orelse return error.TestUnexpectedResult;
     switch (metadata) {
@@ -1306,6 +1363,65 @@ test "spore-netd TCP stops polling a host socket while the guest cannot take mor
     try std.testing.expect(try guest.sock.recvSlice(&drained) > 0);
 }
 
+test "spore-netd TCP delivers concurrent reply bursts without retransmission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sporevm-netd-burst-{s}.sock", .{tmp.sub_path}, 0);
+    const listener = try listenUnix(path);
+    defer _ = std.c.close(listener);
+    defer _ = std.c.unlink(path.ptr);
+
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
+    try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+
+    var guests: [8]TestGuest = undefined;
+    var peers: [8]std.c.fd_t = @splat(-1);
+    defer for (peers) |fd| {
+        if (fd >= 0) _ = std.c.close(fd);
+    };
+    for (&guests, 0..) |*guest, i| {
+        guest.init(Instant.fromMillis(1));
+        try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, @intCast(49152 + i));
+        guest.exchange(&gateway, Instant.fromMillis(1));
+        try std.testing.expectEqual(tcp_socket.State.established, guest.sock.getState());
+        peers[i] = std.c.accept(listener, null, null);
+        try std.testing.expect(peers[i] >= 0);
+    }
+
+    // Two host I/O passes with eight 16 KiB replies exceed even the enlarged
+    // frame queue without a burst limit. Fixed time rules out retransmission.
+    var chunk: [16384]u8 = undefined;
+    for (peers, 0..) |fd, i| {
+        @memset(&chunk, @intCast('A' + i));
+        try std.testing.expectEqual(@as(isize, chunk.len), std.c.send(fd, &chunk, chunk.len, 0));
+    }
+    const now = Instant.fromMillis(2);
+    try pollHost(&gateway, now);
+    try pollHost(&gateway, now);
+    var received: [8]usize = @splat(0);
+    for (0..16) |_| {
+        try TestGuest.deliverAll(&guests, &gateway);
+        for (&guests, 0..) |*guest, i| {
+            _ = guest.stack.poll(now, &guest.device);
+            const n = try guest.sock.recvSlice(&chunk);
+            for (chunk[0..n]) |byte| try std.testing.expectEqual(@as(u8, @intCast('A' + i)), byte);
+            received[i] += n;
+            while (guest.device.dequeueTx()) |frame| {
+                try std.testing.expect(gateway.receiveFrame(frame, now));
+                try TestGuest.deliverAll(&guests, &gateway);
+            }
+        }
+        gateway.service(now);
+    }
+    for (received) |count| try std.testing.expectEqual(@as(usize, chunk.len), count);
+    try std.testing.expectEqual(@as(usize, 0), gateway.stats.output_drops);
+}
+
 test "spore-netd TCP enforces exact learned host ports" {
     var config = spore_net_policy.Config{ .egress = .deny_all };
     try config.addExactHostPorts("github.com", &.{443});
@@ -1319,6 +1435,7 @@ test "spore-netd TCP enforces exact learned host ports" {
 
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
+    defer gateway.deinit();
     try std.testing.expect(gateway.targetForRequest(testForwardRequest(.{ 203, 0, 113, 10 }, 443)) != null);
     try std.testing.expect(gateway.targetForRequest(testForwardRequest(.{ 203, 0, 113, 10 }, 80)) == null);
 }
@@ -1329,6 +1446,7 @@ test "spore-netd TCP routes configured bound service ports to Unix sockets" {
     var policy = try spore_net_policy.Runtime.init(config);
     var gateway: Gateway = undefined;
     try gateway.init(&policy, &.{});
+    defer gateway.deinit();
 
     const target = gateway.targetForRequest(testForwardRequest(spore_net.gateway_ipv4, 8170)) orelse return error.TestUnexpectedResult;
     switch (target) {

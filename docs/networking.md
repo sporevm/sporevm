@@ -125,6 +125,14 @@ Unix socket path.
 Current limits:
 
 - IPv4 TCP and DNS only.
+- Each gateway has 256 concurrent TCP flow slots, shared by outbound egress,
+  bound services, and host port forwards. A new connection beyond that limit
+  is reset immediately rather than silently waiting for a TCP retry.
+- The TCP pool uses about 13 MiB of bounded heap storage: each flow has
+  16 KiB receive and transmit windows and an 8 KiB relay buffer in each
+  direction. Stack dispatch bursts are bounded to the frame queue capacity.
+- Up to 64 DNS queries are forwarded concurrently. Queries that exceed this
+  limit, or have no valid answer after one second, receive SERVFAIL.
 - No IPv6, general UDP, DHCP, arbitrary published ports, or multiple NICs.
 - No live flow preservation across capture, resume, or fork.
 - No per-exec policy replacement for a running named VM.

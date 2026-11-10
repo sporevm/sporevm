@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Managed networking now supports 256 concurrent TCP flows instead of eight.
+  Full TCP and DNS tables fail promptly instead of silently dropping requests,
+  and TCP dispatch bursts respect the helper's frame queue capacity.
+
 ## v0.18.0
 
 ### Upgrading
