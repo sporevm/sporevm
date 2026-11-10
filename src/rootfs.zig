@@ -26,7 +26,7 @@ const test_support = @import("test_support.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
-pub const builder_version = "sporevm-rootfs-v6";
+pub const builder_version = "sporevm-rootfs-v7";
 const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
 /// Recorded in rootfs metadata. Cache lookups reject artifacts from any other
 /// producer, such as the removed e2fsprogs writer.

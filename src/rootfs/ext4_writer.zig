@@ -24,8 +24,6 @@ const lost_found_inode: u32 = 11;
 const min_image_size: u64 = 16 << 20;
 const blocks_per_group: u32 = 32768;
 const group_descriptor_size: u32 = 32;
-const max_direct_blocks: usize = 12;
-const pointers_per_block: usize = block_size / @sizeOf(u32);
 const source_batch_bytes: usize = 16 << 20;
 
 const s_ififo: u16 = 0o010000;
@@ -50,7 +48,11 @@ const file_type_symlink: u8 = 7;
 const fast_symlink_max_len: usize = 60;
 
 const feature_compat_ext_attr: u32 = 0x0008;
+const feature_compat_dir_index: u32 = 0x0020;
 const feature_incompat_filetype: u32 = 0x0002;
+const feature_incompat_extents: u32 = 0x0040;
+const inode_flag_extents: u32 = 0x00080000;
+const inode_flag_index: u32 = 0x00001000;
 const feature_ro_compat_sparse_super: u32 = 0x0001;
 const feature_ro_compat_large_file: u32 = 0x0002;
 const ext4_magic: u16 = 0xef53;
@@ -164,9 +166,9 @@ const InodePlan = struct {
     device: ?Device = null,
     xattrs: []const xattrs_mod.Attribute = &.{},
     data_blocks: []u32 = &.{},
-    indirect_blocks: []u32 = &.{},
-    /// Single, double, and triple indirect root blocks, or zero when unused.
-    indirect_roots: [3]u32 = .{ 0, 0, 0 },
+    extent_blocks: []u32 = &.{},
+    block_map: [60]u8 = @splat(0),
+    indexed: bool = false,
     xattr_block: u32 = 0,
     mtime: ?EncodedMtime = null,
 
@@ -180,6 +182,11 @@ const InodePlan = struct {
             .fifo => file_type_fifo,
             .socket => file_type_sock,
         };
+    }
+
+    fn usesExtents(self: InodePlan) bool {
+        return self.kind == .file or self.kind == .directory or
+            (self.kind == .symlink and self.symlink_target.len >= fast_symlink_max_len);
     }
 };
 
@@ -196,6 +203,7 @@ const PathRef = struct {
 const DirChild = struct {
     name: []const u8,
     inode_index: usize,
+    hash: u32 = 0,
 };
 
 const directory_child_index_threshold: usize = 8_000_000;
@@ -264,11 +272,12 @@ const PlannedImage = struct {
     paths: std.ArrayList(PathRef) = .empty,
     path_index: std.StringHashMap(usize),
     directory_count: usize = 0,
+    hash_seed: [16]u8 = @splat(0),
 
     fn deinit(self: *PlannedImage, allocator: std.mem.Allocator) void {
         for (self.inodes.items) |inode| {
             allocator.free(inode.data_blocks);
-            allocator.free(inode.indirect_blocks);
+            allocator.free(inode.extent_blocks);
         }
         self.inodes.deinit(allocator);
         self.paths.deinit(allocator);
@@ -735,6 +744,7 @@ pub fn emit(
     var profile: EmitProfile = .{};
     const plan_start = monotonicMs();
     var planned = try planImage(allocator, entries, options.inode_count);
+    planned.hash_seed = options.determinism.hash_seed_bytes;
     profile.plan_ms = monotonicMs() -| plan_start;
     defer planned.deinit(allocator);
 
@@ -1188,6 +1198,7 @@ fn assignBlocks(
                 try directoryBytes(allocator, planned, inode.*);
             defer allocator.free(bytes);
             inode.size = bytes.len;
+            inode.indexed = bytes.len > block_size;
             try allocatePayloadBlocks(allocator, inode, bytes, &block_allocator, blocks);
         } else if (inode.kind == .file) {
             if (inode.file_source) |source| {
@@ -1203,7 +1214,7 @@ fn assignBlocks(
             const xattr_block = try xattrBlock(allocator, inode.xattrs);
             try blocks.put(inode.xattr_block, xattr_block);
         }
-        try allocateIndirectBlocks(allocator, inode, &block_allocator, blocks);
+        if (inode.usesExtents()) try allocateExtentBlocks(allocator, inode, &block_allocator, blocks);
     }
 
     var free_blocks: u32 = 0;
@@ -1319,58 +1330,70 @@ fn allocatePayloadBlocks(
     }
 }
 
-fn allocateIndirectBlocks(
+fn allocateExtentBlocks(
     allocator: std.mem.Allocator,
     inode: *InodePlan,
     block_allocator: *BlockAllocator,
     blocks: *BlockStore,
 ) !void {
-    if (inode.data_blocks.len <= max_direct_blocks) return;
-
+    // Without huge_file, i_blocks is a 32-bit count of 512-byte sectors.
+    if (inode.data_blocks.len > std.math.maxInt(u32) / (block_size / 512)) return error.UnsupportedExt4FileSize;
+    var entries = std.ArrayList(ExtentEntry).empty;
+    defer entries.deinit(allocator);
+    var logical: usize = 0;
+    while (logical < inode.data_blocks.len) {
+        const start = logical;
+        // 32768 denotes an initialized extent, not an unwritten extent.
+        while (logical < inode.data_blocks.len and logical - start < 32768 and
+            inode.data_blocks[logical] == inode.data_blocks[start] + logical - start) : (logical += 1)
+        {}
+        try entries.append(allocator, .{ .logical = @intCast(start), .block = inode.data_blocks[start], .len = @intCast(logical - start) });
+    }
     var metadata_blocks = std.ArrayList(u32).empty;
     errdefer metadata_blocks.deinit(allocator);
-
-    // i_block[12..15] root the single, double, and triple indirect trees.
-    var remaining: []const u32 = inode.data_blocks[max_direct_blocks..];
-    for (&inode.indirect_roots, 1..) |*root, depth| {
-        if (remaining.len == 0) break;
-        root.* = try allocateIndirectTree(allocator, depth, &remaining, block_allocator, blocks, &metadata_blocks);
+    var depth: u16 = 0;
+    while (entries.items.len > 4) {
+        var parents = std.ArrayList(ExtentEntry).empty;
+        errdefer parents.deinit(allocator);
+        var offset: usize = 0;
+        while (offset < entries.items.len) {
+            const end = @min(offset + (block_size - 12) / 12, entries.items.len);
+            const block = try block_allocator.alloc();
+            try metadata_blocks.append(allocator, block);
+            try parents.append(allocator, .{ .logical = entries.items[offset].logical, .block = block });
+            const table = try zeroBlock(allocator);
+            errdefer allocator.free(table);
+            writeExtentNode(table, entries.items[offset..end], depth);
+            try blocks.put(block, table);
+            offset = end;
+        }
+        entries.deinit(allocator);
+        entries = parents;
+        depth += 1;
     }
-    if (remaining.len != 0) return error.UnsupportedExt4FileSize;
-
-    // Without huge_file, i_blocks counts 512-byte sectors in 32 bits.
+    writeExtentNode(&inode.block_map, entries.items, depth);
     const allocated = inode.data_blocks.len + metadata_blocks.items.len + @intFromBool(inode.xattr_block != 0);
     if (allocated > std.math.maxInt(u32) / (block_size / 512)) return error.UnsupportedExt4FileSize;
-    inode.indirect_blocks = try metadata_blocks.toOwnedSlice(allocator);
+    inode.extent_blocks = try metadata_blocks.toOwnedSlice(allocator);
 }
 
-/// Allocates one indirect block whose pointers cover `depth` levels and maps
-/// the next data blocks from `remaining` beneath it. Parents are allocated
-/// before their children, so files that fit the double-indirect tree keep the
-/// same block layout they had before triple-indirect support.
-fn allocateIndirectTree(
-    allocator: std.mem.Allocator,
-    depth: usize,
-    remaining: *[]const u32,
-    block_allocator: *BlockAllocator,
-    blocks: *BlockStore,
-    metadata_blocks: *std.ArrayList(u32),
-) error{ OutOfMemory, Ext4ImageTooSmall }!u32 {
-    const block = try block_allocator.alloc();
-    try metadata_blocks.append(allocator, block);
-    const table = try zeroBlock(allocator);
-    errdefer allocator.free(table);
-    var index: usize = 0;
-    while (index < pointers_per_block and remaining.len != 0) : (index += 1) {
-        const pointer = if (depth == 1) leaf: {
-            const data_block = remaining.*[0];
-            remaining.* = remaining.*[1..];
-            break :leaf data_block;
-        } else try allocateIndirectTree(allocator, depth - 1, remaining, block_allocator, blocks, metadata_blocks);
-        put(u32, table, index * @sizeOf(u32), pointer);
+const ExtentEntry = struct { logical: u32, block: u32, len: u16 = 0 };
+
+fn writeExtentNode(buf: []u8, entries: []const ExtentEntry, depth: u16) void {
+    put(u16, buf, 0, 0xf30a);
+    put(u16, buf, 2, @intCast(entries.len));
+    put(u16, buf, 4, @intCast((buf.len - 12) / 12));
+    put(u16, buf, 6, depth);
+    for (entries, 0..) |entry, i| {
+        const offset = 12 + i * 12;
+        put(u32, buf, offset, entry.logical);
+        if (depth == 0) {
+            put(u16, buf, offset + 4, entry.len);
+            put(u32, buf, offset + 8, entry.block);
+        } else {
+            put(u32, buf, offset + 4, entry.block);
+        }
     }
-    try blocks.put(block, table);
-    return block;
 }
 
 fn directoryBytes(allocator: std.mem.Allocator, planned: *const PlannedImage, inode: InodePlan) ![]u8 {
@@ -1385,24 +1408,7 @@ fn directoryBytes(allocator: std.mem.Allocator, planned: *const PlannedImage, in
             .inode_index = path_ref.inode_index,
         });
     }
-    std.mem.sort(DirChild, children.items, planned, lessDirChild);
-
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    try appendDirent(allocator, &out, inode.ino, ".", file_type_dir, false);
-    const parent_inode = if (self_path.len == 0)
-        inode.ino
-    else blk: {
-        const parent = parentPathIndex(planned, self_path) orelse return error.BadExt4Tree;
-        break :blk planned.inodes.items[parent.inode_index].ino;
-    };
-    try appendDirent(allocator, &out, parent_inode, "..", file_type_dir, false);
-    for (children.items, 0..) |child, i| {
-        const child_inode = planned.inodes.items[child.inode_index];
-        try appendDirent(allocator, &out, child_inode.ino, child.name, child_inode.fileType(), i + 1 == children.items.len);
-    }
-    if (children.items.len == 0) try finishDirectoryBlock(allocator, &out);
-    return out.toOwnedSlice(allocator);
+    return directoryFromChildren(allocator, planned, inode, children.items);
 }
 
 fn directoryBytesIndexed(
@@ -1420,8 +1426,11 @@ fn directoryBytesIndexed(
         try children.append(allocator, directory_children.children[child_index]);
         child_index = directory_children.next[child_index];
     }
-    std.mem.sort(DirChild, children.items, planned, lessDirChild);
+    return directoryFromChildren(allocator, planned, inode, children.items);
+}
 
+fn directoryFromChildren(allocator: std.mem.Allocator, planned: *const PlannedImage, inode: InodePlan, children: []DirChild) ![]u8 {
+    std.mem.sort(DirChild, children, planned, lessDirChild);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try appendDirent(allocator, &out, inode.ino, ".", file_type_dir, false);
@@ -1433,12 +1442,120 @@ fn directoryBytesIndexed(
         break :blk planned.inodes.items[parent.inode_index].ino;
     };
     try appendDirent(allocator, &out, parent_inode, "..", file_type_dir, false);
-    for (children.items, 0..) |child, i| {
+    for (children, 0..) |child, i| {
         const child_inode = planned.inodes.items[child.inode_index];
-        try appendDirent(allocator, &out, child_inode.ino, child.name, child_inode.fileType(), i + 1 == children.items.len);
+        try appendDirent(allocator, &out, child_inode.ino, child.name, child_inode.fileType(), i + 1 == children.len);
     }
-    if (children.items.len == 0) try finishDirectoryBlock(allocator, &out);
+    if (children.len == 0) try finishDirectoryBlock(allocator, &out);
+    if (out.items.len <= block_size) return out.toOwnedSlice(allocator);
+
+    // A single-block directory stays linear; Linux converts it to an htree
+    // when it grows. Already-large imported directories need an index now.
+    for (children) |*child| child.hash = directoryHash(child.name, planned.hash_seed);
+    std.mem.sort(DirChild, children, planned, lessHashedChild);
+    out.clearRetainingCapacity();
+    try out.appendNTimes(allocator, 0, block_size);
+    const IndexEntry = struct { hash: u32, block: u32 };
+    var leaves = std.ArrayList(IndexEntry).empty;
+    defer leaves.deinit(allocator);
+    var previous_hash: u32 = 0;
+    for (children, 0..) |child, i| {
+        if (out.items.len % block_size != 0 and block_size - out.items.len % block_size < direntLen(child.name.len)) {
+            try finishDirectoryBlock(allocator, &out);
+        }
+        if (out.items.len % block_size == 0) {
+            // A boundary inside a hash collision chain must carry bit 0,
+            // including boundaries that will sit in an internal dx node.
+            try leaves.append(allocator, .{
+                .hash = if (i == 0) 0 else child.hash | @intFromBool(child.hash == previous_hash),
+                .block = @intCast(out.items.len / block_size),
+            });
+        }
+        const child_inode = planned.inodes.items[child.inode_index];
+        try appendDirent(allocator, &out, child_inode.ino, child.name, child_inode.fileType(), i + 1 == children.len);
+        previous_hash = child.hash;
+    }
+    const root_limit = (block_size - 32) / 8;
+    const node_limit = (block_size - 8) / 8;
+    const indirect = leaves.items.len > root_limit;
+    if (leaves.items.len > root_limit * node_limit) return error.UnsupportedExt4DirectorySize;
+    const node_count = divCeilUsize(leaves.items.len, node_limit);
+    const first_node = out.items.len / block_size;
+    if (indirect) try out.appendNTimes(allocator, 0, node_count * block_size);
+    // dx_root hides its index in the unused tail of '..'.
+    put(u32, out.items, 0, inode.ino);
+    put(u16, out.items, 4, 12);
+    out.items[6] = 1;
+    out.items[7] = file_type_dir;
+    out.items[8] = '.';
+    put(u32, out.items, 12, parent_inode);
+    put(u16, out.items, 16, block_size - 12);
+    out.items[18] = 2;
+    out.items[19] = file_type_dir;
+    @memcpy(out.items[20..22], "..");
+    out.items[28] = 2; // TEA; superblock UNSIGNED_HASH selects version 5.
+    out.items[29] = 8;
+    out.items[30] = @intFromBool(indirect);
+    put(u16, out.items, 32, root_limit);
+    put(u16, out.items, 34, @intCast(if (indirect) node_count else leaves.items.len));
+    if (!indirect) {
+        for (leaves.items, 0..) |leaf, i| {
+            if (i != 0) put(u32, out.items, 32 + i * 8, leaf.hash);
+            put(u32, out.items, 36 + i * 8, leaf.block);
+        }
+    } else {
+        for (0..node_count) |n| {
+            const start = n * node_limit;
+            const end = @min(start + node_limit, leaves.items.len);
+            if (n != 0) put(u32, out.items, 32 + n * 8, leaves.items[start].hash);
+            put(u32, out.items, 36 + n * 8, @intCast(first_node + n));
+            const node = out.items[(first_node + n) * block_size ..][0..block_size];
+            put(u16, node, 4, block_size); // fake empty dirent
+            put(u16, node, 8, node_limit);
+            put(u16, node, 10, @intCast(end - start));
+            for (leaves.items[start..end], 0..) |leaf, i| {
+                if (i != 0) put(u32, node, 8 + i * 8, leaf.hash);
+                put(u32, node, 12 + i * 8, leaf.block);
+            }
+        }
+    }
     return out.toOwnedSlice(allocator);
+}
+
+fn lessHashedChild(planned: *const PlannedImage, a: DirChild, b: DirChild) bool {
+    if (a.hash != b.hash) return a.hash < b.hash;
+    return lessDirChild(planned, a, b);
+}
+
+/// ext4's unsigned TEA directory hash (version 5), with a manifest-derived
+/// seed. Arithmetic and byte interpretation are independent of the worker ABI.
+fn directoryHash(name: []const u8, seed: [16]u8) u32 {
+    var state: [2]u32 = .{
+        std.mem.readInt(u32, seed[0..4], .little),
+        std.mem.readInt(u32, seed[4..8], .little),
+    };
+    if (std.mem.allEqual(u8, &seed, 0)) state = .{ 0x67452301, 0xefcdab89 };
+    var offset: usize = 0;
+    while (offset < name.len) : (offset += @min(name.len - offset, 16)) {
+        const remaining = name.len - offset;
+        const pad = @as(u32, @intCast(remaining)) * 0x01010101;
+        var words: [4]u32 = @splat(pad);
+        for (name[offset..][0..@min(remaining, 16)], 0..) |byte, i| {
+            words[i / 4] = (words[i / 4] << 8) +% byte;
+        }
+        var a = state[0];
+        var b = state[1];
+        var sum: u32 = 0;
+        for (0..16) |_| {
+            sum +%= 0x9e3779b9;
+            a +%= ((b << 4) +% words[0]) ^ (b +% sum) ^ ((b >> 5) +% words[1]);
+            b +%= ((a << 4) +% words[2]) ^ (a +% sum) ^ ((a >> 5) +% words[3]);
+        }
+        state[0] +%= a;
+        state[1] +%= b;
+    }
+    const hash = state[0] & ~@as(u32, 1);
+    return if (hash == 0xfffffffe) 0xfffffffc else hash;
 }
 
 fn appendDirent(
@@ -1586,13 +1703,16 @@ fn writeSuperblock(buf: []u8, layout: Layout, options: Options, group_index: u32
     put(u32, buf, 0x54, first_non_reserved_inode);
     put(u16, buf, 0x58, inode_size);
     put(u16, buf, 0x5a, @intCast(group_index));
-    put(u32, buf, 0x5c, feature_compat_ext_attr);
-    put(u32, buf, 0x60, feature_incompat_filetype);
+    put(u32, buf, 0x5c, feature_compat_ext_attr | feature_compat_dir_index);
+    put(u32, buf, 0x60, feature_incompat_filetype | feature_incompat_extents);
     put(u32, buf, 0x64, feature_ro_compat_sparse_super | feature_ro_compat_large_file);
     @memcpy(buf[0x68..0x78], &options.determinism.uuid_bytes);
     const name = "SporeVM";
     @memcpy(buf[0x78 .. 0x78 + name.len], name);
+    @memcpy(buf[0xec..0xfc], &options.determinism.hash_seed_bytes);
+    buf[0xfc] = 2; // TEA; UNSIGNED_HASH makes byte interpretation portable.
     put(u16, buf, 0xfe, @intCast(group_descriptor_size));
+    put(u32, buf, 0x160, 2); // EXT2_FLAGS_UNSIGNED_HASH
 }
 
 fn writeInode(buf: []u8, inode: InodePlan) void {
@@ -1601,8 +1721,10 @@ fn writeInode(buf: []u8, inode: InodePlan) void {
     put(u32, buf, 0x04, @truncate(inode.size));
     put(u16, buf, 0x18, @truncate(inode.gid));
     put(u16, buf, 0x1a, inode.links);
-    const allocated_blocks = inode.data_blocks.len + inode.indirect_blocks.len + if (inode.xattr_block != 0) @as(usize, 1) else 0;
+    const allocated_blocks = inode.data_blocks.len + inode.extent_blocks.len + if (inode.xattr_block != 0) @as(usize, 1) else 0;
     put(u32, buf, 0x1c, @intCast(allocated_blocks * (block_size / 512)));
+    put(u32, buf, 0x20, (if (inode.usesExtents()) inode_flag_extents else @as(u32, 0)) |
+        (if (inode.indexed) inode_flag_index else @as(u32, 0)));
     if (inode.xattr_block != 0) put(u32, buf, 0x68, inode.xattr_block);
     if (inode.size > std.math.maxInt(u32)) put(u32, buf, 0x6c, @intCast(inode.size >> 32));
     put(u16, buf, 0x78, @truncate(inode.uid >> 16));
@@ -1620,14 +1742,14 @@ fn writeInode(buf: []u8, inode: InodePlan) void {
             if (inode.symlink_target.len < fast_symlink_max_len) {
                 @memcpy(buf[0x28 .. 0x28 + inode.symlink_target.len], inode.symlink_target);
             } else {
-                writeBlockPointers(buf[0x28..0x64], inode);
+                @memcpy(buf[0x28..0x64], &inode.block_map);
             }
         },
         .char_device, .block_device => {
             const dev = inode.device.?;
             put(u32, buf, 0x28, encodeDevice(dev.major, dev.minor));
         },
-        else => writeBlockPointers(buf[0x28..0x64], inode),
+        else => @memcpy(buf[0x28..0x64], &inode.block_map),
     }
 }
 
@@ -1706,16 +1828,6 @@ test "ext4 writer rejects mtime on non-file entries" {
         .mtime = .{ .seconds = 1, .nanoseconds = 2 },
     }};
     try std.testing.expectError(error.UnsupportedEntryMtime, planImage(std.testing.allocator, &entries, 1024));
-}
-
-fn writeBlockPointers(buf: []u8, inode: InodePlan) void {
-    const direct_count = @min(inode.data_blocks.len, max_direct_blocks);
-    for (inode.data_blocks[0..direct_count], 0..) |block, i| {
-        put(u32, buf, i * @sizeOf(u32), block);
-    }
-    for (inode.indirect_roots, max_direct_blocks..) |root, i| {
-        if (root != 0) put(u32, buf, i * @sizeOf(u32), root);
-    }
 }
 
 fn xattrBlock(allocator: std.mem.Allocator, attrs: []const xattrs_mod.Attribute) ![]u8 {

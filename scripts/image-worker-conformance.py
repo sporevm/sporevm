@@ -146,6 +146,16 @@ def build_oci_layout(layout: pathlib.Path) -> dict[str, Any]:
                 "target": "tool",
             },
         ]
+        # Exercise on-disk htree hashes across workers, including unsigned
+        # non-ASCII bytes and names spanning multiple TEA input rounds.
+        + [
+            {
+                "data": b"",
+                "kind": "file",
+                "name": f"opt/spore/wide/entry-{index:04d}-é-long-name.txt",
+            }
+            for index in range(300)
+        ]
     )
     delta_layer = tar_layer(
         [

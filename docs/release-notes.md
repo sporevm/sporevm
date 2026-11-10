@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Native rootfs conversion now enables extents and directory indexing, and
+  builds htrees for populated multi-block directories. This removes linear
+  lookup from large imported directories and lets Linux index new directories
+  as they grow. Builder `sporevm-rootfs-v7` changes converted image bytes and
+  content digests, invalidating old conversion-cache keys without changing
+  native image, chunk or checkpoint formats. Existing immutable images and
+  checkpoints remain readable and are not rewritten; reconvert OCI/tar inputs
+  to get the new filesystem profile. The deterministic, journal-less profile,
+  content deduplication and lazy rootfs reads are retained.
+
 ## v0.18.0
 
 ### Upgrading
