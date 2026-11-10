@@ -14,6 +14,15 @@
   checkpoints remain readable and are not rewritten; reconvert OCI/tar inputs
   to get the new filesystem profile. The deterministic, journal-less profile,
   content deduplication and lazy rootfs reads are retained.
+- New ARM64 managed-kernel selections use `sporevm/kernels` release `v0.7.2`.
+  It patches Linux 6.1.191 so ext4 without a journal reuses freed inodes
+  immediately, as it does with a journal, instead of rescanning every inode
+  deleted in the last minutes on each new file. Creating files after deleting
+  others in a guest root no longer slows down with each round: in a 4 vCPU
+  guest, batches of 2,500 small files that took 340 to 950 ms after earlier
+  batches were deleted now take about 17 ms. x86_64 keeps the approved
+  bzImage, which does not have the patch. Running VMs and saved spores keep
+  their kernels, and build steps cached with the previous kernel run again.
 
 ## v0.18.0
 
