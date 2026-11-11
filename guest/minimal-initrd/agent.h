@@ -397,7 +397,7 @@ int mkdir_p(const char *path, mode_t mode);
 ssize_t readlink_bounded(const char *path, char *out, size_t cap);
 int unmount_build_resolv_for_snapshot(struct build_resolv_state *state);
 int bind_rootfs_resolv(int build_mode, char *error, size_t cap);
-int setup_network(int use_rootfs, int build_mode, char *error, size_t cap);
+int setup_network(int use_network, int use_rootfs, int build_mode, char *error, size_t cap);
 ssize_t read_line(int fd, char *buf, size_t cap);
 int write_all(int fd, const void *raw, size_t len);
 int read_exact(int fd, void *raw, size_t len);

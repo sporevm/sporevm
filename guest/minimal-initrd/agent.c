@@ -46,7 +46,6 @@ struct agent {
   int build_input_count;
   int build_inputs_ready;
   const char *build_inputs_error;
-  int network_requested;
   int network_ready;
   const char *network_error;
   const char *generation_root;
@@ -162,7 +161,7 @@ static void accept_request(struct agent *a) {
       close_client(client);
       return;
     }
-    if (a->network_requested && !a->network_ready) {
+    if (!a->network_ready) {
       (void)send_client_error_exit(client, 126, a->network_error[0] != '\0' ? a->network_error : "spore run: network unavailable\n");
       close_client(client);
       return;
@@ -326,7 +325,7 @@ static void accept_request(struct agent *a) {
       close_client(client);
       return;
     }
-    if (a->network_requested && !a->network_ready) {
+    if (!a->network_ready) {
       (void)send_client_error_exit(client, 126, a->network_error[0] != '\0' ? a->network_error : "spore run: network unavailable\n");
       close_client(client);
       return;
@@ -658,7 +657,7 @@ int main(void) {
   int network_ready = 1;
   char network_error[160];
   network_error[0] = '\0';
-  if (use_network && setup_network(use_rootfs, build_mode, network_error, sizeof(network_error)) != 0) {
+  if (setup_network(use_network, use_rootfs, build_mode, network_error, sizeof(network_error)) != 0) {
     network_ready = 0;
     dprintf(2, "%s\n", network_error);
     size_t len = strlen(network_error);
@@ -686,7 +685,6 @@ int main(void) {
   a.build_input_count = build_input_count;
   a.build_inputs_ready = build_inputs_ready;
   a.build_inputs_error = build_inputs_error;
-  a.network_requested = use_network;
   a.network_ready = network_ready;
   a.network_error = network_error;
   a.generation_root = generation_root_path(use_rootfs, rootfs_ready);

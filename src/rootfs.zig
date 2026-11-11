@@ -26,7 +26,7 @@ const test_support = @import("test_support.zig");
 const Io = std.Io;
 
 const max_rootfs_layers: usize = 512;
-pub const builder_version = "sporevm-rootfs-v7";
+pub const builder_version = "sporevm-rootfs-v8";
 const rootfs_build_profile_env = "SPOREVM_ROOTFS_BUILD_PROFILE";
 /// Recorded in rootfs metadata. Cache lookups reject artifacts from any other
 /// producer, such as the removed e2fsprogs writer.
@@ -1137,7 +1137,7 @@ fn mergeLayers(
     try ensureRequiredMergedDir(allocator, &tree, "run", 0o755);
     try ensureRequiredMergedDir(allocator, &tree, "sys", 0o755);
     try ensureRequiredMergedDir(allocator, &tree, "tmp", 0o1777);
-    try ensureMergedResolverPlaceholder(allocator, &tree);
+    try ensureMergedNetworkFiles(allocator, &tree);
     opts.profile.phase("rootfs_tree_finalize", required_dirs_start);
     return tree;
 }
@@ -1290,12 +1290,13 @@ fn ensureRequiredMergedDir(
     try tar.ensureMergedDirectory(allocator, tree, rel, mode, .{ .uid = 0, .gid = 0 });
 }
 
-fn ensureMergedResolverPlaceholder(
+fn ensureMergedNetworkFiles(
     allocator: std.mem.Allocator,
     tree: *tar.MergedTree,
 ) !void {
     try tar.ensureMergedDirectory(allocator, tree, "etc", 0o755, .{ .uid = 0, .gid = 0 });
     try tar.ensureMergedFile(allocator, tree, resolver_placeholder_path, resolver_placeholder_bytes, 0o644, .{ .uid = 0, .gid = 0 });
+    try tar.ensureMergedFile(allocator, tree, "etc/hosts", "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n", 0o644, .{ .uid = 0, .gid = 0 });
 }
 
 test {
@@ -1539,17 +1540,31 @@ test "direct image config must match requested platform" {
     );
 }
 
-test "rootfs materialization adds required directories and resolver placeholder" {
+test "rootfs materialization adds network defaults without replacing image files" {
     const allocator = std.testing.allocator;
     var tree = tar.MergedTree.init(allocator);
     defer tree.deinit(allocator);
 
     try ensureRequiredMergedDir(allocator, &tree, "tmp", 0o1777);
-    try ensureMergedResolverPlaceholder(allocator, &tree);
+    try ensureMergedNetworkFiles(allocator, &tree);
 
     try std.testing.expectEqual(@as(u16, 0o1777), tree.entries.get("tmp").?.mode);
     try std.testing.expectEqual(tar.MergedEntryKind.directory, tree.entries.get("etc").?.kind);
     const resolver = tree.entries.get(resolver_placeholder_path).?;
     try std.testing.expectEqual(@as(u32, 0), resolver.uid);
     try std.testing.expectEqualStrings(resolver_placeholder_bytes, (try tree.fileSource(resolver.inode_id)).memory);
+    const hosts = tree.entries.get("etc/hosts").?;
+    try std.testing.expectEqual(@as(u16, 0o644), hosts.mode);
+    try std.testing.expectEqual(@as(u32, 0), hosts.uid);
+    try std.testing.expectEqualStrings("127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n", (try tree.fileSource(hosts.inode_id)).memory);
+
+    var custom = tar.MergedTree.init(allocator);
+    defer custom.deinit(allocator);
+    const custom_hosts = "127.0.0.1 localhost app.localhost\n";
+    try tar.ensureMergedFile(allocator, &custom, "etc/hosts", custom_hosts, 0o600, .{ .uid = 123, .gid = 456 });
+    try ensureMergedNetworkFiles(allocator, &custom);
+    const retained = custom.entries.get("etc/hosts").?;
+    try std.testing.expectEqualStrings(custom_hosts, (try custom.fileSource(retained.inode_id)).memory);
+    try std.testing.expectEqual(@as(u16, 0o600), retained.mode);
+    try std.testing.expectEqual(@as(u32, 123), retained.uid);
 }

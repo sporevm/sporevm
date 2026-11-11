@@ -324,11 +324,32 @@ int bind_rootfs_resolv(int build_mode, char *error, size_t cap) {
   return 0;
 }
 
-int setup_network(int use_rootfs, int build_mode, char *error, size_t cap) {
+int setup_network(int use_network, int use_rootfs, int build_mode, char *error, size_t cap) {
   int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     snprintf(error, cap, "network setup failed: socket errno=%d", errno);
     return -1;
+  }
+
+  // Loopback is guest-local, independent of the optional eth0 gateway. Linux
+  // also installs ::1 when lo comes up if IPv6 is enabled in the kernel.
+  if (set_iface_sockaddr(fd, "lo", SIOCSIFADDR, "127.0.0.1") != 0 ||
+      set_iface_sockaddr(fd, "lo", SIOCSIFNETMASK, "255.0.0.0") != 0 ||
+      bring_iface_up(fd, "lo") != 0) {
+    snprintf(error, cap, "network setup failed: loopback errno=%d", errno);
+    close(fd);
+    return -1;
+  }
+  mkdir("/etc", 0755);
+  const char hosts[] = "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n";
+  if (write_file_atomic("/etc/hosts", hosts, sizeof(hosts) - 1) != 0) {
+    snprintf(error, cap, "network setup failed: write /etc/hosts errno=%d", errno);
+    close(fd);
+    return -1;
+  }
+  if (!use_network) {
+    close(fd);
+    return 0;
   }
 
   if (wait_for_iface(fd, SPORE_NET_IFACE, 100, 50000) != 0) {

@@ -21,9 +21,21 @@ gateway IPv4: 100.96.0.1
 DNS:          100.96.0.1
 ```
 
-The minimal initrd configures `eth0`, the default route, and resolver config
-from the `spore_net=1` boot flag. It does not require DHCP, `ip`, or distro
-networking tools.
+The minimal initrd always brings up guest-local `lo` as `127.0.0.1/8`;
+Linux also installs `::1` when IPv6 is enabled. This does not enable egress:
+loopback works without `--net`, including builds with `--network none`.
+Checkpoint restore and fork retain this guest kernel state. Checkpoints made
+before this initialization was added need to be recreated or have loopback
+configured inside the guest; restoring them does not rerun guest init.
+
+The initrd provides localhost entries in `/etc/hosts`. OCI materialization
+also supplies `127.0.0.1 localhost` and `::1 localhost ip6-localhost ip6-loopback`
+when the image omits `/etc/hosts`, preserving existing files and symlinks.
+Caller-supplied raw rootfs disks retain their own hosts configuration.
+
+With networking enabled, the minimal initrd configures `eth0`, the default
+route, and resolver config from the `spore_net=1` boot flag. It does not
+require DHCP, `ip`, or distro networking tools.
 
 ## Egress Policy
 

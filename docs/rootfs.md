@@ -517,7 +517,10 @@ repeated builds of the same resolved image produce identical bytes. This
 journal-less native profile is inside the automatic-growth support envelope.
 
 The native writer is the only rootfs writer and needs no e2fsprogs. It uses
-builder version `sporevm-rootfs-v7`.
+builder version `sporevm-rootfs-v8`. Conversion supplies localhost entries in
+`/etc/hosts` only when the source omits that path, preserving existing files
+and symlinks. Reconvert OCI/tar inputs to get this default; existing native
+images are not changed in place.
 
 The writer uses extent trees for regular files, directories and non-inline
 symlinks, coalescing contiguous blocks into initialized extents. It enables
@@ -530,9 +533,9 @@ the inode's 32-bit sector count limits one regular file to just under 2 TiB,
 and larger files fail closed with `UnsupportedExt4FileSize`; the 32 GiB rootfs
 content limit applies first to OCI and tar imports.
 
-Version v7 changes ext4 bytes and therefore flat-artifact, chunk, disk-index and
+Version v7 changed ext4 bytes and therefore flat-artifact, chunk, disk-index and
 native image digests for reconverted OCI/tar inputs. Conversion cache keys
-include the builder version; reconversion does not reuse a v6 result. Existing
+include the builder version; v8 reconversion does not reuse a v7 result. Existing
 immutable native images and checkpoints keep their exact bytes and identities
 and remain readable. Their filesystems are not upgraded in place. The image,
 chunked-rootfs and checkpoint wire formats are unchanged; deduplication and

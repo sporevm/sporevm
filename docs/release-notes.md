@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Guest loopback is initialized as `127.0.0.1/8` even without `--net`, including
+  builds with `--network none`. IPv6-enabled kernels also bring up `::1`.
+  New checkpoints and forks retain the working loopback configuration; old
+  checkpoints must be recreated or configured inside the guest.
+- The initrd supplies localhost hosts entries. OCI/tar conversion supplies
+  them when `/etc/hosts` is absent, preserving image-provided files and
+  symlinks. Conversion builder `sporevm-rootfs-v8` invalidates previous
+  conversion-cache keys; existing native images are not rewritten.
+
 ## v0.18.1
 
 ### Highlights
