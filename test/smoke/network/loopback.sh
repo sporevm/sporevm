@@ -28,7 +28,15 @@ for mode in none spore; do
   "${spore_bin}" vm save source --output "${workdir}/${mode}.spore"
   "${spore_bin}" vm restore restored --backend "${backend}" --checkpoint "${workdir}/${mode}.spore"
   "${spore_bin}" vm exec restored -- /bin/loopcheck
-  "${spore_bin}" vm fork restored --count 2 --name-prefix child
+  if [[ "${mode}" == none ]]; then
+    "${spore_bin}" vm fork restored --count 2 --name-prefix child
+  else
+    # Networked live named fork is deliberately unsupported. Saved checkpoint
+    # forks do support networking and must retain the same local guest state.
+    "${spore_bin}" checkpoint fork "${workdir}/${mode}.spore" --count 2 --output "${workdir}/forks"
+    "${spore_bin}" vm restore child-0 --backend "${backend}" --checkpoint "${workdir}/forks/000000"
+    "${spore_bin}" vm restore child-1 --backend "${backend}" --checkpoint "${workdir}/forks/000001"
+  fi
   for name in source restored child-0 child-1; do
     "${spore_bin}" vm exec "${name}" -- /bin/loopcheck
     "${spore_bin}" vm rm "${name}"
