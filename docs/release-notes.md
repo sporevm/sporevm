@@ -2,14 +2,38 @@
 
 ## Unreleased
 
-- Guest loopback is initialized as `127.0.0.1/8` even without `--net`, including
-  builds with `--network none`. IPv6-enabled kernels also bring up `::1`.
-  New checkpoints and forks retain the working loopback configuration; old
-  checkpoints must be recreated or configured inside the guest.
-- The initrd supplies localhost hosts entries. OCI/tar conversion supplies
-  them when `/etc/hosts` is absent, preserving image-provided files and
-  symlinks. Conversion builder `sporevm-rootfs-v8` invalidates previous
-  conversion-cache keys; existing native images are not rewritten.
+## v0.18.2
+
+### Highlights
+
+This patch release fixes the guest-loopback limitation documented in v0.18.1.
+Guest-local services can communicate through `127.0.0.1` or `localhost`
+without enabling outbound networking. ([#703](https://github.com/sporevm/sporevm/pull/703))
+
+- **Loopback works independently of egress.** Guest init brings up `lo` as
+  `127.0.0.1/8`, even without `--net` and in builds with `--network none`.
+  Kernels with IPv6 enabled also bring up `::1`. This does not enable egress
+  or access to host-local services.
+- **Missing localhost hosts entries get defaults.** The initrd includes
+  localhost entries in `/etc/hosts`. OCI/tar conversion supplies them when
+  `/etc/hosts` is absent, preserving image-provided files and symlinks.
+
+### Upgrading from v0.18.1
+
+- Image, chunk, checkpoint and wire formats remain compatible. Existing
+  immutable images and checkpoints remain readable and are not rewritten.
+- **Recreate old checkpoints to get initialized loopback**, or configure it
+  inside the guest. Restoring a checkpoint does not rerun guest init. New
+  checkpoints and forks retain the initialized loopback configuration.
+- Conversion builder `sporevm-rootfs-v8` invalidates previous conversion-cache
+  keys. Reconverted OCI/tar inputs produce new filesystem bytes and content
+  digests. Reconvert images missing `/etc/hosts` to get the localhost defaults;
+  existing native images and caller-supplied raw rootfs disks keep their own
+  hosts configuration.
+- The managed kernel remains [kernels v0.7.2](https://github.com/sporevm/kernels/releases/tag/v0.7.2)
+  (Linux 6.1.191); this release does not change kernel bytes.
+- Upgrading from v0.18.0 or earlier still requires the applicable upgrade
+  notes below.
 
 ## v0.18.1
 
