@@ -2,19 +2,44 @@
 
 ## Unreleased
 
-- New managed-kernel selections use `sporevm/kernels` release `v0.7.3` on
-  both architectures. It fixes a kernel crash that SporeVM v0.17.1 through
-  v0.18.2 shipped with Linux 6.1.191: once memory pressure evicted ext4's
-  block-allocator cache, the next file write, `mkdir` or delete in the guest
-  could oops on a NULL pointer and leave the guest's filesystem hung. The
-  kernels carry the upstream 6.1.y fix until a stable release includes it.
-- The managed kernels now use the SLUB allocator instead of SLOB. Metadata-heavy
-  guest work spent most of its CPU time in SLOB's free-list scan: in a
-  4 vCPU / 8 GiB ARM64 guest, creating 6,400 empty files takes 35 ms instead
-  of 110 ms, and building the Buildkite agent takes 70 s instead of 190 s.
-  x86_64 also gets the ext4 inode-reuse patch that ARM64 received in v0.7.2.
-  Running VMs and saved spores keep their kernels, and build steps cached with
-  the previous kernel run again.
+## v0.18.3
+
+### Highlights
+
+This patch release fixes a guest kernel crash that SporeVM v0.17.1 through
+v0.18.2 could hit under memory pressure, and replaces the guest kernel's slow
+memory allocator. A Buildkite cold CI setup in an ARM64 VM ran into both on
+v0.18.2 and timed out after an hour. ([#705](https://github.com/sporevm/sporevm/pull/705))
+
+- **The guest kernel no longer oopses after ext4's allocator cache is
+  evicted.** Linux 6.1.191, the managed kernel since v0.17.1, backported an
+  ext4 change that dereferences NULL when memory pressure has evicted the
+  block allocator's cache. The next file write, `mkdir` or delete in the
+  affected block group oopsed, and the guest's filesystem often hung. Root
+  filesystems in every format were affected. The managed kernels move to
+  [kernels v0.7.3](https://github.com/sporevm/kernels/releases/tag/v0.7.3),
+  which carries the upstream 6.1.y fix.
+- **Managed kernels use SLUB instead of SLOB.** SLOB's free-list scan took
+  most of the guest's CPU time in metadata-heavy work. In a 4 vCPU / 8 GiB
+  ARM64 KVM guest, creating 6,400 empty files went from 110 ms to 35 ms, and
+  building the Buildkite agent from 190 s to 70 s. These are workload-specific
+  measurements.
+- **x86_64 gets the same kernel fixes.** The approved x86_64 bzImage is
+  rebuilt with SLUB, the NULL-pointer fix, and the ext4 inode-reuse patch that
+  ARM64 received in v0.18.1.
+
+### Upgrading from v0.18.2
+
+- Image, chunk, checkpoint and wire formats remain compatible, and the
+  conversion builder is unchanged. Existing images and checkpoints remain
+  readable and are not rewritten.
+- **Start fresh VMs to get the fix.** Running VMs and saved checkpoints keep
+  the kernel they booted with, so checkpoints saved on v0.17.1 through v0.18.2
+  still run the affected kernel. Recreate them from a fresh boot.
+- **Build steps cached with the previous managed kernel rerun once** on both
+  architectures, because both kernel SHAs changed.
+- Upgrading from v0.18.1 or earlier still requires the applicable upgrade
+  notes below.
 
 ## v0.18.2
 
