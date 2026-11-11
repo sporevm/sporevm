@@ -447,8 +447,9 @@ mise run smoke core
 `mise run smoke core` builds `spore` with the shipped ReleaseSafe settings and
 `-Dsmoke-helpers`, which adds the guest helper binaries the scripts run, then
 boots real VMs through run, signal save, fork, named disk forks with save,
-restore, prune and GC, the named lifecycle, copy, the monitor jail, and
-networking. CI runs it on every commit on Linux ARM64 (KVM) and macOS (HVF).
+restore, prune and GC, the named lifecycle, copy, the monitor jail,
+networking, lazy image-store runs, and ext4 writes after the guest evicts its
+block-allocator cache. CI runs it on every commit on Linux ARM64 (KVM) and macOS (HVF).
 `mise run smoke full` adds the other aarch64 scripts in `test/smoke/`. The
 suite prints one line per script and keeps each script's log under
 `zig-cache/smoke/`. `mise run smoke` also takes one script path without `.sh`,

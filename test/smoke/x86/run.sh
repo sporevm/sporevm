@@ -72,6 +72,7 @@ fi
   --image local/x86-run:growth \
   --pull=never \
   -- /bin/sh -lc 'test "$(cat /sys/class/block/vda/size)" -eq 4194304 && grep -Fxq x86-growth-ok /x86-growth-marker'
+"${repo_root}/test/smoke/rootfs/reclaim.sh"
 "${repo_root}/test/smoke/network/config.sh"
 "${repo_root}/test/smoke/network/dns.sh"
 "${repo_root}/test/smoke/network/http.sh"
