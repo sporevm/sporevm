@@ -13,7 +13,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # The per-commit gate: one-shot run, signal save, fork, named disk forks with
 # save, restore, prune and GC, named lifecycle, copy, the monitor jail,
-# networking, and lazy runs from an image store.
+# networking, lazy runs from an image store, and ext4 writes after the guest
+# evicts its block-allocator cache.
 core=(
   run/basic.sh
   run/capture.sh
@@ -27,6 +28,7 @@ core=(
   network/deny.sh
   network/forward.sh
   rootfs/remote-lazy.sh
+  rootfs/reclaim.sh
 )
 
 full=(
