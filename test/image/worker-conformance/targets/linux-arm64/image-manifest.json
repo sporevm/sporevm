@@ -1,7 +1,7 @@
 {
   "kind": "spore-image-gateway-manifest-v1",
   "image": {
-    "digest": "blake3:cc890bb5f22030444bc5271815d32fcaf5bce53f6119425fd55c3af5aed0efe6",
+    "digest": "blake3:413c1383e034631c5adec0344b45569db92175d8b16687d1069ff322de2ff95c",
     "platform": {
       "os": "linux",
       "arch": "arm64"
@@ -22,13 +22,13 @@
       "logical_size": 536870912,
       "chunk_size": 65536,
       "hash_algorithm": "blake3",
-      "index_digest": "blake3:2afdec084fe3a6f8b9204e85cb6333a185c67409005b5dfa392576f81258122b",
-      "base_identity": "blake3:2afdec084fe3a6f8b9204e85cb6333a185c67409005b5dfa392576f81258122b",
+      "index_digest": "blake3:71863c9f74eaf2a8585efd6874cb21a6602e6313d66e575a76c6871df55814b3",
+      "base_identity": "blake3:71863c9f74eaf2a8585efd6874cb21a6602e6313d66e575a76c6871df55814b3",
       "object_namespace": "rootfs/blake3"
     }
   },
   "rootfs_index": {
-    "digest": "blake3:2afdec084fe3a6f8b9204e85cb6333a185c67409005b5dfa392576f81258122b",
+    "digest": "blake3:71863c9f74eaf2a8585efd6874cb21a6602e6313d66e575a76c6871df55814b3",
     "bytes": 1243,
     "object_count": 8,
     "object_bytes": 524288

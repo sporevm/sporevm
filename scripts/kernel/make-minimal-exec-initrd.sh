@@ -186,7 +186,7 @@ helper_dir="${REPO_ROOT}/guest/smoke-helpers"
 programs=(agent true false toybox-sh)
 helpers=()
 if ((smoke_helpers)); then
-  helpers=(writeout finite counter nproc gencheck rngcheck blkcheck netcheck nslookup wget httpd flockcheck cgroupcheck poweroff)
+  helpers=(writeout finite counter nproc gencheck rngcheck blkcheck netcheck loopcheck nslookup wget httpd flockcheck cgroupcheck poweroff)
 fi
 agent_sources=()
 for source in boot build_copy build_run build_run_sandbox copy detached generation network request rootfs session session_io spio util; do

@@ -13,6 +13,10 @@ counter every second, until killed.
 `nproc.c` prints the online CPU count.
 `netcheck.c` verifies the static `spore run --net` guest link setup without
 requiring distro networking tools in the initrd.
+`loopcheck.c` verifies localhost resolution, the loopback address and /8 mask,
+and bidirectional TCP on 127.0.0.1, another 127/8 address, and ::1 when the
+kernel supports IPv6. The core loopback smoke repeats it after restore/fork
+and in an OCI-backed build with `--network none`.
 `nslookup.c` is a tiny smoke helper for the SporeVM-managed DNS proxy; it sends
 one A-record query to the configured resolver and prints the first IPv4 answer.
 `wget.c` is a narrow HTTP-only smoke helper for outbound TCP proxying; it

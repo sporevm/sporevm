@@ -23,6 +23,7 @@ core=(
   lifecycle/timeouts.sh
   lifecycle/copy.sh
   monitor/jail.sh
+  network/loopback.sh
   network/deny.sh
   network/forward.sh
   rootfs/remote-lazy.sh
