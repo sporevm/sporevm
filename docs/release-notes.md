@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- New managed-kernel selections use `sporevm/kernels` release `v0.7.3` on
+  both architectures. It fixes a kernel crash that SporeVM v0.17.1 through
+  v0.18.2 shipped with Linux 6.1.191: once memory pressure evicted ext4's
+  block-allocator cache, the next file write, `mkdir` or delete in the guest
+  could oops on a NULL pointer and leave the guest's filesystem hung. The
+  kernels carry the upstream 6.1.y fix until a stable release includes it.
+- The managed kernels now use the SLUB allocator instead of SLOB. Metadata-heavy
+  guest work spent most of its CPU time in SLOB's free-list scan: in a
+  4 vCPU / 8 GiB ARM64 guest, creating 6,400 empty files takes 35 ms instead
+  of 110 ms, and building the Buildkite agent takes 70 s instead of 190 s.
+  x86_64 also gets the ext4 inode-reuse patch that ARM64 received in v0.7.2.
+  Running VMs and saved spores keep their kernels, and build steps cached with
+  the previous kernel run again.
+
 ## v0.18.2
 
 ### Highlights
