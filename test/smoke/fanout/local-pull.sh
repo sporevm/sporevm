@@ -83,7 +83,13 @@ for i in $(seq 0 $((count - 1))); do
   cache="${workdir}/pull-rootfs-cache-${i}"
   pulled="${workdir}/pulled-${i}.spore"
   pull_json="${workdir}/pull-${i}.json"
-  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" --json checkpoint pull "${ref}" --output "${pulled}" >"${pull_json}"
+  pull_options=(--output "${pulled}")
+  restore_source=chunks
+  if ((i > 0)); then
+    pull_options+=(--local-ram-backing)
+    restore_source=local_backing
+  fi
+  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" --json checkpoint pull "${ref}" "${pull_options[@]}" >"${pull_json}"
   expect_eq "$(json_field "${pull_json}" spore_digest)" "${spore_digest}" "pull ${i} spore digest"
   ram_fetched="$(json_field "${pull_json}" ram.objects_fetched)"
   disk_objects="$(json_field "${pull_json}" disk.objects)"
@@ -98,15 +104,22 @@ for i in $(seq 0 $((count - 1))); do
   cat >"${generation_json}" <<JSON
 {"run_id":"local-pull-smoke","child_id":${i},"parallel_index":${i},"parallel_count":${count},"fork_index":${i},"fork_count":${count},"fork_batch_id":"local-pull-batch","vm_id":"local-pull-${i}"}
 JSON
-  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" run \
+  restore_dir="${pulled}"
+  if ((i == 1)); then
+    # A distributed parent's backing must survive ordinary offline fork too.
+    SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" checkpoint fork "${pulled}" --count 1 --output "${workdir}/children" >"${workdir}/fork.stdout"
+    restore_dir="${workdir}/children/000000"
+  fi
+  SPOREVM_ROOTFS_CACHE_DIR="${cache}" "${spore_bin}" --debug run \
     --backend "${backend}" \
-    --checkpoint "${pulled}" \
+    --checkpoint "${restore_dir}" \
     --generation "${generation_json}" \
     -- /bin/sh -c 'cat /saved-marker /run/sporevm/env /run/sporevm/generation.json' \
     >"${workdir}/from-${i}.stdout" 2>"${workdir}/from-${i}.stderr" || {
     cat "${workdir}/from-${i}.stderr" >&2 || true
     die "spore run --from pulled spore ${i} failed"
   }
+  grep -Fq "source=${restore_source} " "${workdir}/from-${i}.stderr" || die "pull ${i} did not use ${restore_source} RAM restore"
   grep -Fxq saved "${workdir}/from-${i}.stdout" || die "pulled spore ${i} lost the saved disk change"
   if ! grep -Fxq "SPORE_VM_ID=local-pull-${i}" "${workdir}/from-${i}.stdout" ||
     ! grep -Fxq "SPORE_PARALLEL_JOB=${i}" "${workdir}/from-${i}.stdout" ||

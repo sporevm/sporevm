@@ -116,6 +116,16 @@ KVM and HVF map a validated `ram.backing` fd with private mappings. Clean pages
 can be shared by the host; guest writes fault into private CoW pages. This is
 the same-host fork/fan-out fast path.
 
+A default `checkpoint pull` restores from chunks, which copies nonzero RAM
+into each child's anonymous mapping. Use `checkpoint pull STORE/REF --output
+DIR --local-ram-backing` to build and prove the shared sparse file once on the
+destination. It costs an additional local copy of nonzero logical RAM on disk
+(including repeated chunk occurrences) and an upfront verification/write/fsync
+pass. Retain one pulled parent for its children; separate pulls create separate
+backing files and do not share physical clean pages merely because hashes match.
+Private writes still cost memory per child, and child PSS excludes untouched
+backing page cache. See [the pull contract](image-format.md#spores).
+
 `spore checkpoint fork` hard-links a proof-valid parent backing file into each child and
 writes child-local proofs. The proven parent fd stays open across the batch; each
 new child link is opened without following symlinks and must match every

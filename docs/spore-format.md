@@ -344,7 +344,8 @@ representation.
   local acceleration metadata for same-host KVM/HVF fork/fan-out: `kind:
   "map-private-file-v0"`, `path: "ram.backing"`, and `size`. Chunks remain the
   portable verified source of truth; imported and cold spores materialize from
-  chunks instead. Product restore paths (`spore checkpoint resume`, `spore run --checkpoint`, and
+  chunks unless `checkpoint pull --local-ram-backing` builds and proves a new
+  destination-local backing from verified chunks. Product restore paths (`spore checkpoint resume`, `spore run --checkpoint`, and
   named monitor restore) may automatically map `ram.backing` when the local
   `ram.backing.proof` validates against the canonical memory index identity,
   backing metadata, opened file identity, and host-local runtime key. Saves

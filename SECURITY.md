@@ -246,7 +246,11 @@ serves; AWS credentials in the environment.
   nonzero RAM. Every chunk and object is verified, the disk is leased under
   the cache lock, and the pinned manifest is published last; a fetch failure
   removes the directory. A pulled checkpoint is restore input like any other,
-  including its network policy.
+  including its network policy. `--local-ram-backing` additionally caps expanded
+  nonzero logical RAM at 128 GiB before creating output, re-verifies each chunk
+  into a sparse local file, fsyncs it and creates a host-local proof before
+  publishing the manifest. Failure removes the output; remote backing metadata
+  and proofs are never accepted as authority.
 
 Fuzz tests: `fuzz image store tag`, `fuzz image-manifest parser`,
 `fuzz canonical image-config parser`; pulled manifests use

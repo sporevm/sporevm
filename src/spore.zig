@@ -876,6 +876,35 @@ fn saveMemoryInternal(allocator: std.mem.Allocator, dir: []const u8, ram: []cons
     };
 }
 
+/// Build a sparse local accelerator from portable chunks without allocating
+/// guest-sized RAM. Every logical occurrence is verified before it is written;
+/// omitted zero ranges stay holes. The caller may prove it only after success.
+pub fn materializeMemoryBacking(allocator: std.mem.Allocator, dir: []const u8, memory: MemoryManifest) Error!MemoryBacking {
+    const size = std.math.cast(usize, memory.logical_size) orelse return error.BadManifest;
+    const file_size = std.math.cast(std.c.off_t, size) orelse return error.BadManifest;
+    const plan = try validateMemoryForRam(memory, size);
+    const tmp_path = try pathZ(allocator, "{s}/{s}.tmp", .{ dir, ram_backing_path });
+    defer allocator.free(tmp_path);
+    const final_path = try pathZ(allocator, "{s}/{s}", .{ dir, ram_backing_path });
+    defer allocator.free(final_path);
+    const fd = try createNewFile(tmp_path, 0o600);
+    defer _ = std.c.close(fd);
+    defer _ = std.c.unlink(tmp_path.ptr);
+    if (std.c.ftruncate(fd, file_size) != 0) return error.IoFailed;
+    const buffer = try allocator.alloc(u8, @min(chunk_size, size));
+    defer allocator.free(buffer);
+    for (memory.chunks) |entry| {
+        const range = memoryChunkRangeFromPlan(plan, size, @intCast(entry.logical_chunk)) catch return error.BadManifest;
+        const data = buffer[0 .. range.end - range.start];
+        try loadMemoryChunk(allocator, dir, entry.id, data);
+        chunk_sealer.pwriteFileAll(fd, range.start, data) catch |err| return sealerError(err);
+    }
+    chunk_sealer.fsyncFile(fd) catch |err| return sealerError(err);
+    if (std.c.fchmod(fd, 0o444) != 0) return error.IoFailed;
+    try publishFileNoOverwrite(tmp_path, final_path);
+    return .{ .path = ram_backing_path, .size = memory.logical_size };
+}
+
 fn sealerError(err: chunk_sealer.Error) Error {
     return switch (err) {
         error.ClockFailed => error.IoFailed,
@@ -1388,6 +1417,32 @@ test "memory round-trips through the chunk store with zero elision" {
         @memset(zero_chunk, 0);
     }
     try std.testing.expectEqualSlices(u8, ram, out);
+}
+
+test "memory backing materialization rejects corrupt chunks and cleans partial output" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = try testDir(arena);
+    const ram = try arena.alloc(u8, chunk_size + 17);
+    @memset(ram, 0);
+    ram[3] = 0x6f;
+    ram[chunk_size + 11] = 0x31;
+    const memory = try saveMemory(arena, dir, ram);
+    const tail_path = try pathZ(arena, "{s}/chunks/{s}", .{ dir, &memory.chunks[1].id.toHex() });
+    const fd = std.c.open(tail_path, .{ .ACCMODE = .WRONLY }, @as(c_uint, 0));
+    if (fd < 0) return error.IoFailed;
+    defer _ = std.c.close(fd);
+    try std.testing.expectEqual(@as(isize, 1), std.c.pwrite(fd, "x", 1, 0));
+    try std.testing.expectError(error.BadChunk, materializeMemoryBacking(arena, dir, memory));
+    const tmp_path = try pathZ(arena, "{s}/{s}.tmp", .{ dir, ram_backing_path });
+    const backing_path = try pathZ(arena, "{s}/{s}", .{ dir, ram_backing_path });
+    try std.testing.expect(std.c.access(tmp_path, 0) != 0);
+    try std.testing.expect(std.c.access(backing_path, 0) != 0);
+    // Exact-length validation is independent of the content digest.
+    if (std.c.ftruncate(fd, 16) != 0) return error.IoFailed;
+    try std.testing.expectError(error.BadChunk, materializeMemoryBacking(arena, dir, memory));
+    try std.testing.expect(std.c.access(tmp_path, 0) != 0);
 }
 
 test "memory backing is sparse local acceleration metadata" {
