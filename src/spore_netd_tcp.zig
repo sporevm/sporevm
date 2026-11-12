@@ -33,7 +33,7 @@ pub const max_flows = 256;
 pub const max_port_forwards = spore_net_policy.max_port_forwards;
 pub const flow_buffer_len = 8 * 1024;
 pub const tcp_rx_buffer_len = 16 * 1024;
-pub const tcp_tx_buffer_len = 16 * 1024;
+pub const tcp_tx_buffer_len = 64 * 1024;
 pub const output_queue_len = 64;
 pub const connect_timeout_ms = 10_000;
 pub const flow_idle_timeout_ms = 120_000;
@@ -177,6 +177,7 @@ const Flow = struct {
     fn initSocket(self: *Flow) void {
         self.sock = TcpSock.init(&self.rx_storage, &self.tx_storage);
         self.sock.ack_delay = null;
+        self.sock.setNagleEnabled(false);
         self.sock.setTimeout(Duration.fromMillis(flow_idle_timeout_ms));
     }
 
@@ -745,7 +746,10 @@ fn openLoopbackListener(port: u16) error{PortForwardListenFailed}!std.c.fd_t {
 fn openHostSocket(addr: ipv4.Address, port: u16) OpenResult {
     const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, std.c.IPPROTO.TCP);
     if (fd < 0) return .failed;
-    if (!setNonBlocking(fd)) {
+    const no_delay: c_int = 1;
+    if (std.c.setsockopt(fd, std.c.IPPROTO.TCP, std.c.TCP.NODELAY, &no_delay, @sizeOf(c_int)) != 0 or
+        !setNonBlocking(fd))
+    {
         _ = std.c.close(fd);
         return .failed;
     }
@@ -1220,6 +1224,42 @@ test "spore-netd TCP opens bound Unix stream sockets" {
     const n = std.c.recv(accepted, &buf, buf.len, 0);
     try std.testing.expectEqual(@as(isize, 4), n);
     try std.testing.expectEqualStrings("ping", &buf);
+}
+
+test "spore-netd TCP relays short replies without waiting for a delayed ACK" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/sporevm-netd-short-reply-{s}.sock", .{tmp.sub_path}, 0);
+    const listener = try listenUnix(path);
+    defer _ = std.c.close(listener);
+    defer _ = std.c.unlink(path.ptr);
+
+    var config = spore_net_policy.Config{ .egress = .unrestricted };
+    try config.addBoundUnixService("svc", "svc.spore.internal", 80, path);
+    var policy = try spore_net_policy.Runtime.init(config);
+    var gateway: Gateway = undefined;
+    try gateway.init(&policy, &.{});
+    defer gateway.deinit();
+    var guest: TestGuest = undefined;
+    guest.init(Instant.fromMillis(1));
+    try guest.sock.connect(spore_net.gateway_ipv4, 80, spore_net.guest_ipv4, 49153);
+    guest.exchange(&gateway, Instant.fromMillis(1));
+    const peer = std.c.accept(listener, null, null);
+    try std.testing.expect(peer >= 0);
+    defer _ = std.c.close(peer);
+
+    // Hold time fixed so the second reply cannot rely on the delayed ACK.
+    guest.sock.ack_delay = Duration.fromMillis(40);
+    const now = Instant.fromMillis(2);
+    var reply: [8]u8 = undefined;
+    for ([_][]const u8{ "A", "BC" }) |part| {
+        try std.testing.expectEqual(@as(isize, @intCast(part.len)), std.c.send(peer, part.ptr, part.len, 0));
+        try pollHost(&gateway, now);
+        guest.exchange(&gateway, now);
+        const n = try guest.sock.recvSlice(&reply);
+        try std.testing.expectEqualStrings(part, reply[0..n]);
+    }
 }
 
 test "spore-netd TCP applies poll results only to the flow that was polled" {

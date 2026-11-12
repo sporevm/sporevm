@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- TCP relays send short writes without waiting for Nagle and delayed ACKs,
+  on both the guest-facing stack and outbound host sockets.
+- TCP transmit windows grow from 16 to 64 KiB, and the VMM receive queue
+  accepts a complete 64-frame helper output batch instead of dropping frames
+  after the first 16. The bounded TCP pool grows from about 13 to 25 MiB.
+
 ## v0.18.3
 
 ### Highlights
