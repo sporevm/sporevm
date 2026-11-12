@@ -77,7 +77,8 @@ pub const pull_usage =
     \\
     \\Options:
     \\  --output DIR            Write the pulled checkpoint to DIR
-    \\  -h, --help           Show this help
+    \\  --local-ram-backing     Build a verified sparse backing for local CoW restores
+    \\  -h, --help              Show this help
     \\
 ;
 
@@ -231,11 +232,14 @@ fn pullCommand(
 ) !api.PullResult {
     var source: ?[]const u8 = null;
     var out_dir: ?[]const u8 = null;
+    var local_ram_backing = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--output") and i + 1 < args.len) {
             i += 1;
             out_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--local-ram-backing")) {
+            local_ram_backing = true;
         } else if (std.mem.startsWith(u8, args[i], "--")) {
             exitUnknownArgument(allocator, stderr, mode, "checkpoint pull", args[i]);
         } else if (source == null) {
@@ -247,7 +251,7 @@ fn pullCommand(
     if (source == null or out_dir == null) {
         exitUsage(allocator, stderr, mode, "checkpoint pull", "usage: spore checkpoint pull STORE/TAG --output DIR");
     }
-    return api.pull(context, allocator, .{ .source = source.?, .out_dir = out_dir.? }) catch |err| switch (err) {
+    return api.pull(context, allocator, .{ .source = source.?, .out_dir = out_dir.?, .local_ram_backing = local_ram_backing }) catch |err| switch (err) {
         error.CrossDeviceOwnershipLink => {
             const message = allocMessage(allocator, "spore checkpoint pull: {s} must be on the rootfs cache's filesystem", .{out_dir.?});
             exitWithCliError(allocator, stderr, mode, machine_output.usageInvalidArgument(message, "checkpoint pull"), message);

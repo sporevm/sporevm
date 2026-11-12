@@ -233,6 +233,23 @@ each copy its own identity with `--generation` (see
 [fanout.md](fanout.md#single-child-resume-identity)). `--json` prints
 `spore.pull.result.v2` with the objects and bytes fetched.
 
+For local fan-out, add `--local-ram-backing`. After fetching RAM, pull builds a
+sparse `ram.backing` using a single 2 MiB buffer, verifies each logical chunk,
+fsyncs the file, and writes a host-local proof before publishing the save.
+Construction is required in this mode: failure removes the output rather than
+silently producing a chunk-only parent. Both distinct downloaded RAM and
+expanded nonzero backing extents are capped at 128 GiB; repeated chunks count
+at every logical offset for the latter. Zero ranges remain holes. This adds
+local disk allocation and one assembly pass, but children can privately map
+one shared parent file instead of copying RAM from chunks for every restore.
+
+The default remains chunk-only. The opt-in local manifest includes a backing
+descriptor, so its bytes no longer hash to the returned `spore_digest`: that
+field and `ref` identify the verified portable manifest. Re-push strips the
+local descriptor and preserves that identity. Network byte/object counters do
+not include local backing writes. Chunks remain available for fallback and
+re-publication; no proof or runtime key is transported.
+
 ## Converter-worker conformance
 
 The versioned fixture at

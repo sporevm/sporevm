@@ -11,6 +11,7 @@ const Context = @import("context.zig").Context;
 const disk_index = @import("disk_index.zig");
 const image_store = @import("image_store.zig");
 const local_paths = @import("local_paths.zig");
+const local_backing = @import("local_backing.zig");
 const resource = @import("resource.zig");
 const rootfs = @import("rootfs.zig");
 const rootfs_cache = @import("rootfs_cache.zig");
@@ -130,6 +131,8 @@ pub fn push(context: Context, allocator: std.mem.Allocator, options: PushOptions
 pub const PullOptions = struct {
     source: []const u8,
     out_dir: []const u8,
+    /// Require a verified host-local backing for shared MAP_PRIVATE restores.
+    local_ram_backing: bool = false,
 };
 
 pub const PullObjects = struct {
@@ -177,8 +180,8 @@ pub fn pull(context: Context, allocator: std.mem.Allocator, options: PullOptions
     if (!std.mem.eql(u8, &chunk.ChunkId.fromContents(manifest_bytes).toHex(), hex)) return error.SporeIdentityMismatch;
     var parsed = try spore.parseManifest(arena, manifest_bytes);
     defer parsed.deinit();
-    const manifest = parsed.value;
-    // It names a file in the spore directory, which this pull does not write.
+    var manifest = parsed.value;
+    // Remote backing descriptors are never trusted, even in local-backing mode.
     if (manifest.memory.backing != null) return error.BadManifest;
     const disk = manifest.disk orelse if (manifest.rootfs != null) return error.SporeRootfsWithoutDisk else null;
 
@@ -186,11 +189,17 @@ pub fn pull(context: Context, allocator: std.mem.Allocator, options: PullOptions
     var ram_objects: std.ArrayList(image_store.Object) = .empty;
     var seen: std.AutoHashMapUnmanaged(chunk.ChunkId, void) = .empty;
     const memory = manifest.memory;
+    var backing_bytes: u64 = 0;
     for (memory.chunks) |entry| {
-        if ((try seen.getOrPut(arena, entry.id)).found_existing) continue;
         const start = std.math.mul(u64, entry.logical_chunk, memory.chunk_size) catch return error.BadManifest;
         if (start >= memory.logical_size) return error.BadManifest;
         const len = std.math.cast(usize, @min(memory.chunk_size, memory.logical_size - start)) orelse return error.BadManifest;
+        // A repeated content ID still occupies each logical backing extent.
+        if (options.local_ram_backing) {
+            backing_bytes = std.math.add(u64, backing_bytes, len) catch return error.SporeRamTooLarge;
+            if (backing_bytes > max_pull_ram_bytes) return error.SporeRamTooLarge;
+        }
+        if ((try seen.getOrPut(arena, entry.id)).found_existing) continue;
         try ram_objects.append(arena, .{ .digest = entry.id.toDigest(), .len = len });
         ram.bytes_fetched += len;
     }
@@ -211,6 +220,13 @@ pub fn pull(context: Context, allocator: std.mem.Allocator, options: PullOptions
     try image_store.fillEach(io, ram_objects.items, null, &ram_fetch, RamFetch.fetch);
     ram.objects = ram_objects.items.len;
     ram.objects_fetched = ram.objects;
+
+    // Once per destination parent, outside the rootfs lock, never per child.
+    // Assembly re-verifies chunks; the proof itself only binds file identity.
+    if (options.local_ram_backing) {
+        manifest.memory.backing = try spore.materializeMemoryBacking(arena, out_dir, memory);
+        try local_backing.writeLocalMemoryBackingProof(arena, context.environ_map, out_dir, manifest.memory, memory.logical_size);
+    }
 
     const ref = try image_store.pushedRefAlloc(allocator, source.base, digest);
     errdefer allocator.free(ref);
@@ -543,6 +559,73 @@ test "spore checkpoint pull fetches a pushed spore into a pinned save" {
     try std.testing.expectError(error.AlreadyExists, testPull(&fixture, env, pushed.ref, out));
 }
 
+test "spore checkpoint pull can prepare shared local RAM without changing portable identity" {
+    var fixture: image_store.TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const saved = try saveTestSpore(&fixture);
+    // One hole, the same nonzero chunk at two asymmetric offsets, and a short
+    // distinct tail: storage dedup must not omit a logical backing extent.
+    const ram = try allocator.alloc(u8, 4 * spore.chunk_size + 19);
+    @memset(ram, 0);
+    ram[spore.chunk_size + 3] = 0x71;
+    ram[3 * spore.chunk_size + 3] = 0x71;
+    ram[4 * spore.chunk_size + 17] = 0x29;
+    const memory_dir = try fixture.path("memory");
+    var memory = try spore.saveMemory(allocator, memory_dir, ram);
+    const parsed = try spore.loadManifest(allocator, saved.dir);
+    var manifest = parsed.value;
+    manifest.memory = memory;
+    manifest.platform.ram_size = ram.len;
+    try spore.saveManifest(allocator, memory_dir, manifest);
+    const store = try fixture.path("store");
+    const pushed = try testPush(&fixture, memory_dir, try std.fmt.allocPrint(allocator, "{s}/warm", .{store}), "aws");
+    const env = try testEnv(&fixture, "consumer");
+    const out = try fixture.path("pulled-backed");
+    const pulled = try pull(.{ .io = io, .environ_map = env }, allocator, .{
+        .source = pushed.ref,
+        .out_dir = out,
+        .local_ram_backing = true,
+    });
+    try std.testing.expectEqualStrings(pushed.spore_digest, pulled.spore_digest);
+    try std.testing.expectEqual(@as(usize, 2), pulled.ram.objects_fetched);
+    try std.testing.expectEqual(@as(u64, spore.chunk_size + 19), pulled.ram.bytes_fetched);
+    memory = (try spore.loadManifest(allocator, out)).value.memory;
+    const path = try spore.memoryBackingPath(allocator, out, memory.backing.?);
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(ram.len + 1));
+    try std.testing.expectEqualSlices(u8, ram, bytes);
+    var plan = try @import("ram_restore.zig").Plan.fromMemory(allocator, env, out, memory, ram.len, 1);
+    defer plan.deinit();
+    try std.testing.expect(plan.strategy == .local_backing);
+    // The two private views share the same file, but writes cannot change
+    // the parent or a sibling. Exercise the mapping used by both backends.
+    const first = try std.posix.mmap(null, ram.len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE }, plan.strategy.local_backing, 0);
+    defer std.posix.munmap(first);
+    const second = try std.posix.mmap(null, ram.len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE }, plan.strategy.local_backing, 0);
+    defer std.posix.munmap(second);
+    first[spore.chunk_size + 3] = 0x42;
+    try std.testing.expectEqual(@as(u8, 0x71), second[spore.chunk_size + 3]);
+    const repushed = try push(.{ .io = io, .environ_map = env }, allocator, .{
+        .spore_dir = out,
+        .destination = pushed.ref,
+    });
+    try std.testing.expectEqualStrings(pushed.spore_digest, repushed.spore_digest);
+    try std.testing.expectEqual(@as(usize, 0), repushed.objects_written);
+
+    // Failure to create the required proof must not publish a chunk-only save.
+    const bad_env = try testEnv(&fixture, "bad");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_env.get(local_paths.runtime_dir_env).?, .data = "not a directory" });
+    const failed = try fixture.path("failed-backed");
+    try std.testing.expectError(error.IoFailed, pull(.{ .io = io, .environ_map = bad_env }, allocator, .{
+        .source = pushed.ref,
+        .out_dir = failed,
+        .local_ram_backing = true,
+    }));
+    try std.testing.expect(!try exists(failed));
+}
+
 test "spore checkpoint pull writes to a relative --out and one under a symlinked directory" {
     var fixture: image_store.TestImage = undefined;
     try fixture.init(.{});
@@ -586,6 +669,19 @@ test "spore checkpoint pull refuses a spore with more RAM than it writes before 
     try chunk_sealer.ensureDirPath(allocator, try std.fs.path.join(allocator, &.{ store, "spores" }));
     try chunk_sealer.writeFileAtomicDurable(allocator, try std.fmt.allocPrint(allocator, "{s}/spores/{s}", .{ store, digest[chunk.ChunkId.digest_prefix.len..] }), bytes, 0o644);
     try std.testing.expectError(error.SporeRamTooLarge, testPull(&fixture, &fixture.env, try std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ store, &digest }), out));
+    try std.testing.expect(!try exists(out));
+
+    // Dedup can make transfer small while expanded backing allocation exceeds
+    // the limit. Reject before downloading or creating the output directory.
+    for (chunks) |*entry| entry.id = chunks[0].id;
+    const repeated_bytes = try spore.encodeManifestAlloc(allocator, manifest);
+    const repeated_digest = chunk.ChunkId.fromContents(repeated_bytes).toDigest();
+    try chunk_sealer.writeFileAtomicDurable(allocator, try std.fmt.allocPrint(allocator, "{s}/spores/{s}", .{ store, repeated_digest[chunk.ChunkId.digest_prefix.len..] }), repeated_bytes, 0o644);
+    try std.testing.expectError(error.SporeRamTooLarge, pull(.{ .io = std.testing.io, .environ_map = &fixture.env }, allocator, .{
+        .source = try std.fmt.allocPrint(allocator, "file://{s}/{s}", .{ store, &repeated_digest }),
+        .out_dir = out,
+        .local_ram_backing = true,
+    }));
     try std.testing.expect(!try exists(out));
 }
 
