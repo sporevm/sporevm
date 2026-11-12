@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.18.5
+
 - `checkpoint pull --local-ram-backing` builds a verified sparse RAM backing
   once on the receiving host, allowing restores and offline forks to share
   clean pages through the existing private-mapping path. The default pull is
