@@ -1,6 +1,18 @@
 # Release Notes
 
-## Unreleased
+## v0.18.4
+
+- TCP relays send short writes without waiting for Nagle and delayed ACKs,
+  on both the guest-facing stack and outbound host sockets.
+- TCP transmit windows grow from 16 to 64 KiB, and the VMM receive queue
+  accepts a complete 64-frame helper output batch instead of dropping frames
+  after the first 16. The bounded TCP pool grows from about 13 to 25 MiB.
+- Managed kernels move to
+  [v0.7.4](https://github.com/sporevm/kernels/releases/tag/v0.7.4), enabling
+  ARM64 high-resolution timers. Requested 1-ms sleeps take about 1.06 ms
+  instead of 4 ms in the measured KVM guest; the x86_64 kernel is unchanged.
+  Start fresh VMs to use the new kernel; existing VMs and checkpoints keep
+  their booted kernel. ARM64 build steps cached with the old kernel rerun once.
 
 ## v0.18.3
 

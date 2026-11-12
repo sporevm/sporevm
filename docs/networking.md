@@ -134,15 +134,19 @@ Bound Unix services emit a setup `port_forward` event with the service name,
 guest host, guest port, and target kind. The event does not include the host
 Unix socket path.
 
+The guest-facing TCP stack and outbound host TCP sockets disable Nagle so
+short relayed writes do not wait for a delayed ACK or another WAN round trip.
+
 Current limits:
 
 - IPv4 TCP and DNS only.
 - Each gateway has 256 concurrent TCP flow slots, shared by outbound egress,
   bound services, and host port forwards. A new connection beyond that limit
   is reset immediately rather than silently waiting for a TCP retry.
-- The TCP pool uses about 13 MiB of bounded heap storage: each flow has
-  16 KiB receive and transmit windows and an 8 KiB relay buffer in each
-  direction. Stack dispatch bursts are bounded to the frame queue capacity.
+- The TCP pool uses about 25 MiB of bounded heap storage: each flow has a
+  16 KiB receive window, a 64 KiB transmit window, and an 8 KiB relay buffer
+  in each direction. Stack dispatch bursts are bounded to the frame queue
+  capacity, and the parent receive queue holds a full 64-frame output batch.
 - Up to 64 DNS queries are forwarded concurrently. Queries that exceed this
   limit, or have no valid answer after one second, receive SERVFAIL.
 - No IPv6, general UDP, DHCP, arbitrary published ports, or multiple NICs.

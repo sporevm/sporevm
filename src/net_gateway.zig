@@ -15,7 +15,8 @@ const spore_netd_tcp = @import("spore_netd_tcp.zig");
 const virtio_net = @import("virtio/net.zig");
 
 const ready_timeout_ms = 1_000;
-const max_rx_pending = 16;
+// Accept a full helper output batch before the vCPUs drain incoming frames.
+const max_rx_pending = spore_netd_tcp.output_queue_len;
 const max_network_events = 128;
 const max_stderr_line_len = 512;
 
@@ -509,17 +510,29 @@ test "spore-net gateway spawns netd with policy arguments" {
     try std.testing.expectEqual(@as(usize, 0), policy.allowCidrSlice().len + policy.allowHostSlice().len + policy.exactRuleSlice().len);
 }
 
-test "spore-net gateway buffers multiple rx frames" {
+test "spore-net gateway buffers a complete netd output batch" {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+    defer closeIfOpen(&fds[0]);
+    defer closeIfOpen(&fds[1]);
+    for (0..spore_netd_tcp.output_queue_len) |i| {
+        const frame = [_]u8{@intCast(i)};
+        try spore_netd.writeFrameFd(fds[1], &frame);
+    }
+    closeIfOpen(&fds[1]);
     var process = Process{};
-    try std.testing.expect(process.enqueueRxFrame("arp-reply"));
-    try std.testing.expect(process.enqueueRxFrame("dns-reply"));
+    process.from_child_fd = fds[0];
+    fds[0] = -1;
+    process.shutdown_requested.store(true, .release);
+    readStdout(&process);
     try std.testing.expect(process.runtime().consumeWake());
-
-    const backend = process.backend();
-    try std.testing.expectEqualStrings("arp-reply", backend.peekRx().?);
-    backend.consumeRx();
-    try std.testing.expectEqualStrings("dns-reply", backend.peekRx().?);
-    backend.consumeRx();
+    const backend = process.runtime().backend;
+    for (0..spore_netd_tcp.output_queue_len) |i| {
+        const expected = [_]u8{@intCast(i)};
+        const frame = backend.peekRx() orelse return error.MissingFrame;
+        try std.testing.expectEqualSlices(u8, &expected, frame);
+        backend.consumeRx();
+    }
     try std.testing.expect(backend.peekRx() == null);
 }
 
