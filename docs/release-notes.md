@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Store reads recover when an origin closes its idle HTTP connection pool,
+  rather than exhausting retries on other stale sockets. This can otherwise
+  fail a checkpoint pull after preparing its local RAM backing. Active
+  requests and the existing retry/time limits are unchanged.
+
 ## v0.18.5
 
 - `checkpoint pull --local-ram-backing` builds a verified sparse RAM backing
