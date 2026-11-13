@@ -687,7 +687,7 @@ pub const Client = struct {
         const base = try parseBase(url);
         var s3: ?S3 = if (base.scheme == .s3) try S3.init(allocator, io, base, env, s3_endpoint) else null;
         errdefer if (s3) |*value| value.deinit();
-        var client: Client = .{ .allocator = allocator, .io = io, .base = base, .http = .{ .allocator = allocator, .io = io }, .s3 = s3 };
+        var client: Client = .{ .allocator = allocator, .io = io, .base = base, .http = .{ .allocator = allocator, .io = io, .write_buffer_size = request_head_buffer_len }, .s3 = s3 };
         errdefer client.http.deinit();
         if (client.tls()) {
             // Load CA certificates now rather than on a guest fault.
@@ -926,8 +926,18 @@ pub const FetchStats = struct {
     window_unused: u64 = 0,
 };
 
-/// Store reads at once while `Fetcher.fetchAll` fills the cache.
-pub const fill_concurrency = 16;
+/// Store reads at once while `Fetcher.fetchAll` fills the cache. S3 takes
+/// about 50 ms to start answering a GET for an object nothing read recently,
+/// so this many fetch about 1,200 objects a second, under a quarter of the
+/// 5,500 GETs a second S3 serves per prefix.
+pub const fill_concurrency = 64;
+
+/// Buffers a whole request head, so it leaves in one write. The HTTP client's
+/// default 1 KiB splits a signed S3 head, which a session token makes about
+/// 2 KiB, into two writes; the socket then holds the second until the store
+/// acknowledges the first, which a store delays by about 40 ms when no
+/// response is due. S3 rejects heads over 8 KiB.
+const request_head_buffer_len = 8 * 1024;
 
 /// A fault on chunk `i` also starts fetches of the missing chunks in
 /// `[i + 1, i + window_chunks)`, and at most `window_chunks - 1` such fetches
