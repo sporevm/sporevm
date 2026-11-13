@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb for SporeVM development. Amp runs this once per fresh
+# orb and snapshots the result, so every step must be idempotent and must not
+# leave processes running. See https://ampcode.com/docs/orbs/customizing.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Amp checks out a project's additional repositories as siblings of the
+# primary checkout under ../repos/<name>.
+repos_dir="$(cd "$repo_root/.." && pwd)/repos"
+cd "$repo_root"
+
+step() {
+  printf '\n==> %s [%s]\n' "$1" "$(date +%H:%M:%S)"
+}
+
+step "System packages"
+# Native build tools for the minimal exec initrd (Toybox) and e2fsprogs for
+# the rootfs capacity smoke. Check first so a warm run never touches apt.
+missing_packages=()
+for package in ca-certificates cpio curl e2fsprogs gcc make python3 xz-utils; do
+  if ! dpkg -s "$package" >/dev/null 2>&1; then
+    missing_packages+=("$package")
+  fi
+done
+if ((${#missing_packages[@]})); then
+  sudo apt-get update -y
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    "${missing_packages[@]}"
+fi
+
+step "mise"
+# Pinned; the installer verifies the release checksum from SHASUMS256.txt.
+if ! command -v mise >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/mise" ]]; then
+  curl -fsSL https://mise.run | MISE_VERSION=v2026.10.18 sh
+fi
+# The installer cannot change this process's PATH.
+export PATH="$HOME/.local/bin:$PATH"
+
+# Amp and supervised services start in non-interactive login shells that do
+# not activate mise. Put its shims on PATH there so `zig`, `go`, and the other
+# pinned tools resolve to each checkout's mise.toml without `mise exec`.
+profile_marker="# sporevm: mise shims"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >>"$HOME/.bash_profile" <<EOF
+
+$profile_marker
+export PATH="\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$PATH"
+EOF
+fi
+
+step "Pinned tools for sporevm"
+mise trust "$repo_root/mise.toml"
+mise --cd "$repo_root" install
+
+shopt -s nullglob
+for mise_config in "$repos_dir"/*/mise.toml; do
+  repo_dir="$(dirname "$mise_config")"
+  step "Pinned tools for ${repo_dir#"$repos_dir/"}"
+  mise trust "$mise_config"
+  mise --cd "$repo_dir" install
+done
+shopt -u nullglob
+
+step "Warm the Zig package and build caches"
+# Fetches build.zig.zon dependencies and compiles the Debug binary so the
+# first `mise run build` or `mise run test` in a new orb starts warm.
+mise exec -- zig build
+
+step "Ready"
+mise exec -- zig version
+echo "sporevm checkout: $repo_root"
+shopt -s nullglob
+for repo_dir in "$repos_dir"/*/; do
+  echo "additional repository: ${repo_dir%/}"
+done
+shopt -u nullglob
