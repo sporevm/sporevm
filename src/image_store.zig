@@ -846,7 +846,21 @@ pub const Client = struct {
         defer request.deinit();
         try request.sendBodiless();
         var no_redirects: [0]u8 = undefined;
-        var response = try request.receiveHead(&no_redirects);
+        var response = request.receiveHead(&no_redirects) catch |err| {
+            if (err == error.HttpConnectionClosing) {
+                // RAM preparation can outlive the origin's idle timeout. Do
+                // not spend every retry on another expired pooled socket.
+                const pool = &self.http.connection_pool;
+                pool.mutex.lockUncancelable(self.io);
+                defer pool.mutex.unlock(self.io);
+                while (pool.free.popFirst()) |node| {
+                    pool.free_len -= 1;
+                    const connection: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
+                    connection.destroy(self.io);
+                }
+            }
+            return err;
+        };
         switch (response.head.status) {
             .ok => {},
             .not_found => return error.ImageStoreNotFound,
@@ -1709,6 +1723,9 @@ pub const TestServer = struct {
     unsigned: std.atomic.Value(u32) = .init(0),
     /// Requests that carried the secret key anywhere in their head.
     leaked: std.atomic.Value(u32) = .init(0),
+    /// Advertise persistence, then close while idle, like an origin timeout.
+    close_keep_alive: bool = false,
+    connections_closed: std.atomic.Value(u32) = .init(0),
 
     pub fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
         var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
@@ -1754,7 +1771,10 @@ pub const TestServer = struct {
     }
 
     fn connection(self: *TestServer, stream: Io.net.Stream) void {
-        defer stream.close(self.io);
+        defer {
+            stream.close(self.io);
+            _ = self.connections_closed.fetchAdd(1, .release);
+        }
         self.handle(stream) catch {};
     }
 
@@ -1807,7 +1827,7 @@ pub const TestServer = struct {
             return writer.interface.flush();
         };
         defer self.allocator.free(data);
-        try writer.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{data.len});
+        try writer.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ data.len, if (self.close_keep_alive) "keep-alive" else "close" });
         try writer.interface.writeAll(data);
         try writer.interface.flush();
     }
@@ -1891,6 +1911,60 @@ test "HTTP store reads retry transient failures and fail closed on the rest" {
     const start_ms = monotonicMs();
     try std.testing.expectError(error.ImageStoreTimeout, client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, .{ .attempts = 2, .attempt_ms = 200, .total_ms = 600 }));
     try std.testing.expect(monotonicMs() - start_ms < 2_000);
+}
+
+test "HTTP store reads recover when the origin closes the idle connection pool" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const tag = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(allocator, &.{ store, "tags", "1" }), allocator, .limited(tag_file_len + 1));
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    server.close_keep_alive = true;
+    server.held = "/tags/1";
+    var client = try Client.init(std.testing.allocator, io, try server.url(allocator), &fixture.env);
+    defer client.deinit();
+    const quick = Budget{ .attempts = 3, .attempt_ms = 2_000, .total_ms = 5_000 };
+    const Worker = struct {
+        client: *Client,
+        expected: []const u8,
+        ok: bool = false,
+
+        fn run(worker: *@This()) void {
+            const bytes = worker.client.get(std.heap.c_allocator, "tags/1", .{ .max = tag_file_len }, quick) catch return;
+            defer std.heap.c_allocator.free(bytes);
+            worker.ok = std.mem.eql(u8, worker.expected, bytes);
+        }
+    };
+    // More idle sockets than the retry budget: retrying a different stale
+    // pooled socket on every attempt never reaches the healthy origin.
+    var workers: [4]Worker = undefined;
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    defer server.releaseHeld();
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .client = &client, .expected = tag };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        started += 1;
+    }
+    const deadline = monotonicMs() + 2_000;
+    while (server.requests.load(.acquire) < workers.len and monotonicMs() < deadline) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(workers.len, server.requests.load(.acquire));
+    server.releaseHeld();
+    for (threads[0..started]) |thread| thread.join();
+    started = 0;
+    for (workers) |worker| try std.testing.expect(worker.ok);
+    while (server.connections_closed.load(.acquire) < workers.len and monotonicMs() < deadline) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(workers.len, server.connections_closed.load(.acquire));
+    const bytes = try client.get(std.testing.allocator, "tags/1", .{ .max = tag_file_len }, quick);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(tag, bytes);
 }
 
 test "S3 store reads are signed with the environment's credentials, which only the signature carries" {
