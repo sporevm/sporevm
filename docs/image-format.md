@@ -113,6 +113,7 @@ holds each image's canonical files and its objects by digest:
 
 ```text
 objects/blake3/<hex>    rootfs object
+packs/blake3/<hex>      runs of rootfs objects end to end; see [Packs](#packs)
 images/<hex>/manifest   image manifest, named by the native image digest
 images/<hex>/config     canonical config
 images/<hex>/index      canonical rootfs index
@@ -120,7 +121,7 @@ tags/<name>             "blake3:<image hex>\n"
 ```
 
 `spore image push local/app:1 /srv/images/app` writes the image's missing
-objects, then its manifest, config and index, then `tags/app` last, and prints
+objects and packs, then its manifest, config and index, then `tags/app` last, and prints
 the ref to run, `file:///srv/images/app`. Objects already present with the
 right bytes are kept, so pushing again or under another tag writes nothing
 else. A destination of `blake3:<hex>` writes no tag and must name the image.
@@ -142,8 +143,8 @@ fault starts fetches of the missing objects of the next 7 chunks into the
 cache and does not wait for them; a later read of one of those objects waits
 only for the fetch already under way, with one request per object however
 many readers want it. If a window fetch fails, later faults fetch only what the guest reads. Up
-to 8 fault and window requests and 16 save requests can be open at once, so
-serve a store with a listen backlog of at least 32: `python3 -m http.server`
+to 8 fault and window requests and 64 save requests can be open at once, so
+serve a store with a listen backlog of at least 72: `python3 -m http.server`
 uses 5, and a Linux host retries connections past the backlog a second later.
 Over HTTP(S) a fetch makes at most three attempts within 10 seconds; a
 `file://` store has no deadline, so a hung mount blocks the disk, and
@@ -155,7 +156,8 @@ one 10-second fetch.
 
 Saving or committing a disk run from a store (`run --save-checkpoint`, `--save-on`,
 `--commit-image`, `spore vm save`) first fetches every object of the image that is not
-yet local, up to 64 at a time, so the result needs nothing from the store.
+yet local, with up to 64 [pack](#packs) reads at a time, so the result needs
+nothing from the store.
 `spore vm save` fetches before it pauses the guest; if the store cannot supply an
 object, or a guest read from it fails before the save, the save fails and the
 VM keeps running. `spore vm rm` and a client that quits also stop that fetch.
@@ -163,6 +165,39 @@ VM keeps running. `spore vm rm` and a client that quits also stop that fetch.
 before they write the spore or take the rootfs cache lock; a failure fails the
 run and removes the save directory. `--commit-image` takes the cache lock once the
 guest is frozen, so its fetch runs under it.
+
+### Packs
+
+A store with one small file per 64 KiB object is slow to copy in full: S3
+takes about 50 ms to start answering each request, however small the object.
+A pack is a store file that holds a run of a disk's objects end to end, so
+`spore image pull`, `spore checkpoint pull` and the fetch before a save read
+a few megabytes per request instead of one object.
+
+Packs need no descriptor file, because a disk index determines them. Walking
+the index's chunks in order, a pack ends after a chunk whose digest ends in
+a zero byte, about one chunk in 256, or before a chunk that would take it
+past 64 MiB; a chunk already in the pack is not added again. The pack's name
+is the BLAKE3 digest of `spore-pack-v1\n` followed by its members' 32-byte
+digests. Boundaries depend only on the chunks, so two disks that share a run
+of chunks share the packs inside it: a pushed spore reuses most of its
+image's packs, and a push writes only the packs the store lacks, by name and
+size.
+
+A reader asks for the bytes of each run of missing objects with one Range
+request of at most 2 MiB, and checks every object against its own digest
+before installing it, as it does an object fetched alone. When a pack holds
+other bytes for an object, the reader fetches that object from `objects/`,
+which every push still writes. When the store lacks a pack, does not answer
+a Range request with 206, as `python3 -m http.server` does not, or takes
+more than 30 seconds over one pack read, the reader stops asking for packs
+and fetches every remaining object from `objects/`; 64 pack reads at once
+need about 36 Mbit/s. A store pushed by an earlier release therefore reads
+as before, and earlier releases read a store with packs and ignore them.
+Guest reads that fault a chunk in still fetch its object alone.
+
+Packs roughly double the bytes a store holds for its disks. RAM chunks, at
+2 MiB each, and indexes are not packed.
 
 ### S3 stores
 
@@ -192,9 +227,11 @@ tag or object as access denied rather than not found, and either fails closed.
 `spore image push local/app:1 s3://bucket/images/app` stages the store under
 the rootfs cache with hard links to the cached objects, releases the cache
 lock, verifies the staged objects, and uploads with the aws CLI and its own credential chain: `aws s3 sync
---size-only` for `objects/`, then for `images/`, then `aws s3 cp` for the tag,
+--size-only` for `objects/`, then for `packs/`, then for `images/`, then `aws s3 cp` for the tag,
 so a reader never sees a tag before its image. An object's key is its digest,
-so a size match means the bucket already has it. Credentials appear only in
+so a size match means the bucket already has it. Before it stages packs it
+lists the store's with `aws s3api list-objects-v2` and assembles only those
+the store lacks, so a push needs local space for its new packs. Credentials appear only in
 the request signature and the session token header; refs, log lines, errors
 and the catalog's origin show only the `s3://` URL.
 
@@ -205,12 +242,13 @@ store:
 
 ```text
 objects/blake3/<hex>    RAM chunk, disk index or disk object
+packs/blake3/<hex>      runs of disk objects; see [Packs](#packs)
 spores/<hex>            spore manifest, named by its BLAKE3 digest
 spore-tags/<name>       "blake3:<spore hex>\n"
 ```
 
-It writes the RAM chunks, disk index and disk objects the store lacks, then
-the manifest, then the tag, and prints the digest-pinned ref,
+It writes the RAM chunks, disk index, disk objects and disk packs the store
+lacks, then the manifest, then the tag, and prints the digest-pinned ref,
 `file:///srv/images/base/blake3:<hex>`. A spore's unchanged disk chunks are
 its image's objects, so pushing it to a store that holds the image writes only
 the RAM chunks, the changed disk chunks, the index and the manifest. The pushed

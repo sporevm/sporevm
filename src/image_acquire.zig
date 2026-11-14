@@ -176,6 +176,7 @@ test "image pull rejects corrupt store content before publishing the requested t
     init.gpa = std.testing.allocator;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(a, "{s}/app", .{store}));
+    try fixture.dropPacks(store);
     for (try fixture.listStore(store)) |path| {
         if (!std.mem.startsWith(u8, path, "objects/")) continue;
         const full = try std.fs.path.join(a, &.{ store, path });
