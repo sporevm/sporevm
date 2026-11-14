@@ -2879,6 +2879,7 @@ test "a monitor fetches a store-backed root disk before a save pauses the guest,
     const io = std.testing.io;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    try fixture.dropPacks(store);
     const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
     var object: ?[]const u8 = null;
     for (try fixture.listStore(store)) |file| {

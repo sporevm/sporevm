@@ -19,6 +19,7 @@ const rootfs_cas = @import("rootfs_cas.zig");
 const runtime_disk_lease = @import("runtime_disk_lease.zig");
 const saved_spore_pin = @import("saved_spore_pin.zig");
 const spore = @import("spore.zig");
+const store_pack = @import("store_pack.zig");
 
 pub const PushOptions = struct {
     spore_dir: []const u8,
@@ -70,6 +71,7 @@ pub fn push(context: Context, allocator: std.mem.Allocator, options: PushOptions
     defer cache_lock.deinit();
 
     var objects: std.ArrayList(image_store.PushObject) = .empty;
+    var packs: []const store_pack.Pack = &.{};
     var seen: std.AutoHashMapUnmanaged(chunk.ChunkId, void) = .empty;
     const memory = manifest.memory;
     for (memory.chunks) |entry| {
@@ -100,12 +102,14 @@ pub fn push(context: Context, allocator: std.mem.Allocator, options: PushOptions
                 .path = try rootfs_cas.objectPath(arena, cache_root, entry.id),
             });
         }
+        packs = try store_pack.packsAlloc(arena, storage.logical_size, storage.chunk_size, index.parsed.value.chunks);
     }
 
     const files = [_]image_store.PushFile{.{ .path = digest[chunk.ChunkId.digest_prefix.len..], .bytes = manifest_bytes }};
     const written = try image_store.pushClosure(context.io, arena, options.aws_executable, destination, cache_root, &cache_lock, .{
         .digest = &digest,
         .objects = objects.items,
+        .packs = packs,
         .files_dir = "spores",
         .files = &files,
         .tags_dir = "spore-tags",
@@ -217,7 +221,7 @@ pub fn pull(context: Context, allocator: std.mem.Allocator, options: PullOptions
     try Io.Dir.cwd().createDirPath(io, chunks_dir);
 
     var ram_fetch: RamFetch = .{ .io = io, .client = &client, .dir = chunks_dir };
-    try image_store.fillEach(io, ram_objects.items, null, &ram_fetch, RamFetch.fetch);
+    try image_store.fillEach(image_store.Object, io, ram_objects.items, null, &ram_fetch, RamFetch.fetch);
     ram.objects = ram_objects.items.len;
     ram.objects_fetched = ram.objects;
 
@@ -493,9 +497,12 @@ test "spore checkpoint push to S3 uploads objects, then the manifest, then the t
     const commands = try Io.Dir.cwd().readFileAlloc(io, try fixture.path("aws.log"), allocator, .limited(64 * 1024));
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, commands, "\n"), '\n');
     const objects_sync = .{ "s3 sync --size-only --no-progress ", " s3://bucket-1/team/objects" };
+    const packs_list = .{ "s3api list-objects-v2 --bucket bucket-1 --prefix team/packs/blake3/ ", " --output text" };
+    const packs_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/packs" };
     const spores_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/spores" };
     const tag_copy = .{ "s3 cp --only-show-errors ", " s3://bucket-1/team/spore-tags/warm" };
-    inline for (.{ objects_sync, spores_sync, objects_sync, spores_sync, tag_copy }) |expected| {
+    // The disk's packs follow its objects; the second push uploads none.
+    inline for (.{ objects_sync, packs_list, packs_sync, spores_sync, objects_sync, packs_list, spores_sync, tag_copy }) |expected| {
         const line = lines.next() orelse return error.TestExpectedAwsCommand;
         try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
         try std.testing.expect(std.mem.endsWith(u8, line, expected[1]));
@@ -504,9 +511,11 @@ test "spore checkpoint push to S3 uploads objects, then the manifest, then the t
 
     const store = try std.fs.path.join(allocator, &.{ bucket, "bucket-1", "team" });
     const files = try fixture.listStore(store);
-    try std.testing.expectEqual(@as(usize, 8), files.len);
-    try std.testing.expectEqualStrings("spore-tags/warm", files[6]);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "spores/{s}", .{pushed.spore_digest[chunk.ChunkId.digest_prefix.len..]}), files[7]);
+    try std.testing.expectEqual(@as(usize, 9), files.len);
+    // The disk's objects in one pack; RAM chunks and the index are not packed.
+    try std.testing.expect(std.mem.startsWith(u8, files[6], "packs/blake3/"));
+    try std.testing.expectEqualStrings("spore-tags/warm", files[7]);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "spores/{s}", .{pushed.spore_digest[chunk.ChunkId.digest_prefix.len..]}), files[8]);
 
     // Every push removed its staging directory.
     var tmp = try Io.Dir.cwd().openDir(io, try std.fs.path.join(allocator, &.{ fixture.env.get(local_paths.rootfs_cache_env).?, "tmp" }), .{ .iterate = true });
@@ -694,6 +703,7 @@ test "spore checkpoint pull fails closed on bad store data and leaves no save or
     const saved = try saveTestSpore(&fixture);
     const store = try fixture.path("store");
     const pushed = try testPush(&fixture, saved.dir, try std.fmt.allocPrint(allocator, "{s}/warm", .{store}), "aws");
+    try fixture.dropPacks(store);
     const env = try testEnv(&fixture, "consumer");
     const cache = env.get(local_paths.rootfs_cache_env).?;
     const out = try fixture.path("pulled");

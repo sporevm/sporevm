@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `spore image push` and `spore checkpoint push` also write a disk's objects
+  as packs, files of about 16 MiB under `packs/blake3/` that hold runs of
+  objects end to end, and `image pull`, `checkpoint pull` and the fetch
+  before a save read them with Range requests of up to 2 MiB instead of one
+  request per 64 KiB object. Every object is still verified against its own
+  digest, and a reader falls back to the store's `objects/` when a pack is
+  missing or wrong, so stores from earlier releases read as before and
+  earlier releases read new stores. Packs roughly double the bytes a store
+  holds for disks; push an existing image or checkpoint again to add its
+  packs. An S3 push now also calls `aws s3api list-objects-v2`, which needs
+  the `s3:ListBucket` permission `aws s3 sync` already uses. See
+  [Packs](image-format.md#packs).
+
 ## v0.18.7
 
 - Pulling an image or checkpoint from S3 sends each signed request in one

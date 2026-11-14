@@ -1428,6 +1428,7 @@ test "a snapshot of a store image's disk first fetches every missing object, and
     const io = std.testing.io;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    try fixture.dropPacks(store);
     const cache = try fixture.path("consumer-cache");
     try fixture.env.put(local_paths.rootfs_cache_env, cache);
     const resolved = try resolveStoreRefForTest(fixture.processInit(), allocator, .{

@@ -8,6 +8,7 @@
 //! the guest reads it. Layout under the store base:
 //!
 //!   objects/blake3/<hex>    rootfs object; its length comes from the index
+//!   packs/blake3/<hex>      runs of rootfs objects end to end (store_pack.zig)
 //!   images/<hex>/manifest   canonical image manifest (image_manifest.zig)
 //!   images/<hex>/config     canonical image config
 //!   images/<hex>/index      canonical rootfs index
@@ -38,6 +39,7 @@ const rootfs_cas = @import("rootfs_cas.zig");
 const s3_sigv4 = @import("s3_sigv4.zig");
 const aws_credentials = @import("aws_credentials.zig");
 const spore = @import("spore.zig");
+const store_pack = @import("store_pack.zig");
 const test_support = @import("test_support.zig");
 
 const digest_prefix = image.digest_prefix;
@@ -251,6 +253,7 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
         .size = descriptor.size,
         .path = try rootfs_cas.manifestObjectPath(arena, cache_root, descriptor.digest),
     };
+    const index = try rootfs_cas.readStorageIndexPath(arena, try rootfs_cas.manifestIndexPath(arena, cache_root, closure.storage.index_digest), closure.storage);
     const hex = closure.image_digest[digest_prefix.len..];
     const files = [_]PushFile{
         .{ .path = try std.fmt.allocPrint(arena, "{s}/manifest", .{hex}), .bytes = closure.manifest.bytes },
@@ -260,6 +263,7 @@ pub fn push(init: std.process.Init, allocator: std.mem.Allocator, options: PushO
     const written = try pushClosure(init.io, allocator, options.aws_executable, destination, cache_root, &cache_lock, .{
         .digest = closure.image_digest,
         .objects = objects,
+        .packs = try store_pack.packsAlloc(arena, closure.storage.logical_size, closure.storage.chunk_size, index.parsed.value.chunks),
         .files_dir = "images",
         .files = &files,
         .tags_dir = "tags",
@@ -318,6 +322,9 @@ pub const PushFile = struct {
 pub const PushClosure = struct {
     digest: []const u8,
     objects: []const PushObject,
+    /// Packs of the disk's objects, all of which are in `objects`. Written
+    /// after the objects, which a reader uses when a pack is missing.
+    packs: []const store_pack.Pack = &.{},
     /// `images` or `spores`.
     files_dir: []const u8,
     files: []const PushFile,
@@ -370,6 +377,7 @@ pub fn pushClosure(
         written.bytes += object.size;
     }
     if (written.objects != 0) try chunk_sealer.fsyncDirPath(allocator, objects_dir);
+    _ = try writeMissingPacks(io, allocator, dir, closure.packs, null);
 
     for (closure.files) |file| {
         const path = try std.fs.path.join(allocator, &.{ dir, closure.files_dir, file.path });
@@ -445,6 +453,16 @@ fn pushS3(
 
     const base = destination.base.url;
     try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--no-progress", try std.fs.path.join(arena, &.{ stage, "objects" }), try std.fmt.allocPrint(arena, "{s}/objects", .{base}) }, &uploads);
+    if (closure.packs.len != 0) {
+        // Stage only the packs the store lacks: a pack is megabytes, and a
+        // disk shares most of its packs with the image it started from.
+        var stored: StoredPacks = .{ .arena = arena };
+        const prefix = try std.fmt.allocPrint(arena, "{s}packs/blake3/", .{if (destination.base.prefix.len == 0) "" else try std.fmt.allocPrint(arena, "{s}/", .{destination.base.prefix[1..]})});
+        try runAws(io, arena, aws, &.{ "s3api", "list-objects-v2", "--bucket", destination.base.bucket, "--prefix", prefix, "--query", "Contents[].[Key,Size]", "--output", "text" }, &stored);
+        if (try writeMissingPacks(io, allocator, stage, closure.packs, &stored) != 0) {
+            try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--only-show-errors", try std.fs.path.join(arena, &.{ stage, "packs" }), try std.fmt.allocPrint(arena, "{s}/packs", .{base}) }, null);
+        }
+    }
     try runAws(io, arena, aws, &.{ "s3", "sync", "--size-only", "--only-show-errors", try std.fs.path.join(arena, &.{ stage, closure.files_dir }), try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, closure.files_dir }) }, null);
     switch (destination.target) {
         .tag => |name| {
@@ -465,7 +483,7 @@ const Uploads = struct {
     count: usize = 0,
     bytes: u64 = 0,
 
-    fn line(self: *Uploads, text: []const u8) void {
+    fn line(self: *Uploads, text: []const u8) !void {
         if (!std.mem.startsWith(u8, text, "upload: ")) return;
         const key = std.mem.trimEnd(u8, text, "\r");
         const size = self.sizes.get(key[(std.mem.lastIndexOfScalar(u8, key, '/') orelse return) + 1 ..]) orelse return;
@@ -474,9 +492,66 @@ const Uploads = struct {
     }
 };
 
+/// The packs an S3 store holds, from the lines `aws s3api list-objects-v2
+/// --query 'Contents[].[Key,Size]' --output text` prints: `<key>\t<size>`,
+/// or `None` for a page without objects.
+const StoredPacks = struct {
+    arena: std.mem.Allocator,
+    /// Pack sizes by name.
+    sizes: std.StringHashMapUnmanaged(u64) = .empty,
+
+    fn line(self: *StoredPacks, text: []const u8) !void {
+        const tab = std.mem.indexOfScalar(u8, text, '\t') orelse return;
+        const key = text[0..tab];
+        const name = key[if (std.mem.lastIndexOfScalar(u8, key, '/')) |slash| slash + 1 else 0..];
+        if (name.len != chunk.ChunkId.hex_len) return;
+        for (name) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return;
+        const size = std.fmt.parseInt(u64, std.mem.trimEnd(u8, text[tab + 1 ..], "\r"), 10) catch return;
+        try self.sizes.put(self.arena, try self.arena.dupe(u8, name), size);
+    }
+};
+
+/// Write each of `packs` that the store lacks to `<dir>/packs/blake3/`,
+/// from the objects in `<dir>/objects/blake3/`, each verified as it is read.
+/// The store has a pack when `stored` lists it, or without `stored` when
+/// `dir` holds it, at the pack's size. Returns how many it wrote.
+fn writeMissingPacks(io: Io, allocator: std.mem.Allocator, dir: []const u8, packs: []const store_pack.Pack, stored: ?*const StoredPacks) !usize {
+    if (packs.len == 0) return 0;
+    const packs_dir = try std.fs.path.join(allocator, &.{ dir, "packs", "blake3" });
+    defer allocator.free(packs_dir);
+    try chunk_sealer.ensureDirPath(allocator, packs_dir);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    var written: usize = 0;
+    for (packs) |pack| {
+        const path = try std.fs.path.join(allocator, &.{ packs_dir, &pack.name });
+        defer allocator.free(path);
+        const size: ?u64 = if (stored) |listing|
+            listing.sizes.get(&pack.name)
+        else if (Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false })) |stat|
+            (if (stat.kind == .file) stat.size else null)
+        else |err| switch (err) {
+            error.FileNotFound => null,
+            else => |e| return e,
+        };
+        if (size == pack.len()) continue;
+        bytes.clearRetainingCapacity();
+        for (pack.members) |member| {
+            const object = try std.fs.path.join(allocator, &.{ dir, "objects", "blake3", &member.id.toHex() });
+            defer allocator.free(object);
+            const data = try rootfs_cas.readVerifiedChunkPath(allocator, object, &member.id.toDigest(), member.len);
+            defer allocator.free(data);
+            try bytes.appendSlice(allocator, data);
+        }
+        try chunk_sealer.replaceFileAtomicDurable(allocator, path, bytes.items, 0o444);
+        written += 1;
+    }
+    return written;
+}
+
 /// Run `aws ARGS...` and fail unless it exits 0. Its errors go to stderr;
-/// `uploads` counts the uploads it reports on stdout.
-fn runAws(io: Io, allocator: std.mem.Allocator, aws: []const u8, args: []const []const u8, uploads: ?*Uploads) !void {
+/// `sink.line` takes each line it prints on stdout, unless `sink` is null.
+fn runAws(io: Io, allocator: std.mem.Allocator, aws: []const u8, args: []const []const u8, sink: anytype) !void {
     const argv = try std.mem.concat(allocator, []const u8, &.{ &.{aws}, args });
     defer allocator.free(argv);
     var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit }) catch return error.AwsCliUnavailable;
@@ -484,7 +559,7 @@ fn runAws(io: Io, allocator: std.mem.Allocator, aws: []const u8, args: []const [
     var buffer: [64 * 1024]u8 = undefined;
     var reader = child.stdout.?.readerStreaming(io, &buffer);
     while (reader.interface.takeDelimiter('\n') catch return error.ImageStorePushFailed) |text| {
-        if (uploads) |counter| counter.line(text);
+        if (@TypeOf(sink) != @TypeOf(null)) try sink.line(text);
     }
     switch (try child.wait(io)) {
         .exited => |code| if (code == 0) return,
@@ -593,6 +668,10 @@ pub const Limit = struct {
     max: usize,
     /// The body must be exactly `max` bytes.
     exact: bool = false,
+    /// Read the `max` bytes at this offset of the file, not the file from
+    /// its start: a Range request to an HTTP(S) or S3 store, which must
+    /// answer 206.
+    offset: ?u64 = null,
 };
 
 pub const GetError = error{
@@ -815,8 +894,8 @@ pub const Client = struct {
             self.http.now = Io.Clock.real.now(self.io);
         }
         var headers: std.http.Client.Request.Headers = .{ .accept_encoding = .omit };
-        var amz_headers: [3]std.http.Header = undefined;
-        var extra_headers: []const std.http.Header = &.{};
+        var extra_buf: [4]std.http.Header = undefined;
+        var extra_len: usize = 0;
         var signed: s3_sigv4.SignedGet = undefined;
         var session_token: ?[]const u8 = null;
         defer if (session_token) |token| {
@@ -833,15 +912,25 @@ pub const Client = struct {
             var signed_buf: [4]s3_sigv4.Header = undefined;
             // Host goes first; the client writes it from `headers.host`.
             const signed_headers = signed.headers(&signed_buf)[1..];
-            for (signed_headers, 0..) |header, index| amz_headers[index] = .{ .name = header.name, .value = header.value };
-            extra_headers = amz_headers[0..signed_headers.len];
+            for (signed_headers) |header| {
+                extra_buf[extra_len] = .{ .name = header.name, .value = header.value };
+                extra_len += 1;
+            }
             headers.host = .{ .override = s3.host };
             headers.authorization = .{ .override = signed.authorization() };
+        }
+        // S3 does not require Range to be signed.
+        var range_buf: [64]u8 = undefined;
+        if (limit.offset) |offset| {
+            if (limit.max == 0) return error.ImageStoreBadResponse;
+            const last = std.math.add(u64, offset, limit.max - 1) catch return error.ImageStoreBadResponse;
+            extra_buf[extra_len] = .{ .name = "Range", .value = std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ offset, last }) catch unreachable };
+            extra_len += 1;
         }
         var request = try self.http.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
             .headers = headers,
-            .extra_headers = extra_headers,
+            .extra_headers = extra_buf[0..extra_len],
         });
         defer request.deinit();
         try request.sendBodiless();
@@ -862,7 +951,9 @@ pub const Client = struct {
             return err;
         };
         switch (response.head.status) {
-            .ok => {},
+            // A store that ignores Range answers 200 with the whole file.
+            .ok => if (limit.offset != null) return error.ImageStoreBadResponse,
+            .partial_content => if (limit.offset == null) return error.ImageStoreBadResponse,
             .not_found => return error.ImageStoreNotFound,
             .too_many_requests => return error.ImageStoreUnavailable,
             else => |status| return if (status.class() == .server_error) error.ImageStoreUnavailable else error.ImageStoreRejected,
@@ -875,6 +966,8 @@ pub const Client = struct {
         const body = response.reader(&transfer_buffer);
         var out: Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
+        // The length was checked against the limit above.
+        if (response.head.content_length) |length| try out.ensureTotalCapacityPrecise(@intCast(length));
         var scratch: [64 * 1024]u8 = undefined;
         while (true) {
             const n = body.readSliceShort(&scratch) catch |err| switch (err) {
@@ -905,10 +998,15 @@ pub const Client = struct {
         defer file.close(self.io);
         const stat = file.stat(self.io) catch return error.ImageStoreUnavailable;
         if (stat.kind != .file) return error.ImageStoreBadResponse;
-        if (stat.size > limit.max or (limit.exact and stat.size != limit.max)) return error.ImageStoreBadResponse;
-        const bytes = try allocator.alloc(u8, @intCast(stat.size));
+        const offset = limit.offset orelse 0;
+        if (offset > stat.size) return error.ImageStoreBadResponse;
+        // A ranged read takes `max` bytes, or what the file has left.
+        const available = stat.size - offset;
+        const len = if (limit.offset == null) available else @min(available, limit.max);
+        if (len > limit.max or (limit.exact and len != limit.max)) return error.ImageStoreBadResponse;
+        const bytes = try allocator.alloc(u8, @intCast(len));
         errdefer allocator.free(bytes);
-        const read = file.readPositionalAll(self.io, bytes, 0) catch return error.ImageStoreUnavailable;
+        const read = file.readPositionalAll(self.io, bytes, offset) catch return error.ImageStoreUnavailable;
         if (read != bytes.len) return error.ImageStoreBadResponse;
         return bytes;
     }
@@ -924,6 +1022,8 @@ pub const FetchStats = struct {
     window_fetches: u64 = 0,
     /// Objects fault windows fetched that no guest read has used yet.
     window_unused: u64 = 0,
+    /// Ranged reads of packs, each of which fetched one or more objects.
+    pack_reads: u64 = 0,
 };
 
 /// Store reads at once while `Fetcher.fetchAll` fills the cache. S3 takes
@@ -938,6 +1038,16 @@ pub const fill_concurrency = 64;
 /// acknowledges the first, which a store delays by about 40 ms when no
 /// response is due. S3 rejects heads over 8 KiB.
 const request_head_buffer_len = 8 * 1024;
+
+/// `Fetcher.fetchAll` reads at most this much of a pack at once, which each
+/// of its `fill_concurrency` reads holds in memory: the size of a RAM chunk,
+/// which a checkpoint pull already reads that many of at once.
+const span_max_bytes = 2 * 1024 * 1024;
+
+/// One attempt at a pack read; its objects' own files are the retry. A link
+/// too slow to carry `fill_concurrency` reads of `span_max_bytes` in this
+/// time, about 36 Mbit/s, fills from objects as it did before packs.
+const pack_budget = Budget{ .attempts = 1, .attempt_ms = 30_000, .total_ms = 30_000 };
 
 /// A fault on chunk `i` also starts fetches of the missing chunks in
 /// `[i + 1, i + window_chunks)`, and at most `window_chunks - 1` such fetches
@@ -976,6 +1086,11 @@ pub const Fetcher = struct {
     read_failed: std.atomic.Value(bool) = .init(false),
     /// `fetchAll` stops and fails; set when the VM is stopping.
     canceled: std.atomic.Value(bool) = .init(false),
+    /// The store lacks a pack, as one that an earlier release pushed lacks
+    /// them all, took too long to send part of one, or answered with
+    /// something else, as a file server that ignores Range does with the
+    /// whole file. `fetchAll` then asks for no more packs.
+    packs_unreadable: std.atomic.Value(bool) = .init(false),
     /// Objects being fetched, so that concurrent requesters share one GET.
     /// Guarded by `mutex`.
     in_flight: std.AutoHashMapUnmanaged(chunk.ChunkId, *InFlight) = .empty,
@@ -1002,6 +1117,15 @@ pub const Fetcher = struct {
     };
 
     const Purpose = enum { read, window, fill };
+
+    /// Adjacent members of one pack that are missing locally, which one
+    /// ranged read fetches.
+    const Span = struct {
+        pack: [chunk.ChunkId.hex_len]u8,
+        offset: u64,
+        len: usize,
+        objects: []const Object,
+    };
 
     /// `allocator` must be thread-safe: faults run on disk worker or vCPU
     /// threads and requests on `Io` workers. An S3 store takes its credentials from `env`
@@ -1212,29 +1336,92 @@ pub const Fetcher = struct {
         const start_ns = monotonicNs();
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
-        const missing = try self.missingObjects(arena_state.allocator());
-        try fillEach(self.io, missing, &self.canceled, self, fillOne);
+        const missing = try self.missingSpans(arena_state.allocator());
+        try fillEach(Span, self.io, missing, &self.canceled, self, fillSpan);
         self.complete.store(true, .release);
-        std.log.info("image store {s}: fetched the root disk's {d} missing objects in {d} ms", .{ self.client.base.url, missing.len, (monotonicNs() -| start_ns) / std.time.ns_per_ms });
+        var objects: usize = 0;
+        for (missing) |span| objects += span.objects.len;
+        std.log.info("image store {s}: fetched the root disk's {d} missing objects in {d} ms", .{ self.client.base.url, objects, (monotonicNs() -| start_ns) / std.time.ns_per_ms });
     }
 
-    fn fillOne(self: *Fetcher, object: Object) !void {
-        _ = try self.fetchOnce(object, .fill);
+    /// Fetch, verify and install the objects of `span` with one ranged read
+    /// of its pack. Objects the pack cannot supply come from the store's
+    /// `objects/`, where every store keeps them.
+    fn fillSpan(self: *Fetcher, span: Span) !void {
+        const path = try store_pack.pathAlloc(self.allocator, &span.pack);
+        defer self.allocator.free(path);
+        const start_ns = monotonicNs();
+        const packed_bytes: ?[]u8 = if (self.packs_unreadable.load(.acquire))
+            null
+        else if (self.client.get(self.allocator, path, .{ .max = span.len, .exact = true, .offset = span.offset }, pack_budget)) |bytes|
+            bytes
+        else |err| switch (err) {
+            // The store failed this once.
+            error.ImageStoreUnavailable => null,
+            error.ImageStoreNotFound, error.ImageStoreRejected, error.ImageStoreBadResponse, error.ImageStoreTimeout => blk: {
+                if (!self.packs_unreadable.swap(true, .acq_rel)) {
+                    std.log.info("image store {s}: reading objects one by one, not from packs: {s} for pack {s}", .{ self.client.base.url, @errorName(err), &span.pack });
+                }
+                break :blk null;
+            },
+            else => |e| return e,
+        };
+        defer if (packed_bytes) |bytes| self.allocator.free(bytes);
+        if (packed_bytes != null) self.record(.{ .pack_reads = 1, .fetch_ns = monotonicNs() -| start_ns });
+        var offset: usize = 0;
+        for (span.objects) |object| {
+            defer offset += object.len;
+            if (packed_bytes) |bytes| {
+                const data = bytes[offset..][0..object.len];
+                const id = chunk.ChunkId.fromDigest(&object.digest) catch return error.BadChunk;
+                if (id.matches(data)) {
+                    try self.install(&object.digest, data);
+                    self.record(.{ .fetches = 1, .bytes = data.len });
+                    continue;
+                }
+                std.log.debug("image store {s}: pack {s} holds other bytes for {s}", .{ self.client.base.url, &span.pack, &object.digest });
+            }
+            _ = try self.fetchOnce(object, .fill);
+        }
     }
 
     /// The distinct objects of the storage's index that are not in the local
-    /// CAS at their indexed length.
-    fn missingObjects(self: *Fetcher, arena: std.mem.Allocator) ![]const Object {
+    /// CAS at their indexed length, as runs of adjacent members of the
+    /// index's packs. An object in several packs is in the first.
+    fn missingSpans(self: *Fetcher, arena: std.mem.Allocator) ![]const Span {
         const index_path = try rootfs_cas.manifestIndexPath(arena, self.cache_root, self.storage.index_digest);
         const index = try rootfs_cas.readStorageIndexPath(arena, index_path, self.storage);
+        const packs = try store_pack.packsAlloc(arena, self.storage.logical_size, self.storage.chunk_size, index.parsed.value.chunks);
         var seen = std.AutoHashMap(chunk.ChunkId, void).init(arena);
-        var missing: std.ArrayList(Object) = .empty;
-        for (index.parsed.value.chunks) |entry| {
-            if ((try seen.getOrPut(entry.id)).found_existing) continue;
-            const object = Object{ .digest = entry.id.toDigest(), .len = try rootfs_cas.storageChunkLen(self.storage, entry.logical_chunk) };
-            if (!try self.isLocal(object)) try missing.append(arena, object);
+        var spans: std.ArrayList(Span) = .empty;
+        // Each span's objects, end to end; a span slices it once it is whole.
+        var objects: std.ArrayList(Object) = .empty;
+        var counts: std.ArrayList(usize) = .empty;
+        for (packs) |pack| {
+            // The previous member is the last of the last span.
+            var adjacent = false;
+            for (pack.members) |member| {
+                const object = Object{ .digest = member.id.toDigest(), .len = member.len };
+                if ((try seen.getOrPut(member.id)).found_existing or try self.isLocal(object)) {
+                    adjacent = false;
+                    continue;
+                }
+                if (!adjacent or spans.items[spans.items.len - 1].len + member.len > span_max_bytes) {
+                    try spans.append(arena, .{ .pack = pack.name, .offset = member.offset, .len = 0, .objects = &.{} });
+                    try counts.append(arena, 0);
+                }
+                spans.items[spans.items.len - 1].len += member.len;
+                counts.items[counts.items.len - 1] += 1;
+                try objects.append(arena, object);
+                adjacent = true;
+            }
         }
-        return missing.items;
+        var first: usize = 0;
+        for (spans.items, counts.items) |*span, count| {
+            span.objects = objects.items[first..][0..count];
+            first += count;
+        }
+        return spans.items;
     }
 
     fn fetchVerified(self: *Fetcher, digest: []const u8, len: usize) (GetError || error{BadChunk})![]u8 {
@@ -1272,6 +1459,7 @@ pub const Fetcher = struct {
         self.stats.fetch_ns += delta.fetch_ns;
         self.stats.errors += delta.errors;
         self.stats.install_errors += delta.install_errors;
+        self.stats.pack_reads += delta.pack_reads;
     }
 };
 
@@ -1280,15 +1468,16 @@ pub const Fetcher = struct {
 /// Workers stop at a failure, or with `ImageStoreFetchCanceled` once
 /// `canceled` is set.
 pub fn fillEach(
+    comptime T: type,
     io: Io,
-    objects: []const Object,
+    objects: []const T,
     canceled: ?*const std.atomic.Value(bool),
     context: anytype,
     comptime work: anytype,
 ) !void {
     const Fill = struct {
         io: Io,
-        objects: []const Object,
+        objects: []const T,
         canceled: ?*const std.atomic.Value(bool),
         context: @TypeOf(context),
         next: std.atomic.Value(usize) = .init(0),
@@ -1495,6 +1684,19 @@ pub const TestImage = struct {
         return push(self.processInit(), self.arena.allocator(), .{ .source = "local/app:1", .destination = destination, .platform = self.platform });
     }
 
+    /// What the fixture's one pack holds: the rootfs's nonzero chunks in
+    /// order, which are its first, its third and its 100-byte tail.
+    pub fn packBytes(self: *TestImage) ![]const u8 {
+        const chunk_size = rootfs_cas.default_chunk_size;
+        return std.mem.concat(self.arena.allocator(), u8, &.{ self.rootfs_bytes[0..chunk_size], self.rootfs_bytes[2 * chunk_size ..] });
+    }
+
+    /// Remove the packs of `store`, which leaves a store as releases before
+    /// packs wrote it: an object's only copy is its `objects/` file.
+    pub fn dropPacks(self: *TestImage, store: []const u8) !void {
+        try Io.Dir.cwd().deleteTree(std.testing.io, try std.fs.path.join(self.arena.allocator(), &.{ store, "packs" }));
+    }
+
     /// A fake aws CLI that keeps S3 in the fixture's `bucket` directory, with
     /// `sync --size-only` semantics. It logs each command to `aws.log`, and a
     /// sync to `.../<dir>` fails while `bucket/fail-<dir>` exists.
@@ -1514,6 +1716,14 @@ pub const TestImage = struct {
             \\url="${{args[$# - 1]}}"
             \\dst="$root/${{url#s3://}}"
             \\case "$1 $2" in
+            \\  "s3api list-objects-v2")
+            \\    # --bucket B --prefix P --query 'Contents[].[Key,Size]' --output text
+            \\    found=0
+            \\    while read -r file; do
+            \\      found=1
+            \\      printf '%s\t%s\n' "${{file#"$root/$4/"}}" "$(wc -c < "$file" | tr -d ' ')"
+            \\    done < <(find "$root/$4/$6" -type f 2>/dev/null | sort)
+            \\    [[ $found == 1 ]] || echo None ;;
             \\  "s3 sync")
             \\    if [[ -e "$root/fail-${{url##*/}}" ]]; then exit 1; fi
             \\    (cd "$src" && find . -type f | sort) | while read -r file; do
@@ -1570,13 +1780,17 @@ test "image push writes a complete store once and retags without rewriting" {
     try std.testing.expectEqual(@as(u64, 2 * rootfs_cas.default_chunk_size + 100), first.bytes_written);
 
     const files = try fixture.listStore(store);
-    try std.testing.expectEqual(@as(usize, 7), files.len);
+    try std.testing.expectEqual(@as(usize, 8), files.len);
     for (files[0..3]) |file| try std.testing.expect(std.mem.startsWith(u8, file, "images/"));
     for (files[3..6]) |file| try std.testing.expect(std.mem.startsWith(u8, file, "objects/blake3/"));
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "images/{s}/config", .{hex}), files[0]);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "images/{s}/index", .{hex}), files[1]);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "images/{s}/manifest", .{hex}), files[2]);
-    try std.testing.expectEqualStrings("tags/1", files[6]);
+    try std.testing.expectEqualStrings("tags/1", files[7]);
+    // One pack holds the disk's three nonzero chunks end to end.
+    try std.testing.expect(std.mem.startsWith(u8, files[6], "packs/blake3/"));
+    const pack_path = try std.fs.path.join(allocator, &.{ store, files[6] });
+    try std.testing.expectEqualStrings(try fixture.packBytes(), try Io.Dir.cwd().readFileAlloc(io, pack_path, allocator, .limited(1 << 20)));
     const tag_path = try std.fs.path.join(allocator, &.{ store, "tags", "1" });
     const tag_bytes = try Io.Dir.cwd().readFileAlloc(io, tag_path, allocator, .limited(128));
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(allocator, "{s}\n", .{fixture.identity}), tag_bytes);
@@ -1587,21 +1801,26 @@ test "image push writes a complete store once and retags without rewriting" {
 
     const object_path = try std.fs.path.join(allocator, &.{ store, files[3] });
     const object_before = try Io.Dir.cwd().statFile(io, object_path, .{});
+    const pack_before = try Io.Dir.cwd().statFile(io, pack_path, .{});
     const retagged = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/latest", .{store}));
     try std.testing.expectEqual(@as(usize, 0), retagged.objects_written);
     const object_after = try Io.Dir.cwd().statFile(io, object_path, .{});
     try std.testing.expectEqual(object_before.inode, object_after.inode);
+    try std.testing.expectEqual(pack_before.inode, (try Io.Dir.cwd().statFile(io, pack_path, .{})).inode);
     const retagged_files = try fixture.listStore(store);
-    try std.testing.expectEqual(@as(usize, 8), retagged_files.len);
-    try std.testing.expectEqualStrings("tags/latest", retagged_files[7]);
+    try std.testing.expectEqual(@as(usize, 9), retagged_files.len);
+    try std.testing.expectEqualStrings("tags/latest", retagged_files[8]);
 
-    // A damaged object is replaced; a digest destination must name the image.
+    // A damaged object and a pack of the wrong size are replaced; a digest
+    // destination must name the image.
     try chunk_sealer.replaceFileAtomicDurable(allocator, object_path, "damaged", 0o644);
+    try chunk_sealer.replaceFileAtomicDurable(allocator, pack_path, "damaged", 0o644);
     const repaired = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ store, fixture.identity }));
     try std.testing.expectEqual(null, repaired.tag_ref);
     try std.testing.expectEqualStrings(first.digest_ref, repaired.digest_ref);
     try std.testing.expectEqual(@as(usize, 1), repaired.objects_written);
-    try std.testing.expectEqual(@as(usize, 8), (try fixture.listStore(store)).len);
+    try std.testing.expectEqualStrings(try fixture.packBytes(), try Io.Dir.cwd().readFileAlloc(io, pack_path, allocator, .limited(1 << 20)));
+    try std.testing.expectEqual(@as(usize, 9), (try fixture.listStore(store)).len);
     try std.testing.expectError(error.ImageIdentityMismatch, fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/blake3:{s}", .{ store, test_support.repeat("b", 64) })));
     try std.testing.expectError(error.ImageStorePushUnsupportedScheme, fixture.pushTo("https://images.example.test/app"));
 }
@@ -1633,9 +1852,12 @@ test "image push to S3 uploads objects, then the image, then the tag, with the a
     const commands = try Io.Dir.cwd().readFileAlloc(io, log, allocator, .limited(64 * 1024));
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, commands, "\n"), '\n');
     const objects_sync = .{ "s3 sync --size-only --no-progress ", " s3://bucket-1/team/objects" };
+    const packs_list = .{ "s3api list-objects-v2 --bucket bucket-1 --prefix team/packs/blake3/ ", " --output text" };
+    const packs_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/packs" };
     const images_sync = .{ "s3 sync --size-only --only-show-errors ", " s3://bucket-1/team/images" };
     const tag_copy = .{ "s3 cp --only-show-errors ", " s3://bucket-1/team/tags/1" };
-    inline for (.{ objects_sync, images_sync, objects_sync, images_sync, tag_copy }) |expected| {
+    // The second push lists the pack the first uploaded and uploads none.
+    inline for (.{ objects_sync, packs_list, packs_sync, images_sync, objects_sync, packs_list, images_sync, tag_copy }) |expected| {
         const line = lines.next() orelse return error.TestExpectedAwsCommand;
         try std.testing.expect(std.mem.startsWith(u8, line, expected[0]));
         try std.testing.expect(std.mem.endsWith(u8, line, expected[1]));
@@ -1648,6 +1870,11 @@ test "image push to S3 uploads objects, then the image, then the tag, with the a
     const consumer = try fixture.path("consumer-cache");
     const local = try resolve(io, allocator, consumer, try std.fmt.allocPrint(allocator, "{s}/1", .{store}), .{}, &fixture.env);
     try std.testing.expectEqualStrings(fixture.identity, local.identity);
+    for (try fixture.listStore(store)) |file| {
+        if (!std.mem.startsWith(u8, file, "packs/blake3/")) continue;
+        try std.testing.expectEqualStrings(try fixture.packBytes(), try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(allocator, &.{ store, file }), allocator, .limited(1 << 20)));
+        break;
+    } else return error.TestExpectedPack;
     try Io.Dir.cwd().deleteTree(io, try std.fs.path.join(allocator, &.{ store, "objects" }));
     const again = try push(fixture.processInit(), allocator, .{ .source = "local/app:1", .destination = try std.fmt.allocPrint(allocator, "s3://bucket-1/team/{s}", .{fixture.identity}), .platform = fixture.platform, .aws_executable = aws });
     try std.testing.expectEqual(@as(usize, 3), again.objects_written);
@@ -1736,6 +1963,12 @@ pub const TestServer = struct {
     /// Advertise persistence, then close while idle, like an origin timeout.
     close_keep_alive: bool = false,
     connections_closed: std.atomic.Value(u32) = .init(0),
+    /// Answer a Range request with that part of the file. Without it the
+    /// server ignores Range, as some static file servers do. Set before
+    /// requests.
+    ranges: bool = true,
+    /// Range requests answered with part of a file.
+    range_requests: std.atomic.Value(u32) = .init(0),
 
     pub fn start(self: *TestServer, allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
         var address = try Io.net.IpAddress.parseIp4("127.0.0.1", 0);
@@ -1837,8 +2070,24 @@ pub const TestServer = struct {
             return writer.interface.flush();
         };
         defer self.allocator.free(data);
-        try writer.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ data.len, if (self.close_keep_alive) "keep-alive" else "close" });
-        try writer.interface.writeAll(data);
+        var body: []const u8 = data;
+        var status: []const u8 = "200 OK";
+        if (self.ranges) for (head.items[1..]) |line| {
+            // `Range: bytes=<first>-<last>`, the only form the client sends.
+            if (!std.ascii.startsWithIgnoreCase(line, "range: bytes=")) continue;
+            var bounds = std.mem.splitScalar(u8, line["range: bytes=".len..], '-');
+            const first = try std.fmt.parseInt(usize, bounds.first(), 10);
+            const last = try std.fmt.parseInt(usize, bounds.rest(), 10);
+            if (first >= data.len) {
+                try writer.interface.writeAll("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                return writer.interface.flush();
+            }
+            body = data[first..@min(last + 1, data.len)];
+            status = "206 Partial Content";
+            _ = self.range_requests.fetchAdd(1, .monotonic);
+        };
+        try writer.interface.print("HTTP/1.1 {s}\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ status, body.len, if (self.close_keep_alive) "keep-alive" else "close" });
+        try writer.interface.writeAll(body);
         try writer.interface.flush();
     }
 };
@@ -2255,11 +2504,161 @@ test "filling a cache that already holds every object fetches nothing" {
     defer first.release();
     try first.fetchAll();
     try std.testing.expectEqual(@as(u64, 3), first.currentStats().fetches);
+    // One read of the store's pack file supplied all three.
+    try std.testing.expectEqual(@as(u64, 1), first.currentStats().pack_reads);
     // A second VM on the image saves after the first fetched everything.
     const second = try Fetcher.create(std.testing.allocator, io, cache, local.origin.?, local.storage, &fixture.env);
     defer second.release();
     try second.fetchAll();
     try std.testing.expectEqual(@as(u64, 0), second.currentStats().fetches);
+}
+
+/// A fetcher from the store at `origin` into `cache`, which first resolves
+/// the image `ref` names so that it holds the image's index.
+fn testFetcher(fixture: *TestImage, ref: []const u8, cache: []const u8, origin: []const u8) !*Fetcher {
+    const local = try resolve(std.testing.io, fixture.arena.allocator(), cache, ref, .{}, &fixture.env);
+    return Fetcher.create(std.testing.allocator, std.testing.io, cache, origin, local.storage, &fixture.env);
+}
+
+test "filling a cache reads each run of missing objects from its pack with one ranged request" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
+    const storage = (try resolve(io, allocator, try fixture.path("storage-cache"), ref, .{}, &fixture.env)).storage;
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    const url = try server.url(allocator);
+    const chunk_size = rootfs_cas.default_chunk_size;
+    const total: u64 = 2 * chunk_size + 100;
+
+    // An empty cache: the whole pack in one request.
+    const empty = try testFetcher(&fixture, ref, try fixture.path("empty-cache"), url);
+    defer empty.release();
+    try empty.fetchAll();
+    try std.testing.expectEqual(@as(u32, 1), server.requests.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), server.range_requests.load(.monotonic));
+    try std.testing.expectEqual(FetchStats{ .fetches = 3, .bytes = total, .fetch_ns = empty.currentStats().fetch_ns, .pack_reads = 1 }, empty.currentStats());
+    try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, try fixture.path("empty-cache"), storage));
+
+    // A cache that holds the pack's middle object: one request on each side
+    // of it, each for exactly the bytes of its object.
+    const middle_id = chunk.ChunkId.fromContents(fixture.rootfs_bytes[2 * chunk_size .. 3 * chunk_size]);
+    const partial_cache = try fixture.path("partial-cache");
+    _ = try rootfs_cas.installChunkPath(allocator, io, try rootfs_cas.objectPath(allocator, partial_cache, middle_id), fixture.rootfs_bytes[2 * chunk_size .. 3 * chunk_size], &middle_id.toDigest(), chunk_size);
+    const partial = try testFetcher(&fixture, ref, partial_cache, url);
+    defer partial.release();
+    try partial.fetchAll();
+    try std.testing.expectEqual(@as(u32, 3), server.requests.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), server.range_requests.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, chunk_size + 100), partial.currentStats().bytes);
+    try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, partial_cache, storage));
+}
+
+test "filling a cache reads an object's own file when a pack cannot supply it" {
+    var fixture: TestImage = undefined;
+    try fixture.init(.{});
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const io = std.testing.io;
+    const store = try fixture.path("store");
+    _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
+    const storage = (try resolve(io, allocator, try fixture.path("storage-cache"), ref, .{}, &fixture.env)).storage;
+    var server: TestServer = undefined;
+    try server.start(std.testing.allocator, io, store);
+    defer server.stop();
+    const url = try server.url(allocator);
+    const chunk_size = rootfs_cas.default_chunk_size;
+    var pack_path: []const u8 = undefined;
+    for (try fixture.listStore(store)) |file| {
+        if (std.mem.startsWith(u8, file, "packs/")) pack_path = try std.fs.path.join(allocator, &.{ store, file });
+    }
+    const pack_bytes = try fixture.packBytes();
+
+    // A pack with other bytes where its middle object belongs: the pack
+    // supplies the other two, and the middle one comes from its own file.
+    const corrupt = try allocator.dupe(u8, pack_bytes);
+    corrupt[chunk_size + 7] ^= 0xff;
+    try chunk_sealer.replaceFileAtomicDurable(allocator, pack_path, corrupt, 0o644);
+    const corrupt_cache = try fixture.path("corrupt-pack-cache");
+    const from_corrupt = try testFetcher(&fixture, ref, corrupt_cache, url);
+    defer from_corrupt.release();
+    try from_corrupt.fetchAll();
+    try std.testing.expectEqual(@as(u32, 2), server.requests.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3), from_corrupt.currentStats().fetches);
+    try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, corrupt_cache, storage));
+
+    // The object's own file is corrupt too: the store cannot supply it.
+    const middle_id = chunk.ChunkId.fromContents(fixture.rootfs_bytes[2 * chunk_size .. 3 * chunk_size]);
+    const object_path = try std.fs.path.join(allocator, &.{ store, "objects", "blake3", &middle_id.toHex() });
+    try chunk_sealer.replaceFileAtomicDurable(allocator, object_path, corrupt[chunk_size..][0..chunk_size], 0o644);
+    const unsupplied = try testFetcher(&fixture, ref, try fixture.path("unsupplied-cache"), url);
+    defer unsupplied.release();
+    try std.testing.expectError(error.BadChunk, unsupplied.fetchAll());
+    try chunk_sealer.replaceFileAtomicDurable(allocator, object_path, fixture.rootfs_bytes[2 * chunk_size .. 3 * chunk_size], 0o644);
+
+    // A server that ignores Range and answers with the whole pack, then a
+    // store without the pack, as earlier releases pushed it. Of two runs of
+    // missing objects, only the first asks for the pack: three requests.
+    var whole_files: TestServer = undefined;
+    try whole_files.start(std.testing.allocator, io, store);
+    defer whole_files.stop();
+    whole_files.ranges = false;
+    for ([_][]const u8{ "no-range-cache", "no-pack-cache" }) |name| {
+        if (std.mem.eql(u8, name, "no-pack-cache")) try fixture.dropPacks(store);
+        const cache = try fixture.path(name);
+        _ = try rootfs_cas.installChunkPath(allocator, io, try rootfs_cas.objectPath(allocator, cache, middle_id), fixture.rootfs_bytes[2 * chunk_size .. 3 * chunk_size], &middle_id.toDigest(), chunk_size);
+        const fetcher = try testFetcher(&fixture, ref, cache, try whole_files.url(allocator));
+        defer fetcher.release();
+        const before = whole_files.requests.load(.monotonic);
+        const runs = try fetcher.missingSpans(allocator);
+        try std.testing.expectEqual(2, runs.len);
+        for (runs) |run| try fetcher.fillSpan(run);
+        try std.testing.expectEqual(before + 3, whole_files.requests.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), fetcher.currentStats().pack_reads);
+        try std.testing.expect(try rootfs_cas.storageContentComplete(io, allocator, cache, storage));
+    }
+}
+
+fn fuzzStoredPackLine(_: void, smith: *std.testing.Smith) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var stored: StoredPacks = .{ .arena = arena_state.allocator() };
+    var buf: [256]u8 = undefined;
+    try stored.line(buf[0..smith.slice(&buf)]);
+    var names = stored.sizes.keyIterator();
+    while (names.next()) |name| _ = try chunk.ChunkId.fromHex(name.*);
+}
+
+test "fuzz stored pack listing line" {
+    try std.testing.fuzz({}, fuzzStoredPackLine, .{});
+}
+
+test "a pack listing takes each pack's name and size and skips every other line" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var stored: StoredPacks = .{ .arena = arena_state.allocator() };
+    const name = test_support.repeat("0123456789abcdef", 4);
+    for ([_][]const u8{
+        "team/packs/blake3/" ++ name ++ "\t4096",
+        "None",
+        "",
+        // Not a pack name: too short, uppercase, or not hex.
+        "team/packs/blake3/abc\t1",
+        "team/packs/blake3/" ++ test_support.repeat("0123456789ABCDEF", 4) ++ "\t1",
+        "team/packs/blake3/" ++ test_support.repeat("g", 64) ++ "\t1",
+        // No size.
+        "team/packs/blake3/" ++ test_support.repeat("b", 64) ++ "\tNone",
+        "team/packs/blake3/" ++ test_support.repeat("c", 64),
+    }) |line| try stored.line(line);
+    try std.testing.expectEqual(1, stored.sizes.count());
+    try std.testing.expectEqual(4096, stored.sizes.get(name).?);
 }
 
 test "file store reads only regular files and never waits for a FIFO writer" {

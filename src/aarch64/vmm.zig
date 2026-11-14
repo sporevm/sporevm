@@ -2699,6 +2699,7 @@ test "a snapshot fetches a store image's missing objects first, and a disk fork 
     const io = std.testing.io;
     const store = try fixture.path("store");
     _ = try fixture.pushTo(try std.fmt.allocPrint(allocator, "{s}/1", .{store}));
+    try fixture.dropPacks(store);
     const cache = try fixture.path("consumer-cache");
     try fixture.env.put(local_paths.rootfs_cache_env, cache);
     const ref = try std.fmt.allocPrint(allocator, "file://{s}/1", .{store});
