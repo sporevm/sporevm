@@ -6,9 +6,18 @@ const x86_64_board = @import("src/x86_64/board.zig");
 const macos_deployment_target = std.SemanticVersion{ .major = 13, .minor = 0, .patch = 0 };
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{
+    var target_query = b.standardTargetOptionsQueryOnly(.{
         .default_target = defaultTarget(),
     });
+    if (target_query.cpu_arch == .aarch64 and target_query.os_tag == .linux and target_query.cpu_model == .determined_by_arch_os) {
+        // The baseline aarch64 CPU has no AES instructions, and std.crypto
+        // picks its AES at compile time: TLS to an image store then decrypts
+        // in software, which took over half the CPU time of a pull from S3.
+        // ARM64 servers have the instructions; `-Dcpu=generic` builds for a
+        // CPU without them.
+        target_query.cpu_features_add.addFeature(@intFromEnum(std.Target.aarch64.Feature.aes));
+    }
+    const target = b.resolveTargetQuery(target_query);
     const target_os = target.result.os.tag;
     const target_arch = target.result.cpu.arch;
     const target_is_hvf = target_os == .macos and target_arch == .aarch64;
