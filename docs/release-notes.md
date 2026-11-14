@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.18.7
+
 - Pulling an image or checkpoint from S3 sends each signed request in one
   write and reads 64 objects at a time instead of 16. Each request had left
   as two writes, and the second waited about 40 ms for a delayed ACK. In a
