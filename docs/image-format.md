@@ -155,7 +155,7 @@ one 10-second fetch.
 
 Saving or committing a disk run from a store (`run --save-checkpoint`, `--save-on`,
 `--commit-image`, `spore vm save`) first fetches every object of the image that is not
-yet local, up to 16 at a time, so the result needs nothing from the store.
+yet local, up to 64 at a time, so the result needs nothing from the store.
 `spore vm save` fetches before it pauses the guest; if the store cannot supply an
 object, or a guest read from it fails before the save, the save fails and the
 VM keeps running. `spore vm rm` and a client that quits also stop that fetch.

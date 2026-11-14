@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Pulling an image or checkpoint from S3 sends each signed request in one
+  write and reads 64 objects at a time instead of 16. Each request had left
+  as two writes, and the second waited about 40 ms for a delayed ACK. In a
+  KVM ARM64 trial a cold pull of an image with 218,330 objects took 181
+  seconds instead of 911.
+
 ## v0.18.6
 
 - Store reads recover when an origin closes its idle HTTP connection pool,
