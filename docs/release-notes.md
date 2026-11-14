@@ -14,6 +14,12 @@
   packs. An S3 push now also calls `aws s3api list-objects-v2`, which needs
   the `s3:ListBucket` permission `aws s3 sync` already uses. See
   [Packs](image-format.md#packs).
+- The Linux ARM64 release is built for CPUs with the ARMv8 AES instructions,
+  so TLS to an HTTPS or S3 image store uses them instead of AES in software.
+  In a KVM ARM64 trial a pull of an 18.8 GB checkpoint from S3 used 190
+  CPU-seconds instead of 440. On a CPU without those instructions this
+  build stops with an illegal instruction when it opens a TLS connection;
+  build from source with `-Dcpu=generic` for one.
 
 ## v0.18.7
 
