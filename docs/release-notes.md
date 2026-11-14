@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.19.0
+
 - `spore image push` and `spore checkpoint push` also write a disk's objects
   as packs, files of about 16 MiB under `packs/blake3/` that hold runs of
   objects end to end, and `image pull`, `checkpoint pull` and the fetch
@@ -9,11 +11,12 @@
   request per 64 KiB object. Every object is still verified against its own
   digest, and a reader falls back to the store's `objects/` when a pack is
   missing or wrong, so stores from earlier releases read as before and
-  earlier releases read new stores. Packs roughly double the bytes a store
-  holds for disks; push an existing image or checkpoint again to add its
-  packs. An S3 push now also calls `aws s3api list-objects-v2`, which needs
-  the `s3:ListBucket` permission `aws s3 sync` already uses. See
-  [Packs](image-format.md#packs).
+  earlier releases read new stores. In a KVM ARM64 trial a cold pull of an
+  18.8 GB checkpoint from S3 took 28 seconds instead of 221. Packs roughly
+  double the bytes a store holds for disks; push an existing image or
+  checkpoint again to add its packs. An S3 push now also calls
+  `aws s3api list-objects-v2`, which needs the `s3:ListBucket` permission
+  `aws s3 sync` already uses. See [Packs](image-format.md#packs).
 - The Linux ARM64 release is built for CPUs with the ARMv8 AES instructions,
   so TLS to an HTTPS or S3 image store uses them instead of AES in software.
   In a KVM ARM64 trial a pull of an 18.8 GB checkpoint from S3 used 190
